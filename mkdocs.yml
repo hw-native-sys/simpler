@@ -118,6 +118,7 @@ nav:
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
       - Run completion fences: design/run-completion-fence.md
       - Worker Manager: worker-manager.md
+      - Chip startup and shared inputs (Chinese): zh-cn/chip-process-startup.md
       - Hardware:
           - Overview: hardware/README.md
           - Chip architecture: hardware/chip-architecture.md

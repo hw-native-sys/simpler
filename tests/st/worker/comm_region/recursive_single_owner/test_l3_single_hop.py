@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import pytest
+from simpler.chip_process import launch_chip
 from simpler.worker import Worker
 
 from ._helpers import (
@@ -58,3 +59,11 @@ def test_l3_single_hop_two_lifecycles(st_platform, st_device_ids):
         finally:
             if recorder is not None and recorder.restore is not None:
                 recorder.restore()
+
+
+@pytest.mark.platforms(["a2a3sim", "a5sim"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(_RUNTIME)
+def test_exec_l3_single_hop_two_lifecycles(monkeypatch, st_platform, st_device_ids):
+    monkeypatch.setattr(Worker, "_launch_chip_process", launch_chip)
+    test_l3_single_hop_two_lifecycles(st_platform, st_device_ids)

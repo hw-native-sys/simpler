@@ -36,9 +36,9 @@ class SharedMemoryAttachment:
 
     def _map(self, fd: int) -> None:
         self.size = os.fstat(fd).st_size
-        self._mapping = mmap.mmap(fd, self.size)
-        self._buffer: memoryview | None = memoryview(self._mapping)
-        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self._mapping))
+        self._mmap: mmap.mmap | None = mmap.mmap(fd, self.size)
+        self._buffer: memoryview | None = memoryview(self._mmap)
+        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self._mmap))
 
     @property
     def buf(self) -> memoryview | None:
@@ -48,10 +48,12 @@ class SharedMemoryAttachment:
         if self._buffer is not None:
             self._buffer.release()
             self._buffer = None
-        self._mapping.close()
+        if self._mmap is not None:
+            self._mmap.close()
+            self._mmap = None
 
     def __del__(self) -> None:
-        if hasattr(self, "_mapping"):
+        if hasattr(self, "_mmap"):
             try:
                 self.close()
             except (BufferError, OSError):

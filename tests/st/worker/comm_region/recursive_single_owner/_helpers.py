@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import contextvars
 import ctypes
-import multiprocessing
 import os
 import struct
+import tempfile
 from collections.abc import Callable
 from enum import IntEnum
+from multiprocessing import util
+from pathlib import Path
 from typing import Any
 
 from _task_interface import _worker_host_mapped_region_close  # pyright: ignore[reportMissingImports]
@@ -288,8 +290,7 @@ class _LifecycleEventKind(IntEnum):
 
 
 _RECORDER_EVENT_LIMIT = 16
-_RECORDER_RECORD_FIELDS = 3
-_RECORDER_SLOT_COUNT = 1 + _RECORDER_EVENT_LIMIT * _RECORDER_RECORD_FIELDS
+_RECORDER_RECORD = struct.Struct("<QQQ")
 _RELEASE_RESOURCE_ID: contextvars.ContextVar[int] = contextvars.ContextVar(
     "recursive_single_owner_release_resource_id", default=0
 )
@@ -306,29 +307,22 @@ _LIFECYCLE_KIND_ORDER = (
 
 
 class _LifecycleRecorder:
-    def __init__(self) -> None:
-        self._storage = multiprocessing.Array(ctypes.c_uint64, _RECORDER_SLOT_COUNT, lock=True)
+    def __init__(self, path: str | None = None) -> None:
+        self._owner = tempfile.NamedTemporaryFile(prefix="simpler-lifecycle-") if path is None else None
+        self.path = self._owner.name if self._owner is not None else str(path)
         self.restore: Callable[[], None] | None = None
 
     def append(self, kind: int, provider_resource_id: int, part_kind: int) -> None:
-        with self._storage.get_lock():
-            count = int(self._storage[0])
-            if count >= _RECORDER_EVENT_LIMIT:
-                raise AssertionError("lifecycle recorder overflow")
-            base = 1 + count * _RECORDER_RECORD_FIELDS
-            self._storage[base] = int(kind)
-            self._storage[base + 1] = int(provider_resource_id)
-            self._storage[base + 2] = int(part_kind)
-            self._storage[0] = count + 1
+        record = _RECORDER_RECORD.pack(int(kind), int(provider_resource_id), int(part_kind))
+        # Each complete record is one O_APPEND write, shared by fork and exec observers.
+        with open(self.path, "ab", buffering=0) as stream:
+            assert stream.write(record) == len(record)
 
     def events(self) -> list[tuple[int, int, int]]:
-        with self._storage.get_lock():
-            count = int(self._storage[0])
-            records = []
-            for index in range(count):
-                base = 1 + index * _RECORDER_RECORD_FIELDS
-                records.append((int(self._storage[base]), int(self._storage[base + 1]), int(self._storage[base + 2])))
-            return records
+        data = Path(self.path).read_bytes()
+        assert len(data) % _RECORDER_RECORD.size == 0
+        assert len(data) <= _RECORDER_EVENT_LIMIT * _RECORDER_RECORD.size
+        return list(_RECORDER_RECORD.iter_unpack(data))
 
 
 class _LeaseProxy:
@@ -435,12 +429,35 @@ def _lookup_release_resource_id(worker: Worker, session_instance_id: bytes, tran
     raise AssertionError("delegated release has no matching instance resource id")
 
 
+def _install_provider_recorder(recorder: _LifecycleRecorder):
+    original_store_release = ProviderRegionStore.release
+    original_dispatcher = comm_provider._closed_part_dispatcher
+
+    def _store_release(self, provider_resource_id: int):
+        token = _RELEASE_RESOURCE_ID.set(int(provider_resource_id))
+        try:
+            return original_store_release(self, provider_resource_id)
+        finally:
+            _RELEASE_RESOURCE_ID.reset(token)
+
+    def _dispatcher(context, part, spec):
+        inner = original_dispatcher(context, part, spec)
+        return _ShellProxy(inner, part, recorder)
+
+    ProviderRegionStore.release = _store_release  # type: ignore[method-assign]
+    comm_provider._closed_part_dispatcher = _dispatcher
+
+    def restore():
+        ProviderRegionStore.release = original_store_release  # type: ignore[method-assign]
+        comm_provider._closed_part_dispatcher = original_dispatcher
+
+    return restore
+
+
 def install_lifecycle_recorder(worker: Worker) -> _LifecycleRecorder:
     recorder = _LifecycleRecorder()
     original_import = worker._import_region_part_lease
     original_release = worker._dispatch_delegated_release
-    original_store_release = ProviderRegionStore.release
-    original_dispatcher = comm_provider._closed_part_dispatcher
     import_count = {"n": 0}
 
     def _import(worker_id: int, resource_id: int, export: Any, **kwargs) -> Any:
@@ -464,27 +481,25 @@ def install_lifecycle_recorder(worker: Worker) -> _LifecycleRecorder:
         recorder.append(int(_LifecycleEventKind.RELEASE_RESULT), resource_id, int(RegionPartKind.INVALID))
         return result
 
-    def _store_release(self, provider_resource_id: int):
-        token = _RELEASE_RESOURCE_ID.set(int(provider_resource_id))
-        try:
-            return original_store_release(self, provider_resource_id)
-        finally:
-            _RELEASE_RESOURCE_ID.reset(token)
-
-    def _dispatcher(context, part, spec):
-        inner = original_dispatcher(context, part, spec)
-        return _ShellProxy(inner, part, recorder)
-
     worker._import_region_part_lease = _import
     worker._dispatch_delegated_release = _dispatch
-    ProviderRegionStore.release = _store_release  # type: ignore[method-assign]
-    comm_provider._closed_part_dispatcher = _dispatcher
+    restore_provider = _install_provider_recorder(recorder)
+    original_spawn = util.spawnv_passfds
+
+    def _spawn(path, command, passed_fds):
+        if command[1:3] == ["-m", "simpler.chip_process"]:
+            command = [command[0], str(Path(__file__).with_name("_chip_observer.py")), recorder.path, *command[3:]]
+        return original_spawn(path, command, passed_fds)
+
+    util.spawnv_passfds = _spawn
 
     def restore() -> None:
         worker._import_region_part_lease = original_import
         worker._dispatch_delegated_release = original_release
-        ProviderRegionStore.release = original_store_release  # type: ignore[method-assign]
-        comm_provider._closed_part_dispatcher = original_dispatcher
+        restore_provider()
+        util.spawnv_passfds = original_spawn
+        if recorder._owner is not None:
+            recorder._owner.close()
 
     recorder.restore = restore
     return recorder

@@ -815,11 +815,11 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
             assert shm.buf is not None
             worker_mod._PIPELINE_LEASE_FMT.pack_into(shm.buf, worker_mod._OFF_PIPELINE_LEASE, depth, granted_sets, 0)
 
-    def fake_fork() -> int:
-        startup_events.append(("fork",))
+    def fake_launch(*_args) -> int:
+        startup_events.append(("launch",))
         return next(fork_pids)
 
-    monkeypatch.setattr(worker_mod.os, "fork", fake_fork)
+    monkeypatch.setattr(worker, "_launch_chip_process", fake_launch)
     monkeypatch.setattr(worker_mod._simpler_log, "get_current_config", lambda: 60)
     monkeypatch.setattr(
         worker_mod,
@@ -862,7 +862,7 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
     )
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
-    assert startup_events[1:] == [("fork",), ("fork",), ("writer",)]
+    assert startup_events[1:] == [("launch",), ("launch",), ("writer",)]
 
 
 def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monkeypatch):

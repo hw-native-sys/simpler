@@ -1095,15 +1095,11 @@ def _run_program_loader_unload(arch, runtime, device):
 
 
 def _run_program_loader_double_failure(arch, runtime, device, use_acl):
-    """When a program close's unload *and* its device reset both fail, the
-    retained handle has no reachable retry — `device_id_` is cleared and the
-    next close returns early. It is therefore abandoned at that point, so
-    nothing issues an unreported unload against a device whose reset never
-    completed, and the context is still reusable.
+    """A failed reset retains its reference debt and blocks reinitialization.
 
-    Covers the two soft-reset arms. `aclrtResetDeviceForce` is deliberately not
-    injectable here: it belongs to the fatal branch, which this change does not
-    touch and which has its own abandonment already."""
+    A subsequent close retries the reset without reusing abandoned loader handles.
+    Only a confirmed reset makes the context reusable. Both soft-reset arms are covered.
+    """
     lib = _load(arch, "onboard", runtime)
     lib.ensure_acl_ready_ctx.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.ensure_acl_ready_ctx.restype = ctypes.c_int
@@ -1137,27 +1133,24 @@ def _run_program_loader_double_failure(arch, runtime, device, use_acl):
     try:
         assert lib.simpler_init(*init_args) == 0
         if use_acl:
-            # Brings `acl_ready_` up so finalize takes the aclrtResetDevice arm
-            # instead of the bare rtDeviceReset one.
+            # Acquire the ACL reference too; finalize releases it before RTS.
             assert lib.ensure_acl_ready_ctx(ctx, device) == 0
         faults.arm_unload_failures(1)
         faults.arm_reset_failures(1)
         assert lib.finalize_device(ctx) != 0
         assert faults.unload_call_count() == 1
         assert faults.reset_call_count() >= 1
-        # `device_id_` is cleared regardless of the reset's result, so this
-        # close is the last one that could reach anything. It reports the
-        # failure; the next is idempotent over a context that owns nothing.
-        assert lib.finalize_device(ctx) == 0
-        assert faults.unload_call_count() == 1
-        # A repeat no-op finalize does not turn an unproven reset into proof.
         assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
+        failed_reset_count = faults.reset_call_count()
+        assert lib.finalize_device(ctx) == 0
+        assert faults.reset_call_count() > failed_reset_count
         assert faults.unload_call_count() == 1
+        assert lib.simpler_init(*init_args) == 0
+        assert lib.finalize_device(ctx) == 0
+        assert faults.unload_call_count() == 2
         lib.destroy_device_context(ctx)
         destroyed = True
-        # Destruction must not retry the abandoned loader against a device
-        # whose reset was never confirmed.
-        assert faults.unload_call_count() == 1
+        assert faults.unload_call_count() == 2
     finally:
         if not destroyed:
             lib.destroy_device_context(ctx)
@@ -1233,9 +1226,7 @@ def test_program_callable_release_failure_leaves_no_stale_record(arch, runtime, 
 @pytest.mark.parametrize("reset_arm", ["rt", "acl"])
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_program_loader_double_failure_leaves_nothing_to_unload(arch, runtime, reset_arm, kernel_close_faults, request):
-    """A program close whose unload and device reset both fail must not leave a
-    retryable-looking handle behind: there is no reachable retry once
-    `device_id_` is cleared, so the destructor must issue no further unload."""
+    """Retry the failed device reset without retrying an abandoned loader handle."""
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")

@@ -59,6 +59,7 @@ def _unpack_config(packed):
 def launch_chip(worker, index, device_id, snapshots, log_level, requested_depth, deadline) -> int:
     """Pass owned bootstrap data and heap fds; never create a second child reaper."""
     from .comm_endpoints import DEVICE_AICORE, DEVICE_AICPU  # noqa: PLC0415
+    from .task_interface import _bind_host_log_session_directory  # noqa: PLC0415
 
     entries = [
         (digest, ctypes.string_at(target.buffer_ptr(), target.buffer_size()), count)
@@ -78,6 +79,7 @@ def launch_chip(worker, index, device_id, snapshots, log_level, requested_depth,
         prewarm_config=_pack_config(worker._prewarm_config),
         enable_sdma=bool(worker._config.get("enable_sdma", False)),
         log_level=log_level,
+        host_log_directory=_bind_host_log_session_directory(),
         chip_rank=index,
         launch_depth=requested_depth if worker._automatic_admission_requested else worker._launch_depth,
         collect_across_runs=bool(worker._config.get("collect_across_runs", False)),
@@ -114,12 +116,14 @@ def _main(bootstrap_fd: int, tracker_fd: int) -> None:
 
     from . import worker as module  # noqa: PLC0415
     from ._shared_memory import SharedMemoryAttachment  # noqa: PLC0415
-    from .task_interface import ChipCallable  # noqa: PLC0415
+    from .task_interface import ChipCallable, _native_set_host_log_directory  # noqa: PLC0415
 
     mailbox = SharedMemoryAttachment(data["mailbox"])
     buf = mailbox.buf
     assert buf is not None
     try:
+        if not _native_set_host_log_directory(data["host_log_directory"]):
+            raise RuntimeError("chip bootstrap: cannot bind parent host log directory")
         if os.getppid() != data["parent_pid"] or monotonic() >= data["deadline"]:
             raise RuntimeError("chip bootstrap: parent exited or startup deadline exceeded")
         entries = []

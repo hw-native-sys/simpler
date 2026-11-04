@@ -11,10 +11,11 @@
 import ctypes
 import os
 import struct
+from pathlib import Path
 
 import pytest
 from simpler.chip_process import launch_chip
-from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType, _bind_host_log_session_directory
 from simpler.worker import Worker
 
 from .main import N_COLS, N_ROWS, build_chip_callable, run
@@ -91,6 +92,9 @@ def test_exec_chips_compute_from_heap_slices(monkeypatch, st_platform, st_device
     finally:
         worker.close()
     assert len(pids) == 3
+    directory = Path(_bind_host_log_session_directory())
+    for pid in pids[:2]:
+        assert "name=chip.run " in (directory / f"host.{pid}.log").read_text()
     for pid in pids:
         with pytest.raises(ChildProcessError):
             os.waitpid(pid, os.WNOHANG)
