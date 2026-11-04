@@ -1090,6 +1090,9 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             // Every core, not just the AIV pair the sub_block_id loop above walks:
             // an AIC kernel bypasses L2 on the same terms as an AIV one.
             dp.global_context.l2_cache_offset = get_dev_l2_cache_offset();
+            for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; kind++) {
+                dp.global_context.dma_workspace[kind] = get_dma_workspace_addr(kind);
+            }
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }
