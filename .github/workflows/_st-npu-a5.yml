@@ -59,14 +59,14 @@ jobs:
       - name: Checkout target
         uses: actions/checkout@v5
         with:
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || github.ref }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
           persist-credentials: false
 
       - name: Prepare A5 diagnostic logs
         run: |
           mkdir -p "$ASCEND_PROCESS_LOG_PATH"
-          git rev-parse HEAD > "$A5_DIAGNOSTIC_DIR/source.txt"
+          git rev-parse HEAD | tee "$A5_DIAGNOSTIC_DIR/source.txt"
 
       - name: Validate manual mode
         run: |
