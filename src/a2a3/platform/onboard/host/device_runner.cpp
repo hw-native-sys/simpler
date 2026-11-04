@@ -282,7 +282,7 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
-// `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
+// `ensure_aicpu_runtime_registered`, `query_max_block_dim`, and `validate_block_dim`
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
@@ -499,11 +499,9 @@ int DeviceRunner::prepare_execution(
         );
     }
 
-    // Resolve the orchestration SO into a device-resident buffer and refresh
-    // runtime metadata before the Runtime struct is uploaded to device.
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
 
@@ -1100,7 +1098,7 @@ void DeviceRunner::emit_device_dep_gen_graph(
     }
 }
 
-// `print_handshake_results`, `prepare_orch_so`, `register_callable`,
+// `print_handshake_results`, `validate_active_callable`, `register_callable`,
 // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.

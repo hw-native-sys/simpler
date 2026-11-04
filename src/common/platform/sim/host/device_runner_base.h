@@ -925,8 +925,8 @@ protected:
     // directly from CallableState by launch_device_register — no Runtime
     // round-trip.
     virtual int invoke_device_register(const RegisterCallableArgs &reg_args) = 0;
-    int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
+    // Registration owns orchestration code; validation leaves Runtime unchanged.
+    int validate_active_callable(const Runtime &runtime) const;
 
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
@@ -1165,7 +1165,7 @@ protected:
     // Written on the bind path, read by the caller's thread.
     std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
     std::atomic<size_t> scheduler_mode_publish_total_{0};
-    // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
+    // AICPU executor SO: load-once, matching onboard's aicpu_runtime_registered_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
     // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.
     bool aicpu_so_loaded_{false};

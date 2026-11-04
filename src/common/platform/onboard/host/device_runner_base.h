@@ -22,7 +22,7 @@
  *   - Device lifecycle: `bind_current_thread`, `attach_current_thread`,
  *     `adopt_borrowed_device`, `configure_aicore_op_timeout`,
  *     `ensure_device_initialized`,
- *     `ensure_binaries_loaded`, persistent AICPU/AICore streams,
+ *     `ensure_aicpu_runtime_registered`, persistent AICPU/AICore streams,
  *     dispatcher/executor bytes, `LoadAicpuOp`, `KernelArgsHelper`.
  *   - block_dim resolution: `query_max_block_dim`, `resolve_block_dim`.
  *   - Debug: `print_handshake_results`, `create_thread`.
@@ -985,23 +985,9 @@ public:
     int adopt_borrowed_device(int device_id);
 
     /**
-     * One-shot device initialization. Performs, in order:
-     *   1. attach_current_thread on device_id_
-     *   2. rtStreamCreate for AICPU + AICore streams (persistent, freed
-     *      by the subclass `finalize_impl()`).
-     *   3. Bootstrap the dispatcher + register the inner AICPU SO via
-     *      `ensure_binaries_loaded()`.
-     *   4. Provision the requested async-DMA workspaces via
-     *      `ensure_dma_workspace_provisioned()`.
-     *   5. Launch `simpler_aicpu_init` via `ensure_aicpu_init_launched()`,
-     *      which publishes step 4's addresses along with the other resident
-     *      invariants. Step 4 precedes it so that publication is one launch.
-     *   6. Warm the SDMA control path via `ensure_dma_workspace_warmed()`,
-     *      which needs both the live workspace and the AICore stream.
-     *
-     * Called from `simpler_init` after executor + dispatcher bytes and the
-     * async-DMA request have been cached on the runner. Idempotent: each step
-     * short-circuits on its own guard.
+     * Ensure the execution environment is usable on the calling thread.
+     * Program mode attaches the thread and initializes missing resources;
+     * kernel mode only validates the borrowed context and completed cold init.
      *
      * @return 0 on success, error code on failure.
      */
@@ -1035,7 +1021,7 @@ public:
      * when the caller provided a dispatcher path; the eager
      * `ensure_device_initialized()` in simpler_init hands the buffer to
      * `LoadAicpuOp::BootstrapDispatcher` at init time. Leaving this
-     * unset (empty buffer) makes `ensure_binaries_loaded()` fail with a
+     * unset (empty buffer) makes `ensure_aicpu_runtime_registered()` fail with a
      * clear message — callers that drive `_ChipWorker.init` directly
      * without a dispatcher path get a deterministic error at
      * `simpler_init` time rather than a confusing dladdr-derived path.
@@ -1482,8 +1468,8 @@ public:
      * simpler_register_callable(): launches `simpler_aicpu_register_callable` with a
      * RegisterCallableArgs descriptor so the AICPU dlopens the callable's
      * orch SO. Host-orchestration callables are a no-op. On success, AICPU has
-     * populated orch_so_table_[callable_id] and subsequent runs only need to
-     * stamp the active callable_id.
+     * populated orch_so_table_[callable_id]; a later run validates that the
+     * active callable_id names this registered entry.
      */
     int launch_device_register(int32_t callable_id);
 
@@ -2100,6 +2086,22 @@ public:
 protected:
     virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
 
+    /**
+     * Program-mode initialization: attach the calling thread, create persistent
+     * streams, query core limits, register the AICPU runtime, provision DMA,
+     * complete AICPU initialization, then warm DMA. Resources are reused on
+     * subsequent calls. Executor/dispatcher bytes and the DMA request must
+     * already be installed on the runner.
+     */
+    int initialize_program_device();
+
+    /**
+     * Kernel-mode validation: require dispatch admission, AICPU registration
+     * and completed initialization, then validate this thread's borrowed
+     * context. Creates no resources and does not bind a device.
+     */
+    int validate_kernel_context_ready();
+
     // Ctor is protected: this class is for inheritance only — direct
     // instantiation (`new DeviceRunnerBase()`) is a compile error. The
     // public virtual dtor above lets the shared c_api delete through a
@@ -2214,30 +2216,30 @@ protected:
     int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
 
     /**
-     * Load AICPU SO and initialize device args. Called from
-     * `ensure_device_initialized()` after the persistent streams are
-     * created. Reads `aicpu_so_binary_` / `dispatcher_so_binary_` off
-     * the runner; releases both host buffers on success.
+     * Deploy and register the AICPU runtime SO and resolve its entry handles.
+     * Requires a live control stream. Reads `aicpu_so_binary_` /
+     * `dispatcher_so_binary_` off the runner; releases both host buffers on
+     * success. Device-side initialization is a separate operation.
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_binaries_loaded(rtStream_t control_stream);
+    int ensure_aicpu_runtime_registered(rtStream_t control_stream);
 
     /**
-     * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
-     * device id, log config, provisioned async-DMA workspace addresses) into the
-     * resident AICPU SO globals. Idempotent via `aicpu_init_launched_`; called
-     * from `ensure_device_initialized()` after the binaries are loaded and the
-     * workspaces are provisioned, so one launch publishes everything.
+     * Run `simpler_aicpu_init` and wait for completion on the control stream.
+     * Latches the device id, log config and provisioned async-DMA workspace
+     * addresses into the resident AICPU SO globals. Requires registered AICPU
+     * entry handles; `aicpu_initialized_` is set only after synchronization
+     * succeeds.
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_aicpu_init_launched(rtStream_t control_stream);
+    int ensure_aicpu_initialized(rtStream_t control_stream);
 
     /**
      * Provision the async-DMA workspaces this Worker asked for (see
      * `set_dma_workspace_request`) and record their device addresses in
-     * `dma_workspace_addr_`, ready for `ensure_aicpu_init_launched()` to
+     * `dma_workspace_addr_`, ready for `ensure_aicpu_initialized()` to
      * publish. Idempotent: a runner that already holds a provider handle, and
      * one whose request declined the only declinable engine on a device that
      * supports nothing else, both no-op. The handle is released by
@@ -2248,7 +2250,7 @@ protected:
     int ensure_dma_workspace_provisioned();
 
     /**
-     * Walk the SDMA control path once, after `ensure_aicpu_init_launched()` has
+     * Walk the SDMA control path once, after `ensure_aicpu_initialized()` has
      * published the workspace addresses. No-op without a provisioned workspace.
      * One-shot via `sdma_warmed_`, which also releases the warmup ELF bytes.
      *
@@ -2522,7 +2524,7 @@ protected:
      * H2D the Runtime struct via the supplied per-execution kernel arguments. Log config
      * and device ordinal are NOT published here: they are per-device invariants
      * latched once into the AICPU SO globals by `simpler_aicpu_init`
-     * (`ensure_aicpu_init_launched`) at device init, not carried per-run on
+     * (`ensure_aicpu_initialized`) at device init, not carried per-run on
      * KernelArgs.
      *
      * @return 0 on success, the underlying prepare/publish rc on failure.
@@ -2724,7 +2726,7 @@ protected:
      * a5's `rtDeviceReset`). Everything else lives here:
      *
      *   - rtStreamDestroy for both persistent streams
-     *   - aicore_bin_handle_ + binaries_loaded_ reset
+     *   - aicore_bin_handle_ + aicpu_runtime_registered_ reset
      *   - chip_callable_buffers_ free + clear
      *   - callables_ dlclose-on-hbg + clear + aicpu counter reset
      *   - 3 arenas release + cached size reset
@@ -2826,16 +2828,11 @@ protected:
     int finalize_common_impl(bool abandon_device_resources);
 
     /**
-     * Stamp the active callable_id onto a Runtime so the AICPU knows which
-     * orch_so_table_ slot to dispatch. The orch SO itself was already delivered
-     * device-side at register time (launch_device_register), so nothing else
-     * needs rewriting per run.
-     *
-     * @param runtime  Runtime whose active callable_id will be set.
-     * @return 0 on success, non-zero on failure.
+     * Validate the callable selected by bind against this runner's registry.
+     * Registration owns the orchestration code: host-side for HBG and
+     * device-side for TMR. This check neither loads code nor changes Runtime.
      */
-    int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
+    int validate_active_callable(const Runtime &runtime) const;
 
     // ---- Group D state shared by both a2a3 and a5 -------------------------
     //
@@ -2905,7 +2902,7 @@ protected:
     // was created with SDMA enabled.
     void *dma_workspace_handle_{nullptr};
     // Provisioned async-DMA workspace device addresses, indexed by
-    // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_init_launched()
+    // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_initialized()
     // so the resident AICPU SO latches them into g_dma_workspace_addr; the
     // scheduler prefills each core's GlobalContext from there. All-zero until a
     // Worker opts into SDMA via set_dma_workspace_request().
@@ -3015,7 +3012,7 @@ protected:
     // another device-side copy of the ELF and quickly exhaust HBM
     // (manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with
     // a 507899 cascade at `rtStreamCreate`). `aicpu_so_binary_` is
-    // released by `ensure_binaries_loaded()` after bootstrap;
+    // released by `ensure_aicpu_runtime_registered()` after bootstrap;
     // bootstrap is the only consumer and per-task launches go through
     // the cached `rtFuncHandle` on `LoadAicpuOp`, not the host bytes.
     std::vector<uint8_t> aicpu_so_binary_;
@@ -3033,10 +3030,10 @@ protected:
     void *sdma_warmup_bin_handle_{nullptr};
     // Dispatcher SO bytes — populated once via `set_dispatcher_binary()`
     // during simpler_init. Consumed exclusively by
-    // `BootstrapDispatcher` on the first run and released by
-    // `ensure_binaries_loaded()` right after. Empty buffer is permitted
+    // `BootstrapDispatcher` during initialization and released by
+    // `ensure_aicpu_runtime_registered()` right after. Empty buffer is permitted
     // at init time (callers that drive `ChipWorker.init` without a
-    // dispatcher path); `ensure_binaries_loaded()` then fails fast
+    // dispatcher path); `ensure_aicpu_runtime_registered()` then fails fast
     // with a clear message if/when bootstrap is actually attempted.
     std::vector<uint8_t> dispatcher_so_binary_;
 
@@ -3294,7 +3291,7 @@ protected:
     PrebuiltRuntimeArenaCache prebuilt_runtime_arena_cache_;
 
     // Persistent AICPU / AICore streams created in
-    // `ensure_device_initialized()` and torn down in the subclass's
+    // `initialize_program_device()` and torn down in the subclass's
     // `finalize()`. A2A3 reserves these for bootstrap/control operations and
     // submits runs on its own per-slot stream sets; A5 submits runs on these.
     // `nullptr` before init.
@@ -3371,10 +3368,10 @@ protected:
     // epoch distinguishes it without another clear.
     RunResourceSlots<bool> device_run_result_initialized_;
 
-    // True after AICPU SO loaded; reset by the subclass's `finalize_impl()`.
-    bool binaries_loaded_{false};
-    // Per-device guard for the initial simpler_aicpu_init launch.
-    bool aicpu_init_launched_{false};
+    // AICPU runtime registration and entry handles are ready.
+    bool aicpu_runtime_registered_{false};
+    // The control stream has completed simpler_aicpu_init.
+    bool aicpu_initialized_{false};
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live

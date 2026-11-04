@@ -577,7 +577,7 @@ void ChipWorker::init(
         // dispatcher_path is empty on sim (no dispatcher) and on tests that
         // exercise _ChipWorker.init directly without a RuntimeBinaries.
         // simpler_init treats a null/empty buffer as "no dispatcher" — onboard
-        // ensure_binaries_loaded raises with a clear message if the bootstrap
+        // ensure_aicpu_runtime_registered raises with a clear message if the bootstrap
         // is actually attempted, sim ignores it entirely.
         std::vector<uint8_t> dispatcher_bytes;
         if (!dispatcher_path.empty()) {

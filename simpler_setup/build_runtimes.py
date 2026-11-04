@@ -255,9 +255,9 @@ def build_all(
 
         # No device-side deployment step here. The dispatcher SO is uploaded
         # into the main aicpu_scheduler at runtime, on the first
-        # DeviceRunner::ensure_binaries_loaded call, via
-        # LoadAicpuOp::BootstrapDispatcher (see src/common/host/load_aicpu_op.cpp
-        # and src/common/aicpu_dispatcher/aicpu_dispatcher.h for architecture).
+        # DeviceRunnerBase::ensure_aicpu_runtime_registered call, via
+        # LoadAicpuOp::BootstrapDispatcher (see src/common/aicpu_loader/host/load_aicpu_op.cpp
+        # and src/common/aicpu_loader/device/aicpu_dispatcher.h for architecture).
 
     if pto_isa_root_for_metadata is not None:
         from simpler_setup.pto_isa import write_pto_isa_build_metadata  # noqa: PLC0415
