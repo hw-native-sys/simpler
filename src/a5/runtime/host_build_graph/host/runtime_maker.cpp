@@ -1122,7 +1122,7 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
     }
 }
 
-bool create_scheduler_state(
+__attribute__((weak)) bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments
 ) {
