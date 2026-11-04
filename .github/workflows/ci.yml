@@ -2,10 +2,15 @@ name: CI
 
 permissions:
   contents: read
+  pull-requests: read
 
 on:
   pull_request:
     branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   framework-a3:
@@ -26,3 +31,4 @@ jobs:
     uses: ./.github/workflows/_st-npu-a2a3.yml
     with:
       runs_on: '["self-hosted","a2a3"]'
+      include_dfx_smokes: true
