@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -262,3 +263,116 @@ TEST_F(HbgGraphRecordingBoundsTest, ABoundaryOfNoTensorsRecordsAndPublishes) {
     EXPECT_EQ(definition->boundary_scalar_count, 1);
     EXPECT_EQ(definition->task_count, 1u);
 }
+
+// A manual-scope producer has no tensor-map output edge. The Graph shell must
+// preserve its explicit predecessor on the first recording, an in-flight reuse,
+// and a published cache hit. Those invocation edges never enter the Definition.
+TEST_F(HbgGraphRecordingBoundsTest, ExplicitPredecessorsBelongToEachOuterShell) {
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    auto boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+    orch.begin_scope(ScopeMode::MANUAL);
+    std::array<TaskId, 3> producers{};
+    for (auto &producer : producers) {
+        CoreTaskArgs args;
+        producer = orch.submit_dummy_task(args).task_id();
+        ASSERT_TRUE(producer.is_valid());
+    }
+    const uint64_t key = 0x20E50A13;
+    const std::array<TaskId, 2> repeated_dep{producers[0], producers[0]};
+    GraphTaskArgs first;
+    first.add_input(boundary);
+    first.set_dependencies(repeated_dep.data(), repeated_dep.size());
+    const auto cold = orch.graph_begin(key, first);
+    ASSERT_FALSE(cold.has_error);
+    ASSERT_TRUE(cold.recording);
+    ASSERT_TRUE(cold.task_id.is_valid()) << "cold recording already owns an outer shell";
+    ASSERT_NE(cold.params, nullptr);
+    EXPECT_EQ(cold.params->explicit_dep_count(), 0U)
+        << "the recording body must not retain this invocation's GLOBAL dependencies";
+
+    GraphTaskArgs second;
+    second.add_input(boundary);
+    second.set_dependencies(&producers[1], 1);
+    const auto inflight = orch.graph_begin(key, second);
+    ASSERT_FALSE(inflight.has_error);
+    EXPECT_FALSE(inflight.recording);
+    ASSERT_TRUE(inflight.task_id.is_valid());
+
+    ASSERT_TRUE(orch.graph_prepare(cold.recording_handle, first));
+    CoreTaskArgs inner;
+    inner.add_input(cold.params->tensor(0).ref());
+    ASSERT_TRUE(orch.submit_dummy_task(inner).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+
+    GraphTaskArgs third;
+    third.add_input(boundary);
+    third.set_dependencies(producers.data() + 1, 2);
+    const auto cached = orch.graph_begin(key, third);
+    ASSERT_FALSE(cached.has_error);
+    EXPECT_FALSE(cached.recording);
+    ASSERT_TRUE(cached.task_id.is_valid());
+
+    const std::array<TaskId, 3> shells{cold.task_id, inflight.task_id, cached.task_id};
+    const std::array<std::vector<int32_t>, 3> want{
+        std::vector<int32_t>{static_cast<int32_t>(producers[0].local_id())},
+        std::vector<int32_t>{static_cast<int32_t>(producers[1].local_id())},
+        std::vector<int32_t>{
+            static_cast<int32_t>(producers[1].local_id()), static_cast<int32_t>(producers[2].local_id())
+        }
+    };
+    for (size_t i = 0; i < shells.size(); ++i) {
+        const auto &payload = orch.sm_header->tasks.storage_at(shells[i].local_id()).payload;
+        std::vector<int32_t> actual(payload.fanin_data(), payload.fanin_data() + payload.fanin_count);
+        std::sort(actual.begin(), actual.end());
+        EXPECT_EQ(actual, want[i]) << "shell " << i;
+    }
+    const auto published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.entries.size(), 1U);
+    const auto &entry = published.entries.front();
+    const auto *definition = reinterpret_cast<const GraphDefinition *>(
+        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
+    );
+    EXPECT_EQ(definition->task_count, 1U);
+    EXPECT_EQ(definition->edge_count, 0U);
+}
+
+class HbgGraphExplicitDependencyRejectionTest : public HbgGraphRecordingBoundsTest,
+                                                public ::testing::WithParamInterface<int> {};
+
+TEST_P(HbgGraphExplicitDependencyRejectionTest, RejectsSelfAndFuturePredecessors) {
+    const int phase = GetParam() / 2;  // cold, in-flight, cached
+    const int future_offset = GetParam() % 2;
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    auto boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+    GraphTaskArgs initial;
+    initial.add_input(boundary);
+    orch.begin_scope();
+    constexpr uint64_t key = 0x20E50A14;
+    if (phase != 0) {
+        const auto cold = orch.graph_begin(key, initial);
+        ASSERT_TRUE(cold.recording);
+        ASSERT_FALSE(cold.has_error);
+        if (phase == 2) {
+            ASSERT_TRUE(orch.graph_prepare(cold.recording_handle, initial));
+            CoreTaskArgs inner;
+            inner.add_input(cold.params->tensor(0).ref());
+            ASSERT_TRUE(orch.submit_dummy_task(inner).task_id().is_valid());
+            ASSERT_TRUE(orch.graph_end());
+        }
+    }
+    // The next shell is claimed before explicit fanins are appended. That must
+    // not turn its predicted id into a valid predecessor of itself.
+    const auto invalid_predecessor = TaskId::make_global(orch.task_allocator.active_count() + future_offset);
+    GraphTaskArgs invocation;
+    invocation.add_input(boundary);
+    invocation.set_dependencies(&invalid_predecessor, 1);
+    const auto result = orch.graph_begin(key, invocation);
+    EXPECT_TRUE(result.has_error);
+    EXPECT_FALSE(result.task_id.is_valid());
+    EXPECT_TRUE(orch.is_fatal());
+    EXPECT_EQ(orch.fatal_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+}
+
+INSTANTIATE_TEST_SUITE_P(ColdInflightCached, HbgGraphExplicitDependencyRejectionTest, ::testing::Range(0, 6));
