@@ -146,30 +146,36 @@ percounter 目录本身为空。产出与 hbg 等价的第三套二进制。
 
 做完这一步就已经拿到最大的好处：**percounter 的实验不再和 hbg 共用一个二进制。**
 
-### 第 2 步：搬运八个头文件
+### 第 2 步：搬空 hbg
 
-把四个 percounter 子目录整体移到 `src/a5/runtime/percounter/` 下的对应位置，hbg 侧删除。
-同时把模式常量移入 percounter 自己的头。
+把四个 percounter 子目录整体移到 `src/a5/runtime/percounter/` 下的对应位置，把模式常量移入
+percounter 自己的头，并**在同一步删掉 hbg 对它们的全部引用**——头文件一旦移走，hbg 的
+`#include` 就失效，所以搬运和拆接缝必须同时做，不能像本页最初写的那样分成两步。
+
+同样移走的还有那四个 cpput 单元测试：它们测的是 percounter 的主机侧规划，却寄居在
+`tests/ut/cpp/a5/runtime/host_build_graph/` 里，而那个 `CMakeLists.txt` 正是现存两个
+上游冲突之一。
+
+做完这一步，**hbg 干净了，而 percounter 还没接上**——它的八个头躺在新树里没人 include，
+percounter runtime 编出来和 hbg 等价。这是一个可验证的中间态。
 
 验收：
 
-- hbg 树内 `grep -ri percounter` 只剩第 3 步要处理的那几处
+- hbg 树内 `grep -ri percounter` 为空
 - 两套二进制都能编出来
+- `git merge-tree upstream/main HEAD` 的冲突不增加，并且测试 CMakeLists 那一个消失
 
-### 第 3 步：断开三个入口
+### 第 3 步：接上三个入口
 
 | 入口 | 做法 |
 | ---- | ---- |
-| `aicore_execute` | 删掉 hbg 里的 5 行分支；percounter 提供 strong 定义 |
+| `aicore_execute` | hbg 的已经是 weak；percounter 提供 strong 定义 |
 | `aicpu_execute` | hbg 侧加 `weak`；percounter 提供 strong 定义 |
 | `create_scheduler_state` | hbg 侧加 `weak`；percounter 提供约 80 行的自己的版本 |
 
-同时回退 `src/common/host_build_graph/runtime.h` 的注释改动。
-
 验收：
 
-- hbg 树内除 `aicore_lifecycle.h` / `scheduler_topology.h` 的那 8 行外，不含任何 percounter 相关内容
-- **`git merge-tree upstream/main HEAD` 的冲突降到 0 或仅剩测试 CMakeLists**
+- hbg 树内只剩 `aicore_lifecycle.h` / `scheduler_topology.h` 的那 8 行，外加两处 `weak` 标记
 - a5 hbg 的 st 全绿（证明 hbg 行为未变）
 - percounter runtime 能跑通至少一个 DeepSeek 模块，数字与拆分前一致
 

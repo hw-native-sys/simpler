@@ -20,9 +20,6 @@ constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
 // legacy dependency scheduler while continuing to pass result-only tests.
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH = 3;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE = 4;
-// AICore lanes schedule themselves from host-built per-task counters; see
-// runtime/scheduler/percounter/percounter_types.h.
-constexpr uint32_t SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5;
 
 struct AicoreSchedulerLayout {
     uint64_t total_size;

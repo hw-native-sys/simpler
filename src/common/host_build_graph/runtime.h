@@ -194,12 +194,10 @@ inline __aicore__ void aicore_stage_native_report(
  *
  * `runtime_mode` is 0 until a run publishes a choice: a zero is "no scheduler
  * selected", not a selection, and every supported fallback is published
- * explicitly. `worker_context_base` is the mode's device-side entry address.
- * Under resident it is worker 0's SchedulerWorkerContext, so worker i's context
- * is `worker_context_base + i * sizeof(SchedulerWorkerContext)`; under
- * percounter it is the PercounterControl every lane shares; it is 0 under every
- * legacy mode. The two point at unrelated types, so read it only through the
- * accessor that checks the mode.
+ * explicitly. `worker_context_base` is the device address of worker 0's
+ * SchedulerWorkerContext, so worker i's context is
+ * `worker_context_base + i * sizeof(SchedulerWorkerContext)`; it is 0 whenever
+ * the mode is not resident.
  *
  * One 64-byte line of its own so a single AICore `scheduler_observe_cache_line`
  * covers exactly the words that follow it, and so no field another tier writes
@@ -209,7 +207,7 @@ inline __aicore__ void aicore_stage_native_report(
 struct alignas(64) SchedulerBootstrapInputs {
     volatile uint32_t runtime_mode;         // A5 HBG: SCHEDULER_RUNTIME_MODE_*; 0 = none published
     volatile uint32_t reserved_;            // keeps worker_context_base 8-byte aligned
-    volatile uint64_t worker_context_base;  // the mode's device entry address (see above), 0 when unused
+    volatile uint64_t worker_context_base;  // device address of worker 0's SchedulerWorkerContext, 0 when unused
 };
 
 static_assert(sizeof(SchedulerBootstrapInputs) == 64);

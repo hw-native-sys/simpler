@@ -27,8 +27,8 @@
 #include <cinttypes>
 #include <cstdint>
 
-#include "../aicore_lifecycle.h"
-#include "../aicore_scheduler_error.h"
+#include "aicore_lifecycle.h"
+#include "aicore_scheduler_error.h"
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/device_time.h"
 #include "common/memory_barrier.h"

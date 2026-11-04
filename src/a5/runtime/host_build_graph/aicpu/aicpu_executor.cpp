@@ -18,7 +18,6 @@
 #include "aicore_lifecycle.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
-#include "percounter/percounter_aicpu.h"
 #include "scheduler_ready_watchdog.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
@@ -244,9 +243,6 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
     const bool is_leader = (tidx == 0);
-    // Percounter replaces the three resident-specific steps below: configuring
-    // the cores, publishing READY, and waiting for the resident bootstrap.
-    const bool percounter = simpler::hbg::percounter::percounter_mode_enabled(runtime);
 
     if (is_leader) {
         LOG_INFO("AicpuExecutor: Initializing");
@@ -285,11 +281,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             init_failed_.store(true, std::memory_order_release);
         }
         completion_gate_.reset();
-        if (!init_failed_.load(std::memory_order_acquire) &&
-            (percounter ? simpler::hbg::percounter::percounter_post_handshake_init(
-                              runtime, aicore_lifecycle_, resident_scheduler_timeout_cycles()
-                          ) :
-                          aicore_lifecycle_.post_handshake_init(runtime)) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
         hs_config_done_.store(true, std::memory_order_release);
@@ -306,11 +298,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // observation, Ready bootstrap, and initial slot fill while the DMB gate
     // remains closed. This is a one-way publication, not a second launch gate.
     if (!init_failed_.load(std::memory_order_acquire)) {
-        if (percounter) {
-            simpler::hbg::percounter::percounter_publish_partition(runtime, aicore_lifecycle_, tidx, nthreads);
-        } else {
-            aicore_lifecycle_.publish_context_partition(runtime, tidx);
-        }
+        aicore_lifecycle_.publish_context_partition(runtime, tidx);
     }
 
     // Only the leader polls the shared bootstrap line. Peers wait in AICPU
@@ -318,8 +306,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // cache line. The following release is the sole AICore-wide DMB gate.
     aicore_lifecycle_.begin_bootstrap_wait(tidx);
     if (is_leader) {
-        if (!init_failed_.load(std::memory_order_acquire) && !percounter &&
-            aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
         hs_bootstrap_done_.store(true, std::memory_order_release);
@@ -407,17 +394,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     bool shutdown_wait_timed_out = false;
-    if (thread_idx == aicpu_thread_num_ - 1 && simpler::hbg::percounter::percounter_mode_enabled(runtime)) {
-        // Only the completion wait differs; the teardown below is the same for
-        // every mode, and its barrier counts this thread.
-        run_status_.store(
-            simpler::hbg::percounter::percounter_supervise(
-                runtime, resident_scheduler_timeout_cycles(), aicpu_thread_num_
-            ),
-            std::memory_order_release
-        );
-        shutdown_ready_.store(true, std::memory_order_release);
-    } else if (thread_idx == aicpu_thread_num_ - 1) {
+    if (thread_idx == aicpu_thread_num_ - 1) {
         int32_t supervisor_rc = 0;
         SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
         if (context == nullptr || runtime->dev.host_total_tasks < 0) {
@@ -531,13 +508,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
         run_status_.store(supervisor_rc, std::memory_order_release);
         shutdown_ready_.store(true, std::memory_order_release);
-    } else if (simpler::hbg::percounter::percounter_mode_enabled(runtime)) {
-        // The percounter supervisor's own progress watchdog bounds this wait;
-        // the ready watchdog's stamp is never advanced in this mode.
-        simpler::hbg::percounter::percounter_assist(runtime);
-        while (!shutdown_ready_.load(std::memory_order_acquire)) {
-            SPIN_WAIT_HINT();
-        }
     } else {
         if (!ready_watchdog_.wait_until_ready(
                 [this] {
@@ -717,7 +687,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("%s", "Invalid argument: null Runtime pointer");
         return -1;
     }
-    if (!aicore_scheduler_runtime_enabled(runtime) && !simpler::hbg::percounter::percounter_mode_enabled(runtime)) {
+    if (!aicore_scheduler_runtime_enabled(runtime)) {
         const bool explicit_legacy = aicore_scheduler_explicit_legacy_enabled(runtime);
         // Legacy execution also owns the cleanup handshake for the AICores that
         // were already launched. Run it before rejecting an unmarked fallback.

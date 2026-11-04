@@ -20,4 +20,5 @@ endmacro()
 simpler_ut_glob_cases(a5_runtime_case)
 
 add_subdirectory(host_build_graph)
+add_subdirectory(percounter)
 add_subdirectory(tensormap_and_ringbuffer)

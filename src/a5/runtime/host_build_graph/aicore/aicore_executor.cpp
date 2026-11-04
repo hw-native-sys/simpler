@@ -20,7 +20,6 @@
 #include "scheduler/scheduler_memory.h"
 #include "scheduler/scheduler_ready.h"
 #include "scheduler/scheduler_watchdog.h"
-#include "percounter/percounter_executor.h"
 
 typedef void (*UnifiedKernelFunc)(__gm__ int64_t *);
 
@@ -721,10 +720,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
     const uint32_t profiling_flag = get_aicore_profiling_flag();
     scheduler_observe_cache_line(handshake);
-    if (runtime_mode == SCHEDULER_RUNTIME_MODE_PERCOUNTER) {
-        simpler::hbg::percounter::percounter_aicore_execute(runtime, block_idx, core_type);
-        return;
-    }
     if (runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
         runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) {
         legacy_aicore_execute(runtime, block_idx, core_type);

@@ -31,6 +31,12 @@
 #include "scheduler/scheduler_ssbuf.h"
 #include "scheduler/scheduler_types.h"
 
+// Continues the SCHEDULER_RUNTIME_MODE_* numbering scheduler_layout.h starts,
+// which reaches 4. The value is published into SchedulerBootstrapInputs and read
+// back by every tier of this runtime, so it has to agree with those four even
+// though the host_build_graph runtime never produces it.
+constexpr uint32_t SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5;
+
 namespace simpler::hbg::percounter {
 
 inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
