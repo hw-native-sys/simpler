@@ -91,6 +91,7 @@ def test_mixed_sanitizer_builds_use_one_host_toolchain_regardless_of_order(monke
     monkeypatch.setattr(build_runtimes, "RuntimeBuilder", FakeRuntimeBuilder)
     monkeypatch.setattr(build_runtimes, "discover_runtimes", lambda arch: ["runtime"])
     monkeypatch.setattr(build_runtimes, "platform_embeds_pto_isa", lambda platform: False)
+    monkeypatch.setattr(build_runtimes, "a5_urma_toolchain_available", lambda home: True)
 
     build_runtimes.build_all(
         lib_dir=tmp_path / "lib",
@@ -131,3 +132,53 @@ def test_profiling_config_completes_defaults_and_validates_dependencies():
                 "SIMPLER_TENSORMAP_PROFILING": 1,
             }
         )
+
+
+@pytest.mark.parametrize("channel_config", [False, True])
+def test_a5_urma_toolchain_probe_requires_channel_config_api(tmp_path, monkeypatch, channel_config):
+    from simpler_setup import build_runtimes  # noqa: PLC0415
+
+    include = tmp_path / "include/hccl"
+    include.mkdir(parents=True)
+    header = ""
+    if channel_config:
+        header = """
+using HcclChannelConfig = void *;
+constexpr unsigned HCCL_CHANNEL_CONFIG_SHARED_QUEUE_TAG_MAX_LEN = 64;
+constexpr unsigned HCCL_CHANNEL_CONFIG_TYPE_IS_SHARED_QUEUE = 1;
+constexpr unsigned HCCL_CHANNEL_CONFIG_TYPE_SHARED_QUEUE_TAG = 2;
+void HcclChannelConfigCreate();
+void HcclChannelConfigSetInt();
+void HcclChannelConfigSetStr();
+void HcclChannelAcquireWithConfig();
+void HcclChannelConfigDestroy();
+"""
+    (include / "hccl_res.h").write_text(header)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path))
+    monkeypatch.setattr(build_runtimes.shutil, "which", lambda name: name)
+    monkeypatch.setattr(build_runtimes.os.path, "isfile", lambda path: True)
+    assert build_runtimes.a5_urma_toolchain_available(str(tmp_path)) == channel_config
+    platforms = build_runtimes.detect_buildable_platforms()
+    assert "a2a3" in platforms and "a5sim" in platforms and "a5" in platforms
+
+
+@pytest.mark.parametrize("platforms", [None, ["a5"]])
+def test_incompatible_a5_sdk_fails_build_without_removing_artifacts(tmp_path, monkeypatch, platforms):
+    from simpler_setup import build_runtimes  # noqa: PLC0415
+    from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
+
+    monkeypatch.setattr(build_runtimes.RuntimeBuilder, "_LIB_DIR", tmp_path / "lib")
+    monkeypatch.setattr(build_runtimes.RuntimeBuilder, "_CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(RuntimeCompiler, "_sanitizers", "")
+    stale = tmp_path / "lib/a5/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"old optional provider")
+    preserved = tmp_path / "lib/a2a3/onboard/libhost_runtime.so"
+    preserved.parent.mkdir(parents=True)
+    preserved.write_bytes(b"a2a3")
+    monkeypatch.setattr(build_runtimes, "detect_buildable_platforms", lambda: ["a2a3", "a5"])
+    monkeypatch.setattr(build_runtimes, "a5_urma_toolchain_available", lambda home: False)
+    with pytest.raises(RuntimeError, match="A5 onboard build requires.*HcclChannelAcquireWithConfig"):
+        build_runtimes.build_all(tmp_path / "lib", tmp_path / "cache", platforms=platforms)
+    assert stale.read_bytes() == b"old optional provider"
+    assert preserved.read_bytes() == b"a2a3"

@@ -51,12 +51,8 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
 #include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
-#endif
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 #include "pto/comm/async/urma/urma_workspace_manager.hpp"
-#endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
 #ifndef __gm__
 #define __gm__
@@ -94,9 +90,7 @@ struct DomainAllocation {
     // can cycle repeatedly within one comm handle before any device reset, so
     // these are released explicitly at domain teardown rather than left to reset.
     std::vector<std::pair<void *, aclrtDrvMemHandle>> peer_windows;
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
-#endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace;
 #endif
@@ -119,9 +113,7 @@ struct CommHandle_ {
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
-#endif
 };
 
 // ============================================================================
@@ -767,7 +759,6 @@ static std::string domain_barrier_tag(uint64_t allocation_id, const char *phase)
 // Domains requesting asynchronous SDMA share this communicator-owned manager.
 // The first successful request initializes and publishes its workspace.
 static void ensure_sdma_workspace(CommHandle h) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if (h->sdma_workspace) return;
     auto manager = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
     if (!manager->Init() || manager->GetWorkspaceAddr() == nullptr) return;
@@ -775,9 +766,6 @@ static void ensure_sdma_workspace(CommHandle h) {
         h->host_ctx, CommWorkspaceKind::SDMA, reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr()), 16 * 1024
     );
     h->sdma_workspace = std::move(manager);
-#else
-    (void)h;
-#endif
 }
 
 // Callable-declared workspace injection is not available on a5 yet. Its URMA
@@ -803,9 +791,7 @@ extern "C" void dma_workspace_release(void *handle) { (void)handle; }
 
 static uint32_t compiled_comm_workspaces() {
     uint32_t mask = comm_workspace_bit(CommWorkspaceKind::SDMA);
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     mask |= comm_workspace_bit(CommWorkspaceKind::URMA);
-#endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     mask |= comm_workspace_bit(CommWorkspaceKind::RDMA);
 #endif
@@ -820,40 +806,41 @@ static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_coun
     return true;
 }
 
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-static bool init_urma_workspace(
+static int init_urma_workspace(
     CommHandle h, uint32_t rank_id, uint32_t rank_count, void *symmetric_addr, uint64_t symmetric_size,
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> &workspace
-) {
-    if (workspace) return workspace->GetWorkspaceAddr() != nullptr;
+) try {
     if (h == nullptr || h->hccl_comm == nullptr || symmetric_addr == nullptr || symmetric_size == 0 ||
-        rank_id >= rank_count) {
-        return false;
+        rank_count == 0 || rank_id >= rank_count) {
+        return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }
-
-    auto manager = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
-    if (!manager->Init(h->hccl_comm, rank_id, rank_count, symmetric_addr, symmetric_size)) {
-        LOG_WARN(
-            "[comm rank %d] URMA workspace init failed (rank_id=%u rank_count=%u size=%llu)", h->rank, rank_id,
-            rank_count, static_cast<unsigned long long>(symmetric_size)
-        );
-        return false;
+    if (!workspace) {
+        auto manager = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
+        if (!manager->Init(h->hccl_comm, rank_id, rank_count, symmetric_addr, symmetric_size)) {
+            LOG_ERROR("[comm rank %d] URMA workspace initialization failed", h->rank);
+            return COMM_DOMAIN_URMA_INIT_FAILED;
+        }
+        if (manager->GetWorkspaceAddr() == nullptr || manager->GetWorkspaceSize() == 0) {
+            LOG_ERROR("[comm rank %d] URMA manager returned an invalid workspace descriptor", h->rank);
+            return COMM_DOMAIN_URMA_WORKSPACE_INVALID;
+        }
+        workspace = std::move(manager);
     }
-    workspace = std::move(manager);
-    return true;
+    return workspace->GetWorkspaceAddr() != nullptr && workspace->GetWorkspaceSize() != 0 ?
+               0 :
+               COMM_DOMAIN_URMA_WORKSPACE_INVALID;
+} catch (const std::exception &e) {
+    LOG_ERROR("[comm] URMA workspace initialization threw: %s", e.what());
+    return COMM_DOMAIN_URMA_INIT_FAILED;
+} catch (...) {
+    LOG_ERROR("[comm] URMA workspace initialization threw an unknown exception");
+    return COMM_DOMAIN_URMA_INIT_FAILED;
 }
 
-#endif
-
 static void reset_domain_workspaces(DomainAllocation &alloc) {
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     alloc.urma_workspace.reset();
-#endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     alloc.rdma_workspace.reset();
-#endif
-#if !defined(SIMPLER_ENABLE_PTO_URMA_WORKSPACE) && !defined(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
-    (void)alloc;
 #endif
 }
 
@@ -1540,19 +1527,16 @@ static int domain_alloc_via_ipc(
             comm_workspace<CommWorkspaceKind::SDMA>(h->host_ctx).size
         );
     }
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     if ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0) {
-        if (!init_urma_workspace(
-                h, domain_rank, static_cast<uint32_t>(rank_count), localBuf, aligned_size, out->urma_workspace
-            )) {
-            return -1;
-        }
+        const int urma_rc = init_urma_workspace(
+            h, domain_rank, static_cast<uint32_t>(rank_count), localBuf, aligned_size, out->urma_workspace
+        );
+        if (urma_rc != 0) return urma_rc;
         set_comm_workspace(
             ctx, CommWorkspaceKind::URMA, reinterpret_cast<uint64_t>(out->urma_workspace->GetWorkspaceAddr()),
             out->urma_workspace->GetWorkspaceSize()
         );
     }
-#endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     if (rdma_requested) {
         if (!init_rdma_workspace(
@@ -1793,12 +1777,12 @@ extern "C" int comm_alloc_domain_windows(
         ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::RDMA)) != 0 &&
          workspace_mask != comm_workspace_bit(CommWorkspaceKind::RDMA))) {
         LOG_ERROR("[comm rank %d] alloc_domain: unsupported workspace combination 0x%x", h->rank, workspace_mask);
-        return -1;
+        return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     }
     if ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0 &&
         !rank_ids_are_dense_prefix(rank_ids, rank_count)) {
         LOG_ERROR("[comm rank %d] alloc_domain: URMA requires dense prefix ranks", h->rank);
-        return -1;
+        return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }
     if (h->domain_allocations.count(allocation_id) > 0) {
         LOG_ERROR(

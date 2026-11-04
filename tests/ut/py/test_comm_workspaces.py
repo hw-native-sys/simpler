@@ -47,14 +47,12 @@ def test_workspace_names_require_a_sequence(engines):
         DomainConfig.capture([0], 4096, [], False, (), engines)
 
 
-@pytest.mark.parametrize("urma,rdma", [(False, False), (True, False), (False, True), (True, True)])
-def test_a5_host_options_allow_combined_builds(tmp_path, urma, rdma):
+@pytest.mark.parametrize("rdma", [False, True])
+def test_a5_host_options_select_rdma(tmp_path, rdma):
     source = (ROOT / "src/a5/platform/onboard/host/CMakeLists.txt").read_text()
     selection = source[: source.index("# Pin-resolved checkout path")]
     (tmp_path / "CMakeLists.txt").write_text(
-        selection + '\nfile(WRITE "${CMAKE_BINARY_DIR}/selected" '
-        '"${SIMPLER_ENABLE_PTO_SDMA_WORKSPACE};${SIMPLER_ENABLE_PTO_URMA_WORKSPACE};'
-        '${SIMPLER_ENABLE_PTO_RDMA_WORKSPACE}")\n'
+        selection + '\nfile(WRITE "${CMAKE_BINARY_DIR}/selected" "${SIMPLER_ENABLE_PTO_RDMA_WORKSPACE}")\n'
     )
     subprocess.run(
         [
@@ -65,17 +63,16 @@ def test_a5_host_options_allow_combined_builds(tmp_path, urma, rdma):
             str(tmp_path / "build"),
             f"-DSIMPLER_CMAKE_DIR={ROOT / 'cmake'}",
             f"-DCUSTOM_INCLUDE_DIRS={ROOT / 'src/common'}",
-            f"-DSIMPLER_ENABLE_PTO_URMA_WORKSPACE={'ON' if urma else 'OFF'}",
             f"-DSIMPLER_ENABLE_PTO_RDMA_WORKSPACE={'ON' if rdma else 'OFF'}",
         ],
         check=True,
         capture_output=True,
         text=True,
     )
-    assert (tmp_path / "build/selected").read_text() == f"ON;{'ON' if urma else 'OFF'};{'ON' if rdma else 'OFF'}"
+    assert (tmp_path / "build/selected").read_text() == ("ON" if rdma else "OFF")
 
 
-@pytest.fixture(scope="module", params=[(False, False), (True, False), (False, True), (True, True)])
+@pytest.fixture(scope="module", params=[False, True])
 def host_resource_binary(request, tmp_path_factory):
     build = tmp_path_factory.mktemp("comm_workspace_host")
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann"))
@@ -91,10 +88,8 @@ def host_resource_binary(request, tmp_path_factory):
         "#pragma once\n"
         + "".join(f"#define LOG_{level}(...) ((void)0)\n" for level in ("ERROR", "WARN", "INFO", "DEBUG"))
     )
-    urma, rdma = request.param
-    defines = ["-DSIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1"]
-    if urma:
-        defines.append("-DSIMPLER_ENABLE_PTO_URMA_WORKSPACE=1")
+    rdma = request.param
+    defines = []
     if rdma:
         defines.append("-DSIMPLER_ENABLE_PTO_RDMA_WORKSPACE=1")
     binary = build / "host_resources"
@@ -147,3 +142,39 @@ def test_invalid_static_workspace_kind_is_rejected_by_compiler(tmp_path, kind):
     )
     assert result.returncode != 0
     assert "invalid communication workspace kind" in result.stderr
+
+
+@pytest.mark.parametrize("ambient", [None, "ON", "OFF"])
+def test_a5_urma_has_no_build_selection(ambient, monkeypatch):
+    from simpler_setup.runtime_builder import _a5_async_workspace_overlay_defines  # noqa: PLC0415
+
+    if ambient is None:
+        monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
+    else:
+        monkeypatch.setenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", ambient)
+    assert "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in _a5_async_workspace_overlay_defines()
+
+
+@pytest.mark.parametrize(
+    "platform,runtime,members,message",
+    [
+        ("a2a3sim", "tensormap_and_ringbuffer", [0, 1], "requires A5"),
+        ("a5", "host_build_graph", [0, 1], "tensormap_and_ringbuffer"),
+        ("a5", "tensormap_and_ringbuffer", [1, 0], "dense prefix"),
+    ],
+)
+def test_unsupported_urma_domains_are_rejected_before_control(platform, runtime, members, message):
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker = Worker(level=3, platform=platform, runtime=runtime, device_ids=[0, 1], num_sub_workers=0)
+    with pytest.raises(ValueError, match=message):
+        worker._domain_config(members, 4096, [], False, ("urma",))
+
+
+def test_single_rank_urma_configuration_is_delegated_to_provider():
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker = Worker(level=3, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[0], num_sub_workers=0)
+    config = worker._domain_config([0], 4096, [], False, ("urma",))
+    assert config.members == (0,)
+    assert config.workspace_engines == ("urma",)

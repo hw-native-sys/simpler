@@ -10490,6 +10490,11 @@ class Worker:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
             if self._config.get("platform") != "a5":
                 raise ValueError("domain workspace selection requires A5; A2/A3 SDMA uses enable_sdma")
+            if "urma" in config.workspace_engines:
+                if self._config.get("runtime") != "tensormap_and_ringbuffer":
+                    raise ValueError("URMA domain workspaces require the A5 tensormap_and_ringbuffer runtime")
+                if config.members != tuple(range(len(config.members))):
+                    raise ValueError("URMA requires ranks in dense prefix order")
         return config
 
     def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse, workspace_engines=()):
@@ -10544,6 +10549,7 @@ class Worker:
                         buffers=config.specs(),
                         retain_after_run=config.retain_after_run,
                     )
+                handle._use_fn = self._use_domain
                 self._use_domain(handle)
                 handle._config = config
                 return handle

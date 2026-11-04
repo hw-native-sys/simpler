@@ -75,16 +75,15 @@ def test_a5_host_cmake_keeps_optional_rdma_provider() -> None:
     cmake = HOST_CMAKE.read_text(encoding="utf-8")
 
     assert "option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in cmake
-    assert "set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)" in cmake
     assert "PTO RDMA workspace overlay requires pto-isa RDMA headers" in cmake
     assert "PTO_RDMA_SUPPORTED" in cmake
     assert "PTO_RDMA_BACKEND_HNS_1825_SUPPORTED" in cmake
 
 
-def test_a5_comm_hccl_keeps_urma_and_rdma_workspace_paths_macro_gated() -> None:
+def test_a5_comm_hccl_keeps_rdma_optional_and_urma_unconditional() -> None:
     source = HOST_COMM.read_text(encoding="utf-8")
 
-    assert "#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE" in source
+    assert "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in source
     assert "#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in source
     assert '#include "pto/comm/async/rdma/rdma_workspace_manager.hpp"' in source
     assert "std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace" in source

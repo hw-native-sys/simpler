@@ -48,7 +48,6 @@ jobs:
     env:
       MANUAL_MODE: ${{ inputs.manual_mode }}
       SESSION_TIMEOUT_S: ${{ inputs.session_timeout_seconds }}
-      SIMPLER_ENABLE_PTO_URMA_WORKSPACE: "ON"
       SIMPLER_ENABLE_PTO_RDMA_WORKSPACE: "OFF"
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
@@ -131,7 +130,7 @@ jobs:
           MAX_TIME_S=$((SESSION_TIMEOUT_S + 600))
           QUEUE_TIMEOUT_S=$((MAX_TIME_S + 1500))
           task-submit --timeout "$QUEUE_TIMEOUT_S" --max-time "$MAX_TIME_S" --device auto --device-num "$DEVICE_NUM" \
-            --env SIMPLER_ENABLE_PTO_URMA_WORKSPACE --env SIMPLER_ENABLE_PTO_RDMA_WORKSPACE \
+            --env SIMPLER_ENABLE_PTO_RDMA_WORKSPACE \
             --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE'"
 
       - name: DFX smokes (a5)

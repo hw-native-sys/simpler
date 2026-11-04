@@ -2499,7 +2499,24 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
     );
     if (rc != 0) {
-        throw std::runtime_error("comm_alloc_domain_windows failed with code " + std::to_string(rc));
+        const char *reason = "domain allocation failed";
+        switch (rc) {
+        case COMM_DOMAIN_WORKSPACE_UNSUPPORTED:
+            reason = "requested communication workspace combination is unsupported by this runtime";
+            break;
+        case COMM_DOMAIN_URMA_CONFIG_INVALID:
+            reason = "URMA requires ranks in dense prefix order and a valid communication window";
+            break;
+        case COMM_DOMAIN_URMA_INIT_FAILED:
+            reason = "URMA workspace initialization failed; check device/HCCL resources and host logs";
+            break;
+        case COMM_DOMAIN_URMA_WORKSPACE_INVALID:
+            reason = "URMA manager returned a null workspace address or zero workspace size";
+            break;
+        }
+        throw std::runtime_error(
+            "comm_alloc_domain_windows: " + std::string(reason) + " (code " + std::to_string(rc) + ")"
+        );
     }
     if (device_ctx == 0 || local_window_base == 0) {
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");

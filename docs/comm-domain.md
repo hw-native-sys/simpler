@@ -367,7 +367,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; optional providers retain their build gates |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; RDMA retains its optional build gate |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -434,9 +434,8 @@ its communication-context SDMA workspace only when a domain explicitly requests 
 this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
 
-On a5, `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON` and
-`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` compile optional providers independently;
-both still default to OFF. SDMA is always compiled. Compilation alone creates
+On a5, SDMA and URMA providers are always compiled. RDMA remains optional through
+`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`, defaulting to OFF. Compilation alone creates
 no streams or domain resources. `allocate_domain` and `get_or_allocate_domain`
 create synchronous mapped-window communication by default, without initializing
 any asynchronous provider. `workspace_engines=("sdma", "urma")` or `("rdma",)`
@@ -453,6 +452,34 @@ Each `CommContext` stores a POD array `workspaces`, indexed by
 whose template argument is checked at compile time. Host publication rejects
 out-of-range enum values before indexing. An absent backend has zero address
 and size.
+
+Before submitting a URMA task, obtain its context through the checked host API:
+
+```python
+args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
+```
+
+The required engines must have been selected when allocating that live domain.
+For a mixed task use `workspace_engines=("sdma", "urma")`. A missing or different
+engine, a released domain, an unknown worker or a null context raises before
+submission. Scalar-only context use also retains the domain for the current run.
+The engine set records successful native initialization; it is not inferred from
+an environment variable. Native allocation rejects a null URMA workspace address
+or zero size before publishing the context, and propagates initialization failures
+as host errors. Callers must treat handle/context metadata as read-only and obtain
+the checked context in every orchestration run rather than caching its raw address.
+
+URMA requests require A5 TMR L3 domains with ranks in dense prefix order. Simpler
+does not impose a two-rank minimum: single-rank requests reach the provider and
+initialization failures are reported on the host. The currently pinned PTO URMA
+manager rejects single-rank initialization. The successful
+[single-device CANN Hcomm loopback probe](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)
+uses two endpoints and has not been integrated into that provider; the provider
+restriction is not a hardware limitation. HBG URMA completion, arbitrary subsets
+and L4 async domains are unsupported.
+The legacy `device_ctx` field remains a raw address for synchronous consumers;
+it does not declare or validate an asynchronous engine requirement. No compiled
+capability query or `enable_urma` initialization switch is needed.
 
 The context is simpler's own 1088-byte host/device ABI. Rank metadata starts
 at offset zero; there is no legacy workspace pair or PTO-compatible prefix.
@@ -478,7 +505,7 @@ The workspace coverage is split by platform and execution layer:
 
 | Platform / layer | Supported behavior | Coverage |
 | ---------------- | ------------------ | -------- |
-| A5 host | SDMA plus optional URMA/RDMA providers in one build; RDMA uses a separate domain | All four provider combinations, domain isolation, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
+| A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
 | A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
 | A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
 | A2/A3 | Existing Worker-owned SDMA and `enable_sdma` behavior | Existing SDMA and single-card prefetch tests; domain allocation does not provision SDMA |
