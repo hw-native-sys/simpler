@@ -131,6 +131,6 @@ struct alignas(64) DispatchPayload {
     );
 };
 
-static_assert(sizeof(DispatchPayload) == 512, "DispatchPayload hardware ABI size drift");
+static_assert(sizeof(DispatchPayload) == 2304, "DispatchPayload hardware ABI size drift");
 static_assert(offsetof(DispatchPayload, args) == 64, "args[] must start at cache line 1 (control block = CL0)");
 static_assert(offsetof(DispatchPayload, src_payload) < 64, "src_payload (gate) must live on the CL0 control block");

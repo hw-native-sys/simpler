@@ -425,7 +425,13 @@ values are final, at submit:
   re-checked at submit rather than trusted from `add_tensor`, because a tag stays
   mutable afterwards. It is what stops a plain (copy-on-write) tensor from being
   named as an output and then silently losing every write in the child.
-- **No overlapping writes within one task.** Two arguments of one task that name
+- **Exact device read aliases.** One `INPUT` may be a dense row-major reshape
+  of a writable argument over exactly the same bytes of the same device backing,
+  when both use `TensorTransfer.NONE`. The task owns the internal read/write
+  order; materialization preserves the shared device address. Shape and dtype
+  interpretations may differ. This exception does not cover host staging,
+  strided views, partial overlaps, or two writable views.
+- **No other writable overlap within one task.** Two arguments of one task that name
   intersecting bytes of the same backing are rejected: they belong to one node,
   so there is no order between them to express, and a device-side copy of a
   host backing does not even alias on the device for the L2 overlap map to

@@ -7,6 +7,11 @@
 > zero-drop. Responds to
 > [simpler#977](https://github.com/hw-native-sys/simpler/issues/977).
 
+The measurements below describe the historical 4672/4736-byte dep_gen record.
+The current 256-tensor ABI uses 33664-byte records: the 4 × 1024-record device
+pool holds about 131.5 MiB of records. These historical throughput/drop results
+have not been requalified for that layout; see [dep_gen memory](dep-gen.md#memory).
+
 ## 1. TL;DR
 
 Across 6 tensormap_and_ringbuffer examples, **only the bare no-dependency flood
@@ -81,7 +86,7 @@ drains" — **independent of how many buffers you preallocate.** Hence
 | scope_stats | low (per scope enter/exit) | small (52B) | **≈1** | 8 | 8× |
 | l2 task | high (one per task, flood is huge) | small (32B) | **≈4** | 4/8 | 1–2× |
 | l2 phase | high | small W **but buffer is huge (16384)** | T_fill ≫ W → **≪16** | 16 | several× |
-| dep_gen | high (per submit, AICPU at full speed) | **large** (4736B current record) | **explodes** under flood | 4 | far short |
+| dep_gen | high (per submit, AICPU at full speed) | **large** (4736B record at the time of this audit) | **explodes** under flood | 4 | far short |
 
 Reasoning per row:
 
@@ -95,7 +100,7 @@ Reasoning per row:
 - **l2 phase**: viewed differently — the per-buffer capacity 16384 is enormous, so
   filling one takes `T_fill = 16384/λ`, far larger than W (recycle latency). So the
   number of phase buffers simultaneously in flight is ≪ 16. Configured 16 is over.
-- **dep_gen**: λ high × W **large** (4736B current record drains slowly) → under flood L
+- **dep_gen**: λ high × W **large** (4736B record at the time of this audit drains slowly) → under flood L
   exceeds any realistic config → **sizing can't fix it** (proven via the dynamic
   form `drop ∝ (λ−µ)T` in §5.2).
 
@@ -236,8 +241,9 @@ drop ≈ (P − R) × T − N × S      P=produce rate, R=host drain rate, N×S=
   | batch=16 (4096 submits/burst) | — | — | **0** |
 
 - **The only variable is R** (host drain rate), pinned by record size + bandwidth.
-  These measurements used the then-current 4672B record; the current 4736B
-  dep/kind wire record is 1.37% larger, which does not change the sizing conclusion.
+  These measurements used the then-current 4672B record; the subsequent 4736B
+  dep/kind wire record was 1.37% larger. That comparison does not qualify the
+  current 33664B record.
 - **Corollary**: a real layer-serial decoder (qwen3: 40 residual layers, layer
   N+1 waits on N) has `P<R` and is already zero-drop → **dep_gen needs no
   enlargement.** Surviving a 65536 flood would need ≥146 MB in flight, paid for a
@@ -320,7 +326,7 @@ separate fix (fewer threads / merged mgmt / scheduling priority).
 | l2 AicoreTask | `AICORE_BUFFER_SIZE` (1024) | `AICORE_BUFFERS_PER_CORE` (4) | 32B | per-core |
 | l2 phase | `PHASE_RECORDS_PER_THREAD` (16384) | `PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD` (6/8) | 64/32B | per-thread |
 | pmu | `PMU_RECORDS_PER_BUFFER` (512) | `PMU_BUFFERS_PER_CORE` (2) | 64B | per-core |
-| dep_gen | `DEP_GEN_RECORDS_PER_BUFFER` (1024) | `DEP_GEN_BUFFERS_PER_INSTANCE` (4) | 4736B | per-instance |
+| dep_gen | `DEP_GEN_RECORDS_PER_BUFFER` (1024) | `DEP_GEN_BUFFERS_PER_INSTANCE` (4) | 33664B | per-instance |
 | scope_stats | `SCOPE_STATS_RECORDS_PER_BUFFER` (512) | `SCOPE_STATS_BUFFERS_PER_INSTANCE` (4) | 52B | per-instance |
 | args_dump | `PLATFORM_DUMP_RECORDS_PER_BUFFER` (256) + arena | `PLATFORM_DUMP_BUFFERS_PER_THREAD` (8) | 128B+tensor | per-thread |
 

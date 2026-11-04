@@ -353,28 +353,12 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is 4736 B (32 ChipTensor blobs + small header), so a buffer
- * of 1024 records is ~4.6 MB; draining one copies that over SVM.
- * Guaranteed one-shot capacity = BUFFERS_PER_INSTANCE × RECORDS_PER_BUFFER
- * records — the size of a back-to-back submit flood the pool absorbs even if
- * the host never drains. At 4×1024 that is 4096 submits, which aligns
- * dep_gen's in-flight record count with the scope_stats / l2 AicoreTask pools
- * (also 4096) per the #977 cross-subsystem review. By in-flight BYTES dep_gen
- * cannot align (its 4736 B record is 70–90× the others); that tension is
- * inherent — see docs/dfx/dfx-buffer-capacity-audit.md.
- * History: original 32 (commit 77ef83c0) → #977 commit 3f977e54 overshot to
- * 2048 → 1024 here (#977 Primary's actual proposal; the 2× was no gain).
- * Whether a larger workload drops depends on submit ARRIVAL RATE, not total
- * count: dep_gen records are produced at submit_task time on the AICPU, so a
- * dependency-paced workload (real decoder, submits gated by compute) drains
- * faster than it fills and never drops, while an independent-submit flood
- * microbenchmark (paged_attention Case1, 65536 back-to-back submits) outruns
- * host drain. Onboard a2a3: that flood drops ~24576/65536, and the drop is
- * rate-bound — doubling RECORDS, BUFFERS, or SLOT_COUNT each left it unchanged
- * (~24576). So buffer sizing is NOT the lever for floods; 4096 in-flight is
- * sized for the largest realistic single-scope decoder burst (a 4096-submit
- * burst measured max_ready_depth=1, ample headroom).
- * dep_gen is opt-in (--enable-dep-gen).
+ * Each DepGenRecord is 33664 B (256 tensor blobs and metadata). A buffer
+ * holds 1024 records, and four buffers absorb 4096 submissions before the
+ * host drains when each submit has at most 64 explicit dependencies. Larger
+ * dependency lists consume overflow slots from the same pool, so fewer submits
+ * fit. Capture traffic depends on arrival rate and is independent of the
+ * runtime's execution capacity.
  */
 constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 1024;
 

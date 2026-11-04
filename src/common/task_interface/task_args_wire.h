@@ -276,13 +276,42 @@ inline bool tag_writes(TensorArgType tag) {
     return tag == TensorArgType::OUTPUT || tag == TensorArgType::OUTPUT_EXISTING || tag == TensorArgType::INOUT;
 }
 
+// Dense row-major views cover every byte in their bounding range. Equal
+// bounding ranges alone are insufficient for strided or transposed views.
+inline bool is_dense_submit_view(const Tensor &tensor) {
+    uint64_t stride = 1;
+    for (int32_t dim = static_cast<int32_t>(tensor.ndims) - 1; dim >= 0; --dim) {
+        if (tensor.shapes[dim] == 0) return false;
+        if (tensor.shapes[dim] > 1 && tensor.strides[dim] != stride) return false;
+        stride = tensor_mul_sat(stride, tensor.shapes[dim]);
+    }
+    return tensor.ndims > 0 && stride != TENSOR_EXTENT_UNREPRESENTABLE;
+}
+
+// One readonly view may name precisely the bytes of a writable device view.
+// Both retain the same backing and NONE transfer, so materialization preserves
+// their aliasing. The task owns the internal read/write order. Host staging,
+// partial overlaps and two independently writable views have no such contract.
+inline bool is_exact_device_read_alias(const TaskArgs &args, int32_t i, int32_t j) {
+    const Tensor &a = args.tensor(i);
+    const Tensor &b = args.tensor(j);
+    return (args.tag(i) == TensorArgType::INPUT || args.tag(j) == TensorArgType::INPUT) &&
+           a.buffer.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) &&
+           b.buffer.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) &&
+           args.transfer(i) == TensorTransfer::NONE && args.transfer(j) == TensorTransfer::NONE &&
+           a.buffer.identity == b.buffer.identity && a.byte_offset == b.byte_offset && is_dense_submit_view(a) &&
+           is_dense_submit_view(b) && tensor_extent_bytes(a) == tensor_extent_bytes(b);
+}
+
 /**
  * Validate one submit's whole argument set, at the point where the values are final.
  *
  * `access ⊆ granted` is re-checked here rather than trusted from add time because a tag is mutable
  * after its element is added — the pair that governs the dispatch is the one present now.
  *
- * Overlapping writes WITHIN one TaskArgs are rejected because no later layer can catch them: the two
+ * Overlapping writes WITHIN one TaskArgs are rejected except for an exact device read alias:
+ * the task owns the internal ordering of that readonly view and its writable root. For other overlaps,
+ * no later layer can catch them: the two
  * args belong to one task node, so there is no order between them to express, and a device-staged
  * copy of a host backing does not even alias on the device for the L2 overlap map to notice.
  * Disjoint slices of one backing stay legal.
@@ -305,9 +334,10 @@ inline void validate_submit_args(const std::vector<TaskArgs> &args_list) {
     }
     for (const TaskArgs &args : args_list) {
         for (int32_t i = 0; i < args.tensor_count(); ++i) {
-            if (!tag_writes(args.tag(i))) continue;
             for (int32_t j = i + 1; j < args.tensor_count(); ++j) {
+                if (!tag_writes(args.tag(i)) && !tag_writes(args.tag(j))) continue;
                 if (!tensors_overlap(args.tensor(i), args.tensor(j))) continue;
+                if (is_exact_device_read_alias(args, i, j)) continue;
                 throw std::invalid_argument(
                     "submit: two arguments of one task write overlapping bytes of the same buffer; "
                     "give them disjoint ranges, or order them as separate tasks"

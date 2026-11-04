@@ -171,7 +171,7 @@ structure or lookup table that a single fill value cannot represent.
 | `--dump-json <path>` | Reuse an existing `args_dump.json`, skipping the dump re-run. `--restore-arg` requires its selected record payload and sibling `args.bin` |
 | `--restore-arg SLOT` | Restore one tensor's captured `before_dispatch` payload on `a2a3` / `a2a3sim`. Repeatable. The tensor must already be marked with `CoreTaskArgs::dump(...)` in orchestration; scalar/output-only/unmarked/truncated slots are rejected. Cannot target the same slot as `--set-arg`. Do not use with a5 payloads while #1560 is open |
 | `--set-arg SLOT=VALUE` | Override an arg by `args[]` slot. Scalar slot → rewrite value; tensor slot → fill its buffer (integer dtypes). Shrinks a loop count without distortion. Repeatable. By default scalars retain dump values and tensor payloads are zero-filled |
-| `--spmd-block-num N` | `block_num` written into the synthesized SPMD context (slot 48). Default: 1 |
+| `--spmd-block-num N` | `block_num` written into the synthesized SPMD context (LocalContext). Default: 1 |
 | `--debug-line` / `-g` | Compile with `-g` (skip strip) so the trace carries `debug_line` → Insight maps instructions to source lines |
 | `--no-collect` | Stop after workspace generation and smoke build; an onboard dump still uses its locked NPU |
 | `--max-time <sec>` | `task-submit` budget (default 1800) |
@@ -264,7 +264,7 @@ Omitting `--case` auto-pins the **first** `CASES[*]` that lists your
 no "run every case, reconstruct from the newest dump dir" ambiguity). Pass
 `--case` explicitly when that first case is not the smallest — a full-size
 production case's shapes can make the camodel impractical (§3.6). The
-synthesized slot-48 `block_num` comes from `--spmd-block-num` (default 1);
+synthesized `block_num` comes from `--spmd-block-num` (default 1);
 the args dump does not carry that context, so consult the selected task's
 orchestration for its real logical width.
 
@@ -373,7 +373,7 @@ arch-precheck (the case must declare the `--platform` you pass — §3.1).
 | Mix 2 AIV (per-lane) | `mixed_example` | `--func-id 3,4` | ADD_STD@AIV0 + MUL_STD@AIV1 (`get_subblockid` routing) |
 | Mix 3-way 1C2V | `mixed_example` | `--func-id 0,1,2` | MATMUL@AIC + ADD@AIV0 + MUL@AIV1 |
 | SPMD single-source | `spmd_multiblock_aiv` | `--func-id 0 --spmd-block-num 4` | single AIV reading `get_block_idx`; the default lowest task-id is orchestration task T0 with logical `block_num=4` |
-| SPMD mix, 2 AIV share a source | `spmd_multiblock_mix` | `--func-id 0,1,2 --spmd-block-num 2` | the default lowest task-id is orchestration task T0 with logical `block_num=2`. Func 1 & 2 are distinct ids but **both `kernel_spmd_mix.cpp`** → the 2 AIV collapse to one (both lanes run it). Routes by `get_sub_block_id` (slot 49) → in replay both lanes read `sub_block_id=0`; AIV0/AIV1 differ only by write offset, so the pipeline stays representative. (The same-source collapse also covers the duplicate-func_id `[0,1,1]` shape an SPMD mix produces when `aiv0 = aiv1`.) |
+| SPMD mix, 2 AIV share a source | `spmd_multiblock_mix` | `--func-id 0,1,2 --spmd-block-num 2` | the default lowest task-id is orchestration task T0 with logical `block_num=2`. Func 1 & 2 are distinct ids but **both `kernel_spmd_mix.cpp`** → the 2 AIV collapse to one (both lanes run it). Routes by `get_sub_block_id` (GlobalContext) → in replay both lanes read `sub_block_id=0`; AIV0/AIV1 differ only by write offset, so the pipeline stays representative. (The same-source collapse also covers the duplicate-func_id `[0,1,1]` shape an SPMD mix produces when `aiv0 = aiv1`.) |
 | Paged-attn, loop = scalar | `paged_attention_unroll` | `--func-id 0 --set-arg 4=4` | QK stage; `n_blocks` scalar (slot 4) → shrink to 4 ([§7.2](#72-arg-floor-for-a-loop-count-without-distortion)) |
 | Paged-attn, loop = control tensor | `batch_paged_attention` | `--func-id 1 --set-arg 1=512 --case CaseSmall1` | SF reads `context_lens` (**slot 1**) content (`aiv_softmax_prepare.cpp`); `--set-arg 1=512` fills it uniformly → shrinks the derived per-batch block count |
 
@@ -552,19 +552,26 @@ correctly (see [§6](#6-validation)).
 
 ### 5.5 SPMD context synthesis
 
+The replay reads `CORE_MAX_TENSOR_ARGS` and `CORE_MAX_SCALAR_ARGS` from
+`src/common/task_interface/arg_direction.h` in the source tree or wheel assets.
+With 256 tensor and 16 scalar slots, its argument array has 274 entries;
+slots 272/273 hold contexts. Task arguments and `--restore-arg` must stay
+within the payload slots 0–271.
+
 SPMD kernels read an execution context the orchestration builds per
-dispatch — `LocalContext{block_idx, block_num}` at args slot 48 and
-`GlobalContext{sub_block_id}` at slot 49. The isolated replay has no
+dispatch — `LocalContext{block_idx, block_num}` and
+`GlobalContext{sub_block_id}` in the two slots after the Core argument capacity.
+The isolated replay has no
 orchestration, so `replay_host.cpp` **synthesizes** it: one
 `LocalContext{block_idx=0, block_num=--spmd-block-num}` + `GlobalContext`
-pointed at slots 48/49. This is harmless for positional kernels (they
-ignore 48/49) and required for SPMD kernels that read `get_block_idx` /
+pointed at those suffix slots. Positional kernels ignore the suffix;
+the contexts are required for SPMD kernels that read `get_block_idx` /
 `get_block_num` (which would otherwise dereference null). `block_idx=0`
 traces a representative block. The default `block_num=1` models a single-block
 replay and does **not** take multi-block branches such as
 `block_idx+1 < block_num`. That default is sufficient only when the kernel
-ignores `block_num`. The args dump does not record the synthesized slot-48
-context, so read the selected task's logical grid width from its orchestration
+ignores `block_num`. The args dump does not record the synthesized
+LocalContext, so read the selected task's logical grid width from its orchestration
 and supply it with `--spmd-block-num`. Some workloads derive that value from
 `rt_available_cluster_count()`; others set an explicit task-specific value.
 Pass the selected task's real value for faithful branch and grid-stride
@@ -662,8 +669,8 @@ do not draw timing conclusions; retry with a different `n_blocks`.
 | Scalar values (`scale` / offsets …) | Use real dump values | Wrong value → wrong branch → distorted |
 | Loop count (`n_blocks`, via `--set-arg`) | Shrinkable to ≥ 3–4 | Faithful at ≥ 3–4; `= 1` distorts (§7.2) |
 | Tensor contents | Zero by default; on a2a3/a2a3sim, `--restore-arg` selected control tensors | Unrestored data-dependent branches/addresses can distort; supported restored slots use their real `before_dispatch` bytes. A5 restoration is excluded by #1560 |
-| SPMD `block_idx` (slot 48) | Fixed 0 | Traces a real block 0 — representative for uniform SPMD |
-| SPMD `block_num` (slot 48) | Default 1; pass the selected task's real logical width with `--spmd-block-num` when the kernel reads it | `1` is a single-block path; ≥ 2 only approximates a multi-block branch, while the selected task's real value preserves branch and grid-stride behavior |
+| SPMD `block_idx` (LocalContext) | Fixed 0 | Traces a real block 0 — representative for uniform SPMD |
+| SPMD `block_num` (LocalContext) | Default 1; pass the selected task's real logical width with `--spmd-block-num` when the kernel reads it | `1` is a single-block path; ≥ 2 only approximates a multi-block branch, while the selected task's real value preserves branch and grid-stride behavior |
 | Per-AIV-lane routing (`get_subblockid`) | Automatic | Faithful — lanes run their real kernels (§6) |
 | Cross-core sync timing | Not modeled | **Optimistic** — sub-cores appear freely parallel (§9 tier C) |
 | Cross-platform (a2a3 vs a5) | Set by target | Instructions / timing genuinely differ (real silicon — §7.3) |
