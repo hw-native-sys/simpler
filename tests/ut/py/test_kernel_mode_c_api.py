@@ -91,6 +91,12 @@ def test_close_fault_shim_tracks_owner_operations(kernel_close_faults, tmp_path,
     code = f"""
 import ctypes
 lib = ctypes.CDLL(None)
+lib.arm_acl_guard()
+assert lib.rtDeviceReset(0) == -4322
+assert lib.acl_call_count(5) == 1
+lib.disarm_acl_guard()
+assert lib.rtDeviceReset(0) == 0
+assert lib.acl_call_count(5) == 1
 lib.arm_reset_failures(1)
 assert lib.{entry}(0) == -4321
 assert lib.reset_call_count() == 1
@@ -461,6 +467,18 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             "rtDeviceReset",
         )
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
+        # The runtime has finished without resetting its borrowed device. The
+        # test caller now releases the primary context it created above.
+        faults.disarm_acl_guard()
+        if scenario != "fatal_device":
+            _reset_caller_device(lib, device)
+
+
+def _reset_caller_device(lib, device):
+    lib.rtDeviceReset.argtypes = [ctypes.c_int]
+    lib.rtDeviceReset.restype = ctypes.c_int
+    rc = lib.rtDeviceReset(device)
+    assert rc == 0, f"caller rtDeviceReset({device}) failed with {rc}"
 
 
 def _prepared_callable_image(arch, runtime, *, signature=(), function="kernel_prepare_orchestration") -> bytes:
@@ -1038,6 +1056,10 @@ def _run_program_callable_release(arch, runtime, device):
         # A failed teardown leaves an Unproven context. Clearing the callable
         # bookkeeping does not authorize reinitializing that handle.
         assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
+        # The injected free failure is one-shot. Complete the outstanding
+        # cleanup/reset explicitly instead of relying on process-exit cleanup
+        # to make the device available to the next test process.
+        assert lib.finalize_device(ctx) == 0
     finally:
         lib.destroy_device_context(ctx)
 
@@ -1104,6 +1126,7 @@ def _run_loader_unload_retry(arch, runtime, device, scenario):
             assert lib.committed_device_memory_ctx(ctx) == 0
     finally:
         lib.destroy_device_context(ctx)
+        _reset_caller_device(lib, device)
 
 
 def _run_program_loader_unload(arch, runtime, device):

@@ -5723,41 +5723,52 @@ size_t DeviceRunnerBase::native_run_claim_count() const {
 }
 
 bool DeviceRunnerBase::try_reserve_native_run(
-    const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
+    const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
+    bool capture_preparation
 ) {
     if (owner == nullptr || pipeline_slot >= granted_run_resource_sets_ || arena_bank >= granted_run_resource_sets_) {
         return false;
     }
     std::lock_guard<std::mutex> lk(native_run_mu_);
 
-    size_t occupied = 0;
-    bool every_existing_admits_successor = true;
     for (const NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) continue;
         if (reservation.owner == owner || reservation.pipeline_slot == pipeline_slot) {
             return false;
         }
-        ++occupied;
-        // Each reservation already held must belong to a run that has taken the
-        // claim: a successor may prepare alongside *launched* runs, not
-        // alongside another merely prepared one. Every one of them is asked,
-        // not just the newest, because a run prepared beside two live runs is
-        // ordered behind both.
         const bool holds_claim = native_run_claim_index(reservation.owner) < active_native_run_count_;
-        if (!reservation.permits_prepared_successor || !holds_claim) every_existing_admits_successor = false;
-    }
-    if (occupied != 0 && (!allow_prepared_successor || !every_existing_admits_successor)) {
-        return false;
+        if (capture_preparation || reservation.capture_preparation) {
+            // A completed node has retained its backing before another bind may
+            // detach it. An unfinished prepare still owns shared arena/config
+            // mutation until publication succeeds or cleanup removes its reservation.
+            if (!capture_preparation || !reservation.capture_preparation || holds_claim ||
+                reservation.preparation_state != NativeRunPreparationState::Prepared)
+                return false;
+        } else if (!allow_prepared_successor || !reservation.permits_prepared_successor || !holds_claim) {
+            return false;
+        }
     }
 
     for (NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) {
             native_run_observations_.insert(owner);
-            reservation = NativeRunReservation{owner, pipeline_slot, arena_bank, allow_prepared_successor};
+            reservation =
+                NativeRunReservation{owner, pipeline_slot, arena_bank, allow_prepared_successor, capture_preparation};
             return true;
         }
     }
     return false;
+}
+
+void DeviceRunnerBase::mark_native_run_prepared(const void *owner) {
+    if (owner == nullptr) return;
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    for (NativeRunReservation &reservation : native_run_reservations_) {
+        if (reservation.owner == owner) {
+            reservation.preparation_state = NativeRunPreparationState::Prepared;
+            return;
+        }
+    }
 }
 
 bool DeviceRunnerBase::arena_bank_shared_with_other_run(const void *owner, uint32_t arena_bank) const {
