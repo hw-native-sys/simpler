@@ -14,8 +14,8 @@
  *
  * `init` and `run` carry the scaffolding every scheduler needs — thread index
  * assignment, the handshake barriers, the completion gate, the terminal record
- * — and reach the parts a scheduler decides for itself through the five steps
- * declared at the end. Those five are defined weak, so a runtime that schedules
+ * — and reach the parts a scheduler decides for itself through the six steps
+ * declared at the end. Those six are defined weak, so a runtime that schedules
  * AICore differently supplies its own and the linker drops this one's; the
  * scaffolding around them is shared rather than reimplemented.
  *
@@ -100,7 +100,7 @@ struct AicpuExecutor {
     //
     // Each default is what the AICPU-dispatched and resident schedulers do, and
     // each is weak: a replacement replaces that one step, and the code around it
-    // in init and run is the same either way. All five run once per thread per
+    // in init and run is the same either way. All six run once per thread per
     // run, never per task.
 
     // Configure the discovered cores and publish READY, between the handshake
@@ -108,6 +108,9 @@ struct AicpuExecutor {
     int32_t post_handshake_init(Runtime *runtime);
     // Hand this thread's slice of the worker contexts to the cores.
     void publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    // Whether this executor drives the cores at all. False sends the run down
+    // the legacy AICPU dispatch path instead, which owns its own teardown.
+    bool drives_cores(const Runtime *runtime) const;
     // Whether the leader waits for the cores to acknowledge the bootstrap.
     bool awaits_bootstrap() const;
     // Watch the run to completion. Runs on the last thread, and its return

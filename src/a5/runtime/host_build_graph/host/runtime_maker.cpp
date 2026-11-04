@@ -80,6 +80,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/types.h"
 #include "host_build_graph/runtime.h"
+#include "scheduler_extension.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/runtime_c_api.h"
@@ -480,6 +481,18 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
         "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
         counts.external_noop
     );
+}
+
+// Declined unless a runtime that schedules AICore differently links its own.
+// Outside the anonymous namespace below: an internal-linkage symbol cannot be
+// the weak half of an override.
+__attribute__((weak)) bool scheduler_extension_takes_graph_tasks() { return false; }
+
+__attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
+    Runtime *, const HostApi *, SharedMemoryHandle &, int32_t, const std::vector<SchedulerTaskMetadata> &,
+    const std::vector<int64_t> &, const sm_layout::SegmentOffsets &
+) {
+    return SchedulerExtensionResult::DECLINED;
 }
 
 namespace {
@@ -1122,7 +1135,7 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
     }
 }
 
-__attribute__((weak)) bool create_scheduler_state(
+bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments
 ) {
@@ -1139,9 +1152,10 @@ __attribute__((weak)) bool create_scheduler_state(
         static_cast<uint64_t>(total_tasks),
         task_window_size - 1,
     };
+    const bool extension_takes_graph_tasks = scheduler_extension_takes_graph_tasks();
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
-        if (slot.task_kind == TaskKind::GRAPH) {
+        if (slot.task_kind == TaskKind::GRAPH && !extension_takes_graph_tasks) {
             select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
             LOG_INFO("A5 HBG: retaining AICPU scheduling for a graph-execution run");
             return true;
@@ -1159,6 +1173,7 @@ __attribute__((weak)) bool create_scheduler_state(
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_id = -1;
+    uint64_t graph_task_count = 0;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
     // has not run yet, and orch::prepare_task resets every claimed slot this
@@ -1166,6 +1181,11 @@ __attribute__((weak)) bool create_scheduler_state(
     // future host-side publication would silently change what these tests mean.
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
+        // Reached only when an extension takes GRAPH tasks; it validates them.
+        if (slot.task_kind == TaskKind::GRAPH) {
+            ++graph_task_count;
+            continue;
+        }
         SchedulerTaskShape shape{};
         SchedulerGraphResult status = scheduler_classify_task_shape(host_graph, task_id, &shape);
         bool inline_dispatch_task = false;
@@ -1289,9 +1309,21 @@ __attribute__((weak)) bool create_scheduler_state(
         ++executable_task_count;
     }
 
-    if (executable_task_count + inline_completed_task_ids.size() != static_cast<uint64_t>(total_tasks)) {
+    if (executable_task_count + inline_completed_task_ids.size() + graph_task_count !=
+        static_cast<uint64_t>(total_tasks)) {
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
+    }
+    // Offered before this runtime's own fallbacks: an extension that takes the
+    // graph owns the rest of the bind, and a declining one leaves them to decide.
+    const auto extension = scheduler_extension_select(
+        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
+    );
+    if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
+    if (graph_task_count != 0) {
+        select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
+        LOG_INFO("A5 HBG: retaining AICPU scheduling for a graph-execution run");
+        return true;
     }
     if (legacy_shape_task_id >= 0) {
         select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);

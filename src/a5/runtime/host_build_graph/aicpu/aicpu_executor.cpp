@@ -329,6 +329,10 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
 // The AICPU-dispatched and resident schedulers' supervision wait: poll the
 // run control until every task is accounted for, then latch what the cores
 // reported into the shared header.
+__attribute__((weak)) bool AicpuExecutor::drives_cores(const Runtime *runtime) const {
+    return aicore_scheduler_runtime_enabled(runtime);
+}
+
 __attribute__((weak)) bool AicpuExecutor::awaits_bootstrap() const {
     return true;
 }
@@ -655,7 +659,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("%s", "Invalid argument: null Runtime pointer");
         return -1;
     }
-    if (!aicore_scheduler_runtime_enabled(runtime)) {
+    if (!g_aicpu_executor.drives_cores(runtime)) {
         const bool explicit_legacy = aicore_scheduler_explicit_legacy_enabled(runtime);
         // Legacy execution also owns the cleanup handshake for the AICores that
         // were already launched. Run it before rejecting an unmarked fallback.

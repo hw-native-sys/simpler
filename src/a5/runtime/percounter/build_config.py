@@ -38,11 +38,12 @@ SHARED = "../../../common/host_build_graph"
 BUILD_CONFIG = {
     "aicore": {
         "include_dirs": ["aicore", "runtime", f"{HBG}/runtime", f"{HBG}/common", "..", SHARED],
-        "source_dirs": [f"{HBG}/aicore"],
+        "source_dirs": ["aicore"],
     },
     "aicpu": {
         "include_dirs": ["aicpu", "runtime", f"{HBG}/aicpu", f"{HBG}/runtime", f"{HBG}/common", "..", SHARED],
         "source_dirs": [
+            "aicpu",
             f"{HBG}/aicpu",
             f"{HBG}/runtime",
             f"{SHARED}/device",
@@ -50,8 +51,9 @@ BUILD_CONFIG = {
         ],
     },
     "host": {
-        "include_dirs": ["host", "runtime", f"{HBG}/runtime", f"{HBG}/common", "..", SHARED],
+        "include_dirs": ["host", "runtime", f"{HBG}/host", f"{HBG}/runtime", f"{HBG}/common", "..", SHARED],
         "source_dirs": [
+            "host",
             f"{HBG}/host",
             f"{SHARED}/host",
             f"{SHARED}/shared",
