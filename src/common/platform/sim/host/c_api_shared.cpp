@@ -1365,7 +1365,7 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return state->completion_rc;
 }
 
-static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) {
+static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
     SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
@@ -1474,6 +1474,8 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     if (validation_rc != 0) return validation_rc;
     if (no_submission && !launched) publish_released_preparation(state, run_epoch);
     return launched ? execution_rc : 0;
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {

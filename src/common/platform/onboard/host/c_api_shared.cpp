@@ -2555,7 +2555,7 @@ int simpler_probe_run_retention(
     return rc;
 }
 
-static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) {
+static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     // A refused environment leaves the run owned for a retry on its context.
@@ -2766,6 +2766,8 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     if (reclaim_rc != 0) return reclaim_rc;
     if (no_submission && !launched) publish_released_preparation(state, run_epoch);
     return launched ? execution_rc : 0;
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {
