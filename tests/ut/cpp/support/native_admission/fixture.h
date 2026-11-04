@@ -46,12 +46,12 @@ extern thread_local bool refuse_next_host_allocation;
 
 class Runner : public DeviceRunnerBase {
 public:
-    Runner() {
+    explicit Runner(bool managed_workspace = true) {
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
         timeout_configured_ = true;
         max_block_dim_ = block_dim_ = 1;
-        EXPECT_EQ(install_staged_workspace(), 0);
+        if (managed_workspace) EXPECT_EQ(install_staged_workspace(), 0);
         EXPECT_TRUE(set_run_resource_grant(6));
         enable_automatic_admission();
         CallableState callable;

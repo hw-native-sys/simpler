@@ -430,10 +430,11 @@ _OFF_ENTRY_GROUP_INDEX = 88
 _OFF_ENTRY_GROUP_SIZE = 96
 _OFF_ENTRY_ERROR_TEXT = 104
 # Appended after the text so no field above it moves: the run-resource sets the
-# child reports it can hold, published with this run's terminal state. A count
-# of identities, and zero means the child published none.
+# child reports it can hold, published atomically before physical END and with
+# semantic terminal. A count of identities; zero means no capacity report.
 _OFF_ENTRY_ADMISSIBLE_SETS = _OFF_ENTRY_ERROR_TEXT + MAILBOX_ERROR_MSG_SIZE
-_ENTRY_BYTES = _OFF_ENTRY_ADMISSIBLE_SETS + 4
+_OFF_ENTRY_OBSERVATION_REQUESTED = _OFF_ENTRY_ADMISSIBLE_SETS + 4
+_ENTRY_BYTES = _OFF_ENTRY_OBSERVATION_REQUESTED + 4
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -473,6 +474,7 @@ _TASK_LAUNCHED = 9
 _TASK_FAILED = 10
 _ACTIVATE = 11
 _PREPARE_READY = 12
+_TASK_ENDED = 13
 
 
 def _assert_mailbox_wire_constants() -> None:
@@ -497,6 +499,7 @@ def _assert_mailbox_wire_constants() -> None:
         "INIT_FAILED": _INIT_FAILED,
         "FRAME_STAGED": _FRAME_STAGED,
         "TASK_LAUNCHED": _TASK_LAUNCHED,
+        "TASK_ENDED": _TASK_ENDED,
         "TASK_FAILED": _TASK_FAILED,
         "ACTIVATE": _ACTIVATE,
         "PREPARE_READY": _PREPARE_READY,
@@ -569,6 +572,10 @@ def _assert_mailbox_wire_constants() -> None:
         "entry.admissible_run_resource_sets": (
             _OFF_ENTRY_ADMISSIBLE_SETS,
             MAILBOX_RUN_ENTRY_OFFSETS["admissible_run_resource_sets"],
+        ),
+        "entry.observation_requested": (
+            _OFF_ENTRY_OBSERVATION_REQUESTED,
+            MAILBOX_RUN_ENTRY_OFFSETS["observation_requested"],
         ),
         # And the request frame's header, which binds a payload to its entry.
         "frame.entry_index": (_OFF_FRAME_ENTRY_INDEX, MAILBOX_REQUEST_FRAME_OFFSETS["entry_index"]),
@@ -2316,11 +2323,10 @@ def _write_entry_error(buf: memoryview, code: int, msg: str = "") -> None:
 
 
 def _write_entry_admissible_sets(entry_addr: int, sets: int) -> None:
-    """Publish what this endpoint reports it can hold, before the terminal state.
+    """Publish measured capacity before physical END or semantic terminal.
 
-    Written next to the rc and the text, so it is in place before the store that
-    hands the entry to the parent — which is the parent's only reader. Zero is
-    "no report" and is what an endpoint that does not size itself leaves.
+    The child retains the entry after END and may update this figure at terminal.
+    Both accesses are atomic; zero means this endpoint reports no measurement.
     """
     _mailbox_store_i32(entry_addr + _OFF_ENTRY_ADMISSIBLE_SETS, int(sets))
 
@@ -3542,80 +3548,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                 return 1, msg or f"chip_process dev={device_id}: diagnostic Host log flush failed"
         return code, msg
 
-    def handle_task(task_buf, entry_buf) -> tuple[int, str]:
-        task_addr = ctypes.addressof(ctypes.c_char.from_buffer(task_buf))
-        entry_addr = ctypes.addressof(ctypes.c_char.from_buffer(entry_buf))
-        digest = _read_task_digest(task_buf)
-        # The run's identity is the entry's, not the frame's: the frame carries
-        # only the payload and the header that binds it to this entry.
-        frame_identity = _read_run_entry_identity(entry_buf)
-        cid = identity_table.get(digest)
-
-        code = 0
-        msg = ""
-        cfg = None
-        try:
-            # Inside the try because it writes the diagnostic sidecar: a full or
-            # read-only output_prefix must surface as this task's error, not as
-            # an exception that leaves the loop before TASK_DONE is published.
-            cfg, provenance = read_task_config(task_buf, frame_identity, digest)
-            if cid is None:
-                raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-            # Run only consumes a prepared slot — it never lazily
-            # prepares. The callable must have been staged via
-            # _CTRL_PREPARE first; reaching TASK_READY without it is a
-            # control-flow bug, so fail loudly instead of masking the
-            # missing-prepare with a first-task latency spike.
-            if cid not in prepared:
-                raise RuntimeError(
-                    f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
-                    f"(register via _CTRL_PREPARE first)"
-                )
-            pipeline_slot, pipeline_reserved, pipeline_generation = _PIPELINE_LEASE_FMT.unpack_from(
-                task_buf, _OFF_PIPELINE_LEASE
-            )
-            if pipeline_reserved != 0:
-                raise RuntimeError(f"chip_process dev={device_id}: invalid pipeline lease reserved field")
-            # The mailbox bytes decode once, into the wire TaskArgs; the mapping pass and the
-            # chip-POD build both read that object. Each tensor's embedded handle resolves to a
-            # local base by canonical identity (map-once, cached), and the POD is built at those
-            # bases — an exact resolution, not the parent-VA numeric-range rewrite it replaced.
-            args_ptr = task_addr + _OFF_TASK_ARGS_BLOB
-            args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
-            _validate_host_control_access(registry.get(cid), args)
-            chip_args = _materialize_chip_task_args(args, import_registry)
-            # The acceptance flag lives in the mailbox, not in the materialized args, so
-            # the fence still publishes through the address the parent polls.
-            if cfg.output_prefix:
-                _bind_host_log_session_directory()
-            cw.run_materialized(
-                cid,
-                chip_args,
-                cfg,
-                entry_addr + _OFF_ENTRY_ACCEPTED,
-                _TASK_ACCEPTED,
-                pipeline_slot,
-                pipeline_generation,
-                # This route's own identity, forwarded rather than dropped: a
-                # retained artifact names the submission that produced it, and
-                # the serial route is as public as the staged one.
-                frame_identity[1],
-                frame_identity[4],
-                **provenance._asdict(),
-            )
-        except Exception as e:  # noqa: BLE001
-            code = 1
-            msg = _format_exc(f"chip_process dev={device_id}", e)
-
-        # On a successful kernel run, give the caller a chance to do
-        # post-run work (e.g. store_to_host D2H staging) before the
-        # parent sees TASK_DONE. The kernel's failure path skips the
-        # hook because the device output region is undefined and
-        # staging garbage would mask the real error in post-mortems.
-        if code == 0 and on_task_done_success is not None:
-            code, msg = on_task_done_success()
-        return finish_task_logging(cfg, code, msg)
-
     def handle_control(  # noqa: PLR0912, PLR0915 -- one branch per control sub-command
         sub_cmd: int,
     ) -> tuple[int, str]:
@@ -3861,6 +3793,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             digest: bytes
             chip_run: Any = None
             launched_published: bool = False
+            ended_published: bool = False
             published_disposition: int = _DISPOSITION_NONE
 
         staged_runs: dict[int, _StagedRun] = {}
@@ -4064,6 +3997,36 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
         liveness_countdown = _PARENT_LIVENESS_POLL_INTERVAL
         shutdown_message = f"chip_process dev={device_id}: task loop shut down"
         shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
+
+        def activate_pending_runs() -> bool:
+            nonlocal shutdown_message
+
+            broke_on_activation = False
+            for staged in list(staged_runs.values()):
+                entry_state = _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_STATE)
+                if entry_state != _ACTIVATE or staged.activated:
+                    continue
+                if _read_run_entry_identity(staged.entry_buf) != staged.identity:
+                    stale_message = f"chip_process dev={device_id}: stale activation identity"
+                    try:
+                        staged.chip_run.abandon()
+                    except Exception as e:  # noqa: BLE001
+                        stale_message += "; " + _format_exc("chip run abandonment", e)
+                        shutdown_message = stale_message
+                        broke_on_activation = True
+                        break
+                    fail_run(staged, stale_message)
+                    staged_runs.pop(staged.index, None)
+                    continue
+                try:
+                    staged.chip_run.activate()
+                    staged.activated = True
+                except Exception as e:  # noqa: BLE001
+                    shutdown_message = _format_exc(f"chip_process dev={device_id}: native activation", e)
+                    broke_on_activation = True
+                    break
+            return not broke_on_activation
+
         try:
             while True:
                 control_state = _mailbox_load_i32(state_addr)
@@ -4113,31 +4076,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     shutdown_message = invalid_header
                     break
 
-                broke_on_activation = False
-                for staged in list(staged_runs.values()):
-                    entry_state = _mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_STATE)
-                    if entry_state != _ACTIVATE or staged.activated:
-                        continue
-                    if _read_run_entry_identity(staged.entry_buf) != staged.identity:
-                        stale_message = f"chip_process dev={device_id}: stale activation identity"
-                        try:
-                            staged.chip_run.abandon()
-                        except Exception as e:  # noqa: BLE001
-                            stale_message += "; " + _format_exc("chip run abandonment", e)
-                            shutdown_message = stale_message
-                            broke_on_activation = True
-                            break
-                        fail_run(staged, stale_message)
-                        staged_runs.pop(staged.index, None)
-                        continue
-                    try:
-                        staged.chip_run.activate()
-                        staged.activated = True
-                    except Exception as e:  # noqa: BLE001
-                        shutdown_message = _format_exc(f"chip_process dev={device_id}: native activation", e)
-                        broke_on_activation = True
-                        break
-                if broke_on_activation:
+                if not activate_pending_runs():
                     break
 
                 for staged in sorted(new_runs, key=lambda run: run.identity[4]):
@@ -4163,13 +4102,74 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         if not run_complete:
                             continue
 
+                        if not staged.chip_run._execution_ended:
+                            # done() also includes cached terminal failures. Deliver
+                            # those directly; a failed rollback is not physical END.
+                            code, msg = publish_completed_run(staged)
+                            if code != 0 and staged.chip_run.lane_poisoned:
+                                shutdown_message = msg
+                                stop_progress = True
+                                break
+                            continue
+                        if not staged.ended_published:
+                            # Physical retirement returns execution credit only. The entry,
+                            # native carrier, IO and strong observer remain this call's owners.
+                            _write_entry_admissible_sets(
+                                staged.entry_addr, cw.admissible_run_resource_sets if reports_admissible_sets else 0
+                            )
+                            _mailbox_store_i32(staged.entry_addr + _OFF_ENTRY_STATE, _TASK_ENDED)
+                            staged.ended_published = True
+                    except Exception as e:  # noqa: BLE001
+                        shutdown_message = _format_exc(f"chip_process dev={device_id}: chip run progress", e)
+                        stop_progress = True
+                        break
+                if stop_progress:
+                    break
+
+                # Every activation above is processed before a blocking observer. The
+                # staged loop already polls this shared mailbox continuously, so a
+                # parent request needs no new sleeping waiter or wakeup primitive.
+                live_execution = any(run.chip_run.launched and not run.ended_published for run in staged_runs.values())
+                pending_activation = any(not run.activated for run in staged_runs.values())
+                occupied_entries = sum(
+                    _mailbox_load_u64(address + _OFF_ENTRY_GENERATION) % 2 for address in entry_addrs
+                )
+                pressure = occupied_entries == live_entry_count and not pending_activation
+                for staged in sorted(staged_runs.values(), key=lambda run: run.identity[4]):
+                    # Activation can terminal-publish and remove another member
+                    # of this snapshot. Its entry is then the parent's to reuse.
+                    if staged_runs.get(staged.index) is not staged:
+                        continue
+                    requested = bool(_mailbox_load_i32(staged.entry_addr + _OFF_ENTRY_OBSERVATION_REQUESTED))
+                    if requested:
+                        # Parent publishes eligible installed activations before
+                        # the first request word. Acquire that word, then consume
+                        # those authorizations even if staging happened after the
+                        # activation scan at the start of this iteration.
+                        if not activate_pending_runs():
+                            stop_progress = True
+                            break
+                        if staged_runs.get(staged.index) is not staged:
+                            continue
+                    if not staged.chip_run.launched:
+                        continue
+                    idle_delivery = not live_execution and not pending_activation
+                    if not requested and not (staged.ended_published and (idle_delivery or pressure)):
+                        continue
+                    try:
+                        if _read_run_entry_identity(staged.entry_buf) != staged.identity:
+                            raise RuntimeError("stale observation request identity")
+                        if not staged.ended_published:
+                            # An explicit wait must reach the native bounded wait even
+                            # when a hung launch never reports physical END on its own.
+                            staged.chip_run.wait()
                         code, msg = publish_completed_run(staged)
                         if code != 0 and staged.chip_run.lane_poisoned:
                             shutdown_message = msg
                             stop_progress = True
                             break
                     except Exception as e:  # noqa: BLE001
-                        shutdown_message = _format_exc(f"chip_process dev={device_id}: chip run progress", e)
+                        shutdown_message = _format_exc(f"chip_process dev={device_id}: result observation", e)
                         stop_progress = True
                         break
                 if stop_progress:
@@ -4214,16 +4214,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                 frame_buf.release()
 
     try:
-        if granted_sets >= 2:
-            run_staged_frame_loop()
-        else:
-            _run_mailbox_loop(
-                buf,
-                state_addr,
-                handle_task=handle_task,
-                handle_control=handle_control,
-                expected_parent_pid=expected_parent_pid,
-            )
+        run_staged_frame_loop()
     finally:
         _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
 
@@ -5063,6 +5054,7 @@ class RunHandle:
         self._accept_wait_in_progress = False
         self._launch_accepted = False
         self._terminal = False
+        self._execution_done = False
         self._error: BaseException | None = None
         self._finalization_error: BaseException | None = None
         self._finalization_abandoned = False
@@ -5085,6 +5077,7 @@ class RunHandle:
         handle._accept_wait_in_progress = False
         handle._launch_accepted = True
         handle._terminal = True
+        handle._execution_done = True
         handle._error = None
         handle._finalization_error = None
         handle._finalization_abandoned = False
@@ -5103,29 +5096,26 @@ class RunHandle:
 
     @property
     def done(self) -> bool:
-        """True once waiting on this run would not block.
+        """True after this run's native completion or a terminal error is cached.
 
-        This answers the native fence — the device is drained and every task
-        has reached its terminal state — plus this handle's own terminal flag.
-        It does **not** say the run's fence-owned cleanup has happened: the
-        CommDomain, L3-L2 and remote-slot teardown runs after the fence, in
-        whichever thread waits. Anything that has to be ordered behind that
-        teardown keys on ``_cleanup_published`` instead.
-
-        Reads False while another waiter is crossing the fence, because the
-        native run identity can disappear in that interval.
+        A direct L2 query reports physical execution completion without observing
+        errors or delivering Program outputs. Its explicit wait can include later
+        work queued on the same streams. Hierarchical runs report semantic
+        terminal completion. Cleanup finishes separately when wait returns;
+        this property alone does not grant permission to reclaim resources.
         """
         with self._cv:
+            if self._execution_done:
+                return True
             if self._terminal:
                 return True
-            # A waiter may have crossed the native fence and released the run
-            # identity while it is still publishing cleanup. Avoid querying a
-            # native id that can disappear in that interval.
+            # Wait/finalize may release the native identity.
             if self._wait_in_progress:
                 return False
             run_id = self._run_id
             assert run_id is not None
-            return self._worker._run_handle_done(run_id)
+            self._execution_done = self._worker._run_handle_done(run_id)
+            return self._execution_done
 
     def _clear_wait_owner(self) -> None:
         """Make an interrupted pre-finalization fence wait re-electable."""
@@ -5290,6 +5280,10 @@ class RunHandle:
 
             if not completed:
                 raise TimeoutError("RunHandle.wait() timed out")
+
+            if native_error is None:
+                with self._cv:
+                    self._execution_done = True
 
             # An acceptance waiter that already captured this run id must leave
             # the native wait before finalize releases that id. It is terminal
@@ -5695,12 +5689,11 @@ class Worker:
         self._startup_timeout_s = float(config.get("startup_timeout_s", _STARTUP_TIMEOUT_S))
         if not (self._startup_timeout_s > 0 and math.isfinite(self._startup_timeout_s)):
             raise ValueError("Worker startup_timeout_s must be a positive finite number of seconds")
-        # `pending_run_depth` bounds non-terminal logical runs in this Worker's admission FIFO; 0
+        # `pending_run_depth` bounds physically unretired runs in this Worker's admission FIFO; 0
         # derives the bound from the negotiated direct-chip pipeline depth. That cap is a run
         # count: it is not a memory budget, and a terminal run whose RunHandle is unreleased does
         # not occupy it. `launch_depth` bounds how many of those runs may have their device work
-        # launched at once; 1 keeps a successor's work off the device until its predecessor is
-        # terminal.
+        # launched at once; 1 keeps a successor's work off the device until its predecessor physically retires.
         self._pipeline_depth_request, self._pending_run_depth, self._launch_depth = _validated_run_depths(
             config, int(level)
         )
@@ -9491,58 +9484,7 @@ class Worker:
                 chip_pipeline_depth_request,
                 deadline,
             )
-        pid = os.fork()
-        if pid == 0:
-            buf = self._chip_shms[idx].buf
-            assert buf is not None
-            if self._is_startup_root:
-                with contextlib.suppress(OSError):
-                    os.setpgid(0, 0)
-            _close_fork_child_fds(self._config.get("fork_child_close_fds", ()))
-            # _chip_process_loop publishes INIT_READY/INIT_FAILED itself
-            # (around cw.init + ChipCallable prepare). This guard only
-            # ensures the child exits rather than unwinding into the
-            # parent's startup frames (see _forked_child_main). A throw
-            # before cw.init (e.g. identity-table build) leaves the
-            # mailbox IDLE, so publish INIT_FAILED for a bounded parent
-            # error.
-            try:
-                _chip_process_loop(
-                    buf,
-                    self._l3_bins,
-                    dev_id,
-                    *_make_local_identity_tables(
-                        identity_snapshot,
-                        callable_kind="CHIP_CALLABLE",
-                        target_namespace="LOCAL_CHIP",
-                    ),
-                    self._owner_instance_id,
-                    self._device_endpoint_identities[(idx, DEVICE_AICPU)][0],
-                    self._device_endpoint_identities[(idx, DEVICE_AICORE)][0],
-                    log_level=chip_log_level,
-                    platform=str(self._config["platform"]),
-                    runtime=str(self._config["runtime"]),
-                    prewarm_config=self._prewarm_config,
-                    enable_sdma=bool(self._config.get("enable_sdma", False)),
-                    chip_rank=idx,
-                    launch_depth=(
-                        chip_pipeline_depth_request if self._automatic_admission_requested else self._launch_depth
-                    ),
-                    collect_across_runs=bool(self._config.get("collect_across_runs", False)),
-                    pipeline_depth_request=chip_pipeline_depth_request,
-                    automatic_admission=self._automatic_admission_requested,
-                    shared_heap_files=self._shared_heap_files,
-                )
-            except BaseException as e:  # noqa: BLE001
-                import traceback as _tb  # noqa: PLC0415
-
-                _tb.print_exc()
-                if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _IDLE:
-                    _write_error(buf, 1, _format_exc(f"chip worker {idx} dev={dev_id} init", e))
-                    _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-                _exit_after_host_log_flush(1)
-            _exit_after_host_log_flush(0)
-        return pid
+        return os.fork()
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912, PLR0915 -- local fork loops and remote activation share one startup deadline
         """Start every local child, await the subtree, register endpoints, start the scheduler.
@@ -9656,6 +9598,58 @@ class Worker:
                     chip_pipeline_depth_request,
                     deadline,
                 )
+                if pid == 0:
+                    buf = self._chip_shms[idx].buf
+                    assert buf is not None
+                    if self._is_startup_root:
+                        with contextlib.suppress(OSError):
+                            os.setpgid(0, 0)
+                    _close_fork_child_fds(self._config.get("fork_child_close_fds", ()))
+                    # _chip_process_loop publishes INIT_READY/INIT_FAILED itself
+                    # (around cw.init + ChipCallable prepare). This guard only
+                    # ensures the child exits rather than unwinding into the
+                    # parent's startup frames (see _forked_child_main). A throw
+                    # before cw.init (e.g. identity-table build) leaves the
+                    # mailbox IDLE, so publish INIT_FAILED for a bounded parent
+                    # error.
+                    try:
+                        _chip_process_loop(
+                            buf,
+                            self._l3_bins,
+                            dev_id,
+                            *_make_local_identity_tables(
+                                identity_snapshot,
+                                callable_kind="CHIP_CALLABLE",
+                                target_namespace="LOCAL_CHIP",
+                            ),
+                            self._owner_instance_id,
+                            self._device_endpoint_identities[(idx, DEVICE_AICPU)][0],
+                            self._device_endpoint_identities[(idx, DEVICE_AICORE)][0],
+                            log_level=chip_log_level,
+                            platform=str(self._config["platform"]),
+                            runtime=str(self._config["runtime"]),
+                            prewarm_config=self._prewarm_config,
+                            enable_sdma=bool(self._config.get("enable_sdma", False)),
+                            chip_rank=idx,
+                            launch_depth=(
+                                chip_pipeline_depth_request
+                                if self._automatic_admission_requested
+                                else self._launch_depth
+                            ),
+                            collect_across_runs=bool(self._config.get("collect_across_runs", False)),
+                            pipeline_depth_request=chip_pipeline_depth_request,
+                            automatic_admission=self._automatic_admission_requested,
+                            shared_heap_files=self._shared_heap_files,
+                        )
+                    except BaseException as e:  # noqa: BLE001
+                        import traceback as _tb  # noqa: PLC0415
+
+                        _tb.print_exc()
+                        if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _IDLE:
+                            _write_error(buf, 1, _format_exc(f"chip worker {idx} dev={dev_id} init", e))
+                            _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+                        _exit_after_host_log_flush(1)
+                    _exit_after_host_log_flush(0)
                 self._chip_pids.append(pid)
                 if self._is_startup_root:
                     self._startup_group_leader_pids.add(pid)
@@ -13485,7 +13479,7 @@ class Worker:
         ``caller_stream``: Direct L2 RTS stream handle, required for a borrowed
         environment. Successful submit enqueues the caller exit dependency before
         returning. The caller keeps the stream and external allocations alive through
-        retirement. Capture is rejected before source references are reserved.
+        explicit wait or close. Capture is rejected before source references are reserved.
 
         Graph construction remains serialized. A local L3 Worker that owns its
         startup and uses an onboard a2a3/a5 host_build_graph or
@@ -13493,7 +13487,7 @@ class Worker:
         ``pipeline_depth``, ``pending_run_depth``, ``launch_depth`` and
         ``workspace_budget_bytes`` are all omitted. Cold admission starts at
         one run: a second submission blocks before its Python graph callback
-        until the first whole run retires. Endpoint resource proofs then allow
+        until the first whole run physically retires. Endpoint resource proofs then allow
         more runs to prepare and enqueue, subject to the conservative fold
         across participating endpoints. Reclaiming storage can reduce that
         capacity. The startup identity directory bounds the slots that can be
@@ -13501,7 +13495,7 @@ class Worker:
 
         Supplying any of those controls selects explicit behavior. The
         negotiated ``pipeline_depth`` bounds native slots; ``pending_run_depth``
-        bounds logical admission (zero derives it from the native grant).
+        bounds execution admission (zero derives it from the native grant).
         ``launch_depth`` defaults to one and bounds early device enqueue.
         Explicit requests remain subject to backend and topology validation;
         nested, remote, MPI and simulated workers retain their existing
@@ -14112,16 +14106,17 @@ class Worker:
         *,
         _after_step: Any | None = None,
     ) -> BaseException | None:
-        # A direct-chip run owns no orchestration state: the lane finalized the
-        # native run as part of reaching terminal, and this worker built no
-        # domains, remote slots or chip regions for it. Retiring the lane entry
-        # is the whole of its cleanup, so it never enters the cursor below —
+        # A direct-chip run owns no orchestration state: its lane attempts native
+        # finalization before reaching terminal, and this worker built no domains,
+        # remote slots or chip regions for it. Failed native cleanup is retained
+        # for owner close; no direct-chip run enters the orchestration cursor below —
         # driving those steps here would report a cleanup failure for state that
         # was never created. The membership check and both removals share one lock
         # acquisition (pop(..., None), not del) so a concurrent Worker.close() clearing
         # these same dicts can never make this raise KeyError or read a half-updated pair.
         with self._registry_lock:
-            was_l2_run = self._chip_runs.pop(run_id, None) is not None
+            chip_run = self._chip_runs.pop(run_id, None)
+            was_l2_run = chip_run is not None
             if was_l2_run:
                 self._chip_run_touched_identities.pop(run_id, None)
         if was_l2_run:
@@ -14130,6 +14125,16 @@ class Worker:
             else:
                 self._source_context_failed = True
             handle._cache_finalization_error(native_error)
+            if (
+                native_error is not None
+                and not isinstance(native_error, RunPreparationRefused)
+                and chip_run.lane_poisoned
+                and chip_run._owner_recovery_required
+            ):
+                # A failed run can still owe carrier teardown or caller last-use
+                # proof. Its backing stays until owner close confirms recovery.
+                self._publish_abandoned_run(handle, native_error)
+                return native_error
             with self._hierarchical_start_cv:
                 handle._cleanup_published = True
                 self._accepted_run_handles.discard(handle)
@@ -14908,7 +14913,7 @@ class Worker:
         if reap_error is not None:
             raise reap_error
 
-    def _teardown_worker_tree(  # noqa: PLR0912 -- one ordered driver for rollback and close resource classes
+    def _teardown_worker_tree(  # noqa: PLR0912, PLR0915 -- one ordered driver for rollback and close resource classes
         self, *, startup_abort: bool, deadline: float | None = None
     ) -> None:
         """Drive the one resource sequence used by startup rollback and close.
@@ -14932,6 +14937,42 @@ class Worker:
                 fn()
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
+
+        if self.level == 2:
+            close_drained_chip_runs = self._close_completion is not None and self._close_completion.draining_chip_runs
+            recovering_abandoned_runs = bool(self._abandoned_run_handles or self._ordered_cleanup_error is not None)
+
+            def _finalize_chip() -> None:
+                if self._chip_worker:
+                    undelivered = close_drained_chip_runs or bool(self._chip_runs)
+                    lane_error = None
+                    try:
+                        self._chip_worker._close_chip_run_lane()
+                    except Exception as exc:  # noqa: BLE001
+                        if undelivered:
+                            if not recovering_abandoned_runs:
+                                raise
+                            lane_error = exc
+                    # Zero from exceptional owner close proves terminal teardown;
+                    # a run error does not supply that proof or block its attempt.
+                    self._chip_worker.finalize()
+                    for run_id in tuple(self._chip_source_uses):
+                        self._release_source_uses(run_id)
+                    with self._registry_lock:
+                        self._chip_runs.clear()
+                        self._chip_run_touched_identities.clear()
+                    self._chip_worker = None
+                    if lane_error is not None:
+                        errors.append(lane_error)
+
+            # Abandoned run owners keep backing alive until native close. The
+            # native owner classifies fatal Program recovery; a borrowed or
+            # healthy live context refuses and leaves this entire journal live.
+            if self._chip_worker is not None and recovering_abandoned_runs:
+                self._cleanup_journal.add_once("native", "ChipWorker", _finalize_chip)
+                native_err = self._cleanup_journal.drive({("native", "ChipWorker")})
+                if native_err is not None:
+                    raise native_err
 
         # Driven alone, and checked here: the journal below attempts every
         # entry even after one fails, so a workspace consumer that can still be
@@ -14980,34 +15021,6 @@ class Worker:
                 raise session_err
 
         if self.level == 2:
-            close_drained_chip_runs = self._close_completion is not None and self._close_completion.draining_chip_runs
-
-            def _finalize_chip() -> None:
-                if self._chip_worker:
-                    # The lane must close while its device context is alive.
-                    # It also owns the native fallback for entries without a
-                    # remaining public handle.
-                    #
-                    # Runs drained by this close have not delivered their errors
-                    # to an earlier caller. Capture that fact in the journal
-                    # action: retries may find their run maps already empty.
-                    # A poison already reported by individual waits is suppressed.
-                    undelivered = close_drained_chip_runs or bool(self._chip_runs)
-                    try:
-                        self._chip_worker._close_chip_run_lane()
-                    except Exception:
-                        if undelivered:
-                            raise
-                    # Only a successful lane close proves completion for its unawaited runs.
-                    # Uses retained after a reported error remain unproven, even after reset.
-                    for run_id in tuple(self._chip_runs):
-                        self._release_source_uses(run_id)
-                    with self._registry_lock:
-                        self._chip_runs.clear()
-                        self._chip_run_touched_identities.clear()
-                    self._chip_worker.finalize()
-                    self._chip_worker = None
-
             self._cleanup_journal.add_once("native", "ChipWorker", _finalize_chip)
             journal_err = self._cleanup_journal.drive({("native", "ChipWorker")})
             if journal_err is not None:

@@ -58,11 +58,63 @@
 #include "native_run_context.h"
 #include "native_run_execution.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <cstdlib>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
+#include <array>
+#include <filesystem>
+#include <fstream>
+#include <pthread.h>
+#include <unistd.h>
+#include "common/host_log_state.h"
+#include "common/host_span.h"
+#include "common/log_level.h"
+#include "utils/tensor_lease_release.h"
+
+namespace finalize_prefix_test {
+struct AllocationFault {
+    bool armed{false};
+    size_t consumed{0};
+    size_t bytes{0};
+};
+thread_local AllocationFault prefix_allocation_fault;
+thread_local size_t copyback_calls{0};
+}  // namespace finalize_prefix_test
+
+namespace {
+thread_local bool refuse_result_retention_allocation = false;
+thread_local bool sample_trace_allocation = false;
+thread_local size_t trace_allocation_bytes = 0;
+thread_local size_t trace_allocation_failures = 0;
+thread_local const NativeRunContext<SimDeviceRunnerBase> *trace_retirement_fault_owner = nullptr;
+}  // namespace
+
+void *operator new(std::size_t bytes) {
+    if (sample_trace_allocation && trace_allocation_bytes == 0) trace_allocation_bytes = bytes;
+    if (trace_retirement_fault_owner != nullptr && trace_retirement_fault_owner->physical_complete &&
+        trace_retirement_fault_owner->runner_claimed && bytes == trace_allocation_bytes) {
+        trace_retirement_fault_owner = nullptr;
+        ++trace_allocation_failures;
+        throw std::bad_alloc();
+    }
+    if (std::exchange(refuse_result_retention_allocation, false)) throw std::bad_alloc();
+    auto &fault = finalize_prefix_test::prefix_allocation_fault;
+    if (std::exchange(fault.armed, false)) {
+        ++fault.consumed;
+        fault.bytes = bytes;
+        throw std::bad_alloc();
+    }
+    if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
+    throw std::bad_alloc();
+}
 
 /* ===========================================================================
  * The runtime-maker half, which this target does not link.
@@ -98,13 +150,23 @@ int publish_run_image_impl(Runtime * /*runtime*/, const HostApi * /*api*/) { ret
 
 int copy_in_run_inputs_impl(const Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
 
-int copy_back_run_outputs_impl(
-    const Runtime * /*runtime*/, const HostApi * /*api*/, int /*execution_rc*/, int /*launched*/
-) {
+int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
+    ++finalize_prefix_test::copyback_calls;
+    if (execution_rc == 0 && launched != 0 && runtime != nullptr) {
+        for (const auto &lease : runtime->tensor_leases()) {
+            if (lease.needs_copy_back) {
+                const int rc = api->copy_from_device(lease.host_ptr, lease.dev_ptr, lease.size);
+                if (rc != 0) return rc;
+            }
+        }
+    }
     return 0;
 }
 
-int release_run_bindings_impl(Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
+int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime != nullptr) release_tensor_leases(runtime->tensor_leases(), api);
+    return 0;
+}
 
 }  // extern "C"
 
@@ -126,6 +188,7 @@ constexpr int32_t kAccepted = 7;
  */
 class RetryRunner : public SimDeviceRunnerBase {
 public:
+    enum class ProgressException { None, Allocation, Other };
     RetryRunner() {
         // The two registration facts a real `simpler_prepare_run` checks: the
         // callable is registered, and the retained block its hash names exists.
@@ -186,12 +249,40 @@ public:
                 return 0;
             }
         );
+        if (consume_drain_once) active_for_drain = true;
         return result;
     }
 
     void abandon_prepared_execution(PreparedExecution & /*prepared*/) noexcept override {}
-    int poll_execution(const ActiveExecution & /*active*/) override { return SIMPLER_NATIVE_RUN_POLL_COMPLETE; }
-    DrainOutcome drain_execution(ActiveExecution & /*active*/) override { return DrainOutcome::device_complete(0); }
+    int poll_execution(const ActiveExecution & /*active*/) override {
+        if (exception_from_poll) throw_progress_exception();
+        return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    }
+    DrainOutcome drain_execution(ActiveExecution &active) override {
+        ++drain_calls;
+        if (!exception_from_poll) throw_progress_exception();
+        if (consume_drain_once) {
+            if (!std::exchange(active_for_drain, false)) {
+                ++empty_drain_calls;
+                return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
+            }
+            auto *region =
+                reinterpret_cast<DeviceRunResultRegion *>(run_result_region_base(active.prepared->pipeline_slot));
+            *region = {};
+            region->published = active.prepared->identity.run_epoch;
+            region->verdict = static_cast<uint32_t>(drain_rc == 0 ? DeviceRunVerdict::Ok : DeviceRunVerdict::Error);
+            region->completion_code = drain_rc;
+            if (drain_rc != 0) {
+                region->code_source = static_cast<uint32_t>(DeviceRunCodeSource::ThreadRc);
+                region->payload_bytes = sizeof(uint64_t);
+                std::memcpy(region->payload, &region->published, sizeof(uint64_t));
+            }
+            if (clock_timing) device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)] = 1000;
+            // Both production sim backends consume active_run_ before returning.
+            if (std::exchange(fail_result_retention, false)) refuse_result_retention_allocation = true;
+        }
+        return drain_rc == 0 ? DrainOutcome::device_complete(0) : DrainOutcome::device_error(drain_rc, true);
+    }
     int finalize() override { return 0; }
     int ensure_binaries_loaded() override { return 0; }
     int invoke_device_register(const RegisterCallableArgs & /*reg_args*/) override { return 0; }
@@ -200,9 +291,32 @@ public:
     bool fail_after_partial_submission{false};
     int prepare_calls{0};
     int launch_calls{0};
+    bool consume_drain_once{false};
+    bool active_for_drain{false};
+    bool fail_result_retention{false};
+    int drain_calls{0};
+    ProgressException progress_exception{ProgressException::None};
+    bool exception_from_poll{false};
+    int progress_exception_calls{0};
+    int empty_drain_calls{0};
+    int drain_rc{0};
+    bool clock_timing{false};
 
     /** Whether this owner still holds the execution claim. */
     bool claim_held_by(const void *owner) const { return native_run_owned_by(owner); }
+    bool result_retained(uint64_t run_epoch) const {
+        std::lock_guard<std::mutex> lock(retained_result_mu_);
+        return retained_run_results_.find(run_epoch) != retained_run_results_.end();
+    }
+
+private:
+    void throw_progress_exception() {
+        const auto failure = std::exchange(progress_exception, ProgressException::None);
+        if (failure == ProgressException::None) return;
+        ++progress_exception_calls;
+        if (failure == ProgressException::Allocation) throw std::bad_alloc();
+        throw std::runtime_error("simulated physical progress failed");
+    }
 };
 
 /** Runtime storage with the alignment and zeroing `simpler_prepare_run` requires. */
@@ -235,8 +349,7 @@ struct PreparedRun {
     volatile int32_t accepted{kUnaccepted};
 
     /** Drive the real `simpler_prepare_run` to a real PREPARED carrier. */
-    int prepare() {
-        const CallConfig config = diagnostic_config();
+    int prepare(const CallConfig &config = diagnostic_config()) {
         NativeRunDescriptor descriptor{};
         descriptor.pipeline_slot = 0;
         descriptor.arena_bank = 0;
@@ -389,4 +502,596 @@ TEST(DiagnosticCapacityRefusalPhaseTest, TheCapacityCodeCannotBeConfusedWithARun
     EXPECT_NE(SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL, PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_NE(SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL, PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     EXPECT_NE(SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, PhysicalProgressExceptionsPreserveTheUnconsumedOwner) {
+    for (bool blocking : {false, true}) {
+        for (bool poll_fault : {false, true}) {
+            if (blocking && poll_fault) continue;
+            for (bool allocation : {false, true}) {
+                SCOPED_TRACE(blocking);
+                SCOPED_TRACE(poll_fault);
+                SCOPED_TRACE(allocation);
+                PreparedRun run;
+                run.runner.refuse_for_capacity = false;
+                run.runner.consume_drain_once = true;
+                ASSERT_TRUE(run.runner.stand_up());
+                ASSERT_EQ(run.prepare(), 0);
+                ASSERT_EQ(run.launch(), 0);
+                auto *const runtime_owner = run.state()->runtime.get();
+                auto *const execution_owner = run.state()->active_execution.get();
+                run.runner.exception_from_poll = poll_fault;
+                run.runner.progress_exception =
+                    allocation ? RetryRunner::ProgressException::Allocation : RetryRunner::ProgressException::Other;
+                bool escaped = false;
+                int rc = 12345;
+                try {
+                    rc = blocking ? simpler_wait_run_completion(&run.runner, run.storage.handle()) :
+                                    simpler_poll_run(&run.runner, run.storage.handle());
+                } catch (...) {
+                    escaped = true;
+                }
+                EXPECT_FALSE(escaped);
+                const int expected_rc = blocking ? static_cast<int>(PTO_RUNTIME_ERR_INTERNAL) :
+                                                   static_cast<int>(SIMPLER_NATIVE_RUN_POLL_ERROR);
+                EXPECT_EQ(rc, expected_rc);
+                EXPECT_EQ(run.runner.progress_exception_calls, 1);
+                EXPECT_EQ(run.state()->runtime.get(), runtime_owner);
+                EXPECT_EQ(run.state()->active_execution.get(), execution_owner);
+                EXPECT_FALSE(run.state()->physical_complete);
+                EXPECT_FALSE(run.state()->execution_retired);
+                EXPECT_FALSE(run.state()->result_observed);
+                EXPECT_EQ(run.phase(), NativeRunPhase::Running);
+                EXPECT_EQ(run.completion_rc(), 0);
+                EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+                EXPECT_TRUE(run.runner.active_for_drain);
+                EXPECT_EQ(run.runner.drain_calls, poll_fault ? 0 : 1);
+                EXPECT_EQ(run.runner.empty_drain_calls, 0);
+                std::fprintf(
+                    stderr, "SIM_PROGRESS_EXCEPTION entry=%s poll_fault=%d allocation=%d escaped=%d rc=%d drains=%d\n",
+                    blocking ? "wait_completion" : "poll", poll_fault, allocation, escaped, rc, run.runner.drain_calls
+                );
+                if (blocking) ASSERT_EQ(simpler_wait_run_completion(&run.runner, run.storage.handle()), 0);
+                else ASSERT_EQ(simpler_poll_run(&run.runner, run.storage.handle()), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+                EXPECT_TRUE(run.state()->physical_complete);
+                EXPECT_TRUE(run.state()->execution_retired);
+                EXPECT_FALSE(run.runner.claim_held_by(run.storage.handle()));
+                EXPECT_FALSE(run.runner.active_for_drain);
+                EXPECT_EQ(run.runner.drain_calls, poll_fault ? 1 : 2);
+                EXPECT_EQ(run.runner.empty_drain_calls, 0);
+                EXPECT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), 0);
+                EXPECT_EQ(run.finalize(), 0);
+                EXPECT_FALSE(run.runner.native_runs_outstanding());
+            }
+        }
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, TraceAllocationFailureKeepsStagingAndRetirementRetryable) {
+    for (bool blocking : {false, true}) {
+        SCOPED_TRACE(blocking);
+        EXPECT_EXIT(
+            ([blocking]() {
+                static SimplerHostLogState log_state{};
+                log_state.threshold = static_cast<int>(simpler::log::LogLevel::TIMING);
+                log_state.sink_owner_pid = log_state.sink_process_pid = getpid();
+                log_state.sink_context = &log_state;
+                log_state.sink_enqueue = [](void *, SimplerHostLogState *state, const char *record, uint32_t size) {
+                    const bool written = std::fwrite(record, 1, size, stderr) == size;
+                    __atomic_fetch_sub(&state->sink_producer_state, UINT64_C(1), __ATOMIC_RELEASE);
+                    return written ? 1 : 0;
+                };
+                pthread_key_t key;
+                if (pthread_key_create(&key, std::free) != 0) std::_Exit(90);
+                log_state.trace_key_plus_one = static_cast<uint64_t>(key) + 1;
+                if (simpler_host_log_bind_state(&log_state) != 0) std::_Exit(91);
+                SimplerHostSpan span{};
+                span.name = "chip.run.runner_run";
+                span.attributes = "";
+                sample_trace_allocation = true;
+                unified_log_host_span(&span);
+                sample_trace_allocation = false;
+                if (trace_allocation_bytes == 0 || trace_allocation_bytes >= sizeof(DeviceRunResultRegion))
+                    std::_Exit(92);
+
+                PreparedRun run;
+                run.runner.refuse_for_capacity = false;
+                run.runner.consume_drain_once = true;
+                if (!run.runner.stand_up() || run.prepare(CallConfig{}) != 0) std::_Exit(93);
+                auto *const runtime_owner = run.state()->runtime.get();
+                std::array<unsigned char, 16> output;
+                output.fill(0x71);
+                void *const backing = run.runner.allocate_tensor(output.size());
+                if (backing == nullptr) std::_Exit(94);
+                std::memset(backing, 0x42, output.size());
+                run.runner.set_retained_temp_buffer(0, backing, output.size());
+                run.state()->runtime->tensor_leases().push_back(
+                    TensorLease{output.data(), backing, output.size(), false, true, TensorReleaseKind::BufferNoop}
+                );
+                if (run.launch() != 0) std::_Exit(95);
+                auto *const execution_owner = run.state()->active_execution.get();
+                trace_retirement_fault_owner = run.state();
+                int rc = 12345;
+                bool escaped = false;
+                try {
+                    rc = blocking ? simpler_wait_run_completion(&run.runner, run.storage.handle()) :
+                                    simpler_poll_run(&run.runner, run.storage.handle());
+                } catch (...) {
+                    escaped = true;
+                }
+                const bool injected = trace_allocation_failures == 1 && trace_retirement_fault_owner == nullptr;
+                trace_retirement_fault_owner = nullptr;
+                void *slot_staging = nullptr;
+                size_t slot_bytes = 0;
+                run.runner.get_retained_temp_buffer(0, &slot_staging, &slot_bytes);
+                const bool retained_result = run.runner.result_retained(run.state()->descriptor.run_epoch);
+                const bool staging_owned = (slot_staging == backing && run.state()->retired_host_staging == nullptr) ||
+                                           (slot_staging == nullptr && run.state()->retired_host_staging == backing);
+                const int expected_rc = blocking ? static_cast<int>(PTO_RUNTIME_ERR_INTERNAL) :
+                                                   static_cast<int>(SIMPLER_NATIVE_RUN_POLL_ERROR);
+                bool ok = !escaped && injected && rc == expected_rc && retained_result && staging_owned &&
+                          run.state()->physical_complete && run.runner.claim_held_by(run.storage.handle()) &&
+                          run.state()->runtime.get() == runtime_owner &&
+                          run.state()->active_execution.get() == execution_owner &&
+                          std::all_of(output.begin(), output.end(), [](unsigned char value) {
+                              return value == 0x71;
+                          });
+                const int retry_rc = blocking ? simpler_wait_run_completion(&run.runner, run.storage.handle()) :
+                                                simpler_poll_run(&run.runner, run.storage.handle());
+                const bool claim_after_retry = run.runner.claim_held_by(run.storage.handle());
+                run.runner.get_retained_temp_buffer(0, &slot_staging, &slot_bytes);
+                ok = ok && retry_rc == (blocking ? 0 : SIMPLER_NATIVE_RUN_POLL_COMPLETE) && !claim_after_retry &&
+                     run.state()->execution_retired && run.state()->retired_host_staging == backing &&
+                     slot_staging == nullptr && run.runner.drain_calls == 1 && run.runner.empty_drain_calls == 0;
+                const int wait_rc = simpler_wait_run(&run.runner, run.storage.handle());
+                const int finalize_rc = run.finalize();
+                ok = ok && wait_rc == 0 && finalize_rc == 0 && !run.runner.native_runs_outstanding() &&
+                     std::all_of(
+                         output.begin(), output.end(),
+                         [](unsigned char value) {
+                             return value == 0x42;
+                         }
+                     ) &&
+                     log_state.sink_producer_state == 0 && log_state.pending_record_count == 0 &&
+                     log_state.dropped_record_count == 0;
+                std::printf(
+                    "SIM_TRACE_RETIRE entry=%s bytes=%zu injected=%d rc=%d retained_result=%d staging_owned=%d "
+                    "retry_rc=%d claim_after_retry=%d drains=%d finalize=%d ok=%d\n",
+                    blocking ? "wait_completion" : "poll", trace_allocation_bytes, injected, rc, retained_result,
+                    staging_owned, retry_rc, claim_after_retry, run.runner.drain_calls, finalize_rc, ok
+                );
+                std::fflush(stdout);
+                std::_Exit(ok ? 0 : 17);
+            }()),
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, ResultRetentionAllocationFailureRetriesAfterConsumedDrain) {
+    for (bool blocking : {false, true}) {
+        SCOPED_TRACE(blocking ? "wait_completion" : "poll");
+        PreparedRun run;
+        run.runner.refuse_for_capacity = false;
+        run.runner.consume_drain_once = true;
+        ASSERT_TRUE(run.runner.stand_up());
+        ASSERT_EQ(run.prepare(), 0);
+        ASSERT_EQ(run.launch(), 0);
+        auto *const runtime_owner = run.state()->runtime.get();
+        auto *const active_owner = run.state()->active_execution.get();
+        run.runner.fail_result_retention = true;
+        bool escaped = false;
+        int rc = 12345;
+        try {
+            rc = blocking ? simpler_wait_run_completion(&run.runner, run.storage.handle()) :
+                            simpler_poll_run(&run.runner, run.storage.handle());
+        } catch (const std::bad_alloc &) {
+            escaped = true;
+        }
+        const bool consumed = !std::exchange(refuse_result_retention_allocation, false);
+        EXPECT_TRUE(consumed);
+        EXPECT_FALSE(escaped);
+        EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(run.runner.drain_calls, 1);
+        EXPECT_EQ(run.runner.empty_drain_calls, 0);
+        EXPECT_TRUE(run.state()->physical_complete);
+        EXPECT_FALSE(run.state()->execution_retired);
+        EXPECT_EQ(run.phase(), NativeRunPhase::Running);
+        EXPECT_EQ(run.state()->runtime.get(), runtime_owner);
+        EXPECT_EQ(run.state()->active_execution.get(), active_owner);
+        EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+        EXPECT_EQ(run.completion_rc(), 0);
+        std::fprintf(
+            stderr, "SIM_RETENTION entry=%s consumed=%d escaped=%d rc=%d drains=%d physical=%d retired=%d\n",
+            blocking ? "wait_completion" : "poll", consumed, escaped, rc, run.runner.drain_calls,
+            run.state()->physical_complete, run.state()->execution_retired
+        );
+        if (blocking) EXPECT_EQ(simpler_wait_run_completion(&run.runner, run.storage.handle()), 0);
+        else EXPECT_EQ(simpler_poll_run(&run.runner, run.storage.handle()), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+        EXPECT_TRUE(run.state()->execution_retired);
+        EXPECT_FALSE(run.runner.claim_held_by(run.storage.handle()));
+        EXPECT_EQ(run.runner.drain_calls, 1);
+        EXPECT_EQ(run.runner.empty_drain_calls, 0);
+        EXPECT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), 0);
+        EXPECT_EQ(run.finalize(), 0);
+        EXPECT_FALSE(run.runner.native_runs_outstanding());
+        EXPECT_EQ(run.runner.drain_calls, 1);
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, ObserversReuseConsumedDrainAndKeepItsBusinessResult) {
+    for (int business_rc : {0, -4321}) {
+        for (bool finalize_directly : {false, true}) {
+            SCOPED_TRACE(business_rc);
+            SCOPED_TRACE(finalize_directly);
+            PreparedRun run;
+            run.runner.refuse_for_capacity = false;
+            run.runner.consume_drain_once = true;
+            run.runner.drain_rc = business_rc;
+            ASSERT_TRUE(run.runner.stand_up());
+            ASSERT_EQ(run.prepare(), 0);
+            std::array<unsigned char, 16> output;
+            output.fill(0x71);
+            void *const backing = run.runner.allocate_tensor(output.size());
+            ASSERT_NE(backing, nullptr);
+            std::memset(backing, 0x42, output.size());
+            run.runner.set_retained_temp_buffer(0, backing, output.size());
+            run.state()->runtime->tensor_leases().push_back(
+                TensorLease{output.data(), backing, output.size(), false, true, TensorReleaseKind::BufferNoop}
+            );
+            ASSERT_EQ(run.launch(), 0);
+            run.runner.fail_result_retention = true;
+            ASSERT_EQ(simpler_poll_run(&run.runner, run.storage.handle()), SIMPLER_NATIVE_RUN_POLL_ERROR);
+            ASSERT_TRUE(run.state()->physical_complete);
+            EXPECT_FALSE(run.state()->execution_retired);
+            EXPECT_EQ(run.completion_rc(), business_rc);
+            if (!finalize_directly) {
+                EXPECT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), business_rc);
+                EXPECT_EQ(simpler_poll_run(&run.runner, run.storage.handle()), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+                EXPECT_TRUE(run.state()->execution_retired);
+            }
+            EXPECT_EQ(run.finalize(), business_rc);
+            EXPECT_TRUE(std::all_of(output.begin(), output.end(), [&](unsigned char value) {
+                return value == (business_rc == 0 ? 0x42 : 0x71);
+            }));
+            EXPECT_EQ(run.runner.drain_calls, 1);
+            EXPECT_EQ(run.runner.empty_drain_calls, 0);
+            EXPECT_FALSE(run.runner.native_runs_outstanding());
+        }
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, StrongWaitThenPollStillFinishesExecutionRetirement) {
+    PreparedRun run;
+    run.runner.refuse_for_capacity = false;
+    run.runner.consume_drain_once = true;
+    ASSERT_TRUE(run.runner.stand_up());
+    ASSERT_EQ(run.prepare(), 0);
+    ASSERT_EQ(run.launch(), 0);
+    ASSERT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), 0);
+    ASSERT_EQ(run.phase(), NativeRunPhase::Complete);
+    EXPECT_TRUE(run.state()->physical_complete);
+    EXPECT_FALSE(run.state()->execution_retired);
+    EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    ASSERT_EQ(simpler_poll_run(&run.runner, run.storage.handle()), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    EXPECT_TRUE(run.state()->execution_retired);
+    EXPECT_FALSE(run.runner.claim_held_by(run.storage.handle()));
+    EXPECT_EQ(run.finalize(), 0);
+    EXPECT_EQ(run.runner.drain_calls, 1);
+    EXPECT_EQ(run.runner.empty_drain_calls, 0);
+    EXPECT_FALSE(run.runner.native_runs_outstanding());
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, RetiredResultsAndOutputSurviveTheSuccessorUsingTheirSlot) {
+    for (int business_rc : {0, -4321}) {
+        SCOPED_TRACE(business_rc);
+        PreparedRun run;
+        run.runner.refuse_for_capacity = false;
+        run.runner.consume_drain_once = true;
+        run.runner.drain_rc = business_rc;
+        ASSERT_TRUE(run.runner.stand_up());
+        ASSERT_EQ(run.prepare(), 0);
+        std::array<unsigned char, 16> output;
+        output.fill(0x71);
+        void *const backing = run.runner.allocate_tensor(output.size());
+        ASSERT_NE(backing, nullptr);
+        std::memset(backing, 0x42, output.size());
+        run.runner.set_retained_temp_buffer(0, backing, output.size());
+        run.state()->runtime->tensor_leases().push_back(
+            TensorLease{output.data(), backing, output.size(), false, true, TensorReleaseKind::BufferNoop}
+        );
+        ASSERT_EQ(run.launch(), 0);
+        run.runner.fail_result_retention = true;
+        ASSERT_EQ(simpler_wait_run_completion(&run.runner, run.storage.handle()), PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(run.state()->runtime->tensor_leases().front().dev_ptr, backing);
+        EXPECT_EQ(output.front(), 0x71);
+        ASSERT_EQ(simpler_wait_run_completion(&run.runner, run.storage.handle()), 0);
+        EXPECT_EQ(run.state()->retired_host_staging, backing);
+
+        RuntimeStorage successor;
+        NativeRunDescriptor descriptor = run.state()->descriptor;
+        descriptor.run_epoch = 9200;
+        descriptor.generation++;
+        descriptor.dispatch_id++;
+        CallConfig config{};
+        ASSERT_EQ(simpler_prepare_run(&run.runner, successor.handle(), kCallableId, nullptr, &config, &descriptor), 0);
+        run.runner.drain_rc = -6543;
+        ASSERT_EQ(simpler_launch_run(&run.runner, successor.handle()), 0);
+        ASSERT_EQ(simpler_wait_run_completion(&run.runner, successor.handle()), 0);
+        const auto terminal = run.runner.device_run_terminal(0, 9100);
+        EXPECT_EQ(
+            terminal.state, business_rc == 0 ? DeviceRunTerminalState::Succeeded : DeviceRunTerminalState::Failed
+        );
+        EXPECT_EQ(terminal.code, business_rc);
+        if (business_rc != 0) {
+            size_t bytes = 0;
+            const void *payload = run.state()->host_api.run_result(&bytes);
+            ASSERT_NE(payload, nullptr);
+            ASSERT_EQ(bytes, sizeof(uint64_t));
+            uint64_t epoch = 0;
+            std::memcpy(&epoch, payload, sizeof(epoch));
+            EXPECT_EQ(epoch, 9100u);
+        }
+        EXPECT_EQ(run.state()->runtime->tensor_leases().front().dev_ptr, backing);
+        EXPECT_EQ(output.front(), 0x71);
+        EXPECT_EQ(simpler_finalize_run(&run.runner, successor.handle()), -6543);
+        EXPECT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), business_rc);
+        EXPECT_EQ(run.finalize(), business_rc);
+        EXPECT_TRUE(std::all_of(output.begin(), output.end(), [&](unsigned char value) {
+            return value == (business_rc == 0 ? 0x42 : 0x71);
+        }));
+        EXPECT_EQ(run.runner.drain_calls, 2);
+        EXPECT_EQ(run.runner.empty_drain_calls, 0);
+        EXPECT_FALSE(run.runner.native_runs_outstanding());
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, OutputDeliveryDoesNotChangeObservationOrCleanup) {
+    for (int delivery : {-1, 0, 1}) {
+        for (int business_rc : {0, -735}) {
+            SCOPED_TRACE(delivery);
+            SCOPED_TRACE(business_rc);
+            PreparedRun run;
+            run.runner.refuse_for_capacity = false;
+            run.runner.consume_drain_once = true;
+            run.runner.drain_rc = business_rc;
+            ASSERT_TRUE(run.runner.stand_up());
+            ASSERT_EQ(run.prepare(CallConfig{}), 0);
+            std::array<unsigned char, 64> output;
+            output.fill(0x71);
+            void *const backing = run.runner.allocate_tensor(output.size());
+            ASSERT_NE(backing, nullptr);
+            std::memset(backing, 0x42, output.size());
+            run.runner.set_retained_temp_buffer(0, backing, output.size());
+            run.state()->runtime->tensor_leases().push_back(
+                TensorLease{output.data(), backing, output.size(), false, true, TensorReleaseKind::BufferNoop}
+            );
+            ASSERT_EQ(run.launch(), 0);
+            ASSERT_EQ(simpler_wait_run_completion(&run.runner, run.storage.handle()), 0);
+            EXPECT_EQ(output.front(), 0x71);
+            EXPECT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), business_rc);
+            const int rc = delivery < 0 ?
+                               run.finalize() :
+                               simpler_finalize_run_with_delivery(&run.runner, run.storage.handle(), delivery);
+            EXPECT_EQ(rc, business_rc);
+            EXPECT_TRUE(std::all_of(output.begin(), output.end(), [&](unsigned char value) {
+                return value == (delivery != 0 && business_rc == 0 ? 0x42 : 0x71);
+            }));
+            EXPECT_EQ(run.runner.drain_calls, 1);
+            EXPECT_EQ(run.runner.empty_drain_calls, 0);
+            EXPECT_FALSE(run.runner.native_runs_outstanding());
+            std::fprintf(
+                stderr, "SIM_FINALIZE_DELIVERY flag=%d native=%d finalize=%d host=%u drain=%d\n", delivery, business_rc,
+                rc, output.front(), run.runner.drain_calls
+            );
+        }
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, WithheldUnsubmittedDeliveryKeepsTheCleanRefusalProof) {
+    PreparedRun run;
+    ASSERT_TRUE(run.runner.stand_up());
+    ASSERT_EQ(run.prepare(CallConfig{}), 0);
+    EXPECT_EQ(
+        simpler_finalize_run_with_delivery(&run.runner, run.storage.handle(), 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(run.phase(), NativeRunPhase::Prepared);
+    EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    ASSERT_EQ(run.launch(), SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+    EXPECT_EQ(run.phase(), NativeRunPhase::Prepared);
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&run.runner, run.storage.handle(), 0), 0);
+    EXPECT_TRUE(consume_released_preparation(run.storage.handle(), get_runtime_size(), 9100));
+    EXPECT_EQ(run.runner.drain_calls, 0);
+    EXPECT_FALSE(run.runner.native_runs_outstanding());
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, ClockExportFollowsItsRootAfterSlotReuse) {
+    char path[] = "/tmp/simpler-sim-clock-XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    const std::filesystem::path directory(path);
+    static SimplerHostLogState log_state{};
+    log_state.threshold = static_cast<int>(simpler::log::LogLevel::TIMING);
+    log_state.sink_owner_pid = log_state.sink_process_pid = getpid();
+    log_state.sink_context = &log_state;
+    log_state.sink_enqueue = [](void *, SimplerHostLogState *state, const char *record, uint32_t size) {
+        std::ofstream file(
+            std::filesystem::path(state->log_directory) / ("host." + std::to_string(getpid()) + ".log"), std::ios::app
+        );
+        file.write(record, size);
+        file.close();
+        const bool written = static_cast<bool>(file);
+        __atomic_fetch_sub(&state->sink_producer_state, UINT64_C(1), __ATOMIC_RELEASE);
+        return written ? 1 : 0;
+    };
+    std::memcpy(log_state.log_directory, path, sizeof(path));
+    log_state.log_directory_bound = 1;
+    pthread_key_t key;
+    ASSERT_EQ(pthread_key_create(&key, std::free), 0);
+    log_state.trace_key_plus_one = static_cast<uint64_t>(key) + 1;
+    ASSERT_EQ(simpler_host_log_bind_state(&log_state), 0);
+
+    PreparedRun run;
+    run.runner.refuse_for_capacity = false;
+    run.runner.consume_drain_once = run.runner.clock_timing = true;
+    ASSERT_TRUE(run.runner.stand_up());
+    CallConfig config{};
+    std::memcpy(config.output_prefix, path, sizeof(path));
+    ASSERT_EQ(run.prepare(config), 0);
+    const uint64_t invocation = run.state()->trace_inv;
+    const auto runner_records = [&] {
+        std::ifstream process_log(directory / ("host." + std::to_string(getpid()) + ".log"));
+        size_t count = 0;
+        for (std::string line; std::getline(process_log, line);) {
+            if (line.find(" name=chip.run.runner_run ") != std::string::npos &&
+                line.find(" inv=" + std::to_string(invocation) + " ") != std::string::npos)
+                ++count;
+        }
+        return count;
+    };
+    DfxRunConfig dfx;
+    dfx.chip_swimlane_level = ChipSwimlaneLevel::SCHED_PHASES;
+    dfx.output_prefix = path;
+    (void)run.runner.host_phase_pool_arm(0, false);
+    run.runner.begin_host_phase_run(0, dfx);
+    EXPECT_FALSE(run.runner.host_clock_alignment_log_required(0));
+    ASSERT_NE(run.runner.host_phase_pool_arm(0, true), nullptr);
+    EXPECT_FALSE(run.runner.host_clock_alignment_log_required(0));
+    run.runner.host_phase_pool_finish(0, 0, invocation);
+    ASSERT_TRUE(run.runner.host_clock_alignment_log_required(0));
+    ASSERT_EQ(run.launch(), 0);
+    ASSERT_EQ(simpler_wait_run_completion(&run.runner, run.storage.handle()), 0);
+    EXPECT_EQ(run.completion_rc(), 0);
+    EXPECT_EQ(runner_records(), 1u);
+    const auto target = directory / ("host_clock_alignment." + std::to_string(getpid()) + ".log");
+    EXPECT_FALSE(std::filesystem::exists(target));
+
+    RuntimeStorage successor;
+    NativeRunDescriptor descriptor = run.state()->descriptor;
+    descriptor.run_epoch = 9200;
+    descriptor.generation++;
+    descriptor.dispatch_id++;
+    CallConfig ordinary{};
+    ASSERT_EQ(simpler_prepare_run(&run.runner, successor.handle(), kCallableId, nullptr, &ordinary, &descriptor), 0);
+    ASSERT_FALSE(run.runner.host_clock_alignment_log_required(0));
+    const uint64_t successor_invocation =
+        static_cast<NativeRunContext<SimDeviceRunnerBase> *>(successor.handle())->trace_inv;
+    EXPECT_EQ(run.finalize(), 0);
+    EXPECT_EQ(runner_records(), 1u);
+    std::ifstream file(target);
+    EXPECT_TRUE(file);
+    bool root = false, execution = false, wall = false;
+    std::string exported;
+    for (std::string line; std::getline(file, line);) {
+        EXPECT_NE(line.find(" inv=" + std::to_string(invocation) + " "), std::string::npos);
+        EXPECT_EQ(line.find(" inv=" + std::to_string(successor_invocation) + " "), std::string::npos);
+        root |= line.find(" name=chip.run ") != std::string::npos;
+        execution |= line.find(" name=chip.run.runner_run ") != std::string::npos;
+        wall |= line.find(" name=chip.run.runner_run.device_wall ") != std::string::npos;
+        exported += line + '\n';
+    }
+    EXPECT_TRUE(root && execution && wall);
+    EXPECT_EQ(simpler_finalize_run(&run.runner, successor.handle()), 0);
+    if (std::filesystem::exists(target)) {
+        std::ifstream unchanged(target);
+        EXPECT_EQ(std::string(std::istreambuf_iterator<char>(unchanged), {}), exported);
+    }
+    EXPECT_EQ(log_state.sink_producer_state, 0u);
+    EXPECT_EQ(log_state.pending_record_count, 0u);
+    EXPECT_EQ(log_state.dropped_record_count, 0u);
+    std::fprintf(
+        stderr, "SIM_CLOCK_EXPORT path=%s inv=%llu successor_inv=%llu\n", target.c_str(),
+        static_cast<unsigned long long>(invocation), static_cast<unsigned long long>(successor_invocation)
+    );
+}
+
+namespace {
+void check_sim_finalize_prefix_allocation_failure(bool launched, bool delivery_entry) {
+    PreparedRun run;
+    ASSERT_TRUE(run.runner.stand_up());
+    CallConfig config = diagnostic_config();
+    config.enable_scope_stats = 0;
+    const std::string prefix(160, 'p');
+    std::memcpy(config.output_prefix, prefix.c_str(), prefix.size() + 1);
+    ASSERT_EQ(run.prepare(config), 0);
+    if (launched) {
+        run.runner.refuse_for_capacity = false;
+        ASSERT_EQ(run.launch(), 0);
+    }
+    const auto phase = run.phase();
+    const auto completion = run.completion_rc();
+    const auto acceptance = run.acceptance();
+    const auto *prepared_owner = run.state()->prepared_execution.get();
+    const auto *active_owner = run.state()->active_execution.get();
+    const auto descriptor = run.state()->descriptor;
+    const auto launches = run.runner.launch_calls;
+    ASSERT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    std::vector<unsigned char> carrier(get_runtime_size());
+    std::memcpy(carrier.data(), run.storage.handle(), carrier.size());
+    const auto finalize = [&] {
+        return delivery_entry ? simpler_finalize_run_with_delivery(&run.runner, run.storage.handle(), 1) :
+                                run.finalize();
+    };
+    auto &fault = finalize_prefix_test::prefix_allocation_fault;
+    fault = {true, 0, 0};
+    finalize_prefix_test::copyback_calls = 0;
+    bool escaped = false;
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = finalize();
+    } catch (const std::bad_alloc &) {
+        escaped = true;
+    }
+    const bool fault_unconsumed = std::exchange(fault.armed, false);
+    std::printf(
+        "FINALIZE_PREFIX backend=sim launched=%d delivery_entry=%d consumed=%zu escaped=%d rc=%d bytes=%zu\n", launched,
+        delivery_entry, fault.consumed, escaped, rc, fault.bytes
+    );
+    EXPECT_FALSE(fault_unconsumed);
+    EXPECT_EQ(fault.consumed, 1u);
+    EXPECT_GE(fault.bytes, prefix.size() + 1);
+    EXPECT_FALSE(escaped);
+    EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+    ASSERT_EQ(run.state()->magic, NativeRunContext<SimDeviceRunnerBase>::kMagic);
+    EXPECT_EQ(std::memcmp(carrier.data(), run.storage.handle(), carrier.size()), 0);
+    EXPECT_EQ(run.phase(), phase);
+    EXPECT_EQ(run.completion_rc(), completion);
+    EXPECT_EQ(run.acceptance(), acceptance);
+    EXPECT_EQ(run.state()->prepared_execution.get(), prepared_owner);
+    EXPECT_EQ(run.state()->active_execution.get(), active_owner);
+    EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    EXPECT_EQ(run.runner.launch_calls, launches);
+    EXPECT_EQ(finalize_prefix_test::copyback_calls, 0u);
+
+    ASSERT_EQ(finalize(), 0);
+    uint64_t magic = 1;
+    std::memcpy(&magic, run.storage.handle(), sizeof(magic));
+    EXPECT_EQ(magic, 0u);
+    EXPECT_FALSE(run.runner.native_run_active());
+    EXPECT_EQ(finalize_prefix_test::copyback_calls, 1u);
+    RuntimeStorage successor;
+    auto next = descriptor;
+    ++next.run_id;
+    ++next.generation;
+    ++next.dispatch_id;
+    ++next.run_epoch;
+    ASSERT_EQ(simpler_prepare_run(&run.runner, successor.handle(), kCallableId, nullptr, &config, &next), 0);
+    run.runner.refuse_for_capacity = false;
+    ASSERT_EQ(simpler_launch_run(&run.runner, successor.handle()), 0);
+    EXPECT_EQ(simpler_finalize_run(&run.runner, successor.handle()), 0);
+    EXPECT_FALSE(run.runner.native_run_active());
+}
+}  // namespace
+
+TEST(DiagnosticCapacityRefusalPhaseTest, FinalizePrefixAllocationFailureKeepsPreparedOwnerRetryable) {
+    for (bool delivery_entry : {false, true}) {
+        SCOPED_TRACE(delivery_entry);
+        check_sim_finalize_prefix_allocation_failure(false, delivery_entry);
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, FinalizePrefixAllocationFailureKeepsLaunchedOwnerRetryable) {
+    for (bool delivery_entry : {false, true}) {
+        SCOPED_TRACE(delivery_entry);
+        check_sim_finalize_prefix_allocation_failure(true, delivery_entry);
+    }
 }

@@ -15,7 +15,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <new>
 #include <vector>
+#include <unordered_map>
 
 #include "run_resource_arena.h"
 #include "runtime_c_api.h"
@@ -564,6 +566,28 @@ public:
         return b->bytes;
     }
 
+    /** End execution references while preserving the call's host IO reader. */
+    bool retire_execution(uint32_t slot, uint64_t run_epoch) {
+        std::scoped_lock lk(mu_);
+        if (!enabled_) return true;
+        if (slot >= runs_.size()) return false;
+        auto retained = observation_runs_.find(run_epoch);
+        if (retained == observation_runs_.end()) {
+            const RunRecord &run = runs_[slot];
+            if (run.epoch != run_epoch || !run.drain_proved) return false;
+            // Allocate the retained fact owner before releasing any reference.
+            try {
+                retained = observation_runs_.emplace(run_epoch, run).first;
+            } catch (const std::bad_alloc &) {
+                return false;
+            }
+        }
+        for (Block &block : blocks_) {
+            if (block.region.domain == Domain::ExecScratch) drop_ref(block, run_epoch);
+        }
+        return true;
+    }
+
     /**
      * Record one fact about a run, and retire the run when its facts are
      * complete.
@@ -577,18 +601,9 @@ public:
     void note_run_fact(uint32_t slot, uint64_t run_epoch, RunFact fact) {
         std::scoped_lock lk(mu_);
         if (!enabled_ || slot >= runs_.size()) return;
-        RunRecord &r = runs_[slot];
+        auto retained = observation_runs_.find(run_epoch);
+        RunRecord &r = retained != observation_runs_.end() ? retained->second : runs_[slot];
         if (r.epoch != run_epoch) {
-            // Run epochs are minted from one process-wide counter that only
-            // ever increments, so a lower epoch on a slot is necessarily a
-            // predecessor's late fact and not a new run. Its record has been
-            // replaced by the successor's, and replacing it back would erase
-            // facts the successor has already reported.
-            //
-            // The fact still has to reach that predecessor's *references*,
-            // which are keyed by epoch and independent of this slot record:
-            // a late context destruction must still quarantine whatever the
-            // old run held, or those blocks would look reclaimable.
             if (run_epoch < r.epoch) {
                 if (fact == RunFact::ContextDestroyed) quarantine_run_refs(run_epoch);
                 return;
@@ -624,9 +639,13 @@ public:
         }
         if (retired(r)) {
             drop_run_refs(run_epoch);
+            if (retained != observation_runs_.end()) observation_runs_.erase(retained);
             return;
         }
-        if (r.context_destroyed) quarantine_run_refs(run_epoch);
+        if (r.context_destroyed) {
+            quarantine_run_refs(run_epoch);
+            if (retained != observation_runs_.end()) observation_runs_.erase(retained);
+        }
     }
 
     /** Stop admitting new plans; already-accepted work keeps its path. */
@@ -973,6 +992,8 @@ private:
 
     /** This epoch's fact record, or null when it has reported nothing yet. */
     const RunRecord *record_for_locked(uint64_t epoch) const {
+        const auto retained = observation_runs_.find(epoch);
+        if (retained != observation_runs_.end()) return &retained->second;
         for (const RunRecord &r : runs_) {
             if (r.epoch == epoch) return &r;
         }
@@ -1275,4 +1296,6 @@ private:
     std::vector<Block> blocks_;
     // One fact record per granted run-resource set.
     std::vector<RunRecord> runs_ = std::vector<RunRecord>(kDefaultRunResourceSets);
+    // Only calls whose physical execution retired while their host IO remains.
+    std::unordered_map<uint64_t, RunRecord> observation_runs_;
 };

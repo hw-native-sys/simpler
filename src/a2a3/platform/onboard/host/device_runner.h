@@ -107,6 +107,7 @@ public:
     ) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
+    int retire_completed_execution(ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
     // provision/abandon_native_run_resources keep the base no-op: preparation
@@ -313,7 +314,7 @@ private:
      * device: a non-zero here takes the unproven-completion cleanup path and
      * can retire a proven-complete stream as unproven.
      */
-    int reap_run(const PreparedExecution &prepared, int *diagnostics_rc);
+    int reap_run(PreparedExecution &prepared, int *diagnostics_rc);
 
     // Queue this run's own AICore boundary into its AICPU stream, ahead of the
     // AICPU boundary record that then covers the whole operator. The reservation

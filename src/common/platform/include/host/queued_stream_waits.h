@@ -172,7 +172,9 @@ public:
      * caller decides what an undischarged reference costs by asking
      * `holds_reference_to` afterwards.
      */
-    int discharge(const NativeRunIdentity &boundary_owner, bool boundaries_complete, int timeout_ms) {
+    int discharge(
+        const NativeRunIdentity &boundary_owner, bool boundaries_complete, int timeout_ms, bool wait_for_proofs = true
+    ) {
         std::lock_guard<std::mutex> lock(mutex_);
         int first_rc = 0;
         for (Entry &entry : entries_) {
@@ -199,7 +201,7 @@ public:
                 if (first_rc == 0) first_rc = rc;
                 continue;
             }
-            if (!complete && boundaries_complete) {
+            if (!complete && boundaries_complete && wait_for_proofs) {
                 rc = ops_.wait(entry.proof_event, timeout_ms);
                 if (rc != 0) {
                     if (first_rc == 0) first_rc = rc;

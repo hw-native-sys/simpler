@@ -187,6 +187,12 @@ void Worker::init() {
     manager_.start(
         &allocator_,
         [this](WorkerCompletion completion) {
+            // Terminal-only host/remote endpoints retain their existing quiesced
+            // completion fallback. Local device ENDED arrives earlier, separately.
+            // A terminal-only endpoint also returns physical credit here.
+            // Its new capacity bounds the leases that retirement may wake.
+            orchestrator_.note_endpoint_capacity(completion.worker_id, completion.admissible_run_resource_sets);
+            orchestrator_.mark_task_ended(completion.task_slot, completion.group_index);
             scheduler_.worker_done(std::move(completion));
         },
         [this](WorkerDispatch dispatch) {
@@ -195,6 +201,16 @@ void Worker::init() {
         [this](WorkerDispatch dispatch) {
             TaskSlotState *slot = allocator_.slot_state(dispatch.task_slot);
             if (slot != nullptr) orchestrator_.notify_run_staged(slot->run_id);
+        },
+        [this](WorkerCompletion ended) {
+            orchestrator_.note_endpoint_capacity(ended.worker_id, ended.admissible_run_resource_sets);
+            orchestrator_.mark_task_ended(ended.task_slot, ended.group_index);
+        },
+        [this](RunId run_id) noexcept {
+            return orchestrator_.run_observation_requested(run_id);
+        },
+        [this](RunId run_id) noexcept {
+            return orchestrator_.run_activation_authorized(run_id);
         }
     );
     ready_next_level_queues_.reset(manager_.next_level_worker_ids());

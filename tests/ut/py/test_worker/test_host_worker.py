@@ -963,6 +963,21 @@ class _FakeChipRun:
         return self._lane._lane_poisoned
 
     @property
+    def _execution_ended(self) -> bool:
+        # This collaborator completes observation atomically in _progress;
+        # real ENDED/result-pending behavior is covered by native fork tests.
+        return False
+
+    def wait(self, timeout: float = -1.0) -> bool:
+        deadline = time.monotonic() + (5.0 if timeout < 0 else timeout)
+        while not self.done():
+            if time.monotonic() >= deadline:
+                return False
+            self._lane.completed[self.submission.slot_id].wait(0.001)
+        self._raise_if_failed()
+        return True
+
+    @property
     def preparation_disposition(self):
         return SimpleNamespace(value=self._disposition)
 
@@ -4199,6 +4214,131 @@ class TestRunHandle:
         assert observed == [True]
         assert wait_entered.is_set()
 
+    def test_known_done_stays_true_during_a_later_blocking_stream_observer(self):
+        observer_entered = threading.Event()
+        observer_release = threading.Event()
+        later_error = RuntimeError("later caller stream work failed")
+        polls: list[int] = []
+        waits: list[int] = []
+        errors: list[BaseException] = []
+
+        class FakeWorker:
+            def _run_handle_done(self, run_id):
+                assert not waits, "the native identity can be retiring during observation"
+                polls.append(run_id)
+                return True
+
+            def _wait_run_handle(self, run_id, timeout):
+                waits.append(run_id)
+                observer_entered.set()
+                assert observer_release.wait(5.0)
+                raise later_error
+
+            def _finalize_run_handle(self, handle, run_id, error):
+                return error
+
+        handle = RunHandle(cast(Worker, FakeWorker.__new__(FakeWorker)), 1, ())
+        assert handle.done
+
+        def observe():
+            try:
+                handle.wait()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        try:
+            assert observer_entered.wait(3.0)
+            assert handle.done
+            assert observer.is_alive()
+            assert polls == [1]
+        finally:
+            observer_release.set()
+            observer.join(5.0)
+        assert not observer.is_alive()
+        assert errors == [later_error]
+        assert handle.done
+        with pytest.raises(RuntimeError) as repeated:
+            handle.wait()
+        assert repeated.value is later_error
+        assert waits == [1]
+        assert polls == [1]
+
+    def test_completed_chip_run_context_refusal_preserves_public_wait_and_keepalives(self):
+        class Keepalive:
+            pass
+
+        class CompletedChipRun:
+            def __init__(self):
+                self.refuse = True
+                self.waits = 0
+                self.observations = 0
+
+            def done(self):
+                return True
+
+            def wait(self, timeout):
+                assert timeout == -1.0
+                self.waits += 1
+                if self.refuse:
+                    raise worker_mod.ExecutionContextRefused("borrowed context must be current")
+                self.observations += 1
+                return True
+
+        worker = Worker(level=3, num_sub_workers=0)
+        chip_run = CompletedChipRun()
+        worker._chip_runs[1] = chip_run
+        worker._chip_run_touched_identities[1] = set()
+        source_uses = (object(),)
+        released_uses = []
+        worker._chip_source_uses[1] = source_uses
+        worker._device_buffer_source = SimpleNamespace(release=released_uses.append)
+        keepalive = Keepalive()
+        retained = weakref.ref(keepalive)
+        handle = RunHandle(worker, 1, (keepalive,))
+        worker._accepted_run_handles.add(handle)
+        del keepalive
+        assert handle.done
+
+        with pytest.raises(worker_mod.ExecutionContextRefused, match="borrowed context"):
+            handle.wait()
+        gc.collect()
+        assert retained() is not None
+        assert handle.done
+        assert not handle._wait_in_progress
+        assert not handle._terminal
+        assert not handle._cleanup_published
+        assert handle._run_id == 1
+        assert worker._chip_runs[1] is chip_run
+        assert 1 in worker._chip_run_touched_identities
+        assert worker._chip_source_uses[1] is source_uses
+        assert released_uses == []
+        assert handle in worker._accepted_run_handles
+        assert not worker._source_context_failed
+        assert chip_run.observations == 0
+
+        chip_run.refuse = False
+        handle.result()
+        gc.collect()
+        assert retained() is None
+        assert handle._terminal
+        assert handle._cleanup_published
+        assert handle not in worker._accepted_run_handles
+        assert not worker._chip_runs
+        assert not worker._chip_run_touched_identities
+        assert not worker._chip_source_uses
+        assert released_uses == [source_uses]
+        assert not worker._source_context_failed
+        assert chip_run.observations == 1
+
+        chip_run.refuse = True
+        handle.wait()
+        handle.result()
+        assert chip_run.waits == 2
+        assert chip_run.observations == 1
+        worker.close()
+
     def test_interrupted_finalize_still_publishes_terminal_state(self):
         interrupt = KeyboardInterrupt()
 
@@ -4734,6 +4874,14 @@ class TestRunHandle:
         assert worker._abandoned_run_handles == [handle]
         assert isinstance(worker._ordered_cleanup_error, RuntimeError)
         assert worker._ordered_cleanup_error.__cause__ is interrupt
+        assert handle.done
+        with pytest.raises(KeyboardInterrupt) as repeated:
+            handle.wait()
+        assert repeated.value is interrupt
+        assert handle._keepalive == (keepalive, first_ref, second_ref)
+        assert worker._abandoned_run_handles == [handle]
+        assert released_refs == ["first"]
+        assert released_runs == []
 
         worker.close()
 
@@ -8272,8 +8420,6 @@ class TestChipMainLoopDigestRegister:
         # so we hand it the absolute address and let it cast back inside.
         state_addr = _buffer_field_addr(buf, _OFF_STATE)
         _mailbox_store_i32(state_addr, _IDLE)
-        # `mailbox_addr` is only consumed by the TASK_READY branch, which we
-        # never reach in these tests; passing 0 keeps the harness lean.
         return shm, buf, state_addr
 
     @staticmethod
@@ -8371,7 +8517,17 @@ class TestChipMainLoopDigestRegister:
             identity_refs = {}
         t = threading.Thread(
             target=_run_chip_main_loop,
-            args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs, mint_owner_instance_id()),
+            args=(
+                cw,
+                buf,
+                worker_mod._buffer_field_addr(buf, 0),
+                state_addr,
+                0,
+                registry,
+                identity_table,
+                identity_refs,
+                mint_owner_instance_id(),
+            ),
             kwargs={
                 "chip_platform": "",
                 "provider_region_store": _chip_loop_provider_region_store(chip_platform=""),

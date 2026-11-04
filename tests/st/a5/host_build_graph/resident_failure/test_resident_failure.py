@@ -10,8 +10,11 @@
 """Real resident timeouts, retained caller buffers and failed-lane containment."""
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +23,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from simpler import task_interface as _task_interface
 from simpler.task_interface import ArgDirection, CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
@@ -36,17 +40,12 @@ _SHAPES = [(mask, lane) for mask in (1, 2, 4, 3, 5, 6, 7) for lane in range(3) i
 _TICKET_SHAPES = ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2))
 # The exhaustive mask/lane sweep is about silicon behaviour, and each case here
 # holds a device for its own process because a failed run poisons it. A
-# simulator run therefore carries two shapes: the lane the protocol reports in
-# slot 1, which is the one every capture check special-cases, and all three
-# lanes together.
+# simulator tiers therefore cover two shapes: the lane the protocol reports in
+# slot 1, which the Per-PR capture check uses, and all three lanes together in
+# Daily.
 _SIM_SHAPES = frozenset({(4, 2), (7, 0)})
-# Which shapes the silicon carries on every PR. The sweep's cost is one device
-# and one process per case, and the containment machinery under test is shared
-# across every shape, so Per-PR coverage takes one shape per lane position —
-# lane 0 as an AIC's only lane, lane 2 as an AIV's only lane, and lane 1
-# faulting while two siblings must also be contained. The rest of the sweep is
-# what separates a lane-indexing fault from a shared one, which is a question
-# for the daily sweep rather than for every PR.
+# On silicon, Per-PR keeps one shape per failed-lane position for every timeout
+# mode. The remaining mask/lane combinations run in Daily.
 _PER_PR_SHAPES = frozenset({(1, 0), (4, 2), (7, 1)})
 
 
@@ -62,8 +61,13 @@ def _shape_params(shapes):
     params = []
     for mask, lane in shapes:
         marks = [] if (mask, lane) in _SIM_SHAPES else [pytest.mark.platforms(["a5"])]
+        manual_platforms = []
+        if (mask, lane) == (7, 0):
+            manual_platforms.append("a5sim")
         if (mask, lane) not in _PER_PR_SHAPES:
-            marks.append(pytest.mark.manual(["a5"]))
+            manual_platforms.append("a5")
+        if manual_platforms:
+            marks.append(pytest.mark.manual(manual_platforms))
         params.append(pytest.param(mask, lane, marks=marks))
     return params
 
@@ -319,17 +323,211 @@ def test_two_wave_ticket_claim_timeout_keeps_failed_run_contained(st_platform, s
 _RECOVERY_MARKER = "RESIDENT_RECOVERY_EVIDENCE "
 
 
-def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, recovery, two_wave=False):
+def _owned_wait_release(raw, snapshot, native_error):
+    """Qualify the fixture's free assertion from this call's owned RTS wait records."""
+    result = {"complete": False, "reason": "unqualified", "kernel_stop_mechanism": "unknown"}
+
+    def require(condition, reason):
+        if not condition:
+            raise ValueError(reason)
+
+    def fields(line):
+        row = {}
+        for word in line.split("[STRACE] ", 1)[1].split():
+            if "=" in word:
+                key, value = word.split("=", 1)
+                require(key not in row, "duplicate field")
+                row[key] = value
+        return row
+
+    try:
+        require(snapshot.get("host_log_complete") and not snapshot.get("printed_records_truncated"), "incomplete log")
+        require(snapshot["pid"] == os.getpid(), "foreign snapshot PID")
+        require(
+            len(raw) == snapshot["bytes"] and hashlib.sha256(raw).hexdigest() == snapshot["sha256"], "snapshot bytes"
+        )
+        matches = re.findall(
+            r"\(run_id=(\d+) slot=(\d+) generation=(\d+) dispatch_id=(\d+) run_epoch=(\d+)\)",
+            native_error,
+        )
+        require(len(matches) == 1, "missing or ambiguous caught native identity")
+        run, slot, generation, dispatch, epoch = map(int, matches[0])
+        require(epoch > 0 and epoch == snapshot["call"]["capture_run_epoch"], "foreign capture epoch")
+        identity = {"ep": str(epoch), "gen": str(generation), "disp": str(dispatch), "slot": str(slot)}
+        lines = raw.decode("utf-8").splitlines()
+        anchors = {
+            (int(device), runner)
+            for line in lines
+            for device, runner in re.findall(r"Callable registration: device=(\d+) runner=(0x[0-9a-fA-F]+)", line)
+            if int(device) == snapshot["call"]["device"]
+        }
+        require(len(anchors) == 1, "missing or ambiguous owned registration")
+        device, context = anchors.pop()
+        require(int(context, 16) != 0, "null registration context")
+        bindings, pending, completed, roots, releases = {}, {}, {}, [], []
+        pid = str(snapshot["pid"])
+        for line in lines:
+            if "[STRACE] " not in line:
+                continue
+            name_match = re.search(r"\bname=([^ ]+)", line)
+            if name_match is None or not (
+                name_match[1].startswith("chip.run.proof.")
+                or name_match[1].startswith("chip.run.borrow_release")
+                or name_match[1] == "chip.run"
+            ):
+                continue
+            row = fields(line)
+            require(row["pid"] == pid, "foreign record PID")
+            name = row["name"]
+            require(not name.endswith(".invalid"), "invalid diagnostic record")
+            thread = row["pid"], row["tid"]
+            own = all(row.get(key) == value for key, value in identity.items())
+            if name == "chip.run.proof.record":
+                if not releases:
+                    require(
+                        all(proof["event"] != row["e"] for proof in completed.values()),
+                        "event rebound before borrow release",
+                    )
+                bindings[row["e"]] = row
+                pending.pop(thread, None)
+            elif name == "chip.run.proof.event_wait":
+                require(thread not in pending, "unpaired raw wait")
+                pending[thread] = row
+            elif name == "chip.run.proof.consume":
+                sdk = pending.pop(thread, None)
+                if not own:
+                    continue
+                bound = bindings.get(row["e"])
+                require(
+                    bound is not None and all(bound.get(key) == value for key, value in identity.items()),
+                    "foreign event binding",
+                )
+                require(sdk is not None and sdk["e"] == row["e"], "missing raw wait")
+                require(row["op"] == "wait" and sdk["fresh"] == "1" and sdk["status_valid"] == "0", "not a fresh wait")
+                require(
+                    sdk["rc"] == row["rc"] == "0" and row["c"] == row["owner"] == "1", "pending or unowned boundary"
+                )
+                require(bound["f"] == row["f"] and bound["role"] == row["role"], "foreign fence or role")
+                role = int(row["role"])
+                require(role in (0, 1) and role not in completed, "duplicate boundary role")
+                cache = int(row["cache"])
+                mask = sum(1 << done for done in completed)
+                require(0 <= cache <= 3 and not cache & (1 << role) and not cache & ~mask, "foreign cache proof")
+                completed[role] = {"event": row["e"], "fence": row["f"], "stream": bound["s"], "inv": bound["inv"]}
+            elif name == "chip.run.borrow_release" and own:
+                require(set(completed) == {0, 1}, "release preceded both boundaries")
+                require(row["ctx"] == context and int(row["borrow"]) == slot + 1, "foreign borrow context")
+                require(int(row["run"]) == run and row["proof"] == "1" and row["keep"] == "0", "borrow retained")
+                releases.append(row)
+            elif name == "chip.run" and row.get("run_epoch") == str(epoch):
+                require(
+                    row.get("run_id") == str(run)
+                    and row.get("slot_id") == str(slot)
+                    and row.get("generation") == str(generation)
+                    and row.get("dispatch_id") == str(dispatch),
+                    "foreign native root",
+                )
+                roots.append(row)
+        require(set(completed) == {0, 1} and len(releases) == len(roots) == 1, "missing own proof or release")
+        require(completed[0]["event"] != completed[1]["event"], "aliased event roles")
+        require(completed[0]["fence"] == completed[1]["fence"], "different fences")
+        require(all(proof["inv"] == roots[0]["inv"] for proof in completed.values()), "foreign invocation")
+        result.update(
+            complete=True,
+            reason="owned two-boundary wait and borrow release",
+            identity=identity,
+            run_id=run,
+            device=device,
+            context=context,
+            boundaries=completed,
+            context_anchor="same owned log registration; no native failure record is assumed",
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        result["reason"] = str(error)[:256]
+    return result
+
+
+def _retain_completion_proof(
+    artifacts, stage, buffers, *, failed, call=None, free_outcome=None, close_returned=None, native_error=None
+):
+    """Take a best-effort snapshot of this process's existing completion diagnostics."""
+    row = {
+        "stage": stage,
+        "pid": os.getpid(),
+        "mono_ns": time.monotonic_ns(),
+        "free_outcome": free_outcome,
+        "close_returned": close_returned,
+    }
+    records = []
+    try:
+        row["call"] = dict(call or {})
+        row["buffers"] = [
+            {"identity": repr(buffer.identity), "base": int(buffer.base), "bytes": int(buffer.nbytes)}
+            for buffer in buffers
+        ]
+        row["flushed"] = _task_interface._flush_host_log(1000)
+        row["pending"] = _task_interface._host_log_pending_records()
+        row["dropped"] = _task_interface._host_log_dropped_records()
+        directory = _task_interface._native_host_log_directory()
+        if not directory:
+            raise RuntimeError("this process has no bound host-log directory")
+        source = Path(directory) / f"host.{os.getpid()}.log"
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise RuntimeError("owned host log is not a regular file")
+            raw = stream.read()
+        target = Path(artifacts) / f"proof-host-{stage}.log"
+        target.write_bytes(raw)
+        row.update(log=target.name, sha256=hashlib.sha256(raw).hexdigest(), bytes=len(raw))
+        records = [
+            line
+            for line in raw.decode("utf-8", errors="replace").splitlines()
+            if any(
+                marker in line
+                for marker in (
+                    "name=chip.run.proof.",
+                    "name=chip.run.borrow_release",
+                    "name=chip.run.claim_release ",
+                    "name=chip.run ",
+                )
+            )
+        ]
+        row["proof_records"] = len(records)
+        row["printed_records_truncated"] = len(records) > 64 or any(len(line) > 1024 for line in records[-64:])
+        row["host_log_complete"] = bool(row["flushed"] and row["pending"] == 0 and row["dropped"] == 0)
+        if native_error is not None:
+            row["last_use"] = _owned_wait_release(raw, row, native_error)
+    except BaseException as error:  # noqa: BLE001 -- diagnostics cannot replace the original run/free/close error
+        row.update(host_log_complete=False, diagnostic_error=f"{type(error).__name__}: {error}"[:512])
+    try:
+        (Path(artifacts) / f"proof-{stage}.json").write_text(json.dumps(row, indent=2) + "\n")
+    except BaseException as error:  # noqa: BLE001 -- stderr is the remaining diagnostic destination
+        row["snapshot_error"] = f"{type(error).__name__}: {error}"[:512]
+    if failed:
+        # CI's existing failure capture prints stderr; the process's transient
+        # host-log spool is removed on exit and the scene workflow has no upload.
+        try:
+            print("RESIDENT_COMPLETION_PROOF " + json.dumps(row), file=sys.stderr, flush=True)
+            for line in records[-64:]:
+                print(line[:1024], file=sys.stderr, flush=True)
+        except BaseException as error:  # noqa: BLE001 -- failed stderr cannot replace the original exception
+            row["stderr_error"] = f"{type(error).__name__}: {error}"[:512]
+    return row
+
+
+def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, recovery, two_wave=False):  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup paths
     """Drive one Worker over this case and return its evidence rows.
 
-    A failed run keeps its buffers borrowed, so the device holds its
-    process-wide execution reservation until this process exits — a second
-    Worker on that device is refused here. The recovery pass therefore runs in
-    a fresh process, which is what `_recovery_pass` spawns.
+    Returned bounded SIM faults use their joined-producer release check.
+    This test qualifies successful free from this call's owned RTS evidence.
+    Unavailable diagnostics fail qualification without deciding runtime policy.
+    Onboard recovery uses the fresh process `_recovery_pass` spawns.
     """
     nonreturning = stall_ms < 0
     capacity = _two_wave_capacity(mask) if blocks < 0 else blocks
     callable_obj = _compile(platform)
+    _task_interface._bind_host_log_session_directory()
     worker = Worker(
         level=2,
         platform=platform,
@@ -341,6 +539,14 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
     failed = False
     run_in_flight = False
     evidence = []
+    proof_call = {
+        "platform": platform,
+        "device": int(device_id),
+        "mask": mask,
+        "lane": lane,
+        "requested_blocks": blocks,
+        "recovery": recovery,
+    }
     try:
         handle = worker.register(callable_obj)
         worker.init()
@@ -357,11 +563,15 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
             config.enable_chip_swimlane = 4
             config.output_prefix = str(prefix)
             before = worker.scheduler_mode_publish_count
+            proof_call.update(stall_ms=duration, capture=str(prefix), capture_run_epoch=None)
             started = time.monotonic()
             run_in_flight = True
             if duration:
                 failed = True
-                codes = r"(-100|507(046|018|000))" if nonreturning else "-100"
+                if nonreturning:
+                    codes = r"(-100|507(046|018|000))"
+                else:
+                    codes = "-100" if platform.endswith("sim") else "507018"
                 with pytest.raises(RuntimeError, match=rf"finalize_native_run failed with code {codes}\b") as error:
                     worker.run(handle, args, config)
             else:
@@ -372,6 +582,7 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
             assert worker.scheduler_mode_publish_count > before
             assert worker.scheduler_runtime_mode in (1, 2)
             path, raw = _capture(prefix)
+            proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
             assert raw["aicore_protocol"]["schema"] == "hbg-native-protocol-v5"
             launched = _root_block_num(raw["aicore_protocol"])
             assert blocks < 0 or launched == blocks
@@ -392,9 +603,28 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
                 with pytest.raises(RuntimeError, match="poisoned"):
                     worker.run(handle, args, config)
                 assert worker.scheduler_mode_publish_count == rejected_count
-                for buffer in buffers:
-                    with pytest.raises(RuntimeError, match="still in use by a submitted run"):
-                        worker.free(buffer)
+                joined_sim = platform.endswith("sim") and not nonreturning
+                own_wait_complete = False
+                if not joined_sim:
+                    own_wait_complete = (
+                        _retain_completion_proof(
+                            artifacts,
+                            "before-free",
+                            buffers,
+                            failed=True,
+                            call=proof_call,
+                            native_error=str(error.value),
+                        )
+                        .get("last_use", {})
+                        .get("complete", False)
+                    )
+                if joined_sim or own_wait_complete:
+                    while buffers:
+                        worker.free(buffers[-1])
+                        buffers.pop()
+                    run_in_flight = False
+                else:
+                    pytest.fail("owned RTS last-use evidence unavailable; buffers retained until close")
             else:
                 assert read_perf_data(str(path))["protocol_audit"]["protocol_verified"]
             evidence.append(
@@ -409,7 +639,7 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
                     "run_seconds": elapsed,
                     "runtime_mode": worker.scheduler_runtime_mode,
                     "resubmit_refused": failed,
-                    "borrowed_buffers_kept": failed,
+                    "borrowed_buffers_kept": failed and bool(buffers),
                 }
             )
     finally:
@@ -418,9 +648,22 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
                 for buffer in buffers:
                     worker.free(buffer)
         finally:
+            _retain_completion_proof(artifacts, "before-close", buffers, failed=failed, call=proof_call)
             closing = time.monotonic()
-            worker.close()
-            close_elapsed = time.monotonic() - closing
+            close_returned = False
+            try:
+                worker.close()
+                close_returned = True
+            finally:
+                close_elapsed = time.monotonic() - closing
+                _retain_completion_proof(
+                    artifacts,
+                    "after-close",
+                    buffers,
+                    failed=failed or not close_returned,
+                    call=proof_call,
+                    close_returned=close_returned,
+                )
             assert close_elapsed < (60 if nonreturning and failed else 20)
             if evidence:
                 evidence[-1]["worker_close_seconds"] = close_elapsed

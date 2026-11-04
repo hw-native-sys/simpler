@@ -422,11 +422,16 @@ so ordinary workloads are unaffected — see
 [docs/investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md)
 and issue #1425. `enable_sdma` is honored by **both** a2a3 onboard runtimes: the
 PTO-SDMA provider is compiled into every a2a3 onboard `host_runtime.so`, so the
-gate is the platform, not the runtime. Only `tensormap_and_ringbuffer` is
-exercised with it, so host-build-graph's path from a provisioned address to a
-kernel's `get_dma_workspace` is unverified rather than closed. Simulation, a5,
-and provider-disabled builds fail Worker init fast when it is set. A5 provisions
-its communication-context SDMA workspace only when a domain explicitly requests it; this is separate from
+gate is the platform, not the runtime. Both schedulers copy the resident
+workspace addresses into every core's `GlobalContext`; kernels read them with
+`get_dma_workspace(args, kind)`. Invalid kinds and unprovisioned engines return
+`nullptr`. The HBG [prefetch demo](../examples/a2a3/host_build_graph/prefetch_async_demo/)
+reuses the TMR prefetch kernel to exercise address injection and event completion.
+A2/A3 simulation provisions inert scratch for address-injection tests without creating
+SDMA streams; its prefetch is a no-op. A5 onboard and provider-disabled builds fail Worker
+init fast when `enable_sdma` is set. A5 provisions
+its communication-context SDMA workspace only when a domain explicitly requests it;
+this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
 
 On a5, `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON` and

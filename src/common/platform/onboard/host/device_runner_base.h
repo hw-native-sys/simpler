@@ -258,6 +258,10 @@ public:
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
     );
     void release_native_run_reservation(const void *owner);
+    void release_native_run_observation(const void *owner);
+    bool owns_native_run_observation(const void *owner) const;
+    bool
+    retire_run_workspace(uint32_t slot, uint64_t run_epoch, bool retain_host_outputs, void **retired_unmanaged_staging);
     bool native_runs_outstanding() const;
 
     /**
@@ -1087,20 +1091,18 @@ public:
     };
 
     /**
-     * This slot's last completed run's device timing. A slot's result is written
-     * by `read_device_wall_ns(slot)` at drain and consumed by finalize; the slot
-     * is not handed to another run in between, which is what makes the result
-     * this run's own. Returns a zeroed record before the slot has run, or when
-     * capture is off.
+     * This slot's last completed run's device timing. Physical retirement reads
+     * and emits it before releasing the execution slot; a late observer does
+     * not consume the successor's timing. Returns a zeroed record before the
+     * slot has run, or when capture is off.
      */
     const DeviceRunTiming &device_run_timing(uint32_t pipeline_slot) const;
 
     /**
      * Mark this slot's timing result consumed, so the slot may be armed again.
-     * Called by finalize on every path that ends a run, emitted or not: a run
-     * that never launched still owns its slot. Re-arming a slot that is still
-     * armed means a successor took storage whose result nobody read, and
-     * preparation refuses timing for that slot rather than overwriting it.
+     * Physical retirement consumes timing before slot reuse; finalization
+     * consumes it only when execution resources have not already retired.
+     * Preparation refuses to overwrite an armed slot.
      */
     void release_device_run_timing(uint32_t pipeline_slot);
 
@@ -1170,20 +1172,17 @@ public:
      * Absent carries no verdict. A producer attaches a payload only to a
      * failure, so a successful run, a run that reported no detail and a run
      * that never reached its publish point — one the op-execute watchdog
-     * reaped, say — all read as absent here. Whether the run succeeded is
-     * `device_run_terminal`'s answer, and it must not be inferred from the
-     * presence or absence of this payload, nor answered by reading shared
-     * device state, which by then may belong to a successor.
+     * reaped, say — all read as absent here. This payload and the cached terminal
+     * describe diagnostic claims; the explicit stream observer supplies the
+     * execution verdict. Shared device state may already belong to a successor.
      */
     const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
 
     /**
      * Copy this slot's result region into the host-side copy `device_run_result`
-     * and `device_run_terminal` read. Call after the run's own completion
-     * boundaries: what makes the record this run's rather than a successor's is
-     * that its device side published it before its kernel returned, so this read
-     * itself races nothing — the slot is not handed on until the run holding it
-     * finalizes.
+     * and `device_run_terminal` read. Public wait/finalize requests this only
+     * for error detail after the stream observer fails. The live call retains
+     * its original result allocation independently of execution-slot reuse.
      *
      * One read per run. A repeat call for an epoch already read is a no-op, so
      * every later consumer sees the same bytes and no path pays a second D2H —
@@ -1204,14 +1203,15 @@ public:
      * transfer happened.
      */
     int read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+    void release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved);
 
     /**
      * What this slot's cached region says about the run whose epoch is
      * `run_epoch`: succeeded, failed with the runtime's own signed code, or
      * undecided with the reason.
      *
-     * This is the run's execution outcome only. It does not say the device is
-     * healthy and it does not say the run's resources are retirable — a device
+     * This interprets the cached record, not the explicit stream verdict. It
+     * does not say the device is healthy or the resources are retirable — a device
      * can publish a failure and keep tearing down. Quiescence comes from the
      * run's completion boundaries and its outstanding wait references.
      */
@@ -1592,12 +1592,16 @@ public:
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
             streams(std::exchange(other.streams, RunStreams{})),
+            stream_lifetime(std::move(other.stream_lifetime)),
             artifact_identity(other.artifact_identity),
             caller_stream(std::exchange(other.caller_stream, nullptr)),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
-            join(other.join) {}
+            join(other.join),
+            physical_complete(other.physical_complete),
+            retirement_diagnostics_rc(other.retirement_diagnostics_rc),
+            scheduler_runtime_mode(other.scheduler_runtime_mode) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
         NativeRunIdentity identity{};
@@ -1625,6 +1629,7 @@ public:
         // an aliased CPU stream. Neither preparation nor moving this state
         // transfers ownership of the streams themselves.
         RunStreams streams{};
+        std::shared_ptr<void> stream_lifetime;
         /**
          * This run's whole published identity, copied from its descriptor.
          *
@@ -1656,6 +1661,9 @@ public:
          * decided at prepare would by then name a run that is gone.
          */
         NativeRunJoin join{};
+        bool physical_complete{false};
+        int retirement_diagnostics_rc{0};
+        uint32_t scheduler_runtime_mode{0};
     };
 
     // Reads host-owned run/registration state before device recovery or cleanup.
@@ -1827,10 +1835,14 @@ public:
      * SIMPLER_NATIVE_RUN_POLL_* values.
      */
     virtual int poll_execution(const ActiveExecution &active) = 0;
+    // Releases execution resources only after a nonblocking last-use proof.
+    // The live call retains its original streams and result storage for wait.
+    virtual int retire_completed_execution(ActiveExecution &active) { return poll_execution(active); }
+    int wait_execution_completion(ActiveExecution &active);
 
     /**
-     * Wait for the launched run, publish DFX, and release its execution
-     * resources. Called on the child progress path that performed launch.
+     * Observe the actual streams, publish any remaining DFX, and retire proved
+     * execution resources. Semantic observation is separate from physical poll.
      *
      * Returns the device result and this run's diagnostics result separately;
      * see `DrainOutcome` for which of them a caller owes each of its own
@@ -1846,6 +1858,7 @@ public:
     bool terminal_reset_confirmed() const {
         return terminal_close_generation_.has_value() && device_health_.generation() != *terminal_close_generation_;
     }
+    void abandon_native_run_owners_after_reset();
 
     virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
 
@@ -2389,30 +2402,18 @@ protected:
      * queues are the only remaining evidence, and a partial launch is not a
      * path that has a successor queued behind it.
      *
-     * A run the boundaries prove complete is additionally checked against the
-     * streams' sticky error state, which keeps what a whole-pair query used to
-     * report about a stream left in error. That check is not a device-exception
-     * detector; see `wait_run_fence`.
+     * Event completion is only a physical fact. It never caches a semantic
+     * result or reads a private terminal record.
      */
     int poll_run_fence(const PreparedExecution &prepared);
 
     /**
-     * Establish that this run finished and what the device made of it.
-     *
-     * Completion comes from the run's own boundaries, waited with the resolved
-     * stream-sync timeout and the event-timeout sentinel logged with the same
-     * (device, block_dim) context `sync_stream_pair` logs. A run no boundary
-     * covers has no such proof and falls back to the bounded whole-stream wait;
-     * expiry proves nothing about quiescence either way, so the caller's
-     * recover-or-mark-unusable policy still owns the non-zero rc.
-     *
-     * The device's verdict is then read from this run's own published record
-     * where that record decides it, and from a stream synchronize on every other
-     * shape — the only call on this SDK that produces one, see the measurement
-     * in the definition. So the branch a successful run takes touches neither
-     * stream of the pair, which is what lets a successor stay queued behind it.
+     * Observe this call's original stream pair under the resolved timeout.
+     * A zero return proves stream quiescence and success of that observation;
+     * a nonzero return alone proves neither. Private result data supplies only
+     * optional error detail after a failed stream observation.
      */
-    int wait_run_fence(const PreparedExecution &prepared);
+    int wait_run_fence(PreparedExecution &prepared);
 
     /**
      * Give up this run's arming. Idempotent and a no-op for a run that never
@@ -2482,6 +2483,7 @@ protected:
      * marked unusable and the first error is returned.
      */
     int discharge_boundary_waits(const PreparedExecution &prepared, bool boundaries_complete);
+    int poll_boundary_waits(const PreparedExecution &prepared);
 
     /** The same ladder from a path that cannot report, poisoning on failure. */
     void discharge_boundary_waits_noexcept(const PreparedExecution &prepared, bool boundaries_complete) noexcept;
@@ -2939,9 +2941,10 @@ protected:
         uint32_t arena_bank{0};
         bool permits_prepared_successor{false};
     };
-    std::optional<uint64_t> terminal_close_generation_;
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
+    std::unordered_set<const void *> native_run_observations_;
+    std::optional<uint64_t> terminal_close_generation_;
     struct NativeRunClaim {
         const void *owner{nullptr};
         NativeRunIdentity identity{};
@@ -3074,10 +3077,10 @@ protected:
     // base and dropped by that allocation's free, which is what keeps a cached
     // host VA from outliving its pages.
     ChildMemoryHostViewCache child_memory_host_views_;
-    // Retained temporary buffer for device arguments, one per pipeline slot
-    // (see HostApi get/set_retained_temp_buffer). Just a remembered
-    // {addr, size} that the slot reuses across its runs and finalize frees;
-    // the grow/slice logic lives in utils/retained_temp_bump.h.
+    // Current staging block for each pipeline slot. A physically retired call
+    // with pending HOST outputs retains its original block through workspace
+    // references after this alias detaches. The grow/slice logic lives in
+    // utils/retained_temp_bump.h.
     RunResourceSlots<void *> retained_temp_addrs_;
     RunResourceSlots<std::size_t> retained_temp_sizes_;
     // One pipeline slot's Graph Definition staging: host bytes the recorders
@@ -3201,10 +3204,8 @@ protected:
         RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
         RunResourceSlots<bool>::Storage device_timing_armed;
         RunResourceSlots<void *>::Storage device_run_result_dev_ptrs;
-        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
         RunResourceSlots<bool>::Storage device_run_result_initialized;
         RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
-        RunRecordReadLedger::Storage device_run_result_reads;
         RunBoundaryLedger::Storage run_boundaries_observed;
         QueuedStreamWaits::Storage queued_waits;
         RunBoundaryMarks::Storage boundary_marks;
@@ -3357,17 +3358,20 @@ protected:
     // Preparation cannot overwrite an armed slot. Failed publication leaves it
     // unarmed, so readback cannot misattribute a predecessor's timing.
     RunResourceSlots<bool> device_timing_armed_;
-    // One result region per pipeline slot: the device address handed to that
-    // slot's runs, and the host's copy of what the last such run published. Not
-    // gated on diagnostics — an error result must survive with capture off.
+    // Each live call owns its original result address and optional host read.
+    // An idle current-slot allocation is retained for sequential reuse.
+    struct RunResultStorage {
+        uint32_t pipeline_slot{UINT32_MAX};
+        void *device_ptr{nullptr};
+        DeviceRunResultRegion region{};
+        RunRecordRead read{RunRecordRead::NotAttempted};
+        int transfer_rc{0};
+        bool initialized{false};
+    };
+    // Owned by the live call, independently of its reusable execution slot.
+    std::unordered_map<uint64_t, RunResultStorage> run_result_storage_;
+    mutable std::mutex run_result_mu_;
     RunResourceSlots<void *> device_run_result_dev_ptrs_;
-    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
-    // Which run each cached copy was read for, and what that read left behind.
-    // Together they make the read once-per-run and keep the three read states
-    // apart: an empty copy read successfully is an absent record, an empty copy
-    // left by a failed D2H is no observation at all, and a slot with no region
-    // attempted no copy to lose.
-    RunRecordReadLedger device_run_result_reads_;
     // The boundary completion each run's own drain or poll observed, retained
     // because the drain's cleanup retires the fence that could otherwise be
     // asked. See host/run_evidence_retention.h.

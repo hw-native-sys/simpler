@@ -614,14 +614,42 @@ SimDeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepare
     return outcome;
 }
 
+void SimDeviceRunnerBase::retain_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
+    std::lock_guard<std::mutex> lock(retained_result_mu_);
+    retained_run_results_.emplace(run_epoch, device_run_results_[pipeline_slot]);
+}
+
+void SimDeviceRunnerBase::release_run_result(uint64_t run_epoch) {
+    std::lock_guard<std::mutex> lock(retained_result_mu_);
+    retained_run_results_.erase(run_epoch);
+}
+
+bool SimDeviceRunnerBase::native_runs_outstanding() const {
+    if (native_run_active()) return true;
+    std::lock_guard<std::mutex> lock(retained_result_mu_);
+    return !retained_run_results_.empty();
+}
+
 const uint8_t *
 SimDeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const {
     if (bytes_out != nullptr) *bytes_out = 0;
+    std::lock_guard<std::mutex> lock(retained_result_mu_);
     if (pipeline_slot >= device_run_results_.size()) return nullptr;
-    const DeviceRunResultRegion &region = device_run_results_[pipeline_slot];
+    const auto retained = retained_run_results_.find(run_epoch);
+    const DeviceRunResultRegion &region =
+        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot];
     if (!device_run_result_published(region, run_epoch)) return nullptr;
     if (bytes_out != nullptr) *bytes_out = region.payload_bytes;
     return region.payload;
+}
+
+DeviceRunTerminal SimDeviceRunnerBase::device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const {
+    std::lock_guard<std::mutex> lock(retained_result_mu_);
+    if (pipeline_slot >= device_run_results_.size()) return {};
+    const auto retained = retained_run_results_.find(run_epoch);
+    return device_run_result_terminal(
+        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot], run_epoch
+    );
 }
 
 void SimDeviceRunnerBase::get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size) {

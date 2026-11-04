@@ -40,7 +40,7 @@ on:
       session_timeout_seconds:
         description: Pytest session timeout in seconds.
         required: false
-        default: 600
+        default: 1200
         type: number
       job_timeout_minutes:
         description: Job timeout in minutes.

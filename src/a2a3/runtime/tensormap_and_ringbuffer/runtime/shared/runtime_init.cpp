@@ -63,10 +63,11 @@ bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena
     queue->mask = capacity - 1;
     queue->enqueue_pos.store(0, std::memory_order_relaxed);
     queue->dequeue_pos.store(0, std::memory_order_relaxed);
+    queue->mixed_lanes.reset();
 
     for (uint64_t i = 0; i < capacity; i++) {
         slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        slots_arena[i].slot_state = nullptr;
+        slots_arena[i].slot_value = CapturedReadySlot{};
     }
 
     return true;

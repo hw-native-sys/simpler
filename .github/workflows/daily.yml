@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     uses: ./.github/workflows/_st-sim-a2a3.yml
     with:
       runs_on: ${{ toJSON(matrix.os) }}
@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     uses: ./.github/workflows/_st-sim-a5.yml
     with:
       runs_on: ${{ toJSON(matrix.os) }}

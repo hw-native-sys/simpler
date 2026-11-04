@@ -54,17 +54,62 @@ public:
         bool drain = false;
         bool progress = false;
         bool pushed = false;
-        context.dispatch_shape(
-            0, context.sched_->ready_queues, ResourceShape::MIX, phase, context.core_trackers_[0], drain, progress,
-            pushed
-        );
+        dispatch(context, phase, drain, progress, pushed, 0);
         EXPECT_FALSE(drain);
         EXPECT_TRUE(progress);
         EXPECT_TRUE(pushed);
     }
 
-    static void early(SchedulerContext &context, CoreTracker::DispatchPhase phase) {
+    template <typename Context, typename = typename Context::MixPriority>
+    static void
+    dispatch(Context &context, CoreTracker::DispatchPhase phase, bool &drain, bool &progress, bool &pushed, int) {
+        LaneMask observed = LaneMask::none();
+        context.dispatch_shape(
+            0, context.sched_->ready_queues, ResourceShape::MIX, phase, context.core_trackers_[0], drain, progress,
+            pushed, Context::MixPriority::Ready, observed
+        );
+    }
+
+    template <typename Context>
+    static void
+    dispatch(Context &context, CoreTracker::DispatchPhase phase, bool &drain, bool &progress, bool &pushed, long) {
+        context.dispatch_shape(
+            0, context.sched_->ready_queues, ResourceShape::MIX, phase, context.core_trackers_[0], drain, progress,
+            pushed
+        );
+    }
+
+    template <typename Context, typename = typename Context::MixPriority>
+    static void dispatch_early(Context &context, CoreTracker::DispatchPhase phase, int) {
+        LaneMask observed = LaneMask::none();
+        context.early_dispatch_shape(0, ResourceShape::MIX, phase, observed);
+    }
+
+    template <typename Context>
+    static void dispatch_early(Context &context, CoreTracker::DispatchPhase phase, long) {
         context.early_dispatch_shape(0, ResourceShape::MIX, phase);
+    }
+
+    static void early(SchedulerContext &context, CoreTracker::DispatchPhase phase) {
+        dispatch_early(context, phase, 0);
+    }
+
+    template <typename Queue>
+    static auto push_normal(Queue &queue, ChipTaskSlotState *slot, int) -> decltype(queue.push_mix(slot)) {
+        return queue.push_mix(slot);
+    }
+    template <typename Queue>
+    static bool push_normal(Queue &queue, ChipTaskSlotState *slot, long) {
+        return queue.push(slot);
+    }
+    template <typename Queue>
+    static auto push_early(Queue &queue, ChipTaskSlotState *slot, TaskId id, int)
+        -> decltype(queue.push_mix(slot, id)) {
+        return queue.push_mix(slot, id);
+    }
+    template <typename Queue>
+    static bool push_early(Queue &queue, ChipTaskSlotState *slot, TaskId id, long) {
+        return queue.push_tagged(slot, id);
     }
 
     static ChipTaskSlotState *placed(SchedulerContext &context, int core, bool pending) {
@@ -141,7 +186,9 @@ protected:
 };
 
 TEST_P(MixAdmission, NormalSelectsEveryOwnedCluster) {
-    ASSERT_TRUE(scheduler->ready_queues[static_cast<int>(ResourceShape::MIX)].push(&slot));
+    ASSERT_TRUE(
+        MixAdmissionTestPeer::push_normal(scheduler->ready_queues[static_cast<int>(ResourceShape::MIX)], &slot, 0)
+    );
     MixAdmissionTestPeer::normal(*context, phase());
     expect_all_blocks();
 }
@@ -149,7 +196,9 @@ TEST_P(MixAdmission, NormalSelectsEveryOwnedCluster) {
 TEST_P(MixAdmission, EarlySelectsEveryOwnedCluster) {
     payload.early_dispatch_state.store(EARLY_DISPATCH_STAGING);
     ASSERT_TRUE(
-        scheduler->early_dispatch_queues[static_cast<int>(ResourceShape::MIX)].push_tagged(&slot, task.task_id)
+        MixAdmissionTestPeer::push_early(
+            scheduler->early_dispatch_queues[static_cast<int>(ResourceShape::MIX)], &slot, task.task_id, 0
+        )
     );
     MixAdmissionTestPeer::early(*context, phase());
     expect_all_blocks();

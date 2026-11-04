@@ -1057,6 +1057,7 @@ inline void bind_worker(nb::module_ &m) {
     entry_offsets["error_text"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error_text));
     entry_offsets["admissible_run_resource_sets"] =
         static_cast<uint64_t>(offsetof(MailboxRunEntry, admissible_run_resource_sets));
+    entry_offsets["observation_requested"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, observation_requested));
     m.attr("MAILBOX_RUN_ENTRY_OFFSETS") = entry_offsets;
     nb::dict frame_offsets;
     frame_offsets["entry_index"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_INDEX);
@@ -1117,6 +1118,7 @@ inline void bind_worker(nb::module_ &m) {
     mailbox_states["INIT_FAILED"] = static_cast<int32_t>(MailboxState::INIT_FAILED);
     mailbox_states["FRAME_STAGED"] = static_cast<int32_t>(MailboxState::FRAME_STAGED);
     mailbox_states["TASK_LAUNCHED"] = static_cast<int32_t>(MailboxState::TASK_LAUNCHED);
+    mailbox_states["TASK_ENDED"] = static_cast<int32_t>(MailboxState::TASK_ENDED);
     mailbox_states["TASK_FAILED"] = static_cast<int32_t>(MailboxState::TASK_FAILED);
     mailbox_states["ACTIVATE"] = static_cast<int32_t>(MailboxState::ACTIVATE);
     mailbox_states["PREPARE_READY"] = static_cast<int32_t>(MailboxState::PREPARE_READY);
