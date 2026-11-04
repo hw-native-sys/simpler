@@ -9,7 +9,6 @@ on:
 
 jobs:
   framework-a3:
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -20,7 +19,6 @@ jobs:
       runs_on: '["self-hosted","a2a3"]'
 
   onboard-st-a3:
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -28,40 +26,3 @@ jobs:
     uses: ./.github/workflows/_st-npu-a2a3.yml
     with:
       runs_on: '["self-hosted","a2a3"]'
-
-  inspect-a3-runner-startup:
-    strategy:
-      fail-fast: false
-      matrix:
-        slot: [1, 2, 3, 4, 5, 6, 7, 8]
-    runs-on: [self-hosted, a2a3]
-    timeout-minutes: 5
-    steps:
-      - name: Locate inherited compiler flag on the target host
-        run: |
-          echo "Runner: $RUNNER_NAME on $(hostname)"
-          echo "CXXFLAGS=${CXXFLAGS-<unset>}"
-          if [[ "$(hostname -s)" != infra-gpu-npu-021 ]]; then
-            exit 0
-          fi
-          id
-          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
-          echo "Runner root: $runner_root"
-          echo "Runner process configuration files containing the incompatible flag:"
-          while IFS= read -r candidate; do
-            if grep -qF -- '-Wno-error=class-memaccess' "$candidate" 2>/dev/null; then
-              echo "$candidate"
-            fi
-          done < <(find "$(dirname "$runner_root")" -maxdepth 2 -type f -name .env 2>/dev/null)
-          for candidate in /etc/environment /etc/profile /root/.profile /root/.bashrc /root/.pam_environment; do
-            if [[ -f "$candidate" ]] && grep -qF -- '-Wno-error=class-memaccess' "$candidate" 2>/dev/null; then
-              echo "$candidate"
-            fi
-          done
-          grep -rlF -- '-Wno-error=class-memaccess' /etc/profile.d /etc/systemd/system 2>/dev/null || true
-          echo "Runner services with compiler flag in effective environment or unit:"
-          while IFS= read -r unit; do
-            if systemctl show "$unit" -p Environment 2>/dev/null | grep -qF -- '-Wno-error=class-memaccess' || systemctl cat "$unit" 2>/dev/null | grep -qF -- '-Wno-error=class-memaccess'; then
-              echo "$unit"
-            fi
-          done < <(systemctl list-units --all --type=service --no-legend 'actions.runner*' 2>/dev/null | awk '{print $1}')

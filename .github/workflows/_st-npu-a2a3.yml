@@ -53,14 +53,10 @@ jobs:
               ;;
           esac
 
-      - name: Diagnose and normalize A3 runner compiler flags
+      - name: Report A3 runner compiler flags
         run: |
           echo "Runner: $RUNNER_NAME on $(hostname)"
           echo "Inherited CXXFLAGS=${CXXFLAGS-<unset>}"
-          if [[ "${CXXFLAGS-}" == *-Wno-error=class-memaccess* ]]; then
-            echo "CXXFLAGS=${CXXFLAGS//-Wno-error=class-memaccess/}" >> "$GITHUB_ENV"
-            echo "Removed incompatible cross-compiler flag for following steps"
-          fi
 
       - name: Set up environment
         uses: ./.github/actions/setup-venv

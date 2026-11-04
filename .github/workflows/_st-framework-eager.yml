@@ -70,10 +70,6 @@ jobs:
           else
             echo "Without compiler flags: cross-compiler probe failed"
           fi
-          if [[ "${CXXFLAGS-}" == *-Wno-error=class-memaccess* ]]; then
-            echo "CXXFLAGS=${CXXFLAGS//-Wno-error=class-memaccess/}" >> "$GITHUB_ENV"
-            echo "Removed incompatible cross-compiler flag for following steps"
-          fi
 
       - name: Set up framework environment
         id: framework
