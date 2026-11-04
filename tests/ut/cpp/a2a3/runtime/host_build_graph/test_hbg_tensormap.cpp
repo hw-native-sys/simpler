@@ -109,7 +109,7 @@ TEST_F(HbgTensorMapTest, EveryProducerOfARegionStaysVisible) {
     ASSERT_EQ(result.count, 3);
     std::vector<TaskId> producers;
     for (const auto &e : result.entries) {
-        producers.push_back(e.entry->producer_task_id);
+        producers.push_back(e.entry->access_task_id);
     }
     EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make_global(0)), producers.end());
     EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make_global(1)), producers.end());
@@ -130,7 +130,7 @@ TEST_F(HbgTensorMapTest, DistinctLocalIdsGetDistinctTaskChains) {
     ASSERT_EQ(result.count, 2);
     std::vector<TaskId> producers;
     for (const auto &e : result.entries) {
-        producers.push_back(e.entry->producer_task_id);
+        producers.push_back(e.entry->access_task_id);
     }
     EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make_global(0)), producers.end());
     EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make_global(LAST_TASK)), producers.end());
@@ -140,15 +140,15 @@ TEST_F(HbgTensorMapTest, DistinctLocalIdsGetDistinctTaskChains) {
     // an entry count cannot tell one chain per producer from one shared chain.
     ASSERT_NE(tmap.task_entry_heads[0], nullptr);
     ASSERT_NE(tmap.task_entry_heads[LAST_TASK], nullptr);
-    EXPECT_EQ(tmap.task_entry_heads[0]->producer_task_id, TaskId::make_global(0));
-    EXPECT_EQ(tmap.task_entry_heads[LAST_TASK]->producer_task_id, TaskId::make_global(LAST_TASK));
+    EXPECT_EQ(tmap.task_entry_heads[0]->access_task_id, TaskId::make_global(0));
+    EXPECT_EQ(tmap.task_entry_heads[LAST_TASK]->access_task_id, TaskId::make_global(LAST_TASK));
 
     // Unlinking a chain's only entry empties that chain and leaves the other intact.
     tmap.remove_entry(*tmap.task_entry_heads[LAST_TASK]);
     EXPECT_EQ(tmap.valid_count(), 1);
     EXPECT_EQ(tmap.task_entry_heads[LAST_TASK], nullptr);
     ASSERT_NE(tmap.task_entry_heads[0], nullptr);
-    EXPECT_EQ(tmap.task_entry_heads[0]->producer_task_id, TaskId::make_global(0));
+    EXPECT_EQ(tmap.task_entry_heads[0]->access_task_id, TaskId::make_global(0));
 }
 
 // Without an explicit semantic removal, direct inserts consume one pool entry
@@ -195,7 +195,7 @@ TEST_F(HbgTensorMapTest, ResetLeavesTheMapAsFreshlyInitialized) {
     TestLookupResult second_body;
     run_lookup(tmap, t, second_body);
     ASSERT_EQ(second_body.count, 1);
-    EXPECT_EQ(second_body.entries[0].entry->producer_task_id, TaskId::make_global(3));
+    EXPECT_EQ(second_body.entries[0].entry->access_task_id, TaskId::make_global(3));
 }
 
 // Reset is reachable any number of times, including on a map that was never inserted
@@ -213,7 +213,7 @@ TEST_F(HbgTensorMapTest, ResetIsIdempotentAndKeepsReservedSizes) {
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make_global(LAST_TASK));
+    EXPECT_EQ(result.entries[0].entry->access_task_id, TaskId::make_global(LAST_TASK));
 }
 
 // Filling the pool drives free_entries() to zero. No device-completion watermark
@@ -235,7 +235,7 @@ TEST(HbgTensorMapReuse, ClearsReachabilityWithoutReconstructingEntries) {
     ASSERT_TRUE(map.init(16, 64, 32));
     auto *entries = map.entry_pool.get();
     auto *entry = map.new_entry();
-    entry->producer_task_id = TaskId::make_global(7);
+    entry->access_task_id = TaskId::make_global(7);
     map.buckets[2] = entry;
     map.task_entry_heads[7] = entry;
     ASSERT_TRUE(map.init(16, 64, 32));
@@ -246,7 +246,7 @@ TEST(HbgTensorMapReuse, ClearsReachabilityWithoutReconstructingEntries) {
     EXPECT_EQ(map.buckets[2], nullptr);
     EXPECT_EQ(map.task_entry_heads[7], nullptr);
     // Retention, not a default-construction pass over the unused entries.
-    EXPECT_EQ(entries[0].producer_task_id, TaskId::make_global(7));
+    EXPECT_EQ(entries[0].access_task_id, TaskId::make_global(7));
     ASSERT_TRUE(map.init(32, 128, 64));
     EXPECT_EQ(map.pool_capacity(), 128);
     EXPECT_EQ(map.max_tasks, 64);
@@ -299,7 +299,7 @@ TEST(HbgTensorMapReuse, FailedResizePreservesTheMapAndCanBeRetried) {
         TestLookupResult result;
         run_lookup(map, tensor, result);
         ASSERT_EQ(result.count, 1);
-        EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make_global(7));
+        EXPECT_EQ(result.entries[0].entry->access_task_id, TaskId::make_global(7));
         ASSERT_TRUE(map.init(32, 128, 64));
         EXPECT_EQ(map.current_used(), 0);
         result = {};

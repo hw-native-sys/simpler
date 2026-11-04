@@ -1192,3 +1192,94 @@ TEST_F(HbgGraphSubmitFailureTest, AHiddenAllocTaskLeavesItsDispatchPredicateDefi
     EXPECT_EQ(storage[slot].payload.predicate.op, PredicateOp::NONE);
     EXPECT_EQ(storage[slot].payload.predicate.addr, 0u);
 }
+
+TEST_F(HbgGraphSubmitFailureTest, AutomaticWarAcceptsTheFaninLimitAndRejectsOverflow) {
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    auto tensor = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+    orch.begin_scope();
+    CoreTaskArgs read_args;
+    read_args.add_input(tensor);
+    read_args.add_input(tensor);
+    for (int i = 0; i < CHIP_MAX_FANIN; ++i) {
+        auto reader = orch.submit_dummy_task(read_args);
+        ASSERT_TRUE(reader.task_id().is_valid());
+        EXPECT_EQ(sm_handle->header->tasks.storage_at(reader.task_id().local_id()).payload.fanin_count, 0);
+    }
+    CoreTaskArgs write_args;
+    write_args.add_inout(tensor);
+    auto writer = orch.submit_dummy_task(write_args);
+    ASSERT_TRUE(writer.task_id().is_valid());
+    EXPECT_EQ(sm_handle->header->tasks.storage_at(writer.task_id().local_id()).payload.fanin_count, CHIP_MAX_FANIN);
+    ASSERT_FALSE(orch.is_fatal());
+
+    for (int i = 0; i <= CHIP_MAX_FANIN; ++i) {
+        ASSERT_TRUE(orch.submit_dummy_task(read_args).task_id().is_valid());
+    }
+    const int32_t cursor = orch.fanin_pool_cursor;
+    auto rejected = orch.submit_dummy_task(write_args);
+    EXPECT_FALSE(rejected.task_id().is_valid());
+    EXPECT_TRUE(orch.is_fatal());
+    EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED);
+    EXPECT_EQ(orch.fanin_pool_cursor, cursor);
+    EXPECT_FALSE(orch.submit_dummy_task(read_args).task_id().is_valid());
+}
+
+TEST_F(HbgGraphSubmitFailureTest, GraphInputBoundaryOrdersAnOuterWriter) {
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    auto tensor = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+    GraphTaskArgs boundary;
+    boundary.add_input(tensor);
+    orch.begin_scope();
+    const auto graph = orch.graph_begin(0x1388, boundary);
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+    CoreTaskArgs body;
+    body.add_input(graph.params->tensor(0).ref());
+    ASSERT_TRUE(orch.submit_dummy_task(body).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+    orch.graph_commit();
+    ASSERT_FALSE(orch.is_fatal());
+    CoreTaskArgs write_args;
+    write_args.add_inout(tensor);
+    auto writer = orch.submit_dummy_task(write_args);
+    ASSERT_TRUE(writer.task_id().is_valid());
+    const auto &payload = sm_handle->header->tasks.storage_at(writer.task_id().local_id()).payload;
+    ASSERT_EQ(payload.fanin_count, 1);
+    EXPECT_EQ(payload.fanin_data()[0], graph.task_id.local_id());
+}
+
+TEST_F(HbgGraphSubmitFailureTest, RecordedBodyKeepsReadersParallelAndOrdersTheWriter) {
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    auto tensor = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+    GraphTaskArgs boundary;
+    boundary.add_inout(tensor);
+    orch.begin_scope();
+    const auto graph = orch.graph_begin(0x1389, boundary);
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+    CoreTaskArgs read_args;
+    read_args.add_input(graph.params->tensor(0).ref());
+    ASSERT_TRUE(orch.submit_dummy_task(read_args).task_id().is_valid());
+    ASSERT_TRUE(orch.submit_dummy_task(read_args).task_id().is_valid());
+    CoreTaskArgs write_args;
+    write_args.add_inout(graph.params->tensor(0).ref());
+    ASSERT_TRUE(orch.submit_dummy_task(write_args).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+    const auto definitions = graph_host_definitions(*graph_state);
+    ASSERT_EQ(definitions.entries.size(), 1u);
+    const auto *definition = definition_image(definitions.entries[0]);
+    ASSERT_EQ(definition->task_count, 3);
+    const auto *offsets = graph_definition_array<int32_t>(*definition, definition->off_fanin_offsets, 4);
+    const auto *indices =
+        graph_definition_array<uint16_t>(*definition, definition->off_fanin_indices, definition->edge_count);
+    ASSERT_NE(offsets, nullptr);
+    ASSERT_NE(indices, nullptr);
+    EXPECT_EQ(offsets[0], 0);
+    EXPECT_EQ(offsets[1], 0);
+    EXPECT_EQ(offsets[2], 0);
+    ASSERT_EQ(offsets[3], 2);
+    EXPECT_TRUE((indices[0] == 0 && indices[1] == 1) || (indices[0] == 1 && indices[1] == 0));
+}

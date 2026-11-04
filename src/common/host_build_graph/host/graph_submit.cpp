@@ -276,7 +276,7 @@ bool graph_submit_outer(
     DepInputs boundary_inputs{
         args.tensor_count(), args.tensor_data(), args.tag_data(), 0, nullptr,
     };
-    const int32_t tensormap_needed = count_registrable_outputs(boundary_inputs, orch->in_manual_scope());
+    const int32_t tensormap_needed = count_registrable_accesses(boundary_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) return false;
     const TaskAllocResult allocation = allocator.alloc(defer_heap ? 0 : owned_heap);
     if (allocation.failed()) {
@@ -371,7 +371,7 @@ bool graph_submit_outer(
     } else if (!compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), emit)) {
         return false;
     }
-    register_task_outputs(boundary_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
+    register_task_accesses(boundary_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
     // The region's length is settled, so the cursor closes it at the real count. The
     // equality holds only while nothing between the bind and here bound another fanin
     // region, which is what makes the deferred advance safe.
@@ -700,7 +700,7 @@ TaskOutputTensors graph_record_submit_sub_task(
             // the low field TaskId::make_sub_task packs them into, so registering one
             // would key the map outside its task chains.
             recording.unsupported = true;
-        } else if (recording.tensor_map.free_entries() < count_registrable_outputs(dep_inputs, manual_scope)) {
+        } else if (recording.tensor_map.free_entries() < count_registrable_accesses(dep_inputs, manual_scope)) {
             // Recording one more task would assert inside new_entry(). Abandon the
             // Definition instead, so the run fails by name at graph_commit rather
             // than on a hard assert here.
@@ -727,7 +727,7 @@ TaskOutputTensors graph_record_submit_sub_task(
                 return true;
             };
             (void)compute_task_fanin(dep_inputs, recording.tensor_map, manual_scope, emit_inferred);
-            register_task_outputs(dep_inputs, task_id, recording.tensor_map, manual_scope);
+            register_task_accesses(dep_inputs, task_id, recording.tensor_map, manual_scope);
         }
     }
     for (uint32_t i = 0; i < args.explicit_dep_count(); ++i) {

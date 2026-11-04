@@ -14,6 +14,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
+
+#include "tensor.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -183,5 +186,31 @@ TEST(DepGenReplayTest, AcceptsAMultiSegmentChain) {
     ASSERT_TRUE(std::filesystem::exists(path)) << "a well-formed multi-segment chain produced no graph";
     const std::string json = read_file(path);
     EXPECT_NE(json.find("\"edges\""), std::string::npos) << json;
+    std::filesystem::remove(path);
+}
+
+TEST(DepGenReplayTest, OrdinaryInputsEmitWarEdgesWithoutReaderSerialization) {
+    const auto path = chain_output_path("automatic_war");
+    std::filesystem::remove(path);
+    uint32_t shape[] = {16};
+    const auto tensor =
+        simpler::tmr::make_tensor_external(reinterpret_cast<void *>(0x1000), shape, 1, DataType::UINT32);
+    DepGenRecord records[3]{};
+    for (int i = 0; i < 3; ++i) {
+        records[i].task_id = TaskId::make(0, i);
+        records[i].tensor_count = 1;
+        records[i].arg_types[0] = static_cast<uint8_t>(i == 2 ? TensorArgType::INOUT : TensorArgType::INPUT);
+        std::memcpy(records[i].tensors[0], &tensor, sizeof(tensor));
+    }
+    ASSERT_EQ(dep_gen_replay_emit_deps_json(records, 3, path.c_str()), 0);
+    const std::string json = read_file(path);
+    auto edge = [&](int pred, int succ) {
+        return "{\"pred\":\"" + std::to_string(TaskId::to_uint64(records[pred].task_id)) + "\",\"succ\":\"" +
+               std::to_string(TaskId::to_uint64(records[succ].task_id)) +
+               "\",\"arg\":0,\"source\":\"tensormap\",\"flags\":[\"wait\"]";
+    };
+    EXPECT_NE(json.find(edge(0, 2)), std::string::npos) << json;
+    EXPECT_NE(json.find(edge(1, 2)), std::string::npos) << json;
+    EXPECT_EQ(json.find(edge(0, 1)), std::string::npos) << json;
     std::filesystem::remove(path);
 }

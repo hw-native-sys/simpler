@@ -108,6 +108,7 @@ static bool wait_for_tensor_ready(
     // the second encounter.
     constexpr int kSegmentCap = 64;
     const ChipTaskSlotState *seg[kSegmentCap];
+    bool seg_wait_consumers[kSegmentCap]{};
     int seg_count = 0;
     bool failed = false;
 
@@ -175,39 +176,55 @@ static bool wait_for_tensor_ready(
         for (int i = 0; i < seg_count; i++) {
             wait_one_producer(*seg[i]);
             if (failed) return;
-            if (!wait_for_consumers) continue;
+            if (!seg_wait_consumers[i]) continue;
             wait_one_consumers(*seg[i]);
             if (failed) return;
         }
         seg_count = 0;
     };
 
-    auto try_push = [&](const ChipTaskSlotState &s) {
+    auto try_push = [&](const ChipTaskSlotState &s, bool include_consumers) {
         for (int j = 0; j < seg_count; j++) {
-            if (seg[j] == &s) return;  // per-segment dedup
+            if (seg[j] == &s) {
+                seg_wait_consumers[j] |= include_consumers;
+                return;
+            }
         }
         if (seg_count == kSegmentCap) {
             flush_segment();
             if (failed) return;
         }
-        seg[seg_count++] = &s;
+        seg[seg_count] = &s;
+        seg_wait_consumers[seg_count++] = include_consumers;
     };
 
     auto do_wait = [&]() {
         // Step A: creator retention — read owner directly from tensor metadata
         if (owner.is_valid()) {
             auto &s = orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local_id());
-            try_push(s);
+            try_push(s, wait_for_consumers);
             if (failed) return;
         }
 
         // Step B: modifier writer lookup (OverlapMap), direct callback
         orch.tensor_map.lookup(tensor, [&](ChipTensorMapEntry &entry, OverlapStatus) -> bool {
-            TaskId pid = entry.producer_task_id;
+            TaskId pid = entry.access_task_id;
             auto &s = orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local_id());
-            try_push(s);
+            try_push(s, wait_for_consumers);
             return !failed;
         });
+        if (wait_for_consumers && !failed) {
+            orch.tensor_map.lookup(
+                tensor,
+                [&](ChipTensorMapEntry &entry, OverlapStatus) {
+                    TaskId reader = entry.access_task_id;
+                    auto &slot = orch.sm_header->rings[reader.ring()].get_slot_state_by_task_id(reader.local_id());
+                    try_push(slot, false);
+                    return !failed;
+                },
+                TensorAccessKind::READER
+            );
+        }
         if (failed) return;
         flush_segment();
     };

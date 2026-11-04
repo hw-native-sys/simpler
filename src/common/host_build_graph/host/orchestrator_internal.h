@@ -48,7 +48,7 @@ struct DepGraphAnnotate {
     void tensormap(
         int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry, OverlapStatus overlap
     ) const {
-        dep_gen_host_graph_add_tensormap_edge(entry.producer_task_id, arg_idx, consumer, entry, overlap);
+        dep_gen_host_graph_add_tensormap_edge(entry.access_task_id, arg_idx, consumer, entry, overlap);
     }
 };
 
