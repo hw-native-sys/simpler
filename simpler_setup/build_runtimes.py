@@ -36,7 +36,8 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "python"))
 
-from simpler_setup.platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
+from simpler_setup.platform_info import PROJECT_ROOT, TARGETS, discover_runtimes, parse_platform  # noqa: E402
+from simpler_setup.runtime_build_budget import runtime_build_budget, submit_runtime_build  # noqa: E402
 from simpler_setup.runtime_builder import RuntimeBuilder, platform_embeds_pto_isa  # noqa: E402
 from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noqa: E402
 
@@ -161,7 +162,7 @@ def build_all(
                 logger.error(f"Failed to build cpu_sim_context: {e}")
                 raise
 
-    # Collect all (platform, runtime_name) tasks to run in parallel
+    # Runtime variants and their targets share an explicitly configured budget.
     tasks: list[tuple[str, str]] = []
     for platform in platforms:
         arch, variant = parse_platform(platform)
@@ -194,8 +195,8 @@ def build_all(
             profiling_config=profiling_config,
         )
 
-    with ThreadPoolExecutor(max_workers=len(tasks) or 1) as executor:
-        futures = {executor.submit(_build_runtime, p, r): (p, r) for p, r in tasks}
+    with runtime_build_budget(len(tasks) * len(TARGETS)), ThreadPoolExecutor(max_workers=len(tasks) or 1) as executor:
+        futures = {submit_runtime_build(executor, _build_runtime, p, r): (p, r) for p, r in tasks}
         for future in as_completed(futures):
             platform, runtime_name = futures[future]
             try:

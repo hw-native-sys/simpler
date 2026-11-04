@@ -263,6 +263,43 @@ class TestRuntimeBuilderGetBinaries:
         assert result.aicpu_path.name == "libaicpu.so"
         assert result.aicore_path.name == "libaicore.so"
 
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    @pytest.mark.parametrize("budget", [None, ""])
+    def test_runtime_targets_keep_default_parallelism(self, MockCompiler, tmp_path, monkeypatch, budget):
+        import threading  # noqa: PLC0415
+
+        if budget is None:
+            monkeypatch.delenv("CMAKE_BUILD_PARALLEL_LEVEL", raising=False)
+        else:
+            monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", budget)
+        self._make_runtime(tmp_path, "a2a3")
+        builder, compiler = self._isolated_builder(MockCompiler, tmp_path, monkeypatch, "a2a3sim")
+        builder._CACHE_DIR = tmp_path / "cache"
+        monkeypatch.setattr(builder, "ensure_sim_context", lambda **kwargs: None)
+        active = peak = 0
+        calls = []
+        lock = threading.Lock()
+        started = threading.Barrier(3)
+
+        def compile_target(target, *args, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                calls.append(target)
+            started.wait(timeout=5)
+            with lock:
+                active -= 1
+            return Path(kwargs["output_dir"]) / f"lib{target}.so"
+
+        compiler.compile.side_effect = compile_target
+
+        result = builder.get_binaries("test_rt", build=True)
+
+        assert sorted(calls) == ["aicore", "aicpu", "host"]
+        assert result.host_path.name == "libhost.so"
+        assert peak == 3
+
     def _isolated_builder(self, MockCompiler, tmp_path, monkeypatch, platform):
         """A builder whose staging tree is tmp_path rather than the real build/lib.
 

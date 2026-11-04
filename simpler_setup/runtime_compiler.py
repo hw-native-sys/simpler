@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 import logging
-import multiprocessing
 import os
 import shutil
 import subprocess
@@ -18,6 +17,7 @@ from typing import Callable, Optional, Union
 from simpler import env_manager
 
 from .environment import PROJECT_ROOT
+from .runtime_build_budget import runtime_build_budget
 from .toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolchain
 
 logger = logging.getLogger(__name__)
@@ -477,6 +477,19 @@ class RuntimeCompiler:
         if build_dir is None:
             raise ValueError("build_dir must be set")
 
+        with runtime_build_budget(1) as budget, budget.jobs() as build_jobs:
+            return self._run_cmake_build(cmake_source_dir, cmake_args, binary_name, platform, build_dir, build_jobs)
+
+    def _run_cmake_build(
+        self,
+        cmake_source_dir: str,
+        cmake_args: list[str],
+        binary_name: str,
+        platform: str,
+        build_dir: str,
+        build_jobs: int,
+    ) -> Path:
+        """Configure and build while the caller holds its compiler job allocation."""
         cmake_cmd = [
             "cmake",
             cmake_source_dir,
@@ -508,7 +521,7 @@ class RuntimeCompiler:
             "--build",
             ".",
             "--parallel",
-            str(min(multiprocessing.cpu_count(), 32)),
+            str(build_jobs),
         ]
         if logger.isEnabledFor(logging.DEBUG):
             build_cmd.append("--verbose")

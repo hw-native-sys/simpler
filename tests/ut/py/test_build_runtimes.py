@@ -131,3 +131,90 @@ def test_profiling_config_completes_defaults_and_validates_dependencies():
                 "SIMPLER_TENSORMAP_PROFILING": 1,
             }
         )
+
+
+@pytest.mark.parametrize("budget", [None, "", "1", "2", "8", "32"])
+def test_nested_runtime_builds_share_budget_and_preserve_parallelism(monkeypatch, tmp_path, budget):
+    import threading  # noqa: PLC0415
+
+    from simpler_setup import build_runtimes, runtime_build_budget, runtime_compiler, toolchain  # noqa: PLC0415
+    from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+    if budget is None:
+        monkeypatch.delenv("CMAKE_BUILD_PARALLEL_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", budget)
+    monkeypatch.setattr(runtime_build_budget.multiprocessing, "cpu_count", lambda: 64)
+    Compiler = runtime_compiler.RuntimeCompiler
+    monkeypatch.setattr(Compiler, "_instances", {})
+    monkeypatch.setattr(Compiler, "_sanitizers", "")
+    monkeypatch.setattr(Compiler, "_ensure_host_compilers", lambda self: None)
+    monkeypatch.setattr(toolchain, "_is_gcc", lambda path: True)
+    monkeypatch.setattr(RuntimeBuilder, "ensure_sim_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(RuntimeBuilder, "_LIB_DIR", tmp_path / "lib")
+    monkeypatch.setattr(RuntimeBuilder, "_CACHE_DIR", tmp_path / "cache")
+
+    platforms = ["a2a3sim", "a5sim"]
+    expected = {
+        (platform, runtime, target)
+        for platform in platforms
+        for runtime in build_runtimes.discover_runtimes(platform.removesuffix("sim"))
+        for target in ["host", "aicpu", "aicore"]
+    }
+    parallel_targets = min(int(budget), len(expected)) if budget else len(expected)
+    # All expected targets must reach CMake together by default. With a small
+    # explicit limit, only that many may hold compiler jobs simultaneously.
+    started = threading.Barrier(parallel_targets)
+    active_jobs = peak_jobs = active_builds = peak_builds = 0
+    calls = []
+    lock = threading.Lock()
+
+    def build_step(self, command, cwd, platform, step_name):
+        nonlocal active_jobs, peak_jobs, active_builds, peak_builds
+        if "--build" not in command:
+            return
+        jobs = int(command[command.index("--parallel") + 1])
+        with lock:
+            active_jobs += jobs
+            active_builds += 1
+            peak_jobs = max(peak_jobs, active_jobs)
+            peak_builds = max(peak_builds, active_builds)
+        try:
+            # The last, incomplete group need not rendezvous.
+            if len(expected) % parallel_targets == 0:
+                started.wait(timeout=5)
+        finally:
+            with lock:
+                active_jobs -= jobs
+                active_builds -= 1
+
+    def compile_target(self, target, *args, **kwargs):
+        output_dir = kwargs["output_dir"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        binary = output_dir / f"lib{target}.so"
+        binary.touch()
+        with lock:
+            calls.append((self.platform, output_dir.name, target))
+        return self._run_compilation(str(output_dir), [], binary.name, build_dir=str(output_dir))
+
+    monkeypatch.setattr(Compiler, "_run_build_step", build_step)
+    monkeypatch.setattr(Compiler, "compile", compile_target)
+
+    build_runtimes.build_all(tmp_path / "lib", tmp_path / "cache", platforms=platforms)
+
+    assert set(calls) == expected
+    assert len(calls) == len(expected)
+    assert all(
+        (tmp_path / "lib" / platform.removesuffix("sim") / "sim" / runtime / f"lib{target}.so").is_file()
+        for platform, runtime, target in expected
+    )
+    if budget:
+        assert peak_jobs <= int(budget)
+        if int(budget) in (1, 2):
+            assert peak_builds == int(budget)
+        elif int(budget) >= len(expected):
+            assert peak_builds == len(expected)
+            assert peak_jobs == int(budget)
+    else:
+        assert peak_builds == len(expected)
+        assert peak_jobs == 32 * len(expected)

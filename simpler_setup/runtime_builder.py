@@ -19,6 +19,7 @@ from typing import Optional
 
 from .environment import PROJECT_ROOT
 from .platform_info import TARGETS, load_build_config, parse_platform
+from .runtime_build_budget import runtime_build_budget, submit_runtime_build
 from .runtime_compiler import RuntimeCompiler
 
 logger = logging.getLogger(__name__)
@@ -460,18 +461,19 @@ class RuntimeBuilder:
                     cmake_defines=cmake_defines,
                 )
 
-        logger.info("Compiling AICore, AICPU, Host in parallel...")
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            fut_host = executor.submit(_compile_target, "host")
-            fut_aicpu = executor.submit(_compile_target, "aicpu")
-            fut_aicore = executor.submit(_compile_target, "aicore")
-            fut_sim_ctx = executor.submit(self.ensure_sim_context, build=build_shared) if variant == "sim" else None
-
-            host_path = fut_host.result()
-            aicpu_path = fut_aicpu.result()
-            aicore_path = fut_aicore.result()
-            sim_context_path = fut_sim_ctx.result() if fut_sim_ctx else None
+        logger.info("Compiling runtime targets in parallel within the CMake job budget...")
+        build_count = len(TARGETS) + int(variant == "sim" and build_shared)
+        with runtime_build_budget(build_count), ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {target: submit_runtime_build(executor, _compile_target, target) for target in TARGETS}
+            sim_future = (
+                submit_runtime_build(executor, self.ensure_sim_context, build=build_shared)
+                if variant == "sim"
+                else None
+            )
+            host_path = futures["host"].result()
+            aicpu_path = futures["aicpu"].result()
+            aicore_path = futures["aicore"].result()
+            sim_context_path = sim_future.result() if sim_future else None
 
         self._place_compile_commands(name)
         if self._requires_pto_isa_metadata_validation():
