@@ -162,11 +162,3 @@ jobs:
     with:
       runs_on: '["self-hosted","a5"]'
       include_cann_examples: true
-
-  st-onboard-a5:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-npu-a5.yml
-    with:
-      runs_on: '["self-hosted","a5"]'
-      include_dfx_smokes: true

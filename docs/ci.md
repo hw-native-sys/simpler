@@ -79,7 +79,6 @@ PullRequest
   ├── st-network1-onboard-a2a3    (a2a3pod pair)          — a2a3_changed && st_affected
   ├── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── ut-a5                  (a5 self-hosted)        — Python UT, a5 hardware [needs ut_affected]
-  ├── st-onboard-a5          (a5 self-hosted)        — a5_changed && st_affected
   └── st-framework-eager-a5  (a5 self-hosted)        — a5_changed && st_affected
 ```
 
@@ -92,7 +91,6 @@ PullRequest
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
-| `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA, the active URMA regressions and mixed SDMA/URMA cases, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
@@ -547,9 +545,10 @@ fills a cache, so the locked pytest run that follows is what recompiles the
 class and attributes the failure to the case that owns it, instead of one
 unbuildable kernel costing the whole batch its results.
 
-`actions/checkout` cleans ignored files before each job, so the onboard jobs
-restore and save `build/cache/kernels/` through `actions/cache`. Cache keys are
-partitioned by target architecture, runner OS/architecture, and PTO-ISA pin.
+`actions/checkout` cleans ignored files before each job. The a2a3 onboard
+scene-test jobs do not restore or save `build/cache/kernels/` across jobs, so
+their warm-up compiles from an empty kernel cache each time. The following
+pytest step still reuses the artifacts produced by the warm-up in that job.
 The callable key covers the contents of its orchestration, incore, and
 transitively included sources, the compiler identities and effective fixed
 flags, a digest of the modules that decide artifact bytes
@@ -571,11 +570,9 @@ incore bytes, including the CCEC/linker and ELF-section processing used by
 onboard builds.
 
 Entries are content-addressed and therefore never overwritten, so a run prunes
-entries whose last use is more than 14 days old before it exits. Without that,
-the directory grows by one entry per kernel change forever and the saved
-`actions/cache` archive — one new entry per push, restored by prefix — would
-crowd the repository's 10 GB cache budget and evict the pip and other caches
-the other jobs depend on.
+entries whose last use is more than 14 days old before it exits. This bounds
+growth in long-lived local worktrees; a2a3 onboard CI starts each job with an
+empty kernel cache.
 
 The pip download cache is keyed by runner OS, runner architecture, and
 `pyproject.toml`. Source-only changes therefore reuse the same dependency cache
