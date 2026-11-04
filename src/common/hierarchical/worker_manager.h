@@ -182,6 +182,12 @@ static_assert(
     std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,
     "a run-state entry crosses a process boundary, so it must be POD and position-independent"
 );
+// This layout carries no version field, and `validate_mailbox_region` checks a
+// mapping against the `sizeof` of the process doing the checking — so both ends
+// of a version-skewed pair accept their own mapping and then disagree about
+// where a field starts. Parent and child are the same build here, which is what
+// makes that safe; a deployment that could pair different builds needs a
+// negotiated version before this struct grows again.
 
 /** Stride between entries. Rounded up so every entry keeps 8-byte field alignment. */
 static constexpr size_t MAILBOX_RUN_ENTRY_STRIDE = (sizeof(MailboxRunEntry) + 63) & ~size_t{63};

@@ -14298,6 +14298,40 @@ class Worker:
             return 0
         return self._chip_worker.scheduler_mode_publish_count
 
+    @property
+    def unobserved_completed_run_count(self) -> int:
+        """L2 only: recorded-complete calls whose result is not yet delivered.
+
+        Each holds its native carrier and, for Program, its staging, so this
+        tracks host footprint where the pipeline depth does not -- the depth
+        bounds concurrent execution, and a retired call leaves it so a slot can
+        refill before its predecessor is waited on. It is deliberately uncapped:
+        every entry is a result a live `RunHandle` still entitles its caller to.
+        A rising value means handles are being held, not that anything leaked.
+        A call a finalization already owns still counts, since that finalization
+        has not returned the carrier yet.
+
+        Recorded, not probed: a call whose device work has finished stays
+        uncounted until a poll or wait records it, so this is a lower bound on
+        what the device has actually finished.
+        """
+        if self.level != 2 or self._chip_worker is None:
+            return 0
+        return self._chip_worker.unobserved_completed_run_count
+
+    @property
+    def unobserved_completed_run_high_water(self) -> int:
+        """L2 only: the largest `unobserved_completed_run_count` sampled.
+
+        Sampled when the backlog is counted -- every run preparation and every
+        read of either property -- so a backlog that grows and drains entirely
+        between two samples is not recorded. Monotonic, which is what makes it
+        readable after a drain that has already emptied the live count.
+        """
+        if self.level != 2 or self._chip_worker is None:
+            return 0
+        return self._chip_worker.unobserved_completed_run_high_water
+
     # ------------------------------------------------------------------
     # close
     # ------------------------------------------------------------------

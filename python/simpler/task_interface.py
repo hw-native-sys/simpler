@@ -2074,6 +2074,16 @@ class ChipWorker:
         return self._impl.scheduler_mode_publish_count
 
     @property
+    def unobserved_completed_run_count(self) -> int:
+        """Recorded-complete calls whose result has not been delivered yet."""
+        return self._impl.unobserved_completed_run_count
+
+    @property
+    def unobserved_completed_run_high_water(self) -> int:
+        """Largest unobserved_completed_run_count sampled; monotonic."""
+        return self._impl.unobserved_completed_run_high_water
+
+    @property
     def pipeline_depth(self):
         return self._impl.pipeline_depth
 

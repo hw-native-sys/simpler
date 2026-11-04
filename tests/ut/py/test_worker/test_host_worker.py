@@ -749,6 +749,42 @@ def test_a_reconciled_chip_resource_grant_is_taken_as_published():
     assert worker._granted_chip_run_resource_sets([2, 1], [2, 2]) == [2, 1]
 
 
+def test_the_unobserved_completed_backlog_reads_zero_without_an_l2_chip_worker():
+    """The backlog belongs to a bound L2 worker, so every other shape reports none.
+
+    A level-3 worker owns no native run table, and a level-2 one reports nothing
+    before `init` binds a ChipWorker. Both answer rather than raising: these are
+    diagnostic reads a caller may make at any point in a worker's life, including
+    while deciding whether that life has started.
+    """
+    hierarchical = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a5", runtime="host_build_graph")
+    assert hierarchical.unobserved_completed_run_count == 0
+    assert hierarchical.unobserved_completed_run_high_water == 0
+
+    unbound = Worker(level=2, platform="a5", runtime="host_build_graph", device_id=0)
+    assert unbound._chip_worker is None
+    assert unbound.unobserved_completed_run_count == 0
+    assert unbound.unobserved_completed_run_high_water == 0
+
+
+def test_the_unobserved_completed_backlog_forwards_each_value_from_the_chip_worker():
+    """Each property reports its own native value, so neither is stubbed or swapped.
+
+    The zero-return case above never reaches the forwarding return, so on its own
+    it would pass against a property hardcoded to 0. The two values here differ,
+    which also fails if the pair is transposed.
+    """
+
+    class StubChipWorker:
+        unobserved_completed_run_count = 2
+        unobserved_completed_run_high_water = 7
+
+    worker = Worker(level=2, platform="a5", runtime="host_build_graph", device_id=0)
+    worker._chip_worker = StubChipWorker()
+    assert worker.unobserved_completed_run_count == 2
+    assert worker.unobserved_completed_run_high_water == 7
+
+
 @pytest.mark.parametrize(("automatic", "undersized"), [(False, False), (True, False), (False, True)])
 def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkeypatch, automatic, undersized):
     class FakeParentWorker:
