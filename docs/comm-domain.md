@@ -95,13 +95,17 @@ but not freed; its cleanup obligation stays tracked and is reported, while
 independent worker-tree cleanup continues.
 `Worker.live_domains` includes both backends.
 
-`copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
+`copy_to_domain` and `copy_from_domain` use NPU domain rank and the same named-buffer
 bounds checks. They synchronously stage data without issuing an implicit run/DAG
 fence. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
 returns the slice's window offset and byte size. `requested_window_size` preserves the request;
 `mapping_size` reports the backend's actual mapping extent. Complete buffer definitions remain available.
+
+Host Buffer mapping is an independent Worker capability. It does not require a
+domain and does not alter device-domain allocation or release. Extending domain
+creation to Host resources is separate work.
 
 L4 Buffer/Tensor views reach their owning chip through local or remote L3s, preserving canonical
 identity without exposing remote device addresses. Pass an immutable `CommDomainRef` (creator instance,

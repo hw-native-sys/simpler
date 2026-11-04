@@ -135,7 +135,7 @@ def _reject_device_args(args: object, *, kind: str) -> None:
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
-        if desc.address_space == AddressSpace.DEVICE:
+        if desc.address_space == AddressSpace.DEVICE or args.tensor(i).mapping_ref:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
                 f"sub-worker runs on the host and can only take HOST-space tensors"
@@ -354,7 +354,9 @@ class Orchestrator:
             prov_guard = worker._child_prov_lock
         with prov_guard:
             if needs_prov:
-                worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
+                worker._child_prov_check_dispatch_locked(
+                    c_args, cpp_worker_id, api="submit_next_level", sidecar=remote_sidecar
+                )
                 remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
@@ -464,7 +466,12 @@ class Orchestrator:
         with prov_guard:
             for index, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(c_args, worker_ids[index], api="submit_next_level_group")
+                worker._child_prov_check_dispatch_locked(
+                    c_args,
+                    worker_ids[index],
+                    api="submit_next_level_group",
+                    sidecar=remote_sidecars[index] if remote_sidecars is not None else None,
+                )
                 prepared = worker._prepare_buffer_references(
                     c_args, remote_sidecars[index] if remote_sidecars is not None else None, worker_ids[index]
                 )

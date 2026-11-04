@@ -108,7 +108,12 @@ requires matching torch/torch_npu/CANN and does not enable capture submission.
 | `free(handle)` | Releases a device `Buffer` returned by either allocation method |
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
-| `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
+| `create_buffer(nbytes) -> Buffer` | Retains ordinary POSIX shared memory; A3 device registration is lazy at map_view. Use `buffer.buffer` for native CPU bytes |
+| `map_view(tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor` | Shared Host/local DEVICE mapping entry. At L2 target defaults to `device_location`; at L3 use a local next-level worker id. Returns a new restricted view without modifying the native Tensor or backing identity |
+| `unmap_view(tensor) -> None` | Revokes one issued mapping after accepted uses finish. The last Host mapping detaches its device view; DEVICE mapping revocation does not free source HBM. Cleanup failure remains closed and retryable |
+| `release_buffer(buffer)` | For the Host backing, pass the original Buffer returned by this Worker after all accepted uses finish. A borrowed alias cannot release it |
+| `Buffer.buffer` | Native CPU memoryview over the logical Host bytes, read-only for READ backing; retained native exports and their derived views prevent physical release |
+| `Buffer.close()` | Revokes new use of that handle and releases directly owned storage. Use `release_buffer` after mappings and accepted uses retire |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
@@ -116,6 +121,37 @@ dst_offset=32, nbytes=16)`. A handle rebuilt at `base + 32` is not an interior v
 allocation; it is a different canonical identity that names no allocation at all, and is refused.
 Both offsets are bounded together with the length against the *registered* extent, so an offset
 cannot walk a legal-looking length past the end.
+
+`AccessMode`, `AddressSpace` and `TensorTransfer` are available from
+`simpler.task_interface`. Host creation retains ordinary POSIX semantics. A3
+L2/L3 device mapping requires a supported initialized execution context; A5 and
+cross-node Host mapping are outside this implementation. Simulation validates
+mapping semantics without hardware registration.
+
+Build the native Tensor from the Buffer, then call `map_view` for the intended
+device endpoint and use `TensorTransfer.NONE`. Allocation preserves native CPU access
+without pre-registering device consumption grants. Each request registers only
+its selected READ, WRITE or READWRITE access at the actual target. The target's
+ImportRegistry and qualified adapter check the execution environment, extent,
+access and liveness; the registered callable signature determines required
+execution access. TaskArgs tags describe dependencies.
+
+Mapping references are opaque, increase from 1 through 255 per backing, encode
+neither rank nor access, and are never reused. Exhaustion raises an explicit
+error. A mapped Tensor cannot switch refs through `_with_mapping_ref`; native
+ref 0 still supports explicit H2D. `unmap_view` rejects in-flight use, revokes the
+record and detaches the physical Host view only after its target's last active
+record retires. A failed detach stays CLOSING and must be retried before a new
+attachment; successful `map_view` on the native Tensor issues a fresh ref and
+does not revive revoked Tensors. Mapping lifetime is independent of domains.
+CPU pointer writes bypass scheduling checks and require
+caller-established completion and exclusion of concurrent use.
+
+Allocation behavior is unchanged; use matching
+Python and native builds. A runtime without the required private Host
+import/cleanup support rejects that operation explicitly. L2 mapping does not create a synthetic domain.
+See the [Host mechanism and lifetime guide](../../a3-host-domain.md)
+and the [Buffer ABI](../../buffer-abi.md) for the same-build wire contract.
 
 ### Execution
 
@@ -177,10 +213,10 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported. `CommBufferSpec` declares DEVICE storage only |
 | `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
 | `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
-| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
+| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded NPU-rank staging before task submission; L3 requires declared slices |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
 `domain.member(rank).buffers[name].tensor(...)` has the same L3/L4 semantics and routes to its owning chip.
@@ -189,6 +225,11 @@ Borrowed handles reject `release()` and `with`. Cached Tensor use enrolls later 
 release waits for accepted tasks, and unknown cleanup remains tracked and reported with `freed=False`.
 For scalar-only ref/context tasks, the owner's callback must call `get_domain(name_or_ref)`;
 a child lookup does not enroll the owner's run.
+
+Host Buffer mapping does not require or alter a communication domain. L3 selects
+an existing local worker with `worker.map_view(native, target=worker_id, access=...)`.
+After accepted uses finish, unmap and release through the Worker. Domain-owned HBM
+slices retain their existing lifetime and release semantics.
 
 ## Callables and task args
 
