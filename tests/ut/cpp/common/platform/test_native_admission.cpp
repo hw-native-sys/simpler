@@ -2142,3 +2142,85 @@ TEST_F(NativeAdmissionTest, FinalizePrefixAllocationFailureKeepsLaunchedOwnerRet
 }
 
 }  // namespace native_admission_test
+
+namespace native_admission_test {
+TEST_F(NativeAdmissionTest, EntryCacheQualificationRequiresObservedSuccessAndCurrentPublication) {
+    class CacheRunner : public Runner {
+    public:
+        bool run_case(
+            uint64_t epoch, bool fenced, bool matching_record, bool poll_only, uint32_t slot_index,
+            bool fail_sync = false, bool resources_owned = true, int replacement = 0
+        ) {
+            Runtime runtime;
+            CallConfig config;
+            NativeRunIdentity identity{epoch, 3, epoch, slot_index};
+            PreparedExecution prepared(identity, runtime, config, slot_index);
+            static int streams[2];
+            prepared.streams = {&streams[0], &streams[1]};
+            prepared.resources_owned = resources_owned;
+            auto &slot = slot_persistent_args(slot_index);
+            EXPECT_EQ(ensure_device_run_result_region(slot_index, epoch, prepared.kernel_args), 0);
+            EXPECT_EQ(prepared.kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot), 0);
+            LaunchProgressSink sink;
+            EXPECT_EQ(prepared.kernel_args.publish_runtime_args(true, &streams[0], sink), 0);
+            device_run_result_initialized_[slot_index] = true;
+            auto *record = reinterpret_cast<DeviceRunResultRegion *>(prepared.kernel_args.args.run_result_data_base);
+            *record = {};
+            record->published = matching_record ? epoch : epoch + 1;
+            record->verdict = static_cast<uint32_t>(DeviceRunVerdict::Ok);
+            EXPECT_EQ(arm_run_fence(prepared), 0);
+            if (fenced) {
+                auto &fence = run_fence(slot_index);
+                for (auto role : {RunCompletionFence::StreamRole::Aicpu, RunCompletionFence::StreamRole::Aicore}) {
+                    fence.note_kernel_submitted(identity, role);
+                    EXPECT_EQ(fence.record(identity, role, &streams[0]), 0);
+                }
+            }
+            KernelArgsHelper next;
+            if (!resources_owned) {
+                EXPECT_EQ(poll_run_fence(prepared), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+                prepared.physical_complete = true;
+                prepared.kernel_args.release_run_view();
+                EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+                if (replacement == 3) EXPECT_EQ(release_slot_persistent_args(slot, mem_alloc_), 0);
+                if (replacement != 0) {
+                    next.set_entry_cache_epoch(epoch + 1000);
+                    EXPECT_EQ(next.prepare_runtime_args(runtime, mem_alloc_, slot), 0);
+                    if (replacement != 1) {
+                        EXPECT_EQ(next.publish_runtime_args(true, &streams[0], sink), 0);
+                    }
+                }
+            }
+            if (fail_sync) control().stream_sync_rc = -81;
+            if (poll_only) EXPECT_EQ(poll_run_fence(prepared), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+            else EXPECT_EQ(wait_run_fence(prepared), fail_sync ? -81 : 0);
+            control().stream_sync_rc = 0;
+            const bool eligible = slot.entry_cache_qualification.eligible();
+            retire_run_fence(prepared);
+            return eligible;
+        }
+    } runner;
+    EXPECT_EQ(
+        runner.run_case(101, true, true, false, 0),
+        PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && runtime_launch_entry_args_plan(Runtime{}).supported
+    );
+    EXPECT_FALSE(runner.run_case(102, true, true, true, 0));
+    EXPECT_EQ(
+        runner.run_case(103, true, false, false, 0),
+        PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && runtime_launch_entry_args_plan(Runtime{}).supported
+    );
+    EXPECT_EQ(
+        runner.run_case(104, false, true, false, 0),
+        PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && runtime_launch_entry_args_plan(Runtime{}).supported
+    );
+    EXPECT_FALSE(runner.run_case(105, true, true, true, 1));
+    EXPECT_FALSE(runner.run_case(106, true, true, false, 0, true));
+    EXPECT_EQ(
+        runner.run_case(107, true, true, false, 0, false, false),
+        PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && runtime_launch_entry_args_plan(Runtime{}).supported
+    );
+    EXPECT_FALSE(runner.run_case(108, true, true, false, 0, false, false, 1));
+    EXPECT_FALSE(runner.run_case(109, true, true, false, 0, false, false, 2));
+    EXPECT_FALSE(runner.run_case(110, true, true, false, 0, false, false, 3));
+}
+}  // namespace native_admission_test

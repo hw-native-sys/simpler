@@ -30,6 +30,12 @@
 #include <cstddef>
 #include <cstdint>
 
+enum class EntryCacheMaintenance : uint32_t { Full = 0, FullFreshen = 1, Live = 2 };
+
+inline constexpr bool valid_entry_cache_maintenance(uint32_t policy) {
+    return policy <= static_cast<uint32_t>(EntryCacheMaintenance::Live);
+}
+
 /** The carrier and format of this run's entry-argument values. */
 enum class EntryArgsSource : uint32_t {
     Descriptor = 0,        // inside the published Runtime descriptor

@@ -112,6 +112,8 @@ public:
         payload_bytes_ = static_cast<uint32_t>(payload_bytes);
     }
 
+    bool snapshot_is_ok() const { return selection_.verdict == DeviceRunVerdict::Ok; }
+
     bool publish(uint64_t region_base, uint64_t run_epoch) {
         const RunTerminalSelection selection = selection_;
         const uint32_t payload_bytes = payload_bytes_;

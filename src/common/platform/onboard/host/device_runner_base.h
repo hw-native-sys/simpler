@@ -1562,6 +1562,7 @@ public:
             dfx(DfxRunConfig::from(config_in)),
             scope_stats_capacity(runtime_in.scope_stats_capacity()),
             pipeline_slot(pipeline_slot_in) {
+            kernel_args.set_entry_cache_epoch(identity.run_epoch);
             // Device publication and host export share one resolved selection.
             runtime_in.dev.pmu_event_type = dfx.pmu_enabled ? static_cast<uint32_t>(dfx.pmu_event_type) : 0;
         }

@@ -28,6 +28,8 @@ constexpr unsigned char kDeviceMark = 0xa5;
 
 struct RtsState {
     int alloc_rc = 0;
+    int free_rc = 0;
+    int free_host_rc = 0;
     int copy_rc = 0;
     int copies = 0;
     LaunchProgressSink sink;
@@ -89,6 +91,7 @@ extern "C" rtError_t rtMalloc(void **ptr, uint64_t bytes, uint32_t, uint16_t) {
 }
 extern "C" rtError_t rtFree(void *ptr) {
     ++rts.frees;
+    if (rts.free_rc != 0) return rts.free_rc;
     std::free(ptr);
     return 0;
 }
@@ -97,6 +100,7 @@ extern "C" rtError_t rtMallocHost(void **ptr, uint64_t bytes, uint16_t) {
     return *ptr == nullptr ? -1 : 0;
 }
 extern "C" rtError_t rtFreeHost(void *ptr) {
+    if (rts.free_host_rc != 0) return rts.free_host_rc;
     std::free(ptr);
     return 0;
 }
@@ -207,4 +211,37 @@ TEST_F(WorkersPublication, PreparingWithoutPublishingCommitsNothing) {
     ASSERT_EQ(publish_once(), 0);
     EXPECT_EQ(rts.last_copy_bytes, initializing_bytes());
     EXPECT_TRUE(slot.workers_initialized);
+}
+
+TEST_F(WorkersPublication, FailedDeviceFreeRetainsTrimHistoryUntilAllocationEnds) {
+    ASSERT_EQ(publish_once(), 0);
+    slot.entry_cache_qualification.published(1);
+    slot.entry_cache_qualification.observe_success(1);
+    slot.entry_cmo_may_have_trimmed = true;
+    auto *allocation = slot.runtime_args;
+    rts.free_rc = -71;
+    EXPECT_EQ(release_slot_persistent_args(slot, allocator), -71);
+    EXPECT_EQ(slot.runtime_args, allocation);
+    EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+    EXPECT_TRUE(slot.entry_cmo_may_have_trimmed);
+    rts.free_rc = 0;
+    EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0);
+    EXPECT_FALSE(slot.entry_cmo_may_have_trimmed);
+}
+
+TEST_F(WorkersPublication, DeviceFreeClearsHistoryEvenWhenPinnedFreeFails) {
+    ASSERT_EQ(publish_once(), 0);
+    helper.release_run_view();
+    slot.entry_cache_qualification.published(1);
+    slot.entry_cache_qualification.observe_success(1);
+    slot.entry_cmo_may_have_trimmed = true;
+    rts.free_host_rc = -72;
+    EXPECT_EQ(release_slot_persistent_args(slot, allocator), -72);
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+    EXPECT_FALSE(slot.entry_cmo_may_have_trimmed);
+    rts.free_host_rc = 0;
+    ASSERT_EQ(publish_once(), 0);
+    EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+    EXPECT_FALSE(slot.entry_cmo_may_have_trimmed);
 }
