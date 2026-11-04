@@ -53,10 +53,13 @@ jobs:
               ;;
           esac
 
-      - name: Report A3 runner compiler flags
-        run: |
-          echo "Runner: $RUNNER_NAME on $(hostname)"
-          echo "Inherited CXXFLAGS=${CXXFLAGS-<unset>}"
+      - name: Restore scene-test kernel cache (a2a3)
+        uses: actions/cache@v5
+        with:
+          path: build/cache/kernels
+          key: scene-kernels-a2a3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}
+          restore-keys: |
+            scene-kernels-a2a3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-
 
       - name: Set up environment
         uses: ./.github/actions/setup-venv
