@@ -118,3 +118,14 @@ TEST(LaneMask, InvalidSlotsNeverAliasOrActivateAValidLane) {
         }
     }
 }
+
+TEST(LaneMask, DifferencePreservesOnlyUnreservedPhysicalLanes) {
+    for (unsigned left = 0; left < 8; ++left) {
+        for (unsigned right = 0; right < 8; ++right) {
+            LaneMask a{bool(left & 1), bool(left & 2), bool(left & 4)};
+            LaneMask b{bool(right & 1), bool(right & 2), bool(right & 4)};
+            const unsigned bits = left & ~right;
+            EXPECT_EQ(a.without(b), (LaneMask{bool(bits & 1), bool(bits & 2), bool(bits & 4)}));
+        }
+    }
+}
