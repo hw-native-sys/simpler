@@ -140,7 +140,10 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
         EXPECT_EQ(runner.arena_region_backing(2, 0), idle_heap);
         EXPECT_EQ(runner.arena_region_backing(2, 2), idle_image);
         if (rc == 0) EXPECT_EQ(simpler_finalize_run(&runner, warm_consumer.storage), 0);
-        control().ceiling = control().bytes;
+        // Scheduler storage is per pipeline slot and survives idle arena trim.
+        // Reserve one additional aligned backing while keeping arena growth capped.
+        const auto scheduler_bytes = runner.scheduler_capacity(2);
+        control().ceiling = control().bytes + (scheduler_bytes == 0 ? 0 : scheduler_bytes + 127);
     };
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);

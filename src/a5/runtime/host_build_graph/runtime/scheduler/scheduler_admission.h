@@ -95,7 +95,7 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
 }
 
 inline __aicore__ bool scheduler_admission_fail(
-    const SchedulerGraphView &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task_ref,
+    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task_ref,
     SchedulerErrorSite site, const SchedulerLocalSlotState *slot = nullptr
 ) {
     if (run != nullptr)
@@ -104,7 +104,7 @@ inline __aicore__ bool scheduler_admission_fail(
 }
 
 inline __aicore__ bool scheduler_admission_context_valid(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAdmissionLocalState *admission
 ) {
     if (base == nullptr || local == nullptr || run == nullptr || admission == nullptr || !admission->initialized ||
@@ -229,7 +229,7 @@ inline __aicore__ bool scheduler_admission_published_record_valid(
 // The caller uniquely owns the candidate through ready pop or direct resolve.
 // Only PROGRESS transfers it into pending; RETRY leaves that ownership with the caller.
 inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission, const SchedulerReadyClaim &candidate
 ) {
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
@@ -261,7 +261,7 @@ inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
 }
 
 inline __aicore__ bool scheduler_prepare_admission_record(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission
 ) {
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
@@ -290,6 +290,8 @@ inline __aicore__ bool scheduler_prepare_admission_record(
     uint32_t members = 0;
     if (!scheduler_admission_expected_members(base, local, admission, record, expected, &members))
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_TOPOLOGY);
+    // Child arguments were published before the bootstrap scan gate opened.
+    // Each member observes them on first adoption of this record.
     record->run_epoch = admission->epoch;
     record->member_count = members;
     for (uint64_t word = 0; word < admission->member_word_count; ++word)
@@ -302,7 +304,7 @@ inline __aicore__ bool scheduler_prepare_admission_record(
 }
 
 inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission
 ) {
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
@@ -362,7 +364,7 @@ inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission(
 }
 
 inline __aicore__ bool scheduler_refresh_local_obligation(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission
 ) {
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
@@ -416,6 +418,11 @@ inline __aicore__ bool scheduler_refresh_local_obligation(
                 return scheduler_admission_fail(
                     graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
                 );
+            const auto binding_error = scheduler_observe_graph_arguments(graph, task);
+            if (binding_error != SchedulerGraphBindingError::NONE)
+                return scheduler_admission_fail(
+                    graph, local, run, task, scheduler_graph_binding_error_site(binding_error)
+                );
             admission->current_task_ref = task;
             admission->current_block_num = record->logical_block_num;
             admission->current_active_mask = scheduler_lane_mask_load(record->active_mask);
@@ -433,7 +440,7 @@ inline __aicore__ bool scheduler_refresh_local_obligation(
 }
 
 inline __aicore__ bool scheduler_can_enter_ordinary(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission, bool *permit, uint64_t *observed_tail = nullptr
 ) {
     if (permit == nullptr)
@@ -495,7 +502,7 @@ enum class SchedulerBlockClaimResult : uint8_t { CLAIMED, EXHAUSTED, RETRY, ERRO
 enum class SchedulerBlockFinishResult : uint8_t { PARTIAL, TASK_LAST, ERROR };
 
 inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_cursor(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t *block_idx
 ) {
     auto *admission = local == nullptr ? nullptr : local->admission;
@@ -591,7 +598,7 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_cursor(
 }
 
 inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t slot_index
 ) {
     auto *admission = local == nullptr ? nullptr : local->admission;
@@ -616,7 +623,7 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block(
     slot.cooperative = true;
     slot.gm_mix = false;
     slot.candidate_index = UINT8_MAX;
-    slot.predicate_cached = false;
+    slot.predicate = SchedulerPredicateState::UNEVALUATED;
     slot.mix_tracker = UINT8_MAX;
     slot.subtask_slot = scheduler_metadata_single_subtask_slot(admission->current_active_mask);
     slot.state = SchedulerDispatchSlotState::FILLING;
@@ -624,7 +631,7 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block(
 }
 
 inline __aicore__ SchedulerBlockFinishResult scheduler_contribute_ordered_block(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerLocalSlotState *slot = nullptr
 ) {
     auto *admission = local == nullptr ? nullptr : local->admission;
@@ -654,7 +661,7 @@ inline __aicore__ SchedulerBlockFinishResult scheduler_contribute_ordered_block(
 // Generation consumption belongs to the completion caller. Its successful
 // generation check makes this contribution unique; an error terminates the run.
 inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_block(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t slot_index
 ) {
     auto *admission = local == nullptr ? nullptr : local->admission;
@@ -678,7 +685,7 @@ inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_block(
 }
 
 inline __aicore__ bool scheduler_close_ordered_obligation(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *closed
 ) {
     if (closed == nullptr) return false;
@@ -710,7 +717,7 @@ inline __aicore__ bool scheduler_close_ordered_obligation(
 }
 
 inline __aicore__ bool scheduler_ordered_park_ordinary(
-    const SchedulerGraphView &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     auto *admission = local->admission;
     for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
@@ -727,8 +734,8 @@ inline __aicore__ bool scheduler_ordered_park_ordinary(
             return scheduler_admission_fail(
                 graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
             );
-        candidate.predicate_cached = slot.predicate_cached;
-        candidate.predicate_pass = slot.predicate_pass;
+        candidate.args_observed = slot.args_observed;
+        candidate.predicate = slot.predicate;
         candidate.slot_index = UINT8_MAX;
         local->local_ready_mask &= static_cast<uint8_t>(~(1U << index));
         scheduler_initialize_free_slot(&slot);
@@ -738,7 +745,7 @@ inline __aicore__ bool scheduler_ordered_park_ordinary(
 }
 
 inline __aicore__ SchedulerAdmissionResult scheduler_ordered_publish_pending(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     auto *admission = local->admission;
     if (scheduler_task_ref_is_null(admission->pending_task_ref)) return SchedulerAdmissionResult::PROGRESS;
@@ -747,7 +754,7 @@ inline __aicore__ SchedulerAdmissionResult scheduler_ordered_publish_pending(
 }
 
 inline __aicore__ bool scheduler_ordered_can_enter_slot(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t slot_index, bool *permit
 ) {
     if (permit == nullptr) return false;

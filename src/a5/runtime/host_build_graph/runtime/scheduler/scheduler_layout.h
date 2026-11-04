@@ -36,6 +36,8 @@ struct AicoreSchedulerLayout {
     uint64_t aic_task_count;
     uint64_t aiv_task_count;
     uint64_t run_control_offset;
+    uint64_t native_readonly_end_offset;
+    uint64_t control_inboxes_offset;
     uint64_t aicpu_lifecycle_traces_offset;
     uint64_t worker_contexts_offset;
     uint64_t dispatch_payloads_offset;

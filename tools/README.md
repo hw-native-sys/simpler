@@ -32,6 +32,13 @@ the workloads shared by both runtimes plus its matching Qwen case:
 `StressBatch16Seq3500` for TMR and `GraphExecutionBatch16Seq3500` for HBG. SPMD
 paged attention is not part of the benchmark sweep.
 
+## benchmarks/a5_hbg_graph_task/
+
+The A5 HBG collector and its three input manifests cover 19 no-Graph cases:
+seven fixed benchmarks, eleven selected scene tests, and CSA. Qwen is measured
+separately. Raw results and experiment artifacts belong under `outputs/` and
+are not committed. See the [validation and collection guide](../tests/docs/a5-hbg-graph-task/README.zh-CN.md).
+
 ## verify_packaging.sh
 
 Exercises all 5 install paths × 2 entry points from a fully clean state.

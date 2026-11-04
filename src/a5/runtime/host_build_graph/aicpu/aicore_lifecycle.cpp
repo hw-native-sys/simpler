@@ -499,6 +499,7 @@ bool AicoreLifecycle::collect_run_pmu_records(Runtime *runtime, uint64_t *missin
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(state_base, context->task_metadata_offset);
     auto *cells = scheduler_state_at<SchedulerTaskPmuCell>(state_base, pmu_cells_offset);
 
+    const auto graph = aicore_scheduler_graph_view(*context);
     uint64_t missing = 0;
     for (uint64_t task_id = 0; task_id < task_count; ++task_id) {
         if (!scheduler_task_is_executable(metadata[task_id].flags)) continue;
@@ -513,12 +514,13 @@ bool AicoreLifecycle::collect_run_pmu_records(Runtime *runtime, uint64_t *missin
                     ++missing;
                     continue;
                 }
+                const auto identity = aicore_scheduler_public_identity(graph, task_id);
+                if (!identity.is_valid()) {
+                    ++missing;
+                    continue;
+                }
                 pmu_aicpu_record_staged_task(
-                    static_cast<int>(cell.worker_id), kDiagnosticDumpLane,
-                    reinterpret_cast<TaskDescriptor *>(
-                        context->graph_storage_address + task_id * SCHEDULER_GRAPH_TASK_STORAGE_STRIDE
-                    )
-                        ->task_id,
+                    static_cast<int>(cell.worker_id), kDiagnosticDumpLane, identity,
                     static_cast<uint32_t>(metadata[task_id].kernel_ids[subtask]), subtask_core_type(subtask),
                     cell.total_cycles, cell.counters
                 );

@@ -195,7 +195,8 @@ class CCECToolchain(Toolchain):
         # BiSheng VF fusion scale/correctness; BiSheng plans to make this always-on
         # later, so pin it for A5 CCEC builds now.
         if self.platform == "a5":
-            flags.extend(["-mllvm", "-cce-vf-aa-between-iters=true"])
+            # The A5 text-only loader cannot retain CANN's switch jump tables in .rodata.
+            flags.extend(["-fno-jump-tables", "-mllvm", "-cce-vf-aa-between-iters=true"])
         return flags
 
     def get_cmake_args(self) -> list[str]:

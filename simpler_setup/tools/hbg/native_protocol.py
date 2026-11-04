@@ -128,7 +128,9 @@ def _indices(rows, count, path, *, key="index", dense=False):
 
 def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
-    _object(section, ROOT_NUMBERS | ROOT_TABLES | {"schema", "producer", "first_error"}, "root")
+    native = isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v6"
+    extra = {"node_map", "graph_source"} if native else set()
+    _object(section, ROOT_NUMBERS | ROOT_TABLES | {"schema", "producer", "first_error"} | extra, "root")
     if (
         section["schema"]
         not in (
@@ -137,6 +139,7 @@ def read_native_protocol(section):
             "hbg-native-protocol-v3",
             "hbg-native-protocol-v4",
             "hbg-native-protocol-v5",
+            "hbg-native-protocol-v6",
         )
         or section["producer"] != "aicore"
     ):
@@ -158,7 +161,7 @@ def read_native_protocol(section):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
             extra = ("claim_tickets",) if kind == "control" and section["schema"] != "hbg-native-protocol-v1" else ()
-            if kind == "control" and section["schema"] == "hbg-native-protocol-v5":
+            if kind == "control" and section["schema"] in ("hbg-native-protocol-v5", "hbg-native-protocol-v6"):
                 extra += ("admission_claim_lock",)
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
@@ -174,6 +177,10 @@ def read_native_protocol(section):
         for row in section[table]:
             _record(row, kind, f"{table}[{row['index']}]")
     _read_nested_events(section)
+    if native:
+        from .native_graph import read_graph_source  # noqa: PLC0415
+
+        read_graph_source(section)
     return section
 
 
