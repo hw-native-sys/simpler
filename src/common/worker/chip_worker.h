@@ -340,6 +340,29 @@ public:
     /// How many scheduler selections this worker's binds have published.
     size_t scheduler_mode_publish_count() const;
 
+    /// Calls whose completion this worker has recorded and whose result has not
+    /// been delivered yet, and the largest such backlog it has sampled.
+    ///
+    /// Each one owns a native carrier and, for Program, its staging, so the
+    /// worker's host footprint scales with this number rather than with the
+    /// pipeline depth. The depth bounds concurrent execution only; a retired
+    /// call leaves it, which is what lets a slot refill before its predecessor
+    /// is waited on. Nothing caps this backlog: it is the count of results a
+    /// caller is still entitled to, and the caller's handles are what hold it.
+    /// A call a finalization already owns is included — that finalization has
+    /// not returned the carrier yet.
+    ///
+    /// **Recorded, not probed.** A call whose device work has finished stays
+    /// uncounted until a poll or wait records it, because establishing that
+    /// on demand would mean a device call from a diagnostic read. So this is a
+    /// lower bound on what the device has actually finished.
+    ///
+    /// The high-water mark is sampled wherever the backlog is counted — every
+    /// preparation and every read of either accessor — so a backlog that grows
+    /// and drains entirely between two samples is not recorded.
+    size_t unobserved_completed_run_count() const noexcept;
+    size_t unobserved_completed_run_high_water() const noexcept;
+
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
@@ -892,6 +915,12 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<NativeRunEntry>> native_runs_;
     mutable std::mutex native_run_mu_;
     bool native_runs_closing_{false};
+    /**
+     * Retired-but-unobserved entries, and the largest count sampled so far.
+     * Counting walks the run table, so it requires `native_run_mu_` held.
+     */
+    size_t count_unobserved_completed_locked() const noexcept;
+    mutable size_t unobserved_completed_high_water_{0};
     void validate_execution_process() const;
     /** Signalled whenever an operation lease is released or a run entry is removed. */
     std::condition_variable native_run_ops_done_;

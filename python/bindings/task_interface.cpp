@@ -4065,6 +4065,27 @@ NB_MODULE(_task_interface, m) {
             "still holds an earlier run's value', which the mode alone cannot."
         )
         .def_prop_ro(
+            "unobserved_completed_run_count", &ChipWorker::unobserved_completed_run_count,
+            "Calls whose completion this worker has recorded and whose result "
+            "has not been delivered yet, including one a finalization already "
+            "owns. Each holds a native carrier and, for Program, its staging, "
+            "so host footprint tracks this number rather than the pipeline "
+            "depth -- the depth bounds concurrent execution only. Nothing caps "
+            "it: these are results a caller is still entitled to, held by its "
+            "own handles, so a rising value means handles are being kept rather "
+            "than that anything leaked. Recorded, not probed: a call whose "
+            "device work has finished stays uncounted until a poll or wait "
+            "records it, so this is a lower bound on what the device finished."
+        )
+        .def_prop_ro(
+            "unobserved_completed_run_high_water", &ChipWorker::unobserved_completed_run_high_water,
+            "Largest unobserved_completed_run_count this worker has sampled. "
+            "Sampled at every preparation and at every read of either property, "
+            "so a backlog that grows and drains entirely between two samples is "
+            "not recorded. Monotonic, which is what makes it usable as a test "
+            "discriminator where the instantaneous count races the drain."
+        )
+        .def_prop_ro(
             "committed_device_memory", &ChipWorker::committed_device_memory,
             "Total device HBM (bytes) currently committed by this worker's "
             "MemoryAllocator (user tensors + pooled arenas + runtime buffers). "

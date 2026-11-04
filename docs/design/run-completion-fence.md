@@ -52,6 +52,20 @@ attribution remain owned until explicit wait/finalize or owner close.
 it does not observe SDK success or deliver Program outputs. A later explicit
 wait can still observe subsequent work queued on the same streams.
 
+The pipeline depth therefore bounds concurrent *execution*, not the worker's
+host footprint: a retired call leaves the depth while keeping its carrier and
+staging, so the retained set grows with the number of results a caller has not
+taken. That is not a leak — each one is a result its handle still entitles the
+caller to — and it is deliberately uncapped, because capping it would reinstate
+the wait-before-refill coupling this separation exists to remove. Program
+staging pressure reclaims through the typed resource-wait path, which delivers
+an older completed call to free its backing; a caller-owned-IO workload reaches
+no such pressure, so `ChipWorker.unobserved_completed_run_count` and its
+`..._high_water` peak are what make the retained set visible before it becomes
+a footprint surprise. Both count what this worker has *recorded* as complete —
+a call whose device work has finished stays uncounted until a poll or wait
+records it — so they are a lower bound, not a device measurement.
+
 Hierarchical L3 endpoints publish physical completion separately from semantic
 terminal results. Each member's physical END returns its endpoint lane credit;
 whole-run admission returns only after submission is closed and every task/group

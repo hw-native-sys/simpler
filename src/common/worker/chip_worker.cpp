@@ -1208,6 +1208,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 "native-run pipeline lease generation is stale " + format_native_run_identity(run_identity)
             );
         }
+        (void)count_unobserved_completed_locked();
         try {
             auto entry = std::make_unique<NativeRunEntry>();
             entry->storage =
@@ -2129,6 +2130,30 @@ size_t ChipWorker::unproven_native_run_count() const noexcept {
     // communication-resource release, even when no teardown sweep has run.
     std::lock_guard<std::mutex> lk(native_run_mu_);
     return native_runs_.size();
+}
+
+size_t ChipWorker::count_unobserved_completed_locked() const noexcept {
+    // Every entry whose completion is recorded and whose teardown is not in
+    // doubt, including one a finalization already owns: that finalization has
+    // not returned the carrier yet, so the footprint is still this run's.
+    size_t backlog = 0;
+    for (const auto &item : native_runs_) {
+        const NativeRunEntry &entry = *item.second;
+        if (entry.phase == NativeRunPhase::REAPED && !entry.destruction_unknown) ++backlog;
+    }
+    if (backlog > unobserved_completed_high_water_) unobserved_completed_high_water_ = backlog;
+    return backlog;
+}
+
+size_t ChipWorker::unobserved_completed_run_count() const noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    return count_unobserved_completed_locked();
+}
+
+size_t ChipWorker::unobserved_completed_run_high_water() const noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    (void)count_unobserved_completed_locked();
+    return unobserved_completed_high_water_;
 }
 
 void ChipWorker::unregister_callable(int32_t callable_id) {
