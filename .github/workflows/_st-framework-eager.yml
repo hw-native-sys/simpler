@@ -47,7 +47,7 @@ jobs:
           echo "Runner: $RUNNER_NAME on $(hostname)"
           echo "Before CANN: CXXFLAGS=${CXXFLAGS-<unset>}"
           echo "Before CANN: CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS-<unset>}"
-          cann_env="$(python3 -c 'from simpler_setup.test_environments import select_toolchain; print(select_toolchain("torch_npu"))' | tail -n 1)"
+          cann_env="$(python3 simpler_setup/test_environments.py select torch_npu | awk '/^TEST_ENVIRONMENT_TOOLCHAIN_SELECTED / {print $2}')"
           source "$cann_env"
           echo "After CANN: CXXFLAGS=${CXXFLAGS-<unset>}"
           echo "After CANN: CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS-<unset>}"
@@ -69,6 +69,10 @@ jobs:
             echo "Without compiler flags: cross-compiler probe passed"
           else
             echo "Without compiler flags: cross-compiler probe failed"
+          fi
+          if [[ "${CXXFLAGS-}" == *-Wno-error=class-memaccess* ]]; then
+            echo "CXXFLAGS=${CXXFLAGS//-Wno-error=class-memaccess/}" >> "$GITHUB_ENV"
+            echo "Removed incompatible cross-compiler flag for following steps"
           fi
 
       - name: Set up framework environment
