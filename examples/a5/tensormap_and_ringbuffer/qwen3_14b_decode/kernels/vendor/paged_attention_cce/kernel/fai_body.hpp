@@ -220,6 +220,15 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
         reinterpret_cast<__gm__ Tensor *>(args[2])->shapes[0]);
     uint32_t rope_lane = block_idx * 2 + sub_block_idx;
     if (rope_lane < kQwenRopeCores) {
+      // The preceding RMS task rewrites these 16 values in shared scratch.
+      // RoPE reads them through Scalar; its read phase has no concurrent writer.
+      uint64_t inv_rms = reinterpret_cast<uint64_t>(tensor_data<float>(args, 14));
+      uint64_t first_line = inv_rms & ~(static_cast<uint64_t>(qwen_fai_metadata::kDcciLineBytes) - 1);
+      for (uint64_t line = first_line; line < inv_rms + 16 * sizeof(float);
+           line += qwen_fai_metadata::kDcciLineBytes) {
+        dcci(reinterpret_cast<__gm__ void *>(line), SINGLE_CACHE_LINE);
+      }
+      dsb(DSB_DDR);
       qwen_rope_gen::rope_qkv(
           reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 2)),
           reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 1)),
