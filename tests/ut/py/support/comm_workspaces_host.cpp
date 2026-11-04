@@ -206,23 +206,43 @@ int main() {
     assert(mkdtemp(folder));
     auto *h = new CommHandle_{};
     h->rank = 0;
-    h->nranks = 1;
+    h->nranks = 2;
     h->rootinfo_path = std::string(folder) + "/root";
     h->hccl_comm = reinterpret_cast<HcclComm>(1);
     setenv("PTO_ROCE_PHYIDS", "0", 1);
     setenv("PTO_ROCE_LOCAL_IP", "127.0.0.1", 1);
     uint64_t next_id = 1;
-    const uint32_t ranks[] = {0};
+    const uint32_t ranks[] = {0, 1};
     auto allocate = [&](uint32_t mask, uint64_t &id, uint64_t &ctx) {
         id = next_id++;
+        const size_t count = (mask & 2) ? 2 : 1;
+        if (count == 2) {
+            assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, 42));
+            for (const char *phase : {"p2p_ready", "release"}) {
+                std::ofstream marker(
+                    barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1)
+                );
+                marker << "1";
+                assert(marker.good());
+            }
+        }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, 1, 0, 4096, mask, &ctx, &base, &size);
+        return comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size);
     };
     auto release = [&](uint64_t id) {
-        assert(comm_release_domain_windows(h, id, 1, 0) == 0);
+        const auto count = h->domain_allocations.at(id)->nranks;
+        assert(comm_release_domain_windows(h, id, count, 0) == 0);
     };
     uint64_t first = 0, first_ctx = 0;
+    uint64_t base = 0;
+    size_t size = 0;
+    const uint32_t sparse_ranks[] = {0, 2};
+    assert(
+        comm_alloc_domain_windows(h, next_id++, sparse_ranks, 2, 0, 4096, 2, &first_ctx, &base, &size) ==
+        COMM_DOMAIN_URMA_CONFIG_INVALID
+    );
+    assert(mappings.empty() && started[1] == 0);
     assert(allocate(0, first, first_ctx) == 0);
     assert(started[0] == 0 && started[1] == 0 && started[2] == 0);
     release(first);
@@ -250,6 +270,16 @@ int main() {
     setenv("PTO_ROCE_PHYIDS", "0", 1);
     setenv("PTO_ROCE_LOCAL_IP", "127.0.0.1", 1);
 
+    // A single-rank request reaches the provider; its failure is not a domain-policy rejection.
+    fail_engine = 1;
+    assert(
+        comm_alloc_domain_windows(h, next_id++, ranks, 1, 0, 4096, 2, &first_ctx, &base, &size) ==
+        COMM_DOMAIN_URMA_INIT_FAILED
+    );
+    assert(started[1] == 1 && live[1] == 0 && h->domain_allocations.empty());
+    assert(mappings.empty() && physical_handles == 0);
+    fail_engine = -1;
+
     if ((compiled_comm_workspaces() & 2) != 0) {
         uint64_t second = 0, second_ctx = 0;
         assert(allocate(3, first, first_ctx) == 0);
@@ -263,17 +293,24 @@ int main() {
         assert(live[1] == 1 && live[0] == 1);
         const auto held_mappings = mappings.size();
         const int held_physical = physical_handles;
-        for (int failure : {0, 1, 2}) {
+        for (int failure : {0, 1, 2, 3, 4}) {
+            invalid_addr_engine = failure == 3 ? 1 : -1;
+            invalid_size_engine = failure == 4 ? 1 : -1;
             fail_engine = failure == 0 ? 1 : -1;
             throw_engine = failure == 1 ? 1 : -1;
             fail_context_upload = failure == 2;
             uint64_t rejected = 0, rejected_ctx = 0;
-            assert(allocate(3, rejected, rejected_ctx) != 0);
+            const int rc = allocate(3, rejected, rejected_ctx);
+            assert(
+                rc == (failure == 2 ? -1 :
+                       failure >= 3 ? COMM_DOMAIN_URMA_WORKSPACE_INVALID :
+                                      COMM_DOMAIN_URMA_INIT_FAILED)
+            );
             assert(h->domain_allocations.count(rejected) == 0);
             assert(mappings.size() == held_mappings && physical_handles == held_physical);
             assert(live[1] == 1 && live[0] == 1);
         }
-        fail_engine = throw_engine = -1;
+        fail_engine = throw_engine = invalid_addr_engine = invalid_size_engine = -1;
         fail_context_upload = false;
         release(second);
     }
@@ -326,6 +363,13 @@ int main() {
     if ((compiled_comm_workspaces() & 4) != 0) {
         uint64_t held = 0, held_ctx = 0;
         assert(allocate(4, held, held_ctx) == 0);
+    }
+    for (const char *tag : {"destroy", "destroy_departed"}) {
+        assert(
+            file_marker_handshake::publish_marker(
+                file_marker_handshake::marker_path(h->rootinfo_path, h->run_token, tag, 1)
+            )
+        );
     }
     assert(comm_destroy(h) == 0);
     assert(live[0] == 0 && live[1] == 0 && live[2] == 0);

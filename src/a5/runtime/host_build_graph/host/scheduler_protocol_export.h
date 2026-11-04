@@ -28,6 +28,10 @@
 struct SchedulerProtocolTaskSpec {
     SchedulerTaskMetadata metadata;
     std::vector<int32_t> dependencies;
+    SchedulerNodeKind kind{SchedulerNodeKind::TOP_KERNEL};
+    uint64_t public_task_id{0};
+    uint32_t original_task_id{0};
+    uint32_t local_child_id{UINT32_MAX};
 };
 
 inline std::vector<SchedulerProtocolTaskSpec>
@@ -36,18 +40,39 @@ scheduler_protocol_freeze_graph(const SchedulerGraphView &graph, const std::vect
     std::vector<SchedulerProtocolTaskSpec> result;
     result.reserve(metadata.size());
     for (size_t task = 0; task < metadata.size(); ++task) {
+        SchedulerNodeKind kind{};
+        if (scheduler_node_kind(graph, task, &kind) != SchedulerGraphResult::OK)
+            throw std::invalid_argument("invalid protocol node kind");
         SchedulerTaskShape shape{};
         const auto status = scheduler_classify_task_shape(graph, static_cast<int64_t>(task), &shape);
-        if (status != SchedulerGraphResult::OK &&
+        if (!scheduler_node_is_control(kind) && status != SchedulerGraphResult::OK &&
             !(status == SchedulerGraphResult::UNSUPPORTED_SHAPE &&
               (metadata[task].active_mask.is_empty() || scheduler_task_is_inline(metadata[task].flags))))
             throw std::invalid_argument("invalid frozen protocol graph");
-        const auto *payload = scheduler_graph_payload(graph, static_cast<int64_t>(task));
-        const auto count = *reinterpret_cast<const int32_t *>(payload + SCHEDULER_GRAPH_FANIN_COUNT_OFFSET);
+        uint32_t count = 0;
+        if (scheduler_node_fanin_count(graph, static_cast<int64_t>(task), &count) != SchedulerGraphResult::OK)
+            throw std::invalid_argument("invalid frozen protocol fanin row");
         SchedulerProtocolTaskSpec spec{metadata[task], {}};
+        spec.kind = kind;
+        if (scheduler_node_identity(graph, task, &spec.public_task_id) != SchedulerGraphResult::OK)
+            throw std::invalid_argument("invalid protocol public identity");
+        spec.original_task_id = static_cast<uint32_t>(task);
+        if (graph.native_header_offset != 0) {
+            SchedulerNativeNode node{};
+            if (!scheduler_native_node_checked(graph, task, &node))
+                throw std::invalid_argument("invalid protocol native node");
+            spec.original_task_id = node.instance ? node.instance->original_shell_id : node.binding->source_index;
+            if (kind == SchedulerNodeKind::CHILD_KERNEL || (kind == SchedulerNodeKind::CONTROL_DUMMY && node.instance))
+                spec.local_child_id = node.binding->source_index;
+        }
         spec.dependencies.reserve(static_cast<size_t>(count));
-        for (int32_t index = 0; index < count; ++index)
-            spec.dependencies.push_back(scheduler_graph_fanin_id(graph, static_cast<int64_t>(task), index));
+        for (uint32_t index = 0; index < count; ++index) {
+            int64_t producer = -1;
+            if (scheduler_node_fanin_ref(graph, static_cast<int64_t>(task), index, &producer) !=
+                SchedulerGraphResult::OK)
+                throw std::invalid_argument("invalid frozen protocol dependency");
+            spec.dependencies.push_back(static_cast<int32_t>(producer));
+        }
         result.push_back(std::move(spec));
     }
     return result;
@@ -313,7 +338,7 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
 
 inline std::string scheduler_export_protocol(
     const void *base, size_t size, const AicoreSchedulerLayout &layout, uint64_t epoch,
-    const std::vector<SchedulerProtocolTaskSpec> &tasks
+    const std::vector<SchedulerProtocolTaskSpec> &tasks, const std::string &graph_source = {}
 ) {
     using namespace scheduler_protocol_export;
     if (size != layout.total_size || tasks.size() != layout.task_count || layout.protocol_layout_offset == 0)
@@ -324,8 +349,22 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        // v5 records transient claim ownership separately from the published phase.
-        root.string("schema", "hbg-native-protocol-v5");
+        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v5" : "hbg-native-protocol-v6");
+        if (!graph_source.empty()) {
+            root.field("graph_source") << graph_source;
+            root.field("node_map") << '[';
+            for (size_t index = 0; index < tasks.size(); ++index) {
+                if (index != 0) out << ',';
+                JsonObject row(out);
+                const auto &task = tasks[index];
+                row.number("node_ref", index);
+                row.number("kind", static_cast<uint32_t>(task.kind));
+                row.number("public_task_id", task.public_task_id);
+                row.number("original_task_id", task.original_task_id);
+                row.number("local_child_id", task.local_child_id);
+            }
+            out << ']';
+        }
         root.string("producer", "aicore");
         root.number("run_epoch", epoch);
         root.number("task_count", plan.task_count);

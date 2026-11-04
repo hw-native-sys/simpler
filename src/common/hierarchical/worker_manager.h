@@ -81,6 +81,7 @@ enum class MailboxState : int32_t {
     TASK_FAILED = 10,
     ACTIVATE = 11,
     PREPARE_READY = 12,
+    TASK_ENDED = 13,
 };
 
 enum class MailboxPreparationDisposition : int32_t {
@@ -168,12 +169,14 @@ struct MailboxRunEntry {
     uint64_t group_size;
     /* Child, before the terminal state. NUL-terminated, truncated to fit. */
     char error_text[MAILBOX_ERROR_MSG_SIZE];
-    /* Run-resource sets the child reports it can hold, published with this
-       run's terminal state and read by the parent only after observing it. A
-       count of identities, never a byte figure, and zero means "no report" —
-       a child that does not size itself leaves it alone. Appended last so no
-       existing field's offset moves. */
+    /* Run-resource sets the child reports it can hold. Published atomically
+       before physical END and semantic terminal; END leaves the entry owned
+       by the child, so the parent reads an atomic snapshot. A count of
+       identities, never bytes; zero means "no report". */
     uint32_t admissible_run_resource_sets;
+    /* Parent, identity-checked while occupied; child acquire-loads in its
+       existing mailbox loop. A level request, not an activation or verdict. */
+    int32_t observation_requested;
 };
 static_assert(
     std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,
@@ -499,6 +502,7 @@ enum class WorkerProgressKind : int32_t {
     FRAME_STAGED = 0,
     ACCEPTED = 1,
     COMPLETED = 2,
+    ENDED = 3,
 };
 
 struct WorkerEndpointProgress {
@@ -559,6 +563,10 @@ public:
     virtual bool poll_progress(WorkerEndpointProgress &progress);
     virtual bool activate_progress(RunId run_id);
     virtual void request_progress_stop() noexcept;
+    virtual void request_observation(RunId) {}
+    virtual void progress_observations() {}
+    void set_observation_demand(std::function<bool(RunId)> query) { observation_demand_ = std::move(query); }
+    void set_activation_permission(std::function<bool(RunId)> query) { activation_permission_ = std::move(query); }
     // Called when the owning progress driver catches an endpoint exception.
     // Implementations must turn already-published work into terminal progress
     // only after their child/device resources are quiescent.
@@ -622,6 +630,11 @@ public:
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
+
+protected:
+    // Immutable host callbacks; neither is called under endpoint/admission locks.
+    std::function<bool(RunId)> observation_demand_;
+    std::function<bool(RunId)> activation_permission_;
 };
 
 class LocalMailboxEndpoint : public WorkerEndpoint {
@@ -646,6 +659,8 @@ public:
     bool poll_progress(WorkerEndpointProgress &progress) override;
     bool activate_progress(RunId run_id) override;
     void request_progress_stop() noexcept override;
+    void request_observation(RunId run_id) override;
+    void progress_observations() override;
     void report_progress_error(const std::string &reason) override;
     bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) override;
 
@@ -744,6 +759,7 @@ private:
         bool occupied{false};
         bool staged_reported{false};
         bool accepted_reported{false};
+        bool ended_reported{false};
         bool activation_requested{false};
         bool activation_published{false};
         // The disposition this run was last reported with. A staged run may be
@@ -884,6 +900,17 @@ public:
     bool can_dispatch() const;
     bool can_stage() const;
     bool busy() const { return inflight_.load(std::memory_order_acquire) != 0; }
+    void set_on_ended(std::function<void(WorkerCompletion)> callback) { on_ended_ = std::move(callback); }
+    // A non-allocating, non-throwing query of persistent run demand. Called
+    // after publication and outside admission_mu_, never on a timer.
+    void set_observation_demand(std::function<bool(RunId)> query) {
+        observation_demand_ = query;
+        endpoint_->set_observation_demand(std::move(query));
+    }
+    void set_activation_permission(std::function<bool(RunId)> query) {
+        endpoint_->set_activation_permission(std::move(query));
+    }
+    void request_observation(RunId run_id) { endpoint_->request_observation(run_id); }
     const WorkerEndpointCaps &caps() const;
     int32_t worker_id() const;
 
@@ -985,6 +1012,9 @@ private:
     struct LaneState {
         bool occupied{false};
         bool activation_requested{false};
+        // The endpoint owns the sticky intent, including publication delayed
+        // until staging. Promotion preserves this fact with the dispatch.
+        bool activation_handed_off{false};
         RunId run_id{INVALID_RUN_ID};
         uint64_t dispatch_id{0};
         // What the child reported it did with the staged frame. Staging admits
@@ -1003,8 +1033,13 @@ private:
     // A run's dispatch was staged at its child. Non-throwing by contract, like
     // the two above: it runs on the progress driver.
     std::function<void(WorkerDispatch)> on_staged_;
+    // Nonterminal payload: task/group and measured endpoint capacity only.
+    std::function<void(WorkerCompletion)> on_ended_;
+    std::function<bool(RunId)> observation_demand_;
+    std::vector<uint64_t> execution_ended_dispatch_ids_;
     std::atomic<bool> shutdown_{false};
     std::atomic<uint32_t> inflight_{0};
+    std::atomic<uint32_t> execution_inflight_{0};
     uint64_t next_dispatch_id_{1};
     // Linearizes stop with endpoint publication and prepared activation.
     std::mutex admission_mu_;
@@ -1097,11 +1132,17 @@ public:
     // `on_staged` is optional: it announces that a child holds a prepared
     // frame, which only a caller that can launch a staged run early has any use
     // for. Non-throwing on the same terms as the other two.
-    void
-    start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged = {});
+    // `on_ended` carries task/group and measured endpoint capacity without
+    // transferring the entry or delivering the semantic result.
+    void start(
+        Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged = {},
+        const OnCompleteFn &on_ended = {}, const std::function<bool(RunId)> &observation_demand = {},
+        const std::function<bool(RunId)> &activation_permission = {}
+    );
     void stop_workers();
     void stop();
     void progress();
+    void request_observation(RunId run_id);
 
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
     std::vector<int32_t> next_level_worker_ids() const;

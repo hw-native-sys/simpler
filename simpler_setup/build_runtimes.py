@@ -23,8 +23,10 @@ import argparse
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import cache
 from pathlib import Path
 from typing import Optional
 
@@ -65,12 +67,56 @@ def _profiling_config(values: dict[str, Optional[int]]) -> Optional[dict[str, st
     return {name: str(value) for name, value in config.items()}
 
 
+@cache
+def a5_urma_toolchain_available(ascend_home: str) -> bool:
+    """Check SDK declarations required by the pinned, unconditional A5 URMA provider."""
+    compiler = shutil.which("g++")
+    if not compiler or not ascend_home:
+        return False
+    source = """
+#include <hccl/hccl_res.h>
+void probe() {
+    HcclChannelConfig config{};
+    (void)config;
+    (void)HCCL_CHANNEL_CONFIG_SHARED_QUEUE_TAG_MAX_LEN;
+    (void)HCCL_CHANNEL_CONFIG_TYPE_IS_SHARED_QUEUE;
+    (void)HCCL_CHANNEL_CONFIG_TYPE_SHARED_QUEUE_TAG;
+    (void)&HcclChannelConfigCreate;
+    (void)&HcclChannelConfigSetInt;
+    (void)&HcclChannelConfigSetStr;
+    (void)&HcclChannelAcquireWithConfig;
+    (void)&HcclChannelConfigDestroy;
+}
+"""
+    try:
+        result = subprocess.run(
+            [
+                compiler,
+                "-std=c++17",
+                "-fsyntax-only",
+                "-x",
+                "c++",
+                "-",
+                f"-I{ascend_home}/include",
+                f"-I{ascend_home}/pkg_inc/base",
+            ],
+            input=source,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def detect_buildable_platforms() -> list:
     """Detect which platforms can be built with available toolchains.
 
     Returns:
         List of platform strings, e.g. ["a2a3sim", "a5sim"] when only gcc is available,
-        or all four when the onboard cross-compiler is also present.
+        or onboard variants whose compiler and SDK prerequisites are available.
     """
     platforms = []
 
@@ -79,8 +125,6 @@ def detect_buildable_platforms() -> list:
         platforms.extend(["a2a3sim", "a5sim"])
 
     # Onboard platforms: need ccec + cross-compiler from ASCEND_HOME_PATH.
-    # a2a3 and a5 share toolchain prerequisites but build separate artifacts
-    # with architecture-specific AICore targets (dav-c220 and dav-c310).
     has_ccec = shutil.which("ccec") is not None
 
     ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
@@ -129,6 +173,14 @@ def build_all(
     if platforms is None:
         platforms = detect_buildable_platforms()
 
+    if "a5" in platforms and not a5_urma_toolchain_available(os.environ.get("ASCEND_HOME_PATH", "")):
+        raise RuntimeError(
+            "A5 onboard build requires CANN HCCL channel-config APIs "
+            "(including HcclChannelAcquireWithConfig) for the URMA provider. "
+            "Set ASCEND_HOME_PATH to a compatible SDK and rebuild. "
+            "To build only A2/A3 or simulation, explicitly select those build targets."
+        )
+
     if not platforms:
         logger.warning("No buildable platforms detected (missing gcc/g++?)")
         return
@@ -137,12 +189,8 @@ def build_all(
     pto_isa_root_for_metadata: Optional[str] = None
     pto_isa_runtime_keys: list[str] = []
 
-    # Onboard hosts that embed pto-isa headers (a2a3 always; a5 when an async
-    # workspace overlay is opted in) hard-depend on the pinned managed
-    # checkout + CANN aclnn syms. Resolve once for metadata recording;
-    # RuntimeBuilder passes the path to CMake as -DPTO_ISA_ROOT= (#1403) —
-    # do not export it via os.environ. Skipped when no embedding platform is
-    # being built (sim-only, or a5 with overlays OFF). See issue #1351.
+    # Onboard hosts embed the pinned ISA headers. Resolve once for metadata;
+    # RuntimeBuilder passes the path to CMake as -DPTO_ISA_ROOT=.
     if any(platform_embeds_pto_isa(p) for p in platforms):
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 

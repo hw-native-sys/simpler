@@ -16,6 +16,7 @@
 
 #include "hbg_scheduler_test_support.h"
 #include "scheduler_protocol_export.h"
+#include "scheduler_protocol_graph_source.h"
 
 namespace {
 
@@ -60,6 +61,47 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     EXPECT_NE(json.find("\"executions\":[]"), std::string::npos);
     EXPECT_NE(json.find("\"admission_log\":[-1]"), std::string::npos);
     EXPECT_EQ(json.find("protocol_verified"), std::string::npos);
+}
+
+TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSource) {
+    tasks[0].kind = SchedulerNodeKind::CHILD_KERNEL;
+    tasks[0].original_task_id = 7;
+    tasks[0].local_child_id = 3;
+    tasks[0].public_task_id = TaskId::to_uint64(TaskId::make_sub_task(7, 3));
+    const auto json = scheduler_export_protocol(
+        storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
+    );
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v6\""), std::string::npos);
+    EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
+    EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
+}
+
+TEST(ProtocolGraphSourceTest, CopiesOriginalCsrAndDeduplicatesDefinitionsByKey) {
+    scheduler_test::BasicGraphBuffer<2> original(2);
+    original.payload(1).fanin_count = 1;
+    original.payload(1).fanin_data()[0] = 0;
+    GraphDefinition def{};
+    def.graph_key = 31;
+    def.task_count = 2;
+    def.edge_count = 1;
+    def.off_sub_tasks = sizeof(def);
+    def.off_fanin_offsets = def.off_sub_tasks + 2 * sizeof(SubTaskDefinition);
+    def.off_fanin_indices = def.off_fanin_offsets + 3 * sizeof(int32_t);
+    def.total_bytes = def.off_fanin_indices + sizeof(uint16_t);
+    std::vector<std::byte> bytes(def.total_bytes);
+    std::memcpy(bytes.data(), &def, sizeof(def));
+    const int32_t rows[]{0, 0, 1};
+    std::memcpy(bytes.data() + def.off_fanin_offsets, rows, sizeof(rows));
+    const auto json = scheduler_protocol_freeze_source(original.graph(), {{1, 0}, {1, 0}}, bytes);
+    EXPECT_NE(json.find("\"dependencies\":[0]"), std::string::npos);
+    const auto definitions = json.find("\"definitions\":[{\"graph_key\":31");
+    ASSERT_NE(definitions, std::string::npos);
+    const auto first_key = json.find("\"graph_key\":31", definitions);
+    ASSERT_NE(first_key, std::string::npos);
+    EXPECT_EQ(json.find("\"graph_key\":31", first_key + 1), std::string::npos);
+    EXPECT_EQ(json.find("\"node_map\""), std::string::npos);
+    bytes.resize(sizeof(GraphDefinition) - 1);
+    EXPECT_THROW(scheduler_protocol_freeze_source(original.graph(), {{1, 0}, {1, 0}}, bytes), std::invalid_argument);
 }
 
 TEST_F(ProtocolExportFixture, ZeroCycleAndMaximumEpochRemainLiteralValues) {

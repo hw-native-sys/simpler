@@ -34,7 +34,7 @@ on:
       runs_on:
         description: "JSON-encoded runs-on value for the detector job."
         required: false
-        default: '["ubuntu-latest"]'
+        default: '["ubuntu-24.04"]'
         type: string
     outputs:
       a2a3_changed:

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -28,9 +29,10 @@
 #include <vector>
 
 #include "host/chip_swimlane_runs.h"
+#include "common/strace.h"
 
 struct ChipRunState {
-    enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, TERMINAL };
+    enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, ENDED, TERMINAL };
 
     int32_t callable_id{0};
     ChipStorageTaskArgs args{};
@@ -93,6 +95,10 @@ struct ChipRunState {
     // runtime's to make. Incomplete span coverage can also leave a partial borrow that still
     // needs releasing. Cleared when the release discharges both.
     bool caller_references_live{false};
+    // An observer error can quarantine caller last use even when finalization
+    // destroys its carrier; physical END can precede carrier cleanup instead.
+    bool caller_last_use_proven{false};
+    bool native_context_destroyed{false};
     std::exception_ptr error;
     std::exception_ptr poison_error;
 };
@@ -381,26 +387,69 @@ struct ChipRunLaneState {
      * identity and its lifetime — and it runs for every admitted run, not only one that borrowed,
      * since incomplete coverage can leave partial borrows as well as declarations.
      *
-     * `proven_done` means successful finalize or a clean preparation rollback. Finalize
-     * drains device work, copies outputs back and releases bindings; rollback releases
-     * bindings without submitting an operator kernel. Either outcome is what
-     * establishes that nothing on the device can still reach these bytes or still be writing
-     * them. Failure establishes the opposite, and both facts are kept: the caller's release stays
-     * refused rather than handing back pages the device may name, and the bytes this run declared
-     * stay unreadable rather than being served mid-write.
+     * `proven_done` means physical last-use proof or a clean no-submission rollback.
+     * Physical retirement can establish that proof before explicit observation or finalize.
+     * Without it, the caller's release stays refused and the bytes this run declared stay
+     * unreadable. A later semantic or finalize error does not by itself establish that device
+     * readers are still live or revoke an existing last-use proof.
      */
     void release_device_spans(const std::shared_ptr<ChipRunState> &run, bool proven_done) noexcept {
+        if (proven_done) run->caller_last_use_proven = true;
         if (!run->caller_references_live) return;
         worker->release_caller_device_borrow(borrow_identity(*run), !proven_done);
+        try {
+            if (SIMPLER_HOST_STRACE && unified_log_host_span_enabled()) {
+                char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
+                const int size = std::snprintf(
+                    attrs, sizeof(attrs),
+                    "ctx=%p borrow=%llu ep=%llu gen=%llu disp=%llu slot=%u run=%llu proof=%d keep=%d",
+                    worker->device_ctx_, static_cast<unsigned long long>(borrow_identity(*run)),
+                    static_cast<unsigned long long>(run->native_run.run_epoch),
+                    static_cast<unsigned long long>(run->lease.generation),
+                    static_cast<unsigned long long>(run->dispatch_id), run->lease.slot_id,
+                    static_cast<unsigned long long>(run->run_id), proven_done ? 1 : 0, proven_done ? 0 : 1
+                );
+                if (size < 0 || static_cast<size_t>(size) >= sizeof(attrs)) {
+                    STRACE_HOST_SPAN_AT_A("chip.run.borrow_release.invalid", STRACE_NOW_NS(), 0, 1, "truncated=1");
+                } else {
+                    STRACE_HOST_SPAN_AT_A("chip.run.borrow_release", STRACE_NOW_NS(), 0, 1, attrs);
+                }
+            }
+        } catch (...) {}
         run->caller_references_live = false;
         run->device_spans_borrowed = false;
     }
 
+    void retire_execution(const std::shared_ptr<ChipRunState> &run) {
+        // The execution queue ends here. The live handle still owns semantic
+        // observation and Program IO; neither is a prerequisite of a successor.
+        completed.push_back(run);
+        release_device_spans(run, true);
+        run->phase = ChipRunState::Phase::ENDED;
+        const auto it = std::find(fifo.begin(), fifo.end(), run);
+        if (it != fifo.end()) fifo.erase(it);
+    }
+
+    void wait_for_execution(const std::shared_ptr<ChipRunState> &run) {
+        worker->wait_native_run_completion(run->native_run);
+        retire_execution(run);
+    }
+
     void finish(const std::shared_ptr<ChipRunState> &run, std::exception_ptr joined_failure = {}) noexcept {
+        // A later successful cleanup cannot establish a healthy result after
+        // this lane already observed failure. Withhold Program HOST delivery
+        // before finalization, while preserving its mandatory cleanup and this run's own error;
+        // previously confirmed terminal results no longer enter this path.
+        const std::exception_ptr prior_poison = poison;
+        if (prior_poison != nullptr && run->poison_error == nullptr) run->poison_error = prior_poison;
         bool finalized = true;
         bool no_submission_released = false;
         try {
-            worker->finalize_native_run_impl(run->native_run, &no_submission_released);
+            worker->finalize_native_run_impl(
+                run->native_run, &no_submission_released,
+                run->error == nullptr && prior_poison == nullptr && joined_failure == nullptr,
+                &run->native_context_destroyed
+            );
         } catch (...) {
             finalized = no_submission_released;
             const std::exception_ptr finalize_error = std::current_exception();
@@ -408,6 +457,7 @@ struct ChipRunLaneState {
             if (!finalized) poison_with(run, joined_failure != nullptr ? joined_failure : finalize_error);
         }
         if (joined_failure != nullptr && !no_submission_released) poison_with(run, joined_failure);
+        if (prior_poison != nullptr && run->error == nullptr) run->error = prior_poison;
         if (no_submission_released && run->error != nullptr) {
             // A proven-unsubmitted run carries its original error through the
             // clean refusal classification after its inputs are released.
@@ -422,8 +472,8 @@ struct ChipRunLaneState {
             } catch (...) {}
         }
         // After the finalize, never before: that call drains the device work,
-        // copies this run's outputs back and releases its bindings, so it is
-        // the point at which the last consumer of a borrowed address is done.
+        // delivers or withholds this run's outputs and releases its bindings,
+        // ending the last consumer of a borrowed address.
         release_device_spans(run, finalized);
         run->phase = ChipRunState::Phase::TERMINAL;
         // By identity rather than from the front. Ordinarily the front is what
@@ -433,6 +483,8 @@ struct ChipRunLaneState {
         // whose front is supposed to be the oldest live run.
         auto it = std::find(fifo.begin(), fifo.end(), run);
         if (it != fifo.end()) fifo.erase(it);
+        const auto observed = std::find(completed.begin(), completed.end(), run);
+        if (observed != completed.end()) completed.erase(observed);
     }
 
     void fail_prepare(const std::shared_ptr<ChipRunState> &run) noexcept {
@@ -811,12 +863,13 @@ struct ChipRunLaneState {
     }
 
     bool progress(const std::shared_ptr<ChipRunState> &target) {
-        if (target->phase == ChipRunState::Phase::TERMINAL) return true;
+        if (target->phase == ChipRunState::Phase::TERMINAL || target->phase == ChipRunState::Phase::ENDED) return true;
         worker->validate_execution_context();
         if (fifo.empty()) throw std::runtime_error("chip run lane lost a nonterminal run");
         if (fifo.front() != target) {
             (void)progress(fifo.front());
-            if (target->phase == ChipRunState::Phase::TERMINAL) return true;
+            if (target->phase == ChipRunState::Phase::TERMINAL || target->phase == ChipRunState::Phase::ENDED)
+                return true;
             if (fifo.empty() || fifo.front() != target) return false;
         }
 
@@ -850,7 +903,7 @@ struct ChipRunLaneState {
             launch_ready_prefix();
             return true;
         }
-        finish(target);
+        retire_execution(target);
         launch_ready_prefix();
         return true;
     }
@@ -901,12 +954,18 @@ struct ChipRunLaneState {
         }
         if (run->phase == ChipRunState::Phase::LAUNCHED) {
             try {
-                worker->wait_native_run(run->native_run);
+                wait_for_execution(run);
             } catch (...) {
                 run->error = std::current_exception();
                 poison_with(run, run->error);
+                finish(run);
             }
-            finish(run);
+            return DrainOutcome::Progressed;
+        }
+        if (run->resource_wait && !completed.empty()) {
+            // Actual workspace pressure may require delivery of an old call's
+            // retained host outputs. Poll/progress never takes this path.
+            finish(completed.front());
             return DrainOutcome::Progressed;
         }
         // Activated, prepared, and still not launched: the launch above
@@ -1011,15 +1070,19 @@ struct ChipRunLaneState {
     bool block_on_front() noexcept {
         if (fifo.empty()) return false;
         const auto front = fifo.front();
+        if (front->resource_wait && !completed.empty()) {
+            finish(completed.front());
+            return true;
+        }
         if (front->phase != ChipRunState::Phase::LAUNCHED) return false;
         try {
-            worker->wait_native_run(front->native_run);
+            wait_for_execution(front);
         } catch (...) {
             const std::exception_ptr wait_error = std::current_exception();
             if (front->error == nullptr) front->error = wait_error;
             poison_with(front, front->error);
+            finish(front);
         }
-        finish(front);
         launch_ready_prefix();
         return true;
     }
@@ -1029,6 +1092,7 @@ struct ChipRunLaneState {
     ChipWorker *worker;
     mutable std::mutex mu;
     std::deque<std::shared_ptr<ChipRunState>> fifo;
+    std::vector<std::shared_ptr<ChipRunState>> completed;
     std::vector<uint64_t> generations;
     uint64_t direct_generation{0};
     std::exception_ptr poison;
@@ -1060,6 +1124,12 @@ bool ChipRun::wait_until(Deadline deadline) {
         {
             std::unique_lock<std::mutex> lk(lane_->mu);
             if (lane_->progress(run_)) {
+                if (run_->phase == ChipRunState::Phase::ENDED) {
+                    // Observation still uses the original execution context. A refusal
+                    // leaves the completed run intact for a later waiter.
+                    lane_->worker->validate_execution_context();
+                    lane_->finish(run_);
+                }
                 lane_->rethrow_run_error(run_);
                 return true;
             }
@@ -1127,7 +1197,7 @@ void ChipRun::abandon() {
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     if (run_->phase == ChipRunState::Phase::TERMINAL) return;
-    if (run_->phase == ChipRunState::Phase::LAUNCHED) {
+    if (run_->phase == ChipRunState::Phase::LAUNCHED || run_->phase == ChipRunState::Phase::ENDED) {
         throw std::runtime_error("cannot abandon a launched ChipRun");
     }
     lane_->worker->validate_execution_context();
@@ -1159,11 +1229,25 @@ bool ChipRun::launched() const {
     return run_->crossed_launch_fence;
 }
 
+bool ChipRun::execution_ended() const {
+    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    return run_->phase == ChipRunState::Phase::ENDED;
+}
+
 bool ChipRun::lane_poisoned() const {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     return lane_->poison != nullptr;
+}
+
+bool ChipRun::owner_recovery_required() const {
+    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    return !run_->native_context_destroyed || !run_->caller_last_use_proven;
 }
 
 ChipRunPreparationDisposition ChipRun::preparation_disposition() const {
@@ -1381,6 +1465,8 @@ void ChipRunLane::drain() {
             }
         }
     }
+    while (!state_->completed.empty())
+        state_->finish(state_->completed.front());
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }
 
@@ -1429,6 +1515,8 @@ void ChipRunLane::close() {
             state_->expire_credit_deadline(front);
         }
     }
+    while (!state_->completed.empty())
+        state_->finish(state_->completed.front());
     state_->closed = true;
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }
@@ -1438,11 +1526,15 @@ void ChipRunLane::detach_after_failed_teardown(std::exception_ptr error) noexcep
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->closed = true;
     state_->poison = error;
-    for (const auto &run : state_->fifo) {
-        run->error = error;
-        run->poison_error = error;
-        run->phase = ChipRunState::Phase::TERMINAL;
-    }
+    auto terminalize = [&](const auto &runs) {
+        for (const auto &run : runs) {
+            if (run->error == nullptr) run->error = error;
+            if (run->poison_error == nullptr) run->poison_error = error;
+            run->phase = ChipRunState::Phase::TERMINAL;
+        }
+    };
+    terminalize(state_->fifo);
+    terminalize(state_->completed);
     state_->worker = nullptr;
 }
 

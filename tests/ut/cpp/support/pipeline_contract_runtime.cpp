@@ -104,7 +104,12 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PT
 
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
 
+int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
+
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
+int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int) {
+    return simpler_finalize_run(ctx, runtime);
+}
 
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
 

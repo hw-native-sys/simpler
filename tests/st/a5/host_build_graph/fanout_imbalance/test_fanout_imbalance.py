@@ -9,12 +9,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """One root fanning out to many independent consumers — a deliberately unbalanced graph.
 
-Every consumer becomes ready in the same instant, inside the wake-list walk of
-whichever Scheduler observed the root's completion, and that Scheduler publishes
-all of them to the inbox it owns. A Scheduler steals only within its own
-directory shard (`SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD`), so the work is
-reachable by a fraction of the cores rather than all of them. Each consumer
-burns `repeats` iterations so the backlog outlives the moment it is created.
+Every consumer becomes ready inside one root-completion wake-list walk. The
+ready pool must make that work globally reachable by eligible cores, regardless
+of which Scheduler publishes it. Each consumer burns `repeats` iterations so
+the backlog outlives the moment it is created.
 
 This differs from `single_core_dag::mixed_fanout_63`, which is the same graph
 shape, in the two things that make the imbalance observable: scale (up to 1024
@@ -69,12 +67,6 @@ REPEATS = 2048
 # oversubscribe every core several times on any supported topology, which is
 # all the distribution claim needs.
 SPREAD_COUNT = 256
-
-# Floor for the distinct-core count, set from the measurement recorded at the
-# assertion itself. Deliberately below the measured count so ordinary
-# scheduling jitter does not fail the run, and far enough above one cluster's
-# three cores to fail a collapse into the publishing cluster.
-SPREAD_MIN_CORES = 12
 
 # Level 3 is SCHED_PHASES: the level that carries the per-Scheduler records the
 # spread assertion reads.
@@ -170,12 +162,7 @@ def _build_callable(platform: str) -> ChipCallable:
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 def test_fanout_spread_is_wide(st_platform, st_device_ids, tmp_path):
-    """A wide fanout reaches many cores, and some of them steal to get there.
-
-    The thresholds come from the topology the run reports, not from constants: a
-    box with a different core count would otherwise either pass trivially or
-    fail for no reason.
-    """
+    """A wide fanout reaches at least half of the participating cores."""
     count = SPREAD_COUNT
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     buffer = None
@@ -206,42 +193,7 @@ def test_fanout_spread_is_wide(st_platform, st_device_ids, tmp_path):
         records_path = _find_swimlane_records(output_prefix)
         raw = json.loads(records_path.read_text())
 
-        aicore_rows = raw["aicore_tasks"]
-        assert aicore_rows, f"no AICore task records in {records_path}"
-        assert len(aicore_rows) == count, f"expected {count} task records, got {len(aicore_rows)}"
-
-        cores = {int(row[0]) for row in aicore_rows}
-        metadata = raw["metadata"]
-        active = int(metadata["num_cores"])
-        assert active > 0, f"swimlane metadata reports no cores: {metadata}"
-
-        # A fanout cannot leave the directory shards its successors were
-        # published into. A publisher routes by core type to a peer in its own
-        # cluster, so nothing crosses a cluster except by stealing, and a thief
-        # scans only its own shard of SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD
-        # owners. The reachable set is therefore a whole number of shards, and
-        # the two measurements taken on one 96-core box say so directly: 21
-        # cores before per-core scheduling (one AIC shard plus two AIV shards),
-        # 14 after (one of each). Addressing an inbox by type rank is what
-        # merged the two AIV shards into one — a cluster's two AIV lanes take
-        # adjacent ranks, where their worker ids had straddled a shard boundary.
-        #
-        # The floor is a regression guard on those measurements, not a target:
-        # per-core scheduling changes which core schedules, not how far work can
-        # travel, so widening the spread means changing the push target or the
-        # steal range. What the floor must keep catching is a collapse into the
-        # publishing cluster, which would show up as three cores or fewer.
-        assert len(cores) >= SPREAD_MIN_CORES, (
-            f"fanout reached only {len(cores)} of {active} cores (floor {SPREAD_MIN_CORES}): {sorted(cores)}"
-        )
-
-        streams = raw["scheduler_records"]["streams"]
-        assert streams, f"no Scheduler records in {records_path}"
-        kinds = {record["kind"] for stream in streams for record in stream["records"]}
-        assert "worksteal" in kinds, (
-            "no worksteal record: the fanout stayed inside the inbox that published it, "
-            f"so no core outside that shard took any of it. kinds={sorted(kinds)}"
-        )
+        _assert_fanout_spread(raw, count)
     finally:
         # A poisoned run still owns its device memory, so free() would raise and
         # bury whatever actually failed. Closing the worker releases it.
@@ -251,6 +203,25 @@ def test_fanout_spread_is_wide(st_platform, st_device_ids, tmp_path):
             except RuntimeError:
                 pass
         worker.close()
+
+
+def _assert_fanout_spread(raw: dict, count: int) -> None:
+    rows = raw["aicore_tasks"]
+    assert len(rows) == count, f"expected {count} task records, got {len(rows)}"
+    active = int(raw["metadata"]["num_cores"])
+    assert active > 0, f"swimlane metadata reports no cores: {raw['metadata']}"
+    cores = {int(row[0]) for row in rows}
+    # The graph oversubscribes every supported topology. This floor detects
+    # concentration in a publishing cluster or directory shard without requiring
+    # a particular queue topology or a worksteal event for global claims.
+    minimum = min(count, (active + 1) // 2)
+    assert len(cores) >= minimum, (
+        f"fanout reached only {len(cores)} of {active} cores (floor {minimum}): {sorted(cores)}"
+    )
+    streams = raw["scheduler_records"]["streams"]
+    assert streams, "no Scheduler records"
+    kinds = {record["kind"] for stream in streams for record in stream["records"]}
+    assert {"dispatch", "complete"} <= kinds, f"missing dispatch/completion records: {sorted(kinds)}"
 
 
 def _find_swimlane_records(output_prefix: Path) -> Path:

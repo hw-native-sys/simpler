@@ -77,6 +77,10 @@ struct StartupFixture {
             context.graph_storage_address = graph_view.storage_address;
             context.graph_reserved_address = 0;
             context.graph_task_count = graph_view.task_count;
+            context.original_task_count = graph_view.original_task_count;
+            context.graph_view_version = graph_view.view_version;
+            context.graph_view_bytes = graph_view.view_bytes;
+            context.scheduler_state_bytes = storage.layout.total_size;
             context.task_window_last_index = graph_view.task_window_last_index;
             context.scheduler_state_base_address = reinterpret_cast<uint64_t>(base());
             context.run_control_offset = storage.layout.run_control_offset;
@@ -189,8 +193,8 @@ struct StartupFixture {
         write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
         write_reg(RegId::COND, 0);
         if (storage.layout.protocol_layout_offset != 0)
-            run_resident_scheduler<true>(&storage.contexts[worker], storage.run_control, base(), 4, 0, 0);
-        else run_resident_scheduler<false>(&storage.contexts[worker], storage.run_control, base(), 0, 0, 0);
+            run_resident_scheduler<true, false>(&storage.contexts[worker], storage.run_control, base(), 4, 0, 0);
+        else run_resident_scheduler<false, false>(&storage.contexts[worker], storage.run_control, base(), 0, 0, 0);
     }
 
     scheduler_test::FixtureStorage storage;
@@ -200,6 +204,24 @@ struct StartupFixture {
 };
 
 class HbgGmMixStartupExit : public ::testing::TestWithParam<std::array<LaneMask, 2>> {};
+
+TEST(HbgGmMixStartupExit, RejectsMalformedPublishedGraphBeforeBootstrap) {
+    for (uint32_t field = 0; field < 3; ++field) {
+        SCOPED_TRACE(field);
+        StartupFixture fixture({LaneMask::both_aiv(), LaneMask::both_aiv()});
+        auto &context = fixture.storage.contexts[3];
+        if (field == 0) context.graph_view_version = 0;
+        else if (field == 1) context.graph_view_bytes = 32;
+        else context.original_task_count = 0;
+        fixture.run_late_worker();
+        EXPECT_EQ(startup_kernel_calls, 0u);
+        EXPECT_EQ(startup_ssbuf_calls, 0u);
+        EXPECT_EQ(fixture.storage.run_control->bootstrap_scan_arrived_count, 5u);
+        EXPECT_EQ(
+            fixture.storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+        );
+    }
+}
 
 TEST_P(HbgGmMixStartupExit, LateZeroWorkCoordinatorClosesEveryAdmittedMixBeforeExitAck) {
     StartupFixture fixture(GetParam());
@@ -363,7 +385,12 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
         scheduler_state_at<DispatchPayload>(base, local->dispatch_payload_offset(local->config.self_lane, 0));
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     SchedulerWorkerStats stats{};
-    ASSERT_TRUE(run_ready_dispatch_loop(graph.graph(), base, local, run, &stats, level));
+    if (level == 0) {
+        local->profiling = nullptr;
+        ASSERT_TRUE((run_ready_dispatch_loop<false, false>(graph.graph(), base, local, run, &stats, level)));
+    } else {
+        ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, level)));
+    }
     ASSERT_EQ(startup_kernel_calls, 1u);
     ASSERT_EQ(identity_test_payload->local_context.block_idx, 77);
     uint64_t refilled = 0;
@@ -454,7 +481,7 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     startup_kernel_calls = 0;
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     SchedulerWorkerStats stats{};
-    ASSERT_TRUE(run_ready_dispatch_loop(graph.graph(), base, local, run, &stats, 4));
+    ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, 4)));
     ASSERT_EQ(startup_kernel_calls, 2u);
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), base, local, run, nullptr, nullptr, nullptr, 4, nullptr, nullptr

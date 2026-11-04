@@ -116,7 +116,7 @@ def _run(worker, handle, block_num, gate_value):
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.parametrize("gate_value", [1, 0])
+@pytest.mark.parametrize("gate_value", [pytest.param(1, marks=pytest.mark.manual(["a5sim"])), 0])
 def test_predicate_on_a_multi_block_task_is_refused(st_platform, st_device_ids, gate_value, capfd, drain_host_log):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     try:

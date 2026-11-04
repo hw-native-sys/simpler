@@ -36,6 +36,7 @@ _CASES = [
         "runtime_publication_launch",
         "run_execution_streams",
         "run_caller_launch",
+        "run_observer",
         "bootstrap_error",
         "runtime_timeout_configuration",
     ],
@@ -64,13 +65,18 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
             command.append(arg)
     cann = Path(os.environ["ASCEND_HOME_PATH"])
     binary = tmp_path / probe
-    if probe == "run_caller_launch" and arch == "a5":
+    if probe in ("run_caller_launch", "run_observer") and arch == "a5":
         # Compile the real backend so this executable's strong scheduler-export
         # observer replaces its private weak leaf. The drain decision stays real.
         command.append(entry["file"])
+    if probe in ("run_caller_launch", "run_observer"):
+        command += [
+            str(_ROOT / "src/common/log/host_log.cpp"),
+            str(_ROOT / "src/common/log/unified_log_host.cpp"),
+        ]
     command += [
         "-UNDEBUG",
-        str(_ROOT / f"tests/ut/py/support/{probe}_probe.cpp"),
+        str(_ROOT / f"tests/ut/py/support/{'run_caller_launch' if probe == 'run_observer' else probe}_probe.cpp"),
         # The probe reaches its test fixture by path from the unit-test root, the
         # same way the C++ targets do, so a fixture that moves stays reachable
         # from both without this line changing.
@@ -90,6 +96,35 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
     ]
     build = subprocess.run(command, cwd=entry["directory"], capture_output=True, text=True, timeout=120, check=False)
     assert build.returncode == 0, build.stdout + build.stderr
+    if probe == "run_observer":
+        modes = (0, 1, 2, 3) if (arch, runtime) == ("a5", "host_build_graph") else (0,)
+        for mode in modes:
+            for scenario in (
+                "success-record-error",
+                "failed-record-success",
+                "missing-record-success",
+                "stale-record-success",
+                "malformed-record-success",
+                "copy-error-success",
+                "error-record-error",
+                "copy-error-error",
+                "core-error",
+                "program-output",
+                "output-copy-error",
+                "kernel-no-copy",
+                "unknown-stop",
+                "late-stream-error",
+            ) + (("clock-export",) if runtime == "host_build_graph" else ()):
+                observed = subprocess.run(
+                    [str(binary), "--observer", scenario, str(mode)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                assert observed.returncode == 0, observed.stdout + observed.stderr
+                assert "PASS:" in observed.stdout
+        return
     run_args = [str(binary)]
     result = subprocess.run(run_args, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stdout + result.stderr

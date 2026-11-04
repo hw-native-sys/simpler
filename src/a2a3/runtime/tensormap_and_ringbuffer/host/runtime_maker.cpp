@@ -1057,7 +1057,7 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
  * @return 0 on success, -1 on failure
  */
 extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
-    if (runtime == nullptr) {
+    if (runtime == nullptr && execution_rc == 0) {
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1071,8 +1071,8 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    const TensorLease *tensor_leases = runtime->tensor_leases_.data();
-    int tensor_lease_count = static_cast<int>(runtime->tensor_leases_.size());
+    const TensorLease *tensor_leases = runtime != nullptr ? runtime->tensor_leases_.data() : nullptr;
+    int tensor_lease_count = runtime != nullptr ? static_cast<int>(runtime->tensor_leases_.size()) : 0;
 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
@@ -1166,10 +1166,6 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     }
 
     LOG_INFO("=== Result Copy-Back Complete ===");
-
-    if (rc == 0 && runtime_status != 0) {
-        rc = runtime_status;
-    }
 
     return rc;
 }

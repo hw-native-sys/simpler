@@ -556,7 +556,7 @@ extern "C" int comm_alloc_domain_windows(
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
     size_t *actual_window_size_out
 ) try {
-    if (workspace_mask != 0) return -1;
+    if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr ||
         actual_window_size_out == nullptr)
         return -1;

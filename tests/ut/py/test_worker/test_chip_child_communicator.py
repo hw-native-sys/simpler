@@ -10,6 +10,8 @@
 
 import ctypes
 import struct
+import threading
+import time
 from contextlib import ExitStack
 from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import MagicMock, call
@@ -24,6 +26,8 @@ from simpler.comm_provider import (
     RegionEnvironmentKind,
 )
 
+pytestmark = pytest.mark.timeout(20)
+
 
 @pytest.fixture(autouse=True, params=[1, 16384], ids=["exact-size", "page-rounded"])
 def shared_memory_granularity(monkeypatch, request):
@@ -37,13 +41,14 @@ def shared_memory_granularity(monkeypatch, request):
     monkeypatch.setattr(f"{__name__}.SharedMemory", allocate)
 
 
-def _run_controls(monkeypatch, init_results, commands, *, workspace_mask=0):
+def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0):
     cw = MagicMock(
         spec_set=(
             "comm_init",
             "comm_alloc_domain_windows",
             "comm_release_domain_windows",
             "set_exported_device_regions_live",
+            "_close_chip_run_lane",
         )
     )
     cw.comm_init.side_effect = init_results
@@ -79,32 +84,61 @@ def _run_controls(monkeypatch, init_results, commands, *, workspace_mask=0):
         with memoryview(bytearray(worker_mod.mailbox_size(1))) as mailbox:
             address = ctypes.addressof(ctypes.c_char.from_buffer(mailbox))
 
-            def serve(_buf, _state_addr, *, handle_control, **_kwargs):
-                for command in commands:
-                    request = init_request if command == worker_mod._CTRL_COMM_INIT else domain_request
-                    for offset, name in (
-                        (worker_mod._OFF_ARGS, request.name),
-                        (worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES, reply.name),
-                    ):
-                        mailbox[offset : offset + worker_mod._CTRL_SHM_NAME_BYTES] = name.encode().ljust(
-                            worker_mod._CTRL_SHM_NAME_BYTES, b"\0"
-                        )
-                    responses.append(handle_control(command))
+            errors = []
+            stopped = threading.Event()
+            state_addr = address + worker_mod._OFF_STATE
 
-            monkeypatch.setattr(worker_mod, "_run_mailbox_loop", serve)
-            worker_mod._run_chip_main_loop(
-                cw,
-                mailbox,
-                address,
-                address + worker_mod._OFF_STATE,
-                0,
-                {},
-                {},
-                {},
-                owner,
-                chip_platform="a2a3sim",
-                provider_region_store=store,
-            )
+            def submit_controls():
+                try:
+                    for command in commands:
+                        request = init_request if command == worker_mod._CTRL_COMM_INIT else domain_request
+                        for offset, name in (
+                            (worker_mod._OFF_ARGS, request.name),
+                            (worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES, reply.name),
+                        ):
+                            mailbox[offset : offset + worker_mod._CTRL_SHM_NAME_BYTES] = name.encode().ljust(
+                                worker_mod._CTRL_SHM_NAME_BYTES, b"\0"
+                            )
+                        struct.pack_into("Q", mailbox, worker_mod._OFF_CALLABLE, command)
+                        worker_mod._mailbox_store_i32(state_addr, worker_mod._CONTROL_REQUEST)
+                        deadline = time.monotonic() + 5.0
+                        while worker_mod._mailbox_load_i32(state_addr) != worker_mod._CONTROL_DONE:
+                            assert time.monotonic() < deadline, "communicator control was not acknowledged"
+                            assert worker_mod._mailbox_load_i32(state_addr) != worker_mod._SHUTDOWN
+                            assert not stopped.wait(0.001), "communicator control loop stopped before acknowledgment"
+                        code = struct.unpack_from("i", mailbox, worker_mod._OFF_ERROR)[0]
+                        responses.append((code, worker_mod._read_error_msg(mailbox)))
+                        worker_mod._mailbox_store_i32(state_addr, worker_mod._IDLE)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    worker_mod._request_child_shutdown(mailbox)
+
+            producer = threading.Thread(target=submit_controls)
+            producer.start()
+            try:
+                worker_mod._run_chip_main_loop(
+                    cw,
+                    mailbox,
+                    address,
+                    state_addr,
+                    0,
+                    {},
+                    {},
+                    {},
+                    owner,
+                    chip_platform="a2a3sim",
+                    provider_region_store=store,
+                )
+            finally:
+                worker_mod._request_child_shutdown(mailbox)
+                stopped.set()
+                producer.join(timeout=6.0)
+                assert not producer.is_alive(), "communicator control producer outlived its mailbox"
+            if errors:
+                raise errors[0]
+            assert len(responses) == len(commands)
+            cw._close_chip_run_lane.assert_called_once_with()
         reply_buf = reply.buf
         assert reply_buf is not None
         published = worker_mod._DOMAIN_REPLY_HEADER.unpack_from(reply_buf, 0)

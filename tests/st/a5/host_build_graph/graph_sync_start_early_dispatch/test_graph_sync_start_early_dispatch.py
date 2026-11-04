@@ -61,7 +61,7 @@ TMR_TWIN = "../../tensormap_and_ringbuffer"
 GRAPH_TWIN = "../graph_execution"
 
 
-@pytest.mark.scheduler_mode("legacy")
+@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphSyncStartEarlyDispatchHbg(SceneTestCase):
     RTOL = 0

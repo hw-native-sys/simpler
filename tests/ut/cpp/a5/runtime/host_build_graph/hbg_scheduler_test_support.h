@@ -100,12 +100,9 @@ public:
     ChipTaskStorage *storage() { return storage_; }
 
     SchedulerGraphView graph() const {
-        return {
-            reinterpret_cast<uint64_t>(storage_),
-            0,
-            task_count_,
-            capacity_ - 1,
-        };
+        return scheduler_ordinary_graph_view(
+            reinterpret_cast<uint64_t>(storage_), static_cast<uint32_t>(task_count_), capacity_ - 1
+        );
     }
 
 private:
@@ -170,6 +167,10 @@ struct FixtureStorage {
             context.dispatch_payload_offset =
                 layout.dispatch_payloads_offset + worker * SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
             context.graph_task_count = task_count;
+            context.original_task_count = task_count;
+            context.graph_view_version = SCHEDULER_GRAPH_VIEW_VERSION;
+            context.graph_view_bytes = sizeof(SchedulerGraphView);
+            context.scheduler_state_bytes = layout.total_size;
             context.runtime_worker_count = workers;
             context.worker_index = worker;
             context.scheduler_index = worker;

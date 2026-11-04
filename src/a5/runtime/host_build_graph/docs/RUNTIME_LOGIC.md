@@ -20,6 +20,15 @@ The device has no orchestration thread. The resident scheduler uses one AIV
 Scheduler per discovered cluster; AICPU initializes, monitors, and tears down the
 workers. The explicit legacy path uses AICPU scheduling.
 
+Supported Graph tasks use the resident scheduler. The host builds a separate
+native scheduler image containing ENTER, child, and EXIT nodes, shared immutable
+Definition plans, and per-instance argument storage. The public task image keeps
+its original task IDs and layout. AICore control queues release roots at ENTER
+and complete EXIT only after all sinks finish; control nodes consume no execution
+slots. Unsupported capabilities select legacy before publication. The native
+image and binding contracts are specified in
+[the Graph task design](../../../../../docs/zh-cn/design/a5-hbg-graph-task.md).
+
 This ordering is the defining constraint of the runtime. The host constructs the
 whole graph before any device task can complete.
 
@@ -446,15 +455,49 @@ separate participation policy to bootstrap, dispatch and shutdown. All discovere
 lanes therefore participate, and bootstrap partitions the task scan across their
 Schedulers. This scan parallelism is not an isolated performance measurement.
 
+Kernel Ready work uses a type-separated shared ticket pool. The host appends
+its immutable header and descriptors to the run allocation and sizes each queue
+from actual executable metadata. A zero group width gives one queue for each of
+AIC, AIV and MIX; widths four and eight group consumers while allowing every
+eligible worker to claim from every group. Entries are immutable until the run
+fence, with separate atomic-only head/tail lines and bypass-published entry
+regions. Native control nodes retain their separate control inboxes. The detailed
+trade-offs and candidate-validation status are recorded in the
+[queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-task/ready-queue-design.md).
+
+The linked global candidate uses one persistent node per task and one sentinel
+per type. The version-3 pool header selects ticket, linked or chunk storage without a
+runtime environment switch. A linked batch becomes shared at its link CAS;
+tail is a helpable hint and does not restrict consumption. Its independent
+atomic-only links remain valid until the run fence, including after execution.
+Each scheduler owns three 24-byte pending publication descriptors. Bounded
+publication retries retain their private chains and can merge newly resolved
+work. Bootstrap preserves them into the dispatch loop, which services them
+after completion/control resolution and before starting another kernel. Pending
+work does not suspend admission, error or exit polling. A run error preserves
+unpublished backing until the existing exit fence; queue emptiness is never a
+run-completion criterion.
+
+The chunk candidate seals up to eight task refs into an immutable payload,
+using the first task ref as a unique descriptor ID. Each 256-byte descriptor
+separates its atomic cursor from bypass-published payload. At most N descriptors
+are needed for N tasks; no run-time allocation or reuse occurs. The shared head
+advances only past exhausted chunks, while a consumer claims individual refs
+through a chunk-local cursor CAS. A one- or four-chunk window exposes shared
+work without privately acquiring a whole chunk. Every fourth search prioritizes
+the oldest visible chunk; other searches distribute their preferred chunk by
+worker rank and poll count. MIX still follows its existing placement/admission
+contract, and the initial production claimant takes only one task per credit.
+
 Owner pending endpoints and publication masks are private to the Scheduler.
 Self-execution notifications contain only a pending-slot mask: the slot stays
 READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 88 bytes and the base local state 376 bytes
+The local configuration occupies 144 bytes and the base local state 632 bytes
 under the 64-bit ABI, including its optional profiling pointer. A separate
-240-byte profiling state holds six timing slots, two self-execution traces,
+248-byte profiling state holds six timing slots, two self-execution traces,
 worker trace caches, profiling offsets, and the loop counter/valid mask.
 Remote traces reside in SSBUF. Sampling is derived from the timing-slot range.
 
@@ -462,7 +505,7 @@ The host records whether any task requests sampled timing in the run control.
 Only a run with chip profiling or sampled timing enters the resident function
 specialization that allocates profiling state; the plain specialization does
 not allocate it. These functions do not inline into the common entry. The
-combined local state with profiling is 616 bytes. These sizes exclude other
+combined local state with profiling is 880 bytes. These sizes exclude other
 function locals, worker statistics and compiler spills. Compile-time assertions
 anchor the 64-bit configuration, slot, base and profiling state sizes; they do
 not establish the dynamic AICore stack high-water mark.
@@ -514,15 +557,16 @@ Simulation allocates an aligned 3 KiB backing region per physical cluster,
 shared by its AIC and two AIV lanes and retired with the run. Initialization
 tolerates nonzero previous contents.
 
-Resolved counts accumulate locally until an idle pass with no local executable
-task or deferred reservation, or the common run epilogue. Trace and error
-publication precedes each count flush. The AICPU watchdog remains 20 seconds
-by default, so continuously busy work without count publication can reach
-that timeout.
-The intended runs normally complete in under one second. Completion accounting
-therefore avoids periodic publication on the busy path; the continuous-busy
-timeout is an accepted limit outside that expected duration, not evidence that
-busy execution has stopped making progress.
+Ordinary resident runs accumulate resolved counts locally until an idle pass
+with no local executable task or deferred reservation, or the common run epilogue.
+Native Graph runs also flush pending counts when 32 completions have accumulated
+or at least 1 ms has elapsed since the previous flush. Trace and error publication
+precedes each count flush. The AICPU watchdog remains 20 seconds by default, so
+continuously busy ordinary work without count publication can reach that timeout.
+The intended ordinary runs normally complete in under one second. Ordinary
+completion accounting avoids periodic publication on the busy path; its
+continuous-busy timeout is an accepted limit outside that expected duration,
+not evidence that busy execution has stopped making progress.
 
 Single-block ordinary Mix uses the resident path. Each participating lane
 owns an independent GM DispatchPayload and one slot. A local six-entry tracker
@@ -601,3 +645,54 @@ pytest examples tests/st --platform a5sim --runtime host_build_graph
 
 Pure scheduler/core-tracker and lifecycle primitives also have C++ unit tests
 under `tests/ut/cpp`.
+
+## Legacy AICPU residual MIX lane priority
+
+The legacy fallback AICPU scheduler preserves physical lanes needed by residual MIX work. A queued MIX captures
+its AIC/AIV0/AIV1 mask when published; pure work can use the other lanes. Masks 3 and 5 leave one
+vector lane available, mask 6 leaves AIC available, and mask 7 reserves all three. The shape-agnostic
+early sync-start queue counts only its MIX entries; a pure entry has no MIX demand.
+
+Priority prefixes are ready-sync, ready-sync plus regular-ready, and then both normal sources plus
+early sync-start and regular-early. Early demand never protects lanes against normal-ready work.
+Each pure bucket, refill and block-range claim refreshes the applicable prefix and retains demand
+already observed during that attempt. The normal tiers share that observation; the next attempt
+starts fresh. Any nonzero pending-drain state reserves all lanes. These are scheduling snapshots,
+not an atomic reservation across scheduler threads.
+
+CoreTracker filters physical offsets before preparing pure IDLE or PENDING work. A pure vector
+block's logical AIV0 subtask may execute on either physical vector lane. A shape-only peer-idle hint
+does not suppress local PENDING work when only one physical vector lane is eligible. PMU keeps
+IDLE placement and disables PENDING and early staging. Normal admission and early sync-start
+cohort ownership remain independent of lane-demand accounting.
+
+A pure ready sync-start cohort uses one filtered bucket for its complete fit and claim. If it cannot
+fit while MIX protects any lane of its shape, it is requeued rather than entering a global drain
+that would bypass the lane filter. An exact fit uses the spare lanes. With no intersecting demand,
+the existing global-drain path remains available. A failed normal requeue reports
+`SIMPLER_ERROR_READY_QUEUE_OVERFLOW` and stops the dispatch pass.
+
+The shared `TaggedPtr` and `LaneDemandCounter` headers serve all four scheduler
+backends. The counter packs three 21-bit population counts into one atomic word.
+For these priority-prefix queues, a successful MIX batch claim adds its aggregate
+demand once before publishing the first cell. Batch pops capture all original
+handles and TaskIds, subtract one aggregate, then free the cells. A failed push
+claim, plain queue operation, or empty demand performs no counter RMW. The batch
+aggregate conservatively protects the claimed group; it is not a per-cell
+publication timestamp. A5 TMR uses the same types with its reservation-before-claim
+admission policy and corresponding in-flight capacity budget.
+
+Partial requeues retain the original tag. Early candidates retain their TaskId
+snapshot, including local sync-start cancellation. Normal entries retain the
+invalid-TaskId convention in both profiling and ordinary paths. Plain entries
+have an empty tag and no lane accounting. Queue cells remain 24 bytes; headers
+remain 192 bytes with enqueue/dequeue positions at offsets 64/128. Initialization
+resets demand; retained-position reuse does not. Failed normal requeue latches
+the error code and first reporting thread, and records all reporters in the
+error bitmap before stopping the pass.
+
+Host and AICPU components must come from matching runtime builds. Unchanged
+layout sizes do not make tagged entries compatible with a scheduler that treats
+every cell as an untagged pointer. The MIX/pure scene test checks numerical
+correctness; it does not assert temporal overlap. Production-scheduler unit
+tests check lane eligibility and placement.

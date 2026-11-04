@@ -36,7 +36,7 @@ def l2():
     impl = SimpleNamespace(
         _execution_environment=(os.getpid(), 1, 1, 0, False),
         _validate_execution_context=lambda: None,
-        _submit_chip_run_direct=lambda cid, args, cfg: calls.append(args) or object(),
+        _submit_chip_run_direct=lambda cid, args, cfg: calls.append(args) or SimpleNamespace(lane_poisoned=False),
     )
     impl.free = frees.append
     worker._chip_worker = impl

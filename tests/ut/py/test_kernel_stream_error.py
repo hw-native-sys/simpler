@@ -25,9 +25,6 @@ from types import SimpleNamespace
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
-_A5_LEGACY_GRAPH = 3
-
-
 _RESIDENT_TIMEOUT_SIGNATURES = (
     r"aicpu_execute: runtime failed with rc=-100(?!\d)",
     r"simpler_aicpu_exec: aicpu_execute failed with rc=-100(?!\d)",
@@ -1029,7 +1026,45 @@ def test_kernel_error_reaches_caller_stream(runtime, error_origin, failure, requ
     if error_origin == "aicore" and not failure:
         assert observed["output_marker"] == 42, observed
     if arch == "a5" and runtime == "host_build_graph":
-        assert observed["scheduler_runtime_mode"] == _A5_LEGACY_GRAPH, observed
+        assert observed["scheduler_runtime_mode"] in (1, 2), observed
+        assert observed["scheduler_mode_publish_count"] > 0, observed
+        if failure:
+            assert observed["resident_timeout_evidence"], observed
+            _resident_timeout_evidence(logs)
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.platforms(["a2a3", "a5"])
+@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+def test_completed_public_handle_observes_later_caller_error(runtime, request, tmp_path):
+    arch = request.config.getoption("--platform")
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    logs = tmp_path / "ascend"
+    logs.mkdir()
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "public-late-observer", arch, runtime, device, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+        env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0", "ASCEND_PROCESS_LOG_PATH": str(logs)},
+    )
+    (tmp_path / "public-late-observer.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = [
+        json.loads(line.removeprefix("PUBLIC_LATE_OBSERVER "))
+        for line in result.stdout.splitlines()
+        if line.startswith("PUBLIC_LATE_OBSERVER ")
+    ]
+    assert len(records) == 1, result.stdout + result.stderr
+    observed = records[0]
+    assert observed["runtime"] == runtime and observed["platform"] == arch
+    assert observed["old_done_before_later_launch"] and observed["old_done_after_error"]
+    assert observed["peek_before_wait"] == 0 and observed["wait_error"] == 507018
+    assert observed["repeat_wait_error"] == 507018 and observed["distinct_caller_outputs"]
+    assert observed["caller_resources_retained"]
+    if arch == "a5" and runtime == "host_build_graph":
+        assert observed["scheduler_runtime_mode"] in (1, 2), observed
         assert observed["scheduler_mode_publish_count"] > 0, observed
 
 
@@ -1054,11 +1089,15 @@ def _callable(arch, runtime, error_origin, failure, output):
             if failure
             else Path(__file__).with_name("support") / "kernel_stream_output.cpp"
         )
+        includes = list(compiler.get_orchestration_include_dirs(runtime)) + [str(_ROOT / "src/common")]
+        if arch == "a5" and runtime == "host_build_graph" and failure:
+            kernel_source = Path(__file__).with_name("support") / "kernel_stream_timeout.cpp"
+            includes.append(str(compiler.platform_dir / "onboard/aicore"))
         kernel = compiler.compile_incore(
             source_path=str(kernel_source),
             core_type="aiv",
             pto_isa_root=ensure_pto_isa_root(),
-            extra_include_dirs=list(compiler.get_orchestration_include_dirs(runtime)) + [str(_ROOT / "src/common")],
+            extra_include_dirs=includes,
         )
         signature = [ArgDirection.INOUT]
         kernel_binary = extract_text_section(kernel)
@@ -1097,6 +1136,9 @@ def _probe(arch, runtime, error_origin, device, failure, output):
         _native_run_storage,
     )
 
+    resident_graph = arch == "a5" and runtime == "host_build_graph"
+    if resident_graph and failure:
+        _resident_timeout_profile(os.environ)
     chip, hashes = _callable(arch, runtime, error_origin, failure, output)
     image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
     (output / "callable.bin").write_bytes(image)
@@ -1150,6 +1192,11 @@ def _probe(arch, runtime, error_origin, device, failure, output):
     started = time.monotonic()
     rc = lib.aclrtSynchronizeStreamWithTimeout(caller, 60000)
     elapsed = time.monotonic() - started
+    evidence = (
+        _wait_for_resident_timeout_evidence(Path(os.environ["ASCEND_PROCESS_LOG_PATH"]), (4, 2))
+        if resident_graph and failure
+        else []
+    )
     mode = count = 0
     if arch == "a5" and runtime == "host_build_graph":
         lib.get_last_scheduler_runtime_mode.argtypes = [ctypes.c_void_p]
@@ -1174,6 +1221,7 @@ def _probe(arch, runtime, error_origin, device, failure, output):
                 "failure": failure,
                 "caller_sync_rc": rc,
                 "peek_before": peek_before,
+                "resident_timeout_evidence": evidence,
                 **hashes,
             }
         ),
@@ -1193,6 +1241,87 @@ def _probe(arch, runtime, error_origin, device, failure, output):
     assert storage is not None
 
 
+def _public_observer_probe(arch, runtime, device, output):
+    from simpler.buffer import Buffer  # noqa: PLC0415
+    from simpler.task_interface import DataType, TaskArgs, Tensor, TensorArgType  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+    from test_kernel_mode_c_api import _load  # noqa: PLC0415
+
+    if arch == "a5" and runtime == "host_build_graph":
+        _resident_timeout_profile(os.environ)
+    lib = _load(arch, "onboard", runtime)
+    lib.rtSetDevice.argtypes = [ctypes.c_int]
+    lib.aclrtCreateStream.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    lib.aclrtMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int]
+    lib.aclrtMemset.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_size_t]
+    lib.aclrtPeekAtLastError.argtypes = [ctypes.c_int]
+    assert lib.rtSetDevice(device) == 0
+    caller = ctypes.c_void_p()
+    assert lib.aclrtCreateStream(ctypes.byref(caller)) == 0
+    backings = [ctypes.c_void_p(), ctypes.c_void_p()]
+    for backing in backings:
+        assert lib.aclrtMalloc(ctypes.byref(backing), 4, 0) == 0
+        assert lib.aclrtMemset(backing, 4, 0, 4) == 0
+    assert backings[0].value != backings[1].value
+    specs, source_hashes = [], []
+    for failure, name in ((False, "success"), (True, "reported-error")):
+        directory = output / name
+        directory.mkdir()
+        chip, hashes = _callable(arch, runtime, "aicore", failure, directory)
+        specs.append(chip)
+        source_hashes.append(hashes)
+    worker = Worker(level=2, device_id=device, platform=arch, runtime=runtime)
+    handles = [worker.register(spec) for spec in specs]
+    worker.init(borrowed_context_generation=1)
+    buffers, task_args = [], []
+    for backing in backings:
+        assert backing.value is not None
+        buffer = Buffer.wrap(address=backing.value, nbytes=4, location=worker.device_location)
+        buffers.append(buffer)
+        args = TaskArgs()
+        args.add_tensor(Tensor(buffer, shapes=(1,), dtype=DataType.INT32), TensorArgType.INOUT)
+        task_args.append(args)
+    first = worker.submit(handles[0], task_args[0], caller_stream=caller.value)
+    deadline = time.monotonic() + 30
+    while not first.done:
+        assert time.monotonic() < deadline, "Healthy run did not reach its own completion boundary"
+    second = worker.submit(handles[1], task_args[1], caller_stream=caller.value)
+    mode, count = worker.scheduler_runtime_mode, worker.scheduler_mode_publish_count
+    peek_before = lib.aclrtPeekAtLastError(0)
+    observed_errors = []
+    for _ in range(2):
+        try:
+            first.wait()
+        except RuntimeError as error:
+            assert "507018" in str(error), repr(error)
+            observed_errors.append(507018)
+        else:
+            raise AssertionError("Completed handle cached success instead of observing its actual caller stream")
+    print(
+        "PUBLIC_LATE_OBSERVER "
+        + json.dumps(
+            dict(
+                platform=arch,
+                runtime=runtime,
+                old_done_before_later_launch=True,
+                old_done_after_error=first.done,
+                peek_before_wait=peek_before,
+                wait_error=observed_errors[0],
+                repeat_wait_error=observed_errors[1],
+                distinct_caller_outputs=backings[0].value != backings[1].value,
+                caller_resources_retained=bool(second is not None and len(buffers) == len(task_args) == 2),
+                scheduler_runtime_mode=mode,
+                scheduler_mode_publish_count=count,
+                source_hashes=source_hashes,
+            ),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    # A borrowed context with an unresolved failing successor retains every owner until process exit.
+    os._exit(0)
+
+
 if __name__ == "__main__" and sys.argv[1] == "resident-timeout":
     _probe_resident_timeout(
         int(sys.argv[2]),
@@ -1200,5 +1329,7 @@ if __name__ == "__main__" and sys.argv[1] == "resident-timeout":
         Path(sys.argv[4]),
         (int(sys.argv[5]), int(sys.argv[6])) if len(sys.argv) == 7 else (4, 2),
     )
+elif __name__ == "__main__" and sys.argv[1] == "public-late-observer":
+    _public_observer_probe(sys.argv[2], sys.argv[3], int(sys.argv[4]), Path(sys.argv[5]))
 elif __name__ == "__main__":
     _probe(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), bool(int(sys.argv[5])), Path(sys.argv[6]))

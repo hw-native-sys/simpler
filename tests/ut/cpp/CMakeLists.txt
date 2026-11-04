@@ -85,7 +85,7 @@ list(REMOVE_DUPLICATES HBG_ORCH_SHARED_SOURCES)
 
 # Gate for tests that may need CANN headers/libs at build time or that only
 # make sense on Ascend hardware runners.  Default OFF so no-hw runners
-# (ubuntu-latest / macos-latest, no CANN installed) can build the tree
+# (ubuntu-24.04 / macos-latest, no CANN installed) can build the tree
 # without touching anything CANN-adjacent.  CI's hw jobs
 # (ut-a2a3 / ut-a5) pass -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.
 #

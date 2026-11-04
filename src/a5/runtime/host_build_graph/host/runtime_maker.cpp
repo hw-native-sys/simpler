@@ -66,9 +66,12 @@
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
+#include "native_graph_plan.h"
+#include "ready_pool_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler_protocol_export.h"
+#include "scheduler_protocol_graph_source.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/host/retained_prepare_plan.h"
 #include "host_build_graph/host/graph_host_state.h"
@@ -456,9 +459,10 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
 }
 
 static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
-    if (runtime == nullptr || api == nullptr || host_header == nullptr) {
-        return 0;
-    }
+    if (api == nullptr || host_header == nullptr) return 0;
+    // The shared scheduler header can already belong to a successor.
+    if (const auto observed = api->observed_run_status(); observed.has_value()) return *observed;
+    if (runtime == nullptr) return 0;
 
     void *device_sm = runtime->get_gm_sm_ptr();
     if (device_sm == nullptr) {
@@ -497,6 +501,7 @@ struct SchedulerStateOwner {
     AicoreSchedulerLayout layout;
     const HostApi *api;
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
+    std::string protocol_source;
 };
 
 std::mutex scheduler_state_owners_mutex;
@@ -549,7 +554,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         try {
             const auto payload = scheduler_export_protocol(
                 host_base, static_cast<size_t>(owner.layout.total_size), owner.layout, api->run_epoch(),
-                owner.protocol_tasks
+                owner.protocol_tasks, owner.protocol_source
             );
             if (!api->publish_chip_swimlane_extension(
                     ChipSwimlaneExtensionSection::AicoreProtocol, payload.c_str(), payload.size()
@@ -564,6 +569,23 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     }
 
     const auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, owner.layout.worker_contexts_offset);
+    std::vector<uint64_t> public_ids(owner.layout.task_count);
+    SchedulerGraphView diagnostic_graph = scheduler_ordinary_graph_view(
+        contexts[0].graph_storage_address, contexts[0].original_task_count, contexts[0].task_window_last_index
+    );
+    diagnostic_graph.task_count = owner.layout.task_count;
+    diagnostic_graph.native_header_offset = contexts[0].native_header_offset;
+    diagnostic_graph.scheduler_state_address = reinterpret_cast<uint64_t>(host_base);
+    diagnostic_graph.scheduler_state_bytes = owner.layout.total_size;
+    for (uint64_t ref = 0; ref < owner.layout.task_count; ++ref) {
+        if (scheduler_node_identity(diagnostic_graph, ref, &public_ids[ref]) != SchedulerGraphResult::OK) {
+            LOG_WARN("A5 HBG: invalid public task identity in profiling snapshot");
+            return false;
+        }
+    }
+    const auto public_id = [&](uint64_t ref) {
+        return ref < public_ids.size() ? public_ids[ref] : UINT64_MAX;
+    };
     const auto *traces = scheduler_state_at<SchedulerTaskTrace>(host_base, owner.layout.trace_cells_offset);
     const auto *controls = scheduler_state_at<SchedulerTaskControl>(host_base, owner.layout.task_controls_offset);
 
@@ -610,7 +632,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 trace.kernel_start_cycles - trace.ready_observe_cycles :
                 0;
         if (!first_task) tasks_json << ",";
-        tasks_json << "\n    [" << trace.worker_id << ", " << task_ref << ", " << trace_index << ", "
+        tasks_json << "\n    [" << trace.worker_id << ", " << public_id(task_ref) << ", " << trace_index << ", "
                    << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << ", "
                    << swimlane_run_epoch << "]";
         first_task = false;
@@ -639,7 +661,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (!first_identity) identities_json << ",";
         first_identity = false;
         identities_json << "\n{\"run_epoch\":" << trace.execution_run_epoch << ",\"core_id\":" << trace.worker_id
-                        << ",\"reg_task_id\":" << trace_index << ",\"task_id\":" << trace.task_ref
+                        << ",\"reg_task_id\":" << trace_index << ",\"task_id\":" << public_id(trace.task_ref)
                         << ",\"block_idx\":" << trace.execution_block_idx
                         << ",\"block_num\":" << trace.execution_block_num
                         << ",\"subtask_slot\":" << trace.execution_subtask_slot
@@ -841,7 +863,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                            << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \""
                            << sched_phase_kind_name(record.kind)
                            << "\", \"tasks_processed\": " << record.tasks_processed << ", " << kSchedulerJsonTaskKey;
-            if (record.has_task) scheduler_json << record.task_ref;
+            if (record.has_task) scheduler_json << public_id(record.task_ref);
             else scheduler_json << "null";
             scheduler_json << "}";
         }
@@ -962,9 +984,14 @@ struct DefinitionUploads {
 // replaces each task's graph_context with an execution constructed in its own heap.
 bool bind_graph_definitions(
     Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
-    ReadyQueuePopulations *ready_queue_populations
+    ReadyQueuePopulations *ready_queue_populations, NativeGraphHostPlan *native_plan, int32_t total_tasks
 ) {
     *uploads = DefinitionUploads{};
+    *native_plan = NativeGraphHostPlan{};
+    std::unordered_map<uint64_t, uint32_t> native_definition_indices;
+    std::vector<uint32_t> invocation_definitions;
+    if (graph_host_upload_count(graph_state) != 0)
+        invocation_definitions.resize(static_cast<size_t>(total_tasks), SCHEDULER_NATIVE_NO_INSTANCE);
     const size_t count = graph_host_upload_count(graph_state);
     GraphHostDefinitionList definitions = graph_host_definitions(graph_state);
     const auto align_up = [](size_t value) {
@@ -1032,31 +1059,26 @@ bool bind_graph_definitions(
         }
         uploads->count = packed.size();
         uploads->bytes = block_bytes;
-        // Into the run's AICPU launch package, which RTS copies with the launch:
-        // no device block is allocated, uploaded or freed for these bytes, and a
-        // length the package cannot represent is refused here, before any
-        // submission.
-        uint32_t section_source = static_cast<uint32_t>(GraphSectionSource::None);
-        uint64_t section_base = 0;
-        if (api->publish_graph_section(staging, block_bytes, &section_source, &section_base) != 0) {
-            LOG_ERROR("host-orch: failed to carry %zu Definition byte(s) to the device", block_bytes);
-            return false;
-        }
-        // Which carrier delivered it is the platform's answer, not this bind's:
-        // onboard it is the launch package RTS copies, in simulation a run-owned
-        // host snapshot.
-        runtime->publish_graph_section(
-            static_cast<GraphSectionSource>(section_source), section_base, static_cast<uint32_t>(block_bytes)
-        );
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", uploads->count, block_bytes, count,
             uploads->spilled
         );
-        // Packing, not an upload: the phase measures assembling the section and
-        // taking it into the launch package, and the transfer it used to name is
-        // now part of the launch RTS makes.
+        // Packing retains a host section. The selected scheduler determines
+        // whether commit copies Definitions to GM or the AICPU launch package.
         record_bind_phase(HostPhaseKind::BindGraphPack, pack_phase, attrs, block_bytes);
+    }
+
+    for (const auto &[key, object] : packed) {
+        NativeGraphDefinitionPlan definition;
+        std::string error;
+        const auto *image = staging + object.object_offset + sizeof(GraphDefinitionHeader);
+        if (!native_graph_plan_definition(image, object.image_bytes, key, &definition, &error)) {
+            LOG_ERROR("host-orch: invalid native Graph Definition key=%" PRIu64 ": %s", key, error.c_str());
+            return false;
+        }
+        native_definition_indices.emplace(key, static_cast<uint32_t>(native_plan->definitions.size()));
+        native_plan->definitions.push_back(std::move(definition));
     }
 
     for (size_t index = 0; index < count; ++index) {
@@ -1134,7 +1156,23 @@ bool bind_graph_definitions(
         upload->outer_slot->to_descriptor().graph_definition_offset =
             static_cast<uint32_t>(object_it->second.object_offset + sizeof(GraphDefinitionHeader));
         upload->outer_slot->graph_context = nullptr;
+        const TaskId shell_id = upload->outer_slot->to_descriptor().task_id;
+        if (!shell_id.is_global() || shell_id.local_id() < 0 || shell_id.local_id() >= total_tasks ||
+            invocation_definitions[static_cast<size_t>(shell_id.local_id())] != SCHEDULER_NATIVE_NO_INSTANCE) {
+            LOG_ERROR("host-orch: invalid or duplicate Graph shell identity");
+            return false;
+        }
+        invocation_definitions[static_cast<size_t>(shell_id.local_id())] =
+            native_definition_indices.at(upload->graph_key);
     }
+    if (!invocation_definitions.empty()) {
+        std::string error;
+        if (!native_graph_plan_nodes(invocation_definitions, native_plan, &error)) {
+            LOG_ERROR("host-orch: invalid native Graph node map: %s", error.c_str());
+            return false;
+        }
+    }
+    if (block_bytes != 0) native_plan->legacy_section.assign(staging, staging + block_bytes);
     return true;
 }
 
@@ -1185,7 +1223,7 @@ void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode
 
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments
+    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1194,18 +1232,23 @@ bool create_scheduler_state(
         );
         return false;
     }
-    SchedulerGraphView host_graph{
-        reinterpret_cast<uint64_t>(host_sm_handle.header->tasks.task_storage),
-        0,
-        static_cast<uint64_t>(total_tasks),
-        task_window_size - 1,
-    };
-    for (int64_t task_ref = 0; task_ref < total_tasks; ++task_ref) {
-        ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_ref);
-        if (slot.task_kind == TaskKind::GRAPH) {
-            select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
-            LOG_INFO("A5 HBG: retaining AICPU scheduling for a graph-execution run");
-            return true;
+    const SchedulerGraphView host_graph = scheduler_ordinary_graph_view(
+        reinterpret_cast<uint64_t>(host_sm_handle.header->tasks.task_storage), static_cast<uint32_t>(total_tasks),
+        task_window_size - 1
+    );
+    const bool native_graph = !native_plan.instances.empty();
+    const uint64_t node_count = native_graph ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
+    bool legacy_graph_required = false;
+    for (const auto &definition : native_plan.definitions) {
+        legacy_graph_required = legacy_graph_required || !definition.resident_supported;
+        for (const auto &child : definition.children) {
+            for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+                if (child.metadata.active_mask.has(static_cast<SubtaskSlot>(lane)) &&
+                    runtime->get_function_bin_addr(child.metadata.kernel_ids[lane]) == 0) {
+                    LOG_ERROR("A5 HBG: Graph child has an unregistered callable");
+                    return false;
+                }
+            }
         }
     }
     const int32_t worker_count = runtime->get_worker_count();
@@ -1214,8 +1257,17 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: invalid worker count %d for complete clusters", worker_count);
         return false;
     }
+    if (native_graph) {
+        std::string error;
+        if (!native_graph_plan_worker_capacity(native_plan, worker_count, &error)) {
+            LOG_ERROR("A5 HBG: %s", error.c_str());
+            return false;
+        }
+    }
     std::vector<int64_t> inline_completed_task_refs;
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
+    uint64_t control_task_count = 0;
+    uint64_t graph_shell_count = 0;
     uint64_t aic_task_count = 0;
     bool sampled_task_timing_enabled = false;
     uint64_t aiv_task_count = 0;
@@ -1234,6 +1286,10 @@ bool create_scheduler_state(
     // future host-side publication would silently change what these tests mean.
     for (int64_t task_ref = 0; task_ref < total_tasks; ++task_ref) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_ref);
+        if (slot.task_kind == TaskKind::GRAPH) {
+            ++graph_shell_count;
+            continue;
+        }
         SchedulerTaskShape shape{};
         SchedulerGraphResult status = scheduler_classify_task_shape(host_graph, task_ref, &shape);
         bool inline_dispatch_task = false;
@@ -1309,18 +1365,15 @@ bool create_scheduler_state(
                 return false;
             }
         }
-        __gm__ uint8_t *payload = scheduler_graph_payload(host_graph, task_ref);
-        const auto *predicate =
-            reinterpret_cast<const SchedulerDispatchPredicate *>(payload + SCHEDULER_GRAPH_PREDICATE_OFFSET);
-        if (!scheduler_dispatch_predicate_metadata_valid(predicate->addr, predicate->elem_size, predicate->op)) {
+        const auto *predicate = scheduler_node_predicate(host_graph, task_ref);
+        if (predicate == nullptr ||
+            !scheduler_dispatch_predicate_metadata_valid(predicate->addr, predicate->elem_size, predicate->op)) {
             LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " has malformed predicate metadata", task_ref);
             return false;
         }
-        int32_t fanin_count = *reinterpret_cast<__gm__ int32_t *>(payload + SCHEDULER_GRAPH_FANIN_COUNT_OFFSET);
-        if (fanin_count < 0) {
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: task ref=%" PRId64 " has invalid fanin count %d", task_ref, fanin_count
-            );
+        uint32_t fanin_count = 0;
+        if (scheduler_node_fanin_count(host_graph, task_ref, &fanin_count) != SchedulerGraphResult::OK) {
+            LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " has invalid fanin row", task_ref);
             return false;
         }
         if (slot.task_attrs.requires_sync_start() && logical_block_num == 1) {
@@ -1387,9 +1440,85 @@ bool create_scheduler_state(
         ++executable_task_count;
     }
 
-    if (executable_task_count + inline_completed_task_refs.size() != static_cast<uint64_t>(total_tasks)) {
+    if (executable_task_count + inline_completed_task_refs.size() + graph_shell_count !=
+            static_cast<uint64_t>(total_tasks) ||
+        graph_shell_count != native_plan.instances.size()) {
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
+    }
+    if (legacy_graph_required) {
+        select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
+        return true;
+    }
+    if (native_graph) {
+        std::vector<SchedulerTaskMetadata> expanded(node_count);
+        for (uint64_t ref = 0; ref < node_count; ++ref) {
+            auto &binding = native_plan.bindings[ref];
+            auto &metadata = expanded[ref];
+            if (binding.instance_index == SCHEDULER_NATIVE_NO_INSTANCE) {
+                const uint32_t original = binding.source_index;
+                metadata = task_metadata[original];
+                if (host_sm_handle.header->tasks.is_completed(original)) {
+                    binding.kind = SchedulerNodeKind::HOST_DONE;
+                } else if (scheduler_task_is_inline(metadata.flags)) {
+                    binding.kind = SchedulerNodeKind::CONTROL_DUMMY;
+                    metadata.active_mask = LaneMask::none();
+                    metadata.flags &= SCHEDULER_TASK_HAS_FANIN;
+                    --executable_task_count;
+                    --aiv_task_count;
+                    ++control_task_count;
+                }
+                continue;
+            }
+            const auto &instance = native_plan.instances[binding.instance_index];
+            const auto &definition = native_plan.definitions[instance.definition_index];
+            if (binding.kind != SchedulerNodeKind::CHILD_KERNEL) {
+                metadata.active_mask = LaneMask::none();
+                metadata.logical_block_num = 1;
+                metadata.flags = SCHEDULER_TASK_HAS_FANIN;
+                metadata.timing_slot = -1;
+                for (auto &kernel : metadata.kernel_ids)
+                    kernel = UINT16_MAX;
+                ++control_task_count;
+                continue;
+            }
+            metadata = definition.children[binding.source_index].metadata;
+            metadata.flags |= SCHEDULER_TASK_HAS_FANIN;
+            metadata.trace_index_base = static_cast<uint32_t>(executable_subtask_count);
+            const uint32_t lanes = static_cast<uint32_t>(metadata.active_mask.count());
+            uint32_t executions = 0;
+            uint64_t next_count = 0;
+            if (!scheduler_subtask_count_checked(metadata.logical_block_num, lanes, &executions) ||
+                !scheduler_trace_count_checked(executable_subtask_count, executions, &next_count)) {
+                LOG_ERROR("A5 HBG: native child trace count overflow ref=%" PRIu64, ref);
+                return false;
+            }
+            executable_subtask_count = next_count;
+            sampled_task_timing_enabled = sampled_task_timing_enabled || metadata.timing_slot >= 0;
+            if (metadata.active_mask.has_aic()) ++aic_task_count;
+            if (metadata.active_mask.has_aiv0() || metadata.active_mask.has_aiv1()) ++aiv_task_count;
+            auto demand = scheduler_minimum_worker_demand(metadata.active_mask);
+            if (scheduler_task_requires_sync_start(metadata.flags) &&
+                !scheduler_resident_worker_demand_checked(
+                    metadata.active_mask, metadata.logical_block_num, true, worker_count, &demand
+                )) {
+                LOG_ERROR("A5 HBG: native child exceeds sync-start worker capacity ref=%" PRIu64, ref);
+                return false;
+            }
+            aic_worker_demand = std::max<uint64_t>(aic_worker_demand, demand.aic);
+            aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, demand.aiv);
+            if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
+            if (metadata.logical_block_num > 1 || lanes > 1 || scheduler_task_requires_sync_start(metadata.flags))
+                ++cooperative_task_count;
+            ++executable_task_count;
+        }
+        for (auto &ref : inline_completed_task_refs)
+            ref = native_plan.completion_refs[ref];
+        task_metadata = std::move(expanded);
+        if (executable_task_count + control_task_count + inline_completed_task_refs.size() != node_count) {
+            LOG_ERROR("A5 HBG: native metadata does not cover all nodes");
+            return false;
+        }
     }
     if (legacy_shape_task_ref >= 0) {
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
@@ -1414,25 +1543,40 @@ bool create_scheduler_state(
         mix_task_count,
     };
     const bool protocol_profiling = api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES);
-    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
-    if (protocol_profiling) {
-        try {
-            protocol_tasks = scheduler_protocol_freeze_graph(host_graph, task_metadata);
-        } catch (const std::exception &error) {
-            LOG_ERROR("A5 HBG: failed to freeze protocol graph: %s", error.what());
+    NativeGraphReadonlyImage native_image;
+    if (native_graph) {
+        std::string error;
+        if (!native_graph_plan_readonly_image(native_plan, &native_image, &error)) {
+            LOG_ERROR("A5 HBG: native readonly image failed: %s", error.c_str());
             return false;
         }
     }
+    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
+    std::string protocol_source;
     AicoreSchedulerLayout layout{};
     if (!scheduler_plan_layout(
-            static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
+            node_count, aic_task_count, aiv_task_count, &layout,
             runtime->dev.chip_swimlane_level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
-            executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled()
+            executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled(), native_image.bytes.size()
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
         return false;
     }
+    // Zero gives one queue per type; four and eight bound the preferred
+    // consumer group while retaining global visibility of all ready tasks.
+    constexpr uint32_t kReadyPoolGroupWidth = 8;
+    constexpr auto kReadyPoolKind = SchedulerReadyPoolKind::TICKET;
+    constexpr uint32_t kReadyChunkWindow = 0;
+    SchedulerReadyPoolPlan ready_pool_plan;
+    if (!scheduler_plan_ready_pool(
+            task_metadata, static_cast<uint32_t>(spmd.cluster_count), kReadyPoolGroupWidth, layout.total_size,
+            &ready_pool_plan, kReadyPoolKind, kReadyChunkWindow
+        )) {
+        LOG_ERROR("A5 HBG: ready pool layout overflow or invalid topology");
+        return false;
+    }
+    layout.total_size = ready_pool_plan.total_size;
     layout.executable_task_count = executable_task_count;
     layout.executable_subtask_count = executable_subtask_count;
     layout.aic_worker_demand = aic_worker_demand;
@@ -1466,6 +1610,47 @@ bool create_scheduler_state(
         return false;
     }
 
+    if (native_graph) {
+        std::memcpy(
+            static_cast<std::byte *>(host_base) + sizeof(SchedulerRunControl),
+            native_image.bytes.data() + sizeof(SchedulerRunControl),
+            native_image.bytes.size() - sizeof(SchedulerRunControl)
+        );
+        auto *header = scheduler_state_at<SchedulerNativeGraphHeader>(host_base, native_image.header_offset);
+        header->image_bytes = layout.total_size;
+        header->control_inboxes_offset = layout.control_inboxes_offset;
+        header->control_inbox_count = worker_count;
+        header->run_epoch = api->run_epoch();
+    }
+    if (protocol_profiling) {
+        try {
+            SchedulerGraphView snapshot = host_graph;
+            if (native_graph) {
+                snapshot.task_count = node_count;
+                snapshot.scheduler_state_address = reinterpret_cast<uint64_t>(host_base);
+                snapshot.scheduler_state_bytes = layout.total_size;
+                snapshot.native_header_offset = native_image.header_offset;
+                std::vector<SchedulerProtocolSourceTask> sources;
+                sources.reserve(total_tasks);
+                for (int64_t ref = 0; ref < total_tasks; ++ref) {
+                    const auto &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(ref);
+                    const uint32_t kind = slot.task_kind == TaskKind::GRAPH              ? 1 :
+                                          host_sm_handle.header->tasks.is_completed(ref) ? 3 :
+                                          slot.active_mask.is_empty()                    ? 2 :
+                                                                                           0;
+                    sources.push_back({kind, slot.to_descriptor().graph_definition_offset});
+                }
+                protocol_source = scheduler_protocol_freeze_source(host_graph, sources, native_plan.legacy_section);
+            }
+            protocol_tasks = scheduler_protocol_freeze_graph(snapshot, task_metadata);
+        } catch (const std::exception &error) {
+            LOG_ERROR("A5 HBG: failed to freeze protocol graph: %s", error.what());
+            return false;
+        }
+    }
+    scheduler_init_ready_pool(host_base, ready_pool_plan);
+    scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset)->ready_pool_offset =
+        ready_pool_plan.header_offset;
     auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, layout.task_controls_offset);
     for (int64_t task_ref : inline_completed_task_refs) {
         task_controls[task_ref].state = static_cast<int64_t>(SchedulerTaskState::DONE);
@@ -1480,7 +1665,7 @@ bool create_scheduler_state(
 
     const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
     auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, layout.run_control_offset);
-    run_control->expected_task_count = static_cast<uint64_t>(total_tasks);
+    run_control->expected_task_count = node_count;
     run_control->inline_completed_count = inline_completed_task_refs.size();
     run_control->aic_task_count = aic_task_count;
     run_control->aiv_task_count = aiv_task_count;
@@ -1534,7 +1719,12 @@ bool create_scheduler_state(
         context.trace_cells_offset = layout.trace_cells_offset;
         context.pmu_cells_offset = layout.pmu_cells_offset;
         context.task_window_last_index = task_window_size - 1;
-        context.graph_task_count = static_cast<uint64_t>(total_tasks);
+        context.graph_task_count = node_count;
+        context.native_header_offset = native_image.header_offset;
+        context.original_task_count = static_cast<uint64_t>(total_tasks);
+        context.graph_view_version = SCHEDULER_GRAPH_VIEW_VERSION;
+        context.graph_view_bytes = sizeof(SchedulerGraphView);
+        context.scheduler_state_bytes = layout.total_size;
         context.worker_index = static_cast<uint64_t>(i);
     }
 
@@ -1545,8 +1735,10 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime,
-            SchedulerStateOwner{reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks)}
+            runtime, SchedulerStateOwner{
+                         reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks),
+                         std::move(protocol_source)
+                     }
         );
     }
     runtime->add_pending_metadata(
@@ -1557,7 +1749,9 @@ bool create_scheduler_state(
     return true;
 }
 
-using HostPreparePlan = RetainedHostPreparePlan<RuntimeArenaLayout>;
+struct HostPreparePlan : RetainedHostPreparePlan<RuntimeArenaLayout> {
+    NativeGraphHostPlan native_graph;
+};
 
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
     const auto &layout = plan.layout;
@@ -1658,8 +1852,39 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     always_assert(compacted == image_bytes);
 
     const sm_layout::SegmentOffsets device_segments = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage));
-    if (!create_scheduler_state(runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments)) {
+    for (auto &instance : plan.native_graph.instances) {
+        const auto *storage =
+            reinterpret_cast<const ChipTaskStorage *>(upload_base + copied_bytes + device_segments.storage) +
+            instance.original_shell_id;
+        const auto &payload = storage->payload;
+        const auto &definition = plan.native_graph.definitions[instance.definition_index].definition;
+        instance.boundary_tensor_count = static_cast<uint32_t>(payload.tensor_count);
+        instance.boundary_scalar_count = static_cast<uint32_t>(payload.scalar_count);
+        const auto image_address = [&](const void *address) {
+            return reinterpret_cast<uint64_t>(device_sm) +
+                   (static_cast<const char *>(address) - (upload_base + copied_bytes));
+        };
+        instance.boundary_tensors_address = payload.tensor_count == 0 ? 0 : image_address(payload.tensors.get());
+        instance.boundary_scalars_address = payload.scalar_count == 0 ? 0 : image_address(payload.scalars.get());
+        instance.heap_base = reinterpret_cast<uint64_t>(storage->task.packed_buffer_base);
+        if (definition.required_heap > UINT64_MAX - instance.heap_base) return PTO_RUNTIME_ERR_INTERNAL;
+        instance.args_base = instance.heap_base + definition.required_heap;
+    }
+    if (!create_scheduler_state(
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph
+        )) {
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (!plan.native_graph.legacy_section.empty() &&
+        runtime->dev.scheduler_bootstrap.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING) {
+        uint32_t source = static_cast<uint32_t>(GraphSectionSource::None);
+        uint64_t base = 0;
+        const auto &section = plan.native_graph.legacy_section;
+        if (api->publish_graph_section(section.data(), section.size(), &source, &base) != 0)
+            return PTO_RUNTIME_ERR_INTERNAL;
+        runtime->publish_graph_section(
+            static_cast<GraphSectionSource>(source), base, static_cast<uint32_t>(section.size())
+        );
     }
 
     // Prepared, not published: `publish_run_image_impl` performs this write, and
@@ -1877,7 +2102,9 @@ int32_t run_host_orchestration(
     // Bind Graph tasks to retained Definition addresses. The slot holds the
     // prepared source until synchronous publication consumes it.
     DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &ready_queue_populations)) {
+    if (!bind_graph_definitions(
+            runtime, api, *graph_state, &definition_uploads, &ready_queue_populations, &plan.native_graph, total_tasks
+        )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
@@ -2574,7 +2801,7 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
  * @return 0 on success, -1 on failure
  */
 extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
-    if (runtime == nullptr) {
+    if (runtime == nullptr && execution_rc == 0) {
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2588,8 +2815,8 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    const TensorLease *tensor_leases = runtime->tensor_leases().data();
-    int tensor_lease_count = static_cast<int>(runtime->tensor_leases().size());
+    const TensorLease *tensor_leases = runtime != nullptr ? runtime->tensor_leases().data() : nullptr;
+    int tensor_lease_count = runtime != nullptr ? static_cast<int>(runtime->tensor_leases().size()) : 0;
 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
@@ -2598,29 +2825,23 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    // The shared-memory status is device state, readable only for a run that
-    // reached a stream.
+    // A common observer's status has no shared-header scheduler provenance.
+    // Only the legacy fallback reads the shared header of a launched run.
     if (execution_rc != 0 && launched != 0) {
         runtime_status = read_runtime_status(runtime, api, &host_header);
     }
     if (runtime_status != 0) {
-        int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
-        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);
+        if (api->observed_run_status().has_value()) {
+            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read)", runtime_status);
+        } else {
+            int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
+            LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);
+        }
     }
 
     if (skip_tensor_copy_back) {
         LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
-        // Every recorded lease is a slice of the retained temporary block this run's slot
-        // published when its bind cut them, so each must still lie inside the block the slot
-        // publishes now. One outside it names bytes the slot no longer owns: the block was
-        // replaced while this run held slices of it, and both the device's writes and the copy
-        // below would then be about different memory.
-        void *retained_base = nullptr;
-        size_t retained_size = 0;
-        api->get_retained_temp_buffer(&retained_base, &retained_size);
-        const uintptr_t block = reinterpret_cast<uintptr_t>(retained_base);
-
         for (int i = 0; i < tensor_lease_count; i++) {
             const TensorLease &lease = tensor_leases[i];
 
@@ -2628,15 +2849,6 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
             if (lease.dev_ptr == nullptr) {
                 LOG_WARN("ChipTensor %d has null device pointer, skipping", i);
                 continue;
-            }
-
-            const uintptr_t slice = reinterpret_cast<uintptr_t>(lease.dev_ptr);
-            if (retained_base == nullptr || slice < block || slice + lease.size > block + retained_size) {
-                LOG_WARN(
-                    "ChipTensor %d names [%p, +%zu) outside the retained temporary block this slot publishes "
-                    "([%p, +%zu)), so its bind sliced a block that has since been replaced",
-                    i, lease.dev_ptr, lease.size, retained_base, retained_size
-                );
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
@@ -2664,10 +2876,6 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     }
 
     LOG_INFO("=== Result Copy-Back Complete ===");
-
-    if (rc == 0 && runtime_status != 0) {
-        rc = runtime_status;
-    }
 
     return rc;
 }

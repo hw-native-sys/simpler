@@ -37,6 +37,14 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
+// Domain allocation failures that callers can distinguish from generic ACL errors.
+typedef enum CommDomainStatus {
+    COMM_DOMAIN_WORKSPACE_UNSUPPORTED = -2,
+    COMM_DOMAIN_URMA_CONFIG_INVALID = -3,
+    COMM_DOMAIN_URMA_INIT_FAILED = -4,
+    COMM_DOMAIN_URMA_WORKSPACE_INVALID = -5,
+} CommDomainStatus;
+
 #define COMM_GLOBAL_DOMAIN_VERSION 2U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
 #define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U

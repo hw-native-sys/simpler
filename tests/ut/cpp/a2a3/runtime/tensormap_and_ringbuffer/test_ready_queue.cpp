@@ -127,12 +127,12 @@ TEST_F(ReadyQueueTest, SlotReuseAfterFullDrain) {
 TEST_F(ReadyQueueTest, PushBatchThenIndividualPop) {
     constexpr int BATCH_SIZE = 5;
     ChipTaskSlotState items[BATCH_SIZE];
-    ChipTaskSlotState *ptrs[BATCH_SIZE];
+    CapturedReadySlot values[BATCH_SIZE];
     for (int i = 0; i < BATCH_SIZE; i++) {
-        ptrs[i] = &items[i];
+        values[i] = CapturedReadySlot(&items[i], LaneMask::none());
     }
 
-    queue.push_batch(ptrs, BATCH_SIZE);
+    queue.push_shaped_batch(values, nullptr, BATCH_SIZE, ResourceShape::AIC);
 
     for (int i = 0; i < BATCH_SIZE; i++) {
         EXPECT_EQ(queue.pop(), &items[i]);
@@ -141,7 +141,7 @@ TEST_F(ReadyQueueTest, PushBatchThenIndividualPop) {
 }
 
 TEST_F(ReadyQueueTest, PushBatchZeroIsNoop) {
-    queue.push_batch(nullptr, 0);
+    queue.push_shaped_batch(nullptr, nullptr, 0, ResourceShape::AIC);
 
     EXPECT_EQ(queue.size(), 0u);
     EXPECT_EQ(queue.pop(), nullptr);
@@ -183,9 +183,11 @@ TEST_F(ReadyQueueTest, PopBatchPartial) {
 
 TEST_F(ReadyQueueTest, TaggedBatchPopPreservesTaskGeneration) {
     ChipTaskSlotState items[2];
-    ChipTaskSlotState *input[2]{&items[0], &items[1]};
+    CapturedReadySlot input[2]{
+        CapturedReadySlot(&items[0], LaneMask::none()), CapturedReadySlot(&items[1], LaneMask::none())
+    };
     constexpr TaskId queued_task_ids[2]{TaskId::make(1, 0x1234), TaskId::make(2, 0x5678)};
-    queue.push_batch_tagged(input, queued_task_ids, 2);
+    queue.push_shaped_batch(input, queued_task_ids, 2, ResourceShape::AIC);
 
     ChipTaskSlotState *out[2];
     TaskId task_id_snapshots[2]{};

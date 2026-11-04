@@ -16,7 +16,7 @@
 enum class SchedulerGmMixResult : uint8_t { WAIT, PROGRESS, TASK_LAST, ERROR };
 
 inline __aicore__ bool scheduler_gm_mix_context_valid(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     auto *admission = local == nullptr ? nullptr : local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
@@ -59,7 +59,7 @@ inline __aicore__ bool scheduler_gm_mix_descriptor_valid(
 }
 
 inline __aicore__ bool scheduler_gm_mix_close(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *closed, bool critical = false
 ) {
     if (closed == nullptr) return false;
@@ -136,7 +136,7 @@ inline __aicore__ bool scheduler_gm_mix_close(
 }
 
 inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     // No shared ownership changes until the cursor helper's error gate.
     if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return SchedulerBlockClaimResult::ERROR;
@@ -173,7 +173,7 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
 }
 
 inline __aicore__ bool scheduler_gm_mix_publish(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return false;
     auto &admission = *local->admission;
@@ -214,7 +214,7 @@ inline __aicore__ bool scheduler_gm_mix_publish(
 }
 
 inline __aicore__ bool scheduler_gm_mix_observe(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {
     if (progress == nullptr) return false;
@@ -264,7 +264,7 @@ inline __aicore__ bool scheduler_gm_mix_observe(
 }
 
 inline __aicore__ bool scheduler_gm_mix_arrive(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {
     if (progress == nullptr) return false;
@@ -285,7 +285,7 @@ inline __aicore__ bool scheduler_gm_mix_arrive(
 }
 
 inline __aicore__ bool scheduler_gm_mix_check_acks(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool releases, bool *all
 ) {
     *all = false;
@@ -321,7 +321,7 @@ inline __aicore__ void scheduler_gm_mix_publish_release(__gm__ void *base, Sched
 }
 
 inline __aicore__ bool scheduler_gm_mix_prepare_lane(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool *progress
 ) {
     if (progress == nullptr) return false;
@@ -377,7 +377,7 @@ inline __aicore__ bool scheduler_gm_mix_prepare_lane(
 // Completion owns the generation check. Both slot retirement and trace
 // publication precede this release operation.
 inline __aicore__ bool scheduler_gm_mix_release_lane(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t task_ref, uint32_t slot_index, uint32_t generation
 ) {
     if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return false;
@@ -393,7 +393,7 @@ inline __aicore__ bool scheduler_gm_mix_release_lane(
 }
 
 inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     // The completion contribution below owns the error gate. A partial
     // release observation neither retires the group nor contributes a block.

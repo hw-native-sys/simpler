@@ -81,7 +81,13 @@ int rtFreeHost(void *ptr) {
 int rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
     return rtMemcpy(dst, capacity, src, bytes, kind);
 }
-int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t) {
+int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+    if (kind == RT_MEMCPY_DEVICE_TO_HOST) {
+        ++native_admission_transport::control().d2h_calls;
+        native_admission_transport::control().downloads.push_back(src);
+        native_admission_transport::control().d2h_bytes += bytes;
+    }
+    if (kind == RT_MEMCPY_HOST_TO_DEVICE) native_admission_transport::control().uploads.emplace_back(dst, src);
     if (const int rc = native_admission_transport::control().copy_rc) return rc;
     if (bytes > capacity || (bytes && (!dst || !src))) return -2;
     std::memcpy(dst, src, bytes);
@@ -111,7 +117,10 @@ int rtStreamDestroy(rtStream_t p) {
     return 0;
 }
 int rtStreamQuery(rtStream_t) { return 0; }
-int rtStreamSynchronize(rtStream_t) { return 0; }
+int rtStreamSynchronize(rtStream_t stream) {
+    native_admission_transport::control().observed_streams.push_back(stream);
+    return native_admission_transport::control().stream_sync_rc;
+}
 int rtRegisterAllKernel(const rtDevBinary_t *, void **out) {
     *out = std::malloc(1);
     return *out ? 0 : -12;
@@ -140,17 +149,20 @@ int aclrtDestroyEvent(aclrtEvent p) {
 int aclrtRecordEvent(aclrtEvent, aclrtStream) { return 0; }
 int aclrtResetEvent(aclrtEvent, aclrtStream) { return 0; }
 int aclrtQueryEventStatus(aclrtEvent, aclrtEventRecordedStatus *out) {
-    *out = ACL_EVENT_RECORDED_STATUS_COMPLETE;
+    *out = native_admission_transport::control().events_complete ? ACL_EVENT_RECORDED_STATUS_COMPLETE :
+                                                                   ACL_EVENT_RECORDED_STATUS_NOT_READY;
     return 0;
 }
-int aclrtSynchronizeEventWithTimeout(aclrtEvent, int32_t) { return 0; }
+int aclrtSynchronizeEventWithTimeout(aclrtEvent, int32_t) {
+    return native_admission_transport::control().event_wait_rc;
+}
 int aclrtEventGetTimestamp(aclrtEvent, uint64_t *out) {
     *out = 1;
     return 0;
 }
 int aclrtStreamWaitEvent(aclrtStream, aclrtEvent) { return 0; }
-int aclrtSynchronizeStream(aclrtStream) { return 0; }
-int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) { return 0; }
+int aclrtSynchronizeStream(aclrtStream stream) { return rtStreamSynchronize(stream); }
+int aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t) { return rtStreamSynchronize(stream); }
 int aclrtGetStreamResLimit(aclrtStream, int, uint32_t *out) {
     *out = 1;
     return 0;

@@ -46,11 +46,11 @@ extern thread_local bool refuse_next_host_allocation;
 
 class Runner : public DeviceRunnerBase {
 public:
-    Runner() {
+    explicit Runner(bool managed_workspace = true) {
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
         max_block_dim_ = block_dim_ = 1;
-        EXPECT_EQ(install_staged_workspace(), 0);
+        if (managed_workspace) EXPECT_EQ(install_staged_workspace(), 0);
         EXPECT_TRUE(set_run_resource_grant(6));
         enable_automatic_admission();
         CallableState callable;
@@ -61,6 +61,7 @@ public:
         callables_[1] = std::move(callable);
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
+    size_t scheduler_capacity(uint32_t slot) const { return scheduler_state_storage_[slot].device_capacity(); }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
     void allocate_callable() {
         void *allocation = mem_alloc_.alloc(64);

@@ -250,12 +250,11 @@ struct HostApiOps {
         void *runner_ctx, uint64_t run_epoch, ChipSwimlaneExtensionSection section, const char *json_value,
         size_t json_size
     );
-    // This run's device-published result payload, or nullptr when the run
-    // published none. The platform holds one region per pipeline slot and never
-    // interprets the bytes — the layout is the runtime's own. `run_epoch` is the
-    // epoch the caller's run was given: a region still carrying an earlier run's
-    // epoch reads as absent, so a predecessor's payload cannot be returned as
-    // this run's. See common/device_run_result.h for why the region exists and
+    // This live call's device-published result payload, or nullptr when absent
+    // or unpublished for its own `run_epoch`. The platform retains a call's
+    // result across pipeline-slot reuse; another epoch's payload is not this
+    // call's result. The platform validates the common result header, while
+    // the payload layout belongs to the runtime. See common/device_run_result.h
     // for what "absent" does and does not mean.
     const void *(*get_run_result)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out);
     // Declare which caller device allocations this run produces. Taken from the orchestration
@@ -526,6 +525,9 @@ public:
      * its publish point both read as absent. A caller decides that a run failed
      * from the execution error channel and comes here for the detail.
      */
+    void set_observed_run_status(int32_t code) noexcept { observed_run_status_ = code; }
+    std::optional<int32_t> observed_run_status() const noexcept { return observed_run_status_; }
+
     const void *run_result(size_t *bytes_out) const noexcept {
         if (ops_->get_run_result == nullptr) {
             if (bytes_out != nullptr) *bytes_out = 0;
@@ -568,11 +570,12 @@ public:
     }
 
 private:
+    std::optional<int32_t> observed_run_status_;
     /**
      * This run's identity for the caller-buffer table: its pipeline slot, offset so it is never
-     * zero. A slot holds one run for that run's whole lifetime, so it names the declaring run for
-     * exactly as long as the declaration may exist, and it is the same identity the lane's
-     * reference uses.
+     * zero. The lane ends its declarations and device borrows after physical
+     * last use, before that slot can name another execution. A late host-output
+     * observer holds separate call-owned staging and never clears this identity.
      */
     uint64_t run_identity() const noexcept { return static_cast<uint64_t>(pipeline_slot_) + 1; }
 

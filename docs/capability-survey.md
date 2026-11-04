@@ -223,7 +223,7 @@ values yield `SIMPLER_ERROR_ASYNC_COMPLETION_INVALID`.
 
 | Engine | a2a3 | a5 | Status |
 | ------ | ---- | -- | ------ |
-| COUNTER (default) | registered | registered | **Shipped** — `tests/st/worker/comm_domain/async_notify` runs onboard on both architectures; `tests/st/worker/comm_domain/deferred_notify` runs in sim on both and onboard on a2a3, through the `st-onboard-*` / `st-sim-*` jobs in `ci.yml`. Routed by `CASES[*]["platforms"]`, no `skipif` |
+| COUNTER (default) | registered | registered | **Shipped** — `tests/st/worker/comm_domain/async_notify` runs onboard on both architectures. `tests/st/worker/comm_domain/deferred_notify` runs Per-PR on a2a3 onboard and a5sim, and in Daily on a2a3sim. Selection uses `CASES[*]["platforms"]` and `CASES[*]["manual"]`. |
 | SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (the "SDMA pytest (a2a3)" step in `ci.yml`); a5 not built |
 | URMA | absent | full implementation | **Gated** — see below |
 | ROCE, CCU | enum only | enum only | **Name only** |
@@ -251,8 +251,8 @@ fully wired, so turning it on does not help — the device path stays unreachabl
 At that snapshot, A5's SDMA and URMA overlays were mutually exclusive by CMake
 `FATAL_ERROR` because `CommContext` exposed a single `workSpace` pair.
 
-**Current A5 workspace selection.** SDMA is always compiled; optional URMA and
-RDMA providers default OFF and can both be enabled in the same build.
+**Current A5 workspace selection.** SDMA and URMA are always compiled; optional
+RDMA defaults OFF and can be enabled alongside both providers.
 `CommContext.workspaces` stores independent descriptors indexed by
 `CommWorkspaceKind::{SDMA, URMA, RDMA}`. Domains create synchronous mapped
 windows by default and initialize async providers only when explicitly requested
@@ -260,8 +260,8 @@ through `workspace_engines`. SDMA and URMA can share a domain; RDMA currently
 requires its own domain and cannot be combined with either in one domain.
 The [URMA example](../examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo/README.md)
 covers ordered mixed DAGs and same-kernel SDMA/URMA requests. The A5 onboard CI
-job explicitly enables URMA and runs these cases alongside SDMA; ordinary builds
-retain the optional provider's OFF default.
+job runs these cases alongside SDMA using the default providers. RDMA remains
+optional and defaults to OFF.
 
 **HCCL is bootstrap, not data movement.** The complete set of functions called
 is `HcclGetRootInfo`, `HcclCommInitRootInfo`, `HcclBarrier`, `HcclCommDestroy`.

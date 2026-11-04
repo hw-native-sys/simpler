@@ -13,6 +13,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
+#include <vector>
 namespace native_admission_transport {
 struct Control {
     size_t ceiling{std::numeric_limits<size_t>::max()};
@@ -34,6 +36,14 @@ struct Control {
     int copy_rc{0};
     size_t stream_create_calls{0};
     size_t fail_stream_create{0};
+    size_t d2h_calls{0};
+    size_t d2h_bytes{0};
+    std::vector<const void *> downloads;
+    int stream_sync_rc{0};
+    std::vector<void *> observed_streams;
+    bool events_complete{true};
+    int event_wait_rc{0};
+    std::vector<std::pair<void *, const void *>> uploads;
 };
 Control &control();
 void release_provider_state();

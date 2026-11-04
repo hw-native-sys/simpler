@@ -51,7 +51,7 @@ INIT_VAL = -1.0
 GATES = ((0, 0, 1), (1, 0, 1), (0, 1, 1), (0, 0, 0))
 
 
-@pytest.mark.scheduler_mode("legacy")
+@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphPredicatedDispatchA5(SceneTestCase):
     """graph_predicated_dispatch: predicates recorded into a Graph resolve per replay."""

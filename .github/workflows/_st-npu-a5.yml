@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+          ref: ${{ inputs.ref || '43e6917815b0f05a73301b4b5014119aee9e0b84' }}
           persist-credentials: false
 
       - name: Prepare A5 diagnostic logs

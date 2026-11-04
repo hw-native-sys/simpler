@@ -10,10 +10,15 @@
 from __future__ import annotations
 
 import copy
+import importlib
+import os
+import signal
 import struct
 import threading
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +28,133 @@ from simpler.buffer import AccessMode, buffer_reference, wrap_vmm_window
 from simpler.orchestrator import _callback_run
 from simpler.task_interface import CommBufferSpec, CommDomainHandle, DataType, GlobalCommDomainHandle, TaskArgs
 from simpler.worker import Worker
+
+
+@pytest.fixture
+def rejected_collective_scene(monkeypatch):
+    root = Path(__file__).resolve().parents[2] / "st/worker"
+    monkeypatch.syspath_prepend(str(root))
+    scene = importlib.import_module("collectives.allreduce.test_allreduce")
+    assert scene.__file__ is not None
+    assert Path(scene.__file__).resolve() == root / "collectives/allreduce/test_allreduce.py"
+    return scene
+
+
+@pytest.mark.parametrize(
+    "damage, damaged_device",
+    [
+        (None, 3),
+        ("sdk-alone", 3),
+        ("foreign-pid", 3),
+        ("stale", 3),
+        ("wrong-orch", 3),
+        ("wrong-scheduler", 3),
+        ("wrong-sdk", 3),
+        ("success", 3),
+        ("missing", 3),
+        ("wrong-orch", 5),
+        ("missing", 5),
+    ],
+)
+def test_rejected_collective_requires_owned_fault_and_strong_error(
+    rejected_collective_scene, tmp_path, damage, damaged_device
+):
+    failure = (
+        "chip_process dev=3: chip run: RuntimeError: chip run lane is poisoned: "
+        "finalize_native_run failed with code 507018 "
+        "(run_id=1 slot=0 generation=1 dispatch_id=1 run_epoch=1)"
+    )
+    fault = (
+        "[mono_ns=123][T0x1][ERROR] copy_back_run_outputs_impl: [runtime_maker.cpp:1111] "
+        "simpler runtime failed: orch_error_code=5 sched_error_code=0 runtime_status=-5\n"
+    )
+    logs = {}
+    for device, pid in [(3, 111), (5, 222)]:
+        source = tmp_path / f"host.{pid}.log"
+        prefix = fault if damage == "stale" else "prior setup record\n"
+        body = fault
+        if device == damaged_device:
+            if damage in ("sdk-alone", "stale"):
+                body = "SDK error 507018\n"
+            elif damage == "wrong-orch":
+                body = body.replace("orch_error_code=5", "orch_error_code=6")
+            elif damage == "wrong-scheduler":
+                body = body.replace("sched_error_code=0", "sched_error_code=100")
+            elif damage == "foreign-pid":
+                source = tmp_path / "host.999.log"
+        source.write_text(prefix + body)
+        logs[device] = (pid, source, len(prefix.encode()))
+    if damage == "missing":
+        logs[damaged_device][1].unlink()
+    elif damage == "wrong-sdk":
+        failure = failure.replace("507018", "507011")
+    elif damage == "success":
+        failure = "execution succeeded"
+    copied = rejected_collective_scene._copy_rejected_rank_logs(logs, tmp_path / "captured")
+    if damage is None:
+        rejected_collective_scene._assert_rejected_domain_error(failure, "a2a3", copied)
+    else:
+        with pytest.raises(AssertionError):
+            rejected_collective_scene._assert_rejected_domain_error(failure, "a2a3", copied)
+
+
+def test_rejected_collective_keeps_sim_invalid_args_contract(rejected_collective_scene):
+    rejected_collective_scene._assert_rejected_domain_error("run failed with code -5", "a2a3sim", {})
+    with pytest.raises(AssertionError):
+        rejected_collective_scene._assert_rejected_domain_error("run failed with code 507018", "a2a3sim", {})
+
+
+@pytest.mark.timeout(10)
+def test_rejected_collective_reads_the_inherited_native_process_sink(
+    rejected_collective_scene, drain_host_log, tmp_path
+):
+    from _task_interface import _host_log_directory  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+    from simpler.task_interface import _native_emit_host_log  # noqa: PLC0415
+
+    directory = Path(_host_log_directory())
+    read_fd, write_fd = os.pipe()
+    worker_mod._initialize_host_log(defer_writer=True)
+    try:
+        pid = os.fork()
+    except BaseException:
+        os.close(read_fd)
+        os.close(write_fd)
+        worker_mod._start_host_log_writer()
+        raise
+    if pid == 0:
+        os.close(write_fd)
+        try:
+            assert os.read(read_fd, 1) == b"1"
+            assert Path(_host_log_directory()) == directory
+            worker_mod._start_host_log_writer()
+            assert _native_emit_host_log(40, "collective_sink_control", "owned child host-log record")
+            worker_mod._exit_after_host_log_flush(0)
+        except BaseException:
+            os._exit(1)
+    os.close(read_fd)
+    source = directory / f"host.{pid}.log"
+    offset = source.stat().st_size if source.exists() else 0
+    reaped = False
+    poll = threading.Event()
+    try:
+        os.write(write_fd, b"1")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            found, status = os.waitpid(pid, os.WNOHANG)
+            if found == pid:
+                reaped = True
+                assert os.waitstatus_to_exitcode(status) == 0
+                break
+            poll.wait(0.001)
+        assert reaped, "native host-log child did not exit"
+    finally:
+        os.close(write_fd)
+        if not reaped:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        worker_mod._start_host_log_writer()
+    captured = rejected_collective_scene._copy_rejected_rank_logs({3: (pid, source, offset)}, tmp_path / "owned")
+    assert "[ERROR] collective_sink_control: owned child host-log record" in captured[3]["text"]
 
 
 @pytest.fixture(params=[3, 4])
@@ -1137,3 +1269,52 @@ def test_registered_views_resolve_and_revalidate_after_revocation(domain_worker)
             worker._reexport(logical.to_descriptor())
     finally:
         registry.close()
+
+
+@pytest.mark.parametrize("engines", [(), ("sdma",), ("rdma",)])
+def test_checked_device_context_rejects_missing_urma(domain_worker, engines):
+    worker, members = domain_worker
+
+    def build(orch, _args, _cfg):
+        handle = orch.allocate_domain(**_request(members))
+        if worker.level != 3:
+            with pytest.raises(KeyError):
+                handle.device_context(0, workspace_engines=("urma",))
+            return
+        handle._config = replace(handle._config, workspace_engines=engines)
+        with pytest.raises(ValueError, match="urma.*not initialized"):
+            handle.device_context(handle.workers[0], workspace_engines=("urma",))
+
+    worker.run(build)
+
+
+def test_checked_device_context_validates_live_domain_and_scalar_use(domain_worker):
+    worker, members = domain_worker
+    if worker.level != 3:
+        return
+    saved = []
+
+    def allocate(orch, _args, _cfg):
+        handle = orch.allocate_domain(**_request(members))
+        handle._config = replace(handle._config, workspace_engines=("sdma", "urma"))
+        saved.append(handle)
+        target = handle.workers[0]
+        assert handle.device_context(target, workspace_engines=("urma", "sdma")) == handle[target].device_ctx
+        with pytest.raises(KeyError):
+            handle.device_context(999, workspace_engines=("urma",))
+        with pytest.raises(ValueError, match="distinct names"):
+            handle.device_context(target, workspace_engines=("unknown",))
+
+    worker.run(allocate)
+    handle = saved[0]
+
+    def reuse(_orch, _args, _cfg):
+        handle.device_context(handle.workers[0], workspace_engines=("urma",))
+        resources = worker._building_run_resources
+        table = resources.live_domains if worker.level == 3 else resources.live_global_domains
+        assert table[handle.name] is handle
+
+    worker.run(reuse)
+    handle.release()
+    with pytest.raises(RuntimeError, match="released"):
+        handle.device_context(handle.workers[0], workspace_engines=("urma",))

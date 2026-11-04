@@ -108,6 +108,9 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
             # SDMA run stream early so reset precedes DEV_RUNNING_DOWN.
             error_codes = r"(-100|507(046|018|015|000))"
         native_run_error = rf"finalize_native_run failed with code {error_codes}\b"
+        if enable_sdma:
+            # An event wait can report the fault before native finalization.
+            native_run_error = rf"(?:{native_run_error}|wait_native_run_completion failed with code 507015\b)"
         with pytest.raises(RuntimeError, match=native_run_error):
             worker.run(handle, None, config)
         elapsed = time.monotonic() - t0

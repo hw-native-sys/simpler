@@ -84,6 +84,7 @@ class TestDeferredNotifyDemo(SceneTestCase):
         {
             "name": "peer_notification",
             "platforms": ["a2a3", "a2a3sim", "a5sim"],
+            "manual": ["a2a3sim"],
             "config": {"device_count": NRANKS, "num_sub_workers": 0},
             "params": {},
         }

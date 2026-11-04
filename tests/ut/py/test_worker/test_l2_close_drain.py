@@ -345,3 +345,71 @@ def test_close_does_not_repeat_poison_already_delivered_by_wait(chip, monkeypatc
     with pytest.raises(RuntimeError) as caught:
         handle.result()
     assert caught.value is failure and native.wait_count == 1
+
+
+@pytest.mark.parametrize("confirmed", [False, True], ids=["unconfirmed-retains", "confirmed-retires"])
+def test_owned_close_crosses_native_proof_before_workspace_and_source_release(chip, monkeypatch, confirmed):
+    target = chip.worker.register(
+        ChipCallable.build(signature=[ArgDirection.IN], func_name="unknown_stop", binary=b"\x00", children=[])
+    )
+    backing = Buffer.wrap(address=0x9000, nbytes=64, location=chip.worker.device_location)
+    args = TaskArgs()
+    args.add_tensor(Tensor(backing, shapes=(4,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+    handle = chip.worker.submit(target, args)
+    keepalive = handle._keepalive
+    primary = RuntimeError("original native execution failure")
+    chip.state.error = primary
+
+    def interrupted_finalizer(*_):
+        raise KeyboardInterrupt("unknown native cleanup boundary")
+
+    # Exercise the real RunHandle recovery path: it retains this live native
+    # run and its source uses, rather than synthesizing a completion verdict.
+    with monkeypatch.context() as patch:
+        patch.setattr(chip.worker, "_finalize_run_handle", interrupted_finalizer)
+        with pytest.raises(RuntimeError) as caught:
+            handle.wait()
+    assert caught.value is primary
+    assert handle._finalization_abandoned and handle in chip.worker._abandoned_run_handles
+    assert handle._keepalive is keepalive and chip.live and chip.worker._chip_source_uses
+    with pytest.raises(RuntimeError, match="in-flight"):
+        backing.close()
+
+    original_finalize = chip.impl.finalize
+    original_buffers = chip.worker._release_all_buffers
+    native_attempts = []
+
+    def native_finalize():
+        native_attempts.append("native close")
+        assert chip.live and handle._keepalive is keepalive
+        assert chip.worker._chip_source_uses and not backing.closed
+        if not confirmed:
+            raise RuntimeError("owned reset was not confirmed")
+        chip.live.clear()  # The controlled DSO's successful terminal close.
+        original_finalize()
+
+    def release_buffers():
+        assert chip.impl.finalized and not chip.live
+        chip.events.append("host buffers")
+        original_buffers()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(chip.impl, "finalize", native_finalize)
+        patch.setattr(chip.worker, "_release_all_buffers", release_buffers)
+        if confirmed:
+            chip.worker.close()
+            assert chip.impl.finalized and chip.worker._chip_worker is None
+            assert not chip.worker._chip_source_uses and not chip.worker._abandoned_run_handles
+            assert handle._keepalive is None and "host buffers" in chip.events
+            backing.close()
+            assert backing.closed
+        else:
+            with pytest.raises(RuntimeError, match="owned reset was not confirmed"):
+                chip.worker.close()
+            assert chip.worker._chip_worker is chip.impl and not chip.impl.finalized
+            assert chip.live and handle._keepalive is keepalive and chip.worker._chip_source_uses
+            assert "host buffers" not in chip.events and not backing.closed
+    assert native_attempts == ["native close"]
+    with pytest.raises(RuntimeError) as caught:
+        handle.wait()
+    assert caught.value is primary and chip.runs[0].wait_count == 1

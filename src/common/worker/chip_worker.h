@@ -569,6 +569,7 @@ private:
     using SimplerRunFn = decltype(&simpler_run);
     using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
+    using SimplerFinalizeRunFn = decltype(&simpler_finalize_run_with_delivery);
     using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
     using ValidateExecutionContextFn = decltype(&simpler_validate_execution_context);
     using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
@@ -655,7 +656,8 @@ private:
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
-    SimplerNativeRunFn finalize_run_fn_ = nullptr;
+    SimplerNativeRunFn wait_run_completion_fn_ = nullptr;
+    SimplerFinalizeRunFn finalize_run_fn_ = nullptr;
     SimplerProbeRunRetentionFn probe_run_retention_fn_ = nullptr;
     GetTeardownReportFn get_teardown_report_fn_ = nullptr;
     // The first captured teardown observation, kept by value so it outlives
@@ -770,6 +772,41 @@ private:
     public:
         using std::runtime_error::runtime_error;
     };
+    class RuntimeStorage {
+    public:
+        RuntimeStorage() = default;
+        RuntimeStorage(size_t size, size_t alignment, std::shared_ptr<RuntimeModule> module);
+        ~RuntimeStorage();
+        RuntimeStorage(RuntimeStorage &&other) noexcept;
+        RuntimeStorage &operator=(RuntimeStorage &&other) noexcept;
+        RuntimeStorage(const RuntimeStorage &) = delete;
+        RuntimeStorage &operator=(const RuntimeStorage &) = delete;
+
+        // Unproven completion retains the allocation for the process lifetime.
+        void *data() { return data_; }
+        const void *data() const { return data_; }
+        size_t size() const noexcept { return size_; }
+        size_t alignment() const noexcept { return alignment_; }
+
+        /**
+         * Give up ownership of the block without freeing it.
+         *
+         * For a run whose carrier could not be proved destroyed. The block then
+         * outlives this object, which is the whole point: a carrier the device
+         * or the AICPU may still reach must not have its bytes returned to the
+         * allocator, and no owner that dies can keep it. Deliberately a leak —
+         * a bounded one, with the reason logged, which is what the alternative
+         * of reusing those bytes cannot offer.
+         */
+        void abandon() noexcept;
+
+    private:
+        void *data_{nullptr};
+        size_t size_{0};
+        size_t alignment_{0};
+        std::shared_ptr<RuntimeModule> module_;
+    };
+
     /**
      * One live native run, owned by this worker and keyed by its own epoch.
      *
@@ -780,6 +817,7 @@ private:
      * The entry outlives the carrier object the runtime places in that run's storage.
      */
     struct NativeRunEntry {
+        RuntimeStorage storage;
         uint32_t slot_id{0};
         uint64_t lease_generation{0};
         uint64_t run_epoch{0};
@@ -791,12 +829,22 @@ private:
         /** First writer wins: an established error is never replaced by a later one. */
         int pending_rc{0};
         bool pending_rc_set{false};
+        bool result_observed{false};
         bool permits_prepared_successor{false};
     };
     /** What the storage tag says after a finalize that reached the C entry. */
     enum class RunStorageTag : uint8_t { Destroyed, Canonical, Noncanonical };
     /** Which operation a lease is being taken for; decides blocking and the admitted phases. */
-    enum class NativeRunOp : uint8_t { Launch, Poll, Wait, Finalize, Probe, Predecessor, ProbeSuccessor };
+    enum class NativeRunOp : uint8_t {
+        Launch,
+        Poll,
+        WaitCompletion,
+        Wait,
+        Finalize,
+        Probe,
+        Predecessor,
+        ProbeSuccessor
+    };
     /** Why a lease was refused, or that the run had already completed. */
     enum class NativeRunLease : uint8_t { Acquired, AlreadyComplete, Absent, Stale, Reserved, Busy };
     ChipWorkerNativeRun prepare_native_run_on_slot(
@@ -809,6 +857,7 @@ private:
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
         bool pipeline_leased, NativeRunProvenance provenance
     );
+    void wait_native_run_completion(const ChipWorkerNativeRun &run);
     void cleanup_native_runs_noexcept() noexcept;
     void clear_runtime_binding(bool release_device_reservation = true);
     void abandon_after_failed_teardown(std::exception_ptr error) noexcept;
@@ -829,42 +878,9 @@ private:
 
     friend struct ChipRunLaneState;
 
-    class RuntimeStorage {
-    public:
-        RuntimeStorage() = default;
-        RuntimeStorage(size_t size, size_t alignment, std::shared_ptr<RuntimeModule> module);
-        ~RuntimeStorage();
-        RuntimeStorage(RuntimeStorage &&other) noexcept;
-        RuntimeStorage &operator=(RuntimeStorage &&other) noexcept;
-        RuntimeStorage(const RuntimeStorage &) = delete;
-        RuntimeStorage &operator=(const RuntimeStorage &) = delete;
-
-        // Unproven completion retains the allocation for the process lifetime.
-        void *data() { return data_; }
-        const void *data() const { return data_; }
-        size_t size() const noexcept { return size_; }
-
-        /**
-         * Give up ownership of the block without freeing it.
-         *
-         * For a run whose carrier could not be proved destroyed. The block then
-         * outlives this object, which is the whole point: a carrier the device
-         * or the AICPU may still reach must not have its bytes returned to the
-         * allocator, and no owner that dies can keep it. Deliberately a leak —
-         * a bounded one, with the reason logged, which is what the alternative
-         * of reusing those bytes cannot offer.
-         */
-        void abandon() noexcept;
-
-    private:
-        void *data_{nullptr};
-        size_t size_{0};
-        std::shared_ptr<RuntimeModule> module_;
-    };
-
-    // Allocated once during init and never resized. Each allocation honors the
-    // runtime-reported alignment and keeps a stable C ABI address through
-    // prepare/finalize even if the owning vector itself is moved.
+    // One reusable idle carrier per slot, with opaque runtime size/alignment.
+    // A live call moves its carrier into NativeRunEntry until finalize; slot
+    // reuse can allocate another while an old observation remains live.
     std::vector<RuntimeStorage> runtime_bufs_;
     /**
      * Every live native run, keyed by the epoch that names it.
@@ -875,6 +891,8 @@ private:
      */
     std::unordered_map<uint64_t, std::unique_ptr<NativeRunEntry>> native_runs_;
     mutable std::mutex native_run_mu_;
+    bool native_runs_closing_{false};
+    void validate_execution_process() const;
     /** Signalled whenever an operation lease is released or a run entry is removed. */
     std::condition_variable native_run_ops_done_;
 
@@ -956,7 +974,9 @@ private:
     /** Record that a run's work reached the device. */
     void note_native_run_launched(uint64_t run_epoch) noexcept;
     /** Record that a run's device work is over, and the error it carries, if any. */
-    void note_native_run_completion(uint64_t run_epoch, int rc) noexcept;
+    void note_native_run_completion(uint64_t run_epoch, int rc, bool result_observed = true) noexcept;
+    void note_native_run_result(uint64_t run_epoch, int rc) noexcept;
+    void note_native_run_wait(uint64_t run_epoch, void *storage, int rc) noexcept;
     /** Remove an entry that never got past preparation. */
     void drop_preparing_native_run(uint64_t run_epoch) noexcept;
     /** Whether a finalization reports to a caller or is closing this worker down. */
@@ -987,10 +1007,14 @@ private:
         FinalizeFault fault{FinalizeFault::None};
         int rc{0};
         bool no_submission_released{false};
+        bool context_destroyed{false};
         std::exception_ptr captured;
     };
-    // This out-fact survives a persisted launch error, never failed cleanup.
-    void finalize_native_run_impl(const ChipWorkerNativeRun &run, bool *no_submission_released);
+    // Cleanup facts survive a persisted run error; its code establishes neither.
+    void finalize_native_run_impl(
+        const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs = true,
+        bool *context_destroyed = nullptr
+    );
     /**
      * Finalize one run and report what it established.
      *
@@ -998,8 +1022,9 @@ private:
      * exact ordering instead of carrying a second implementation of it. A null `token` identifies
      * the run by epoch alone, which is what teardown has.
      */
-    NativeRunFinalizeOutcome
-    finalize_native_run_epoch(uint64_t run_epoch, const ChipWorkerNativeRun *token, FinalizeMode mode) noexcept;
+    NativeRunFinalizeOutcome finalize_native_run_epoch(
+        uint64_t run_epoch, const ChipWorkerNativeRun *token, FinalizeMode mode, bool deliver_outputs = true
+    ) noexcept;
     /** Give back a finalization reservation that could not be used; never throws. */
     void clear_finalize_reservation_noexcept(uint64_t run_epoch) noexcept;
     PipelineSlotGenerationFilter pipeline_generations_;

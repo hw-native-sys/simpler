@@ -156,14 +156,14 @@ class TestHbgDepGenAcrossRuns(SceneTestCase):
         {
             "name": "vector",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3"],
+            "manual": True,
             "config": {"device_count": 1, "num_sub_workers": 0},
             "params": {"graph": "vector"},
         },
         {
             "name": "predicated",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3"],
+            "manual": True,
             "config": {"device_count": 1, "num_sub_workers": 0, "aicpu_thread_num": 2},
             "params": {"graph": "predicated"},
         },
