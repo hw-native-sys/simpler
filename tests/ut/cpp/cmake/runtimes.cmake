@@ -47,18 +47,39 @@ endfunction()
 # A target covering such a source is therefore built once per runtime, and this
 # list is the only place that says how many that is.
 #
-# The two archs must agree: a runtime present under one and not the other leaves
-# every target built from the missing side uncovered, with nothing to report it.
-# The check below turns that into a configure-time error.
+# Only the runtimes both archs carry: such a target compiles for every name in
+# this list under both, so a runtime one arch lacks would resolve task_id.h into
+# a directory that is not there. The intersection is what keeps that from
+# happening, and it is the whole of what this list is for.
+#
+# A runtime under one arch only is a real state, not a mistake to reject. It
+# is covered by that arch's own cases under <arch>/runtime/<name>/, which name
+# their include directories and so need no entry here. Those cases are the only
+# ones that see it, which is why the status line below names it: nothing else
+# reports that an arch-independent case skipped a runtime.
 simpler_discover_runtimes(a2a3 _a2a3_runtimes)
 simpler_discover_runtimes(a5 _a5_runtimes)
-if(NOT _a2a3_runtimes STREQUAL _a5_runtimes)
-    message(FATAL_ERROR
-        "Runtime sets differ between archs — a2a3 has [${_a2a3_runtimes}], "
-        "a5 has [${_a5_runtimes}]. Add the missing build_config.py before "
-        "building the unit tests.")
-endif()
+
+set(_a2a3_only "${_a2a3_runtimes}")
+list(REMOVE_ITEM _a2a3_only ${_a5_runtimes})
+set(_a5_only "${_a5_runtimes}")
+list(REMOVE_ITEM _a5_only ${_a2a3_runtimes})
+
 set(SIMPLER_RUNTIMES "${_a2a3_runtimes}")
+if(_a2a3_only)
+    list(REMOVE_ITEM SIMPLER_RUNTIMES ${_a2a3_only})
+endif()
+if(NOT SIMPLER_RUNTIMES)
+    message(FATAL_ERROR
+        "No runtime is present under both archs — a2a3 has [${_a2a3_runtimes}], "
+        "a5 has [${_a5_runtimes}]. Every arch-independent case needs one.")
+endif()
+if(_a2a3_only OR _a5_only)
+    message(STATUS
+        "Runtimes under one arch only: a2a3 [${_a2a3_only}], a5 [${_a5_only}] — "
+        "arch-independent cases are not built for them; their own "
+        "<arch>/runtime/<name>/ cases are.")
+endif()
 
 # A discovered runtime must have unit tests of its own.
 #
