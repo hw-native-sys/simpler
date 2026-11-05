@@ -9797,11 +9797,19 @@ class Worker:
                     wpid, status = os.waitpid(pids[i], os.WNOHANG)
                 except ChildProcessError:
                     self._startup_reaped_pids.add(pids[i])
+                    if _mailbox_load_i32(addr) == _INIT_FAILED:
+                        raise RuntimeError(
+                            f"{kind} worker {i} (pid {pids[i]}) failed during init: {_read_error_msg(buf)}"
+                        ) from None
                     raise RuntimeError(
                         f"{kind} worker {i} (pid {pids[i]}) exited during init before signalling ready"
                     ) from None
                 if wpid != 0:
                     self._startup_reaped_pids.add(pids[i])
+                    if _mailbox_load_i32(addr) == _INIT_FAILED:
+                        raise RuntimeError(
+                            f"{kind} worker {i} (pid {pids[i]}) failed during init: {_read_error_msg(buf)}"
+                        )
                     raise RuntimeError(
                         f"{kind} worker {i} (pid {pids[i]}) exited during init "
                         f"before signalling ready (wait status {status})"
