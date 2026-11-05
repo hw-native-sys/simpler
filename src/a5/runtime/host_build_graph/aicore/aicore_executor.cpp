@@ -14,6 +14,8 @@
 #include "aicore/pmu_collector_aicore.h"
 // AICore dependency scheduling uses one device-side protocol.
 #include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_async_execution.h"
+#include "backend/async_resource_binding.h"
 #include "scheduler/scheduler_graph_control.h"
 #include "scheduler/scheduler_protocol_execute.h"
 #include "common/platform_config.h"
@@ -342,6 +344,16 @@ __aicore__ bool run_ready_dispatch_loop(
                               published_graph.storage_address, static_cast<uint32_t>(published_graph.task_count),
                               published_graph.task_window_last_index
                           );
+    using AsyncBackend = AsyncResourceBindings<>;
+    SchedulerAsyncExecutionState<AsyncBackend> async_state{};
+    if (!scheduler_async_execution_mount(published_graph, scheduler_state_base, context, run_control, &async_state))
+        return false;
+    AsyncResourceTables async_tables{};
+    if (async_state.view.enabled() &&
+        !AsyncResourceTables::mount(async_state.view.base, async_state.view.layout, &async_tables))
+        return scheduler_async_runtime_detail::fail(graph, context, run_control, SCHEDULER_TASK_REF_INVALID);
+    AsyncBackend async_backend(async_tables, context->config.self_core_type == 0 ? ASYNC_CORE_AIC : ASYNC_CORE_AIV);
+    const SchedulerAsyncRuntimeView *async_view = async_state.view.enabled() ? &async_state.view : nullptr;
     const uint32_t cluster_lane = context->config.self_lane;
     // Non-zero only when this run enabled PMU and this core has a PMU window;
     // it is the whole gate, so a run with PMU off issues no counter access and
@@ -363,6 +375,7 @@ __aicore__ bool run_ready_dispatch_loop(
     uint64_t idle_start_cycles = 0;
     bool idle_active = false;
     while (true) {
+        async_state.gate.begin_iteration();
         if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
             if (phase_timing_enabled) {
                 stats->exit_observed_cycles = get_sys_cnt_aicore();
@@ -395,7 +408,7 @@ __aicore__ bool run_ready_dispatch_loop(
             const bool completion_progress = scheduler_service_cluster_completions<WithProfiling>(
                 graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
                 phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
-                profiling_level, &direct_refilled_slot_mask, nullptr
+                profiling_level, &direct_refilled_slot_mask, nullptr, nullptr, async_view
             );
             scheduler_progress = completion_progress;
             if (graph.native_header_offset != 0) {
@@ -431,12 +444,19 @@ __aicore__ bool run_ready_dispatch_loop(
                 graph, scheduler_state_base, context, run_control, ready_victim_cursors,
                 phase_timing_enabled ? &stats->ready : nullptr, profiling_level, direct_refilled_slot_mask,
                 &fill_failed, nullptr, phase_timing_enabled ? &stats->wake : nullptr,
-                phase_timing_enabled ? &stats->completion : nullptr
+                phase_timing_enabled ? &stats->completion : nullptr, async_view
             );
             scheduler_progress = dispatch_progress || scheduler_progress;
             if (fill_failed) return false;
         }
 
+        if (!scheduler_async_execution_service(
+                &async_state, graph, scheduler_state_base, context, run_control, async_backend,
+                SchedulerAsyncAdmission::BEFORE_ADMISSION,
+                context->local_ready_mask != 0 && !scheduler_ready_pool_has_pending(context), &scheduler_progress,
+                profiling_level
+            ))
+            return false;
         if (phase_timing_enabled && scheduler_progress && idle_active) {
             scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, idle_candidate_start);
             idle_active = false;
@@ -455,7 +475,12 @@ __aicore__ bool run_ready_dispatch_loop(
             uint64_t local_generation = 0;
             // Every executable payload belongs to an own slot. Its ready bit,
             // slot state and non-zero generation identify the publication.
-            if (scheduler_local_ready_pop(context, &local_slot, &local_generation)) {
+            bool ready_found = false;
+            if (!scheduler_async_execution_select(
+                    &async_state, graph, context, run_control, &local_slot, &local_generation, &ready_found
+                ))
+                return false;
+            if (ready_found) {
                 if (scheduler_dispatch_state(local_generation) != SchedulerDispatchSlotState::READY ||
                     scheduler_dispatch_generation(local_generation) == 0) {
                     scheduler_record_error(
@@ -467,7 +492,17 @@ __aicore__ bool run_ready_dispatch_loop(
                 }
                 ready_slot = static_cast<int32_t>(local_slot);
                 ready_generation = scheduler_dispatch_generation(local_generation);
-                if (context->admission != nullptr) {
+                bool consumer_ready = false;
+                if (!scheduler_async_execution_prepare(
+                        &async_state, graph, scheduler_state_base, context, run_control, local_slot, async_backend,
+                        &consumer_ready
+                    ))
+                    return false;
+                if (!consumer_ready) {
+                    scheduler_local_ready_publish(context, local_slot);
+                    ready_slot = -1;
+                }
+                if (ready_slot >= 0 && context->admission != nullptr) {
                     bool permit = false;
                     if (!scheduler_ordered_can_enter_slot<WithProfiling>(
                             graph, scheduler_state_base, context, run_control, local_slot, &permit
@@ -480,8 +515,15 @@ __aicore__ bool run_ready_dispatch_loop(
                 }
             }
         }
+        if (ready_slot < 0 && !scheduler_async_execution_service(
+                                  &async_state, graph, scheduler_state_base, context, run_control, async_backend,
+                                  SchedulerAsyncAdmission::ADMISSION_DENIED, false, &scheduler_progress, profiling_level
+                              ))
+            return false;
         if (ready_slot >= 0) {
             uint32_t slot_index = static_cast<uint32_t>(ready_slot);
+            if (!scheduler_async_execution_permitted(&async_state, graph, context, run_control, slot_index))
+                return false;
             SchedulerLocalSlotState *local_slot = &context->slots[slot_index];
             const int32_t timing_slot = context->timing_slot(cluster_lane, slot_index);
             __gm__ DispatchPayload *payload = scheduler_state_at<DispatchPayload>(
@@ -539,6 +581,10 @@ __aicore__ bool run_ready_dispatch_loop(
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
             uint64_t completion_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            if (!scheduler_async_execution_returned(
+                    &async_state, graph, scheduler_state_base, context, run_control, slot_index, async_backend
+                ))
+                return false;
             // Own-slot retirement publishes a Mix lane's release after trace completion.
             context->local_completed_generations[slot_index] = ready_generation;
             if (phase_timing_enabled) ++stats->completion.enqueue_count;

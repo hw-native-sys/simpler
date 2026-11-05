@@ -23,7 +23,8 @@ static inline __aicore__ bool scheduler_service_gm_mix(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, bool *progress,
-    SchedulerGmMixPhase ack_prefilter_phase = SchedulerGmMixPhase::IDLE
+    SchedulerGmMixPhase ack_prefilter_phase = SchedulerGmMixPhase::IDLE,
+    const SchedulerAsyncRuntimeView *async = nullptr
 ) {
     *progress = false;
     auto &admission = *local->admission;
@@ -38,11 +39,15 @@ static inline __aicore__ bool scheduler_service_gm_mix(
     }
     if (local->is_mix_coordinator()) {
         if (group.phase == SchedulerGmMixPhase::RELEASED) {
+            const int64_t released_task = admission.current_task_ref;
+            const uint32_t released_block = group.block_idx;
+            bool deferred = false;
+            if (!scheduler_completion_async_task(async, graph, local, run, released_task, &deferred)) return false;
             const auto retired = scheduler_gm_mix_retire<RecordProtocol, true>(
                 graph, base, local, run, ack_prefilter_phase == SchedulerGmMixPhase::RELEASED
             );
             if (retired == SchedulerGmMixResult::ERROR) return false;
-            if (retired == SchedulerGmMixResult::TASK_LAST &&
+            if (!deferred && retired == SchedulerGmMixResult::TASK_LAST &&
                 !scheduler_complete_ordered_task<RecordProtocol>(
                     graph, base, local, run, admission.current_task_ref, profiling_level, wake_stats, ready_stats,
                     completion_stats
@@ -51,6 +56,16 @@ static inline __aicore__ bool scheduler_service_gm_mix(
             if (retired == SchedulerGmMixResult::PROGRESS || retired == SchedulerGmMixResult::TASK_LAST) {
                 *progress = true;
                 if (!scheduler_gm_mix_close<RecordProtocol, true>(graph, base, local, run, &closed)) return false;
+                if (deferred) {
+                    // Retirement owns this cohort generation after all actual
+                    // lane release acknowledgements and its local close tail.
+                    SchedulerAsyncExecutionRelease grant{released_task, released_block, false};
+                    bool finish_published = false;
+                    if (!scheduler_async_runtime_release_execution_block(
+                            *async, graph, local, run, &grant, &finish_published
+                        ))
+                        return false;
+                }
                 if (closed) return true;
             }
         }
@@ -166,7 +181,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t *victim_cursors, SchedulerReadyStats *ready_stats, uint64_t profiling_level, bool *failed,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerWakeStats *wake_stats = nullptr,
-    SchedulerCompletionStats *completion_stats = nullptr
+    SchedulerCompletionStats *completion_stats = nullptr, const SchedulerAsyncRuntimeView *async = nullptr
 ) {
     if (failed == nullptr) return false;
     *failed = false;
@@ -286,7 +301,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             bool group_progress = false;
             if (!scheduler_service_gm_mix<RecordProtocol>(
                     graph, base, local, run, profiling_level, wake_stats, ready_stats, completion_stats,
-                    &group_progress, ack_prefilter_phase
+                    &group_progress, ack_prefilter_phase, async
                 )) {
                 *failed = true;
                 return progress || group_progress;
@@ -449,14 +464,15 @@ static inline __aicore__ bool scheduler_fill_own_slots(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint64_t *ready_victim_cursors, SchedulerReadyStats *ready_stats,
     uint64_t profiling_level, uint64_t skip_slot_mask, bool *failed, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region,
-    SchedulerWakeStats *wake_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr
+    SchedulerWakeStats *wake_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr,
+    const SchedulerAsyncRuntimeView *async = nullptr
 ) {
     if (failed != nullptr) *failed = false;
     if (scheduler == nullptr) return false;
     if (scheduler->admission != nullptr)
         return scheduler_fill_ordered_slots<RecordProtocol, EnableNativeDiscovery>(
             graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors, ready_stats, profiling_level,
-            failed, ssbuf_region, wake_stats, completion_stats
+            failed, ssbuf_region, wake_stats, completion_stats, async
         );
     const uint32_t core_type = scheduler->config.self_core_type;
     if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask)) return false;

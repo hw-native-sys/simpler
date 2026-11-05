@@ -15,6 +15,7 @@
 #include <set>
 
 #include "async_plan.h"
+#include "scheduler/scheduler_async_cohort.h"
 
 namespace {
 constexpr uint64_t kBudget = 64 * 1024 * 1024;
@@ -447,4 +448,64 @@ TEST(HbgAsyncPlan, InitializationRejectsLayoutOrCapabilityDriftBeforeWriting) {
     EXPECT_EQ(backing, saved);
     EXPECT_FALSE(scheduler_initialize_async_state(metadata, caps, layout, nullptr, backing.size(), nullptr));
 }
+TEST(HbgAsyncPlan, CohortsIncludeSynchronousAndNoPayloadParticipantsInAnAsyncRun) {
+    const std::vector<SchedulerTaskMetadata> metadata{
+        task(1), task(6, 3), task(7, 2, true), task(2, 5), task(1, 2, true)
+    };
+    const std::vector<SchedulerAsyncCapabilities> caps{
+        capabilities(1), capabilities(), capabilities(), capabilities(), capabilities()
+    };
+    SchedulerAsyncHostPlan plan;
+    ASSERT_TRUE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, {}, &plan, nullptr));
+    const auto h = record<SchedulerAsyncCohortHeader>(plan, plan.layout.scratch_offset);
+    EXPECT_EQ(h.run_epoch, kEpoch);
+    EXPECT_EQ(h.task_count, 5u);
+    EXPECT_EQ(h.cohort_count, 5u);
+    const auto map = [&](uint64_t task_index) {
+        return record<SchedulerAsyncCohortTaskMap>(plan, plan.layout.scratch_offset + h.maps_offset, task_index);
+    };
+    EXPECT_EQ(map(0).cohort_base, kNone);
+    EXPECT_EQ(map(1).lane_mask, 6u);
+    EXPECT_EQ(map(1).cohort_count, 3u);
+    EXPECT_EQ(map(1).expected, 2u);
+    EXPECT_EQ(map(2).cohort_count, 1u);
+    EXPECT_EQ(map(2).expected, 6u);
+    EXPECT_EQ(map(3).cohort_base, kNone);
+    EXPECT_EQ(map(4).expected, 2u);
+    for (uint64_t i = 0; i < h.cohort_count; ++i) {
+        const auto counter =
+            record<SchedulerAsyncCohortCounter>(plan, plan.layout.scratch_offset + h.counters_offset, i);
+        EXPECT_EQ(counter.ready, 0u);
+        for (uint8_t value : counter.reserved)
+            EXPECT_EQ(value, 0u);
+    }
+}
+
+TEST(HbgAsyncPlan, CohortPrefixAndBackendScratchRoundTripWithoutDoubleBudgeting) {
+    const std::vector<SchedulerTaskMetadata> metadata{task(7, 2, true)};
+    const std::vector<SchedulerAsyncCapabilities> caps{capabilities(2)};
+    SchedulerAsyncHostPlan plan;
+    ASSERT_TRUE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, {0, 0, 0, 129}, &plan, nullptr));
+    const auto h = record<SchedulerAsyncCohortHeader>(plan, plan.layout.scratch_offset);
+    EXPECT_EQ(h.auxiliary_bytes, 129u);
+    EXPECT_EQ(h.auxiliary_offset % 128, 0u);
+    EXPECT_EQ(h.total_bytes, h.auxiliary_offset + 129);
+    EXPECT_EQ(plan.layout.scratch_bytes, h.total_bytes);
+    SchedulerAsyncLayout exact{};
+    ASSERT_TRUE(
+        scheduler_plan_async_layout(metadata, caps, kEpoch, plan.layout.total_bytes, {0, 0, 0, 129}, &exact, nullptr)
+    );
+    EXPECT_FALSE(scheduler_plan_async_layout(
+        metadata, caps, kEpoch, plan.layout.total_bytes - 1, {0, 0, 0, 129}, &exact, nullptr
+    ));
+    std::vector<std::byte> rebuilt(plan.image.size(), std::byte{0xA5});
+    ASSERT_TRUE(scheduler_initialize_async_state(metadata, caps, plan.layout, rebuilt.data(), rebuilt.size(), nullptr));
+    EXPECT_EQ(rebuilt, plan.image);
+    auto bad = plan.layout;
+    bad.scratch_bytes = h.auxiliary_offset - 1;
+    const auto saved = rebuilt;
+    EXPECT_FALSE(scheduler_initialize_async_state(metadata, caps, bad, rebuilt.data(), rebuilt.size(), nullptr));
+    EXPECT_EQ(rebuilt, saved);
+}
+
 }  // namespace
