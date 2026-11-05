@@ -109,6 +109,7 @@ requires matching torch/torch_npu/CANN and does not enable capture submission.
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
 | `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
+| `Buffer.shm.buf` | CPU bytes of shared Host storage. Host-source domain buffers expose the whole rank window; select slices with `domain.buffer_range(name)`. Device-source HBM buffers have `shm=None` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
@@ -177,11 +178,16 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
-| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
+| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | Reuse the same live handle after full configuration validation, or create it |
 | `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
 | `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
+
+A5 TMR L3 domains may select `memory_source=AddressSpace.HOST`; each rank owns a
+Host window and the L3 creator accesses it with `buffer.shm.buf`, selecting named
+slices with `domain.buffer_range(name)`. L2 owns allocation and unlink.
+See [Host-source domains](../../a5-host-comm-domain.md).
 
 `domain.member(rank).buffers[name].tensor(...)` has the same L3/L4 semantics and routes to its owning chip.
 `domain.ref` is immutable across nodes; `local_context(rank)` requires a local mapping.

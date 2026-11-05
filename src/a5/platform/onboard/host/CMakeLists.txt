@@ -253,6 +253,7 @@ target_link_libraries(host_runtime
         c_sec
         nnopbase
         dl
+        rt
         pthread
 )
 

@@ -86,6 +86,9 @@ aclError unmap_buffer(void *p) {
 }
 }  // namespace
 
+extern "C" aclError aclrtHostRegisterV2(void *, uint64_t, uint32_t) { return ACL_ERROR_FAILURE; }
+extern "C" aclError aclrtHostGetDevicePointer(void *, void **, uint32_t) { return ACL_ERROR_FAILURE; }
+extern "C" aclError aclrtHostUnregister(void *) { return ACL_ERROR_FAILURE; }
 extern "C" aclError aclrtGetDevice(int32_t *id) {
     if (fail_get_device) return 1;
     *id = 0;

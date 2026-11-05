@@ -152,7 +152,7 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
-from .comm_domain import CommDomainRef, DomainConfig
+from .comm_domain import CommDomainRef, DomainConfig, HostBufferMapping, seal_host_mappings
 from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
@@ -2892,6 +2892,10 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
         rank_ids_offset = nbytes_offset + nbytes_struct.size
         rank_ids_struct = struct.Struct(f"<{rank_count}I")
         rank_ids = list(rank_ids_struct.unpack_from(req_buf, rank_ids_offset))
+        tail_offset = rank_ids_offset + rank_ids_struct.size
+        host_shm_name = ""
+        if len(req_buf) >= tail_offset + _CTRL_SHM_NAME_BYTES:
+            host_shm_name = _read_shm_name(req_buf, tail_offset)
     finally:
         req_buf.release()
         req_shm.close()
@@ -2913,6 +2917,7 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
             int(window_size),
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
             workspace_mask=workspace_mask,
+            **({"host_shm_name": host_shm_name} if host_shm_name else {}),
         )
 
         # Carve buffer pointers sequentially inside the local window.
@@ -10464,7 +10469,9 @@ class Worker:
             after_success=lambda: setattr(self, "_comm_base_ready", True),
         )
 
-    def _domain_config(self, members, window_size, buffers, retain_after_run, workspace_engines=()) -> DomainConfig:
+    def _domain_config(
+        self, members, window_size, buffers, retain_after_run, workspace_engines=(), memory_source=AddressSpace.DEVICE
+    ) -> DomainConfig:
         if self.level == 3:
             ids = tuple(self._config.get("device_ids", ()))
             members = tuple(operator.index(member) for member in members)
@@ -10494,7 +10501,18 @@ class Worker:
             topology = (self._global_cluster_id, tuple(targets))
         else:
             raise RuntimeError("communication domains require an L3+ Worker")
-        config = DomainConfig.capture(members, window_size, buffers, retain_after_run, topology, workspace_engines)
+        config = DomainConfig.capture(
+            members, window_size, buffers, retain_after_run, topology, workspace_engines, memory_source
+        )
+        if config.memory_source == AddressSpace.HOST:
+            if (
+                self.level != 3
+                or self._config.get("platform") != "a5"
+                or self._config.get("runtime") != "tensormap_and_ringbuffer"
+            ):
+                raise ValueError("Host-source domains require L3 A5 tensormap_and_ringbuffer")
+            if any(engine != "urma" for engine in config.workspace_engines):
+                raise ValueError("Host-source domains support only the URMA workspace")
         if config.workspace_engines:
             if self.level != 3:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
@@ -10507,7 +10525,18 @@ class Worker:
                     raise ValueError("URMA requires ranks in dense prefix order")
         return config
 
-    def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse, workspace_engines=()):
+    def _comm_domain(
+        self,
+        *,
+        name,
+        members,
+        window_size,
+        buffers,
+        retain_after_run,
+        reuse,
+        workspace_engines=(),
+        memory_source=AddressSpace.DEVICE,
+    ):
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
@@ -10519,7 +10548,9 @@ class Worker:
         with control:
             if not name:
                 raise ValueError("domain name must be non-empty")
-            config = self._domain_config(members, window_size, buffers, retain_after_run, workspace_engines)
+            config = self._domain_config(
+                members, window_size, buffers, retain_after_run, workspace_engines, memory_source
+            )
             table = self._live_domains if self.level == 3 else self._live_global_domains
             handle = table.get(name)
             if handle is not None:
@@ -10540,6 +10571,9 @@ class Worker:
                         window_size=config.window_size,
                         buffers=config.specs(),
                         workspace_mask=config.workspace_mask(),
+                        **(
+                            {"memory_source": config.memory_source} if config.memory_source == AddressSpace.HOST else {}
+                        ),
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -10664,6 +10698,7 @@ class Worker:
         window_size: int,
         buffers: list[CommBufferSpec],
         workspace_mask: int = 0,
+        memory_source: AddressSpace = AddressSpace.DEVICE,
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -10685,6 +10720,10 @@ class Worker:
         # per-chip reply shm.  We let the chip child write back its own slot.
         buffer_count = len(buffers)
         req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
+        host_names = {}
+        if memory_source == AddressSpace.HOST:
+            host_names = {chip: "sph_" + uuid.uuid4().hex[:24] for chip in workers}
+            req_size += _CTRL_SHM_NAME_BYTES
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
         # Precompute worker → dense rank for O(1) lookup in the staging /
         # context loops below (and again in _release_domain_handle).  Without
@@ -10695,7 +10734,7 @@ class Worker:
         contexts: dict[int, ChipDomainContext] = {}
         previous_ordered_cleanup = resources.requires_ordered_cleanup
 
-        def allocate(staged_shms: _SharedMemoryOwner) -> CommDomainHandle:
+        def allocate(staged_shms: _SharedMemoryOwner) -> CommDomainHandle:  # noqa: PLR0912 -- ordered allocation and rollback
             nonlocal handle
             request_shms: dict[int, SharedMemory] = {}
             reply_shms: dict[int, SharedMemory] = {}
@@ -10726,6 +10765,9 @@ class Worker:
                         struct.pack_into(f"<{buffer_count}Q", req_buf, nbytes_off, *[int(b.nbytes) for b in buffers])
                     rank_ids_off = nbytes_off + buffer_count * 8
                     struct.pack_into(f"<{len(workers)}I", req_buf, rank_ids_off, *[int(w) for w in workers])
+                    if chip_idx in host_names:
+                        host_name_offset = rank_ids_off + len(workers) * 4
+                        struct.pack_into("32s", req_buf, host_name_offset, host_names[chip_idx].encode("ascii"))
                     reply = staged_shms.create(reply_size)
                     reply_shms[chip_idx] = reply
 
@@ -10743,6 +10785,7 @@ class Worker:
                     requested_window_size=window_size,
                     _domain_size=len(workers),
                     _domain_ranks=worker_to_rank,
+                    memory_source=memory_source,
                 )
                 handle._allocation_pending = True  # noqa: SLF001 -- owner controls publication/rollback
                 self._live_domains[name] = handle
@@ -10780,6 +10823,10 @@ class Worker:
                         ptrs: list[int] = []
                         if buffer_count:
                             ptrs = list(struct.unpack_from(f"<{buffer_count}Q", reply_buf, _DOMAIN_REPLY_HEADER.size))
+                        host_mapping = None
+                        if chip_idx in host_names:
+                            host_mapping = HostBufferMapping(host_names[chip_idx], int(actual_window_size))
+                            handle._host_mappings.append(host_mapping)
                         named_buffers: dict[str, Buffer] = {}
                         for i, b in enumerate(buffers):
                             identity = self._burn_buffer_identity()
@@ -10792,6 +10839,8 @@ class Worker:
                                 generation=int(identity.generation),
                                 owner_worker_id=int(chip_idx),
                             )
+                            if host_mapping is not None:
+                                named_buffers[b.name].shm = host_mapping
                         contexts[chip_idx] = ChipDomainContext(
                             name=name,
                             domain_rank=worker_to_rank[chip_idx],
@@ -10860,6 +10909,7 @@ class Worker:
         """
         if self._worker is None:
             return
+        seal_host_mappings(handle._host_mappings)
         self._drop_domain_allocs(handle.allocation_id)
         with resources.domain_lock:
             if not resources.retired:
@@ -10986,6 +11036,7 @@ class Worker:
         """
         if handle.freed:
             return
+        seal_host_mappings(handle._host_mappings)
         try:
             results = self._domain_free_results if self.level == 3 else self._global_domain_free_results
             key = handle.allocation_id if self.level == 3 else handle.domain_id
@@ -11113,6 +11164,9 @@ class Worker:
             )
 
         def retire_live_handle() -> None:
+            for mapping in handle._host_mappings:
+                mapping.close()
+            handle._host_mappings.clear()
             if self._live_domains.get(handle.name) is handle:
                 self._live_domains.pop(handle.name)
 
@@ -12150,6 +12204,9 @@ class Worker:
         )
         return decode_copy_result(reply)
 
+    def _seal_domain_cpu_exports(self) -> None:
+        seal_host_mappings(mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings)
+
     def _release_all_live_domains(
         self, resources: _RunResources | None = None, *, include_retained: bool = True
     ) -> None:
@@ -12169,6 +12226,7 @@ class Worker:
         def _release(handle: CommDomainHandle) -> None:
             if handle.retain_after_run and not handle.released and not include_retained:
                 return
+            seal_host_mappings(handle._host_mappings)
             # Mark released first (flips handle._released so further indexing
             # raises), then synchronously free.  The handle is not in the
             # deferred-release queue, so we use the direct path.
@@ -14416,6 +14474,10 @@ class Worker:
         never closed keeps its device held.
 
         - Reentrant ``close()`` from inside a leased operation is rejected.
+        - Live Host-domain CPU exports reject close with ``BufferError`` before
+          the claim. Drop arrays and release memoryviews, then retry. If an
+          admitted run exports a new window during drain, teardown is deferred
+          and close remains retryable with the worker CLOSED.
         - ``close()`` during an in-progress ``init()`` on another thread
           cooperatively cancels it: the init epoch unwinds and this call
           proceeds to teardown. Cancellation is observed only at cooperative
@@ -14530,6 +14592,7 @@ class Worker:
                         "init()'d it (native teardown is thread-bound)"
                     )
                 self._validate_chip_execution_context()
+                self._seal_domain_cpu_exports()
                 deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.
@@ -14599,6 +14662,9 @@ class Worker:
                                 f"({_ROLLBACK_GRACEFUL_TIMEOUT_S}s); teardown deferred (worker stays CLOSED)"
                             )
                     else:
+                        # An operation admitted before CLOSED may have created
+                        # another Host domain while close drained its run.
+                        self._seal_domain_cpu_exports()
                         teardown_tree = self._has_live_resources()
                         # Fence drain makes this close terminal even when the
                         # run error is the only remaining outcome and no native

@@ -420,6 +420,8 @@ class Buffer:
         place, so a second ``close()`` attempts it again — that retry is what
         ``Worker._release_all_buffers`` leaves the registry entry behind for.
         """
+        if self.backend_kind == BackendKind.VMM_WINDOW and self.shm is not None:
+            raise ValueError("Host domain buffers borrow shared memory; use domain.release()")
         if self._source_registration is not None:
             source, identity = self._source_registration
             source.close(identity)

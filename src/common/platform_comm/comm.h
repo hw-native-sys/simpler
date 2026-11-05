@@ -288,6 +288,20 @@ int comm_alloc_domain_windows(
 );
 
 /**
+ * Allocate an A5 Host-backed domain. The runtime owns the exclusive POSIX shm
+ * named by host_shm_name (a bare name of at most 31 ASCII letters/digits/_/-).
+ * The mapping extent is page-aligned. Only the local windowsIn/windowsOut entry
+ * is directly addressable; peers are reached through the URMA workspace.
+ * workspace_mask accepts zero or URMA. Ownership and abort/release semantics
+ * match comm_alloc_domain_windows. This symbol is optional on other backends.
+ */
+int comm_alloc_host_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
+    uint64_t *local_window_base_out, size_t *actual_window_size_out
+);
+
+/**
  * Collectively release a domain window pool allocated by
  * comm_alloc_domain_windows().
  *

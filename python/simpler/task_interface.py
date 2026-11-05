@@ -127,7 +127,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef, normalize_workspace_engines
+from .comm_domain import CommDomainRef, normalize_workspace_engines, seal_host_mappings
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -1174,6 +1174,8 @@ class CommDomainHandle:
         "_config",
         "_ref",
         "requested_window_size",
+        "memory_source",
+        "_host_mappings",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1195,10 +1197,13 @@ class CommDomainHandle:
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
         requested_window_size: int | None = None,
+        memory_source: AddressSpace = AddressSpace.DEVICE,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
         _use_fn: Callable[[CommDomainHandle], None] | None = None,
     ) -> None:
         self.name = name
+        self.memory_source = memory_source
+        self._host_mappings = []
         self.workers = tuple(workers)
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
@@ -1292,11 +1297,12 @@ class CommDomainHandle:
 
     @property
     def released(self) -> bool:
-        """True once ``release()`` (or ``with`` exit) has been called.
+        """True once release has been accepted (including ``with`` exit).
 
         Backend memory may still be alive — it is freed by the Worker after
         DAG drain at end-of-run.  Use this to gate further indexing /
         submission, not to assert physical teardown (use ``freed`` for that).
+        A release refused because of live Host CPU exports leaves this false.
         """
         return self._released
 
@@ -1319,6 +1325,10 @@ class CommDomainHandle:
         this domain's ``device_ctx`` see live memory through execution.
         Serial release after run completion frees a retained domain immediately.
 
+        Host CPU arrays and memoryviews must be dropped first. Live exports
+        raise ``BufferError`` without marking the domain released; retry after
+        dropping them. Accepted release prevents new CPU exports immediately.
+
         After this returns, the handle is treated as released for the
         user's purposes: ``__getitem__`` raises, repeated ``release()`` is
         a no-op, and the orch function must not pass it to further
@@ -1331,6 +1341,7 @@ class CommDomainHandle:
         with self._release_scope(self):
             if self._released:
                 return
+            seal_host_mappings(self._host_mappings)
             self._released = True
             assert self._release_fn is not None
             self._release_fn(self)

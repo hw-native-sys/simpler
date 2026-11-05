@@ -428,7 +428,8 @@ public:
     /// retained after failure; a set flag does not imply a usable device context.
     std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-        size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr
+        size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
+        const std::string &host_shm_name = {}
     );
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
@@ -627,6 +628,10 @@ private:
     using CommAllocDomainWindowsFn = int (*)(
         void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
     );
+    using CommAllocHostDomainWindowsFn = int (*)(
+        void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, const char *, uint64_t *, uint64_t *,
+        size_t *
+    );
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
         int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
@@ -766,6 +771,7 @@ private:
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
+    CommAllocHostDomainWindowsFn comm_alloc_host_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
