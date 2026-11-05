@@ -38,17 +38,17 @@ public:
         stream_wait_(std::move(stream_wait)),
         sync_(std::move(sync)) {}
 
+    // Provision every possible caller edge without binding a run or queueing work.
+    int prepare_resources() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return prepare_resources_locked(true, false);
+    }
+
     int arm(const NativeRunIdentity &id, void *caller, void *aicpu, void *aicore) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (active_ || aicpu == nullptr || aicore == nullptr || caller == aicore) return PTO_RUNTIME_ERR_INVALID_STATE;
-        for (size_t i = 0; i < events_.size(); ++i) {
-            if (caller == nullptr && i != Fork) continue;
-            if (caller == aicpu && i == Start) continue;
-            void *&event = events_[i];
-            if (event != nullptr) continue;
-            int rc = ops_.create(&event);
-            if (rc != 0) return rc;
-        }
+        const int rc = prepare_resources_locked(caller != nullptr, caller == aicpu);
+        if (rc != 0) return rc;
         identity_ = id;
         streams_ = {caller, aicpu, aicore};
         active_ = true;
@@ -187,6 +187,17 @@ public:
         return 0;
     }
 
+    // The external owner has ended the graph and every in-flight execution.
+    // Recording uses the caller as its CPU stream, so it owns no cross-run ref.
+    int end_recording(const NativeRunIdentity &id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!active_) return 0;
+        if (!owns(id) || reference_.valid() || streams_[Caller] != streams_[Aicpu])
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        consumed_ = true;
+        return 0;
+    }
+
     int retire(const NativeRunIdentity &id) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_) return 0;
@@ -221,6 +232,19 @@ public:
     }
 
 private:
+    int prepare_resources_locked(bool has_caller, bool aliases_aicpu) {
+        for (size_t i = 0; i < events_.size(); ++i) {
+            if (!has_caller && i != Fork) continue;
+            if (aliases_aicpu && i == Start) continue;
+            if (events_[i] != nullptr) continue;
+            void *event = nullptr;
+            const int rc = ops_.create(&event);
+            if (rc != 0) return rc;
+            events_[i] = event;
+        }
+        return 0;
+    }
+
     static constexpr size_t Start = 0, Fork = 1, Tail = 2;
     static constexpr size_t Caller = 0, Aicpu = 1, Aicore = 2;
     bool owns(const NativeRunIdentity &id) const { return active_ && identity_ == id; }

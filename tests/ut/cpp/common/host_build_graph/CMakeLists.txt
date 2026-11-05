@@ -81,7 +81,6 @@ hbg_cases(
     test_hbg_async_wait_init.cpp
     test_hbg_graph_submit_failure.cpp
     test_hbg_graph_definition_arena.cpp
-    test_hbg_slot_claim.cpp
     test_hbg_ed_qualification.cpp
     test_hbg_graph_ed_qualification.cpp
     test_hbg_graph_recording_bounds.cpp
@@ -194,6 +193,9 @@ hbg_case(test_native_run_acceptance.cpp
 # Explicit host views never acquire device mappings or invoke device copies.
 hbg_case(test_hbg_tensor_access.cpp
     SOURCES ${HBG_HOST_DIR}/host_tensor_access.cpp)
+
+hbg_case(test_hbg_slot_claim.cpp ORCH
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp)
 
 # Everything else here is a case of this runtime with nothing beyond the
 # directory's own contract, built for both arches. Declaring one above takes it

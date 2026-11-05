@@ -78,8 +78,39 @@ void next_fanin_seen_epoch(OrchestratorState *orch);
 
 bool append_fanin_or_fail(OrchestratorState &orch, TaskId producer_task_id, int32_t *fanin_slots, int32_t &fanin_count);
 
+// Explicit predecessors are independent of TensorMap/manual-scope tracking.
+// Share this loop between ordinary tasks and GRAPH shells: DepInputs carries
+// the list for creator retention, but compute_task_fanin only infers tensor
+// edges and deliberately does not append the explicit list itself.
+inline bool append_explicit_fanins_or_fail(
+    OrchestratorState &orch, TaskId consumer, const DepInputs &inputs, int32_t *fanin_slots, int32_t &fanin_count,
+    bool capture
+) {
+    for (int32_t i = 0; i < inputs.explicit_dep_count; ++i) {
+        const TaskId producer = inputs.explicit_deps[i];
+        if (!producer.is_valid()) {
+            orch.report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+            );
+            return false;
+        }
+        // The consumer's slot has already been claimed, so active_count alone
+        // admits a forged self edge. Only previously submitted tasks can precede it.
+        if (producer == consumer) {
+            orch.report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) cannot depend on its own task"
+            );
+            return false;
+        }
+        if (capture) dep_gen_host_graph_add_explicit_edge(producer);
+        if (!append_fanin_or_fail(orch, producer, fanin_slots, fanin_count)) return false;
+    }
+    return true;
+}
+
 }  // namespace simpler::hbg
 
+using simpler::hbg::append_explicit_fanins_or_fail;
 using simpler::hbg::append_fanin_or_fail;
 using simpler::hbg::calculate_output_layout;
 using simpler::hbg::DepGraphAnnotate;

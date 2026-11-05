@@ -152,8 +152,9 @@ private:
  * its predecessor executes. The asynchronous copy is ordered on the bound
  * AICPU stream and a fork event orders the AICore reader behind it.
  *
- * The runner owns this for its whole lifetime and releases it in `finalize()`,
- * alongside the collector resources that already work this way.
+ * The runner caches this storage. Prepared uses retain the actual instance;
+ * subsequent preparation replaces a retained instance before writing it.
+ * Cleanup runs explicitly on the owning device context once uses have ended.
  *
  * The AICore register tables are deliberately NOT here: they are device
  * constants, identical for every slot, and are owned per device context by
@@ -161,8 +162,8 @@ private:
  * `KernelArgs`: AICore receives everything it needs as launch arguments.
  */
 struct SlotPersistentArgs {
-    // Pinned copy source, immutable from enqueue through the run's drain. A
-    // slot cannot be prepared again until its previous run has retired.
+    // Pinned copy source, immutable while a prepared use retains this storage.
+    // Slot reuse replaces the owner before binding if a previous use survives.
     void *runtime_upload_source{nullptr};
     uint64_t runtime_upload_bytes{0};
 
@@ -455,7 +456,9 @@ private:
  * failure cannot acquire a no-submission receipt. A cache hit queues no copy.
  * An already-published run is an idempotent no-op.
  */
-int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink);
+int publish_for_launch(
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording = false
+);
 
 /**
  * Release a retired slot's device block and pinned source, retaining failed frees.

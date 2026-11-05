@@ -27,7 +27,14 @@ constexpr int32_t MAX_GATE_THREADS = 16;
 //
 // Used by sim platforms. a2a3/a5 onboard use the _filter variant below
 // instead.
-bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched);
+// With initialize set, all callbacks rendezvous before one invokes it and
+// releases any survivor. All callbacks supply the same non-throwing initializer.
+// Calls for different executions must not overlap; the gate is not retirement proof.
+using AicpuEntryInitializer = void (*)();
+extern "C" void aicpu_reset_execution_entry();
+bool platform_aicpu_affinity_gate(
+    int32_t logical_count, int32_t total_launched, AicpuEntryInitializer initialize = nullptr
+);
 
 // Filter-style affinity gate. Every launched thread reads sched_getcpu(),
 // barriers, and the gate keeps exactly those whose cpu_id appears in
@@ -45,7 +52,10 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 // (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH on the target arch); the
 // gate stops exactly that many threads on its barrier and lets only the
 // allowed_count survivors continue.
-bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched);
+bool platform_aicpu_affinity_gate_filter(
+    const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched,
+    AicpuEntryInitializer initialize = nullptr
+);
 
 // Deterministic position (0..allowed_count-1) of the calling thread in the
 // `allowed_cpus[]` array that was passed to the most recent
@@ -70,3 +80,25 @@ int32_t platform_aicpu_affinity_thread_idx();
 // drops every sub-phase stamp. Must be called on the executing thread, before
 // any phase stamping.
 void platform_aicpu_affinity_set_thread_idx(int32_t idx);
+
+// The native index includes filtered callbacks. It is not a runtime role index.
+struct AicpuEntryGateResult {
+    int32_t callback_index{-1};
+    int32_t status{-1};
+    bool execute{false};
+};
+
+struct AicpuEntryGateInitializer {
+    int32_t (*initialize)(void *context);
+    void *context;
+};
+
+// All participants provide the same trusted N and execution binding. A local
+// logical-config rejection is collected before any worker is released. The
+// initializer runs once even on rejection, so every identified callback can
+// contribute its status to the invocation's completion state.
+AicpuEntryGateResult
+platform_aicpu_entry_gate(int32_t logical_count, int32_t total_launched, AicpuEntryGateInitializer initialize);
+AicpuEntryGateResult platform_aicpu_entry_gate_filter(
+    const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched, AicpuEntryGateInitializer initialize
+);

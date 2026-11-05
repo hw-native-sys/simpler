@@ -200,6 +200,35 @@ def _trivial_orch(orch, args, config):
 
 
 class TestNextLevelStartupFailure:
+    @pytest.mark.parametrize("already_reaped", [False, True])
+    @pytest.mark.parametrize("publish_failure", [False, True])
+    def test_init_failure_published_between_state_read_and_reap(self, monkeypatch, already_reaped, publish_failure):
+        """A failed child's final mailbox state is authoritative after exit."""
+        pid = 12345
+        parent = Worker(level=4, num_sub_workers=0)
+        buf = memoryview(bytearray(worker_mod.MAILBOX_FRAME_SIZE))
+        state_addr = worker_mod._buffer_field_addr(buf, worker_mod._OFF_STATE)
+
+        def exit_after_state_read(child_pid, options):
+            assert child_pid == pid
+            assert options == os.WNOHANG
+            assert worker_mod._mailbox_load_i32(state_addr) == worker_mod._IDLE
+            if publish_failure:
+                worker_mod._write_error(buf, 1, "injected sibling init failure")
+                worker_mod._mailbox_store_i32(state_addr, worker_mod._INIT_FAILED)
+            if already_reaped:
+                raise ChildProcessError
+            return pid, 256
+
+        monkeypatch.setattr(worker_mod.os, "waitpid", exit_after_state_read)
+        expected = "injected sibling init failure" if publish_failure else "exited during init before signalling ready"
+        try:
+            with pytest.raises(RuntimeError, match=expected):
+                Worker._await_children_ready(parent, [SimpleNamespace(buf=buf)], [pid], "next_level", float("inf"))
+            assert parent._startup_reaped_pids == {pid}
+        finally:
+            buf.release()
+
     def test_sigterm_during_setup_unwinds_before_child_exit(self, monkeypatch):
         """Cooperative cancellation lets setup release its resources before exit."""
         import simpler.worker as worker_mod  # noqa: PLC0415

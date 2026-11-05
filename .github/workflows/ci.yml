@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_packaging.yml
     with:
@@ -51,7 +51,7 @@ jobs:
     if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_ut-no-hardware.yml
     with:
@@ -64,7 +64,7 @@ jobs:
     if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_st-sim-a2a3.yml
     with:
@@ -78,7 +78,7 @@ jobs:
     if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_st-sim-a5.yml
     with:
@@ -110,14 +110,6 @@ jobs:
     with:
       platform: a2a3
       runs_on: '["self-hosted","a2a3"]'
-
-  st-framework-eager-a5:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-framework-eager.yml
-    with:
-      platform: a5
-      runs_on: '["self-hosted","a5"]'
 
   st-onboard-a2a3:
     needs: [detect-changes, pre-commit]
@@ -154,19 +146,3 @@ jobs:
     uses: ./.github/workflows/_st-deepseek-a2a3.yml
     with:
       runs_on: '["self-hosted","a2a3"]'
-
-  ut-a5:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
-    uses: ./.github/workflows/_ut-npu-a5.yml
-    with:
-      runs_on: '["self-hosted","a5"]'
-      include_cann_examples: true
-
-  st-onboard-a5:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-npu-a5.yml
-    with:
-      runs_on: '["self-hosted","a5"]'
-      include_dfx_smokes: true

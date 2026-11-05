@@ -95,6 +95,7 @@ struct AicpuExecutor {
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
+    void reset_entry_state();
     int32_t finish_failed_init(Runtime *runtime);
     // Decide this run's terminal record while the state it reads is still
     // valid. Runs inside the completion gate's finalizer, on the last
@@ -102,7 +103,7 @@ struct AicpuExecutor {
     void snapshot_run_terminal(Runtime *runtime, bool cores_retired);
     // Commit the decided record. Runs on the thread that claims cleanup, after
     // teardown and before it returns from the kernel.
-    void publish_run_terminal();
+    void handoff_run_terminal();
 
     // ===== The steps a scheduler decides for itself =====
     //

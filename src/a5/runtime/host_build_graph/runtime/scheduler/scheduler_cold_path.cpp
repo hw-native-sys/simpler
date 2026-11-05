@@ -17,6 +17,7 @@
 #include "assert_compat.h"
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -613,6 +614,13 @@ int32_t SchedulerContext::retire_cores(Runtime *runtime, const int32_t *core_ids
 
     bool released[PLATFORM_MAX_CORES];
     const int32_t rc = platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
+    for (size_t i = 0; i < count; ++i) {
+        if (!released[i]) continue;
+        Handshake *report = &runtime->dev.workers[claimed_ids[i]];
+        aicore_invalidate_retired_report(report);
+        cache_flush_range(report, sizeof(*report));
+    }
+    wmb();
     if (rc != 0) {
         for (size_t i = 0; i < count; ++i) {
             if (!released[i]) LOG_ERROR("AICore retirement: core %d not released", claimed_ids[i]);

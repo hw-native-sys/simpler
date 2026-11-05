@@ -107,6 +107,7 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
                 "malformed-record-success",
                 "copy-error-success",
                 "error-record-error",
+                "retired-error-record",
                 "copy-error-error",
                 "core-error",
                 "program-output",
@@ -130,26 +131,9 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS:" in result.stdout
     if probe == "run_caller_launch":
-        # Each close-failure case has a fresh process. Unconfirmed resets retain
-        # the context and backing.
-        for scenario in ("reset-failure", "probe-failure", "acl-finalize-retry", "borrowed"):
-            failed_reset = subprocess.run(
-                [str(binary), scenario], capture_output=True, text=True, timeout=30, check=False
-            )
-            assert failed_reset.returncode == 0, failed_reset.stdout + failed_reset.stderr
-            expected = (
-                "standalone collector acl-finalize-retry: confirmed reset reused; original error="
-                if scenario == "acl-finalize-retry"
-                else "standalone collector borrowed: context retained, no reset"
-                if scenario == "borrowed"
-                else f"standalone collector {scenario}: unconfirmed context retained"
-            )
-            assert expected in failed_reset.stderr
-            if scenario in ("reset-failure", "probe-failure"):
-                assert (
-                    f"standalone collector {scenario}: same-runner retry confirmed; original error=-739"
-                    in failed_reset.stderr
-                )
+        assert "external resources: public retain/finalize/reuse/release and retries passed" in result.stderr
+        assert "capture release: timeout/error retain, completion retry and duplicate rejection passed" in result.stderr
+        _check_close_failure_cases(binary)
     if probe == "runtime_timeout_configuration":
         output = result.stdout + result.stderr
         assert output.count("Configured timeout ordering warning:") == 1
@@ -168,3 +152,42 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
         assert "device filesystem query failed: errno=38" in result.stdout + result.stderr
         assert "aclrtMalloc(result) failed: -1515" in result.stdout + result.stderr
         assert "aclrtMemcpy(result initialization) failed: -1616" in result.stdout + result.stderr
+
+
+def _check_close_failure_cases(binary: Path):
+    # Each close-failure case has a fresh process. Unconfirmed resets retain
+    # the context and backing.
+    for scenario in (
+        "reset-failure",
+        "probe-failure",
+        "acl-finalize-retry",
+        "borrowed",
+        "held-program",
+        "held-borrowed",
+        "external-program",
+        "external-borrowed",
+        "unused",
+        "unused-release-retry",
+        "unused-sticky-close",
+    ):
+        failed_reset = subprocess.run([str(binary), scenario], capture_output=True, text=True, timeout=30, check=False)
+        assert failed_reset.returncode == 0, failed_reset.stdout + failed_reset.stderr
+        if scenario.startswith("unused"):
+            assert "standalone collector unused: preparation retired without submission" in failed_reset.stderr
+            continue
+        if scenario.startswith(("held-", "external-")):
+            assert f"standalone collector {scenario}: external close deferred; readers_" in failed_reset.stderr
+            continue
+        expected = (
+            "standalone collector acl-finalize-retry: confirmed reset reused; original error="
+            if scenario == "acl-finalize-retry"
+            else "standalone collector borrowed: context retained, no reset"
+            if scenario == "borrowed"
+            else f"standalone collector {scenario}: unconfirmed context retained"
+        )
+        assert expected in failed_reset.stderr
+        if scenario in ("reset-failure", "probe-failure"):
+            assert (
+                f"standalone collector {scenario}: same-runner retry confirmed; original error=-739"
+                in failed_reset.stderr
+            )

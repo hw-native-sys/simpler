@@ -385,21 +385,24 @@ communication-domain property. Construct the Worker with `enable_sdma=True` and
 the runtime provisions the SDMA workspace once at init, latches its address into
 the resident `KernelArgs`, and injects it into every run's kernel
 `GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
-SDMA streams and its kernels read a zero workspace address. The workspace is
-released at Worker finalize by ordinary stream/manager teardown.
+SDMA streams and its kernels read a zero workspace address. The platform calls
+`SdmaWorkspaceManager::GetWorkspaceSize`, allocates device memory with
+`aclrtMalloc`, and binds it with `Init(workspaceAddr, workspaceSize)`. Ordinary
+Worker finalize destroys the manager's streams before freeing the allocation;
+fatal device teardown retains both with the abandoned provider.
 
 **`enable_sdma` is a defect quarantine, not a capability switch, and it has an
 exit condition.** Selecting an engine already belongs to the kernel, which reads
 whichever addresses were injected; the runtime would otherwise provision every
 engine the platform supports. SDMA is the exception because
-`SdmaWorkspaceManager::Init()` is indivisible — the 16 KB workspace *is* the
-descriptor table for 48 CP-process STARS streams, so there is no way to have the
-address without holding the streams — and a Worker holding those streams gets a
+`SdmaWorkspaceManager::Init(workspaceAddr, workspaceSize)` creates 48 CP-process
+STARS streams while binding the external workspace. A usable SDMA workspace
+therefore holds those streams, and a Worker holding them gets a
 single device-reset attempt instead of three after an AICore fault. Defaulting it
 on would therefore put every ordinary Worker in that population, which is exactly
 the regression [the investigation](investigations/2026-07-a2a3-sdma-fault-teardown.md)
 records. The flag disappears once CANN bounds the final CP-process stream release,
-or once pto-isa offers an `Init()` that separates the workspace from the streams.
+or once pto-isa supports binding a usable workspace without creating the streams.
 
 Provisioning also warms the SDMA control path once, in the same call: a
 vector-only AICore ELF (`sdma_warmup_kernel.o`, staged per arch under

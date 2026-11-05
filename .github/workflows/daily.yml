@@ -13,6 +13,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  packaging-macos:
+    uses: ./.github/workflows/_packaging.yml
+    with:
+      runs_on: '["macos-latest"]'
+      setup_variant: github
+      python_version: "3.10"
+
+  ut-macos:
+    uses: ./.github/workflows/_ut-no-hardware.yml
+    with:
+      runs_on: '["macos-latest"]'
+      setup_variant: github
+      python_version: "3.10"
+
   st-sim-a2a3:
     strategy:
       fail-fast: false

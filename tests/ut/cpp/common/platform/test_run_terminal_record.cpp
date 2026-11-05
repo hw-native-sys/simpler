@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "aicpu/device_run_result_aicpu.h"
+#include "aicpu/native_invocation_completion.h"
 #include "common/device_run_result.h"
 #include "common/run_terminal_accumulator.h"
 
@@ -398,4 +399,59 @@ TEST(RunTerminalSelect, ACompletedNormalPathWithNothingToReportSucceeds) {
     EXPECT_EQ(selection.verdict, DeviceRunVerdict::Ok);
     EXPECT_EQ(selection.code, 0);
     EXPECT_EQ(selection.source, DeviceRunCodeSource::None);
+}
+
+TEST(RunTerminalReplay, SameBindingCannotReadPreviousSuccessAfterInvalidation) {
+    DeviceRunResultRegion region{};
+    const auto base = reinterpret_cast<uint64_t>(&region);
+    ASSERT_TRUE(
+        aicpu_publish_run_terminal(base, kEpoch, DeviceRunVerdict::Ok, 0, DeviceRunCodeSource::None, nullptr, 0)
+    );
+    EXPECT_EQ(device_run_result_terminal(region, kEpoch).state, DeviceRunTerminalState::Succeeded);
+    ASSERT_TRUE(aicpu_invalidate_run_terminal(base, kEpoch));
+    EXPECT_EQ(device_run_result_terminal(region, kEpoch).state, DeviceRunTerminalState::Undecided);
+    EXPECT_EQ(region.verdict, static_cast<uint32_t>(DeviceRunVerdict::Ok));
+    ASSERT_TRUE(aicpu_publish_run_terminal(
+        base, kEpoch, DeviceRunVerdict::Error, -41, DeviceRunCodeSource::ThreadRc, nullptr, 0
+    ));
+    EXPECT_EQ(device_run_result_terminal(region, kEpoch).code, -41);
+}
+
+TEST(RunTerminalReplay, ReplayedClearCannotEraseExternalEvidence) {
+    DeviceRunResultRegion region{};
+    NativeInvocationCompletion completion;
+    NativeInvocationEvidence evidence;
+    const auto base = reinterpret_cast<uint64_t>(&region);
+    auto publish = [&](RunTerminalSelection selection, const void *payload, size_t bytes) {
+        const bool published = aicpu_publish_run_terminal(
+            base, kEpoch, selection.verdict, selection.code, selection.source, payload, bytes
+        );
+        return published ? NativeTerminalPublication::Published : NativeTerminalPublication::InvalidState;
+    };
+    ASSERT_TRUE(completion.begin(1, &evidence));
+    uint8_t payload[] = {8, 9};
+    ASSERT_TRUE(completion.accept_runtime_terminal(
+        {DeviceRunVerdict::Error, -61, DeviceRunCodeSource::Header}, payload, sizeof(payload)
+    ));
+    EXPECT_EQ(completion.finish(0, 0, publish), -61);
+    // Model the recorded cold publication of the unpublished marker.
+    region.published = 0;
+    ASSERT_TRUE(completion.begin(1, &evidence));
+    ASSERT_TRUE(aicpu_invalidate_run_terminal(base, kEpoch));
+    ASSERT_TRUE(completion.accept_runtime_terminal({DeviceRunVerdict::Ok, 0, DeviceRunCodeSource::None}, nullptr, 0));
+    EXPECT_EQ(completion.finish(0, 0, publish), 0);
+    EXPECT_EQ(device_run_result_terminal(region, kEpoch).state, DeviceRunTerminalState::Succeeded);
+    const auto saved = evidence.read_after_exit();
+    EXPECT_EQ(saved.terminal.code, -61);
+    EXPECT_EQ(saved.payload[0], 8);
+    EXPECT_EQ(saved.payload_bytes, sizeof(payload));
+}
+
+TEST(RunTerminalReplay, MissingRegionIsCompatibleButHalfBindingIsRejected) {
+    DeviceRunResultRegion region{};
+    region.published = kEpoch;
+    EXPECT_TRUE(aicpu_invalidate_run_terminal(0, 0));
+    EXPECT_FALSE(aicpu_invalidate_run_terminal(0, kEpoch));
+    EXPECT_FALSE(aicpu_invalidate_run_terminal(reinterpret_cast<uint64_t>(&region), 0));
+    EXPECT_EQ(region.published, kEpoch);
 }

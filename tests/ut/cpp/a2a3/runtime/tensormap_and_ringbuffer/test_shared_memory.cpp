@@ -251,12 +251,16 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
     void *sm = sm_arena.region_ptr(sm_off);
     std::memset(sm, 0, static_cast<size_t>(sm_size));
 
+    std::memset(runtime_arena.base(), 0xA5, runtime_arena.total_size());
     std::vector<char> gm(static_cast<size_t>(total_heap));
     RuntimeContext *rt =
         runtime_init_data_from_layout(runtime_arena, layout, MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
     ASSERT_NE(rt, nullptr);
     runtime_wire_arena_pointers(runtime_arena, layout, rt);
 
+    EXPECT_EQ(rt->aicore_mailbox->head.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->tail.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->entries[0].seq.load(), 0);
     EXPECT_EQ(rt->gm_heap_size, total_heap);
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         EXPECT_EQ(layout.sizing.task_window_sizes[r], ws[r]);
@@ -267,6 +271,21 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
         EXPECT_EQ(rt->orchestrator.rings[r].fanin_pool.capacity, dep_caps[r]);
         EXPECT_EQ(rt->scheduler.ring_sched_states[r].dep_pool.capacity, dep_caps[r]);
     }
+    auto *original = rt;
+    rt->total_cycles = 99;
+    rt->aicore_mailbox->head.store(7);
+    rt->aicore_mailbox->tail.store(7);
+    rt->aicore_mailbox->entries[0].seq.store(7);
+    runtime_destroy(rt, runtime_arena);
+    rt = runtime_init_data_from_layout(runtime_arena, layout, MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
+    ASSERT_EQ(rt, original);
+    runtime_wire_arena_pointers(runtime_arena, layout, rt);
+    EXPECT_EQ(rt->total_cycles, 0);
+    EXPECT_EQ(rt->gm_heap_size, total_heap);
+    EXPECT_EQ(rt->aicore_mailbox->head.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->tail.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->entries[0].seq.load(), 0);
+    runtime_destroy(rt, runtime_arena);
 }
 
 TEST(RuntimeArenaLayout, RejectsOverflowingPerRingHeapSum) {

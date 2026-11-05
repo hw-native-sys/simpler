@@ -116,6 +116,7 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
             "https://download.pytorch.org/whl/cpu",
         ],
         ["-m", "pip", "install", "--ignore-installed", "--no-deps", requirements[1]],
+        ["-m", "pip", "install", "--ignore-installed", "--no-deps", "nanobind>=2,<3"],
     ]
     dependency_install = next(args for args in commands if "scikit-build-core>=0.10" in args)
     assert dependency_install == [
@@ -126,7 +127,6 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
         ".github/actions/setup-framework-eager/constraints.txt",
         *requirements,
         "scikit-build-core>=0.10",
-        "nanobind>=2,<3",
         "cmake>=3.20",
         "ninja",
         "setuptools",
@@ -225,7 +225,7 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
         "args=sys.argv[1:]\n"
         "if args==['--list']: sys.exit(0)\n"
         "assert args[args.index('--device-num')+1]=='1'\n"
-        "assert args[args.index('--timeout')+1]=='1200'\n"
+        "assert args[args.index('--timeout')+1]=='2100'\n"
         "assert args[args.index('--max-time')+1]=='1200'\n"
         "assert ['--env','PLATFORM']==args[4:6]\n"
         "subprocess.run(['bash','-e','-c',args[args.index('--run')+1]], "
@@ -269,10 +269,18 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     assert commands[2][:3] == ["-m", "simpler_setup.test_environments", "verify"]
 
 
-@pytest.mark.parametrize("caller", ["ci", "ci-self-cpu", "daily"])
+@pytest.mark.parametrize("caller", ["ci", "ci-self", "daily"])
 def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller):
     jobs = _yaml(_ROOT / f".github/workflows/{caller}.yml")["jobs"]
     for platform_name in ("a2a3", "a5"):
+        if caller == "ci" and platform_name == "a5":
+            assert "st-framework-eager-a5" not in jobs
+            job = _yaml(_ROOT / ".github/workflows/ci-a5-comment.yml")["jobs"]["st-framework-eager-a5"]
+            assert job["uses"] == "./.github/workflows/_st-framework-eager.yml"
+            assert job["with"]["platform"] == "a5"
+            assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
+            assert job["needs"] == ["gate-and-resolve"]
+            continue
         job = jobs[f"st-framework-eager-{platform_name}"]
         assert job["uses"] == "./.github/workflows/_st-framework-eager.yml"
         assert job["with"]["platform"] == platform_name

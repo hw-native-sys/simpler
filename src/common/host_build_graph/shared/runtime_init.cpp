@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <new>
+#include <type_traits>
+
 #include "host_build_graph/runtime_core.h"
 #include "host_build_graph/shared_memory.h"
 #include "scheduler/scheduler.h"
@@ -234,7 +237,7 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
 /**
  * Populate the prebuilt runtime-arena image in place (host build path).
  *
- * Zeroes the RuntimeContext header at layout.off_runtime and initializes the
+ * Value-initializes the RuntimeContext header at layout.off_runtime and initializes the
  * scheduler (ready / sync / dummy / graph queues) against the device SM. The
  * orchestrator is a host-owned object that the host-orch path
  * (run_host_orchestration) stands up against the host SM on its own OrchContext,
@@ -245,8 +248,8 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
 RuntimeContext *runtime_init_data_from_layout(
     DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeMode mode, void *sm_dev_base, uint64_t /*sm_size*/
 ) {
-    RuntimeContext *rt = static_cast<RuntimeContext *>(arena.region_ptr(layout.off_runtime));
-    memset(rt, 0, sizeof(*rt));
+    static_assert(std::is_trivially_destructible_v<RuntimeContext>);
+    auto *rt = ::new (arena.region_ptr(layout.off_runtime)) RuntimeContext{};
 
     // The ops table and the orchestrator are not here at all: they live on the
     // host-side OrchContext, so nothing host-only travels in this image.

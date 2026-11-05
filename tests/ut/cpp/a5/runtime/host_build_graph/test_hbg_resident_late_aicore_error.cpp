@@ -18,7 +18,7 @@
 // can still land.
 //
 // These cases call `AicpuExecutor::snapshot_run_terminal` and
-// `AicpuExecutor::publish_run_terminal` **themselves**, on a real executor, and
+// `AicpuExecutor::handoff_run_terminal` **themselves**, on a real executor, and
 // read the record out of a host region. So they cover the call site, not only
 // the rule it calls: reverting the finalizer to a bare header read fails the
 // first case.
@@ -30,6 +30,7 @@
 // production call sits inside the completion gate's finalizer — the
 // all-participant boundary — is reviewed statically and is not what these cases
 // establish.
+#include "common/native_invocation_evidence.h"
 #include "aicpu_executor.cpp"  // NOLINT(bugprone-suspicious-include): drives the executor in its own TU
 
 #include <gtest/gtest.h>
@@ -54,7 +55,7 @@ protected:
         );
         executor.aicpu_thread_num_ = 1;
         executor.normal_path_claims_.store(1);
-        set_platform_run_result(reinterpret_cast<uint64_t>(&region), kEpoch);
+        ASSERT_EQ(aicpu_begin_native_invocation(1, reinterpret_cast<uint64_t>(&result_storage), kEpoch), 0);
     }
 
     std::atomic<int32_t> &header() { return header_storage.sched_error_code; }
@@ -69,14 +70,16 @@ protected:
     /** The finalizer, then the cleanup owner's commit — both the executor's own. */
     DeviceRunTerminal finalize_and_publish(bool cores_retired = true) {
         executor.snapshot_run_terminal(&runtime, cores_retired);
-        executor.publish_run_terminal();
+        executor.handoff_run_terminal();
+        aicpu_finish_native_invocation(0, 0);
         return device_run_result_terminal(region, kEpoch);
     }
 
     SharedMemoryHeader header_storage{};
     SchedulerWorkerContext context{};
     SchedulerRunControl run_control{};
-    DeviceRunResultRegion region{};
+    NativeInvocationResultStorage result_storage{};
+    DeviceRunResultRegion &region{result_storage.result};
     Runtime runtime{};
     AicpuExecutor executor{};
 };
@@ -136,7 +139,8 @@ TEST_F(ResidentFinalizer, AnUnclaimedAuditedPathPublishesNothing) {
     executor.normal_path_claims_.store(0);
 
     executor.snapshot_run_terminal(&runtime, /*cores_retired=*/true);
-    executor.publish_run_terminal();
+    executor.handoff_run_terminal();
+    aicpu_finish_native_invocation(0, 0);
 
     EXPECT_EQ(region.published, 0u) << "no record to publish";
     EXPECT_EQ(device_run_result_terminal(region, kEpoch).state, DeviceRunTerminalState::Undecided);

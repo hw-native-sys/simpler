@@ -917,10 +917,18 @@ TEST_F(HbgBindLedgerTest, PreparingTheRunImageDoesNotPublishIt) {
 
     // Consumed: a second publication is an error, not a second write.
     EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+    auto initial = runtime.prepared_publication();
+    ASSERT_NE(initial, nullptr);
+    EXPECT_EQ(initial->source, source);
+    EXPECT_EQ(initial->device_target, target);
+    EXPECT_EQ(initial->bytes, bytes);
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
     EXPECT_EQ(copies_to_target(), 1u);
 
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(runtime.prepared_publication(), nullptr);
+    EXPECT_EQ(initial->source, source);
+    EXPECT_EQ(initial->bytes, bytes);
 }
 
 // One trace spans preparation and publication. The image's H2D segment is the

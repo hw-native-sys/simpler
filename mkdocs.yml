@@ -133,6 +133,10 @@ nav:
           - Qwen 性能与正确性实测: zh-cn/design/a5-hbg-graph-task/qwen-performance.md
           - 独立 block 原型历史测量: zh-cn/design/a5-hbg-graph-task/qwen-block-work.md
           - Qwen 历史测量与排查: zh-cn/design/a5-hbg-graph-task/qwen-performance-history.md
+      - Native capture:
+          - Execution and API: design/native-capture-common-contract.md
+          - Resource lifetime: design/native-hbg-prepared-lifetime.md
+          - HBG state restoration: design/native-hbg-resource-reset.md
       - Worker Manager: worker-manager.md
       - Hardware:
           - Overview: hardware/README.md

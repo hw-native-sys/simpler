@@ -34,7 +34,9 @@ bool fabric_supported = true;
 int unsupported_attempts = 0;
 std::weak_ptr<PhysicalAllocation> unsupported_resource;
 bool fail_context_upload = false;
-enum class PeerFailure { NONE, IMPORT, RESERVE, MAP, ACCESS };
+bool reject_explicit_access = false;
+int explicit_access_calls = 0;
+enum class PeerFailure { NONE, IMPORT, RESERVE, MAP };
 PeerFailure peer_failure = PeerFailure::NONE;
 bool peer_reserve_pending = false;
 int peer_import_calls = 0;
@@ -122,11 +124,9 @@ extern "C" aclError aclrtUnmapMem(void *address) {
     peer_mappings.erase(address);
     return ACL_SUCCESS;
 }
-extern "C" aclError aclrtMemSetAccess(void *address, size_t, aclrtMemAccessDesc *, size_t) {
-    if (peer_mappings.count(address) != 0 && peer_failure == PeerFailure::ACCESS) {
-        ++injected_peer_failures;
-        return 1;
-    }
+extern "C" aclError aclrtMemSetAccess(void *, size_t, aclrtMemAccessDesc *, size_t) {
+    ++explicit_access_calls;
+    if (reject_explicit_access) return ACL_ERROR_RT_INVALID_DEVICEID;
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMemGetAllocationGranularity(aclrtPhysicalMemProp *, aclrtMemGranularityOptions, size_t *n) {
@@ -204,14 +204,14 @@ static void prepare_peer(CommHandle h, uint64_t id, bool release_marker) {
 int main(int argc, char **argv) {
     assert(argc == 3);
     fabric_supported = std::string(argv[1]) == "fabric";
-    const std::string scenario = argv[2];
+    reject_explicit_access = std::string(argv[2]) == "map_grants_access";
+    const std::string scenario = reject_explicit_access ? "success" : argv[2];
     fail_physical_free = scenario == "fallback_cleanup";
     fail_context_upload = scenario == "late_import";
     fail_get_device = scenario == "early_get_device";
     if (scenario == "peer_import") peer_failure = PeerFailure::IMPORT;
     if (scenario == "peer_reserve") peer_failure = PeerFailure::RESERVE;
     if (scenario == "peer_map") peer_failure = PeerFailure::MAP;
-    if (scenario == "peer_access") peer_failure = PeerFailure::ACCESS;
     char folder[] = "/tmp/simpler-a2a3-lifecycle-XXXXXX";
     assert(mkdtemp(folder));
     auto *h = new CommHandle_{};
@@ -298,6 +298,7 @@ int main(int argc, char **argv) {
         assert(comm_release_domain_windows(h, 3, 2, 0) == 0);
         assert(h->domain_allocations.empty() && mappings.empty() && physical_handles == 0);
     }
+    assert(explicit_access_calls == 0);
     delete h;
     std::filesystem::remove_all(folder);
     return 0;

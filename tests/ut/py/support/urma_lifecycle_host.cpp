@@ -71,11 +71,14 @@ aclError map_buffer(void **out, size_t bytes) {
     return ACL_SUCCESS;
 }
 aclError unmap_buffer(void *p) {
-    for (const auto &entry : registrations)
-        for (const auto &mem : entry.second)
-            if (mem.addr == p) ++unsafe_frees;
     auto it = mappings.find(p);
     assert(it != mappings.end());
+    const auto start = reinterpret_cast<uintptr_t>(p);
+    for (const auto &entry : registrations)
+        for (const auto &mem : entry.second) {
+            const auto address = reinterpret_cast<uintptr_t>(mem.addr);
+            if (address >= start && address - start < it->second) ++unsafe_frees;
+        }
     const int rc = munmap(p, it->second);
     assert(rc == 0);
     mappings.erase(it);

@@ -1,13 +1,13 @@
-name: CI Self CPU Report
+name: CI Self Report
 
-# Posts the /run-cpu lane result back on the PR that triggered it. The button
-# workflow (ci-self-cpu-button.yml) sets its run-name to "/run-cpu PR <n>",
+# Posts the /run-self lane result back on the PR that triggered it. The comment
+# workflow (ci-self-comment.yml) sets its run-name to "/run-self PR <n>",
 # which this watcher parses to find the PR. Runs on the cpu runner so it is
 # not subject to GitHub-hosted congestion (the lane's reason to exist).
 
 on:
   workflow_run:
-    workflows: ["CI Self CPU Button"]
+    workflows: ["CI Self Comment"]
     types: [completed]
 
 permissions:
@@ -52,8 +52,8 @@ jobs:
               return `- ${icon} ${j.name.replace('lane / ', '')}`;
             });
             const head = run.conclusion === 'success'
-              ? `✅ **/run-cpu lane passed** — ${run.html_url}`
-              : `❌ **/run-cpu lane finished with ${run.conclusion}** — ${run.html_url}`;
+              ? `✅ **/run-self lane passed** — ${run.html_url}`
+              : `❌ **/run-self lane finished with ${run.conclusion}** — ${run.html_url}`;
 
             await github.rest.issues.createComment({
               ...context.repo,

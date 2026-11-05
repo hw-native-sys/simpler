@@ -22,17 +22,24 @@
 #include <cerrno>
 #include <csignal>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include "remote_endpoint.h"
 #include "ring.h"
+#include "worker_manager.h"
+
+#define private public
+#include "remote_endpoint.h"
+#undef private
 
 namespace {
 
@@ -1121,6 +1128,63 @@ TEST(MpiGroupMailboxChannel, GroupArrivalTimeoutFailsTaskWithoutKillingGroup) {
     rank1.join();
     EXPECT_EQ(reply0, std::vector<uint8_t>({0xB0}));
     EXPECT_EQ(reply1, std::vector<uint8_t>({0xB1}));
+}
+
+TEST(MpiGroupMailboxChannel, CompletedReplyWinsAfterTimedWaitReacquiresMutex) {
+    using namespace mpi_group_mailbox;
+    using namespace std::chrono_literals;
+    auto mailbox = ready_mpi_mailbox(2);
+    MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 2, -1, 0.5);
+    auto reply = std::async(std::launch::async, [&] {
+        return channel.exchange_group_task({0x10}, 0, 9, 2);
+    });
+    const auto ready_deadline = std::chrono::steady_clock::now() + 2s;
+    while (true) {
+        std::lock_guard<std::mutex> lock(channel.group_mu_);
+        if (channel.group_arrived_ == 1) break;
+        ASSERT_LT(std::chrono::steady_clock::now(), ready_deadline);
+    }
+    ASSERT_EQ(reply.wait_for(5ms), std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(channel.group_mu_);
+        // A completed leader has moved the frames and departed before its peer reacquires this mutex.
+        auto dispatched_frames = std::move(channel.group_frames_);
+        EXPECT_EQ(dispatched_frames.size(), 2u);
+        channel.group_frames_.clear();
+        channel.group_replies_ = {{0xB0}, {0xB1}};
+        channel.group_done_ = true;
+        channel.group_leader_running_ = false;
+        channel.group_departed_ = 1;
+        std::this_thread::sleep_for(600ms);
+    }
+    EXPECT_EQ(reply.get(), std::vector<uint8_t>({0xB0}));
+    EXPECT_FALSE(channel.group_active_);
+    EXPECT_FALSE(channel.terminal());
+}
+
+TEST(MpiGroupMailboxChannel, RetiredPriorBatchWinsAfterTimedWaitReacquiresMutex) {
+    using namespace mpi_group_mailbox;
+    using namespace std::chrono_literals;
+    auto mailbox = ready_mpi_mailbox(1);
+    MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 1, -1, 0.5);
+    channel.group_active_ = true;
+    channel.group_task_slot_ = 9;
+    auto reply = std::async(std::launch::async, [&] {
+        return channel.exchange_group_task({0x10}, 0, 10, 1);
+    });
+    ASSERT_EQ(reply.wait_for(5ms), std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(channel.group_mu_);
+        channel.group_active_ = false;
+        std::this_thread::sleep_for(600ms);
+    }
+    const auto request_deadline = std::chrono::steady_clock::now() + 2s;
+    while (mailbox_state(mailbox, OFF_REQUEST_STATE) != static_cast<int32_t>(RequestState::REQUEST_READY) &&
+           reply.wait_for(0ms) != std::future_status::ready && std::chrono::steady_clock::now() < request_deadline) {}
+    if (mailbox_state(mailbox, OFF_REQUEST_STATE) == static_cast<int32_t>(RequestState::REQUEST_READY))
+        respond_with_payloads(mailbox, {{0xB0}});
+    EXPECT_EQ(reply.get(), std::vector<uint8_t>({0xB0}));
+    EXPECT_FALSE(channel.terminal());
 }
 
 TEST(MpiGroupMailboxTransport, GroupProgressSubmitAndPollRoundTrip) {

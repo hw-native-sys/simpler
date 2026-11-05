@@ -5,26 +5,24 @@ establish it, and what runs queued on the same streams may rely on.
 
 ## Initial publication of the run-result region
 
-Each live call retains its original 280-byte result region through observation.
-An idle slot allocation is reused for an ordinary finalized call; a call that
-reuses an execution slot while its predecessor remains unobserved takes another
-allocation. Preparation snapshots a zero
-`published` marker into the existing launch metadata batch, without copying to
-device. Launch publishes the batch from slot-owned pinned memory on the AICPU
-stream before the entry fork and either kernel. Only a successful publication
-marks the allocation initialized; an error-detail read follows strong observation. The pinned source
-stays live through retirement or quarantine, including failed enqueue attempts.
+Each live call retains its original result allocation through observation,
+independently of its reusable execution slot. `RunResultStorage` keeps the call's
+read state and a lease on `PreparedSubmissionStorage`; late observers never
+read the successor's result address. Sequential finalized calls can reuse the
+idle backing, while overlapping observations or model references require a
+new submission allocation before preparation writes it.
 
-A failed or skipped initial publication leaves the allocation untrusted. Even
-allocator bytes equal to the requested epoch cannot produce a certified read or
-terminal result. Explicit waits use the RTS stream verdict for TMR, legacy HBG,
-and resident HBG. Optional private diagnostics never establish normal success.
-A failure after any async enqueue attempt is Partial and prevents kernel launch.
-Preparation abort discards its unpublished snapshot, and a later attempt stages
-a fresh marker. Once initialized, ordinary slot reuse needs no marker copy:
-per-run epochs distinguish the device's results. This adds eight bytes to an
-uninitialized slot's pinned publication source, with no warm-run transfer or
-latency claim. Cold allocation and other initialization remain outside capture.
+Cold preparation initializes `NativeInvocationResultStorage` once, including
+its unchanged result prefix and private replay-evidence tail. Device entry
+invalidates the current result publication before every execution. This does
+not add a host reset task to the captured sequence or erase evidence on replay.
+A failed cold copy leaves the allocation uninitialized and retryable.
+
+Execution progress and normal successful observation perform no private-result
+D2H. An SDK error can request the original call's optional structured detail;
+that detail cannot override the SDK verdict. Only backing admitted for recording
+requires the separate replay-evidence read at external-use cleanup. That read
+never becomes an eager progress or ordinary result-observation prerequisite.
 
 ## The question a stream cannot answer
 
@@ -110,8 +108,9 @@ and reset policy. A borrowed kernel context is poisoned without a device-wide
 drain or reset; the caller owns device recovery. The native eager entry
 `simpler_launch_run_on_stream` binds a borrowed caller stream to an already
 prepared run. Public `Worker.init(borrowed_context_generation=...)` and
-`Worker.submit(..., caller_stream=...)` use this same native path. Capture/replay
-is rejected by the eager entry.
+`Worker.submit(..., caller_stream=...)` use this same native path. Kernel capture uses the same launch entry with explicitly retained preparation
+resources; Program remains eager-only. The [capture execution contract](native-capture-common-contract.md)
+specifies preparation purpose, recording behavior and support limits.
 
 ## Borrowed caller ordering
 
@@ -194,9 +193,15 @@ keeps references quarantined; borrowed execution never resets or synchronizes
 the whole device. Launch failure does not establish the exit dependency, so
 callers cannot consume output merely because launch returned an error.
 
-This entry is eager-only. It validates the current borrowed RTS context and
-rejects an active caller capture before launch metadata publication. Preparation
-and callable registration take place outside capture. The common eager launch
+The entry validates the current borrowed RTS context. Active capture is accepted
+only for Kernel mode with a retained run prepared explicitly for capture,
+diagnostics disabled and no predecessor argument. The default eager preparation
+cannot be upgraded to capture. `NativeRunDescriptor.prepare_purpose` selects the
+preparation contract; capture preparation rejects writable HOST/NONE parameters
+before orchestration, while read-only Host controls determine fixed graph/task
+snapshots. Program capture is refused before changing recording,
+caller or claim state. Preparation and callable registration take place outside
+capture. The common eager launch
 publishes its Runtime descriptor asynchronously on the actual AICPU stream;
 its entry fork orders the AICore reader behind that copy. The slot retains a
 pinned immutable source through run retirement. A copy attempt marks Partial
@@ -206,7 +211,11 @@ work requires bounded private-stream discharge or quarantine. Bulk HBG arena
 publication and DFX writes retain their own synchronization. The compatibility
 `simpler_kernel_mode_launch` stub and capability bit remain closed; public Worker
 eager uses the shared native lane. Native completion events and their caller
-references are not a captured-graph lifetime contract.
+references remain distinct from a captured-graph lifetime contract. Explicit
+`simpler_retain_run_resources` / `simpler_release_run_resources` obligations hold
+prepared backing across Host run finalization, and external release requires the
+caller to have ended model and in-flight uses. Completion releases execution
+capacity; it does not discharge that external obligation or deliver Program IO.
 
 A direct L2 Python `Worker` owns the native `_ChipWorker` itself. Its callable
 handles, argument imports, source uses and close journal belong to `Worker`;
@@ -795,5 +804,18 @@ orchestration view before clearing the storage.
 The first descriptor publication still initializes its complete handshake
 prefix. Program descriptor and launch-envelope routes retain their behavior;
 kernel packets require permitted launch transport and cannot silently fall back
-to unvalidated descriptor values. Active capture remains rejected by the eager
-entry. These per-run resources do not provide captured-graph lifetime.
+to unvalidated descriptor values. Default eager preparation cannot be recorded;
+capture-purpose preparation uses the same native launch with a matching retained
+reference. Per-run ownership alone is insufficient for graph lifetime; the
+[external resource contract](native-hbg-prepared-lifetime.md) covers that obligation.
+
+### Native terminal publication contract
+
+Native completion distinguishes a published private record, a valid unrequested
+record, and invalid producer state. `NotRequested` does not gate normal success;
+`InvalidState` converts success to INTERNAL but never replaces a known functional
+error. Optional diagnostic payload is not required to report that error. The
+actual publisher rejects malformed bindings or records; it does not return an
+RTS DMA failure status. A missing required runtime terminal remains an unknown
+functional outcome, distinct from missing private detail. Physical retirement
+and strong caller-stream observation retain their separate contracts above.

@@ -37,6 +37,7 @@
  */
 
 #pragma once
+#include "host/aligned_image_storage.h"
 
 #include <runtime/rt.h>
 
@@ -64,6 +65,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "utils/retained_scheduler_storage.h"
+#include "host/prepared_run_resources.h"
 #include "aicore_pmu_lease.h"
 #include "device_phase_capture.h"
 #include "device_runner_helpers.h"
@@ -107,6 +109,22 @@
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
 #include "kernel_persistent_args.h"
+#include "common/native_invocation_evidence.h"
+
+// Actual submission backing, independent of a slot's next execution. The runner
+// explicitly releases RTS allocations on its attached context; destruction of
+// an arbitrary host reference is never device-completion proof.
+struct PreparedSubmissionStorage {
+    SlotPersistentArgs args;
+    std::unique_ptr<RunCompletionFence> fence;
+    std::unique_ptr<RunCallerOrder> caller_order;
+    void *device_wall{nullptr};
+    void *device_result{nullptr};
+    bool result_initialized{false};
+    bool retain_replay_evidence{false};
+    bool evidence_observed{false};
+    NativeInvocationEvidence::Snapshot observed_evidence{};
+};
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
@@ -249,14 +267,19 @@ public:
 
     /**
      * Reserve caller-owned native-run storage before binding starts. A
-     * concurrent reservation is admitted only while the first reservation
-     * owns the execution claim and selects a distinct pipeline slot. A backend
+     * concurrent eager reservation requires the earlier reservations to own
+     * execution claims. Completed cold capture preparations may coexist in distinct
+     * granted slots; their retained owners protect backing before any bind
+     * replaces it. This does not grant concurrent execution. A backend
      * that shares an arena bank must reject or defer incompatible preparation
      * before mutating that bank.
      */
     bool try_reserve_native_run(
-        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
+        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
+        bool capture_preparation = false
     );
+    /** Publish preparation only after its backing owner and resource plan are complete. */
+    void mark_native_run_prepared(const void *owner);
     void release_native_run_reservation(const void *owner);
     void release_native_run_observation(const void *owner);
     bool owns_native_run_observation(const void *owner) const;
@@ -380,7 +403,7 @@ public:
     // device and RTS context without changing them. Also used for abandoning
     // an unlaunched run.
     int enter_run_thread();
-    int validate_caller_stream(rtStream_t caller);
+    int validate_caller_stream(rtStream_t caller, bool *recording = nullptr);
     // A borrowed environment must be current before resource mutation. An
     // owned environment has no caller binding to validate; enter_run_thread
     // performs its thread attachment before device work.
@@ -589,7 +612,7 @@ public:
      * it rather than dying with the caller's frame.
      */
     int acquire_run_image_staging(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
-    void clear_temporary_buffer();
+    int clear_temporary_buffer();
 
     /**
      * Record that this context wants workspace ownership management, and
@@ -773,9 +796,7 @@ public:
      * Called from the run phase entries, never derived from a phase word or
      * from the code a caller received.
      */
-    void note_workspace_run_fact(uint32_t pipeline_slot, std::uint64_t run_epoch, WorkspaceManager::RunFact fact) {
-        workspace_.note_run_fact(pipeline_slot, run_epoch, fact);
-    }
+    void note_workspace_run_fact(const NativeRunIdentity &identity, WorkspaceManager::RunFact fact);
 
     /**
      * Publish the run identity this thread's workspace requests belong to.
@@ -1386,6 +1407,9 @@ public:
     /** Latch a prepared Runtime's geometry immediately before execution. */
     void activate_launch_shape(const Runtime &runtime);
 
+    // Pure preflight: capture cannot replay Host orchestration writes.
+    int validate_capture_prepare_args(int32_t callable_id, const void *args) const;
+
     /**
      * Point a fresh Runtime at a previously-registered callable and complete
      * the per-run binding in one step. Installs the reference to that
@@ -1578,10 +1602,12 @@ public:
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
+            prepared_resources(std::move(other.prepared_resources)),
             streams(std::exchange(other.streams, RunStreams{})),
             stream_lifetime(std::move(other.stream_lifetime)),
             artifact_identity(other.artifact_identity),
             caller_stream(std::exchange(other.caller_stream, nullptr)),
+            recording(other.recording),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1611,6 +1637,7 @@ public:
         int num_aicore{0};
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
+        std::shared_ptr<const PreparedRunResources> prepared_resources;
         // Bound before publication under the execution claim, unchanged through
         // retirement. The runner retains its Core stream and the caller owns
         // an aliased CPU stream. Neither preparation nor moving this state
@@ -1627,6 +1654,7 @@ public:
          */
         NativeRunArtifactIdentity artifact_identity{};
         rtStream_t caller_stream{nullptr};
+        bool recording{false};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1801,6 +1829,22 @@ public:
 
         bool poisoned() const { return progress == LaunchProgress::Partial; }
     };
+    virtual int prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) {
+        *lease = {};
+        prepared.streams =
+            execution_mode_latch().is_kernel() ? borrowed_run_streams() : RunStreams{stream_aicpu_, stream_aicore_};
+        return prepared.streams.ready() ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    virtual int reclaim_execution_streams() { return 0; }
+    int prepare_run_storage(uint32_t pipeline_slot);
+    int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1);
+    int retain_external_run_resources(PreparedExecution &prepared, void *caller_stream, void **out_reference);
+    int release_external_run_resources(void *reference);
+    int admit_recording(PreparedExecution &prepared);
+    bool prepared_storage_in_use() const;
+    bool prepared_resources_block_fatal_reset() const;
+    bool prepared_resources_can_abandon() const;
+
     /**
      * Prepare host-owned execution state without crossing the device launch
      * boundary. The returned object owns everything needed by launch.
@@ -1942,10 +1986,9 @@ public:
     int launch_aicpu_payload(rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num);
 
     /**
-     * Launch an AICore kernel. Lazy-registers the kernel binary
-     * (`aicore_kernel_binary_`) on first call via `rtRegisterAllKernel`
-     * and caches the resulting `aicore_bin_handle_`; subsequent calls
-     * reuse the cached handle. CANN has no public
+     * Launch an AICore kernel using the binary registered during preparation.
+     * Direct launch users also ensure registration before submission. All calls
+     * reuse the cached `aicore_bin_handle_`. CANN has no public
      * `rtUnregisterAllKernel`, so re-registering on every run would pin
      * another device-side copy of the ELF and quickly exhaust HBM —
      * manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with a
@@ -1957,6 +2000,7 @@ public:
      * the call must follow collector arming.
      */
     int launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args);
+    int ensure_aicore_binary_registered();
 
     /**
      * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
@@ -2372,7 +2416,10 @@ protected:
     // docs/design/run-completion-fence.md for why each fallback below exists.
 
     /** One pipeline slot's fence. Slots are indexed as everywhere else. */
-    RunCompletionFence &run_fence(uint32_t pipeline_slot) { return *run_fences_[pipeline_slot]; }
+    RunCompletionFence &run_fence(uint32_t pipeline_slot) { return *submission_storage_[pipeline_slot]->fence; }
+
+    /** Prepare Simpler-owned registration and events, without binding or submitting a run. */
+    int prepare_submission_resources(const PreparedExecution &prepared);
 
     /**
      * Take this run's slot fence, committing its events. Belongs in the launch
@@ -2744,51 +2791,7 @@ protected:
      * @return 0 on success, first nonzero rc encountered otherwise.
      */
     int finalize_common();
-
-    /**
-     * Retire loader state that a program close's device teardown has left
-     * unreachable, whichever way that teardown went.
-     *
-     * `LoadAicpuOp::Finalize()` keeps its binary handle when `rtsBinaryUnload`
-     * fails, so that an owner able to retry it survives. Neither outcome of a
-     * program close leaves that retry reachable, so both forget the handle:
-     *
-     *   - `reset_confirmed` — the reset ended the generation the handle
-     *     belonged to, so it names a binary that no longer exists. Forgetting
-     *     it is what keeps `init -> finalize -> init` working on one context.
-     *   - otherwise — the device's state is unconfirmed, and this close has
-     *     already released every other owner and is about to clear
-     *     `device_id_`. Forgetting the handle is what keeps `~LoadAicpuOp`
-     *     from issuing an unreported unload against that device.
-     *
-     * Neither is a successful release and neither is reported as one: the
-     * error this close already returned to the caller is the last word on it.
-     *
-     * A no-op on a kernel context, which resets nothing — its retained handle
-     * stays valid and its explicit close is the only thing that may retire it.
-     * That close cannot reach here today, because a retained handle makes
-     * `finalize_common()` return non-zero and the arch tail returns early on a
-     * kernel latch; the guard enforces the invariant rather than resting on
-     * that.
-     */
-    void retire_loader_after_device_teardown(bool reset_confirmed) {
-        if (execution_mode_latch_.is_kernel()) return;
-        if (load_aicpu_op_.has_live_resources()) {
-            if (reset_confirmed) {
-                LOG_WARN("finalize: reset retired the retained AICPU registration; forgetting its handles");
-            } else {
-                LOG_ERROR("finalize: reset is unconfirmed; abandoning AICPU handles without another device call");
-            }
-            load_aicpu_op_.ForgetWithoutUnload();
-        }
-        if (common_cleanup_pending_) {
-            // Program's existing tail attempted its reset after common cleanup
-            // failed. No individual device release is legal past that boundary,
-            // including when the reset itself failed. Clear only bookkeeping.
-            (void)abandon_common_after_device_failure();
-            mark_teardown_unresolved();
-        }
-    }
+    int recover_failed_close(int rc);
 
     void release_graph_definition_staging();
 
@@ -2874,6 +2877,8 @@ protected:
     // `aicpu_seen_callable_ids_` tracks which ids have completed a successful
     // AICPU SO load for the monotonic dlopen counter.
     struct CallableState {
+        std::shared_ptr<const PreparedRunResources::CallableUse> use =
+            std::make_shared<PreparedRunResources::CallableUse>();
         uint64_t residency_generation{0};
         // trb path (AICPU dlopens orch SO from device buffer)
         // Orchestration ELF Build-ID returned by callable_hash(); distinct from
@@ -2928,11 +2933,14 @@ protected:
     // Written on the bind path, read by the caller's thread.
     std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
     std::atomic<size_t> scheduler_mode_publish_total_{0};
+    enum class NativeRunPreparationState { Preparing, Prepared };
     struct NativeRunReservation {
         const void *owner{nullptr};
         uint32_t pipeline_slot{0};
         uint32_t arena_bank{0};
         bool permits_prepared_successor{false};
+        bool capture_preparation{false};
+        NativeRunPreparationState preparation_state{NativeRunPreparationState::Preparing};
     };
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
@@ -2984,7 +2992,6 @@ protected:
     TeardownProof teardown_proof_{TeardownProof::NotAttempted};
     ExecutionModeLatch execution_mode_latch_;
     bool program_initialized_{false};
-    bool common_cleanup_pending_{false};
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
@@ -3006,7 +3013,7 @@ protected:
 
     // Executor binaries — populated once via `set_executors()` during
     // simpler_init. `aicore_kernel_binary_` is consumed once by
-    // `launch_aicore_kernel()` (`rtRegisterAllKernel` returns
+    // `ensure_aicore_binary_registered()` (`rtRegisterAllKernel` returns
     // `aicore_bin_handle_`, cached and reused on every subsequent
     // launch). Caching is required: CANN has no public
     // `rtUnregisterAllKernel`, so re-registering on every run would pin
@@ -3018,12 +3025,13 @@ protected:
     // the cached `rtFuncHandle` on `LoadAicpuOp`, not the host bytes.
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
-    // AICore kernel handle from `rtRegisterAllKernel` — lazily
-    // populated by the subclass's `launch_aicore_kernel()` and reused
+    // AICore kernel handle from `rtRegisterAllKernel` — populated by
+    // `ensure_aicore_binary_registered()` and reused
     // across all runs. `nullptr` means not yet registered. Reset to
     // `nullptr` in `finalize()`; CANN releases the device-side state
     // implicitly when the device context tears down.
     void *aicore_bin_handle_{nullptr};
+    std::mutex aicore_registration_mutex_;
     // SDMA warmup ELF handle from `rtRegisterAllKernel`, kept separate from
     // `aicore_bin_handle_` because it is a different (vector-only) binary. Only
     // ever registered once, during provisioning. Reset the same way in
@@ -3063,12 +3071,13 @@ protected:
     // base and dropped by that allocation's free, which is what keeps a cached
     // host VA from outliving its pages.
     ChildMemoryHostViewCache child_memory_host_views_;
-    // Current staging block for each pipeline slot. A physically retired call
-    // with pending HOST outputs retains its original block through workspace
-    // references after this alias detaches. The grow/slice logic lives in
-    // utils/retained_temp_bump.h.
-    RunResourceSlots<void *> retained_temp_addrs_;
-    RunResourceSlots<std::size_t> retained_temp_sizes_;
+    // Retained temporary buffer for device arguments, one per pipeline slot
+    // (see HostApi get/set_retained_temp_buffer). Just a remembered
+    // {addr, size} that the slot reuses across its runs and finalize frees;
+    // the grow/slice logic lives in utils/retained_temp_bump.h.
+    RunResourceSlots<std::shared_ptr<PreparedRunResources::TemporaryStorage>> temporary_storage_;
+    std::vector<std::shared_ptr<PreparedRunResources::TemporaryStorage>> retired_temporary_storage_;
+    int detach_retained_temporary(uint32_t slot);
     // One pipeline slot's Graph Definition staging: host bytes the recorders
     // build their objects into and the bind packs into the run's AICPU launch
     // package. Grow-only and content-preserving, because a bind knows the run's
@@ -3084,7 +3093,7 @@ protected:
     // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
     // which holds the grow, alignment and failure rules. One pair per slot
     // because a slot's runs are serialized while different slots' runs are not.
-    RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
+    RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>> scheduler_state_storage_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -3100,63 +3109,70 @@ protected:
     // std::vector: `resize` would zero every page of a capacity the caller writes
     // a fraction of, and would copy the old bytes on growth for a buffer whose
     // contents mean nothing between binds.
-    struct RetainedSmMirror {
-        std::unique_ptr<std::byte[]> storage;
-        std::size_t capacity{0};
-    };
+    using RetainedSmMirror = AlignedImageStorage;
     RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
     RunResourceSlots<std::shared_ptr<void>> prepare_plans_;
     RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
     // Host staging for the device execution image, one retained buffer per
     // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
-    // and the same grow-only retention as the mirror above; what differs is
+    // and grow-only retention when unreferenced; what differs is
     // what it holds and how long it has to hold it. A bind assembles the
     // bytes here and records where they go; the publication reads them
     // afterwards, so this buffer is what makes the source outlive the
     // preparation. Sized to the image a bind ships rather than to the
-    // mirror's capacity.
-    RunResourceSlots<RetainedSmMirror> run_image_stagings_;
+    // mirror's capacity. A prepared owner pins this version; the next acquire
+    // then takes a separate buffer, including for an equal-size request.
+    RunResourceSlots<std::shared_ptr<PreparedRunResources::ImageStorage>> run_image_stagings_;
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
     // preparing one bank never mutates a region the active run is executing
     // out of. `cached_*` back `setup_static_arena`'s "fits" check: a later
     // init asking for an equal-or-smaller layout on an already-committed
-    // arena reuses it instead of re-allocating.
-    struct ArenaBank {
-        ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
-            gm_heap(alloc, free_fn, ctx),
-            gm_sm(alloc, free_fn, ctx),
-            runtime_pool(alloc, free_fn, ctx) {}
-
-        DeviceArena gm_heap;
-        DeviceArena gm_sm;
-        DeviceArena runtime_pool;
-        size_t cached_gm_heap_size{0};
-        size_t cached_gm_sm_size{0};
-        size_t cached_runtime_arena_size{0};
-    };
+    // arena reuses it instead of re-allocating when no prepared owner holds it.
+    using ArenaBank = PreparedRunResources::ArenaBank;
     // Held by pointer because DeviceArena is non-copyable and non-movable, so a
     // bank is constructed in place with its allocator rather than default-built
     // with the rest of its set.
-    RunResourceSlots<std::unique_ptr<ArenaBank>> arena_banks_;
+    RunResourceSlots<std::shared_ptr<ArenaBank>> arena_banks_;
+    mutable std::mutex prepared_storage_mutex_;
+    std::vector<PreparedRunResources::RetiredArena> retired_prepared_arenas_;
+    std::vector<std::shared_ptr<RetainedSchedulerStorage>> retired_prepared_schedulers_;
+    struct PreparedUseRecord {
+        NativeRunIdentity identity;
+        PreparedRunUse use;
+    };
+    std::vector<PreparedUseRecord> prepared_uses_;
+    // Registered published owners; internal use records never own this lifetime.
+    std::vector<std::weak_ptr<const PreparedRunResources>> prepared_resource_owners_;
+    struct ExternalRunReference {
+        NativeRunIdentity identity;
+        std::shared_ptr<const PreparedRunResources> resources;
+        // Kept through a failed close even after backing moved to retirement.
+        std::shared_ptr<const PreparedRunResources::CallableUse> callable;
+        std::vector<WorkspaceManager::BackingIdentity> managed_backing;
+        void *caller_stream{nullptr};
+        bool recording{false};
+        bool release_requested{false};
+        bool closing{false};
+    };
+    std::unordered_map<void *, std::unique_ptr<ExternalRunReference>> external_run_references_;
+    // Serializes external close across RTS calls without holding the storage lock.
+    std::mutex external_reference_mutex_;
+
+    bool prepared_storage_has_external_references_locked() const;
+    void note_prepared_waits_consumed(const NativeRunIdentity &identity);
+    int reclaim_prepared_storage();
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
 
     // The device blocks each pipeline slot reuses across its runs. Committed on
     // a slot's first prepare and released in finalize(), so a steady-state run
     // rewrites their contents instead of reallocating them.
-    RunResourceSlots<SlotPersistentArgs> slot_persistent_args_;
-
-    // One completion fence per pipeline slot. The events are runner-owned for
-    // the same reason the blocks above are: a reuse-capable event re-records
-    // without a reset, so creating a pair per run would add device calls to
-    // every dispatch. The per-run facts they carry are identity-bound, so a
-    // slot's next run cannot read the previous one's completion. Held by
-    // pointer because the fence is non-copyable, so the array cannot be
-    // brace-initialised without naming every slot.
-    RunResourceSlots<std::unique_ptr<RunCompletionFence>> run_fences_;
-    RunResourceSlots<std::unique_ptr<RunCallerOrder>> caller_orders_;
+    RunResourceSlots<std::shared_ptr<PreparedSubmissionStorage>> submission_storage_;
+    std::vector<std::shared_ptr<PreparedSubmissionStorage>> retired_submission_storage_;
+    static std::shared_ptr<PreparedSubmissionStorage> make_submission_storage();
+    int release_submission_storage(PreparedSubmissionStorage &storage, bool abandon);
 
     /**
      * Per-set storage an arch runner owns itself, built but not yet adopted.
@@ -3173,24 +3189,18 @@ protected:
     struct RunResourceStaging {
         RunResourceSlots<NativeRunReservation>::Storage native_run_reservations;
         RunResourceSlots<NativeRunClaim>::Storage active_native_runs;
-        RunResourceSlots<void *>::Storage retained_temp_addrs;
-        RunResourceSlots<std::size_t>::Storage retained_temp_sizes;
+        RunResourceSlots<std::shared_ptr<PreparedRunResources::TemporaryStorage>>::Storage temporary_storage;
         RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
-        RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>>::Storage scheduler_state_storage;
         RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
         RunResourceSlots<std::shared_ptr<void>>::Storage prepare_plans;
         RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
-        RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
-        RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
-        RunResourceSlots<SlotPersistentArgs>::Storage slot_persistent_args;
-        RunResourceSlots<std::unique_ptr<RunCompletionFence>>::Storage run_fences;
-        RunResourceSlots<std::unique_ptr<RunCallerOrder>>::Storage caller_orders;
+        RunResourceSlots<std::shared_ptr<PreparedRunResources::ImageStorage>>::Storage run_image_stagings;
+        RunResourceSlots<std::shared_ptr<ArenaBank>>::Storage arena_banks;
+        RunResourceSlots<std::shared_ptr<PreparedSubmissionStorage>>::Storage submission_storage;
         RunResourceSlots<NativeRunIdentity>::Storage whole_operator_boundaries;
-        RunResourceSlots<void *>::Storage device_wall_dev_ptrs;
         RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
         RunResourceSlots<bool>::Storage device_timing_armed;
-        RunResourceSlots<void *>::Storage device_run_result_dev_ptrs;
-        RunResourceSlots<bool>::Storage device_run_result_initialized;
         RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
         RunBoundaryLedger::Storage run_boundaries_observed;
         QueuedStreamWaits::Storage queued_waits;
@@ -3282,7 +3292,9 @@ protected:
 
 public:
     /** The persistent device blocks belonging to one pipeline slot. */
-    SlotPersistentArgs &slot_persistent_args(uint32_t pipeline_slot) { return slot_persistent_args_[pipeline_slot]; }
+    SlotPersistentArgs &slot_persistent_args(uint32_t pipeline_slot) {
+        return submission_storage_[pipeline_slot]->args;
+    }
 
 protected:
     // The one prebuilt runtime-arena image entry, describing bank 0's region
@@ -3331,13 +3343,9 @@ protected:
     // subclass drain always pulls back the header + phases after stream sync,
     // and only pulls the tail when the header marks it used.
     //
-    // One buffer per pipeline slot, allocated lazily on that slot's first
-    // capture-enabled run and freed in subclass `finalize_impl()`. Per slot rather
-    // than per run so the hot path does no device malloc/free, and rather than
-    // one shared buffer because the device writes it for the whole of a run
-    // while the host reads it only at that run's drain — a successor armed into
-    // the same storage would corrupt both.
-    RunResourceSlots<void *> device_wall_dev_ptrs_;
+    // The device buffer belongs to submission_storage_, cached between eager
+    // runs but replaced if an older preparation retains it. Host observations
+    // below belong to the single run and do not extend that device lifetime.
     // Per-slot readback results; see device_run_timing().
     RunResourceSlots<DeviceRunTiming> device_run_timing_;
     // An accepted publication arms the slot; retirement consumes its result.
@@ -3349,6 +3357,7 @@ protected:
     struct RunResultStorage {
         uint32_t pipeline_slot{UINT32_MAX};
         void *device_ptr{nullptr};
+        std::shared_ptr<PreparedSubmissionStorage> backing;
         DeviceRunResultRegion region{};
         RunRecordRead read{RunRecordRead::NotAttempted};
         int transfer_rc{0};
@@ -3357,18 +3366,10 @@ protected:
     // Owned by the live call, independently of its reusable execution slot.
     std::unordered_map<uint64_t, RunResultStorage> run_result_storage_;
     mutable std::mutex run_result_mu_;
-    RunResourceSlots<void *> device_run_result_dev_ptrs_;
     // The boundary completion each run's own drain or poll observed, retained
     // because the drain's cleanup retires the fence that could otherwise be
     // asked. See host/run_evidence_retention.h.
     RunBoundaryLedger run_boundaries_observed_;
-    // A successful launch publication enqueues this allocation's first marker
-    // clear before the entry fork. Readback follows drain and refuses an
-    // uninitialized allocation; stale allocator bytes may match any run epoch.
-    // Slot retirement excludes the previous DMA reader before warm reuse, whose
-    // epoch distinguishes it without another clear.
-    RunResourceSlots<bool> device_run_result_initialized_;
-
     // AICPU runtime registration and entry handles are ready.
     bool aicpu_runtime_registered_{false};
     // The control stream has completed simpler_aicpu_init.

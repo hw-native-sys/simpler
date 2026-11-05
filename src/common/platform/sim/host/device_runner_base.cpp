@@ -160,7 +160,7 @@ SimDeviceRunnerBase::RunResourceStaging SimDeviceRunnerBase::build_run_resources
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.run_image_stagings = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.host_phase_runs = RunResourceSlots<HostPhaseRunState>::build(granted);
-    staged.device_run_results = RunResourceSlots<DeviceRunResultRegion>::build(granted);
+    staged.device_run_results = RunResourceSlots<NativeInvocationResultStorage>::build(granted);
     // The bank carries constructor arguments. Built here rather than filled in
     // after a resize, so the table is never visible holding a null entry.
     staged.arena_banks = RunResourceSlots<std::unique_ptr<ArenaBank>>::build(granted);
@@ -648,7 +648,7 @@ SimDeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepare
 
 void SimDeviceRunnerBase::retain_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
     std::lock_guard<std::mutex> lock(retained_result_mu_);
-    retained_run_results_.emplace(run_epoch, device_run_results_[pipeline_slot]);
+    retained_run_results_.emplace(run_epoch, device_run_results_[pipeline_slot].result);
 }
 
 void SimDeviceRunnerBase::release_run_result(uint64_t run_epoch) {
@@ -669,7 +669,7 @@ SimDeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoc
     if (pipeline_slot >= device_run_results_.size()) return nullptr;
     const auto retained = retained_run_results_.find(run_epoch);
     const DeviceRunResultRegion &region =
-        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot];
+        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot].result;
     if (!device_run_result_published(region, run_epoch)) return nullptr;
     if (bytes_out != nullptr) *bytes_out = region.payload_bytes;
     return region.payload;
@@ -680,7 +680,8 @@ DeviceRunTerminal SimDeviceRunnerBase::device_run_terminal(uint32_t pipeline_slo
     if (pipeline_slot >= device_run_results_.size()) return {};
     const auto retained = retained_run_results_.find(run_epoch);
     return device_run_result_terminal(
-        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot], run_epoch
+        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot].result,
+        run_epoch
     );
 }
 
@@ -788,29 +789,8 @@ int SimDeviceRunnerBase::release_scheduler_state_storage() {
 int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out == nullptr) return -1;
     *addr_out = nullptr;
-    if (pipeline_slot >= sm_mirrors_.size() || bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
-        bytes > SIZE_MAX - (alignment - 1)) {
-        return -1;
-    }
-    RetainedSmMirror &mirror = sm_mirrors_[pipeline_slot];
-    // Grow-only and never shrunk: the task capacity is fixed for a given run
-    // configuration, so past the first bind the image is written into host pages
-    // that are already mapped, and each page of it faults once per process rather
-    // than once per bind.
-    const size_t needed = bytes + alignment - 1;
-    if (mirror.capacity < needed) {
-        // `new[]` on a trivially-typed array default-initializes, so the block
-        // costs no page until a bind writes one; make_unique would zero it. The
-        // outgoing block's bytes are not carried over, because nothing reads a byte
-        // this bind did not write.
-        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
-        if (storage == nullptr) return -1;
-        mirror.storage = std::move(storage);
-        mirror.capacity = needed;
-    }
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(mirror.storage.get());
-    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
-    return 0;
+    if (pipeline_slot >= sm_mirrors_.size()) return -1;
+    return sm_mirrors_[pipeline_slot].acquire(bytes, alignment, addr_out) == 0 ? 0 : -1;
 }
 
 int SimDeviceRunnerBase::acquire_run_image_staging(
@@ -818,26 +798,8 @@ int SimDeviceRunnerBase::acquire_run_image_staging(
 ) {
     if (addr_out == nullptr) return -1;
     *addr_out = nullptr;
-    if (pipeline_slot >= run_image_stagings_.size() || bytes == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
-        return -1;
-    }
-    RetainedSmMirror &staging = run_image_stagings_[pipeline_slot];
-    // Grow-only, like the mirror: an image's size follows the graph a run builds,
-    // so a repeated workload writes host pages that are already mapped.
-    const size_t needed = bytes + alignment - 1;
-    if (staging.capacity < needed) {
-        // `new[]` default-initializes a trivially-typed array, so the block costs
-        // no page until the bind writes one. The outgoing block's bytes are not
-        // carried over: a publication ships what its own bind assembled.
-        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
-        if (storage == nullptr) return -1;
-        staging.storage = std::move(storage);
-        staging.capacity = needed;
-    }
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(staging.storage.get());
-    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
-    return 0;
+    if (pipeline_slot >= run_image_stagings_.size()) return -1;
+    return run_image_stagings_[pipeline_slot].acquire(bytes, alignment, addr_out) == 0 ? 0 : -1;
 }
 
 void SimDeviceRunnerBase::release_run_image_stagings() {

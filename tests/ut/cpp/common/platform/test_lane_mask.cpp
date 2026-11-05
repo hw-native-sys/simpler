@@ -33,10 +33,23 @@ template <typename T, typename = void>
 struct HasRawConstructor : std::false_type {};
 template <typename T>
 struct HasRawConstructor<T, std::void_t<decltype(T::from_bits(uint8_t{}))>> : std::true_type {};
-template <typename T, typename = void>
-struct HasBitConstant : std::false_type {};
 template <typename T>
-struct HasBitConstant<T, std::void_t<decltype(T::kAic)>> : std::true_type {};
+auto has_bit_constant(int) -> decltype(T::kAic, std::true_type{});
+template <typename T>
+auto has_bit_constant(...) -> std::false_type;
+template <typename T>
+using HasBitConstant = decltype(has_bit_constant<T>(0));
+
+struct PublicBitConstant {
+    static constexpr unsigned kAic = 1;
+};
+class PrivateBitConstant {
+    static constexpr unsigned kAic = 1;
+};
+struct NoBitConstant {};
+static_assert(HasBitConstant<PublicBitConstant>::value);
+static_assert(!HasBitConstant<PrivateBitConstant>::value);
+static_assert(!HasBitConstant<NoBitConstant>::value);
 }  // namespace
 
 static_assert(!HasRawBits<LaneMask>::value && !HasBitwiseUnion<LaneMask>::value);
