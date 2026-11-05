@@ -26,17 +26,13 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <string>
-#include <thread>
 #include <unordered_map>
 
 #include "host/run_progress_slots.h"
-#include <unordered_set>
-#include <vector>
 
 #include "callable.h"
 #include "prepare_callable_common.h"
@@ -200,7 +196,7 @@ private:
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
-    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
+    // aicpu_runtime_registered_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
@@ -215,8 +211,8 @@ private:
     // offline replay. a5-specific (the base keeps dep_gen as a virtual hook).
     DepGenCollector dep_gen_collector_;
 
-    // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
-    // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
+    // `query_max_block_dim`, `validate_block_dim`, `ensure_aicpu_runtime_registered`,
+    // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited
     // (protected) from `DeviceRunnerBase`.
 
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
@@ -310,15 +306,11 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    /**
-     * Build this run's collector pools, profiling flag and device KernelArgs
-     * refresh, under the execution claim.
-     *
-     * The collectors are resident and shared by every run on this runner, and a
-     * run whose core / AICPU-thread counts differ from the pools' releases and
-     * rebuilds them. Neither is safe while another run is executing against
-     * them, which is why none of it happens during preparation.
-     */
+    // Resident pools may still have device/retained-writer users. Storage
+    // construction requires the execution claim until those pools have
+    // independent lifetimes; it does not acquire a run bank or start readers.
+    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared);
+    // Bind the per-run terminal bank after storage preparation succeeds.
     int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     /**

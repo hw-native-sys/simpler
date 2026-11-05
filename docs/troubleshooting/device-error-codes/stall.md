@@ -98,6 +98,48 @@ interleave; redirect them per-run with `ASCEND_PROCESS_LOG_PATH` (the directory 
 exist) before reading. See the "Device logs" section of
 [`running-onboard.md`](../../../.claude/rules/running-onboard.md).
 
+### TMR running and pending publication records
+
+For A2/A3 and A5 `tensormap_and_ringbuffer`, each owner's local INFO snapshot
+also emits `publication_records=owner_local implicit_wait_metadata=unavailable`
+and one `SLOT` line for each valid running or pending token on its own cores:
+
+```text
+[STALL thread=0] SLOT core=0 slot=running token=1 bank=1 task_id=0x0 block=0/1 ...
+[STALL thread=0] SLOT core=0 slot=pending token=2 bank=0 task_id=0x1 block=0/1 ...
+```
+
+The owner that wins the scheduler-timeout shutdown also emits its own records
+at WARN before the global snapshot. An owner that reaches its tensor-data
+timeout fatal branch also emits its own WARN records before that thread calls
+emergency retirement. Owners that exit on an already published completion flag
+do not reach this branch. These records cover only the reporting owner, not
+every owner; the all-owner shutdown scan does not emit owner-local records.
+HBG diagnostics are unchanged.
+
+`core` is the scheduler core id; `block=i/n` names the task's logical block.
+The token selects a reusable bank, and the task id comes from the published
+payload's control fields. `function_bin_addr` and `src_payload` are recorded
+addresses, not dereferenced memory. `src_payload != 0` indicates the gated
+payload form; it does not establish whether its doorbell has opened.
+`slot=running` describes scheduler placement, not proof of kernel execution;
+`slot=pending` proves neither pickup nor completion. The helper does not read
+kernel arguments or follow task-slot pointers.
+
+Registered deferred conditions appear in `ASYNC_WAIT` warnings with the counter
+address, expected value and observed value. These conditions describe registered
+counter waits; they do not identify the notifying task or an unregistered wait
+inside a kernel.
+
+The report marks implicit wait metadata as unavailable. Placement can locate a
+candidate producer behind a consumer on the same core, but it does not prove the
+notification relationship or a complete resource-wait cycle. Task ids are scoped
+to a run, and dispatch tokens can wrap. Correlate the kernel's signal accesses
+and submitted dependencies using the
+[TMR task dependency and progress constraints](../../aicore-kernel-programming/task-progress.md).
+A scheduler timeout is neither guaranteed cancellation nor proof that resources
+can be freed or a Worker reused.
+
 ## Code 8, specifically
 
 Only `tensormap_and_ringbuffer` raises this code. Its frequency-scaled

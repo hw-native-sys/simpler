@@ -156,11 +156,17 @@ public:
     RunCompletionFence(const RunCompletionFence &) = delete;
     RunCompletionFence &operator=(const RunCompletionFence &) = delete;
 
+    // Allocation only: preserve the current run's identity, completion and wait references.
+    int prepare_resources() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return prepare_resources_locked();
+    }
+
     /**
      * Take the fence for one run, committing both events on first use.
      *
-     * Creation happens here, ahead of the caller's first device-visible
-     * submission, so a run that cannot be fenced fails while it is still
+     * Reuse pre-created events, creating any missing ones ahead of the caller's
+     * first device-visible submission, so a run that cannot be fenced fails while it is still
      * rollback-able. A previous run's facts are dropped; outstanding wait
      * references are not droppable, so an armed-over fence that still holds
      * one is refused and its slot stops admitting runs.
@@ -168,13 +174,8 @@ public:
     int arm(const NativeRunIdentity &identity) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (references_outstanding()) return PTO_RUNTIME_ERR_INTERNAL;
-        for (Boundary &boundary : boundaries_) {
-            if (boundary.event != nullptr) continue;
-            void *event = nullptr;
-            int rc = ops_.create(&event);
-            if (rc != 0) return rc;
-            boundary.event = event;
-        }
+        const int rc = prepare_resources_locked();
+        if (rc != 0) return rc;
         for (Boundary &boundary : boundaries_) {
             boundary.reset_run_facts();
         }
@@ -602,6 +603,17 @@ private:
             }
             STRACE_HOST_SPAN_AT_A("chip.run.proof.consume", STRACE_NOW_NS(), 0, 1, attrs);
         } catch (...) {}
+    }
+
+    int prepare_resources_locked() {
+        for (Boundary &boundary : boundaries_) {
+            if (boundary.event != nullptr) continue;
+            void *event = nullptr;
+            const int rc = ops_.create(&event);
+            if (rc != 0) return rc;
+            boundary.event = event;
+        }
+        return 0;
     }
 
     struct Boundary {

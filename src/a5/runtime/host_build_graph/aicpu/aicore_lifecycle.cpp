@@ -114,15 +114,7 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
     // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
     const uint64_t report_epoch = get_platform_run_result_epoch();
 
-    struct ReadyCore {
-        int32_t worker_id;
-        uint32_t physical_core_id;
-        uint64_t reg_addr;
-        CoreType core_type;
-    };
-    ReadyCore ready[kMaxWorkers]{};
     bool observed[kMaxWorkers]{};
-    int32_t ready_count = 0;
     const bool record_lifecycle_timing = lifecycle_timing_enabled();
     const uint64_t wait_start = get_sys_cnt_aicpu();
     if (record_lifecycle_timing) thread_handshake_timing_[tidx].start_cycles = wait_start;
@@ -151,7 +143,9 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
                 handshake_failed_.store(true, std::memory_order_release);
                 continue;
             }
-            ready[ready_count++] = {i, physical_core_id, regs[physical_core_id], handshake->core_type};
+            // Discovery also owns failure cleanup, even if a peer never reports.
+            cores_[i] = {regs[physical_core_id], physical_core_id, handshake->core_type};
+            physical_core_ids_[i] = physical_core_id;
         }
         if (scheduler_watchdog_expired(wait_start, get_sys_cnt_aicpu(), timeout_cycles)) {
             LOG_ERROR("A5 HBG AICore Scheduler handshake timeout thread=%d remaining=%d", tidx, remaining);
@@ -161,11 +155,6 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
         }
     }
 
-    for (int32_t i = 0; i < ready_count; ++i) {
-        const ReadyCore &core = ready[i];
-        cores_[core.worker_id] = {core.reg_addr, core.physical_core_id, core.core_type};
-        physical_core_ids_[core.worker_id] = core.physical_core_id;
-    }
     if (record_lifecycle_timing) thread_handshake_timing_[tidx].end_cycles = get_sys_cnt_aicpu();
 }
 
@@ -409,13 +398,25 @@ int32_t AicoreLifecycle::release_partition(Runtime *runtime, int32_t thread_idx,
         }
     } else {
         AicoreExitTarget targets[kMaxWorkers];
+        int32_t core_ids[kMaxWorkers];
         size_t count = 0;
         for (int32_t i = lo; i < hi; ++i) {
             if (cores_[i].reg_addr == 0) continue;
             targets[count] = {cores_[i].reg_addr, &runtime->get_teardown_gates()[i]};
+            core_ids[count] = i;
             ++count;
         }
-        if (count != 0 && platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline()) != 0) rc = -1;
+        bool released[kMaxWorkers];
+        if (count != 0) {
+            rc = platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
+            for (size_t i = 0; i < count; ++i) {
+                if (!released[i]) continue;
+                Handshake *report = &runtime->dev.workers[core_ids[i]];
+                aicore_invalidate_retired_report(report);
+                cache_flush_range(report, sizeof(*report));
+            }
+            wmb();
+        }
     }
     if (start_execution && trace != nullptr && lifecycle_timing_enabled())
         trace->register_release_end_cycles = get_sys_cnt_aicpu();
@@ -462,12 +463,16 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
         if (cores_[i].reg_addr == 0) ++proved;
     }
     for (size_t i = 0; i < count; ++i) {
-        if (rc == 0 || released[i]) {
+        if (released[i]) {
+            Handshake *report = &runtime->dev.workers[core_ids[i]];
+            aicore_invalidate_retired_report(report);
+            cache_flush_range(report, sizeof(*report));
             ++proved;
         } else {
             LOG_ERROR("AICore retirement: core %d not released", core_ids[i]);
         }
     }
+    wmb();
     retired_core_count_.fetch_add(proved, std::memory_order_acq_rel);
     if (trace != nullptr && lifecycle_timing_enabled()) {
         trace->exit_wait_end_cycles = get_sys_cnt_aicpu();

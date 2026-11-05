@@ -131,6 +131,10 @@ enum {
        remains whose retirement could supply them: either none ever held any, or
        this plan has already waited for every one that did. Terminal. */
     SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
+    /* Reserved for simpler_wait_run: this wait did not observe the result.
+       The run remains live and may be waited/finalized again. Never store this
+       operation result as the execution's terminal error. */
+    SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
 };
 
 /**
@@ -284,6 +288,8 @@ typedef struct NativeRunArtifactIdentity {
     uint32_t group_size;
 } NativeRunArtifactIdentity;
 
+typedef enum NativeRunPreparePurpose { SIMPLER_PREPARE_EAGER = 0, SIMPLER_PREPARE_CAPTURE = 1 } NativeRunPreparePurpose;
+
 /**
  * Immutable resource and trace identity copied into one prepared run.
  * `pipeline_slot` and `arena_bank` must be smaller than the run-resource grant
@@ -317,6 +323,10 @@ typedef struct NativeRunDescriptor {
     uint32_t joinable_boundary;
     /** Where this dispatch came from, for diagnostic attribution only. */
     NativeRunProvenance provenance;
+    /** Host-only purpose, fixed before orchestration. Zero preserves eager.
+     * CAPTURE requires Kernel mode and rejects writable HOST/NONE arguments
+     * before user code runs. All callers must use this descriptor layout. */
+    uint32_t prepare_purpose;
 } NativeRunDescriptor;
 
 /**
@@ -1075,9 +1085,13 @@ int simpler_run(
  * Build and bind one run into caller-owned opaque storage without launching it.
  * A successful prepare must be paired with simpler_finalize_run(), even when
  * launch is abandoned or fails. The `args` container itself is consumed during
- * prepare and need not remain alive afterward, but every tensor backing buffer
- * referenced by it must remain valid through finalize (which may copy results
- * back to those addresses). See the storage size/alignment/lifetime contract at
+ * prepare and need not remain alive afterward. Eager tensor backing buffers
+ * must remain valid through finalize, including Program output delivery. After
+ * successful capture-purpose preparation, readonly HOST/NONE control values
+ * have been consumed and their source backing may be released. Borrowed device
+ * tensors and the execution environment must survive all model/external uses
+ * through resource-reference release, even after the Host run is finalized.
+ * See the storage size/alignment/lifetime contract at
  * the top of this header. `descriptor` is required and copied before this
  * function returns. A non-null acceptance sink in the descriptor must remain
  * valid until launch returns or the prepared run is finalized without launch.
@@ -1104,6 +1118,10 @@ int simpler_run(
  * sinks. The outer prepare remains owned until it returns or unwinds; a later
  * sequential call is permitted. This guard does not serialize different
  * threads, which remain subject to the context's native reservation rules.
+ *
+ * Capture callers set descriptor.prepare_purpose before preparation. HOST/NONE
+ * controls must be IN: their prepare-time values determine fixed task arguments,
+ * not values re-read by each replay. Eager preparation cannot later be recorded.
  */
 int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
@@ -1140,15 +1158,24 @@ int simpler_validate_execution_context(DeviceContextHandle ctx);
 
 /**
  * Submit a prepared native run between the caller stream's preceding and
- * following work. The caller retains its stream and external tensor storage
- * through run finalization. Prepare is a host operation performed outside
- * capture; this eager launch rejects an active/invalidated capture before
- * publication. `predecessor`, when non-null, has the joined-launch contract.
+ * following work. For eager execution, the caller retains its stream and
+ * external tensor storage through run finalization. For recording, the borrowed
+ * execution environment, stream and device tensors remain valid through all
+ * model/external uses and resource-reference release. Prepare runs outside
+ * capture. An active capture requires a resource reference retained before
+ * CaptureBegin, no diagnostics, and no predecessor. The same task sequence is
+ * recorded once; an invalidated capture is refused before publication.
+ * `predecessor`, when non-null outside capture, has the joined-launch contract.
  *
  * Both owned and borrowed contexts use the same native run. A borrowed context
  * requires this explicit stream entry. Poll/wait/finalize retain the run and
  * its event references through the caller's exit wait. A partial enqueue
- * failure poisons the execution domain; it is not a rollback permission.
+ * failure in eager poisons the execution domain; it is not a rollback permission.
+ * During recording, poll/wait do not report execution completion; finalize
+ * ends only the Host run without synchronization or output copyback. RTS owns
+ * failed/cancelled capture teardown. The external reference must survive it.
+ * Host recording support does not qualify the runtime's device replay reset
+ * protocol; repeated hardware replay still requires that implementation.
  */
 int simpler_launch_run_on_stream(
     DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
@@ -1222,7 +1249,15 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  */
 int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
 
-/** Observe the actual run streams once; may include later queued work. */
+/**
+ * Observe the actual run streams once; may include later queued work.
+ * For a valid launched run, SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE means the
+ * operation failed before observation; retain the run for retry. Every other
+ * return records the observer result, not proof of physical completion; use
+ * poll or wait_run_completion to establish that separate fact.
+ * The reserved incomplete code is never a terminal run result. Host consumers
+ * and runtime modules must be rebuilt together for this contract.
+ */
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
@@ -1232,6 +1267,8 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * leaves its epoch release marker after successful cleanup. A returned
  * NotStarted transaction supplies that fact; a backend exception or an absent
  * ActiveExecution alone does not. The original launch error remains observable.
+ * Onboard binding-cleanup failure keeps the carrier live for a finalize retry;
+ * returned copyback is not repeated and the carrier cannot be launched again.
  */
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
@@ -1243,6 +1280,43 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * caller. This operation is required before a worker accepts any run.
  */
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs);
+
+/**
+ * Retain preparation backing independently of the original run. Call before
+ * CaptureBegin on a Prepared run; exactly one retention is allowed per run.
+ * The output is a resource reference, not an executable RuntimeHandle. The
+ * caller still finalizes the original run. Success submits no user task and
+ * does not advertise capture/replay support on this backend.
+ *
+ * Onboard Program and Kernel retain their actual internal backing, including
+ * Program input staging. Diagnostic backing is not yet covered and is refused;
+ * sim returns UNSUPPORTED. Borrowed context, caller stream and device tensor
+ * addresses must remain valid through successful release. Internal code,
+ * workspace, staging, arguments, streams and events stay protected.
+ */
+int simpler_retain_run_resources(
+    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle *out_reference
+);
+
+/**
+ * The caller must first finish capture cancellation/model destruction and ALL
+ * external in-flight uses, including uses on other execution streams. This
+ * call cannot infer those facts from a recording stream or a reference count.
+ * It additionally synchronizes the retained caller stream and respects the
+ * original run's device/wait/binding completion obligations.
+ *
+ * On failure the reference remains valid for release retry; after close has
+ * begun it must never be used for execution. After confirmed owned Program
+ * reset, existing resource retirement can consume release-requested references;
+ * those tokens are then invalid even if close returns an earlier device error
+ * or a later cleanup error. The close return code alone proves neither reset
+ * confirmation nor whether a reference remains valid. Borrowed contexts never
+ * reset the caller's device. On ordinary release success the reference is consumed.
+ * Backing still needed by the original run or reusable caches may remain
+ * allocated. This API is not called once per replay and must not be called
+ * directly from a callback that forbids synchronization/device APIs.
+ */
+int simpler_release_run_resources(DeviceContextHandle ctx, RuntimeHandle reference);
 
 /**
  * Committed GM heap base of one arena bank, or 0 when that bank has never been

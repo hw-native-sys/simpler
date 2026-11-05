@@ -1,7 +1,7 @@
 # CI Change Detection and Job Gating
 
-Every *downstream* PR job in `.github/workflows/ci.yml` and the emergency CPU
-lane in `.github/workflows/ci-self-cpu.yml` is gated by an output of the
+Every *downstream automatic* PR job in `.github/workflows/ci.yml` and the self-hosted emergency
+lane in `.github/workflows/ci-self.yml` is gated by an output of the
 canonical `.github/workflows/_detect-changes.yml` reusable workflow. Two jobs
 are deliberately ungated in the main CI path: `detect-changes` itself, which
 produces the outputs, and `pre-commit`, which every gated job declares in
@@ -11,12 +11,18 @@ ninety seconds on a GitHub runner. They are cheap to get subtly wrong and the
 symptom is silent — a job that should have skipped merely *passes*, so nobody
 notices until a flake in it reddens an unrelated PR.
 
+The explicit admin `/run-a5` command in `ci-a5-comment.yml` is a separate
+exception: it runs all three requested A5 hardware suites without change
+detection, even for non-code PRs. Ordinary `ci.yml` has no automatic A5 hardware
+jobs; A5 simulation, CPU and profiling gates remain automatic. The emergency
+`/run-self` lane and Daily retain their A5 jobs.
+
 This rule is about keeping the gates honest. It is not a description of the
 current filters; those change. It is the set of invariants they must satisfy.
 
 ## 1. One vocabulary for "cannot change what the code does"
 
-`detect-changes` defines exactly one such set, `NON_CODE`. **Every gate derives
+`detect-changes` defines exactly one such set, `NON_CODE`. **Every change-selection gate derives
 from it.** Do not introduce a second, narrower notion for some jobs and a wider
 one for others.
 
@@ -38,10 +44,11 @@ A file belongs in `NON_CODE` when changing it cannot change what the code does
 - `mkdocs.yml` sits at the repo root and is pure docs tooling. **In.**
 - `.github/workflows/docs.yml` is a workflow, and is also pure docs tooling —
   and it runs unconditionally on every PR, so it is its own gate. **In.**
-- `.github/workflows/ci.yml`, `.github/workflows/ci-self-cpu.yml`, and the
+- `.github/workflows/ci.yml`, `.github/workflows/ci-self.yml`, and the
   reusable `.github/workflows/_*.yml` CI implementation workflows define gates
   or job bodies. **Out, always.** A change to CI implementation must run
-  everything, including the jobs it might have just switched off.
+  the complete automatic matrix, including any automatically gated jobs it
+  might have just switched off. Explicit `/run-a5` hardware suites remain manual.
 
 The corollary is a habit, not a pattern: **adding a top-level config file or a
 tooling workflow is a change-detection event.** Ask whether `NON_CODE` needs to
@@ -98,9 +105,9 @@ That is a decision about the *arch* axis only; the category axis is a different
 question, because a scene-test-only change genuinely cannot break a unit test.
 
 The vocabulary exists once, in `.github/workflows/_detect-changes.yml`. Both
-`.github/workflows/ci.yml` and `.github/workflows/ci-self-cpu.yml` call that
+`.github/workflows/ci.yml` and `.github/workflows/ci-self.yml` call that
 workflow and consume the same output names. Do not reintroduce a lane-local
-copy. That copy drifted twice — `examples_only` never reached the CPU lane
+copy. That copy drifted twice — `examples_only` never reached the self-hosted lane
 (#1607), and `tests_only` did not either (#1635). Any change to an axis now
 means one detector file plus any consumers whose `if:` expression actually
 changes.
@@ -194,7 +201,7 @@ awk '
 
 echo "== consumed by callers"
 grep -h -oE 'needs\.detect-changes\.outputs\.[a-z0-9_]+' \
-  .github/workflows/ci.yml .github/workflows/ci-self-cpu.yml |
+  .github/workflows/ci.yml .github/workflows/ci-self.yml |
   sed 's/.*outputs\.//' | sort -u
 ```
 

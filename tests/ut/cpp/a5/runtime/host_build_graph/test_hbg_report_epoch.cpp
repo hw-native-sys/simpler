@@ -245,4 +245,34 @@ TEST(HandshakeReportEpoch, TheWholeReportFitsOneCacheLine) {
     EXPECT_LE(offsetof(Handshake, report_epoch) + sizeof(Handshake::report_epoch), 64u);
 }
 
+TEST(HandshakeReportEpoch, SerialReplayNeedsANewReportEvenWithTheSameEpoch) {
+    for (bool cpu_first : {false, true}) {
+        Handshake handshake = left_by_previous_resident_run();
+        for (int replay = 0; replay < 3; ++replay) {
+            aicore_invalidate_retired_report(&handshake);
+            EXPECT_EQ(handshake.aicpu_ready, 0u);
+            EXPECT_EQ(handshake.report_epoch, kRunN);
+            EXPECT_EQ(handshake.physical_core_id, kPhysicalCoreId);
+            EXPECT_EQ(handshake.task, kStaleContext);
+            if (cpu_first) EXPECT_FALSE(aicore_report_accepted(&handshake, kRunN));
+            publish_native_report(&handshake, kRunN);
+            EXPECT_TRUE(aicore_report_accepted(&handshake, kRunN));
+            EXPECT_EQ(handshake.aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
+            handshake.aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+            handshake.task = kStaleContext;
+        }
+    }
+}
+
+TEST(HandshakeReportEpoch, RetirementInvalidatesUnstampedReportsWithoutErasingHistory) {
+    Handshake handshake = left_by_previous_resident_run();
+    aicore_invalidate_retired_report(&handshake);
+    EXPECT_FALSE(aicore_report_accepted(&handshake, 0));
+    EXPECT_FALSE(aicore_report_accepted(&handshake, kRunN));
+    EXPECT_EQ(handshake.report_epoch, kRunN);
+    handshake.aicore_done = kBlockIdx + 1;
+    EXPECT_TRUE(aicore_report_accepted(&handshake, 0));
+    EXPECT_EQ(handshake.aicpu_ready, 0u);
+}
+
 }  // namespace

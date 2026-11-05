@@ -49,8 +49,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
 
-    // Domains without URMA selected publish a null URMA workspace, including
-    // builds without the provider; skip before dereferencing it.
+    // A domain without URMA resources has a null URMA descriptor.
     if (comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
         comm_workspace<CommWorkspaceKind::URMA>(*comm_ctx).addr == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
         pipe_barrier(PIPE_ALL);

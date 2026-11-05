@@ -10,6 +10,7 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 
 #include <gtest/gtest.h>
@@ -29,11 +30,13 @@ TEST(MemoryAllocatorTest, AllocAccumulatesBytesAndFreeDecrements) {
 
     void *p = a.alloc(100);
     ASSERT_NE(p, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(p) % 64, 0u);
     EXPECT_EQ(a.committed_bytes(), 100u);
     EXPECT_EQ(a.get_allocation_count(), 1u);
 
     void *q = a.alloc(256);
     ASSERT_NE(q, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(q) % 64, 0u);
     EXPECT_EQ(a.committed_bytes(), 100u + 256u);
     EXPECT_EQ(a.get_allocation_count(), 2u);
 
@@ -44,6 +47,21 @@ TEST(MemoryAllocatorTest, AllocAccumulatesBytesAndFreeDecrements) {
     a.free(q);
     EXPECT_EQ(a.committed_bytes(), 0u);
     EXPECT_EQ(a.get_allocation_count(), 0u);
+}
+
+TEST(MemoryAllocatorTest, ReservedAllocationIsAligned) {
+    MemoryAllocator a;
+    void *p = nullptr;
+    {
+        auto reservation = a.begin_reservation();
+        ASSERT_TRUE(reservation.valid());
+        p = reservation.commit_alloc(1);
+        ASSERT_NE(p, nullptr);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(p) % 64, 0u);
+    }
+    EXPECT_EQ(a.committed_bytes(), 1u);
+    EXPECT_EQ(a.get_allocation_count(), 1u);
+    EXPECT_EQ(a.free(p), 0);
 }
 
 TEST(MemoryAllocatorTest, FreeOfUntrackedOrNullPointerIsNoop) {

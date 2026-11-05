@@ -141,6 +141,13 @@ inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t
     return expected_epoch == 0 || handshake->report_epoch == expected_epoch;
 }
 
+/** The retirement owner invalidates only after this core's final writeback
+ * and exit ACK. It must publish the stores before a serialized successor. */
+inline void aicore_invalidate_retired_report(Handshake *handshake) {
+    handshake->aicore_done = 0;
+    handshake->aicpu_ready = 0;
+}
+
 // =============================================================================
 // Device launch descriptor
 // =============================================================================

@@ -351,6 +351,27 @@ TEST(HbgReadyQueueSizing, EnlargesOnlyGraphReservationAndSeedsOnlyLogicalSlots) 
     }
 }
 
+TEST(HbgReadyQueueSizing, ColdHeaderInitializationReusesStorageWithoutTouchingDeviceOnlyState) {
+    DeviceArena arena;
+    const auto layout = runtime_reserve_layout(arena, 2048);
+    ASSERT_NE(arena.commit(), nullptr);
+    std::memset(arena.base(), 0xA5, arena.total_size());
+    for (int round = 0; round < 2; ++round) {
+        auto *runtime = runtime_init_data_from_layout(arena, layout, MODE_EXECUTE, nullptr, 0);
+        ASSERT_EQ(runtime, arena.region_ptr(layout.off_runtime));
+        EXPECT_EQ(runtime->total_cycles, 0);
+        EXPECT_EQ(runtime->inline_completed_tasks, 0);
+        EXPECT_EQ(runtime->scheduler, nullptr);
+        EXPECT_EQ(runtime->sm_handle, nullptr);
+        EXPECT_EQ(runtime->aicore_mailbox, nullptr);
+        const auto *bytes = static_cast<const uint8_t *>(arena.base());
+        for (size_t i = 0; i < layout.off_copied_begin; ++i)
+            ASSERT_EQ(bytes[i], 0xA5);
+        runtime->total_cycles = 91;
+        runtime->inline_completed_tasks = 17;
+    }
+}
+
 TEST(HbgReadyQueueSizing, FullGraphSeedPreservesTheCopiedRuntimeAndSharedMemoryTail) {
     DeviceArena arena;
     const auto layout = runtime_reserve_layout(arena, 2048);

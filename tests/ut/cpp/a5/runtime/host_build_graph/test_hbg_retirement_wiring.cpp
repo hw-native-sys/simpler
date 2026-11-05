@@ -40,8 +40,13 @@ struct RetireCall {
 std::vector<RetireCall> retire_calls;
 std::vector<uint64_t> exit_signals;
 int32_t retirement_result = 0;
+uint64_t released_despite_failure = 0;
+Runtime *observed_retirement_runtime = nullptr;
 std::mutex retire_mutex;
+int scheduler_timeout_ms = 0;
 }  // namespace
+
+uint32_t platform_get_physical_cores_count() { return 3; }
 
 uint64_t platform_aicore_exit_deadline() { return std::numeric_limits<uint64_t>::max(); }
 
@@ -50,7 +55,13 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     for (size_t i = 0; i < count; ++i) {
         call.addrs.push_back(targets[i].reg_addr);
         call.gates.push_back(targets[i].teardown);
-        if (released != nullptr) released[i] = retirement_result == 0;
+        if (observed_retirement_runtime != nullptr) {
+            const auto worker = targets[i].teardown - observed_retirement_runtime->get_teardown_gates();
+            EXPECT_NE(observed_retirement_runtime->dev.workers[worker].aicore_done, 0u);
+            EXPECT_NE(observed_retirement_runtime->dev.workers[worker].aicpu_ready, 0u);
+        }
+        if (released != nullptr)
+            released[i] = retirement_result == 0 || targets[i].reg_addr == released_despite_failure;
     }
     {
         std::lock_guard<std::mutex> lock(retire_mutex);
@@ -70,7 +81,7 @@ uint64_t get_platform_regs() {
     static std::array<uint64_t, PLATFORM_MAX_CORES> registers{};
     return reinterpret_cast<uint64_t>(registers.data());
 }
-extern "C" int get_scheduler_timeout_ms() { return 0; }
+extern "C" int get_scheduler_timeout_ms() { return scheduler_timeout_ms; }
 extern "C" bool is_dump_args_enabled() { return false; }
 // The shutdown partition settles its dump lane; this target links no args-dump
 // producer, and the stub above keeps either from being reached.
@@ -101,6 +112,15 @@ public:
         for (int i = 0; i < 3; ++i)
             lifecycle.cores_[i].reg_addr = addrs[i];
     }
+
+    static void prepare_handshake(AicoreLifecycle &lifecycle, const uint64_t *registers) {
+        lifecycle.core_count_ = 3;
+        lifecycle.aicpu_thread_num_ = 1;
+        lifecycle.regs_base_ = reinterpret_cast<uint64_t>(registers);
+        for (auto &core : lifecycle.cores_)
+            core = {};
+    }
+    static bool handshake_failed(const AicoreLifecycle &lifecycle) { return lifecycle.handshake_failed_.load(); }
 
     static int32_t retired_cores(const AicoreLifecycle &lifecycle) {
         return lifecycle.retired_core_count_.load(std::memory_order_acquire);
@@ -167,6 +187,9 @@ protected:
         retire_calls.clear();
         exit_signals.clear();
         retirement_result = 0;
+        released_despite_failure = 0;
+        observed_retirement_runtime = nullptr;
+        scheduler_timeout_ms = 0;
         set_pmu_enabled(false);
     }
 
@@ -179,6 +202,80 @@ protected:
             EXPECT_EQ(retire_calls[0].gates[i], &runtime.dev.teardown_gates[i]);
     }
 };
+
+TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRoute) {
+    for (int route = 0; route < 3; ++route) {
+        for (int failure = 0; failure < 3; ++failure) {
+            const bool fail = failure != 0;
+            auto runtime = std::make_unique<Runtime>();
+            for (int i = 0; i < 3; ++i) {
+                auto &report = runtime->dev.workers[i];
+                report.aicore_done = i + 1;
+                report.aicpu_ready = 2;
+                report.report_epoch = 42;
+                report.task = 0x1234;
+            }
+            observed_retirement_runtime = runtime.get();
+            retirement_result = fail ? -1 : 0;
+            released_despite_failure = failure == 1 ? kAddrs[1] : 0;
+            if (route == 0) {
+                SchedulerContext context;
+                SchedulerContextTestPeer::seed(context, kAddrs);
+                SchedulerContextTestPeer::emergency(context, runtime.get());
+            } else {
+                AicoreLifecycle lifecycle;
+                AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+                const int rc = route == 1 ? lifecycle.release_partition(runtime.get(), 0, false) :
+                                            lifecycle.finish_shutdown_partition(0, runtime.get());
+                EXPECT_EQ(rc, fail ? -1 : 0);
+            }
+            for (int i = 0; i < 3; ++i) {
+                const auto &report = runtime->dev.workers[i];
+                const bool acknowledged = !fail || (failure == 1 && i == 1);
+                EXPECT_EQ(report.aicore_done, acknowledged ? 0u : static_cast<uint32_t>(i + 1));
+                EXPECT_EQ(report.aicpu_ready, acknowledged ? 0u : 2u);
+                EXPECT_EQ(report.report_epoch, 42u);
+                EXPECT_EQ(report.task, 0x1234u);
+            }
+            observed_retirement_runtime = nullptr;
+        }
+    }
+}
+
+TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
+    scheduler_timeout_ms = 1;
+    auto runtime = std::make_unique<Runtime>();
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
+    for (int i : {0, 2}) {
+        runtime->dev.workers[i].physical_core_id = i;
+        runtime->dev.workers[i].core_type = CoreType::AIV;
+        runtime->dev.workers[i].aicore_done = i + 1;
+    }
+    lifecycle.handshake_partition(runtime.get(), 0, 1);
+    ASSERT_TRUE(AicoreLifecycleTestPeer::handshake_failed(lifecycle));
+    EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), 0);
+    ASSERT_EQ(retire_calls.size(), 1u);
+    EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0], kAddrs[2]}));
+    EXPECT_EQ(retire_calls[0].gates[0], &runtime->dev.teardown_gates[0]);
+    EXPECT_EQ(retire_calls[0].gates[1], &runtime->dev.teardown_gates[2]);
+}
+
+TEST_F(HbgRetirementWiring, CompleteHandshakePreservesFailureRetirementError) {
+    auto runtime = std::make_unique<Runtime>();
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
+    for (int i = 0; i < 3; ++i) {
+        runtime->dev.workers[i].physical_core_id = i;
+        runtime->dev.workers[i].core_type = CoreType::AIV;
+        runtime->dev.workers[i].aicore_done = i + 1;
+    }
+    lifecycle.handshake_partition(runtime.get(), 0, 1);
+    ASSERT_FALSE(AicoreLifecycleTestPeer::handshake_failed(lifecycle));
+    retirement_result = -1;
+    EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -1);
+    expect_group(*runtime);
+}
 
 TEST_F(HbgRetirementWiring, SchedulerNormalShutdownClaimsEachCoreBeforeEmergency) {
     auto runtime = std::make_unique<Runtime>();

@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <memory>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -101,7 +102,8 @@
  *   it. The host publishes the selected mode in
  *   DeviceRuntimeLaunchDesc::scheduler_bootstrap, not here
  * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
- *   and core_type are published alongside it in the same write)
+ *   and core_type are published alongside it in the same write). AICPU clears
+ *   this marker and aicpu_ready only after acknowledged retirement.
  * - task: Written by AICPU before window-open, read by AICore after window-open.
  *   On a5 the AICPU publishes it again at resident hand-off; the AICore's
  *   pre-READY context address comes from scheduler_bootstrap instead
@@ -152,12 +154,22 @@ static_assert(offsetof(Handshake, report_epoch) == 24);
  *
  * A kernel/persistent launch passes 0 and keeps the original predicate: its
  * producer writes no stamp, and its per-run reset is what makes `aicore_done`
- * meaningful. Accepting the epoch here does not order the payload reads that
+ * meaningful. HBG invalidates retired reports before serial reuse, including
+ * replays with an unchanged epoch. Accepting the epoch does not order the payload reads that
  * follow — the caller's existing `rmb()` does that.
  */
 inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t expected_epoch) {
     if (handshake->aicore_done == 0) return false;
     return expected_epoch == 0 || handshake->report_epoch == expected_epoch;
+}
+
+/** Retire a report only after its core's final writeback and exit ACK.
+ * The caller owns cache publication and excludes the next execution until it
+ * completes. Payload and identity remain available for post-run diagnostics.
+ */
+inline void aicore_invalidate_retired_report(Handshake *handshake) {
+    handshake->aicore_done = 0;
+    handshake->aicpu_ready = 0;
 }
 
 /**
@@ -493,6 +505,7 @@ private:
             std::vector<MetadataRegion> prerequisites;
         };
         RunImagePublication pending_publication_;
+        std::shared_ptr<const RunImagePublication> prepared_publication_;
     };
     HostOnlyState host_;
 
@@ -542,6 +555,7 @@ public:
         void *device_target, const void *source, uint64_t bytes, uint64_t fanin_elems, uint64_t tensor_elems,
         uint64_t scalar_elems
     ) {
+        host_.prepared_publication_.reset();
         auto &pending = host_.pending_publication_;
         pending.device_target = device_target;
         pending.source = source;
@@ -564,6 +578,15 @@ public:
     }
     auto take_pending_publication() { return std::exchange(host_.pending_publication_, {}); }
     void clear_pending_publication() { host_.pending_publication_ = {}; }
+
+    // Large image bytes remain in their leased backing. Prerequisite values
+    // already belong to staged launch metadata; retain no duplicate sources.
+    void retain_prepared_publication(RunImagePublication publication) {
+        publication.prerequisites.clear();
+        host_.prepared_publication_ = std::make_shared<const RunImagePublication>(std::move(publication));
+    }
+    std::shared_ptr<const RunImagePublication> prepared_publication() const { return host_.prepared_publication_; }
+    void clear_prepared_publication() { host_.prepared_publication_.reset(); }
 
     /**
      * Constructor - zero-initialize all arrays

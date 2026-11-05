@@ -41,6 +41,8 @@
 #include "common/dma_workspace.h"
 #include "common/launch_entry_args.h"
 
+inline constexpr bool PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE = false;
+
 // Forward declarations
 class Runtime;
 
@@ -162,6 +164,8 @@ struct KernelArgs {
     uint32_t graph_section_bytes{0};
     uint32_t graph_section_source{static_cast<uint32_t>(GraphSectionSource::None)};
 
+    uint32_t entry_cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
+
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
@@ -181,8 +185,8 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 // what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
 // offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
 // seventeen 8-byte fields end at 136 rather than 144, and its 32-bit tail holds
-// nine uint32_t rather than eight. The two sizes coincide at 176 only because
-// the extra tail field is absorbed by the padding a2a3 does not need.
+// ten uint32_t rather than nine. This fills 176 bytes exactly; a2a3 rounds
+// its 180 bytes of members to 184 bytes for 8-byte alignment.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
@@ -194,11 +198,11 @@ static_assert(
 static_assert(
     offsetof(KernelArgs, args_dump_run_terminal_bank) == 104, "KernelArgs::args_dump_run_terminal_bank offset drift"
 );
-// Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
-// reorder inside that tail, because every member of it is the same width, and
-// here it cannot see an appended one either: 172 bytes of members round up to
-// the same 176 as 176 would.
+// `sizeof` cannot detect reordering within the 32-bit tail. These offsets
+// independently lock the Graph triple, cache policy and trailing SIMT anchor.
 static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
+static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 168, "entry cache policy offset drift");
+static_assert(offsetof(KernelArgs, force_simt_anchor) == 172, "SIMT anchor offset drift");
 static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so

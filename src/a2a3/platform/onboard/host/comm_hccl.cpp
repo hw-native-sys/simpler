@@ -24,7 +24,6 @@
 #include "platform_comm/comm_context.h"
 #include "runtime_c_api.h"
 
-#include "common/acl_hal_device.h"
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
@@ -47,9 +46,7 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
 #include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
-#endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
 // layer in case we need to swap (e.g., InitConfig variant) later.
@@ -68,6 +65,7 @@ struct VmmWindow {
     void *base = nullptr;
     aclrtDrvMemHandle handle = nullptr;
     uint64_t size = 0;
+    bool mapped = false;
 
     VmmWindow() = default;
     ~VmmWindow();
@@ -84,6 +82,7 @@ struct DomainAllocation {
 
     int rank = 0;
     int nranks = 0;
+    bool initialized = false;
     bool release_failed = false;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
@@ -236,10 +235,11 @@ static void record_first_error(aclError status, aclError *first_error) {
 static aclError release_vmm_window(VmmWindow *window) {
     aclError first_error = ACL_SUCCESS;
     if (window->base != nullptr) {
-        record_first_error(aclrtUnmapMem(window->base), &first_error);
+        if (window->mapped) record_first_error(aclrtUnmapMem(window->base), &first_error);
         record_first_error(aclrtReleaseMemAddress(window->base), &first_error);
         window->base = nullptr;
     }
+    window->mapped = false;
     if (window->handle != nullptr) {
         record_first_error(aclrtFreePhysical(window->handle), &first_error);
         window->handle = nullptr;
@@ -258,42 +258,35 @@ static aclError release_vmm_windows(std::vector<VmmWindow> *windows) {
 }
 
 static aclError reserve_and_map_vmm_window(
-    int32_t device_id, uint64_t size, aclrtDrvMemHandle handle, uint64_t page_type, VmmWindow *window
+    uint64_t size, aclrtDrvMemHandle handle, uint64_t page_type, VmmWindow *window, bool retain_on_failure = false
 ) {
+    if (retain_on_failure) {
+        window->handle = handle;
+        window->size = size;
+    }
     void *base = nullptr;
     aclError status = aclrtReserveMemAddress(&base, size, 0, nullptr, page_type);
     if (status != ACL_SUCCESS) return status;
+    if (retain_on_failure) window->base = base;
 
     status = aclrtMapMem(base, size, 0, handle, 0);
     if (status != ACL_SUCCESS) {
-        aclrtReleaseMemAddress(base);
+        if (!retain_on_failure) aclrtReleaseMemAddress(base);
         return status;
     }
 
-    // aclrtMemAccessDesc::location.id is consumed in the driver-visible space, unlike
-    // aclrtPhysicalMemProp::location.id in its caller create_local_vmm_window, which takes the ACL-logical
-    // id. Under ASCEND_RT_VISIBLE_DEVICES the logical id here names the wrong card and aclrtMemSetAccess
-    // fails with 507899 (ACL_ERROR_RT_DRV_INTERNAL_ERROR). See common/acl_hal_device.h.
-    aclrtMemAccessDesc access_desc{};
-    access_desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
-    access_desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    access_desc.location.id = static_cast<uint32_t>(pto::acl_to_hal_device_id(device_id));
-    status = aclrtMemSetAccess(base, size, &access_desc, 1);
-    if (status != ACL_SUCCESS) {
-        aclrtUnmapMem(base);
-        aclrtReleaseMemAddress(base);
-        return status;
-    }
-
+    // MapMem grants read/write access to the device that allocated or imported the handle.
+    // These windows are mapped on that owner device; no additional device grant is needed.
     window->base = base;
     window->handle = handle;
     window->size = size;
+    window->mapped = true;
     return ACL_SUCCESS;
 }
 
 static aclError create_local_vmm_window(
     int32_t device_id, uint64_t requested_size, decltype(aclrtPhysicalMemProp{}.memAttr) mem_attr, uint64_t page_type,
-    VmmWindow *window
+    VmmWindow *window, bool retain_on_failure = false
 ) {
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
@@ -314,17 +307,22 @@ static aclError create_local_vmm_window(
     status = aclrtMallocPhysical(&handle, aligned_size, &prop, 0);
     if (status != ACL_SUCCESS) return status;
 
-    status = reserve_and_map_vmm_window(device_id, aligned_size, handle, page_type, window);
-    if (status != ACL_SUCCESS) aclrtFreePhysical(handle);
+    status = reserve_and_map_vmm_window(aligned_size, handle, page_type, window, retain_on_failure);
+    if (status != ACL_SUCCESS && !retain_on_failure) aclrtFreePhysical(handle);
     return status;
 }
 
-static aclError create_local_fabric_window(int32_t device_id, uint64_t requested_size, VmmWindow *window) {
-    return create_local_vmm_window(device_id, requested_size, ACL_HBM_MEM_HUGE, HUGE_PAGE_TYPE, window);
+static aclError create_local_fabric_window(
+    int32_t device_id, uint64_t requested_size, VmmWindow *window, bool retain_on_failure = false
+) {
+    return create_local_vmm_window(
+        device_id, requested_size, ACL_HBM_MEM_HUGE, HUGE_PAGE_TYPE, window, retain_on_failure
+    );
 }
 
-static aclError create_local_ipc_window(int32_t device_id, uint64_t requested_size, VmmWindow *window) {
-    return create_local_vmm_window(device_id, requested_size, ACL_HBM_MEM_NORMAL, 0, window);
+static aclError
+create_local_ipc_window(int32_t device_id, uint64_t requested_size, VmmWindow *window, bool retain_on_failure = false) {
+    return create_local_vmm_window(device_id, requested_size, ACL_HBM_MEM_NORMAL, 0, window, retain_on_failure);
 }
 
 static aclError export_fabric_window(const VmmWindow &window, aclrtMemFabricHandle *fabric_handle) {
@@ -334,8 +332,9 @@ static aclError export_fabric_window(const VmmWindow &window, aclrtMemFabricHand
     );
 }
 
-static aclError
-import_fabric_window(int32_t device_id, const aclrtMemFabricHandle &fabric_handle, uint64_t size, VmmWindow *window) {
+static aclError import_fabric_window(
+    const aclrtMemFabricHandle &fabric_handle, uint64_t size, VmmWindow *window, bool retain_on_failure = false
+) {
     aclrtMemFabricHandle mutable_handle = fabric_handle;
     aclrtDrvMemHandle imported_handle = nullptr;
     aclError status = aclrtMemImportFromShareableHandleV2(
@@ -343,8 +342,8 @@ import_fabric_window(int32_t device_id, const aclrtMemFabricHandle &fabric_handl
     );
     if (status != ACL_SUCCESS) return status;
 
-    status = reserve_and_map_vmm_window(device_id, size, imported_handle, HUGE_PAGE_TYPE, window);
-    if (status != ACL_SUCCESS) aclrtFreePhysical(imported_handle);
+    status = reserve_and_map_vmm_window(size, imported_handle, HUGE_PAGE_TYPE, window, retain_on_failure);
+    if (status != ACL_SUCCESS && !retain_on_failure) aclrtFreePhysical(imported_handle);
     return status;
 }
 
@@ -354,13 +353,15 @@ static aclError export_ipc_window(const VmmWindow &window, uint64_t *shareable_h
     );
 }
 
-static aclError import_ipc_window(int32_t device_id, uint64_t shareable_handle, uint64_t size, VmmWindow *window) {
+static aclError import_ipc_window(
+    int32_t device_id, uint64_t shareable_handle, uint64_t size, VmmWindow *window, bool retain_on_failure = false
+) {
     aclrtDrvMemHandle imported_handle = nullptr;
     aclError status = aclrtMemImportFromShareableHandle(shareable_handle, device_id, &imported_handle);
     if (status != ACL_SUCCESS) return status;
 
-    status = reserve_and_map_vmm_window(device_id, size, imported_handle, 0, window);
-    if (status != ACL_SUCCESS) aclrtFreePhysical(imported_handle);
+    status = reserve_and_map_vmm_window(size, imported_handle, 0, window, retain_on_failure);
+    if (status != ACL_SUCCESS && !retain_on_failure) aclrtFreePhysical(imported_handle);
     return status;
 }
 
@@ -384,7 +385,8 @@ VmmWindow::~VmmWindow() { release_vmm_window(this); }
 VmmWindow::VmmWindow(VmmWindow &&other) noexcept :
     base(std::exchange(other.base, nullptr)),
     handle(std::exchange(other.handle, nullptr)),
-    size(std::exchange(other.size, 0)) {}
+    size(std::exchange(other.size, 0)),
+    mapped(std::exchange(other.mapped, false)) {}
 
 VmmWindow &VmmWindow::operator=(VmmWindow &&other) noexcept {
     if (this != &other) {
@@ -392,6 +394,7 @@ VmmWindow &VmmWindow::operator=(VmmWindow &&other) noexcept {
         base = std::exchange(other.base, nullptr);
         handle = std::exchange(other.handle, nullptr);
         size = std::exchange(other.size, 0);
+        mapped = std::exchange(other.mapped, false);
     }
     return *this;
 }
@@ -840,7 +843,7 @@ static FabricAttempt alloc_windows_via_fabric(CommHandle h, uint64_t win_size) {
     for (int p = 0; p < nranks; ++p) {
         if (p == rank) continue;
         VmmWindow peer_window;
-        aret = import_fabric_window(myDevice, peers[p].fabric_handle, peers[p].mapping_size, &peer_window);
+        aret = import_fabric_window(peers[p].fabric_handle, peers[p].mapping_size, &peer_window);
         if (aret != ACL_SUCCESS) {
             LOG_ERROR("[comm rank %d] fabric: import peer=%d -> %d", rank, p, static_cast<int>(aret));
             release_vmm_windows(&peer_windows);
@@ -967,8 +970,8 @@ static int domain_alloc_via_ipc(
         return -1;
     }
 
-    VmmWindow local_window;
-    aclError status = create_local_ipc_window(device_id, win_size, &local_window);
+    VmmWindow &local_window = out->local_window;
+    aclError status = create_local_ipc_window(device_id, win_size, &local_window, true);
     if (status != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain ipc: create local window -> %d", h->rank, static_cast<int>(status));
         return -1;
@@ -1034,19 +1037,19 @@ static int domain_alloc_via_ipc(
     ctx.winSize = local_window.size;
     ctx.windowsIn[local_rank] = reinterpret_cast<uint64_t>(local_window.base);
 
-    std::vector<VmmWindow> peer_windows;
+    auto &peer_windows = out->peer_windows;
     peer_windows.reserve(static_cast<size_t>(subset_n - 1));
     for (int p = 0; p < subset_n; ++p) {
         if (p == local_rank) continue;
-        VmmWindow peer_window;
+        peer_windows.emplace_back();
+        VmmWindow &peer_window = peer_windows.back();
         const IpcAnnounceFile &peer = peers[static_cast<size_t>(p)];
-        status = import_ipc_window(device_id, peer.shareable_handle, peer.mapping_size, &peer_window);
+        status = import_ipc_window(device_id, peer.shareable_handle, peer.mapping_size, &peer_window, true);
         if (status != ACL_SUCCESS) {
             LOG_ERROR("[comm rank %d] alloc_domain ipc: import peer_dr=%d -> %d", h->rank, p, static_cast<int>(status));
             return -1;
         }
         ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peer_window.base);
-        peer_windows.push_back(std::move(peer_window));
     }
 
     void *new_dev_mem = nullptr;
@@ -1055,18 +1058,13 @@ static int domain_alloc_via_ipc(
         LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(status));
         return -1;
     }
+    out->device_ctx = reinterpret_cast<CommContext *>(new_dev_mem);
     status = aclrtMemcpy(new_dev_mem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
     if (status != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(status));
-        aclrtFree(new_dev_mem);
         return -1;
     }
 
-    out->rank = local_rank;
-    out->nranks = subset_n;
-    out->local_window = std::move(local_window);
-    out->peer_windows = std::move(peer_windows);
-    out->device_ctx = reinterpret_cast<CommContext *>(new_dev_mem);
     return 0;
 }
 
@@ -1074,28 +1072,16 @@ static int domain_alloc_via_ipc(
 // opaque handle returned to the runner IS this manager; dma_workspace_release()
 // destroys it. There is no per-device generation gate: an SDMA-enabled Worker
 // owns its provider for its whole life and releases it at finalize.
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
 using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
-#endif
 
-extern "C" uint32_t dma_workspace_supported_mask(void) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    return uint32_t{1} << DMA_WORKSPACE_SDMA;
-#else
-    return 0;
-#endif
-}
+extern "C" uint32_t dma_workspace_supported_mask(void) { return uint32_t{1} << DMA_WORKSPACE_SDMA; }
 
 extern "C" uint32_t dma_workspace_channel_count(void) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     // kSdmaMaxChannelGroups, not the device-side kSdmaMaxChannel: the two are the
     // same 48 (PTO static_asserts kPostMaxQueues == kSdmaMaxChannelGroups) but
     // only this one comes in through the host-safe workspace-manager header, and
     // it is what SdmaWorkspaceManager::Init actually creates streams for.
     return pto::comm::sdma::kSdmaMaxChannelGroups;
-#else
-    return 0;
-#endif
 }
 
 extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
@@ -1105,22 +1091,36 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
         addr_out[i] = 0;
     const uint32_t supported = dma_workspace_supported_mask();
     if ((required_mask & ~supported) != 0) return -1;
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if ((required_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
     if (count <= DMA_WORKSPACE_SDMA) return -1;
     try {
         auto manager = std::make_unique<SdmaManager>();
+        uint64_t workspace_size = 0;
+        void *workspace_addr = nullptr;
+        SdmaManager::GetWorkspaceSize(&workspace_size);
+        if (workspace_size == 0) {
+            LOG_ERROR("dma_workspace_provision: SDMA GetWorkspaceSize returned zero");
+            return -1;
+        }
+        if (aclrtMalloc(&workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+            LOG_ERROR("dma_workspace_provision: workspace aclrtMalloc failed");
+            return -1;
+        }
         bool init_ok = false;
         try {
-            // Init creates the 48 STARS streams + 16KB workspace. It may fail
+            // Init binds the workspace and creates 48 STARS streams. It may fail
             // after creating only a subset; destructing that partial manager on
             // an error-state card can itself stall, so leak it on failure rather
             // than risk the stall.
-            init_ok = manager->Init();
+            init_ok = manager->Init(workspace_addr, workspace_size);
         } catch (...) {
             LOG_ERROR("SdmaWorkspaceManager::Init threw; abandoning its partial resources");
         }
         if (!init_ok) {
+            if (workspace_addr != nullptr && manager->GetWorkspaceAddr() == nullptr &&
+                aclrtFree(workspace_addr) != ACL_SUCCESS) {
+                LOG_ERROR("dma_workspace_provision: freeing unbound workspace failed");
+            }
             (void)manager.release();
             return -1;
         }
@@ -1137,23 +1137,20 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
         LOG_ERROR("dma_workspace_provision: exception while provisioning SDMA");
         return -1;
     }
-#else
-    return required_mask == 0 ? 0 : -1;
-#endif
 }
 
 extern "C" void dma_workspace_release(void *handle) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if (!handle) return;
     try {
         std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
+        void *workspace_addr = manager->GetWorkspaceAddr();
         manager.reset();
+        if (aclrtFree(workspace_addr) != ACL_SUCCESS) {
+            LOG_WARN("dma_workspace_release: workspace aclrtFree failed");
+        }
     } catch (...) {
         LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
     }
-#else
-    (void)handle;
-#endif
 }
 
 // Performs the per-allocation Fabric V2 exchange for one subset rank. rank_ids
@@ -1161,9 +1158,9 @@ extern "C" void dma_workspace_release(void *handle) {
 // rank's domain_rank must match its base rank for the same invariant
 // alloc_windows_via_fabric relies on (rank_ids[domain_rank] == h->rank).
 //
-// Failure paths tear down the local VMM window plus every peer import already
-// recorded on `out`. On success
-// the peer imports live on `out->peer_windows` for comm_release_domain_windows.
+// The registered owner retains partial acquisitions until the parent joins
+// all initializers and requests a local abort. Successful allocations use
+// collective release after all domain users finish.
 static FabricAttempt domain_alloc_via_fabric(
     CommHandle h, uint64_t allocation_id, const uint32_t *, size_t rank_count, uint32_t domain_rank, uint64_t win_size,
     DomainAllocation *out
@@ -1179,7 +1176,7 @@ static FabricAttempt domain_alloc_via_fabric(
         return FabricAttempt::kError;
     }
 
-    aclError aret = create_local_fabric_window(myDevice, win_size, &out->local_window);
+    aclError aret = create_local_fabric_window(myDevice, win_size, &out->local_window, true);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: create local Fabric window -> %d", h->rank, static_cast<int>(aret));
         return FabricAttempt::kError;
@@ -1189,18 +1186,17 @@ static FabricAttempt domain_alloc_via_fabric(
     aret = export_fabric_window(out->local_window, &fabric_handle);
     if (aret != ACL_SUCCESS) {
         if (aret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-            release_domain_windows(out);
+            // No handle is published when Fabric export is unsupported.
+            if (release_domain_windows(out) != ACL_SUCCESS) return FabricAttempt::kError;
             return FabricAttempt::kUnsupported;
         }
         LOG_ERROR("[comm rank %d] alloc_domain: ExportToShareableHandleV2 -> %d", h->rank, static_cast<int>(aret));
-        release_domain_windows(out);
         return FabricAttempt::kError;
     }
 
     aret = zero_local_window(out->local_window);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: aclrtMemset -> %d", h->rank, static_cast<int>(aret));
-        release_domain_windows(out);
         return FabricAttempt::kError;
     }
 
@@ -1209,7 +1205,6 @@ static FabricAttempt domain_alloc_via_fabric(
             rootinfo, allocation_id, domain_rank, run_token, myPid, myDevice, out->local_window.size, fabric_handle
         )) {
         LOG_ERROR("[comm rank %d] alloc_domain: write_announce failed", h->rank);
-        release_domain_windows(out);
         return FabricAttempt::kError;
     }
     std::vector<FabricAnnounceFile> peers(subset_n);
@@ -1224,7 +1219,6 @@ static FabricAttempt domain_alloc_via_fabric(
         }
         if (!domain_read_announce(rootinfo, allocation_id, static_cast<uint32_t>(p), run_token, &peers[p])) {
             LOG_ERROR("[comm rank %d] alloc_domain: read_announce(peer_dr=%d) timed out or invalid", h->rank, p);
-            release_domain_windows(out);
             return FabricAttempt::kError;
         }
         if (peers[p].mapping_size != out->local_window.size) {
@@ -1233,18 +1227,14 @@ static FabricAttempt domain_alloc_via_fabric(
                 static_cast<unsigned long long>(peers[p].mapping_size),
                 static_cast<unsigned long long>(out->local_window.size)
             );
-            release_domain_windows(out);
             return FabricAttempt::kError;
         }
     }
 
     if (!file_barrier(rootinfo, my_dr, subset_n, domain_barrier_tag(allocation_id, "fabric_ready"), run_token)) {
-        release_domain_windows(out);
         return FabricAttempt::kError;
     }
 
-    out->rank = my_dr;
-    out->nranks = subset_n;
     // Build a host-side CommContext for the subset and upload it as device_ctx.
     // Async-engine workspaces are runtime-owned and injected through each
     // kernel's GlobalContext, independent of this communication domain.
@@ -1253,36 +1243,33 @@ static FabricAttempt domain_alloc_via_fabric(
     ctx.rankNum = static_cast<uint32_t>(subset_n);
     ctx.winSize = out->local_window.size;
     ctx.windowsIn[my_dr] = reinterpret_cast<uint64_t>(out->local_window.base);
+    out->peer_windows.reserve(static_cast<size_t>(subset_n - 1));
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) continue;
-        VmmWindow peer_window;
-        aret = import_fabric_window(myDevice, peers[p].fabric_handle, peers[p].mapping_size, &peer_window);
+        out->peer_windows.emplace_back();
+        VmmWindow &peer_window = out->peer_windows.back();
+        aret = import_fabric_window(peers[p].fabric_handle, peers[p].mapping_size, &peer_window, true);
         if (aret != ACL_SUCCESS) {
             LOG_ERROR(
                 "[comm rank %d] alloc_domain: import Fabric peer_dr=%d -> %d", h->rank, p, static_cast<int>(aret)
             );
-            release_domain_windows(out);
             return FabricAttempt::kError;
         }
         ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peer_window.base);
-        out->peer_windows.push_back(std::move(peer_window));
     }
 
     void *newDevMem = nullptr;
     aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
-        release_domain_windows(out);
-        return FabricAttempt::kError;
-    }
-    aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
-        aclrtFree(newDevMem);
-        release_domain_windows(out);
         return FabricAttempt::kError;
     }
     out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
+    aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (aret != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
+        return FabricAttempt::kError;
+    }
     return FabricAttempt::kSuccess;
 }
 
@@ -1430,7 +1417,7 @@ extern "C" int comm_alloc_domain_windows(
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
     size_t *actual_window_size_out
 ) try {
-    if (workspace_mask != 0) return -1;
+    if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
@@ -1463,21 +1450,34 @@ extern "C" int comm_alloc_domain_windows(
     }
 
     auto alloc = std::make_unique<DomainAllocation>();
-    const FabricAttempt fabric_result =
-        domain_alloc_via_fabric(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
-    if (fabric_result == FabricAttempt::kError) return -1;
-    if (fabric_result == FabricAttempt::kUnsupported) {
-        LOG_INFO("[comm rank %d] Fabric V2 unsupported; using VMM IPC domain windows", h->rank);
-        const int rc =
-            domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
-        if (rc != 0) return rc;
-    }
+    alloc->rank = static_cast<int>(domain_rank);
+    alloc->nranks = static_cast<int>(rank_count);
+    auto [it, inserted] = h->domain_allocations.emplace(allocation_id, std::move(alloc));
+    if (!inserted) return -1;
+    DomainAllocation *owner = it->second.get();
+    try {
+        const FabricAttempt fabric_result =
+            domain_alloc_via_fabric(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, owner);
+        if (fabric_result == FabricAttempt::kError) return COMM_INITIALIZATION_ABORT_REQUIRED;
+        if (fabric_result == FabricAttempt::kUnsupported) {
+            LOG_INFO("[comm rank %d] Fabric V2 unsupported; using VMM IPC domain windows", h->rank);
+            const int rc =
+                domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, owner);
+            if (rc != 0) return COMM_INITIALIZATION_ABORT_REQUIRED;
+        }
 
-    *device_ctx_out = reinterpret_cast<uint64_t>(alloc->device_ctx);
-    *local_window_base_out = reinterpret_cast<uint64_t>(alloc->local_window.base);
-    *actual_window_size_out = alloc->local_window.size;
-    h->domain_allocations.emplace(allocation_id, std::move(alloc));
-    return 0;
+        owner->initialized = true;
+        *device_ctx_out = reinterpret_cast<uint64_t>(owner->device_ctx);
+        *local_window_base_out = reinterpret_cast<uint64_t>(owner->local_window.base);
+        *actual_window_size_out = owner->local_window.size;
+        return 0;
+    } catch (const std::exception &e) {
+        LOG_ERROR("[comm] alloc_domain: pending allocation exception: %s", e.what());
+        return COMM_INITIALIZATION_ABORT_REQUIRED;
+    } catch (...) {
+        LOG_ERROR("[comm] alloc_domain: pending allocation unknown exception");
+        return COMM_INITIALIZATION_ABORT_REQUIRED;
+    }
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] alloc_domain: exception: %s", e.what());
     return -1;
@@ -1486,8 +1486,9 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
-extern "C" int
-comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
+static int release_domain_allocation(
+    CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool collective
+) try {
     if (!h) return -1;
     auto it = h->domain_allocations.find(allocation_id);
     if (it == h->domain_allocations.end()) {
@@ -1498,6 +1499,10 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         return -1;
     }
     auto &alloc = it->second;
+    if (collective && !alloc->initialized) {
+        LOG_ERROR("[comm rank %d] release_domain: incomplete allocation requires local abort", h->rank);
+        return COMM_INITIALIZATION_ABORT_REQUIRED;
+    }
     if (static_cast<size_t>(alloc->nranks) != rank_count || static_cast<uint32_t>(alloc->rank) != domain_rank) {
         LOG_ERROR(
             "[comm rank %d] release_domain: caller (rank_count=%zu, domain_rank=%u) "
@@ -1507,13 +1512,12 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         return -1;
     }
     int rc = 0;
-    // Best-effort subset barrier so peers don't free local memory under each
-    // other.  If a peer crashed mid-allocation, the timeout returns false and
-    // we proceed with local teardown anyway — same shape as comm_destroy.
-    if (!file_barrier(
-            h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
-            domain_barrier_tag(allocation_id, "release"), h->run_token
-        )) {
+    // Published domains enter the subset barrier before local teardown.
+    // Abort runs locally only after the parent joins every initializer.
+    if (collective && !file_barrier(
+                          h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
+                          domain_barrier_tag(allocation_id, "release"), h->run_token
+                      )) {
         LOG_WARN("[comm rank %d] release_domain: barrier timed out; releasing local state anyway", h->rank);
         rc = -1;
     }
@@ -1538,6 +1542,16 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
 } catch (...) {
     LOG_ERROR("[comm] release_domain: unknown exception");
     return -1;
+}
+
+extern "C" int
+comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
+    return release_domain_allocation(h, allocation_id, rank_count, domain_rank, true);
+}
+
+extern "C" int
+comm_abort_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
+    return release_domain_allocation(h, allocation_id, rank_count, domain_rank, false);
 }
 
 extern "C" int comm_global_domain_prepare(
@@ -1630,10 +1644,6 @@ extern "C" int comm_global_domain_import(
         rank_order[descriptor.domain_rank] = &descriptor;
     }
 
-    int32_t device_id = -1;
-    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) {
-        return -1;
-    }
     CommContext ctx{};
     ctx.rankId = static_cast<uint32_t>(allocation->rank);
     ctx.rankNum = static_cast<uint32_t>(allocation->nranks);
@@ -1650,7 +1660,7 @@ extern "C" int comm_global_domain_import(
             aclrtMemFabricHandle fabric_handle{};
             std::memcpy(&fabric_handle, descriptor->handle, sizeof(fabric_handle));
             VmmWindow peer_window;
-            aclError status = import_fabric_window(device_id, fabric_handle, descriptor->mapping_size, &peer_window);
+            aclError status = import_fabric_window(fabric_handle, descriptor->mapping_size, &peer_window);
             if (status != ACL_SUCCESS) {
                 LOG_ERROR(
                     "[global domain rank %d] import peer rank %u -> %d", allocation->rank, rank,

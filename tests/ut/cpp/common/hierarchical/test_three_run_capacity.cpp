@@ -239,6 +239,52 @@ TEST(ThreeRunCapacityLaneTest, TheRunPastTheGrantedCapacityIsRefusedRatherThanQu
     worker.finalize();
 }
 
+TEST(ThreeRunCapacityLaneTest, TheUnobservedCompletedBacklogIsCountedAndItsPeakRetained) {
+    // The backlog the pipeline depth deliberately does not bound: each run's
+    // execution has ended and its slot is refillable, while its result is still
+    // the caller's to take. The count is what makes that retention visible, and
+    // the peak survives the drain that empties the count.
+    ChipWorker worker;
+    prime_worker(worker, /*depth=*/3, /*launch_depth=*/3);
+    ChipRunLane lane(worker);
+
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 0u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 0u);
+
+    ChipRun first = submit_at(lane, 1, 0, CallConfig{}, /*activate=*/true);
+    ChipRun second = submit_at(lane, 2, 1, CallConfig{}, /*activate=*/false);
+    second.activate();
+    ChipRun third = submit_at(lane, 3, 2, CallConfig{}, /*activate=*/false);
+    third.activate();
+    // Launched, not ended: execution still owns all three.
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 0u);
+
+    g_complete = {true, true, true};
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.done());
+    EXPECT_TRUE(third.done());
+    // Ended and unobserved: three results the callers have not taken.
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 3u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 3u);
+
+    // Past the granted depth, which is the property being claimed: the first
+    // run's slot refilled while its result is still untaken, so a backlog
+    // capped at the pipeline depth would stop here. Submitting resets the
+    // slot's completion flag, so this run needs its own.
+    ChipRun fourth = submit_at(lane, 4, 0, CallConfig{}, /*activate=*/true);
+    g_complete[0] = true;
+    EXPECT_TRUE(fourth.done());
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 4u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 4u);
+
+    lane.close();
+    // Close delivers every accepted run, so the backlog empties while the peak
+    // stays readable — which is what a test can assert after the race is over.
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 0u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 4u);
+    worker.finalize();
+}
+
 TEST(ThreeRunCapacityLaneTest, AMiddleRunsResultFailurePreservesConfirmedResultsAndProvedLastUse) {
     // Three live runs separate confirmed results from later unobserved outcomes.
     // The native CPU leaf injects the result failure; each run still needs its

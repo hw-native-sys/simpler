@@ -17,6 +17,10 @@
 #include <pthread.h>
 #endif
 
+#include <algorithm>
+#include <cerrno>
+#include <future>
+#include <system_error>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -156,7 +160,7 @@ SimDeviceRunnerBase::RunResourceStaging SimDeviceRunnerBase::build_run_resources
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.run_image_stagings = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.host_phase_runs = RunResourceSlots<HostPhaseRunState>::build(granted);
-    staged.device_run_results = RunResourceSlots<DeviceRunResultRegion>::build(granted);
+    staged.device_run_results = RunResourceSlots<NativeInvocationResultStorage>::build(granted);
     // The bank carries constructor arguments. Built here rather than filled in
     // after a resize, so the table is never visible holding a null entry.
     staged.arena_banks = RunResourceSlots<std::unique_ptr<ArenaBank>>::build(granted);
@@ -359,19 +363,44 @@ void *SimDeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
 }
 
 std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn, std::string name) {
-    int dev_id = device_id_;
-    return std::thread([dev_id, fn = std::move(fn), name = std::move(name)]() {
+    const int dev_id = device_id_;
+    if (dev_id < 0) throw std::system_error(EINVAL, std::generic_category(), "sim device is unbound");
+    // Linux thread names allow at most 15 characters plus NUL.
+    name.resize(std::min(name.size(), size_t{15}));
+    std::promise<int> binding;
+    auto ready = binding.get_future();
+    std::thread child([dev_id, fn = std::move(fn), name, binding = std::move(binding)]() mutable {
 #if defined(__linux__)
-        // Linux caps a thread name at 15 characters plus NUL and fails the call
-        // outright on a longer one, which would leave the thread unnamed.
-        if (!name.empty()) {
-            pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
-        }
+        if (!name.empty()) pthread_setname_np(pthread_self(), name.c_str());
 #endif
-        pto_cpu_sim_bind_device(dev_id);
+        int error;
+        try {
+            error = pto_cpu_sim_bind_device_checked(dev_id);
+        } catch (...) {
+            error = EIO;
+        }
+        binding.set_value(error);
+        if (error != 0) return;
         fn();
-        pto_cpu_sim_bind_device(-1);
+        // A fresh thread's scalar binding expires at thread exit.
     });
+    int error;
+    try {
+        // attach_current_thread() initializes the process key before publishing
+        // device_id_: child binding takes no key-initialization mutex.
+        // This wait has no deadline: a timed-out child still needs joining before
+        // its runner or module can be released; detaching is not safe cleanup.
+        error = ready.get();
+    } catch (...) {
+        child.join();
+        throw;
+    }
+    if (error != 0) {
+        child.join();
+        LOG_ERROR("sim device binding failed: device=%d thread=%s pthread_error=%d", dev_id, name.c_str(), error);
+        throw std::system_error(error, std::generic_category(), "sim device binding failed");
+    }
+    return child;
 }
 
 int SimDeviceRunnerBase::attach_current_thread(int device_id) {
@@ -390,7 +419,10 @@ int SimDeviceRunnerBase::attach_current_thread(int device_id) {
     // Per-thread bind so sim hooks (TPUSH/TPOP, identity helpers) route through
     // the correct context. acquire is process-wide and idempotent (no-op after
     // first call for a given device_id), so it is safe to fold in here.
-    pto_cpu_sim_bind_device(device_id);
+    if (const int error = pto_cpu_sim_bind_device_checked(device_id); error != 0) {
+        LOG_ERROR("Failed to bind simulated device %d: %d", device_id, error);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     pto_cpu_sim_acquire_device(device_id);
     device_id_ = device_id;
     return 0;
@@ -616,7 +648,7 @@ SimDeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepare
 
 void SimDeviceRunnerBase::retain_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
     std::lock_guard<std::mutex> lock(retained_result_mu_);
-    retained_run_results_.emplace(run_epoch, device_run_results_[pipeline_slot]);
+    retained_run_results_.emplace(run_epoch, device_run_results_[pipeline_slot].result);
 }
 
 void SimDeviceRunnerBase::release_run_result(uint64_t run_epoch) {
@@ -637,7 +669,7 @@ SimDeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoc
     if (pipeline_slot >= device_run_results_.size()) return nullptr;
     const auto retained = retained_run_results_.find(run_epoch);
     const DeviceRunResultRegion &region =
-        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot];
+        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot].result;
     if (!device_run_result_published(region, run_epoch)) return nullptr;
     if (bytes_out != nullptr) *bytes_out = region.payload_bytes;
     return region.payload;
@@ -648,7 +680,8 @@ DeviceRunTerminal SimDeviceRunnerBase::device_run_terminal(uint32_t pipeline_slo
     if (pipeline_slot >= device_run_results_.size()) return {};
     const auto retained = retained_run_results_.find(run_epoch);
     return device_run_result_terminal(
-        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot], run_epoch
+        retained != retained_run_results_.end() ? retained->second : device_run_results_[pipeline_slot].result,
+        run_epoch
     );
 }
 
@@ -756,29 +789,8 @@ int SimDeviceRunnerBase::release_scheduler_state_storage() {
 int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out == nullptr) return -1;
     *addr_out = nullptr;
-    if (pipeline_slot >= sm_mirrors_.size() || bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
-        bytes > SIZE_MAX - (alignment - 1)) {
-        return -1;
-    }
-    RetainedSmMirror &mirror = sm_mirrors_[pipeline_slot];
-    // Grow-only and never shrunk: the task capacity is fixed for a given run
-    // configuration, so past the first bind the image is written into host pages
-    // that are already mapped, and each page of it faults once per process rather
-    // than once per bind.
-    const size_t needed = bytes + alignment - 1;
-    if (mirror.capacity < needed) {
-        // `new[]` on a trivially-typed array default-initializes, so the block
-        // costs no page until a bind writes one; make_unique would zero it. The
-        // outgoing block's bytes are not carried over, because nothing reads a byte
-        // this bind did not write.
-        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
-        if (storage == nullptr) return -1;
-        mirror.storage = std::move(storage);
-        mirror.capacity = needed;
-    }
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(mirror.storage.get());
-    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
-    return 0;
+    if (pipeline_slot >= sm_mirrors_.size()) return -1;
+    return sm_mirrors_[pipeline_slot].acquire(bytes, alignment, addr_out) == 0 ? 0 : -1;
 }
 
 int SimDeviceRunnerBase::acquire_run_image_staging(
@@ -786,26 +798,8 @@ int SimDeviceRunnerBase::acquire_run_image_staging(
 ) {
     if (addr_out == nullptr) return -1;
     *addr_out = nullptr;
-    if (pipeline_slot >= run_image_stagings_.size() || bytes == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
-        return -1;
-    }
-    RetainedSmMirror &staging = run_image_stagings_[pipeline_slot];
-    // Grow-only, like the mirror: an image's size follows the graph a run builds,
-    // so a repeated workload writes host pages that are already mapped.
-    const size_t needed = bytes + alignment - 1;
-    if (staging.capacity < needed) {
-        // `new[]` default-initializes a trivially-typed array, so the block costs
-        // no page until the bind writes one. The outgoing block's bytes are not
-        // carried over: a publication ships what its own bind assembled.
-        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
-        if (storage == nullptr) return -1;
-        staging.storage = std::move(storage);
-        staging.capacity = needed;
-    }
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(staging.storage.get());
-    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
-    return 0;
+    if (pipeline_slot >= run_image_stagings_.size()) return -1;
+    return run_image_stagings_[pipeline_slot].acquire(bytes, alignment, addr_out) == 0 ? 0 : -1;
 }
 
 void SimDeviceRunnerBase::release_run_image_stagings() {
@@ -842,30 +836,17 @@ void SimDeviceRunnerBase::clear_temporary_buffer() {
     }
 }
 
-int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
-    // Registered-callable flow only: the orch SO was already delivered to the
-    // sim AICPU at launch_device_register time. A run just needs the active
-    // callable_id so the AICPU dispatches the right orch_so_table_ slot.
-    if (cid < 0) {
-        LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    auto it = callables_.find(cid);
-    if (it == callables_.end()) {
-        LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    runtime.set_active_callable_id(cid);
-    return 0;
-}
-
-int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
+int SimDeviceRunnerBase::validate_active_callable(const Runtime &runtime) const {
     const int32_t cid = runtime.get_active_callable_id();
     if (cid < 0) {
-        LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
+        LOG_ERROR("validate_active_callable: no active callable_id; registered-callable flow required");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    return stamp_orch_so(runtime, cid);
+    if (callables_.find(cid) == callables_.end()) {
+        LOG_ERROR("validate_active_callable: callable_id=%d not registered", cid);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    return 0;
 }
 
 int SimDeviceRunnerBase::commit_device_register(int32_t cid) {

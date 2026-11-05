@@ -941,11 +941,10 @@ _DOMAIN_REPLY_HEADER = struct.Struct("<QQQQI4x")
 # fields: committed (u64), device_ctx (u64), local_window_base (u64),
 #         actual_window_size (u64), buffer_count (u32), padding (4 bytes)
 assert _DOMAIN_REPLY_HEADER.size == 40
-# `committed` leads the header and is written on the chip the instant its window
-# exists, before anything else that can fail. It is the only honest answer to
-# "does this chip hold an allocation": the RPC's outcome is not, because the
-# window is committed well before the reply is written. The parent's shm is
-# zero-filled, so an unwritten slot reads as not committed.
+# `committed` records a cleanup obligation, including an unpublished allocation
+# retained after initialization failed. Native code sets it before returning or
+# throwing; it does not imply the window is usable. The parent's shm is
+# zero-filled, so an unwritten slot records no reported ownership.
 _OFF_DOMAIN_REPLY_COMMITTED = 0
 
 # Control args layout (reuses task mailbox fields when state == _CONTROL_*):
@@ -1364,10 +1363,10 @@ def _held_control_reservations() -> set[int]:
 
 
 def _domain_reply_committed(reply_shm: SharedMemory | None) -> bool:
-    """Whether the chip owning *reply_shm* published a committed window.
+    """Whether the chip owning *reply_shm* reported an allocation to clean up.
 
     The parent creates the shm zero-filled, so a chip that never ran, never
-    allocated, or died before its window existed reads as not committed.
+    allocated, or died before reporting ownership reads as not committed.
     """
     if reply_shm is None:
         return False
@@ -3404,19 +3403,22 @@ def _teardown_chip_process_resources(
 
 
 def _handle_ctrl_release_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
-    """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
+    """Release a published domain or locally abort an unpublished allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
     req_buf = req_shm.buf
     assert req_buf is not None
     try:
-        (allocation_id, rank_count, domain_rank, _ws, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        (allocation_id, rank_count, domain_rank, abort_initialization, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
     finally:
         req_buf.release()
         req_shm.close()
 
     handle = _require_base_communicator(base_comm_handle)
-    cw.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
+    if abort_initialization not in (0, 1):
+        raise ValueError("invalid domain release mode")
+    release = cw.comm_abort_domain_windows if abort_initialization else cw.comm_release_domain_windows
+    release(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
 def _require_base_communicator(handle: int) -> int:
@@ -9795,11 +9797,19 @@ class Worker:
                     wpid, status = os.waitpid(pids[i], os.WNOHANG)
                 except ChildProcessError:
                     self._startup_reaped_pids.add(pids[i])
+                    if _mailbox_load_i32(addr) == _INIT_FAILED:
+                        raise RuntimeError(
+                            f"{kind} worker {i} (pid {pids[i]}) failed during init: {_read_error_msg(buf)}"
+                        ) from None
                     raise RuntimeError(
                         f"{kind} worker {i} (pid {pids[i]}) exited during init before signalling ready"
                     ) from None
                 if wpid != 0:
                     self._startup_reaped_pids.add(pids[i])
+                    if _mailbox_load_i32(addr) == _INIT_FAILED:
+                        raise RuntimeError(
+                            f"{kind} worker {i} (pid {pids[i]}) failed during init: {_read_error_msg(buf)}"
+                        )
                     raise RuntimeError(
                         f"{kind} worker {i} (pid {pids[i]}) exited during init "
                         f"before signalling ready (wait status {status})"
@@ -10490,6 +10500,11 @@ class Worker:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
             if self._config.get("platform") != "a5":
                 raise ValueError("domain workspace selection requires A5; A2/A3 SDMA uses enable_sdma")
+            if "urma" in config.workspace_engines:
+                if self._config.get("runtime") != "tensormap_and_ringbuffer":
+                    raise ValueError("URMA domain workspaces require the A5 tensormap_and_ringbuffer runtime")
+                if config.members != tuple(range(len(config.members))):
+                    raise ValueError("URMA requires ranks in dense prefix order")
         return config
 
     def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse, workspace_engines=()):
@@ -10544,6 +10559,7 @@ class Worker:
                         buffers=config.specs(),
                         retain_after_run=config.retain_after_run,
                     )
+                handle._use_fn = self._use_domain
                 self._use_domain(handle)
                 handle._config = config
                 return handle
@@ -10728,17 +10744,16 @@ class Worker:
                     _domain_size=len(workers),
                     _domain_ranks=worker_to_rank,
                 )
+                handle._allocation_pending = True  # noqa: SLF001 -- owner controls publication/rollback
                 self._live_domains[name] = handle
                 resources.live_domains[name] = handle
                 resources.requires_ordered_cleanup = True
 
-                # A chip that committed its window holds it whether or not this call
-                # returns a handle, and whether or not its RPC reported success —
-                # the window exists before the reply is written. Each chip says so
-                # itself, and the chips that did are registered under a handle the
-                # run owns, so the fence sweep releases exactly those and poisons
-                # the worker if that release fails too. Inferring it from the RPC
-                # outcome leaks an allocation whose reply could not be delivered.
+                # Every owner reports its cleanup obligation, including failed
+                # initialization that must keep exports alive until all peers
+                # finish importing. Dispatch joins all requests before the fence
+                # sweep aborts these unpublished allocations. RPC success alone
+                # cannot identify the ranks that still hold resources.
                 dispatch_started = True
                 try:
                     self._dispatch_control_domain(
@@ -10819,6 +10834,7 @@ class Worker:
                 for ctx in contexts.values():
                     for buf in ctx.buffers.values():
                         self._record_device_alloc(buf, domain_allocation_id=allocation_id)
+            handle._allocation_pending = False  # noqa: SLF001 -- every member committed before publication
 
         published_handle = _run_with_owned_shared_memory(
             len(workers) * 2,
@@ -11085,7 +11101,7 @@ class Worker:
                     int(handle.allocation_id),
                     int(handle._domain_size),  # noqa: SLF001 -- backend release identity belongs to the handle
                     int(handle._domain_ranks[chip_idx]),  # noqa: SLF001 -- preserve the allocation-time rank
-                    0,  # window_size — ignored on release
+                    int(handle._allocation_pending),  # noqa: SLF001 -- unpublished rollback skips collective
                     0,  # buffer_count — ignored on release
                 )
             self._dispatch_control_domain(
@@ -14297,6 +14313,40 @@ class Worker:
         if self.level != 2 or self._chip_worker is None:
             return 0
         return self._chip_worker.scheduler_mode_publish_count
+
+    @property
+    def unobserved_completed_run_count(self) -> int:
+        """L2 only: recorded-complete calls whose result is not yet delivered.
+
+        Each holds its native carrier and, for Program, its staging, so this
+        tracks host footprint where the pipeline depth does not -- the depth
+        bounds concurrent execution, and a retired call leaves it so a slot can
+        refill before its predecessor is waited on. It is deliberately uncapped:
+        every entry is a result a live `RunHandle` still entitles its caller to.
+        A rising value means handles are being held, not that anything leaked.
+        A call a finalization already owns still counts, since that finalization
+        has not returned the carrier yet.
+
+        Recorded, not probed: a call whose device work has finished stays
+        uncounted until a poll or wait records it, so this is a lower bound on
+        what the device has actually finished.
+        """
+        if self.level != 2 or self._chip_worker is None:
+            return 0
+        return self._chip_worker.unobserved_completed_run_count
+
+    @property
+    def unobserved_completed_run_high_water(self) -> int:
+        """L2 only: the largest `unobserved_completed_run_count` sampled.
+
+        Sampled when the backlog is counted -- every run preparation and every
+        read of either property -- so a backlog that grows and drains entirely
+        between two samples is not recorded. Monotonic, which is what makes it
+        readable after a drain that has already emptied the live count.
+        """
+        if self.level != 2 or self._chip_worker is None:
+            return 0
+        return self._chip_worker.unobserved_completed_run_high_water
 
     # ------------------------------------------------------------------
     # close

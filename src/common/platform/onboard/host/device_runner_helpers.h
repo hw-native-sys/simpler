@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <runtime/rt.h>
 
 #include <array>
@@ -105,6 +107,36 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream);
  */
 bool launch_route_permitted_by_capture(int query_rc, int capture_status);
 
+// Host-only publication receipt. A stale observer can neither qualify a new
+// publication nor race a prepare that consumes the preceding qualification.
+class EntryCacheQualification {
+public:
+    EntryCacheQualification() = default;
+    EntryCacheQualification(const EntryCacheQualification &) = delete;
+    EntryCacheQualification &operator=(const EntryCacheQualification &) = delete;
+    EntryCacheQualification(EntryCacheQualification &&other) noexcept :
+        state_(other.state_.exchange(0, std::memory_order_relaxed)) {}
+    EntryCacheQualification &operator=(EntryCacheQualification &&other) noexcept {
+        state_.store(other.state_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+    bool eligible() const { return (state_.load(std::memory_order_relaxed) & 1) != 0; }
+    bool consume() { return (state_.exchange(0, std::memory_order_relaxed) & 1) != 0; }
+    void clear() { state_.store(0, std::memory_order_relaxed); }
+    void published(uint64_t epoch) { state_.store(token(epoch), std::memory_order_relaxed); }
+    void observe_success(uint64_t epoch) {
+        uint64_t expected = token(epoch);
+        if (expected != 0) {
+            state_.compare_exchange_strong(expected, expected | 1, std::memory_order_relaxed);
+        }
+    }
+
+private:
+    // Exhausting the encoded epoch range conservatively disables qualification.
+    static uint64_t token(uint64_t epoch) { return epoch <= (UINT64_MAX >> 1) ? epoch << 1 : 0; }
+    std::atomic<uint64_t> state_{0};
+};
+
 /**
  * The device block one pipeline slot reuses across every run it prepares.
  *
@@ -120,8 +152,9 @@ bool launch_route_permitted_by_capture(int query_rc, int capture_status);
  * its predecessor executes. The asynchronous copy is ordered on the bound
  * AICPU stream and a fork event orders the AICore reader behind it.
  *
- * The runner owns this for its whole lifetime and releases it in `finalize()`,
- * alongside the collector resources that already work this way.
+ * The runner caches this storage. Prepared uses retain the actual instance;
+ * subsequent preparation replaces a retained instance before writing it.
+ * Cleanup runs explicitly on the owning device context once uses have ended.
  *
  * The AICore register tables are deliberately NOT here: they are device
  * constants, identical for every slot, and are owned per device context by
@@ -129,8 +162,8 @@ bool launch_route_permitted_by_capture(int query_rc, int capture_status);
  * `KernelArgs`: AICore receives everything it needs as launch arguments.
  */
 struct SlotPersistentArgs {
-    // Pinned copy source, immutable from enqueue through the run's drain. A
-    // slot cannot be prepared again until its previous run has retired.
+    // Pinned copy source, immutable while a prepared use retains this storage.
+    // Slot reuse replaces the owner before binding if a previous use survives.
     void *runtime_upload_source{nullptr};
     uint64_t runtime_upload_bytes{0};
 
@@ -151,6 +184,9 @@ struct SlotPersistentArgs {
     // that copy. A failed enqueue leaves it false. Slot reuse requires retirement
     // of the previous run, never just an accepted publication.
     bool workers_initialized{false};
+    EntryCacheQualification entry_cache_qualification;
+    // Survives failed submissions and failed frees of this allocation.
+    bool entry_cmo_may_have_trimmed{false};
 
     // Host staging for this slot's AICPU launch package, on a runtime whose
     // entry values can travel as launch arguments. Grow-only across the runs a
@@ -229,6 +265,8 @@ struct KernelArgsHelper {
     KernelArgsHelper(KernelArgsHelper &&other) noexcept :
         args(other.args),
         allocator_(std::exchange(other.allocator_, nullptr)),
+        entry_cache_epoch_(std::exchange(other.entry_cache_epoch_, 0)),
+        entry_cache_eligible_(std::exchange(other.entry_cache_eligible_, false)),
         runtime_image_(std::move(other.runtime_image_)),
         launch_metadata_(std::move(other.launch_metadata_)),
         runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)),
@@ -324,6 +362,8 @@ struct KernelArgsHelper {
     void *launch_payload();
     size_t launch_payload_bytes() const { return launch_payload_bytes_; }
 
+    void set_entry_cache_epoch(uint64_t epoch) { entry_cache_epoch_ = epoch; }
+
     /**
      * Drop this run's view of the slot's device blocks.
      *
@@ -335,6 +375,7 @@ struct KernelArgsHelper {
         launch_metadata_.clear();
         runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
+        args.entry_cache_maintenance = static_cast<uint32_t>(EntryCacheMaintenance::Full);
         initializing_slot_ = nullptr;
         slot_ = nullptr;
         plan_ = LaunchEntryArgsPlan{};
@@ -365,6 +406,8 @@ struct KernelArgsHelper {
 private:
     enum class RuntimeArgsState : uint8_t { Empty, Prepared, Published };
 
+    uint64_t entry_cache_epoch_{0};
+    bool entry_cache_eligible_{false};
     RuntimeLaunchImage runtime_image_;
     RuntimeLaunchMetadata launch_metadata_;
     RuntimeArgsState runtime_args_state_{RuntimeArgsState::Empty};
@@ -413,7 +456,9 @@ private:
  * failure cannot acquire a no-submission receipt. A cache hit queues no copy.
  * An already-published run is an idempotent no-op.
  */
-int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink);
+int publish_for_launch(
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording = false
+);
 
 /**
  * Release a retired slot's device block and pinned source, retaining failed frees.

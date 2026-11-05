@@ -368,8 +368,8 @@ static bool prepare_task(
     // Init-on-write: this slot's dynamic scheduling fields and progress state are
     // initialized here, as the orchestrator claims the slot. whole-graph-resident
     // hbg claims slots [0, total_tasks) exactly once and the device reads no slot
-    // past total_tasks, so this claim-time write is the only per-slot SM reset and
-    // the unclaimed tail is neither initialized nor read.
+    // past total_tasks. Claim establishes prepared state; device entry restores
+    // progress for each execution without touching the unclaimed tail.
     out->slot_state->reset_for_reuse();
     orch->sm_header->tasks.reset_task_state(out->alloc_result.task_id);
 
@@ -634,28 +634,18 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
-        TaskId dep_task_id = args.explicit_dep(i);
-        if (!dep_task_id.is_valid()) {
-            orch->report_fatal(
-                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
-            );
-            return result;
-        }
-        if (capture_dep_graph) {
-            dep_gen_host_graph_add_explicit_edge(dep_task_id);
-        }
-        if (!append_fanin_or_fail(*orch, dep_task_id, fanin_slots, payload.fanin_count)) {
-            return result;
-        }
-    }
-
-    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
     DepInputs dep_inputs{
         args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
         args.explicit_deps_data(),
     };
+    if (!append_explicit_fanins_or_fail(
+            *orch, task_id, dep_inputs, fanin_slots, payload.fanin_count, capture_dep_graph
+        )) {
+        if (capture_dep_graph) dep_gen_host_graph_end_task();
+        return result;
+    }
 
+    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
     auto runtime_emit = [&](TaskId producer_task_id) -> bool {
         return append_fanin_or_fail(*orch, producer_task_id, fanin_slots, payload.fanin_count);
     };
@@ -1021,6 +1011,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         // on device and the run hangs.
         SharedMemoryTaskHeader &done_tasks = orch->sm_header->tasks;
         int32_t done_local = prepared.task_id.local_id();
+        prepared.slot_state->initial_task_state = CHIP_TASK_COMPLETED;
         done_tasks.store_completed(done_local);
     }
     orch->inline_completed_tasks++;

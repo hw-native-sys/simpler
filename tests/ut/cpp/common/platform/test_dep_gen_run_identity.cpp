@@ -35,6 +35,7 @@
 #include "common/memory_barrier.h"
 #include "host/dep_gen_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace {
 
@@ -44,7 +45,7 @@ namespace {
 // spelling of a value the code under test does not interpret.
 constexpr uint8_t kCreatorEdgeDepKinds = 0x3;  // wait | retain
 
-void *dep_gen_test_alloc(size_t size) { return std::calloc(1, size); }
+void *dep_gen_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int dep_gen_test_free(void *ptr) {
     std::free(ptr);

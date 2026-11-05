@@ -33,7 +33,13 @@
 #include <gtest/gtest.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 
+#include <atomic>
+#include <cerrno>
+#include <climits>
+#include <csignal>
+#include <system_error>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +52,33 @@
 #include "callable.h"
 #include "chip_callable_layout.h"
 #include "device_runner_base.h"
+#include "cpu_sim_context.h"
+#include "host/sim_thread_start_gate.h"
 #include "runtime.h"
+#include "profiler_test_allocator.h"
+
+#if defined(__linux__)
+static std::atomic<bool> reject_device_bind{false};
+static std::atomic<bool> reject_device_key{false};
+static std::atomic<bool> reject_thread_create{false};
+extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg) {
+    if (reject_thread_create.exchange(false)) return EAGAIN;
+    using Create = int (*)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+    static auto real = reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+    return real(thread, attr, entry, arg);
+}
+extern "C" int __real_pthread_setspecific(pthread_key_t, const void *);
+extern "C" int __real_pthread_key_create(pthread_key_t *, void (*)(void *));
+extern "C" int __wrap_pthread_setspecific(pthread_key_t key, const void *value) {
+    if (reject_device_bind.exchange(false)) return ENOMEM;
+    return __real_pthread_setspecific(key, value);
+}
+extern "C" int __wrap_pthread_key_create(pthread_key_t *key, void (*destroy)(void *)) {
+    if (reject_device_key.exchange(false)) return EAGAIN;
+    return __real_pthread_key_create(key, destroy);
+}
+
+#endif
 
 namespace {
 
@@ -84,7 +116,7 @@ namespace {
 
 // The collector owns host storage for its terminal banks; this is the allocator pair the runner
 // would otherwise be handed by the platform.
-void *sim_bank_alloc(size_t size) { return std::calloc(1, size); }
+void *sim_bank_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int sim_bank_free(void *ptr) {
     std::free(ptr);
@@ -607,3 +639,164 @@ TEST(SimOrchestrationScratchTest, RunnerDestructionReleasesRetainedStorage) {
 }
 
 }  // namespace
+
+#if defined(__linux__)
+TEST(SimDeviceBinding, AttachReturnsBindingFailure) {
+    PoolRunner runner;
+    reject_device_bind = true;
+    EXPECT_NE(runner.attach_current_thread(0), 0);
+    reject_device_bind = false;
+    pto_cpu_sim_release_device(0);
+}
+TEST(SimDeviceBinding, FailedChildBindingDoesNotInvokeBodyAndIsJoinedBeforeThrow) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    std::atomic<bool> body_ran{false};
+    reject_device_bind = true;
+    std::weak_ptr<int> child_capture;
+    bool threw = false;
+    try {
+        auto value = std::make_shared<int>(1);
+        child_capture = value;
+        auto child = runner.create_thread([&, value = std::move(value)] {
+            (void)value;
+            body_ran = true;
+        });
+        child.join();
+    } catch (const std::system_error &error) {
+        threw = true;
+        EXPECT_EQ(error.code().value(), ENOMEM);
+    }
+    reject_device_bind = false;
+    EXPECT_TRUE(threw);
+    EXPECT_FALSE(body_ran.load());
+    EXPECT_TRUE(child_capture.expired());
+    pto_cpu_sim_release_device(0);
+}
+
+TEST(SimDeviceBindingDeathTest, FailedKeyCreationIsReportedAndCanRetryWithoutChangingOtherKeys) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(
+        {
+            pthread_key_t sentinel_key;
+            if (pthread_key_create(&sentinel_key, nullptr) != 0) _exit(1);
+            int sentinel = 41;
+            if (pthread_setspecific(sentinel_key, &sentinel) != 0) _exit(2);
+            PoolRunner runner;
+            reject_device_key = true;
+            if (runner.attach_current_thread(0) == 0 || pto_cpu_sim_get_bound_device() != -1) _exit(3);
+            reject_device_key = true;
+            if (pto_cpu_sim_bind_device_checked(0) != EAGAIN) _exit(7);
+            if (pthread_getspecific(sentinel_key) != &sentinel) _exit(4);
+            if (pto_cpu_sim_bind_device_checked(0) != 0 || pto_cpu_sim_get_bound_device() != 0) _exit(5);
+            if (pto_cpu_sim_bind_device_checked(-1) != 0 || pto_cpu_sim_get_bound_device() != -1) _exit(6);
+            pthread_key_delete(sentinel_key);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+TEST(SimDeviceBinding, FailedRebindPreservesPreviousDeviceAndSuccessfulChildIsIsolated) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    ASSERT_EQ(pto_cpu_sim_bind_device_checked(7), 0);
+    reject_device_bind = true;
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(8), ENOMEM);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    int child_device = -1;
+    auto child = runner.create_thread([&] {
+        child_device = pto_cpu_sim_get_bound_device();
+    });
+    child.join();
+    EXPECT_EQ(child_device, 0);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(-1), 0);
+    pto_cpu_sim_release_device(0);
+}
+TEST(SimDeviceBinding, FailedThreadCreationReportsErrorWithoutInvokingBody) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    std::atomic<bool> body_ran{false};
+    reject_thread_create = true;
+    bool threw = false;
+    try {
+        auto child = runner.create_thread([&] {
+            body_ran = true;
+        });
+        child.join();
+    } catch (const std::system_error &error) {
+        EXPECT_EQ(error.code().value(), EAGAIN);
+        threw = true;
+    }
+    reject_thread_create = false;
+    EXPECT_TRUE(threw);
+    EXPECT_FALSE(body_ran.load());
+    pto_cpu_sim_release_device(0);
+}
+
+TEST(SimDeviceBindingDeathTest, LegacyBindingFailureDoesNotReturnWithStaleDevice) {
+    ASSERT_EXIT(
+        {
+            if (pto_cpu_sim_bind_device_checked(7) != 0) _exit(1);
+            reject_device_bind = true;
+            pto_cpu_sim_bind_device(8);
+            _exit(0);
+        },
+        ::testing::KilledBySignal(SIGABRT), ""
+    );
+}
+
+#endif
+
+TEST(SimDeviceBinding, UninitializedRunnerCannotStartAnUnboundTask) {
+    PoolRunner runner;
+    std::atomic<bool> ran{false};
+    EXPECT_THROW(
+        {
+            auto child = runner.create_thread([&] {
+                ran = true;
+            });
+            child.join();
+        },
+        std::system_error
+    );
+    EXPECT_FALSE(ran.load());
+}
+
+TEST(SimDeviceBinding, CohortStartsOnlyAfterReleaseAndCanRetryAfterCancellation) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    SimThreadStartGate startup;
+    for (bool release : {false, true}) {
+        startup.reset();
+        std::atomic<int> executed{0};
+        std::vector<std::thread> children;
+        for (int i = 0; i < 8; ++i) {
+            children.push_back(runner.create_thread([&] {
+                if (startup.wait()) {
+                    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 0);
+                    ++executed;
+                }
+            }));
+        }
+        EXPECT_EQ(executed.load(), 0);
+        if (release) startup.release();
+        else startup.cancel();
+        for (auto &child : children)
+            child.join();
+        EXPECT_EQ(executed.load(), release ? 8 : 0);
+    }
+    pto_cpu_sim_bind_device(-1);
+    pto_cpu_sim_release_device(0);
+}
+
+TEST(SimDeviceBinding, SuccessfulLegacyBindingAndCheckedValidation) {
+    pto_cpu_sim_bind_device(7);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(-2), EINVAL);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(INT_MAX), 0);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), INT_MAX);
+    pto_cpu_sim_bind_device(-1);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), -1);
+}

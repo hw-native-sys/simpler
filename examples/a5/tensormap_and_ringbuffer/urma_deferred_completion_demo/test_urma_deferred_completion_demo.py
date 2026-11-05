@@ -15,7 +15,6 @@ event. The consumer depends on that output and writes ``result = out + 1``.
 """
 
 import copy
-import os
 
 import pytest
 import torch
@@ -29,24 +28,9 @@ N = 128 * 128
 NRANKS = 2
 DTYPE_NBYTES = 4
 URMA_DATA_OFFSET_NBYTES = 64 * DTYPE_NBYTES
-_URMA_WORKSPACE_ENV = "SIMPLER_ENABLE_PTO_URMA_WORKSPACE"
-_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
-
-
-def _urma_workspace_enabled():
-    return os.environ.get(_URMA_WORKSPACE_ENV, "").upper() in _WORKSPACE_TRUTHY
-
-
-def _require_urma_workspace_enabled():
-    if not _urma_workspace_enabled():
-        raise RuntimeError(
-            "urma_deferred_completion_demo requires host runtime built with "
-            f"{_URMA_WORKSPACE_ENV}=ON; set it before rebuilding simpler."
-        )
 
 
 def urma_deferred_completion_orch_fn(orch, callables, task_args, config, *, workspace_engines=("urma",)):
-    _require_urma_workspace_enabled()
     input_nbytes = N * DTYPE_NBYTES
     with orch.allocate_domain(
         workspace_engines=workspace_engines,
@@ -76,15 +60,10 @@ def urma_deferred_completion_orch_fn(orch, callables, task_args, config, *, work
             args.add_tensor(
                 _rehosted_ref_for(task_args, getattr(task_args, f"result_{rank}")), TensorArgType.OUTPUT_EXISTING
             )
-            args.add_scalar(domain.device_ctx)
+            args.add_scalar(handle.device_context(rank, workspace_engines=workspace_engines))
             orch.submit_next_level(callables.urma_deferred_completion, args, config, worker=rank)
 
 
-@pytest.mark.skipif(
-    not _urma_workspace_enabled(),
-    reason="URMA workspace overlay not enabled (set SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON to run). "
-    "See docs/a5-sdma-overlay.md (#1315).",
-)
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaDeferredCompletionDemo(SceneTestCase):
     CALLABLE = {
@@ -147,7 +126,6 @@ class TestUrmaDeferredCompletionDemo(SceneTestCase):
 
 
 def mixed_workspace_orch_fn(orch, callables, task_args, config):
-    _require_urma_workspace_enabled()
     input_nbytes = N * DTYPE_NBYTES
     with orch.allocate_domain(
         name="sdma_urma",
@@ -180,7 +158,7 @@ def mixed_workspace_orch_fn(orch, callables, task_args, config):
                 args.add_tensor(
                     _rehosted_ref_for(task_args, getattr(task_args, f"result_{rank}")), TensorArgType.OUTPUT_EXISTING
                 )
-                args.add_scalar(domain[rank].device_ctx)
+                args.add_scalar(domain.device_context(rank, workspace_engines=("sdma", "urma")))
                 orch.submit_next_level(callable_obj, args, config, worker=rank)
 
 
@@ -209,7 +187,6 @@ def _mixed_workspace_callable():
     return spec
 
 
-@pytest.mark.skipif(not _urma_workspace_enabled(), reason="mixed workspace test requires a URMA-enabled build")
 @pytest.mark.sdma(worker_workspace=False)
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestSdmaUrmaWorkspaceMix(SceneTestCase):
@@ -248,7 +225,6 @@ def _same_task_workspace_callable():
     return spec
 
 
-@pytest.mark.skipif(not _urma_workspace_enabled(), reason="mixed workspace test requires a URMA-enabled build")
 @pytest.mark.sdma(worker_workspace=False)
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestSdmaUrmaSameTask(SceneTestCase):

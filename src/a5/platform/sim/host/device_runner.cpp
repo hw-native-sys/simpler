@@ -15,6 +15,7 @@
  * device_runner_base.cpp.
  */
 
+#include "aicpu/native_invocation_entry.h"
 #include "device_runner.h"
 
 #include <dlfcn.h>
@@ -22,6 +23,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -43,9 +46,11 @@
 #include "host/dfx_run_config.h"
 #include "host/host_graph_runs.h"
 #include "host/raii_scope_guard.h"
+#include "host/sim_native_launch.h"
 #include "host/run_boundary.h"
 #include "host/runtime_timeout_config.h"
 #include "runtime.h"
+#include "host/sim_thread_start_gate.h"
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:
@@ -92,19 +97,9 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
     return true;
 }
 
-// a5 sim: malloc / free wrappers shared by the four profiling subsystems'
-// init_* methods. Plain function pointers convert implicitly into the
-// framework's std::function alloc / free shapes. Kept on the subclass (not
-// SimDeviceRunnerBase) because the corresponding a2a3 path uses the device
-// allocator (mem_alloc_) directly; a5's stays on std::malloc/free as before.
-static void *prof_alloc_cb(size_t size) { return std::malloc(size); }
-
-static int prof_free_cb(void *dev_ptr) {
-    std::free(dev_ptr);
-    return 0;
-}
-
 struct DeviceRunner::ActiveRun {
+    SimThreadStartGate startup;
+    SimNativeEntryGate entry_gate{PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH};
     Runtime *runtime{nullptr};
     void *reg_blocks{nullptr};
     void *ssbuf_allocation{nullptr};
@@ -112,6 +107,18 @@ struct DeviceRunner::ActiveRun {
     std::vector<std::thread> aicpu_threads;
     std::vector<std::thread> aicore_threads;
     DevicePhaseBufferStorage<PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH> phase_buf{};
+
+    void reset_startup() {
+        // The launch owner serializes reset with thread creation and join.
+        // A joinable thread may not have reached startup.wait() yet.
+        assert(std::all_of(aicpu_threads.begin(), aicpu_threads.end(), [](const std::thread &thread) {
+            return !thread.joinable();
+        }));
+        assert(std::all_of(aicore_threads.begin(), aicore_threads.end(), [](const std::thread &thread) {
+            return !thread.joinable();
+        }));
+        startup.reset();
+    }
 
     void join() noexcept {
         for (auto &thread : aicpu_threads) {
@@ -151,7 +158,7 @@ void DeviceRunner::cleanup_active_run() noexcept {
 }
 
 int DeviceRunner::ensure_binaries_loaded() {
-    // AICPU .so: load-once, matching onboard's binaries_loaded_ pattern.
+    // AICPU .so: load-once, matching onboard's aicpu_runtime_registered_ pattern.
     if (!aicpu_so_loaded_ && !aicpu_so_binary_.empty()) {
         if (!simpler::common::sim_host::create_temp_so_file(
                 "/tmp/aicpu_sim_XXXXXX", aicpu_so_binary_.data(), aicpu_so_binary_.size(), &aicpu_so_path_
@@ -183,6 +190,7 @@ int DeviceRunner::ensure_binaries_loaded() {
 
         if (!load_sym("aicpu_execute", reinterpret_cast<void **>(&aicpu_execute_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
+        if (!native_invocation_functions_.load(load_sym)) return PTO_RUNTIME_ERR_INTERNAL;
         load_optional_sym("simpler_aicpu_register_callable", reinterpret_cast<void **>(&aicpu_register_callable_func_));
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
@@ -515,9 +523,9 @@ int DeviceRunner::prepare_execution(
     // The profiling flag is built by `arm_collectors_for_run` at launch, beside
     // the collector pools it describes.
 
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
 
@@ -559,13 +567,13 @@ int DeviceRunner::prepare_execution(
     }
     kernel_args_.regs = reinterpret_cast<uint64_t>(regs_array);
 
-    if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
-        set_platform_dump_base_func_ == nullptr || set_platform_phase_base_func_ == nullptr ||
-        set_platform_run_result_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
-        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
-        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
-        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr ||
-        set_platform_chip_swimlane_base_func_ == nullptr ||
+    if (aicpu_execute_func_ == nullptr || !native_invocation_functions_.ready() || aicore_execute_func_ == nullptr ||
+        set_platform_regs_func_ == nullptr || set_platform_dump_base_func_ == nullptr ||
+        set_platform_phase_base_func_ == nullptr || set_platform_run_result_func_ == nullptr ||
+        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
+        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
+        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
+        set_platform_scope_stats_base_func_ == nullptr || set_platform_chip_swimlane_base_func_ == nullptr ||
         set_platform_chip_swimlane_run_terminal_bank_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
         set_chip_swimlane_enabled_func_ == nullptr || set_platform_dump_args_run_terminal_func_ == nullptr ||
@@ -595,6 +603,14 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
         return LaunchTransactionResult{};
     }
 
+    run->reset_startup();
+    int startup_error = PTO_RUNTIME_ERR_INTERNAL;
+    auto startup_cleanup = RAIIScopeGuard([this, run, &startup_error]() {
+        run->startup.cancel();
+        run->join();
+        // Includes workers never created and those cancelled before execution.
+        run_completion_.abandon(startup_error);
+    });
     std::chrono::steady_clock::time_point sim_t0;
 
     LaunchTransactionResult result = exact_launch_transaction(
@@ -710,6 +726,9 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                                                                                      PLATFORM_AIV_CORES_PER_BLOCKDIM;
                         const uint64_t ssbuf_base = reinterpret_cast<uint64_t>(run->ssbuf_blocks) +
                                                     static_cast<uint64_t>(cluster_id) * PLATFORM_SSBUF_SIZE;
+                        // Cancelled startup is joined and abandoned by the launch owner;
+                        // only released workers contribute task_finished().
+                        if (!run->startup.wait()) return;
                         aicore_execute_func_(
                             run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
                             kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table,
@@ -726,18 +745,25 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
             for (int i = 0; i < over_launch; i++) {
                 run->aicpu_threads.push_back(create_thread(
-                    [this, run, launch_aicpu_num, over_launch, sim_t0]() {
-                        if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
-                            run_completion_.task_finished();
-                            return;
-                        }
-                        int rc = aicpu_execute_func_(run->runtime);
-                        if (kernel_args_.device_wall_data_base != 0) {
-                            const auto t1 = std::chrono::steady_clock::now();
-                            *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
-                            );
-                        }
+                    [this, run, launch_aicpu_num, over_launch, sim_t0,
+                     result_base = run_result_region_base(prepared.pipeline_slot)]() {
+                        // Cancelled startup is joined and abandoned by the launch owner;
+                        // only released workers contribute task_finished().
+                        if (!run->startup.wait()) return;
+                        auto invocation =
+                            native_invocation_functions_.bind(over_launch, result_base, kernel_args_.run_result_epoch);
+                        const auto entry = run->entry_gate.enter(launch_aicpu_num, invocation.initializer());
+                        const int rc = invocation.complete(entry, [this, run, sim_t0] {
+                            const int status = aicpu_execute_func_(run->runtime);
+                            if (kernel_args_.device_wall_data_base != 0) {
+                                const auto t1 = std::chrono::steady_clock::now();
+                                *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) =
+                                    static_cast<uint64_t>(
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count()
+                                    );
+                            }
+                            return status;
+                        });
                         run_completion_.task_finished(rc);
                     },
                     "sim-aicpu-" + std::to_string(i)
@@ -746,6 +772,12 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             return 0;
         }
     );
+    if (result.rc == 0) {
+        run->startup.release();
+        startup_cleanup.dismiss();
+    } else {
+        startup_error = result.rc;
+    }
     return result;
 }
 
@@ -770,6 +802,18 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     });
 
     LOG_INFO("All threads completed");
+    auto *result_storage =
+        reinterpret_cast<NativeInvocationResultStorage *>(run_result_region_base(active.prepared->pipeline_slot));
+    if (result_storage != nullptr) {
+        const auto evidence = result_storage->evidence.read_after_exit();
+        if (evidence.kind != NativeInvocationEvidence::Kind::None) {
+            LOG_ERROR(
+                "native invocation evidence: kind=%u code=%d source=%u faults=%llu",
+                static_cast<unsigned>(evidence.kind), evidence.terminal.code,
+                static_cast<unsigned>(evidence.terminal.source), static_cast<unsigned long long>(evidence.fault_count)
+            );
+        }
+    }
 
     device_wall_ns_ = 0;
     if (device_wall_dev_ptr_ != nullptr) {
@@ -930,6 +974,7 @@ void DeviceRunner::unload_executor_binaries() {
         dlclose(aicpu_so_handle_);
         aicpu_so_handle_ = nullptr;
         aicpu_execute_func_ = nullptr;
+        native_invocation_functions_ = {};
         aicpu_register_callable_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
         set_orch_device_id_func_ = nullptr;
@@ -1054,24 +1099,27 @@ bool DeviceRunner::terminal_backing_retained() const {
 
 int DeviceRunner::finalize_collectors() {
     clear_collector_shape();
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
     if (chip_swimlane_collector_.is_initialized()) {
-        chip_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        chip_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     // The one collector whose finalize can discover a failure of its own:
     // retained ArgsDump does its last host sealing there, after the caller's
     // own diagnostic flush has already run and returned.
     int rc = 0;
     if (dump_collector_.is_initialized()) {
-        rc = dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        rc = dump_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     if (scope_stats_collector_.is_initialized()) {
-        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
         kernel_args_.scope_stats_data_base = 0;
     }
     if (terminal_backing_retained() && rc == 0) rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -1215,9 +1263,14 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
 int DeviceRunner::init_chip_swimlane(
     int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
 ) {
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
     int rc = chip_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, prof_alloc_cb, /*register_cb=*/nullptr,
-        prof_free_cb
+        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, /*register_cb=*/nullptr, free_cb
     );
     if (rc == 0) {
         kernel_args_.chip_swimlane_data_base =
@@ -1230,9 +1283,14 @@ int DeviceRunner::init_chip_swimlane(
 
 int DeviceRunner::init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
-
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, dump_args_level, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb
+        num_dump_threads, device_id, dump_args_level, alloc_cb, /*register_cb=*/nullptr, free_cb
     );
     if (rc != 0) {
         return rc;
@@ -1243,9 +1301,13 @@ int DeviceRunner::init_args_dump(const Runtime &runtime, int device_id, DumpArgs
 }
 
 int DeviceRunner::init_pmu(int num_cores, int num_threads, int /*device_id*/) {
-    int rc = pmu_collector_.init(
-        num_cores, num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1
-    );
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+    int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
     if (rc == 0) {
         kernel_args_.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
         kernel_args_.aicore_pmu_ring_addrs =
@@ -1255,12 +1317,16 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int /*device_id*/) {
 }
 
 int DeviceRunner::init_scope_stats(int num_threads) {
-    // a5 sim: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5 sim: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer; sim's profiling_copy_* are plain memcpys, so the dev/host
     // shadow path collapses to one allocation pair without address-space tricks.
-    int rc = scope_stats_collector_.init(
-        num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1
-    );
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+    int rc = scope_stats_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
     if (rc != 0) {
         return rc;
     }
@@ -1272,8 +1338,13 @@ int DeviceRunner::init_scope_stats(int num_threads) {
 int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
     // a5 sim: register_cb=nullptr; sim's profiling_copy_* are plain memcpys, so
     // the dev/host shadow path collapses to one allocation pair.
-    int rc =
-        dep_gen_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+    int rc = dep_gen_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
     if (rc != 0) {
         return rc;
     }

@@ -481,11 +481,10 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     // A boundary that cannot open a Graph is a contract violation, not a reason to run
     // the body quietly: the caller declared a Graph and gets told why it is not one.
     //
-    // Explicit dependencies are tested here rather than inside rt_graph_args_cacheable
-    // because they are refused only at a Graph boundary -- an ordinary task takes them. The
-    // same pair is tested again in graph_begin_inner, which is what a caller reaching the
-    // host layer by another route meets; this one reports at the API the caller named.
-    if (!rt_graph_args_cacheable(args) || args.explicit_dep_count() != 0) {
+    // Invocation predecessors order the outer shell and do not participate in
+    // the Definition's boundary shape or Config key. graph_begin consumes them
+    // before the caller's borrowed dependency storage can go out of scope.
+    if (!rt_graph_args_cacheable(args)) {
         rt_report_fatal(
             SIMPLER_ERROR_INVALID_ARGS,
             "[GraphExecution] boundary cannot open a Graph: tensors=%d scalars=%d explicit_deps=%u error=%d",

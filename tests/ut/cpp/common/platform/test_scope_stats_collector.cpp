@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
 
 namespace profiling_common {
 
@@ -45,7 +46,7 @@ struct ProfilerBaseTestPeer {
 
 namespace {
 
-void *test_alloc(size_t size) { return std::calloc(1, size); }
+void *test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int test_free(void *ptr) {
     std::free(ptr);

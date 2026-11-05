@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -510,4 +511,64 @@ TEST_F(SchedulerRetirement, UnstampedModeUsesNonceAfterOwnershipPublication) {
     EXPECT_EQ(request_all(), 0);
     expect_once();
     EXPECT_EQ(nonce_batches.load(), 1);
+}
+
+TEST_F(SchedulerRetirement, ReportsAreInvalidatedOnlyAfterTheirOwnExitAcknowledgement) {
+    handshake();
+    for (int i = 0; i < kCores; ++i) {
+        runtime->dev.workers[i].aicpu_ready = 2;
+        runtime->dev.workers[i].report_epoch = 42;
+    }
+    silent_first_core = true;
+    EXPECT_NE(request_all(), 0);
+    for (int i = 0; i < kCores; ++i) {
+        const auto &report = runtime->dev.workers[i];
+        EXPECT_EQ(report.aicore_done, i == 0 ? 1u : 0u);
+        EXPECT_EQ(report.aicpu_ready, i == 0 ? 2u : 0u);
+        EXPECT_EQ(report.report_epoch, 42u);
+        EXPECT_EQ(aicore_report_accepted(&report, 42), i == 0);
+    }
+    const int previous_batches = batches.load();
+    emergency();
+    EXPECT_EQ(batches.load(), previous_batches);
+    EXPECT_EQ(runtime->dev.workers[0].aicore_done, 1u);
+}
+
+TEST_F(SchedulerRetirement, MissingReportDoesNotTurnAcceptedRetirementIntoExitProof) {
+    EXPECT_EXIT(
+        {
+            SchedulerContextTestPeer::clear_ownership(*context);
+            runtime->dev.workers[kCores - 1].aicore_done = 0;
+            context->handshake_partition(runtime.get(), 0, 2);
+            for (int i = 0; i < kCores / 2; ++i)
+                if (opened[i].load() != 1) std::_Exit(1);
+
+            std::atomic<bool> entered{false};
+            std::atomic<bool> returned{false};
+            std::thread missing_report([&] {
+                entered.store(true, std::memory_order_release);
+                context->handshake_partition(runtime.get(), 1, 2);
+                returned.store(true, std::memory_order_release);
+            });
+            const auto startup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (!entered.load(std::memory_order_acquire)) {
+                if (std::chrono::steady_clock::now() >= startup_deadline) std::_Exit(2);
+            }
+            if (request_all() != 0) std::_Exit(3);
+            const auto observation_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            while (std::chrono::steady_clock::now() < observation_deadline) {
+                if (returned.load(std::memory_order_acquire)) std::_Exit(4);
+            }
+            // READY is published only after the handshake join. An accepted
+            // request is still pending, even for the already-open first slice.
+            if (batches.load() != 0 || deadlines.load() != 0) std::_Exit(5);
+            for (int i = 0; i < kCores; ++i) {
+                if (retired[i].load() != 0 || runtime->get_teardown_gates()[i].post_close_release != 0) std::_Exit(6);
+            }
+            if (opened[kCores - 1].load() != 0) std::_Exit(7);
+            // Only the fixture process ends here; no physical-exit fact is minted.
+            std::_Exit(0);
+        },
+        testing::ExitedWithCode(0), ""
+    );
 }

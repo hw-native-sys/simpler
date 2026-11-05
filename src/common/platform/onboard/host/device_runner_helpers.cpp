@@ -104,9 +104,13 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream) {
     return launch_route_permitted_by_capture(static_cast<int>(rc), static_cast<int>(status));
 }
 
-int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink) {
+int publish_for_launch(
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording
+) {
     if (kernel_args.runtime_args_published()) return 0;
-    const bool permitted = launch_entry_args_permitted(aicpu_stream);
+    // A retained recording has passed resource admission; RTS records the
+    // same launch packet used by eager, including KernelInvocation identity.
+    const bool permitted = retained_recording || launch_entry_args_permitted(aicpu_stream);
     const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink);
     if (rc != 0) {
         LOG_ERROR("publish_for_launch: launch metadata publication failed: %d", rc);
@@ -118,6 +122,7 @@ int KernelArgsHelper::prepare_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
 ) {
     if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
+    entry_cache_eligible_ = slot.entry_cache_qualification.consume();
     // Ahead of the allocation and of the snapshot, so a descriptor carrying
     // counts no consumer may believe fails the run here: nothing is allocated,
     // nothing is copied, and the caller's prepare returns the error rather than
@@ -155,6 +160,9 @@ int KernelArgsHelper::prepare_runtime_args(
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
         slot.runtime_bytes = runtime_extent;
         slot.workers_initialized = false;
+        entry_cache_eligible_ = false;
+        slot.entry_cache_qualification.clear();
+        slot.entry_cmo_may_have_trimmed = false;
         // A fresh block inherits no claim about its contents. The two teardown
         // paths reset the whole struct, but a slot reaching this branch with a
         // freed pointer has not been through either, so the transition is made
@@ -399,6 +407,18 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
         launch_payload_bytes_ = graph_package_bytes;
     }
 
+    EntryCacheMaintenance maintenance = EntryCacheMaintenance::Full;
+    if (PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && plan_.supported && !kernel_route) {
+        if (launch_route && entry_cache_eligible_) {
+            maintenance = EntryCacheMaintenance::Live;
+            slot_->entry_cmo_may_have_trimmed = true;
+        } else if (source == EntryArgsSource::Descriptor && slot_->entry_cmo_may_have_trimmed) {
+            maintenance = EntryCacheMaintenance::FullFreshen;
+        }
+    }
+    args.entry_cache_maintenance = static_cast<uint32_t>(maintenance);
+    entry_cache_eligible_ = false;
+
     const size_t publish_bytes = launch_route ? plan_.descriptor_bytes_when_launched : runtime_image_.size();
     // A publication this block may already be holding: the launch route's own
     // prefix, onto an allocation a previous launch-route publication recorded.
@@ -475,6 +495,12 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
         return rc;
     }
     runtime_args_state_ = RuntimeArgsState::Published;
+    slot_->entry_cache_qualification.published(
+        PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && plan_.supported && !kernel_route &&
+                valid_entry_cache_maintenance(args.entry_cache_maintenance) ?
+            entry_cache_epoch_ :
+            0
+    );
     // An accepted initializing copy precedes the entry fork on the AICPU
     // stream; both kernels wait behind it. Slot retirement protects the next
     // publication from reusing this block or its source while that copy is live.
@@ -486,11 +512,15 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
 }
 
 int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator) {
+    slot.entry_cache_qualification.clear();
     int first_error = 0;
     if (slot.runtime_args != nullptr) {
         const int rc = allocator.free(slot.runtime_args);
         if (rc != 0) first_error = rc;
-        else slot.runtime_args = nullptr;
+        else {
+            slot.runtime_args = nullptr;
+            slot.entry_cmo_may_have_trimmed = false;
+        }
     }
     if (slot.runtime_upload_source != nullptr) {
         const int rc = rtFreeHost(slot.runtime_upload_source);

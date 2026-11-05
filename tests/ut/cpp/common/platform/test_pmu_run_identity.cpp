@@ -46,6 +46,7 @@
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 // `set_platform_pmu_reg_addrs` / `get_platform_pmu_reg_addrs` live in the
 // platform register layer, whose translation unit reaches further into the
@@ -101,7 +102,7 @@ void write_reg(uint64_t, RegId, uint64_t) {
 
 namespace {
 
-void *pmu_test_alloc(size_t size) { return std::calloc(1, size); }
+void *pmu_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int pmu_test_free(void *ptr) {
     std::free(ptr);

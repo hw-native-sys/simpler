@@ -12,6 +12,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -34,12 +35,17 @@ struct Control {
     uint64_t requested_op_timeout_us{0};
     size_t op_timeout_calls{0};
     int copy_rc{0};
+    int free_rc{0};
+    void *selected_free{nullptr};
+    int selected_free_rc{0};
+    size_t selected_free_attempts{0};
     size_t stream_create_calls{0};
     size_t fail_stream_create{0};
     size_t d2h_calls{0};
     size_t d2h_bytes{0};
     std::vector<const void *> downloads;
     int stream_sync_rc{0};
+    std::function<void()> stream_sync_hook;
     std::vector<void *> observed_streams;
     bool events_complete{true};
     int event_wait_rc{0};

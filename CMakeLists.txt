@@ -23,7 +23,23 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Find Python and nanobind
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
-find_package(nanobind CONFIG REQUIRED)
+find_package(nanobind CONFIG QUIET)
+if(NOT nanobind_FOUND)
+    # Python-visible packages outside the venv may not be CMake search prefixes.
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        RESULT_VARIABLE _nanobind_query_status
+        OUTPUT_VARIABLE nanobind_ROOT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_VARIABLE _nanobind_query_error
+    )
+    if(NOT _nanobind_query_status EQUAL 0 OR nanobind_ROOT STREQUAL "")
+        message(FATAL_ERROR
+            "Cannot locate nanobind for ${Python_EXECUTABLE}: ${_nanobind_query_error}"
+        )
+    endif()
+    find_package(nanobind CONFIG REQUIRED)
+endif()
 
 # Include Python bindings
 add_subdirectory(python/bindings)

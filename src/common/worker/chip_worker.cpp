@@ -456,6 +456,7 @@ void ChipWorker::init(
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
+        comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
@@ -577,7 +578,7 @@ void ChipWorker::init(
         // dispatcher_path is empty on sim (no dispatcher) and on tests that
         // exercise _ChipWorker.init directly without a RuntimeBinaries.
         // simpler_init treats a null/empty buffer as "no dispatcher" — onboard
-        // ensure_binaries_loaded raises with a clear message if the bootstrap
+        // ensure_aicpu_runtime_registered raises with a clear message if the bootstrap
         // is actually attempted, sim ignores it entirely.
         std::vector<uint8_t> dispatcher_bytes;
         if (!dispatcher_path.empty()) {
@@ -805,6 +806,7 @@ void ChipWorker::finalize() {
         if (run_lane_ != nullptr) run_lane_->detach_after_failed_teardown(lane_error);
         run_lane_.reset();
     }
+    require_comm_cleanup_confirmed();
     if (comm_reclamation_unconfirmed_) {
         // Carrier destruction does not prove device users stopped. Keep comm
         // owners and their code alive, but allow the device's reset path below.
@@ -927,6 +929,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
+    comm_abort_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
@@ -1178,6 +1181,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
 ) {
     validate_execution_process();
+    require_comm_cleanup_confirmed();
     try {
         config.validate();
     } catch (const std::invalid_argument &e) {
@@ -1208,6 +1212,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 "native-run pipeline lease generation is stale " + format_native_run_identity(run_identity)
             );
         }
+        (void)count_unobserved_completed_locked();
         try {
             auto entry = std::make_unique<NativeRunEntry>();
             entry->storage =
@@ -1589,6 +1594,7 @@ void ChipWorker::note_native_run_wait(uint64_t run_epoch, void *storage, int rc)
 
 ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
     validate_execution_process();
+    require_comm_cleanup_confirmed();
     void *storage = nullptr;
     NativeRunOpLease held;
     const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::Launch, &storage, nullptr, &held);
@@ -1642,6 +1648,7 @@ bool ChipWorker::launch_native_run_joined(
     const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream
 ) {
     validate_execution_process();
+    require_comm_cleanup_confirmed();
     if (run.slot_id == predecessor.slot_id) {
         throw std::runtime_error("a native run cannot be ordered behind its own pipeline slot");
     }
@@ -1770,11 +1777,14 @@ void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
     std::exception_ptr failure;
     try {
         wait_rc = wait_run_fn_(device_ctx_, storage);
+        if (wait_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) {
+            throw std::runtime_error("native run wait incomplete; retry wait or finalize");
+        }
     } catch (...) {
         failure = std::current_exception();
     }
     // Cache the observer once, independently of whether device last use is proved.
-    // An exception supplies neither fact and leaves the observation retryable.
+    // An exception or incomplete wait leaves the observation retryable.
     if (failure == nullptr) note_native_run_wait(run.run_epoch, storage, wait_rc);
     if (failure != nullptr) std::rethrow_exception(failure);
 }
@@ -1936,6 +1946,9 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         int wait_rc = 0;
         try {
             wait_rc = wait_run_fn_(device_ctx_, storage);
+            if (wait_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) {
+                throw std::runtime_error("native run wait incomplete; retry wait or finalize");
+            }
         } catch (...) {
             outcome.captured = std::current_exception();
         }
@@ -2131,6 +2144,30 @@ size_t ChipWorker::unproven_native_run_count() const noexcept {
     return native_runs_.size();
 }
 
+size_t ChipWorker::count_unobserved_completed_locked() const noexcept {
+    // Every entry whose completion is recorded and whose teardown is not in
+    // doubt, including one a finalization already owns: that finalization has
+    // not returned the carrier yet, so the footprint is still this run's.
+    size_t backlog = 0;
+    for (const auto &item : native_runs_) {
+        const NativeRunEntry &entry = *item.second;
+        if (entry.phase == NativeRunPhase::REAPED && !entry.destruction_unknown) ++backlog;
+    }
+    if (backlog > unobserved_completed_high_water_) unobserved_completed_high_water_ = backlog;
+    return backlog;
+}
+
+size_t ChipWorker::unobserved_completed_run_count() const noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    return count_unobserved_completed_locked();
+}
+
+size_t ChipWorker::unobserved_completed_run_high_water() const noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    (void)count_unobserved_completed_locked();
+    return unobserved_completed_high_water_;
+}
+
 void ChipWorker::unregister_callable(int32_t callable_id) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
@@ -2224,14 +2261,15 @@ void *ChipWorker::create_comm_stream_checked(const char *op_name) {
     return create_comm_stream_fn_(device_ctx_);
 }
 
-void ChipWorker::destroy_comm_stream_best_effort(void *stream, int *rc) {
+int ChipWorker::destroy_comm_stream_best_effort(void *stream, int *rc) {
     if (stream == nullptr || device_ctx_ == nullptr || destroy_comm_stream_fn_ == nullptr) {
-        return;
+        return 0;
     }
     int srv = destroy_comm_stream_fn_(device_ctx_, stream);
     if (srv != 0 && rc != nullptr && *rc == 0) {
         *rc = srv;
     }
+    return srv;
 }
 
 ChipWorker::CommSession *ChipWorker::find_comm_session(uint64_t comm_handle) {
@@ -2265,20 +2303,28 @@ ChipWorker::CommSession *ChipWorker::create_comm_session(void *handle, void *str
 }
 
 int ChipWorker::destroy_comm_session(CommSession &session) {
+    if (comm_cleanup_unconfirmed_) return COMM_RECLAMATION_UNCONFIRMED;
     int rc = 0;
     if (session.handle != nullptr && comm_destroy_fn_ != nullptr) {
         rc = comm_destroy_fn_(session.handle);
+        if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            retain_unconfirmed_comm_cleanup();
+            return rc;
+        }
     }
-    destroy_comm_stream_best_effort(session.stream, &rc);
     if (reinterpret_cast<uint64_t>(session.handle) == base_comm_handle_) {
         base_comm_handle_ = 0;
     }
     comm_session_index_.erase(reinterpret_cast<uint64_t>(session.handle));
     session.handle = nullptr;
-    session.stream = nullptr;
     session.device_ctx = 0;
     session.local_window_base = 0;
     session.window_size = 0;
+    if (destroy_comm_stream_best_effort(session.stream, &rc) != 0) {
+        retain_unconfirmed_comm_cleanup();
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
+    session.stream = nullptr;
     return rc;
 }
 
@@ -2287,13 +2333,17 @@ uint64_t ChipWorker::create_base_comm(int rank, int nranks, const std::string &r
     void *handle = comm_init_fn_(rank, nranks, stream, rootinfo_path.c_str());
     if (handle == nullptr) {
         int rc = 0;
-        destroy_comm_stream_best_effort(stream, &rc);
+        if (destroy_comm_stream_best_effort(stream, &rc) != 0) retain_unconfirmed_comm_stream(stream);
         throw std::runtime_error("comm_init failed");
     }
     CommSession *session = create_comm_session(handle, stream, true);
     if (session == nullptr) {
         int rc = comm_destroy_fn_(handle);
-        destroy_comm_stream_best_effort(stream, &rc);
+        if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            retain_unconfirmed_comm_stream(stream);
+            throw std::runtime_error("comm_init: duplicate handle cleanup is unconfirmed");
+        }
+        if (destroy_comm_stream_best_effort(stream, &rc) != 0) retain_unconfirmed_comm_stream(stream);
         throw std::runtime_error("comm_init: duplicate comm handle");
     }
     base_comm_handle_ = reinterpret_cast<uint64_t>(handle);
@@ -2301,18 +2351,43 @@ uint64_t ChipWorker::create_base_comm(int rank, int nranks, const std::string &r
 }
 
 void ChipWorker::clear_comm_sessions() {
+    require_comm_cleanup_confirmed();
     for (auto it = comm_sessions_.rbegin(); it != comm_sessions_.rend(); ++it) {
         if (it->handle == nullptr && it->stream == nullptr) {
             continue;
         }
         destroy_comm_session(*it);
+        require_comm_cleanup_confirmed();
     }
     comm_sessions_.clear();
     comm_session_index_.clear();
     base_comm_handle_ = 0;
 }
 
+void ChipWorker::retain_unconfirmed_comm_cleanup() noexcept {
+    comm_cleanup_unconfirmed_ = true;
+    stop_chip_run_lane_admission();
+    if (runtime_module_ != nullptr) runtime_module_->retain_until_process_exit();
+}
+
+void ChipWorker::retain_unconfirmed_comm_stream(void *stream) {
+    retain_unconfirmed_comm_cleanup();
+    CommSession retained{};
+    retained.stream = stream;
+    comm_sessions_.push_back(retained);
+}
+
+void ChipWorker::require_comm_cleanup_confirmed() const {
+    if (comm_cleanup_unconfirmed_) {
+        throw std::runtime_error(
+            "communication cleanup is unconfirmed; keeping communication owners, streams, device context and host "
+            "runtime"
+        );
+    }
+}
+
 void ChipWorker::require_comm_reclamation_safe() const {
+    require_comm_cleanup_confirmed();
     if (comm_reclamation_unconfirmed_ || (run_lane_ != nullptr && run_lane_->poisoned()) ||
         unproven_native_run_count() != 0) {
         throw std::runtime_error("communication resource reclamation is unconfirmed");
@@ -2402,6 +2477,7 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
 }
 
 uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo_path) {
+    require_comm_cleanup_confirmed();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
@@ -2413,6 +2489,7 @@ uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo
 }
 
 uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {
+    require_comm_cleanup_confirmed();
     uint64_t device_ctx = 0;
     int rc = comm_alloc_windows_fn_(reinterpret_cast<void *>(comm_handle), win_size, &device_ctx);
     if (rc != 0) {
@@ -2426,6 +2503,7 @@ uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {
 }
 
 uint64_t ChipWorker::comm_get_local_window_base(uint64_t comm_handle) {
+    require_comm_cleanup_confirmed();
     uint64_t base = 0;
     int rc = comm_get_local_window_base_fn_(reinterpret_cast<void *>(comm_handle), &base);
     if (rc != 0) {
@@ -2439,6 +2517,7 @@ uint64_t ChipWorker::comm_get_local_window_base(uint64_t comm_handle) {
 }
 
 size_t ChipWorker::comm_get_window_size(uint64_t comm_handle) {
+    require_comm_cleanup_confirmed();
     size_t win_size = 0;
     int rc = comm_get_window_size_fn_(reinterpret_cast<void *>(comm_handle), &win_size);
     if (rc != 0) {
@@ -2455,6 +2534,7 @@ uint64_t ChipWorker::comm_derive_context(
     uint64_t comm_handle, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, size_t window_offset,
     size_t window_size
 ) {
+    require_comm_cleanup_confirmed();
     if (comm_derive_context_fn_ == nullptr) {
         throw std::runtime_error("comm_derive_context is not supported by this runtime");
     }
@@ -2477,8 +2557,9 @@ uint64_t ChipWorker::comm_derive_context(
 
 std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_mask
+    size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag
 ) {
+    require_comm_cleanup_confirmed();
     if (comm_alloc_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("comm_alloc_domain_windows is not supported by this runtime");
     }
@@ -2498,8 +2579,37 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
         window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
     );
+    if (ownership_flag != nullptr &&
+        (rc == 0 || rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED)) {
+        __atomic_store_n(ownership_flag, uint64_t{1}, __ATOMIC_RELEASE);
+    }
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
     if (rc != 0) {
-        throw std::runtime_error("comm_alloc_domain_windows failed with code " + std::to_string(rc));
+        const char *reason = "domain allocation failed";
+        switch (rc) {
+        case COMM_INITIALIZATION_ABORT_REQUIRED:
+            reason = "initialization failed with retained resources; join all allocation requests before local abort; "
+                     "check host logs";
+            break;
+        case COMM_RECLAMATION_UNCONFIRMED:
+            reason = "communication reclamation is unconfirmed; resources and device environment are retained";
+            break;
+        case COMM_DOMAIN_WORKSPACE_UNSUPPORTED:
+            reason = "requested communication workspace combination is unsupported by this runtime";
+            break;
+        case COMM_DOMAIN_URMA_CONFIG_INVALID:
+            reason = "URMA requires ranks in dense prefix order and a valid communication window";
+            break;
+        case COMM_DOMAIN_URMA_INIT_FAILED:
+            reason = "URMA workspace initialization failed; check device/HCCL resources and host logs";
+            break;
+        case COMM_DOMAIN_URMA_WORKSPACE_INVALID:
+            reason = "URMA manager returned a null workspace address or zero workspace size";
+            break;
+        }
+        throw std::runtime_error(
+            "comm_alloc_domain_windows: " + std::string(reason) + " (code " + std::to_string(rc) + ")"
+        );
     }
     if (device_ctx == 0 || local_window_base == 0) {
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
@@ -2516,14 +2626,31 @@ void ChipWorker::comm_release_domain_windows(
     }
     int rc =
         comm_release_domain_windows_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
     if (rc != 0) {
         throw std::runtime_error("comm_release_domain_windows failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::comm_abort_domain_windows(
+    uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
+) {
+    require_comm_reclamation_safe();
+    if (comm_abort_domain_windows_fn_ == nullptr) {
+        throw std::runtime_error("comm_abort_domain_windows is not supported by this runtime");
+    }
+    int rc =
+        comm_abort_domain_windows_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
+    if (rc != 0) {
+        throw std::runtime_error("comm_abort_domain_windows failed with code " + std::to_string(rc));
     }
 }
 
 std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
 ) {
+    require_comm_cleanup_confirmed();
     if (comm_global_domain_prepare_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_prepare is not supported by this runtime");
     }
@@ -2551,6 +2678,7 @@ std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domai
 }
 
 uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors) {
+    require_comm_cleanup_confirmed();
     if (comm_global_domain_import_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_import is not supported by this runtime");
     }
@@ -2584,6 +2712,7 @@ void ChipWorker::comm_global_domain_release(uint64_t domain_id) {
 }
 
 void ChipWorker::comm_barrier(uint64_t comm_handle) {
+    require_comm_cleanup_confirmed();
     int rc = comm_barrier_fn_(reinterpret_cast<void *>(comm_handle));
     if (rc != 0) {
         throw std::runtime_error("comm_barrier failed with code " + std::to_string(rc));
@@ -2595,6 +2724,10 @@ void ChipWorker::comm_destroy(uint64_t comm_handle) {
     CommSession *session = find_comm_session(comm_handle);
     if (session == nullptr) {
         int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
+        if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            retain_unconfirmed_comm_cleanup();
+            create_comm_session(reinterpret_cast<void *>(comm_handle), nullptr, false);
+        }
         if (rc != 0) {
             throw std::runtime_error("comm_destroy failed with code " + std::to_string(rc));
         }
@@ -2624,6 +2757,9 @@ void ChipWorker::comm_destroy_all() {
             continue;
         }
         int rc = destroy_comm_session(*it);
+        if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            throw std::runtime_error("comm_destroy_all: communication cleanup is unconfirmed");
+        }
         if (rc != 0 && first_rc == 0) {
             first_rc = rc;
         }

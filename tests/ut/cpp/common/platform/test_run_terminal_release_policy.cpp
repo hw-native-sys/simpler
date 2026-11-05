@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
+#include "profiler_test_allocator.h"
 
 namespace runs = simpler::dfx::runs;
 
@@ -56,7 +57,7 @@ struct FreeLedger {
     bool abandon{false};
 
     void *allocate(size_t bytes) {
-        void *p = std::calloc(1, bytes);
+        void *p = profiler_test_calloc(bytes);
         if (p != nullptr) live.push_back(p);
         return p;
     }

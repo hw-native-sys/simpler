@@ -61,7 +61,16 @@ public:
         callables_[1] = std::move(callable);
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
-    size_t scheduler_capacity(uint32_t slot) const { return scheduler_state_storage_[slot].device_capacity(); }
+    size_t scheduler_capacity(uint32_t slot) const {
+        return scheduler_state_storage_[slot] ? scheduler_state_storage_[slot]->device_capacity() : 0;
+    }
+    int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
+        KernelArgsHelper args;
+        submission_storage_[slot]->retain_replay_evidence = true;
+        return ensure_device_run_result_region(slot, epoch, args);
+    }
+    PreparedSubmissionStorage &result_storage(uint32_t slot = 0) { return *submission_storage_[slot]; }
+    int close_result(uint32_t slot = 0) { return release_submission_storage(*submission_storage_[slot], false); }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
     void allocate_callable() {
         void *allocation = mem_alloc_.alloc(64);
@@ -86,6 +95,16 @@ public:
     }
     bool ready_to_join_launch() const override { return true; }
     int fill_persistent_arch_fields(KernelArgs *, uint64_t) override { return 0; }
+    int prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) override {
+        if (execution_mode_latch().is_kernel()) return DeviceRunnerBase::prepare_execution_streams(prepared, lease);
+        // This fixture replaces device submission; its stream identities are
+        // borrowed test tokens, with no RTS resource to destroy.
+        static int streams[2];
+        prepared.streams = {&streams[0], &streams[1]};
+        lease->reset();
+        return 0;
+    }
+
     int prepare_execution(
         Runtime &runtime, const CallConfig &config, uint32_t slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *out
@@ -132,9 +151,13 @@ public:
     }
     void abandon_prepared_execution(PreparedExecution &) noexcept override {}
     int poll_execution(const ActiveExecution &) override { return SIMPLER_NATIVE_RUN_POLL_NOT_READY; }
-    DrainOutcome drain_execution(ActiveExecution &) override {
+    DrainOutcome drain_execution(ActiveExecution &active) override {
         ++drain_calls;
         if (drain_throws) throw std::runtime_error("completion not observed");
+        if (drain_result.device_rc == 0 && active.prepared) {
+            const int rc = discharge_boundary_waits(*active.prepared, true);
+            if (rc != 0) return DrainOutcome::device_error(rc);
+        }
         return drain_result;
     }
     int finalize_impl() override { return finalize_common(); }
@@ -157,7 +180,7 @@ public:
         for (auto fact :
              {Fact::DrainAttempted, Fact::DrainProvedComplete, Fact::CopybackReturned, Fact::BindingsReleased,
               Fact::ContextDestroyed})
-            note_workspace_run_fact(slot, epoch, fact);
+            note_workspace_run_fact(NativeRunIdentity{epoch, epoch, epoch, slot}, fact);
     }
     void stop_serving() { workspace_.enter_closed(); }
 };
@@ -237,7 +260,7 @@ protected:
     }
     static void launched(Runner &r, uint32_t slot, uint64_t epoch) {
         r.note_run_resources_proven(slot, epoch);
-        r.note_workspace_run_fact(slot, epoch, Fact::Launched);
+        r.note_workspace_run_fact(NativeRunIdentity{epoch, epoch, epoch, slot}, Fact::Launched);
     }
 };
 

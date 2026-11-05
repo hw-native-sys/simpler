@@ -23,6 +23,7 @@
  */
 
 #pragma once
+#include "host/aligned_image_storage.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -54,6 +55,7 @@
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
 #include "common/device_run_result.h"
+#include "common/native_invocation_evidence.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/dma_workspace.h"
 #include "common/platform_config.h"
@@ -340,6 +342,9 @@ public:
      * over a hundred of them share this factory — without a name every one
      * reports as the host process's own `comm` and a crash dump cannot say
      * which tier faulted.
+     *
+     * Returns only after binding succeeds. Failure joins the child without
+     * invoking fn and throws std::system_error; an unattached runner is rejected.
      */
     std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
@@ -925,8 +930,8 @@ protected:
     // directly from CallableState by launch_device_register — no Runtime
     // round-trip.
     virtual int invoke_device_register(const RegisterCallableArgs &reg_args) = 0;
-    int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
+    // Registration owns orchestration code; validation leaves Runtime unchanged.
+    int validate_active_callable(const Runtime &runtime) const;
 
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
@@ -1009,10 +1014,7 @@ protected:
     // std::vector: `resize` would zero every page of a capacity the caller writes
     // a fraction of, and would copy the old bytes on growth for a buffer whose
     // contents mean nothing between binds.
-    struct RetainedSmMirror {
-        std::unique_ptr<std::byte[]> storage;
-        size_t capacity{0};
-    };
+    using RetainedSmMirror = AlignedImageStorage;
     RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
     RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
@@ -1076,7 +1078,7 @@ protected:
         RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
         RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
         RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
-        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
+        RunResourceSlots<NativeInvocationResultStorage>::Storage device_run_results;
     };
 
     /** Allocate every per-set resource for `granted`; publishes nothing. */
@@ -1165,7 +1167,7 @@ protected:
     // Written on the bind path, read by the caller's thread.
     std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
     std::atomic<size_t> scheduler_mode_publish_total_{0};
-    // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
+    // AICPU executor SO: load-once, matching onboard's aicpu_runtime_registered_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
     // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.
     bool aicpu_so_loaded_{false};
@@ -1230,7 +1232,7 @@ protected:
      * publishing run's epoch, so a slot still holding an earlier run's record
      * fails the epoch comparison rather than being mistaken for this run's.
      */
-    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
+    RunResourceSlots<NativeInvocationResultStorage> device_run_results_;
     mutable std::mutex retained_result_mu_;
     std::unordered_map<uint64_t, DeviceRunResultRegion> retained_run_results_;
     ArgsDumpCollector dump_collector_;

@@ -778,6 +778,64 @@ TEST(HbgAdmission, OrdinaryMultiBlockPreparationDoesNotRequireAllBlocksToFitAtOn
     }
 }
 
+TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
+    constexpr uint64_t workers = 3 * (SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD + 1);
+    constexpr uint64_t first = 1;
+    for (bool cross_shard : {false, true}) {
+        SCOPED_TRACE(cross_shard);
+        AdmissionFixture fixture({{3, LaneMask::aiv0()}}, workers, 17, {}, true);
+        uint64_t remote = workers;
+        for (uint64_t worker = 0; worker < workers; ++worker) {
+            const auto &context = fixture.storage.contexts[worker];
+            if (context.core_type == static_cast<int32_t>(CoreType::AIV) &&
+                context.type_rank >= static_cast<int32_t>(SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD)) {
+                remote = worker;
+                break;
+            }
+        }
+        ASSERT_LT(remote, workers);
+        ASSERT_EQ(fixture.storage.contexts[first].type_rank, 0);
+        ASSERT_TRUE(fixture.publish(0, first));
+        for (uint64_t worker : {first, remote}) {
+            fixture.locals[worker]->admission = &fixture.admissions[worker];
+            ASSERT_TRUE(fixture.refresh(worker));
+            ASSERT_EQ(fixture.admissions[worker].current_task_ref, 0);
+        }
+
+        const std::array<uint64_t, 3> owners{first, cross_shard ? remote : first, first};
+        const auto *blocks = scheduler_state_at<SchedulerProtocolBlockTrace>(
+            fixture.base(), fixture.storage.layout.protocol.blocks_offset
+        );
+        for (uint32_t expected = 0; expected < owners.size(); ++expected) {
+            uint32_t block = UINT32_MAX;
+            ASSERT_EQ(
+                scheduler_claim_ordered_cursor(
+                    fixture.graph.graph(), fixture.base(), fixture.locals[owners[expected]], fixture.run(), &block
+                ),
+                SchedulerBlockClaimResult::CLAIMED
+            );
+            ASSERT_EQ(block, expected);
+            EXPECT_EQ(blocks[block].owner.worker_index, owners[expected]);
+            EXPECT_EQ(blocks[block].owner.task_ref, 0);
+            EXPECT_EQ(blocks[block].owner.block_idx, block);
+            EXPECT_EQ(blocks[block].owner.logical_block_num, owners.size());
+        }
+        for (uint64_t worker : {first, remote}) {
+            uint32_t block = UINT32_MAX;
+            EXPECT_EQ(
+                scheduler_claim_ordered_cursor(
+                    fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &block
+                ),
+                SchedulerBlockClaimResult::EXHAUSTED
+            );
+            EXPECT_EQ(block, UINT32_MAX);
+        }
+        EXPECT_EQ(fixture.task_control(0)->next_block, owners.size());
+        EXPECT_EQ(fixture.task_control(0)->completed_blocks, 0u);
+        EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+    }
+}
+
 TEST(HbgAdmission, NonzeroBlockCountersAreRejectedWithoutResettingTheirEvidence) {
     for (const auto &counts : std::vector<std::array<uint64_t, 2>>{{1, 0}, {0, 1}, {2, 2}, {UINT64_MAX, UINT64_MAX}}) {
         SCOPED_TRACE(counts[0]);

@@ -50,8 +50,8 @@
  *
  * **Every run publishes, success included.** A producer folds each
  * participant's error state and its runtime's shared error state into one
- * record and publishes it from a single cleanup owner after the last work that
- * could still change the run's outcome. So a matching epoch carries a verdict:
+ * record. The runtime cleanup owner hands off its snapshot; the final native
+ * callback publishes after all callback work that could change the outcome. So a matching epoch carries a verdict:
  *
  *   - `Ok` — the run reached the end of its audited normal path. Code 0, no
  *     source, no payload.

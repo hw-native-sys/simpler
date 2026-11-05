@@ -1042,6 +1042,9 @@ int simpler_prepare_run(
 ) {
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
+    if (descriptor->prepare_purpose != SIMPLER_PREPARE_EAGER)
+        return descriptor->prepare_purpose == SIMPLER_PREPARE_CAPTURE ? PTO_RUNTIME_ERR_UNSUPPORTED :
+                                                                        PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     // Against the grant this context was given, not a compile-time width: a set
     // exists because this context was granted it, so a slot past the grant names
     // no resource here rather than one that happens to be laid out.
@@ -1341,13 +1344,20 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // drain, so sim's lifecycle entry points carry the same contract as
     // onboard's. attach_current_thread() is idempotent for a thread already
     // bound to this device.
+    int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+    } catch (...) {
+        attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (attach_rc != 0) {
+        // No drain has occurred: the carrier and execution claim remain retryable.
+        LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    }
     DrainOutcome drain{};
     try {
-        const int attach_rc = state->runner->attach_current_thread(state->runner->device_id());
-        if (attach_rc != 0) {
-            drain.device_rc = attach_rc;
-            LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
-        } else if (state->active_execution != nullptr) {
+        if (state->active_execution != nullptr) {
             drain = state->runner->drain_execution(*state->active_execution);
         }
     } catch (...) {
@@ -1365,7 +1375,7 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return state->completion_rc;
 }
 
-static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) {
+static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
     SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
@@ -1397,6 +1407,9 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     }
     if (attach_rc != 0) {
         LOG_ERROR("simpler_finalize_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        // The canonical carrier tag keeps the caller's resources retained for
+        // retry. Neither drain nor binding release is proved by attach failure.
+        return attach_rc;
     }
     if (phase == NativeRunPhase::Running && launched && !state->physical_complete) {
         DrainOutcome drain{};
@@ -1474,6 +1487,8 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     if (validation_rc != 0) return validation_rc;
     if (no_submission && !launched) publish_released_preparation(state, run_epoch);
     return launched ? execution_rc : 0;
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {
@@ -1522,6 +1537,14 @@ int simpler_validate_execution_context(DeviceContextHandle ctx) {
 }
 
 int simpler_validate_caller_stream(DeviceContextHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
+int simpler_retain_run_resources(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle *out_reference) {
+    if (out_reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *out_reference = nullptr;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_release_run_resources(DeviceContextHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
 int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;

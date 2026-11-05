@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "aicpu/native_invocation_entry.h"
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"
 #include "sim_run_completion.h"
@@ -114,6 +115,7 @@ private:
     // a2a3 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().
     int (*aicpu_execute_func_)(Runtime *){nullptr};
+    NativeInvocationFunctions native_invocation_functions_;
     // The runtime exports simpler_aicpu_register_callable(void*) directly (TMARB
     // only; hbg does not export it). Optional dlsym: null on the hbg SO.
     int (*aicpu_register_callable_func_)(void *){nullptr};

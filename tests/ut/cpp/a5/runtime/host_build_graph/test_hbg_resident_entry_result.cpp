@@ -23,6 +23,7 @@
 
 #include "aicpu/pmu_collector_aicpu.h"
 #include "common/args_dump.h"
+#include "common/native_invocation_evidence.h"
 
 namespace {
 
@@ -131,6 +132,8 @@ void dump_args_flush(int) {}
 void dump_args_close_run(int) {}
 void dump_args_init(int, DumpArgsLevel) {}
 
+extern "C" void aicpu_reset_legacy_execution_entry() {}
+
 extern "C" int32_t legacy_aicpu_execute(Runtime *) {
     ADD_FAILURE() << "resident entry reached legacy execution";
     return -1;
@@ -161,7 +164,8 @@ protected:
         image = std::make_unique<SchedulerImage>();
         state = std::make_unique<RegisterTransport>();
         header.sched_error_code.store(SIMPLER_ERROR_NONE);
-        result = {};
+        result_storage = {};
+        private_result = true;
         runtime->set_worker_count(kParticipants);
         runtime->set_gm_sm_ptr(&header);
         runtime->dev.aicpu_thread_num = kParticipants;
@@ -204,11 +208,23 @@ protected:
 
     std::array<int32_t, kParticipants> execute() {
         std::array<int32_t, kParticipants> statuses{};
+        std::array<int32_t, kParticipants> native_statuses{};
+        EXPECT_EQ(
+            aicpu_begin_native_invocation(
+                kParticipants, private_result ? reinterpret_cast<uint64_t>(&result_storage) : 0,
+                private_result ? kEpoch : 0
+            ),
+            0
+        );
+        aicpu_reset_execution_entry();
         std::array<std::thread, kParticipants> threads;
         for (int32_t i = 0; i < kParticipants; ++i) {
             threads[i] = std::thread([&, i] {
                 platform_aicpu_affinity_set_thread_idx(i);
                 statuses[i] = aicpu_execute(runtime.get());
+                // Keep the runtime's own status assertions and additionally
+                // exercise the production owner that publishes after teardown.
+                native_statuses[i] = aicpu_finish_native_invocation(i, statuses[i]);
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     state->returned[i] = true;
@@ -218,6 +234,28 @@ protected:
         }
         for (auto &thread : threads)
             thread.join();
+        // Each case independently asserts these runtime statuses. Do not
+        // derive the expected native return from the record being verified.
+        int expected_error = 0;
+        for (int status : statuses)
+            if (status != 0) {
+                expected_error = status;
+                break;
+            }
+        if (private_result) {
+            const auto terminal = device_run_result_terminal(result, kEpoch);
+            EXPECT_EQ(
+                terminal.state, expected_error != 0 ? DeviceRunTerminalState::Failed : DeviceRunTerminalState::Succeeded
+            );
+            EXPECT_EQ(terminal.code, expected_error);
+        }
+        int failed_callbacks = 0;
+        for (int status : native_statuses) {
+            EXPECT_TRUE(status == 0 || status == expected_error);
+            failed_callbacks += status != 0;
+        }
+        EXPECT_EQ(failed_callbacks, expected_error != 0 ? 1 : 0);
+        if (state->held_participant >= 0) EXPECT_EQ(native_statuses[state->held_participant], expected_error);
         return statuses;
     }
 
@@ -236,7 +274,9 @@ protected:
     std::unique_ptr<SchedulerImage> image;
     std::unique_ptr<RegisterTransport> state;
     SharedMemoryHeader header{};
-    DeviceRunResultRegion result{};
+    NativeInvocationResultStorage result_storage{};
+    DeviceRunResultRegion &result{result_storage.result};
+    bool private_result{true};
 };
 
 TEST_F(ResidentEntryResult, BothResidentModesReturnSuccessThroughTheMixedTopologyLifecycle) {
@@ -284,7 +324,7 @@ TEST_F(ResidentEntryResult, AnEarlierHeaderErrorStillOwnsTheActualLateEntryStatu
 TEST_F(ResidentEntryResult, TheLateEntryStatusDoesNotDependOnPublishingAPrivateResult) {
     state->held_participant = 2;
     state->late_error = true;
-    set_platform_run_result(0, kEpoch);
+    private_result = false;
     EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, -SIMPLER_ERROR_SCHEDULER_TIMEOUT}));
     EXPECT_EQ(result.published, 0u);
     expect_normal_lifecycle();
@@ -314,7 +354,10 @@ TEST_F(ResidentEntryResult, FailedTopologyInitializationReturnsThroughTheActualA
     EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
     EXPECT_EQ(state->signaled, (std::array<int, kParticipants>{0, 0, 0}));
     EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
-    EXPECT_EQ(result.published, 0u);
+    const auto terminal = device_run_result_terminal(result, kEpoch);
+    EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+    EXPECT_EQ(terminal.code, -1);
+    EXPECT_EQ(terminal.source, DeviceRunCodeSource::ThreadRc);
     EXPECT_EQ(aicpu_release_callables(), 0);
     configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
     EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));
@@ -323,3 +366,40 @@ TEST_F(ResidentEntryResult, FailedTopologyInitializationReturnsThroughTheActualA
 }
 
 }  // namespace
+
+TEST(HbgResidentEntryInitialization, ClearsCoordinationBeforeRuntimeInitialization) {
+    auto &executor = g_aicpu_executor;
+    executor.init_done_ = true;
+    executor.init_failed_ = true;
+    executor.hs_setup_done_ = true;
+    executor.hs_config_done_ = true;
+    executor.hs_bootstrap_done_ = true;
+    executor.shutdown_ready_ = true;
+    executor.thread_idx_ = 4;
+    executor.hs_thread_seq_ = 4;
+    executor.hs_arrived_ = 4;
+    executor.hs_release_arrived_ = 4;
+    executor.init_failure_arrived_ = 4;
+    executor.shutdown_signaled_ = 4;
+    executor.run_status_ = -1;
+    executor.normal_path_claims_ = 4;
+    executor.terminal_publisher_.take({DeviceRunVerdict::Ok, 0, DeviceRunCodeSource::None}, nullptr, 0);
+    aicpu_reset_execution_entry();
+    DeviceRunResultRegion result{};
+    EXPECT_TRUE(executor.terminal_publisher_.publish(reinterpret_cast<uint64_t>(&result), 7));
+    EXPECT_EQ(result.published, 7u);
+    EXPECT_FALSE(executor.init_done_.load());
+    EXPECT_FALSE(executor.init_failed_.load());
+    EXPECT_FALSE(executor.hs_setup_done_.load());
+    EXPECT_FALSE(executor.hs_config_done_.load());
+    EXPECT_FALSE(executor.hs_bootstrap_done_.load());
+    EXPECT_FALSE(executor.shutdown_ready_.load());
+    EXPECT_EQ(executor.thread_idx_.load(), 0);
+    EXPECT_EQ(executor.hs_thread_seq_.load(), 0);
+    EXPECT_EQ(executor.hs_arrived_.load(), 0);
+    EXPECT_EQ(executor.hs_release_arrived_.load(), 0);
+    EXPECT_EQ(executor.init_failure_arrived_.load(), 0);
+    EXPECT_EQ(executor.shutdown_signaled_.load(), 0);
+    EXPECT_EQ(executor.run_status_.load(), 0);
+    EXPECT_EQ(executor.normal_path_claims_.load(), 0);
+}

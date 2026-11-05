@@ -143,6 +143,28 @@ public:
         return first_error;
     }
 
+    // Fallible owner cleanup: keep every failed address and its host source
+    // for a later retry. Successful frees are never attempted twice.
+    template <class DeviceFree>
+    int release_preserving_failure(DeviceFree device_free) {
+        int first_error = 0;
+        for (void **allocation : {&device_allocation_, &failed_release_}) {
+            if (*allocation == nullptr) continue;
+            const int rc = device_free(*allocation);
+            if (rc == 0) {
+                *allocation = nullptr;
+            } else if (first_error == 0) {
+                first_error = rc;
+            }
+        }
+        if (device_allocation_ == nullptr) {
+            device_addr_ = nullptr;
+            device_capacity_ = 0;
+        }
+        if (first_error == 0) forget();
+        return first_error;
+    }
+
     /** Forget the pair without any device call, after a force reset. */
     void abandon() { forget(); }
 

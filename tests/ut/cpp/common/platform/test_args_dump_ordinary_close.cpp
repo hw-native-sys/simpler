@@ -30,6 +30,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "device_runner_base.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
@@ -63,7 +64,7 @@ constexpr uint64_t kRunEpoch = 8100;
 constexpr uint32_t kPublishedValue = 0x12345678;
 constexpr uint32_t kHeldValue = 0xABCDEF01;
 
-void *close_alloc(size_t size) { return std::calloc(1, size); }
+void *close_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int close_free(void *ptr) {
     std::free(ptr);

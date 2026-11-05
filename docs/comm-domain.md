@@ -367,7 +367,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; optional providers retain their build gates |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; RDMA retains its optional build gate |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -385,21 +385,24 @@ communication-domain property. Construct the Worker with `enable_sdma=True` and
 the runtime provisions the SDMA workspace once at init, latches its address into
 the resident `KernelArgs`, and injects it into every run's kernel
 `GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
-SDMA streams and its kernels read a zero workspace address. The workspace is
-released at Worker finalize by ordinary stream/manager teardown.
+SDMA streams and its kernels read a zero workspace address. The platform calls
+`SdmaWorkspaceManager::GetWorkspaceSize`, allocates device memory with
+`aclrtMalloc`, and binds it with `Init(workspaceAddr, workspaceSize)`. Ordinary
+Worker finalize destroys the manager's streams before freeing the allocation;
+fatal device teardown retains both with the abandoned provider.
 
 **`enable_sdma` is a defect quarantine, not a capability switch, and it has an
 exit condition.** Selecting an engine already belongs to the kernel, which reads
 whichever addresses were injected; the runtime would otherwise provision every
 engine the platform supports. SDMA is the exception because
-`SdmaWorkspaceManager::Init()` is indivisible — the 16 KB workspace *is* the
-descriptor table for 48 CP-process STARS streams, so there is no way to have the
-address without holding the streams — and a Worker holding those streams gets a
+`SdmaWorkspaceManager::Init(workspaceAddr, workspaceSize)` creates 48 CP-process
+STARS streams while binding the external workspace. A usable SDMA workspace
+therefore holds those streams, and a Worker holding them gets a
 single device-reset attempt instead of three after an AICore fault. Defaulting it
 on would therefore put every ordinary Worker in that population, which is exactly
 the regression [the investigation](investigations/2026-07-a2a3-sdma-fault-teardown.md)
 records. The flag disappears once CANN bounds the final CP-process stream release,
-or once pto-isa offers an `Init()` that separates the workspace from the streams.
+or once pto-isa supports binding a usable workspace without creating the streams.
 
 Provisioning also warms the SDMA control path once, in the same call: a
 vector-only AICore ELF (`sdma_warmup_kernel.o`, staged per arch under
@@ -434,9 +437,8 @@ its communication-context SDMA workspace only when a domain explicitly requests 
 this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
 
-On a5, `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON` and
-`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` compile optional providers independently;
-both still default to OFF. SDMA is always compiled. Compilation alone creates
+On a5, SDMA and URMA providers are always compiled. RDMA remains optional through
+`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`, defaulting to OFF. Compilation alone creates
 no streams or domain resources. `allocate_domain` and `get_or_allocate_domain`
 create synchronous mapped-window communication by default, without initializing
 any asynchronous provider. `workspace_engines=("sdma", "urma")` or `("rdma",)`
@@ -453,6 +455,34 @@ Each `CommContext` stores a POD array `workspaces`, indexed by
 whose template argument is checked at compile time. Host publication rejects
 out-of-range enum values before indexing. An absent backend has zero address
 and size.
+
+Before submitting a URMA task, obtain its context through the checked host API:
+
+```python
+args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
+```
+
+The required engines must have been selected when allocating that live domain.
+For a mixed task use `workspace_engines=("sdma", "urma")`. A missing or different
+engine, a released domain, an unknown worker or a null context raises before
+submission. Scalar-only context use also retains the domain for the current run.
+The engine set records successful native initialization; it is not inferred from
+an environment variable. Native allocation rejects a null URMA workspace address
+or zero size before publishing the context, and propagates initialization failures
+as host errors. Callers must treat handle/context metadata as read-only and obtain
+the checked context in every orchestration run rather than caching its raw address.
+
+URMA requests require A5 TMR L3 domains with ranks in dense prefix order. Simpler
+does not impose a two-rank minimum: single-rank requests reach the provider and
+initialization failures are reported on the host. The currently pinned PTO URMA
+manager rejects single-rank initialization. The successful
+[single-device CANN Hcomm loopback probe](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)
+uses two endpoints and has not been integrated into that provider; the provider
+restriction is not a hardware limitation. HBG URMA completion, arbitrary subsets
+and L4 async domains are unsupported.
+The legacy `device_ctx` field remains a raw address for synchronous consumers;
+it does not declare or validate an asynchronous engine requirement. No compiled
+capability query or `enable_urma` initialization switch is needed.
 
 The context is simpler's own 1088-byte host/device ABI. Rank metadata starts
 at offset zero; there is no legacy workspace pair or PTO-compatible prefix.
@@ -474,11 +504,37 @@ remain specific to `tensormap_and_ringbuffer`; workspace storage does not add
 completion backends to `host_build_graph`. Domain cleanup does not release another
 domain's workspace or the shared SDMA resource.
 
+Each A5 URMA domain owns an HCCL subcommunicator, including its registrations
+and channels. The L2 host process keeps that owner from the first initialization
+step through rollback or release. After the run fence, release checks every
+active queue's BB and CQE completion counters, waits for peer quiescence, destroys
+the domain communicator, and then releases its workspace and windows. A healthy
+domain is reclaimed without waiting for the base communicator or Worker to close.
+The additional communicator costs initialization time and HCCL resources per live
+domain; synchronous and SDMA-only domains do not create it.
+
+If any allocation participant fails before the domain is published, the parent
+joins the allocation requests and locally aborts every reported A2/A3 or A5 owner,
+including failed participants. Failed initialization keeps exported physical
+memory alive until peers finish importing; its ownership flag does not publish
+a usable domain. This rollback does not use a normal release collective.
+The A2/A3 Fabric-to-IPC fallback can discard its temporary Fabric window only
+before publishing the export; failed initialization after publication keeps the
+window owned until abort.
+Allocation IDs cannot be reused during an A5 communicator's lifetime. Used-ID
+bookkeeping remains until communicator close; device windows and communication
+resources do not. Python allocates fresh IDs automatically.
+
+On A5, an unconfirmed drain, handshake or communication destruction is reported as an
+error. The affected owner, its stream and device environment remain retained,
+new work is refused, and later close does not blindly retry uncertain handles.
+This is a terminal failure of that Worker, not successful resource reclamation.
+
 The workspace coverage is split by platform and execution layer:
 
 | Platform / layer | Supported behavior | Coverage |
 | ---------------- | ------------------ | -------- |
-| A5 host | SDMA plus optional URMA/RDMA providers in one build; RDMA uses a separate domain | All four provider combinations, domain isolation, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
+| A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
 | A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
 | A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
 | A2/A3 | Existing Worker-owned SDMA and `enable_sdma` behavior | Existing SDMA and single-card prefetch tests; domain allocation does not provision SDMA |

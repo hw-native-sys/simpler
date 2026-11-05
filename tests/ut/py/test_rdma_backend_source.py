@@ -75,16 +75,15 @@ def test_a5_host_cmake_keeps_optional_rdma_provider() -> None:
     cmake = HOST_CMAKE.read_text(encoding="utf-8")
 
     assert "option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in cmake
-    assert "set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)" in cmake
     assert "PTO RDMA workspace overlay requires pto-isa RDMA headers" in cmake
     assert "PTO_RDMA_SUPPORTED" in cmake
     assert "PTO_RDMA_BACKEND_HNS_1825_SUPPORTED" in cmake
 
 
-def test_a5_comm_hccl_keeps_urma_and_rdma_workspace_paths_macro_gated() -> None:
+def test_a5_comm_hccl_keeps_rdma_optional_and_urma_unconditional() -> None:
     source = HOST_COMM.read_text(encoding="utf-8")
 
-    assert "#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE" in source
+    assert "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in source
     assert "#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in source
     assert '#include "pto/comm/async/rdma/rdma_workspace_manager.hpp"' in source
     assert "std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace" in source
@@ -108,7 +107,8 @@ def test_a5_comm_hccl_uses_mr1374_rdma_host_api_shape() -> None:
     assert 's.find("\\"CLOS\\"", dev_key_pos)' in source
     assert "hccn_tool -g -dev_info -i %d" in source
     assert '\\"addr\\"' in source
-    assert "manager->Init(config)" in source
+    assert "RdmaWorkspaceManager::GetWorkspaceSize(rank_count, &workspace_size, config.qpNum)" in source
+    assert "manager->Init(config, workspace_addr, workspace_size)" in source
     assert "WorkspaceInitResult::READY" in source
     assert "RdmaBackend::HNS_1825" not in source
 

@@ -69,6 +69,55 @@ def kernel_close_faults(tmp_path_factory):
     return output
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="LD_PRELOAD interposition requires Linux")
+@pytest.mark.parametrize("delegated", [False, True])
+def test_close_fault_shim_tracks_owner_operations(kernel_close_faults, tmp_path, delegated):
+    """An ACL implementation may call the interposed RT entry internally."""
+    fake = tmp_path / "fake_rts.so"
+    subprocess.run(
+        [
+            "c++",
+            "-shared",
+            "-fPIC",
+            str(Path(__file__).with_name("support") / "kernel_close_fake_rts.cpp"),
+            "-o",
+            str(fake),
+        ],
+        check=True,
+    )
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = f"{kernel_close_faults}:{fake}"
+    entry = "aclrtResetDevice" if delegated else "rtDeviceReset"
+    code = f"""
+import ctypes
+lib = ctypes.CDLL(None)
+lib.arm_acl_guard()
+assert lib.rtDeviceReset(0) == -4322
+assert lib.acl_call_count(5) == 1
+lib.disarm_acl_guard()
+assert lib.rtDeviceReset(0) == 0
+assert lib.acl_call_count(5) == 1
+lib.arm_reset_failures(1)
+assert lib.{entry}(0) == -4321
+assert lib.reset_call_count() == 1
+assert lib.{entry}(0) == 0
+assert lib.reset_call_count() == 2, lib.reset_call_count()
+lib.rtFree.argtypes = [ctypes.c_void_p]
+lib.arm_destroy_failure_after(4, 0)
+assert lib.rtFree(0x1000) == -4321
+assert lib.failed_free_retry_attempts() == 1
+assert lib.failed_free_retry_successes() == 0
+assert lib.rtFree(0x2000) == 0
+assert lib.failed_free_retry_attempts() == 1
+assert lib.failed_free_retry_successes() == 0
+assert lib.rtFree(0x1000) == 0
+assert lib.failed_free_retry_attempts() == 2
+assert lib.failed_free_retry_successes() == 1
+"""
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.fixture(scope="module")
 def prepare_release_faults(tmp_path_factory):
     output = tmp_path_factory.mktemp("prepare-release-faults") / "faults.so"
@@ -94,7 +143,7 @@ def prepare_release_faults(tmp_path_factory):
         "init_failure",
         "stream_close",
         "event_close",
-        "persistent_free_close",
+        "owned_free_close",
         "destroy_unclosed",
         "prepare",
         "fatal_device",
@@ -375,19 +424,22 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
         elif scenario == "prepare":
             _check_prepare_reuse(lib, ctx, arch, runtime)
             finalized = True
-        elif scenario == "persistent_free_close":
+        elif scenario == "owned_free_close":
             _check_prepare_reuse(lib, ctx, arch, runtime, close=False)
-            # The first rtFree releases the callable upload. Fail the next
-            # call, which is owned by PersistentKernelArgs, to cover the exact
-            # owner -> finalize_common -> allocator retry chain.
+            # Inject a device-free failure, then follow that exact address.
+            # Other resources can remain to be released after the first close
+            # stops; their frees must not be confused with this owner's retry.
             faults.arm_destroy_failure_after(4, 1)
-            # The allocator path may translate an injected RTS status, but it
-            # must never report success or forget the allocation before retry.
             assert lib.finalize_device(ctx) != 0
-            first_attempts = faults.destroy_attempts()
-            assert first_attempts > 0
+            assert faults.failed_free_retry_attempts() == 1
+            assert faults.failed_free_retry_successes() == 0
+            assert lib.committed_device_memory_ctx(ctx) > 0
             assert lib.finalize_device(ctx) == 0
-            assert faults.destroy_attempts() == first_attempts + 1
+            assert faults.failed_free_retry_attempts() == 2
+            assert faults.failed_free_retry_successes() == 1
+            assert lib.committed_device_memory_ctx(ctx) == 0
+            assert lib.finalize_device(ctx) == 0
+            assert faults.failed_free_retry_attempts() == 2
             finalized = True
         elif scenario in ("repeat_init", "init_failure"):
             assert lib.simpler_kernel_mode_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
@@ -415,6 +467,18 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             "rtDeviceReset",
         )
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
+        # The runtime has finished without resetting its borrowed device. The
+        # test caller now releases the primary context it created above.
+        faults.disarm_acl_guard()
+        if scenario != "fatal_device":
+            _reset_caller_device(lib, device)
+
+
+def _reset_caller_device(lib, device):
+    lib.rtDeviceReset.argtypes = [ctypes.c_int]
+    lib.rtDeviceReset.restype = ctypes.c_int
+    rc = lib.rtDeviceReset(device)
+    assert rc == 0, f"caller rtDeviceReset({device}) failed with {rc}"
 
 
 def _prepared_callable_image(arch, runtime, *, signature=(), function="kernel_prepare_orchestration") -> bytes:
@@ -498,6 +562,25 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
         assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
     finally:
         lib.destroy_device_context(ctx)
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_simulated_capture_retention_is_unsupported(arch: str, runtime: str):
+    lib = _load(arch, "sim", runtime)
+    lib.simpler_retain_run_resources.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.simpler_retain_run_resources.restype = ctypes.c_int
+    lib.simpler_release_run_resources.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.simpler_release_run_resources.restype = ctypes.c_int
+    reference = ctypes.c_void_p(1)
+    assert lib.simpler_retain_run_resources(None, None, None, ctypes.byref(reference)) == PTO_RUNTIME_ERR_UNSUPPORTED
+    assert reference.value is None
+    assert lib.simpler_retain_run_resources(None, None, None, None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    assert lib.simpler_release_run_resources(None, None) == PTO_RUNTIME_ERR_UNSUPPORTED
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -973,6 +1056,10 @@ def _run_program_callable_release(arch, runtime, device):
         # A failed teardown leaves an Unproven context. Clearing the callable
         # bookkeeping does not authorize reinitializing that handle.
         assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
+        # The injected free failure is one-shot. Complete the outstanding
+        # cleanup/reset explicitly instead of relying on process-exit cleanup
+        # to make the device available to the next test process.
+        assert lib.finalize_device(ctx) == 0
     finally:
         lib.destroy_device_context(ctx)
 
@@ -1039,13 +1126,11 @@ def _run_loader_unload_retry(arch, runtime, device, scenario):
             assert lib.committed_device_memory_ctx(ctx) == 0
     finally:
         lib.destroy_device_context(ctx)
+        _reset_caller_device(lib, device)
 
 
 def _run_program_loader_unload(arch, runtime, device):
-    """A program close that resets its device ends the generation a retained
-    binary handle belongs to, so the retention must not outlive the reset: the
-    failure is reported and the handle is retired. The Unproven context
-    refuses reinitialization; destruction must not unload the stale handle."""
+    """An ordinary unload failure retains its owner until a close retry succeeds."""
     lib = _load(arch, "onboard", runtime)
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
@@ -1075,35 +1160,26 @@ def _run_program_loader_unload(arch, runtime, device):
     try:
         assert lib.simpler_init(*init_args) == 0
         faults.arm_unload_failures(1)
-        # The failure is reported out of close on the program path too — it just
-        # does not hold the context, because the reset below invalidates the
-        # handle rather than leaving it retryable.
         assert lib.finalize_device(ctx) != 0
         assert faults.unload_call_count() == 1
-        # The failed teardown leaves this handle Unproven, even though reset
-        # retired the loader. It cannot start another lifecycle.
         assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
         assert faults.unload_call_count() == 1
-        after_close = faults.unload_call_count()
+        # Destruction retries the retained loader while its device is still live.
         lib.destroy_device_context(ctx)
         destroyed = True
-        # Nothing is left for `~LoadAicpuOp` to unload.
-        assert faults.unload_call_count() == after_close
+        assert faults.unload_call_count() == 2
     finally:
         if not destroyed:
             lib.destroy_device_context(ctx)
 
 
 def _run_program_loader_double_failure(arch, runtime, device, use_acl):
-    """When a program close's unload *and* its device reset both fail, the
-    retained handle has no reachable retry — `device_id_` is cleared and the
-    next close returns early. It is therefore abandoned at that point, so
-    nothing issues an unreported unload against a device whose reset never
-    completed, and the context is still reusable.
+    """Unload and reset failures retain distinct, reachable close obligations.
 
-    Covers the two soft-reset arms. `aclrtResetDeviceForce` is deliberately not
-    injectable here: it belongs to the fatal branch, which this change does not
-    touch and which has its own abandonment already."""
+    An unload retry must succeed before reset is attempted. A failed reset
+    keeps the device identity and ACL ownership for the next close, without
+    retrying an already unloaded binary.
+    """
     lib = _load(arch, "onboard", runtime)
     lib.ensure_acl_ready_ctx.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.ensure_acl_ready_ctx.restype = ctypes.c_int
@@ -1144,20 +1220,23 @@ def _run_program_loader_double_failure(arch, runtime, device, use_acl):
         faults.arm_reset_failures(1)
         assert lib.finalize_device(ctx) != 0
         assert faults.unload_call_count() == 1
-        assert faults.reset_call_count() >= 1
-        # `device_id_` is cleared regardless of the reset's result, so this
-        # close is the last one that could reach anything. It reports the
-        # failure; the next is idempotent over a context that owns nothing.
-        assert lib.finalize_device(ctx) == 0
-        assert faults.unload_call_count() == 1
-        # A repeat no-op finalize does not turn an unproven reset into proof.
+        assert faults.reset_call_count() == 0
         assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
-        assert faults.unload_call_count() == 1
+        # The second close unloads successfully, then reports the injected reset failure.
+        assert lib.finalize_device(ctx) != 0
+        assert faults.unload_call_count() == 2
+        assert faults.reset_call_count() == 1
+        assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
+        # The third close retries only the outstanding reset.
+        assert lib.finalize_device(ctx) == 0
+        assert faults.unload_call_count() == 2
+        assert faults.reset_call_count() == 2
+        assert lib.finalize_device(ctx) == 0
+        assert faults.reset_call_count() == 2
         lib.destroy_device_context(ctx)
         destroyed = True
-        # Destruction must not retry the abandoned loader against a device
-        # whose reset was never confirmed.
-        assert faults.unload_call_count() == 1
+        assert faults.unload_call_count() == 2
+        assert faults.reset_call_count() == 2
     finally:
         if not destroyed:
             lib.destroy_device_context(ctx)
@@ -1186,9 +1265,7 @@ def test_loader_unload_failure_keeps_a_retryable_owner(arch, runtime, scenario, 
 
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_program_loader_unload_failure_does_not_outlive_its_device(arch, runtime, kernel_close_faults, request):
-    """The same retention on a program context must not survive that context's
-    device reset: the failure is reported, the stale handle is retired, and
-    the unproven context refuses reinitialization."""
+    """The retained binary is unloaded before its owning device is reset."""
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
@@ -1200,9 +1277,6 @@ def test_program_loader_unload_failure_does_not_outlive_its_device(arch, runtime
         text=True,
         timeout=180,
     )
-    # The discriminators are the unload count and refusal to reinitialize an
-    # unproven context; the retirement itself logs at WARN,
-    # which the test log threshold does not admit.
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -1232,10 +1306,8 @@ def test_program_callable_release_failure_leaves_no_stale_record(arch, runtime, 
 
 @pytest.mark.parametrize("reset_arm", ["rt", "acl"])
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
-def test_program_loader_double_failure_leaves_nothing_to_unload(arch, runtime, reset_arm, kernel_close_faults, request):
-    """A program close whose unload and device reset both fail must not leave a
-    retryable-looking handle behind: there is no reachable retry once
-    `device_id_` is cleared, so the destructor must issue no further unload."""
+def test_program_loader_and_reset_failures_remain_retryable(arch, runtime, reset_arm, kernel_close_faults, request):
+    """Each failed close stage stays retryable without repeating completed stages."""
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
@@ -1274,6 +1346,7 @@ class NativeRunDescriptor(ctypes.Structure):
         ("accepted_value", ctypes.c_int32),
         ("joinable_boundary", ctypes.c_uint32),
         ("provenance", NativeRunProvenance),
+        ("prepare_purpose", ctypes.c_uint32),
     ]
 
 

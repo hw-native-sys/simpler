@@ -48,6 +48,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 #include "common/launch_entry_args.h"
 
@@ -69,7 +70,10 @@ struct PlatformEntryArgs {
     uint32_t graph_offset{0};
     uint32_t graph_bytes{0};
     uint32_t graph_source{static_cast<uint32_t>(GraphSectionSource::None)};
+    uint32_t cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
 };
+static_assert(offsetof(PlatformEntryArgs, cache_maintenance) == 36);
+static_assert(sizeof(PlatformEntryArgs) == 40);
 
 /**
  * Publish this thread's view, after the affinity gate has kept it.
