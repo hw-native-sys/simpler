@@ -43,6 +43,7 @@ TEST(EntryCacheQualificationTest, ValidEpochsRequireMatchingObservationAndConsum
         receipt.observe_success(epoch == 1 ? 2 : epoch - 1);
         EXPECT_FALSE(receipt.eligible());
         receipt.observe_success(epoch);
+        EXPECT_TRUE(receipt.eligible());
         EXPECT_TRUE(receipt.consume());
         EXPECT_FALSE(receipt.consume());
         receipt.observe_success(epoch);
