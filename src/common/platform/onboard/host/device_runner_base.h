@@ -267,14 +267,19 @@ public:
 
     /**
      * Reserve caller-owned native-run storage before binding starts. A
-     * concurrent reservation is admitted only while the first reservation
-     * owns the execution claim and selects a distinct pipeline slot. A backend
+     * concurrent eager reservation requires the earlier reservations to own
+     * execution claims. Completed cold capture preparations may coexist in distinct
+     * granted slots; their retained owners protect backing before any bind
+     * replaces it. This does not grant concurrent execution. A backend
      * that shares an arena bank must reject or defer incompatible preparation
      * before mutating that bank.
      */
     bool try_reserve_native_run(
-        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
+        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
+        bool capture_preparation = false
     );
+    /** Publish preparation only after its backing owner and resource plan are complete. */
+    void mark_native_run_prepared(const void *owner);
     void release_native_run_reservation(const void *owner);
     void release_native_run_observation(const void *owner);
     bool owns_native_run_observation(const void *owner) const;
@@ -2928,11 +2933,14 @@ protected:
     // Written on the bind path, read by the caller's thread.
     std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
     std::atomic<size_t> scheduler_mode_publish_total_{0};
+    enum class NativeRunPreparationState { Preparing, Prepared };
     struct NativeRunReservation {
         const void *owner{nullptr};
         uint32_t pipeline_slot{0};
         uint32_t arena_bank{0};
         bool permits_prepared_successor{false};
+        bool capture_preparation{false};
+        NativeRunPreparationState preparation_state{NativeRunPreparationState::Preparing};
     };
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;

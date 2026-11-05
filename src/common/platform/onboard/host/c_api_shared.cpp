@@ -1829,7 +1829,8 @@ int simpler_prepare_run(
         );
         const bool allow_prepared_successor = concurrent_native_prepare_supported_impl() != 0;
         if (!runner->try_reserve_native_run(
-                state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor
+                state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor,
+                state->descriptor.prepare_purpose == SIMPLER_PREPARE_CAPTURE
             )) {
             LOG_ERROR("simpler_prepare_run: native-run admission is occupied (%s)", state->trace_attrs);
             state->runner->release_native_run_observation(state);
@@ -2037,6 +2038,7 @@ int simpler_prepare_run(
         // allocated. The grower's permission goes back here, after the last
         // request this prepare can make.
         runner->note_run_resources_proven(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+        runner->mark_native_run_prepared(state);
         return 0;
     } catch (...) {
         if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);

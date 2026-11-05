@@ -118,6 +118,7 @@ extern "C" void arm_acl_guard() {
     forbidden_calls.fill(0);
     guard_acl = true;
 }
+extern "C" void disarm_acl_guard() { guard_acl = false; }
 extern "C" int acl_call_count(int index) { return forbidden_calls.at(index); }
 extern "C" void arm_fatal_drain() {
     fake_device_drain = true;
