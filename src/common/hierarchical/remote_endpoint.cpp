@@ -1030,6 +1030,9 @@ std::vector<uint8_t> MpiGroupMailboxChannel::exchange_group_task(
     std::unique_lock<std::mutex> lock(group_mu_);
     while (!group_done_) {
         if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            // Completion may be published before this waiter reacquires the mutex,
+            // even when the deadline has elapsed. Consume that result below.
+            if (group_done_) break;
             if (!group_leader_running_) {
                 // No leader formed: withdraw this rank's frame so a later,
                 // correctly-targeted batch starts from a clean slate.

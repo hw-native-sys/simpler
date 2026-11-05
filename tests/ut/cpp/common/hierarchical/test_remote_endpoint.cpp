@@ -1123,6 +1123,40 @@ TEST(MpiGroupMailboxChannel, GroupArrivalTimeoutFailsTaskWithoutKillingGroup) {
     EXPECT_EQ(reply1, std::vector<uint8_t>({0xB1}));
 }
 
+TEST(MpiGroupMailboxChannel, GroupFailureReachesEveryRankAndAllowsNextBatch) {
+    using namespace mpi_group_mailbox;
+    auto mailbox = ready_mpi_mailbox(2);
+    MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 2, -1, 2.0);
+    auto rank0 = std::async(std::launch::async, [&]() {
+        return channel.exchange_group_task({0x10}, 0, 11, 2);
+    });
+    auto rank1 = std::async(std::launch::async, [&]() {
+        return channel.exchange_group_task({0x20}, 1, 11, 2);
+    });
+    while (mailbox_state(mailbox, OFF_REQUEST_STATE) != static_cast<int32_t>(RequestState::REQUEST_READY)) {}
+    set_mailbox_state(mailbox, OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::TASK_FAILED));
+    for (auto *rank : {&rank0, &rank1}) {
+        try {
+            (void)rank->get();
+            ADD_FAILURE() << "the failed batch must reach every rank";
+        } catch (const std::runtime_error &error) {
+            EXPECT_STREQ(error.what(), "MpiGroupMailboxChannel: MPI group request failed");
+        }
+    }
+    EXPECT_FALSE(channel.terminal());
+    EXPECT_EQ(mailbox_state(mailbox, OFF_REQUEST_STATE), static_cast<int32_t>(RequestState::IDLE));
+
+    rank0 = std::async(std::launch::async, [&]() {
+        return channel.exchange_group_task({0x11}, 0, 12, 2);
+    });
+    rank1 = std::async(std::launch::async, [&]() {
+        return channel.exchange_group_task({0x21}, 1, 12, 2);
+    });
+    respond_with_payloads(mailbox, {{0xB0}, {0xB1}});
+    EXPECT_EQ(rank0.get(), std::vector<uint8_t>({0xB0}));
+    EXPECT_EQ(rank1.get(), std::vector<uint8_t>({0xB1}));
+}
+
 TEST(MpiGroupMailboxTransport, GroupProgressSubmitAndPollRoundTrip) {
     using namespace mpi_group_mailbox;
     auto mailbox = ready_mpi_mailbox(2);
