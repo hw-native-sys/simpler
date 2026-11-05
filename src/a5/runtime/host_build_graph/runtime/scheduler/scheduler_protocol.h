@@ -350,7 +350,7 @@ scheduler_protocol_member_observed(__gm__ void *base, const Local *local, const 
 template <typename Local, typename Admission>
 inline __aicore__ void scheduler_protocol_member_closed(
     __gm__ void *base, const Local *local, const Admission *admission, uint64_t cursor, uint64_t seal,
-    uint64_t last_group_seq
+    uint64_t last_group_seq, bool used_claim_seal = false
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -366,6 +366,8 @@ inline __aicore__ void scheduler_protocol_member_closed(
     member->closed_cursor = cursor;
     member->close_seal = seal;
     member->last_group_seq = last_group_seq;
+    member->claim_seal_seen = used_claim_seal ? cursor : 0;
+    member->claim_cursor_seen = used_claim_seal ? cursor : 0;
     member->pending_mask = 0;
     for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
         const auto &slot = local->slots[index];

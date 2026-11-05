@@ -254,7 +254,8 @@ task control、queue、predicate 取值和 Tensor 数据不进入该状态，参
 
 普通 `deps.json` 的外层 Graph task 不能替代内部 kernel DAG。使用
 `simpler_setup.tools.hbg.native_graph.export_kernel_dependencies(section, executed_task_ids)`
-从已通过协议审计的 v6 来源构造实际执行 kernel 的依赖；该函数独立复审原始来源与 node map，
+从已通过协议审计的原生 Graph v9 或历史 Graph v6 来源构造实际执行 kernel 的依赖；
+该函数独立复审原始来源与 node map，
 穿透 ENTER/EXIT/DUMMY、Host service 和未执行的 predicate，并保留所有 root/sink 的前驱关系。
 未知 execution identity、缺失的非 predicate kernel 和不一致的原始边必须拒绝。
 该投影对应一次实际 predicate 结果；复用到另一 capture 前必须核对 callable、输入以及逐 task/block 执行集合。

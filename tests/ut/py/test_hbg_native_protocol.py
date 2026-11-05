@@ -149,6 +149,37 @@ def test_legacy_protocol_does_not_silently_accept_v5_claim_lock(version):
         read_native_protocol(raw)
 
 
+@pytest.mark.parametrize("stride", (None, 0, 8, 64, 127, 129, 256, True, 128.0, "128", -1, 1 << 64))
+@pytest.mark.parametrize("version", (7, 8))
+def test_isolated_close_versions_require_typed_exact_stride_even_without_mix(stride, version):
+    raw = capture()
+    raw.update(schema=f"hbg-native-protocol-v{version}", close_seal_stride=128)
+    raw["task_controls"][0].update(claim_tickets=0, admission_claim_lock=0, claim_seal=0)
+    assert read_native_protocol(raw) == raw
+    if stride is None:
+        del raw["close_seal_stride"]
+    else:
+        raw["close_seal_stride"] = stride
+    with pytest.raises(ValueError, match="close_seal_stride|missing or unknown fields"):
+        read_native_protocol(raw)
+
+
+@pytest.mark.parametrize("version", (1, 2, 3, 4, 5, 6))
+def test_old_production_schemas_cannot_silently_accept_v7_stride(version):
+    raw = capture()
+    raw["schema"] = f"hbg-native-protocol-v{version}"
+    if version > 1:
+        raw["task_controls"][0]["claim_tickets"] = 0
+    if version >= 5:
+        raw["task_controls"][0]["admission_claim_lock"] = 0
+    if version == 6:
+        raw["task_controls"][0]["claim_seal"] = 0
+    assert read_native_protocol(raw) == raw
+    raw["close_seal_stride"] = 128
+    with pytest.raises(ValueError, match="unknown fields"):
+        read_native_protocol(raw)
+
+
 @pytest.mark.parametrize("field", tuple(capture()))
 def test_every_root_field_is_required(field):
     raw = capture()

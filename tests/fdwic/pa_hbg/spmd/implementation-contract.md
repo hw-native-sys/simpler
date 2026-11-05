@@ -38,7 +38,7 @@ a fixed upper bound on discovery latency.
 
 | Path | Ownership operation | Closure requirement |
 | ---- | ------------------- | ------------------- |
-| Ordinary N>1 | FAA on `claim_tickets`; t<N owns block t and confirms a valid claim in `next_block` | Strongly confirm `next_block == N`, then retire all local obligations |
+| Ordinary N>1 | FAA on `claim_tickets`; t<N owns block t and confirms a valid claim in `next_block` | Confirm exhaustion atomically or through the final claimant's certificate, then retire local obligations |
 | N=1 or `sync_start` | Bounded CAS on `next_block` | No outstanding local execution/publication/resource work |
 | `sync_start` member | At most one successful claim at a distinct execution position | A claimant may close after retirement; an unclaimed member waits for exhaustion |
 | Mix AIV | Consumes its AIC's published descriptor, never independently claims a block | Observes and consumes its task/cluster close seal |
@@ -51,6 +51,12 @@ exhaustion alone is insufficient: the last valid claimant may not yet have
 confirmed `next_block`. No claim can be transferred to a worker that passed the
 task. Preparation failure fails the run instead of reissuing the owned block.
 
+Only the final valid claimant publishes `claim_seal=N`. The certificate occupies
+an isolated atomic-only region and is published with atomic exchange. A positive
+bypass hint is confirmed atomically before it can authorize closure; a missing
+certificate retains the original strong cursor-read path. Reservation tickets
+that overshoot N cannot publish this certificate.
+
 `LocalContext.block_num` remains the original N; `block_idx` is the owned index.
 Tensor pointers are not adjusted a second time. Pure C/V retains at most two
 unretired claims per worker and one executing kernel. A `sync_claimed` bit
@@ -59,15 +65,22 @@ survives early return until that obligation closes, preventing a second claim.
 ## Mix group lifecycle
 
 ```text
-claim block -> publish descriptor/sequence -> all three resource lanes arrive
+claim block -> publish descriptor/sequence -> all required resource lanes arrive
             -> active lanes prepare and execute -> each lane releases
             -> AIC aggregates one block completion -> mailbox reusable
 ```
 
 One cluster has one in-flight group. The descriptor binds task, order, block,
 epoch, cluster, group sequence and fixed slot-to-lane placement. Each lane owns
-its acknowledgment region. ARRIVED, kernel return and RELEASED are distinct;
-inactive lanes release resources without inventing a kernel execution.
+its acknowledgment region. ARRIVED, kernel return and RELEASED are distinct.
+The resource mask is `active_mask | AIC`. A 1C1V group coordinates two lanes;
+1C2V and 2V coordinate three, including the AIC coordinator. Unused AIV lanes do
+not acquire this group's resource obligation. All workers still participate in
+run bootstrap and shutdown.
+
+Each AIV observes its own assignment sequence. The descriptor records the
+previous group that used each lane, so skipping an unrelated two-lane group
+does not manufacture a missing arrival or permit reuse of a live descriptor.
 
 The AIC waits for all required releases before replacing the descriptor. After
 it can claim no more work and its groups have retired, it publishes the task's
@@ -113,6 +126,7 @@ separate; an observed control word does not automatically acquire its payload.
 | Admission record and bitmap | Owner prepares and publishes cache lines before phase/log/tail; reader invalidates and validates after observing publication |
 | Mix descriptor | AIC publishes cached payload before atomic sequence; receiver confirms sequence atomically, invalidates payload and checks identity |
 | Mix arrival/release and close seal | Atomic generation-bearing publication and critical confirmation |
+| Claim certificate | Final valid claimant publishes by atomic exchange in an isolated region; positive hints require atomic confirmation |
 | First-error status | Isolated bypass signal after identity publication; AICPU writer additionally follows its identity/status writeback contract |
 
 Bypass signal lines have one active writer, complete publication before ownership
@@ -127,11 +141,11 @@ images, not Host pointers. Important layout contracts have C++ static assertions
 
 | Object | Retained layout |
 | ------ | --------------- |
-| TaskControl | 512 bytes; valid claims at 128, completed blocks at 256, admission signal at 384, each isolated by 128 bytes |
+| TaskControl | 640 bytes; valid claims at 128, completed blocks at 256, admission signal at 384 and atomic claim certificate at 512 |
 | Admission control | Lock and tail on separate 128-byte regions |
 | Admission record | 64-byte header plus worker bitmap; stride rounded to 128 bytes |
 | Group mailbox | 640 bytes: descriptor, sequence and three independent lane regions |
-| Close seals | 8 bytes per Mix task per candidate cluster, retained until run teardown |
+| Close seals | One 128-byte atomic-only cell per Mix task per candidate cluster, retained until run teardown |
 | RunControl | 512 bytes; extended identity uses reserved bytes 336-383, error signal begins at 384 |
 
 Topology facts may be cached until run reinitialization. A negative ready probe
@@ -140,6 +154,12 @@ queues were checked and no pending/candidate/local READY work exists. It grants
 neither ownership nor entry permission, does not cache emptiness across turns,
 and does not hide invalid scheduler metadata or delay obligation servicing.
 
+AICPU discovery validates compact worker identities and complete clusters before
+READY publishes an immutable topology marker. Workers use that proof to build
+their private membership cache; general layouts retain the checked scan. Static
+configuration validation is reusable only inside one bounded service call.
+Error, epoch, phase, slot and task identity checks remain live.
+
 ## Native evidence and compatibility
 
 Execution trace indices include block and active subtask rank. Kernel entry
@@ -147,16 +167,21 @@ captures identity from the actual payload; Host export preserves independent
 `hbg-execution-identity-v1` records. Predicate skips use `executed=false`.
 Compact worker IDs in swimlanes are not physical core IDs in topology records.
 
-L4 additionally exports `hbg-native-protocol-v5`: frozen graph/members, admission,
+L4 additionally exports `hbg-native-protocol-v8`: frozen graph/members, admission,
 claims, entry permits, LocalDone, group publication/release, completion and terminal
 state. Readers in `simpler_setup/tools/hbg/` check per-worker sequences, exact
 execution joins, ownership and causal edges from observed values and atomic
 tickets. Cross-core timestamps are not a total-order proof.
 
-Versions v1-v4 remain strictly readable. Ticket thresholds are N>2P in v2,
-N>=2P in v3 and N>1 in v4/v5; N1/sync_start never use tickets. v5 also requires
-the raw admission claim lock, zero at successful termination. Missing fields
+Versions v1-v7 remain strictly readable. Ticket thresholds are N>2P in v2,
+N>=2P in v3 and N>1 from v4 onward; N1/sync_start never use tickets. v5 requires
+the raw admission claim lock, zero at successful termination. v6 adds claim
+certificates, v7 requires the 128-byte close-seal stride, and v8 records scoped
+Mix membership and per-lane predecessor sequences. Missing fields
 are not synthesized, and old captures without protocol objects remain unverified.
+Native Graph captures use v9 with the same resource and claim contracts plus
+`node_map` and `graph_source`. Legacy Graph v6 is identified by those source tables
+and validated separately from the ordinary v6 claim-certificate format.
 The strict CSA gate additionally matches independent dep-gen, original kernels,
 block counts, all fan-in and the full task/block/slot set. Truncated/missing
 evidence fails the gate even when golden values match. Failed runs require their

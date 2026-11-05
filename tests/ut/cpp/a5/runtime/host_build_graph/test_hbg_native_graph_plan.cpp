@@ -996,16 +996,18 @@ TEST(HbgNativeGraphPlan, BootstrapBindsBlockedChildAndRefreshesReusedArgumentBac
 }
 
 namespace {
-DefinitionFixture cooperative_argument_definition(bool mix) {
+DefinitionFixture cooperative_argument_definition(bool mix, LaneMask mix_mask = LaneMask::all()) {
     auto body = argument_definition(false);
     SubTaskDefinition task{};
     std::memcpy(&task, body.bytes.data() + body.header.off_sub_tasks, sizeof(task));
     task.logical_block_num = 2;
     task.total_required_subtasks = mix ? 6 : 2;
     if (mix) {
-        task.active_mask = LaneMask::all();
-        task.kernel_id[1] = 1;
-        task.kernel_id[2] = 2;
+        task.active_mask = mix_mask;
+        task.total_required_subtasks = 2 * mix_mask.count();
+        task.kernel_id[0] = mix_mask.has_aic() ? 0 : -1;
+        task.kernel_id[1] = mix_mask.has_aiv0() ? 1 : -1;
+        task.kernel_id[2] = mix_mask.has_aiv1() ? 2 : -1;
     }
     body.put(body.header.off_sub_tasks, 0, task);
     return body;
@@ -1015,8 +1017,8 @@ struct NativeAdmissionFixture : NativeViewFixture {
     std::array<SchedulerAdmissionLocalState, 3> admissions;
     BoundArgumentsFixture bound;
     SchedulerRunControl *run;
-    explicit NativeAdmissionFixture(bool mix) :
-        NativeViewFixture(cooperative_argument_definition(mix), {0}, true),
+    explicit NativeAdmissionFixture(bool mix, LaneMask mix_mask = LaneMask::all()) :
+        NativeViewFixture(cooperative_argument_definition(mix, mix_mask), {0}, true),
         bound(*this, 0) {
         run = static_cast<SchedulerRunControl *>(backing.get());
         run->expected_task_count = graph.task_count;
@@ -1025,6 +1027,8 @@ struct NativeAdmissionFixture : NativeViewFixture {
             contexts[worker].worker_index = worker;
             contexts[worker].core_type = static_cast<int32_t>(worker == 0 ? CoreType::AIC : CoreType::AIV);
             contexts[worker].cluster_index = 0;
+            for (uint32_t lane = 0; lane < 3; ++lane)
+                contexts[worker].cluster_worker_ids[lane] = lane;
             auto &config = locals[worker].config;
             config.graph = &graph;
             config.shared_context = contexts + worker;
@@ -1116,4 +1120,37 @@ TEST(HbgNativeGraphPlan, BootstrapBindingFailureCannotClaimOrPublishAdmission) {
     EXPECT_EQ(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED));
     EXPECT_EQ(view.control()->commit_tail, 0);
     EXPECT_EQ(view.control()->commit_lock, 0);
+}
+
+TEST(HbgNativeGraphPlan, NativeMixAdmissionIncludesOnlyActiveLanesAndCoordinator) {
+    for (const auto mask : {LaneMask{true, true, false}, LaneMask{true, false, true}, LaneMask::both_aiv()}) {
+        NativeAdmissionFixture view(true, mask);
+        auto *base = view.backing.get();
+        auto *local = &view.locals[0];
+        auto *admission = &view.admissions[0];
+        ASSERT_TRUE(scheduler_bootstrap_bind_arguments(view.graph, view.child(), local, view.run));
+        view.run->bootstrap_scan_complete = 1;
+        SchedulerReadyClaim candidate{};
+        candidate.task_ref = view.child();
+        ASSERT_EQ(
+            scheduler_try_claim_admission(view.graph, base, local, view.run, admission, candidate),
+            SchedulerAdmissionResult::PROGRESS
+        );
+        ASSERT_TRUE(scheduler_prepare_admission_record(view.graph, base, local, view.run, admission));
+        ASSERT_EQ(
+            scheduler_try_commit_admission(view.graph, base, local, view.run, admission),
+            SchedulerAdmissionResult::PROGRESS
+        );
+        const auto *record = scheduler_admission_record_at(base, admission, view.child());
+        EXPECT_EQ(record->member_count, mask.has_aic() ? 2u : 3u);
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            ASSERT_TRUE(scheduler_refresh_local_obligation(
+                view.graph, base, &view.locals[worker], view.run, &view.admissions[worker]
+            ));
+            const bool participates = worker == 0 || mask.has(static_cast<SubtaskSlot>(worker));
+            EXPECT_EQ(
+                view.admissions[worker].current_task_ref, participates ? view.child() : SCHEDULER_TASK_REF_INVALID
+            );
+        }
+    }
 }

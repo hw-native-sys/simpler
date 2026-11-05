@@ -210,6 +210,22 @@ inline void block_owner(JsonObject &parent, const SchedulerProtocolBlockOwner &r
     row.numbers("released_seq", record.released_seq, 3);
 }
 
+inline void claim_certificate(JsonObject &parent, const SchedulerProtocolClaimTrace &record) {
+    auto &out = parent.field("claim");
+    if (!populated(record)) {
+        out << "null";
+        return;
+    }
+    JsonObject row(out);
+    row.stamp("published_before", record.published_before);
+    row.stamp("published_after", record.published_after);
+    row.number("confirmed_count", record.confirmed_count);
+    row.number("seal_value", record.seal_value);
+    row.number("worker_index", record.worker_index);
+    row.number("block_idx", record.block_idx);
+    row.number("run_epoch", record.run_epoch);
+}
+
 inline void lane(JsonObject &row, const SchedulerProtocolLaneTrace &record) {
     row.stamp("descriptor_ready", record.descriptor_ready);
     row.stamp("arrive_before", record.arrive_before);
@@ -231,6 +247,7 @@ inline void lane(JsonObject &row, const SchedulerProtocolLaneTrace &record) {
     row.lane_mask("resource_mask", record.resource_mask);
     row.numbers("arrived_seq", record.arrived_seq, 3);
     row.numbers("lane_subtasks", record.lane_subtasks, 3);
+    row.numbers("previous_lane_seq", record.previous_lane_seq, 3);
 }
 
 inline void execution(JsonObject &row, const SchedulerProtocolExecutionTrace &record) {
@@ -303,15 +320,19 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
         const auto &record = *image.array<SchedulerAdmissionRecord>(offset, 1);
         if (record.member_words_offset != offset + sizeof(SchedulerAdmissionRecord))
             throw std::invalid_argument("protocol member bitmap outside its task record");
-        const uint64_t *seals = nullptr;
+        std::vector<uint64_t> seals;
         if (record.mix_close_seals_offset != 0) {
             const uint64_t first = layout.mix_close_seals_offset;
-            const uint64_t stride = layout.spmd.cluster_count * sizeof(uint64_t);
+            const uint64_t stride = layout.spmd.cluster_count * sizeof(SchedulerMixCloseSeal);
             if (stride == 0 || record.mix_close_seals_offset < first ||
                 (record.mix_close_seals_offset - first) % stride != 0 ||
                 (record.mix_close_seals_offset - first) / stride >= layout.spmd.mix_task_count)
                 throw std::invalid_argument("protocol close seal outside Host planned region");
-            seals = image.array<uint64_t>(record.mix_close_seals_offset, layout.spmd.cluster_count);
+            const auto *cells =
+                image.array<SchedulerMixCloseSeal>(record.mix_close_seals_offset, layout.spmd.cluster_count);
+            seals.reserve(static_cast<size_t>(layout.spmd.cluster_count));
+            for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster)
+                seals.push_back(static_cast<uint64_t>(cells[cluster].value));
         }
         if (task != 0) out << ',';
         JsonObject row(out);
@@ -329,7 +350,7 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
             "member_words", image.array<uint64_t>(record.member_words_offset, layout.admission_member_word_count),
             layout.admission_member_word_count
         );
-        row.numbers("close_seals", seals, seals == nullptr ? 0 : layout.spmd.cluster_count);
+        row.numbers("close_seals", seals.data(), seals.size());
     }
     out << ']';
 }
@@ -349,7 +370,8 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v5" : "hbg-native-protocol-v6");
+        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v8" : "hbg-native-protocol-v9");
+        root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
             root.field("node_map") << '[';
@@ -445,6 +467,7 @@ inline std::string scheduler_export_protocol(
             row.number("completed_blocks", controls[task].completed_blocks);
             row.number("admission_state", controls[task].admission_state);
             row.number("admission_claim_lock", controls[task].admission_claim_lock);
+            row.number("claim_seal", controls[task].claim_seal);
         }
         out << ']';
         sparse(
@@ -469,12 +492,15 @@ inline std::string scheduler_export_protocol(
                 row.number("worker_index", record.worker_index);
                 row.number("flags", record.flags);
                 row.number("pending_mask", record.pending_mask);
+                row.number("claim_seal_seen", record.claim_seal_seen);
+                row.number("claim_cursor_seen", record.claim_cursor_seen);
             }
         );
         sparse(
             root, "blocks", image.array<SchedulerProtocolBlockTrace>(plan.blocks_offset, plan.trace_count),
             plan.trace_count, [](JsonObject &row, const auto &record) {
                 block_owner(row, record.owner);
+                claim_certificate(row, record.claim);
                 sparse(row, "lanes", record.lanes, 3, lane);
             }
         );

@@ -12,7 +12,7 @@
 from collections.abc import Iterable
 from typing import Any
 
-from .native_protocol import _array, _error, _indices, _number, _object
+from .native_protocol import _array, _error, _indices, _number, _object, has_native_graph
 
 TOP, CHILD, DUMMY, ENTER, EXIT, HOST_DONE = range(6)
 NO_CHILD = (1 << 32) - 1
@@ -136,8 +136,8 @@ def export_kernel_dependencies(section: dict[str, Any], executed_task_ids: Itera
     Their predecessor frontier preserves cross-Graph and join dependencies.
     This projection is specific to the observed predicate outcomes.
     """
-    if section.get("schema") != "hbg-native-protocol-v6":
-        _error("kernel dependency export requires native Graph v6 source")
+    if not has_native_graph(section):
+        _error("kernel dependency export requires native Graph source")
     nodes = audit_graph_expansion(section)
     tasks = {row["task_ref"]: row for row in section["tasks"]}
     kernels = {

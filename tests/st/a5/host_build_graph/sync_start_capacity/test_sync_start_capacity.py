@@ -81,6 +81,7 @@ def _check_normalized_capture(path, mask):
     raw = json.loads(path.read_text())
     protocol = raw["aicore_protocol"]
     assert protocol["producer"] == "aicore"
+    assert protocol["schema"] == "hbg-native-protocol-v8"
     tasks = [
         task
         for task in protocol["tasks"]
@@ -109,12 +110,14 @@ def _check_normalized_capture(path, mask):
     assert protocol["mix_task_count"] == (2 if mixed else 0)
     groups = [block for block in protocol["blocks"] if block["owner"]["task_ref"] in refs]
     if mixed:
+        resources = mask | 1
+        resource_lanes = {lane for lane in range(3) if resources & (1 << lane)}
         assert len(groups) == 2
         assert {group["owner"]["task_ref"] for group in groups} == refs
         for group in groups:
-            assert len(group["lanes"]) == 3
-            assert {lane["lane"] for lane in group["lanes"]} == {0, 1, 2}
-            assert all(lane["resource_mask"] == 7 for lane in group["lanes"])
+            assert len(group["lanes"]) == len(resource_lanes)
+            assert {lane["lane"] for lane in group["lanes"]} == resource_lanes
+            assert all(lane["resource_mask"] == resources for lane in group["lanes"])
             assert all(lane["active_mask"] == mask for lane in group["lanes"])
     else:
         assert not groups

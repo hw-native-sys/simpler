@@ -46,7 +46,8 @@ struct SchedulerRefillCandidates {
 // The caller's execution trace, or all released Mix lane traces, precedes
 // this logical completion. Mix successors enter the ready queue; own-type
 // successors may retain one persistent admission candidate.
-inline __aicore__ bool scheduler_complete_ordered_task(
+template <bool RecordProtocol = true>
+static inline __aicore__ bool scheduler_complete_ordered_task(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats
@@ -54,9 +55,9 @@ inline __aicore__ bool scheduler_complete_ordered_task(
     if (scheduler == nullptr || scheduler->admission == nullptr || !scheduler_task_ref_valid(graph, task_ref))
         return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
-    scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
+    if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-    scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
+    if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
     if (!scheduler_resolve_completion(
             graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats, completion_stats,
             profiling_level, false, scheduler_ordered_direct_sink(scheduler->admission),
@@ -72,7 +73,8 @@ inline __aicore__ bool scheduler_complete_ordered_task(
     return true;
 }
 
-inline __aicore__ bool scheduler_service_cluster_completion_slot(
+template <bool RecordProtocol = true>
+static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t cluster_lane, uint32_t pending_slot,
     uint32_t completed_generation, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
@@ -222,8 +224,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             );
             return false;
         }
-        const SchedulerBlockFinishResult result =
-            scheduler_finish_ordered_block(graph, scheduler_state_base, scheduler, run_control, pending_slot);
+        const SchedulerBlockFinishResult result = scheduler_finish_ordered_block<RecordProtocol>(
+            graph, scheduler_state_base, scheduler, run_control, pending_slot
+        );
         if (result == SchedulerBlockFinishResult::ERROR) {
             scheduler_record_error(
                 run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -234,7 +237,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         task_complete = result == SchedulerBlockFinishResult::TASK_LAST;
     }
     scheduler_mark_completion_consumed(scheduler, cluster_lane, pending_slot, completed_generation, mix_slot);
-    if (!mix_slot) scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, *local_slot);
+    if constexpr (RecordProtocol)
+        if (!mix_slot)
+            scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, *local_slot);
     uint64_t refill_start_cycles = 0;
     uint64_t refill_end_cycles = 0;
     bool refilled = false;
@@ -249,9 +254,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     SchedulerReadyClaim resolved_ready{};
     if (task_complete && scheduler->admission == nullptr) {
         __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
-        scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
+        if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-        scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
+        if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
         // A peer AIV's remote Mix slot belongs to coordinator placement.
         SchedulerReadyClaim *direct_ready = nullptr;
         if (replacement_ready == nullptr && !mix_slot) {
@@ -330,24 +335,25 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->descriptor_cache_observed_cycles);
         scheduler_cache_barrier();
         scheduler_gm_store(completed_trace->valid, UINT64_C(1));
-        if (!mix_slot)
-            scheduler_protocol_execution_trace_published(
-                scheduler_state_base, scheduler, task_ref, completed_block_idx, completed_subtask_slot, pending_slot,
-                completed_generation
-            );
+        if constexpr (RecordProtocol)
+            if (!mix_slot)
+                scheduler_protocol_execution_trace_published(
+                    scheduler_state_base, scheduler, task_ref, completed_block_idx, completed_subtask_slot,
+                    pending_slot, completed_generation
+                );
         // The preceding barrier publishes trace lines before valid. The store
         // drains valid before pending_completed reaches resolved_task_count.
     } else if (completed_trace != nullptr) {
         scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
     }
     if (gm_mix) {
-        if (!scheduler_gm_mix_release_lane(
+        if (!scheduler_gm_mix_release_lane<RecordProtocol>(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, pending_slot, completed_generation
             ))
             return false;
     } else if (task_complete) {
         if (scheduler->admission != nullptr) {
-            if (!scheduler_complete_ordered_task(
+            if (!scheduler_complete_ordered_task<RecordProtocol>(
                     graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,
                     ready_stats, completion_stats
                 ))
@@ -360,7 +366,8 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     return true;
 }
 
-inline __aicore__ bool scheduler_service_cluster_completions(
+template <bool RecordProtocol = true>
+static inline __aicore__ bool scheduler_service_cluster_completions(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t profiling_level, uint64_t *direct_refilled_slot_mask,
@@ -380,7 +387,7 @@ inline __aicore__ bool scheduler_service_cluster_completions(
             ))
             continue;
         bool direct_refilled = false;
-        if (!scheduler_service_cluster_completion_slot(
+        if (!scheduler_service_cluster_completion_slot<RecordProtocol>(
                 graph, scheduler_state_base, scheduler, run_control, scheduler->config.self_lane, pending_slot,
                 completed_generation, wake_stats, ready_stats, completion_stats, profiling_level, nullptr,
                 &direct_refilled, ssbuf_region, candidates
@@ -409,7 +416,7 @@ inline __aicore__ bool scheduler_service_cluster_completions(
                 scheduler_cache_barrier();
                 mix_acquired = true;
             }
-            if (!scheduler_service_cluster_completion_slot(
+            if (!scheduler_service_cluster_completion_slot<RecordProtocol>(
                     graph, scheduler_state_base, scheduler, run_control, cluster_lane, mix_slot, completed_generation,
                     wake_stats, ready_stats, completion_stats, profiling_level, nullptr, nullptr, ssbuf_region,
                     candidates, true

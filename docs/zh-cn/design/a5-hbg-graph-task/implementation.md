@@ -144,7 +144,8 @@ ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的�
 
 主线 native protocol JSON 的 v5 reader 不能猜测新映射语义；新增 schema 版本与明确 node map。
 同步修改 `simpler_setup/tools/hbg/native_protocol.py`、export UT 和 Python oracle UT，保留旧版本读取能力。
-当前实现的 `hbg-native-protocol-v6` 保留 v5 执行/成员/所有权表，增加两部分：
+当前实现的 `hbg-native-protocol-v9` 保留 v8 的领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
+并包含两部分原生 Graph 来源：
 
 - `node_map`：每个 internal ref 的 kind、public TaskId、original task/shell id 与 local child id；
   ENTER/EXIT 使用相同 shell id，由 kind 区分，kernel identity 仍用公共 TaskId 与 block/subtask 信息关联。
@@ -154,7 +155,8 @@ ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的�
 `native_graph.py` 从该源重建 ENTER、body、全部 sink→EXIT 及 outer completion 映射，
 再与运行视图导出的 `tasks`/`node_map` 比较；`native_causality.py` 继续验证发布、成员、block 和完成顺序。
 control 节点使用 protocol TaskDone actor，不伪造 kernel execution 或 legacy GraphPrepare。
-无 Graph capture 继续输出 v5，reader 保留 v1–v5 兼容性。
+无 Graph capture 输出 v8。reader 保留 v1–v8 兼容性；历史 Graph v6 通过
+`node_map` 和 `graph_source` 区分于领取结束证明 v6，分别执行各自的严格字段校验。
 
 expected graph 必须由原始外部 dep_gen 与原始 Definition 独立展开得到；
 不能把被测 NativeGraphHostPlan 自己输出的边再当 oracle，否则同一种漏边会同时通过两边。

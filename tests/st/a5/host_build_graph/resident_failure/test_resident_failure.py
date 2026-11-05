@@ -29,6 +29,7 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
+from simpler_setup.tools.hbg.native_protocol import has_claim_seal, has_native_graph, protocol_version
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 _ROOT = Path(__file__).resolve().parents[5]
@@ -226,23 +227,25 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert controls[root["task_ref"]]["completed_blocks"] < blocks
     assert controls[consumer["task_ref"]]["completed_blocks"] == 0
     positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
-    assert protocol["schema"] in (
-        "hbg-native-protocol-v2",
-        "hbg-native-protocol-v3",
-        "hbg-native-protocol-v4",
-        "hbg-native-protocol-v5",
-        "hbg-native-protocol-v6",
-    )
-    if protocol["schema"] in ("hbg-native-protocol-v5", "hbg-native-protocol-v6"):
+    version = protocol_version(protocol)
+    assert 2 <= version <= 9
+    if version >= 7:
+        assert type(protocol.get("close_seal_stride")) is int and protocol["close_seal_stride"] == 128
+    else:
+        assert "close_seal_stride" not in protocol
+    if version >= 5:
         assert all(
             type(control.get("admission_claim_lock")) is int and control["admission_claim_lock"] == 0
             for control in control_rows
         )
-    minimum_blocks = (
-        2
-        if protocol["schema"] in ("hbg-native-protocol-v4", "hbg-native-protocol-v5", "hbg-native-protocol-v6")
-        else positions * 2 + (1 if protocol["schema"] == "hbg-native-protocol-v2" else 0)
-    )
+    if has_claim_seal(protocol):
+        for task in protocol["tasks"]:
+            control = controls[task["task_ref"]]
+            seal = control.get("claim_seal")
+            assert type(seal) is int and seal >= 0
+            cooperative = task["block_num"] > 1 or task["active_mask"].bit_count() > 1
+            assert seal == 0 or (cooperative and seal == control["next_block"] == task["block_num"])
+    minimum_blocks = 2 if version >= 4 else positions * 2 + (1 if version == 2 else 0)
     uses_tickets = blocks >= minimum_blocks
     tickets = controls[root["task_ref"]]["claim_tickets"]
     if uses_tickets:
@@ -251,7 +254,7 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     else:
         assert tickets == 0
     assert controls[consumer["task_ref"]]["claim_tickets"] == 0
-    if protocol["schema"] == "hbg-native-protocol-v6":
+    if has_native_graph(protocol):
         enters = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 3]
         exits = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 4]
         assert len(enters) == len(exits) == 1
@@ -359,7 +362,7 @@ def _root_block_num(protocol):
 def _check_two_wave_topology(protocol, blocks, mask, required):
     if not required:
         return
-    assert protocol["schema"] in ("hbg-native-protocol-v3", "hbg-native-protocol-v4", "hbg-native-protocol-v5")
+    assert 3 <= protocol_version(protocol) <= 9
     positions = protocol["cluster_count"] * _lane_positions_per_cluster(mask)
     assert blocks == positions * 2, "two-wave fault must use the actual device topology"
 
@@ -644,7 +647,7 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             path, raw = _capture(prefix)
             proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
             assert raw["aicore_protocol"]["schema"] == (
-                "hbg-native-protocol-v6" if native_graph else "hbg-native-protocol-v5"
+                "hbg-native-protocol-v9" if native_graph else "hbg-native-protocol-v8"
             )
             launched = _root_block_num(raw["aicore_protocol"])
             assert blocks < 0 or launched == blocks

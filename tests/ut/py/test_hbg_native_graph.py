@@ -20,7 +20,7 @@ from simpler_setup.tools.hbg.native_protocol import read_native_protocol
 from simpler_setup.tools.sched_overhead_analysis import build_task_graph
 
 
-def native_capture():
+def native_capture(version=9):
     # Outer kernel -> Graph(kernel -> dummy) -> outer consumer.
     raw, identities = ProtocolBuilder(
         [(2, 1, ()), (0, 1, (0,)), (2, 1, (1,)), (0, 1, (2,)), (0, 1, (3,)), (2, 1, (4,))]
@@ -82,14 +82,40 @@ def native_capture():
             next(event for event in raw["task_events"] if event["index"] == ref)["completion"]["flags"] = 2
     for identity in identities:
         identity["task_id"] = raw["node_map"][identity["task_id"]]["public_task_id"]
+    if version == 9:
+        raw.update(schema="hbg-native-protocol-v9", close_seal_stride=128)
+        for control in raw["task_controls"]:
+            control["claim_seal"] = 0
+        for member in raw["members"]:
+            member.update(claim_seal_seen=0, claim_cursor_seen=0)
+        for block in raw["blocks"]:
+            block["claim"] = None
+            for lane in block["lanes"]:
+                lane["previous_lane_seq"] = [0, 0, 0]
     return raw, identities
 
 
-def test_native_graph_full_causality_and_public_identity_join():
-    raw, identities = native_capture()
+@pytest.mark.parametrize("version", (6, 9))
+def test_native_graph_full_causality_and_public_identity_join(version):
+    raw, identities = native_capture(version)
     result = audit_native_protocol(raw, identities)
     assert result["protocol_verified"] and result["device_logical_tasks"] == 6
     assert result["executions"] == 3
+
+
+@pytest.mark.parametrize("field", ("graph_source", "node_map", "close_seal_stride"))
+def test_native_graph_v9_requires_graph_and_scheduler_contracts(field):
+    raw, _ = native_capture()
+    del raw[field]
+    with pytest.raises(ValueError, match="missing or unknown fields"):
+        read_native_protocol(raw)
+
+
+def test_legacy_native_graph_rejects_claim_seal_fields():
+    raw, _ = native_capture(6)
+    raw["task_controls"][0]["claim_seal"] = 0
+    with pytest.raises(ValueError, match="missing or unknown fields"):
+        read_native_protocol(raw)
 
 
 @pytest.mark.parametrize("ref,deps", [(1, []), (2, []), (3, [1]), (4, [2]), (5, [1])])
