@@ -207,6 +207,7 @@ static inline int32_t latched_error_code(int32_t orch_error_code, int32_t sched_
 }
 
 static inline const char *latched_error_field(int32_t orch_error_code, int32_t sched_error_code) {
+    (void)sched_error_code;
     return orch_error_code != SIMPLER_ERROR_NONE ? "orch_error_code" : "sched_error_code";
 }
 

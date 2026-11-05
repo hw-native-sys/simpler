@@ -20,17 +20,27 @@
 #include "host_build_graph/runtime_status.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
+#include "../../../../common/runtime_status/error_names.h"
 
 // This bridge is intentionally AICPU/host-only. AICore code publishes its
 // detailed first error through SchedulerRunControl; AICPU maps that internal
 // diagnostic to the existing host runtime status ABI without making this
 // std::atomic helper visible to either AICore compiler.
 inline int32_t aicore_scheduler_runtime_error_code(uint64_t scheduler_error) {
-    if (scheduler_error == 0) return SIMPLER_ERROR_NONE;
-    if (scheduler_error == static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)) {
+    switch (static_cast<SchedulerGraphResult>(scheduler_error)) {
+    case SchedulerGraphResult::OK:
+        return SIMPLER_ERROR_NONE;
+    case SchedulerGraphResult::TIMEOUT:
         return SIMPLER_ERROR_SCHEDULER_TIMEOUT;
+    case SchedulerGraphResult::ASYNC_COMPLETION_INVALID:
+        return SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+    case SchedulerGraphResult::ASYNC_WAIT_OVERFLOW:
+        return SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+    case SchedulerGraphResult::ASYNC_REGISTRATION_FAILED:
+        return SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+    default:
+        return SIMPLER_ERROR_INVALID_ARGS;
     }
-    return SIMPLER_ERROR_INVALID_ARGS;
 }
 
 inline bool latch_aicore_scheduler_runtime_error(std::atomic<int32_t> *sched_error_code, uint64_t scheduler_error) {
@@ -85,13 +95,14 @@ inline void log_aicore_scheduler_error_identity(SchedulerRunControl *run, const 
     // The identity spans two 64B lines, separate from the publication word.
     // Reload both after acquiring the status to exclude prefetched identity.
     cache_invalidate_range(error_line, 128);
+    const int32_t runtime_error = aicore_scheduler_runtime_error_code(status);
     LOG_ERROR(
         "A5 HBG scheduler identity: phase=%s task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64 " type=%" PRIu64
         " site=%" PRIu64 " epoch=%" PRIu64 " order=%" PRIu64 " block=%" PRIu64 " group_seq=%" PRIu64 " worker=%" PRIu64
-        " lane=%" PRIu32 " identity_fields=0x%" PRIx32,
+        " lane=%" PRIu32 " identity_fields=0x%" PRIx32 " runtime_error=%d(%s)",
         phase, run->error_task_ref, status, run->error_core_id, run->error_core_type, run->error_site,
         run->error_run_epoch, run->error_order_key, run->error_block_idx, run->error_group_seq, run->error_worker_index,
-        run->error_cluster_lane, run->error_identity_fields
+        run->error_cluster_lane, run->error_identity_fields, runtime_error, error_name(runtime_error)
     );
 }
 

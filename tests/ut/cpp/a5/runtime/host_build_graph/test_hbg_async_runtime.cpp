@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "hbg_scheduler_test_support.h"
 #include "ready_pool_plan.h"
 #include "scheduler/scheduler_async_runtime.h"
+#include "async_completion_writer.h"
 
 namespace {
 constexpr uint64_t kEpoch = 37;
@@ -460,6 +462,73 @@ TEST(HbgAsyncRuntime, StickyWriterOverflowInvalidBindingAndDuplicateSealPreserve
         EXPECT_EQ(fixture.completed(), 0u);
         EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
     }
+}
+
+TEST(HbgAsyncRuntime, SixtyFifthWriterAppendPublishesOverflowAsTheFirstSchedulerError) {
+    RuntimeFixture fixture(1, 1, 1, 64);
+    fixture.bind(0);
+    auto &ctx = fixture.payload(0, 0).local_context.async_ctx;
+    const CompletionToken token{kRecords, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, kCookie};
+    for (uint32_t condition = 0; condition < 64; ++condition)
+        ASSERT_TRUE(async_completion_append(ctx, token));
+    ASSERT_FALSE(async_completion_append(ctx, token));
+    ASSERT_EQ(*ctx.completion_count, 64u);
+    ASSERT_EQ(*ctx.completion_error_code, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_FALSE(fixture.seal(0));
+    EXPECT_EQ(scheduler_read_error(fixture.run), static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW));
+    scheduler_record_error(fixture.run, 1, SchedulerGraphResult::INVALID_ARGUMENTS);
+    EXPECT_EQ(scheduler_read_error(fixture.run), static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW));
+    EXPECT_EQ(*ctx.completion_error_code, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_EQ(fixture.backend.bindings, 0u);
+    EXPECT_EQ(fixture.completed(), 0u);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+}
+
+TEST(HbgAsyncRuntime, SealPreservesRecognizedWriterReasonsAndAnEarlierSchedulerFailure) {
+    for (const auto reason : {SIMPLER_ERROR_ASYNC_COMPLETION_INVALID, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED}) {
+        RuntimeFixture fixture;
+        fixture.bind(0);
+        auto &ctx = fixture.payload(0, 0).local_context.async_ctx;
+        async_completion_error(ctx, reason);
+        EXPECT_FALSE(fixture.seal(0));
+        const auto expected = reason == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ?
+                                  SchedulerGraphResult::ASYNC_COMPLETION_INVALID :
+                                  SchedulerGraphResult::ASYNC_REGISTRATION_FAILED;
+        EXPECT_EQ(scheduler_read_error(fixture.run), static_cast<uint64_t>(expected));
+        EXPECT_EQ(*ctx.completion_error_code, reason);
+        EXPECT_EQ(fixture.completed(), 0u);
+    }
+    RuntimeFixture fixture;
+    fixture.bind(0);
+    auto &ctx = fixture.payload(0, 0).local_context.async_ctx;
+    async_completion_error(ctx, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    scheduler_record_error(fixture.run, 1, SchedulerGraphResult::TIMEOUT);
+    EXPECT_FALSE(fixture.seal(0));
+    EXPECT_EQ(scheduler_read_error(fixture.run), static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    EXPECT_EQ(*ctx.completion_error_code, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+}
+
+TEST(HbgAsyncRuntime, AbortObserverCannotPublishAGenericErrorBeforeTheOriginalCause) {
+    RuntimeFixture fixture;
+    auto &join = *fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset);
+    std::atomic<bool> observer_ready{false};
+    uint64_t observed_error = 0;
+    std::thread observer([&] {
+        observer_ready.store(true, std::memory_order_release);
+        while ((scheduler_async_join_load(join) & SCHEDULER_ASYNC_JOIN_FAILED) == 0) {}
+        observed_error = scheduler_read_error(fixture.run);
+        scheduler_record_error(fixture.run, 1, SchedulerGraphResult::INVALID_ARGUMENTS);
+    });
+    while (!observer_ready.load(std::memory_order_acquire)) {}
+    EXPECT_FALSE(
+        scheduler_async_runtime_detail::fail(
+            fixture.graph, &fixture.locals[0], fixture.run, 0, &fixture.views[0], 0,
+            SchedulerGraphResult::ASYNC_WAIT_OVERFLOW
+        )
+    );
+    observer.join();
+    EXPECT_EQ(observed_error, static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW));
+    EXPECT_EQ(scheduler_read_error(fixture.run), static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW));
 }
 
 TEST(HbgAsyncRuntime, BackendFailureKeepsFailedRecordAndNeverMakesTaskDone) {

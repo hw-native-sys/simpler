@@ -452,6 +452,26 @@ TEST(HbgErrorIdentity, ACleanStatusDoesNotEmitAnErrorIdentityLog) {
     EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
 }
 
+TEST(HbgErrorIdentity, ColdDiagnosticNamesTheActualMappedRuntimeFailure) {
+    struct Case {
+        SchedulerGraphResult status;
+        const char *diagnostic;
+    };
+    for (const auto entry : {
+             Case{SchedulerGraphResult::TIMEOUT, "runtime_error=100(SCHEDULER_TIMEOUT)"},
+             Case{SchedulerGraphResult::ASYNC_COMPLETION_INVALID, "runtime_error=101(ASYNC_COMPLETION_INVALID)"},
+             Case{SchedulerGraphResult::ASYNC_WAIT_OVERFLOW, "runtime_error=102(ASYNC_WAIT_OVERFLOW)"},
+             Case{SchedulerGraphResult::ASYNC_REGISTRATION_FAILED, "runtime_error=103(ASYNC_REGISTRATION_FAILED)"},
+         }) {
+        ErrorFixture fixture;
+        scheduler_record_error(fixture.run(), 0, entry.status);
+        testing::internal::CaptureStderr();
+        log_aicore_scheduler_error_identity(fixture.run(), "terminal");
+        const auto message = testing::internal::GetCapturedStderr();
+        EXPECT_NE(message.find(entry.diagnostic), std::string::npos) << message;
+    }
+}
+
 TEST(HbgErrorIdentity, ASuccessStatusMustNotConsumeTheFirstErrorClaim) {
     ErrorFixture fixture;
     const auto graph = fixture.graph.graph();

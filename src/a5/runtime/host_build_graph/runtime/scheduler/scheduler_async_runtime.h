@@ -93,12 +93,28 @@ inline __aicore__ bool contained(uint64_t begin, uint64_t bytes, uint64_t offset
 
 inline __aicore__ bool fail(
     const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task,
-    const SchedulerAsyncRuntimeView *view = nullptr, uint64_t finish = SCHEDULER_ASYNC_INDEX_NONE
+    const SchedulerAsyncRuntimeView *view = nullptr, uint64_t finish = SCHEDULER_ASYNC_INDEX_NONE,
+    SchedulerGraphResult status = SchedulerGraphResult::INVALID_ARGUMENTS
 ) {
+    // Claim the original cause before a peer can react to the poisoned join
+    // and report a secondary generic failure.
+    scheduler_record_error(run, task, status, &graph, local);
     if (view != nullptr && view->enabled() && finish < view->layout.finish_count)
         scheduler_async_join_abort(*at<SchedulerAsyncTaskJoin>(*view, view->layout.finish_join_offset, finish));
-    scheduler_record_error(run, task, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
     return false;
+}
+
+inline __aicore__ SchedulerGraphResult writer_error_result(int32_t error) {
+    switch (error) {
+    case SIMPLER_ERROR_ASYNC_COMPLETION_INVALID:
+        return SchedulerGraphResult::ASYNC_COMPLETION_INVALID;
+    case SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW:
+        return SchedulerGraphResult::ASYNC_WAIT_OVERFLOW;
+    case SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED:
+        return SchedulerGraphResult::ASYNC_REGISTRATION_FAILED;
+    default:
+        return SchedulerGraphResult::INVALID_ARGUMENTS;
+    }
 }
 
 inline __aicore__ bool task_map(const SchedulerAsyncRuntimeView &view, int64_t task, SchedulerAsyncTaskMap *out) {
@@ -369,7 +385,7 @@ inline __aicore__ bool scheduler_async_runtime_seal(
         (void)scheduler_async_lease_try_transition(
             lease, scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT), SchedulerAsyncPhase::FAILED
         );
-        return fail(graph, local, run, task, &view, map.finish_index);
+        return fail(graph, local, run, task, &view, map.finish_index, writer_error_result(snapshot.error_code));
     }
     if (count == 0) return true;
     auto &join = *at<SchedulerAsyncTaskJoin>(view, view.layout.finish_join_offset, map.finish_index);

@@ -57,6 +57,37 @@ TEST(AicoreSchedulerError, LatchesFirstHostVisibleFailure) {
     EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
 }
 
+TEST(AicoreSchedulerError, AsyncReasonsReachTheExistingHostCodeAndNameWithoutOverwritingTheFirstFailure) {
+    struct Case {
+        SchedulerGraphResult status;
+        int32_t code;
+        const char *name;
+    };
+    for (const auto entry : {
+             Case{
+                 SchedulerGraphResult::ASYNC_COMPLETION_INVALID, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID,
+                 "ASYNC_COMPLETION_INVALID"
+             },
+             Case{SchedulerGraphResult::ASYNC_WAIT_OVERFLOW, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW, "ASYNC_WAIT_OVERFLOW"},
+             Case{
+                 SchedulerGraphResult::ASYNC_REGISTRATION_FAILED, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED,
+                 "ASYNC_REGISTRATION_FAILED"
+             },
+         }) {
+        SchedulerRunControl run{};
+        run.scheduler_error = static_cast<uint64_t>(entry.status);
+        std::atomic<int32_t> status{SIMPLER_ERROR_NONE};
+        EXPECT_EQ(settle_aicore_runtime_status(&run, &status), -entry.code);
+        EXPECT_EQ(status.load(), entry.code);
+        EXPECT_STREQ(error_name(status.load()), entry.name);
+        run.scheduler_error = static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS);
+        EXPECT_EQ(settle_aicore_runtime_status(&run, &status), -entry.code);
+        status.store(SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+        run.scheduler_error = static_cast<uint64_t>(entry.status);
+        EXPECT_EQ(settle_aicore_runtime_status(&run, &status), -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    }
+}
+
 TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(0));
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING));
