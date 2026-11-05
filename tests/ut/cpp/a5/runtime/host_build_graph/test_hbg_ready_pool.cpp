@@ -21,6 +21,7 @@
 
 #include "hbg_scheduler_test_support.h"
 #include "ready_pool_plan.h"
+#include "scheduler/scheduler_graph_control.h"
 
 namespace {
 std::vector<SchedulerTaskMetadata> tasks(uint32_t count, uint32_t type) {
@@ -651,6 +652,328 @@ TEST(SchedulerReadyPoolTest, ChunkLayoutRejectsPayloadOverlapAndUnknownWindow) {
     EXPECT_FALSE(valid());
     EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, 0, 128, &fixture.plan, SchedulerReadyPoolKind::CHUNK, 0));
     EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, 0, 128, &fixture.plan, SchedulerReadyPoolKind::TICKET, 4));
+}
+
+struct ResolveFixture : PoolFixture {
+    explicit ResolveFixture(uint32_t count) :
+        PoolFixture(tasks(count, 0), 1, 4) {}
+
+    SchedulerTaskControl *control(int64_t ref) { return scheduler_task_control_at(base(), &locals[0], ref); }
+
+    void completed(int64_t ref) {
+        scheduler_gm_store(control(ref)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+        scheduler_gm_store(control(ref)->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
+    }
+
+    void full_fanin(int64_t ref) {
+        std::vector<int32_t> fanins(SCHEDULER_GRAPH_MAX_FANIN);
+        std::iota(fanins.begin(), fanins.end(), 0);
+        graph_storage.executable(ref, 0, fanins);
+        for (int64_t producer : fanins)
+            completed(producer);
+    }
+
+    void detached_control_chain(int64_t producer, int64_t head) {
+        // Start at the real post-detach boundary. Ordinary graph storage is
+        // enough for these executable waiters; native control dequeue has its
+        // own tests in test_hbg_native_graph_plan.cpp.
+        completed(producer);
+        locals[0].config.control_inboxes_offset = layout.ready_inboxes_offset;
+        locals[0].control_resolve.producer_ref = producer;
+        locals[0].control_resolve.next_waiter = head;
+        scheduler_gm_store(run->bootstrap_scan_complete, uint64_t{1});
+    }
+};
+
+TEST(SchedulerResolveTest, ZeroBudgetDoesNotStartAndFaninBudgetSurvivesWorkerHandoff) {
+    ResolveFixture fixture(129);
+    fixture.full_fanin(128);
+    auto cursor = scheduler_resolve_begin(128);
+    SchedulerWakeStats stats{};
+    uint32_t budget = 0;
+    EXPECT_EQ(
+        scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::YIELD
+    );
+    EXPECT_EQ(cursor.phase, SchedulerResolvePhase::INITIALIZE);
+    EXPECT_EQ(stats.fanin_state_load_count, 0u);
+
+    budget = 8;
+    ASSERT_EQ(
+        scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::YIELD
+    );
+    EXPECT_EQ(budget, 0u);
+    EXPECT_EQ(cursor.next_fanin, 7u);
+    EXPECT_EQ(stats.fanin_state_load_count, 7u);
+    auto transferred = cursor;
+    for (uint32_t slice = 0; slice < 16; ++slice) {
+        budget = 8;
+        const uint64_t before = stats.fanin_state_load_count;
+        const auto result = scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[1], fixture.run, &transferred, &budget, &stats
+        );
+        EXPECT_LE(stats.fanin_state_load_count - before, 8u);
+        EXPECT_EQ(result, slice == 15 ? SchedulerRouteResult::READY_TO_ENQUEUE : SchedulerRouteResult::YIELD);
+    }
+    EXPECT_EQ(stats.fanin_state_load_count, 128u);
+    EXPECT_EQ(transferred.next_fanin, 128u);
+    EXPECT_EQ(budget, 7u);
+    EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
+}
+
+struct ContendedResolveLink {
+    static int64_t compare_exchange(volatile int64_t &head, int64_t expected, int64_t desired) {
+        // Model a competing publisher between our load and CAS, then use the
+        // production atomic for the attempt that must lose its comparison.
+        scheduler_gm_store(head, expected == SCHEDULER_WAKE_LIST_OPEN ? int64_t{1} : SCHEDULER_WAKE_LIST_OPEN);
+        return scheduler_gm_compare_exchange(head, expected, desired);
+    }
+};
+
+TEST(SchedulerResolveTest, EveryFailedLinkCasConsumesBudgetWithoutRescanningFanin) {
+    ResolveFixture fixture(3);
+    fixture.graph_storage.executable(2, 0, {0});
+    auto cursor = scheduler_resolve_begin(2);
+    SchedulerWakeStats stats{};
+    uint32_t budget = 6;
+    ASSERT_EQ(
+        scheduler_resolve_step<ContendedResolveLink>(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::YIELD
+    );
+    EXPECT_EQ(budget, 0u);
+    EXPECT_EQ(stats.fanin_state_load_count, 1u);
+    EXPECT_EQ(stats.wake_cas_retry_count, 4u);
+    EXPECT_EQ(stats.wake_register_count, 0u);
+    EXPECT_EQ(cursor.phase, SchedulerResolvePhase::LINK);
+    EXPECT_EQ(cursor.producer_ref, 0);
+    budget = 3;
+    ASSERT_EQ(
+        scheduler_resolve_step<ContendedResolveLink>(
+            fixture.graph, fixture.base(), &fixture.locals[1], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::YIELD
+    );
+    EXPECT_EQ(stats.wake_cas_retry_count, 7u);
+    EXPECT_EQ(stats.fanin_state_load_count, 1u);
+    budget = 1;
+    ASSERT_EQ(
+        scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[2], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::WAITING
+    );
+    EXPECT_EQ(stats.fanin_state_load_count, 1u);
+    EXPECT_EQ(stats.wake_register_count, 1u);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(0)->wake_list_head), 2);
+}
+
+TEST(SchedulerResolveTest, ProducerClosingBetweenSlicesSkipsItsLink) {
+    ResolveFixture fixture(2);
+    fixture.graph_storage.executable(1, 0, {0});
+    auto cursor = scheduler_resolve_begin(1);
+    SchedulerWakeStats stats{};
+    uint32_t budget = 2;
+    ASSERT_EQ(
+        scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::YIELD
+    );
+    ASSERT_EQ(cursor.phase, SchedulerResolvePhase::LINK);
+    fixture.completed(0);
+    budget = 1;
+    EXPECT_EQ(
+        scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[1], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::READY_TO_ENQUEUE
+    );
+    EXPECT_EQ(budget, 0u);
+    EXPECT_EQ(stats.wake_closed_retry_count, 1u);
+    EXPECT_EQ(stats.wake_cas_retry_count, 0u);
+    EXPECT_EQ(stats.wake_register_count, 0u);
+}
+
+struct ClosingResolveLink {
+    static int64_t compare_exchange(volatile int64_t &head, int64_t expected, int64_t desired) {
+        scheduler_gm_exchange(head, SCHEDULER_WAKE_LIST_CLOSED);
+        return scheduler_gm_compare_exchange(head, expected, desired);
+    }
+};
+
+TEST(SchedulerResolveTest, ProducerClosingDuringCasConsumesOneAttemptThenResumesNextFanin) {
+    ResolveFixture fixture(3);
+    fixture.graph_storage.executable(2, 0, {0, 1});
+    fixture.completed(1);
+    auto cursor = scheduler_resolve_begin(2);
+    SchedulerWakeStats stats{};
+    uint32_t budget = 3;
+    ASSERT_EQ(
+        scheduler_resolve_step<ClosingResolveLink>(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::YIELD
+    );
+    EXPECT_EQ(stats.wake_cas_retry_count, 1u);
+    EXPECT_EQ(stats.wake_closed_retry_count, 1u);
+    EXPECT_EQ(cursor.phase, SchedulerResolvePhase::FANIN);
+    EXPECT_EQ(cursor.next_fanin, 1u);
+    budget = 1;
+    EXPECT_EQ(
+        scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::READY_TO_ENQUEUE
+    );
+    EXPECT_EQ(stats.fanin_state_load_count, 2u);
+}
+
+TEST(SchedulerResolveTest, SuccessfulLinkTransfersOwnershipEvenWhenNodeImmediatelyChanges) {
+    ResolveFixture fixture(2);
+    fixture.graph_storage.executable(1, 0, {0});
+    auto cursor = scheduler_resolve_begin(1);
+    uint32_t budget = 3;
+    ASSERT_EQ(
+        scheduler_resolve_step(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget),
+        SchedulerRouteResult::WAITING
+    );
+    auto *waiter = fixture.control(1);
+    waiter->next_fanin_index = -77;
+    waiter->waiting_producer = -88;
+    scheduler_gm_store(waiter->next_waiter, int64_t{-99});
+    scheduler_gm_store(waiter->state, int64_t{-100});
+    budget = 0;
+    // Terminal queries only inspect the cursor, so they need no live graph or
+    // task storage after ownership has passed to the next producer.
+    EXPECT_EQ(
+        scheduler_resolve_step(SchedulerGraphView{}, nullptr, nullptr, nullptr, &cursor, &budget),
+        SchedulerRouteResult::WAITING
+    );
+    EXPECT_EQ(waiter->next_fanin_index, -77);
+    EXPECT_EQ(waiter->waiting_producer, -88);
+    EXPECT_EQ(scheduler_gm_load(waiter->next_waiter), -99);
+}
+
+TEST(SchedulerResolveTest, EmptyDoneAndInvalidTasksHaveDistinctTerminalResults) {
+    for (int scenario = 0; scenario < 5; ++scenario) {
+        ResolveFixture fixture(2);
+        fixture.graph_storage.executable(1, 0);
+        auto cursor = scheduler_resolve_begin(1);
+        if (scenario == 1) fixture.completed(1);
+        if (scenario == 2) cursor.task_ref = 2;
+        if (scenario == 3) fixture.control(1)->next_fanin_index = -1;
+        if (scenario == 4) scheduler_gm_store(fixture.control(1)->state, int64_t{-17});
+        uint32_t budget = 1;
+        const auto result =
+            scheduler_resolve_step(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget);
+        EXPECT_EQ(
+            result, scenario == 0 ? SchedulerRouteResult::READY_TO_ENQUEUE :
+                    scenario == 1 ? SchedulerRouteResult::COMPLETED :
+                                    SchedulerRouteResult::ERROR
+        );
+        EXPECT_EQ(scheduler_read_error(fixture.run) != 0, scenario >= 2);
+        EXPECT_EQ(budget, 0u);
+    }
+}
+
+TEST(SchedulerResolveTest, InvalidFaninFailsAtItsOwnBudgetedStep) {
+    ResolveFixture fixture(2);
+    fixture.graph_storage.executable(1, 0, {1});
+    auto cursor = scheduler_resolve_begin(1);
+    uint32_t budget = 1;
+    ASSERT_EQ(
+        scheduler_resolve_step(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget),
+        SchedulerRouteResult::YIELD
+    );
+    EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
+    budget = 1;
+    EXPECT_EQ(
+        scheduler_resolve_step(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget),
+        SchedulerRouteResult::ERROR
+    );
+    EXPECT_NE(scheduler_read_error(fixture.run), 0u);
+}
+
+TEST(SchedulerResolveTest, SynchronousRouteDrainsTheSameFaninAlgorithm) {
+    ResolveFixture fixture(129);
+    fixture.full_fanin(128);
+    SchedulerWakeStats stats{};
+    EXPECT_EQ(
+        scheduler_route_task(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 128, &stats),
+        SchedulerRouteResult::READY_TO_ENQUEUE
+    );
+    EXPECT_EQ(stats.fanin_state_load_count, 128u);
+    EXPECT_EQ(stats.wake_register_count, 0u);
+}
+
+TEST(SchedulerResolveTest, ControlSlicePublishesPrefixWhileLongFaninRemainsOwned) {
+    ResolveFixture fixture(130);
+    fixture.full_fanin(128);
+    fixture.graph_storage.executable(129, 0, {0});
+    scheduler_gm_store(fixture.control(129)->next_waiter, int64_t{128});
+    fixture.detached_control_chain(0, 129);
+    bool progress = false;
+    ASSERT_TRUE(
+        scheduler_service_controls(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, &progress)
+    );
+    EXPECT_TRUE(progress);
+    const auto &continuation = fixture.locals[0].control_resolve;
+    EXPECT_EQ(continuation.next_waiter, 128);
+    EXPECT_EQ(continuation.route.next_fanin, SCHEDULER_CONTROL_RESOLVE_BUDGET - 3);
+    EXPECT_EQ(fixture.locals[0].pending_completed, 0u);
+    uint64_t pool_cursor = 0;
+    SchedulerReadyClaim claim{};
+    ASSERT_TRUE(fixture.pop(0, 0, &pool_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, 129);
+    for (uint32_t slice = 0; slice < 2; ++slice)
+        ASSERT_TRUE(
+            scheduler_service_controls(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, &progress)
+        );
+    EXPECT_EQ(fixture.locals[0].pending_completed, 1u);
+    EXPECT_EQ(continuation.producer_ref, SCHEDULER_TASK_REF_INVALID);
+    ASSERT_TRUE(fixture.pop(0, 0, &pool_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, 128);
+    ASSERT_TRUE(fixture.pop(0, 0, &pool_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+}
+
+TEST(SchedulerResolveTest, ControlResumeUsesDetachedSuccessorAfterWaiterMigratesToAnotherProducer) {
+    ResolveFixture fixture(131);
+    fixture.full_fanin(128);
+    fixture.graph_storage.executable(129, 0, {0});
+    fixture.graph_storage.executable(130, 0, {127});
+    scheduler_gm_store(fixture.control(127)->state, static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+    scheduler_gm_store(fixture.control(127)->wake_list_head, int64_t{130});
+    scheduler_gm_store(fixture.control(128)->next_waiter, int64_t{129});
+    fixture.detached_control_chain(0, 128);
+    bool progress = false;
+    ASSERT_TRUE(
+        scheduler_service_controls(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, &progress)
+    );
+    EXPECT_EQ(fixture.locals[0].control_resolve.detached_next, 129);
+    EXPECT_EQ(fixture.locals[0].control_resolve.route.next_fanin, SCHEDULER_CONTROL_RESOLVE_BUDGET - 1);
+    EXPECT_EQ(fixture.locals[0].pending_completed, 0u);
+    for (uint32_t slice = 0; slice < 2; ++slice)
+        ASSERT_TRUE(
+            scheduler_service_controls(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, &progress)
+        );
+    EXPECT_EQ(fixture.locals[0].pending_completed, 1u);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(127)->wake_list_head), 128);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(128)->next_waiter), 130);
+    uint64_t pool_cursor = 0;
+    SchedulerReadyClaim claim{};
+    ASSERT_TRUE(fixture.pop(0, 0, &pool_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, 129);
+    ASSERT_TRUE(fixture.pop(0, 0, &pool_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
 }
 
 }  // namespace

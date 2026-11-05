@@ -14,7 +14,7 @@
 #include "scheduler_ready.h"
 
 inline constexpr uint32_t SCHEDULER_CONTROL_NODE_BUDGET = 8;
-inline constexpr uint32_t SCHEDULER_CONTROL_WAITER_BUDGET = 64;
+inline constexpr uint32_t SCHEDULER_CONTROL_RESOLVE_BUDGET = 64;
 
 // A detached wake chain belongs to one worker until fully routed. No reference
 // is recycled during a run; keeping the remaining head needs no epoch protocol.
@@ -26,10 +26,11 @@ inline __aicore__ bool scheduler_service_controls(
     if (local->config.control_inboxes_offset == 0) return true;
     if (scheduler_read_error(run) != 0) return false;
     if (scheduler_gm_query(run->bootstrap_scan_complete) == 0) return true;
-    uint32_t started = 0, routed = 0, completed = 0;
+    uint32_t started = 0, completed = 0;
+    uint32_t budget = SCHEDULER_CONTROL_RESOLVE_BUDGET;
     SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     auto &continuation = local->control_resolve;
-    while (routed < SCHEDULER_CONTROL_WAITER_BUDGET) {
+    while (budget != 0) {
         if (continuation.producer_ref < 0) {
             if (started == SCHEDULER_CONTROL_NODE_BUDGET) break;
             int64_t ref = SCHEDULER_TASK_REF_INVALID;
@@ -82,22 +83,27 @@ inline __aicore__ bool scheduler_service_controls(
             ++started;
             *progress = true;
         }
-        while (continuation.next_waiter >= 0 && routed < SCHEDULER_CONTROL_WAITER_BUDGET) {
+        while (continuation.next_waiter >= 0 && budget != 0) {
             const int64_t waiter = continuation.next_waiter;
-            if (!scheduler_task_ref_valid(graph, waiter)) {
-                scheduler_record_error(
-                    run, continuation.producer_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, local
-                );
-                return false;
+            if (continuation.route.task_ref == SCHEDULER_TASK_REF_INVALID) {
+                if (!scheduler_task_ref_valid(graph, waiter)) {
+                    scheduler_record_error(
+                        run, continuation.producer_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, local
+                    );
+                    return false;
+                }
+                auto *control = scheduler_task_control_at(base, local, waiter);
+                continuation.detached_next = scheduler_observe_next_waiter(control);
+                if (continuation.detached_next < SCHEDULER_WAKE_LIST_OPEN) {
+                    scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
+                    return false;
+                }
+                continuation.route = scheduler_resolve_begin(waiter);
             }
-            auto *control = scheduler_task_control_at(base, local, waiter);
-            const int64_t next = scheduler_observe_next_waiter(control);
-            if (next < SCHEDULER_WAKE_LIST_OPEN) {
-                scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
-                return false;
-            }
-            const auto route = scheduler_route_task(graph, base, local, run, waiter, nullptr);
+            const auto route = scheduler_resolve_step(graph, base, local, run, &continuation.route, &budget);
             if (route == SchedulerRouteResult::ERROR) return false;
+            *progress = true;
+            if (route == SchedulerRouteResult::YIELD) break;
             if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
                 SchedulerNodeKind kind{};
                 if (scheduler_node_kind(graph, waiter, &kind) != SchedulerGraphResult::OK) {
@@ -117,9 +123,10 @@ inline __aicore__ bool scheduler_service_controls(
                     }
                 }
             }
-            continuation.next_waiter = next;
-            ++routed;
-            *progress = true;
+            // A successful link may already have been detached by its new
+            // producer. Advance using our saved link, never the waiter's fields.
+            continuation.next_waiter = continuation.detached_next;
+            continuation.route = {};
         }
         if (continuation.next_waiter >= 0) break;
         ++completed;
