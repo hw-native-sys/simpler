@@ -142,6 +142,7 @@ void SchedulerContext::build_payload(
     DispatchPayload &dispatch_payload, ChipTaskSlotState &slot_state, SubtaskSlot subslot, int32_t block_idx,
     bool force_gate
 ) {
+    dispatch_payload.async_submission_context = 0;
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.to_descriptor().kernel_id[slot_idx]);
     const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);

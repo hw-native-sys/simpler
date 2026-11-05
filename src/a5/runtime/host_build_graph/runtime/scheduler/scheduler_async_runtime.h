@@ -262,6 +262,7 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
     using namespace scheduler_async_runtime_detail;
     if (bound == nullptr || payload == nullptr) return false;
     *bound = false;
+    payload->async_submission_context = 0;
     auto &ctx = payload->local_context.async_ctx;
     ctx.completion_count = nullptr;
     ctx.completion_error_code = nullptr;

@@ -126,6 +126,9 @@ struct alignas(64) DispatchPayload {
      *  the legacy scheduler seeds the equivalent per-core value at startup.
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
+    // Versioned per-execution submission contract in the retained async image.
+    // Zero means no qualified contract. Existing argument/context offsets stay fixed.
+    uint64_t async_submission_context;
     // No explicit tail padding: alignas(64) rounds sizeof up to 512 (8 cache lines).
 
     static_assert(sizeof(args[0]) == 8);
@@ -137,4 +140,6 @@ struct alignas(64) DispatchPayload {
 
 static_assert(sizeof(DispatchPayload) == 512, "DispatchPayload hardware ABI size drift");
 static_assert(offsetof(DispatchPayload, args) == 64, "args[] must start at cache line 1 (control block = CL0)");
+static_assert(offsetof(DispatchPayload, global_context) == 464, "global context offset changed");
+static_assert(offsetof(DispatchPayload, async_submission_context) == 472, "submission context offset changed");
 static_assert(offsetof(DispatchPayload, src_payload) < 64, "src_payload (gate) must live on the CL0 control block");

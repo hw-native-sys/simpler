@@ -2030,6 +2030,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     };
     __gm__ DispatchPayload *payload =
         scheduler_state_at<DispatchPayload>(scheduler_state_base, dispatch_payload_offset);
+    payload->async_submission_context = 0;
     SchedulerGraphResult status = SchedulerGraphResult::OK;
     if (inline_task) {
         payload->function_bin_addr = 0;
