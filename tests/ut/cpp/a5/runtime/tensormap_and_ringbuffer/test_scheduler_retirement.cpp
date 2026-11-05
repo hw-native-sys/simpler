@@ -82,6 +82,9 @@ public:
             context.core_type_compact_[i] = static_cast<uint8_t>(i < 2 ? CoreType::AIC : CoreType::AIV);
         }
     }
+    static uint32_t urma_queue(const SchedulerContext &context, int core, int buffer) {
+        return context.payload_per_core_[core][buffer].local_context.async_ctx.urma_queue_index;
+    }
     static void configure_diagnostic(
         SchedulerContext &context, ChipTaskSlotState *running, int32_t running_token, int32_t pending_token,
         bool busy = true
@@ -306,10 +309,31 @@ TEST_F(SchedulerRetirement, SerialInitializationPublishesAssignedGroups) {
     SchedulerRetirementTestPeer::open_cores(*context);
     SchedulerRetirementTestPeer::set_core_types(*context);
     ASSERT_EQ(context->post_handshake_init(runtime.get()), 0);
+    for (int core = 0; core < kCores; ++core) {
+        for (int buffer = 0; buffer < 2; ++buffer) {
+            EXPECT_EQ(
+                SchedulerRetirementTestPeer::urma_queue(*context, core, buffer),
+                core < 2 ? UINT32_MAX : static_cast<uint32_t>(core - 2)
+            );
+        }
+    }
     context->shutdown(0);
     context->shutdown(1);
     context->shutdown(2);
     expect_once();
+}
+
+TEST_F(SchedulerRetirement, DecoupledInitializationGivesEveryPhysicalAivItsOwnQueue) {
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    for (int core = 0; core < kCores; ++core) {
+        for (int buffer = 0; buffer < 2; ++buffer) {
+            EXPECT_EQ(
+                SchedulerRetirementTestPeer::urma_queue(*context, core, buffer),
+                core < 2 ? UINT32_MAX : static_cast<uint32_t>(core - 2)
+            );
+        }
+    }
 }
 
 TEST_F(SchedulerRetirement, NewGenerationDoesNotInheritPendingRetirement) {

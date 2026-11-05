@@ -13,6 +13,21 @@
 #include "device_runner.h"
 #include "runtime_c_api.h"
 
+extern "C" int host_urma_supported_ctx(DeviceContextHandle ctx) {
+    return ctx && static_cast<DeviceRunner *>(ctx)->host_urma_supported();
+}
+
+extern "C" int host_urma_publish_ctx(DeviceContextHandle ctx, uint64_t workspace) {
+    if (!ctx) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->publish_host_urma_workspace(workspace);
+    } catch (...) {
+        static_cast<DeviceRunnerBase *>(static_cast<DeviceRunner *>(ctx))
+            ->mark_device_unusable(PTO_RUNTIME_ERR_INTERNAL);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 extern "C" int host_ddr_map_ctx(
     DeviceContextHandle ctx, int device, uint64_t host, uint64_t bytes, uint64_t *mapped, unsigned *registered
 ) {

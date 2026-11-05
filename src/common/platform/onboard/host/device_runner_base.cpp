@@ -1986,6 +1986,22 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
     return kernel_exec_state_.mark_ready_enqueued();
 }
 
+int DeviceRunnerBase::publish_host_urma_workspace(uint64_t address) {
+    if (!host_urma_supported() || !aicpu_initialized_ || !can_accept_run()) return PTO_RUNTIME_ERR_INTERNAL;
+    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    if (control_stream == nullptr) control_stream = stream_aicpu_;
+    if (control_stream == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    int rc = launch_aicpu_payload(control_stream, &address, sizeof(address), host::KernelNames::UpdateHostUrmaName, 1);
+    if (rc == 0) rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc != 0) {
+        // A failed update may already have reached the device. Retain both possible owners.
+        mark_device_unusable(rc);
+        return rc;
+    }
+    dma_workspace_addr_[DMA_WORKSPACE_URMA] = address;
+    return 0;
+}
+
 /**
  * Distance from a GM address to its nocache alias on `device_id`, or 0.
  *
@@ -2087,6 +2103,7 @@ int DeviceRunnerBase::ensure_aicpu_runtime_registered(rtStream_t control_stream)
     for (size_t i = 0; i < extra_count && extra != nullptr; ++i) {
         if (extra[i] != nullptr) extra_symbols.emplace_back(extra[i]);
     }
+    if (host_urma_supported()) extra_symbols.emplace_back(host::KernelNames::UpdateHostUrmaName);
     rc = load_aicpu_op_.Init(extra_symbols);
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);

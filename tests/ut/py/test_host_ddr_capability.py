@@ -71,11 +71,10 @@ def test_old_binding_without_capability_is_not_supported(worker, monkeypatch):
         worker.map_view(tensor)
 
 
-@pytest.mark.parametrize("level", [3, 4])
-def test_host_ddr_refuses_hierarchical_workers(level):
-    worker = Worker(level=level)
+def test_host_ddr_refuses_l4_workers():
+    worker = Worker(level=4)
     try:
-        with pytest.raises(TypeError, match="direct level 2"):
+        with pytest.raises(TypeError, match="local level 2 or level 3"):
             worker.map_view(None)
     finally:
         worker.close()

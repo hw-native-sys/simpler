@@ -276,6 +276,7 @@ from .global_comm_domain import (
     validate_descriptor_table,
 )
 from .host_ddr import HostMappingRegistry
+from .host_ddr_l3 import ChildHostMappings, ParentHostMappings
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -897,6 +898,10 @@ _CTRL_COMMITTED_DEVICE_MEMORY = 18
 _CTRL_GLOBAL_DOMAIN_NODE = 24
 _CTRL_DEVICE_MEMORY_INFO = 25
 _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
+# Distributed Host registration uses generic control_payload transport.
+_CTRL_HOST_DDR = 28
+_CTRL_OP_NAMES[_CTRL_HOST_DDR] = "host_ddr"
+
 # Publish every diagnostic run this chip child has closed. 26 is the delegated
 # region control; 27 mirrors worker_manager.h::CTRL_DFX_FLUSH.
 _CTRL_DFX_FLUSH = 27
@@ -3455,6 +3460,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     prepared: set[int] | None = None,
     granted_sets: int = 1,
     chip_rank: int | None = None,
+    chip_count: int = 0,
     provider_region_store: ProviderRegionStore,
     reports_admissible_sets: bool = False,
 ) -> None:
@@ -3491,6 +3497,20 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             device_owner_instance_id=owner_instance_id,
         )
     )
+    if (
+        chip_count >= 2
+        and chip_rank is not None
+        and chip_platform == "a5"
+        and chip_runtime == "tensormap_and_ringbuffer"
+    ):
+        import_registry.host_mappings = ChildHostMappings(
+            cw,
+            import_registry,
+            owner_instance_id=owner_instance_id,
+            rank=chip_rank,
+            rank_count=chip_count,
+            alive=lambda: True,
+        )
     global_domain_store = _L2GlobalDomainStore()
     base_comm_handle = 0
     diagnostic_capture_index = 0
@@ -3644,6 +3664,19 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
             elif sub_cmd == _CTRL_COMM_INIT:
                 base_comm_handle = _handle_ctrl_comm_init(cw, buf)
+            elif sub_cmd == _CTRL_HOST_DDR:
+                mappings = import_registry.host_mappings
+                if not isinstance(mappings, ChildHostMappings):
+                    raise RuntimeError("L3 Host URMA mapping requires at least two A5 TMR chip workers")
+                staged_shm, payload, payload_size = _open_ctrl_payload(buf, what="Host DDR")
+                try:
+                    reply = mappings.handle(bytes(payload[:payload_size]), base_comm_handle=base_comm_handle)
+                    if len(reply) != payload_size:
+                        raise RuntimeError("Host DDR control reply size differs from its request")
+                    payload[:payload_size] = reply
+                finally:
+                    payload.release()
+                    staged_shm.close()
             elif sub_cmd == _CTRL_DELEGATED_REGION:
                 _handle_ctrl_delegated_region_terminal(buf, provider_transaction_table, provider_region_store)
             elif sub_cmd == _CTRL_COMMITTED_DEVICE_MEMORY:
@@ -3707,7 +3740,10 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # whose debt keeps the resource — and the query is non-mutating, so asking costs the
             # error path nothing and changes nothing about it.
             try:
-                cw.set_exported_device_regions_live(provider_region_store.holds_resources)
+                cw.set_exported_device_regions_live(
+                    provider_region_store.holds_resources
+                    or (import_registry.host_mappings is not None and import_registry.host_mappings.holds_resources)
+                )
             except Exception as flag_error:  # noqa: BLE001
                 # The flag could not be refreshed, so what this worker owns is unknown. Declare a
                 # region live: withholding every join is the answer that cannot be unsafe.
@@ -3904,7 +3940,16 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
             _validate_host_control_access(registry.get(staged.cid), args)
-            chip_args = _materialize_chip_task_args(args, import_registry)
+            # The workspace can be used even by a kernel without a mapped Tensor argument.
+            # Reserve before materialization/admission; an uncertain native failure retains it.
+            if import_registry.host_mappings is not None:
+                import_registry.host_mappings.acquire(staged.identity, args)
+            try:
+                chip_args = _materialize_chip_task_args(args, import_registry)
+            except BaseException:
+                if import_registry.host_mappings is not None:
+                    import_registry.host_mappings.release(staged.identity)
+                raise
             if staged.config.output_prefix:
                 _bind_host_log_session_directory()
             staged.chip_run = cw._submit_chip_run_materialized(
@@ -3955,6 +4000,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             msg = ""
             try:
                 staged.chip_run._raise_if_failed()
+                if import_registry.host_mappings is not None:
+                    import_registry.host_mappings.release(staged.identity)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 msg = _format_exc(f"chip_process dev={device_id}: chip run", e)
@@ -4003,6 +4050,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     stale_message = f"chip_process dev={device_id}: stale activation identity"
                     try:
                         staged.chip_run.abandon()
+                        if import_registry.host_mappings is not None:
+                            import_registry.host_mappings.release(staged.identity)
                     except Exception as e:  # noqa: BLE001
                         stale_message += "; " + _format_exc("chip run abandonment", e)
                         shutdown_message = stale_message
@@ -4027,7 +4076,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     break
                 if control_state == _CONTROL_REQUEST:
                     sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-                    registry_control = sub_cmd in (_CTRL_PREPARE, _CTRL_REGISTER, _CTRL_UNREGISTER)
+                    registry_control = sub_cmd in (_CTRL_PREPARE, _CTRL_REGISTER, _CTRL_UNREGISTER, _CTRL_HOST_DDR)
                     defer_control = registry_control and bool(staged_runs)
                     if sub_cmd == _CTRL_UNREGISTER:
                         defer_control = defer_control or task_frame_references_digest(_read_control_digest(buf))
@@ -4228,6 +4277,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     prewarm_config=None,
     enable_sdma: bool = False,
     chip_rank: int | None = None,
+    chip_count: int = 0,
     launch_depth: int = 1,
     collect_across_runs: bool = False,
     pipeline_depth_request: int = 0,
@@ -4358,6 +4408,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prepared=prepared,
             granted_sets=granted_sets,
             chip_rank=chip_rank,
+            chip_count=chip_count,
             provider_region_store=provider_region_store,
             reports_admissible_sets=reports_admissible_sets,
         )
@@ -5885,6 +5936,9 @@ class Worker:
         # args itself (no forked child, no mailbox), resolving each ref's descriptor to a local base
         # map-once — the chip-child path minus the mailbox hop. Lazily created on first L2 run.
         self._chip_import_registry: ImportRegistry | None = None
+        self._host_group_mappings: ParentHostMappings | None = None
+        self._host_group_mutex = threading.RLock()
+        self._host_group_teardown_thread: int | None = None
 
     @property
     def _initialized(self) -> bool:
@@ -9579,6 +9633,7 @@ class Worker:
                             prewarm_config=self._prewarm_config,
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
                             chip_rank=idx,
+                            chip_count=len(device_ids),
                             launch_depth=(
                                 chip_pipeline_depth_request
                                 if self._automatic_admission_requested
@@ -13170,19 +13225,24 @@ class Worker:
         return self._chip_import_registry
 
     def map_view(self, tensor: Tensor) -> Tensor:
-        """Return a local A5 Device view with the source Buffer's access grant.
+        """Return an A5 Device view with the source Buffer's access grant.
 
-        The initialized Worker supplies the device/context. Whole-buffer registration
-        is reused by views, and each view keeps its own geometry and access lifetime.
+        L2 maps into its own device. L3 maps the same complete Host backing into
+        every child and prepares an independent Host URMA workspace per child.
+        L3 requires at least two A5 TMR workers and no outstanding runs.
+        Registration is reused by views; geometry and view lifetimes stay independent.
         """
-        if self.level != 2:
-            raise TypeError("map_view requires a direct level 2 Worker")
+        if self.level not in (2, 3):
+            raise TypeError("map_view requires a local level 2 or level 3 Worker")
         if not isinstance(tensor, Tensor):
             raise TypeError("map_view requires a Tensor")
         with self._operation_lease("map_view"):
             buffer = self._buffers.get(int(tensor.buffer.identity.buffer_id))
             if buffer is None or buffer.identity != tensor.buffer.identity:
-                raise ValueError("map_view requires Host storage owned by this L2 Worker")
+                raise ValueError("map_view requires Host storage owned by this Worker")
+            if self.level == 3:
+                with self._host_group_control():
+                    return self._l3_host_mappings().map_view(buffer, tensor)
             registry = self._l2_import_registry()
             if registry.host_mappings is None:
                 owner = weakref.ref(self)
@@ -13197,13 +13257,80 @@ class Worker:
 
     def unmap_view(self, tensor: Tensor) -> None:
         """Revoke this view after its accepted uses retire; failed cleanup is retryable."""
-        if self.level != 2 or not isinstance(tensor, Tensor) or not tensor._mapping_ref:
-            raise ValueError("unmap_view requires a mapped local L2 Tensor")
+        if self.level not in (2, 3) or not isinstance(tensor, Tensor) or not tensor._mapping_ref:
+            raise ValueError("unmap_view requires a mapped local Tensor")
         with self._operation_lease("unmap_view"):
+            if self.level == 3:
+                if self._host_group_mappings is None:
+                    raise ValueError("mapped Host view belongs to another context")
+                self._host_group_mappings.unmap_view(tensor)
+                return
             registry = self._chip_import_registry
             if registry is None or registry.host_mappings is None:
                 raise ValueError("mapped Host view belongs to another context")
             registry.host_mappings.unmap_view(tensor)
+
+    @contextlib.contextmanager
+    def _host_group_control(self):
+        """Fence every accepted run, including users of a workspace without tensor arguments."""
+        if _callback_frame_for(self) is not None:
+            raise RuntimeError("Host map/unmap must run outside orchestration callbacks, after outstanding runs finish")
+        teardown = self._host_group_teardown_thread == threading.get_ident()
+        lease = contextlib.nullcontext() if teardown else self._operation_lease("Host mapping", allow_continuation=True)
+        with lease, self._control_admission("Host mapping"):
+            yield
+
+    def _l3_host_mappings(self) -> ParentHostMappings:
+        if self._config.get("platform") != "a5" or self._config.get("runtime") != "tensormap_and_ringbuffer":
+            raise RuntimeError("L3 Host URMA mapping requires the A5 onboard tensormap_and_ringbuffer runtime")
+        members = tuple(range(len(self._config.get("device_ids", ()))))
+        if len(members) < 2:
+            raise ValueError("L3 Host URMA mapping requires at least two chip workers")
+        with self._host_group_mutex:
+            if self._host_group_mappings is None:
+
+                def allocate_group():
+                    with self._alloc_id_lock:
+                        allocation_id = max(1, self._next_alloc_id)
+                        self._next_alloc_id = allocation_id + 1
+                        return allocation_id
+
+                def dispatch(member, payload):
+                    if self._worker is None:
+                        raise RuntimeError("Host mapping transport is unavailable")
+                    return self._worker.control_payload(
+                        WorkerType.NEXT_LEVEL, member, _CTRL_HOST_DDR, payload, self._py_control_timeout_s
+                    )
+
+                self._host_group_mappings = ParentHostMappings(
+                    members=members,
+                    alive=lambda: self._worker is not None and self._initialized,
+                    admission=self._host_group_control,
+                    allocate_group=allocate_group,
+                    ensure_comm=self._ensure_comm_base,
+                    dispatch=dispatch,
+                    fanout=lambda items, target: _start_and_join_threads(items, target, name_prefix="host_ddr_chip_"),
+                )
+        return self._host_group_mappings
+
+    def _validate_mapped_host_args(self, args, worker_id=None, *, device_target=True):
+        if args is None:
+            return
+        if not any(args.tensor(i)._mapping_ref for i in range(args.tensor_count())):
+            return
+        if not device_target or self.level != 3 or self._host_group_mappings is None:
+            raise ValueError("mapped Host views can only target their registered local L2 device workers")
+        self._host_group_mappings.validate_args(args, worker_id)
+
+    def _close_host_group_mappings(self):
+        if self._host_group_mappings is None:
+            return
+        self._host_group_teardown_thread = threading.get_ident()
+        try:
+            self._host_group_mappings.close_all()
+            self._host_group_mappings.require_closed()
+        finally:
+            self._host_group_teardown_thread = None
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
         """Allocate a runtime-managed intermediate buffer (the ``Tensor`` form of ``orch.alloc``).
@@ -13983,8 +14110,7 @@ class Worker:
         return self._chip_runs.get(run_id)
 
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
-        if args is not None and any(args.tensor(i)._mapping_ref for i in range(args.tensor_count())):
-            raise ValueError("local mapped Host views cannot be forwarded to L3 workers")
+        self._validate_mapped_host_args(args)
         assert self._orch is not None
         assert self._worker is not None
         if getattr(cfg, "output_prefix", ""):
@@ -15017,6 +15143,13 @@ class Worker:
         if gate_err is not None:
             errors.append(gate_err)
             raise gate_err
+
+        # Failed distributed deregistration must retain both the parent backing and
+        # its child transports; the following journal attempts independent entries.
+        self._cleanup_journal.add_once("native", "Host DDR mappings", self._close_host_group_mappings)
+        host_gate_error = self._cleanup_journal.drive({("native", "Host DDR mappings")})
+        if host_gate_error is not None:
+            raise host_gate_error
 
         # Register the whole pre-transport ownership set before driving it. The
         # journal attempts every independent action and removes only successful

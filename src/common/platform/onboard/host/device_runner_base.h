@@ -127,6 +127,9 @@ class DeviceRunnerBase {
     friend class RunRetentionProbePeer;
 
 public:
+    virtual bool host_urma_supported() const noexcept { return false; }
+    // Caller holds quiescent control admission through the synchronized update.
+    int publish_host_urma_workspace(uint64_t address);
     // Public virtual dtor so the shared c_api can `delete` a polymorphic
     // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each
     // arch's `DeviceRunner` defaults this through the compiler-generated dtor.

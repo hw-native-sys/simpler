@@ -763,6 +763,11 @@ bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
 
 void ChipWorker::finalize() {
     validate_execution_context();
+    {
+        std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+        if (host_urma_comm_ != 0)
+            throw std::runtime_error("ChipWorker::finalize: shared Host URMA resources still retained");
+    }
     std::exception_ptr lane_error;
     if (run_lane_ != nullptr) {
         run_lane_->stop_admission();
@@ -2380,6 +2385,8 @@ uint64_t ChipWorker::map_host_ddr(uint64_t host, uint64_t bytes) {
 
 void ChipWorker::unmap_host_ddr(uint64_t host) {
     std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+    if (host_urma_comm_ != 0 && host_urma_host_ == host)
+        throw std::runtime_error("Host DDR remains registered with URMA; release the collective workspace first");
     auto it = host_ddr_mappings_.find(host);
     if (it == host_ddr_mappings_.end()) return;
     validate_execution_context();
@@ -2388,6 +2395,83 @@ void ChipWorker::unmap_host_ddr(uint64_t host) {
     const int rc = runtime_module_->required<Unmap>("host_ddr_unmap_ctx")(device_ctx_, device_id_, host);
     if (rc != 0) throw std::runtime_error("Host DDR unmapping failed: " + std::to_string(rc));
     host_ddr_mappings_.erase(it);
+}
+
+bool ChipWorker::host_urma_supported() const noexcept {
+    if (runtime_module_ == nullptr || device_ctx_ == nullptr) return false;
+    using Supported = int (*)(DeviceContextHandle);
+    auto supported = runtime_module_->optional<Supported>("host_urma_supported_ctx");
+    return supported != nullptr && supported(device_ctx_) != 0;
+}
+
+uint64_t ChipWorker::prepare_host_urma(uint64_t base_comm, uint64_t allocation_id, uint64_t host, uint64_t bytes) {
+    if (!initialized_ || !host_urma_supported())
+        throw std::runtime_error("Host URMA requires the A5 onboard TMR runtime");
+    if (!allocation_id || allocation_id > UINT32_MAX || !bytes)
+        throw std::invalid_argument("Host URMA requires a nonzero uint32 allocation ID and nonempty backing");
+    validate_execution_context();
+    require_comm_reclamation_safe();
+    std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+    std::lock_guard<std::mutex> run_lock(native_run_mu_);
+    if (!native_runs_.empty()) throw std::runtime_error("Host URMA preparation requires an idle worker");
+    auto mapping = host_ddr_mappings_.find(host);
+    if (mapping == host_ddr_mappings_.end() || mapping->second.closing || !mapping->second.mapped ||
+        mapping->second.bytes != bytes)
+        throw std::invalid_argument("Host URMA requires the complete live Host mapping");
+    auto *session = find_comm_session(base_comm);
+    if (session == nullptr || !session->is_base)
+        throw std::invalid_argument("Host URMA requires this worker's base communicator");
+    if (host_urma_comm_ != 0) {
+        if (host_urma_comm_ == base_comm && host_urma_allocation_ == allocation_id && host_urma_host_ == host &&
+            host_urma_workspace_ != 0 && !host_urma_revoked_)
+            return host_urma_workspace_;
+        throw std::runtime_error("Host URMA already owns a backing or retains incomplete preparation");
+    }
+    // Commit ownership before the first collective side effect. Failure is cleanup debt.
+    host_urma_comm_ = base_comm;
+    host_urma_allocation_ = allocation_id;
+    host_urma_host_ = host;
+    host_urma_revoked_ = false;
+    using Prepare = int (*)(void *, uint64_t, uint64_t, uint64_t, uint64_t *);
+    uint64_t workspace = 0;
+    int rc = runtime_module_->required<Prepare>("comm_prepare_host_urma")(
+        reinterpret_cast<void *>(base_comm), allocation_id, mapping->second.mapped, bytes, &workspace
+    );
+    if (rc != 0 || workspace == 0)
+        throw std::runtime_error("Host URMA collective preparation failed: " + std::to_string(rc));
+    using Publish = int (*)(DeviceContextHandle, uint64_t);
+    rc = runtime_module_->required<Publish>("host_urma_publish_ctx")(device_ctx_, workspace);
+    if (rc != 0) {
+        comm_reclamation_unconfirmed_ = true;
+        throw std::runtime_error("Host URMA publication is unconfirmed: " + std::to_string(rc));
+    }
+    host_urma_workspace_ = workspace;
+    return workspace;
+}
+
+void ChipWorker::release_host_urma() {
+    validate_execution_context();
+    require_comm_reclamation_safe();
+    std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+    if (host_urma_comm_ == 0) return;
+    std::lock_guard<std::mutex> run_lock(native_run_mu_);
+    if (!native_runs_.empty()) throw std::runtime_error("Host URMA release requires an idle worker");
+    if (!host_urma_revoked_) {
+        using Publish = int (*)(DeviceContextHandle, uint64_t);
+        const int rc = runtime_module_->required<Publish>("host_urma_publish_ctx")(device_ctx_, 0);
+        if (rc != 0) {
+            comm_reclamation_unconfirmed_ = true;
+            throw std::runtime_error("Host URMA revocation is unconfirmed: " + std::to_string(rc));
+        }
+        host_urma_revoked_ = true;
+    }
+    using Release = int (*)(void *, uint64_t);
+    const int rc = runtime_module_->required<Release>("comm_release_host_urma")(
+        reinterpret_cast<void *>(host_urma_comm_), host_urma_allocation_
+    );
+    if (rc != 0) throw std::runtime_error("Host URMA resources retained after release failure: " + std::to_string(rc));
+    host_urma_comm_ = host_urma_allocation_ = host_urma_host_ = host_urma_workspace_ = 0;
+    host_urma_revoked_ = false;
 }
 
 uint64_t ChipWorker::malloc(size_t size) {
@@ -2679,6 +2763,11 @@ void ChipWorker::comm_barrier(uint64_t comm_handle) {
 }
 
 void ChipWorker::comm_destroy(uint64_t comm_handle) {
+    {
+        std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+        if (host_urma_comm_ == comm_handle && host_urma_comm_ != 0)
+            throw std::runtime_error("base communicator retains a shared Host URMA workspace");
+    }
     require_comm_reclamation_safe();
     CommSession *session = find_comm_session(comm_handle);
     if (session == nullptr) {
@@ -2705,6 +2794,10 @@ void ChipWorker::comm_destroy(uint64_t comm_handle) {
 }
 
 void ChipWorker::comm_destroy_all() {
+    {
+        std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+        if (host_urma_comm_ != 0) throw std::runtime_error("shared Host URMA workspace must be released first");
+    }
     require_comm_reclamation_safe();
     int first_rc = 0;
     for (auto it = comm_sessions_.rbegin(); it != comm_sessions_.rend(); ++it) {
