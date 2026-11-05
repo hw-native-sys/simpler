@@ -111,21 +111,10 @@ jobs:
           command -v ninja
           command -v g++
           command -v clang-tidy
-          if ! command -v g++-15 >/dev/null 2>&1; then
-            mkdir -p "$RUNNER_TEMP/bin"
-            ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"
-            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          fi
-          if command -v clang-tidy-18 >/dev/null 2>&1; then
-            mkdir -p "$RUNNER_TEMP/bin"
-            ln -sf "$(command -v clang-tidy-18)" "$RUNNER_TEMP/bin/clang-tidy"
-            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          fi
-          PATH="$RUNNER_TEMP/bin:$PATH" command -v clang-tidy
-          PATH="$RUNNER_TEMP/bin:$PATH" clang-tidy --version
+          clang-tidy --version
 
       - name: Cache pip packages
-        if: inputs.setup_variant == 'self-cpu' || steps.lint-build.outputs.needs_build == 'true'
+        if: inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'
         uses: ./.github/actions/cache-pip
 
       - name: Install package (for clang-tidy compile databases)

@@ -86,11 +86,7 @@ jobs:
           command -v ninja
           command -v g++
           command -v dot
-          if ! command -v g++-15 >/dev/null 2>&1; then
-            mkdir -p "$RUNNER_TEMP/bin"
-            ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"
-            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          fi
+          command -v g++-15
 
       - name: Set up Python ${{ inputs.python_version }}
         if: inputs.setup_variant == 'github'
@@ -99,6 +95,7 @@ jobs:
           python-version: ${{ inputs.python_version }}
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
 
       - name: Set up environment
@@ -106,6 +103,8 @@ jobs:
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a2a3sim .[test]"
+          install-torch: ${{ inputs.setup_variant != 'self-cpu' }}
+          system-site-packages: ${{ inputs.setup_variant == 'self-cpu' }}
 
       - name: Run pytest scene tests
         run: |
