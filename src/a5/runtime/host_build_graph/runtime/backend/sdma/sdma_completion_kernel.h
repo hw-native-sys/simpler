@@ -13,10 +13,8 @@
 
 #include <stdint.h>
 
-#include <pto/comm/async_common/async_event_impl.hpp>
-#include <pto/comm/async/sdma/sdma_async_intrin.hpp>
-
 #include "async_kernel_api.h"
+#include "sdma_submission_contract.h"
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/runtime_status.h"
 
@@ -30,11 +28,6 @@
 // Re-exposed PTO-ISA constant so examples / callers don't need to include
 // <pto/comm/async/sdma/sdma_types.hpp> just to spell their scratch tile.
 inline constexpr uint32_t SDMA_SCRATCH_ALIGNMENT = pto::comm::sdma::UB_ALIGN_SIZE;
-
-enum class SdmaOp : uint8_t {
-    TGET = 0,
-    TPUT = 1,
-};
 
 // SdmaRequestDescriptor bundles everything send_request_entry needs to drive
 // one SDMA transfer + completion registration. It is a template because the
@@ -75,44 +68,42 @@ inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> Sdma
 
 namespace pto2::detail {
 
-inline __aicore__ void
+inline __aicore__ bool
 register_sdma_post_done_record(AsyncCtx &ctx, volatile __gm__ void *record_addr, uint64_t post_id) {
     CompletionToken token{
         reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD, post_id
     };
-    (void)register_completion_condition(ctx, token);
+    return register_completion_condition(ctx, token);
 }
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ void
-register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
-    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        (void)event.Wait(session);
-        return;
-    }
-    if (event.handle == 0) {
-        return;
-    }
-
+inline __aicore__ bool register_pto_async_event(
+    AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, const AsyncCompletionAllowance &allowance
+) {
     const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
+    if (event.postFailed || engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        return;
+        return false;
     }
+    if (!ctx.task_token.is_valid()) return event.Wait(session);
+    if (event.handle == 0) return async_completion_accept_count(ctx, allowance, 0);
 
-    uint64_t post_id = 0;
-    uint32_t queue_num = 0;
-    __gm__ uint8_t *post_done_base = session.rt.sdma.postDoneBase;
-    if (!::pto::comm::sdma::detail::DecodeSdmaEventHandle(event.handle, post_id, queue_num) ||
-        post_done_base == nullptr) {
+    const uint32_t record_count = event.CompletionRecordCount(session);
+    if (record_count == 0 || record_count == ::pto::comm::kCompletionRecordCountError ||
+        !async_completion_accept_count(ctx, allowance, record_count)) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        return;
+        return false;
     }
-    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
-        register_sdma_post_done_record(
-            ctx, ::pto::comm::sdma::detail::GetPostDoneRecordAddr(post_done_base, queue_id), post_id
-        );
+    for (uint32_t index = 0; index < record_count; ++index) {
+        const auto record = event.CompletionRecordAt(session, index);
+        if (record.kind != ::pto::comm::CompletionKind::SDMA_POST_DONE || record.addr == nullptr ||
+            (reinterpret_cast<uint64_t>(record.addr) & 7u) != 0 || record.expected == 0) {
+            defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
+        if (!register_sdma_post_done_record(ctx, record.addr, record.expected)) return false;
     }
+    return true;
 }
 
 }  // namespace pto2::detail
@@ -124,19 +115,56 @@ register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsy
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 inline __aicore__ bool
 send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
+    if (ctx.task_token.is_valid() && !async_completion_writer_valid(ctx)) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
+    if (ctx.task_token.is_valid() && *ctx.completion_error_code != 0) {
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
+    if (desc.op != SdmaOp::TGET && desc.op != SdmaOp::TPUT) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
+    uint64_t transfer_bytes = 0;
+    if (!async_sdma_transfer_bytes(desc.dst, desc.src, &transfer_bytes)) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
     pto::comm::AsyncSession session;
     if (!pto::comm::BuildAsyncSession(desc.scratch, desc.workspace, session, desc.sync_id)) {
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
         return false;
     }
 
+    // A post may produce a completion record for every queue in this session.
+    // The context is single-writer; hold that entire suffix until the submit
+    // returns, then accept only an actual record count within this allowance.
+    AsyncCompletionAllowance allowance;
+    if (ctx.task_token.is_valid() && !async_completion_reserve(ctx, session.cfg.sdma.queueNum, &allowance)) {
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
     pto::comm::AsyncEvent event;
     if (desc.op == SdmaOp::TGET) {
         event = pto::comm::TGET_ASYNC(desc.dst, desc.src, session);
     } else {
         event = pto::comm::TPUT_ASYNC(desc.dst, desc.src, session);
     }
-    pto2::detail::register_pto_async_event(ctx, event, session);
+    if (!async_sdma_event_valid(
+            desc.op, transfer_bytes, event.handle, event.postFailed, static_cast<uint32_t>(event.engine),
+            static_cast<uint32_t>(pto::comm::DmaEngine::SDMA)
+        )) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
+    const bool registered = pto2::detail::register_pto_async_event(ctx, event, session, allowance);
     pto2::detail::defer_flush(ctx);
-    return true;
+    return registered;
 }

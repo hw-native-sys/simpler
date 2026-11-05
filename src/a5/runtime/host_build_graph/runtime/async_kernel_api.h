@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PTO_ASYNC_KERNEL_API_H
-#define PTO_ASYNC_KERNEL_API_H
+#pragma once
 
 #include <stdint.h>
 
@@ -18,6 +17,7 @@
 #include <pto/comm/pto_comm_inst.hpp>
 
 #include "intrinsic.h"
+#include "async_completion_writer.h"
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/completion_token.h"
 #include "host_build_graph/runtime_status.h"
@@ -45,11 +45,7 @@ inline __aicore__ void defer_load_slab(AsyncCtx &ctx) {
 #endif
 }
 
-inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code) {
-    if (ctx.task_token.is_valid() && ctx.completion_error_code != nullptr) {
-        *ctx.completion_error_code = error_code;
-    }
-}
+inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code) { async_completion_error(ctx, error_code); }
 
 inline __aicore__ void defer_flush_range(volatile __gm__ void *addr, uint32_t size_bytes) {
     if (addr == nullptr || size_bytes == 0) return;
@@ -66,31 +62,27 @@ inline __aicore__ void defer_flush_range(volatile __gm__ void *addr, uint32_t si
 #endif
 }
 
-inline __aicore__ void defer_flush(AsyncCtx &ctx) {
-    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr) return;
+struct CompletionCache {
+    inline __aicore__ void flush_range(volatile __gm__ void *address, uint32_t bytes) {
+        defer_flush_range(address, bytes);
+    }
+    inline __aicore__ void finish() {
 #if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
-    uint32_t count = *ctx.completion_count;
-    if (count > ctx.completion_capacity) {
-        count = ctx.completion_capacity;
-    }
-    uint32_t flush_bytes = static_cast<uint32_t>(sizeof(*ctx.completion_count));
-    if (ctx.completion_error_code != nullptr) {
-        flush_bytes += static_cast<uint32_t>(sizeof(*ctx.completion_error_code));
-    }
-    if (ctx.completion_entries != nullptr) {
-        flush_bytes += count * static_cast<uint32_t>(sizeof(DeferredCompletionEntry));
-    }
-    defer_flush_range(ctx.completion_count, flush_bytes);
 #if defined(__CPU_SIM)
-    dsb(0);
+        dsb(0);
 #else
-    dsb(DSB_DDR);
+        dsb(DSB_DDR);
 #endif
-    pipe_barrier(PIPE_ALL);
+        pipe_barrier(PIPE_ALL);
 #else
-    (void)ctx;
-    __asm__ __volatile__("" ::: "memory");
+        __asm__ __volatile__("" ::: "memory");
 #endif
+    }
+};
+
+inline __aicore__ void defer_flush(AsyncCtx &ctx) {
+    CompletionCache cache;
+    async_completion_flush(ctx, cache);
 }
 
 }  // namespace pto2::detail
@@ -116,27 +108,7 @@ inline __aicore__ bool async_ctx_is_deferred(const AsyncCtx &ctx) { return ctx.t
 // SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW in ctx.completion_error_code) or when ctx is
 // not currently a deferred context.
 inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const CompletionToken &token) {
-    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        return false;
-    }
-
-    uint32_t idx = *ctx.completion_count;
-    if (idx >= ctx.completion_capacity) {
-        if (ctx.completion_error_code != nullptr) {
-            *ctx.completion_error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
-        }
-        return false;
-    }
-
-    volatile __gm__ DeferredCompletionEntry *slot = &ctx.completion_entries[idx];
-    slot->addr = token.addr;
-    slot->backend_cookie = token.backend_cookie;
-    slot->expected_value = token.expected_value;
-    slot->engine = token.engine;
-    slot->completion_type = token.completion_type;
-    slot->_pad = 0;
-    *ctx.completion_count = idx + 1;
-    return true;
+    return async_completion_append(ctx, token);
 }
 
 inline __aicore__ void
@@ -154,5 +126,3 @@ save_expected_notification_counter(AsyncCtx &ctx, volatile __gm__ void *counter_
     (void)register_completion_condition(ctx, token);
     pto2::detail::defer_flush(ctx);
 }
-
-#endif  // PTO_ASYNC_KERNEL_API_H
