@@ -68,7 +68,7 @@ def a2a3_lifecycle_binary(tmp_path_factory):
 
 @pytest.mark.parametrize("transport", ["fabric", "ipc"])
 @pytest.mark.parametrize(
-    "scenario", ["success", "late_import", "early_get_device", "peer_import", "peer_reserve", "peer_map", "peer_access"]
+    "scenario", ["success", "late_import", "early_get_device", "peer_import", "peer_reserve", "peer_map"]
 )
 def test_a2a3_domain_lifecycle(a2a3_lifecycle_binary, transport, scenario):
     subprocess.run([str(a2a3_lifecycle_binary), transport, scenario], check=True, timeout=5)
@@ -76,3 +76,8 @@ def test_a2a3_domain_lifecycle(a2a3_lifecycle_binary, transport, scenario):
 
 def test_a2a3_fallback_stops_when_cleanup_reports_an_error_after_consumption(a2a3_lifecycle_binary):
     subprocess.run([str(a2a3_lifecycle_binary), "ipc", "fallback_cleanup"], check=True, timeout=5)
+
+
+@pytest.mark.parametrize("transport", ["fabric", "ipc"])
+def test_a2a3_mapped_owner_needs_no_explicit_access_grant(a2a3_lifecycle_binary, transport):
+    subprocess.run([str(a2a3_lifecycle_binary), transport, "map_grants_access"], check=True, timeout=5)
