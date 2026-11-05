@@ -249,14 +249,19 @@ class KernelCompiler:
         """
         Get all include directories needed for orchestration compilation.
 
-        Combines the runtime-specific directory with platform include directories.
+        A runtime's own tree comes first, then whatever its build_config
+        declares, then the shared and platform directories. A runtime that
+        compiles a sibling's sources keeps no copy of that sibling's headers,
+        so the declaration is the only record of where they are, and it has to
+        precede the shared directories for the same reason the runtime's own
+        tree does: several of these directories hold a `tensor.h`, and only the
+        arch-local one declares the `using Tensor` alias kernels rely on.
 
         Args:
             runtime_name: Name of the runtime (e.g., "host_build_graph")
 
         Returns:
-            List of include directory paths:
-            [runtime_dir, platform_host_dir, platform_include_dir]
+            List of include directory paths, in search order.
         """
         # Map platform to runtime architecture
         if self.platform in ("a2a3", "a2a3sim"):
@@ -270,7 +275,10 @@ class KernelCompiler:
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         src_common_dir = str(self.project_root / "src" / "common")
-        return [runtime_dir, runtime_common_dir, common_dir, src_common_dir] + self.get_platform_include_dirs()
+        config_include_dirs, _ = self._get_orchestration_config(runtime_name)
+        own_dirs = [runtime_dir, runtime_common_dir]
+        declared = [d for d in config_include_dirs if d not in own_dirs]
+        return own_dirs + declared + [common_dir, src_common_dir] + self.get_platform_include_dirs()
 
     def get_incore_include_dirs(self) -> list[str]:
         """
@@ -389,26 +397,25 @@ class KernelCompiler:
         persistent scene-test cache hashes the same inputs the compiler sees.
         """
         include_dirs = self.get_orchestration_include_dirs(runtime_name)
-        config_include_dirs, config_sources = self._get_orchestration_config(runtime_name)
+        _, config_sources = self._get_orchestration_config(runtime_name)
         platform_sources = self._get_orchestration_platform_sources()
         if self._orchestration_toolchain(runtime_name).is_host:
             include_dirs.append(str(self.project_root / "src" / "common" / "log" / "include"))
             host_log_dir = self.project_root / "src" / "common" / "log"
             platform_sources.extend([str(host_log_dir / "host_log.cpp"), str(host_log_dir / "unified_log_host.cpp")])
         return (
-            [*include_dirs, *config_include_dirs],
+            include_dirs,
             [*config_sources, *platform_sources],
         )
 
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
-        if runtime_name == "host_build_graph":
-            return self.host_gxx
-        if runtime_name == "tensormap_and_ringbuffer":
-            if self.platform.endswith("sim"):
-                return self.host_gxx
+        # tensormap_and_ringbuffer's orchestration runs on the AICPU, so on
+        # hardware it is built for aarch64; on sim it runs in the host process.
+        # Every other runtime's orchestration runs on the host.
+        if runtime_name == "tensormap_and_ringbuffer" and not self.platform.endswith("sim"):
             assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
             return self.aarch64
-        raise ValueError(f"Unknown runtime_name: {runtime_name!r}")
+        return self.host_gxx
 
     def _orchestration_compile_flags(self, toolchain: Union[GxxToolchain, Aarch64GxxToolchain]) -> list[str]:
         return [*toolchain.get_compile_flags(), *self._sanitizer_flags(toolchain)]
