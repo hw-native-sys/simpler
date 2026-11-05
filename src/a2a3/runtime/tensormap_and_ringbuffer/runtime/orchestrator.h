@@ -177,6 +177,11 @@ struct OrchestratorState {
         const OrchestratorLayout &layout, void *sm_dev_base, void *gm_heap,
         const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH]
     );
+    bool reset_for_reuse_prepared(
+        const OrchestratorLayout &layout, void *sm_dev_base, void *gm_heap,
+        const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
+        const PreparedRunLayout &prepared
+    );
 
     // Phase 3b: write the arena-internal pointer fields (scope_tasks,
     // scope_begins, rings[].fanin_pool.base, tensor_map.{buckets,entry_pool,
