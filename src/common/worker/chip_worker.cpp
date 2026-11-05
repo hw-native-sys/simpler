@@ -793,6 +793,12 @@ void ChipWorker::finalize() {
         // unknown. Only the common owner close may end its device generation.
         (void)abandon_unproven_native_run_storage();
         comm_reclamation_unconfirmed_ = true;
+        if (!comm_sessions_.empty() || !global_domain_ids_.empty()) {
+            // Stopping/resetting this device cannot prove a peer or SDMA has
+            // stopped naming its exported windows. Keep the existing comm
+            // owner and context, rather than treating a local reset as drain.
+            retain_unconfirmed_comm_cleanup();
+        }
         if (run_lane_ != nullptr) {
             if (lane_error == nullptr) {
                 lane_error = std::make_exception_ptr(std::runtime_error("native close retained an unproved run"));

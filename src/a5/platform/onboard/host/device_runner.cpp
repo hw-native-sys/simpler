@@ -50,7 +50,17 @@
 
 namespace {
 constexpr const char *kAicpuTopologyQueryName = "simpler_aicpu_query_topology";
+
+template <typename RuntimeType>
+auto prepared_scheduler_mode(const RuntimeType &runtime, int)
+    -> decltype(runtime.dev.scheduler_bootstrap.runtime_mode) {
+    return runtime.dev.scheduler_bootstrap.runtime_mode;
 }
+template <typename RuntimeType>
+uint32_t prepared_scheduler_mode(const RuntimeType &, long) {
+    return 0;  // TMR has no HBG scheduler bootstrap or deferred resident image.
+}
+}  // namespace
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:
@@ -95,6 +105,14 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
     Runtime * /*runtime*/
 ) noexcept {
     return true;
+}
+
+// TMR publishes no HBG scheduler mode or async image. HBG supplies the strong
+// parser for its retained, versioned image; missing evidence is never "sync".
+extern "C" __attribute__((weak, visibility("hidden"))) int runtime_async_last_use_requirement(
+    uint32_t mode, const void * /*host*/, size_t /*bytes*/, uint64_t /*epoch*/
+) noexcept {
+    return mode == 0 ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 // =============================================================================
@@ -375,7 +393,7 @@ int DeviceRunner::prepare_execution(
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
-    execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
+    execution->scheduler_runtime_mode = prepared_scheduler_mode(runtime, 0);
     execution->resources_owned = true;
     auto prepare_rollback = RAIIScopeGuard([this, &execution]() {
         cleanup_execution(*execution, /*launched=*/false);
@@ -771,9 +789,16 @@ int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
         return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
     const int poll_rc = poll_execution(active);
     if (poll_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return poll_rc;
-    prepared.physical_complete = true;
+    const bool external_last_use = async_last_use_requirement(prepared) != 0;
+    bool retired = false;
+    auto incomplete_last_use = RAIIScopeGuard([&prepared, external_last_use, &retired]() {
+        if (external_last_use && !retired) prepared.physical_complete = false;
+    });
+    prepared.physical_complete = !external_last_use;
     const int wait_rc = poll_boundary_waits(prepared);
     if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
+    prepared.physical_complete = true;
+    if (qualify_async_last_use(prepared) != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     read_device_wall_ns(prepared.pipeline_slot);
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
         !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
@@ -784,6 +809,7 @@ int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
     emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
     print_handshake_results(prepared.kernel_args, prepared.num_aicore);
     cleanup_execution(prepared, true);
+    retired = true;
     return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
 }
 
@@ -806,12 +832,28 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         );
         return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     }
-    auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
-        cleanup_execution(prepared, /*launched=*/true);
+    const bool external_last_use = async_last_use_requirement(prepared) != 0;
+    bool retain_external_owner = external_last_use;
+    auto drain_cleanup = RAIIScopeGuard([this, &prepared, &retain_external_owner]() {
+        if (retain_external_owner) prepared.physical_complete = false;
+        else cleanup_execution(prepared, /*launched=*/true);
     });
 
     int rc = wait_run_fence(prepared);
+    const int last_use_rc = qualify_async_last_use(prepared);
+    if (last_use_rc != 0) {
+        // Keep the core-boundary observations independently, but do not report
+        // all users ended or discard the resources an external engine may name.
+        retain_external_owner = true;
+        return DrainOutcome::device_error(rc != 0 ? rc : last_use_rc, false);
+    }
     if (rc != 0) {
+        if (external_last_use) {
+            // An independently completed boundary can prove this run ended
+            // despite a stream error. It still does not consume queued waits.
+            if (discharge_boundary_waits(prepared, true) != 0) return DrainOutcome::device_error(rc, false);
+            retain_external_owner = false;
+        }
         log_run_failure(prepared, rc);
         // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
@@ -853,6 +895,11 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // is what this ordering exists to prevent.
     const int discharge_rc = discharge_boundary_waits(prepared, /*boundaries_complete=*/true);
     if (discharge_rc != 0) {
+        if (async_last_use_requirement(prepared) != 0) {
+            prepared.physical_complete = false;
+            retain_external_owner = true;
+            return DrainOutcome::device_error(discharge_rc, false);
+        }
         // No poison here: on the one branch where a wait may still name an event of
         // this run the discharge has already stopped admission and kept the
         // reference, and a code reported with the references retired is a failure to
@@ -872,6 +919,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         );
         return DrainOutcome::device_error(discharge_rc, prepared.physical_complete);
     }
+    retain_external_owner = false;
 
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
         !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
@@ -893,6 +941,50 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // launched last, which at depth two is not necessarily this one.
     print_handshake_results(prepared.kernel_args, prepared.num_aicore);
     return DrainOutcome::device_complete(teardown_rc);
+}
+
+int DeviceRunner::async_last_use_requirement(const PreparedExecution &prepared) const {
+    const void *host = nullptr;
+    size_t bytes = 0;
+    (void)prepared_scheduler_state_view(prepared, &host, &bytes);
+    return runtime_async_last_use_requirement(
+        prepared.scheduler_runtime_mode, host, bytes, prepared.identity.run_epoch
+    );
+}
+
+int DeviceRunner::qualify_async_last_use(PreparedExecution &prepared) {
+    const int required = async_last_use_requirement(prepared);
+    if (required == 0) return 0;
+    int rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    const char *reason = "invalid or missing retained async image";
+    if (required > 0 && prepared.physical_complete) {
+        rc = read_device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch);
+        const auto terminal = device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch);
+        // HBG publishes Ok only after resolved+inline==expected, the final
+        // scheduler-error fold, and acknowledged retirement of every AICore.
+        // Stream completion alone cannot establish any of those async facts.
+        if (rc == 0 && terminal.state == DeviceRunTerminalState::Succeeded) return 0;
+        if (rc == 0) rc = terminal.code != 0 ? terminal.code : PTO_RUNTIME_ERR_INVALID_STATE;
+        reason = terminal.reason != nullptr ? terminal.reason : "run terminal reports failure";
+    } else if (required > 0) {
+        reason = "core completion boundaries are unproved";
+    }
+    prepared.physical_complete = false;
+    LOG_ERROR(
+        "A5 async last use unproved: epoch=%llu slot=%u: %s; retaining run, communication and workspace owners",
+        static_cast<unsigned long long>(prepared.identity.run_epoch), prepared.pipeline_slot, reason
+    );
+    mark_device_unusable(rc);
+    return rc;
+}
+
+bool DeviceRunner::retained_run_blocks_fatal_reset(
+    const NativeRunIdentity &identity, const PreparedRunResources &resources
+) const {
+    const void *host = nullptr;
+    size_t bytes = 0;
+    (void)prepared_scheduler_state_view(resources, &host, &bytes);
+    return runtime_async_last_use_requirement(resources.scheduler_runtime_mode(), host, bytes, identity.run_epoch) != 0;
 }
 
 void DeviceRunner::emit_device_dep_gen_graph(

@@ -932,9 +932,18 @@ hbg_case(test_native_admission.cpp
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
 if(TARGET test_a5_hbg_native_admission)
     target_sources(test_a5_hbg_native_admission PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_async_last_use.cpp
+        ${SIMPLER_SRC}/a5/platform/onboard/host/device_runner.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+    target_include_directories(test_a5_hbg_native_admission BEFORE PRIVATE
+        ${SIMPLER_SRC}/a5/platform/onboard/host
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/runtime)
+    target_compile_definitions(test_a5_hbg_native_admission PRIVATE SIMPLER_TEST_REAL_A5_RUNNER)
 endif()
+# Already compiled explicitly into the A5 native-admission target above.
+simpler_ut_exclude_case(test_native_async_last_use.cpp)
 tmr_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}
         ${CMAKE_SOURCE_DIR}/support/native_admission/tmr_preparation.cpp

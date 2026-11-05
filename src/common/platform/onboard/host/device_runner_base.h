@@ -1681,6 +1681,32 @@ public:
         uint32_t scheduler_runtime_mode{0};
     };
 
+    // Read the preparation this execution retains, never a slot's current
+    // cache: a later prepare may have replaced that cache with another image.
+    bool prepared_scheduler_state_view(const PreparedExecution &prepared, const void **host, size_t *bytes) const {
+        if (prepared.prepared_resources)
+            return prepared_scheduler_state_view(*prepared.prepared_resources, host, bytes);
+        if (host == nullptr || bytes == nullptr) return false;
+        *host = nullptr;
+        *bytes = 0;
+        return false;
+    }
+    bool prepared_scheduler_state_view(const PreparedRunResources &resources, const void **host, size_t *bytes) const {
+        if (host == nullptr || bytes == nullptr) return false;
+        *host = nullptr;
+        *bytes = 0;
+        if (!resources.scheduler_) return false;
+        const auto &storage = *resources.scheduler_;
+        *host = storage.host_addr();
+        *bytes = std::min(storage.host_capacity(), storage.device_capacity());
+        return *host != nullptr && *bytes != 0;
+    }
+    virtual bool retained_run_blocks_fatal_reset(
+        const NativeRunIdentity & /*identity*/, const PreparedRunResources & /*resources*/
+    ) const {
+        return false;
+    }
+
     // Reads host-owned run/registration state before device recovery or cleanup.
     void log_run_failure(const PreparedExecution &prepared, int rc) const;
 

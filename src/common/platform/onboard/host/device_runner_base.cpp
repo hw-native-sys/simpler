@@ -3941,7 +3941,8 @@ int DeviceRunnerBase::retain_prepared_run_resources(
         leases.push_back(std::move(lease));
     }
     auto resources = std::make_shared<PreparedRunResources>(
-        run_image_stagings_[slot], scheduler_state_storage_[slot], std::move(bank), std::move(leases)
+        run_image_stagings_[slot], scheduler_state_storage_[slot], std::move(bank), std::move(leases),
+        prepared.scheduler_runtime_mode
     );
     if (callable_id >= 0) {
         auto callable = callables_.find(callable_id);
@@ -4123,9 +4124,16 @@ bool DeviceRunnerBase::prepared_storage_has_external_references_locked() const {
 bool DeviceRunnerBase::prepared_resources_block_fatal_reset() const {
     std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
     return execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM &&
-           std::any_of(external_run_references_.begin(), external_run_references_.end(), [](const auto &entry) {
-               return !entry.second->release_requested;
-           });
+           (std::any_of(
+                external_run_references_.begin(), external_run_references_.end(),
+                [](const auto &entry) {
+                    return !entry.second->release_requested;
+                }
+            ) ||
+            std::any_of(prepared_uses_.begin(), prepared_uses_.end(), [this](const auto &entry) {
+                return !entry.use.device_use_ended() &&
+                       retained_run_blocks_fatal_reset(entry.identity, *entry.use.resources());
+            }));
 }
 
 bool DeviceRunnerBase::prepared_resources_can_abandon() const {
@@ -4368,6 +4376,13 @@ int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
 int DeviceRunnerBase::wait_execution_completion(ActiveExecution &active) {
     if (active.prepared == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     PreparedExecution &prepared = *active.prepared;
+    const bool initially_owned = prepared.resources_owned;
+    bool retired = false;
+    auto incomplete_last_use = RAIIScopeGuard([this, &prepared, initially_owned, &retired]() {
+        if (initially_owned && !retired && prepared.prepared_resources &&
+            retained_run_blocks_fatal_reset(prepared.identity, *prepared.prepared_resources))
+            prepared.physical_complete = false;
+    });
     if (!prepared.physical_complete) {
         const RunBoundaryWait observed = wait_and_retain_run_boundaries(
             run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity,
@@ -4385,6 +4400,7 @@ int DeviceRunnerBase::wait_execution_completion(ActiveExecution &active) {
     if (wait_rc != 0) return wait_rc;
     if (queued_waits_->holds_reference_to(prepared.identity)) return PTO_RUNTIME_ERR_INTERNAL;
     const int retire_rc = retire_completed_execution(active);
+    retired = retire_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     return retire_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? 0 : PTO_RUNTIME_ERR_INTERNAL;
 }
 

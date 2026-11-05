@@ -179,6 +179,38 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
     return 1;
 }
 
+// This parser receives the immutable Host mirror held by PreparedRunResources,
+// not Runtime's current binding or the reusable slot cache. No device read and
+// no second async marker is needed to recover the run's existing declaration.
+extern "C" int
+runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes, uint64_t epoch) noexcept {
+    if (mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE)
+        return 0;  // Admission already rejects deferred callables in either fallback.
+    if ((mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING && mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) ||
+        host == nullptr || epoch == 0 || bytes < sizeof(SchedulerRunControl))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    SchedulerRunControl run{};
+    std::memcpy(&run, host, sizeof(run));
+    const auto fits = [bytes](uint64_t offset, uint64_t length) {
+        return offset <= bytes && length <= bytes - offset;
+    };
+    if (run.graph_summary_offset == 0 || run.graph_summary_offset % alignof(SchedulerGraphSummary) != 0 ||
+        !fits(run.graph_summary_offset, sizeof(SchedulerGraphSummary)))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    SchedulerGraphSummary summary{};
+    std::memcpy(&summary, static_cast<const std::byte *>(host) + run.graph_summary_offset, sizeof(summary));
+    if (summary.run_epoch != epoch) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (summary.async_layout_offset == 0) return 0;
+    if (summary.async_layout_offset % 128 != 0 || !fits(summary.async_layout_offset, sizeof(SchedulerAsyncLayout)))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    SchedulerAsyncLayout layout{};
+    std::memcpy(&layout, static_cast<const std::byte *>(host) + summary.async_layout_offset, sizeof(layout));
+    if (layout.version != SCHEDULER_ASYNC_LAYOUT_VERSION || layout.run_epoch != epoch || layout.group_count == 0 ||
+        layout.total_bytes < sizeof(layout) || !fits(summary.async_layout_offset, layout.total_bytes))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return 1;
+}
+
 extern "C" int joined_native_launch_supported_impl(void) {
     // Every per-run device region this runtime names is selected by the run's
     // own lease — the graph heap and the runtime image are both HOST_PER_RUN

@@ -140,12 +140,18 @@ public:
 
     PreparedRunResources(
         std::shared_ptr<ImageStorage> image, std::shared_ptr<RetainedSchedulerStorage> scheduler,
-        std::shared_ptr<ArenaBank> arena, std::vector<WorkspaceManager::BackingLease> backing
+        std::shared_ptr<ArenaBank> arena, std::vector<WorkspaceManager::BackingLease> backing,
+        uint32_t scheduler_runtime_mode = UINT32_MAX
     ) :
         image_(std::move(image)),
         scheduler_(std::move(scheduler)),
         arena_(std::move(arena)),
-        backing_(std::move(backing)) {}
+        backing_(std::move(backing)),
+        scheduler_runtime_mode_(scheduler_runtime_mode) {}
+
+    // The existing execution mode travels with the image after its execution
+    // carrier ends. UINT32_MAX means unknown, never an implicit synchronous run.
+    uint32_t scheduler_runtime_mode() const { return scheduler_runtime_mode_; }
 
     // A candidate is published only after allocation succeeds; same-capacity
     // acquires also detach when an older prepared execution holds the bytes.
@@ -194,6 +200,7 @@ private:
     std::shared_ptr<RetainedSchedulerStorage> scheduler_;
     std::shared_ptr<ArenaBank> arena_;
     std::vector<WorkspaceManager::BackingLease> backing_;
+    uint32_t scheduler_runtime_mode_{UINT32_MAX};
 };
 
 // One use's obligations, independent of the immutable preparation and of its
@@ -247,6 +254,7 @@ public:
     }
     bool obligations_ended() const { return internal_obligations_ended() && external_ended_; }
     bool host_ended() const { return host_ended_; }
+    bool device_use_ended() const { return device_ended_ || (not_submitted_ && !launched_); }
 
 private:
     std::shared_ptr<const PreparedRunResources> resources_;

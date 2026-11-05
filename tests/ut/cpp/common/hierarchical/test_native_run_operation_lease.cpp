@@ -1088,6 +1088,47 @@ TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProv
     EXPECT_TRUE(worker.native_runs_.empty());
 }
 
+TEST(NativeRunOperationLeaseTest, UnknownRunWithCommunicationCannotUseLocalResetAsPeerDrain) {
+    for (bool communication_owner : {false, true}) {
+        EXPECT_EXIT(
+            {
+                ChipWorker worker;
+                prime(worker);
+                worker.finalize_device_fn_ = stub_finalize_device;
+                worker.destroy_device_context_fn_ = stub_destroy_device_context;
+                worker.comm_destroy_fn_ = stub_destroy_comm;
+                static int comm = 0;
+                if (communication_owner && worker.create_comm_session(&comm, nullptr, true) == nullptr) _exit(2);
+                const auto run = prepare(worker, 0, 1);
+                worker.launch_native_run(run);
+                g_wait_rc = -23;
+                g_finalize_rc = -23;
+                g_finalize_destroys = false;
+                bool refused = false;
+                try {
+                    worker.finalize();
+                } catch (const std::exception &) {
+                    refused = true;
+                }
+                if (communication_owner) {
+                    if (!refused || !worker.comm_cleanup_unconfirmed_ || g_device_finalize_calls != 0 ||
+                        g_destroy_context_calls != 0 || g_comm_free_calls != 0 || worker.device_ctx_ == nullptr ||
+                        worker.runtime_module_->unload_allowed_ || worker.unproven_native_run_count() != 1)
+                        _exit(3);
+                    try {
+                        worker.comm_destroy_all();
+                        _exit(4);
+                    } catch (const std::exception &) {}
+                } else if (refused || g_device_finalize_calls != 1 || g_destroy_context_calls != 1) {
+                    _exit(5);
+                }
+                _exit(0);  // The failed owner intentionally survives; do not invoke test-process destructors.
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+
 // A destroyed carrier permits device teardown, but a poisoned lane cannot authorize comm free.
 TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeardownRetry) {
     for (bool failed : {false, true}) {

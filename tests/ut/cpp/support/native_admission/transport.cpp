@@ -16,6 +16,10 @@
 #include "kernel_platform_ops.h"
 #include "platform_comm/comm.h"
 #include "run_retention_probe.h"
+#ifdef SIMPLER_TEST_REAL_A5_RUNNER
+#include "aicpu_topology_probe.h"
+#include "host/host_regs.h"
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -123,6 +127,13 @@ int rtStreamDestroy(rtStream_t p) {
     return 0;
 }
 int rtStreamQuery(rtStream_t) { return 0; }
+int aclInit(const char *) { return 0; }
+int aclrtSetDevice(int32_t device) { return rtSetDevice(device); }
+int aclrtResetDevice(int32_t device) { return rtDeviceReset(device); }
+int aclrtResetDeviceForce(int32_t device) { return rtDeviceReset(device); }
+int aclrtCreateStream(aclrtStream *stream) { return rtStreamCreate(stream, 0); }
+int aclrtDestroyStream(aclrtStream stream) { return rtStreamDestroy(stream); }
+int aclrtSynchronizeDeviceWithTimeout(int32_t) { return native_admission_transport::control().stream_sync_rc; }
 int rtStreamSynchronize(rtStream_t stream) {
     auto &control = native_admission_transport::control();
     control.observed_streams.push_back(stream);
@@ -154,14 +165,20 @@ int aclrtDestroyEvent(aclrtEvent p) {
     std::free(p);
     return 0;
 }
-int aclrtRecordEvent(aclrtEvent, aclrtStream) { return 0; }
+int aclrtRecordEvent(aclrtEvent event, aclrtStream) {
+    native_admission_transport::control().last_recorded_event = event;
+    return 0;
+}
 int aclrtResetEvent(aclrtEvent, aclrtStream) { return 0; }
-int aclrtQueryEventStatus(aclrtEvent, aclrtEventRecordedStatus *out) {
-    *out = native_admission_transport::control().events_complete ? ACL_EVENT_RECORDED_STATUS_COMPLETE :
-                                                                   ACL_EVENT_RECORDED_STATUS_NOT_READY;
+int aclrtQueryEventStatus(aclrtEvent event, aclrtEventRecordedStatus *out) {
+    auto &control = native_admission_transport::control();
+    if (event == control.incomplete_event && control.incomplete_query_rc != 0) return control.incomplete_query_rc;
+    *out = control.events_complete && event != control.incomplete_event ? ACL_EVENT_RECORDED_STATUS_COMPLETE :
+                                                                          ACL_EVENT_RECORDED_STATUS_NOT_READY;
     return 0;
 }
 int aclrtSynchronizeEventWithTimeout(aclrtEvent, int32_t) {
+    if (native_admission_transport::control().event_wait_hook) native_admission_transport::control().event_wait_hook();
     return native_admission_transport::control().event_wait_rc;
 }
 int aclrtEventGetTimestamp(aclrtEvent, uint64_t *out) {
@@ -214,8 +231,21 @@ int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::str
 
 KernelContextOps make_onboard_kernel_context_ops() { return {}; }
 
+#ifdef SIMPLER_TEST_REAL_A5_RUNNER
+// The native lifecycle tests replace prepare/submission, never probe real
+// device topology or register MMIO. Unexpected calls fail closed.
+int init_aicore_register_addresses(uint64_t *, uint64_t, MemoryAllocator &) { return -1; }
+namespace pto::a5 {
+bool probe_aicpu_topology(uint32_t, const AicpuDeviceOccupancy &, AicpuTopology &) { return false; }
+bool build_aicpu_launch_plan(const AicpuTopology &, int32_t, AicpuLaunchPlan &, std::string &) { return false; }
+const char *aicpu_scenario_name(AicpuScenarioType) { return "CPU test transport"; }
+const char *aicpu_topology_source_name(AicpuTopologySource) { return "CPU test transport"; }
+}  // namespace pto::a5
+#endif
+
 // The late-read hardware probe needs real stream-pair ownership. This transport
 // cannot retire that ownership; native admission/close uses the real base runner.
+#ifndef SIMPLER_TEST_REAL_A5_RUNNER
 int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &, PreparedExecution &) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }
@@ -224,3 +254,4 @@ void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const Prep
     std::fputs("native admission CPU transport cannot adopt hardware drain ownership\n", stderr);
     std::abort();
 }
+#endif

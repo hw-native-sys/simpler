@@ -65,17 +65,22 @@ void record_kernel_entry(const ChipTaskArgs &args, bool in_graph) {
 }
 void ordinary_kernel_entry(const ChipTaskArgs &args) { record_kernel_entry(args, false); }
 void graph_kernel_entry(const ChipTaskArgs &args) { record_kernel_entry(args, true); }
+void empty_entry(const ChipTaskArgs &) {
+    ++callbacks;
+    current_orchestrator = nullptr;
+}
 struct EntryPoints {
     void (*entry)(const ChipTaskArgs &);
     void (*bind)(OrchContext *);
     void (*finish)();
 } entry_points{entry, bind, nullptr}, other_entry_points{other_entry, other_bind, nullptr},
     ordinary_kernel_entry_points{ordinary_kernel_entry, bind, nullptr},
-    graph_kernel_entry_points{graph_kernel_entry, bind, nullptr};
+    graph_kernel_entry_points{graph_kernel_entry, bind, nullptr}, empty_points{empty_entry, bind, nullptr};
 }  // namespace
 
 void *primary_entry_points() { return &entry_points; }
 void *alternate_entry_points() { return &other_entry_points; }
+void *empty_entry_points() { return &empty_points; }
 void *kernel_entry_points(bool in_graph) {
     return in_graph ? &graph_kernel_entry_points : &ordinary_kernel_entry_points;
 }

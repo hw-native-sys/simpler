@@ -32,7 +32,14 @@ enum aclmdlRICaptureStatus {
 };
 extern "C" {
 const char *aclGetRecentErrMsg();
+int aclInit(const char *);
 int aclFinalize();
+int aclrtSetDevice(int32_t);
+int aclrtResetDevice(int32_t);
+int aclrtResetDeviceForce(int32_t);
+int aclrtCreateStream(aclrtStream *);
+int aclrtDestroyStream(aclrtStream);
+int aclrtSynchronizeDeviceWithTimeout(int32_t);
 int aclrtGetMemInfo(int, size_t *, size_t *);
 int aclrtCreateEventExWithFlag(aclrtEvent *, uint32_t);
 int aclrtDestroyEvent(aclrtEvent);

@@ -276,6 +276,14 @@ private:
     // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
+    // Stream completion proves that the cores stopped. Deferred work also
+    // needs this epoch's audited successful terminal before its owners end.
+    int qualify_async_last_use(PreparedExecution &prepared);
+    int async_last_use_requirement(const PreparedExecution &prepared) const;
+    bool retained_run_blocks_fatal_reset(
+        const NativeRunIdentity &identity, const PreparedRunResources &resources
+    ) const override;
+
     // Quarantine needs no current device; recovery may drain an owned device.
     // Both keep admission closed until owner recovery or terminal quarantine.
     void mark_device_unusable(int runtime_rc) override;

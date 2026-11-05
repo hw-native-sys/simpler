@@ -186,7 +186,7 @@ public:
 };
 
 struct Attempt {
-    explicit Attempt(Runner &r, uint32_t slot, uint64_t epoch, size_t payload = 16) :
+    explicit Attempt(DeviceRunnerBase &r, uint32_t slot, uint64_t epoch, size_t payload = 16) :
         runner(r),
         bytes(payload, 0x71) {
         storage = ::operator new(get_runtime_size(), std::align_val_t(get_runtime_alignment()));
@@ -220,7 +220,7 @@ struct Attempt {
         std::memcpy(&magic, storage, sizeof(magic));
         return magic == 0;
     }
-    Runner &runner;
+    DeviceRunnerBase &runner;
     void *storage;
     std::vector<uint8_t> bytes;
     ChipStorageTaskArgs args;
