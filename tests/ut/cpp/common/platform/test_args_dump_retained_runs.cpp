@@ -43,12 +43,13 @@
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int retained_free(void *ptr) {
     std::free(ptr);
@@ -759,7 +760,7 @@ TEST(ArgsDumpRetainedRuns, FatalLossSurvivesConfirmedResetWithoutInvokingRelease
     size_t releases = 0;
     ArgsDumpCollector collector;
     auto alloc = [&](size_t bytes) {
-        void *ptr = std::calloc(1, bytes);
+        void *ptr = profiler_test_calloc(bytes);
         backing.emplace_back(ptr, &std::free);
         return ptr;
     };

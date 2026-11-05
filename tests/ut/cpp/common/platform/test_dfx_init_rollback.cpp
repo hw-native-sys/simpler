@@ -28,6 +28,7 @@
 #include "host/pmu_collector.h"
 #include "host/profiling_copy.h"
 #include "host/scope_stats_collector.h"
+#include "profiler_test_allocator.h"
 
 namespace allocation_fault {
 thread_local int countdown = -1;
@@ -138,7 +139,7 @@ struct Ledger {
     void *allocate(size_t size) {
         allocation_fault::Pause pause;
         if (++allocation_attempts == fail_allocation) return nullptr;
-        void *p = std::calloc(1, size);
+        void *p = profiler_test_calloc(size);
         EXPECT_NE(p, nullptr);
         if (p != nullptr) {
             EXPECT_TRUE(live.insert(p).second);

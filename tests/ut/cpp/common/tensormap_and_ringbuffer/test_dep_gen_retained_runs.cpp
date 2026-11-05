@@ -47,6 +47,7 @@
 #include "host/dep_gen_collector.h"
 #include "support/test_task_id.h"
 #include "dep_gen_replay.h"
+#include "../platform/profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 namespace runs = simpler::dfx::runs;
@@ -56,7 +57,7 @@ namespace {
 
 constexpr uint8_t kCreatorEdgeDepKinds = 0x3;  // wait | retain
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int retained_free(void *ptr) {
     std::free(ptr);

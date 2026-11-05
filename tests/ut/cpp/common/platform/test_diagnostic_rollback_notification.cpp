@@ -58,6 +58,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 namespace credit = simpler::dfx::credit;
@@ -67,7 +68,7 @@ namespace {
 /** The simulated device this runner's collector threads bind to. */
 constexpr int kSimDeviceId = 0;
 
-void *rollback_alloc(size_t size) { return std::calloc(1, size); }
+void *rollback_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int rollback_free(void *ptr) {
     std::free(ptr);

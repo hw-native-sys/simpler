@@ -17,7 +17,7 @@
  *
  * Platform Support (same shape for both arches):
  * - onboard: Device memory management using CANN runtime API (rtMalloc/rtFree)
- * - sim: Host memory management using standard malloc/free
+ * - sim: Host memory management using 64-byte-aligned allocation and free
  *
  * Key Features:
  * - Automatic tracking of all allocated memory
@@ -40,7 +40,7 @@
  *
  * Platform Behavior:
  * - onboard: Wraps CANN runtime memory allocation APIs (rtMalloc/rtFree)
- * - sim: Wraps standard malloc/free
+ * - sim: Wraps 64-byte-aligned host allocation and free
  *
  * Both implementations provide automatic tracking of allocations to
  * prevent memory leaks. Uses RAII pattern for automatic cleanup.
@@ -59,7 +59,7 @@ public:
      *
      * Platform-specific behavior:
      * - onboard: Allocates device memory using rtMalloc
-     * - sim: Allocates host memory using malloc
+     * - sim: Allocates 64-byte-aligned host memory
      *
      * @param size  Size in bytes to allocate
      * @return Memory pointer on success, nullptr on failure

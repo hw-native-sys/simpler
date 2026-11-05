@@ -51,12 +51,13 @@
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/raii_scope_guard.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-void *joined_alloc(size_t size) { return std::calloc(1, size); }
+void *joined_alloc(size_t size) { return profiler_test_calloc(size); }
 int joined_free(void *p) {
     std::free(p);
     return 0;

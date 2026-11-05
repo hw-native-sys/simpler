@@ -24,10 +24,11 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include "profiler_test_allocator.h"
 
 namespace {
 
-void *test_alloc(size_t size) { return std::calloc(1, size); }
+void *test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int test_free(void *ptr) {
     std::free(ptr);
@@ -132,7 +133,7 @@ TEST(PmuCollectorTest, FinalizeReleasesItsSharedHeaderExactlyOnce) {
     std::vector<void *> allocations;
     std::vector<void *> releases;
     auto alloc = [&](size_t size) -> void * {
-        void *pointer = std::calloc(1, size);
+        void *pointer = profiler_test_calloc(size);
         allocations.push_back(pointer);
         return pointer;
     };
@@ -176,7 +177,7 @@ TEST(PmuCollectorTest, FinalizeUnregistersTheSharedHeaderBeforeReleasingIt) {
     std::vector<void *> allocations;
     std::vector<void *> releases;
     auto alloc = [&](size_t size) -> void * {
-        void *pointer = std::calloc(1, size);
+        void *pointer = profiler_test_calloc(size);
         allocations.push_back(pointer);
         return pointer;
     };
@@ -206,7 +207,7 @@ TEST(PmuCollectorTest, FinalizeReleasesEveryOwnedAllocationExactlyOnce) {
     std::vector<void *> allocations;
     std::vector<void *> releases;
     auto alloc = [&](size_t size) -> void * {
-        void *pointer = std::calloc(1, size);
+        void *pointer = profiler_test_calloc(size);
         allocations.push_back(pointer);
         return pointer;
     };
@@ -250,7 +251,7 @@ struct PmuAllocationLedger {
 
     void *allocate(size_t size) {
         if (++allocation_attempts == fail_allocation) return nullptr;
-        void *pointer = std::calloc(1, size);
+        void *pointer = profiler_test_calloc(size);
         allocations.push_back(pointer);
         return pointer;
     }

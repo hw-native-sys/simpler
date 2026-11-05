@@ -18,6 +18,7 @@
 #include "host/profiling_copy.h"
 #include "support/test_task_id.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -26,13 +27,14 @@
 #include <limits>
 #include <string>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
 
 namespace {
 const volatile void *refused_source = nullptr;
 void *last_buffer_shadow = nullptr;
 const volatile void *tracked_buffer_source = nullptr;
 int refused_copies = 0;
-void *allocate(size_t bytes) { return std::calloc(1, bytes); }
+void *allocate(size_t bytes) { return profiler_test_calloc(bytes); }
 int release(void *ptr) {
     std::free(ptr);
     return 0;
@@ -74,6 +76,8 @@ protected:
         ASSERT_EQ(collector.initialize(dump_thread_count(), 0, DumpArgsLevel::FULL, allocate, nullptr, release), 0);
         device = collector.get_dump_shm_device_ptr();
         host = collector.host_ptr();
+        ASSERT_NE(host, nullptr);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(host) % 64, 0u);
         ASSERT_NE(device, host);
         set_platform_dump_base(reinterpret_cast<uint64_t>(device));
         set_platform_dump_args_run_terminal(0);

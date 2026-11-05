@@ -33,13 +33,14 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 namespace runs = simpler::dfx::runs;
 
 namespace {
 
-void *admission_alloc(size_t size) { return std::calloc(1, size); }
+void *admission_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int admission_free(void *ptr) {
     std::free(ptr);
@@ -190,7 +191,7 @@ size_t g_refuse_alloc_at_least = 0;
 
 void *failing_alloc(size_t size) {
     if (g_refuse_alloc_at_least != 0 && size >= g_refuse_alloc_at_least) return nullptr;
-    return std::calloc(1, size);
+    return profiler_test_calloc(size);
 }
 
 }  // namespace
