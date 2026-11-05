@@ -54,6 +54,7 @@ struct Control {
     int event_wait_rc{0};
     std::function<void()> event_wait_hook;
     std::vector<std::pair<void *, const void *>> uploads;
+    std::function<void()> host_copy_hook;
 };
 Control &control();
 void release_provider_state();

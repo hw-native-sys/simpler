@@ -626,6 +626,21 @@ stage_launch_metadata(void *runner_ctx, uint32_t pipeline_slot, const HostMetada
     }
 }
 
+static bool query_async_retained_span(
+    void *runner_ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t address, uint64_t bytes,
+    HostAsyncRetainedSpan *out
+) {
+    if (out != nullptr) *out = {};
+    if (runner_ctx == nullptr) return false;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)
+            ->query_async_retained_span(owner, slot, bank, epoch, address, bytes, out);
+    } catch (...) {
+        if (out != nullptr) *out = {};
+        return false;
+    }
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -665,6 +680,7 @@ static const HostApiOps g_host_api_ops = {
     .get_prepare_plan = get_prepare_plan,
     .set_prepare_plan = set_prepare_plan,
     .stage_launch_metadata = stage_launch_metadata,
+    .query_async_retained_span = query_async_retained_span,
 };
 
 /* ===========================================================================

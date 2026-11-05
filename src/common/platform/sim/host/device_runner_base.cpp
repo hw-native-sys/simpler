@@ -37,6 +37,7 @@
 #include "call_config.h"
 #include "chip_callable_layout.h"
 #include "common/host_api.h"
+#include "native_run_context.h"
 #include "cpu_sim_context.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
@@ -559,6 +560,49 @@ bool SimDeviceRunnerBase::borrow_caller_buffers(
     uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count
 ) {
     return caller_device_buffers_.borrow(identity, spans, count);
+}
+
+bool SimDeviceRunnerBase::query_async_retained_span(
+    const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t address, uint64_t bytes,
+    HostAsyncRetainedSpan *out
+) const {
+    if (out != nullptr) *out = {};
+    if (out == nullptr || owner == nullptr || epoch == 0 || address == 0 || bytes == 0 ||
+        bytes > UINT64_MAX - address || !can_accept_run() ||
+        active_native_run_.load(std::memory_order_acquire) != owner)
+        return false;
+    const auto *state = static_cast<const NativeRunContext<SimDeviceRunnerBase> *>(owner);
+    if (state->magic != NativeRunContext<SimDeviceRunnerBase>::kMagic || state->runner != this ||
+        !state->runner_claimed || state->descriptor.pipeline_slot != slot || state->descriptor.arena_bank != bank ||
+        state->descriptor.run_epoch != epoch ||
+        state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared || state->runtime == nullptr ||
+        state->prepared_execution || state->active_execution)
+        return false;
+    CallerDeviceBuffers::Allocation allocation;
+    if (caller_device_buffers_.resolve_borrowed(static_cast<uint64_t>(slot) + 1, address, bytes, &allocation)) {
+        *out = {allocation.base, allocation.bytes, HostAsyncRetainedOwner::CALLER_BORROW, 0};
+        return true;
+    }
+    const auto contains = [address, bytes](uint64_t base, uint64_t extent) {
+        return base != 0 && extent <= UINT64_MAX - base && address >= base && address - base <= extent &&
+               bytes <= extent - (address - base);
+    };
+    if (slot < retained_temp_addrs_.size()) {
+        const uint64_t base = reinterpret_cast<uint64_t>(retained_temp_addrs_[slot]);
+        if (contains(base, retained_temp_sizes_[slot])) {
+            *out = {base, retained_temp_sizes_[slot], HostAsyncRetainedOwner::TEMPORARY, 0};
+            return true;
+        }
+    }
+    if (bank < arena_banks_.size() && arena_banks_[bank]) {
+        const auto &heap = arena_banks_[bank]->gm_heap;
+        const uint64_t base = reinterpret_cast<uint64_t>(heap.base());
+        if (heap.is_committed() && contains(base, heap.total_size())) {
+            *out = {base, heap.total_size(), HostAsyncRetainedOwner::GM_HEAP, 0};
+            return true;
+        }
+    }
+    return false;
 }
 
 void SimDeviceRunnerBase::release_caller_buffers(uint64_t identity, bool keep) {

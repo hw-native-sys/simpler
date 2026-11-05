@@ -77,6 +77,7 @@
 #include "runtime.h"
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
+struct HostAsyncRetainedSpan;
 
 // Width sim resolves the CallConfig "auto" sentinel to, deliberately below
 // PLATFORM_MAX_BLOCKDIM (24 on a2a3, 36 on a5). The simulator runs one OS
@@ -366,6 +367,10 @@ public:
     int free_caller_buffer(void *dev_ptr);
 
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count);
+    bool query_async_retained_span(
+        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, uint64_t address,
+        uint64_t bytes, HostAsyncRetainedSpan *out
+    ) const;
     void release_caller_buffers(uint64_t identity, bool keep);
     /**
      * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.

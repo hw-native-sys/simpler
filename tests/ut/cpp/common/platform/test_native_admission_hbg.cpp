@@ -18,6 +18,95 @@ extern "C" int args_dump_capture_supported_impl(void);
 namespace native_admission_test {
 void *kernel_entry_points(bool in_graph);
 
+TEST_F(NativeAdmissionTest, AsyncRetentionQueryRequiresTheCurrentPreparingOwnerAndItsCallerBorrow) {
+    Runner runner;
+    auto *caller = runner.allocate_caller_buffer(64);
+    auto *unborrowed = runner.allocate_caller_buffer(64);
+    ASSERT_NE(caller, nullptr);
+    ASSERT_NE(unborrowed, nullptr);
+    const uint64_t address = reinterpret_cast<uint64_t>(caller);
+    const CallerDeviceBuffers::Span span{address, 64};
+    ASSERT_TRUE(runner.borrow_caller_buffers(2, &span, 1));  // Slot 1's existing borrow, not epoch 20.
+    std::optional<HostApi> previous;
+    Attempt first(runner, 1, 20);
+    callback_hook = [&] {
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(first.storage);
+        previous = state->host_api;
+        HostAsyncRetainedSpan found;
+        ASSERT_TRUE(state->host_api.query_async_retained_span(address + 8, 8, &found));
+        EXPECT_EQ(found.base, address);
+        EXPECT_EQ(found.bytes, 64u);
+        EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::CALLER_BORROW);
+        EXPECT_FALSE(state->host_api.query_async_retained_span(reinterpret_cast<uint64_t>(unborrowed), 8, &found));
+        EXPECT_EQ(found.base, 0u);
+        EXPECT_FALSE(runner.query_async_retained_span(state, 1, 2, 20, address, 8, &found));
+        EXPECT_FALSE(runner.query_async_retained_span(state, 1, 1, 21, address, 8, &found));
+        EXPECT_FALSE(runner.query_async_retained_span(reinterpret_cast<void *>(1), 1, 1, 20, address, 8, &found));
+        EXPECT_FALSE(state->host_api.query_async_retained_span(address, 0, &found));
+        EXPECT_FALSE(state->host_api.query_async_retained_span(address, UINT64_MAX, &found));
+        EXPECT_EQ(found.base, 0u);
+        EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::UNKNOWN);
+    };
+    ASSERT_EQ(first.prepare(), 0);
+    ASSERT_TRUE(previous.has_value());
+    HostAsyncRetainedSpan found{99, 99, HostAsyncRetainedOwner::GM_HEAP, 0};
+    EXPECT_FALSE(previous->query_async_retained_span(address, 8, &found));
+    EXPECT_EQ(found.base, 0u);  // The preparation was published; its query window ended.
+    ASSERT_EQ(simpler_finalize_run(&runner, first.storage), 0);
+    runner.release_caller_buffers(2, false);
+    ASSERT_TRUE(runner.borrow_caller_buffers(2, &span, 1));
+    Attempt second(runner, 1, 21);
+    callback_hook = [&] {
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(second.storage);
+        EXPECT_FALSE(previous->query_async_retained_span(address, 8, &found));
+        EXPECT_TRUE(state->host_api.query_async_retained_span(address, 8, &found));
+    };
+    ASSERT_EQ(second.prepare(), 0);
+    ASSERT_EQ(simpler_finalize_run(&runner, second.storage), 0);
+    runner.release_caller_buffers(2, false);
+    EXPECT_EQ(runner.free_caller_buffer(caller), 0);
+    EXPECT_EQ(runner.free_caller_buffer(unborrowed), 0);
+}
+
+TEST_F(NativeAdmissionTest, AsyncRetentionQueryUsesThisPreparationsTemporaryAndCommittedHeap) {
+    Runner runner;
+    Attempt attempt(runner, 1, 20);
+    bool temporary_checked = false, heap_checked = false;
+    callback_hook = [&] {
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+        void *temporary = nullptr;
+        size_t capacity = 0;
+        runner.get_retained_temp_buffer(1, &temporary, &capacity);
+        ASSERT_NE(temporary, nullptr);
+        ASSERT_GE(capacity, 16u);
+        HostAsyncRetainedSpan found;
+        ASSERT_TRUE(state->host_api.query_async_retained_span(reinterpret_cast<uint64_t>(temporary), 16, &found));
+        EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::TEMPORARY);
+        EXPECT_EQ(found.bytes, capacity);
+        temporary_checked = true;
+        // This hook runs during publication after the real Host maker commits
+        // the arena, before native preparation publishes PreparedExecution.
+        control().host_copy_hook = [&] {
+            auto *current = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+            const uint64_t heap = reinterpret_cast<uint64_t>(runner.acquire_pooled_gm_heap(1));
+            ASSERT_NE(heap, 0u);
+            HostAsyncRetainedSpan owned;
+            ASSERT_TRUE(current->host_api.query_async_retained_span(heap, 1, &owned));
+            EXPECT_EQ(owned.owner_kind, HostAsyncRetainedOwner::GM_HEAP);
+            EXPECT_EQ(owned.base, heap);
+            EXPECT_GT(owned.bytes, 0u);
+            const uint64_t extent = owned.bytes;
+            EXPECT_FALSE(current->host_api.query_async_retained_span(heap + extent - 1, 2, &owned));
+            EXPECT_EQ(owned.base, 0u);
+            heap_checked = true;
+        };
+    };
+    ASSERT_EQ(attempt.prepare(), 0);
+    EXPECT_TRUE(temporary_checked);
+    EXPECT_TRUE(heap_checked);
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
 namespace {
 class CapabilityRunner : public Runner {
 public:

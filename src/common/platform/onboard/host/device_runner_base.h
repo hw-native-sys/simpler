@@ -127,6 +127,7 @@ struct PreparedSubmissionStorage {
 };
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
+struct HostAsyncRetainedSpan;
 
 /**
  * Common base class for both a2a3 and a5 onboard `DeviceRunner`s.
@@ -517,6 +518,10 @@ public:
      * allocation is what makes this refuse, which is the proof-of-owner the joined path needs.
      */
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count);
+    bool query_async_retained_span(
+        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, uint64_t address,
+        uint64_t bytes, HostAsyncRetainedSpan *out
+    ) const;
 
     /** Drop `identity`'s borrow, or keep it for good when its last consumer is unproven. */
     void release_caller_buffers(uint64_t identity, bool keep);

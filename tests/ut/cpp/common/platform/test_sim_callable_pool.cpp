@@ -56,6 +56,7 @@
 #include "host/sim_thread_start_gate.h"
 #include "runtime.h"
 #include "profiler_test_allocator.h"
+#include "native_run_context.h"
 
 #if defined(__linux__)
 static std::atomic<bool> reject_device_bind{false};
@@ -681,6 +682,83 @@ TEST(SimOrchestrationScratchTest, TeardownReleasesAllSlotsAndIsIdempotent) {
     EXPECT_EQ(destroyed, granted);
     runner.release_retained_orchestration();
     EXPECT_EQ(destroyed, granted);
+}
+
+TEST(SimAsyncRetainedSpan, NativeOwnerAndExistingBorrowQualifyOnlyTheCurrentPreparation) {
+    PoolRunner runner;
+    ASSERT_TRUE(runner.set_run_resource_grant(3));
+    void *caller = runner.allocate_caller_buffer(64);
+    void *unborrowed = runner.allocate_caller_buffer(64);
+    void *temporary = runner.allocate_tensor(128);
+    ASSERT_NE(caller, nullptr);
+    ASSERT_NE(unborrowed, nullptr);
+    ASSERT_NE(temporary, nullptr);
+    runner.set_retained_temp_buffer(1, temporary, 128);
+    const uint64_t address = reinterpret_cast<uint64_t>(caller);
+    const CallerDeviceBuffers::Span span{address, 64};
+    ASSERT_TRUE(runner.borrow_caller_buffers(2, &span, 1));
+    HostApiOps ops{};
+    ops.query_async_retained_span = [](void *context, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch,
+                                       uint64_t at, uint64_t bytes, HostAsyncRetainedSpan *out) {
+        return static_cast<SimDeviceRunnerBase *>(context)->query_async_retained_span(
+            owner, slot, bank, epoch, at, bytes, out
+        );
+    };
+    NativeRunDescriptor descriptor{};
+    descriptor.run_epoch = descriptor.generation = descriptor.dispatch_id = 17;
+    descriptor.pipeline_slot = descriptor.arena_bank = 1;
+    NativeRunContext<SimDeviceRunnerBase> state(&runner, CallConfig{}, 0, descriptor, &ops);
+    HostAsyncRetainedSpan found{99, 99, HostAsyncRetainedOwner::GM_HEAP, 0};
+    EXPECT_FALSE(state.host_api.query_async_retained_span(address, 8, &found));
+    EXPECT_EQ(found.base, 0u);
+    LaunchPermit permit;
+    ASSERT_TRUE(runner.try_acquire_native_run(&state, state.identity(), &permit));
+    state.runner_claimed = true;
+    ASSERT_TRUE(state.host_api.query_async_retained_span(address + 8, 8, &found));
+    EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::CALLER_BORROW);
+    EXPECT_EQ(found.base, address);
+    EXPECT_EQ(found.bytes, 64u);
+    EXPECT_FALSE(state.host_api.query_async_retained_span(reinterpret_cast<uint64_t>(unborrowed), 8, &found));
+    EXPECT_EQ(found.base, 0u);
+    EXPECT_FALSE(runner.query_async_retained_span(&state, 1, 2, 17, address, 8, &found));
+    EXPECT_FALSE(runner.query_async_retained_span(&state, 1, 1, 18, address, 8, &found));
+    EXPECT_FALSE(runner.query_async_retained_span(reinterpret_cast<void *>(1), 1, 1, 17, address, 8, &found));
+    EXPECT_FALSE(state.host_api.query_async_retained_span(address, UINT64_MAX, &found));
+    EXPECT_EQ(found.base, 0u);
+    ASSERT_TRUE(state.host_api.query_async_retained_span(reinterpret_cast<uint64_t>(temporary), 128, &found));
+    EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::TEMPORARY);
+    ASSERT_EQ(runner.setup_static_arena(1, 256, 0, 0), 0);
+    const uint64_t heap = runner.arena_bank_gm_heap_base(1);
+    ASSERT_NE(heap, 0u);
+    ASSERT_TRUE(state.host_api.query_async_retained_span(heap + 8, 8, &found));
+    EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::GM_HEAP);
+    const uint64_t extent = found.bytes;
+    EXPECT_FALSE(state.host_api.query_async_retained_span(heap + extent - 1, 2, &found));
+    state.prepared_execution =
+        std::make_unique<SimDeviceRunnerBase::PreparedExecution>(state.identity(), *state.runtime, state.config, 1);
+    EXPECT_FALSE(state.host_api.query_async_retained_span(address, 8, &found));
+    EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::UNKNOWN);
+    state.prepared_execution.reset();
+    runner.release_native_run(&state);
+    state.runner_claimed = false;
+    EXPECT_FALSE(state.host_api.query_async_retained_span(address, 8, &found));
+    EXPECT_EQ(found.base, 0u);
+    runner.release_caller_buffers(2, false);
+    EXPECT_EQ(runner.free_caller_buffer(caller), 0);
+    EXPECT_EQ(runner.free_caller_buffer(unborrowed), 0);
+    runner.clear_temporary_buffer();
+    EXPECT_EQ(runner.setup_static_arena(1, 0, 0, 0), 0);
+}
+
+TEST(SimAsyncRetainedSpan, PrewarmAndMissingProviderNeverProduceOwnershipEvidence) {
+    HostApiOps ops{};
+    HostApi no_run(nullptr, 0, 0, 0, &ops);
+    HostAsyncRetainedSpan found{99, 99, HostAsyncRetainedOwner::GM_HEAP, 0};
+    EXPECT_FALSE(no_run.query_async_retained_span(0x1000, 8, &found));
+    EXPECT_EQ(found.base, 0u);
+    EXPECT_EQ(found.bytes, 0u);
+    EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::UNKNOWN);
+    EXPECT_FALSE(no_run.query_async_retained_span(0x1000, 8, nullptr));
 }
 
 TEST(SimOrchestrationScratchTest, RunnerDestructionReleasesRetainedStorage) {

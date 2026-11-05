@@ -101,6 +101,9 @@ int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMe
     if (const int rc = native_admission_transport::control().copy_rc) return rc;
     if (bytes > capacity || (bytes && (!dst || !src))) return -2;
     std::memcpy(dst, src, bytes);
+    if (kind == RT_MEMCPY_HOST_TO_DEVICE) {
+        if (auto hook = std::exchange(native_admission_transport::control().host_copy_hook, {})) hook();
+    }
     return 0;
 }
 int rtSetDevice(int32_t) { return native_admission_transport::control().attach_rc; }

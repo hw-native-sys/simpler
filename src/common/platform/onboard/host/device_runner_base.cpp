@@ -47,6 +47,7 @@
 #include "chip_callable_layout.h"
 #include "common/core_type.h"
 #include "common/host_api.h"
+#include "native_run_context.h"
 #include "common/platform_config.h"
 #include "common/sdma_warmup_layout.h"
 #include "common/unified_log.h"
@@ -579,6 +580,59 @@ bool DeviceRunnerBase::borrow_caller_buffers(
     uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count
 ) {
     return caller_device_buffers_.borrow(identity, spans, count);
+}
+
+bool DeviceRunnerBase::query_async_retained_span(
+    const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t address, uint64_t bytes,
+    HostAsyncRetainedSpan *out
+) const {
+    if (out != nullptr) *out = {};
+    if (out == nullptr || owner == nullptr || epoch == 0 || address == 0 || bytes == 0 ||
+        bytes > UINT64_MAX - address || !can_accept_run())
+        return false;
+    std::scoped_lock lock(native_run_mu_, prepared_storage_mutex_);
+    const auto reservation = std::find_if(
+        native_run_reservations_.begin(), native_run_reservations_.end(), [owner, slot, bank](const auto &row) {
+            return row.owner == owner && row.pipeline_slot == slot && row.arena_bank == bank &&
+                   row.preparation_state == NativeRunPreparationState::Preparing;
+        }
+    );
+    // Prove that this pointer is the live native owner before interpreting it.
+    if (reservation == native_run_reservations_.end()) return false;
+    const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(owner);
+    if (state->magic != NativeRunContext<DeviceRunnerBase>::kMagic || state->runner != this ||
+        !state->runner_reserved || state->descriptor.pipeline_slot != slot || state->descriptor.arena_bank != bank ||
+        state->descriptor.run_epoch != epoch ||
+        state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared || state->runtime == nullptr ||
+        state->prepared_execution || state->active_execution)
+        return false;
+    CallerDeviceBuffers::Allocation allocation;
+    // The lane's existing borrow key is slot+1, not its execution epoch.
+    if (caller_device_buffers_.resolve_borrowed(static_cast<uint64_t>(slot) + 1, address, bytes, &allocation)) {
+        *out = {allocation.base, allocation.bytes, HostAsyncRetainedOwner::CALLER_BORROW, 0};
+        return true;
+    }
+    const auto contains = [address, bytes](uint64_t base, uint64_t extent) {
+        return base != 0 && extent <= UINT64_MAX - base && address >= base && address - base <= extent &&
+               bytes <= extent - (address - base);
+    };
+    if (slot < temporary_storage_.size() && temporary_storage_[slot]) {
+        const auto &storage = *temporary_storage_[slot];
+        const uint64_t base = reinterpret_cast<uint64_t>(storage.base);
+        if (contains(base, storage.capacity)) {
+            *out = {base, storage.capacity, HostAsyncRetainedOwner::TEMPORARY, 0};
+            return true;
+        }
+    }
+    if (bank < arena_banks_.size() && arena_banks_[bank]) {
+        const auto &heap = arena_banks_[bank]->gm_heap;
+        const uint64_t base = reinterpret_cast<uint64_t>(heap.base());
+        if (heap.is_committed() && contains(base, heap.total_size())) {
+            *out = {base, heap.total_size(), HostAsyncRetainedOwner::GM_HEAP, 0};
+            return true;
+        }
+    }
+    return false;
 }
 
 void DeviceRunnerBase::release_caller_buffers(uint64_t identity, bool keep) {

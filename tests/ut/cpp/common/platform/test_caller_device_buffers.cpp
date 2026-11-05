@@ -46,6 +46,49 @@ TEST(CallerDeviceBuffers, OnlyARecordedMintResolves) {
     EXPECT_FALSE(buffers.resolve(kBase + 0x100000, kSize, &allocation));
 }
 
+TEST(CallerDeviceBuffers, ResolveBorrowedRequiresThisExistingBorrowAndDoesNotAcquireAnother) {
+    CallerDeviceBuffers buffers;
+    buffers.record(at(kBase), kSize);
+    buffers.record(at(kBase + 2 * kSize), kSize);
+    CallerDeviceBuffers::Allocation found{99, 99};
+    EXPECT_FALSE(buffers.resolve_borrowed(kRunA, kBase, 8, &found));
+    EXPECT_EQ(found.base, 0u);
+    const auto borrowed = span(kBase + 16, 32);
+    ASSERT_TRUE(buffers.borrow(kRunA, &borrowed, 1));
+    ASSERT_TRUE(buffers.resolve_borrowed(kRunA, kBase + kSize - 8, 8, &found));
+    EXPECT_EQ(found.base, kBase);
+    EXPECT_EQ(found.bytes, kSize);
+    EXPECT_EQ(buffers.borrow_count(), 1u);
+    EXPECT_FALSE(buffers.resolve_borrowed(kRunB, kBase, 8, &found));
+    EXPECT_FALSE(buffers.resolve_borrowed(kRunA, kBase + 2 * kSize, 8, &found));
+    EXPECT_EQ(buffers.borrow_count(), 1u);
+    EXPECT_FALSE(buffers.forget_if_unborrowed(at(kBase)));
+    buffers.release(kRunA, false);
+    EXPECT_FALSE(buffers.resolve_borrowed(kRunA, kBase, 8, &found));
+    EXPECT_TRUE(buffers.forget_if_unborrowed(at(kBase)));
+}
+
+TEST(CallerDeviceBuffers, BorrowedLookupClearsMalformedAndRetiredAnswers) {
+    CallerDeviceBuffers buffers;
+    buffers.record(at(kBase), kSize);
+    const auto borrowed = span(kBase, kSize);
+    ASSERT_TRUE(buffers.borrow(kRunA, &borrowed, 1));
+    for (const auto &invalid :
+         {span(0, 8), span(kBase, 0), span(kBase - 1, 8), span(kBase + kSize - 1, 2), span(kBase, UINT64_MAX)}) {
+        CallerDeviceBuffers::Allocation found{99, 99};
+        EXPECT_FALSE(buffers.resolve_borrowed(kRunA, invalid.addr, invalid.bytes, &found));
+        EXPECT_EQ(found.base, 0u);
+        EXPECT_EQ(found.bytes, 0u);
+    }
+    EXPECT_FALSE(buffers.resolve_borrowed(kRunA, kBase, 8, nullptr));
+    CallerDeviceBuffers::Allocation found{99, 99};
+    EXPECT_FALSE(buffers.resolve_borrowed(0, kBase, 8, &found));
+    buffers.release(kRunA, true);
+    EXPECT_EQ(buffers.retained_count(), 1u);
+    EXPECT_FALSE(buffers.resolve_borrowed(kRunA, kBase, 8, &found));
+    EXPECT_EQ(found.base, 0u);  // Quarantined retention is not a new run's borrow authority.
+}
+
 TEST(CallerDeviceBuffers, AnInteriorSpanResolvesToItsContainingAllocation) {
     CallerDeviceBuffers buffers;
     buffers.record(at(kBase), kSize);
