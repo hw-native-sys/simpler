@@ -411,6 +411,16 @@ hbg_case(test_sim_callable_pool.cpp
     LINK    ${CMAKE_DL_LIBS}
     DEPENDS test_fake_child_kernel)
 
+hbg_case(test_sim_native_last_use.cpp
+    TIMEOUT 90
+    SOURCES
+        ${SIM_CALLABLE_POOL_SOURCES}
+        ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/c_api_shared.cpp
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    INCLUDES ${SIM_CALLABLE_POOL_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK ${CMAKE_DL_LIBS})
+
 # The same case against the other runtime: the registration-owned tables are a
 # contract all four (arch, runtime) pairs carry, and the runner resolves its
 # bare "runtime.h" to whichever Runtime it was built for. Declared twice rather

@@ -544,6 +544,14 @@ public:
      * Record whether this Worker asked for an async-DMA workspace.
      */
     void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
+    // A full CPU-thread join is a whole-run stop proof only when no separate
+    // engine was requested or provisioned on this simulated device context.
+    bool independent_dma_configured() const {
+        if (sdma_requested_ || dma_workspace_handle_ != nullptr) return true;
+        for (uint64_t address : dma_workspace_addr_)
+            if (address != 0) return true;
+        return false;
+    }
     int ensure_dma_workspace_provisioned();
     int device_id() const { return device_id_; }
 

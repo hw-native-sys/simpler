@@ -22,6 +22,51 @@ extern "C" int args_dump_capture_supported_impl(void);
 namespace native_admission_test {
 void *kernel_entry_points(bool in_graph);
 
+TEST_F(NativeAdmissionTest, LastUseExtensionValidatesOutputBeforeMutatingTheRun) {
+    Runner runner;
+    Attempt attempt(runner, 1, 20);
+    ASSERT_EQ(attempt.prepare(), 0);
+    EXPECT_EQ(
+        simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    uint32_t proof = 99;
+    EXPECT_EQ(
+        simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 2, &proof), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
+    EXPECT_FALSE(attempt.empty());
+    EXPECT_EQ(runner.drain_calls, 0);
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, PhysicalRetirementFromAnUnauditedBackendIsNotExternalLastUseProof) {
+    Runner runner;
+    Attempt attempt(runner, 1, 20);
+    ASSERT_EQ(attempt.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
+    uint32_t proof = 99;
+    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof), 0);
+    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
+    EXPECT_EQ(runner.drain_calls, 1);
+    EXPECT_TRUE(attempt.empty());
+}
+
+TEST_F(NativeAdmissionTest, ThrowingOptionalLastUseQueryDoesNotInterruptFinalization) {
+    class ThrowingProofRunner : public Runner {
+        bool run_origin_accesses_ended(const PreparedExecution &) const override {
+            throw std::runtime_error("proof query unavailable");
+        }
+    } runner;
+    Attempt attempt(runner, 1, 20);
+    ASSERT_EQ(attempt.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
+    uint32_t proof = 99;
+    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof), 0);
+    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
+    EXPECT_TRUE(attempt.empty());
+    EXPECT_EQ(runner.drain_calls, 1);
+}
+
 TEST_F(NativeAdmissionTest, DomainExtensionRejectsShortImagesBeforeReadingThem) {
     const auto *unreadable_descriptor = reinterpret_cast<const NativeRunDescriptor *>(1);
     const auto *unreadable_provider = reinterpret_cast<const NativeRunDomainProvider *>(1);

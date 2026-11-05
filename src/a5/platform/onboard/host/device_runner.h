@@ -100,6 +100,7 @@ public:
     int poll_execution(const ActiveExecution &active) override;
     int retire_completed_execution(ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
+    bool run_origin_accesses_ended(const PreparedExecution &prepared) const override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
 
     /**

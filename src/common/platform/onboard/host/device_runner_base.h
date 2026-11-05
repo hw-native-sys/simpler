@@ -1718,6 +1718,10 @@ public:
         return false;
     }
 
+    // Separate from physical stream completion. Only an audited backend may
+    // prove this run's independent accesses ended; unknown backends stay false.
+    virtual bool run_origin_accesses_ended(const PreparedExecution & /*prepared*/) const { return false; }
+
     // Reads host-owned run/registration state before device recovery or cleanup.
     void log_run_failure(const PreparedExecution &prepared, int rc) const;
 

@@ -1431,7 +1431,22 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return state->completion_rc;
 }
 
-static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
+static bool sim_run_origin_accesses_ended(const SimNativeRunContext &state) {
+    if (!state.physical_complete || state.recording || state.active_execution == nullptr ||
+        state.active_execution->prepared == nullptr ||
+        !(state.active_execution->prepared->identity == state.identity()) || state.runner->independent_dma_configured())
+        return false;
+    for (const auto &snapshot : state.domain_snapshots)
+        for (const auto &workspace : snapshot.context.workspaces)
+            if (workspace.addr != 0 || workspace.size != 0) return false;
+    // Sim drain's physical fact is the completed join of all executing CPU
+    // threads. No separately configured engine can outlive that join here.
+    return true;
+}
+
+static int finalize_native_run(
+    DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs, uint32_t *out_proof = nullptr
+) try {
     SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
@@ -1490,6 +1505,7 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     emit_native_run_runner_wall(state);
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
+    bool bindings_ended = false;
     try {
         if (attach_rc == 0) {
             {
@@ -1511,6 +1527,7 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
                 // after output delivery or its refusal has ended that reader.
                 const int release_rc =
                     state->runtime != nullptr ? release_run_bindings_impl(state->runtime.get(), &state->host_api) : 0;
+                bindings_ended = release_rc == 0;
                 if (validation_rc == 0) validation_rc = release_rc;
             }
             if (launched && execution_rc == 0 && !state->execution_retired) emit_device_phase_markers(state->runner);
@@ -1534,8 +1551,10 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
         state->runner_claimed = false;
     }
     if (state->retired_host_staging != nullptr) state->runner->free_tensor(state->retired_host_staging);
+    const bool last_use_proved = out_proof != nullptr && bindings_ended && sim_run_origin_accesses_ended(*state);
     state->runner->release_run_result(state->descriptor.run_epoch);
     destroy_native_run_context(state);
+    if (last_use_proved) *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1550,6 +1569,15 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {
     if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return finalize_native_run(ctx, runtime, deliver_outputs != 0);
+}
+
+int simpler_finalize_run_with_last_use_v1(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs, uint32_t *out_proof
+) {
+    if (out_proof == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
+    if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return finalize_native_run(ctx, runtime, deliver_outputs != 0, out_proof);
 }
 
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {

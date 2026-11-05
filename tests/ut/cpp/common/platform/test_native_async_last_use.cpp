@@ -200,8 +200,21 @@ TEST_F(NativeAdmissionTest, AsyncSuccessUsesActualA5PollRetirementAndReleasesNat
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
     );
     EXPECT_EQ(simpler_wait_run(&runner, attempt.storage), 0);
-    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    uint32_t proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
+    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 1, &proof), 0);
+    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
     EXPECT_FALSE(runner.holds_epoch(20));
+}
+
+TEST_F(NativeAdmissionTest, AsyncLastUseProofIsCapturedWhenFinalizePerformsTheFirstDrain) {
+    AsyncRunner runner;
+    Attempt attempt(runner, 1, 20);
+    ASSERT_EQ(attempt.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
+    uint32_t proof = 99;
+    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof), 0);
+    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
+    EXPECT_TRUE(attempt.empty());
 }
 
 TEST_F(NativeAdmissionTest, AsyncSuccessUsesActualA5BlockingDrainAndReleasesNativeOwner) {
@@ -230,8 +243,9 @@ TEST_F(NativeAdmissionTest, StreamSuccessWithoutThisEpochsSuccessfulAsyncTermina
                     if (state->physical_complete || state->execution_retired ||
                         !state->active_execution->prepared->resources_owned)
                         _exit(5);
-                    if (simpler_finalize_run(&runner, attempt.storage) == 0 || attempt.empty() ||
-                        !runner.holds_epoch(20))
+                    uint32_t proof = 99;
+                    if (simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 1, &proof) == 0 ||
+                        proof != SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN || attempt.empty() || !runner.holds_epoch(20))
                         _exit(6);
                     if (!runner.fatal_reset_blocked() || finalize_device(&runner) == 0 || control().retired) _exit(7);
                     const auto retained = runner.retained(20);
@@ -269,7 +283,9 @@ TEST_F(NativeAdmissionTest, SynchronousAndLegacyRunsDoNotRequireAnAsyncTerminal)
         ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
         EXPECT_EQ(simpler_wait_run(&runner, attempt.storage), 0);
         EXPECT_FALSE(runner.fatal_reset_blocked());
-        EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+        uint32_t proof = 99;
+        EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 1, &proof), 0);
+        EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
     }
 }
 

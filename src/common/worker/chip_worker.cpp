@@ -362,6 +362,8 @@ void ChipWorker::init(
         wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
         wait_run_completion_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run_completion");
         finalize_run_fn_ = module->required<SimplerFinalizeRunFn>("simpler_finalize_run_with_delivery");
+        finalize_run_with_last_use_fn_ =
+            module->optional<decltype(finalize_run_with_last_use_fn_)>("simpler_finalize_run_with_last_use_v1");
         // Absent on every simulated and stand-in module by construction, so a
         // null here is a fact about the backend rather than a stale build. The
         // caller reports it.
@@ -779,7 +781,6 @@ void ChipWorker::finalize() {
         } catch (...) {
             lane_error = std::current_exception();
         }
-        comm_reclamation_unconfirmed_ |= run_lane_->poisoned();
     }
     {
         std::unique_lock<std::mutex> lock(native_run_mu_);
@@ -798,7 +799,7 @@ void ChipWorker::finalize() {
         // Raw storage and code remain live even if the C++ object lifetime is
         // unknown. Only the common owner close may end its device generation.
         (void)abandon_unproven_native_run_storage();
-        comm_reclamation_unconfirmed_ = true;
+        mark_comm_reclamation_unconfirmed();
         if (!comm_sessions_.empty() || !global_domain_ids_.empty()) {
             // Stopping/resetting this device cannot prove a peer or SDMA has
             // stopped naming its exported windows. Keep the existing comm
@@ -820,7 +821,7 @@ void ChipWorker::finalize() {
         run_lane_.reset();
     }
     require_comm_cleanup_confirmed();
-    if (comm_reclamation_unconfirmed_) {
+    if (comm_reclamation_unconfirmed()) {
         // Carrier destruction does not prove device users stopped. Keep comm
         // owners and their code alive, but allow the device's reset path below.
         if ((!comm_sessions_.empty() || !global_domain_ids_.empty()) && runtime_module_ != nullptr) {
@@ -901,6 +902,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     wait_run_fn_ = nullptr;
     wait_run_completion_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
+    finalize_run_with_last_use_fn_ = nullptr;
     probe_run_retention_fn_ = nullptr;
     get_teardown_report_fn_ = nullptr;
     // Reached only past the throw a failed teardown takes, which keeps the
@@ -1875,14 +1877,19 @@ void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
 void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) { finalize_native_run_impl(run, nullptr); }
 
 void ChipWorker::finalize_native_run_impl(
-    const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs, bool *context_destroyed
+    const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs, bool *context_destroyed,
+    bool *retirement_finalized, bool *backend_last_use_proved
 ) {
     if (no_submission_released != nullptr) *no_submission_released = false;
     if (context_destroyed != nullptr) *context_destroyed = false;
+    if (retirement_finalized != nullptr) *retirement_finalized = false;
+    if (backend_last_use_proved != nullptr) *backend_last_use_proved = false;
     validate_execution_process();
     const NativeRunFinalizeOutcome outcome =
         finalize_native_run_epoch(run.run_epoch, &run, FinalizeMode::Caller, deliver_outputs);
     if (context_destroyed != nullptr) *context_destroyed = outcome.context_destroyed;
+    if (retirement_finalized != nullptr) *retirement_finalized = outcome.retirement_finalized;
+    if (backend_last_use_proved != nullptr) *backend_last_use_proved = outcome.backend_last_use_proved;
     if (no_submission_released != nullptr && outcome.captured == nullptr &&
         (outcome.fault == FinalizeFault::None || outcome.fault == FinalizeFault::Failed)) {
         *no_submission_released = outcome.no_submission_released;
@@ -2021,6 +2028,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
 
     bool entered_finalize = false;
     int finalize_rc = 0;
+    uint32_t last_use_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
 
     // This call's own wait records its outcome where every other operation records one, and before
     // the teardown below can run. A later call on a retained handle then reads completion and this
@@ -2047,8 +2055,10 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     if (outcome.captured == nullptr) {
         entered_finalize = true;
         try {
-            finalize_rc =
-                finalize_run_fn_(device_ctx_, storage, deliver_outputs && (!persisted || persisted_rc == 0) ? 1 : 0);
+            const int delivery = deliver_outputs && (!persisted || persisted_rc == 0) ? 1 : 0;
+            finalize_rc = finalize_run_with_last_use_fn_ != nullptr ?
+                              finalize_run_with_last_use_fn_(device_ctx_, storage, delivery, &last_use_proof) :
+                              finalize_run_fn_(device_ctx_, storage, delivery);
         } catch (...) {
             outcome.captured = std::current_exception();
         }
@@ -2068,6 +2078,13 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         if (it != native_runs_.end()) {
             NativeRunEntry &entry = *it->second;
             if (tag == RunStorageTag::Destroyed && !threw) {
+                // This call's wait may have established retirement after the
+                // initial phase snapshot. Carrier destruction alone is not proof.
+                outcome.backend_last_use_proved = last_use_proof == SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
+                outcome.retirement_finalized = entry.phase == NativeRunPhase::REAPED || outcome.backend_last_use_proved;
+                if (holds_live_comm_resources() && (finalize_rc != 0 || (persisted && persisted_rc != 0)) &&
+                    !outcome.no_submission_released && !outcome.backend_last_use_proved)
+                    comm_reclamation_unconfirmed_ = true;
                 auto &cache = runtime_bufs_[entry.slot_id];
                 if (cache.data() == nullptr) cache = std::move(entry.storage);
                 native_runs_.erase(it);
@@ -2471,10 +2488,20 @@ void ChipWorker::require_comm_cleanup_confirmed() const {
 
 void ChipWorker::require_comm_reclamation_safe() const {
     require_comm_cleanup_confirmed();
-    if (comm_reclamation_unconfirmed_ || (run_lane_ != nullptr && run_lane_->poisoned()) ||
-        unproven_native_run_count() != 0) {
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    if (comm_reclamation_unconfirmed_ || !native_runs_.empty()) {
         throw std::runtime_error("communication resource reclamation is unconfirmed");
     }
+}
+
+void ChipWorker::mark_comm_reclamation_unconfirmed() noexcept {
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    comm_reclamation_unconfirmed_ = true;
+}
+
+bool ChipWorker::comm_reclamation_unconfirmed() const noexcept {
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    return comm_reclamation_unconfirmed_;
 }
 
 uint64_t ChipWorker::malloc(size_t size) {

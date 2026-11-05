@@ -4110,7 +4110,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                             # done() also includes cached terminal failures. Deliver
                             # those directly; a failed rollback is not physical END.
                             code, msg = publish_completed_run(staged)
-                            if code != 0 and staged.chip_run.lane_poisoned:
+                            if code != 0 and staged.chip_run.lane_poisoned and staged.chip_run._owner_recovery_required:
                                 shutdown_message = msg
                                 stop_progress = True
                                 break
@@ -4166,9 +4166,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         if not staged.ended_published:
                             # An explicit wait must reach the native bounded wait even
                             # when a hung launch never reports physical END on its own.
-                            staged.chip_run.wait()
+                            try:
+                                staged.chip_run.wait()
+                            except Exception:  # noqa: BLE001
+                                if not staged.chip_run.done() or staged.chip_run._owner_recovery_required:
+                                    raise
                         code, msg = publish_completed_run(staged)
-                        if code != 0 and staged.chip_run.lane_poisoned:
+                        if code != 0 and staged.chip_run.lane_poisoned and staged.chip_run._owner_recovery_required:
                             shutdown_message = msg
                             stop_progress = True
                             break

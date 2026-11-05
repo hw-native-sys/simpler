@@ -1311,6 +1311,27 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  */
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs);
 
+enum {
+    SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN = 0,
+    SIMPLER_NATIVE_RUN_LAST_USE_PROVED = 1,
+};
+
+/** Optional v1 finalization result for this run's own accesses. The return code
+ * preserves the original execution/cleanup result. PROVED independently states
+ * that this run can submit no further work and its core/backend accesses ended,
+ * and that its native cleanup and carrier destruction completed. It does not
+ * prove another peer's accesses ended or replace the domain owner's release
+ * protocol. Physical completion alone is insufficient on an unaudited backend.
+ *
+ * A non-null output is set to UNKNOWN before validation; a null output is
+ * rejected without mutating the run. Missing support must be treated as UNKNOWN.
+ * The backend captures proof while the carrier is live and publishes it only
+ * after destruction, including when a semantic execution error is returned.
+ */
+int simpler_finalize_run_with_last_use_v1(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs, uint32_t *out_proof
+);
+
 /**
  * Retain preparation backing independently of the original run. Call before
  * CaptureBegin on a Prepared run; exactly one retention is allowed per run.

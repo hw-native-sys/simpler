@@ -205,6 +205,32 @@ struct ChipRunLaneState {
         worker->validate_execution_context();
     }
 
+    void finalize_run_context(
+        const std::shared_ptr<ChipRunState> &run, bool *no_submission_released, bool deliver_outputs,
+        bool *retirement_finalized, bool failed_execution = false
+    ) {
+        bool backend_last_use_proved = false;
+        const auto retain_unproved_comm = [&] {
+            if (worker->holds_live_comm_resources() && !backend_last_use_proved &&
+                (no_submission_released == nullptr || !*no_submission_released))
+                worker->mark_comm_reclamation_unconfirmed();
+        };
+        try {
+            worker->finalize_native_run_impl(
+                run->native_run, no_submission_released, deliver_outputs, &run->native_context_destroyed,
+                retirement_finalized, &backend_last_use_proved
+            );
+        } catch (...) {
+            retain_unproved_comm();
+            throw;
+        }
+        if (run->crossed_launch_fence && (run->error != nullptr || failed_execution)) retain_unproved_comm();
+    }
+
+    bool comm_recovery_required() const noexcept {
+        return detached_comm_reclamation_unconfirmed || (worker != nullptr && worker->comm_reclamation_unconfirmed());
+    }
+
     /**
      * Finish every run that has not crossed the launch boundary, without
      * launching it.
@@ -228,10 +254,12 @@ struct ChipRunLaneState {
             }
             if (run->phase == ChipRunState::Phase::PREPARED) {
                 bool finalized = true;
+                bool no_submission_released = false;
+                bool retirement_finalized = false;
                 try {
-                    worker->finalize_native_run(run->native_run);
+                    finalize_run_context(run, &no_submission_released, true, &retirement_finalized);
                 } catch (...) {
-                    finalized = false;
+                    finalized = no_submission_released || retirement_finalized;
                     const std::exception_ptr finalize_error = std::current_exception();
                     if (run->error == nullptr) run->error = finalize_error;
                     poison_with(run, finalize_error);
@@ -396,7 +424,9 @@ struct ChipRunLaneState {
      * readers are still live or revoke an existing last-use proof.
      */
     void release_device_spans(const std::shared_ptr<ChipRunState> &run, bool proven_done) noexcept {
+        proven_done = proven_done || run->caller_last_use_proven;
         if (proven_done) run->caller_last_use_proven = true;
+        else worker->mark_comm_reclamation_unconfirmed();
         if (!run->caller_references_live) return;
         worker->release_caller_device_borrow(borrow_identity(*run), !proven_done);
         try {
@@ -446,17 +476,18 @@ struct ChipRunLaneState {
         if (prior_poison != nullptr && run->poison_error == nullptr) run->poison_error = prior_poison;
         bool finalized = true;
         bool no_submission_released = false;
+        bool retirement_finalized = false;
         try {
-            worker->finalize_native_run_impl(
-                run->native_run, &no_submission_released,
-                run->error == nullptr && prior_poison == nullptr && joined_failure == nullptr,
-                &run->native_context_destroyed
+            finalize_run_context(
+                run, &no_submission_released,
+                run->error == nullptr && prior_poison == nullptr && joined_failure == nullptr, &retirement_finalized,
+                joined_failure != nullptr
             );
         } catch (...) {
-            finalized = no_submission_released;
+            finalized = no_submission_released || retirement_finalized;
             const std::exception_ptr finalize_error = std::current_exception();
             if (run->error == nullptr) run->error = finalize_error;
-            if (!finalized) poison_with(run, joined_failure != nullptr ? joined_failure : finalize_error);
+            if (!no_submission_released) poison_with(run, joined_failure != nullptr ? joined_failure : finalize_error);
         }
         if (joined_failure != nullptr && !no_submission_released) poison_with(run, joined_failure);
         if (prior_poison != nullptr && run->error == nullptr) run->error = prior_poison;
@@ -620,23 +651,24 @@ struct ChipRunLaneState {
         // carrier, so it has nothing to retire.
         bool finalized = true;
         if (run->phase == ChipRunState::Phase::PREPARED) {
+            bool no_submission_released = false;
+            bool retirement_finalized = false;
             try {
-                worker->finalize_native_run(run->native_run);
+                finalize_run_context(run, &no_submission_released, true, &retirement_finalized);
             } catch (...) {
                 // The admission failure is this run's first cause and is kept:
                 // a cleanup that then failed is a second fact about the lane,
-                // not a replacement for why the run never launched. It
-                // poisons the lane on the existing terms, because an
-                // un-retired carrier is exactly what a later run must not
-                // prepare over.
-                finalized = false;
+                // not a replacement for why the run never launched.
+                // A cleanup error still prevents further admission even when
+                // its independent retirement receipt releases the backing.
+                finalized = no_submission_released || retirement_finalized;
                 poison_with(run, std::current_exception());
             }
         }
         // After the finalize, never before, for the reason `finish` gives: it
         // is the call that releases this run's bindings, so it is the point at
-        // which the last consumer of a borrowed address is done. A finalize
-        // that failed cannot prove that, and the reference is kept.
+        // which the last consumer of a borrowed address is done. Missing
+        // retirement and no-submission receipts keep the reference live.
         release_device_spans(run, finalized);
         run->phase = ChipRunState::Phase::TERMINAL;
         auto it = std::find(fifo.begin(), fifo.end(), run);
@@ -899,7 +931,7 @@ struct ChipRunLaneState {
             if (!worker->poll_native_run(target->native_run)) return false;
         } catch (...) {
             const std::exception_ptr poll_error = std::current_exception();
-            finish(target);
+            finish(target, poll_error);
             if (target->error == nullptr) target->error = poll_error;
             poison_with(target, target->error);
             launch_ready_prefix();
@@ -1092,6 +1124,8 @@ struct ChipRunLaneState {
     // Immutable across fork; read before mu or the mutable worker pointer.
     const pid_t process_id{getpid()};
     ChipWorker *worker;
+    // Worker-wide recovery debt retained after detach, independent of every run's semantic result.
+    bool detached_comm_reclamation_unconfirmed{false};
     mutable std::mutex mu;
     std::deque<std::shared_ptr<ChipRunState>> fifo;
     std::vector<std::shared_ptr<ChipRunState>> completed;
@@ -1207,10 +1241,12 @@ void ChipRun::abandon() {
     if (it == lane_->fifo.end()) throw std::runtime_error("chip run lane lost an unlaunched run");
     if (run_->phase == ChipRunState::Phase::PREPARED) {
         bool finalized = true;
+        bool no_submission_released = false;
+        bool retirement_finalized = false;
         try {
-            lane_->worker->finalize_native_run(run_->native_run);
+            lane_->finalize_run_context(run_, &no_submission_released, true, &retirement_finalized);
         } catch (...) {
-            finalized = false;
+            finalized = no_submission_released || retirement_finalized;
             run_->error = std::current_exception();
             lane_->poison_with(run_, run_->error);
         }
@@ -1249,7 +1285,7 @@ bool ChipRun::owner_recovery_required() const {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
-    return !run_->native_context_destroyed || !run_->caller_last_use_proven;
+    return !run_->native_context_destroyed || !run_->caller_last_use_proven || lane_->comm_recovery_required();
 }
 
 ChipRunPreparationDisposition ChipRun::preparation_disposition() const {
@@ -1541,6 +1577,7 @@ void ChipRunLane::detach_after_failed_teardown(std::exception_ptr error) noexcep
     };
     terminalize(state_->fifo);
     terminalize(state_->completed);
+    state_->detached_comm_reclamation_unconfirmed = state_->comm_recovery_required();
     state_->worker = nullptr;
 }
 

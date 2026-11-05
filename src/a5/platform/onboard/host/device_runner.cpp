@@ -952,6 +952,18 @@ int DeviceRunner::async_last_use_requirement(const PreparedExecution &prepared) 
     );
 }
 
+bool DeviceRunner::run_origin_accesses_ended(const PreparedExecution &prepared) const {
+    // The retained image, not the slot's latest publication, identifies this
+    // async run. Retirement clears resources_owned only after its qualified
+    // terminal and queued-wait discharge. A legacy/sync image supplies no
+    // independent-engine qualification through this optional interface.
+    if (prepared.recording || !prepared.physical_complete || prepared.resources_owned ||
+        async_last_use_requirement(prepared) <= 0)
+        return false;
+    return device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch).state ==
+           DeviceRunTerminalState::Succeeded;
+}
+
 int DeviceRunner::qualify_async_last_use(PreparedExecution &prepared) {
     const int required = async_last_use_requirement(prepared);
     if (required == 0) return 0;

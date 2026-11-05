@@ -663,6 +663,8 @@ private:
     void retain_unconfirmed_comm_stream(void *stream);
     void require_comm_cleanup_confirmed() const;
     void require_comm_reclamation_safe() const;
+    void mark_comm_reclamation_unconfirmed() noexcept;
+    bool comm_reclamation_unconfirmed() const noexcept;
 
     std::shared_ptr<RuntimeModule> runtime_module_;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -694,6 +696,7 @@ private:
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_completion_fn_ = nullptr;
     SimplerFinalizeRunFn finalize_run_fn_ = nullptr;
+    decltype(&simpler_finalize_run_with_last_use_v1) finalize_run_with_last_use_fn_ = nullptr;
     SimplerProbeRunRetentionFn probe_run_retention_fn_ = nullptr;
     GetTeardownReportFn get_teardown_report_fn_ = nullptr;
     // The first captured teardown observation, kept by value so it outlives
@@ -1059,12 +1062,14 @@ private:
         int rc{0};
         bool no_submission_released{false};
         bool context_destroyed{false};
+        bool retirement_finalized{false};
+        bool backend_last_use_proved{false};
         std::exception_ptr captured;
     };
     // Cleanup facts survive a persisted run error; its code establishes neither.
     void finalize_native_run_impl(
         const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs = true,
-        bool *context_destroyed = nullptr
+        bool *context_destroyed = nullptr, bool *retirement_finalized = nullptr, bool *backend_last_use_proved = nullptr
     );
     /**
      * Finalize one run and report what it established.
@@ -1088,6 +1093,7 @@ private:
     // neither creates nor tracks. Plain: written and read from the one thread
     // that drives this worker's control commands and its run lane.
     bool exported_device_regions_live_ = false;
+    // Protected by native_run_mu_; independent of a lane's semantic failure.
     bool comm_reclamation_unconfirmed_ = false;
     // A backend retained communication references; device reset is not a cleanup proof.
     bool comm_cleanup_unconfirmed_ = false;

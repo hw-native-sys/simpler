@@ -2679,7 +2679,9 @@ int simpler_release_run_resources(DeviceContextHandle ctx, RuntimeHandle referen
     }
 }
 
-static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
+static int finalize_native_run(
+    DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs, uint32_t *out_proof = nullptr
+) try {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     // A refused environment leaves the run owned for a retry on its context.
@@ -2886,6 +2888,20 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
         reclaim_rc = state->runner->reclaim_workspace_obsolete();
     }
 
+    // Capture while the run's retained image and result owner are still live.
+    // A returned semantic error does not revoke separately qualified last use.
+    bool last_use_proved = false;
+    if (out_proof != nullptr && launched && state->physical_complete && state->copyback_returned &&
+        state->bindings_released && reclaim_rc == 0 && state->active_execution->prepared != nullptr &&
+        state->active_execution->prepared->identity == state->identity()) {
+        try {
+            last_use_proved = state->runner->run_origin_accesses_ended(*state->active_execution->prepared);
+        } catch (...) {
+            // An optional proof query cannot interrupt the established cleanup
+            // path or replace the original result. Unknown remains conservative.
+        }
+    }
+
     // The epoch selects this call's retained workspace facts when execution
     // retirement has already released the slot to a successor. Destruction
     // ends this call's IO ownership without changing that successor's record.
@@ -2911,6 +2927,7 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     }
     state->runner->release_native_run_observation(state);
     destroy_native_run_context(state);
+    if (last_use_proved) *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -2930,6 +2947,15 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {
     if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return finalize_native_run(ctx, runtime, deliver_outputs != 0);
+}
+
+int simpler_finalize_run_with_last_use_v1(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs, uint32_t *out_proof
+) {
+    if (out_proof == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
+    if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return finalize_native_run(ctx, runtime, deliver_outputs != 0, out_proof);
 }
 
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
