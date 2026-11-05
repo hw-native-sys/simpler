@@ -85,7 +85,7 @@ PullRequest
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut` | `[self-hosted, cpu]` | `pytest tests/ut` + `ctest -LE requires_hardware` |
+| `ut` | `[self-hosted, cpu]` | Python UT with 4 xdist workers; `test_test_environments.py` runs separately on the controller because it checks controller/worker identity. C++ build and CTest use 8 jobs. |
 | `st-sim-a2a3` | `[self-hosted, cpu]` | `pytest examples tests/st --platform a2a3sim` |
 | `st-sim-a5` | `[self-hosted, cpu]` | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |

@@ -116,7 +116,11 @@ jobs:
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
-            python -m pytest tests/ut -m "not requires_hardware" -n 4 --dist loadfile -v
+            # These tests exercise xdist's controller/worker identity and must
+            # not themselves run inside an xdist worker.
+            python -m pytest tests/ut -m "not requires_hardware" -n 4 --dist loadfile \
+              --ignore=tests/ut/py/test_test_environments.py -v
+            python -m pytest tests/ut/py/test_test_environments.py -m "not requires_hardware" -v
           else
             pytest tests/ut -m "not requires_hardware" -v
           fi
