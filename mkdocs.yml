@@ -141,6 +141,7 @@ nav:
           - CANN source references: hardware/cann-source-references.md
   - Kernels:
       - AICore Kernel Programming: aicore-kernel-programming.md
+      - TMR task dependencies and progress: aicore-kernel-programming/task-progress.md
       - L2 Cache Bypass: l2-cache-bypass.md
       - a5 SIMT Launch: simt-launch.md
       - Manual Scope: manual-scope.md
