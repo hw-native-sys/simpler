@@ -28,11 +28,11 @@ _NATIVE = Path(__file__).with_name("native")
 pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.runtime("host_build_graph")]
 
 
-def build_probe(build: Path):
+def build_probe(build: Path, *, retained_models: bool = False):
     build.mkdir(parents=True, exist_ok=True)
     compiler = KernelCompiler("a2a3")
     kernel = compiler.compile_incore(
-        str(_NATIVE / "hbg_step.cpp"),
+        str(_NATIVE / ("hbg_inout_step.cpp" if retained_models else "hbg_step.cpp")),
         core_type="aiv",
         pto_isa_root=ensure_pto_isa_root(),
         extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
@@ -41,10 +41,13 @@ def build_probe(build: Path):
     orch = compiler.compile_orchestration(
         "host_build_graph", str(_NATIVE / "hbg_orchestration.cpp"), build_dir=str(build)
     )
-    child = CoreCallable.build(signature=[D.IN, D.OUT, D.SCALAR], binary=extract_text_section(kernel))
+    child = CoreCallable.build(
+        signature=[D.INOUT, D.SCALAR] if retained_models else [D.IN, D.OUT, D.SCALAR],
+        binary=extract_text_section(kernel),
+    )
     chip = ChipCallable.build(
-        signature=[D.IN, D.OUT, D.IN, D.SCALAR],
-        func_name="hbg_capture_orchestration",
+        signature=[D.INOUT, D.SCALAR] if retained_models else [D.IN, D.OUT, D.IN, D.SCALAR],
+        func_name="hbg_inout_orchestration" if retained_models else "hbg_capture_orchestration",
         binary=orch,
         children=[(0, child)],
     )
@@ -56,8 +59,8 @@ def build_probe(build: Path):
         "c++",
         "-std=c++17",
         "-O2",
-        str(_NATIVE / "hbg_driver.cpp"),
-        str(_NATIVE / "capture_submit_fault.cpp"),
+        str(_NATIVE / ("hbg_retained_models.cpp" if retained_models else "hbg_driver.cpp")),
+        *([] if retained_models else [str(_NATIVE / "capture_submit_fault.cpp")]),
         f"-I{_ROOT / 'src/common/worker'}",
         f"-I{_ROOT / 'src/common/task_interface'}",
         f"-I{_ROOT / 'src/common'}",
@@ -94,6 +97,29 @@ def build_probe(build: Path):
 def hbg_capture_probe(tmp_path_factory):
     build = tmp_path_factory.mktemp("hbg-capture")
     return build, build_probe(build)
+
+
+def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
+    binaries = build_probe(tmp_path, retained_models=True)
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    logs = tmp_path / "ascend-retained-models"
+    logs.mkdir()
+    result = subprocess.run(
+        [binaries[0], device, *binaries[1:]],
+        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    (tmp_path / "retained-models.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}\nDevice logs: {logs}"
+    assert "hbg_retained_models PASS models=2 references=2 replays=6 eager=1 elements=16" in result.stdout
+    for stage in ("a-recorded", "b-prepared", "b-recorded", "b1", "a1", "b2", "a2", "b3", "b-after-a-release", "eager"):
+        assert f"state={stage} verified=48" in result.stdout
+    for stage in ("a-retains-callable", "a-retains-context", "b-retains-callable", "b-retains-context"):
+        assert f"stage={stage} rc=0" in result.stdout
+    assert "stage=same-carrier-and-slot rc=0" in result.stdout
 
 
 @pytest.mark.parametrize(
