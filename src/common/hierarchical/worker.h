@@ -133,6 +133,12 @@ public:
     void control_alloc_domain(int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name) {
         manager_.control_alloc_domain(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());
     }
+
+    void control_alloc_domain_sdma_sdk_v1(
+        int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name
+    ) {
+        manager_.control_alloc_domain_sdma_sdk_v1(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());
+    }
     void control_release_domain(int worker_id, const std::string &request_shm_name) {
         manager_.control_release_domain(worker_id, request_shm_name.c_str());
     }

@@ -39,7 +39,8 @@ struct NativeRunContext {
 
     NativeRunContext(
         Runner *runner_in, const CallConfig &config_in, uint64_t trace_hid_in, const NativeRunDescriptor &descriptor_in,
-        const HostApiOps *host_api_ops, const NativeRunDomainProvider *domain_provider = nullptr
+        const HostApiOps *host_api_ops, const NativeRunDomainProvider *domain_provider = nullptr,
+        const NativeRunDomainProviderV2 *domain_provider_v2 = nullptr
     ) :
         runner(runner_in),
         config(config_in),
@@ -52,13 +53,16 @@ struct NativeRunContext {
         trace_hid(trace_hid_in) {
         const NativeRunDomainProvider empty_provider{1, 0, nullptr, nullptr, 0};
         const auto &provider = domain_provider != nullptr ? *domain_provider : empty_provider;
-        if (provider.version != 1 || provider.reserved != 0)
+        if (provider.reserved != 0 ||
+            (domain_provider_v2 == nullptr ? provider.version != 1 :
+                                             (domain_provider != &domain_provider_v2->base || provider.version != 2)))
             throw std::invalid_argument("unsupported native communication-domain provider version");
         if (provider.count != 0) {
             if (provider.owner == nullptr || provider.query == nullptr)
                 throw std::invalid_argument("native communication-domain provider is missing");
             domain_snapshots.resize(provider.count);
             domain_execution.resize(provider.count);
+            domain_sdma_owners.resize(provider.count);
             std::vector<CommDomainUse> uses;
             uses.reserve(provider.count);
             for (size_t i = 0; i < provider.count; ++i) {
@@ -70,6 +74,18 @@ struct NativeRunContext {
                     qualification > static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN) ||
                     !comm_domain_snapshot_valid(domain_snapshots[i]))
                     throw std::invalid_argument("native communication-domain owner query failed");
+                if (domain_provider_v2 != nullptr && domain_provider_v2->query_sdma_owner != nullptr) {
+                    auto &info = domain_sdma_owners[i];
+                    if (domain_provider_v2->query_sdma_owner(
+                            provider.owner, descriptor.run_epoch, descriptor.pipeline_slot, i, &info, sizeof(info)
+                        ) != 0 ||
+                        !comm_sdma_owner_info_valid(info))
+                        throw std::invalid_argument("native SDMA workspace owner query failed");
+                    const auto &workspace = comm_workspace<CommWorkspaceKind::SDMA>(domain_snapshots[i].context);
+                    if (info.access != CommSdmaAccess::UNKNOWN &&
+                        (info.workspace_addr != workspace.addr || info.workspace_bytes != workspace.size))
+                        throw std::invalid_argument("native SDMA workspace owner does not match selected domain");
+                }
                 domain_execution[i] = static_cast<CommDomainExecution>(qualification);
                 uses.push_back(domain_snapshots[i].use);
             }
@@ -104,6 +120,7 @@ struct NativeRunContext {
     HostApi host_api;
     std::vector<CommDomainSnapshot> domain_snapshots;
     std::vector<CommDomainExecution> domain_execution;
+    std::vector<CommSdmaOwnerInfoV1> domain_sdma_owners;
     std::unique_ptr<Runtime> runtime{std::make_unique<Runtime>()};
     uint64_t trace_hid{0};
     uint64_t trace_inv{0};

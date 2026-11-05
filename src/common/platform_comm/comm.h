@@ -33,9 +33,11 @@
 
 #ifdef __cplusplus
 #include "comm_domain_use.h"
+#include "comm_sdma_owner.h"
 extern "C" {
 #else
 typedef struct CommDomainSnapshot CommDomainSnapshot;
+typedef struct CommSdmaOwnerInfoV1 CommSdmaOwnerInfoV1;
 #endif
 
 typedef struct CommHandle_ *CommHandle;
@@ -49,6 +51,8 @@ typedef struct CommHandle_ *CommHandle;
  */
 int comm_query_domain_snapshot(CommHandle h, uint64_t allocation_id, CommDomainSnapshot *out);
 int comm_query_global_domain_snapshot(uint64_t domain_id, CommDomainSnapshot *out);
+// Sized read-only owner configuration; no lifetime/cache/record rights added.
+int comm_query_domain_sdma_owner_v1(CommHandle h, uint64_t allocation_id, CommSdmaOwnerInfoV1 *out, size_t out_bytes);
 
 // Domain allocation failures that callers can distinguish from generic ACL errors.
 typedef enum CommDomainStatus {
@@ -297,6 +301,16 @@ int comm_derive_context(
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
+    size_t *actual_window_size_out
+);
+
+/** Explicit qualified-SDK-only SDMA allocation. queue_num is fixed for the
+ * shared communicator workspace lifetime. Legacy exposure or a different q
+ * refuses collectively through the normal domain allocation/abort protocol.
+ * Other engines and unsupported backends are not silently substituted. */
+int comm_alloc_domain_windows_sdma_sdk_v1(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t queue_num, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
     size_t *actual_window_size_out
 );
 

@@ -180,6 +180,149 @@ TEST_F(NativeAdmissionTest, DomainOwnerSnapshotReachesTheActualNativeHostQuery) 
     EXPECT_EQ(comm_release_domain_windows(comm, 1, 1, 0), 0);
     EXPECT_EQ(comm_destroy(comm), 0);
 }
+TEST_F(NativeAdmissionTest, DomainV2RejectsShortOrWrongVersionBeforeReadingPayload) {
+    const auto *descriptor = reinterpret_cast<const NativeRunDescriptor *>(1);
+    const auto *unreadable = reinterpret_cast<const NativeRunDomainProviderV2 *>(1);
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v2(
+            nullptr, nullptr, 0, nullptr, nullptr, descriptor, sizeof(NativeRunDescriptor) - 1, unreadable,
+            sizeof(NativeRunDomainProviderV2)
+        ),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v2(
+            nullptr, nullptr, 0, nullptr, nullptr, descriptor, sizeof(NativeRunDescriptor), unreadable,
+            sizeof(NativeRunDomainProviderV2) - 1
+        ),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    NativeRunDomainProviderV2 provider{{1, 0, nullptr, nullptr, 0}, nullptr};
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v2(
+            nullptr, nullptr, 0, nullptr, nullptr, descriptor, sizeof(NativeRunDescriptor), &provider, sizeof(provider)
+        ),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    provider.base.version = 2;
+    provider.base.reserved = 1;
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v2(
+            nullptr, nullptr, 0, nullptr, nullptr, descriptor, sizeof(NativeRunDescriptor), &provider, sizeof(provider)
+        ),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+}
+
+// The trusted provider fixture supplies metadata only. This exercises the real
+// native prepare/HostApi bridge, not hardware SDMA qualification.
+struct SdmaProviderFixture {
+    CommDomainSnapshot snapshot{};
+    CommSdmaOwnerInfoV1 info{0x8000, 4096, CommSdmaAccess::SDK_ONLY, 3};
+    SdmaProviderFixture() {
+        snapshot.use = {CommDomainKind::LOCAL, 0, 7, 0x1000};
+        snapshot.context.rankNum = 1;
+        snapshot.context.winSize = 4096;
+        snapshot.context.windowsIn[0] = snapshot.context.windowsOut[0] = 0x4000;
+        set_comm_workspace(snapshot.context, CommWorkspaceKind::SDMA, info.workspace_addr, info.workspace_bytes);
+    }
+    NativeRunDomainProviderV2 provider() {
+        return {
+            {2, 0, this,
+             [](void *raw, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *execution) {
+                 if (epoch != 20 || slot != 1 || index != 0) return -1;
+                 *out = static_cast<SdmaProviderFixture *>(raw)->snapshot;
+                 *execution = static_cast<uint32_t>(CommDomainExecution::UNKNOWN);
+                 return 0;
+             },
+             1},
+            [](void *raw, uint64_t epoch, uint32_t slot, size_t index, CommSdmaOwnerInfoV1 *out, size_t bytes) {
+                if (epoch != 20 || slot != 1 || index != 0 || bytes != sizeof(*out)) return -1;
+                *out = static_cast<SdmaProviderFixture *>(raw)->info;
+                return 0;
+            }
+        };
+    }
+};
+
+TEST_F(NativeAdmissionTest, DomainV2CopiesOwnerFactForTheCurrentPreparationOnly) {
+    Runner runner;
+    Attempt attempt(runner, 1, 20);
+    SdmaProviderFixture fixture;
+    auto provider = fixture.provider();
+    std::optional<HostApi> saved;
+    callback_hook = [&] {
+        const auto &api = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage)->host_api;
+        saved = api;
+        fixture.info.queue_num = 8;  // The provider is already consumed; no later callback reads it.
+        CommSdmaOwnerInfoV1 info;
+        ASSERT_TRUE(api.query_async_sdma_owner(0x1000, &info));
+        EXPECT_EQ(info.queue_num, 3u);
+        EXPECT_EQ(info.access, CommSdmaAccess::SDK_ONLY);
+        EXPECT_EQ(info.workspace_addr, 0x8000u);
+        EXPECT_FALSE(api.query_async_sdma_owner(0x1001, &info));
+        EXPECT_EQ(info.workspace_addr, 0u);
+        CommDomainSnapshot snapshot;
+        CommDomainExecution execution;
+        ASSERT_TRUE(api.query_async_domain_context(0x1000, &snapshot, &execution));
+        EXPECT_EQ(execution, CommDomainExecution::UNKNOWN);  // q cannot invent execution exclusivity.
+    };
+    ASSERT_EQ(
+        simpler_prepare_run_with_domains_v2(
+            &runner, attempt.storage, 1, &attempt.args, &attempt.config, &attempt.descriptor,
+            sizeof(attempt.descriptor), &provider, sizeof(provider)
+        ),
+        0
+    );
+    ASSERT_TRUE(saved);
+    CommSdmaOwnerInfoV1 info;
+    EXPECT_FALSE(saved->query_async_sdma_owner(0x1000, &info));
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, DomainV2MissingExtensionRemainsUnknown) {
+    Runner runner;
+    Attempt attempt(runner, 1, 20);
+    SdmaProviderFixture fixture;
+    auto provider = fixture.provider();
+    provider.query_sdma_owner = nullptr;
+    callback_hook = [&] {
+        const auto &api = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage)->host_api;
+        CommSdmaOwnerInfoV1 info;
+        EXPECT_FALSE(api.query_async_sdma_owner(0x1000, &info));
+        EXPECT_EQ(info.queue_num, 0u);
+    };
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v2(
+            &runner, attempt.storage, 1, &attempt.args, &attempt.config, &attempt.descriptor,
+            sizeof(attempt.descriptor), &provider, sizeof(provider)
+        ),
+        0
+    );
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, DomainV2RefusesMismatchingWorkspaceOrInvalidPartition) {
+    for (bool wrong_workspace : {false, true}) {
+        Runner runner;
+        Attempt attempt(runner, 1, 20);
+        SdmaProviderFixture fixture;
+        if (wrong_workspace) fixture.info.workspace_addr += 128;
+        else fixture.info.queue_num = 0;
+        auto provider = fixture.provider();
+        EXPECT_NE(
+            simpler_prepare_run_with_domains_v2(
+                &runner, attempt.storage, 1, &attempt.args, &attempt.config, &attempt.descriptor,
+                sizeof(attempt.descriptor), &provider, sizeof(provider)
+            ),
+            0
+        );
+        EXPECT_TRUE(attempt.consume_release());
+        EXPECT_TRUE(attempt.empty());
+        EXPECT_EQ(runner.launch_calls, 0);
+    }
+}
+
 void *counter_entry_points(bool in_graph, uint32_t declaration);
 
 TEST_F(NativeAdmissionTest, AsyncRetentionQueryRequiresTheCurrentPreparingOwnerAndItsCallerBorrow) {

@@ -375,7 +375,7 @@ public:
     ) const;
     bool query_async_domain_context(
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, uint64_t device_context,
-        CommDomainSnapshot *out, CommDomainExecution *execution
+        CommDomainSnapshot *out, CommDomainExecution *execution, CommSdmaOwnerInfoV1 *sdma_owner = nullptr
     ) const;
     void release_caller_buffers(uint64_t identity, bool keep);
     /**

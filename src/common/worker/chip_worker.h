@@ -434,6 +434,10 @@ public:
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr
     );
+    std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows_sdma_sdk_v1(
+        uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
+        size_t window_size, uint32_t queue_num, uint64_t *ownership_flag = nullptr
+    );
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
     /// `rank_count` + `domain_rank` size the subset barrier; the rank list
@@ -687,6 +691,7 @@ private:
     SimplerRunFn run_fn_ = nullptr;
     SimplerPrepareRunFn prepare_run_fn_ = nullptr;
     decltype(&simpler_prepare_run_with_domains_v1) prepare_run_with_domains_fn_ = nullptr;
+    decltype(&simpler_prepare_run_with_domains_v2) prepare_run_with_domains_v2_fn_ = nullptr;
     SimplerNativeRunFn launch_run_fn_ = nullptr;
     ValidateExecutionContextFn validate_execution_context_fn_ = nullptr;
     ValidateCallerStreamFn validate_caller_stream_fn_ = nullptr;
@@ -774,12 +779,14 @@ private:
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
+    CommAllocDomainWindowsFn comm_alloc_domain_windows_sdma_sdk_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     decltype(&comm_query_domain_snapshot) comm_query_domain_snapshot_fn_ = nullptr;
+    decltype(&comm_query_domain_sdma_owner_v1) comm_query_domain_sdma_owner_fn_ = nullptr;
     decltype(&comm_query_global_domain_snapshot) comm_query_global_domain_snapshot_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
@@ -893,6 +900,13 @@ private:
     enum class NativeRunLease : uint8_t { Acquired, AlreadyComplete, Absent, Stale, Reserved, Busy };
     static int query_native_domain_snapshot(
         void *owner, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *qualification
+    );
+    static int query_native_sdma_owner(
+        void *owner, uint64_t epoch, uint32_t slot, size_t index, CommSdmaOwnerInfoV1 *out, size_t out_bytes
+    );
+    std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows_impl(
+        uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
+        size_t window_size, uint32_t workspace_or_queue_num, uint64_t *ownership_flag, bool sdk_only
     );
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,

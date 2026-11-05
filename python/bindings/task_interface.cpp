@@ -4189,6 +4189,27 @@ NB_MODULE(_task_interface, m) {
             "responsibility before result conversion or an allocation error; it does not imply a usable context."
         )
         .def(
+            "comm_alloc_domain_windows_sdma_sdk_v1",
+            [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
+               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t queue_num) {
+                if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
+                    throw std::invalid_argument(
+                        "comm_alloc_domain_windows_sdma_sdk_v1: commit flag address is invalid"
+                    );
+                }
+                auto [device_ctx, local_window_base, actual_window_size] = self.comm_alloc_domain_windows_sdma_sdk_v1(
+                    comm_handle, allocation_id, rank_ids, domain_rank, window_size, queue_num,
+                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address))
+                );
+                return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
+            },
+            nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
+            nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("queue_num"),
+            "Collectively allocate a fresh per-rank pool for a subset; returns "
+            "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
+            "responsibility before result conversion or an allocation error; it does not imply a usable context."
+        )
+        .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."

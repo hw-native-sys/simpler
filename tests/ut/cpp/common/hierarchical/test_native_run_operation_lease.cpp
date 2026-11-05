@@ -426,6 +426,103 @@ TEST(NativeRunOperationLeaseTest, ActualLaneDomainProviderUsesTheCurrentOwnerAnd
     EXPECT_NO_THROW(worker.comm_destroy_all());
 }
 
+NativeRunDomainProviderV2 g_sdma_provider{};
+CommSdmaOwnerInfoV1 g_sdma_answer{};
+
+int sdma_domain_snapshot_backend(CommHandle owner, uint64_t id, CommDomainSnapshot *out) {
+    const int rc = domain_snapshot_backend(owner, id, out);
+    if (rc == 0) set_comm_workspace(out->context, CommWorkspaceKind::SDMA, 0x8000, 4096);
+    return rc;
+}
+int sdma_owner_backend(CommHandle owner, uint64_t id, CommSdmaOwnerInfoV1 *out, size_t bytes) {
+    if (owner == nullptr || id != 31 || bytes != sizeof(*out)) return -1;
+    *out = {0x8000, 4096, CommSdmaAccess::SDK_ONLY, 3};
+    return 0;
+}
+int prepare_sdma_domain_run(
+    void *device, void *runtime, int32_t callable, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProviderV2 *provider,
+    size_t provider_bytes
+) {
+    EXPECT_EQ(descriptor_bytes, sizeof(NativeRunDescriptor));
+    EXPECT_EQ(provider_bytes, sizeof(NativeRunDomainProviderV2));
+    EXPECT_EQ(provider->base.version, 2u);
+    g_sdma_provider = *provider;
+    const auto &base = provider->base;
+    CommDomainSnapshot snapshot;
+    uint32_t execution = 0;
+    int rc = base.query(base.owner, descriptor->run_epoch, descriptor->pipeline_slot, 0, &snapshot, &execution);
+    if (rc == 0)
+        rc = provider->query_sdma_owner(
+            base.owner, descriptor->run_epoch, descriptor->pipeline_slot, 0, &g_sdma_answer, sizeof(g_sdma_answer)
+        );
+    CommSdmaOwnerInfoV1 wrong{1, 1, CommSdmaAccess::SDK_ONLY, 1};
+    EXPECT_NE(
+        provider->query_sdma_owner(
+            base.owner, descriptor->run_epoch, descriptor->pipeline_slot + 1, 0, &wrong, sizeof(wrong)
+        ),
+        0
+    );
+    EXPECT_EQ(wrong.workspace_addr, 0u);
+    EXPECT_NE(
+        provider->query_sdma_owner(
+            base.owner, descriptor->run_epoch, descriptor->pipeline_slot, 1, &wrong, sizeof(wrong)
+        ),
+        0
+    );
+    if (rc != 0) {
+        publish_released_preparation(runtime, descriptor->run_epoch);
+        return rc;
+    }
+    return prepare_run(device, runtime, callable, args, config, descriptor);
+}
+
+TEST(NativeRunOperationLeaseTest, ActualLaneV2QueriesOnlyItsSelectedLiveOwnerDuringPrepare) {
+    for (bool supported : {false, true}) {
+        ChipWorker worker;
+        prime(worker);
+        worker.execution_environment_ =
+            ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, false};
+        worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+        worker.prepare_run_with_domains_fn_ = prepare_domain_run;
+        worker.prepare_run_with_domains_v2_fn_ = prepare_sdma_domain_run;
+        worker.comm_query_domain_snapshot_fn_ = sdma_domain_snapshot_backend;
+        worker.comm_query_domain_sdma_owner_fn_ = supported ? sdma_owner_backend : nullptr;
+        worker.comm_release_domain_windows_fn_ = stub_release_domain;
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        static int comm = 0;
+        ASSERT_NE(worker.create_comm_session(&comm, nullptr, true), nullptr);
+        worker.base_comm_handle_ = reinterpret_cast<uint64_t>(&comm);
+        g_sdma_answer = {};
+        g_sdma_provider = {};
+        ChipStorageTaskArgs args;
+        auto run = worker.submit_chip_run(
+            1, args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 8, 9, nullptr, 0, true, {},
+            {{CommDomainKind::LOCAL, 0, 31, 0x1000}}
+        );
+        ASSERT_NE(g_sdma_provider.query_sdma_owner, nullptr);
+        EXPECT_EQ(g_sdma_answer.access, supported ? CommSdmaAccess::SDK_ONLY : CommSdmaAccess::UNKNOWN);
+        EXPECT_EQ(g_sdma_answer.queue_num, supported ? 3u : 0u);
+        CommSdmaOwnerInfoV1 stale{1, 1, CommSdmaAccess::SDK_ONLY, 1};
+        EXPECT_NE(g_sdma_provider.query_sdma_owner(&worker, g_prepare_epoch, 0, 0, &stale, sizeof(stale)), 0);
+        EXPECT_EQ(stale.workspace_addr, 0u);
+        EXPECT_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0), std::runtime_error);
+        g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        EXPECT_TRUE(run.wait_until(ChipRun::Clock::now() + std::chrono::seconds(1)));
+        EXPECT_NE(g_sdma_provider.query_sdma_owner(&worker, g_prepare_epoch, 0, 0, &stale, sizeof(stale)), 0);
+        EXPECT_NO_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0));
+        EXPECT_NO_THROW(worker.comm_destroy_all());
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, ManagedAllocationNeverFallsBackToTheLegacySymbol) {
+    ChipWorker worker;
+    prime(worker);
+    worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+    EXPECT_THROW(worker.comm_alloc_domain_windows_sdma_sdk_v1(1, 1, {0, 1}, 0, 4096, 3), std::runtime_error);
+    EXPECT_EQ(g_comm_alloc_calls, 0);
+}
+
 TEST(NativeRunOperationLeaseTest, SelectedDomainsCannotFallBackToAnOldPrepareEntry) {
     ChipWorker worker;
     prime(worker);

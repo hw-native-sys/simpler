@@ -77,8 +77,10 @@
 #ifdef __cplusplus
 struct CallConfig;
 struct CommDomainSnapshot;
+struct CommSdmaOwnerInfoV1;
 #else
 typedef struct CommDomainSnapshot CommDomainSnapshot;
+typedef struct CommSdmaOwnerInfoV1 CommSdmaOwnerInfoV1;
 #endif
 
 #ifdef __cplusplus
@@ -319,6 +321,17 @@ typedef struct NativeRunDomainProvider {
     );
     size_t count;
 } NativeRunDomainProvider;
+
+/** Sized read-only extension. base.version is 2; all other base rules are
+ * unchanged. The optional query copies existing workspace-owner configuration,
+ * never binds or changes it. A missing callback supplies UNKNOWN, not q=1. */
+typedef struct NativeRunDomainProviderV2 {
+    NativeRunDomainProvider base;
+    int (*query_sdma_owner)(
+        void *owner, uint64_t run_epoch, uint32_t pipeline_slot, size_t index, CommSdmaOwnerInfoV1 *out,
+        size_t out_bytes
+    );
+} NativeRunDomainProviderV2;
 
 typedef struct NativeRunDescriptor {
     uint32_t pipeline_slot;
@@ -1155,6 +1168,13 @@ int simpler_prepare_run(
 int simpler_prepare_run_with_domains_v1(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
+    size_t provider_bytes
+);
+
+/** Read-only owner configuration extension; v1/Descriptor remain unchanged. */
+int simpler_prepare_run_with_domains_v2(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProviderV2 *provider,
     size_t provider_bytes
 );
 

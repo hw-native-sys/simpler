@@ -658,9 +658,10 @@ bool DeviceRunnerBase::query_async_retained_span(
 
 bool DeviceRunnerBase::query_async_domain_context(
     const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context, CommDomainSnapshot *out,
-    CommDomainExecution *execution
+    CommDomainExecution *execution, CommSdmaOwnerInfoV1 *sdma_owner
 ) const {
     if (out != nullptr) *out = {};
+    if (sdma_owner != nullptr) *sdma_owner = {};
     if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
     if (out == nullptr || owner == nullptr || epoch == 0 || device_context == 0 || !can_accept_run()) return false;
     std::scoped_lock lock(native_run_mu_, prepared_storage_mutex_);
@@ -682,6 +683,7 @@ bool DeviceRunnerBase::query_async_domain_context(
     for (size_t i = 0; i < state->domain_snapshots.size(); ++i) {
         if (state->domain_snapshots[i].use.device_context != device_context) continue;
         *out = state->domain_snapshots[i];
+        if (sdma_owner != nullptr) *sdma_owner = state->domain_sdma_owners[i];
         if (execution != nullptr)
             *execution = execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM ? state->domain_execution[i] :
                                                                                         CommDomainExecution::UNKNOWN;

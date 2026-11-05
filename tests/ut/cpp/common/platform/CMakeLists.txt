@@ -102,6 +102,7 @@ simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_profiling ARCH a2a3 RUNTIME te
     DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK a2a3_ut_support TIMEOUT 30)
 platform_single_case(test_comm_workspaces.cpp)
 platform_single_case(test_comm_domain_use_wire.cpp)
+platform_single_case(test_comm_sdma_owner.cpp)
 platform_single_case(test_comm_sim_domain_cleanup.cpp)
 
 # The growth coordinator is production: the onboard host runtime links this

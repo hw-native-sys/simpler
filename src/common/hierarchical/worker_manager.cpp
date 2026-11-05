@@ -212,6 +212,10 @@ void WorkerEndpoint::control_generic(uint64_t, const char *, size_t, double, con
 void WorkerEndpoint::control_alloc_domain(const char *, const char *) {
     throw_unsupported_control("control_alloc_domain");
 }
+
+void WorkerEndpoint::control_alloc_domain_sdma_sdk_v1(const char *, const char *) {
+    throw_unsupported_control("control_alloc_domain_sdma_sdk_v1");
+}
 void WorkerEndpoint::control_release_domain(const char *) { throw_unsupported_control("control_release_domain"); }
 void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control("control_comm_init"); }
 
@@ -2065,6 +2069,17 @@ void LocalMailboxEndpoint::control_alloc_domain(const char *request_shm_name, co
     run_control_command("control_alloc_domain");
 }
 
+void LocalMailboxEndpoint::control_alloc_domain_sdma_sdk_v1(const char *request_shm_name, const char *reply_shm_name) {
+    if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
+        throw std::runtime_error("control_alloc_domain_sdma_sdk_v1: request and reply shm names must be non-empty");
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_ALLOC_DOMAIN_SDMA_SDK_V1;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
+    run_control_command("control_alloc_domain_sdma_sdk_v1");
+}
+
 void LocalMailboxEndpoint::control_release_domain(const char *request_shm_name) {
     if (!request_shm_name || !*request_shm_name) {
         throw std::runtime_error("control_release_domain: request shm name must be non-empty");
@@ -2227,6 +2242,11 @@ void WorkerThread::control_alloc_domain(const char *request_shm_name, const char
     endpoint_->control_alloc_domain(request_shm_name, reply_shm_name);
 }
 
+void WorkerThread::control_alloc_domain_sdma_sdk_v1(const char *request_shm_name, const char *reply_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_alloc_domain_sdma_sdk_v1: null endpoint");
+    endpoint_->control_alloc_domain_sdma_sdk_v1(request_shm_name, reply_shm_name);
+}
+
 void WorkerThread::control_release_domain(const char *request_shm_name) {
     if (!endpoint_) throw std::runtime_error("control_release_domain: null endpoint");
     endpoint_->control_release_domain(request_shm_name);
@@ -2368,6 +2388,16 @@ void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_
         throw std::runtime_error("control_alloc_domain: invalid worker_id " + std::to_string(worker_id));
     }
     wt->control_alloc_domain(request_shm_name, reply_shm_name);
+}
+
+void WorkerManager::control_alloc_domain_sdma_sdk_v1(
+    int worker_id, const char *request_shm_name, const char *reply_shm_name
+) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_alloc_domain_sdma_sdk_v1: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_alloc_domain_sdma_sdk_v1(request_shm_name, reply_shm_name);
 }
 
 void WorkerManager::control_release_domain(int worker_id, const char *request_shm_name) {

@@ -18,6 +18,7 @@
 
 #include "common/chip_swimlane_extension.h"
 #include "platform_comm/comm_domain_use.h"
+#include "platform_comm/comm_sdma_owner.h"
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -320,6 +321,10 @@ struct HostApiOps {
         void *runner_ctx, const void *run_owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch,
         uint64_t device_context, CommDomainSnapshot *out, CommDomainExecution *execution
     );
+    bool (*query_async_sdma_owner)(
+        void *runner_ctx, const void *run_owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch,
+        uint64_t device_context, CommSdmaOwnerInfoV1 *out
+    );
 };
 
 /**
@@ -391,6 +396,16 @@ public:
                ops_->query_async_domain_context != nullptr &&
                ops_->query_async_domain_context(
                    runner_ctx_, run_owner_, pipeline_slot_, arena_bank_, run_epoch_, device_context, out, execution
+               );
+    }
+
+    // Existing selected owner's immutable allocation-time SDK access/q contract.
+    // No retained reference, cache proof or public completion-record span is added.
+    bool query_async_sdma_owner(uint64_t device_context, CommSdmaOwnerInfoV1 *out) const {
+        if (out != nullptr) *out = {};
+        return out != nullptr && run_owner_ != nullptr && ops_ != nullptr && ops_->query_async_sdma_owner != nullptr &&
+               ops_->query_async_sdma_owner(
+                   runner_ctx_, run_owner_, pipeline_slot_, arena_bank_, run_epoch_, device_context, out
                );
     }
 

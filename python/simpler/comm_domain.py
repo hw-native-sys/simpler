@@ -53,9 +53,12 @@ class DomainConfig:
     retain_after_run: bool
     topology: tuple
     workspace_engines: tuple[str, ...] = ()
+    sdma_sdk_queue_num: int | None = None
 
     @classmethod
-    def capture(cls, members, window_size, buffers, retain_after_run, topology, workspace_engines=()):
+    def capture(
+        cls, members, window_size, buffers, retain_after_run, topology, workspace_engines=(), sdma_sdk_queue_num=None
+    ):
         snapshot = tuple(
             (
                 str(b.name),
@@ -86,7 +89,23 @@ class DomainConfig:
         if sum(b[3] for b in snapshot) > window_size:
             raise ValueError("domain buffers exceed window_size")
         workspace_engines = normalize_workspace_engines(workspace_engines)
-        return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology), workspace_engines)
+        if sdma_sdk_queue_num is not None:
+            if isinstance(sdma_sdk_queue_num, bool):
+                raise TypeError("sdma_sdk_queue_num requires an explicit integer in 1..48")
+            sdma_sdk_queue_num = operator.index(sdma_sdk_queue_num)
+            if not 1 <= sdma_sdk_queue_num <= 48:
+                raise ValueError("sdma_sdk_queue_num must be in 1..48")
+            if workspace_engines != ("sdma",):
+                raise ValueError("sdma_sdk_queue_num requires exactly workspace_engines=('sdma',)")
+        return cls(
+            members,
+            window_size,
+            snapshot,
+            bool(retain_after_run),
+            tuple(topology),
+            workspace_engines,
+            sdma_sdk_queue_num,
+        )
 
     def workspace_mask(self) -> int:
         return sum(1 << ("sdma", "urma", "rdma").index(name) for name in self.workspace_engines)

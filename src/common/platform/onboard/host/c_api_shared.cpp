@@ -658,6 +658,24 @@ static bool query_async_domain_context(
     }
 }
 
+static bool query_async_sdma_owner(
+    void *ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context,
+    CommSdmaOwnerInfoV1 *out
+) {
+    if (out != nullptr) *out = {};
+    if (ctx == nullptr || out == nullptr) return false;
+    try {
+        CommDomainSnapshot snapshot{};
+        return static_cast<DeviceRunnerBase *>(ctx)->query_async_domain_context(
+                   owner, slot, bank, epoch, device_context, &snapshot, nullptr, out
+               ) &&
+               out->access != CommSdmaAccess::UNKNOWN;
+    } catch (...) {
+        *out = {};
+        return false;
+    }
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -699,6 +717,7 @@ static const HostApiOps g_host_api_ops = {
     .stage_launch_metadata = stage_launch_metadata,
     .query_async_retained_span = query_async_retained_span,
     .query_async_domain_context = query_async_domain_context,
+    .query_async_sdma_owner = query_async_sdma_owner,
 };
 
 /* ===========================================================================
@@ -1753,7 +1772,8 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
 
 static int prepare_run_impl(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, const NativeRunDomainProvider *domain_provider
+    const NativeRunDescriptor *descriptor, const NativeRunDomainProvider *domain_provider,
+    const NativeRunDomainProviderV2 *domain_provider_v2 = nullptr
 ) {
     // One prepare owns this module's thread-local workspace and diagnostic
     // transaction until its cleanup returns, including across host callbacks.
@@ -1852,8 +1872,9 @@ static int prepare_run_impl(
                 resolved.pipeline_slot, descriptor->arena_bank, resolved.arena_bank
             );
         }
-        state = new (runtime)
-            OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops, domain_provider);
+        state = new (runtime) OnboardNativeRunContext(
+            runner, *config, trace_hid, resolved, &g_host_api_ops, domain_provider, domain_provider_v2
+        );
         std::snprintf(
             state->trace_attrs, sizeof(state->trace_attrs),
             "run_id=%llu dispatch_id=%llu slot_id=%u generation=%llu run_epoch=%llu",
@@ -2103,6 +2124,21 @@ int simpler_prepare_run_with_domains_v1(
         (provider->count != 0 && (provider->owner == nullptr || provider->query == nullptr)))
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, provider);
+}
+
+int simpler_prepare_run_with_domains_v2(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProviderV2 *provider,
+    size_t provider_bytes
+) {
+    if (descriptor == nullptr || descriptor_bytes != sizeof(NativeRunDescriptor) || provider == nullptr ||
+        provider_bytes != sizeof(NativeRunDomainProviderV2))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const auto &base = provider->base;
+    if (base.version != 2 || base.reserved != 0 ||
+        (base.count != 0 && (base.owner == nullptr || base.query == nullptr)))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, &base, provider);
 }
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {

@@ -147,7 +147,13 @@ extern "C" aclError aclrtMemImportFromShareableHandle(uint64_t exported, int32_t
         ++injected_peer_failures;
         return 1;
     }
+#ifdef SIMPLER_COMM_VMM_ACTOR_STUBS_ONLY
+    // A forked CPU actor cannot import another process's mock pointer. Give the
+    // imported mapping its own retained mock owner; no payload/DMA is simulated.
+    auto resource = std::make_shared<PhysicalAllocation>();
+#else
     auto resource = exported == 42 ? std::make_shared<PhysicalAllocation>() : exported_resources[exported].lock();
+#endif
     if (!resource) return 1;
     *out = reinterpret_cast<aclrtDrvMemHandle>(new int(2));
     physical_resources.emplace(*out, std::move(resource));
@@ -182,6 +188,7 @@ aclrtMemImportFromShareableHandleV2(void *in, aclrtMemSharedHandleType, uint64_t
 }
 extern "C" HcclResult HcclCommDestroy(HcclComm) { return HCCL_SUCCESS; }
 
+#ifndef SIMPLER_COMM_VMM_ACTOR_STUBS_ONLY
 static void prepare_peer(CommHandle h, uint64_t id, bool release_marker) {
     aclrtMemFabricHandle fabric{};
     const uint64_t token = 42;
@@ -303,3 +310,5 @@ int main(int argc, char **argv) {
     std::filesystem::remove_all(folder);
     return 0;
 }
+
+#endif  // SIMPLER_COMM_VMM_ACTOR_STUBS_ONLY
