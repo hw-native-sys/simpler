@@ -9,11 +9,85 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "fixture.h"
+#include "callable.h"
+#include "host/platform_compile_info.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
 extern "C" int args_dump_capture_supported_impl(void);
 
 namespace native_admission_test {
+void *kernel_entry_points(bool in_graph);
+
+namespace {
+class CapabilityRunner : public Runner {
+public:
+    CapabilityRunner(CoreAsyncCapability capability, bool include_table, bool in_graph) {
+        callables_.at(1).host_orch_func_ptr = kernel_entry_points(in_graph);
+        callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, capability);
+        reinterpret_cast<CoreCallable *>(callable_.data())->set_resolved_addr(0x1000);
+        auto &tables = chip_callable_buffers_.at(1);
+        tables.object_table = {reinterpret_cast<uint64_t>(callable_.data())};
+        tables.object_table_dev = reinterpret_cast<uint64_t>(tables.object_table.data());
+        tables.entry_table_dev = reinterpret_cast<uint64_t>(&entry_);
+        tables.table_len = 1;
+        if (include_table) tables.capability_table = {capability};
+    }
+
+private:
+    std::vector<uint8_t> callable_;
+    uint64_t entry_{0x1000};
+};
+
+class NativeAsyncCapabilityTest : public NativeAdmissionTest,
+                                  public ::testing::WithParamInterface<bool> {
+protected:
+    void SetUp() override {
+        NativeAdmissionTest::SetUp();
+        if (std::strncmp(get_platform(), "a5", 2) != 0) GTEST_SKIP() << "A5 resident preparation contract";
+    }
+};
+}  // namespace
+
+TEST_P(NativeAsyncCapabilityTest, MissingAndUnknownDeclarationsAreRefusedBeforeSchedulerPublication) {
+    for (bool include_table : {false, true}) {
+        CapabilityRunner runner(CoreAsyncCapability{}, include_table, GetParam());
+        Attempt attempt(runner, 1, 20);
+        volatile int32_t accepted = 73;
+        attempt.descriptor.accepted_state = &accepted;
+        attempt.descriptor.accepted_value = 1;
+        EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_TRUE(attempt.consume_release());
+        EXPECT_TRUE(attempt.empty());
+        EXPECT_EQ(runner.scheduler_capacity(1), 0u);
+        EXPECT_EQ(runner.last_scheduler_runtime_mode(), 0u);
+        EXPECT_EQ(runner.launch_calls, 0);
+        EXPECT_EQ(accepted, 73);
+    }
+}
+
+TEST_P(NativeAsyncCapabilityTest, DeferredDeclarationNeedsRealServiceQualificationBeforeLaunch) {
+    CapabilityRunner runner({1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER}, true, GetParam());
+    Attempt attempt(runner, 1, 20);
+    EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_TRUE(attempt.empty());
+    EXPECT_EQ(runner.scheduler_capacity(1), 0u);
+    EXPECT_EQ(runner.last_scheduler_runtime_mode(), 0u);
+    EXPECT_EQ(runner.launch_calls, 0);
+}
+
+TEST_P(NativeAsyncCapabilityTest, ExplicitSynchronousDeclarationPreservesOrdinaryAndGraphPreparation) {
+    CapabilityRunner runner({1, CoreAsyncMode::SYNCHRONOUS, 0, 0}, true, GetParam());
+    Attempt attempt(runner, 1, 20);
+    ASSERT_EQ(attempt.prepare(), 0);
+    EXPECT_GT(runner.scheduler_capacity(1), 0u);
+    EXPECT_NE(runner.last_scheduler_runtime_mode(), 0u);
+    EXPECT_EQ(runner.launch_calls, 0);
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(OrdinaryAndNativeGraph, NativeAsyncCapabilityTest, ::testing::Bool());
+
 TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunState) {
     Runner outer_runner;
     Runner inner_runner;

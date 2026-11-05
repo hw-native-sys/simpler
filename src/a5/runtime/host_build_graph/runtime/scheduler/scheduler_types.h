@@ -1070,7 +1070,9 @@ struct alignas(128) SchedulerGraphSummary {
     uint64_t protocol_layout_offset;
     SchedulerTopologyLayout topology_layout;
     uint64_t ready_pool_offset;
-    uint8_t cache_line_padding[8];
+    // Explicit runtime-private locator from scheduler base to the versioned
+    // async region. Host initializes it every run; zero means no async region.
+    uint64_t async_layout_offset;
 };
 
 struct alignas(64) SchedulerReadyDirectoryShard {
@@ -1492,6 +1494,7 @@ static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
 static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");
 static_assert(alignof(SchedulerGraphSummary) == 128, "graph summary alignment changed");
+static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 120, "async locator offset changed");
 static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard must occupy one cache line");
 static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
 static_assert(

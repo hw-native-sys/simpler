@@ -19,6 +19,9 @@ a5_hbg_case(test_hbg_async_join.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_check.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_observer.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_writer.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_runtime.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)
 a5_hbg_case(test_hbg_async_discovery.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_finish.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)

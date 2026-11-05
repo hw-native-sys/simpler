@@ -41,15 +41,44 @@ void entry(const ChipTaskArgs &args) { record_entry(args, current_orchestrator);
 void bind(OrchContext *ctx) { current_orchestrator = ctx; }
 void other_entry(const ChipTaskArgs &args) { record_entry(args, other_orchestrator); }
 void other_bind(OrchContext *ctx) { other_orchestrator = ctx; }
+void record_kernel_entry(const ChipTaskArgs &args, bool in_graph) {
+    ++callbacks;
+    auto &orch = *current_orchestrator->orchestrator;
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    CoreTaskArgs task;
+    if (in_graph) {
+        GraphTaskArgs boundary;
+        boundary.add_input(args.tensor(0).ref());
+        const auto graph = orch.graph_begin(0x522, boundary);
+        ASSERT_TRUE(graph.recording);
+        ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+        task.add_input(graph.params->tensor(0).ref());
+        ASSERT_TRUE(orch.submit_task(kernels, task).task_id().is_valid());
+        ASSERT_TRUE(orch.graph_end());
+        orch.graph_commit();
+    } else {
+        task.add_input(args.tensor(0).ref());
+        ASSERT_TRUE(orch.submit_task(kernels, task).task_id().is_valid());
+    }
+    current_orchestrator = nullptr;
+}
+void ordinary_kernel_entry(const ChipTaskArgs &args) { record_kernel_entry(args, false); }
+void graph_kernel_entry(const ChipTaskArgs &args) { record_kernel_entry(args, true); }
 struct EntryPoints {
     void (*entry)(const ChipTaskArgs &);
     void (*bind)(OrchContext *);
     void (*finish)();
-} entry_points{entry, bind, nullptr}, other_entry_points{other_entry, other_bind, nullptr};
+} entry_points{entry, bind, nullptr}, other_entry_points{other_entry, other_bind, nullptr},
+    ordinary_kernel_entry_points{ordinary_kernel_entry, bind, nullptr},
+    graph_kernel_entry_points{graph_kernel_entry, bind, nullptr};
 }  // namespace
 
 void *primary_entry_points() { return &entry_points; }
 void *alternate_entry_points() { return &other_entry_points; }
+void *kernel_entry_points(bool in_graph) {
+    return in_graph ? &graph_kernel_entry_points : &ordinary_kernel_entry_points;
+}
 void set_dep_gen_capture(bool enabled) { dep_gen_host_graph_set_enabled(enabled); }
 uint32_t arena_bank(uint32_t slot) { return slot; }
 

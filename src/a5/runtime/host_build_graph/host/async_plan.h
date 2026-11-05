@@ -35,6 +35,30 @@ struct SchedulerAsyncHostPlan {
     std::vector<std::byte> image;
 };
 
+// Count and validate without allocating an image. Offsets in the result are
+// relative to the async region, independent of its final scheduler placement.
+bool scheduler_plan_async_layout(
+    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
+    uint64_t run_epoch, uint64_t byte_budget, const SchedulerAsyncAuxiliaryBytes &auxiliary, SchedulerAsyncLayout *out,
+    std::string *error
+);
+
+// Append to the same retained scheduler backing. Zero bytes produce locator 0.
+// A failure leaves both output values unchanged; byte_budget covers the whole
+// backing, not just the async region.
+bool scheduler_append_async_layout(
+    uint64_t prefix_bytes, const SchedulerAsyncLayout &layout, uint64_t byte_budget, uint64_t *async_offset,
+    uint64_t *total_bytes, std::string *error
+);
+
+// Initialize directly in the retained Host mirror. The complete layout is
+// revalidated before any write; only its own extent is initialized. No device
+// address or pointer fix-up is needed, and no second full image is allocated.
+bool scheduler_initialize_async_state(
+    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
+    const SchedulerAsyncLayout &layout, void *region, uint64_t region_bytes, std::string *error
+);
+
 // Metadata is the final expanded native-Graph/TOP node sequence. Capabilities
 // belong to actual registered lane callables, never profiling/trace identities.
 // Failure leaves out unchanged. A fully synchronous run has an empty image.

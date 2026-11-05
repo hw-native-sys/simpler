@@ -68,6 +68,7 @@
 #include "host_build_graph/graph_execution.h"
 #include "native_graph_plan.h"
 #include "ready_pool_plan.h"
+#include "async_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler_protocol_export.h"
@@ -1239,6 +1240,7 @@ bool create_scheduler_state(
     const bool native_graph = !native_plan.instances.empty();
     const uint64_t node_count = native_graph ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
     bool legacy_graph_required = false;
+    bool has_deferred_callable = false;
     for (const auto &definition : native_plan.definitions) {
         legacy_graph_required = legacy_graph_required || !definition.resident_supported;
         for (const auto &child : definition.children) {
@@ -1248,6 +1250,19 @@ bool create_scheduler_state(
                     LOG_ERROR("A5 HBG: Graph child has an unregistered callable");
                     return false;
                 }
+                if (!child.metadata.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+                CoreAsyncCapability capability{};
+                const int kernel_id = child.metadata.kernel_ids[lane];
+                if (!runtime->get_function_async_capability(kernel_id, &capability) ||
+                    !core_async_capability_valid(capability) || capability.mode == CoreAsyncMode::UNKNOWN) {
+                    LOG_ERROR(
+                        "A5 HBG: Graph child kernel=%d lane=%u has missing, UNKNOWN, or invalid async capability; "
+                        "rebuild and register the callable with an explicit completion declaration",
+                        kernel_id, lane
+                    );
+                    return false;
+                }
+                has_deferred_callable = has_deferred_callable || capability.mode == CoreAsyncMode::DEFERRED;
             }
         }
     }
@@ -1364,6 +1379,17 @@ bool create_scheduler_state(
                 );
                 return false;
             }
+            CoreAsyncCapability capability{};
+            if (!runtime->get_function_async_capability(kernel_id, &capability) ||
+                !core_async_capability_valid(capability) || capability.mode == CoreAsyncMode::UNKNOWN) {
+                LOG_ERROR(
+                    "A5 HBG: task ref=%" PRId64 " kernel=%d lane=%u has missing, UNKNOWN, or invalid async "
+                    "capability; rebuild and register the callable with an explicit completion declaration",
+                    task_ref, kernel_id, subtask_slot
+                );
+                return false;
+            }
+            has_deferred_callable = has_deferred_callable || capability.mode == CoreAsyncMode::DEFERRED;
         }
         const auto *predicate = scheduler_node_predicate(host_graph, task_ref);
         if (predicate == nullptr ||
@@ -1447,6 +1473,10 @@ bool create_scheduler_state(
         return false;
     }
     if (legacy_graph_required) {
+        if (has_deferred_callable) {
+            LOG_ERROR("A5 HBG: deferred completion is not qualified for legacy Graph scheduling");
+            return false;
+        }
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
         return true;
     }
@@ -1521,6 +1551,10 @@ bool create_scheduler_state(
         }
     }
     if (legacy_shape_task_ref >= 0) {
+        if (has_deferred_callable) {
+            LOG_ERROR("A5 HBG: deferred completion is not qualified for legacy task-shape scheduling");
+            return false;
+        }
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
             "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with unsupported task shape",
@@ -1582,6 +1616,55 @@ bool create_scheduler_state(
     layout.aic_worker_demand = aic_worker_demand;
     layout.aiv_worker_demand = aiv_worker_demand;
 
+    const uint64_t scheduler_prefix_bytes = layout.total_size;
+    const uint64_t max_state_bytes =
+        std::min<uint64_t>(std::numeric_limits<uint64_t>::max(), std::numeric_limits<size_t>::max()) -
+        (SCHEDULER_STATE_ALIGNMENT - 1);
+    SchedulerAsyncLayout async_layout{};
+    std::vector<SchedulerAsyncCapabilities> async_capabilities;
+    std::string async_error;
+    if (has_deferred_callable) {
+        // Registration-owned descriptors are projected onto the final expanded
+        // nodes. A synchronous run needs neither these rows nor an async region.
+        async_capabilities.resize(task_metadata.size());
+        for (size_t task_ref = 0; task_ref < task_metadata.size(); ++task_ref) {
+            const auto &task = task_metadata[task_ref];
+            if (!scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags)) continue;
+            for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+                if (!task.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+                if (!runtime->get_function_async_capability(
+                        task.kernel_ids[lane], &async_capabilities[task_ref][lane]
+                    )) {
+                    LOG_ERROR("A5 HBG: task ref=%zu lane=%u lost its registered callable capability", task_ref, lane);
+                    return false;
+                }
+            }
+        }
+        if (!scheduler_plan_async_layout(
+                task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, {}, &async_layout, &async_error
+            )) {
+            LOG_ERROR("A5 HBG: async state planning failed: %s", async_error.c_str());
+            return false;
+        }
+    }
+    uint64_t async_offset = 0;
+    if (!scheduler_append_async_layout(
+            scheduler_prefix_bytes, async_layout, max_state_bytes, &async_offset, &layout.total_size, &async_error
+        )) {
+        LOG_ERROR("A5 HBG: async state placement failed: %s", async_error.c_str());
+        return false;
+    }
+    // A well-formed image is not a backend or consumer-visibility qualification.
+    // Refuse launch until the resident service and those contracts are connected.
+    if (async_layout.group_count != 0) {
+        LOG_ERROR(
+            "A5 HBG: deferred completion launch is unavailable: resident CHECK and resource/consumer qualification "
+            "are not connected (groups=%" PRIu64 ", async_bytes=%" PRIu64 ", scheduler_bytes=%" PRIu64 ")",
+            async_layout.group_count, async_layout.total_bytes, layout.total_size
+        );
+        return false;
+    }
+
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
     // The slot's retained pair, each side aligned with at least total_size
     // behind it. Handed over uninitialized and never carrying anything between
@@ -1601,12 +1684,26 @@ bool create_scheduler_state(
         return false;
     }
     const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
+    if (layout.total_size > UINT64_MAX - aligned_address ||
+        layout.total_size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(host_base)) {
+        LOG_ERROR("A5 HBG: scheduler backing extent overflows its base address");
+        return false;
+    }
 
-    // The only pass over this run's total_size: it zeroes and fills the whole
-    // length, which is what makes a retained block's previous contents
-    // unreachable.
-    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address)) {
+    // Initialize the disjoint prefix and async region directly in the retained
+    // Host mirror; no full temporary async image or pointer relocation is needed.
+    auto prefix_layout = layout;
+    prefix_layout.total_size = async_offset == 0 ? layout.total_size : async_offset;
+    if (!scheduler_init_data_from_layout(host_base, prefix_layout, aligned_address)) {
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
+        return false;
+    }
+    if (async_offset != 0 &&
+        !scheduler_initialize_async_state(
+            task_metadata, async_capabilities, async_layout, static_cast<std::byte *>(host_base) + async_offset,
+            layout.total_size - async_offset, &async_error
+        )) {
+        LOG_ERROR("A5 HBG: async state initialization failed: %s", async_error.c_str());
         return false;
     }
 
@@ -1649,8 +1746,9 @@ bool create_scheduler_state(
         }
     }
     scheduler_init_ready_pool(host_base, ready_pool_plan);
-    scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset)->ready_pool_offset =
-        ready_pool_plan.header_offset;
+    auto *summary = scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset);
+    summary->ready_pool_offset = ready_pool_plan.header_offset;
+    summary->async_layout_offset = async_offset;
     auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, layout.task_controls_offset);
     for (int64_t task_ref : inline_completed_task_refs) {
         task_controls[task_ref].state = static_cast<int64_t>(SchedulerTaskState::DONE);

@@ -185,7 +185,11 @@ TEST(HbgAsyncPlan, ImageBeginsDormantEmptyAndUnbound) {
         EXPECT_EQ(
             record<SchedulerAsyncLease>(plan, plan.layout.group_lease_offset, i).word, SchedulerAsyncLease{}.word
         );
-        EXPECT_EQ(record<SchedulerAsyncGroupProgress>(plan, plan.layout.group_progress_offset, i).remaining_mask, 0u);
+        const auto progress = record<SchedulerAsyncGroupProgress>(plan, plan.layout.group_progress_offset, i);
+        EXPECT_EQ(progress.remaining_mask, 0u);
+        EXPECT_EQ(progress.acquire_condition, SCHEDULER_ASYNC_INDEX_NONE);
+        EXPECT_EQ(progress.acquire_count, 0u);
+        EXPECT_EQ(progress.failure_code, 0);
         for (uint64_t condition = 0; condition < 64; ++condition) {
             const auto binding = record<SchedulerAsyncConditionBinding>(plan, id.condition_bindings_offset, condition);
             EXPECT_EQ(binding.binding_index, kNone);
@@ -362,5 +366,85 @@ TEST(HbgAsyncPlan, ValidatesInputsBeforePublishingThePlan) {
     );
     EXPECT_TRUE(scheduler_plan_async_state({}, {}, kEpoch, 0, {}, &plan, nullptr));
     EXPECT_TRUE(plan.image.empty());
+}
+
+TEST(HbgAsyncPlan, DirectInitializationMatchesTheImageWithoutWritingTheBackingPrefix) {
+    const std::vector<SchedulerTaskMetadata> metadata{task(1), task(7, 4, true)};
+    const std::vector<SchedulerAsyncCapabilities> caps{capabilities(), capabilities(5, 3)};
+    SchedulerAsyncHostPlan plan;
+    ASSERT_TRUE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, {}, &plan, nullptr));
+    SchedulerAsyncLayout layout;
+    ASSERT_TRUE(scheduler_plan_async_layout(metadata, caps, kEpoch, kBudget, {}, &layout, nullptr));
+    EXPECT_EQ(std::memcmp(&layout, &plan.layout, sizeof(layout)), 0);
+    uint64_t offset = 0, total = 0;
+    ASSERT_TRUE(scheduler_append_async_layout(385, layout, kBudget, &offset, &total, nullptr));
+    EXPECT_EQ(offset, 512u);
+    EXPECT_EQ(total, offset + layout.total_bytes);
+    std::vector<std::byte> backing(total + 17, std::byte{0xA5});
+    ASSERT_TRUE(
+        scheduler_initialize_async_state(metadata, caps, layout, backing.data() + offset, layout.total_bytes, nullptr)
+    );
+    EXPECT_EQ(std::memcmp(backing.data() + offset, plan.image.data(), plan.image.size()), 0);
+    for (uint64_t byte = 0; byte < offset; ++byte)
+        EXPECT_EQ(backing[byte], std::byte{0xA5});
+    for (uint64_t byte = total; byte < backing.size(); ++byte)
+        EXPECT_EQ(backing[byte], std::byte{0xA5});
+}
+
+TEST(HbgAsyncPlan, TotalBackingBudgetIncludesThePrefixAndAlignment) {
+    SchedulerAsyncLayout layout;
+    ASSERT_TRUE(scheduler_plan_async_layout({task(1)}, {capabilities(1)}, kEpoch, kBudget, {}, &layout, nullptr));
+    const uint64_t exact = 256 + layout.total_bytes;
+    uint64_t offset = 13, total = 17;
+    EXPECT_FALSE(scheduler_append_async_layout(129, layout, exact - 1, &offset, &total, nullptr));
+    EXPECT_EQ(offset, 13u);
+    EXPECT_EQ(total, 17u);
+    ASSERT_TRUE(scheduler_append_async_layout(129, layout, exact, &offset, &total, nullptr));
+    EXPECT_EQ(offset, 256u);
+    EXPECT_EQ(total, exact);
+    EXPECT_FALSE(scheduler_append_async_layout(UINT64_MAX, layout, UINT64_MAX, &offset, &total, nullptr));
+    EXPECT_EQ(offset, 256u);
+    EXPECT_EQ(total, exact);
+    EXPECT_FALSE(scheduler_append_async_layout(0, layout, kBudget, &offset, &total, nullptr));
+    EXPECT_FALSE(scheduler_append_async_layout(129, layout, kBudget, nullptr, &total, nullptr));
+}
+
+TEST(HbgAsyncPlan, SynchronousLayoutLeavesTheBackingAndLocatorUnchanged) {
+    SchedulerAsyncLayout layout;
+    ASSERT_TRUE(scheduler_plan_async_layout({task(7, 4)}, {capabilities()}, kEpoch, 0, {}, &layout, nullptr));
+    uint64_t offset = 7, total = 9;
+    ASSERT_TRUE(scheduler_append_async_layout(385, layout, 385, &offset, &total, nullptr));
+    EXPECT_EQ(offset, 0u);
+    EXPECT_EQ(total, 385u);
+    std::byte untouched{0xA5};
+    EXPECT_TRUE(scheduler_initialize_async_state({task(7, 4)}, {capabilities()}, layout, &untouched, 0, nullptr));
+    EXPECT_EQ(untouched, std::byte{0xA5});
+    EXPECT_FALSE(scheduler_append_async_layout(385, layout, 384, &offset, &total, nullptr));
+    EXPECT_EQ(offset, 0u);
+    EXPECT_EQ(total, 385u);
+}
+
+TEST(HbgAsyncPlan, InitializationRejectsLayoutOrCapabilityDriftBeforeWriting) {
+    const std::vector<SchedulerTaskMetadata> metadata{task(1)};
+    const std::vector<SchedulerAsyncCapabilities> caps{capabilities(1)};
+    SchedulerAsyncLayout layout;
+    ASSERT_TRUE(scheduler_plan_async_layout(metadata, caps, kEpoch, kBudget, {}, &layout, nullptr));
+    std::vector<std::byte> backing(layout.total_bytes, std::byte{0xA5});
+    const auto saved = backing;
+    auto corrupt = layout;
+    corrupt.group_progress_offset = 0;
+    EXPECT_FALSE(scheduler_initialize_async_state(metadata, caps, corrupt, backing.data(), backing.size(), nullptr));
+    EXPECT_EQ(backing, saved);
+    corrupt = layout;
+    ++corrupt.version;
+    EXPECT_FALSE(scheduler_initialize_async_state(metadata, caps, corrupt, backing.data(), backing.size(), nullptr));
+    EXPECT_EQ(backing, saved);
+    EXPECT_FALSE(scheduler_initialize_async_state(metadata, caps, layout, backing.data(), backing.size() - 1, nullptr));
+    EXPECT_EQ(backing, saved);
+    EXPECT_FALSE(scheduler_initialize_async_state(
+        metadata, {capabilities(1, 2)}, layout, backing.data(), backing.size(), nullptr
+    ));
+    EXPECT_EQ(backing, saved);
+    EXPECT_FALSE(scheduler_initialize_async_state(metadata, caps, layout, nullptr, backing.size(), nullptr));
 }
 }  // namespace
