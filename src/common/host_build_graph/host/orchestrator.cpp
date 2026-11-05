@@ -634,28 +634,18 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
-        TaskId dep_task_id = args.explicit_dep(i);
-        if (!dep_task_id.is_valid()) {
-            orch->report_fatal(
-                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
-            );
-            return result;
-        }
-        if (capture_dep_graph) {
-            dep_gen_host_graph_add_explicit_edge(dep_task_id);
-        }
-        if (!append_fanin_or_fail(*orch, dep_task_id, fanin_slots, payload.fanin_count)) {
-            return result;
-        }
-    }
-
-    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
     DepInputs dep_inputs{
         args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
         args.explicit_deps_data(),
     };
+    if (!append_explicit_fanins_or_fail(
+            *orch, task_id, dep_inputs, fanin_slots, payload.fanin_count, capture_dep_graph
+        )) {
+        if (capture_dep_graph) dep_gen_host_graph_end_task();
+        return result;
+    }
 
+    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
     auto runtime_emit = [&](TaskId producer_task_id) -> bool {
         return append_fanin_or_fail(*orch, producer_task_id, fanin_slots, payload.fanin_count);
     };

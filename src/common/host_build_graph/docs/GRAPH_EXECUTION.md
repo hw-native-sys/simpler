@@ -128,6 +128,15 @@ hazard is silent: an explicit `GRAPH_KEY` must be unique for every distinct Grap
 function in an orchestration callable, or one of them replays the other's
 recorded topology.
 
+An invocation may declare explicit predecessors with
+`GraphTaskArgs::set_dependencies`. They order that invocation's outer `GRAPH`
+shell, including its first recording and an in-flight or cached reuse. Their
+count and ids may change between invocations without changing the Definition.
+The recording's formal parameters contain no such predecessors; recorded tasks
+must still express their internal edges using their own local ids or boundary
+tensor provenance. An accepted submission returns a valid outer `task_id` on
+all three paths. That completion covers the whole body, never one internal task.
+
 The Definition cache belongs to one orchestration run and is never persisted.
 It uses `graph_key` directly for recording, reuse, upload matching, and Definition
 framing validation. Separate runs have independent caches, so orchestration
@@ -271,10 +280,10 @@ why it cannot be diagnosed instead:
   before the Graph, is refused by name: recording is abandoned and the bind fails
   rather than baking a Definition that would rebind that tensor to someone else's
   buffer. Pass it as a boundary parameter instead.
-- A recorded task may not depend on a task submitted before the Graph. The only
-  way to order a body behind one is to pass that task's output as a boundary
-  parameter, which the outer Graph task then depends on like any other argument.
-  An explicit dependency naming a task outside the Graph is refused by name.
+- A recorded task may not name a GLOBAL task submitted before the Graph in its
+  internal edges. Order the outer shell behind that producer through a boundary
+  tensor or an invocation-level explicit predecessor. An external task id read
+  directly inside the recorded body is still refused by name.
 - A recorded task may carry a dispatch predicate. Submit resolves a predicate
   into an absolute GM address, which no Definition can hold, so the Definition
   stores the operand tensor plus the element index within it, and materialize
@@ -834,7 +843,6 @@ slower path:
 
 - an empty Graph boundary, or one carrying more than `GRAPH_MAX_TENSOR_ARGS`
   (128) Tensors or `GRAPH_MAX_SCALAR_ARGS` (64) scalars;
-- an explicit dependency declared on the boundary itself;
 - nested Graph submission;
 - variable ChipTensor shape, stride, dtype, size, direction, or contiguity;
 - a boundary whose alias partition changed, or whose members moved relative to

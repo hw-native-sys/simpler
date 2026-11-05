@@ -59,6 +59,8 @@ struct FakeRuntime {
     int four_prepare_overlaps{0};
     int prepare_overlaps{0};
     int begin_calls{0};
+    uint32_t begin_explicit_dep_count{0};
+    TaskId begin_first_explicit_dep{TaskId::invalid()};
     int prepare_calls{0};
     int end_calls{0};
     // A recorded body reports a fatal on the recorder thread while the bind thread
@@ -125,7 +127,10 @@ GraphScopeResult fake_graph_begin(OrchContext *ctx, uint64_t, const GraphTaskArg
     FakeRuntime &fake = *as_fake(ctx);
     std::lock_guard<std::mutex> lock(fake.mutex);
     fake.begin_calls++;
+    fake.begin_explicit_dep_count = args.explicit_dep_count();
+    fake.begin_first_explicit_dep = args.explicit_dep_count() == 0 ? TaskId::invalid() : args.explicit_dep(0);
     GraphScopeResult result;
+    result.task_id = TaskId::make_global(fake.begin_calls);
     result.has_error = false;
     result.recording = fake.record_every_begin || fake.begin_calls == 1;
     if (result.recording) {
@@ -726,7 +731,7 @@ TEST(HbgGraphAsyncSubmit, ABoundaryCarryingAConstructionErrorIsRefusedAtTheEntry
     framework_bind_orch_context(nullptr);
 }
 
-TEST(HbgGraphAsyncSubmit, ABoundaryCarryingExplicitDependenciesIsRefusedAtTheEntry) {
+TEST(HbgGraphAsyncSubmit, ABoundaryPredecessorReachesAdmissionAndStaysOutsideRecording) {
     std::array<FakeBoundary, 2> boundaries;
     FakeRuntime fake{};
     fake.ops = &kFakeOps;
@@ -740,15 +745,14 @@ TEST(HbgGraphAsyncSubmit, ABoundaryCarryingExplicitDependenciesIsRefusedAtTheEnt
     uint32_t shape[] = {8};
     simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
 
-    // A boundary that is otherwise valid: only the explicit dependency refuses it, so
-    // this case pins the condition rather than reaching the error path by accident.
+    // The outer predecessor is admission data, never a recorded-local task id.
     const std::array<TaskId, 1> deps{TaskId::make_global(3)};
     GraphTaskArgs args;
     args.add_input(boundary);
     args.set_dependencies(deps.data(), static_cast<uint32_t>(deps.size()));
     ASSERT_FALSE(args.has_error());
     ASSERT_EQ(args.explicit_dep_count(), 1U);
-    ASSERT_TRUE(rt_graph_args_cacheable(args)) << "the tensor half is valid; the dependency is what refuses it";
+    ASSERT_TRUE(rt_graph_args_cacheable(args)) << "valid tensors and invocation predecessors are cacheable";
 
     bool body_ran = false;
     GraphSubmitResult result{};
@@ -757,12 +761,20 @@ TEST(HbgGraphAsyncSubmit, ABoundaryCarryingExplicitDependenciesIsRefusedAtTheEnt
         result = rt_submit_graph_impl(0x1741, args, [&](const GraphTaskArgs &) {
             body_ran = true;
         });
+        // Admission is asynchronous. Join the recorder through the same public
+        // barrier an orchestration completion uses before inspecting its writes.
+        rt_graph_commit();
     }
 
-    EXPECT_TRUE(result.has_error);
-    EXPECT_FALSE(body_ran) << "a refused boundary records nothing";
-    EXPECT_EQ(fake.fatal_code.load(), SIMPLER_ERROR_INVALID_ARGS);
-    EXPECT_EQ(fake.begin_calls, 0) << "the entry refuses before it reaches graph_begin";
+    EXPECT_FALSE(result.has_error);
+    EXPECT_EQ(result.task_id, TaskId::make_global(1));
+    EXPECT_TRUE(body_ran);
+    EXPECT_EQ(fake.fatal_code.load(), 0);
+    EXPECT_EQ(fake.begin_calls, 1);
+    EXPECT_EQ(fake.begin_explicit_dep_count, 1U);
+    EXPECT_EQ(fake.begin_first_explicit_dep, deps[0]);
+    EXPECT_EQ(boundaries[0].params.explicit_dep_count(), 0U)
+        << "the recorded body must not retain the borrowed outer predecessor";
 
     framework_bind_orch_context(nullptr);
 }

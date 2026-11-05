@@ -135,8 +135,7 @@ bool graph_require_boundary_match(
     OrchestratorState *orch, BoundaryExpectation origin, int32_t expected_tensor_count, int32_t expected_scalar_count,
     const GraphBoundaryTensorMatch *expected_tensors, const GraphTaskArgs &args
 ) {
-    if (args.scalar_count() != expected_scalar_count || args.explicit_dep_count() != 0 ||
-        args.tensor_count() != expected_tensor_count) {
+    if (args.scalar_count() != expected_scalar_count || args.tensor_count() != expected_tensor_count) {
         orch->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "[GraphExecution] %s boundary contract mismatch: tensors=%d/%d scalars=%d/%d explicit_deps=%u",
@@ -273,8 +272,12 @@ bool graph_submit_outer(
     pending.graph_key = graph_key;
     pending.deferred_heap = defer_heap;
 
+    // Explicit predecessors belong to this invocation's outer shell. They are
+    // consumed now, like ordinary task dependencies, and never become edges or
+    // identity fields of the immutable recorded body.
     DepInputs boundary_inputs{
-        args.tensor_count(), args.tensor_data(), args.tag_data(), 0, nullptr,
+        args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
+        args.explicit_deps_data(),
     };
     const int32_t tensormap_needed = count_registrable_outputs(boundary_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) return false;
@@ -362,6 +365,14 @@ bool graph_submit_outer(
             task_id, orch->in_manual_scope(), /*early_dispatch=*/false, kernel_ids_capture.data(),
             slot.logical_block_num, args.tensor_count(), args.tensor_data(), args.tag_data()
         );
+    }
+    if (!append_explicit_fanins_or_fail(
+            *orch, task_id, boundary_inputs, fanin_slots, payload.fanin_count, capture_dep_graph
+        )) {
+        if (capture_dep_graph) dep_gen_host_graph_end_task();
+        return false;
+    }
+    if (capture_dep_graph) {
         const bool ok =
             compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), emit, DepGraphAnnotate{});
         // The task's last capture point, so the entry closes whether or not the
@@ -801,7 +812,7 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
     // Every orchestrator this runtime builds carries a Graph host state; reaching here
     // without one means the orchestrator was not the one this call belongs to.
     always_assert(state != nullptr && "an HBG orchestrator owns a Graph host state");
-    if (!rt_graph_args_cacheable(args) || args.explicit_dep_count() != 0) {
+    if (!rt_graph_args_cacheable(args)) {
         orch->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "[GraphExecution] boundary cannot open a Graph: tensors=%d scalars=%d explicit_deps=%u error=%d",
