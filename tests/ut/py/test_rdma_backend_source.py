@@ -107,7 +107,8 @@ def test_a5_comm_hccl_uses_mr1374_rdma_host_api_shape() -> None:
     assert 's.find("\\"CLOS\\"", dev_key_pos)' in source
     assert "hccn_tool -g -dev_info -i %d" in source
     assert '\\"addr\\"' in source
-    assert "manager->Init(config)" in source
+    assert "RdmaWorkspaceManager::GetWorkspaceSize(rank_count, &workspace_size, config.qpNum)" in source
+    assert "manager->Init(config, workspace_addr, workspace_size)" in source
     assert "WorkspaceInitResult::READY" in source
     assert "RdmaBackend::HNS_1825" not in source
 

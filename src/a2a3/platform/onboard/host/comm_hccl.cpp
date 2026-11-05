@@ -1114,17 +1114,32 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     if (count <= DMA_WORKSPACE_SDMA) return -1;
     try {
         auto manager = std::make_unique<SdmaManager>();
+        uint64_t workspace_size = 0;
+        void *workspace_addr = nullptr;
+        SdmaManager::GetWorkspaceSize(&workspace_size);
+        if (workspace_size == 0) {
+            LOG_ERROR("dma_workspace_provision: SDMA GetWorkspaceSize returned zero");
+            return -1;
+        }
+        if (aclrtMalloc(&workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+            LOG_ERROR("dma_workspace_provision: workspace aclrtMalloc failed");
+            return -1;
+        }
         bool init_ok = false;
         try {
-            // Init creates the 48 STARS streams + 16KB workspace. It may fail
+            // Init binds the workspace and creates 48 STARS streams. It may fail
             // after creating only a subset; destructing that partial manager on
             // an error-state card can itself stall, so leak it on failure rather
             // than risk the stall.
-            init_ok = manager->Init();
+            init_ok = manager->Init(workspace_addr, workspace_size);
         } catch (...) {
             LOG_ERROR("SdmaWorkspaceManager::Init threw; abandoning its partial resources");
         }
         if (!init_ok) {
+            if (workspace_addr != nullptr && manager->GetWorkspaceAddr() == nullptr &&
+                aclrtFree(workspace_addr) != ACL_SUCCESS) {
+                LOG_ERROR("dma_workspace_provision: freeing unbound workspace failed");
+            }
             (void)manager.release();
             return -1;
         }
@@ -1147,7 +1162,11 @@ extern "C" void dma_workspace_release(void *handle) {
     if (!handle) return;
     try {
         std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
+        void *workspace_addr = manager->GetWorkspaceAddr();
         manager.reset();
+        if (aclrtFree(workspace_addr) != ACL_SUCCESS) {
+            LOG_WARN("dma_workspace_release: workspace aclrtFree failed");
+        }
     } catch (...) {
         LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
     }

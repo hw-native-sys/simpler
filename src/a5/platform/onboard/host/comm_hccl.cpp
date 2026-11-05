@@ -104,8 +104,10 @@ struct DomainAllocation {
     bool cleanup_failed = false;
     HcclComm urma_comm = nullptr;
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
+    void *urma_workspace_addr = nullptr;
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace;
+    void *rdma_workspace_addr = nullptr;
 #endif
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
     size_t mapping_size = 0;
@@ -129,6 +131,7 @@ struct CommHandle_ {
     std::unordered_set<uint64_t> used_domain_ids;
     bool cleanup_failed = false;
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
+    void *sdma_workspace_addr = nullptr;
 };
 
 // ============================================================================
@@ -769,10 +772,32 @@ static std::string domain_barrier_tag(uint64_t allocation_id, const char *phase)
 static void ensure_sdma_workspace(CommHandle h) {
     if (h->sdma_workspace) return;
     auto manager = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
-    if (!manager->Init() || manager->GetWorkspaceAddr() == nullptr) return;
+    uint64_t workspace_size = 0;
+    void *workspace_addr = nullptr;
+    pto::comm::sdma::SdmaWorkspaceManager::GetWorkspaceSize(&workspace_size);
+    if (workspace_size == 0) {
+        LOG_ERROR("[comm rank %d] SDMA GetWorkspaceSize returned zero", h->rank);
+        return;
+    }
+    if (aclrtMalloc(&workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+        return;
+    }
+    try {
+        if (!manager->Init(workspace_addr, workspace_size) || manager->GetWorkspaceAddr() == nullptr) {
+            manager.reset();
+            if (workspace_addr != nullptr) aclrtFree(workspace_addr);
+            return;
+        }
+    } catch (...) {
+        manager.reset();
+        if (workspace_addr != nullptr) aclrtFree(workspace_addr);
+        throw;
+    }
     set_comm_workspace(
-        h->host_ctx, CommWorkspaceKind::SDMA, reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr()), 16 * 1024
+        h->host_ctx, CommWorkspaceKind::SDMA, reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr()),
+        manager->GetWorkspaceSize()
     );
+    h->sdma_workspace_addr = workspace_addr;
     h->sdma_workspace = std::move(manager);
 }
 
@@ -834,8 +859,20 @@ static int init_urma_workspace(
         LOG_ERROR("[comm rank %d] URMA domain communicator init failed: %d", h->rank, static_cast<int>(result));
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
+    uint64_t workspace_size = 0;
+    pto::comm::urma::UrmaWorkspaceManager::GetWorkspaceSize(rank_count, &workspace_size);
+    if (workspace_size == 0) {
+        LOG_ERROR("[comm rank %d] URMA GetWorkspaceSize returned zero", h->rank);
+        return COMM_DOMAIN_URMA_INIT_FAILED;
+    }
     alloc.urma_workspace = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
-    if (!alloc.urma_workspace->Init(alloc.urma_comm, domain_rank, rank_count, alloc.local_buf, alloc.mapping_size)) {
+    if (aclrtMalloc(&alloc.urma_workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+        return COMM_DOMAIN_URMA_INIT_FAILED;
+    }
+    if (!alloc.urma_workspace->Init(
+            alloc.urma_comm, domain_rank, rank_count, alloc.local_buf, alloc.mapping_size, alloc.urma_workspace_addr,
+            workspace_size
+        )) {
         LOG_ERROR("[comm rank %d] URMA workspace initialization failed", h->rank);
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
@@ -899,8 +936,16 @@ static bool close_domain_resources(DomainAllocation &alloc) {
         alloc.urma_comm = nullptr;
     }
     alloc.urma_workspace.reset();
+    if (alloc.urma_workspace_addr != nullptr) {
+        if (aclrtFree(alloc.urma_workspace_addr) != ACL_SUCCESS) return false;
+        alloc.urma_workspace_addr = nullptr;
+    }
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     alloc.rdma_workspace.reset();
+    if (alloc.rdma_workspace_addr != nullptr) {
+        if (aclrtFree(alloc.rdma_workspace_addr) != ACL_SUCCESS) return false;
+        alloc.rdma_workspace_addr = nullptr;
+    }
 #endif
     if (alloc.device_ctx != nullptr) {
         if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return false;
@@ -1318,33 +1363,53 @@ static bool init_rdma_workspace(
     }
 
     auto manager = std::make_unique<pto::comm::rdma::RdmaWorkspaceManager>();
-    const auto init_result = manager->Init(config);
-    if (init_result != pto::comm::rdma::WorkspaceInitResult::READY) {
-        LOG_ERROR(
-            "[comm rank %d] RDMA workspace init failed (result=%u rank_id=%u rank_count=%u phy_id=%u ip=%s "
-            "base_port=%u peer0_phy=%u peer0_ip=%s peer0_addr=0x%llx peer1_phy=%u peer1_ip=%s "
-            "peer1_addr=0x%llx size=%llu)",
-            h->rank, static_cast<unsigned>(init_result), domain_rank, rank_count, bootstrap.phy_id,
-            bootstrap.local_ip.c_str(), static_cast<unsigned>(bootstrap.base_port),
-            rank_count > 0 ? peers[0].phy_id : 0, rank_count > 0 ? peers[0].roce_ip : "",
-            static_cast<unsigned long long>(rank_count > 0 ? peers[0].symmetric_addr : 0),
-            rank_count > 1 ? peers[1].phy_id : 0, rank_count > 1 ? peers[1].roce_ip : "",
-            static_cast<unsigned long long>(rank_count > 1 ? peers[1].symmetric_addr : 0),
-            static_cast<unsigned long long>(symmetric_size)
-        );
+    uint64_t workspace_size = 0;
+    void *workspace_addr = nullptr;
+    pto::comm::rdma::RdmaWorkspaceManager::GetWorkspaceSize(rank_count, &workspace_size, config.qpNum);
+    if (workspace_size == 0) {
+        LOG_ERROR("[comm rank %d] RDMA GetWorkspaceSize returned zero", h->rank);
         return false;
     }
-
-    // The HNS1825 SQ hardware doorbell encodes the QP's class of service in a
-    // cos field; if it does not match the NIC's configured value the NIC
-    // silently ignores the doorbell (WQEs posted, software doorbell written,
-    // but nothing is consumed). The workspace's sq context dbCos is decoded by
-    // pto-isa from the HCOMM DbVendorSpecified field; on some pins it resolves
-    // to 0 while the NIC expects 4 (as native pto-isa tests observe). Patch the
-    // device workspace so AICore rings the doorbell with the NIC-configured cos.
-    if (!patch_rdma_workspace_db_cos(manager->GetWorkspaceAddr(), static_cast<uint32_t>(rank_count))) {
-        LOG_ERROR("[comm rank %d] RDMA workspace dbCos patch failed", h->rank);
+    if (aclrtMalloc(&workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
         return false;
+    }
+    try {
+        const auto init_result = manager->Init(config, workspace_addr, workspace_size);
+        if (init_result != pto::comm::rdma::WorkspaceInitResult::READY) {
+            LOG_ERROR(
+                "[comm rank %d] RDMA workspace init failed (result=%u rank_id=%u rank_count=%u phy_id=%u ip=%s "
+                "base_port=%u peer0_phy=%u peer0_ip=%s peer0_addr=0x%llx peer1_phy=%u peer1_ip=%s "
+                "peer1_addr=0x%llx size=%llu)",
+                h->rank, static_cast<unsigned>(init_result), domain_rank, rank_count, bootstrap.phy_id,
+                bootstrap.local_ip.c_str(), static_cast<unsigned>(bootstrap.base_port),
+                rank_count > 0 ? peers[0].phy_id : 0, rank_count > 0 ? peers[0].roce_ip : "",
+                static_cast<unsigned long long>(rank_count > 0 ? peers[0].symmetric_addr : 0),
+                rank_count > 1 ? peers[1].phy_id : 0, rank_count > 1 ? peers[1].roce_ip : "",
+                static_cast<unsigned long long>(rank_count > 1 ? peers[1].symmetric_addr : 0),
+                static_cast<unsigned long long>(symmetric_size)
+            );
+            manager.reset();
+            if (workspace_addr != nullptr) aclrtFree(workspace_addr);
+            return false;
+        }
+
+        // The HNS1825 SQ hardware doorbell encodes the QP's class of service in a
+        // cos field; if it does not match the NIC's configured value the NIC
+        // silently ignores the doorbell (WQEs posted, software doorbell written,
+        // but nothing is consumed). The workspace's sq context dbCos is decoded by
+        // pto-isa from the HCOMM DbVendorSpecified field; on some pins it resolves
+        // to 0 while the NIC expects 4 (as native pto-isa tests observe). Patch the
+        // device workspace so AICore rings the doorbell with the NIC-configured cos.
+        if (!patch_rdma_workspace_db_cos(manager->GetWorkspaceAddr(), static_cast<uint32_t>(rank_count))) {
+            LOG_ERROR("[comm rank %d] RDMA workspace dbCos patch failed", h->rank);
+            manager.reset();
+            aclrtFree(workspace_addr);
+            return false;
+        }
+    } catch (...) {
+        manager.reset();
+        if (workspace_addr != nullptr) aclrtFree(workspace_addr);
+        throw;
     }
 
     workspace = std::move(manager);
@@ -1605,6 +1670,7 @@ static int domain_alloc_via_ipc(
             )) {
             return -1;
         }
+        out->rdma_workspace_addr = out->rdma_workspace->GetWorkspaceAddr();
         set_comm_workspace(
             ctx, CommWorkspaceKind::RDMA, reinterpret_cast<uint64_t>(out->rdma_workspace->GetWorkspaceAddr()),
             out->rdma_workspace->GetWorkspaceSize()
@@ -2002,6 +2068,11 @@ extern "C" int comm_destroy(CommHandle h) try {
     if (h->owns_device_ctx && h->device_ctx != nullptr) {
         if (aclrtFree(h->device_ctx) != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
         h->device_ctx = nullptr;
+    }
+    h->sdma_workspace.reset();
+    if (h->sdma_workspace_addr != nullptr) {
+        if (aclrtFree(h->sdma_workspace_addr) != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
+        h->sdma_workspace_addr = nullptr;
     }
     int rc = 0;
 
