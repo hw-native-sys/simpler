@@ -869,6 +869,7 @@ platform_case(test_chip_swimlane_aicore.cpp PER_ARCH PER_RUNTIME BARE
 file(GLOB NATIVE_ADMISSION_SHARED_HOST CONFIGURE_DEPENDS
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/*.cpp)
 set(NATIVE_ADMISSION_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_entry_cache_qualification.cpp
     ${SIMPLER_SRC}/common/worker/chip_run_lane.cpp
     ${SIMPLER_SRC}/common/worker/chip_worker.cpp
     ${SIMPLER_SRC}/common/worker/runtime_module.cpp
