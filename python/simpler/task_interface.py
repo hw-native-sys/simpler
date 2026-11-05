@@ -1157,6 +1157,7 @@ class CommDomainHandle:
         "contexts",
         "allocation_id",
         "_domain_size",
+        "_allocation_pending",
         "_domain_ranks",
         "_release_fn",
         "_release_scope",
@@ -1201,6 +1202,7 @@ class CommDomainHandle:
         self.workers = tuple(workers)
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
+        self._allocation_pending = False
         self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)

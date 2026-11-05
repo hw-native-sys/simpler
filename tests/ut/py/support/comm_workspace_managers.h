@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "pto/comm/async/urma/urma_types.hpp"
+
 namespace workspace_fixture {
 inline int started[3]{};
 inline int live[3]{};
@@ -65,9 +67,22 @@ class UrmaWorkspaceManager : public workspace_fixture::Manager {
 public:
     UrmaWorkspaceManager() :
         Manager(1) {}
-    template <typename... Args>
-    bool Init(Args...) {
-        return create();
+    bool Init(void *, uint32_t, uint32_t ranks, void *, uint64_t) {
+        const bool ok = create();
+        auto *info = static_cast<UrmaInfo *>(GetWorkspaceAddr());
+        if (info == nullptr) return ok;
+        info->rankCount = ranks;
+        info->rowsPerPeer = 1;
+        info->jettyCount = ranks;
+        info->sqPtr = reinterpret_cast<uint64_t>(info + 1);
+        info->scqPtr = info->sqPtr + ranks * sizeof(UrmaWQCtx);
+        auto *sq = reinterpret_cast<UrmaWQCtx *>(info->sqPtr);
+        auto *cq = reinterpret_cast<UrmaCqCtx *>(info->scqPtr);
+        for (uint32_t row = 0; row < ranks; ++row) {
+            sq[row].headAddr = sq[row].tailAddr = reinterpret_cast<uint64_t>(&sq[row].submittedWqeCount);
+            cq[row].tailAddr = sq[row].headAddr;
+        }
+        return ok;
     }
 };
 }  // namespace pto::comm::urma

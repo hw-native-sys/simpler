@@ -133,6 +133,11 @@ extern "C" aclError aclrtDevicePeerAccessStatus(int32_t, int32_t, int32_t *statu
     *status = 1;
     return ACL_SUCCESS;
 }
+extern "C" HcclResult
+HcclCreateSubCommConfig(HcclComm *, uint32_t, uint32_t *, uint64_t id, uint32_t, HcclCommConfig *, HcclComm *out) {
+    *out = reinterpret_cast<HcclComm>(static_cast<uintptr_t>(id + 2));
+    return HCCL_SUCCESS;
+}
 extern "C" HcclResult HcclCommDestroy(HcclComm) { return HCCL_SUCCESS; }
 
 static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
@@ -173,10 +178,11 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
             const int old_failures = injected_peer_failures;
             const std::vector<int> held_live{live[0], live[1], live[2]};
             uint64_t rejected = 0, ctx = 0;
-            assert(allocate(mask, rejected, ctx) != 0);
+            assert(allocate(mask, rejected, ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
             assert(peer_import_calls == old_calls + 1);
             assert(injected_peer_failures == old_failures + (failure != PeerFailure::NONE));
-            assert(ctx == 0 && h->domain_allocations.count(rejected) == 0);
+            assert(ctx == 0 && h->domain_allocations.count(rejected) == 1);
+            assert(comm_abort_domain_windows(h, rejected, 2, 0) == 0);
             assert(h->domain_allocations.size() == held_domains);
             assert(mappings.size() == held_mappings && physical_handles == held_physical);
             assert(imported_handles.size() == held_imports && peer_mappings.size() == held_peers);
@@ -272,11 +278,14 @@ int main() {
 
     // A single-rank request reaches the provider; its failure is not a domain-policy rejection.
     fail_engine = 1;
+    const uint64_t single_rank_id = next_id++;
     assert(
-        comm_alloc_domain_windows(h, next_id++, ranks, 1, 0, 4096, 2, &first_ctx, &base, &size) ==
-        COMM_DOMAIN_URMA_INIT_FAILED
+        comm_alloc_domain_windows(h, single_rank_id, ranks, 1, 0, 4096, 2, &first_ctx, &base, &size) ==
+        COMM_INITIALIZATION_ABORT_REQUIRED
     );
-    assert(started[1] == 1 && live[1] == 0 && h->domain_allocations.empty());
+    assert(started[1] == 1 && live[1] == 1 && h->domain_allocations.count(single_rank_id) == 1);
+    assert(comm_abort_domain_windows(h, single_rank_id, 1, 0) == 0);
+    assert(live[1] == 0 && h->domain_allocations.empty());
     assert(mappings.empty() && physical_handles == 0);
     fail_engine = -1;
 
@@ -300,12 +309,9 @@ int main() {
             throw_engine = failure == 1 ? 1 : -1;
             fail_context_upload = failure == 2;
             uint64_t rejected = 0, rejected_ctx = 0;
-            const int rc = allocate(3, rejected, rejected_ctx);
-            assert(
-                rc == (failure == 2 ? -1 :
-                       failure >= 3 ? COMM_DOMAIN_URMA_WORKSPACE_INVALID :
-                                      COMM_DOMAIN_URMA_INIT_FAILED)
-            );
+            assert(allocate(3, rejected, rejected_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+            assert(h->domain_allocations.count(rejected) == 1);
+            assert(comm_abort_domain_windows(h, rejected, h->domain_allocations.at(rejected)->nranks, 0) == 0);
             assert(h->domain_allocations.count(rejected) == 0);
             assert(mappings.size() == held_mappings && physical_handles == held_physical);
             assert(live[1] == 1 && live[0] == 1);
@@ -331,7 +337,9 @@ int main() {
             throw_engine = failure == 1 ? 2 : -1;
             fail_context_upload = failure == 2;
             uint64_t rejected = 0, rejected_ctx = 0;
-            assert(allocate(4, rejected, rejected_ctx) != 0);
+            assert(allocate(4, rejected, rejected_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+            assert(h->domain_allocations.count(rejected) == 1);
+            assert(comm_abort_domain_windows(h, rejected, h->domain_allocations.at(rejected)->nranks, 0) == 0);
             assert(h->domain_allocations.count(rejected) == 0);
             assert(mappings.size() == held_mappings && physical_handles == held_physical);
             assert(live[2] == 1);
@@ -380,11 +388,13 @@ int main() {
     h->rootinfo_path = std::string(folder) + "/second";
     h->hccl_comm = reinterpret_cast<HcclComm>(1);
     throw_engine = 0;
-    assert(allocate(1, first, first_ctx) != 0);
+    assert(allocate(1, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+    assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
     assert(!h->sdma_workspace && mappings.empty() && physical_handles == 0 && live[0] == 0);
     throw_engine = -1;
     fail_engine = 0;
-    assert(allocate(1, first, first_ctx) != 0);
+    assert(allocate(1, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+    assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
     assert(!h->sdma_workspace && mappings.empty() && physical_handles == 0);
     assert(allocate(0, first, first_ctx) == 0);
     assert(!comm_workspace<CommWorkspaceKind::SDMA>(*reinterpret_cast<CommContext *>(first_ctx)).addr);
