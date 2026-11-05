@@ -36,6 +36,14 @@
 #include "scheduler_ready_watchdog.h"
 #include "utils/thread_completion_gate.h"
 
+// Hidden, not weak: the weak marker belongs on this runtime's definitions, so
+// that a replacement's strong one wins at static link time. Visibility keeps
+// that resolution inside one shared object — the AICPU images of two runtimes
+// can share a process, and a default-visibility weak symbol is preemptible, so
+// a step would otherwise bind to whichever image defined it first and then run
+// a graph the other runtime bound.
+#define SIMPLER_SCHEDULER_STEP __attribute__((visibility("hidden")))
+
 struct Runtime;
 
 struct AicpuExecutor {
@@ -105,18 +113,18 @@ struct AicpuExecutor {
 
     // Configure the discovered cores and publish READY, between the handshake
     // and the bootstrap gate. Leader only.
-    int32_t post_handshake_init(Runtime *runtime);
+    SIMPLER_SCHEDULER_STEP int32_t post_handshake_init(Runtime *runtime);
     // Hand this thread's slice of the worker contexts to the cores.
-    void publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    SIMPLER_SCHEDULER_STEP void publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
     // Whether this executor drives the cores at all. False sends the run down
     // the legacy AICPU dispatch path instead, which owns its own teardown.
-    bool drives_cores(const Runtime *runtime) const;
+    SIMPLER_SCHEDULER_STEP bool drives_cores(const Runtime *runtime) const;
     // Whether the leader waits for the cores to acknowledge the bootstrap.
-    bool awaits_bootstrap() const;
+    SIMPLER_SCHEDULER_STEP bool awaits_bootstrap() const;
     // Watch the run to completion. Runs on the last thread, and its return
     // value is this run's status.
-    int32_t supervise(Runtime *runtime);
+    SIMPLER_SCHEDULER_STEP int32_t supervise(Runtime *runtime);
     // Wait for the supervisor to declare shutdown. Runs on every other thread.
     // Returns whether the wait timed out.
-    bool await_shutdown(Runtime *runtime);
+    SIMPLER_SCHEDULER_STEP bool await_shutdown(Runtime *runtime);
 };

@@ -48,7 +48,13 @@ enum class SchedulerExtensionResult : uint8_t {
  * an extension as the shells the task table holds. An extension that takes the
  * graph owns the rest of the bind, including reading those shells' Definitions.
  */
-SchedulerExtensionResult scheduler_extension_select(
+// Hidden, not weak: the weak marker belongs on this runtime's definition, so
+// that an extension's strong one wins at static link time. Visibility keeps
+// that resolution inside one shared object — two runtimes' host images can
+// share a process, and a default-visibility weak symbol is preemptible, so
+// this one would otherwise bind to whichever image defined it first and hand
+// the graph to a scheduler the loaded AICore image cannot run.
+__attribute__((visibility("hidden"))) SchedulerExtensionResult scheduler_extension_select(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
     const sm_layout::SegmentOffsets &device_segments
