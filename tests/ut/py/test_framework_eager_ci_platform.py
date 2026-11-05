@@ -116,6 +116,7 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
             "https://download.pytorch.org/whl/cpu",
         ],
         ["-m", "pip", "install", "--ignore-installed", "--no-deps", requirements[1]],
+        ["-m", "pip", "install", "--ignore-installed", "--no-deps", "nanobind>=2,<3"],
     ]
     dependency_install = next(args for args in commands if "scikit-build-core>=0.10" in args)
     assert dependency_install == [
@@ -126,7 +127,6 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
         ".github/actions/setup-framework-eager/constraints.txt",
         *requirements,
         "scikit-build-core>=0.10",
-        "nanobind>=2,<3",
         "cmake>=3.20",
         "ninja",
         "setuptools",
