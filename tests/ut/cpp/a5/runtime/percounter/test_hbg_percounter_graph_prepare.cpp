@@ -71,7 +71,7 @@ std::vector<std::byte> make_definition(uint64_t graph_key) {
         std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
         const bool aiv = i == 1;
         task.kernel_id[aiv ? 1 : 0] = 42;
-        task.active_mask = aiv ? 2 : 1;
+        task.active_mask = aiv ? LaneMask::aiv0() : LaneMask::aic();
         task.logical_block_num = 1;
         task.total_required_subtasks = 1;
         task.tensor_count = 1;

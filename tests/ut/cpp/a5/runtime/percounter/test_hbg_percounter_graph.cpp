@@ -285,10 +285,10 @@ TEST(PercounterGraphTemplate, ReadsAFramedDefinition) {
     std::byte *image = section.data() + header_bytes;
     std::memcpy(image, &definition, sizeof(definition));
     SubTaskDefinition tasks[kTasks]{};
-    tasks[0].active_mask = kAic;
+    tasks[0].active_mask = LaneMask::aic();
     tasks[0].logical_block_num = 1;
     tasks[0].total_required_subtasks = 1;
-    tasks[1].active_mask = kAiv;
+    tasks[1].active_mask = LaneMask::aiv0();
     tasks[1].logical_block_num = 4;
     tasks[1].total_required_subtasks = 4;
     std::memcpy(image + definition.off_sub_tasks, tasks, sizeof(tasks));
