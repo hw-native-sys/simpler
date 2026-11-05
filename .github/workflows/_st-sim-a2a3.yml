@@ -104,7 +104,7 @@ jobs:
       - name: Set up environment
         uses: ./.github/actions/setup-venv
         with:
-          python-executable: ${{ inputs.setup_variant == 'self-cpu' && '/usr/local/ptoas/runtimes/cpython-3.11/bin/python3.11' || 'python3' }}
+          toolchain-bundle: ${{ inputs.setup_variant == 'self-cpu' }}
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a2a3sim .[test]"
 

@@ -10,10 +10,10 @@ inputs:
     description: Arguments passed to pip install after torch, for example ".[test]" or "-e .[test]".
     required: false
     default: ""
-  python-executable:
-    description: Python executable used to create the venv.
+  toolchain-bundle:
+    description: Source the preinstalled PyPTO toolchain before creating the venv.
     required: false
-    default: python3
+    default: "false"
   install-torch:
     description: Install the CPU torch wheel before packages.
     required: false
@@ -62,10 +62,19 @@ runs:
         IN_HTTP_PROXY: ${{ inputs.http-proxy }}
         IN_HTTPS_PROXY: ${{ inputs.https-proxy }}
         IN_NO_PROXY: ${{ inputs.no-proxy }}
+        USE_TOOLCHAIN_BUNDLE: ${{ inputs.toolchain-bundle }}
       run: |
         set -f
         if [ "${{ inputs.source-cann }}" = "true" ]; then
           source "$CANN_ENV"
+        fi
+        if [ "$USE_TOOLCHAIN_BUNDLE" = "true" ]; then
+          source /opt/pypto/toolchain/current/activate.sh
+          test -n "$PYPTO_TOOLCHAIN"
+          printf '%s\n' "$PYPTO_TOOLCHAIN/bin" "$PYPTO_TOOLCHAIN/gcc/bin" "$PYPTO_TOOLCHAIN/python/bin" >> "$GITHUB_PATH"
+          printf 'LD_LIBRARY_PATH=%s\n' "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          printf 'PYPTO_TOOLCHAIN=%s\n' "$PYPTO_TOOLCHAIN" >> "$GITHUB_ENV"
+          python3 --version
         fi
 
         # Only the network1 workflow passes these; every other caller runs on a
@@ -81,7 +90,7 @@ runs:
           VENV_ARGS+=(--system-site-packages)
         fi
 
-        "${{ inputs.python-executable }}" -m venv "${VENV_ARGS[@]}" .venv
+        python3 -m venv "${VENV_ARGS[@]}" .venv
         source .venv/bin/activate
         pip install --upgrade pip
         if [ "${{ inputs.install-torch }}" = "true" ]; then
