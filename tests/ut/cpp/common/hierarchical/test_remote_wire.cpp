@@ -403,3 +403,9 @@ TEST(RemoteWire, RejectsTransferThatTheProtocolWouldLose) {
         EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
     }
 }
+
+TEST(RemoteWire, ProcessLocalMappingCannotBeSilentlyDroppedByRemoteEncoding) {
+    Tensor tensor = remote_arg_tensor();
+    tensor.mapping_ref = 42;
+    EXPECT_THROW((void)remote_l3::encode_tensor(tensor), std::runtime_error);
+}

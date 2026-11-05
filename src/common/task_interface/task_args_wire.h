@@ -74,10 +74,16 @@ public:
     using Base::tensor_data;
 
     void add_tensor(const Tensor &t, TensorArgType tag = TensorArgType::INPUT) {
-        add_tensor(t, tag, legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space)));
+        add_tensor(
+            t, tag,
+            t.mapping_ref ? TensorTransfer::NONE :
+                            legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space))
+        );
     }
 
     void add_tensor(const Tensor &t, TensorArgType tag, TensorTransfer transfer) {
+        if (t.mapping_ref && transfer != TensorTransfer::NONE)
+            throw std::invalid_argument("mapped Host views require no staging transfer");
         if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), transfer)) {
             throw std::invalid_argument(error);
         }
@@ -98,6 +104,8 @@ public:
 
     TensorTransfer transfer(int32_t i) const {
         const auto request = transfers_.at(static_cast<size_t>(i));
+        if (tensor(i).mapping_ref && request != TensorTransfer::NONE)
+            throw std::invalid_argument("mapped Host views require no staging transfer");
         if (const char *error =
                 tensor_transfer_error(static_cast<AddressSpace>(tensor(i).buffer.address_space), request)) {
             throw std::invalid_argument(error);
@@ -112,7 +120,7 @@ public:
 };
 
 // The mailbox argument slot reserves one byte of the view padding for the invocation request.
-// Tensor itself remains a view: standalone Tensor serialization leaves all three bytes padding.
+// Tensor carries its mapping reference separately from the invocation transfer byte.
 inline constexpr size_t TASK_ARG_TRANSFER_OFFSET = offsetof(Tensor, _pad);
 static_assert(TASK_ARG_TRANSFER_OFFSET == 141, "mailbox transfer offset is wire ABI");
 
@@ -152,6 +160,8 @@ struct TaskArgsView {
         const auto request = static_cast<TensorTransfer>(
             tensor_bytes[static_cast<size_t>(i) * sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET]
         );
+        if (t.mapping_ref && request != TensorTransfer::NONE)
+            throw std::invalid_argument("mapped Host views cannot use staging transfers");
         if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), request)) {
             throw std::invalid_argument(error);
         }

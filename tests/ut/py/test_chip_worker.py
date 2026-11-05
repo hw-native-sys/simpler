@@ -1142,6 +1142,7 @@ class TestWorkerNativeChip:
         )
         context = {
             "staged_runs": staged_runs,
+            "import_registry": SimpleNamespace(host_mappings=None),
             "device_id": 0,
             "live_execution": False,
             "pending_activation": True,

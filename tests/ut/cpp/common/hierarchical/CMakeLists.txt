@@ -102,6 +102,9 @@ hierarchical_case(test_pipeline_contract_loader.cpp
 
 simpler_ut_glob_cases(hierarchical_case)
 
+# The Host URMA fault-injection runtime lives in this executable.
+set_target_properties(test_host_urma_lifetime PROPERTIES ENABLE_EXPORTS ON)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(test_device_execution_owners PRIVATE "LINKER:--wrap=pthread_atfork")
 endif()

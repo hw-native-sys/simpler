@@ -368,6 +368,13 @@ public:
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
 
+    bool host_ddr_mapping_supported() const noexcept;
+    uint64_t map_host_ddr(uint64_t host, uint64_t bytes);
+    void unmap_host_ddr(uint64_t host);
+    bool host_urma_supported() const noexcept;
+    uint64_t prepare_host_urma(uint64_t base_comm, uint64_t allocation_id, uint64_t host, uint64_t bytes);
+    void release_host_urma();
+
     /// One span of a caller device allocation a run names. The lane's
     /// vocabulary for the borrow it takes on a run's behalf; the wire form it
     /// becomes is the platform's (`CallerBufferSpan`).
@@ -1084,6 +1091,20 @@ private:
     // thread, as enforced by Worker.close().
     std::optional<ExecutionEnvironment> execution_environment_;
     bool device_owner_reserved_ = false;
+    struct HostDdrMapping {
+        uint64_t bytes;
+        uint64_t mapped{0};
+        unsigned registered{0};
+        bool closing{false};
+    };
+    std::mutex host_ddr_mutex_;
+    std::unordered_map<uint64_t, HostDdrMapping> host_ddr_mappings_;
+    // Set before collective initialization: even a failed prepare can retain HCCL references.
+    uint64_t host_urma_comm_{0};
+    uint64_t host_urma_allocation_{0};
+    uint64_t host_urma_host_{0};
+    uint64_t host_urma_workspace_{0};
+    bool host_urma_revoked_{false};
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

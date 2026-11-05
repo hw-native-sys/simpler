@@ -346,6 +346,7 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
 // descriptor.nbytes is the whole backing and byte_offset is the view origin. The sidecar carries
 // the transport locator for the same view and is checked against the decoded Tensor by the session.
 std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
+    ensure(tensor.mapping_ref == 0, "remote_wire: local mapping references cannot be forwarded");
     const BufferDescriptor &desc = tensor.buffer;
     ensure(
         desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR),

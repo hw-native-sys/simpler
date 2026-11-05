@@ -85,6 +85,7 @@ class DeviceRunner : public DeviceRunnerBase {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
+    bool host_urma_supported() const noexcept override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
     // `copy_to_device`, `copy_from_device`,

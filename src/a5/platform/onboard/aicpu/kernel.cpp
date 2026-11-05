@@ -182,10 +182,9 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
  * AICPU per-device init entry point.
  *
  * Launched at worker init (before any register_callable / exec), this latches
- * the per-device invariants into the resident AICPU SO globals. It is launched
- * again only when first-use provisioning adds an async-DMA workspace. Because
- * the inner SO stays dlopen'd across launches, the latest values survive every
- * subsequent per-task launch.
+ * the per-device invariants into the resident AICPU SO globals once. Host URMA
+ * uses its separate quiescent update entry after mapping. The resident SO keeps
+ * these values across subsequent task launches.
  *
  * @param arg Pointer to an InitArgs payload
  * @return 0 on success, non-zero on error
@@ -207,6 +206,14 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
         set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
     }
 
+    return 0;
+}
+
+// Runs only under quiescent host control admission; existing task contexts have retired.
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_update_host_urma(void *arg) {
+    if (arg == nullptr) return -1;
+    set_dma_workspace_addr(DMA_WORKSPACE_URMA, *static_cast<const uint64_t *>(arg));
+    wmb();
     return 0;
 }
 

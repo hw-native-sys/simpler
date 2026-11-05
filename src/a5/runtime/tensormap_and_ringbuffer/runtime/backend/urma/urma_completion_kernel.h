@@ -280,6 +280,33 @@ submit_urma_request_once(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTens
 #endif
 }
 
+#if defined(PTO_URMA_SUPPORTED)
+inline __aicore__ bool
+build_urma_session(const AsyncCtx &ctx, __gm__ uint8_t *workspace, uint32_t peer, pto::comm::AsyncSession &session) {
+    session = pto::comm::AsyncSession{};
+    pto::comm::detail::ActivateEngineState<pto::comm::DmaEngine::URMA>(session);
+    session.valid = false;
+    session.contextGm = workspace;
+    session.destRankId = peer;
+    if (workspace == nullptr || ctx.urma_queue_index == UINT32_MAX) return false;
+    auto *info = reinterpret_cast<__gm__ pto::comm::urma::UrmaInfo *>(workspace);
+    const uint32_t width = info->jettiesPerCore;
+    if (peer >= info->rankCount || width == 0 || width > pto::comm::urma::kUrmaMaxJettiesPerCore) return false;
+    if (info->layout != pto::comm::urma::UrmaLayout::PER_PEER &&
+        info->layout != pto::comm::urma::UrmaLayout::SHARED_POOL)
+        return false;
+    const uint32_t bound =
+        info->layout == pto::comm::urma::UrmaLayout::SHARED_POOL ? info->jettyCount : info->rowsPerPeer;
+    if (width > bound || ctx.urma_queue_index > (bound - width) / width) return false;
+    // PTO's default builder reads a CCE block register shared by sibling AIVs
+    // under persistent MIX dispatch. Each runtime AIV must instead own its queue run.
+    session.cfg.urma.qpCount = width;
+    session.qpIdxBase = ctx.urma_queue_index * width;
+    session.valid = true;
+    return true;
+}
+#endif
+
 template <typename DstTensor, typename SrcTensor>
 inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
     using RawDType = typename DstTensor::RawDType;
@@ -297,7 +324,7 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
     }
 #if defined(PTO_URMA_SUPPORTED)
     pto::comm::AsyncSession session;
-    if (!pto::comm::BuildAsyncSession<pto::comm::DmaEngine::URMA>(desc.workspace, desc.remote_rank, session)) {
+    if (!build_urma_session(ctx, desc.workspace, desc.remote_rank, session)) {
         pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
@@ -332,6 +359,7 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     ctx.completion_error_code = lc->async_ctx.completion_error_code;
     ctx.completion_entries = lc->async_ctx.completion_entries;
     ctx.completion_capacity = lc->async_ctx.completion_capacity;
+    ctx.urma_queue_index = lc->async_ctx.urma_queue_index;
     TaskId::assign(ctx.task_token, lc->async_ctx.task_token);
     return ctx;
 }

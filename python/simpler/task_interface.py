@@ -135,6 +135,9 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
     """Check callable-side host access before descriptors become address-only PODs."""
     for i in range(args.tensor_count()):
         buffer = args.tensor(i).buffer
+        if args.tensor(i)._mapping_ref:
+            if args.transfer(i) != TensorTransfer.NONE:
+                raise ValueError(f"argument {i}: mapped Host view cannot use staging transfers")
         if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
             continue
         direction = target.sig(i) if target is not None and i < target.sig_count else None
