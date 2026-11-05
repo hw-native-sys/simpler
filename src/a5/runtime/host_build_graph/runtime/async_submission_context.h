@@ -150,6 +150,8 @@ inline __aicore__ bool async_submission_begin(__gm__ AsyncSubmissionContext &con
 
 // Publisher completes the actual backend queue/cursor/committed-post stores
 // before this SDK fact is published. Token writeback alone is not this proof.
+// A false publisher result retains the attempted operation without publishing
+// committed evidence; the backend may already have performed side effects.
 template <typename Publisher>
 inline __aicore__ bool async_submission_commit(__gm__ AsyncSubmissionContext &context, Publisher &publisher) {
     auto &e = context.evidence;
@@ -158,7 +160,10 @@ inline __aicore__ bool async_submission_commit(__gm__ AsyncSubmissionContext &co
         async_submission_error(context, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
-    publisher.publish_backend_metadata();
+    if (!publisher.publish_backend_metadata()) {
+        async_submission_error(context, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
     e.committed = e.committed + 1;
     e.flags = ASYNC_SUBMISSION_METADATA_PUBLISHED;
     publisher.flush_evidence(&e, sizeof(e));

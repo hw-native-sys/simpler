@@ -60,10 +60,14 @@ struct Fixture {
 struct Publisher {
     AsyncSubmissionContext *context;
     std::vector<int> operations;
-    void publish_backend_metadata() {
+    bool metadata_ready{true};
+    int32_t metadata_error{0};
+    bool publish_backend_metadata() {
         EXPECT_EQ(context->evidence.flags, 0u);
         EXPECT_EQ(context->evidence.attempted, context->evidence.committed + 1);
         operations.push_back(1);
+        if (metadata_error != 0) async_submission_error(*context, metadata_error);
+        return metadata_ready;
     }
     void flush_evidence(volatile void *address, uint32_t bytes) {
         EXPECT_EQ(address, &context->evidence);
@@ -171,6 +175,30 @@ TEST(HbgAsyncSubmissionContext, BackendPublicationPrecedesCommittedEvidence) {
     }
     EXPECT_EQ(publisher.operations, (std::vector<int>{1, 2, 3, 1, 2, 3, 1, 2, 3}));
     EXPECT_EQ(f.ctx().evidence.error_code, 0);
+}
+
+TEST(HbgAsyncSubmissionContext, FailedMetadataPublicationKeepsTheAttemptWithoutPublishingSuccess) {
+    for (int32_t error : {0, -37}) {
+        Fixture f;
+        Publisher publisher{&f.ctx(), {}};
+        ASSERT_TRUE(async_submission_begin(f.ctx()));
+        ASSERT_TRUE(async_submission_commit(f.ctx(), publisher));
+        publisher.operations.clear();
+        publisher.metadata_ready = false;
+        publisher.metadata_error = error;
+        ASSERT_TRUE(async_submission_begin(f.ctx()));
+        EXPECT_FALSE(async_submission_commit(f.ctx(), publisher));
+        EXPECT_EQ(f.ctx().evidence.attempted, 2u);
+        EXPECT_EQ(f.ctx().evidence.committed, 1u);
+        EXPECT_EQ(f.ctx().evidence.flags, 0u);
+        EXPECT_EQ(f.ctx().evidence.error_code, error != 0 ? error : SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        EXPECT_EQ(publisher.operations, (std::vector<int>{1}));
+        EXPECT_FALSE(async_submission_begin(f.ctx()));
+        EXPECT_FALSE(async_submission_commit(f.ctx(), publisher));
+        EXPECT_EQ(publisher.operations, (std::vector<int>{1}));
+        EXPECT_EQ(f.ctx().evidence.attempted, 2u);
+        EXPECT_EQ(f.ctx().evidence.committed, 1u);
+    }
 }
 
 TEST(HbgAsyncSubmissionContext, UncommittedOrFailedAttemptsNeverBecomeNoSubmission) {
