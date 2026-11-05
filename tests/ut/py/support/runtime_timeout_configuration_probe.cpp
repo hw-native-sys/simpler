@@ -25,11 +25,25 @@ int stream_calls;
 int setter_error;
 uint64_t actual_timeout;
 SimplerHostLogState log_state{};
+int context_token;
+thread_local rtContext_t current_context = nullptr;
 }  // namespace
 
-extern "C" rtError_t rtSetDevice(int32_t) { return 0; }
+extern "C" rtError_t rtSetDevice(int32_t) {
+    current_context = &context_token;
+    return 0;
+}
+extern "C" rtError_t rtCtxGetCurrent(rtContext_t *out) {
+    *out = current_context;
+    return 0;
+}
+extern "C" rtError_t rtCtxSetCurrent(rtContext_t context) {
+    current_context = context;
+    return 0;
+}
 extern "C" rtError_t rtDeviceReset(int32_t) {
     ++reset_calls;
+    current_context = nullptr;
     return 0;
 }
 extern "C" aclError aclrtSetOpExecuteTimeOutV2(uint64_t requested, uint64_t *actual) {

@@ -46,6 +46,7 @@ from simpler.worker import Worker  # noqa: E402
 from simpler_setup.elf_parser import extract_text_section  # noqa: E402
 from simpler_setup.kernel_compiler import KernelCompiler  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
+from simpler_setup.torch_interop import create_shared_tensor  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _F32 = DataType.FLOAT32
@@ -123,10 +124,9 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
     print(f"[allreduce] platform={platform} devices={device_ids} nranks={nranks}")
 
     host_inputs = [
-        torch.tensor([i + rank * 100 for i in range(ALLREDUCE_COUNT)], dtype=torch.float32).share_memory_()
-        for rank in range(nranks)
+        torch.tensor([i + rank * 100 for i in range(ALLREDUCE_COUNT)], dtype=torch.float32) for rank in range(nranks)
     ]
-    host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
+    host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32) for _ in range(nranks)]
 
     print("[allreduce] compiling onephase kernel...")
     chip_callable = build_chip_callable(platform)
@@ -140,9 +140,13 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
     )
     chip_handle = worker.register(chip_callable)
 
+    shared = {}
     try:
         print("[allreduce] init worker...")
         worker.init()
+
+        shared["host_inputs"] = [create_shared_tensor(worker, tensor) for tensor in host_inputs]
+        shared["host_outputs"] = [create_shared_tensor(worker, tensor) for tensor in host_outputs]
 
         def orch_fn(orch, _args, cfg):
             with orch.allocate_domain(
@@ -156,11 +160,11 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
                     domain = handle[i]
                     chip_args = TaskArgs()
                     chip_args.add_tensor(
-                        worker.make_tensor_arg(host_inputs[i], shapes=(ALLREDUCE_COUNT,), dtype=_F32),
+                        shared["host_inputs"][i][0],
                         TensorArgType.INPUT,
                     )
                     chip_args.add_tensor(
-                        worker.make_tensor_arg(host_outputs[i], shapes=(ALLREDUCE_COUNT,), dtype=_F32),
+                        shared["host_outputs"][i][0],
                         TensorArgType.OUTPUT_EXISTING,
                     )
                     chip_args.add_tensor(
@@ -173,6 +177,9 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
 
         print(f"[allreduce] running {nranks}-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
+
+        for i in range(len(host_outputs)):
+            host_outputs[i].copy_(shared["host_outputs"][i][1])
 
         expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
         ok = True
@@ -188,6 +195,7 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
         print("[allreduce] all ranks matched golden ✅")
         return 0
     finally:
+        shared.clear()
         worker.close()
 
 

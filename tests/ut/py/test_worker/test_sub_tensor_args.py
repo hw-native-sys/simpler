@@ -42,7 +42,7 @@ from ._wire_blob import encode_blob
 _F32 = 0  # DataType.FLOAT32 value
 
 
-def test_alloc_shared_tensor_returns_managed_fork_handle():
+def test_alloc_shared_tensor_returns_managed_shared_handle():
     hw = Worker(level=3, num_sub_workers=1)
     hw.init()
     captured = {}
@@ -55,8 +55,8 @@ def test_alloc_shared_tensor_returns_managed_fork_handle():
         hw.run(orch, args=None, config=CallConfig())
         h = captured["h"]
         assert h.nbytes == 4 * 8 * 4  # prod(shape) * element_size
-        # Backed by the orchestrator's HeapRing VA (FORK_SHM, no POSIX shm), runtime-managed.
-        assert h.backend_kind == BackendKind.FORK_SHM
+        # The allocation owns no separate name; its descriptor locates a slab in the managed ring.
+        assert h.backend_kind == BackendKind.SHARED_FD_SLICE
         assert h.shm is None and h.base != 0
     finally:
         hw.close()

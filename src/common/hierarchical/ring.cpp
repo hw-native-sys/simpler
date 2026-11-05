@@ -12,21 +12,36 @@
 #include "ring.h"
 
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include <chrono>
 #include <stdexcept>
 
-Ring::~Ring() {
+Ring::~Ring() { release_heaps(); }
+
+void Ring::release_heaps() {
     for (HeapRing &r : rings_) {
         if (r.mapped && r.base) {
             munmap(r.base, r.size);
             r.base = nullptr;
             r.mapped = false;
         }
+        if (r.fd >= 0) {
+            close(r.fd);
+            r.fd = -1;
+        }
     }
 }
 
-void Ring::init(uint64_t heap_bytes, uint32_t timeout_ms) {
+void Ring::init(uint64_t heap_bytes, uint32_t timeout_ms) { init_shared(heap_bytes, {}, timeout_ms); }
+
+void Ring::init_shared(uint64_t heap_bytes, const std::vector<int> &fds, uint32_t timeout_ms) {
+    if (!fds.empty() && fds.size() != MAX_RING_DEPTH) {
+        throw std::invalid_argument("Ring: one backing fd is required per heap ring");
+    }
+    size_t fd_index = 0;
     for (const HeapRing &r : rings_) {
         if (r.mapped) {
             throw std::logic_error("Ring::init called twice");
@@ -50,17 +65,21 @@ void Ring::init(uint64_t heap_bytes, uint32_t timeout_ms) {
         r.slot_heap_end.clear();
 
         if (heap_bytes > 0) {
-            void *base = mmap(nullptr, heap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-            if (base == MAP_FAILED) {
-                // Unwind any rings already mapped so destruction stays clean.
-                for (HeapRing &rr : rings_) {
-                    if (rr.mapped && rr.base) {
-                        munmap(rr.base, rr.size);
-                        rr.base = nullptr;
-                        rr.size = 0;
-                        rr.mapped = false;
-                    }
+            void *base = MAP_FAILED;
+            if (fds.empty()) {
+                base = mmap(nullptr, heap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            } else {
+                r.fd = fcntl(fds[fd_index], F_DUPFD_CLOEXEC, 3);
+                struct stat info{};
+                if (r.fd < 0 || fstat(r.fd, &info) != 0 || info.st_size < 0 ||
+                    static_cast<uint64_t>(info.st_size) < heap_bytes) {
+                    release_heaps();
+                    throw std::invalid_argument("Ring: shared backing does not cover the heap");
                 }
+                base = mmap(nullptr, heap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, r.fd, 0);
+            }
+            if (base == MAP_FAILED) {
+                release_heaps();
                 throw std::runtime_error("Ring: per-ring heap mmap failed");
             }
             r.base = base;
@@ -70,7 +89,42 @@ void Ring::init(uint64_t heap_bytes, uint32_t timeout_ms) {
             r.base = nullptr;
             r.size = 0;
         }
+        ++fd_index;
     }
+}
+
+std::vector<int> Ring::shared_fds() const {
+    std::vector<int> result;
+    for (const auto &ring : rings_) {
+        if (ring.fd >= 0) result.push_back(ring.fd);
+    }
+    return result;
+}
+
+BufferDescriptor Ring::shared_descriptor(uint64_t address, uint64_t nbytes, const CanonicalIdentity &identity) const {
+    for (const auto &ring : rings_) {
+        const uint64_t base = reinterpret_cast<uint64_t>(ring.base);
+        if (!ring.mapped || address < base) continue;
+        const uint64_t offset = address - base;
+        if (offset > ring.size || nbytes > ring.size - offset) continue;
+        if (ring.fd < 0) throw std::invalid_argument("Ring: heap has no exported backing");
+        BufferDescriptor descriptor{};
+        descriptor.magic = BUFFER_DESCRIPTOR_MAGIC;
+        descriptor.address_space = static_cast<uint8_t>(AddressSpace::HOST);
+        descriptor.access = static_cast<uint8_t>(AccessMode::READWRITE);
+        descriptor.backend_kind = static_cast<uint8_t>(BackendKind::SHARED_FD_SLICE);
+        descriptor.identity = identity;
+        descriptor.nbytes = nbytes;
+        descriptor.body_len = 16;
+        const uint32_t pid = static_cast<uint32_t>(getpid());
+        const uint32_t fd = static_cast<uint32_t>(ring.fd);
+        std::memcpy(descriptor.body, &pid, sizeof(pid));
+        std::memcpy(descriptor.body + 4, &fd, sizeof(fd));
+        std::memcpy(descriptor.body + 8, &offset, sizeof(offset));
+        validate_buffer_descriptor(descriptor);
+        return descriptor;
+    }
+    throw std::invalid_argument("Ring: buffer is outside the owned heaps");
 }
 
 // ---------------------------------------------------------------------------

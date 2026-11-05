@@ -31,6 +31,8 @@ Control &control() {
 namespace {
 std::unordered_map<void *, size_t> allocations;
 std::unordered_set<void *> streams;
+int device_context;
+thread_local rtContext_t current_context = nullptr;
 }  // namespace
 namespace native_admission_transport {
 void release_provider_state() {
@@ -93,12 +95,42 @@ int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMe
     std::memcpy(dst, src, bytes);
     return 0;
 }
-int rtSetDevice(int32_t) { return native_admission_transport::control().attach_rc; }
+int rtSetDevice(int32_t) {
+    auto &c = native_admission_transport::control();
+    ++c.device_set_calls;
+    if (c.attach_rc != 0) return c.attach_rc;
+    ++c.device_refs;
+    current_context = &device_context;
+    return 0;
+}
 int rtDeviceReset(int32_t) {
     auto &c = native_admission_transport::control();
-    c.retired = true;
-    if (c.reset_error == 0) native_admission_transport::release_provider_state();
+    ++c.device_reset_calls;
+    if (c.reset_error == 0) {
+        if (c.device_refs > 0) --c.device_refs;
+        c.retired = c.device_refs == 0;
+        if (c.retired) native_admission_transport::release_provider_state();
+    } else {
+        // A failed reset forbids later per-resource calls even though its reference remains owed.
+        c.retired = true;
+    }
     return c.reset_error;
+}
+int rtCtxGetCurrent(rtContext_t *context) {
+    auto &c = native_admission_transport::control();
+    ++c.context_get_calls;
+    if (c.context_get_rc != 0) return c.context_get_rc;
+    *context = c.null_context ? nullptr : current_context;
+    return 0;
+}
+int rtCtxSetCurrent(rtContext_t context) {
+    auto &c = native_admission_transport::control();
+    ++c.context_set_calls;
+    if (c.attach_rc != 0) return c.attach_rc;
+    if (c.context_set_rc != 0 && (c.fail_context_set_call == 0 || c.fail_context_set_call == c.context_set_calls))
+        return c.context_set_rc;
+    c.last_bound_context = current_context = context;
+    return 0;
 }
 int rtStreamCreate(rtStream_t *out, int32_t) {
     auto &c = native_admission_transport::control();
@@ -133,7 +165,27 @@ int rtKernelLaunchWithHandleV2(void *, uint64_t, uint32_t, rtArgsEx_t *, void *,
     return -1;
 }
 const char *aclGetRecentErrMsg() { return "native admission CPU transport"; }
-int aclFinalize() { return 0; }
+int aclInit(const char *) {
+    auto &c = native_admission_transport::control();
+    ++c.acl_init_calls;
+    return c.acl_init_rc;
+}
+int aclrtSetDevice(int32_t device) {
+    auto &c = native_admission_transport::control();
+    ++c.acl_set_calls;
+    return c.acl_set_rc != 0 ? c.acl_set_rc : rtSetDevice(device);
+}
+int aclrtResetDevice(int32_t device) {
+    auto &c = native_admission_transport::control();
+    ++c.acl_reset_calls;
+    return c.acl_reset_rc != 0 ? c.acl_reset_rc : rtDeviceReset(device);
+}
+int aclFinalize() {
+    auto &c = native_admission_transport::control();
+    ++c.acl_finalize_calls;
+    c.refs_at_acl_finalize = c.device_refs;
+    return c.acl_finalize_rc;
+}
 int aclrtGetMemInfo(int, size_t *free, size_t *total) {
     *free = *total = 1ULL << 30;
     return 0;

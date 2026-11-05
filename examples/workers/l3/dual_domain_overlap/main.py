@@ -59,7 +59,7 @@ from simpler.worker import Worker  # noqa: E402
 from simpler_setup.elf_parser import extract_text_section  # noqa: E402
 from simpler_setup.kernel_compiler import KernelCompiler  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
-from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
+from simpler_setup.torch_interop import create_shared_tensor  # noqa: E402
 
 _F32 = DataType.FLOAT32
 
@@ -152,7 +152,7 @@ def build_affine_callable(platform: str) -> ChipCallable:
 
 def _domain_tensor_map(fill_value: float = 0.0) -> dict[str, dict[int, torch.Tensor]]:
     return {
-        name: {worker_idx: torch.full((COUNT,), fill_value, dtype=torch.float32).share_memory_() for worker_idx in ids}
+        name: {worker_idx: torch.full((COUNT,), fill_value, dtype=torch.float32) for worker_idx in ids}
         for name, ids in DOMAINS.items()
     }
 
@@ -175,12 +175,9 @@ def run(platform: str, device_ids: list[int]) -> int:
     assert nranks == 3
     print(f"[dual_domain_overlap] platform={platform} devices={device_ids}")
 
-    host_x = [
-        torch.tensor([rank * 100 + i for i in range(COUNT)], dtype=torch.float32).share_memory_()
-        for rank in range(nranks)
-    ]
-    scale = [torch.full((COUNT,), 0.5 + rank * 0.01, dtype=torch.float32).share_memory_() for rank in range(nranks)]
-    bias = [torch.full((COUNT,), 10.0 + rank, dtype=torch.float32).share_memory_() for rank in range(nranks)]
+    host_x = [torch.tensor([rank * 100 + i for i in range(COUNT)], dtype=torch.float32) for rank in range(nranks)]
+    scale = [torch.full((COUNT,), 0.5 + rank * 0.01, dtype=torch.float32) for rank in range(nranks)]
+    bias = [torch.full((COUNT,), 10.0 + rank, dtype=torch.float32) for rank in range(nranks)]
     reduce_out = _domain_tensor_map()
     affine_out = _domain_tensor_map()
 
@@ -198,9 +195,22 @@ def run(platform: str, device_ids: list[int]) -> int:
     allreduce_handle = worker.register(allreduce_cc)
     affine_handle = worker.register(affine_cc)
 
+    shared = {}
     try:
         print("[dual_domain_overlap] init worker...")
         worker.init()
+
+        shared["host_x"] = [create_shared_tensor(worker, tensor) for tensor in host_x]
+        shared["scale"] = [create_shared_tensor(worker, tensor) for tensor in scale]
+        shared["bias"] = [create_shared_tensor(worker, tensor) for tensor in bias]
+        shared["reduce_out"] = {
+            name: {i: create_shared_tensor(worker, tensor) for i, tensor in tensors.items()}
+            for name, tensors in reduce_out.items()
+        }
+        shared["affine_out"] = {
+            name: {i: create_shared_tensor(worker, tensor) for i, tensor in tensors.items()}
+            for name, tensors in affine_out.items()
+        }
 
         def reduce_orch_fn(domain_name: str):
             def _orch_fn(orch, _args, cfg):
@@ -220,10 +230,8 @@ def run(platform: str, device_ids: list[int]) -> int:
                             f"scratch=0x{domain.buffers['scratch'].base:x} ctx=0x{domain.device_ctx:x}"
                         )
                         args = TaskArgs()
-                        args.add_tensor(make_tensor_arg(worker, host_x[worker_idx]), TensorArgType.INPUT)
-                        args.add_tensor(
-                            make_tensor_arg(worker, reduce_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING
-                        )
+                        args.add_tensor(shared["host_x"][worker_idx][0], TensorArgType.INPUT)
+                        args.add_tensor(shared["reduce_out"][domain_name][worker_idx][0], TensorArgType.OUTPUT_EXISTING)
                         _add_domain_scratch(args, domain)
                         args_list.append(args)
                     orch.submit_next_level_group(allreduce_handle, args_list, cfg, workers=worker_indices)
@@ -235,12 +243,10 @@ def run(platform: str, device_ids: list[int]) -> int:
                 args_list = []
                 for worker_idx in worker_indices:
                     args = TaskArgs()
-                    args.add_tensor(make_tensor_arg(worker, reduce_out[domain_name][worker_idx]), TensorArgType.INPUT)
-                    args.add_tensor(make_tensor_arg(worker, scale[worker_idx]), TensorArgType.INPUT)
-                    args.add_tensor(make_tensor_arg(worker, bias[worker_idx]), TensorArgType.INPUT)
-                    args.add_tensor(
-                        make_tensor_arg(worker, affine_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING
-                    )
+                    args.add_tensor(shared["reduce_out"][domain_name][worker_idx][0], TensorArgType.INPUT)
+                    args.add_tensor(shared["scale"][worker_idx][0], TensorArgType.INPUT)
+                    args.add_tensor(shared["bias"][worker_idx][0], TensorArgType.INPUT)
+                    args.add_tensor(shared["affine_out"][domain_name][worker_idx][0], TensorArgType.OUTPUT_EXISTING)
                     args_list.append(args)
                 orch.submit_next_level_group(affine_handle, args_list, cfg, workers=worker_indices)
 
@@ -248,6 +254,11 @@ def run(platform: str, device_ids: list[int]) -> int:
         for domain_name in DOMAINS:
             worker.run(reduce_orch_fn(domain_name), args=None, config=CallConfig())
         worker.run(affine_orch_fn, args=None, config=CallConfig())
+
+        for name, worker_indices in DOMAINS.items():
+            for i in worker_indices:
+                reduce_out[name][i].copy_(shared["reduce_out"][name][i][1])
+                affine_out[name][i].copy_(shared["affine_out"][name][i][1])
 
         ok = True
         for domain_name, worker_indices in DOMAINS.items():
@@ -275,6 +286,7 @@ def run(platform: str, device_ids: list[int]) -> int:
         print("[dual_domain_overlap] all golden checks PASSED")
         return 0
     finally:
+        shared.clear()
         worker.close()
 
 

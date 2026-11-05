@@ -52,7 +52,7 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
-from simpler_setup.torch_interop import make_tensor_arg
+from simpler_setup.torch_interop import create_shared_tensor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Reuse the L2 vector_add kernel verbatim — this example only varies ring sizing.
@@ -170,11 +170,10 @@ def run(platform: str, device_id: int) -> int:
     """Core logic — callable from both CLI and pytest."""
     print(f"[per_task_runtime_env] device={device_id}, {len(L2_TASKS)} L2 tasks")
 
-    # Shared-memory tensors so the forked chip child writes results the parent
-    # sees in place (no explicit copy_back). One (a, b, out) triple per L2.
-    host_a = [torch.full((N_ROWS, N_COLS), t["a"], dtype=torch.float32).share_memory_() for t in L2_TASKS]
-    host_b = [torch.full((N_ROWS, N_COLS), t["b"], dtype=torch.float32).share_memory_() for t in L2_TASKS]
-    host_out = [torch.zeros(N_ROWS, N_COLS, dtype=torch.float32).share_memory_() for _ in L2_TASKS]
+    # One host (a, b, out) triple per L2 task.
+    host_a = [torch.full((N_ROWS, N_COLS), t["a"], dtype=torch.float32) for t in L2_TASKS]
+    host_b = [torch.full((N_ROWS, N_COLS), t["b"], dtype=torch.float32) for t in L2_TASKS]
+    host_out = [torch.zeros(N_ROWS, N_COLS, dtype=torch.float32) for _ in L2_TASKS]
     expected = [a + b for a, b in zip(host_a, host_b)]
 
     worker = Worker(
@@ -191,7 +190,11 @@ def run(platform: str, device_id: int) -> int:
 
     print("[per_task_runtime_env] init worker...")
     worker.init()
+    shared = {}
     try:
+        shared["host_a"] = [create_shared_tensor(worker, tensor) for tensor in host_a]
+        shared["host_b"] = [create_shared_tensor(worker, tensor) for tensor in host_b]
+        shared["host_out"] = [create_shared_tensor(worker, tensor) for tensor in host_out]
 
         def orch_fn(orch, _args, _cfg):
             # One chip task per L2 spec, each with its OWN runtime_env. This is
@@ -199,15 +202,18 @@ def run(platform: str, device_id: int) -> int:
             # launch, each binding its own rings.
             for i, spec in enumerate(L2_TASKS):
                 chip_args = TaskArgs()
-                chip_args.add_tensor(make_tensor_arg(worker, host_a[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(worker, host_b[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(worker, host_out[i]), TensorArgType.OUTPUT_EXISTING)
+                chip_args.add_tensor(shared["host_a"][i][0], TensorArgType.INPUT)
+                chip_args.add_tensor(shared["host_b"][i][0], TensorArgType.INPUT)
+                chip_args.add_tensor(shared["host_out"][i][0], TensorArgType.OUTPUT_EXISTING)
                 cfg = _l2_config(_cfg, spec)
                 print(f"[per_task_runtime_env] submit '{spec['label']}': runtime_env={cfg.runtime_env!r}")
                 orch.submit_next_level(chip_handle, chip_args, cfg, worker=0)
 
         print(f"[per_task_runtime_env] running DAG ({len(L2_TASKS)} L2 tasks, distinct rings)...")
         worker.run(orch_fn, args=None, config=CallConfig())
+
+        for i in range(len(host_out)):
+            host_out[i].copy_(shared["host_out"][i][1])
 
         for i, spec in enumerate(L2_TASKS):
             max_diff = float(torch.max(torch.abs(host_out[i] - expected[i])))
@@ -216,6 +222,7 @@ def run(platform: str, device_id: int) -> int:
 
         print("[per_task_runtime_env] all golden checks PASSED ✅")
     finally:
+        shared.clear()
         worker.close()
     return 0
 

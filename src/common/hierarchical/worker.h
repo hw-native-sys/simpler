@@ -67,6 +67,8 @@ public:
     // installation) also runs in the ctor, still in the parent, before
     // child forks.
     explicit Worker(int32_t level, uint64_t heap_ring_size = DEFAULT_HEAP_RING_SIZE);
+    Worker(int32_t level, uint64_t heap_ring_size, const std::vector<int> &heap_fds);
+    std::vector<int> shared_heap_fds() const { return allocator_.shared_fds(); }
     ~Worker();
 
     Worker(const Worker &) = delete;

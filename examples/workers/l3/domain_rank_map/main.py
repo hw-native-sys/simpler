@@ -54,6 +54,7 @@ from simpler.worker import Worker  # noqa: E402
 from simpler_setup.elf_parser import extract_text_section  # noqa: E402
 from simpler_setup.kernel_compiler import KernelCompiler  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
+from simpler_setup.torch_interop import create_shared_tensor  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _F32 = DataType.FLOAT32
@@ -128,11 +129,11 @@ def run(platform: str, device_ids: list[int]) -> int:
         worker_idx: torch.tensor(
             [worker_idx * 100 + i for i in range(COUNT)],
             dtype=torch.float32,
-        ).share_memory_()
+        )
         for worker_idx in range(len(device_ids))
     }
     outputs = {
-        name: {worker_idx: torch.zeros(COUNT, dtype=torch.float32).share_memory_() for worker_idx in worker_indices}
+        name: {worker_idx: torch.zeros(COUNT, dtype=torch.float32) for worker_idx in worker_indices}
         for name, worker_indices in DOMAINS.items()
     }
 
@@ -207,11 +208,11 @@ def run(platform: str, device_ids: list[int]) -> int:
                     domain = handle[worker_idx]
                     args = TaskArgs()
                     args.add_tensor(
-                        worker.make_tensor_arg(host_inputs[worker_idx], shapes=(COUNT,), dtype=_F32),
+                        shared["host_inputs"][worker_idx][0],
                         TensorArgType.INPUT,
                     )
                     args.add_tensor(
-                        worker.make_tensor_arg(outputs[domain_name][worker_idx], shapes=(COUNT,), dtype=_F32),
+                        shared["outputs"][domain_name][worker_idx][0],
                         TensorArgType.OUTPUT_EXISTING,
                     )
                     _add_domain_scratch(args, domain)
@@ -220,9 +221,16 @@ def run(platform: str, device_ids: list[int]) -> int:
 
         return _orch_fn
 
+    shared = {}
     try:
         print("[domain_rank_map] init worker...")
         worker.init()
+
+        shared["host_inputs"] = {i: create_shared_tensor(worker, tensor) for i, tensor in host_inputs.items()}
+        shared["outputs"] = {
+            name: {i: create_shared_tensor(worker, tensor) for i, tensor in tensors.items()}
+            for name, tensors in outputs.items()
+        }
 
         print("[domain_rank_map] verifying domain rank map...")
         worker.run(verify_orch_fn, args=None, config=CallConfig())
@@ -232,6 +240,10 @@ def run(platform: str, device_ids: list[int]) -> int:
         print("[domain_rank_map] running one allreduce per domain...")
         for domain_name in DOMAINS:
             worker.run(reduce_orch_fn(domain_name), args=None, config=CallConfig())
+
+        for name, tensors in outputs.items():
+            for i, tensor in tensors.items():
+                tensor.copy_(shared["outputs"][name][i][1])
 
         ok = state["ok"]
         for domain_name, worker_indices in DOMAINS.items():
@@ -249,6 +261,7 @@ def run(platform: str, device_ids: list[int]) -> int:
         print("[domain_rank_map] communication checks PASSED")
         return 0
     finally:
+        shared.clear()
         worker.close()
 
 

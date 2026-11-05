@@ -8,7 +8,7 @@ chip outputs. The smallest correct L3 program.
 
 | Concept | Where it shows up in `main.py` |
 | ------- | ------------------------------ |
-| Shared-memory tensors | `torch.randn(...).share_memory_()` — chip children see the same storage |
+| Shared Buffers | `create_shared_tensor(worker, tensor)` returns a task argument and a shared Torch view |
 | `TensorArgType` tags | `INPUT` / `OUTPUT_EXISTING` drive DAG dependency tracking |
 | ChipCallable handle | `chip_handle = worker.register(chip_callable)` **before** `init()` |
 | Python SubWorker | `sub_handle = worker.register(fn)` **before** `init()` |
@@ -59,33 +59,47 @@ explicitly.
 
 ## The lifecycle, step by step
 
-### 1. Pre-init — shared-memory tensors + callable registration
+### 1. Pre-init: prepare inputs and register callables
 
 ```python
-host_a   = [torch.randn(...).share_memory_() for _ in device_ids]
-host_b   = [torch.randn(...).share_memory_() for _ in device_ids]
-host_out = [torch.zeros(...).share_memory_() for _ in device_ids]
+host_a   = [torch.randn(...) for _ in device_ids]
+host_b   = [torch.randn(...) for _ in device_ids]
+host_out = [torch.zeros(...) for _ in device_ids]
 
 def subworker(sub_args): ...
 chip_handle = worker.register(chip_callable)   # ChipCallable: BEFORE init()
 sub_handle  = worker.register(subworker)        # Python SubWorker: BEFORE init()
 ```
 
-`share_memory_()` moves the tensor's storage to a `mmap` region. After
-`fork()`, the chip child process has that region mapped at the same virtual
-address, so when the kernel writes to `host_out[i]`, the parent's tensor sees
-it immediately. No explicit copy back.
+Ordinary Torch tensors hold inputs and golden values. After initialization,
+explicit shared Buffers supply the chip arguments; children attach their
+backing from descriptors rather than inheriting parent virtual addresses.
 
 This example calls **`register()` before `init()`** for every callable — both
 the `ChipCallable` dispatched to chips and the Python sub functions — so
 startup can seed child registries and pre-warm chip callables before the first
 DAG dispatch.
 
-### 2. `init()` — fork + C++ scheduler
+### 2. `init()`: child processes and the C++ scheduler
 
 Worker allocates `MAILBOX_SIZE` shared-memory mailboxes (one per chip, one per
-sub), forks child processes, and starts the C++ scheduler. After this call
+sub), starts child processes, and starts the C++ scheduler. After this call
 returns, 4 processes are alive: parent, sub, chip 0, chip 1.
+
+After initialization, copy inputs and outputs into Worker-owned shared Buffers:
+
+```python
+from simpler_setup.torch_interop import create_shared_tensor
+
+shared = {
+    "host_a": [create_shared_tensor(worker, t) for t in host_a],
+    "host_b": [create_shared_tensor(worker, t) for t in host_b],
+    "host_out": [create_shared_tensor(worker, t) for t in host_out],
+}
+```
+
+Each entry is `(Tensor, Torch view)`. Tasks access the same backing while
+the original Torch tensor remains independent.
 
 ### 3. Orchestration function — submit nodes
 
@@ -93,14 +107,14 @@ returns, 4 processes are alive: parent, sub, chip 0, chip 1.
 def orch_fn(orch, _args, cfg):
     for i in range(len(device_ids)):
         chip_args = TaskArgs()
-        chip_args.add_tensor(make_chip_tensor_arg(host_a[i]),   TensorArgType.INPUT)
-        chip_args.add_tensor(make_chip_tensor_arg(host_b[i]),   TensorArgType.INPUT)
-        chip_args.add_tensor(make_chip_tensor_arg(host_out[i]), TensorArgType.OUTPUT_EXISTING)
+        chip_args.add_tensor(shared["host_a"][i][0],   TensorArgType.INPUT)
+        chip_args.add_tensor(shared["host_b"][i][0],   TensorArgType.INPUT)
+        chip_args.add_tensor(shared["host_out"][i][0], TensorArgType.OUTPUT_EXISTING)
         orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
     sub_args = TaskArgs()
     for i in range(len(device_ids)):
-        sub_args.add_tensor(make_chip_tensor_arg(host_out[i]), TensorArgType.INPUT)
+        sub_args.add_tensor(shared["host_out"][i][0], TensorArgType.INPUT)
     orch.submit_sub(sub_handle, sub_args)
 ```
 
@@ -121,12 +135,14 @@ written, sub task has run.
 
 ### 5. Verify + close
 
-Because `host_out` is shared memory, reading it in the parent gives the chip
-output directly. No `copy_from` needed.
+Read outputs from the shared views. This example copies them into the
+original Torch tensors for golden checks. Drop every shared view before close.
 
 ```python
 for i in range(len(device_ids)):
+    host_out[i].copy_(shared["host_out"][i][1])
     assert torch.allclose(host_out[i], expected[i], rtol=1e-5, atol=1e-5)
+shared.clear()
 worker.close()
 ```
 
@@ -157,9 +173,8 @@ from host memory, but the runtime handles DMA transparently based on the
 
 ## Common pitfalls
 
-- **Not using `share_memory_()`** → chip child sees zeros where it expects
-  inputs. `torch` tensors without `share_memory_()` live in each process's
-  private heap.
+- **Passing legacy fork arguments to onboard chips**: a new interpreter cannot
+  use parent virtual addresses; create shared Buffers explicitly.
 - **Forgetting `OUTPUT_EXISTING` on writable tensors** → runtime treats them
   as new allocations rather than writing into the provided buffer, and the
   sub task reads from a different tensor than the one the host expects.

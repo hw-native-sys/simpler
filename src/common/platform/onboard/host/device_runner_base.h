@@ -946,21 +946,21 @@ public:
     );
 
     /**
-     * Create a thread bound to this device. The thread calls
-     * rtSetDevice(device_id) on entry.
+     * Create a thread bound to this context without acquiring a device reference.
+     * Context binding failures are reported before the callback runs.
      */
     std::thread create_thread(std::function<void()> fn);
 
     /**
-     * Bind the calling thread to a device, taking nothing else from it.
-     *
-     * Idempotent for the same id; errors if called with a different id after
-     * a prior adopt. Creates no streams and records no identity.
+     * Acquire one owned device reference and bind subsequent threads to its exact context.
+     * Creates no streams; a different device or a borrowed context is refused.
      *
      * @param device_id  Device ID (0-15)
      * @return 0 on success, error code on failure.
      */
     int bind_current_thread(int device_id);
+    /** Lazily acquire ACL initialization and one ACL device reference. */
+    int ensure_acl_ready(int device_id);
 
     /**
      * Bind the current host thread and adopt the device for a program
@@ -2110,6 +2110,11 @@ protected:
     DeviceRunnerBase();
 
     virtual int finalize_impl() = 0;
+    int release_owned_device_binding(
+        bool &reset_completed, const std::function<void(TeardownResetApi, int)> &record_reset = {}
+    );
+    int finalize_owned_acl();
+    void retire_owned_device_binding() noexcept;
     void begin_fatal_close() {
         if (!terminal_close_generation_.has_value()) terminal_close_generation_ = device_health_.generation();
     }
@@ -2969,11 +2974,18 @@ protected:
     //
     // Which device this context is on — not a claim of ownership, which the
     // execution-mode latch carries instead. Written once before any prepare,
-    // execution or collector thread attaches: `attach_current_thread` writes
+    // execution or collector thread attaches: `bind_current_thread` writes
     // it for a program context and `adopt_borrowed_device` for a kernel one, both
     // guarded on the still-unset value, so repeated same-value writes from
     // later-attaching threads cannot race.
     int device_id_{-1};
+    // Each successful device acquisition owes its own reset, including a failed capture.
+    rtContext_t owned_context_{nullptr};
+    bool rts_device_ref_{false};
+    bool acl_device_ref_{false};
+    bool acl_ready_{false};
+    bool acl_init_owned_{false};
+    bool timeout_configured_{false};
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     // Recorded by `stage_workspace_management` before init and consumed once

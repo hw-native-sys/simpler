@@ -123,8 +123,8 @@ def make_tensor_arg(worker, tensor):
     """A ``Tensor`` task arg over a **pre-fork** host torch tensor.
 
     Names ``tensor`` as a memoized ``FORK_SHM`` handle on ``worker`` (``worker.make_tensor_arg``), inferring
-    shapes + dtype from the tensor. Use for standalone L3 examples whose host inputs/outputs are
-    ``share_memory_()`` tensors allocated before ``worker.init()`` (fork-inherited). A contiguous CPU
+    shapes + dtype from the tensor. Only same-process or fork-inherited consumers can use this
+    reference; onboard chip children require ``create_shared_tensor`` instead. A contiguous CPU
     tensor is required (as for ``make_chip_tensor_arg``).
     """
     _ensure_torch_map()
@@ -137,3 +137,29 @@ def make_tensor_arg(worker, tensor):
         raise ValueError("make_tensor_arg requires a contiguous tensor; call tensor.contiguous() first.")
     shapes = tuple(int(s) for s in tensor.shape)
     return worker.make_tensor_arg(tensor, shapes=shapes, dtype=int(dt.value))
+
+
+def create_shared_tensor(worker, tensor):
+    """Copy a contiguous, nonempty CPU tensor into a Worker-owned shared Buffer.
+
+    Return ``(Tensor, torch.Tensor)``: the address-free task argument and a host view of the same
+    backing. Reuse the argument across producer/consumer tasks to preserve its identity. The view
+    sees task outputs in place; the source tensor is independent. Drop every view before
+    ``worker.close()``, which releases the backing. The Worker must already be initialized.
+    """
+    import torch
+
+    dtype = torch_dtype_to_datatype(tensor.dtype)
+    if tensor.device.type != "cpu" or not tensor.is_contiguous() or tensor.numel() == 0:
+        raise ValueError("create_shared_tensor requires a contiguous, nonempty CPU tensor")
+    handle = worker.create_buffer(tensor.numel() * tensor.element_size())
+    view = None
+    try:
+        assert handle.shm is not None
+        view = torch.frombuffer(handle.shm.buf, dtype=tensor.dtype, count=tensor.numel()).view(tensor.shape)
+        view.copy_(tensor)
+        return handle.tensor(tuple(tensor.shape), dtype), view
+    except BaseException:
+        view = None
+        worker.release_buffer(handle)
+        raise

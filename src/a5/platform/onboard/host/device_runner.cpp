@@ -124,52 +124,6 @@ DeviceRunner::~DeviceRunner() { finalize(); }
 // Comm/ACL lifecycle methods are arch-specific (HCCL backend), so they
 // stay on DeviceRunner rather than DeviceRunnerBase. Mirrors a2a3 onboard.
 
-int DeviceRunner::ensure_acl_ready(int device_id) {
-    if (device_id < 0) {
-        LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    // aclInit / aclrtSetDevice below, and the aclFinalize this records
-    // responsibility for, are acts of device ownership, so reaching this entry
-    // makes the context a program context. Latching here rather than merely
-    // testing is_kernel() closes the unclaimed path: ensure_acl_ready_ctx is a
-    // standalone initialization entry that callers reach without simpler_init
-    // (tests/ut/cpp/common/platform_comm/test_comm_lifecycle.cpp), and an unlatched context
-    // that took ACL ownership would later let a kernel latch coexist with
-    // acl_ready_, whose finalize resets a device this context does not own.
-    // Latching before the first ACL call is also what keeps the refusal
-    // side-effect-free. The latch is write-once: an ACL failure below leaves
-    // the identity in place, and a repeat call re-latches the same mode.
-    const int mode_rc = execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
-    if (mode_rc != 0) {
-        LOG_ERROR("ensure_acl_ready: refused — this context already belongs to kernel mode");
-        return mode_rc;
-    }
-
-    // aclInit is process-wide; CANN returns 100002 if it has already been
-    // initialized (possibly by another owner), which we treat as success.
-    constexpr int kAclRepeatInit = 100002;
-    aclError aRet = aclInit(nullptr);
-    if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != kAclRepeatInit) {
-        LOG_ERROR("aclInit failed: %d", static_cast<int>(aRet));
-        ACL_LOG_ERROR_DETAIL(aRet);
-        return static_cast<int>(aRet);
-    }
-
-    // ACL device binding is per-thread; every caller must still hit it.
-    aRet = aclrtSetDevice(device_id);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("aclrtSetDevice(%d) failed: %d", device_id, static_cast<int>(aRet));
-        ACL_LOG_ERROR_DETAIL(aRet);
-        return static_cast<int>(aRet);
-    }
-
-    // Record that we are responsible for aclFinalize at teardown.
-    acl_ready_ = true;
-    if (device_id_ < 0) device_id_ = device_id;
-    return 0;
-}
-
 void *DeviceRunner::create_comm_stream() {
     aclrtStream stream = nullptr;
     aclError aRet = aclrtCreateStream(&stream);
@@ -1309,15 +1263,9 @@ int DeviceRunner::finalize_impl() {
         abandon_shared_collectors_after_device_reset();
         dep_gen_collector_.abandon_after_device_reset();
         int abandon_rc = abandon_common_after_device_failure();
-        if (acl_ready_) {
-            const int finalize_rc = aclFinalize();
-            if (finalize_rc != 0) {
-                LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
-                if (abandon_rc == 0) abandon_rc = finalize_rc;
-            } else {
-                acl_ready_ = false;
-            }
-        }
+        retire_owned_device_binding();
+        const int acl_rc = finalize_owned_acl();
+        if (abandon_rc == 0) abandon_rc = acl_rc;
 
         if (abandon_rc == 0) {
             device_id_ = -1;
@@ -1331,7 +1279,7 @@ int DeviceRunner::finalize_impl() {
     // A kernel-mode context runs on the caller's already-current device, so
     // this thread needs no bind and the context owns no device state to adopt.
     int rc = 0;
-    if (!execution_mode_latch().is_kernel()) {
+    if (owned_context_ != nullptr) {
         rc = bind_current_thread(device_id_);
         if (rc != 0) {
             LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
@@ -1359,34 +1307,9 @@ int DeviceRunner::finalize_impl() {
     // can report without diverting teardown.
     if (rc != 0 && execution_mode_latch().is_kernel()) return rc;
 
-    // Reset device and finalize ACL AFTER all device memory is freed. When the
-    // ACL layer was brought up (comm path), aclrtResetDevice supersedes
-    // rtDeviceReset and additionally releases ACL's per-thread ref-count;
-    // calling raw rtDeviceReset in that state would leave ACL with stale
-    // bookkeeping. Pure rt-layer runtimes that never asked for ACL still get
-    // the bare rtDeviceReset.
     bool reset_completed = false;
-    if (acl_ready_ && device_id_ >= 0) {
-        int reset_rc = aclrtResetDevice(device_id_);
-        if (reset_rc != 0) {
-            LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
-            if (rc == 0) rc = reset_rc;
-        }
-        reset_completed = reset_rc == 0;
-        int finalize_rc = aclFinalize();
-        if (finalize_rc != 0) {
-            LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
-            if (rc == 0) rc = finalize_rc;
-        }
-        acl_ready_ = false;
-    } else if (!execution_mode_latch().is_kernel()) {
-        int reset_rc = rtDeviceReset(device_id_);
-        if (reset_rc != 0) {
-            LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
-            if (rc == 0) rc = reset_rc;
-        }
-        reset_completed = reset_rc == 0;
-    }
+    const int binding_rc = release_owned_device_binding(reset_completed);
+    if (rc == 0) rc = binding_rc;
     // A successful reset invalidates the retained loader handle.
     // If reset failed, abandon the handle to prevent an implicit unload;
     // the device binary may remain resident and release is unconfirmed.
@@ -1395,12 +1318,11 @@ int DeviceRunner::finalize_impl() {
     // forget a handle without unloading it. The helper's latch guard is
     // what makes that inert, independently of the early return above.
     retire_loader_after_device_teardown(reset_completed);
+    if (binding_rc != 0) return rc;
 
     // A poisoned card returned from the fatal branch at the top of finalize(),
     // which owns the force reset, so the card reaching here is not poisoned.
-    // Its reset may still have failed: `rc` carries that, and every owner —
-    // including the loader handle retired just above — has already been
-    // released or abandoned, so there is nothing a later close could reach.
+    // Device references and owned ACL initialization have both been released.
     clear_aicpu_topology_cache();
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);

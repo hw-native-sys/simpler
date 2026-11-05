@@ -122,10 +122,28 @@ class TimeoutRunner : public Runner {
 public:
     TimeoutRunner() {
         device_id_ = -1;
+        timeout_configured_ = false;
         callables_.clear();
         chip_callable_buffers_.clear();
     }
     HostRuntimeTimeoutConfig timeouts() const { return timeout_config_; }
+};
+
+class OwnedContextRunner : public TimeoutRunner {
+public:
+    ~OwnedContextRunner() override { EXPECT_EQ(finalize(), 0); }
+    int finalize_impl() override {
+        if (owned_context_ != nullptr) {
+            const int rc = bind_current_thread(device_id_);
+            if (rc != 0) return rc;
+        }
+        const int rc = finalize_common();
+        if (rc != 0) return rc;
+        bool reset = false;
+        const int release_rc = release_owned_device_binding(reset);
+        if (release_rc == 0) device_id_ = -1;
+        return release_rc;
+    }
 };
 
 // Only kernel execution is supplied by the transport. The C API, boundary
@@ -1099,6 +1117,189 @@ TEST_F(NativeAdmissionTest, SdkErrorWithoutPhysicalCompletionRetainsTheOwner) {
         },
         ::testing::ExitedWithCode(0), ""
     );
+}
+
+TEST_F(NativeAdmissionTest, OwnedContextRebindsExactIdentityWithoutRetainingAgain) {
+    OwnedContextRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    rtContext_t owned = nullptr;
+    ASSERT_EQ(rtCtxGetCurrent(&owned), 0);
+    ASSERT_NE(owned, nullptr);
+    int foreign;
+    ASSERT_EQ(rtCtxSetCurrent(&foreign), 0);
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    EXPECT_EQ(control().last_bound_context, owned);
+    bool called = false;
+    auto thread = runner.create_thread([&] {
+        rtContext_t actual = nullptr;
+        EXPECT_EQ(rtCtxGetCurrent(&actual), 0);
+        EXPECT_EQ(actual, owned);
+        called = true;
+    });
+    thread.join();
+    EXPECT_TRUE(called);
+    EXPECT_EQ(control().device_set_calls, 1u);
+    EXPECT_EQ(control().op_timeout_calls, 1u);
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_EQ(control().device_refs, 0);
+    EXPECT_EQ(control().device_reset_calls, 1u);
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_EQ(control().device_reset_calls, 1u);
+}
+
+TEST_F(NativeAdmissionTest, ContextCaptureFailureKeepsDebtWithoutAdoptingLaterForeignContext) {
+    for (bool acl_first : {false, true}) {
+        SCOPED_TRACE(acl_first);
+        for (bool null_context : {false, true}) {
+            SCOPED_TRACE(null_context);
+            control() = {};
+            OwnedContextRunner runner;
+            control().context_get_rc = null_context ? 0 : -4242;
+            control().null_context = null_context;
+            EXPECT_NE(acl_first ? runner.ensure_acl_ready(0) : runner.attach_current_thread(0), 0);
+            control().context_get_rc = 0;
+            control().null_context = false;
+            int foreign;
+            ASSERT_EQ(rtCtxSetCurrent(&foreign), 0);
+            EXPECT_EQ(runner.attach_current_thread(0), PTO_RUNTIME_ERR_INVALID_STATE);
+            EXPECT_EQ(runner.ensure_acl_ready(0), PTO_RUNTIME_ERR_INVALID_STATE);
+            EXPECT_EQ(control().context_get_calls, 1u);
+            EXPECT_EQ(control().device_set_calls, 1u);
+            EXPECT_EQ(runner.finalize(), 0);
+            EXPECT_EQ(control().device_refs, 0);
+            EXPECT_EQ(control().device_reset_calls, 1u);
+            EXPECT_EQ(control().acl_finalize_calls, acl_first ? 1u : 0u);
+        }
+    }
+}
+
+TEST_F(NativeAdmissionTest, ThreadContextStartupFailureIsReportedBeforeUserCode) {
+    OwnedContextRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    // The parent bind succeeds; the child is the next setter call.
+    control().context_set_rc = -4242;
+    control().fail_context_set_call = control().context_set_calls + 2;
+    bool called = false;
+    EXPECT_THROW(
+        runner.create_thread([&] {
+            called = true;
+        }),
+        std::runtime_error
+    );
+    EXPECT_FALSE(called);
+    control().context_set_rc = 0;
+    EXPECT_EQ(runner.finalize(), 0);
+}
+
+TEST_F(NativeAdmissionTest, ClosingOwnedContextPreservesReferencesHeldByOtherOwners) {
+    ASSERT_EQ(rtSetDevice(0), 0);
+    OwnedContextRunner runner;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        ASSERT_EQ(runner.attach_current_thread(0), 0);
+        EXPECT_EQ(control().device_refs, 2);
+        ASSERT_EQ(runner.finalize(), 0);
+        EXPECT_EQ(control().device_refs, 1);
+        EXPECT_FALSE(control().retired);
+    }
+    EXPECT_EQ(control().op_timeout_calls, 3u);
+    EXPECT_EQ(rtDeviceReset(0), 0);
+    EXPECT_EQ(control().device_refs, 0);
+}
+
+TEST_F(NativeAdmissionTest, BorrowedCollectorThreadUsesCallerContextWithoutOwningADeviceReference) {
+    OwnedContextRunner runner;
+    ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL), 0);
+    KernelContextOps ops{&runner,
+                         fake_current_device,
+                         fake_current_context,
+                         fake_create_hidden_stream,
+                         fake_destroy_hidden_stream,
+                         fake_create_event,
+                         fake_destroy_event};
+    ASSERT_EQ(runner.kernel_execution_state().initialize(0, ops), 0);
+    ASSERT_EQ(runner.adopt_borrowed_device(0), 0);
+    void *borrowed = nullptr;
+    ASSERT_EQ(fake_current_context(nullptr, &borrowed), 0);
+    ASSERT_EQ(rtCtxSetCurrent(borrowed), 0);
+    auto thread = runner.create_thread([&] {
+        rtContext_t actual = nullptr;
+        EXPECT_EQ(rtCtxGetCurrent(&actual), 0);
+        EXPECT_EQ(actual, borrowed);
+    });
+    thread.join();
+    EXPECT_EQ(runner.bind_current_thread(0), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_EQ(control().device_set_calls, 0u);
+    EXPECT_EQ(control().device_reset_calls, 0u);
+}
+
+TEST_F(NativeAdmissionTest, FailedResetCanRetryWithoutAcquiringAnotherReference) {
+    OwnedContextRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    control().reset_error = -4242;
+    EXPECT_EQ(runner.finalize(), -4242);
+    EXPECT_EQ(control().device_refs, 1);
+    EXPECT_EQ(runner.attach_current_thread(0), 0);
+    control().reset_error = 0;
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_EQ(control().device_refs, 0);
+    EXPECT_EQ(control().device_set_calls, 1u);
+}
+
+TEST_F(NativeAdmissionTest, AclAndRtsReferencesAreBalancedBeforeOwnedAclFinalize) {
+    for (bool external_init : {false, true}) {
+        SCOPED_TRACE(external_init);
+        for (bool rts_first : {false, true}) {
+            SCOPED_TRACE(rts_first);
+            control() = {};
+            OwnedContextRunner runner;
+            control().acl_init_rc = external_init ? 100002 : 0;
+            if (rts_first) ASSERT_EQ(runner.attach_current_thread(0), 0);
+            ASSERT_EQ(runner.ensure_acl_ready(0), 0);
+            ASSERT_EQ(runner.ensure_acl_ready(0), 0);
+            ASSERT_EQ(runner.attach_current_thread(0), 0);
+            EXPECT_EQ(control().device_refs, rts_first ? 2 : 1);
+            EXPECT_EQ(control().acl_set_calls, 1u);
+            EXPECT_EQ(runner.finalize(), 0);
+            EXPECT_EQ(control().device_refs, 0);
+            EXPECT_EQ(control().device_reset_calls, rts_first ? 2u : 1u);
+            EXPECT_EQ(control().acl_finalize_calls, external_init ? 0u : 1u);
+            EXPECT_EQ(control().refs_at_acl_finalize, external_init ? -1 : 0);
+        }
+    }
+}
+
+TEST_F(NativeAdmissionTest, AclInitOwnershipSurvivesDeviceInitFailureAndRespectsExternalInit) {
+    for (bool external : {false, true}) {
+        SCOPED_TRACE(external);
+        control() = {};
+        OwnedContextRunner runner;
+        control().acl_init_rc = external ? 100002 : 0;
+        control().acl_set_rc = -4242;
+        EXPECT_EQ(runner.ensure_acl_ready(0), -4242);
+        EXPECT_EQ(runner.finalize(), 0);
+        EXPECT_EQ(control().acl_finalize_calls, external ? 0u : 1u);
+        EXPECT_EQ(control().device_refs, 0);
+    }
+}
+
+TEST_F(NativeAdmissionTest, AclResetAndFinalizeFailuresPreserveOnlyOutstandingCleanup) {
+    OwnedContextRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    ASSERT_EQ(runner.ensure_acl_ready(0), 0);
+    control().acl_reset_rc = -4242;
+    EXPECT_EQ(runner.finalize(), -4242);
+    EXPECT_EQ(control().device_refs, 2);
+    EXPECT_EQ(control().acl_finalize_calls, 0u);
+    control().acl_reset_rc = 0;
+    control().acl_finalize_rc = -4243;
+    EXPECT_EQ(runner.finalize(), -4243);
+    EXPECT_EQ(control().device_refs, 0);
+    control().acl_finalize_rc = 0;
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_EQ(control().device_reset_calls, 2u);
+    EXPECT_EQ(control().device_set_calls, 2u);
+    EXPECT_EQ(control().acl_finalize_calls, 2u);
 }
 
 TEST_F(NativeAdmissionTest, ProgramColdCleanupDebtAbandonsOnlyAfterResetAttempt) {

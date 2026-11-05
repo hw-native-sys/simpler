@@ -14,10 +14,10 @@ input tensors), then runs a Python SubWorker that depends on the chip outputs.
 
 Primitives introduced over L2 (see ../../l2/vector_add/main.py for the L2 version):
 
-  * torch.share_memory_() tensors       — visible to forked chip children, IS the data plane
+  * Worker-owned shared Buffers          — attachable by chip and SUB children
   * TaskArgs + TensorArgType tags        — INPUT / OUTPUT_EXISTING drive DAG deps
   * Worker.register(python_fn)           — register Python callable runnable as a sub task
-  * Worker(level=3, device_ids=[...], num_sub_workers=N) — multi-chip + sub fork-and-serve
+  * Worker(level=3, device_ids=[...], num_sub_workers=N) — multi-chip + sub process dispatch
   * orch.submit_next_level(cb, args, cfg, worker=i)  — submit a chip task
   * orch.submit_sub(handle, args)        — submit a Python sub task
 
@@ -47,7 +47,7 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
-from simpler_setup.torch_interop import make_tensor_arg
+from simpler_setup.torch_interop import create_shared_tensor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -111,14 +111,11 @@ def run(platform: str, device_ids: list[int]) -> int:
     """Core logic — callable from both CLI and pytest."""
     print(f"[multi_chip_dispatch] devices={device_ids}")
 
-    # --- 1. Allocate shared-memory tensors (visible to forked chip processes).
-    # ``share_memory_()`` moves the storage into an mmap region, so when the
-    # chip process writes to ``host_out[i]`` the parent's tensor sees the
-    # update immediately — no explicit copy_back needed.
+    # --- 1. Prepare host inputs and golden outputs.
     torch.manual_seed(42)
-    host_a = [torch.randn(N_ROWS, N_COLS, dtype=torch.float32).share_memory_() for _ in device_ids]
-    host_b = [torch.randn(N_ROWS, N_COLS, dtype=torch.float32).share_memory_() for _ in device_ids]
-    host_out = [torch.zeros(N_ROWS, N_COLS, dtype=torch.float32).share_memory_() for _ in device_ids]
+    host_a = [torch.randn(N_ROWS, N_COLS, dtype=torch.float32) for _ in device_ids]
+    host_b = [torch.randn(N_ROWS, N_COLS, dtype=torch.float32) for _ in device_ids]
+    host_out = [torch.zeros(N_ROWS, N_COLS, dtype=torch.float32) for _ in device_ids]
     expected = [a + b for a, b in zip(host_a, host_b)]
 
     # --- 2. Worker(level=3, ...) construction. No fork / no ACL yet.
@@ -148,15 +145,20 @@ def run(platform: str, device_ids: list[int]) -> int:
     # Register the ChipCallable so submit_next_level takes a handle.
     chip_handle = worker.register(chip_callable)
 
-    # --- 5. init() forks chip + sub child processes, starts C++ scheduler.
+    # --- 5. init() starts chip + sub child processes and the C++ scheduler.
     print("[multi_chip_dispatch] init worker...")
     worker.init()
 
+    shared = {}
     try:
         # --- 6. Define the orchestration function. It runs in the parent
         # process once per worker.run() call. Each ``orch.submit_*`` adds a
         # node to the DAG; the scheduler (running on C++ threads) actually
         # dispatches the nodes to child processes.
+        shared["host_a"] = [create_shared_tensor(worker, tensor) for tensor in host_a]
+        shared["host_b"] = [create_shared_tensor(worker, tensor) for tensor in host_b]
+        shared["host_out"] = [create_shared_tensor(worker, tensor) for tensor in host_out]
+
         def orch_fn(orch, _args, cfg):
             # Submit one chip task per device. ``worker=i`` pins the task to
             # the i-th ChipWorker. TensorArgType drives dependency tracking:
@@ -164,9 +166,9 @@ def run(platform: str, device_ids: list[int]) -> int:
             #   OUTPUT_EXISTING = "task writes to this pre-allocated tensor"
             for i in range(len(device_ids)):
                 chip_args = TaskArgs()
-                chip_args.add_tensor(make_tensor_arg(worker, host_a[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(worker, host_b[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(worker, host_out[i]), TensorArgType.OUTPUT_EXISTING)
+                chip_args.add_tensor(shared["host_a"][i][0], TensorArgType.INPUT)
+                chip_args.add_tensor(shared["host_b"][i][0], TensorArgType.INPUT)
+                chip_args.add_tensor(shared["host_out"][i][0], TensorArgType.OUTPUT_EXISTING)
                 orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
             # Sub task that depends on both chip outputs. Tagging the two
@@ -174,7 +176,7 @@ def run(platform: str, device_ids: list[int]) -> int:
             # both chip tasks to finish before running the sub.
             sub_args = TaskArgs()
             for i in range(len(device_ids)):
-                sub_args.add_tensor(make_tensor_arg(worker, host_out[i]), TensorArgType.INPUT)
+                sub_args.add_tensor(shared["host_out"][i][0], TensorArgType.INPUT)
             orch.submit_sub(sub_handle, sub_args)
 
         # --- 7. Run the DAG. Worker.run() opens a scope, invokes orch_fn,
@@ -182,8 +184,10 @@ def run(platform: str, device_ids: list[int]) -> int:
         print("[multi_chip_dispatch] running DAG (2 chip tasks + 1 sub)...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
-        # --- 8. Verify outputs. ``host_out`` was written in-place by the
-        # chip processes via shared memory; no explicit copy needed.
+        for i in range(len(host_out)):
+            host_out[i].copy_(shared["host_out"][i][1])
+
+        # --- 8. Verify the outputs copied from the shared views.
         for i in range(len(device_ids)):
             max_diff = float(torch.max(torch.abs(host_out[i] - expected[i])))
             print(f"[multi_chip_dispatch] chip {i}: max |out - expected| = {max_diff:.3e}")
@@ -191,6 +195,7 @@ def run(platform: str, device_ids: list[int]) -> int:
 
         print("[multi_chip_dispatch] all golden checks PASSED ✅")
     finally:
+        shared.clear()
         # close() shuts down sub + chip child processes, unlinks shared memory.
         worker.close()
     return 0

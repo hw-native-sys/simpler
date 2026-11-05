@@ -133,6 +133,7 @@ nav:
           - 独立 block 原型历史测量: zh-cn/design/a5-hbg-graph-task/qwen-block-work.md
           - Qwen 历史测量与排查: zh-cn/design/a5-hbg-graph-task/qwen-performance-history.md
       - Worker Manager: worker-manager.md
+      - Chip startup and shared inputs (Chinese): zh-cn/chip-process-startup.md
       - Hardware:
           - Overview: hardware/README.md
           - Chip architecture: hardware/chip-architecture.md

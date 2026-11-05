@@ -14,9 +14,9 @@ Per rank, in one orch_fn:
   Stage 1 (AIC matmul):  partial_local = x_shard @ w_shard
   Stage 2 (AIV reduce):  y             = sum_over_ranks(partial_local)
 
-partial_local is a per-rank torch.share_memory_() tensor; it is the OUTPUT of
+partial_local is a per-rank shared Buffer; it is the OUTPUT of
 stage 1 and the INPUT of stage 2.  Because both submits see the same
-``buffer.addr``, the framework's TensorMap discovers the producer/consumer
+canonical Buffer identity, the framework's TensorMap discovers the producer/consumer
 edge automatically — no manual barriers in Python.  Cross-rank exchange in
 stage 2 still goes through a per-chip communication-window ``scratch`` buffer (laid
 out as ``[mailbox: nranks * M*N floats | signal tail: nranks int32 slots]``).
@@ -54,7 +54,7 @@ from simpler.worker import Worker  # noqa: E402
 from simpler_setup.elf_parser import extract_text_section  # noqa: E402
 from simpler_setup.kernel_compiler import KernelCompiler  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
-from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
+from simpler_setup.torch_interop import create_shared_tensor  # noqa: E402
 
 _F32 = DataType.FLOAT32
 
@@ -171,12 +171,12 @@ def run(
 
     print(f"[ffn_tp_parallel] platform={platform} devices={device_ids} nranks={nranks} M={M} K={K} N={N}")
 
-    # Per-rank host tensors via torch.share_memory_(): inputs, partial_local
+    # Per-rank host tensors: inputs, partial_local
     # (stage1 output / stage2 input), and final y (stage2 output).
-    host_x_shards = [make_rank_inputs(r)[0].share_memory_() for r in range(nranks)]
-    host_w_shards = [make_rank_inputs(r)[1].share_memory_() for r in range(nranks)]
-    host_partial = [torch.zeros(M, N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
-    host_y = [torch.zeros(M, N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
+    host_x_shards = [make_rank_inputs(r)[0] for r in range(nranks)]
+    host_w_shards = [make_rank_inputs(r)[1] for r in range(nranks)]
+    host_partial = [torch.zeros(M, N, dtype=torch.float32) for _ in range(nranks)]
+    host_y = [torch.zeros(M, N, dtype=torch.float32) for _ in range(nranks)]
 
     print("[ffn_tp_parallel] compiling kernels...")
     ffn_local_cc = build_ffn_local_callable(platform)
@@ -192,9 +192,15 @@ def run(
     ffn_handle = worker.register(ffn_local_cc)
     allreduce_handle = worker.register(allreduce_cc)
 
+    shared = {}
     try:
-        print("[ffn_tp_parallel] init worker (forks chip children; base comm is lazy)...")
+        print("[ffn_tp_parallel] init worker (starts chip children; base comm is lazy)...")
         worker.init()
+
+        shared["host_x_shards"] = [create_shared_tensor(worker, tensor) for tensor in host_x_shards]
+        shared["host_w_shards"] = [create_shared_tensor(worker, tensor) for tensor in host_w_shards]
+        shared["host_partial"] = [create_shared_tensor(worker, tensor) for tensor in host_partial]
+        shared["host_y"] = [create_shared_tensor(worker, tensor) for tensor in host_y]
 
         def orch_fn(orch, _args, cfg):
             with orch.allocate_domain(
@@ -214,17 +220,17 @@ def run(
                     # Stage 1: AIC matmul. partial_local is OUTPUT_EXISTING here;
                     # the framework records its ref identity as a producer.
                     a1 = TaskArgs()
-                    a1.add_tensor(make_tensor_arg(worker, host_x_shards[i]), TensorArgType.INPUT)
-                    a1.add_tensor(make_tensor_arg(worker, host_w_shards[i]), TensorArgType.INPUT)
-                    a1.add_tensor(make_tensor_arg(worker, host_partial[i]), TensorArgType.OUTPUT_EXISTING)
+                    a1.add_tensor(shared["host_x_shards"][i][0], TensorArgType.INPUT)
+                    a1.add_tensor(shared["host_w_shards"][i][0], TensorArgType.INPUT)
+                    a1.add_tensor(shared["host_partial"][i][0], TensorArgType.OUTPUT_EXISTING)
                     orch.submit_next_level(ffn_handle, a1, cfg, worker=i)
 
                     # Stage 2: AIV cross-rank sum. Tagging partial_local INPUT resolves to the same
-                    # memoized ref identity as stage 1's output, so TensorMap auto-links this task as a
+                    # shared Buffer identity as stage 1's output, so TensorMap auto-links this task as a
                     # consumer of stage 1, no explicit barrier needed.
                     a2 = TaskArgs()
-                    a2.add_tensor(make_tensor_arg(worker, host_partial[i]), TensorArgType.INPUT)
-                    a2.add_tensor(make_tensor_arg(worker, host_y[i]), TensorArgType.OUTPUT_EXISTING)
+                    a2.add_tensor(shared["host_partial"][i][0], TensorArgType.INPUT)
+                    a2.add_tensor(shared["host_y"][i][0], TensorArgType.OUTPUT_EXISTING)
                     a2.add_tensor(
                         Tensor(domain.buffers["scratch"], shapes=(scratch_count,), dtype=_F32), TensorArgType.INOUT
                     )
@@ -235,6 +241,9 @@ def run(
 
         print("[ffn_tp_parallel] running 2-chip 2-stage DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
+
+        for i in range(len(host_y)):
+            host_y[i].copy_(shared["host_y"][i][1])
 
         # Golden: every rank's y should equal sum over r of x_shard[r] @ w_shard[r].
         expected = torch.zeros(M, N, dtype=torch.float32)
@@ -264,6 +273,7 @@ def run(
         print("[ffn_tp_parallel] all ranks matched golden ✅")
         return 0
     finally:
+        shared.clear()
         worker.close()
 
 
