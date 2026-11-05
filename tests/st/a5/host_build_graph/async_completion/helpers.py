@@ -19,8 +19,16 @@ from functools import cache
 from pathlib import Path
 
 import torch
+from simpler.task_interface import (
+    CORE_ASYNC_CONDITION_COUNTER,
+    CORE_ASYNC_CONDITION_SDMA_POST_DONE,
+    CallConfig,
+    CommBufferSpec,
+    DataType,
+    TaskArgs,
+    TensorArgType,
+)
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, CommBufferSpec, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import _bound_host_logs, _pto_isa_compile_cache_token, compile_chip_callable_spec
@@ -185,6 +193,15 @@ def compile_counter(platform: str):
                 "source": str(HERE / "kernels" / source),
                 "core_type": core,
                 "signature": [D.INOUT] * 5,
+                # Zero-condition invocations retain this source-level bound;
+                # the 65-condition case must still exceed the declared 64 slots.
+                "async_capability": {
+                    "mode": "DEFERRED",
+                    "max_conditions": CONDITION_LIMIT,
+                    "condition_types": CORE_ASYNC_CONDITION_COUNTER,
+                }
+                if index < 3
+                else {"mode": "SYNCHRONOUS"},
             }
             for index, source, core in (
                 (0, "aic/waiter.cpp", "aic"),
@@ -368,6 +385,13 @@ def compile_sdma(platform: str):
                 "source": str(HERE / "kernels/aiv" / source),
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.OUT, D.INOUT],
+                "async_capability": {
+                    "mode": "DEFERRED",
+                    "max_conditions": CONDITION_LIMIT,
+                    "condition_types": CORE_ASYNC_CONDITION_SDMA_POST_DONE,
+                }
+                if index == 0
+                else {"mode": "SYNCHRONOUS"},
             }
             for index, source in enumerate(("sdma_submit.cpp", "sdma_consumer.cpp", "sdma_probe.cpp"))
         ],
