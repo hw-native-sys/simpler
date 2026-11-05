@@ -131,6 +131,16 @@ def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_re
     subprocess.run([str(host_resource_binary)], check=True, timeout=20)
 
 
+@pytest.mark.parametrize("scenario", ["sdma_destroy", "urma_release", "urma_destroy", "destroy_exception"])
+def test_workspace_cleanup_failure_retains_owner(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
+
+
+@pytest.mark.parametrize("host_resource_binary", [True], indirect=True)
+def test_rdma_workspace_free_failure_retains_owner(host_resource_binary):
+    subprocess.run([str(host_resource_binary), "rdma_release"], check=True, timeout=20)
+
+
 @pytest.mark.parametrize("kind", ["CommWorkspaceKind::COUNT", "static_cast<CommWorkspaceKind>(UINT32_MAX)"])
 def test_invalid_static_workspace_kind_is_rejected_by_compiler(tmp_path, kind):
     source = tmp_path / "invalid_workspace.cpp"

@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -23,6 +24,8 @@
 namespace {
 std::unordered_map<void *, size_t> mappings;
 int physical_handles = 0;
+void *fail_free_once = nullptr;
+bool throw_hccl_destroy = false;
 bool fail_context_upload = false;
 enum class PeerFailure { NONE, IMPORT, RESERVE, MAP, ACCESS };
 PeerFailure peer_failure = PeerFailure::NONE;
@@ -56,7 +59,13 @@ extern "C" aclError aclrtGetDevice(int32_t *id) {
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
-extern "C" aclError aclrtFree(void *p) { return unmap_buffer(p); }
+extern "C" aclError aclrtFree(void *p) {
+    if (p == fail_free_once) {
+        fail_free_once = nullptr;
+        return ACL_ERROR_FAILURE;
+    }
+    return unmap_buffer(p);
+}
 extern "C" aclError aclrtMemcpy(void *out, size_t, const void *in, size_t bytes, aclrtMemcpyKind) {
     if (fail_context_upload && bytes == sizeof(CommContext)) return 1;
     std::memcpy(out, in, bytes);
@@ -138,7 +147,10 @@ HcclCreateSubCommConfig(HcclComm *, uint32_t, uint32_t *, uint64_t id, uint32_t,
     *out = reinterpret_cast<HcclComm>(static_cast<uintptr_t>(id + 2));
     return HCCL_SUCCESS;
 }
-extern "C" HcclResult HcclCommDestroy(HcclComm) { return HCCL_SUCCESS; }
+extern "C" HcclResult HcclCommDestroy(HcclComm) {
+    if (throw_hccl_destroy) throw std::runtime_error("injected HCCL destroy failure");
+    return HCCL_SUCCESS;
+}
 
 static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     using namespace workspace_fixture;
@@ -207,7 +219,61 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     h->nranks = old_nranks;
 }
 
-int main() {
+static void test_cleanup_failure(const std::string &scenario) {
+    using namespace workspace_fixture;
+    setenv("PTO_ROCE_PHYIDS", "0", 1);
+    setenv("PTO_ROCE_LOCAL_IP", "127.0.0.1", 1);
+    char folder[] = "/tmp/simpler-workspace-cleanup-XXXXXX";
+    assert(mkdtemp(folder));
+    auto *h = new CommHandle_{};
+    h->rank = 0;
+    h->nranks = 1;
+    h->rootinfo_path = std::string(folder) + "/root";
+    h->hccl_comm = reinterpret_cast<HcclComm>(1);
+    const int engine = scenario == "urma_release" || scenario == "urma_destroy" ? 1 :
+                       scenario == "rdma_release"                               ? 2 :
+                                                                                  0;
+    const uint32_t ranks[] = {0};
+    uint64_t ctx = 0, base = 0;
+    size_t size = 0;
+    assert(comm_alloc_domain_windows(h, 1, ranks, 1, 0, 4096, 1U << engine, &ctx, &base, &size) == 0);
+    void *workspace = reinterpret_cast<void *>(reinterpret_cast<CommContext *>(ctx)->workspaces[engine].addr);
+    assert(workspace != nullptr && mappings.count(workspace) == 1);
+    const bool destroy = scenario == "sdma_destroy" || scenario == "urma_destroy" || scenario == "destroy_exception";
+    if (engine == 0) assert(comm_release_domain_windows(h, 1, 1, 0) == 0);
+    const bool exception = scenario == "destroy_exception";
+    throw_hccl_destroy = exception;
+    if (!exception) fail_free_once = workspace;
+    const auto held_mappings = mappings.size();
+    assert((destroy ? comm_destroy(h) : comm_release_domain_windows(h, 1, 1, 0)) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(h->cleanup_failed && mappings.count(workspace) == 1);
+    assert(fail_free_once == nullptr);
+    if (exception) {
+        assert(mappings.size() == held_mappings && live[0] == 1);
+    } else {
+        assert(live[engine] == 0);
+        if (engine == 0) assert(h->sdma_workspace_addr == workspace);
+        else {
+            const auto &alloc = *h->domain_allocations.at(1);
+            assert(alloc.cleanup_failed);
+            if (engine == 1) assert(alloc.urma_workspace_addr == workspace);
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+            else assert(alloc.rdma_workspace_addr == workspace);
+#endif
+        }
+    }
+    const auto retained_mappings = mappings.size();
+    assert(comm_destroy(h) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(mappings.size() == retained_mappings);
+    std::filesystem::remove_all(folder);
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2) {
+        test_cleanup_failure(argv[1]);
+        return 0;
+    }
+    assert(argc == 1);
     using namespace workspace_fixture;
     char folder[] = "/tmp/simpler-comm-workspaces-XXXXXX";
     assert(mkdtemp(folder));
