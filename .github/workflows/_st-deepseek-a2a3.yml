@@ -33,19 +33,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
-      # Own key family, separate from _st-npu-a2a3.yml's: the main sweep
-      # compiles with --manual exclude and never builds these kernels, while
-      # this job compiles only the two DS directories. Sharing the main key
-      # would let this partial compilation win the immutable-cache save race
-      # and starve the main sweep's cache.
-      - name: Restore scene-test kernel cache (a2a3)
-        uses: actions/cache@v5
-        with:
-          path: build/cache/kernels
-          key: scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}
-          restore-keys: |
-            scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-
-
       - name: Set up environment
         uses: ./.github/actions/setup-venv
         with:
