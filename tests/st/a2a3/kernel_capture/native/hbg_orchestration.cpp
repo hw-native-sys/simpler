@@ -59,3 +59,10 @@ extern "C" void hbg_capture_orchestration(const ChipTaskArgs &args) {
         always_assert(rt_graph_end());
     }
 }
+
+extern "C" void hbg_inout_orchestration(const ChipTaskArgs &args) {
+    CoreTaskArgs task;
+    task.add_inout(args.tensor(0).ref());
+    task.add_scalar(args.scalar<int32_t>(0));
+    rt_submit_aiv_task(0, task);
+}
