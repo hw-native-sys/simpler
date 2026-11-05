@@ -51,6 +51,7 @@
 #include "tensor.h"
 #include "tensormap.h"
 #include "types.h"
+#include "../platform_comm/comm_domain_use_wire.h"
 
 // The activation hook holds runs_mu_; the locking public capacity getter
 // cannot be called from it. Only the existing protected value is read there.
@@ -642,6 +643,61 @@ struct CapacityHarness {
         return orch.on_consumed(run.task.task_slot);
     }
 };
+
+TEST(ThreeRunCapacityEndpointTest, DomainUsesSurviveRealGroupSubmissionAndFramePublication) {
+    CapacityHarness h(2, 1);
+    h.rq_next_level.reset({0, 1});
+    const RunId run = h.orch.begin_run();
+    TaskArgs first, second;
+    first.add_scalar(0x1000);
+    second.add_scalar(0x3000);
+    CallableIdentity callable;
+    callable.digest.fill(53);
+    const auto task = h.orch.submit_next_level_group(
+        callable, {first, second}, CallConfig{}, {0, 1}, {}, {},
+        {{{CommDomainKind::LOCAL, 0, 31, 0x1000}}, {{CommDomainKind::GLOBAL, 0, 32, 0x3000}}}
+    );
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox0{}, mailbox1{};
+    LocalMailboxEndpoint endpoint0(0, mailbox0.data(), mailbox0.size(), -1, 2);
+    LocalMailboxEndpoint endpoint1(1, mailbox1.data(), mailbox1.size(), -1, 2);
+    endpoint0.submit_progress(&h.allocator, WorkerDispatch{task.task_slot, 0, 91, false});
+    endpoint1.submit_progress(&h.allocator, WorkerDispatch{task.task_slot, 1, 92, false});
+    for (int member = 0; member < 2; ++member) {
+        auto &mailbox = member == 0 ? mailbox0 : mailbox1;
+        const auto *entry = capacity_entry(mailbox, 0);
+        EXPECT_EQ(entry->protocol, 8u);
+        EXPECT_EQ(entry->group_index, static_cast<uint64_t>(member));
+        EXPECT_EQ(entry->group_size, 2u);
+        const auto *blob =
+            reinterpret_cast<const uint8_t *>(capacity_task_frame(mailbox, 0) + MAILBOX_OFF_TASK_ARGS_BLOB);
+        const auto view = read_blob(blob, MAILBOX_ARGS_CAPACITY);
+        ASSERT_EQ(view.tensor_count, 0);
+        ASSERT_EQ(view.scalar_count, 1);
+        const size_t offset = TASK_ARGS_BLOB_HEADER_SIZE + sizeof(uint64_t);
+        const auto uses = read_comm_domain_uses(blob + offset, MAILBOX_ARGS_CAPACITY - offset);
+        ASSERT_EQ(uses.size(), 1u);
+        EXPECT_EQ(uses[0].id, static_cast<uint64_t>(31 + member));
+        EXPECT_EQ(uses[0].device_context, member == 0 ? 0x1000u : 0x3000u);
+        EXPECT_EQ(uses[0].kind, member == 0 ? CommDomainKind::LOCAL : CommDomainKind::GLOBAL);
+    }
+    h.orch.close_run_submission(run);
+}
+
+TEST(ThreeRunCapacityEndpointTest, DomainSidecarMemberCountIsCheckedBeforeTaskPublication) {
+    CapacityHarness h(2, 1);
+    h.rq_next_level.reset({0, 1});
+    const RunId run = h.orch.begin_run();
+    CallableIdentity callable;
+    callable.digest.fill(53);
+    EXPECT_THROW(
+        h.orch.submit_next_level_group(
+            callable, {TaskArgs{}, TaskArgs{}}, CallConfig{}, {0, 1}, {}, {}, {{{CommDomainKind::LOCAL, 0, 31, 0x1000}}}
+        ),
+        std::invalid_argument
+    );
+    h.orch.close_run_submission(run);
+    EXPECT_TRUE(h.orch.run_done(run));
+}
 
 /** Poll `ready` until it holds, or report the deadline as the failure it is. */
 bool settled_within(const std::function<bool()> &ready, double seconds = 5.0) {

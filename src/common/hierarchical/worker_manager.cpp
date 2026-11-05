@@ -10,6 +10,7 @@
  */
 
 #include "worker_manager.h"
+#include "../platform_comm/comm_domain_use_wire.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1033,6 +1034,9 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     TaskSlotState *slot_state = ring->slot_state(dispatch.task_slot);
     if (slot_state == nullptr) throw std::out_of_range("LocalMailboxEndpoint::submit_progress: invalid task slot");
     TaskSlotState &state = *slot_state;
+    if (dispatch.group_index < 0 || dispatch.group_index >= state.group_size() ||
+        (!state.domain_uses.empty() && state.domain_uses.size() != static_cast<size_t>(state.group_size())))
+        throw std::invalid_argument("domain sidecar does not match the dispatched group member");
     const TaskArgs &a = state.args(dispatch.group_index);
     if (!state.remote_sidecar_for(dispatch.group_index).empty()) {
         throw std::runtime_error("remote task sidecar is not supported by local mailbox");
@@ -1042,7 +1046,10 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
         throw std::runtime_error("task frame has an invalid pipeline lease identity");
     }
     const size_t blob_bytes = task_args_blob_size(a);
-    if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
+    const auto &domain_uses = state.domain_uses_for(dispatch.group_index);
+    validate_comm_domain_uses(domain_uses);
+    const size_t domain_bytes = comm_domain_uses_wire_size(domain_uses);
+    if (blob_bytes > MAILBOX_ARGS_CAPACITY || domain_bytes > MAILBOX_ARGS_CAPACITY - blob_bytes) {
         throw std::runtime_error(
             "args blob exceeds mailbox capacity: need " + std::to_string(blob_bytes) + ", capacity " +
             std::to_string(MAILBOX_ARGS_CAPACITY)
@@ -1153,6 +1160,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     // materializes it to a ChipTensor blob before run).
     uint8_t *blob = reinterpret_cast<uint8_t *>(frame + MAILBOX_OFF_TASK_ARGS_BLOB);
     write_blob(blob, a);
+    write_comm_domain_uses(blob + blob_bytes, MAILBOX_ARGS_CAPACITY - blob_bytes, domain_uses);
 
     const uint64_t frame_generation = next_frame_generation_++;
     const uint64_t entry_index_wire = static_cast<uint64_t>(entry_index);

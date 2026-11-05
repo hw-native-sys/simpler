@@ -128,6 +128,8 @@ struct PreparedSubmissionStorage {
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 struct HostAsyncRetainedSpan;
+struct CommDomainSnapshot;
+enum class CommDomainExecution : uint32_t;
 
 /**
  * Common base class for both a2a3 and a5 onboard `DeviceRunner`s.
@@ -521,6 +523,10 @@ public:
     bool query_async_retained_span(
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, uint64_t address,
         uint64_t bytes, HostAsyncRetainedSpan *out
+    ) const;
+    bool query_async_domain_context(
+        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, uint64_t device_context,
+        CommDomainSnapshot *out, CommDomainExecution *execution
     ) const;
 
     /** Drop `identity`'s borrow, or keep it for good when its last consumer is unproven. */

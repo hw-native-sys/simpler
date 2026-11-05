@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
+#include <vector>
 
 #include "call_config.h"
 #include "common/host_api.h"
@@ -23,6 +25,7 @@
 #include "native_run_storage_tag.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
+#include "../platform_comm/comm_domain_use_wire.h"
 
 /**
  * The single placement-owned carrier for one progressable native lifecycle.
@@ -36,7 +39,7 @@ struct NativeRunContext {
 
     NativeRunContext(
         Runner *runner_in, const CallConfig &config_in, uint64_t trace_hid_in, const NativeRunDescriptor &descriptor_in,
-        const HostApiOps *host_api_ops
+        const HostApiOps *host_api_ops, const NativeRunDomainProvider *domain_provider = nullptr
     ) :
         runner(runner_in),
         config(config_in),
@@ -47,6 +50,33 @@ struct NativeRunContext {
             this
         ),
         trace_hid(trace_hid_in) {
+        const NativeRunDomainProvider empty_provider{1, 0, nullptr, nullptr, 0};
+        const auto &provider = domain_provider != nullptr ? *domain_provider : empty_provider;
+        if (provider.version != 1 || provider.reserved != 0)
+            throw std::invalid_argument("unsupported native communication-domain provider version");
+        if (provider.count != 0) {
+            if (provider.owner == nullptr || provider.query == nullptr)
+                throw std::invalid_argument("native communication-domain provider is missing");
+            domain_snapshots.resize(provider.count);
+            domain_execution.resize(provider.count);
+            std::vector<CommDomainUse> uses;
+            uses.reserve(provider.count);
+            for (size_t i = 0; i < provider.count; ++i) {
+                uint32_t qualification = 0;
+                if (provider.query(
+                        provider.owner, descriptor.run_epoch, descriptor.pipeline_slot, i, &domain_snapshots[i],
+                        &qualification
+                    ) != 0 ||
+                    qualification > static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN) ||
+                    !comm_domain_snapshot_valid(domain_snapshots[i]))
+                    throw std::invalid_argument("native communication-domain owner query failed");
+                domain_execution[i] = static_cast<CommDomainExecution>(qualification);
+                uses.push_back(domain_snapshots[i].use);
+            }
+            validate_comm_domain_uses(uses);
+        }
+        // The borrowed provider is consumed here and never stored. Later
+        // phases retain values, never the submitting Host object's address.
         // Publish the storage tag only after every potentially-throwing member
         // has been constructed. A failed placement construction must leave the
         // caller-owned slot reusable rather than looking like a prepared run.
@@ -72,6 +102,8 @@ struct NativeRunContext {
     CallConfig config{};
     NativeRunDescriptor descriptor{};
     HostApi host_api;
+    std::vector<CommDomainSnapshot> domain_snapshots;
+    std::vector<CommDomainExecution> domain_execution;
     std::unique_ptr<Runtime> runtime{std::make_unique<Runtime>()};
     uint64_t trace_hid{0};
     uint64_t trace_inv{0};

@@ -9,6 +9,10 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "fixture.h"
+#include "platform_comm/comm.h"
+
+#include <sys/mman.h>
+#include <unistd.h>
 #include "callable.h"
 #include "host/platform_compile_info.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
@@ -18,6 +22,119 @@ extern "C" int args_dump_capture_supported_impl(void);
 namespace native_admission_test {
 void *kernel_entry_points(bool in_graph);
 
+TEST_F(NativeAdmissionTest, DomainExtensionRejectsShortImagesBeforeReadingThem) {
+    const auto *unreadable_descriptor = reinterpret_cast<const NativeRunDescriptor *>(1);
+    const auto *unreadable_provider = reinterpret_cast<const NativeRunDomainProvider *>(1);
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v1(
+            nullptr, nullptr, 0, nullptr, nullptr, unreadable_descriptor, sizeof(NativeRunDescriptor) - 1,
+            unreadable_provider, sizeof(NativeRunDomainProvider)
+        ),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v1(
+            nullptr, nullptr, 0, nullptr, nullptr, unreadable_descriptor, sizeof(NativeRunDescriptor),
+            unreadable_provider, sizeof(NativeRunDomainProvider) - 1
+        ),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    NativeRunDomainProvider provider{2, 0, nullptr, nullptr, 0};
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v1(
+            nullptr, nullptr, 0, nullptr, nullptr, unreadable_descriptor, sizeof(NativeRunDescriptor), &provider,
+            sizeof(provider)
+        ),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+}
+
+TEST_F(NativeAdmissionTest, LegacyDescriptorAtGuardPageStillUsesTheOriginalEntry) {
+    struct LegacyDescriptor {
+        uint32_t pipeline_slot, arena_bank;
+        uint64_t run_id, generation, dispatch_id, run_epoch;
+        volatile int32_t *accepted_state;
+        int32_t accepted_value;
+        uint32_t joinable_boundary;
+        NativeRunProvenance provenance;
+        uint32_t prepare_purpose;
+    };
+    static_assert(sizeof(LegacyDescriptor) == sizeof(NativeRunDescriptor));
+    static_assert(offsetof(LegacyDescriptor, prepare_purpose) == offsetof(NativeRunDescriptor, prepare_purpose));
+    const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *mapping = mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    ASSERT_EQ(mprotect(static_cast<uint8_t *>(mapping) + page, page, PROT_NONE), 0);
+    Runner runner;
+    Attempt attempt(runner, 1, 20);
+    auto *legacy = static_cast<uint8_t *>(mapping) + page - sizeof(LegacyDescriptor);
+    std::memcpy(legacy, &attempt.descriptor, sizeof(LegacyDescriptor));
+    EXPECT_EQ(
+        simpler_prepare_run(
+            &runner, attempt.storage, 1, &attempt.args, &attempt.config,
+            reinterpret_cast<const NativeRunDescriptor *>(legacy)
+        ),
+        0
+    );
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_EQ(munmap(mapping, page * 2), 0);
+}
+
+TEST_F(NativeAdmissionTest, DomainOwnerSnapshotReachesTheActualNativeHostQuery) {
+    const std::string name = "native-domain-query-" + std::to_string(getpid());
+    CommHandle comm = comm_init(0, 1, nullptr, name.c_str());
+    ASSERT_NE(comm, nullptr);
+    const uint32_t ranks[] = {0};
+    uint64_t context = 0, window = 0;
+    size_t bytes = 0;
+    ASSERT_EQ(comm_alloc_domain_windows(comm, 1, ranks, 1, 0, 4096, 0, &context, &window, &bytes), 0);
+    NativeRunDomainProvider provider{
+        1, 0, comm,
+        [](void *owner, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *execution) {
+            if (epoch != 20 || slot != 1 || index != 0) return -1;
+            *execution = static_cast<uint32_t>(CommDomainExecution::UNKNOWN);
+            return comm_query_domain_snapshot(static_cast<CommHandle>(owner), 1, out);
+        },
+        1
+    };
+    Runner runner;
+    Attempt attempt(runner, 1, 20);
+    std::optional<HostApi> saved;
+    callback_hook = [&] {
+        const auto &api = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage)->host_api;
+        saved = api;
+        HostAsyncRetainedSpan span;
+        ASSERT_TRUE(api.query_async_retained_span(window + 16, 64, &span));
+        EXPECT_EQ(span.owner_kind, HostAsyncRetainedOwner::DOMAIN_WINDOW);
+        EXPECT_EQ(span.base, window);
+        EXPECT_EQ(span.bytes, bytes);
+        EXPECT_TRUE(api.query_async_retained_span(context, sizeof(CommContext), &span));
+        EXPECT_EQ(span.owner_kind, HostAsyncRetainedOwner::DOMAIN_CONTEXT);
+        EXPECT_FALSE(api.query_async_retained_span(window + bytes - 1, 2, &span));
+        EXPECT_EQ(span.base, 0u);
+        CommDomainSnapshot snapshot;
+        CommDomainExecution execution = CommDomainExecution::EXCLUSIVE_RUN;
+        EXPECT_TRUE(api.query_async_domain_context(context, &snapshot, &execution));
+        EXPECT_EQ(snapshot.use.id, 1u);
+        EXPECT_EQ(execution, CommDomainExecution::UNKNOWN);  // Retention cannot invent lane provenance.
+        EXPECT_FALSE(api.query_async_domain_context(context + 1, &snapshot, &execution));
+        EXPECT_EQ(snapshot.use.id, 0u);
+    };
+    EXPECT_EQ(
+        simpler_prepare_run_with_domains_v1(
+            &runner, attempt.storage, 1, &attempt.args, &attempt.config, &attempt.descriptor,
+            sizeof(attempt.descriptor), &provider, sizeof(provider)
+        ),
+        0
+    );
+    if (saved) {
+        CommDomainSnapshot snapshot;
+        EXPECT_FALSE(saved->query_async_domain_context(context, &snapshot));
+    }
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_EQ(comm_release_domain_windows(comm, 1, 1, 0), 0);
+    EXPECT_EQ(comm_destroy(comm), 0);
+}
 void *counter_entry_points(bool in_graph, uint32_t declaration);
 
 TEST_F(NativeAdmissionTest, AsyncRetentionQueryRequiresTheCurrentPreparingOwnerAndItsCallerBorrow) {

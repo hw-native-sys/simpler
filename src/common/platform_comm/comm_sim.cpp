@@ -924,6 +924,34 @@ extern "C" int comm_global_domain_import(
     return -1;
 }
 
+extern "C" int comm_query_domain_snapshot(CommHandle h, uint64_t allocation_id, CommDomainSnapshot *out) {
+    if (out != nullptr) *out = {};
+    if (h == nullptr || out == nullptr || allocation_id == 0) return -1;
+    const auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end()) return -1;
+    const auto &allocation = *found->second;
+    if (allocation.host_ctx == nullptr || allocation.mmap_base == nullptr) return -1;
+    out->use = {CommDomainKind::LOCAL, 0, allocation_id, reinterpret_cast<uint64_t>(allocation.host_ctx.get())};
+    out->context = *allocation.host_ctx;
+    return 0;
+}
+
+extern "C" int comm_query_global_domain_snapshot(uint64_t domain_id, CommDomainSnapshot *out) try {
+    if (out != nullptr) *out = {};
+    if (out == nullptr || domain_id == 0) return -1;
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    const auto found = global_domain_allocations.find(domain_id);
+    if (found == global_domain_allocations.end()) return -1;
+    const auto &allocation = *found->second;
+    if (allocation.host_ctx == nullptr || allocation.local_base == nullptr) return -1;
+    out->use = {CommDomainKind::GLOBAL, 0, domain_id, reinterpret_cast<uint64_t>(allocation.host_ctx.get())};
+    out->context = *allocation.host_ctx;
+    return 0;
+} catch (...) {
+    if (out != nullptr) *out = {};
+    return -1;
+}
+
 extern "C" int comm_global_domain_release(uint64_t domain_id) try {
     std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);

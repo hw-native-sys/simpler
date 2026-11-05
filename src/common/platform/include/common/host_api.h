@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "common/chip_swimlane_extension.h"
+#include "platform_comm/comm_domain_use.h"
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -26,7 +27,15 @@ struct HostMetadataRegion {
     size_t bytes;
 };
 
-enum class HostAsyncRetainedOwner : uint32_t { UNKNOWN = 0, CALLER_BORROW = 1, TEMPORARY = 2, GM_HEAP = 3 };
+enum class HostAsyncRetainedOwner : uint32_t {
+    UNKNOWN = 0,
+    CALLER_BORROW = 1,
+    TEMPORARY = 2,
+    GM_HEAP = 3,
+    DOMAIN_WINDOW = 4,
+    DOMAIN_CONTEXT = 5,
+    DOMAIN_WORKSPACE = 6
+};
 
 // A read-only ownership answer, not permission for cache maintenance, DMA or
 // access to a communication domain. The existing run owner retains the bytes.
@@ -307,6 +316,10 @@ struct HostApiOps {
         void *runner_ctx, const void *run_owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch,
         uint64_t address, uint64_t bytes, HostAsyncRetainedSpan *out
     );
+    bool (*query_async_domain_context)(
+        void *runner_ctx, const void *run_owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch,
+        uint64_t device_context, CommDomainSnapshot *out, CommDomainExecution *execution
+    );
 };
 
 /**
@@ -363,6 +376,21 @@ public:
                ops_->query_async_retained_span != nullptr &&
                ops_->query_async_retained_span(
                    runner_ctx_, run_owner_, pipeline_slot_, arena_bank_, run_epoch_, address, bytes, out
+               );
+    }
+
+    // The same borrowed preparation lifetime as query_async_retained_span.
+    // Execution qualification comes from the native owner, independently of
+    // retention, cache visibility and legal SDMA completion-record geometry.
+    bool query_async_domain_context(
+        uint64_t device_context, CommDomainSnapshot *out, CommDomainExecution *execution = nullptr
+    ) const {
+        if (out != nullptr) *out = {};
+        if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
+        return out != nullptr && run_owner_ != nullptr && ops_ != nullptr &&
+               ops_->query_async_domain_context != nullptr &&
+               ops_->query_async_domain_context(
+                   runner_ctx_, run_owner_, pipeline_slot_, arena_bank_, run_epoch_, device_context, out, execution
                );
     }
 

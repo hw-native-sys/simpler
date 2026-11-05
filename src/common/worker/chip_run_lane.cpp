@@ -30,12 +30,14 @@
 
 #include "host/chip_swimlane_runs.h"
 #include "common/strace.h"
+#include "../platform_comm/comm_domain_use_wire.h"
 
 struct ChipRunState {
     enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, ENDED, TERMINAL };
 
     int32_t callable_id{0};
     ChipStorageTaskArgs args{};
+    std::vector<CommDomainUse> domain_uses;
     CallConfig config{};
     PipelineSlotLease lease{};
     uint64_t run_id{0};
@@ -295,7 +297,7 @@ struct ChipRunLaneState {
     void prepare(const std::shared_ptr<ChipRunState> &run) {
         run->native_run = worker->prepare_native_run_for_lane(
             run->callable_id, &run->args, run->config, run->lease, run->run_id, run->dispatch_id, run->accepted_state,
-            run->accepted_value, run->pipeline_leased, run->provenance
+            run->accepted_value, run->pipeline_leased, run->provenance, run->domain_uses
         );
         run->phase = ChipRunState::Phase::PREPARED;
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;
@@ -1269,8 +1271,9 @@ ChipRunLane::~ChipRunLane() {
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated,
-    NativeRunProvenance provenance
+    NativeRunProvenance provenance, const std::vector<CommDomainUse> &domain_uses
 ) {
+    validate_comm_domain_uses(domain_uses);
     state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->require_usable();
@@ -1299,6 +1302,7 @@ ChipRun ChipRunLane::submit(
     auto run = std::make_shared<ChipRunState>();
     run->callable_id = callable_id;
     run->args = args;
+    run->domain_uses = domain_uses;
     run->config = config;
     run->lease = lease;
     run->run_id = run_id;
@@ -1350,8 +1354,9 @@ ChipRun ChipRunLane::submit(
 
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value, void *caller_stream
+    int32_t accepted_value, void *caller_stream, const std::vector<CommDomainUse> &domain_uses
 ) {
+    validate_comm_domain_uses(domain_uses);
     state_->validate_process();
     std::unique_lock<std::mutex> lk(state_->mu);
     state_->require_usable();
@@ -1402,6 +1407,7 @@ ChipRun ChipRunLane::submit(
     auto run = std::make_shared<ChipRunState>();
     run->callable_id = callable_id;
     run->args = args;
+    run->domain_uses = domain_uses;
     run->config = config;
     run->lease = PipelineSlotLease{slot_id, 0, state_->direct_generation};
     run->accepted_state = accepted_state;

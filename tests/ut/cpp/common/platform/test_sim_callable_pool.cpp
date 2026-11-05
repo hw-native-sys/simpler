@@ -57,6 +57,7 @@
 #include "runtime.h"
 #include "profiler_test_allocator.h"
 #include "native_run_context.h"
+#include "platform_comm/comm.h"
 
 #if defined(__linux__)
 static std::atomic<bool> reject_device_bind{false};
@@ -759,6 +760,67 @@ TEST(SimAsyncRetainedSpan, PrewarmAndMissingProviderNeverProduceOwnershipEvidenc
     EXPECT_EQ(found.bytes, 0u);
     EXPECT_EQ(found.owner_kind, HostAsyncRetainedOwner::UNKNOWN);
     EXPECT_FALSE(no_run.query_async_retained_span(0x1000, 8, nullptr));
+}
+
+TEST(SimAsyncRetainedSpan, OnlyTheSelectedActualDomainOwnerIsVisibleDuringPreparation) {
+    const std::string name = "sim-native-domain-" + std::to_string(getpid());
+    CommHandle comm = comm_init(0, 1, nullptr, name.c_str());
+    ASSERT_NE(comm, nullptr);
+    const uint32_t ranks[] = {0};
+    uint64_t context = 0, window = 0, other_context = 0, other_window = 0;
+    size_t bytes = 0;
+    ASSERT_EQ(comm_alloc_domain_windows(comm, 1, ranks, 1, 0, 4096, 0, &context, &window, &bytes), 0);
+    ASSERT_EQ(comm_alloc_domain_windows(comm, 2, ranks, 1, 0, 4096, 0, &other_context, &other_window, &bytes), 0);
+    NativeRunDomainProvider provider{
+        1, 0, comm,
+        [](void *owner, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *execution) {
+            if (epoch != 17 || slot != 1 || index != 0) return -1;
+            *execution = static_cast<uint32_t>(CommDomainExecution::UNKNOWN);
+            return comm_query_domain_snapshot(static_cast<CommHandle>(owner), 1, out);
+        },
+        1
+    };
+    PoolRunner runner;
+    ASSERT_TRUE(runner.set_run_resource_grant(3));
+    HostApiOps ops{};
+    ops.query_async_retained_span = [](void *ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch,
+                                       uint64_t address, uint64_t size, HostAsyncRetainedSpan *out) {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->query_async_retained_span(
+            owner, slot, bank, epoch, address, size, out
+        );
+    };
+    ops.query_async_domain_context = [](void *ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch,
+                                        uint64_t address, CommDomainSnapshot *out, CommDomainExecution *execution) {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->query_async_domain_context(
+            owner, slot, bank, epoch, address, out, execution
+        );
+    };
+    NativeRunDescriptor descriptor{};
+    descriptor.run_epoch = descriptor.generation = descriptor.dispatch_id = 17;
+    descriptor.pipeline_slot = descriptor.arena_bank = 1;
+    NativeRunContext<SimDeviceRunnerBase> state(&runner, CallConfig{}, 0, descriptor, &ops, &provider);
+    LaunchPermit permit;
+    ASSERT_TRUE(runner.try_acquire_native_run(&state, state.identity(), &permit));
+    state.runner_claimed = true;
+    HostAsyncRetainedSpan span;
+    ASSERT_TRUE(state.host_api.query_async_retained_span(window + 16, 64, &span));
+    EXPECT_EQ(span.base, window);
+    EXPECT_EQ(span.owner_kind, HostAsyncRetainedOwner::DOMAIN_WINDOW);
+    EXPECT_FALSE(state.host_api.query_async_retained_span(other_window, 64, &span));
+    EXPECT_EQ(span.base, 0u);
+    CommDomainSnapshot snapshot;
+    CommDomainExecution execution = CommDomainExecution::EXCLUSIVE_RUN;
+    EXPECT_TRUE(state.host_api.query_async_domain_context(context, &snapshot, &execution));
+    EXPECT_EQ(execution, CommDomainExecution::UNKNOWN);
+    EXPECT_FALSE(state.host_api.query_async_domain_context(other_context, &snapshot, &execution));
+    EXPECT_EQ(snapshot.use.id, 0u);
+    runner.release_native_run(&state);
+    state.runner_claimed = false;
+    EXPECT_FALSE(state.host_api.query_async_retained_span(window, 64, &span));
+    EXPECT_FALSE(state.host_api.query_async_domain_context(context, &snapshot));
+    EXPECT_EQ(comm_release_domain_windows(comm, 2, 1, 0), 0);
+    EXPECT_EQ(comm_release_domain_windows(comm, 1, 1, 0), 0);
+    EXPECT_EQ(comm_destroy(comm), 0);
 }
 
 TEST(SimOrchestrationScratchTest, RunnerDestructionReleasesRetainedStorage) {

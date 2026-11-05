@@ -110,6 +110,7 @@ struct DomainAllocation {
     void *rdma_workspace_addr = nullptr;
 #endif
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
+    CommContext published_context{};    // Same bytes published by this allocation; Host-only query metadata.
     size_t mapping_size = 0;
 };
 
@@ -1740,6 +1741,7 @@ static int domain_alloc_via_ipc(
         return -1;
     }
     out->mapping_size = aligned_size;
+    out->published_context = ctx;
     return 0;
 }
 
@@ -2009,6 +2011,25 @@ static int release_domain_windows(
     LOG_ERROR("[comm] release_domain: unknown exception");
     if (h) h->cleanup_failed = true;
     return COMM_RECLAMATION_UNCONFIRMED;
+}
+
+extern "C" int comm_query_domain_snapshot(CommHandle h, uint64_t allocation_id, CommDomainSnapshot *out) {
+    if (out != nullptr) *out = {};
+    if (h == nullptr || out == nullptr || allocation_id == 0 || h->cleanup_failed) return -1;
+    const auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end()) return -1;
+    const auto &allocation = *found->second;
+    if (!allocation.initialized || allocation.cleanup_failed || allocation.device_ctx == nullptr ||
+        !allocation.local_mapped || allocation.local_buf == nullptr)
+        return -1;
+    out->use = {CommDomainKind::LOCAL, 0, allocation_id, reinterpret_cast<uint64_t>(allocation.device_ctx)};
+    out->context = allocation.published_context;
+    return 0;
+}
+
+extern "C" int comm_query_global_domain_snapshot(uint64_t, CommDomainSnapshot *out) {
+    if (out != nullptr) *out = {};
+    return -1;  // This backend has no global-domain allocation implementation.
 }
 
 extern "C" int

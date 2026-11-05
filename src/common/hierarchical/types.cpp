@@ -42,6 +42,7 @@ void TaskSlotState::reset() {
     is_group_ = false;
     remote_sidecar.clear();
     remote_sidecars.clear();
+    domain_uses.clear();
     target_worker_ids.clear();
     // ring_idx / ring_slot_idx are deliberately NOT cleared here: Ring
     // stamps them at alloc() before the Orchestrator ever calls reset(),

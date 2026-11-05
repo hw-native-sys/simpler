@@ -616,6 +616,27 @@ bool DeviceRunnerBase::query_async_retained_span(
         return base != 0 && extent <= UINT64_MAX - base && address >= base && address - base <= extent &&
                bytes <= extent - (address - base);
     };
+    for (const auto &snapshot : state->domain_snapshots) {
+        const auto &context = snapshot.context;
+        if (contains(snapshot.use.device_context, sizeof(CommContext))) {
+            *out = {snapshot.use.device_context, sizeof(CommContext), HostAsyncRetainedOwner::DOMAIN_CONTEXT, 0};
+            return true;
+        }
+        for (uint32_t i = 0; i < context.rankNum; ++i) {
+            for (uint64_t base : {context.windowsIn[i], context.windowsOut[i]}) {
+                if (contains(base, context.winSize)) {
+                    *out = {base, context.winSize, HostAsyncRetainedOwner::DOMAIN_WINDOW, 0};
+                    return true;
+                }
+            }
+        }
+        for (const auto &workspace : context.workspaces) {
+            if (contains(workspace.addr, workspace.size)) {
+                *out = {workspace.addr, workspace.size, HostAsyncRetainedOwner::DOMAIN_WORKSPACE, 0};
+                return true;
+            }
+        }
+    }
     if (slot < temporary_storage_.size() && temporary_storage_[slot]) {
         const auto &storage = *temporary_storage_[slot];
         const uint64_t base = reinterpret_cast<uint64_t>(storage.base);
@@ -631,6 +652,40 @@ bool DeviceRunnerBase::query_async_retained_span(
             *out = {base, heap.total_size(), HostAsyncRetainedOwner::GM_HEAP, 0};
             return true;
         }
+    }
+    return false;
+}
+
+bool DeviceRunnerBase::query_async_domain_context(
+    const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context, CommDomainSnapshot *out,
+    CommDomainExecution *execution
+) const {
+    if (out != nullptr) *out = {};
+    if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
+    if (out == nullptr || owner == nullptr || epoch == 0 || device_context == 0 || !can_accept_run()) return false;
+    std::scoped_lock lock(native_run_mu_, prepared_storage_mutex_);
+    const auto reservation = std::find_if(
+        native_run_reservations_.begin(), native_run_reservations_.end(), [owner, slot, bank](const auto &row) {
+            return row.owner == owner && row.pipeline_slot == slot && row.arena_bank == bank &&
+                   row.preparation_state == NativeRunPreparationState::Preparing;
+        }
+    );
+    // Prove that this pointer is the live native owner before interpreting it.
+    if (reservation == native_run_reservations_.end()) return false;
+    const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(owner);
+    if (state->magic != NativeRunContext<DeviceRunnerBase>::kMagic || state->runner != this ||
+        !state->runner_reserved || state->descriptor.pipeline_slot != slot || state->descriptor.arena_bank != bank ||
+        state->descriptor.run_epoch != epoch ||
+        state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared || state->runtime == nullptr ||
+        state->prepared_execution || state->active_execution)
+        return false;
+    for (size_t i = 0; i < state->domain_snapshots.size(); ++i) {
+        if (state->domain_snapshots[i].use.device_context != device_context) continue;
+        *out = state->domain_snapshots[i];
+        if (execution != nullptr)
+            *execution = execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM ? state->domain_execution[i] :
+                                                                                        CommDomainExecution::UNKNOWN;
+        return true;
     }
     return false;
 }

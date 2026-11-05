@@ -536,6 +536,23 @@ static bool query_async_retained_span(
     }
 }
 
+static bool query_async_domain_context(
+    void *runner_ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context,
+    CommDomainSnapshot *out, CommDomainExecution *execution
+) {
+    if (out != nullptr) *out = {};
+    if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
+    if (runner_ctx == nullptr) return false;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+            ->query_async_domain_context(owner, slot, bank, epoch, device_context, out, execution);
+    } catch (...) {
+        if (out != nullptr) *out = {};
+        if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
+        return false;
+    }
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -578,6 +595,7 @@ static const HostApiOps g_host_api_ops = {
     .get_orchestration_scratch = get_orchestration_scratch,
     .set_orchestration_scratch = set_orchestration_scratch,
     .query_async_retained_span = query_async_retained_span,
+    .query_async_domain_context = query_async_domain_context,
 };
 
 /* ===========================================================================
@@ -1052,9 +1070,9 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) 
     return execution_rc;
 }
 
-int simpler_prepare_run(
+static int prepare_run_impl(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor
+    const NativeRunDescriptor *descriptor, const NativeRunDomainProvider *domain_provider
 ) {
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1105,7 +1123,8 @@ int simpler_prepare_run(
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
-        state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
+        state = new (runtime)
+            SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops, domain_provider);
         if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
             LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
             destroy_native_run_context(state);
@@ -1193,6 +1212,27 @@ int simpler_prepare_run(
         publish_released_preparation(runtime, descriptor->run_epoch);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+}
+
+int simpler_prepare_run(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
+) {
+    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, nullptr);
+}
+
+int simpler_prepare_run_with_domains_v1(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
+    size_t provider_bytes
+) {
+    if (descriptor == nullptr || descriptor_bytes != sizeof(NativeRunDescriptor) || provider == nullptr ||
+        provider_bytes != sizeof(NativeRunDomainProvider))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (provider->version != 1 || provider->reserved != 0 ||
+        (provider->count != 0 && (provider->owner == nullptr || provider->query == nullptr)))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, provider);
 }
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {

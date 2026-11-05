@@ -349,6 +349,8 @@ void ChipWorker::init(
         register_callable_v2_fn_ = module->optional<SimplerRegisterCallableV2Fn>("simpler_register_callable_v2");
         run_fn_ = module->required<SimplerRunFn>("simpler_run");
         prepare_run_fn_ = module->required<SimplerPrepareRunFn>("simpler_prepare_run");
+        prepare_run_with_domains_fn_ =
+            module->optional<decltype(&simpler_prepare_run_with_domains_v1)>("simpler_prepare_run_with_domains_v1");
         launch_run_fn_ = module->required<SimplerNativeRunFn>("simpler_launch_run");
         validate_execution_context_fn_ =
             module->optional<ValidateExecutionContextFn>("simpler_validate_execution_context");
@@ -461,6 +463,10 @@ void ChipWorker::init(
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
+        comm_query_domain_snapshot_fn_ =
+            module->optional<decltype(&comm_query_domain_snapshot)>("comm_query_domain_snapshot");
+        comm_query_global_domain_snapshot_fn_ =
+            module->optional<decltype(&comm_query_global_domain_snapshot)>("comm_query_global_domain_snapshot");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
         kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
@@ -885,6 +891,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     register_callable_v2_fn_ = nullptr;
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
+    prepare_run_with_domains_fn_ = nullptr;
     launch_run_fn_ = nullptr;
     validate_execution_context_fn_ = nullptr;
     validate_caller_stream_fn_ = nullptr;
@@ -940,6 +947,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
+    comm_query_domain_snapshot_fn_ = nullptr;
+    comm_query_global_domain_snapshot_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     set_retain_runs_fn_ = nullptr;
@@ -1088,11 +1097,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run(
 ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    bool pipeline_leased, NativeRunProvenance provenance
+    bool pipeline_leased, NativeRunProvenance provenance, const std::vector<CommDomainUse> &domain_uses
 ) {
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        pipeline_leased, provenance
+        pipeline_leased, provenance, domain_uses, true
     );
 }
 
@@ -1192,10 +1201,52 @@ void ChipWorker::configure_launch_depth(unsigned depth) {
     launch_depth_ = depth;
 }
 
+int ChipWorker::query_native_domain_snapshot(
+    void *owner, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *qualification
+) try {
+    if (out != nullptr) *out = {};
+    if (qualification != nullptr) *qualification = 0;
+    if (owner == nullptr || out == nullptr || qualification == nullptr) return -1;
+    auto &worker = *static_cast<ChipWorker *>(owner);
+    std::lock_guard<std::mutex> lock(worker.native_run_mu_);
+    const auto found = worker.native_runs_.find(epoch);
+    if (found == worker.native_runs_.end() || found->second->phase != NativeRunPhase::PREPARING ||
+        found->second->slot_id != slot || index >= found->second->domain_uses.size() ||
+        worker.comm_cleanup_unconfirmed_ || worker.comm_reclamation_unconfirmed_)
+        return -1;
+    const auto &entry = *found->second;
+    const auto &use = entry.domain_uses[index];
+    int result = -1;
+    if (use.kind == CommDomainKind::LOCAL && worker.comm_query_domain_snapshot_fn_ != nullptr &&
+        worker.base_comm_handle_ != 0 && worker.find_comm_session(worker.base_comm_handle_) != nullptr) {
+        result =
+            worker.comm_query_domain_snapshot_fn_(reinterpret_cast<CommHandle>(worker.base_comm_handle_), use.id, out);
+    } else if (use.kind == CommDomainKind::GLOBAL && worker.comm_query_global_domain_snapshot_fn_ != nullptr &&
+               worker.global_domain_ids_.count(use.id) != 0) {
+        result = worker.comm_query_global_domain_snapshot_fn_(use.id, out);
+    }
+    if (result != 0 || out->use.kind != use.kind || out->use.id != use.id ||
+        out->use.device_context != use.device_context || out->use.reserved != 0) {
+        *out = {};
+        return -1;
+    }
+    // Only the actual owned chip lane supplies this provenance. Its existing
+    // live-communication gate forbids joined launches; raw prepare has none.
+    if (entry.domains_from_lane && worker.execution_environment_.has_value() &&
+        !worker.execution_environment_->borrowed)
+        *qualification = static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN);
+    return 0;
+} catch (...) {
+    if (out != nullptr) *out = {};
+    if (qualification != nullptr) *qualification = 0;
+    return -1;
+}
+
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
+    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance,
+    const std::vector<CommDomainUse> &domain_uses, bool domains_from_lane
 ) {
     validate_execution_process();
     require_comm_cleanup_confirmed();
@@ -1240,6 +1291,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             entry->lease_generation = generation;
             entry->run_epoch = run_epoch;
             entry->phase = NativeRunPhase::PREPARING;
+            entry->domain_uses = domain_uses;
+            entry->domains_from_lane = domains_from_lane;
             entry->permits_prepared_successor = allow_prepared_successor;
             native_runs_.emplace(run_epoch, std::move(entry));
         } catch (const std::bad_alloc &) {
@@ -1298,11 +1351,23 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             }
             native_runs_.at(run_epoch)->permits_prepared_successor = allow_prepared_successor;
         }
-        const NativeRunDescriptor descriptor{
+        NativeRunDescriptor descriptor{
             slot_id,        arena_bank_for_slot(slot_id), run_id,    generation, dispatch_id, run_epoch, accepted_state,
             accepted_value, launch_depth_ > 1 ? 1u : 0u,  provenance
         };
-        rc = prepare_run_fn_(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
+        if (domain_uses.empty()) {
+            rc = prepare_run_fn_(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
+        } else {
+            if (prepare_run_with_domains_fn_ == nullptr)
+                throw RunPreparationRefused("runtime has no versioned native communication-domain owner entry");
+            const NativeRunDomainProvider provider{
+                1, 0, this, &ChipWorker::query_native_domain_snapshot, domain_uses.size()
+            };
+            rc = prepare_run_with_domains_fn_(
+                device_ctx_, run_storage, callable_id, args, &config, &descriptor, sizeof(descriptor), &provider,
+                sizeof(provider)
+            );
+        }
     } catch (...) {
         drop_preparing_native_run(run_epoch);
         throw;
@@ -1354,20 +1419,21 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated,
-    NativeRunProvenance provenance
+    NativeRunProvenance provenance, const std::vector<CommDomainUse> &domain_uses
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
     return run_lane_->submit(
-        callable_id, args, config, lease, run_id, dispatch_id, accepted_state, accepted_value, activated, provenance
+        callable_id, args, config, lease, run_id, dispatch_id, accepted_state, accepted_value, activated, provenance,
+        domain_uses
     );
 }
 
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value, void *caller_stream
+    int32_t accepted_value, void *caller_stream, const std::vector<CommDomainUse> &domain_uses
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
-    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream);
+    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream, domain_uses);
 }
 
 void ChipWorker::stop_chip_run_lane_admission() noexcept {

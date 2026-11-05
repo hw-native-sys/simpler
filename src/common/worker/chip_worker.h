@@ -288,7 +288,7 @@ public:
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
-        bool activated = true, NativeRunProvenance provenance = {}
+        bool activated = true, NativeRunProvenance provenance = {}, const std::vector<CommDomainUse> &domain_uses = {}
     );
     // Direct admission uses the lane's capacity and generations. With a caller
     // stream, success means the whole run and its exit wait have been enqueued;
@@ -297,7 +297,8 @@ public:
     // run() is the blocking composition without caller stream ordering.
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr,
+        const std::vector<CommDomainUse> &domain_uses = {}
     );
     void close_chip_run_lane();
     /**
@@ -683,6 +684,7 @@ private:
     SimplerRegisterCallableV2Fn register_callable_v2_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
     SimplerPrepareRunFn prepare_run_fn_ = nullptr;
+    decltype(&simpler_prepare_run_with_domains_v1) prepare_run_with_domains_fn_ = nullptr;
     SimplerNativeRunFn launch_run_fn_ = nullptr;
     ValidateExecutionContextFn validate_execution_context_fn_ = nullptr;
     ValidateCallerStreamFn validate_caller_stream_fn_ = nullptr;
@@ -774,6 +776,8 @@ private:
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
+    decltype(&comm_query_domain_snapshot) comm_query_domain_snapshot_fn_ = nullptr;
+    decltype(&comm_query_global_domain_snapshot) comm_query_global_domain_snapshot_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     KernelSupportedFn kernel_supported_fn_ = nullptr;
@@ -853,6 +857,8 @@ private:
      */
     struct NativeRunEntry {
         RuntimeStorage storage;
+        std::vector<CommDomainUse> domain_uses;
+        bool domains_from_lane{false};
         uint32_t slot_id{0};
         uint64_t lease_generation{0};
         uint64_t run_epoch{0};
@@ -882,15 +888,19 @@ private:
     };
     /** Why a lease was refused, or that the run had already completed. */
     enum class NativeRunLease : uint8_t { Acquired, AlreadyComplete, Absent, Stale, Reserved, Busy };
+    static int query_native_domain_snapshot(
+        void *owner, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *qualification
+    );
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
         uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
+        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance,
+        const std::vector<CommDomainUse> &domain_uses = {}, bool domains_from_lane = false
     );
     ChipWorkerNativeRun prepare_native_run_for_lane(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-        bool pipeline_leased, NativeRunProvenance provenance
+        bool pipeline_leased, NativeRunProvenance provenance, const std::vector<CommDomainUse> &domain_uses
     );
     void wait_native_run_completion(const ChipWorkerNativeRun &run);
     void cleanup_native_runs_noexcept() noexcept;

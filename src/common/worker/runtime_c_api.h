@@ -76,6 +76,9 @@
 // include call_config.h in their .cpp before calling / defining simpler_run.
 #ifdef __cplusplus
 struct CallConfig;
+struct CommDomainSnapshot;
+#else
+typedef struct CommDomainSnapshot CommDomainSnapshot;
 #endif
 
 #ifdef __cplusplus
@@ -300,6 +303,23 @@ typedef enum NativeRunPreparePurpose { SIMPLER_PREPARE_EAGER = 0, SIMPLER_PREPAR
  * id remain diagnostic after admission. A non-null acceptance sink is written
  * only at the real kernel-launch marker.
  */
+/** Trusted Host-only provider borrowed from the submitting native run owner.
+ * It is queried synchronously during preparation only. The provider resolves
+ * selected domains against retained backend allocations and certifies its
+ * execution qualification; the runtime checks returned structure and mode.
+ * The production provider derives these facts from the actual chip lane and
+ * backend owner. A custom provider must uphold the same contract. */
+typedef struct NativeRunDomainProvider {
+    uint32_t version;
+    uint32_t reserved;
+    void *owner;
+    int (*query)(
+        void *owner, uint64_t run_epoch, uint32_t pipeline_slot, size_t index, CommDomainSnapshot *out,
+        uint32_t *execution_qualification
+    );
+    size_t count;
+} NativeRunDomainProvider;
+
 typedef struct NativeRunDescriptor {
     uint32_t pipeline_slot;
     uint32_t arena_bank;
@@ -1126,6 +1146,16 @@ int simpler_run(
 int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
+);
+
+/** Sized v1 Host-domain extension. The original NativeRunDescriptor layout and
+ * simpler_prepare_run symbol stay unchanged. Both extents and provider version
+ * are checked before reading either image. Missing support must be refused by
+ * callers that selected domains, never silently retried without their owner. */
+int simpler_prepare_run_with_domains_v1(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
+    size_t provider_bytes
 );
 
 /**

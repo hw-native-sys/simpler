@@ -340,6 +340,98 @@ void prime_joined(ChipWorker &worker) {
     worker.retained_epoch_limit_granted_ = 3;
 }
 
+NativeRunDomainProvider g_domain_provider{};
+CommDomainSnapshot g_domain_answer{};
+uint32_t g_domain_qualification = 0;
+int g_domain_backend_queries = 0;
+
+int domain_snapshot_backend(CommHandle handle, uint64_t id, CommDomainSnapshot *out) {
+    ++g_domain_backend_queries;
+    *out = {};
+    if (handle == nullptr || id != 31) return -1;
+    out->use = {CommDomainKind::LOCAL, 0, 31, 0x1000};
+    out->context.rankNum = 1;
+    out->context.winSize = 4096;
+    out->context.windowsIn[0] = 0x2000;
+    return 0;
+}
+
+int prepare_domain_run(
+    void *device, void *runtime, int32_t callable, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
+    size_t provider_bytes
+) {
+    EXPECT_EQ(descriptor_bytes, sizeof(NativeRunDescriptor));
+    EXPECT_EQ(provider_bytes, sizeof(NativeRunDomainProvider));
+    EXPECT_EQ(provider->version, 1u);
+    EXPECT_EQ(provider->count, 1u);
+    g_domain_provider = *provider;
+    const int rc = provider->query(
+        provider->owner, descriptor->run_epoch, descriptor->pipeline_slot, 0, &g_domain_answer, &g_domain_qualification
+    );
+    if (rc != 0) {
+        publish_released_preparation(runtime, descriptor->run_epoch);
+        return rc;
+    }
+    return prepare_run(device, runtime, callable, args, config, descriptor);
+}
+
+TEST(NativeRunOperationLeaseTest, ActualLaneDomainProviderUsesTheCurrentOwnerAndBlocksRelease) {
+    ChipWorker worker;
+    prime(worker);
+    worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, false};
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    worker.prepare_run_with_domains_fn_ = prepare_domain_run;
+    worker.comm_query_domain_snapshot_fn_ = domain_snapshot_backend;
+    worker.comm_release_domain_windows_fn_ = stub_release_domain;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    static int comm = 0;
+    ASSERT_NE(worker.create_comm_session(&comm, nullptr, true), nullptr);
+    worker.base_comm_handle_ = reinterpret_cast<uint64_t>(&comm);
+    g_domain_backend_queries = 0;
+    g_domain_provider = {};
+    g_domain_answer = {};
+    g_domain_qualification = 0;
+    ChipStorageTaskArgs args;
+    const auto run = worker.submit_chip_run(
+        1, args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 8, 9, nullptr, 0, true, {},
+        {{CommDomainKind::LOCAL, 0, 31, 0x1000}}
+    );
+    EXPECT_EQ(g_domain_backend_queries, 1);
+    EXPECT_EQ(g_domain_answer.use.id, 31u);
+    EXPECT_EQ(g_domain_qualification, static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN));
+    EXPECT_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 0);
+    CommDomainSnapshot stale;
+    uint32_t qualification = 99;
+    ASSERT_NE(g_domain_provider.query, nullptr);
+    EXPECT_NE(g_domain_provider.query(&worker, g_prepare_epoch, 0, 0, &stale, &qualification), 0);
+    EXPECT_EQ(qualification, 0u);  // The owner exists, but preparation has ended.
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    auto completed = run;
+    EXPECT_TRUE(completed.wait_until(ChipRun::Clock::now() + std::chrono::seconds(1)));
+    EXPECT_NE(g_domain_provider.query(&worker, g_prepare_epoch, 0, 0, &stale, &qualification), 0);
+    EXPECT_EQ(stale.use.device_context, 0u);
+    EXPECT_NO_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0));
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_NO_THROW(worker.comm_destroy_all());
+}
+
+TEST(NativeRunOperationLeaseTest, SelectedDomainsCannotFallBackToAnOldPrepareEntry) {
+    ChipWorker worker;
+    prime(worker);
+    ChipStorageTaskArgs args;
+    EXPECT_THROW(
+        worker.prepare_native_run_for_lane(
+            1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 1, 1, nullptr, 0, true, {},
+            {{CommDomainKind::LOCAL, 0, 31, 0x1000}}
+        ),
+        RunPreparationRefused
+    );
+    EXPECT_FALSE(g_prepare_entered);
+    EXPECT_EQ(worker.unproven_native_run_count(), 0u);
+}
+
 ChipWorkerNativeRun prepare(ChipWorker &worker, uint32_t slot, uint64_t generation) {
     ChipStorageTaskArgs args{};
     return worker.prepare_native_run_on_slot(

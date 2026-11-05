@@ -360,9 +360,22 @@ class Orchestrator:
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
+            domain_uses = (
+                worker._domain_uses_for_dispatch(c_args, cpp_worker_id, provenance_locked=needs_prov)
+                if worker is not None
+                else []
+            )
             _admit_task_submission(self._worker)
             return self._o.submit_next_level(
-                digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
+                digest,
+                kind,
+                target_namespace,
+                c_args,
+                cfg,
+                cpp_worker_id,
+                final_worker_ids,
+                remote_sidecar,
+                domain_uses,
             )
 
     def submit_next_level_group(  # noqa: PLR0912 -- linear per-member sidecar + eligibility + kind4-provenance passes, one branch each
@@ -476,9 +489,25 @@ class Orchestrator:
             if worker is not None:
                 for c_args in c_args_list:
                     worker._record_touched_identities(c_args)
+            domain_uses = (
+                [
+                    worker._domain_uses_for_dispatch(c_args, worker_ids[i], provenance_locked=bool(member_checks))
+                    for i, c_args in enumerate(c_args_list)
+                ]
+                if worker is not None
+                else []
+            )
             _admit_task_submission(self._worker)
             return self._o.submit_next_level_group(
-                digest, kind, target_namespace, c_args_list, cfg, worker_ids, worker_id_sets, remote_sidecars
+                digest,
+                kind,
+                target_namespace,
+                c_args_list,
+                cfg,
+                worker_ids,
+                worker_id_sets,
+                remote_sidecars,
+                domain_uses,
             )
 
     def submit_sub(self, callable_handle: Any, args: TaskArgs | None = None):
