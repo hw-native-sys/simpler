@@ -59,6 +59,7 @@ macro(hbg_cases)
 endmacro()
 
 hbg_case(test_hbg_scope_mode.cpp)
+hbg_case(test_hbg_async_declarations.cpp ORCH)
 
 # Fault injection uses the ELF linker's pthread wrappers.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

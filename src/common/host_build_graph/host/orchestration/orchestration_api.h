@@ -175,6 +175,53 @@ static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels
     return ctx->ops->submit_task(ctx, mixed_kernels, args);
 }
 
+static inline bool rt_declare_async_use(TaskId task, const AsyncUseDeclaration &use) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx == nullptr || ctx->ops->is_fatal(ctx)) return false;
+    if (ctx->ops->declare_async_use == nullptr) {
+        ctx->ops->report_fatal(
+            ctx, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "runtime does not support async use declarations"
+        );
+        return false;
+    }
+    return ctx->ops->declare_async_use(ctx, task, use);
+}
+
+// These positions refer to the submitted task's own tensor/scalar arguments,
+// including a recorded Graph child's parameter-backed arguments. Declaration
+// does not grant ownership or cache cleanliness: native preparation must resolve
+// the actual ranges through its retained owners before enabling the run.
+static inline bool rt_declare_async_counter_payload(
+    TaskId task, uint32_t signal_arg, uint32_t payload_arg, uint32_t signal_record_stride
+) {
+    return rt_declare_async_use(
+        task, {AsyncUseDeclarationKind::COUNTER_PAYLOAD, signal_arg, payload_arg, UINT32_MAX, UINT32_MAX,
+               signal_record_stride}
+    );
+}
+
+// An explicit control-only wait has no payload acquisition obligation.
+static inline bool rt_declare_async_counter(TaskId task, uint32_t signal_arg, uint32_t signal_record_stride) {
+    return rt_declare_async_use(
+        task,
+        {AsyncUseDeclarationKind::COUNTER_ONLY, signal_arg, UINT32_MAX, UINT32_MAX, UINT32_MAX, signal_record_stride}
+    );
+}
+
+static inline bool rt_declare_async_consumer(TaskId task, uint32_t payload_arg) {
+    return rt_declare_async_use(
+        task, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, payload_arg, UINT32_MAX, UINT32_MAX, 0}
+    );
+}
+
+static inline bool rt_declare_async_sdma_transfer(
+    TaskId task, uint32_t source_arg, uint32_t destination_arg, uint32_t comm_context_scalar
+) {
+    return rt_declare_async_use(
+        task, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, destination_arg, source_arg, comm_context_scalar, 0}
+    );
+}
+
 /**
  * Convenience wrapper: submit an AIC-only task.
  */

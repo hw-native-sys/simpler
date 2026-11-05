@@ -1256,7 +1256,8 @@ void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode
 
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan
+    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
+    const AsyncHostDeclarations *async_declarations
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1656,6 +1657,10 @@ bool create_scheduler_state(
     std::vector<SchedulerAsyncCapabilities> async_capabilities;
     std::string async_error;
     if (has_deferred_callable) {
+        if (async_declarations == nullptr) {
+            LOG_ERROR("A5 HBG: deferred callable has no explicit resource/payload declarations for this run");
+            return false;
+        }
         // Registration-owned descriptors are projected onto the final expanded
         // nodes. A synchronous run needs neither these rows nor an async region.
         async_capabilities.resize(task_metadata.size());
@@ -1881,6 +1886,7 @@ bool create_scheduler_state(
 
 struct HostPreparePlan : RetainedHostPreparePlan<RuntimeArenaLayout> {
     NativeGraphHostPlan native_graph;
+    std::unique_ptr<AsyncHostDeclarations> async_declarations;
 };
 
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
@@ -2001,7 +2007,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         instance.args_base = instance.heap_base + definition.required_heap;
     }
     if (!create_scheduler_state(
-            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph,
+            plan.async_declarations.get()
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2237,6 +2244,7 @@ int32_t run_host_orchestration(
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    plan.async_declarations = std::move(graph_state->async_declarations);
 
     ReadyQueueCapacities ready_queue_capacities{};
     const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);

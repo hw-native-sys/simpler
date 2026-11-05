@@ -37,6 +37,7 @@
 #include "host_build_graph/submit_types.h"      // MixedKernels
 #include "host_build_graph/tensor.h"            // simpler::hbg::Tensor
 #include "host_build_graph/types.h"             // TaskOutputTensors, CoreTaskArgs, GraphTaskArgs
+#include "host_build_graph/async_use_declaration.h"
 
 // Every op runs on the host and takes the orchestration context, so this table
 // belongs to orchestration rather than to the device-side runtime. The
@@ -98,4 +99,5 @@ struct OrchOps {
     // caller record the body inline instead.
     bool (*graph_record_start)(OrchContext *ctx, const GraphTaskArgs &args, void *job);
     void (*graph_record_wait)(OrchContext *ctx);
+    bool (*declare_async_use)(OrchContext *ctx, TaskId task, const AsyncUseDeclaration &use);
 };

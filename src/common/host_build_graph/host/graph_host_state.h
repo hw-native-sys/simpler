@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "host_build_graph/host/graph_recording.h"
+#include "host_build_graph/host/async_declarations.h"
 
 struct ChipTaskSlotState;
 
@@ -126,6 +127,9 @@ struct GraphHostState {
     // Definitions are keyed by graph_key in this run's cache. Separate runs own
     // independent caches, so orchestration callable identity is not part of the key.
     std::unordered_map<uint64_t, GraphDefinitionRecord> definitions;
+    // Optional Host-only declarations, scoped to this run's real Graph keys.
+    // They contain task-argument positions and never captured device addresses.
+    std::unique_ptr<AsyncHostDeclarations> async_declarations;
     // Recordings in flight, at most one per Graph key. Several record at once,
     // each on its own thread; graph_commit drains and finalizes all of them.
     std::unordered_map<uint64_t, std::unique_ptr<GraphInflightRecording>> inflight;
