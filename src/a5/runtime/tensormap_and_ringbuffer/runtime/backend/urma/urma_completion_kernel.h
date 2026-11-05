@@ -168,6 +168,36 @@ inline __aicore__ bool is_flat_contiguous_1d(TensorT &tensor) {
 }
 
 #if defined(PTO_URMA_SUPPORTED)
+inline __aicore__ bool
+build_urma_session(const AsyncCtx &ctx, __gm__ uint8_t *workspace, uint32_t peer, pto::comm::AsyncSession &session) {
+    session = pto::comm::AsyncSession{};
+    // Activate both URMA union alternatives without consulting the CCE block identity.
+    pto::comm::detail::ActivateEngineState<pto::comm::DmaEngine::URMA>(session);
+    session.valid = false;
+    session.contextGm = workspace;
+    session.destRankId = peer;
+    if (workspace == nullptr || ctx.urma_sender_id == UINT32_MAX) return false;
+    auto *info = reinterpret_cast<__gm__ UrmaInfo *>(workspace);
+    const uint32_t per_sender = info->jettiesPerCore;
+    if (peer >= info->rankCount || per_sender == 0 || per_sender > pto::comm::urma::kUrmaMaxJettiesPerCore)
+        return false;
+    uint32_t bound = 0;
+    if (info->layout == UrmaLayout::PER_PEER) {
+        if (static_cast<uint64_t>(info->rankCount) * info->rowsPerPeer != info->jettyCount) return false;
+        bound = info->rowsPerPeer;
+    } else if (info->layout == UrmaLayout::SHARED_POOL) {
+        if (info->rowsPerPeer != 1) return false;
+        bound = info->jettyCount;
+    } else {
+        return false;
+    }
+    if (bound < per_sender || bound % per_sender != 0 || ctx.urma_sender_id >= bound / per_sender) return false;
+    session.cfg.urma.qpCount = per_sender;
+    session.qpIdxBase = ctx.urma_sender_id * per_sender;
+    session.valid = true;
+    return true;
+}
+
 template <typename TensorT>
 inline __aicore__ auto make_tensor_slice(TensorT &tensor, uint64_t elem_offset, uint64_t elem_count) {
     using Shape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
@@ -297,7 +327,7 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
     }
 #if defined(PTO_URMA_SUPPORTED)
     pto::comm::AsyncSession session;
-    if (!pto::comm::BuildAsyncSession<pto::comm::DmaEngine::URMA>(desc.workspace, desc.remote_rank, session)) {
+    if (!build_urma_session(ctx, desc.workspace, desc.remote_rank, session)) {
         pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
@@ -332,6 +362,7 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     ctx.completion_error_code = lc->async_ctx.completion_error_code;
     ctx.completion_entries = lc->async_ctx.completion_entries;
     ctx.completion_capacity = lc->async_ctx.completion_capacity;
+    ctx.urma_sender_id = lc->async_ctx.urma_sender_id;
     TaskId::assign(ctx.task_token, lc->async_ctx.task_token);
     return ctx;
 }

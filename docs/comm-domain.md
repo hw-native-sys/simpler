@@ -480,6 +480,32 @@ manager rejects single-rank initialization. The successful
 uses two endpoints and has not been integrated into that provider; the provider
 restriction is not a hardware limitation. HBG URMA completion, arbitrary subsets
 and L4 async domains are unsupported.
+
+URMA domains use `PER_PEER`: each resident AIV owns a separate queue group
+for each remote peer. The provider selects the device AIV count and uses its
+default one jetty per AIV and default SQ depth. Queue resources scale with
+both AIV and peer count. Different AIVs can submit to the same peer without
+sharing a producer queue.
+
+`get_async_ctx(args)` carries `urma_sender_id`, the scheduler's contiguous
+resident AIV ordinal, including distinct identities for both lanes of a MIX
+cluster. It remains the same across tasks and both dispatch buffers. It is
+neither a hardware core ID nor a task-local block index. AIC and unbound
+contexts have no valid sender and cannot submit URMA requests.
+
+The URMA adapter constructs its session directly from this identity and the
+chosen workspace; it does not use CCE block IDs. It checks the workspace
+layout, peer and queue bounds before posting. The same adapter binds AIV
+requests to Host or Device URMA workspaces without changing peer MR addressing.
+ISA-specific session activation is isolated in the adapter's session helper
+and must be checked when updating the ISA pin.
+
+The queue's submitted and completed counters persist across task switches;
+the AICPU completion poller is the only tail publisher. An AIV returning does
+not complete its network requests: dependencies and buffer lifetimes remain
+protected by the existing deferred-completion protocol. Requests that exceed
+the available queue or completion-slab capacity fail before posting.
+
 The legacy `device_ctx` field remains a raw address for synchronous consumers;
 it does not declare or validate an asynchronous engine requirement. No compiled
 capability query or `enable_urma` initialization switch is needed.

@@ -1126,6 +1126,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 ac.completion_error_code = &slab->error_code;
                 ac.completion_entries = &slab->entries[0];
                 ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+                ac.urma_sender_id = core_id >= aic_n ? static_cast<uint32_t>(core_id - aic_n) : UINT32_MAX;
                 slab->count = 0;
                 slab->error_code = SIMPLER_ERROR_NONE;
                 for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
@@ -1436,10 +1437,10 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    // Prefill the per-dispatch AsyncCtx constant fields once. Of AsyncCtx's five
-    // fields, four are constant for a given (core, buf_idx): the three pointers
-    // target the fixed deferred_slab_per_core_[core][buf] members, and capacity is
-    // MAX_COMPLETIONS_PER_TASK. Only task_token varies per dispatch, so build_payload
+    // Prefill the per-dispatch AsyncCtx constant fields once. The three pointers
+    // target fixed deferred_slab_per_core_[core][buf] members, capacity is
+    // MAX_COMPLETIONS_PER_TASK, and the sender identity belongs to the resident AIV.
+    // Only task_token varies per dispatch, so build_payload
     // writes just that; these constants survive across dispatches because the
     // payload buffer is never zeroed between them.
     // The two context-pointer args are also per-(core, buf_idx) constants — they
@@ -1447,7 +1448,13 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // here too and drop them from the per-dispatch build_payload writes. This keeps
     // the per-dispatch write footprint on the CL0 control block only (args[48]/[49]
     // live on a later line).
+    uint32_t next_urma_sender = 0;
     for (int32_t core_id = 0; core_id < RUNTIME_MAX_WORKER; core_id++) {
+        // Match the discovered aiv_worker_ids_ order, including non-blocked layouts.
+        const uint32_t urma_sender =
+            core_id < cores_total_num_ && static_cast<CoreType>(core_type_compact_[core_id]) == CoreType::AIV ?
+                next_urma_sender++ :
+                UINT32_MAX;
         for (int32_t buf = 0; buf < 2; buf++) {
             DispatchPayload &dp = payload_per_core_[core_id][buf];
             AsyncCtx &ac = dp.local_context.async_ctx;
@@ -1456,6 +1463,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             ac.completion_error_code = &slab->error_code;
             ac.completion_entries = &slab->entries[0];
             ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+            ac.urma_sender_id = urma_sender;
             // Clear the slab once here; thereafter only the completion path re-clears
             // count (and only when a deferred task dirtied it), never per dispatch.
             slab->count = 0;
