@@ -15,10 +15,13 @@ group metadata, so ownership is never supplied by a fabricated registry row.
 
 from __future__ import annotations
 
+import ctypes
+import struct
 from dataclasses import replace
 
 import pytest
 import simpler.orchestrator as orch_module
+from _task_interface import _read_comm_domain_uses_from_blob
 from simpler.comm_domain import CommDomainRef
 from simpler.global_comm_domain import (
     GlobalDomainBuffer,
@@ -124,6 +127,48 @@ def test_scalar_only_device_context_records_the_same_live_owner(owner):
         assert owner._building_run_resources.live_domains[domain.name] is domain
 
     _run(owner, inspect)
+
+
+@pytest.mark.parametrize("source", ["tensor", "scalar"])
+def test_default_worker_first_local_domain_zero_reaches_the_native_decoder(source):
+    worker = Worker(
+        level=3,
+        platform="a2a3sim",
+        runtime="tensormap_and_ringbuffer",
+        device_ids=[0],
+        num_sub_workers=0,
+        startup_timeout_s=5,
+        py_control_timeout_s=5,
+    )
+    try:
+        worker.init()
+        domain = _allocate(worker, "first-local")
+        assert domain.allocation_id == 0
+
+        def inspect(_orch):
+            if source == "tensor":
+                args = _tensor_args(domain[0])
+            else:
+                args = TaskArgs()
+                args.add_scalar(domain.device_context(0))
+            selected = worker._domain_uses_for_dispatch(args, 0)
+            assert selected == [(1, 0, domain[0].device_ctx)]
+            resources = worker._building_run_resources
+            assert resources is not None
+            assert resources.live_domains[domain.name] is domain
+            kind, identity, context = selected[0]
+            # The C++ consumer reads the domain trailer after an empty TaskArgs blob.
+            payload = (
+                struct.pack("<ii", 0, 0)
+                + struct.pack("<IIII", 0x53554443, 1, 1, 24)
+                + struct.pack("<IIQQ", kind, 0, identity, context)
+            )
+            blob = ctypes.create_string_buffer(payload)
+            assert _read_comm_domain_uses_from_blob(ctypes.addressof(blob), len(payload)) == selected
+
+        _run(worker, inspect)
+    finally:
+        worker.close()
 
 
 def test_wrong_worker_and_an_unselected_live_domain_do_not_gain_authority(owner):

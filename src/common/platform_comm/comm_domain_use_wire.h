@@ -35,7 +35,7 @@ inline void validate_comm_domain_uses(const std::vector<CommDomainUse> &uses) {
     for (size_t i = 0; i < uses.size(); ++i) {
         const auto &use = uses[i];
         if ((use.kind != CommDomainKind::LOCAL && use.kind != CommDomainKind::GLOBAL) || use.reserved != 0 ||
-            use.id == 0 || use.device_context == 0)
+            (use.kind == CommDomainKind::GLOBAL && use.id == 0) || use.device_context == 0)
             throw std::invalid_argument("invalid communication-domain use identity");
         for (size_t j = 0; j < i; ++j) {
             if ((uses[j].kind == use.kind && uses[j].id == use.id) || uses[j].device_context == use.device_context)

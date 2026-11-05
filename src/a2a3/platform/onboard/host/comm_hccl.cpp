@@ -1702,7 +1702,7 @@ extern "C" int comm_global_domain_import(
 
 extern "C" int comm_query_domain_snapshot(CommHandle h, uint64_t allocation_id, CommDomainSnapshot *out) {
     if (out != nullptr) *out = {};
-    if (h == nullptr || out == nullptr || allocation_id == 0) return -1;
+    if (h == nullptr || out == nullptr) return -1;
     const auto found = h->domain_allocations.find(allocation_id);
     if (found == h->domain_allocations.end()) return -1;
     const auto &allocation = *found->second;

@@ -185,6 +185,29 @@ TEST_F(CommSimDomainCleanupTest, SnapshotRefusesPartiallyReleasedDomainWithRetai
     destroy_successfully();
 }
 
+TEST_F(CommSimDomainCleanupTest, LocalZeroSnapshotRequiresItsActualLiveAllocation) {
+    CommDomainSnapshot snapshot{};
+    EXPECT_NE(comm_query_domain_snapshot(handle_, 0, &snapshot), 0);
+    const uint32_t ranks[] = {0};
+    uint64_t context = 0;
+    uint64_t base = 0;
+    size_t size = 0;
+    ASSERT_EQ(comm_alloc_domain_windows(handle_, 0, ranks, 1, 0, 4096, 0, &context, &base, &size), 0);
+    ASSERT_EQ(comm_query_domain_snapshot(handle_, 0, &snapshot), 0);
+    EXPECT_TRUE(comm_domain_snapshot_valid(snapshot));
+    EXPECT_EQ(snapshot.use.kind, CommDomainKind::LOCAL);
+    EXPECT_EQ(snapshot.use.id, 0u);
+    EXPECT_EQ(snapshot.use.device_context, context);
+    EXPECT_EQ(snapshot.context.windowsIn[0], base);
+    EXPECT_EQ(snapshot.context.winSize, 4096u);
+    EXPECT_EQ(snapshot.context.workspaces[0].addr, 0u);
+    ASSERT_EQ(comm_release_domain_windows(handle_, 0, 1, 0), 0);
+    EXPECT_NE(comm_query_domain_snapshot(handle_, 0, &snapshot), 0);
+    EXPECT_FALSE(comm_domain_snapshot_valid(snapshot));
+    EXPECT_EQ(snapshot.use.device_context, 0u);
+    EXPECT_EQ(snapshot.context.windowsIn[0], 0u);
+}
+
 TEST_F(CommSimDomainCleanupTest, GlobalSnapshotRequiresCompletedImportAndRevokesAfterRelease) {
     const uint64_t id = (static_cast<uint64_t>(getpid()) << 32) | 73;
     CommGlobalDomainDescriptor descriptor{};

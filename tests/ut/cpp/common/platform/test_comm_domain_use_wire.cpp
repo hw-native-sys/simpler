@@ -63,6 +63,37 @@ TEST(CommDomainUseWire, UnalignedRoundTripPreservesNamespacesAndFullWidthIdentit
     }
 }
 
+TEST(CommDomainUseWire, LocalZeroIdentityRoundTripsButGlobalZeroIsReserved) {
+    const std::vector<CommDomainUse> uses{{CommDomainKind::LOCAL, 0, 0, UINT64_C(0x1000)}};
+    std::vector<uint8_t> bytes(comm_domain_uses_wire_size(uses));
+    ASSERT_NO_THROW(write_comm_domain_uses(bytes.data(), bytes.size(), uses));
+    const auto decoded = read_comm_domain_uses(bytes.data(), bytes.size());
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded[0].kind, CommDomainKind::LOCAL);
+    EXPECT_EQ(decoded[0].id, 0u);
+    EXPECT_EQ(decoded[0].device_context, uses[0].device_context);
+
+    auto global = uses;
+    global[0].kind = CommDomainKind::GLOBAL;
+    EXPECT_THROW(write_comm_domain_uses(bytes.data(), bytes.size(), global), std::invalid_argument);
+    std::memcpy(bytes.data() + sizeof(CommDomainUsesHeader), global.data(), sizeof(CommDomainUse));
+    EXPECT_THROW(read_comm_domain_uses(bytes.data(), bytes.size()), std::invalid_argument);
+}
+
+TEST(CommDomainUseWire, SnapshotIdentityUsesTheSameLocalAndGlobalZeroContract) {
+    CommDomainSnapshot snapshot{};
+    EXPECT_FALSE(comm_domain_snapshot_valid(snapshot));
+    snapshot.use = {CommDomainKind::LOCAL, 0, 0, UINT64_C(0x1000)};
+    snapshot.context.rankNum = 1;
+    snapshot.context.winSize = 4096;
+    snapshot.context.windowsIn[0] = UINT64_C(0x2000);
+    EXPECT_TRUE(comm_domain_snapshot_valid(snapshot));
+    snapshot.use.kind = CommDomainKind::GLOBAL;
+    EXPECT_FALSE(comm_domain_snapshot_valid(snapshot));
+    snapshot.use.id = 1;
+    EXPECT_TRUE(comm_domain_snapshot_valid(snapshot));
+}
+
 TEST(CommDomainUseWire, InvalidFormatAndCountAreRejectedBeforeReadingRows) {
     const auto uses = examples();
     std::vector<uint8_t> bytes(comm_domain_uses_wire_size(uses));
@@ -91,7 +122,7 @@ TEST(CommDomainUseWire, InvalidAndDuplicateRowsCannotBePublishedOrDecoded) {
         auto invalid = valid;
         if (kind == 0) invalid[0].kind = static_cast<CommDomainKind>(0);
         if (kind == 1) invalid[0].reserved = 1;
-        if (kind == 2) invalid[0].id = 0;
+        if (kind == 2) invalid[1].id = 0;
         if (kind == 3) invalid[0].device_context = 0;
         if (kind == 4) {
             invalid[1].kind = invalid[0].kind;

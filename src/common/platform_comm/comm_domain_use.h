@@ -24,7 +24,7 @@ enum class CommDomainExecution : uint32_t { UNKNOWN = 0, EXCLUSIVE_RUN = 1 };
 struct CommDomainUse {
     CommDomainKind kind{};
     uint32_t reserved{0};
-    uint64_t id{0};
+    uint64_t id{0};  // LOCAL allocations begin at zero; GLOBAL reserves zero.
     uint64_t device_context{0};
 };
 
@@ -43,9 +43,9 @@ inline bool comm_domain_snapshot_valid(const CommDomainSnapshot &snapshot) {
     const auto valid_span = [](uint64_t base, uint64_t bytes) {
         return base != 0 && bytes != 0 && bytes <= UINT64_MAX - base;
     };
-    if ((use.kind != CommDomainKind::LOCAL && use.kind != CommDomainKind::GLOBAL) || use.reserved != 0 || use.id == 0 ||
-        !valid_span(use.device_context, sizeof(CommContext)) || context.rankNum == 0 ||
-        context.rankNum > COMM_MAX_RANK_NUM || context.rankId >= context.rankNum ||
+    if ((use.kind != CommDomainKind::LOCAL && use.kind != CommDomainKind::GLOBAL) || use.reserved != 0 ||
+        (use.kind == CommDomainKind::GLOBAL && use.id == 0) || !valid_span(use.device_context, sizeof(CommContext)) ||
+        context.rankNum == 0 || context.rankNum > COMM_MAX_RANK_NUM || context.rankId >= context.rankNum ||
         !valid_span(context.windowsIn[context.rankId], context.winSize))
         return false;
     for (uint32_t i = 0; i < context.rankNum; ++i) {
