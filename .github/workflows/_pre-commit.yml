@@ -152,6 +152,16 @@ jobs:
         if: inputs.setup_variant == 'self-cpu'
         run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
+      - name: Install pre-commit on CPU runner
+        if: inputs.setup_variant == 'self-cpu'
+        run: |
+          for attempt in 1 2 3; do
+            python -m pip install pre-commit && exit 0
+            echo "Package index attempt $attempt failed; retrying"
+            sleep 5
+          done
+          exit 1
+
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.0
         with:
