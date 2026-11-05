@@ -7,9 +7,9 @@ The CI pipeline maps test categories (st, ut-py, ut-cpp) × hardware tiers to Gi
 Design principles:
 
 1. **Merge by runner, not by language** — Python and applicable C++ unit tests share setup cost and run as steps within a single job per runner tier. A runner with no platform-specific C++ tests does not carry an empty CTest step; currently `ut-a5` is Python-only.
-2. **Runner matches hardware tier** — no-hardware tests run on GitHub-hosted `ubuntu-24.04` per PR, with macOS coverage in Daily; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
+2. **Runner matches hardware tier** — no-hardware PR jobs run on `[self-hosted, cpu]`; macOS coverage runs in Daily. Platform-specific tests use self-hosted runners with the matching label (`a2a3`, `a5`). Daily Linux and sim jobs remain on GitHub-hosted runners.
 3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
-4. **sim = no hardware** — `a2a3sim`/`a5sim` jobs run on github-hosted runners alongside unit tests.
+4. **sim = no hardware** — `a2a3sim`/`a5sim` PR jobs run on CPU runners alongside unit tests.
 5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so pure-a5 PRs skip a2a3 scene-test runs and vice versa. **UT jobs are still not gated by platform** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings. They *are* gated by test category: a diff confined to `tests/st/` or `examples/` cannot break a unit test, and one confined to `tests/ut/` cannot break a scene test, because the two suites execute disjoint trees (`pytest examples tests/st` vs `pytest tests/ut` plus the C++ ctest) and no unit test reads `examples/` or `tests/st/`. Shared test infrastructure — the root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/` — belongs to neither category and runs both.
 6. **Non-code PRs run pre-commit and docs, and nothing else** — `detect-changes` sets `non_code_only` when *no* changed file falls outside the `NON_CODE` set. Skipping the UT jobs is riskless there because nothing in that set can change what the code does, and each member already has its own gate: markdownlint inside `pre-commit` reads the markdown, `docs.yml` (unconditional on every PR) builds the site with `--strict`, and `pre-commit` itself is ungated so a `.pre-commit-config.yaml` change is fully exercised by it.
 
@@ -66,13 +66,13 @@ timeouts remain a per-connection safeguard, not a wall-clock guarantee.
 
 ```text
 PullRequest
-  ├── pre-commit             (ubuntu-24.04)
-  ├── packaging-matrix       (ubuntu-24.04)          — [needs !examples_only && !tests_only]
-  ├── profiling-flags-smoke  (ubuntu-24.04)         — (a2a3_changed || a5_changed) && !examples_only && !tests_only
-  ├── ut                     (ubuntu-24.04)          — Python + C++ UT, no hardware [needs ut_affected]
-  ├── detect-changes         (reusable; ubuntu-24.04 in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
-  ├── st-sim-a2a3            (ubuntu-24.04)          — a2a3_changed && st_affected
-  ├── st-sim-a5              (ubuntu-24.04)          — a5_changed && st_affected
+  ├── pre-commit             (self-hosted cpu)
+  ├── packaging-matrix       (self-hosted cpu)       — [needs !examples_only && !tests_only]
+  ├── profiling-flags-smoke  (self-hosted cpu)       — (a2a3_changed || a5_changed) && !examples_only && !tests_only
+  ├── ut                     (self-hosted cpu)       — Python + C++ UT, no hardware [needs ut_affected]
+  ├── detect-changes         (reusable; self-hosted cpu in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
+  ├── st-sim-a2a3            (self-hosted cpu)       — a2a3_changed && st_affected
+  ├── st-sim-a5              (self-hosted cpu)       — a5_changed && st_affected
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
@@ -85,9 +85,9 @@ PullRequest
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut` | `ubuntu-24.04` | `pytest tests/ut` + `ctest -LE requires_hardware` |
-| `st-sim-a2a3` | `ubuntu-24.04` | `pytest examples tests/st --platform a2a3sim` |
-| `st-sim-a5` | `ubuntu-24.04` | `pytest examples tests/st --platform a5sim` |
+| `ut` | `[self-hosted, cpu]` | `pytest tests/ut` + `ctest -LE requires_hardware` |
+| `st-sim-a2a3` | `[self-hosted, cpu]` | `pytest examples tests/st --platform a2a3sim` |
+| `st-sim-a5` | `[self-hosted, cpu]` | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
@@ -303,26 +303,15 @@ selects its own platform. The profiling-flags smoke installs only the
 `_task_interface` binding because its matrix builds every runtime configuration
 itself.
 
-### Sim jobs on CPU-constrained runners
+### Sim jobs on CPU runners
 
-The Ubuntu cells of sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-24.04`, whose standard
-GitHub-hosted runner currently has **4 vCPUs**. `--device 0-15` is still the
-right choice for the **pool size** (some L3 cases need several virtual ids), but
-the default `--max-parallel auto` caps the in-flight subprocess count to
-`min(nproc, len(--device))` — on a 4-core runner that becomes `4`. Note
-`os.cpu_count()` reports the host's logical CPUs and ignores any cgroup CPU
-quota, so this is the true core count, not a container limit.
+The Linux cells of sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on the self-hosted
+CPU pool. `--device 0-15` supplies virtual device IDs for the L3 cases, and
+`--max-parallel auto` caps in-flight subprocesses at `min(nproc, 16)`.
 
 ```bash
-# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-24.04 runner
+# Sim: --max-parallel auto resolves to 16 on the CPU runner
 pytest examples tests/st --platform a2a3sim --device 0-15
-
-# Throttle further on a CPU-starved runner: 4 concurrent cases (each forking
-# several chip subprocesses with many threads) can oversubscribe 4 cores and
-# trigger the sim handshake/deinit failures in
-# troubleshooting/sim-oversubscription-hang.md. --max-parallel 2 trades
-# throughput for stability.
-pytest examples tests/st --platform a2a3sim --device 0-15 --max-parallel 2
 ```
 
 On hardware jobs the `auto` default is `len(--device)` because each subprocess
@@ -483,10 +472,10 @@ queueing entirely:
   `[self-hosted, a2a3/a5]`. T2 (macOS) is intentionally absent. The lane calls
   the same reusable job-body workflows as `ci.yml`, passing
   `setup_variant=self-cpu`, `repository`, `ref`, and self-hosted runner labels
-  where the main CI passes `setup_variant=github` and GitHub-hosted runners.
+  as the main CI does for its Linux PR jobs.
   Gate outputs still come from the canonical `detect-changes` workflow, executed
   on `[self-hosted, cpu]` in this lane.
-- **cpu runner contract**: dnf-installed `cmake ninja-build gcc-c++ clang-tools-extra graphviz gtest-devel python3-devel`, plus a pip-installable torch aarch64 CPU wheel. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on this lane and on the github-hosted ones. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim.
+- **CPU runner contract**: `/opt/pypto/toolchain/current/activate.sh` provides Python 3.10, GCC 15, ccache and libatomic. Each CPU job activates it through `setup-self-cpu-toolchain`, creates its own venv, and installs dependencies with a pip cache. Torch stays a per-job dependency. The runner also provides CMake, Ninja, GoogleTest, Graphviz and clang-tidy 18.
 - The lane run is standalone — it attaches no checks to the PR; results are read from the run.
 
 ## Hardware Classification
@@ -495,7 +484,7 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 
 | Tier | CI Runner | Job examples |
 | ---- | --------- | ------------ |
-| No hardware | `ubuntu-24.04`, `macos-latest` | `ut`, `st-sim-*` |
+| No hardware | `[self-hosted, cpu]` per PR; GitHub-hosted Linux and macOS in Daily | `ut`, `st-sim-*` |
 | Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-a2a3`, `st-onboard-a2a3` |
 | Platform-specific (a5) | `[self-hosted, a5]` | `ut-a5`, `st-onboard-a5` |
 

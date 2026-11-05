@@ -22,15 +22,15 @@ jobs:
       base_ref: ${{ github.event.pull_request.base.ref }}
       base_sha: ${{ github.event.pull_request.base.sha }}
       head_sha: ${{ github.event.pull_request.head.sha }}
-      runs_on: '["ubuntu-24.04"]'
+      runs_on: '["self-hosted","cpu"]'
 
   pre-commit:
     uses: ./.github/workflows/_pre-commit.yml
     with:
       base_sha: ${{ github.event.pull_request.base.sha }}
       head_sha: ${{ github.event.pull_request.head.sha }}
-      runs_on: '["ubuntu-24.04"]'
-      setup_variant: github
+      runs_on: '["self-hosted","cpu"]'
+      setup_variant: self-cpu
 
   packaging-matrix:
     needs: [detect-changes, pre-commit]
@@ -42,8 +42,8 @@ jobs:
         python-version: ["3.10"]
     uses: ./.github/workflows/_packaging.yml
     with:
-      runs_on: ${{ toJSON(matrix.os) }}
-      setup_variant: github
+      runs_on: '["self-hosted","cpu"]'
+      setup_variant: self-cpu
       python_version: ${{ matrix.python-version }}
 
   ut:
@@ -55,8 +55,8 @@ jobs:
         python-version: ["3.10"]
     uses: ./.github/workflows/_ut-no-hardware.yml
     with:
-      runs_on: ${{ toJSON(matrix.os) }}
-      setup_variant: github
+      runs_on: '["self-hosted","cpu"]'
+      setup_variant: self-cpu
       python_version: ${{ matrix.python-version }}
 
   st-sim-a2a3:
@@ -68,8 +68,8 @@ jobs:
         python-version: ["3.10"]
     uses: ./.github/workflows/_st-sim-a2a3.yml
     with:
-      runs_on: ${{ toJSON(matrix.os) }}
-      setup_variant: github
+      runs_on: '["self-hosted","cpu"]'
+      setup_variant: self-cpu
       include_dfx_smokes: true
       python_version: ${{ matrix.python-version }}
 
@@ -82,8 +82,8 @@ jobs:
         python-version: ["3.10"]
     uses: ./.github/workflows/_st-sim-a5.yml
     with:
-      runs_on: ${{ toJSON(matrix.os) }}
-      setup_variant: github
+      runs_on: '["self-hosted","cpu"]'
+      setup_variant: self-cpu
       include_dfx_smokes: true
       python_version: ${{ matrix.python-version }}
 
@@ -92,8 +92,8 @@ jobs:
     if: (needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true') && needs.detect-changes.outputs.examples_only != 'true' && needs.detect-changes.outputs.tests_only != 'true'
     uses: ./.github/workflows/_profiling-flags-smoke.yml
     with:
-      runs_on: '["ubuntu-24.04"]'
-      setup_variant: github
+      runs_on: '["self-hosted","cpu"]'
+      setup_variant: self-cpu
 
   ut-a2a3:
     needs: [detect-changes, pre-commit]

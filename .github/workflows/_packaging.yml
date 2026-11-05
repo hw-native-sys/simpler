@@ -37,6 +37,10 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Set up CPU toolchain
+        if: inputs.setup_variant == 'self-cpu'
+        uses: ./.github/actions/setup-self-cpu-toolchain
+
       - name: Set up C++ compiler
         id: packaging-tools
         if: inputs.setup_variant == 'github'

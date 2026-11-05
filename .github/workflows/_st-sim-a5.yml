@@ -64,6 +64,10 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Set up CPU toolchain
+        if: inputs.setup_variant == 'self-cpu'
+        uses: ./.github/actions/setup-self-cpu-toolchain
+
       - name: Validate manual mode
         run: |
           case "$MANUAL_MODE" in

@@ -1,0 +1,22 @@
+name: Set up self-hosted CPU toolchain
+description: Use the provisioned Python 3.10 and GCC 15 bundle on CPU runners.
+
+runs:
+  using: composite
+  steps:
+    - name: Activate toolchain bundle
+      shell: bash
+      run: |
+        set -euo pipefail
+        bundle=/opt/pypto/toolchain/current/activate.sh
+        if [ ! -f "$bundle" ]; then
+          echo "::error::CPU runner is missing $bundle"
+          exit 1
+        fi
+        source "$bundle"
+        test -n "${PYPTO_TOOLCHAIN:-}"
+        python3 -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version'
+        command -v g++-15
+        python3 -c 'import ctypes; ctypes.CDLL("libatomic.so.1")'
+        printf '%s\n' "$PYPTO_TOOLCHAIN/bin" "$PYPTO_TOOLCHAIN/gcc/bin" "$PYPTO_TOOLCHAIN/python/bin" >> "$GITHUB_PATH"
+        printf 'PYPTO_TOOLCHAIN=%s\nLD_LIBRARY_PATH=%s\n' "$PYPTO_TOOLCHAIN" "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"

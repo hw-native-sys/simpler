@@ -41,6 +41,10 @@ jobs:
           fetch-depth: ${{ inputs.setup_variant == 'self-cpu' && '0' || '1' }}
           persist-credentials: false
 
+      - name: Set up CPU toolchain
+        if: inputs.setup_variant == 'self-cpu'
+        uses: ./.github/actions/setup-self-cpu-toolchain
+
       - name: Set up Python ${{ inputs.python_version }}
         if: inputs.setup_variant == 'github'
         uses: actions/setup-python@v6
@@ -105,7 +109,7 @@ jobs:
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
-            python -m pytest tests/ut -m "not requires_hardware" -v
+            python -m pytest tests/ut -m "not requires_hardware" -n 4 --dist loadfile -v
           else
             pytest tests/ut -m "not requires_hardware" -v
           fi
@@ -114,6 +118,9 @@ jobs:
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
+            jobs=8
+          else
+            jobs=4
           fi
           # Real entry tests may skip in a standalone C++ build, but not in CI.
           test -f build/lib/libcpu_sim_context.so
@@ -143,14 +150,14 @@ jobs:
             ccache --zero-stats >/dev/null 2>&1 || true
           fi
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${launcher[@]}"
-          cmake --build tests/ut/cpp/build --parallel 4
+          cmake --build tests/ut/cpp/build --parallel "$jobs"
           # The hit rate is what says whether the restored cache was usable, and
           # it is only readable here — a cold cache and a key that stopped
           # matching produce the same full-length build otherwise.
           if command -v ccache >/dev/null 2>&1; then
             ccache --show-stats
           fi
-          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure --timeout 300
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j "$jobs" --output-on-failure --timeout 300
 
       - name: Check C++ unit-test axis coverage
         run: |

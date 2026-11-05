@@ -8,14 +8,9 @@ run-name: CI Self CPU / PR ${{ inputs.pr_number || inputs.ref }}
 # runner/setup inputs differ here; gate outputs come from the canonical reusable
 # detect-changes workflow, executed on [self-hosted, cpu] in this lane.
 #
-# Provisioning contract for the cpu runner (out-of-repo, dnf): every cpu agent
-# needs the same set — cmake ninja-build gcc-c++ clang-tools-extra graphviz
-# gtest-devel python3-devel. T1 jobs create plain venvs from the runner's
-# python3 (the repo supports >=3.9; the runner's 3.9 caught the zip(strict=)
-# bug that CI's 3.10 never did) with a pip cache; the venv isolates T1 from
-# any system/user python state. T3 (NPU) jobs keep their --system-site-packages
-# venvs (driver bindings). g++-15 is a symlink stand-in for the
-# ubuntu-toolchain ppa g++ — see below. ci.yml lints with clang-tidy 18 while
+# CPU jobs activate /opt/pypto/toolchain/current for Python 3.10, GCC 15 and
+# libatomic, then create per-job venvs with a pip cache. T3 (NPU) jobs keep
+# their --system-site-packages venvs (driver bindings). ci.yml lints with clang-tidy 18 while
 # HCE 2.0 packages only LLVM 12, so an agent also provides 18 on PATH under the
 # versioned name clang-tidy-18 (installed with its clang builtin headers,
 # without which it resolves no resource dir); the pre-commit job shadows the
