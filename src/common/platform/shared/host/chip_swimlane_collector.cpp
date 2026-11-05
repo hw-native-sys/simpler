@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 
 #include <algorithm>
@@ -61,6 +62,17 @@
 // the source of truth).
 
 namespace {
+
+template <typename Record, size_t N>
+Record read_buffer_record(const TypedBuffer<Record, N> *buffer, uint32_t index) {
+    using Buffer = TypedBuffer<Record, N>;
+    Record record{};
+    // Host mappings carry wire bytes, not the device record's alignment.
+    const auto *source =
+        reinterpret_cast<const unsigned char *>(buffer) + offsetof(Buffer, records) + index * sizeof(record);
+    std::memcpy(&record, source, sizeof(record));
+    return record;
+}
 
 std::string linux_boot_clock_domain_id() {
     std::ifstream boot_id_file("/proc/sys/kernel/random/boot_id");
@@ -822,7 +834,7 @@ void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int co
         auto &dst = store(slot).perf[shard][core_index];
         if (!reserve_run_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
+            dst.push_back({read_buffer_record(buf, i), buf->run_epoch, buf->local_seq, 0});
         }
         if (!simpler::dfx::runs::checked_increment(store(slot).counters[shard].total_perf_collected, count)) {
             set_fatal("aicpu-task record counter is out of headroom");
@@ -843,7 +855,7 @@ void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info,
         auto &dst = store(slot).sched_phase[shard][tidx];
         if (!reserve_run_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
+            dst.push_back({read_buffer_record(buf, i), buf->run_epoch, buf->local_seq, 0});
         }
         if (!simpler::dfx::runs::checked_increment(store(slot).counters[shard].total_sched_phase_collected, count)) {
             set_fatal("sched-phase record counter is out of headroom");
@@ -867,7 +879,7 @@ void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, 
         auto &dst = store(slot).orch_phase[shard][tidx];
         if (!reserve_run_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
+            dst.push_back({read_buffer_record(buf, i), buf->run_epoch, buf->local_seq, 0});
         }
         if (!simpler::dfx::runs::checked_increment(store(slot).counters[shard].total_orch_phase_collected, count)) {
             set_fatal("orch-phase record counter is out of headroom");
@@ -947,7 +959,7 @@ void ChipSwimlaneCollector::copy_aicore_buffer(
         return;
     }
     for (uint32_t i = 0; i < count; i++) {
-        const ChipSwimlaneAicoreTaskRecord &r = buf->records[i];
+        const auto r = read_buffer_record(buf, i);
         if (r.start_time == 0) {
             skipped++;
             continue;
