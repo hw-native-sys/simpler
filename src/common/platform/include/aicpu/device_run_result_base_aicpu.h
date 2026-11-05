@@ -9,21 +9,21 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_BASE_AICPU_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_BASE_AICPU_H_
+#pragma once
 
 #include <cstdint>
+#include <cstddef>
+#include "common/run_terminal_accumulator.h"
 
-/**
- * This run's result-region base and epoch, published by the platform kernel
- * entry from KernelArgs. Every launched AICPU thread calls the setter with the
- * same pair, so the stores are concurrent and the storage behind them is
- * atomic; see the implementation for why relaxed ordering suffices. Both zero
- * when the host provided no region, which the publisher treats as "nothing to
- * publish into".
- */
+/** The active result binding in the AICPU DSO. Native begin sets it once
+ * before the gate releases callbacks. The atomic setter also serves standalone
+ * producers and sim arming; readers never use the pair as retirement proof. */
 extern "C" void set_platform_run_result(uint64_t region_base, uint64_t run_epoch);
 extern "C" uint64_t get_platform_run_result_base();
 extern "C" uint64_t get_platform_run_result_epoch();
 
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_BASE_AICPU_H_
+// A nonzero base must name a cold-initialized NativeInvocationResultStorage,
+// not merely a standalone result prefix. The owner retains it through all use.
+extern "C" int32_t aicpu_begin_native_invocation(int32_t callbacks, uint64_t region_base, uint64_t run_epoch);
+extern "C" bool aicpu_accept_runtime_terminal(RunTerminalSelection selection, const void *payload, size_t bytes);
+extern "C" int32_t aicpu_finish_native_invocation(int32_t callback_index, int32_t status);

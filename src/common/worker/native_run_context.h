@@ -94,6 +94,13 @@ struct NativeRunContext {
     // submission, or whose returned transaction explicitly reports NotStarted.
     // Backend exceptions return Partial with an active owner, never this proof.
     bool launch_not_started_proven{false};
+    // A returned finalize may leave a Canonical carrier for cleanup retry.
+    // The synchronous output reader is not repeated after it has returned.
+    bool recording{false};
+    bool copyback_returned{false};
+    bool failure_reported{false};
+    int copyback_rc{0};
+    bool bindings_released{false};
     bool runner_resources_owned{false};
     bool runner_reserved{false};
     bool runner_claimed{false};

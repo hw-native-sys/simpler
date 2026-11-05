@@ -23,6 +23,7 @@
  */
 
 #pragma once
+#include "host/aligned_image_storage.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -54,6 +55,7 @@
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
 #include "common/device_run_result.h"
+#include "common/native_invocation_evidence.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/dma_workspace.h"
 #include "common/platform_config.h"
@@ -1012,10 +1014,7 @@ protected:
     // std::vector: `resize` would zero every page of a capacity the caller writes
     // a fraction of, and would copy the old bytes on growth for a buffer whose
     // contents mean nothing between binds.
-    struct RetainedSmMirror {
-        std::unique_ptr<std::byte[]> storage;
-        size_t capacity{0};
-    };
+    using RetainedSmMirror = AlignedImageStorage;
     RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
     RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
@@ -1079,7 +1078,7 @@ protected:
         RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
         RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
         RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
-        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
+        RunResourceSlots<NativeInvocationResultStorage>::Storage device_run_results;
     };
 
     /** Allocate every per-set resource for `granted`; publishes nothing. */
@@ -1233,7 +1232,7 @@ protected:
      * publishing run's epoch, so a slot still holding an earlier run's record
      * fails the epoch comparison rather than being mistaken for this run's.
      */
-    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
+    RunResourceSlots<NativeInvocationResultStorage> device_run_results_;
     mutable std::mutex retained_result_mu_;
     std::unordered_map<uint64_t, DeviceRunResultRegion> retained_run_results_;
     ArgsDumpCollector dump_collector_;

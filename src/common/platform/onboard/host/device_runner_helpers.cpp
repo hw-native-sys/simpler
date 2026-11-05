@@ -104,9 +104,13 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream) {
     return launch_route_permitted_by_capture(static_cast<int>(rc), static_cast<int>(status));
 }
 
-int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink) {
+int publish_for_launch(
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording
+) {
     if (kernel_args.runtime_args_published()) return 0;
-    const bool permitted = launch_entry_args_permitted(aicpu_stream);
+    // A retained recording has passed resource admission; RTS records the
+    // same launch packet used by eager, including KernelInvocation identity.
+    const bool permitted = retained_recording || launch_entry_args_permitted(aicpu_stream);
     const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink);
     if (rc != 0) {
         LOG_ERROR("publish_for_launch: launch metadata publication failed: %d", rc);

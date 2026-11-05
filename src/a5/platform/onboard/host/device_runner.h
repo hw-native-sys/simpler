@@ -26,17 +26,13 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <string>
-#include <thread>
 #include <unordered_map>
 
 #include "host/run_progress_slots.h"
-#include <unordered_set>
-#include <vector>
 
 #include "callable.h"
 #include "prepare_callable_common.h"
@@ -310,15 +306,11 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    /**
-     * Build this run's collector pools, profiling flag and device KernelArgs
-     * refresh, under the execution claim.
-     *
-     * The collectors are resident and shared by every run on this runner, and a
-     * run whose core / AICPU-thread counts differ from the pools' releases and
-     * rebuilds them. Neither is safe while another run is executing against
-     * them, which is why none of it happens during preparation.
-     */
+    // Resident pools may still have device/retained-writer users. Storage
+    // construction requires the execution claim until those pools have
+    // independent lifetimes; it does not acquire a run bank or start readers.
+    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared);
+    // Bind the per-run terminal bank after storage preparation succeeds.
     int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     /**

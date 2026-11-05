@@ -59,6 +59,12 @@ int rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     return 0;
 }
 int rtFree(void *ptr) {
+    auto &c = native_admission_transport::control();
+    if (c.selected_free != nullptr && ptr == c.selected_free) {
+        ++c.selected_free_attempts;
+        if (c.selected_free_rc != 0) return c.selected_free_rc;
+    }
+    if (const int rc = c.free_rc) return rc;
     if (native_admission_transport::control().retired) {
         ++native_admission_transport::control().calls_after_retire;
         return -4244;
@@ -118,8 +124,10 @@ int rtStreamDestroy(rtStream_t p) {
 }
 int rtStreamQuery(rtStream_t) { return 0; }
 int rtStreamSynchronize(rtStream_t stream) {
-    native_admission_transport::control().observed_streams.push_back(stream);
-    return native_admission_transport::control().stream_sync_rc;
+    auto &control = native_admission_transport::control();
+    control.observed_streams.push_back(stream);
+    if (control.stream_sync_hook) control.stream_sync_hook();
+    return control.stream_sync_rc;
 }
 int rtRegisterAllKernel(const rtDevBinary_t *, void **out) {
     *out = std::malloc(1);

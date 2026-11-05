@@ -818,37 +818,23 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         scheduler_state_at<SchedulerRunControl>(pending_scheduler_state_base, pending_context->run_control_offset);
     scheduler_observe_cache_line(pending_run_control);
     uint32_t startup_signal = 0;
+    bool context_wait_timed_out = false;
     const uint64_t context_wait_start = get_sys_cnt_aicore();
     while (handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY && startup_signal != AICORE_EXIT_SIGNAL) {
         scheduler_observe_cache_line(handshake);
-        if (scheduler_read_error(pending_run_control) != 0) {
-            startup_signal = AICORE_EXIT_SIGNAL;
-            break;
-        }
-        if (scheduler_watchdog_expired(
-                context_wait_start, get_sys_cnt_aicore(),
-                scheduler_gm_query(pending_run_control->scheduler_timeout_cycles)
-            )) {
-            scheduler_record_error(
-                pending_run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, nullptr,
-                pending_context, SchedulerErrorSite::CONTEXT_READY_TIMEOUT
-            );
-            startup_signal = AICORE_EXIT_SIGNAL;
-            break;
-        }
+        // Configuration remains valid while AICPU initializes execution state.
+        // The error record does not: it may still belong to the preceding run.
+        context_wait_timed_out =
+            context_wait_timed_out || scheduler_watchdog_expired(
+                                          context_wait_start, get_sys_cnt_aicore(),
+                                          scheduler_gm_query(pending_run_control->scheduler_timeout_cycles)
+                                      );
         startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
         SPIN_WAIT_HINT();
     }
     if (startup_signal == AICORE_EXIT_SIGNAL) {
-        // A local watchdog or scheduler error can request exit before AICPU
-        // has reset this run's return gate. Wait for its actual DMB EXIT,
-        // which AICPU publishes only after that reset. Do this before ACK:
-        // after ACK the AICPU may close the window back to IDLE.
-        wait_for_aicpu_exit_signal();
-        // The AICPU reads this acknowledgement as the point this core's writes
-        // have landed, and the timeout above publishes its error through
-        // `pending_run_control`. Complete the preceding GM writes first.
-        OUT_OF_ORDER_STORE_BARRIER();
+        // Failed initialization owns its error reporting. EXIT permits retirement,
+        // but does not publish a writable scheduler context to this core.
         acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
         return;
     }
@@ -863,6 +849,16 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ SchedulerRunControl *run_control =
         scheduler_state_at<SchedulerRunControl>(scheduler_state_base, context->run_control_offset);
     scheduler_observe_cache_line(run_control);
+    if (context_wait_timed_out) {
+        scheduler_record_error(
+            run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, nullptr, context,
+            SchedulerErrorSite::CONTEXT_READY_TIMEOUT
+        );
+        wait_for_aicpu_exit_signal();
+        OUT_OF_ORDER_STORE_BARRIER();
+        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        return;
+    }
     scheduler_observe_cache_line(&run_control->chip_swimlane_level);
     const uint64_t profiling_level = scheduler_gm_query(run_control->chip_swimlane_level);
     // READY fixes the graph format for the whole run.

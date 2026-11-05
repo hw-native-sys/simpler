@@ -527,17 +527,11 @@ struct TaskPayload {
         memcpy(dump_metadata.scalar_dtypes, args.scalar_dtypes(), args.scalar_count() * sizeof(uint8_t));
 #endif
 
-        // Early-dispatch metadata — the single init point for these
-        // fields. reset_for_reuse MUST NOT touch the payload (it runs at slot
-        // init and would pull this cold cache line across structures);
-        // prepare_task only allocates/binds. prefetch() warms this
-        // line (cache line 1) so these writes land in warm cache.
-        //
-        // early_dispatch_state / staged_core_mask are CONSUMER-side: a task
-        // whose own allow_early_resolve is false can still have them touched
-        // by the release path, independent of the consumer's own hint. So they
-        // MUST be zeroed here unconditionally. Publication and launch fields
-        // share this same per-submit lifetime and are reset here too.
+        reset_execution_state();
+    }
+
+    // Only execution progress: argument regions, predicate and dump metadata survive replay.
+    void reset_execution_state() {
         early_dispatch_state.store(EARLY_DISPATCH_NONE, std::memory_order_relaxed);
         for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_core_mask[w].store(0, std::memory_order_relaxed);
@@ -711,9 +705,9 @@ struct alignas(64) ChipTaskSlotState {
     //                      so its publication state must be recorded
     uint8_t ed_flags{0};
 
-    // Keeps the record at one cache line. Members run widest-first up to the
-    // byte block above, so their sizes sum to exactly the bytes this leaves.
-    uint8_t reserved[3];
+    ChipTaskState initial_task_state{CHIP_TASK_PENDING};  // Host-established state, immutable during execution
+    // Keeps the record at one cache line.
+    uint8_t reserved[2];
 
     int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
         int16_t current = next_block_idx.load(std::memory_order_relaxed);
@@ -736,15 +730,10 @@ struct alignas(64) ChipTaskSlotState {
 
     bool has_any_subtask_deferred() const { return any_subtask_deferred.load(std::memory_order_acquire); }
 
-    /**
-     * Reset dynamic scheduling fields to their pristine values. Called once per
-     * slot as the orchestrator claims it in prepare_task, and again as an
-     * sub-task's storage is materialized — whole-graph-resident hbg has no
-     * execution-time slot recycle. The task's completion state is not here; its
-     * owning array is cleared alongside this call.
-     * wake_list_head starts nullptr (open for registration), NOT SENTINEL.
-     */
-    void reset_for_reuse() {
+    // Restore progress before any reader of this invocation, after prior device users have retired.
+    // Prepared task kind, ED qualification, shape and attributes remain unchanged.
+    // The owning table restores the separate completion byte; an open wake list starts null.
+    void reset_execution_state() {
         wake_list_head.store(nullptr, std::memory_order_relaxed);
         next_in_wake_list = nullptr;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
@@ -752,19 +741,18 @@ struct alignas(64) ChipTaskSlotState {
         next_block_idx.store(0, std::memory_order_relaxed);
         sub_task_local_id = -1;
         graph_context = nullptr;
-        task_kind = TaskKind::KERNEL;
-        // ED_FLAG_TRACKED is only ever set by a consumer submitted AFTER this
-        // slot was claimed (producers precede consumers), so clearing at claim
-        // time cannot race a tracker.
-        ed_flags = 0;
         ed_publish_scan_cursor = 0;
         wake_scan_cursor = 0xFFFF;
         ed_publish_list_head.store(nullptr, std::memory_order_relaxed);
         next_in_ed_publish_list = nullptr;
-        // Note: active_mask and task_attrs are per-submit-constant fields
-        // rewritten in prepare_task on every reuse, so they are not reset here.
-        // Payload early-dispatch/fanin fields are (re)initialized in
-        // TaskPayload::init on every submit, before the slot is visible.
+    }
+
+    void reset_for_reuse() {
+        reset_execution_state();
+        task_kind = TaskKind::KERNEL;
+        ed_flags = 0;
+        initial_task_state = CHIP_TASK_PENDING;
+        // Shape and attributes are assigned by the submitter; payload has its own initializer.
     }
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
@@ -783,7 +771,7 @@ static_assert(offsetof(ChipTaskSlotState, active_mask) == 56);
 static_assert(
     offsetof(ChipTaskSlotState, ed_publish_list_head) == 16, "the ED publish pair sits right after its wake-list twin"
 );
-static_assert(offsetof(ChipTaskSlotState, reserved) == 61, "ChipTaskSlotState grew interior padding");
+static_assert(offsetof(ChipTaskSlotState, initial_task_state) == 61, "ChipTaskSlotState grew interior padding");
 
 // =============================================================================
 // Per-Task Storage

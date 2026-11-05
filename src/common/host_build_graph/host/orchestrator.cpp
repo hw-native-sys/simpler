@@ -368,8 +368,8 @@ static bool prepare_task(
     // Init-on-write: this slot's dynamic scheduling fields and progress state are
     // initialized here, as the orchestrator claims the slot. whole-graph-resident
     // hbg claims slots [0, total_tasks) exactly once and the device reads no slot
-    // past total_tasks, so this claim-time write is the only per-slot SM reset and
-    // the unclaimed tail is neither initialized nor read.
+    // past total_tasks. Claim establishes prepared state; device entry restores
+    // progress for each execution without touching the unclaimed tail.
     out->slot_state->reset_for_reuse();
     orch->sm_header->tasks.reset_task_state(out->alloc_result.task_id);
 
@@ -1021,6 +1021,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         // on device and the run hangs.
         SharedMemoryTaskHeader &done_tasks = orch->sm_header->tasks;
         int32_t done_local = prepared.task_id.local_id();
+        prepared.slot_state->initial_task_state = CHIP_TASK_COMPLETED;
         done_tasks.store_completed(done_local);
     }
     orch->inline_completed_tasks++;

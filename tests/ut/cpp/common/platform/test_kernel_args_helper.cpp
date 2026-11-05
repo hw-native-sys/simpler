@@ -527,6 +527,17 @@ TEST_F(KernelArgsPublication, MetadataValuesArePublishedBeforeDescriptorFromSlot
     EXPECT_EQ(first, 17U);
     EXPECT_EQ(second, 29U);
     EXPECT_EQ(published_worker_count(), 7);
+    // Replay the recorded DMA operations without another Host prepare/publication.
+    const int recorded_copies = rts.copies;
+    for (int round = 0; round < 3; ++round) {
+        first = 800 + round;
+        second = 900 + round;
+        for (const auto &copy : rts.queued)
+            std::memcpy(copy.target, copy.source, copy.bytes);
+        EXPECT_EQ(first, 17U);
+        EXPECT_EQ(second, 29U);
+        EXPECT_EQ(rts.copies, recorded_copies);
+    }
 }
 
 TEST_F(KernelArgsPublication, EveryMetadataEnqueueFailureStopsTheDescriptorAndRetainsTheSource) {

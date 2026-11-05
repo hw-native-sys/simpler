@@ -125,6 +125,56 @@ void check_exit(bool resident, uint64_t epoch, CoreType type, uint32_t old_cond)
         std::_Exit(17);
     std::_Exit(0);
 }
+// The first register read pauses the real Core after its first READY poll.
+// All test-side state changes happen while that Core is stopped at the seam.
+void check_ready_error_publication(bool publish_ready, bool stale_error) {
+    auto runtime = std::make_unique<Runtime>();
+    SchedulerWorkerContext context{};
+    SchedulerRunControl control{};
+    context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&control);
+    control.scheduler_timeout_cycles = 1;
+    control.scheduler_error = stale_error ? 7 : 0;
+    runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(&context));
+    report_epoch = 42;
+    registers.fill(0);
+    first_read.store(false);
+    pause_first_read.store(true);
+    resume_read.store(false);
+    const uint64_t address = reinterpret_cast<uint64_t>(registers.data());
+    std::thread core([&] {
+        aicore_execute(runtime.get(), 0, CoreType::AIV);
+    });
+    if (!wait_until(
+            [] {
+                return first_read.load();
+            },
+            std::chrono::seconds(2)
+        ))
+        std::_Exit(30);
+    if (control.scheduler_error != (stale_error ? 7u : 0u) || control.error_claimed != 0) std::_Exit(31);
+    if (publish_ready) {
+        control.scheduler_error = 0;
+        runtime->dev.workers[0].task = reinterpret_cast<uint64_t>(&context);
+        runtime->dev.workers[0].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+    }
+    resume_read.store(true, std::memory_order_release);
+    if (publish_ready && !wait_until(
+                             [&] {
+                                 return __atomic_load_n(&control.scheduler_error, __ATOMIC_ACQUIRE) != 0;
+                             },
+                             std::chrono::seconds(2)
+                         ))
+        std::_Exit(32);
+    const AicoreExitTarget target{address, &runtime->dev.teardown_gates[0]};
+    if (platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()) != 0) std::_Exit(33);
+    core.join();
+    if (publish_ready) {
+        if (control.error_site != static_cast<uint64_t>(SchedulerErrorSite::CONTEXT_READY_TIMEOUT)) std::_Exit(34);
+    } else if (control.scheduler_error != (stale_error ? 7u : 0u) || control.error_claimed != 0) {
+        std::_Exit(35);
+    }
+    std::_Exit(0);
+}
 }  // namespace
 
 Runtime::Runtime() {
@@ -161,4 +211,14 @@ TEST(HbgNonceExitDeathTest, LegacyFailureBeforeIdleRequiresCurrentNonce) {
         for (auto type : {CoreType::AIC, CoreType::AIV})
             for (auto old : {AICORE_EXIT_NONCE_0, AICORE_EXIT_NONCE_1})
                 EXPECT_EXIT(check_exit(false, epoch, type, old), testing::ExitedWithCode(0), "");
+}
+
+TEST(HbgNonceExitDeathTest, ContextTimeoutDoesNotWriteBeforeReadyOrOnFailedInitExit) {
+    EXPECT_EXIT(check_ready_error_publication(false, false), testing::ExitedWithCode(0), "");
+    EXPECT_EXIT(check_ready_error_publication(false, true), testing::ExitedWithCode(0), "");
+}
+
+TEST(HbgNonceExitDeathTest, ContextTimeoutPublishesAfterReadyIncludingWithAStaleError) {
+    EXPECT_EXIT(check_ready_error_publication(true, false), testing::ExitedWithCode(0), "");
+    EXPECT_EXIT(check_ready_error_publication(true, true), testing::ExitedWithCode(0), "");
 }

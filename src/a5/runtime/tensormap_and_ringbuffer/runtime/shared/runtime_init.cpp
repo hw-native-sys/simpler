@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include <limits>
+#include <new>
 
 #include "orchestrator.h"
 #include "runtime_core.h"
@@ -617,8 +618,7 @@ RuntimeContext *runtime_init_data_from_layout(
     DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeMode mode, void *sm_dev_base, uint64_t /*sm_size*/,
     void *gm_heap_dev_base, const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH]
 ) {
-    RuntimeContext *rt = static_cast<RuntimeContext *>(arena.region_ptr(layout.offsets.off_runtime));
-    memset(rt, 0, sizeof(*rt));
+    auto *rt = ::new (arena.region_ptr(layout.offsets.off_runtime)) RuntimeContext{};
 
     auto *sm_wrap = static_cast<SharedMemoryHandle *>(arena.region_ptr(layout.offsets.off_sm_handle));
     memset(sm_wrap, 0, sizeof(*sm_wrap));
@@ -643,8 +643,7 @@ RuntimeContext *runtime_init_data_from_layout(
         return nullptr;
     }
 
-    auto *mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.offsets.off_mailbox));
-    memset(mailbox, 0, sizeof(*mailbox));
+    ::new (arena.region_ptr(layout.offsets.off_mailbox)) AICoreCompletionMailbox{};
 
     return rt;
 }

@@ -40,6 +40,7 @@
 #include "assert_compat.h"
 #include "utils/device_arena.h"
 #include "host_build_graph/runtime_types.h"
+#include "host_build_graph/runtime_status.h"
 
 // =============================================================================
 // Shared Memory Header
@@ -130,6 +131,17 @@ struct alignas(64) SharedMemoryTaskHeader {
         task_states[local_id].store(CHIP_TASK_PENDING, std::memory_order_relaxed);
     }
 
+    // Serial invocation boundary: no scheduler or completion writer may still use this table.
+    // Restore all producers before classification can inspect their state or register a waiter.
+    void reset_execution_state() {
+        for (int32_t id = 0; id < total_tasks; ++id) {
+            auto &entry = task_storage[id];
+            entry.slot.reset_execution_state();
+            entry.payload.reset_execution_state();
+            task_states[id].store(entry.slot.initial_task_state, std::memory_order_relaxed);
+        }
+    }
+
     // A task id is its own storage index, so the three records it names are reached
     // by one index into one array.
     ChipTaskStorage &storage_at(int32_t local_id) { return task_storage[local_id]; }
@@ -161,6 +173,15 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
     std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+
+    // Exclusive invocation initialization, before publishing readiness to schedulers.
+    // Historical fault evidence belongs to NativeInvocationEvidence, not this header.
+    void reset_execution_state() {
+        tasks.reset_execution_state();
+        sched_error_bitmap.store(0, std::memory_order_relaxed);
+        sched_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
+        sched_error_thread.store(-1, std::memory_order_relaxed);
+    }
 };
 
 static_assert(sizeof(SharedMemoryHeader) == 128, "SharedMemoryHeader layout drift");

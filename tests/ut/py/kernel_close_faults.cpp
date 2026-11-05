@@ -22,6 +22,9 @@ int failure_kind = 0;
 int attempts = 0;
 bool pending = false;
 int failures_to_skip = 0;
+void *failed_free_address = nullptr;
+int failed_free_attempts = 0;
+int failed_free_successes = 0;
 SimplerHostLogState test_log_state{};
 bool guard_acl = false;
 std::array<int, 8> forbidden_calls{};
@@ -68,20 +71,31 @@ int forbidden(size_t index) {
 }
 
 int destroy(const char *symbol, void *handle, int kind) {
+    const bool retrying_free = kind == 4 && handle == failed_free_address && failed_free_address != nullptr;
+    if (retrying_free) ++failed_free_attempts;
     if (failure_kind == kind) {
         ++attempts;
         if (pending && attempts > failures_to_skip) {
             pending = false;
+            if (kind == 4) {
+                failed_free_address = handle;
+                failed_free_attempts = 1;
+                failed_free_successes = 0;
+            }
             return -4321;
         }
     }
     auto real_destroy = reinterpret_cast<int (*)(void *)>(dlsym(RTLD_NEXT, symbol));
-    return real_destroy(handle);
+    const int rc = real_destroy(handle);
+    if (retrying_free && rc == 0) ++failed_free_successes;
+    return rc;
 }
 }  // namespace
 
 extern "C" void arm_destroy_failure(int kind) {
     failure_kind = kind;
+    failed_free_address = nullptr;
+    failed_free_attempts = failed_free_successes = 0;
     attempts = 0;
     pending = true;
     failures_to_skip = 0;
@@ -89,12 +103,16 @@ extern "C" void arm_destroy_failure(int kind) {
 
 extern "C" void arm_destroy_failure_after(int kind, int skip) {
     failure_kind = kind;
+    failed_free_address = nullptr;
+    failed_free_attempts = failed_free_successes = 0;
     attempts = 0;
     pending = true;
     failures_to_skip = skip;
 }
 
 extern "C" int destroy_attempts() { return attempts; }
+extern "C" int failed_free_retry_attempts() { return failed_free_attempts; }
+extern "C" int failed_free_retry_successes() { return failed_free_successes; }
 
 extern "C" void arm_acl_guard() {
     forbidden_calls.fill(0);
@@ -196,12 +214,23 @@ bool reset_should_fail() {
     --reset_failures_left;
     return true;
 }
+// Count the owner's request once even when ACL delegates to the RT entry.
+thread_local unsigned reset_depth = 0;
+int reset_device(const char *symbol, int device) {
+    const bool outermost = reset_depth++ == 0;
+    if (outermost && reset_should_fail()) {
+        --reset_depth;
+        return -4321;
+    }
+    const int rc = reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, symbol))(device);
+    --reset_depth;
+    return rc;
+}
 }  // namespace
 
 extern "C" int aclrtResetDevice(int device) {
     if (guard_acl) return forbidden(2);
-    if (reset_should_fail()) return -4321;
-    return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "aclrtResetDevice"))(device);
+    return reset_device("aclrtResetDevice", device);
 }
 extern "C" int aclrtResetDeviceForce(int device) {
     if (guard_acl) return forbidden(3);
@@ -213,8 +242,7 @@ extern "C" int aclFinalize() {
 }
 extern "C" int rtDeviceReset(int device) {
     if (guard_acl) return forbidden(5);
-    if (reset_should_fail()) return -4321;
-    return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "rtDeviceReset"))(device);
+    return reset_device("rtDeviceReset", device);
 }
 extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
     if (fake_device_drain) {
