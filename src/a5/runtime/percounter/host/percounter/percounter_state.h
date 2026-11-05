@@ -9,18 +9,17 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * The bind's percounter decision and, when percounter takes the graph, its
- * scheduler state.
+ * This runtime's scheduler state, built from the default selection's per-task
+ * walk.
  *
- * Two entry points, both called from create_scheduler_state:
+ * select_percounter_state runs after that walk, reuses its validation and
+ * metadata, and builds the percounter region. GRAPH tasks pass the walk
+ * untouched and are validated here through their Definitions.
  *
- *  - check_scheduler_request, before anything else: rejects an unrecognised
- *    SIMPLER_HBG_SCHEDULER_TYPE.
- *  - select_percounter_state, after the default selection's per-task walk:
- *    reuses that walk's validation and metadata, and either builds the
- *    percounter region or logs why the graph falls back. When percounter is
- *    requested the walk passes over GRAPH tasks, which are validated here
- *    through their Definitions.
+ * A graph percounter cannot run fails the bind. This runtime's AICore object
+ * carries no legacy or resident executor, so there is no scheduler to fall back
+ * to: a lane would run the percounter loop against a region that was never
+ * published.
  *
  * Header-only because the UT targets that compile runtime_maker.cpp list their
  * sources by name.
@@ -44,37 +43,17 @@
 #include "intrinsic.h"
 #include "percounter_graph.h"
 #include "percounter_plan.h"
-#include "percounter_selection.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 
 namespace simpler::hbg::percounter {
 
-inline bool percounter_requested() {
-    SchedulerRequest request = SchedulerRequest::DEFAULT;
-    return parse_scheduler_request(std::getenv(SCHEDULER_TYPE_ENV), &request) &&
-           request == SchedulerRequest::PERCOUNTER;
-}
-
-inline void log_fallback(int32_t total_tasks, const char *reason, int64_t task_id) {
-    LOG_INFO(
-        "A5 HBG: %s=percounter for %d tasks: task id=%" PRId64 " is %s, which percounter does not run; keeping the "
-        "default scheduler selection",
-        SCHEDULER_TYPE_ENV, total_tasks, task_id, reason
+inline void log_unsupported(int32_t total_tasks, const char *reason, int64_t task_id) {
+    LOG_ERROR(
+        "A5 HBG percounter: graph of %d tasks: task id=%" PRId64 " is %s, which percounter does not run", total_tasks,
+        task_id, reason
     );
 }
-
-/**
- * Settle this bind's scheduler request before the default selection runs.
- * Returns false, failing the bind, only for an unrecognised value.
- */
-inline bool check_scheduler_request() {
-    SchedulerRequest request = SchedulerRequest::DEFAULT;
-    return resolve_scheduler_request(&request);
-}
-
-/** Whether the default selection's walk leaves GRAPH tasks to percounter. */
-inline bool percounter_takes_graph_tasks() { return percounter_requested(); }
 
 /** The bind's Graph templates and invocations, gathered from the task table. */
 struct GraphInputs {
@@ -137,15 +116,14 @@ inline TemplateResult gather_graph_inputs(
 }
 
 enum class StateSelection : uint8_t {
-    DEFAULT,     // percounter was not requested, or does not run this graph
     PERCOUNTER,  // the percounter region is built and published; the bind is done
-    FAILED,      // percounter was requested and accepted the graph, but building it failed
+    FAILED,      // this graph does not run on percounter, or building its region failed
 };
 
 /**
- * Take the graph for percounter when it was requested and every task has a
- * shape percounter runs: one active subtask (AIC, or AIV0) or a MIX task of
- * two or three, any block count, with or without sync start.
+ * Build this run's percounter region. Every task must have a shape percounter
+ * runs: one active subtask (AIC, or AIV0) or a MIX task of two or three, any
+ * block count, with or without sync start.
  *
  * `task_metadata` and `inline_completed_task_ids` are the default selection's
  * per-task walk, which has already rejected any malformed task, checked every
@@ -157,8 +135,6 @@ inline StateSelection select_percounter_state(
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
     const sm_layout::SegmentOffsets &device_segments
 ) {
-    if (!percounter_requested()) return StateSelection::DEFAULT;
-
     const size_t task_count = static_cast<size_t>(total_tasks);
     std::vector<bool> inline_completed(task_count, false);
     for (int64_t id : inline_completed_task_ids)
@@ -177,8 +153,8 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
     if (graph_status.status == TemplateStatus::UNSUPPORTED) {
-        log_fallback(total_tasks, graph_status.reason, graph_failed_task);
-        return StateSelection::DEFAULT;
+        log_unsupported(total_tasks, graph_status.reason, graph_failed_task);
+        return StateSelection::FAILED;
     }
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
@@ -207,8 +183,10 @@ inline StateSelection select_percounter_state(
             const uint8_t active_mask = task_metadata[t].active_mask;
             const TaskPlacement placement = task_placement_from_active_mask(active_mask, &input.core_type_index);
             if (placement == TaskPlacement::UNSUPPORTED) {
-                log_fallback(total_tasks, active_mask == 4U ? "an AIV1-only task" : "a task with no subtask", task_id);
-                return StateSelection::DEFAULT;
+                log_unsupported(
+                    total_tasks, active_mask == 4U ? "an AIV1-only task" : "a task with no subtask", task_id
+                );
+                return StateSelection::FAILED;
             }
             input.block_num = slot.logical_block_num;
             input.is_mix = placement == TaskPlacement::MIX;

@@ -26,10 +26,10 @@
 
 // Percounter validates GRAPH tasks itself, through their Definitions, in
 // select_percounter_state.
-bool scheduler_extension_takes_graph_tasks() {
-    return simpler::hbg::percounter::percounter_takes_graph_tasks();
-}
+bool scheduler_extension_takes_graph_tasks() { return true; }
 
+// Never DECLINED: percounter is the only scheduler this runtime carries, so a
+// graph it cannot run has nowhere to go and fails the bind instead.
 SchedulerExtensionResult scheduler_extension_select(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
@@ -38,13 +38,6 @@ SchedulerExtensionResult scheduler_extension_select(
     const auto selection = simpler::hbg::percounter::select_percounter_state(
         runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
     );
-    switch (selection) {
-        case simpler::hbg::percounter::StateSelection::PERCOUNTER:
-            return SchedulerExtensionResult::TAKEN;
-        case simpler::hbg::percounter::StateSelection::FAILED:
-            return SchedulerExtensionResult::FAILED;
-        case simpler::hbg::percounter::StateSelection::DEFAULT:
-            break;
-    }
-    return SchedulerExtensionResult::DECLINED;
+    return selection == simpler::hbg::percounter::StateSelection::PERCOUNTER ? SchedulerExtensionResult::TAKEN :
+                                                                              SchedulerExtensionResult::FAILED;
 }

@@ -214,15 +214,17 @@ percounter runtime 编出来和 hbg 等价。这是一个可验证的中间态�
 
 无条件化之后的清理：
 
-- **回退路径要变成硬失败。** percounter 的 `scheduler_extension_select` 现在仍可能返回
-  `DECLINED`（开关未设、graph template `UNSUPPORTED`、AIV1-only task），落回 hbg 的
-  resident/legacy 选择。但本 runtime 的 aicore `.o` 里**没有** legacy/resident executor
+- **回退路径变成硬失败。** 本 runtime 的 aicore `.o` 里**没有** legacy/resident executor
   （入口无条件进 percounter executor，hbg 的 `aicore_executor.cpp` 不参与编译），
-  所以这条回退没有可落地的去处：host 发布了 legacy 模式，lane 却还在跑 percounter。
-  应改为 `FAILED`。
-- 去掉 `SIMPLER_HBG_SCHEDULER_TYPE` 这个三选一开关——本 runtime 里它只有一个合法取值
-- 模式常量退化为固定值
-- percounter 自己的形状校验与 hbg walk 的分类结果合并，去掉重复
+  所以 `DECLINED` 没有可落地的去处：host 发布了 legacy 模式，lane 却还在跑 percounter。
+  `StateSelection` 因此只剩 `PERCOUNTER` / `FAILED`，percounter 跑不了的图直接失败。
+- **删掉 `SIMPLER_HBG_SCHEDULER_TYPE`**，连同 `percounter_selection.h` 和它的单元测试。
+  本 runtime 里这个开关只有一个合法取值，而它恰恰是"无条件 percounter"唯一的反例。
+- **模式常量保留。** 它在三选一的世界里是选择器，现在是 host→AICPU→lane 的确认字：
+  lane 等的就是 `aicpu_ready == SCHEDULER_RUNTIME_MODE_PERCOUNTER`。退化成固定值会把
+  "bind 确实走到了 percounter"这唯一一道校验也去掉。
+- 形状校验的重复在第 3 步就没有了：percounter 消费 hbg per-task walk 的
+  `task_metadata`，不再自己走一遍。
 
 ## 这个分支不做的事
 

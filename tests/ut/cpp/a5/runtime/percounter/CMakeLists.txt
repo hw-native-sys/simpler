@@ -19,9 +19,6 @@ macro(a5_percounter_case src)
     hbg_case(${src} ARCHS a5 ${ARGN})
 endmacro()
 
-a5_percounter_case(test_hbg_percounter_selection.cpp
-    INCLUDES ${SIMPLER_SRC}/a5/runtime/percounter/host)
-
 a5_percounter_case(test_hbg_percounter_graph.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/percounter/host ${SIMPLER_SRC}/a5/runtime/percounter/runtime)
 
