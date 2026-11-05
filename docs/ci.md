@@ -15,7 +15,7 @@ Design principles:
 
 A5 hardware validation for ordinary PRs is requested by an admin with `/run-a5`.
 A5 simulation, CPU tests and profiling remain automatic under their existing
-change gates. The `/run-cpu` emergency lane and Daily retain their A5 jobs.
+change gates. The `/run-self` emergency lane and Daily retain their A5 jobs.
 
 ## Full Job Matrix
 
@@ -28,7 +28,7 @@ The complete test-type × hardware-tier matrix across automatic CI, the A5 comme
 
 ## GitHub Actions Jobs
 
-`ci.yml`, `ci-a5-comment.yml` and `ci-self-cpu.yml` are thin topology callers: they own
+`ci.yml`, `ci-a5-comment.yml` and `ci-self.yml` are thin topology callers: they own
 triggers, `needs:`, gate `if:` expressions, runner/setup inputs, and matrix
 shape. The executable job bodies live in reusable workflows:
 `_detect-changes.yml`, `_pre-commit.yml`, `_ut-no-hardware.yml`,
@@ -339,7 +339,7 @@ not need `--max-parallel` manually.
 ### Scheduling constraints
 
 - Sim scene tests and no-hardware unit tests run on github-hosted runners (no hardware).
-- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the opposite platform's tree (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/ci-self-cpu.yml`, `.github/workflows/_*.yml`) — flips both flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. Explicit `/run-a5` hardware suites remain manual.
+- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the opposite platform's tree (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/ci-self.yml`, `.github/workflows/_*.yml`) — flips both flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. Explicit `/run-a5` hardware suites remain manual.
 - **Test-category axis:** `ST_ONLY='^(tests/st/|examples/)'` and `UT_ONLY='^tests/ut/'`, applied in the same shape as the arch patterns — a category is unaffected only when *every* changed file is exclusively the other's. `st_affected` gates automatic scene-test jobs; `ut_affected` gates automatic `ut` and `ut-a2a3`. The emergency lane retains its existing gates, including `ut-a5`; explicit `/run-a5` requests run all three A5 hardware suites without change detection. Anything belonging to neither (root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/`) flips both, so shared infrastructure always runs both suites.
 - **Corpus axis:** `EXAMPLES_ONLY='^examples/'` and `TESTS_ONLY='^(tests/)'`, same shape again, one per side of the product jobs' payload. `packaging-matrix` and `profiling-flags-smoke` build and install the product and then exercise it with a fixed, tiny payload — one entry-point script (a `tests/st/` file) and one `vector_example` — so neither reads either suite as a corpus, and a diff confined to `examples/` or to `tests/` cannot reach them: `wheel.packages` is `["simpler_setup", "python/simpler"]`, so both partitions are provably absent from the product. A payload file changed under either is still exercised by the scene-test job that reads the same corpus.
 - **Gated jobs (scene tests):** automatic `st-sim-{a2a3,a5}` and `st-onboard-a2a3` run iff their platform's flag **and** `st_affected` are `true`. The emergency lane also applies these gates to `st-onboard-a5`; `/run-a5` does not.
@@ -500,15 +500,15 @@ default branch's definition, so this new command cannot execute on GitHub until
 `ci-a5-comment.yml` is merged into the default branch. Local mocked-API tests
 validate its scripts and topology before that deployment.
 
-### CPU emergency lane (`ci-self-cpu.yml`) and the `/run-cpu` button
+### Self-hosted emergency lane (`ci-self.yml`) and the `/run-self` comment
 
 When GitHub-hosted runners are congested, a repo admin can validate a PR on the
 repo-level self-hosted runners via the emergency lane, bypassing GitHub-hosted
 queueing entirely:
 
-- **Trigger**: comment `/run-cpu` on the PR (`ci-self-cpu-button.yml`), or
-  `gh workflow run ci-self-cpu.yml -f repository=<repo> -f ref=<sha>` manually
-  (covers forks and arbitrary SHAs). The button gate is
+- **Trigger**: comment `/run-self` on the PR (`ci-self-comment.yml`), or
+  `gh workflow run ci-self.yml -f repository=<repo> -f ref=<sha>` manually
+  (covers forks and arbitrary SHAs). The comment gate is
   `permission(commenter) == 'admin'` only (`getCollaboratorPermissionLevel`).
   `issue_comment` from fork PRs runs with a read-only token, so the permission
   check must work under it — verify on first fork-PR use.
@@ -666,7 +666,7 @@ launcher is passed only when `ccache` is on `PATH`, so a runner whose package
 manager could not serve it still builds; the step prints `ccache --show-stats`
 after the build, which is the only place a restored-but-unusable cache is
 distinguishable from a cold one. Self-hosted runners keep their home directory
-between runs, so the emergency CPU lane uses the on-disk cache and skips the
+between runs, so the self-hosted emergency lane uses the on-disk cache and skips the
 upload.
 
 ### `examples/` — Small examples (sim + onboard)

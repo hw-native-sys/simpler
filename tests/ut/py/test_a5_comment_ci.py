@@ -103,7 +103,7 @@ def test_only_three_hardware_suites_move_from_automatic_ci():
     assert all(name not in ci for name in _SUITES)
     for name in ("ut", "packaging-matrix", "st-sim-a5", "profiling-flags-smoke", "ut-a2a3", "st-onboard-a2a3"):
         assert name in ci
-    assert all(name in _workflow("ci-self-cpu")["jobs"] for name in _SUITES)
+    assert all(name in _workflow("ci-self")["jobs"] for name in _SUITES)
     daily = _workflow("daily")["jobs"]
     assert "ut-a5" not in daily
     assert "st-onboard-a5" in daily and "st-framework-eager-a5" in daily
@@ -182,7 +182,9 @@ def test_rerun_gate_cannot_admit_the_current_head(attempt):
     assert len(result["failures"]) == 1
 
 
-@pytest.mark.parametrize("body", ["/run-a5 extra", "/run-a5evil", "please /run-a5", "/run-cpu", "", "/run-a5\n/run-a5"])
+@pytest.mark.parametrize(
+    "body", ["/run-a5 extra", "/run-a5evil", "please /run-a5", "/run-self", "", "/run-a5\n/run-a5"]
+)
 def test_unmatched_comment_does_not_query_permission_or_resolve(body):
     fixture = _fixture()
     fixture["context"]["payload"]["comment"]["body"] = body

@@ -1,8 +1,8 @@
-name: CI Self CPU Button
-run-name: /run-cpu PR ${{ github.event.issue.number }}
+name: CI Self Comment
+run-name: /run-self PR ${{ github.event.issue.number }}
 
-# PR comment command: a repo admin comments "/run-cpu" on a pull request and
-# this calls ci-self-cpu.yml (workflow_call) to validate that PR's head on the
+# PR comment command: a repo admin comments "/run-self" on a pull request and
+# this calls ci-self.yml (workflow_call) to validate that PR's head on the
 # cpu + NPU runners — the emergency lane for GitHub-hosted congestion.
 #
 # Gate: permission(commenter) == 'admin' ONLY (getCollaboratorPermissionLevel).
@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   gate-and-resolve:
-    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/run-cpu')
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/run-self')
     runs-on: [self-hosted, cpu]
     outputs:
       repository: ${{ steps.resolve.outputs.repository }}
@@ -42,7 +42,7 @@ jobs:
             if (perm !== 'admin') {
               core.setFailed(
                 `denied: ${user} has ${perm || 'no'} repo permission; ` +
-                `admin required to trigger /run-cpu`);
+                `admin required to trigger /run-self`);
             }
       - name: Resolve PR head
         id: resolve
@@ -59,7 +59,7 @@ jobs:
 
   lane:
     needs: [gate-and-resolve]
-    uses: ./.github/workflows/ci-self-cpu.yml
+    uses: ./.github/workflows/ci-self.yml
     with:
       repository: ${{ needs.gate-and-resolve.outputs.repository }}
       ref: ${{ needs.gate-and-resolve.outputs.ref }}
