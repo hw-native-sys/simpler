@@ -268,7 +268,7 @@ inline __aicore__ bool percounter_resolve(const LaneConfig &cfg, int64_t id, Per
     }
     task->id = id;
     task->local = body_index;
-    task->graph = SchedulerGraphView{storage, 0, static_cast<uint64_t>(body_index) + 1, 0};
+    task->graph = scheduler_ordinary_graph_view(storage, body_index + 1, body_index);
     task->shell = shell;
     task->sink = (flags & PERCOUNTER_BODY_SINK) != 0;
     task->body_base = id - static_cast<int64_t>(body_index);
@@ -1288,9 +1288,11 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
 
     LaneConfig cfg{};
     cfg.control = control;
-    cfg.graph = SchedulerGraphView{
-        scheduler_gm_query(control->graph_storage_address), 0, scheduler_gm_query(control->graph_storage_count), 0
-    };
+    const uint64_t storage_count = scheduler_gm_query(control->graph_storage_count);
+    cfg.graph = scheduler_ordinary_graph_view(
+        scheduler_gm_query(control->graph_storage_address), static_cast<uint32_t>(storage_count),
+        storage_count > 0 ? storage_count - 1 : 0
+    );
     cfg.callable_addresses =
         reinterpret_cast<__gm__ uint64_t *>(scheduler_gm_query(control->callable_addresses_address));
     cfg.callable_count = static_cast<uint32_t>(scheduler_gm_query(control->callable_addresses_count));
