@@ -22,11 +22,15 @@ from types import SimpleNamespace
 import pytest
 import simpler.task_interface as task_interface_module
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    CORE_ASYNC_CONDITION_COUNTER,
+    CORE_ASYNC_CONDITION_SDMA_POST_DONE,
     MAX_TENSOR_DIMS,
     ArgDirection,
     ChipCallable,
     ChipStorageTaskArgs,
     ChipTensor,
+    CoreAsyncCapability,
+    CoreAsyncMode,
     CoreCallable,
     DataType,
     TaskArgs,
@@ -1499,6 +1503,36 @@ class TestArgDirection:
 
 
 class TestCoreCallable:
+    def test_bare_binary_remains_unknown(self):
+        core = CoreCallable.build(signature=[], binary=b"kernel")
+        assert core.async_capability.version == 1
+        assert core.async_capability.mode == CoreAsyncMode.UNKNOWN
+        assert core.async_capability.max_conditions == 0
+
+    @pytest.mark.parametrize("maximum", [1, 64])
+    def test_explicit_deferred_descriptor(self, maximum):
+        types = CORE_ASYNC_CONDITION_COUNTER | CORE_ASYNC_CONDITION_SDMA_POST_DONE
+        capability = CoreAsyncCapability(mode=CoreAsyncMode.DEFERRED, max_conditions=maximum, condition_types=types)
+        core = CoreCallable.build(signature=[], binary=b"kernel", async_capability=capability)
+        assert core.async_capability.mode == CoreAsyncMode.DEFERRED
+        assert core.async_capability.max_conditions == maximum
+        assert core.async_capability.condition_types == types
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"version": 2},
+            {"mode": CoreAsyncMode.SYNCHRONOUS, "max_conditions": 1},
+            {"mode": CoreAsyncMode.DEFERRED, "max_conditions": 0, "condition_types": 1},
+            {"mode": CoreAsyncMode.DEFERRED, "max_conditions": 65, "condition_types": 1},
+            {"mode": CoreAsyncMode.DEFERRED, "max_conditions": 1, "condition_types": 0},
+            {"mode": CoreAsyncMode.DEFERRED, "max_conditions": 1, "condition_types": 4},
+        ],
+    )
+    def test_invalid_descriptor_refused(self, fields):
+        with pytest.raises(ValueError, match="Invalid core async capability"):
+            CoreAsyncCapability(**fields)
+
     def test_build_and_access(self):
         sig = [ArgDirection.IN, ArgDirection.OUT, ArgDirection.SCALAR]
         binary = b"\x01\x02\x03\x04"
@@ -1550,6 +1584,54 @@ class TestCoreCallable:
 
 
 class TestChipCallable:
+    def test_capability_and_child_extent_survive_serialization(self):
+        children = [
+            CoreCallable.build(
+                signature=[], binary=b"abc", async_capability=CoreAsyncCapability(mode=CoreAsyncMode.SYNCHRONOUS)
+            ),
+            CoreCallable.build(
+                signature=[ArgDirection.OUT],
+                binary=b"d",
+                async_capability=CoreAsyncCapability(
+                    mode=CoreAsyncMode.DEFERRED, max_conditions=64, condition_types=CORE_ASYNC_CONDITION_COUNTER
+                ),
+            ),
+        ]
+        chip = ChipCallable.build(signature=[], func_name="entry", binary=b"orch", children=list(enumerate(children)))
+        raw = ctypes.string_at(chip.buffer_ptr(), chip.buffer_size())
+        restored = ChipCallable.from_bytes(raw)
+        for index, expected in enumerate(children):
+            actual = restored.child(index)
+            assert actual.buffer_size() == expected.buffer_size()
+            assert ctypes.string_at(actual.buffer_ptr(), actual.buffer_size()) == ctypes.string_at(
+                expected.buffer_ptr(), expected.buffer_size()
+            )
+        assert restored.child(0).async_capability.mode == CoreAsyncMode.SYNCHRONOUS
+        assert restored.child(1).async_capability.max_conditions == 64
+        rebuilt = ChipCallable.build(
+            signature=[], func_name="entry", binary=b"orch", children=[(i, restored.child(i)) for i in range(2)]
+        )
+        assert ctypes.string_at(rebuilt.buffer_ptr(), rebuilt.buffer_size()) == raw
+
+    @pytest.mark.parametrize("raw", [b"", b"short", bytes(17568 + 64)])
+    def test_legacy_or_truncated_image_refused(self, raw):
+        with pytest.raises(ValueError, match="Incompatible or invalid ChipCallable image"):
+            ChipCallable.from_bytes(raw)
+
+    def test_raw_import_checks_actual_extent_and_child_version(self):
+        child = CoreCallable.build(signature=[], binary=b"kernel")
+        chip = ChipCallable.build(signature=[], func_name="entry", binary=b"", children=[(0, child)])
+        raw = ctypes.string_at(chip.buffer_ptr(), chip.buffer_size())
+        for invalid in (raw[:-1], raw + b"\0"):
+            with pytest.raises(ValueError, match="Incompatible or invalid"):
+                ChipCallable.from_bytes(invalid)
+        # The fixed prefix specifies its header extent; the child starts in storage.
+        header_size = struct.unpack_from("<I", raw, 8)[0]
+        corrupted = bytearray(raw)
+        struct.pack_into("<H", corrupted, header_size + chip.child_offset(0) + 4, 99)
+        with pytest.raises(ValueError, match="Incompatible or invalid"):
+            ChipCallable.from_bytes(bytes(corrupted))
+
     def _make_child(self, sig, binary):
         return CoreCallable.build(signature=sig, binary=binary)
 
@@ -1724,11 +1806,10 @@ class TestChipCallable:
             children=[],
         )
         raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
-        # The wire signature contains 256 int32 ArgDirection entries before sig_count.
-        struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
-        clone = ChipCallable.from_bytes(bytes(raw))
-        with pytest.raises(ValueError, match=rf"signature count {signature_count}.*256"):
-            _ = clone.scalar_count
+        # The versioned prefix precedes 256 int32 signature entries.
+        struct.pack_into("<i", raw, struct.calcsize("<IHHII") + 256 * struct.calcsize("<i"), signature_count)
+        with pytest.raises(ValueError, match="Incompatible or invalid ChipCallable image"):
+            ChipCallable.from_bytes(bytes(raw))
 
 
 # ============================================================================

@@ -2485,7 +2485,7 @@ class TestChipWorkerBorrowedInit:
             elif operation == "register_blob":
 
                 def action():
-                    native.register_callable_from_blob(0, target.buffer_ptr())
+                    native.register_callable_from_blob(0, target.buffer_ptr(), target.buffer_size())
 
                 calls = observer.test_registrations
             else:
@@ -2894,7 +2894,7 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
         with pytest.raises(RuntimeError, match="not initialized"):
-            worker.register_callable_from_blob(0, callable_obj.buffer_ptr())
+            worker.register_callable_from_blob(0, callable_obj.buffer_ptr(), callable_obj.buffer_size())
 
     def test_run_before_init_raises(self):
         from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415

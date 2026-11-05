@@ -1069,7 +1069,8 @@ class _FakeNativeRunImpl:
         """
         self.admission_stopped = True
 
-    def register_callable_from_blob(self, cid: int, blob_addr: int) -> None:
+    def register_callable_from_blob(self, cid: int, blob_addr: int, blob_size: int) -> None:
+        assert blob_size > 0
         self.register_calls.append((int(cid), int(blob_addr)))
         self.register_called.set()
 
@@ -8606,6 +8607,7 @@ class TestChipMainLoopDigestRegister:
                 assert cw.unregister_callable.call_count == 0
                 cw.register_callable_from_blob.assert_called_once()
                 assert cw.register_callable_from_blob.call_args.args[0] == 0
+                assert cw.register_callable_from_blob.call_args.args[2] == callable_obj.buffer_size()
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -8646,6 +8648,7 @@ class TestChipMainLoopDigestRegister:
                 )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
                 cw.register_callable_from_blob.assert_called_once()
+                assert cw.register_callable_from_blob.call_args.args[2] == len(payload)
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)

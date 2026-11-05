@@ -316,7 +316,8 @@ class _FakeChipImpl(FakeWorkspaceAccounting):
         """Reached only when the control loop could not establish resource ownership."""
         self.admission_stopped = True
 
-    def register_callable_from_blob(self, cid: int, addr: int) -> None:
+    def register_callable_from_blob(self, cid: int, addr: int, blob_size: int) -> None:
+        assert blob_size > 0
         if self._register_error is not None:
             raise RuntimeError(self._register_error)
 

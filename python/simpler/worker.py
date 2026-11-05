@@ -3612,7 +3612,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         exported = ctypes.c_char.from_buffer(shm_buf)
                         try:
                             addr = ctypes.addressof(exported)
-                            cw.register_callable_from_blob(int(cid), addr)
+                            cw.register_callable_from_blob(int(cid), addr, payload_size)
                         finally:
                             del exported
                         prepared.add(int(cid))

@@ -3042,6 +3042,29 @@ NB_MODULE(_task_interface, m) {
         nb::arg("direction"), "Return the string name of an ArgDirection."
     );
 
+    nb::enum_<CoreAsyncMode>(m, "CoreAsyncMode")
+        .value("UNKNOWN", CoreAsyncMode::UNKNOWN)
+        .value("SYNCHRONOUS", CoreAsyncMode::SYNCHRONOUS)
+        .value("DEFERRED", CoreAsyncMode::DEFERRED);
+    nb::class_<CoreAsyncCapability>(m, "CoreAsyncCapability")
+        .def(
+            "__init__",
+            [](CoreAsyncCapability *self, uint32_t version, CoreAsyncMode mode, uint32_t max_conditions,
+               uint32_t condition_types) {
+                CoreAsyncCapability capability{version, mode, max_conditions, condition_types};
+                if (!core_async_capability_valid(capability)) throw nb::value_error("Invalid core async capability");
+                new (self) CoreAsyncCapability(capability);
+            },
+            nb::arg("version") = CORE_ASYNC_CAPABILITY_VERSION, nb::arg("mode") = CoreAsyncMode::UNKNOWN,
+            nb::arg("max_conditions") = 0, nb::arg("condition_types") = 0
+        )
+        .def_ro("version", &CoreAsyncCapability::version)
+        .def_ro("mode", &CoreAsyncCapability::mode)
+        .def_ro("max_conditions", &CoreAsyncCapability::max_conditions)
+        .def_ro("condition_types", &CoreAsyncCapability::condition_types);
+    m.attr("CORE_ASYNC_CONDITION_COUNTER") = CORE_ASYNC_CONDITION_COUNTER;
+    m.attr("CORE_ASYNC_CONDITION_SDMA_POST_DONE") = CORE_ASYNC_CONDITION_SDMA_POST_DONE;
+
     // --- PyCoreCallable wrapper ---
     struct PyCoreCallable {
         std::vector<uint8_t> buffer_;
@@ -3051,17 +3074,28 @@ NB_MODULE(_task_interface, m) {
     nb::class_<PyCoreCallable>(m, "CoreCallable")
         .def_static(
             "build",
-            [](std::vector<ArgDirection> signature, nb::bytes binary) -> PyCoreCallable {
+            [](std::vector<ArgDirection> signature, nb::bytes binary,
+               const CoreAsyncCapability &capability) -> PyCoreCallable {
+                if (binary.size() > std::numeric_limits<uint32_t>::max())
+                    throw nb::value_error("Core binary too large");
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto buf = make_callable<CORE_MAX_TENSOR_ARGS>(
-                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size
+                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size, capability
                 );
                 return PyCoreCallable{std::move(buf)};
             },
-            nb::arg("signature"), nb::arg("binary"),
+            nb::arg("signature"), nb::arg("binary"), nb::arg("async_capability") = CoreAsyncCapability{},
             "Build a CoreCallable from a signature list and binary bytes. The dump "
-            "maps signature entry i to payload slot i positionally."
+            "maps signature entry i to payload slot i positionally. An omitted capability "
+            "is UNKNOWN, not a synchronous-completion declaration."
+        )
+
+        .def_prop_ro(
+            "async_capability",
+            [](const PyCoreCallable &self) {
+                return self.get().async_capability();
+            }
         )
 
         .def(
@@ -3129,6 +3163,8 @@ NB_MODULE(_task_interface, m) {
             "build",
             [](std::vector<ArgDirection> signature, std::string func_name, nb::bytes binary,
                std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name) -> PyChipCallable {
+                if (binary.size() > std::numeric_limits<uint32_t>::max())
+                    throw nb::value_error("Chip binary too large");
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto child_count = static_cast<int32_t>(children.size());
@@ -3165,6 +3201,9 @@ NB_MODULE(_task_interface, m) {
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
                 );
+                if (!chip_callable_image_valid(buf.data(), buf.size())) {
+                    throw nb::value_error("Incompatible or invalid ChipCallable image; rebuild the callable");
+                }
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("raw"),
@@ -3248,14 +3287,8 @@ NB_MODULE(_task_interface, m) {
                 // Reconstruct a PyCoreCallable by copying the child's raw bytes
                 auto offset = parent.child_offset(i);
                 const uint8_t *child_start = reinterpret_cast<const uint8_t *>(parent.storage_ + offset);
-                // Determine child size: from offset to next child or end of buffer
-                size_t child_size;
-                if (i + 1 < parent.child_count()) {
-                    child_size = parent.child_offset(i + 1) - offset;
-                } else {
-                    size_t header_size = offsetof(ChipCallable, storage_);
-                    child_size = self.buffer_.size() - header_size - offset;
-                }
+                // Inter-child alignment belongs to the parent, not the child image.
+                size_t child_size = c.image_size();
                 std::vector<uint8_t> child_buf(child_start, child_start + child_size);
                 return PyCoreCallable{std::move(child_buf)};
             },
@@ -3678,7 +3711,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
-                self.register_callable(callable_id, callable.buffer_.data());
+                self.register_callable(callable_id, callable.buffer_.data(), callable.buffer_.size());
             },
             nb::arg("callable_id"), nb::arg("callable"),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
@@ -3686,10 +3719,10 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "register_callable_from_blob",
-            [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
-                self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
+            [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr, size_t blob_size) {
+                self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr), blob_size);
             },
-            nb::arg("callable_id"), nb::arg("blob_ptr"),
+            nb::arg("callable_id"), nb::arg("blob_ptr"), nb::arg("blob_size"),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
             "bytes via shared memory; see docs/callable-identity-registration.md). "

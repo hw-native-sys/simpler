@@ -10,6 +10,7 @@
  */
 
 #include "chip_worker.h"
+#include "../task_interface/callable.h"
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
@@ -960,6 +961,9 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
 }
 
 int32_t ChipWorker::register_callable(const void *callable, size_t callable_size) {
+    if (!chip_callable_image_valid(callable, callable_size)) {
+        throw std::invalid_argument("register_callable: incompatible or invalid image; rebuild the callable");
+    }
     if (!initialized_) throw std::runtime_error("ChipWorker not initialized; call init() first");
     validate_execution_context();
     if (register_callable_v2_fn_ == nullptr)
@@ -968,6 +972,13 @@ int32_t ChipWorker::register_callable(const void *callable, size_t callable_size
     const int rc = register_callable_v2_fn_(device_ctx_, callable, callable_size, &id);
     if (rc != 0) throw std::runtime_error("callable registration failed with code " + std::to_string(rc));
     return id;
+}
+
+void ChipWorker::register_callable(int32_t callable_id, const void *callable, size_t callable_size) {
+    if (!chip_callable_image_valid(callable, callable_size)) {
+        throw std::invalid_argument("register_callable: incompatible or invalid image; rebuild the callable");
+    }
+    register_callable(callable_id, callable);
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {

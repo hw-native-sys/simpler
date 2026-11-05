@@ -225,4 +225,102 @@ TEST(CallableFunctionTables, IdenticalBytesYieldIdenticalTables) {
         << "a different func_id domain must not dedup onto the same block";
 }
 
+TEST(CallableCapability, UnknownBinaryIsDistinctFromDeclaredSynchronousCode) {
+    auto unknown = make_core_child(0x51, 3);
+    const auto *core = reinterpret_cast<const CoreCallable *>(unknown.data());
+    ASSERT_TRUE(core_callable_image_valid(unknown.data(), unknown.size()));
+    EXPECT_EQ(core->async_capability().mode, CoreAsyncMode::UNKNOWN);
+    auto synchronous = make_callable<CORE_MAX_TENSOR_ARGS>(
+        nullptr, 0, core->binary_data(), core->binary_size(),
+        {CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::SYNCHRONOUS, 0, 0}
+    );
+    ASSERT_TRUE(core_callable_image_valid(synchronous.data(), synchronous.size()));
+    EXPECT_NE(unknown, synchronous);
+}
+
+TEST(CallableCapability, DescriptorBoundsAndUnknownFieldsAreValidated) {
+    for (uint32_t count : {1u, 64u}) {
+        EXPECT_TRUE(core_async_capability_valid({1, CoreAsyncMode::DEFERRED, count, CORE_ASYNC_CONDITION_COUNTER}));
+        EXPECT_TRUE(
+            core_async_capability_valid({1, CoreAsyncMode::DEFERRED, count, CORE_ASYNC_CONDITION_SDMA_POST_DONE})
+        );
+    }
+    const CoreAsyncCapability invalid[] = {
+        {2, CoreAsyncMode::SYNCHRONOUS, 0, 0},
+        {1, static_cast<CoreAsyncMode>(99), 0, 0},
+        {1, CoreAsyncMode::UNKNOWN, 1, 0},
+        {1, CoreAsyncMode::SYNCHRONOUS, 0, CORE_ASYNC_CONDITION_COUNTER},
+        {1, CoreAsyncMode::DEFERRED, 0, CORE_ASYNC_CONDITION_COUNTER},
+        {1, CoreAsyncMode::DEFERRED, 65, CORE_ASYNC_CONDITION_COUNTER},
+        {1, CoreAsyncMode::DEFERRED, 1, 0},
+        {1, CoreAsyncMode::DEFERRED, 1, 4},
+    };
+    for (const auto &capability : invalid) {
+        EXPECT_FALSE(core_async_capability_valid(capability));
+        EXPECT_THROW(make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, capability), std::invalid_argument);
+    }
+}
+
+TEST(CallableCapability, LegacyTruncatedAndCorruptImagesAreRefusedBeforeChildAccess) {
+    // A valid old empty-signature image with 64 orchestration bytes had no prefix.
+    std::vector<uint8_t> legacy(17568 + 64, 0);
+    const uint32_t old_binary_size = 64;
+    std::memcpy(legacy.data() + 1028, &old_binary_size, sizeof(old_binary_size));
+    EXPECT_FALSE(chip_callable_image_valid(legacy.data(), legacy.size()));
+    auto image = make_chip_with_children({3});
+    ASSERT_TRUE(chip_callable_image_valid(image.data(), image.size()));
+    for (size_t size : {size_t{0}, sizeof(CallableImageHeader) - 1, sizeof(ChipCallable) - 1, image.size() - 1}) {
+        EXPECT_FALSE(chip_callable_image_valid(image.data(), size));
+    }
+    auto corrupt = image;
+    auto *chip = reinterpret_cast<ChipCallable *>(corrupt.data());
+    chip->image_.version += 1;
+    EXPECT_FALSE(chip_callable_image_valid(corrupt.data(), corrupt.size()));
+    corrupt = image;
+    chip = reinterpret_cast<ChipCallable *>(corrupt.data());
+    chip->child_offsets_[0] = UINT32_MAX;
+    EXPECT_FALSE(chip_callable_image_valid(corrupt.data(), corrupt.size()));
+    corrupt = image;
+    chip = reinterpret_cast<ChipCallable *>(corrupt.data());
+    auto *child = reinterpret_cast<CoreCallable *>(chip->storage_ + chip->child_offset(0));
+    child->image_.image_size = UINT32_MAX;
+    EXPECT_FALSE(chip_callable_image_valid(corrupt.data(), corrupt.size()));
+    corrupt = image;
+    chip = reinterpret_cast<ChipCallable *>(corrupt.data());
+    child = reinterpret_cast<CoreCallable *>(chip->storage_ + chip->child_offset(0));
+    child->async_capability_.version = 0;
+    EXPECT_FALSE(chip_callable_image_valid(corrupt.data(), corrupt.size()));
+}
+
+TEST(CallableCapability, CapabilityParticipatesInBothHashesAndSurvivesScratchPatch) {
+    const uint8_t code[] = {1, 2, 3};
+    std::vector<uint8_t> children[] = {
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, code, sizeof(code), {1, CoreAsyncMode::SYNCHRONOUS, 0, 0}),
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, code, 1, {1, CoreAsyncMode::DEFERRED, 64, 3}),
+    };
+    const int32_t ids[] = {7, 2};
+    auto image = make_chip_callable(nullptr, 0, "entry", code, sizeof(code), ids, children, 2, "");
+    ASSERT_TRUE(chip_callable_image_valid(image.data(), image.size()));
+    const auto *chip = as_chip(image);
+    const auto layout = compute_chip_callable_layout(chip);
+    EXPECT_EQ(layout.total_size, image.size());
+    EXPECT_EQ(chip->child(0).image_size(), children[0].size());
+    EXPECT_EQ(chip->child(1).image_size(), children[1].size());
+    auto scratch = image;
+    patch_chip_callable_scratch_for_device(chip, layout, kDeviceBase, scratch.data());
+    ASSERT_TRUE(chip_callable_image_valid(scratch.data(), scratch.size()));
+    EXPECT_EQ(as_chip(scratch)->child(1).async_capability().max_conditions, 64u);
+    EXPECT_EQ(as_chip(scratch)->child(1).async_capability().condition_types, 3u);
+    EXPECT_EQ(chip->child(1).resolved_addr(), 0u);
+    EXPECT_EQ(compute_chip_callable_layout(as_chip(scratch)).aicore_image_hash, layout.aicore_image_hash);
+
+    auto *changed = reinterpret_cast<ChipCallable *>(image.data());
+    auto *last = reinterpret_cast<CoreCallable *>(changed->storage_ + changed->child_offset(1));
+    last->async_capability_.max_conditions = 63;
+    ASSERT_TRUE(chip_callable_image_valid(image.data(), image.size()));
+    const auto new_layout = compute_chip_callable_layout(changed);
+    EXPECT_NE(new_layout.content_hash, layout.content_hash);
+    EXPECT_NE(new_layout.aicore_image_hash, layout.aicore_image_hash);
+}
+
 }  // namespace

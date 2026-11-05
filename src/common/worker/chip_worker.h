@@ -309,7 +309,10 @@ public:
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64). An ID that is already
     // registered is rejected; unregister it before reuse.
+    // Pointer-only overload is for previously validated/constructed owned
+    // images. External bytes must use the overload with an actual extent.
     void register_callable(int32_t callable_id, const void *callable);
+    void register_callable(int32_t callable_id, const void *callable, size_t callable_size);
     /// Register with a runtime-assigned ID in either initialization mode.
     int32_t register_callable(const void *callable, size_t callable_size);
     void unregister_callable(int32_t callable_id);
