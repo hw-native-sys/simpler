@@ -1341,13 +1341,20 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // drain, so sim's lifecycle entry points carry the same contract as
     // onboard's. attach_current_thread() is idempotent for a thread already
     // bound to this device.
+    int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+    } catch (...) {
+        attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (attach_rc != 0) {
+        // No drain has occurred: the carrier and execution claim remain retryable.
+        LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    }
     DrainOutcome drain{};
     try {
-        const int attach_rc = state->runner->attach_current_thread(state->runner->device_id());
-        if (attach_rc != 0) {
-            drain.device_rc = attach_rc;
-            LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
-        } else if (state->active_execution != nullptr) {
+        if (state->active_execution != nullptr) {
             drain = state->runner->drain_execution(*state->active_execution);
         }
     } catch (...) {
@@ -1397,6 +1404,9 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     }
     if (attach_rc != 0) {
         LOG_ERROR("simpler_finalize_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        // The canonical carrier tag keeps the caller's resources retained for
+        // retry. Neither drain nor binding release is proved by attach failure.
+        return attach_rc;
     }
     if (phase == NativeRunPhase::Running && launched && !state->physical_complete) {
         DrainOutcome drain{};

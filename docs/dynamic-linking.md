@@ -243,6 +243,46 @@ keys only when the last loader reference is released and the module really unloa
 | `execution_context` | `thread_local` | Kernel SO (PTO ISA) | Per-thread execution context (fallback, cached values only) |
 | `NPUMemoryModel::instance` | `thread_local` | Kernel SO (PTO ISA) | Per-core memory model simulation |
 
+### Sim Context device binding and thread startup
+
+The process-resident `libcpu_sim_context.so` owns the device-binding key. It
+stores only an encoded device ID, with no heap value or thread-exit destructor;
+releasing a device or unloading a runtime does not delete this shared key.
+
+`pto_cpu_sim_bind_device_checked` returns a pthread error code on key creation
+or binding failure, preserving the previous binding. IDs below -1 are rejected;
+-1 unbinds. The existing `void pto_cpu_sim_bind_device(int)` symbol retains its
+ABI and aborts on failure, since it cannot report an error to an old consumer.
+New host runtimes require the matching sim-context library exporting the checked
+entry point; legacy consumers can still use the new library.
+
+For a valid launched run, `simpler_wait_run` returns
+`SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE` when device attachment fails before drain.
+The original attachment error remains in the log; the reserved return code is
+an operation failure, not the run's terminal result. `ChipWorker` preserves its
+launched state, reports the failed wait, and permits another wait or finalize.
+Its finalize path likewise stops before teardown when its wait is incomplete.
+Other wait results, including execution errors, record the observer result.
+Physical completion is established separately by poll or wait-completion.
+Rebuild host consumers and runtime modules together for this return contract;
+old consumers that treat every returned integer as completion are unsupported.
+
+`attach_current_thread` reports binding failure before publishing the runner's
+device ID. `create_thread` waits for the child's binding result, joins a failed
+child, and throws without invoking its body. A successful child owns its scalar
+binding until thread exit. For simulated execution, an additional run-owned gate
+holds both AICore and AICPU bodies until the entire cohort has been created and
+bound. Failure cancels the gate and joins the created threads before returning;
+the run retains its launch failure. Partial launches still follow the existing
+conservative poisoned-run lifecycle. The gate adds one startup wait per core,
+with no work in task dispatch and no extra pthread keys.
+
+If caller-thread binding fails in `simpler_wait_run` or `simpler_finalize_run`,
+the entry returns an error without declaring the run drained or releasing its
+execution claim and carrier. The caller must retain the run's resources and
+retry finalization after binding becomes available; a failed attach is not
+proof that simulated worker threads have stopped.
+
 ### STRACE ownership across module unload
 
 STRACE borrows one process-owned pthread key through the bound host-log state.
@@ -386,7 +426,7 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
     allocate zeroed, aligned, stable native-run storage per pipeline slot
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size, ...)
       DeviceRunner::attach_current_thread(device_id)
-        pto_cpu_sim_bind_device(device_id)
+        pto_cpu_sim_bind_device_checked(device_id)  // return on error
         pto_cpu_sim_acquire_device(device_id)
       DeviceRunner::set_executors(aicpu, aicore)       binaries owned by runner
 

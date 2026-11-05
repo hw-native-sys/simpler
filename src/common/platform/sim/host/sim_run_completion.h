@@ -23,8 +23,11 @@ namespace simpler::common::sim_host {
  * Sticky completion state shared by a simulated run's kernel threads and its
  * nonblocking poller.
  *
- * reset() is called before any kernel thread starts. Each submitted thread
- * calls task_finished() exactly once. The final task publishes COMPLETE only
+ * reset() is called before any kernel thread starts. On a successful launch,
+ * each released thread calls task_finished() exactly once. If startup is
+ * cancelled, the launch owner joins every created thread and calls abandon(rc);
+ * cancelled or uncreated threads do not decrement the remaining task count.
+ * The final task of a successful launch publishes COMPLETE only
  * after every earlier task's writes and any recorded error are visible to a
  * poller that observes completion. abandon() publishes sticky ERROR when
  * enqueue rollback wins; a late task completion cannot overwrite it.
@@ -38,7 +41,13 @@ public:
         state_.store(SIMPLER_NATIVE_RUN_POLL_NOT_READY, std::memory_order_release);
     }
 
-    void abandon() noexcept { state_.store(SIMPLER_NATIVE_RUN_POLL_ERROR, std::memory_order_release); }
+    void abandon(int rc = 0) noexcept {
+        if (rc != 0) {
+            int expected = 0;
+            first_error_.compare_exchange_strong(expected, rc, std::memory_order_relaxed);
+        }
+        state_.store(SIMPLER_NATIVE_RUN_POLL_ERROR, std::memory_order_release);
+    }
 
     void task_finished(int rc = 0) noexcept {
         if (rc != 0) {
