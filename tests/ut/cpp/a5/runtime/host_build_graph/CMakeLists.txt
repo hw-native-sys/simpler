@@ -15,6 +15,7 @@ macro(a5_hbg_case src)
 endmacro()
 
 a5_hbg_case(test_hbg_async_records.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_join.cpp NO_OBJS TIMEOUT 30)
 
 a5_hbg_case(test_hbg_scheduler_contracts.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu)
