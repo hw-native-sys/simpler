@@ -1625,10 +1625,6 @@ extern "C" int comm_global_domain_import(
         rank_order[descriptor.domain_rank] = &descriptor;
     }
 
-    int32_t device_id = -1;
-    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) {
-        return -1;
-    }
     CommContext ctx{};
     ctx.rankId = static_cast<uint32_t>(allocation->rank);
     ctx.rankNum = static_cast<uint32_t>(allocation->nranks);

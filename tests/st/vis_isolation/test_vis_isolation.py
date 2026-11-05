@@ -25,10 +25,9 @@ onboard chip bring-up, so *any* scene test launched under the variable covers
 all of those call sites. ``dummy_task`` is the cheapest one.
 
 Allocating a comm domain exercises VMM mappings as well as chip initialization.
-On A2/A3, MapMem grants read/write access to the allocating/importing device.
-An explicit MemSetAccess grant for that same device is redundant, and its device
-id interpretation differs between Runtime 9.0 and 9.3. The comm-domain case covers
-both local and imported windows under the remapping.
+On A2/A3, mapping a window grants read/write access to the allocating or
+importing device; the comm-domain case covers both local and imported windows
+under the remapping.
 
 The scene test runs in a subprocess: the variable has to be set before the
 process performing ACL init starts, and mutating it in-process would leak into
