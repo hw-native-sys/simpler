@@ -11,6 +11,7 @@
 
 #include "../sdma.h"
 #include "async_kernel_api.h"
+#include "backend/sdma/sdma_submission_contract.h"
 #include "platform_comm/comm_context.h"
 
 using namespace pto;
@@ -30,14 +31,24 @@ __aicore__ void submit(__gm__ int64_t *args, AsyncCtx &ctx, __gm__ uint64_t *met
     TASSIGN(scratch, 0);
     pto::comm::AsyncSession session;
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::SDMA>(*comm).addr);
-    bool failed = workspace == nullptr || comm->rankNum != 2 || ctx.completion_capacity < kSdmaRecords;
+    Global destination(data<float>(args[1]));
+    Global source(remote);
+    uint64_t transfer_bytes = 0;
+    bool failed =
+        workspace == nullptr || comm->rankNum != 2 || !async_sdma_transfer_bytes(destination, source, &transfer_bytes);
     if (!failed) failed = !pto::comm::BuildAsyncSession(scratch, workspace, session, 0);
+    AsyncCompletionAllowance allowance;
+    if (!failed)
+        failed = session.cfg.sdma.queueNum > kSdmaRecords ||
+                 !async_completion_reserve(ctx, session.cfg.sdma.queueNum, &allowance);
     if (!failed) {
-        Global destination(data<float>(args[1]));
-        Global source(remote);
         const auto event = pto::comm::TGET_ASYNC(destination, source, session);
         const uint32_t count = event.CompletionRecordCount(session);
-        failed = event.postFailed || !event.valid() || count == 0 || count > kSdmaRecords;
+        failed = !async_sdma_event_valid(
+                     SdmaOp::TGET, transfer_bytes, event.handle, event.postFailed, static_cast<uint32_t>(event.engine),
+                     static_cast<uint32_t>(pto::comm::DmaEngine::SDMA)
+                 ) ||
+                 count == 0 || count > kSdmaRecords || !async_completion_accept_count(ctx, allowance, count);
         if (!failed) {
             for (uint32_t i = 0; i < count; ++i) {
                 const auto record = event.CompletionRecordAt(session, i);
