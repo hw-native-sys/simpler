@@ -533,15 +533,12 @@ def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(
         check=False,
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == (0 if has_gcc_15 else 1), result.stdout + result.stderr
+    expected_commands = ("ninja", "g++", "dot") + (("g++-15",) if has_gcc_15 else ())
+    assert result.stdout.splitlines() == [str(bin_dir / command) for command in expected_commands]
     alias = runner_temp / "bin/g++-15"
-    if has_gcc_15:
-        assert not alias.exists()
-        assert not github_path.exists()
-    else:
-        assert alias.is_symlink()
-        assert alias.resolve() == bin_dir / "g++"
-        assert github_path.read_text().splitlines() == [str(runner_temp / "bin")]
+    assert not alias.exists()
+    assert not github_path.exists()
 
 
 @pytest.mark.parametrize("path", (ACTION_PATH, APT_ACTION_PATH, *WORKFLOW_PATHS), ids=lambda path: path.name)

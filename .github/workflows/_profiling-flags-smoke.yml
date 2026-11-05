@@ -44,6 +44,7 @@ jobs:
           python-version: "3.10"
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
 
       - name: Set up environment
@@ -51,6 +52,8 @@ jobs:
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=_task_interface -e .[test]"
+          install-torch: ${{ inputs.setup_variant != 'self-cpu' }}
+          system-site-packages: ${{ inputs.setup_variant == 'self-cpu' }}
 
       - name: Run all profiling flag combos x 2 arches
         run: |

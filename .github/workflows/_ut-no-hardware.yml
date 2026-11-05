@@ -48,6 +48,7 @@ jobs:
           python-version: ${{ inputs.python_version }}
 
       - name: Set up C++ compiler
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/setup-gcc-15
 
       - name: Install GoogleTest and AArch64 C++ compiler
@@ -69,6 +70,7 @@ jobs:
             echo "::warning::brew could not install ccache; the C++ build will compile from scratch"
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
 
       # Self-hosted runners keep one checkout and one home directory across
@@ -91,6 +93,8 @@ jobs:
         uses: ./.github/actions/setup-venv
         with:
           packages: ".[test]"
+          install-torch: "false"
+          system-site-packages: "true"
 
       - name: Install MPI for Linux unit tests
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'
@@ -105,7 +109,12 @@ jobs:
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
-            python -m pytest tests/ut -m "not requires_hardware" -v
+            workers=${SIMPLER_CPU_PYUT_WORKERS:-4}
+            # These tests exercise xdist's controller/worker identity and must
+            # not themselves run inside an xdist worker.
+            python -m pytest tests/ut -m "not requires_hardware" -n "$workers" --dist loadfile \
+              --ignore=tests/ut/py/test_test_environments.py -v
+            python -m pytest tests/ut/py/test_test_environments.py -m "not requires_hardware" -v
           else
             pytest tests/ut -m "not requires_hardware" -v
           fi
@@ -114,6 +123,11 @@ jobs:
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
+            jobs=${SIMPLER_CPU_CPP_JOBS:-8}
+            compiler=(-DCMAKE_CXX_COMPILER=g++-15)
+          else
+            jobs=4
+            compiler=()
           fi
           # Real entry tests may skip in a standalone C++ build, but not in CI.
           test -f build/lib/libcpu_sim_context.so
@@ -142,15 +156,16 @@ jobs:
             launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
             ccache --zero-stats >/dev/null 2>&1 || true
           fi
-          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${launcher[@]}"
-          cmake --build tests/ut/cpp/build --parallel 4
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            "${compiler[@]}" "${launcher[@]}"
+          cmake --build tests/ut/cpp/build --parallel "$jobs"
           # The hit rate is what says whether the restored cache was usable, and
           # it is only readable here — a cold cache and a key that stopped
           # matching produce the same full-length build otherwise.
           if command -v ccache >/dev/null 2>&1; then
             ccache --show-stats
           fi
-          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure --timeout 300
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j "$jobs" --output-on-failure --timeout 300
 
       - name: Check C++ unit-test axis coverage
         run: |
