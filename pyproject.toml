@@ -30,7 +30,7 @@ simpler-mpi-direct = "simpler.mpi_direct_supervisor:main"
 [project.optional-dependencies]
 # ``torch>=2.3`` is required by ``simpler_setup.torch_interop`` (uses
 # ``torch.uint16`` / ``torch.uint32``, added in PyTorch 2.3). CI installs
-# torch via a custom index URL and does not rely on this pin; it is here
+# torch from a CPU index or reuses a runner installation and does not rely on this pin; it is here
 # so ``pip install -e '.[test]'`` resolves a usable version for local devs.
 test = [
     "pytest>=6.0",

@@ -1,0 +1,61 @@
+name: Find CPU Torch for self-hosted jobs
+description: Reuse a compatible CPU Torch installation, or populate a shared runner cache once.
+
+outputs:
+  site-packages:
+    description: Site-packages directory to add to the job venv.
+    value: ${{ steps.find.outputs.site-packages }}
+
+runs:
+  using: composite
+  steps:
+    - name: Find or cache CPU Torch
+      id: find
+      shell: bash
+      run: |
+        set -euo pipefail
+        configured_site=${SIMPLER_CPU_TORCH_SITE_PACKAGES:-}
+
+        verify_site() {
+          PYTHONPATH="$1" python3 - "$1" <<'PY'
+        import pathlib
+        import sys
+        import torch
+
+        site = pathlib.Path(sys.argv[1]).resolve()
+        assert pathlib.Path(torch.__file__).resolve().is_relative_to(site)
+        assert torch.version.cuda is None, torch.__version__
+        print(f"CPU Torch {torch.__version__}: {torch.__file__}")
+        PY
+        }
+
+        # A runner can expose an existing installation without changing the job.
+        current_site=$(python3 -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).resolve().parent.parent)' 2>/dev/null || true)
+        if [ -n "$current_site" ] && verify_site "$current_site"; then
+          site="$current_site"
+        else
+          python_tag=$(python3 -c 'import sys; print(f"py{sys.version_info.major}.{sys.version_info.minor}")')
+          cache_dir="$HOME/.cache/simpler-cpu-torch/$python_tag-$(uname -m)"
+          site="$cache_dir/site-packages"
+          mkdir -p "$cache_dir"
+          exec 9>"$cache_dir/install.lock"
+          flock -x 9
+          if ! verify_site "$site" >/dev/null 2>&1; then
+            tmp=$(mktemp -d "$cache_dir/install.XXXXXX")
+            trap 'rm -rf "$tmp"' EXIT
+            if [ -n "$configured_site" ] && [ -d "$configured_site" ] && verify_site "$configured_site"; then
+              mkdir -p "$tmp/site-packages"
+              cp -a --reflink=auto "$configured_site/." "$tmp/site-packages/"
+            else
+              python3 -m pip install --target "$tmp/site-packages" \
+                --index-url https://mirror.sjtu.edu.cn/pytorch-wheels/cpu/ \
+                --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+                'torch==2.10.0+cpu'
+            fi
+            verify_site "$tmp/site-packages"
+            rm -rf "$site"
+            mv "$tmp/site-packages" "$site"
+          fi
+        fi
+        verify_site "$site"
+        printf 'site-packages=%s\n' "$site" >> "$GITHUB_OUTPUT"

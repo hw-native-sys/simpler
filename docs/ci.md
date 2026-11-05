@@ -475,7 +475,7 @@ queueing entirely:
   as the main CI does for its Linux PR jobs.
   Gate outputs still come from the canonical `detect-changes` workflow, executed
   on `[self-hosted, cpu]` in this lane.
-- **CPU runner contract**: `/opt/pypto/toolchain/current/activate.sh` provides Python 3.10, GCC 15, ccache and libatomic. Each CPU job activates it through `setup-self-cpu-toolchain`, creates its own venv, and installs dependencies with a pip cache. Torch stays a per-job dependency. The runner also provides CMake, Ninja, GoogleTest, Graphviz and clang-tidy 18.
+- **CPU runner contract**: `setup-self-cpu-toolchain` uses `/opt/pypto/toolchain/current/activate.sh` when present, or a runner-provided Python 3.10, GCC 15 and libatomic. Each CPU job creates its own venv. `setup-self-cpu-torch` reuses CPU Torch from the active Python or a shared host cache. An optional runner environment variable, `SIMPLER_CPU_TORCH_SITE_PACKAGES`, can seed that cache from another compatible environment. If none exists, it installs CPU Torch once into the shared host cache from the SJTU PyTorch CPU mirror, using Tsinghua PyPI for dependencies. Other dependencies use the pip cache. Pre-commit reuses Node 20+ and npm from the runner. The runner also provides CMake, Ninja, GoogleTest, Graphviz and clang-tidy 18.
 - The lane run is standalone — it attaches no checks to the PR; results are read from the run.
 
 ## Hardware Classification

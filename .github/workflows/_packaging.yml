@@ -87,10 +87,17 @@ jobs:
         if: inputs.setup_variant == 'self-cpu'
         uses: ./.github/actions/cache-pip
 
+      - name: Find CPU Torch
+        if: inputs.setup_variant == 'self-cpu'
+        id: cpu-torch
+        uses: ./.github/actions/setup-self-cpu-torch
+
       - name: Install build + runtime deps in venv
         uses: ./.github/actions/setup-venv
         with:
           packages: "scikit-build-core>=0.10.0 nanobind>=2.0.0,<3 cmake>=3.20 ninja>=1.11 pytest>=6.0"
+          install-torch: ${{ inputs.setup_variant != 'self-cpu' }}
+          extra-site-packages: ${{ steps.cpu-torch.outputs.site-packages }}
 
       - name: Run packaging matrix
         run: |

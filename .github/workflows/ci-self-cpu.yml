@@ -8,8 +8,8 @@ run-name: CI Self CPU / PR ${{ inputs.pr_number || inputs.ref }}
 # runner/setup inputs differ here; gate outputs come from the canonical reusable
 # detect-changes workflow, executed on [self-hosted, cpu] in this lane.
 #
-# CPU jobs activate /opt/pypto/toolchain/current for Python 3.10, GCC 15 and
-# libatomic, then create per-job venvs with a pip cache. T3 (NPU) jobs keep
+# CPU jobs use a provisioned Python 3.10/GCC 15 toolchain, reuse CPU Torch from
+# the runner or its shared cache, then create per-job venvs. T3 (NPU) jobs keep
 # their --system-site-packages venvs (driver bindings). ci.yml lints with clang-tidy 18 while
 # HCE 2.0 packages only LLVM 12, so an agent also provides 18 on PATH under the
 # versioned name clang-tidy-18 (installed with its clang builtin headers,

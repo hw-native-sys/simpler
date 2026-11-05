@@ -162,6 +162,38 @@ jobs:
           done
           exit 1
 
+      - name: Use installed Node for CPU lint
+        if: inputs.setup_variant == 'self-cpu'
+        run: |
+          set -euo pipefail
+          echo 'NPM_CONFIG_REGISTRY=https://registry.npmmirror.com' >> "$GITHUB_ENV"
+          if command -v node >/dev/null && command -v npm >/dev/null &&
+             [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 20 ] &&
+             npm --version >/dev/null 2>&1; then
+            node --version
+            npm --version
+            exit 0
+          fi
+
+          runner_root=$(dirname "$(dirname "$RUNNER_TEMP")")
+          for version in node24 node20; do
+            candidate="$runner_root/externals/$version"
+            if [ -x "$candidate/bin/node" ] && [ -f "$candidate/lib/node_modules/npm/bin/npm-cli.js" ]; then
+              mkdir -p "$RUNNER_TEMP/node-bin"
+              ln -s "$candidate/bin/node" "$RUNNER_TEMP/node-bin/node"
+              printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' \
+                "$candidate/bin/node" "$candidate/lib/node_modules/npm/bin/npm-cli.js" \
+                > "$RUNNER_TEMP/node-bin/npm"
+              chmod +x "$RUNNER_TEMP/node-bin/npm"
+              "$RUNNER_TEMP/node-bin/node" --version
+              "$RUNNER_TEMP/node-bin/npm" --version
+              echo "$RUNNER_TEMP/node-bin" >> "$GITHUB_PATH"
+              exit 0
+            fi
+          done
+          echo '::error::CPU runner needs Node 20 or newer with npm'
+          exit 1
+
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.0
         with:

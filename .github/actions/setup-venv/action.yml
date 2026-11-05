@@ -14,6 +14,10 @@ inputs:
     description: Install the CPU torch wheel before packages.
     required: false
     default: "true"
+  extra-site-packages:
+    description: Optional existing site-packages directory, appended after the venv's own packages.
+    required: false
+    default: ""
   system-site-packages:
     description: Create the venv with --system-site-packages.
     required: false
@@ -54,6 +58,7 @@ runs:
       env:
         BUILD_PACKAGES: ${{ inputs.build-packages }}
         PACKAGES: ${{ inputs.packages }}
+        EXTRA_SITE_PACKAGES: ${{ inputs.extra-site-packages }}
         CANN_ENV: ${{ inputs.cann-env }}
         IN_HTTP_PROXY: ${{ inputs.http-proxy }}
         IN_HTTPS_PROXY: ${{ inputs.https-proxy }}
@@ -79,6 +84,11 @@ runs:
 
         python3 -m venv "${VENV_ARGS[@]}" .venv
         source .venv/bin/activate
+        if [ -n "$EXTRA_SITE_PACKAGES" ]; then
+          venv_site=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+          printf '%s\n' "$EXTRA_SITE_PACKAGES" > "$venv_site/shared-cpu-torch.pth"
+          python -c 'import torch; assert torch.version.cuda is None; print("Using CPU Torch", torch.__version__, torch.__file__)'
+        fi
         pip install --upgrade pip
         if [ "${{ inputs.install-torch }}" = "true" ]; then
           pip install torch --index-url https://download.pytorch.org/whl/cpu

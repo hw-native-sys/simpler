@@ -90,11 +90,18 @@ jobs:
           pip install --no-build-isolation \
             --config-settings=build.targets=build_package_sim -e '.[test]'
 
+      - name: Find CPU Torch
+        if: inputs.setup_variant == 'self-cpu'
+        id: cpu-torch
+        uses: ./.github/actions/setup-self-cpu-torch
+
       - name: venv + deps
         if: inputs.setup_variant == 'self-cpu'
         uses: ./.github/actions/setup-venv
         with:
           packages: ".[test]"
+          install-torch: "false"
+          extra-site-packages: ${{ steps.cpu-torch.outputs.site-packages }}
 
       - name: Install MPI for Linux unit tests
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'

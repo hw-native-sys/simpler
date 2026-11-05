@@ -105,11 +105,18 @@ jobs:
       - name: Cache pip packages
         uses: ./.github/actions/cache-pip
 
+      - name: Find CPU Torch
+        if: inputs.setup_variant == 'self-cpu'
+        id: cpu-torch
+        uses: ./.github/actions/setup-self-cpu-torch
+
       - name: Set up environment
         uses: ./.github/actions/setup-venv
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a2a3sim .[test]"
+          install-torch: ${{ inputs.setup_variant != 'self-cpu' }}
+          extra-site-packages: ${{ steps.cpu-torch.outputs.site-packages }}
 
       - name: Run pytest scene tests
         run: |
