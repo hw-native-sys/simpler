@@ -180,7 +180,7 @@ inline StateSelection select_percounter_state(
         } else if (!input.inline_completed) {
             input.sync_start = slot.task_attrs.requires_sync_start();
             input.has_predicate = slot.task_attrs.has_predicate();
-            const uint8_t active_mask = task_metadata[t].active_mask;
+            const uint8_t active_mask = task_metadata[t].active_mask.raw();
             const TaskPlacement placement = task_placement_from_active_mask(active_mask, &input.core_type_index);
             if (placement == TaskPlacement::UNSUPPORTED) {
                 log_unsupported(

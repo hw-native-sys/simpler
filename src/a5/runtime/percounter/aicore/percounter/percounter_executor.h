@@ -446,7 +446,7 @@ inline __aicore__ bool percounter_clear_mix_signal(const LaneConfig &cfg, uint64
     __gm__ uint64_t *ready = cfg.mix_signal_ready + cfg.cluster_index;
     if (cfg.cluster_lane == PERCOUNTER_MIX_CLAIMER_LANE) {
         percounter_mix_signal_clear(cfg.mix_signal);
-        scheduler_gm_publish(*ready, UINT64_C(1));
+        scheduler_gm_store(*ready, UINT64_C(1));
         return true;
     }
     const uint64_t start = get_sys_cnt_aicore();

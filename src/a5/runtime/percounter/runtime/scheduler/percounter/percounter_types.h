@@ -27,6 +27,10 @@
 #include <cstdint>
 #include <type_traits>
 
+// scheduler_protocol_types.h, which scheduler_layout.h pulls in, names LaneMask
+// without including it; host_build_graph's own translation units happen to have
+// it in scope by then, and this runtime's do not.
+#include "common/lane_mask.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_ssbuf.h"
 #include "scheduler/scheduler_types.h"
