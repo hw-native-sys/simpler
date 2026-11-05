@@ -111,21 +111,52 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
 ## hbg 的最终残留
 
+没有复制任何一个文件，但"两行 `weak`"的预估落空了。实际是 6 个文件：
+
 | 文件 | 残留 | 性质 |
 | ---- | ---: | ---- |
-| `aicore/aicore_executor.cpp` | **0 行** | 现有 5 行删除，靠已有的 weak 覆盖 |
-| `aicpu/aicpu_executor.cpp` | **1 行** | 给 `aicpu_execute` 加 `weak` |
-| `host/runtime_maker.cpp` | **1 行** | 给 `create_scheduler_state` 加 `weak` |
+| `aicore/aicore_executor.cpp` | **0 行** | percounter 根本不编译 hbg 的 aicore 源码 |
 | `runtime/scheduler/scheduler_layout.h` | **0 行** | 模式常量移入 percounter 自己的头 |
-| `aicpu/aicore_lifecycle.h` | 7 行 | 三个 accessor；上游从未改动此文件 |
-| `runtime/scheduler/scheduler_topology.h` | 1 行 | 加 `__aicore__`；上游从未改动此文件 |
 | `src/common/host_build_graph/runtime.h` | **0 行** | 只改过注释，回退 |
+| `aicpu/aicore_lifecycle.h` | 7 行 | 三个只读 accessor（核数、核类型、是否报到） |
+| `runtime/scheduler/scheduler_topology.h` | 1 行 | 给拓扑换算函数加 `__aicore__`，lane 自己要调它 |
+| `host/scheduler_extension.h` | **新增 60 行** | 两个扩展点的声明 + 三值 enum |
+| `host/runtime_maker.cpp` | +36 −8 | 两个弱扩展点 + `create_scheduler_state` 内 4 处调用点 |
+| `aicpu/aicpu_executor.h` | **新增 122 行** | `AicpuExecutor` 从 `.cpp` 提出来，声明六个步骤 |
+| `aicpu/aicpu_executor.cpp` | 352 行 | 其中约 290 行是纯搬移，真改动约 20 行 |
 
-合计约 10 行，**没有一处出现 `percounter` 字样，没有一处落在上游正在重写的函数体内**。
+**没有一处出现 `percounter` 字样。** 默认行为逐字不变：六个步骤和两个扩展点都是
+`__attribute__((weak))`，弱定义就是这两个文件原本做的事。cpput 398/398 在该状态下通过。
 
-那两行 `weak` 做不到零：percounter 的构建会同时编进 hbg 的 `runtime_maker.cpp`
-（其中 2,600 行 host 初始化要复用）和 percounter 自己的 `create_scheduler_state`，
-两个 strong 定义就是重复符号。要么 hbg 那个标 weak（1 行），要么 fork 整个文件（2,600 行）。
+### 为什么"一行 weak"不成立
+
+两处，各有各的原因，都是实现时才暴露的：
+
+- **`create_scheduler_state` 在匿名 namespace 里**（`runtime_maker.cpp` 约 485–1898 行）。
+  内部链接的符号不能充当 weak override 的弱侧，`weak` 标上去是惰性的，链接器不会用强的那个。
+  改为在匿名 namespace **外面**定义两个扩展点：一个让 GRAPH task 不被提前退出挡掉，
+  一个在 per-task walk 之后接管 bind。percounter 因此不必重写那 80 行分类循环——
+  它拿 walk 的产物，不重做 walk。
+- **`aicpu_execute` 能标 weak，但 percounter 要换的不是整个函数**，是函数体内的六个决策点。
+  整体替换意味着把线程汇合、握手屏障、完成门、终态记录、拆解这约 290 行复制一份。
+  改为把 `AicpuExecutor` 提到头文件里，六个步骤各自带弱默认。
+
+  这六个步骤**不是 virtual**：`test_hbg_resident_late_aicore_error` 直接 `#include` 这个
+  `.cpp`，并用 `-ffunction-sections` + `--gc-sections` 丢掉它不驱动的部分；vtable 会引用
+  每个步骤、丢不掉，会把该测试没链的符号拖出来。原因记在头文件注释里。
+
+### 实际的冲突面
+
+| 文件 | 冲突块 | 行数 | 成因 |
+| ---- | ---: | ---: | ---- |
+| `aicpu_executor.cpp` | 1 | 108 | 上游改 supervisor body，本分支把它搬进了 `supervise()` |
+| `runtime_maker.cpp` | 4 | 155 | 调用点落在 `create_scheduler_state` 内，和上游新增的 509 行重叠 |
+
+合计 2 文件 5 块 263 行。两个新增头文件永不冲突；`aicore_lifecycle.h` 与
+`scheduler_topology.h` 上游自分叉以来零改动。测试 CMakeLists 那个冲突已永久消失。
+
+`aicpu_executor.cpp` 的解法是固定的：把上游的新 supervisor body 搬进
+`AicpuExecutor::supervise()`，保留调用点那一行。
 
 ## 分步计划
 
@@ -169,23 +200,29 @@ percounter runtime 编出来和 hbg 等价。这是一个可验证的中间态�
 
 | 入口 | 做法 |
 | ---- | ---- |
-| `aicore_execute` | hbg 的已经是 weak；percounter 提供 strong 定义 |
-| `aicpu_execute` | hbg 侧加 `weak`；percounter 提供 strong 定义 |
-| `create_scheduler_state` | hbg 侧加 `weak`；percounter 提供约 80 行的自己的版本 |
+| `aicore_execute` | percounter 提供自己的定义，同样标 weak——每个 AICore 源码会被 AIC 和 AIV 各编一遍再合并，strong 会和自己的另一半撞 |
+| AICPU 的六个步骤 | hbg 侧弱默认即原行为；percounter 提供 strong 定义 |
+| host 的两个扩展点 | hbg 侧弱默认是弃权；percounter 提供 strong 定义，接管 walk 的产物 |
 
 验收：
 
-- hbg 树内只剩 `aicore_lifecycle.h` / `scheduler_topology.h` 的那 8 行，外加两处 `weak` 标记
-- a5 hbg 的 st 全绿（证明 hbg 行为未变）
-- percounter runtime 能跑通至少一个 DeepSeek 模块，数字与拆分前一致
+- hbg 树内 `grep -ri percounter` 为空
+- cpput 全绿（证明 hbg 行为未变）
+- percounter runtime 能跑通 a5 的 scene test，数字与拆分前一致
 
 ### 第 4 步：收紧 percounter 内部
 
-无条件化之后可做的清理，不改变行为：
+无条件化之后的清理：
 
+- **回退路径要变成硬失败。** percounter 的 `scheduler_extension_select` 现在仍可能返回
+  `DECLINED`（开关未设、graph template `UNSUPPORTED`、AIV1-only task），落回 hbg 的
+  resident/legacy 选择。但本 runtime 的 aicore `.o` 里**没有** legacy/resident executor
+  （入口无条件进 percounter executor，hbg 的 `aicore_executor.cpp` 不参与编译），
+  所以这条回退没有可落地的去处：host 发布了 legacy 模式，lane 却还在跑 percounter。
+  应改为 `FAILED`。
+- 去掉 `SIMPLER_HBG_SCHEDULER_TYPE` 这个三选一开关——本 runtime 里它只有一个合法取值
 - 模式常量退化为固定值
-- 去掉 `SIMPLER_EXP_FORCE_SCHED` 一类的选择开关（它们属于旧的三选一世界）
-- percounter 自己的形状校验与第 3 步新写的分类循环合并，去掉重复
+- percounter 自己的形状校验与 hbg walk 的分类结果合并，去掉重复
 
 ## 这个分支不做的事
 
