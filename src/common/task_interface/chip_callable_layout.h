@@ -104,17 +104,19 @@ chip_callable_table_length(const ChipCallable *callable, uint32_t max_func_id, u
  * pointer in sim; one formula therefore serves both platforms. Entries no child
  * claims stay 0, which is what an unmapped func_id must read.
  *
- * Both spans hold `length` entries, as chip_callable_table_length() computed
+ * All supplied spans hold `length` entries, as chip_callable_table_length() computed
  * for this same callable. `entry` may be null on a runtime whose consumers
- * resolve the entry out of the object themselves.
+ * resolve the entry out of the object themselves. The optional capabilities
+ * stay in host memory; holes carry UNKNOWN and never imply synchronous code.
  */
 inline void chip_callable_fill_tables(
     const ChipCallable *callable, const ChipCallableLayout &layout, const uint8_t *scratch, uint64_t object_base,
-    uint32_t length, uint64_t *object, uint64_t *entry
+    uint32_t length, uint64_t *object, uint64_t *entry, CoreAsyncCapability *capabilities = nullptr
 ) {
     for (uint32_t i = 0; i < length; ++i) {
         object[i] = 0;
         if (entry != nullptr) entry[i] = 0;
+        if (capabilities != nullptr) capabilities[i] = CoreAsyncCapability{};
     }
     for (int32_t i = 0; i < callable->child_count(); ++i) {
         const uint32_t off = callable->child_offset(i);
@@ -122,6 +124,7 @@ inline void chip_callable_fill_tables(
         const uint32_t func_id = static_cast<uint32_t>(callable->child_func_id(i));
         object[func_id] = object_base + layout.header_size + off;
         if (entry != nullptr) entry[func_id] = child->resolved_addr();
+        if (capabilities != nullptr) capabilities[func_id] = child->async_capability();
     }
 }
 

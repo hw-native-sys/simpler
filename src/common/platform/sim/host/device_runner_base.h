@@ -1133,6 +1133,8 @@ protected:
         // registration's dlopen resolved, which is what a device consumer of
         // resolved entries would dispatch through.
         std::vector<uint64_t> object_table;
+        // Host-only metadata with the same func_id domain and registration lifetime.
+        std::vector<CoreAsyncCapability> capability_table;
         std::vector<uint64_t> entry_table;
         uint64_t object_table_dev{0};
         uint64_t entry_table_dev{0};

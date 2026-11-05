@@ -45,6 +45,7 @@
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "dispatch_payload.h"
 #include "aicore_teardown.h"
+#include "async_capability.h"
 #include "callable_limits.h"
 #include "task_args.h"
 #include "common/launch_entry_args.h"             // EntryArgsSource, LaunchEntryArgsPlan
@@ -380,6 +381,10 @@ public:
      */
     uint64_t get_function_bin_addr(int func_id) const;
 
+    // Host-only, registration-owned metadata. A missing slot/table returns false
+    // and resets *out to UNKNOWN; a registered UNKNOWN declaration returns true.
+    bool get_function_async_capability(int func_id, CoreAsyncCapability *out) const;
+
     /**
      * Bind this run to one registration-owned function-table pair.
      *
@@ -388,9 +393,14 @@ public:
      * same table's device address, and `entry_table_addr` names its
      * resolved-entry sibling — zero on a runtime whose device scheduler reads
      * no such view.
+     * `capabilities`, when present, borrows `len` host-only descriptors from
+     * that same registration. Omitting it clears any previous capability view;
+     * it never declares the callable synchronous.
      */
-    void
-    set_callable_tables(const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len);
+    void set_callable_tables(
+        const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len,
+        const CoreAsyncCapability *capabilities = nullptr
+    );
 
     /**
      * Drop the function-table reference.
@@ -431,6 +441,7 @@ public:
     // is a host pointer, and because the host lookup must not reach for the
     // device address `dev` carries.
     const uint64_t *callable_table_host_{nullptr};
+    const CoreAsyncCapability *callable_capabilities_host_{nullptr};
     uint64_t callable_entry_table_addr_{0};
 
     // The launch shape's AIC/AIV rule, one entry per active worker. Host state

@@ -323,4 +323,34 @@ TEST(CallableCapability, CapabilityParticipatesInBothHashesAndSurvivesScratchPat
     EXPECT_NE(new_layout.aicore_image_hash, layout.aicore_image_hash);
 }
 
+TEST(CallableCapability, DenseTableCarriesCapabilitiesAndUnknownHoles) {
+    const uint8_t code[] = {1, 2, 3};
+    const CoreAsyncCapability synchronous{1, CoreAsyncMode::SYNCHRONOUS, 0, 0};
+    const CoreAsyncCapability deferred{1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_SDMA_POST_DONE};
+    std::vector<uint8_t> children[] = {
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, code, sizeof(code), synchronous),
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, code, sizeof(code), deferred),
+    };
+    const int32_t ids[] = {7, 2};
+    const auto image = make_chip_callable(nullptr, 0, "entry", nullptr, 0, ids, children, 2, "");
+    const auto *chip = as_chip(image);
+    const auto layout = compute_chip_callable_layout(chip);
+    uint64_t objects[8];
+    CoreAsyncCapability capabilities[8];
+    chip_callable_fill_tables(chip, layout, image.data(), kDeviceBase, 8, objects, nullptr, capabilities);
+    EXPECT_EQ(capabilities[7].mode, CoreAsyncMode::SYNCHRONOUS);
+    EXPECT_EQ(capabilities[2].mode, CoreAsyncMode::DEFERRED);
+    EXPECT_EQ(capabilities[2].max_conditions, 2u);
+    EXPECT_EQ(capabilities[2].condition_types, CORE_ASYNC_CONDITION_SDMA_POST_DONE);
+    for (uint32_t id : {0u, 1u, 3u, 4u, 5u, 6u}) {
+        EXPECT_EQ(objects[id], 0u);
+        EXPECT_EQ(capabilities[id].mode, CoreAsyncMode::UNKNOWN);
+        EXPECT_TRUE(core_async_capability_valid(capabilities[id]));
+    }
+
+    const auto empty = make_chip_with_children({});
+    const auto empty_layout = compute_chip_callable_layout(as_chip(empty));
+    chip_callable_fill_tables(as_chip(empty), empty_layout, empty.data(), kDeviceBase, 0, nullptr, nullptr, nullptr);
+}
+
 }  // namespace

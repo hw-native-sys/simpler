@@ -1047,7 +1047,8 @@ int SimDeviceRunnerBase::bind_callable_to_runtime(
     const ChipCallableBuffer &tables = block->second;
     runtime.set_callable_tables(
         tables.object_table.empty() ? nullptr : tables.object_table.data(), tables.object_table_dev,
-        tables.entry_table_dev, tables.table_len
+        tables.entry_table_dev, tables.table_len,
+        tables.capability_table.empty() ? nullptr : tables.capability_table.data()
     );
     // The AICPU dispatches the orch SO via this callable_id; the SO descriptor
     // was already delivered at launch_device_register time.
@@ -1055,11 +1056,16 @@ int SimDeviceRunnerBase::bind_callable_to_runtime(
 
     // Per-run binding. host_orch_func_ptr + signature come from CallableState and
     // stay inside the runner — no longer returned to the c_api.
-    return bind_callable_to_runtime_impl(
+    auto table_guard = RAIIScopeGuard([&]() {
+        runtime.clear_callable_tables();
+    });
+    const int rc = bind_callable_to_runtime_impl(
         &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,
         state.signature.empty() ? nullptr : state.signature.data(), static_cast<int>(state.signature.size()),
         ring_task_window, ring_heap, ring_dep_pool
     );
+    if (rc == 0) table_guard.dismiss();
+    return rc;
 }
 
 // Eager prebuilt-arena warm-up. A runtime with a prebuilt runtime arena
@@ -1675,6 +1681,7 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
     // only raw resource it owns is created with nothing fallible left between
     // it and the guard that owns it. Filling these below allocates nothing.
     std::vector<uint64_t> object_table(table_len, 0);
+    std::vector<CoreAsyncCapability> capability_table(table_len);
     std::vector<uint64_t> entry_table;
     if (want_entry_table) entry_table.assign(table_len, 0);
     std::vector<void *> dlopen_handles;
@@ -1769,7 +1776,7 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
     // that child's resolved_addr_ now holds.
     chip_callable_fill_tables(
         callable, layout, scratch, chip_dev, table_len, object_table.data(),
-        want_entry_table ? entry_table.data() : nullptr
+        want_entry_table ? entry_table.data() : nullptr, capability_table.data()
     );
 
     // One publication point. The entry is built with no handles and inserted
@@ -1786,6 +1793,7 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
     auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
     ChipCallableBuffer &owner = inserted.first->second;
     owner.object_table = std::move(object_table);
+    owner.capability_table = std::move(capability_table);
     owner.entry_table = std::move(entry_table);
     owner.dlopen_handles = std::move(dlopen_handles);
     published = true;
