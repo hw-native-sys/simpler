@@ -10,6 +10,10 @@ inputs:
     description: Arguments passed to pip install after torch, for example ".[test]" or "-e .[test]".
     required: false
     default: ""
+  python-executable:
+    description: Python executable used to create the venv.
+    required: false
+    default: python3
   install-torch:
     description: Install the CPU torch wheel before packages.
     required: false
@@ -77,7 +81,7 @@ runs:
           VENV_ARGS+=(--system-site-packages)
         fi
 
-        python3 -m venv "${VENV_ARGS[@]}" .venv
+        "${{ inputs.python-executable }}" -m venv "${VENV_ARGS[@]}" .venv
         source .venv/bin/activate
         pip install --upgrade pip
         if [ "${{ inputs.install-torch }}" = "true" ]; then

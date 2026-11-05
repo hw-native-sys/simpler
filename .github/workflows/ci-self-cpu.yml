@@ -10,9 +10,9 @@ run-name: CI Self CPU / PR ${{ inputs.pr_number || inputs.ref }}
 #
 # Provisioning contract for the cpu runner (out-of-repo, dnf): every cpu agent
 # needs the same set — cmake ninja-build gcc-c++ clang-tools-extra graphviz
-# gtest-devel python3-devel. T1 jobs create plain venvs from the runner's
-# python3 (the repo supports >=3.9; the runner's 3.9 caught the zip(strict=)
-# bug that CI's 3.10 never did) with a pip cache; the venv isolates T1 from
+# gtest-devel python3-devel. Reusable T1 test jobs create plain venvs from the
+# provisioned Python 3.11 runtime (the runner's default Python 3.9 exposed
+# unsupported zip(strict=True) calls) with a pip cache; the venv isolates T1 from
 # any system/user python state. T3 (NPU) jobs keep their --system-site-packages
 # venvs (driver bindings). g++-15 is a symlink stand-in for the
 # ubuntu-toolchain ppa g++ — see below. ci.yml lints with clang-tidy 18 while

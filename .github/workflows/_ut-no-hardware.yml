@@ -98,6 +98,7 @@ jobs:
         if: inputs.setup_variant == 'self-cpu'
         uses: ./.github/actions/setup-venv
         with:
+          python-executable: /usr/local/ptoas/runtimes/cpython-3.11/bin/python3.11
           packages: ".[test]"
 
       - name: Install MPI for Linux unit tests
