@@ -260,13 +260,11 @@ class KernelCompiler:
         """
         Get all include directories needed for orchestration compilation.
 
-        A runtime's own tree comes first, then whatever its build_config
-        declares, then the shared and platform directories. A runtime that
-        compiles a sibling's sources keeps no copy of that sibling's headers,
-        so the declaration is the only record of where they are, and it has to
-        precede the shared directories for the same reason the runtime's own
-        tree does: several of these directories hold a `tensor.h`, and only the
-        arch-local one declares the `using Tensor` alias kernels rely on.
+        The conventional directories come first, then whatever the runtime's
+        build_config declares. A runtime that compiles a sibling's sources keeps
+        no copy of that sibling's headers, so the declaration is the only record
+        of where they are. It goes last because the first match on an include
+        path wins: appending can only resolve an include that had none.
 
         Args:
             runtime_name: Name of the runtime (e.g., "host_build_graph")
@@ -286,10 +284,10 @@ class KernelCompiler:
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         src_common_dir = str(self.project_root / "src" / "common")
+        conventional = [runtime_dir, runtime_common_dir, common_dir, src_common_dir]
+        conventional += self.get_platform_include_dirs()
         config_include_dirs, _ = self._get_orchestration_config(runtime_name)
-        own_dirs = [runtime_dir, runtime_common_dir]
-        declared = [d for d in config_include_dirs if d not in own_dirs]
-        return own_dirs + declared + [common_dir, src_common_dir] + self.get_platform_include_dirs()
+        return conventional + [d for d in config_include_dirs if d not in conventional]
 
     def get_incore_include_dirs(self) -> list[str]:
         """
@@ -421,13 +419,14 @@ class KernelCompiler:
         )
 
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
-        # tensormap_and_ringbuffer's orchestration runs on the AICPU, so on
-        # hardware it is built for aarch64; on sim it runs in the host process.
-        # Every other runtime's orchestration runs on the host.
-        if runtime_name == "tensormap_and_ringbuffer" and not self.platform.endswith("sim"):
+        if runtime_name in ("host_build_graph", "percounter"):
+            return self.host_gxx
+        if runtime_name == "tensormap_and_ringbuffer":
+            if self.platform.endswith("sim"):
+                return self.host_gxx
             assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
             return self.aarch64
-        return self.host_gxx
+        raise ValueError(f"Unknown runtime_name: {runtime_name!r}")
 
     def _orchestration_compile_flags(self, toolchain: Union[GxxToolchain, Aarch64GxxToolchain]) -> list[str]:
         return [*toolchain.get_compile_flags(), *self._sanitizer_flags(toolchain)]
