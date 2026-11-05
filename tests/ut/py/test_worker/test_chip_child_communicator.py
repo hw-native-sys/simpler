@@ -59,6 +59,7 @@ def _run_controls(
             "comm_release_domain_windows",
             "comm_abort_domain_windows",
             "set_exported_device_regions_live",
+            "_stop_chip_run_lane_admission",
             "_close_chip_run_lane",
         )
     )
@@ -163,7 +164,9 @@ def _run_controls(
             if errors:
                 raise errors[0]
             assert len(responses) == len(commands)
+            cw._stop_chip_run_lane_admission.assert_called_once_with()
             cw._close_chip_run_lane.assert_called_once_with()
+            cw.assert_has_calls([call._stop_chip_run_lane_admission(), call._close_chip_run_lane()])
         reply_buf = reply.buf
         assert reply_buf is not None
         published = worker_mod._DOMAIN_REPLY_HEADER.unpack_from(reply_buf, 0)

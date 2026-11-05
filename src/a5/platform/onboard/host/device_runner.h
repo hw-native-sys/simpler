@@ -165,6 +165,8 @@ public:
      * @return 0 on success, error code on failure.
      */
     int ensure_acl_ready(int device_id);
+    /** Terminal Host last-use proof; keeps ACL mappings alive for explicit unregister. */
+    int quiesce_host_uses();
 
     /**
      * Create a caller-owned aclrtStream for comm_* usage.

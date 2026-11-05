@@ -47,3 +47,12 @@ extern "C" int host_ddr_unmap_ctx(DeviceContextHandle ctx, int device, uint64_t 
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
+
+extern "C" int quiesce_host_uses_ctx(DeviceContextHandle ctx) {
+    if (!ctx) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->quiesce_host_uses();
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}

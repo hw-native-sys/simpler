@@ -23,6 +23,7 @@ side table lives only in the owning process.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import operator
 import os
@@ -444,11 +445,18 @@ class Buffer:
         """
         if self.backend_kind == BackendKind.VMM_WINDOW and self.shm is not None:
             raise ValueError("Host domain buffers borrow shared memory; use domain.release()")
-        if self._mapping_registration is not None:
-            self._mapping_registration[0]._check_pid()
+        registration = self._mapping_registration
+        admission = contextlib.nullcontext()
+        if registration is not None:
+            registration[0]._check_pid()
+            admission = registration[0].release_admission()
         if self.shm is not None and hasattr(self.shm, "_check_pid"):
             self.shm._check_pid()
-        with self._host_lock:
+        # Distributed admission precedes the Buffer lock: an active callback may
+        # need host_view() before it can leave the submission serializer.
+        with admission, self._host_lock:
+            if registration is not self._mapping_registration:
+                raise RuntimeError("Host registration changed during close; retry after submission")
             if self._mapping_registration is not None:
                 registry, identity = self._mapping_registration
                 registry.check_unused(identity)
@@ -1214,7 +1222,7 @@ class ImportRegistry:
             transfer = args.transfer(i)
             if transfer == TensorTransfer.MAP:
                 if self.host_mappings is None:
-                    raise ValueError("MAP requires its owning direct L2 Worker")
+                    raise ValueError("MAP requires a prepared device endpoint")
                 base, space = self.host_mappings.resolve(tensor)
                 resolved.append((base, space, int(TensorTransfer.NONE)))
             else:
@@ -1287,6 +1295,8 @@ class ImportRegistry:
         before that point is a mapping nothing can reach to retry — so the raise leaves the entry
         in place for this registry's own ``close()`` to attempt again.
         """
+        if self.host_mappings is not None:
+            self.host_mappings.check_unregistered(identity)
         imported = self._by_identity.get(identity)
         if imported is None:
             return

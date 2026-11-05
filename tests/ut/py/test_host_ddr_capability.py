@@ -82,11 +82,11 @@ def test_old_binding_without_capability_is_not_supported(worker, monkeypatch):
 
 
 @pytest.mark.parametrize("level", [3, 4])
-def test_host_ddr_refuses_hierarchical_workers(level, worker):
+def test_host_ddr_refuses_unsupported_hierarchical_workers(level, worker):
     tensor = worker.create_buffer(64).tensor((4,), DataType.INT32)
     hierarchical = Worker(level=level)
     try:
-        with pytest.raises(ValueError, match="direct L2"):
+        with pytest.raises(RuntimeError, match="L3 MAP requires local A5"):
             hierarchical._submit_l3_locked(None, map_args(tensor), CallConfig())
     finally:
         hierarchical.close()
