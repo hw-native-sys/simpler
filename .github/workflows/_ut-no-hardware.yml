@@ -48,7 +48,15 @@ jobs:
           python-version: ${{ inputs.python_version }}
 
       - name: Set up C++ compiler
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/setup-gcc-15
+
+      - name: Verify provisioned C++ compiler
+        if: inputs.setup_variant == 'self-cpu'
+        run: |
+          command -v gcc
+          command -v g++
+          command -v ninja
 
       - name: Install GoogleTest and AArch64 C++ compiler
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'

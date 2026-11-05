@@ -17,6 +17,8 @@ permissions:
 
 jobs:
   build:
+    # CPU-only PR trial: skip docs until its Python 3.10 toolchain is available.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
