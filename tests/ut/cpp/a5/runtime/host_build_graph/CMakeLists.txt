@@ -16,7 +16,12 @@ endmacro()
 
 a5_hbg_case(test_hbg_async_records.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_join.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_check.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_observer.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_writer.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_discovery.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_finish.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 a5_hbg_case(test_hbg_async_plan.cpp NO_OBJS TIMEOUT 30
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
     SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)

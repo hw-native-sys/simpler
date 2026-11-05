@@ -67,7 +67,13 @@ struct alignas(128) SchedulerAsyncGroupProgress {
     uint64_t acquire_stage{0};
     uint64_t acquire_byte_offset{0};
     uint64_t observation_count{0};
-    uint8_t reserved[88]{};
+    uint64_t phase{0};
+    uint64_t acquire_condition{SCHEDULER_ASYNC_INDEX_NONE};
+    uint64_t acquire_count{0};
+    uint64_t work_units{0};
+    uint64_t slice_count{0};
+    int64_t failure_code{0};
+    uint8_t reserved[40]{};
 };
 
 struct alignas(128) SchedulerAsyncFinishIdentity {
@@ -80,11 +86,23 @@ struct alignas(128) SchedulerAsyncFinishIdentity {
 
 struct alignas(128) SchedulerAsyncFinishProgress {
     SchedulerResolveCursor resolve{};
+    int64_t current_waiter{SCHEDULER_TASK_REF_INVALID};
     int64_t detached_next{SCHEDULER_TASK_REF_INVALID};
     uint64_t phase{0};
     uint64_t pending_count{0};
     uint64_t pending_queue{0};
+    uint64_t pending_target{0};
+    uint64_t pending_kind{0};
+    uint64_t resume_phase{0};
+    int64_t pending_first{SCHEDULER_TASK_REF_INVALID};
+    int64_t pending_last{SCHEDULER_TASK_REF_INVALID};
+    uint64_t pending_link_count{0};
+    uint64_t visited_count{0};
     int64_t pending_tasks[8]{};
+    uint64_t active_slice_cycles{0};
+    uint64_t slice_count{0};
+    uint64_t work_units{0};
+    uint8_t reserved[40]{};
 };
 
 struct SchedulerAsyncLayout {
@@ -125,7 +143,7 @@ struct SchedulerAsyncLayout {
 static_assert(sizeof(SchedulerAsyncTaskMap) == 32);
 static_assert(sizeof(SchedulerAsyncGroupIdentity) == 128 && sizeof(SchedulerAsyncGroupWriter) == 128);
 static_assert(sizeof(SchedulerAsyncGroupProgress) == 128 && sizeof(SchedulerAsyncFinishIdentity) == 128);
-static_assert(sizeof(SchedulerAsyncFinishProgress) == 128);
+static_assert(sizeof(SchedulerAsyncFinishProgress) == 256);
 static_assert(sizeof(SchedulerAsyncConditionBinding) == 16);
 static_assert(sizeof(SchedulerAsyncLayout) == 256);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
