@@ -35,6 +35,7 @@ int unsupported_attempts = 0;
 std::weak_ptr<PhysicalAllocation> unsupported_resource;
 bool fail_context_upload = false;
 bool reject_explicit_access = false;
+int explicit_access_calls = 0;
 enum class PeerFailure { NONE, IMPORT, RESERVE, MAP };
 PeerFailure peer_failure = PeerFailure::NONE;
 bool peer_reserve_pending = false;
@@ -124,6 +125,7 @@ extern "C" aclError aclrtUnmapMem(void *address) {
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMemSetAccess(void *, size_t, aclrtMemAccessDesc *, size_t) {
+    ++explicit_access_calls;
     if (reject_explicit_access) return ACL_ERROR_RT_INVALID_DEVICEID;
     return ACL_SUCCESS;
 }
@@ -296,6 +298,7 @@ int main(int argc, char **argv) {
         assert(comm_release_domain_windows(h, 3, 2, 0) == 0);
         assert(h->domain_allocations.empty() && mappings.empty() && physical_handles == 0);
     }
+    assert(explicit_access_calls == 0);
     delete h;
     std::filesystem::remove_all(folder);
     return 0;

@@ -16,6 +16,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 
+# The fixture compiles the production host path against the CANN headers.
+pytestmark = pytest.mark.requires_hardware
+
 
 @pytest.fixture(scope="module")
 def a2a3_lifecycle_binary(tmp_path_factory):
