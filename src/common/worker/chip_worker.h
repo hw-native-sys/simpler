@@ -371,6 +371,9 @@ public:
     bool host_ddr_mapping_supported() const noexcept;
     uint64_t map_host_ddr(uint64_t host, uint64_t bytes);
     void unmap_host_ddr(uint64_t host);
+    bool host_urma_supported() const noexcept;
+    uint64_t prepare_host_urma(uint64_t base_comm, uint64_t allocation_id, uint64_t host, uint64_t bytes);
+    void release_host_urma();
 
     /// One span of a caller device allocation a run names. The lane's
     /// vocabulary for the borrow it takes on a run's behalf; the wire form it
@@ -1085,6 +1088,12 @@ private:
     };
     std::mutex host_ddr_mutex_;
     std::unordered_map<uint64_t, HostDdrMapping> host_ddr_mappings_;
+    // Set before collective initialization: even a failed prepare can retain HCCL references.
+    uint64_t host_urma_comm_{0};
+    uint64_t host_urma_allocation_{0};
+    uint64_t host_urma_host_{0};
+    uint64_t host_urma_workspace_{0};
+    bool host_urma_revoked_{false};
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

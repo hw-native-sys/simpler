@@ -445,11 +445,17 @@ class Buffer:
         ``Worker._release_all_buffers`` leaves the registry entry behind for.
         """
         if self._mapping_registration is not None:
-            self._mapping_registration[0]._check_pid()
+            registry, identity = self._mapping_registration
+            registry._check_pid()
+            # Distributed cleanup reserves Worker admission. A graph callback may
+            # need host_view(), so never wait for that reservation holding this lock.
+            registry.close(identity)
         with self._host_lock:
             if self._mapping_registration is not None:
                 registry, identity = self._mapping_registration
-                registry.close(identity)
+                # A concurrent map can install a registration before this lock is
+                # acquired. Reject it while holding the same lock map_view uses.
+                registry.check_unregistered(identity)
             if self._source_registration is not None:
                 source, identity = self._source_registration
                 source.close(identity)
@@ -1267,6 +1273,8 @@ class ImportRegistry:
         before that point is a mapping nothing can reach to retry — so the raise leaves the entry
         in place for this registry's own ``close()`` to attempt again.
         """
+        if self.host_mappings is not None:
+            self.host_mappings.check_unregistered(identity)
         imported = self._by_identity.get(identity)
         if imported is None:
             return

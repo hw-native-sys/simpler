@@ -98,6 +98,17 @@ struct DomainAllocation {
     size_t mapping_size = 0;
 };
 
+struct HostUrmaAllocation {
+    uint64_t allocation_id = 0;
+    uint64_t mapped = 0;
+    uint64_t bytes = 0;
+    HcclComm comm = nullptr;
+    bool create_attempted = false;
+    bool teardown_uncertain = false;
+    bool ready = false;
+    std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> workspace;
+};
+
 struct CommHandle_ {
     int rank;
     int nranks;
@@ -114,6 +125,7 @@ struct CommHandle_ {
     std::vector<CommContext *> derived_contexts;
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
+    std::unique_ptr<HostUrmaAllocation> host_urma;
 };
 
 // ============================================================================
@@ -1900,8 +1912,91 @@ extern "C" int comm_global_domain_release(uint64_t) {
     return -1;
 }
 
+extern "C" int comm_prepare_host_urma(
+    CommHandle h, uint64_t allocation_id, uint64_t mapped, uint64_t bytes, uint64_t *workspace_out
+) try {
+    if (!h || !h->hccl_comm || !workspace_out || !allocation_id || allocation_id > UINT32_MAX || !mapped || !bytes ||
+        mapped > UINT64_MAX - bytes || h->nranks < 2)
+        return -1;
+    *workspace_out = 0;
+    if (h->host_urma) {
+        const auto &owner = *h->host_urma;
+        if (owner.allocation_id != allocation_id || owner.mapped != mapped || owner.bytes != bytes || !owner.ready)
+            return -1;
+        *workspace_out = reinterpret_cast<uint64_t>(owner.workspace->GetWorkspaceAddr());
+        return 0;
+    }
+    if (HcclCreateSubCommConfig == nullptr) return -1;
+    auto owner = std::make_unique<HostUrmaAllocation>();
+    owner->allocation_id = allocation_id;
+    owner->mapped = mapped;
+    owner->bytes = bytes;
+    owner->workspace = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
+    h->host_urma = std::move(owner);
+    auto &allocation = *h->host_urma;
+    std::vector<uint32_t> ranks(static_cast<size_t>(h->nranks));
+    for (uint32_t rank = 0; rank < ranks.size(); ++rank)
+        ranks[rank] = rank;
+    HcclCommConfig config{};
+    HcclCommConfigInit(&config);
+    allocation.create_attempted = true;
+    HcclResult rc = HcclCreateSubCommConfig(
+        &h->hccl_comm, static_cast<uint32_t>(h->nranks), ranks.data(), allocation_id, static_cast<uint32_t>(h->rank),
+        &config, &allocation.comm
+    );
+    if (rc != HCCL_SUCCESS || allocation.comm == nullptr) {
+        LOG_ERROR("[comm rank %d] Host URMA subcommunicator creation failed: %d", h->rank, static_cast<int>(rc));
+        return -1;
+    }
+    if (!allocation.workspace->Init(
+            allocation.comm, static_cast<uint32_t>(h->rank), static_cast<uint32_t>(h->nranks),
+            reinterpret_cast<void *>(mapped), bytes
+        )) {
+        LOG_ERROR("[comm rank %d] Host URMA workspace initialization failed; owner retained", h->rank);
+        return -1;
+    }
+    *workspace_out = reinterpret_cast<uint64_t>(allocation.workspace->GetWorkspaceAddr());
+    if (*workspace_out == 0 || allocation.workspace->GetWorkspaceSize() == 0) return -1;
+    allocation.ready = true;
+    return 0;
+} catch (const std::exception &error) {
+    LOG_ERROR("[comm] Host URMA preparation failed with retained owner: %s", error.what());
+    return -1;
+} catch (...) {
+    return -1;
+}
+
+extern "C" int comm_release_host_urma(CommHandle h, uint64_t allocation_id) try {
+    if (!h) return -1;
+    if (!h->host_urma) return 0;
+    auto &owner = *h->host_urma;
+    if (owner.allocation_id != allocation_id || owner.teardown_uncertain) return -1;
+    // A failed collective with no returned handle does not prove its side effects were undone.
+    if (owner.create_attempted && owner.comm == nullptr) return -1;
+    if (owner.comm != nullptr) {
+        const auto rc = HcclCommDestroy(owner.comm);
+        if (rc != HCCL_SUCCESS) {
+            owner.teardown_uncertain = true;
+            LOG_ERROR("[comm rank %d] Host URMA destruction is unconfirmed: %d", h->rank, static_cast<int>(rc));
+            return -1;
+        }
+        owner.comm = nullptr;
+    }
+    // PTO Finalize frees notify/workspace storage; its HCCL users must be gone first.
+    owner.workspace.reset();
+    h->host_urma.reset();
+    return 0;
+} catch (...) {
+    if (h && h->host_urma) h->host_urma->teardown_uncertain = true;
+    return -1;
+}
+
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
+    if (h->host_urma) {
+        LOG_ERROR("[comm rank %d] base communicator retains Host URMA resources", h->rank);
+        return -1;
+    }
 
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.

@@ -115,6 +115,10 @@ int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+bool DeviceRunner::host_urma_supported() const noexcept {
+    return std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") == 0;
+}
+
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
 // `configure_aicore_op_timeout`, `ensure_device_initialized`,
 // `ensure_aicpu_runtime_registered`, `query_max_block_dim`, and `validate_block_dim`

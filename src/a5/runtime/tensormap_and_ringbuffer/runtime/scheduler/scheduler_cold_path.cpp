@@ -1090,6 +1090,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 ac.completion_error_code = &slab->error_code;
                 ac.completion_entries = &slab->entries[0];
                 ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+                ac.urma_queue_index = core_id >= aic_n ? static_cast<uint32_t>(core_id - aic_n) : UINT32_MAX;
                 slab->count = 0;
                 slab->error_code = SIMPLER_ERROR_NONE;
                 for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
@@ -1400,10 +1401,10 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    // Prefill the per-dispatch AsyncCtx constant fields once. Of AsyncCtx's five
-    // fields, four are constant for a given (core, buf_idx): the three pointers
-    // target the fixed deferred_slab_per_core_[core][buf] members, and capacity is
-    // MAX_COMPLETIONS_PER_TASK. Only task_token varies per dispatch, so build_payload
+    // Prefill the per-dispatch AsyncCtx constant fields once: the three pointers
+    // target the fixed deferred_slab_per_core_[core][buf] members, capacity is
+    // MAX_COMPLETIONS_PER_TASK, and the URMA queue belongs to the physical AIV.
+    // Only task_token varies per dispatch, so build_payload
     // writes just that; these constants survive across dispatches because the
     // payload buffer is never zeroed between them.
     // The two context-pointer args are also per-(core, buf_idx) constants — they
@@ -1420,6 +1421,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             ac.completion_error_code = &slab->error_code;
             ac.completion_entries = &slab->entries[0];
             ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+            ac.urma_queue_index = UINT32_MAX;
             // Clear the slab once here; thereafter only the completion path re-clears
             // count (and only when a deferred task dirtied it), never per dispatch.
             slab->count = 0;
@@ -1429,6 +1431,13 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             }
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
+        }
+    }
+
+    for (int32_t index = 0; index < aiv_count_; ++index) {
+        for (int32_t buf = 0; buf < 2; ++buf) {
+            payload_per_core_[aiv_worker_ids_[index]][buf].local_context.async_ctx.urma_queue_index =
+                static_cast<uint32_t>(index);
         }
     }
 

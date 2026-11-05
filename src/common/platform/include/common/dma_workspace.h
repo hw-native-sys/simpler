@@ -38,7 +38,8 @@
  * every a2a3 onboard host_runtime, so both runtimes there provision SDMA on
  * request — the gate is the platform, not the runtime. Both schedulers copy the
  * provisioned addresses into every core's GlobalContext for get_dma_workspace.
- * The URMA slot is not provisioned by this Worker-level interface.
+ * A5 TMR publishes the URMA slot when L3 maps a shared Host backing; it is
+ * separate from Device communication-domain workspaces and revoked before release.
  * A2/A3 simulation provisions inert scratch for the same address-injection contract;
  * it creates no SDMA streams and does not model prefetch performance. A5 onboard and
  * builds without the a2a3 PTO-SDMA provider reject Worker-level SDMA requests.
@@ -49,7 +50,7 @@
 
 enum DmaWorkspaceKind {
     DMA_WORKSPACE_SDMA = 0,  // PTO-ISA async-SDMA (a2a3): TPREFETCH_ASYNC / TGET_ASYNC / TPUT_ASYNC
-    DMA_WORKSPACE_URMA = 1,  // Reserved; not provisioned by the Worker-level provider
+    DMA_WORKSPACE_URMA = 1,  // A5 TMR shared Host backing, prepared by L3 map_view
     DMA_WORKSPACE_KIND_COUNT = 2,
 };
 

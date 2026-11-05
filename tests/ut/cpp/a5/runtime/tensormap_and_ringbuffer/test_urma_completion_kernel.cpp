@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -98,8 +99,10 @@ namespace comm {
 using AsyncSession = TestSession;
 using AsyncEvent = TestEvent;
 
+namespace detail {
 template <DmaEngine Engine>
-bool BuildAsyncSession(uint8_t *workspace, uint32_t peer, AsyncSession &session);
+void ActivateEngineState(AsyncSession &session);
+}  // namespace detail
 template <DmaEngine Engine, typename Dst, typename Src>
 AsyncEvent TGET_ASYNC(Dst dst, Src src, const AsyncSession &session);
 template <DmaEngine Engine, typename Dst, typename Src>
@@ -126,22 +129,20 @@ struct PostScript {
     TestSession session;
     std::vector<TestEvent> events;
     std::vector<Submission> submissions;
-    uint32_t build_calls{};
-    bool build_ok{true};
+    uint32_t activation_calls{};
 };
 PostScript *active_script = nullptr;
 }  // namespace
 
 namespace pto::comm {
+namespace detail {
 template <DmaEngine Engine>
-bool BuildAsyncSession(uint8_t *workspace, uint32_t peer, AsyncSession &session) {
+void ActivateEngineState(AsyncSession &session) {
     static_assert(Engine == DmaEngine::URMA);
-    ++active_script->build_calls;
-    EXPECT_EQ(workspace, active_script->session.contextGm);
-    EXPECT_EQ(peer, active_script->session.destRankId);
-    session = active_script->session;
-    return active_script->build_ok;
+    if (active_script != nullptr) ++active_script->activation_calls;
+    session.engine = Engine;
 }
+}  // namespace detail
 template <typename Dst, typename Src>
 AsyncEvent post_for_test(bool put, Dst dst, Src src) {
     auto &script = *active_script;
@@ -194,6 +195,7 @@ struct RegistrationFixture {
     TestEvent event{};
 
     RegistrationFixture() {
+        ctx.urma_queue_index = 1;
         info.rowsPerPeer = 4;
         info.rankCount = 2;
         info.layout = pto::comm::urma::UrmaLayout::PER_PEER;
@@ -237,6 +239,70 @@ TEST(A5UrmaCompletionKernel, RegistersEveryActualJettyAndIndependentTarget) {
     EXPECT_EQ(fixture.slab.entries[0].completion_type, COMPLETION_TYPE_URMA_EVENT_HANDLE);
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.event.wait_calls, 0u);
+}
+
+TEST(A5UrmaCompletionKernel, PhysicalQueueIdentityPreservesContextLayoutAndLogicalBlockIndependence) {
+    static_assert(sizeof(AsyncCtx) == 40);
+    static_assert(offsetof(AsyncCtx, urma_queue_index) == 28);
+    static_assert(offsetof(AsyncCtx, task_token) == 32);
+    RegistrationFixture fixture;
+    LocalContext local{};
+    local.block_idx = 0;
+    local.block_num = 1;
+    local.async_ctx = fixture.ctx;
+    int64_t args[PAYLOAD_GLOBAL_CONTEXT_INDEX + 1]{};
+    args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&local);
+    for (uint32_t physical = 0; physical < 2; ++physical) {
+        local.async_ctx.urma_queue_index = physical;
+        auto ctx = get_async_ctx(args);
+        EXPECT_EQ(ctx.urma_queue_index, physical);
+        TestSession session;
+        ASSERT_TRUE(pto2::urma_backend::build_urma_session(ctx, fixture.workspace(), 1, session));
+        EXPECT_EQ(session.qpIdxBase, physical * 2);
+        EXPECT_EQ(session.cfg.urma.qpCount, 2u);
+        EXPECT_EQ(session.destRankId, 1u);
+        EXPECT_EQ(local.block_idx, 0);
+    }
+}
+
+TEST(A5UrmaCompletionKernel, PhysicalQueueRunsCoverBothLayoutsAndAllSupportedWidths) {
+    RegistrationFixture fixture;
+    for (auto layout : {pto::comm::urma::UrmaLayout::PER_PEER, pto::comm::urma::UrmaLayout::SHARED_POOL}) {
+        fixture.info.layout = layout;
+        for (uint32_t width : {1u, 2u, 8u}) {
+            fixture.info.rowsPerPeer = fixture.info.jettyCount = width * 5;
+            fixture.info.jettiesPerCore = width;
+            for (uint32_t physical = 0; physical < 5; ++physical) {
+                fixture.ctx.urma_queue_index = physical;
+                TestSession session;
+                ASSERT_TRUE(pto2::urma_backend::build_urma_session(fixture.ctx, fixture.workspace(), 1, session));
+                EXPECT_EQ(session.qpIdxBase, physical * width);
+                EXPECT_EQ(session.cfg.urma.qpCount, width);
+            }
+            fixture.ctx.urma_queue_index = 5;
+            TestSession session;
+            EXPECT_FALSE(pto2::urma_backend::build_urma_session(fixture.ctx, fixture.workspace(), 1, session));
+            EXPECT_FALSE(session.valid);
+        }
+    }
+}
+
+TEST(A5UrmaCompletionKernel, InvalidPhysicalIdentityOrWorkspaceCannotBuildSession) {
+    RegistrationFixture fixture;
+    TestSession session;
+    fixture.ctx.urma_queue_index = UINT32_MAX;
+    EXPECT_FALSE(pto2::urma_backend::build_urma_session(fixture.ctx, fixture.workspace(), 1, session));
+    fixture.ctx.urma_queue_index = 0;
+    EXPECT_FALSE(pto2::urma_backend::build_urma_session(fixture.ctx, nullptr, 1, session));
+    EXPECT_FALSE(pto2::urma_backend::build_urma_session(fixture.ctx, fixture.workspace(), 2, session));
+    for (uint32_t width : {0u, 9u, UINT32_MAX}) {
+        fixture.info.jettiesPerCore = width;
+        EXPECT_FALSE(pto2::urma_backend::build_urma_session(fixture.ctx, fixture.workspace(), 1, session));
+        EXPECT_FALSE(session.valid);
+    }
+    fixture.info.jettiesPerCore = 2;
+    fixture.info.rowsPerPeer = 1;
+    EXPECT_FALSE(pto2::urma_backend::build_urma_session(fixture.ctx, fixture.workspace(), 1, session));
 }
 
 TEST(A5UrmaCompletionKernel, ZeroHandleWithRealTargetsIsRegistered) {
@@ -598,7 +664,7 @@ protected:
 TEST_P(A5UrmaChunkedSubmission, PostsEverySliceOnceWithExactOffsetsAndPackedExtents) {
     ASSERT_TRUE(submit());
     ASSERT_EQ(script.submissions.size(), 3u);
-    EXPECT_EQ(script.build_calls, 1u);
+    EXPECT_EQ(script.activation_calls, 1u);
     const uint64_t offsets[] = {0, kLimit, 2 * kLimit};
     const int64_t lengths[] = {kLimit / sizeof(float), kLimit / sizeof(float), 8192};
     for (size_t i = 0; i < script.submissions.size(); ++i) {
@@ -651,7 +717,7 @@ TEST_P(A5UrmaChunkedSubmission, SecondSliceUnsubmittedFailureKeepsFirstSliceTarg
 TEST_P(A5UrmaChunkedSubmission, WholeRequestBudgetRejectsBeforeFirstPost) {
     ctx.completion_capacity = 5;
     EXPECT_FALSE(submit());
-    EXPECT_EQ(script.build_calls, 1u);
+    EXPECT_EQ(script.activation_calls, 1u);
     EXPECT_TRUE(script.submissions.empty());
     EXPECT_EQ(slab.count, 0u);
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
@@ -666,16 +732,16 @@ TEST_P(A5UrmaChunkedSubmission, ExistingErrorRejectsBeforePostingAndStaysFirst) 
 }
 
 TEST_P(A5UrmaChunkedSubmission, SessionFailureDoesNotPost) {
-    script.build_ok = false;
+    ctx.urma_queue_index = UINT32_MAX;
     EXPECT_FALSE(submit());
-    EXPECT_EQ(script.build_calls, 1u);
+    EXPECT_EQ(script.activation_calls, 1u);
     EXPECT_TRUE(script.submissions.empty());
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
 }
 
 TEST_P(A5UrmaChunkedSubmission, EmptyRequestDoesNotBuildSessionOrPost) {
     EXPECT_TRUE(submit(0));
-    EXPECT_EQ(script.build_calls, 0u);
+    EXPECT_EQ(script.activation_calls, 0u);
     EXPECT_TRUE(script.submissions.empty());
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_NONE);
 }

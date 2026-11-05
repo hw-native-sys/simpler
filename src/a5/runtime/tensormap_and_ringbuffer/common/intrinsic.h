@@ -21,8 +21,8 @@
  *        startup based on each core's cluster position; never changes.
  *        Only meaningful for AIV kernels in MIX tasks.
  *      - dma_workspace : optional per-engine device addresses copied from the
- *        resident runtime config when the scheduler starts. A declaring
- *        callable is provisioned before that scheduler run begins.
+ *        resident runtime config when the scheduler starts. SDMA follows the
+ *        callable's requirements; Host URMA is prepared by Host mapping.
  *
  *   2. Local per-dispatch context (changes each dispatch):
  *      - block_idx : which logical block the current worker is executing
@@ -132,6 +132,9 @@ struct AsyncCtx {
     volatile __gm__ int32_t *completion_error_code;
     volatile __gm__ DeferredCompletionEntry *completion_entries;
     uint32_t completion_capacity;
+    // Physical AIV ordinal, independent of CCE topology and the task's logical block index.
+    // Occupies the alignment padding before task_token; AIC/unbound contexts cannot post URMA.
+    uint32_t urma_queue_index{UINT32_MAX};
     TaskId task_token;
 
     static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
@@ -184,12 +187,12 @@ static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
 /**
  * Return the device-global async-DMA workspace address for one engine kind
  * (see DmaWorkspaceKind), or nullptr when unavailable. Runtime-provided (like
- * get_block_idx): the host provisions each engine once per device and the
- * scheduler injects the addresses into every core's context, so kernels bind
+ * get_block_idx): the scheduler injects prepared addresses into every core's
+ * context, so kernels bind
  * the workspace to pto.tprefetch_async / SDMA / URMA sessions without threading
- * it as a user arg. A declaring callable is rejected before dispatch unless its
- * provider is supported and provisioning succeeds; nullptr is reserved for an
- * invalid kind or an unavailable slot and must not be used to submit DMA work.
+ * it as a user arg. SDMA requirements are checked before dispatch; Host URMA
+ * is available while the Worker's Host mapping is live. An invalid kind or
+ * unavailable slot returns nullptr and must not be used to submit DMA work.
  */
 static __aicore__ inline __gm__ uint8_t *get_dma_workspace(__gm__ int64_t *args, int kind) {
     if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return nullptr;

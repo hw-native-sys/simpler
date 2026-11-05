@@ -4007,6 +4007,9 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("_host_ddr_mapping_supported", &ChipWorker::host_ddr_mapping_supported)
         .def("_map_host_ddr", &ChipWorker::map_host_ddr, nb::call_guard<nb::gil_scoped_release>())
         .def("_unmap_host_ddr", &ChipWorker::unmap_host_ddr, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("_host_urma_supported", &ChipWorker::host_urma_supported)
+        .def("_prepare_host_urma", &ChipWorker::prepare_host_urma, nb::call_guard<nb::gil_scoped_release>())
+        .def("_release_host_urma", &ChipWorker::release_host_urma, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "launch_depth", &ChipWorker::launch_depth,
             "How many runs this worker may have launched at once, after its request was resolved "
