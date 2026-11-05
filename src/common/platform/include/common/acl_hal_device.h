@@ -33,34 +33,13 @@ namespace pto {
  *     function: `hal_fn(acl_to_hal_device_id(device_id))`.
  *   - ACL/rt entry points (`aclrtSetDevice`, `rtMalloc`, `rtMemcpy`, stream
  *     APIs, ...) take the logical id and MUST NOT.
- *   - One ACL exception, measured on CANN 9.0.0 / a2a3:
- *     `aclrtMemAccessDesc::location.id` reaches the driver untranslated and MUST
- *     translate, even though `aclrtMemSetAccess` is an ACL entry point. Its
- *     sibling `aclrtPhysicalMemProp::location.id` MUST NOT: it is read in the
- *     logical space, and must in fact name the *bound* logical device.
- *     The A5 ACL runtime validates both fields in the ACL-logical space, so neither
- *     field may be translated there.
- *
- *     Measured under `ASCEND_RT_VISIBLE_DEVICES=2,3` bound to logical 0 (card 2).
- *     The grant matters: the translated id of the bound device (2) has to fall
- *     outside the logical range `[0,1]`, or the same value is legal in both
- *     spaces and no outcome can tell them apart.
- *
- *       aclrtMallocPhysical  prop.location.id=0 (bound logical) -> 0        2 GiB appears on card 2
- *                            prop.location.id=2 (translated)    -> 107001   ACL_ERROR_RT_INVALID_DEVICEID
- *                            prop.location.id=1 (other logical) -> 507899
- *       aclrtMemSetAccess    desc.location.id=0 (logical)        -> 507899
- *                            desc.location.id=2 (translated)     -> 0        OK
- *
- *     The 107001 row is what settles the field's space: under a driver-visible
- *     reading, 2 *is* the bound card and the call would have succeeded.
- *     `aclrtMemGetAllocationGranularity` rejects it identically, so the check is
- *     not specific to the allocation call. A symmetric "fix" of the memory
- *     property therefore fails loudly rather than silently allocating elsewhere —
- *     107001 for the translated id, 507899 for any other logical id.
- *
- *     The asymmetry is per-field, not per-API, so neither half generalises to the
- *     other.
+ *   - `aclrtMemAccessDesc::location.id` is Runtime-dependent on A2/A3:
+ *     CANN 9.0.0 was measured to consume driver-visible ids, 9.3.0 ACL-logical
+ *     ids; the version where the interpretation changed is unknown (issue #2884).
+ *     A5 consumes logical ids. The A2/A3 communication-window path relies on
+ *     MapMem's automatic read/write grant to the allocating/importing device
+ *     and does not call MemSetAccess. `aclrtPhysicalMemProp::location.id` stays
+ *     logical.
  *
  * `ASCEND_RT_VISIBLE_DEVICES` renumbers the logical space to `0..N-1` while the
  * HAL keeps indexing the driver-visible space; a direct HAL call made with the

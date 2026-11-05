@@ -24,14 +24,10 @@ the wrong device and fails with ``halMemCtl rc=42`` in
 onboard chip bring-up, so *any* scene test launched under the variable covers
 all of those call sites. ``dummy_task`` is the cheapest one.
 
-Allocating a comm domain crosses a second, independent device-id layer that chip
-init never reaches, so it gets its own case: ``aclrtMemAccessDesc::location.id``
-is consumed in the driver-visible space on a2a3 with CANN 9.0 even though
-``aclrtMemSetAccess`` is an ACL entry point, and a logical id there fails with
-507899. The A5 ACL runtime instead validates this field in the ACL-logical space.
-Its sibling ``aclrtPhysicalMemProp::location.id`` is logical, so the two must
-not be treated alike on the measured a2a3 stack — see
-``common/acl_hal_device.h``.
+Allocating a comm domain exercises VMM mappings as well as chip initialization.
+On A2/A3, mapping a window grants read/write access to the allocating or
+importing device; the comm-domain case covers both local and imported windows
+under the remapping.
 
 The scene test runs in a subprocess: the variable has to be set before the
 process performing ACL init starts, and mutating it in-process would leak into
@@ -55,10 +51,7 @@ _DUMMY_TASK = {
     "a5": _ST_ROOT / "a5" / RUNTIME / "dummy_task" / "test_dummy_task.py",
 }
 
-# A comm domain maps device memory, which is a second device-id layer the chip-init path never
-# reaches. On a2a3/CANN 9.0, `aclrtMemAccessDesc::location.id` is consumed in the driver-visible
-# space, so a logical id there fails with 507899 on every card pair except an identity mapping.
-# Both ranks take part, so this one runs on all the granted cards rather than a single logical id.
+# Both ranks map local and imported windows under the same visible-device remapping.
 _COMM_DOMAIN = _ST_ROOT / "worker" / "comm_domain" / "async_notify" / "test_async_notify.py"
 
 # The subprocess re-runs a full scene test (build cache hit + one chip bring-up).
