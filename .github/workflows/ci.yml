@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_packaging.yml
     with:
@@ -51,7 +51,7 @@ jobs:
     if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_ut-no-hardware.yml
     with:
@@ -64,7 +64,7 @@ jobs:
     if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_st-sim-a2a3.yml
     with:
@@ -78,7 +78,7 @@ jobs:
     if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     strategy:
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-24.04]
         python-version: ["3.10"]
     uses: ./.github/workflows/_st-sim-a5.yml
     with:

@@ -7,7 +7,7 @@ The CI pipeline maps test categories (st, ut-py, ut-cpp) × hardware tiers to Gi
 Design principles:
 
 1. **Merge by runner, not by language** — Python and applicable C++ unit tests share setup cost and run as steps within a single job per runner tier. A runner with no platform-specific C++ tests does not carry an empty CTest step; currently `ut-a5` is Python-only.
-2. **Runner matches hardware tier** — no-hardware tests run on GitHub-hosted `ubuntu-24.04` and `macos-latest`; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
+2. **Runner matches hardware tier** — no-hardware tests run on GitHub-hosted `ubuntu-24.04` per PR, with macOS coverage in Daily; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
 3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
 4. **sim = no hardware** — `a2a3sim`/`a5sim` jobs run on github-hosted runners alongside unit tests.
 5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so pure-a5 PRs skip a2a3 scene-test runs and vice versa. **UT jobs are still not gated by platform** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings. They *are* gated by test category: a diff confined to `tests/st/` or `examples/` cannot break a unit test, and one confined to `tests/ut/` cannot break a scene test, because the two suites execute disjoint trees (`pytest examples tests/st` vs `pytest tests/ut` plus the C++ ctest) and no unit test reads `examples/` or `tests/st/`. Shared test infrastructure — the root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/` — belongs to neither category and runs both.
@@ -67,12 +67,12 @@ timeouts remain a per-connection safeguard, not a wall-clock guarantee.
 ```text
 PullRequest
   ├── pre-commit             (ubuntu-24.04)
-  ├── packaging-matrix       (ubuntu + macOS)        — [needs !examples_only && !tests_only]
+  ├── packaging-matrix       (ubuntu-24.04)          — [needs !examples_only && !tests_only]
   ├── profiling-flags-smoke  (ubuntu-24.04)         — (a2a3_changed || a5_changed) && !examples_only && !tests_only
-  ├── ut                     (ubuntu + macOS)        — Python + C++ UT, no hardware [needs ut_affected]
+  ├── ut                     (ubuntu-24.04)          — Python + C++ UT, no hardware [needs ut_affected]
   ├── detect-changes         (reusable; ubuntu-24.04 in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
-  ├── st-sim-a2a3            (ubuntu + macOS)        — a2a3_changed && st_affected
-  ├── st-sim-a5              (ubuntu + macOS)        — a5_changed && st_affected
+  ├── st-sim-a2a3            (ubuntu-24.04)          — a2a3_changed && st_affected
+  ├── st-sim-a5              (ubuntu-24.04)          — a5_changed && st_affected
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
@@ -85,9 +85,9 @@ PullRequest
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut` | `ubuntu-24.04`, `macos-latest` | `pytest tests/ut` + `ctest -LE requires_hardware` |
-| `st-sim-a2a3` | `ubuntu-24.04`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` |
-| `st-sim-a5` | `ubuntu-24.04`, `macos-latest` | `pytest examples tests/st --platform a5sim` |
+| `ut` | `ubuntu-24.04` | `pytest tests/ut` + `ctest -LE requires_hardware` |
+| `st-sim-a2a3` | `ubuntu-24.04` | `pytest examples tests/st --platform a2a3sim` |
+| `st-sim-a5` | `ubuntu-24.04` | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
@@ -163,8 +163,9 @@ the `test_*.py` network1 wrapper, and the manual `run_parent.sh` — is covered 
 
 [`daily.yml`](../.github/workflows/daily.yml) runs the full regular + manual
 scene-test corpus with `--manual include` once per day and supports manual
-re-runs through `workflow_dispatch`. Simulation runs on Ubuntu and macOS for
-both architectures; onboard runs on the A2/A3 and A5 self-hosted pools. The
+re-runs through `workflow_dispatch`. It also runs packaging and no-hardware
+unit tests on macOS. Simulation runs on Ubuntu and macOS for both
+architectures; onboard runs on the A2/A3 and A5 self-hosted pools. The
 same DFX smoke steps used by Per-PR run once in each Daily platform job, and
 the A2/A3 `network1` corpus runs through the existing two-machine workflow. The
 main Per-PR scene-test steps keep the default `--manual exclude`, so moving an
