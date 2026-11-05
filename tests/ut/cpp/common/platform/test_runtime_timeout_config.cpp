@@ -23,7 +23,7 @@ namespace {
 constexpr RuntimeTimeoutConfig kDefaults{
     PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS
 };
-constexpr RuntimeTimeoutConfig kCiTightTimeouts{3000000, 4000, 2000};
+constexpr RuntimeTimeoutConfig kCiTightTimeouts{3000000, 6000, 2000};
 
 void set_env_var(const char *name, const char *value) {
 #if defined(_WIN32)
@@ -147,6 +147,16 @@ TEST(RuntimeTimeoutConfig, ReusedParseStatusStartsClean) {
 
 TEST(RuntimeTimeoutConfig, CiTightTimeoutsStillValidate) {
     EXPECT_EQ(validate_runtime_timeout_order(kCiTightTimeouts), RuntimeTimeoutOrderStatus::OK);
+}
+
+TEST(RuntimeTimeoutConfig, RequestedOrderDoesNotProveTheAdjustedOrder) {
+    const RuntimeTimeoutConfig requested{3000000, 4000, 2000};
+    EXPECT_EQ(validate_runtime_timeout_order(requested), RuntimeTimeoutOrderStatus::OK);
+    auto adjusted = requested;
+    adjusted.op_execute_timeout_us = 4294967;
+    EXPECT_EQ(validate_runtime_timeout_order(adjusted), RuntimeTimeoutOrderStatus::OP_EXECUTE_NOT_BELOW_STREAM_SYNC);
+    adjusted.stream_sync_timeout_ms = kCiTightTimeouts.stream_sync_timeout_ms;
+    EXPECT_EQ(validate_runtime_timeout_order(adjusted), RuntimeTimeoutOrderStatus::OK);
 }
 
 TEST(RuntimeTimeoutConfig, InvalidTokenKeepsPriorValue) {

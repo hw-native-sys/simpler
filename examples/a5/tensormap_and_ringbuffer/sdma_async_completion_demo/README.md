@@ -26,10 +26,10 @@ The a5 host runtime includes the async-SDMA workspace by default:
 | ---- | ------ |
 | `CASES[*]["platforms"] = ["a5"]` | deselected on any other `--platform` |
 | `CASES[*]["config"]["device_count"] = 2` | needs two dies |
-| `@pytest.mark.skipif(_urma_workspace_enabled())` | skipped when `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` selects the URMA backend |
 
-URMA replaces SDMA in a URMA build. Rebuild without
-`SIMPLER_ENABLE_PTO_URMA_WORKSPACE` before running this demo.
+The demo explicitly requests `workspace_engines=("sdma",)` and reads
+`comm_workspace<CommWorkspaceKind::SDMA>(*ctx).addr`. It also runs in builds containing URMA or
+RDMA; those providers do not replace its workspace.
 
 ```bash
 pytest examples/a5/tensormap_and_ringbuffer/sdma_async_completion_demo \
@@ -40,5 +40,5 @@ Wrap the hardware run in `task-submit` on a shared box.
 
 ## Compare with
 
-- [`../urma_deferred_completion_demo/`](../urma_deferred_completion_demo/) — the same protocol over URMA. `kernel_consumer.cpp` is byte-identical; only the transfer kernel, its completion header, and the build flag differ. **The two overlays are mutually exclusive in one build**, so comparing them means rebuilding — that README has the detail.
+- [`../urma_deferred_completion_demo/`](../urma_deferred_completion_demo/) — the same protocol over URMA. `kernel_consumer.cpp` is byte-identical; only the transfer kernel, its completion header, and the build flag differ. The URMA example also includes a mixed SDMA/URMA DAG that runs both in one build and one domain.
 - [`examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/`](../../../a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/) — the a2a3 port of this demo, which needs no overlay flag.

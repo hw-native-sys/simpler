@@ -27,7 +27,10 @@ def _run_script() -> str:
 
 
 @pytest.mark.parametrize("device_count", [1, 2, 3, 4])
-def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, device_count: int) -> None:
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_onboard_dfx_smokes_adapt_to_device_count_without_overlap(
+    tmp_path: Path, device_count: int, platform: str
+) -> None:
     workspace = tmp_path / "workspace"
     bin_dir = tmp_path / "bin"
     state_dir = tmp_path / "state"
@@ -108,7 +111,7 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
             "CANN_ENV": str(cann_env),
             "DEVICE_RANGE": f"7-{6 + device_count}",
             "DEVICE_NUM": str(device_count),
-            "DFX_PLATFORM": "a5",
+            "DFX_PLATFORM": platform,
             "FAKE_STATE": str(state_dir),
             "FAKE_TASK_DEVICE": ",".join(str(device) for device in range(7, 7 + device_count)),
             "GITHUB_WORKSPACE": str(workspace),
@@ -129,12 +132,11 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (state_dir / "overlap").exists()
     invocations = (state_dir / "invocations").read_text().splitlines()
-    # What a5 starts, in the action's own order: dep_gen (tensormap_and_ringbuffer),
-    # chip_swimlane, chip_swimlane (host_build_graph), PMU, args_dump (full),
-    # dep_gen (host_build_graph). The count is what the per-device distribution
-    # below is computed from, so a job added to the action moves this number.
+    # Each platform starts six DFX jobs. The count determines the per-device
+    # distribution below, so adding a job to the action changes this number.
     expected_jobs = 6
     assert len(invocations) == expected_jobs
+    assert all("--manual include" in invocation for invocation in invocations)
     for device in range(7, 7 + device_count):
         expected_count = expected_jobs // device_count + (device - 7 < expected_jobs % device_count)
         assert sum(f"--device {device}" in invocation for invocation in invocations) == expected_count

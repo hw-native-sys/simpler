@@ -152,6 +152,8 @@ public:
     int validate_current_context() const;
     int mark_ready_enqueued();
     void poison(int runtime_error);
+    // Stop admission while retaining the control stream for cold cleanup.
+    int begin_close();
     int close();
 
     KernelContextPhase phase() const;

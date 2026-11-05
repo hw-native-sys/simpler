@@ -43,7 +43,7 @@ def _helpers():
     return module
 
 
-def _compile(runtime):
+def _compile(runtime, platform="a2a3"):
     from simpler.task_interface import ArgDirection as D  # noqa: PLC0415
 
     from simpler_setup.scene_test import compile_chip_callable_spec  # noqa: PLC0415
@@ -65,9 +65,9 @@ def _compile(runtime):
                 }
             ],
         },
-        "a2a3",
+        platform,
         runtime,
-        f"framework-persistent-state-{runtime}",
+        f"framework-persistent-state-{platform}-{runtime}",
     )
 
 
@@ -197,7 +197,7 @@ def _prepare_frame(torch, worker, handle, stream, raw_stream) -> tuple[dict, lis
     ), [weakref.ref(tensor) for tensor in owned]
 
 
-def run(runtime, device, bridge_path):
+def run(runtime, device, bridge_path, *, platform="a2a3"):
     import torch  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415, F401 -- registers the framework backend
     from simpler.worker import Worker  # noqa: PLC0415
@@ -206,8 +206,8 @@ def run(runtime, device, bridge_path):
     torch.npu.set_device(device)
     stream = torch.npu.Stream(device=device)
     raw_stream = stream.npu_stream
-    worker = Worker(level=2, device_id=device, platform="a2a3", runtime=runtime)
-    handle = worker.register(_compile(runtime))
+    worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
+    handle = worker.register(_compile(runtime, platform=platform))
     worker.init(borrowed_context_generation=1)
     frame, queued, runs = {}, [], []
     caller_thread, task_queue = threading.get_native_id(), os.environ.get("TASK_QUEUE_ENABLE", "1")
@@ -249,6 +249,7 @@ def run(runtime, device, bridge_path):
             buffer.close()
         retired = True
         summary = dict(
+            platform=platform,
             runtime=runtime,
             task_queue=task_queue,
             calls=len(runs),
@@ -282,6 +283,7 @@ def run(runtime, device, bridge_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=["tensormap_and_ringbuffer", "host_build_graph"], required=True)
+    parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--build-dir", type=Path, required=True)
     options = parser.parse_args()
@@ -290,7 +292,7 @@ def main():
         modules = [_helpers().build_bridge(options.build_dir)]
     if len(modules) != 1:
         parser.error("--build-dir must contain exactly one framework queue bridge")
-    run(options.runtime, options.device, modules[0])
+    run(options.runtime, options.device, modules[0], platform=options.platform)
 
 
 if __name__ == "__main__":

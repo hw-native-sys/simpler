@@ -200,6 +200,10 @@ class PmuCollector : public profiling_common::ProfilerBase<PmuCollector, PmuModu
 public:
     PmuCollector() = default;
     ~PmuCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     PmuCollector(const PmuCollector &) = delete;
     PmuCollector &operator=(const PmuCollector &) = delete;

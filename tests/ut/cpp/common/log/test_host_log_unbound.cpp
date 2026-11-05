@@ -13,6 +13,7 @@
 
 #include "common/host_span.h"
 #include "common/log_level.h"
+#include "common/strace.h"
 #include "host_log.h"
 
 TEST(HostLogUnboundTest, PrivateModuleStateStartsSilent) {
@@ -23,5 +24,14 @@ TEST(HostLogUnboundTest, PrivateModuleStateStartsSilent) {
     testing::internal::CaptureStderr();
     HostLogger::get_instance().log(simpler::log::LogLevel::ERROR, "unbound", "must stay silent");
     unified_log_host_span(&span);
+    {
+        STRACE_CONTEXT(7, 9, 2);
+        STRACE("unbound");
+        STRACE_HOST_SPAN_AT("unbound_explicit", 100, 25, 0);
+        EXPECT_EQ(STRACE_NEW_INV(), 0u);
+        EXPECT_EQ(STRACE_ALLOC_INV(), 0u);
+        STRACE_SET_HID(19);
+        EXPECT_EQ(simpler::strace::strace_state(), nullptr);
+    }
     EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
 }

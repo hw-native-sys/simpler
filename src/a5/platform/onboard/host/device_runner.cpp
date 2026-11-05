@@ -117,7 +117,7 @@ DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
 // `configure_aicore_op_timeout`, `ensure_device_initialized`,
-// `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
+// `ensure_aicpu_runtime_registered`, `query_max_block_dim`, and `validate_block_dim`
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
@@ -377,6 +377,7 @@ int DeviceRunner::prepare_execution(
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     // Resolved from this run's own CallConfig rather than read off the runner:
     // apply_call_config() is skipped when this prepare overlaps an in-flight
     // predecessor, so the members still describe that predecessor.
@@ -520,9 +521,9 @@ int DeviceRunner::prepare_execution(
         }
     }
 
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
     SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
@@ -548,6 +549,7 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
 
     prepared.streams =
         execution_mode_latch_.is_kernel() ? borrowed_run_streams() : RunStreams{stream_aicpu_, stream_aicore_};
+    if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
 
     if (prepared.caller_stream != nullptr) {
@@ -655,19 +657,12 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             run_progress_.claim(prepared.identity);
             (void)run_progress_.publish(prepared.identity, RunProgressState::Enqueuing);
 
-            // Ahead of this run's first execution-visible submission, on the stream that
-            // submission enters: a successor is ordered behind its predecessor's whole
-            // operator by one queued wait on the AICore stream, and the proof event
-            // recorded behind that wait is what lets the predecessor retire without
-            // waiting for this run's kernels. The AICPU half needs no token of its own —
-            // that stream's FIFO already places this run's payload behind the
-            // predecessor's whole-operator boundary record.
-            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
-
+            // The successor's CPU stream may differ from its predecessor's.
             if (prepared.join.predecessor_owner != nullptr) {
-                const int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
+                const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
             }
+            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
             // After any cross-run wait and before the kernel: the instant this stream was
             // released to begin this run's AICore work. A record is not a wait and no stream
@@ -763,10 +758,41 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     return rc;
 }
 
+int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned)
+        return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const int poll_rc = poll_execution(active);
+    if (poll_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return poll_rc;
+    prepared.physical_complete = true;
+    const int wait_rc = poll_boundary_waits(prepared);
+    if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
+    read_device_wall_ns(prepared.pipeline_slot);
+    if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
+        !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+        LOG_WARN("Runtime chip-swimlane extension publication failed");
+    }
+    prepared.retirement_diagnostics_rc =
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
+    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
+    cleanup_execution(prepared, true);
+    return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
 DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     PreparedExecution &prepared = *active.prepared;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
+    if (!prepared.resources_owned && prepared.physical_complete) {
+        const int rc = wait_run_fence(prepared);
+        if (rc != 0) {
+            log_run_failure(prepared, rc);
+            recover_device_or_mark_unusable(rc);
+        }
+        return DrainOutcome{rc, prepared.retirement_diagnostics_rc, true};
+    }
     if (!prepared.resources_owned || run_progress_.state_of(prepared.identity) == RunProgressState::Idle) {
         LOG_ERROR(
             "drain_execution: slot %u does not describe run epoch %llu (owns=%d)", pipeline_slot,
@@ -806,7 +832,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             prepared.dfx, prepared.identity.run_epoch, /*device_execution_complete=*/false,
             /*device_producers_stopped=*/false
         );
-        return DrainOutcome::device_error(rc);
+        return DrainOutcome::device_error(rc, prepared.physical_complete);
     }
 
     read_device_wall_ns(prepared.pipeline_slot);
@@ -838,7 +864,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             prepared.dfx, prepared.identity.run_epoch, /*device_execution_complete=*/false,
             /*device_producers_stopped=*/false
         );
-        return DrainOutcome::device_error(discharge_rc);
+        return DrainOutcome::device_error(discharge_rc, prepared.physical_complete);
     }
 
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
@@ -1008,19 +1034,21 @@ int DeviceRunner::queue_cross_run_wait(
     // Recorded immediately behind the wait, so it completes when the wait is
     // consumed — not when this run finishes. That is what lets the predecessor
     // retire its boundary without waiting for this run's kernels. Its own
-    // failure leaves the wait queued and committed, so the entry falls back to
-    // the quiescence proof at discharge rather than failing the run.
-    (void)record_cross_run_proof(prepared, waiter_stream);
-    return 0;
+    // failure leaves the wait queued and committed. Stop before publication;
+    // the owner's stream pair cannot prove this successor CPU consumed it.
+    return record_cross_run_proof(prepared, waiter_stream);
+}
+
+void DeviceRunner::mark_device_unusable(int runtime_rc) {
+    device_unusable_.store(true, std::memory_order_release);
+    if (execution_mode_latch_.is_kernel()) kernel_exec_state_.poison(runtime_rc);
 }
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
-    // Admission is closed before recovery performs any fallible operation.
-    device_unusable_.store(true, std::memory_order_release);
+    mark_device_unusable(aicore_rc);
     // A borrowed context cannot drain or reset the caller's entire device.
     // Poison stops this runner's admission; recovery belongs to the caller.
     if (execution_mode_latch_.is_kernel()) {
-        kernel_exec_state_.poison(aicore_rc);
         LOG_ERROR("Execution error %d: borrowed device context marked unusable", aicore_rc);
         return;
     }
@@ -1222,7 +1250,7 @@ int DeviceRunner::force_reset_device() {
     return 0;
 }
 
-// `print_handshake_results`, `prepare_orch_so`, `register_callable`,
+// `print_handshake_results`, `validate_active_callable`, `register_callable`,
 // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
@@ -1232,14 +1260,9 @@ int DeviceRunner::finalize_impl() {
     // Stop collector threads locally, drain and force-reset the card, then
     // forget the old generation's handles.
     if (device_unusable_.load(std::memory_order_acquire)) {
-        // Its result cannot displace the device failure that brought this path
-        // here, so it is folded in below only if nothing about the device
-        // itself was reported. It is sticky in the collector's own summary
-        // either way.
-        const int fatal_collector_rc = finalize_collectors(true);
-        if (fatal_collector_rc != 0) {
-            LOG_ERROR("Fatal teardown: diagnostics collectors reported %d while being released", fatal_collector_rc);
-        }
+        begin_fatal_close();
+        stop_shared_collectors_for_device_failure();
+        dep_gen_collector_.stop_for_device_failure();
 
         // force_reset_device() drains before it resets and returns 0 only when
         // its post-reset probe confirms the card, so a second pass runs against
@@ -1255,15 +1278,15 @@ int DeviceRunner::finalize_impl() {
         // once per attempt and then report a reset that "did not confirm
         // clean", which reads as a failed reset rather than the designed
         // refusal it is.
-        const bool owns_device_reset = !execution_mode_latch().is_kernel();
-        int reset_rc = owns_device_reset ? attempt_fatal_reset(
-                                               [this]() {
-                                                   return force_reset_device();
-                                               },
-                                               sdma_provisioned ? 1 : kFatalResetAttempts
-                                           ) :
-                                           0;
-        const bool reset_confirmed = owns_device_reset && reset_rc == 0;
+        const bool owns_device_reset = execution_mode_latch().latched_mode() == SIMPLER_MODE_PROGRAM;
+        int reset_rc = owns_device_reset && !terminal_reset_confirmed() ? attempt_fatal_reset(
+                                                                              [this]() {
+                                                                                  return force_reset_device();
+                                                                              },
+                                                                              sdma_provisioned ? 1 : kFatalResetAttempts
+                                                                          ) :
+                                                                          0;
+        const bool reset_confirmed = owns_device_reset && terminal_reset_confirmed();
         if (!reset_confirmed && owns_device_reset) {
             LOG_ERROR(
                 "Fatal teardown: force reset of device %d did not confirm clean (rc=%d); "
@@ -1272,50 +1295,36 @@ int DeviceRunner::finalize_impl() {
             );
         }
 
-        // Program mode abandons resource bookkeeping after the reset attempt.
-        // Kernel mode cannot reset the borrowed device, so it retains ownership
-        // and quarantines the context permanently. Later close calls cannot
-        // release these resources.
-        int abandon_rc = 0;
-        if (owns_device_reset) {
-            abandon_rc = abandon_common_after_device_failure();
-        } else {
-            kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
-        }
-        if (acl_ready_) {
-            if (reset_confirmed) {
-                int finalize_rc = aclFinalize();
-                if (finalize_rc != 0) {
-                    LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
-                    if (abandon_rc == 0) abandon_rc = finalize_rc;
-                }
-            } else {
-                LOG_WARN("Fatal teardown: skipping aclFinalize because device reset was not confirmed");
+        if (!reset_confirmed) {
+            if (!owns_device_reset) {
+                kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
+                LOG_ERROR(
+                    "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
+                    "process lifetime; no later close can retire them",
+                    device_id_
+                );
             }
-            acl_ready_ = false;
+            return owns_device_reset && reset_rc != 0 ? reset_rc : PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+        abandon_shared_collectors_after_device_reset();
+        dep_gen_collector_.abandon_after_device_reset();
+        int abandon_rc = abandon_common_after_device_failure();
+        if (acl_ready_) {
+            const int finalize_rc = aclFinalize();
+            if (finalize_rc != 0) {
+                LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
+                if (abandon_rc == 0) abandon_rc = finalize_rc;
+            } else {
+                acl_ready_ = false;
+            }
         }
 
-        // The quarantine is terminal: `device_unusable_` routes every later
-        // close onto this same branch, so these resources stay pinned for the
-        // process lifetime. No entry point retires them.
-        if (!owns_device_reset) {
-            LOG_ERROR(
-                "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
-                "process lifetime; no later close can retire them",
-                device_id_
-            );
-            return abandon_rc != 0 ? abandon_rc : PTO_RUNTIME_ERR_INVALID_STATE;
-        }
-
-        device_id_ = -1;
-        if (reset_confirmed) {
+        if (abandon_rc == 0) {
+            device_id_ = -1;
             device_unusable_.store(false, std::memory_order_release);
         }
         LOG_WARN("DeviceRunner finalized after fatal device failure");
         int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
-        // Last in priority: a diagnostics failure found while releasing the
-        // collectors is reported only when the device side reported nothing.
-        if (fatal_rc == 0) fatal_rc = fatal_collector_rc;
         return fatal_rc;
     }
 
@@ -1323,7 +1332,7 @@ int DeviceRunner::finalize_impl() {
     // this thread needs no bind and the context owns no device state to adopt.
     int rc = 0;
     if (!execution_mode_latch().is_kernel()) {
-        rc = attach_current_thread(device_id_);
+        rc = bind_current_thread(device_id_);
         if (rc != 0) {
             LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
             return rc;
@@ -1650,7 +1659,7 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
 }
 
 int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device (see
     // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
     auto alloc_cb = [this](size_t size) -> void * {
@@ -1669,7 +1678,7 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device. No
     // halHostRegister on a5 (matches PMU / chip swimlane / dump collectors).
     auto alloc_cb = [this](size_t size) -> void * {

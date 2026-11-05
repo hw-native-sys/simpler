@@ -35,6 +35,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -49,6 +50,7 @@
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 // The platform register accessors, for the reason test_pmu_run_identity.cpp
 // gives: the two architectures define them in translation units that reach
@@ -89,7 +91,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int retained_free(void *ptr) {
     std::free(ptr);
@@ -812,4 +814,55 @@ TEST(PmuRunTerminal, AFatalOnlyRunIsNotPublishedEmpty) {
         simpler::dfx::pmu::classify(cut, fatal_with_records, /*collected=*/4, /*io_failed=*/false),
         simpler::dfx::pmu::Verdict::PublishedShort
     );
+}
+
+TEST(PmuRetainedRuns, FatalStopReportsAnUnpublishedRunOnceWithoutReleasingIt) {
+    RetainedPmuFixture fx("fatal-held");
+    ASSERT_TRUE(fx.begin(9201, fx.root.csv("run-a")));
+    const auto before = fx.stats();
+    ASSERT_EQ(before.open_epochs, 1u);
+    fx.collector.stop_for_device_failure();
+    EXPECT_EQ(fx.stats().open_epochs, before.open_epochs);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    EXPECT_NE(error.find("abandoned=1"), std::string::npos) << error;
+    fx.collector.stop_for_device_failure();
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    fx.collector.finalize(nullptr, retained_free);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+}
+
+TEST(PmuRetainedRuns, FatalLossSurvivesConfirmedResetWithoutInvokingReleaseCallbacks) {
+    OutputRoot root("fatal-reset");
+    // The fixture owns host backing across the simulated device reset.
+    std::vector<std::unique_ptr<void, decltype(&std::free)>> backing;
+    size_t releases = 0;
+    PmuCollector collector;
+    auto alloc = [&](size_t bytes) {
+        void *ptr = profiler_test_calloc(bytes);
+        backing.emplace_back(ptr, &std::free);
+        return ptr;
+    };
+    auto release = [&](void *) {
+        ++releases;
+        return 0;
+    };
+    collector.configure_retained_runs(true);
+    ASSERT_EQ(collector.init(1, 1, alloc, nullptr, release, 0), 0);
+    collector.start(retained_thread_factory);
+    ASSERT_TRUE(collector.run_begin(9301, root.csv("run-a").string(), PmuEventType::PIPE_UTILIZATION));
+    const auto allocations = backing.size();
+    collector.stop_for_device_failure();
+    collector.stop_for_device_failure();
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(backing.size(), allocations);
+    collector.abandon_after_device_reset();
+    collector.finalize(nullptr, release);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    std::string error;
+    EXPECT_FALSE(collector.flush_retained_runs(100, &error));
+    EXPECT_NE(error.find("abandoned=1"), std::string::npos) << error;
 }

@@ -74,20 +74,12 @@ def _normalize_overlay_env(name: str) -> Optional[str]:
 
 
 def _a5_async_workspace_overlay_defines() -> dict[str, str]:
-    """Explicit a5 host backend selection for the two cached overlay options.
+    """Forward the optional RDMA provider selection, clearing stale cached ON values.
 
-    `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` and `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE`
-    are the host CMakeLists' only cached options, so each is forwarded with an
-    explicit ON/OFF: a value left in the CMake cache by an earlier build cannot
-    otherwise survive a reconfigure (build once with RDMA=ON, then unset it, and
-    the cached option stays ON). `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE` is not
-    forwarded — it is an internal marker the CMakeLists derives from these two,
-    and a `-D` value for it is overwritten unconditionally.
+    A5 SDMA and URMA providers are always compiled. Compilation creates no
+    resources; communication domains select their engines at allocation time.
     """
-    return {
-        "SIMPLER_ENABLE_PTO_URMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_URMA_WORKSPACE") or "OFF",
-        "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE") or "OFF",
-    }
+    return {"SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE") or "OFF"}
 
 
 def _abbrev_stamp(stamp: str) -> str:
@@ -230,13 +222,17 @@ class RuntimeBuilder:
         cfg = build_config[target]
         include_dirs = [str((config_dir / p).resolve()) for p in cfg["include_dirs"]]
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
+        if self._arch == "a5" and config_dir.name == "tensormap_and_ringbuffer":
+            from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+            include_dirs.append(str(Path(ensure_pto_isa_root()) / "include"))
         return include_dirs, source_dirs
 
     def _requires_pto_isa_metadata_validation(self) -> bool:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
         Driven by :func:`platform_embeds_pto_isa`: a2a3 and a5 onboard always
-        embed one async workspace backend; simulation platforms do not.
+        embed async workspace backends; simulation platforms do not.
         """
         return platform_embeds_pto_isa(self.platform)
 
@@ -247,15 +243,16 @@ class RuntimeBuilder:
         bump must invalidate that build's
         cmake cache even when the runtime repo HEAD is unchanged (issue #1139:
         a stale host_runtime.so compiled against the old headers otherwise
-        survives a reinstall). For every other arch/variant the pto-isa
-        revision does not affect the compiled objects, so return "" and leave
-        the stamp keyed on the runtime HEAD.
+        survives a reinstall). A5 simulation includes ISA workspace types too,
+        so its cache stamp includes the pin. Other simulation builds return ""
+        and leave the
+        stamp keyed on the runtime HEAD.
 
         ``pto_isa.pin`` is the single source of truth. If the pin is missing or
         invalid, let ``read_pto_isa_pin`` raise so an embedding onboard build
         cannot silently proceed with unknown PTO-ISA headers.
         """
-        if not self._requires_pto_isa_metadata_validation():
+        if not self._requires_pto_isa_metadata_validation() and self.platform != "a5sim":
             return ""
         from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
@@ -264,8 +261,8 @@ class RuntimeBuilder:
     def _build_cache_stamp(self, pto_isa_commit: Optional[str] = None) -> str:
         """Stamp identifying the sources this build was compiled from.
 
-        Combines the runtime repo HEAD with the pto-isa commit for a2a3 and a5
-        onboard builds so the cmake cache is invalidated whenever either
+        Combines the runtime repo HEAD with the pto-isa commit for onboard
+        builds and A5 simulation so the cmake cache is invalidated whenever either
         changes. An empty runtime HEAD is preserved verbatim so the
         ``_invalidate_cache_if_stale`` 'unavailable → clean rebuild' path still
         fires rather than being masked by a present pto-isa commit.

@@ -44,7 +44,7 @@ production dispatcher):
 ```text
 +---------------------+        rtAicpuKernelLaunchExWithArgs (KFC, libaicpu_extend_kernels)
 |   host launcher     | ---->  bootstrap: dispatcher SO dlopens, writes inner SO bytes to
-|  aicpu_thread_spread|        /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so
+|  aicpu_thread_spread|        /usr/lib64/aicpu_kernels/<vf>/aicpu_kernels_device/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<dev>.so
 +---------------------+
           |
           | rtsBinaryLoadFromFile (JSON), rtsFuncGetByName, rtsLaunchCpuKernel(aicpu_num=N)

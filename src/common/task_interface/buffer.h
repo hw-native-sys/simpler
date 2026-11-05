@@ -478,9 +478,8 @@ enum class TensorOverlap : uint8_t {
  * The geometry of a view inside its backing — what decides whether two views touch a common byte.
  *
  * `ndims == 0` is the whole-backing footprint: what a caller registers when it knows a buffer is
- * touched but not which bytes (an allocation; a remote argument whose key already carries the
- * offset). No valid Tensor has `ndims == 0`, so a default-constructed footprint means exactly
- * that, and overlaps everything.
+ * touched but not which bytes (an allocation). No valid Tensor has `ndims == 0`, so a
+ * default-constructed footprint means exactly that, and overlaps everything.
  *
  * The backing's identity is deliberately absent: a footprint is only ever compared against
  * another over the SAME backing, which the caller establishes — a shared dependency key, or the

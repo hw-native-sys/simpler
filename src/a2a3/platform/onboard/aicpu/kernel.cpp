@@ -8,6 +8,9 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include "aicpu_loader/finalize_args.h"
+#include "aicpu/cache_maintenance.h"
+#include "common/memory_barrier.h"
 #include <atomic>
 #include <cstdio>
 
@@ -142,7 +145,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         PlatformEntryArgs{
             arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
             k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
-            k_args->graph_section_source
+            k_args->graph_section_source, k_args->entry_cache_maintenance
         }
     );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
@@ -188,5 +191,19 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     }
     set_dev_l2_cache_offset(init_args->l2_cache_offset);
 
+    return 0;
+}
+
+// Each executor owns only its backend's persistent resources. The host calls
+// this after supported eager runs retire, before unloading RTS registration.
+extern "C" int32_t aicpu_release_callables();
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_finalize(void *arg) {
+    auto *args = static_cast<AicpuFinalizeArgs *>(arg);
+    if (args == nullptr || args->result_addr == 0) return -1;
+    auto *result = reinterpret_cast<AicpuFinalizeResult *>(args->result_addr);
+    result->status = aicpu_release_callables();
+    result->completed = 1;
+    wmb();
+    cache_flush_range(result, sizeof(*result));
     return 0;
 }

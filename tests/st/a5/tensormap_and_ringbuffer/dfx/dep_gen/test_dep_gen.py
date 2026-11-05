@@ -92,7 +92,7 @@ class TestDepGen(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             "params": {},
         },
     ]

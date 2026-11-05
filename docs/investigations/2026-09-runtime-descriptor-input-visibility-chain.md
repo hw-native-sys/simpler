@@ -1,7 +1,7 @@
 # The Runtime descriptor's input-visibility chain: what the code expresses and what remains unestablished
 
 **Date**: 2026-09-19
-**Verdict**: host↔device coherence supplied as a project premise; the end-of-run
+**Historical verdict**: host↔device coherence supplied as a project premise; the end-of-run
 clean is audited per field — excluded as publisher for three of the four device-writer
 groups with a named dependency each, and, since a second owner premise answered the
 AICPU→AICore edge for the gate's access shape, excluded for the a2a3 teardown gate too;
@@ -15,6 +15,32 @@ deleted, so a reader arriving from #2368 can see which claim was retracted and
 why. The #2368 and #2369 revisions share the `31da0560e` baseline below; the later
 **outbound audit section pins its own, newer baseline** and its code references and
 extent figures belong to that commit alone.
+
+## Current disposition (2026-10-26)
+
+The owner clarified the architecture contract for #2745: A5 GM accesses
+require no AICPU-side clean or invalidate, including Host DMA, SDMA and
+reads of device-written RDMA/URMA completion records (CQEs). Completed AICPU GM writes are visible to
+consumers without a cache clean. This supplies the outbound premise that
+the historical A5 audit below left open; it is a project architecture
+statement, not a vendor citation or a new silicon measurement.
+
+Under that contract, A5 HBG resident and legacy descriptor teardown do not
+perform descriptor-wide cache maintenance. Required completion barriers,
+publication ordering, current-run retirement and exclusive reuse remain
+independent requirements. The platform build selects separate cache
+implementations: a2a3 retains cache maintenance and its completion barriers;
+A5 and sim implementations are empty. Shared callers supply protocol
+ordering with explicit barriers or existing acquire/release operations.
+A2/A3 Host DMA maintenance and conservative SDMA invalidation remain, as
+do AICore-side publication operations.
+
+The source walkthroughs and withdrawn conclusions below are retained at
+their named historical baselines. Their statements that no operation was
+changed or that the A5 clean's outbound role was unestablished describe
+those audits, not the current implementation. The broader premise does
+not resolve their separate ownership, atomicity or exceptional-lifetime
+questions. See [the current cache contract](../hardware/cache-coherency.md).
 
 ## Question
 
@@ -227,7 +253,7 @@ write-back. At this audit's baseline a5 TRB instead wrote back and returned, but
 post-baseline (#2388) it takes the a2a3 shape; a5 HBG resident still has no final
 flush. The resident path's exit must not be described using the legacy path's flush.
 
-**What the primitive is** (`src/common/platform/onboard/aicpu/cache_ops.cpp:20`):
+**What the primitive was at the audit baseline** (`src/common/platform/onboard/aicpu/cache_ops.cpp:20`):
 
 - **`dc civac`** — clean *and* invalidate to Point of Coherency, not a pure
   invalidate. It has two roles: it can make externally written bytes visible to

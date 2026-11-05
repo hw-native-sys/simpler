@@ -40,7 +40,7 @@ bindings are deltas from the slot state's own address rather than pointers.
 
 ## Resource Shapes
 
-`ActiveMask::to_shape()` maps a task to one of four shapes:
+`LaneMask::to_shape()` maps a task to one of four shapes:
 
 | Shape | Meaning |
 | ----- | ------- |

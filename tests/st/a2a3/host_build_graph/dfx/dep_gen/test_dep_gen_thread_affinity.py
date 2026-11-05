@@ -78,7 +78,7 @@ class TestDepGenHostGraphThreadAffinity(SceneTestCase):
         {
             "name": "drained_by_another_thread",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": True,
             "params": {},
         },
     ]

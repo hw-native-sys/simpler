@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -42,12 +43,13 @@
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int retained_free(void *ptr) {
     std::free(ptr);
@@ -716,4 +718,71 @@ TEST(ArgsDumpRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     set_platform_run_result(0, 0);
     collector.stop();
     EXPECT_EQ(collector.finalize(nullptr, retained_free), 0);
+}
+
+TEST(ArgsDumpRetainedRuns, FatalStopWritesCopiedPayloadsAndReportsTheHeldRunOnce) {
+    RetainedArgsDumpFixture fx("fatal-held-payloads");
+    constexpr int kPayloads = 100;
+    fx.collector.hold_retained_writer_for_test(true);
+    ASSERT_TRUE(fx.begin(9202, fx.root.prefix("run-a")));
+    fx.produce(9202, kPayloads);
+    ASSERT_TRUE(fx.wait_for_collected(kPayloads));
+    const auto before = fx.stats();
+    auto payload_bytes = [&] {
+        std::string bytes;
+        for (const auto &entry : fs::directory_iterator(fx.root.run_dir("run-a"))) {
+            if (entry.path().extension() == ".bin") bytes += read_file(entry.path());
+        }
+        return bytes;
+    };
+    EXPECT_TRUE(payload_bytes().empty());
+    fx.collector.stop_for_device_failure();
+    const auto bytes = payload_bytes();
+    ASSERT_EQ(bytes.size(), kPayloads * kTensorBytes);
+    for (int i = 0; i < kPayloads; ++i) {
+        EXPECT_EQ(std::memcmp(bytes.data() + i * kTensorBytes, fx.tensor.data(), kTensorBytes), 0);
+    }
+    EXPECT_FALSE(fs::exists(fx.root.manifest("run-a")));
+    EXPECT_EQ(fx.stats().open_epochs, before.open_epochs);
+    EXPECT_LT(fx.stats().charged_bytes, before.charged_bytes);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    fx.collector.stop_for_device_failure();
+    EXPECT_EQ(payload_bytes(), bytes);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    EXPECT_NE(fx.collector.finalize(nullptr, retained_free), 0);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+}
+
+TEST(ArgsDumpRetainedRuns, FatalLossSurvivesConfirmedResetWithoutInvokingReleaseCallbacks) {
+    OutputRoot root("fatal-reset");
+    // The fixture owns host backing across the simulated device reset.
+    std::vector<std::unique_ptr<void, decltype(&std::free)>> backing;
+    size_t releases = 0;
+    ArgsDumpCollector collector;
+    auto alloc = [&](size_t bytes) {
+        void *ptr = profiler_test_calloc(bytes);
+        backing.emplace_back(ptr, &std::free);
+        return ptr;
+    };
+    auto release = [&](void *) {
+        ++releases;
+        return 0;
+    };
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    ASSERT_EQ(collector.initialize(1, 0, DumpArgsLevel::FULL, alloc, nullptr, release), 0);
+    collector.start(retained_thread_factory);
+    ASSERT_TRUE(collector.run_begin(9302, root.prefix("run-a").string(), DumpArgsLevel::FULL));
+    const auto allocations = backing.size();
+    collector.stop_for_device_failure();
+    collector.stop_for_device_failure();
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(backing.size(), allocations);
+    collector.abandon_after_device_reset();
+    EXPECT_EQ(collector.finalize(nullptr, release), 0);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    std::string error;
+    EXPECT_FALSE(collector.flush_retained_runs(100, &error));
+    EXPECT_NE(error.find("abandoned=1"), std::string::npos) << error;
 }

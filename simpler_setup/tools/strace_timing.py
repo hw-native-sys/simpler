@@ -137,7 +137,9 @@ class Span:
 
     @property
     def is_device(self) -> bool:
-        return "clk=dev" in self.attrs
+        # Old device-boundary records tagged their device-clock *attributes*
+        # as clk=dev, although their own ts is a Host CLOCK_MONOTONIC point.
+        return "clk=dev" in self.attrs and self.name != "chip.run.runner_run.device_boundaries"
 
 
 class NativeOverlapError(ValueError):
@@ -255,9 +257,15 @@ def warn_about_lost_records(lines, spans):
 
 def parse_spans(lines):
     """Yield every complete span, including adjacent records on one line."""
+    for span, _record in parse_span_records(lines):
+        yield span
+
+
+def parse_span_records(lines):
+    """Yield each complete span with its own exact [STRACE] record text."""
     for line in lines:
         for m in _STRACE_RE.finditer(line):
-            yield Span(
+            span = Span(
                 pid=int(m["pid"]),
                 tid=int(m["tid"]),
                 inv=int(m["inv"]),
@@ -268,6 +276,7 @@ def parse_spans(lines):
                 dur=int(m["dur"]),
                 attrs=m["attrs"].strip(),
             )
+            yield span, m.group(0).rstrip("\r\n")
 
 
 def _trace_document(events, **extra):

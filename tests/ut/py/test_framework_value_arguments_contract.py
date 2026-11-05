@@ -21,7 +21,7 @@ from simpler.task_interface import DataType, Tensor, TensorArgType, TensorTransf
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CONSUMER = _ROOT / "examples/workers/l2/framework_eager/value_arguments.py"
-_ST = _ROOT / "tests/st/a2a3/framework_eager/test_value_arguments.py"
+_ST = _ROOT / "tests/st/worker/framework_eager/test_value_arguments.py"
 
 
 def _load(path, name):
@@ -95,6 +95,7 @@ def test_precision_and_width_choices_change_the_reference_result(consumer):
 def _summary(runtime, queue):
     host = runtime == "host_build_graph"
     return dict(
+        platform="a2a3",
         runtime=runtime,
         task_queue=queue,
         verified=True,
@@ -122,7 +123,9 @@ def _invoke_st(tmp_path, monkeypatch, records, runtime, queue, returncode=0):
         return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
 
     monkeypatch.setattr(module, "subprocess", SimpleNamespace(run=run))
-    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda _: "0"))
+    request = SimpleNamespace(
+        config=SimpleNamespace(getoption=lambda name: {"--device": "0", "--platform": "a2a3"}[name])
+    )
     module.test_framework_value_arguments(runtime, queue, tmp_path, tmp_path, request)
 
 

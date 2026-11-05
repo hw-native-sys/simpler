@@ -17,6 +17,7 @@ import contextlib
 import copy
 import ctypes
 import importlib
+import sys
 import threading
 import time
 from multiprocessing.shared_memory import SharedMemory
@@ -39,6 +40,8 @@ from simpler.worker import (
     _OFF_ENTRY_GENERATION,
     _TASK_ACCEPTED,
     _TASK_DONE,
+    _TASK_ENDED,
+    _TASK_FAILED,
     _TASK_LAUNCHED,
     _mailbox_load_i32,
     _mailbox_load_u64,
@@ -52,6 +55,7 @@ from tests.st.a2a3.host_build_graph.worker_async_fifo.test_worker_async_fifo imp
     _SUB_RELEASE,
     _wait_for_release,
 )
+from tests.st.a2a3.tensormap_and_ringbuffer.early_enqueue import test_early_enqueue as stream_evidence
 
 _SIZE = 128 * 128
 _TIMEOUT = 60.0
@@ -139,6 +143,11 @@ class NativeRunTrace(evidence._RunTrace):
     def __init__(self, worker):
         super().__init__(worker)
         self.epochs = {}
+        self._origins = dict(self._offsets)
+
+    def child_log_window(self):
+        # Owned PID paths and byte origins satisfy the shared raw-window reader contract.
+        return stream_evidence._RunTrace.child_log_window(self)
 
     def _note_identity(self, pid, span):
         super()._note_identity(pid, span)
@@ -160,6 +169,8 @@ class Observe:
         self.windows = set()
         self.by_slot = {}
         self.accepted = set()
+        self.completed_identities = set()
+        self.failed_identities = set()
         self.mapping_hold = views[0][1][0:1]
         self.thread = threading.Thread(target=self.sample, daemon=True)
 
@@ -178,6 +189,23 @@ class Observe:
                     key = evidence._run_key(identity)
                     if key is None or key not in self.case_runs:
                         continue
+                    # Releasing a terminal entry advances its odd ownership
+                    # generation once. It still names that exact accepted lease.
+                    entry_identity = (tuple(identity), generation if generation % 2 else generation - 1)
+                    if state == _TASK_FAILED and generation > 0:
+                        # Failure is not physical proof. It ends only the test's
+                        # barrier so the original strong wait can report it.
+                        self.failed_identities.add(entry_identity)
+                    elif (
+                        accepted == _TASK_ACCEPTED
+                        and generation > 0
+                        and (
+                            (state == _TASK_ENDED and generation % 2 == 1)
+                            or state == _TASK_DONE
+                            or (state == _IDLE and generation > 0 and generation % 2 == 0)
+                        )
+                    ):
+                        self.completed_identities.add(entry_identity)
                     if state == _TASK_LAUNCHED and accepted == _TASK_ACCEPTED:
                         assert generation % 2 == 1 and identity[3] > 0
                         full = (*key, identity[3])
@@ -373,6 +401,7 @@ class AutomaticAdmissionScene(SceneTestCase):
 
     def refill(self, worker):
         handles, outputs, keepalive = [], [], []
+        submitted = set()
         with entries(worker) as views, Observe(worker, views) as observer:
             try:
                 for index in range(_ROUNDS):
@@ -381,19 +410,47 @@ class AutomaticAdmissionScene(SceneTestCase):
                     handles.append(self.submit(worker, buffers))
                     outputs.append((tensors[2], self.expected(index)))
                     run_id = handles[-1]._run_id
-                    until(
-                        lambda: any(
-                            r[0][1] == run_id and r[1] in (_TASK_LAUNCHED, _TASK_DONE) and r[2] == _TASK_ACCEPTED
-                            for r in snapshot(views)
+                    accepted = until(
+                        lambda: next(
+                            (
+                                r
+                                for r in snapshot(views)
+                                if r[0][1] == run_id
+                                and r[1] in (_TASK_LAUNCHED, _TASK_ENDED, _TASK_DONE)
+                                and r[2] == _TASK_ACCEPTED
+                            ),
+                            None,
                         ),
                         "owned HOST inputs after native acceptance",
                     )
+                    generation = accepted[3]
+                    submitted.add((tuple(accepted[0]), generation if generation % 2 else generation - 1))
                     # submit returns after Python graph construction. Accepted LAUNCHED
                     # proves native materialization and input copy have completed.
                     tensors[0].fill_(-999)
                     tensors[1].fill_(-999)
+                # Strong observation covers the shared stream, including this
+                # already-queued suffix. Every accepted identity must reach END
+                # or a semantic terminal before this finite window is observed.
+                until(
+                    lambda: submitted <= observer.completed_identities or bool(submitted & observer.failed_identities),
+                    "this refill window physically completed before stream observation",
+                )
                 for handle in handles:
                     handle.wait(_TIMEOUT)
+            except Exception:
+                # Diagnostics cannot replace the original error or interrupt mandatory cleanup.
+                with contextlib.suppress(Exception):
+                    print(
+                        "automatic refill failure:\n" + stream_evidence._log_window_text(observer.trace),
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"runs={observer.case_runs.sorted_keys()} accepted={sorted(observer.accepted)} "
+                        f"windows={sorted(observer.windows)} slots={observer.by_slot}",
+                        file=sys.stderr,
+                    )
+                raise
             finally:
                 for handle in handles:
                     handle.wait(_TIMEOUT)
@@ -449,7 +506,10 @@ class AutomaticAdmissionScene(SceneTestCase):
     def error_and_close(self, worker):
         buffers, tensors = self.group(worker, 19.0)
         good, failure = None, None
-        trace = evidence._RunTrace(worker)
+        tmr = self._st_runtime == "tensormap_and_ringbuffer"
+        trace = stream_evidence._RunTrace(worker) if tmr else evidence._RunTrace(worker)
+        good_error, failure_error = None, None
+        cleanup_errors = []
         with entries(worker) as views:
             case_runs = evidence._CaseRuns(views)
             try:
@@ -462,7 +522,7 @@ class AutomaticAdmissionScene(SceneTestCase):
                     ),
                     "good predecessor launched",
                 )
-                bad_buffers, _ = self.group(worker)
+                bad_buffers, bad_tensors = self.group(worker)
                 if self._st_runtime == "host_build_graph":
                     # The HBG callback reports its failure before device launch.
                     with pytest.raises(RuntimeError):
@@ -471,17 +531,37 @@ class AutomaticAdmissionScene(SceneTestCase):
                 else:
                     failure = self.submit(worker, bad_buffers, name="reported_fatal", spin=0)
                     failure_id = failure._run_id
-                    with pytest.raises(RuntimeError):
+                    with pytest.raises(RuntimeError) as observed:
                         failure.wait(_TIMEOUT)
-                good.wait(_TIMEOUT)
-                torch.testing.assert_close(tensors[2], torch.full_like(tensors[2], self.expected(19.0)))
+                    failure_error = str(observed.value)
+                try:
+                    good.wait(_TIMEOUT)
+                except RuntimeError as error:
+                    if not tmr:
+                        raise
+                    good_error = str(error)
+                if not tmr:
+                    torch.testing.assert_close(tensors[2], torch.full_like(tensors[2], self.expected(19.0)))
                 rows = snapshot(views)
                 case_runs.note([(r[0], r[1], r[2]) for r in rows])
-                if self._st_runtime == "tensormap_and_ringbuffer":
+                if tmr:
                     assert failure is not None
                     identities = {r[0][1]: evidence._run_key(r[0]) for r in rows}
                     pair = (identities[good_id], identities[failure_id])
                     records = []
+                    # A strong wait may observe a queued successor's fault. Only
+                    # this pair's owned observation can anchor propagated failure.
+                    stream_evidence._assert_stream_observations(
+                        trace,
+                        worker._chip_pids[0],
+                        case_runs,
+                        [
+                            (tensors[2], torch.full_like(tensors[2], self.expected(19.0)), good_error),
+                            (bad_tensors[2], torch.full_like(bad_tensors[2], self.expected(2.0)), failure_error),
+                        ],
+                        records,
+                        "automatic admission queued stream failure",
+                    )
 
                     def joined_failure():
                         records.extend(trace.take())
@@ -490,10 +570,19 @@ class AutomaticAdmissionScene(SceneTestCase):
                     assert until(joined_failure, "this failing successor joined behind its successful predecessor")
             finally:
                 if good:
-                    good.wait(_TIMEOUT)
+                    try:
+                        good.wait(_TIMEOUT)
+                    except RuntimeError as error:
+                        if not tmr:
+                            raise
+                        cleanup_errors.append(str(error))
                 if failure:
-                    with contextlib.suppress(RuntimeError):
+                    try:
                         failure.wait(_TIMEOUT)
+                    except RuntimeError as error:
+                        cleanup_errors.append(str(error))
+        if tmr:
+            assert all(error in (good_error, failure_error) for error in cleanup_errors), cleanup_errors
         # Fatal reporting can poison the endpoint; outstanding-close has its own fresh scene.
 
     def test_run(self, st_platform, st_worker):

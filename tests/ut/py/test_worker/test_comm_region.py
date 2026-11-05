@@ -2875,7 +2875,8 @@ def test_wrong_owner_nonce_is_session_fatal_without_import():
     assert ctx.worker._delegated_session_fatal is not None
 
 
-def test_epoch_change_after_allocated_latches_fatal_without_import():
+@pytest.mark.parametrize("release_status", [ProviderReleaseStatus.RELEASED, ProviderReleaseStatus.CLEANUP_INCOMPLETE])
+def test_epoch_change_after_allocated_releases_without_import(release_status):
     ctx = _accepted_context()
     captured: dict[str, RegionInstance] = {}
     original_track = ctx.worker._region_instance_registry.track
@@ -2898,15 +2899,19 @@ def test_epoch_change_after_allocated_latches_fatal_without_import():
 
     ctx.worker._dispatch_delegated_allocate = _stale
     ctx.worker._dispatch_delegated_release = lambda **kwargs: releases.append(kwargs) or ProviderReleaseResult(
-        provider_resource_id=11, status=ProviderReleaseStatus.RELEASED
+        provider_resource_id=11, status=release_status
     )
     with pytest.raises(MaterializationRefusal) as excinfo:
         materialize_region_instance(ctx)
     assert excinfo.value.reason is RefusalReason.REGISTRY_MISMATCH
-    assert captured["instance"]._delegated_allocation_committed is False
+    assert captured["instance"]._delegated_allocation_committed is True
     assert import_calls == []
-    assert releases == []
-    assert ctx.worker._delegated_session_fatal is excinfo.value
+    assert len(releases) == 1
+    assert releases[0]["transaction_id"] == captured["instance"]._delegated_transaction_id
+    assert ctx.worker._delegated_session_fatal is None
+    assert (ctx.worker._ordered_cleanup_error is not None) == (
+        release_status is ProviderReleaseStatus.CLEANUP_INCOMPLETE
+    )
 
 
 def test_typed_attachment_keeps_provider_identity(region_worker):

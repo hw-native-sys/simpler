@@ -41,6 +41,7 @@ Checks: >
 
 WarningsAsErrors: '*'
 
-HeaderFilterRegex: '(src|include)/.*'
+# Project headers live under src/; dependency include/ trees are external.
+HeaderFilterRegex: '(^|/)src/.*'
 
 FormatStyle: file

@@ -707,7 +707,7 @@ static bool check_scope_can_accept_task(OrchestratorState *orch, TaskAllocator &
 }
 
 static bool prepare_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, uint64_t total_output_size, ActiveMask active_mask,
+    OrchestratorState *orch, const CoreTaskArgs &args, uint64_t total_output_size, LaneMask active_mask,
     TaskAttrs task_attrs, PreparedTask *out
 ) {
     uint8_t ring_id = orch->current_ring_id();
@@ -781,8 +781,7 @@ static bool prepare_task(
     // observers); set to PENDING here when orchestrator actually reuses the slot.
     out->slot_state->task_state.store(CHIP_TASK_PENDING, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.block_num();
-    out->slot_state->total_required_subtasks =
-        static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
+    out->slot_state->total_required_subtasks = static_cast<int16_t>(block_num * active_mask.count());
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
@@ -1010,7 +1009,7 @@ static bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed) {
 // computation (explicit_deps + auto), output registration, slot init, and
 // Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
-    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     CYCLE_COUNT_START();
@@ -1318,8 +1317,8 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
 
     always_assert(orch->scheduler != nullptr);
     // === Validate submit inputs ===
-    ActiveMask active_mask = mixed_kernels.to_active_mask();
-    always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
+    LaneMask active_mask = mixed_kernels.to_lanes();
+    always_assert(!active_mask.is_empty() && "MixedKernels must have at least one active slot");
 
     int16_t block_num = args.launch_spec.block_num();
     always_assert(block_num >= 1 && "block_num must be >= 1");
@@ -1330,13 +1329,13 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
     // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
     MixedKernels normalized = mixed_kernels;
-    bool has_aic = active_mask.has_mask(SUBTASK_MASK_AIC);
-    bool has_aiv0 = active_mask.has_mask(SUBTASK_MASK_AIV0);
-    bool has_aiv1 = active_mask.has_mask(SUBTASK_MASK_AIV1);
+    bool has_aic = active_mask.has_aic();
+    bool has_aiv0 = active_mask.has_aiv0();
+    bool has_aiv1 = active_mask.has_aiv1();
     if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = normalized.to_active_mask();
+        active_mask = normalized.to_lanes();
     }
 
     TaskAttrs task_attrs;
@@ -1402,7 +1401,7 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
     task_attrs.set_timing_slot(args.task_timing_slot());
 
     return submit_task_common(
-        orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+        orch, args, LaneMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
     );
 }
 
@@ -1448,7 +1447,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     PreparedTask prepared;
     // Kernel-less alloc task: no active subtasks, no dispatch-time markers. The
     // early-dispatch hint is force-set below (see the flag-the-creator note).
-    if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, TaskAttrs{}, &prepared)) {
+    if (!prepare_task(orch, args, layout.total_output_size, LaneMask{}, TaskAttrs{}, &prepared)) {
         return TaskOutputTensors{};
     }
 

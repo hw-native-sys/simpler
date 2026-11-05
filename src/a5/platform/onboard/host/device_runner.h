@@ -102,6 +102,7 @@ public:
     ) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
+    int retire_completed_execution(ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
 
@@ -199,7 +200,7 @@ private:
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
-    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
+    // aicpu_runtime_registered_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
@@ -214,8 +215,8 @@ private:
     // offline replay. a5-specific (the base keeps dep_gen as a virtual hook).
     DepGenCollector dep_gen_collector_;
 
-    // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
-    // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
+    // `query_max_block_dim`, `validate_block_dim`, `ensure_aicpu_runtime_registered`,
+    // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited
     // (protected) from `DeviceRunnerBase`.
 
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
@@ -279,10 +280,9 @@ private:
     // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
-    // On an AICore launch/sync error, best-effort drain the device so a later
-    // enqueue on the same DeviceRunner can recover in place; if the drain itself
-    // errors the context is unrecoverable without a full reset, so flip
-    // device_unusable_ and let admission/enqueue fail fast.
+    // Quarantine needs no current device; recovery may drain an owned device.
+    // Both keep admission closed until owner recovery or terminal quarantine.
+    void mark_device_unusable(int runtime_rc) override;
     void recover_device_or_mark_unusable(int aicore_rc) override;
 
     // Force-reset the card via aclrtResetDeviceForce to clear an op-timeout

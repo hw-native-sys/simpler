@@ -168,6 +168,10 @@ class ScopeStatsCollector : public profiling_common::ProfilerBase<ScopeStatsColl
 public:
     ScopeStatsCollector() = default;
     ~ScopeStatsCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     ScopeStatsCollector(const ScopeStatsCollector &) = delete;
     ScopeStatsCollector &operator=(const ScopeStatsCollector &) = delete;

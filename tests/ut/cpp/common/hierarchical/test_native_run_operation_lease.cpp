@@ -17,6 +17,8 @@
  * tag. The runtime entries are stubs here, so each of those can be produced on demand rather than
  * waited for.
  */
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,9 +26,11 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include <dlfcn.h>
@@ -39,11 +43,11 @@
 // worker to be destructible here.
 #include "chip_run_lane.h"
 #include "chip_worker.h"
+#include "runtime_module.h"
 #undef private
 #undef protected
 
 #include "native_run_storage_tag.h"
-#include "runtime_module.h"
 
 namespace {
 
@@ -68,6 +72,11 @@ TEST(NativeRunOperationLeaseTest, RunStorageRetainsItsModuleAcrossMoves) {
 // What each stub should do on its next call. Plain globals because one case drives one worker.
 std::mutex g_mu;
 std::condition_variable g_cv;
+uint64_t g_prepare_epoch = 0;
+bool g_prepare_entered = false;
+bool g_prepare_released = true;
+bool g_prepare_in_progress = false;
+bool g_finalize_during_prepare = false;
 bool g_wait_entered = false;
 bool g_wait_released = true;
 int g_wait_rc = 0;
@@ -94,11 +103,68 @@ int g_query_calls = 0;
 int g_device_finalize_rc = 0;
 int g_device_finalize_calls = 0;
 int g_destroy_context_calls = 0;
+int g_comm_free_calls = 0;
+int g_context_rc = 0;
+struct StubCarrier {
+    uint64_t magic;
+    uint64_t epoch;
+};
+std::unordered_map<uint64_t, int> g_per_run_wait_rc;
+std::vector<uint64_t> g_waited_epochs;
 
-int prepare_run(void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *) {
+int validate_context(void *) { return g_context_rc; }
+int g_comm_rc = 0;
+int g_comm_stream_free_calls = 0;
+int g_comm_stream_rc = 0;
+int g_comm_alloc_calls = 0;
+int g_comm_abort_calls = 0;
+
+int stub_release_domain(void *, uint64_t, size_t, uint32_t) {
+    ++g_comm_free_calls;
+    return g_comm_rc;
+}
+int stub_release_global_domain(uint64_t) {
+    ++g_comm_free_calls;
+    return 0;
+}
+int stub_abort_domain(void *, uint64_t, size_t, uint32_t) {
+    ++g_comm_abort_calls;
+    return g_comm_rc;
+}
+int stub_destroy_comm(void *) {
+    ++g_comm_free_calls;
+    return g_comm_rc;
+}
+
+int stub_destroy_comm_stream(void *, void *) {
+    ++g_comm_stream_free_calls;
+    return g_comm_stream_rc;
+}
+
+int stub_alloc_domain(
+    void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
+) {
+    ++g_comm_alloc_calls;
+    return g_comm_rc;
+}
+
+int prepare_run(
+    void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
+) {
+    {
+        std::unique_lock<std::mutex> lk(g_mu);
+        g_prepare_epoch = descriptor->run_epoch;
+        g_prepare_entered = true;
+        g_prepare_in_progress = true;
+        g_cv.notify_all();
+        g_cv.wait(lk, [] {
+            return g_prepare_released;
+        });
+        g_prepare_in_progress = false;
+    }
     // The carrier the platform would place here; only its tag matters to the worker.
-    uint64_t tag = kNativeRunContextMagic;
-    std::memcpy(runtime, &tag, sizeof(tag));
+    const StubCarrier carrier{kNativeRunContextMagic, descriptor->run_epoch};
+    std::memcpy(runtime, &carrier, sizeof(carrier));
     return 0;
 }
 
@@ -106,7 +172,7 @@ int launch_run(void *, void *) { return g_launch_rc; }
 
 int poll_run(void *, void *) { return g_poll_rc; }
 
-int wait_run(void *, void *) {
+int wait_run(void *, void *runtime) {
     {
         std::unique_lock<std::mutex> lk(g_mu);
         ++g_wait_calls;
@@ -117,10 +183,28 @@ int wait_run(void *, void *) {
         });
     }
     if (g_wait_throws) throw std::runtime_error("stub wait failed");
+    StubCarrier carrier{};
+    std::memcpy(&carrier, runtime, sizeof(carrier));
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_waited_epochs.push_back(carrier.epoch);
+    const auto found = g_per_run_wait_rc.find(carrier.epoch);
+    if (found != g_per_run_wait_rc.end()) return found->second;
+    if (g_wait_rc == 0) g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     return g_wait_rc;
 }
 
-int finalize_run(void *, void *runtime) {
+int wait_run_completion(void *, void *) {
+    std::unique_lock<std::mutex> lk(g_mu);
+    g_wait_entered = true;
+    g_cv.notify_all();
+    g_cv.wait(lk, [] {
+        return g_wait_released;
+    });
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    return 0;
+}
+
+int finalize_run(void *, void *runtime, int) {
     ++g_finalize_calls;
     if (g_finalize_destroys) {
         uint64_t cleared = 0;
@@ -170,6 +254,8 @@ int supports_joined_diagnostic_launch(void *, void *, void *predecessor_runtime)
 }
 
 int stub_finalize_device(void *) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_finalize_during_prepare |= g_prepare_in_progress;
     ++g_device_finalize_calls;
     return g_device_finalize_rc;
 }
@@ -179,6 +265,9 @@ void stub_destroy_device_context(void *) { ++g_destroy_context_calls; }
 void prime(ChipWorker &worker, uint32_t depth = 2) {
     {
         std::lock_guard<std::mutex> lk(g_mu);
+        g_prepare_entered = false;
+        g_prepare_released = true;
+        g_prepare_in_progress = g_finalize_during_prepare = false;
         g_wait_entered = false;
         g_wait_released = true;
     }
@@ -205,12 +294,22 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     g_device_finalize_rc = 0;
     g_device_finalize_calls = 0;
     g_destroy_context_calls = 0;
+    g_comm_free_calls = 0;
+    g_context_rc = 0;
+    g_per_run_wait_rc.clear();
+    g_waited_epochs.clear();
+    g_comm_rc = 0;
+    g_comm_stream_free_calls = 0;
+    g_comm_stream_rc = 0;
+    g_comm_alloc_calls = 0;
+    g_comm_abort_calls = 0;
     worker.initialized_ = true;
     // The stubs ignore it, but teardown refuses to run without one, which is the production
     // guard against closing a worker that never reached a device.
     static int device_context_placeholder = 0;
     worker.device_ctx_ = &device_context_placeholder;
     worker.destroy_device_context_fn_ = stub_destroy_device_context;
+    worker.validate_execution_context_fn_ = validate_context;
     // A reference to this executable supplies the runtime owner without another DSO.
     if (worker.runtime_module_ == nullptr) worker.runtime_module_ = std::make_shared<RuntimeModule>(nullptr);
     EXPECT_NE(worker.runtime_module_, nullptr);
@@ -226,6 +325,7 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;
     worker.wait_run_fn_ = wait_run;
+    worker.wait_run_completion_fn_ = wait_run_completion;
     worker.finalize_run_fn_ = finalize_run;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
 }
@@ -347,6 +447,132 @@ private:
 
 }  // namespace
 
+TEST(NativeRunOperationLeaseTest, CompletedPollDoesNotReplaceTheExplicitObserver) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    EXPECT_TRUE(worker.poll_native_run(run));
+    EXPECT_TRUE(worker.poll_native_run(run));
+    EXPECT_EQ(g_wait_calls, 0);
+    EXPECT_EQ(g_finalize_calls, 0);
+
+    g_wait_rc = -731;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    g_wait_rc = -732;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "the explicit observer's failure was replaced by a completed poll";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-731"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_EQ(g_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, CloseBeforeWaitObservesEvenAfterCompletedPoll) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    ASSERT_TRUE(worker.poll_native_run(run));
+    g_wait_rc = -733;
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "closing an unobserved call omitted the explicit observer";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-733"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_EQ(g_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, CompletedPollKeepsAnUnobservedRunRetryableAfterContextRefusal) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    ASSERT_TRUE(worker.poll_native_run(run));
+    g_context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_THROW(worker.wait_native_run(run), ExecutionContextRefused);
+    EXPECT_THROW(worker.finalize_native_run(run), ExecutionContextRefused);
+    EXPECT_EQ(g_wait_calls, 0);
+    EXPECT_EQ(g_finalize_calls, 0);
+    g_context_rc = 0;
+    g_wait_rc = -734;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "context refusal lost the pending explicit observation";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-734"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, SlotReuseKeepsEachUnobservedCallAndDoesNotForceAnObserver) {
+    ChipWorker worker;
+    prime(worker);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    std::vector<ChipWorkerNativeRun> runs;
+    for (uint64_t generation = 1; generation <= 6; ++generation) {
+        std::optional<ChipWorkerNativeRun> current;
+        EXPECT_NO_THROW(current = prepare(worker, (generation - 1) % 2, generation));
+        if (!current) break;
+        runs.push_back(*current);
+        g_per_run_wait_rc[current->run_epoch] = -740 - static_cast<int>(generation);
+        worker.launch_native_run(*current);
+        ASSERT_TRUE(worker.poll_native_run(*current));
+        EXPECT_EQ(g_wait_calls, 0);
+        EXPECT_EQ(g_finalize_calls, 0);
+    }
+    ASSERT_EQ(runs.size(), 6u) << "unobserved calls are not executing occupants of the pipeline slots";
+    for (auto it = runs.rbegin(); it != runs.rend(); ++it) {
+        const int expected = g_per_run_wait_rc.at(it->run_epoch);
+        EXPECT_TRUE(worker.poll_native_run(*it));
+        worker.wait_native_run(*it);
+        worker.wait_native_run(*it);
+        try {
+            worker.finalize_native_run(*it);
+            FAIL() << "the old handle lost its own observer error";
+        } catch (const std::runtime_error &error) {
+            EXPECT_NE(std::string(error.what()).find(std::to_string(expected)), std::string::npos);
+        }
+    }
+    EXPECT_EQ(g_wait_calls, 6);
+    EXPECT_EQ(g_finalize_calls, 6);
+    std::vector<uint64_t> expected_epochs;
+    for (auto it = runs.rbegin(); it != runs.rend(); ++it)
+        expected_epochs.push_back(it->run_epoch);
+    EXPECT_EQ(g_waited_epochs, expected_epochs);
+}
+
+TEST(NativeRunOperationLeaseTest, ObserverErrorDoesNotProvePhysicalCompletionOrReleaseTheSlot) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    g_wait_rc = -751;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_FALSE(worker.poll_native_run(run)) << "an observer error does not prove that device readers stopped";
+    EXPECT_THROW(prepare(worker, 0, 2), RunPreparationRefused);
+    EXPECT_EQ(g_finalize_calls, 0);
+    g_finalize_destroys = false;
+    g_finalize_rc = -752;
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_THROW(prepare(worker, 0, 3), RunPreparationRefused);
+    EXPECT_EQ(g_wait_calls, 1);
+}
+
 // A refused finalization must not undo the completion its own wait established, or the next
 // attempt waits again and reports whatever that second wait says instead of the first error.
 TEST(NativeRunOperationLeaseTest, RefusedFinalizeKeepsItsWaitOutcomeAndDoesNotWaitTwice) {
@@ -365,7 +591,8 @@ TEST(NativeRunOperationLeaseTest, RefusedFinalizeKeepsItsWaitOutcomeAndDoesNotWa
         std::lock_guard<std::mutex> lk(worker.native_run_mu_);
         const auto it = worker.native_runs_.find(run.run_epoch);
         ASSERT_NE(it, worker.native_runs_.end());
-        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::REAPED);
+        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+        EXPECT_TRUE(it->second->result_observed);
         EXPECT_TRUE(it->second->pending_rc_set);
         EXPECT_EQ(it->second->pending_rc, -7);
         EXPECT_FALSE(it->second->finalize_reserved);
@@ -510,8 +737,8 @@ TEST(NativeRunOperationLeaseTest, AdmittingLaterRunsRehashesTheTableUnderASleepi
         const auto it = worker.native_runs_.find(run.run_epoch);
         ASSERT_NE(it, worker.native_runs_.end());
         EXPECT_EQ(it->second.get(), entry_before);
-        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::REAPED)
-            << "the waiter's own completion did not land on its own entry";
+        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+        EXPECT_TRUE(it->second->result_observed) << "the waiter's own observation did not land on its own entry";
         EXPECT_TRUE(it->second->pending_rc_set);
         EXPECT_EQ(it->second->pending_rc, -7) << "the waiter's own outcome was not the one it recorded";
         EXPECT_EQ(it->second->ops_in_flight, 0u);
@@ -768,6 +995,78 @@ TEST(NativeRunOperationLeaseTest, TeardownClosesEveryRunAndSwallowsForeignExcept
     }
 }
 
+TEST(NativeRunOperationLeaseTest, WholeCloseCannotDetachAHostPreparationInProgress) {
+    EXPECT_EXIT(
+        {
+            ChipWorker worker;
+            prime(worker);
+            worker.finalize_device_fn_ = stub_finalize_device;
+            worker.destroy_device_context_fn_ = stub_destroy_device_context;
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_prepare_released = false;
+            }
+            std::thread preparer([&] {
+                try {
+                    (void)prepare(worker, 0, 1);
+                } catch (...) {}
+            });
+            uint64_t preparing_epoch = 0;
+            {
+                std::unique_lock<std::mutex> lk(g_mu);
+                if (!g_cv.wait_for(lk, std::chrono::seconds(5), [] {
+                        return g_prepare_entered;
+                    }))
+                    _exit(2);
+                preparing_epoch = g_prepare_epoch;
+            }
+            bool close_started = false;
+            bool close_finished = false;
+            std::thread closer([&] {
+                {
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    close_started = true;
+                    g_cv.notify_all();
+                }
+                try {
+                    worker.finalize();
+                } catch (...) {}
+                {
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    close_finished = true;
+                    g_cv.notify_all();
+                }
+            });
+            {
+                std::unique_lock<std::mutex> lk(g_mu);
+                g_cv.wait(lk, [&] {
+                    return close_started;
+                });
+                (void)g_cv.wait_for(lk, std::chrono::milliseconds(200), [&] {
+                    return close_finished;
+                });
+            }
+            bool retained = false;
+            {
+                std::lock_guard<std::mutex> lk(worker.native_run_mu_);
+                const auto found = worker.native_runs_.find(preparing_epoch);
+                retained = found != worker.native_runs_.end() && found->second->storage.data() != nullptr;
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_prepare_released = true;
+                g_cv.notify_all();
+            }
+            preparer.join();
+            closer.join();
+            if (!retained) _exit(3);
+            if (g_finalize_during_prepare) _exit(4);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
 // The whole close, not just its sweep: a worker whose every run closed cleanly reaches the device
 // teardown and the context destruction, and gives up its run storage.
 TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProvedDestroyed) {
@@ -789,13 +1088,386 @@ TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProv
     EXPECT_TRUE(worker.native_runs_.empty());
 }
 
-// A run the sweep could not prove destroyed still owns whatever its carrier holds, and that
-// carrier still lives in this worker's run storage. The close therefore refuses the whole
-// reclamation below it rather than freeing those resources twice or unloading their owner.
-TEST(NativeRunOperationLeaseTest, WholeCloseRefusesToReclaimBehindAnUnprovenRun) {
+// A destroyed carrier permits device teardown, but a poisoned lane cannot authorize comm free.
+TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeardownRetry) {
+    for (bool failed : {false, true}) {
+        SCOPED_TRACE(failed);
+        ChipWorker worker;
+        prime(worker);
+        worker.finalize_device_fn_ = stub_finalize_device;
+        worker.comm_release_domain_windows_fn_ = stub_release_domain;
+        worker.comm_global_domain_release_fn_ = stub_release_global_domain;
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        static int comm_placeholder = 0;
+        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+        ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+        worker.base_comm_handle_ = comm;
+        worker.global_domain_ids_.insert(7);
+        const auto module = worker.runtime_module_;
+        worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+        ChipStorageTaskArgs args{};
+        ChipRun run = worker.run_lane_->submit(1, args, CallConfig{});
+        g_wait_rc = failed ? -5 : 0;
+        if (failed) {
+            EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+        } else {
+            EXPECT_TRUE(run.wait_until(ChipRun::Deadline::max()));
+        }
+        EXPECT_EQ(worker.run_lane_->poisoned(), failed);
+        EXPECT_EQ(g_finalize_calls, 1);
+        EXPECT_EQ(worker.unproven_native_run_count(), 0u);
+        uint64_t tag = kNativeRunContextMagic;
+        std::memcpy(&tag, worker.runtime_bufs_[0].data(), sizeof(tag));
+        EXPECT_EQ(tag, 0u);
+        if (!failed) {
+            EXPECT_NO_THROW(worker.finalize());
+            EXPECT_EQ(g_comm_free_calls, 2);
+            EXPECT_EQ(g_device_finalize_calls, 1);
+            EXPECT_TRUE(module->unload_allowed_);
+            EXPECT_TRUE(worker.comm_sessions_.empty());
+            EXPECT_TRUE(worker.global_domain_ids_.empty());
+            continue;
+        }
+        const auto expect_refused = [&] {
+            EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
+            EXPECT_THROW(worker.comm_global_domain_release(7), std::runtime_error);
+            EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+            EXPECT_THROW(worker.comm_destroy_all(), std::runtime_error);
+            EXPECT_EQ(g_comm_free_calls, 0);
+            ASSERT_EQ(worker.comm_sessions_.size(), 1u);
+            EXPECT_EQ(worker.comm_sessions_[0].handle, &comm_placeholder);
+            EXPECT_EQ(worker.global_domain_ids_.count(7), 1u);
+        };
+        expect_refused();
+        g_device_finalize_rc = -9;
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        EXPECT_EQ(g_device_finalize_calls, 1);
+        EXPECT_EQ(g_destroy_context_calls, 0);
+        EXPECT_FALSE(module->unload_allowed_);
+        expect_refused();
+        g_device_finalize_rc = 0;
+        EXPECT_NO_THROW(worker.finalize());
+        EXPECT_EQ(g_device_finalize_calls, 2);
+        EXPECT_EQ(g_destroy_context_calls, 1);
+        expect_refused();
+        EXPECT_NO_THROW(worker.finalize());
+        EXPECT_EQ(g_device_finalize_calls, 2);
+        EXPECT_EQ(g_comm_free_calls, 0);
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, UnpublishedDomainAbortUsesLocalBackendAndHonorsReclamationGuard) {
     ChipWorker worker;
     prime(worker);
     worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.comm_release_domain_windows_fn_ = stub_release_domain;
+    worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+    EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
+    EXPECT_EQ(g_comm_abort_calls, 1);
+    EXPECT_EQ(g_comm_free_calls, 0);
+
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    EXPECT_THROW(worker.comm_abort_domain_windows(comm, 2, 2, 0), std::runtime_error);
+    EXPECT_EQ(g_comm_abort_calls, 1);
+    worker.finalize_native_run(run);
+
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.comm_abort_domain_windows(comm, 2, 2, 0), std::runtime_error);
+    EXPECT_EQ(g_comm_abort_calls, 2);
+    ASSERT_NE(worker.find_comm_session(comm), nullptr);
+    EXPECT_THROW(worker.comm_abort_domain_windows(comm, 2, 2, 0), std::runtime_error);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_abort_calls, 2);
+    EXPECT_EQ(g_comm_free_calls, 0);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, DomainAllocationFailurePublishesCleanupOwnership) {
+    const int results[] = {
+        -1,
+        COMM_DOMAIN_WORKSPACE_UNSUPPORTED,
+        COMM_DOMAIN_URMA_CONFIG_INVALID,
+        COMM_DOMAIN_URMA_INIT_FAILED,
+        COMM_DOMAIN_URMA_WORKSPACE_INVALID,
+        COMM_INITIALIZATION_ABORT_REQUIRED,
+        COMM_RECLAMATION_UNCONFIRMED
+    };
+    for (int rc : results) {
+        SCOPED_TRACE(rc);
+        ChipWorker worker;
+        prime(worker);
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+        worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
+        int comm_placeholder = 0;
+        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+        ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+        uint64_t ownership = 0;
+        g_comm_rc = rc;
+        EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 1, {0, 1}, 0, 4096, 2, &ownership), std::runtime_error);
+        EXPECT_EQ(
+            __atomic_load_n(&ownership, __ATOMIC_ACQUIRE),
+            (rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED) ? 1u : 0u
+        );
+        ASSERT_NE(worker.find_comm_session(comm), nullptr);
+        EXPECT_EQ(worker.comm_cleanup_unconfirmed_, rc == COMM_RECLAMATION_UNCONFIRMED);
+        g_comm_rc = 0;
+        if (rc == COMM_INITIALIZATION_ABORT_REQUIRED) {
+            EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
+            EXPECT_EQ(g_comm_abort_calls, 1);
+            EXPECT_NO_THROW(worker.finalize());
+        } else if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            EXPECT_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0), std::runtime_error);
+            EXPECT_EQ(g_comm_abort_calls, 0);
+            EXPECT_THROW(worker.finalize(), std::runtime_error);
+        }
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, DomainAllocationOwnershipPrecedesOutputValidation) {
+    ChipWorker worker;
+    prime(worker);
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+    worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+    uint64_t ownership = 0;
+    EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 1, {0, 1}, 0, 4096, 2, &ownership), std::runtime_error);
+    EXPECT_EQ(__atomic_load_n(&ownership, __ATOMIC_ACQUIRE), 1u);
+    EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
+
+    worker.comm_alloc_domain_windows_fn_ = [](void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t,
+                                              uint64_t *ctx, uint64_t *window, size_t *size) {
+        *ctx = 0x100;
+        *window = 0x200;
+        *size = 4096;
+        return 0;
+    };
+    ownership = 0;
+    const auto result = worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2, &ownership);
+    EXPECT_EQ(std::get<0>(result), 0x100u);
+    EXPECT_EQ(std::get<1>(result), 0x200u);
+    EXPECT_EQ(__atomic_load_n(&ownership, __ATOMIC_ACQUIRE), 1u);
+}
+
+TEST(NativeRunOperationLeaseTest, FailedCommCleanupRetainsOwnerStreamAndDeviceAcrossClose) {
+    for (int operation = 0; operation < 3; ++operation) {
+        SCOPED_TRACE(operation);
+        const auto module = std::make_shared<RuntimeModule>(nullptr);
+        {
+            ChipWorker worker;
+            worker.runtime_module_ = module;
+            prime(worker);
+            worker.finalize_device_fn_ = stub_finalize_device;
+            worker.comm_destroy_fn_ = stub_destroy_comm;
+            worker.comm_release_domain_windows_fn_ = stub_release_domain;
+            worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+            worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+            int comm_placeholder = 0;
+            int stream_placeholder = 0;
+            const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+            ASSERT_NE(worker.create_comm_session(&comm_placeholder, &stream_placeholder, true), nullptr);
+            worker.base_comm_handle_ = comm;
+            g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+            if (operation == 0) {
+                EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+            } else if (operation == 1) {
+                EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
+            } else {
+                EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 1, {0, 1}, 0, 4096, 2), std::runtime_error);
+            }
+            ASSERT_NE(worker.find_comm_session(comm), nullptr);
+            EXPECT_EQ(worker.find_comm_session(comm)->handle, &comm_placeholder);
+            EXPECT_EQ(worker.find_comm_session(comm)->stream, &stream_placeholder);
+            EXPECT_EQ(worker.base_comm_handle_, comm);
+            EXPECT_EQ(g_comm_stream_free_calls, 0);
+            const int cleanup_calls = g_comm_free_calls;
+            const int allocation_calls = g_comm_alloc_calls;
+            EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+            EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
+            EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2), std::runtime_error);
+            EXPECT_THROW(prepare(worker, 0, 1), std::runtime_error);
+            EXPECT_THROW(worker.finalize(), std::runtime_error);
+            EXPECT_THROW(worker.finalize(), std::runtime_error);
+            EXPECT_EQ(g_comm_free_calls, cleanup_calls);
+            EXPECT_EQ(g_comm_alloc_calls, allocation_calls);
+            EXPECT_EQ(g_device_finalize_calls, 0);
+            EXPECT_EQ(g_destroy_context_calls, 0);
+            EXPECT_FALSE(module->unload_allowed_);
+        }
+        EXPECT_EQ(g_comm_stream_free_calls, 0);
+        EXPECT_EQ(g_device_finalize_calls, 0);
+        EXPECT_EQ(g_destroy_context_calls, 0);
+        EXPECT_FALSE(module->unload_allowed_);
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, FinalizeStopsBeforeBaseWhenChildCommCleanupIsUnconfirmed) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    int base = 0;
+    int child = 0;
+    int stream = 0;
+    ASSERT_NE(worker.create_comm_session(&base, &stream, true), nullptr);
+    ASSERT_NE(worker.create_comm_session(&child, &stream, false), nullptr);
+    worker.base_comm_handle_ = reinterpret_cast<uint64_t>(&base);
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(worker.comm_sessions_.size(), 2u);
+    EXPECT_EQ(worker.comm_session_index_.size(), 2u);
+    EXPECT_EQ(g_comm_stream_free_calls, 0);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, ConsumedCommErrorStillReleasesSessionAndStream) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    int comm_placeholder = 0;
+    int stream_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, &stream_placeholder, true), nullptr);
+    worker.base_comm_handle_ = comm;
+    g_comm_rc = -1;
+    EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+    EXPECT_EQ(worker.find_comm_session(comm), nullptr);
+    EXPECT_EQ(worker.base_comm_handle_, 0u);
+    EXPECT_EQ(g_comm_stream_free_calls, 1);
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 1);
+    EXPECT_EQ(g_destroy_context_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, FailedCommStreamDestroyRetainsStreamWithoutRetryingConsumedHandle) {
+    for (int backend_rc : {0, -1}) {
+        SCOPED_TRACE(backend_rc);
+        ChipWorker worker;
+        prime(worker);
+        worker.finalize_device_fn_ = stub_finalize_device;
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+        int comm_placeholder = 0;
+        int stream_placeholder = 0;
+        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+        ASSERT_NE(worker.create_comm_session(&comm_placeholder, &stream_placeholder, true), nullptr);
+        worker.base_comm_handle_ = comm;
+        g_comm_rc = backend_rc;
+        g_comm_stream_rc = -7;
+        EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+        ASSERT_EQ(worker.comm_sessions_.size(), 1u);
+        EXPECT_EQ(worker.comm_sessions_[0].handle, nullptr);
+        EXPECT_EQ(worker.comm_sessions_[0].stream, &stream_placeholder);
+        EXPECT_EQ(worker.find_comm_session(comm), nullptr);
+        EXPECT_EQ(worker.base_comm_handle_, 0u);
+        EXPECT_EQ(g_comm_free_calls, 1);
+        EXPECT_EQ(g_comm_stream_free_calls, 1);
+        EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        EXPECT_EQ(g_comm_free_calls, 1);
+        EXPECT_EQ(g_comm_stream_free_calls, 1);
+        EXPECT_EQ(g_device_finalize_calls, 0);
+        EXPECT_EQ(g_destroy_context_calls, 0);
+        EXPECT_FALSE(worker.runtime_module_->unload_allowed_);
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, UntrackedCommCleanupFailureRegistersRetainedOwner) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+    ASSERT_NE(worker.find_comm_session(comm), nullptr);
+    EXPECT_EQ(worker.find_comm_session(comm)->handle, &comm_placeholder);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, FailedCommInitRetainsStreamWhenRollbackFails) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    static int stream_placeholder = 0;
+    worker.ensure_acl_ready_fn_ = [](void *, int) {
+        return 0;
+    };
+    worker.create_comm_stream_fn_ = [](void *) -> void * {
+        return &stream_placeholder;
+    };
+    worker.comm_init_fn_ = [](int, int, void *, const char *) -> void * {
+        return nullptr;
+    };
+    g_comm_stream_rc = -7;
+    EXPECT_THROW(worker.create_base_comm(0, 2, "unused"), std::runtime_error);
+    ASSERT_EQ(worker.comm_sessions_.size(), 1u);
+    EXPECT_EQ(worker.comm_sessions_[0].handle, nullptr);
+    EXPECT_EQ(worker.comm_sessions_[0].stream, &stream_placeholder);
+    EXPECT_EQ(g_comm_stream_free_calls, 1);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_stream_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, DuplicateCommCleanupFailureRetainsBothStreams) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    static int comm_placeholder = 0;
+    static int new_stream_placeholder = 0;
+    int old_stream_placeholder = 0;
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, &old_stream_placeholder, false), nullptr);
+    worker.ensure_acl_ready_fn_ = [](void *, int) {
+        return 0;
+    };
+    worker.create_comm_stream_fn_ = [](void *) -> void * {
+        return &new_stream_placeholder;
+    };
+    worker.comm_init_fn_ = [](int, int, void *, const char *) -> void * {
+        return &comm_placeholder;
+    };
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.create_base_comm(0, 2, "unused"), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_comm_stream_free_calls, 0);
+    ASSERT_EQ(worker.comm_sessions_.size(), 2u);
+    EXPECT_EQ(worker.comm_sessions_[0].stream, &old_stream_placeholder);
+    EXPECT_EQ(worker.comm_sessions_[1].stream, &new_stream_placeholder);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+}
+
+// A run the sweep could not prove destroyed still owns whatever its carrier holds, and that
+// carrier still lives in this worker's run storage. The close therefore refuses the whole
+// reclamation below it rather than freeing those resources twice or unloading their owner.
+TEST(NativeRunOperationLeaseTest, WholeCloseRetainsAnUnprovenRunWhenDeviceTeardownRefuses) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    g_device_finalize_rc = -9;
     worker.destroy_device_context_fn_ = stub_destroy_device_context;
     const ChipWorkerNativeRun run = prepare(worker, 0, 1);
     worker.launch_native_run(run);
@@ -803,7 +1475,7 @@ TEST(NativeRunOperationLeaseTest, WholeCloseRefusesToReclaimBehindAnUnprovenRun)
     g_finalize_destroys = false;
     g_finalize_corrupts = true;
     EXPECT_THROW(worker.finalize(), std::runtime_error);
-    EXPECT_EQ(g_device_finalize_calls, 0) << "the device teardown ran behind an undestroyed run";
+    EXPECT_EQ(g_device_finalize_calls, 1);
     EXPECT_EQ(g_destroy_context_calls, 0) << "the context was destroyed behind an undestroyed run";
     EXPECT_NE(worker.device_ctx_, nullptr);
     EXPECT_FALSE(worker.runtime_bufs_.empty()) << "the carrier's storage was released under it";
@@ -814,12 +1486,36 @@ TEST(NativeRunOperationLeaseTest, WholeCloseRefusesToReclaimBehindAnUnprovenRun)
         EXPECT_TRUE(it->second->destruction_unknown);
     }
     // The refusal is not a one-shot: a second close sees the same unproven run and refuses again
-    // without attempting any device call, so nothing is reclaimed by a retry either.
+    // without re-entering the partially executed destructor. The common close may retry its proof.
     EXPECT_THROW(worker.finalize(), std::runtime_error);
-    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_device_finalize_calls, 2);
     EXPECT_EQ(g_finalize_calls, 1) << "an isolated run was handed to the runtime again";
     // The fixture's worker is destroyed holding the isolated run, which is what production does
     // too; its destructor absorbs the same refusal.
+}
+
+// This zero models the strengthened common-close contract, not the business
+// verdict: the real architecture/probe consumer separately proves reset.
+TEST(NativeRunOperationLeaseTest, ConfirmedTerminalCloseNeverReentersAPartialDestructor) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.destroy_device_context_fn_ = stub_destroy_device_context;
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    void *carrier = worker.native_runs_.at(run.run_epoch)->storage.data();
+    g_finalize_destroys = false;
+    g_finalize_corrupts = true;
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_finalize_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 1);
+    EXPECT_EQ(g_destroy_context_calls, 1);
+    EXPECT_EQ(worker.device_ctx_, nullptr);
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_finalize_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 1);
+    std::free(carrier);  // This stub carrier owns no real resources.
 }
 
 // Retaining a map entry preserves nothing once the owner is gone: the entry and
@@ -838,10 +1534,11 @@ TEST(NativeRunOperationLeaseTest, AnUnprovenRunsStorageOutlivesTheWorkerThatHeld
         ChipWorker worker;
         prime(worker);
         worker.finalize_device_fn_ = stub_finalize_device;
+        g_device_finalize_rc = -9;
         worker.destroy_device_context_fn_ = stub_destroy_device_context;
         const ChipWorkerNativeRun run = prepare(worker, 0, 1);
         worker.launch_native_run(run);
-        carrier = worker.runtime_bufs_[run.slot_id].data();
+        carrier = worker.native_runs_.at(run.run_epoch)->storage.data();
         ASSERT_NE(carrier, nullptr);
 
         // A teardown that leaves the tag unreadable: the run is isolated, and
@@ -854,7 +1551,7 @@ TEST(NativeRunOperationLeaseTest, AnUnprovenRunsStorageOutlivesTheWorkerThatHeld
         // Detached from the owner, so the block is no longer this object's to
         // free — the run table still names the set, but that is bookkeeping and
         // this is the ownership.
-        EXPECT_EQ(worker.runtime_bufs_[run.slot_id].data(), nullptr)
+        EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->storage.data(), nullptr)
             << "the carrier's storage is still owned by a worker that is about to be destroyed";
         std::memcpy(carrier, &kCarrierWitness, sizeof(kCarrierWitness));
     }
@@ -867,8 +1564,8 @@ TEST(NativeRunOperationLeaseTest, AnUnprovenRunsStorageOutlivesTheWorkerThatHeld
     std::free(carrier);
 }
 
-// A failed launch that nonetheless reached the device records completion and its own error, so a
-// later finalization reports that error instead of waiting.
+// A launch error outranks the later explicit observer's error, independently of
+// which operation first established physical completion.
 TEST(NativeRunOperationLeaseTest, FailedLaunchThatCompletedKeepsItsOwnError) {
     ChipWorker worker;
     prime(worker);
@@ -884,6 +1581,85 @@ TEST(NativeRunOperationLeaseTest, FailedLaunchThatCompletedKeepsItsOwnError) {
         EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::REAPED);
         EXPECT_EQ(it->second->pending_rc, -11);
     }
+    g_wait_rc = -12;
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "the launch error was discarded";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-11"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
+}
+
+// Model the checked sim wait's early binding failure using the existing backend
+// stubs, while exercising the production ChipWorker state machine.
+TEST(NativeRunOperationLeaseTest, IncompleteWaitRemainsRetryable) {
+    ChipWorker worker;
+    prime(worker);
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_wait_rc = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    EXPECT_THROW(worker.wait_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->pending_rc_set);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->result_observed);
+    EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+    EXPECT_FALSE(worker.poll_native_run(run));
+    // A second caller must reach the backend while it still owes a drain.
+    EXPECT_THROW(worker.wait_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 2);
+    // A later successful wait must complete without retaining the transient error.
+    g_wait_rc = 0;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    EXPECT_NO_THROW(worker.wait_native_run(run));
+    EXPECT_EQ(g_wait_calls, 3);
+    EXPECT_TRUE(worker.poll_native_run(run));
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+}
+
+TEST(NativeRunOperationLeaseTest, FinalizeIncompleteWaitRemainsRetryable) {
+    ChipWorker worker;
+    prime(worker);
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_wait_rc = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    g_finalize_rc = PTO_RUNTIME_ERR_INTERNAL;
+    g_finalize_destroys = false;
     EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
-    EXPECT_EQ(g_wait_calls, 0) << "a completed run was waited on";
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->pending_rc_set);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->result_observed);
+    EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+    EXPECT_FALSE(worker.poll_native_run(run));
+    EXPECT_EQ(g_finalize_calls, 0);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->finalize_reserved);
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 2);
+    g_wait_rc = 0;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    g_finalize_rc = 0;
+    g_finalize_destroys = true;
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+    EXPECT_EQ(g_wait_calls, 3);
+    EXPECT_EQ(g_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, CompletedExecutionErrorStaysComplete) {
+    for (int error : {-7, static_cast<int>(PTO_RUNTIME_ERR_INTERNAL)}) {
+        ChipWorker worker;
+        prime(worker);
+        const auto run = prepare(worker, 0, 1);
+        worker.launch_native_run(run);
+        g_wait_rc = error;
+        g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        EXPECT_NO_THROW(worker.wait_native_run(run));
+        EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::REAPED);
+        EXPECT_TRUE(worker.poll_native_run(run));
+        EXPECT_NO_THROW(worker.wait_native_run(run));
+        EXPECT_EQ(g_wait_calls, 1);
+        EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+        EXPECT_EQ(g_finalize_calls, 1);
+    }
 }

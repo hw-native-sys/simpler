@@ -45,7 +45,7 @@ struct GraphRecordedPredicate {
 
 struct RecordedSubTask {
     std::array<int32_t, SUBTASK_SLOT_COUNT> kernel_ids{};
-    ActiveMask active_mask{};
+    LaneMask active_mask{};
     TaskAttrs task_attrs{};
     int16_t logical_block_num{1};
     int16_t total_required_subtasks{0};

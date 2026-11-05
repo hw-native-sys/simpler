@@ -13,9 +13,9 @@
 Re-uses ``vector_example`` as a known-good 5-task AIV-only workload. When the
 ``--enable-chip-swimlane`` flag is on, the helper in :mod:`_swimlane_validate`
 asserts schema, runs the converter / sched_overhead tool smokes, and fires a
-differential gate over Pop / Fanout / Fanin. Without the flag the assertions
-are skipped — the test still runs the case so the default ``pytest tests/st``
-invocation doesn't pay an extra step.
+differential gate over Pop / Fanout / Fanin. These manual cases are excluded
+from the default ``pytest tests/st`` invocation; use ``--manual include`` to
+run them.
 
 A mixed AIC+AIV companion lives in ``test_chip_swimlane_mixed.py`` —
 that variant exercises the per-task dedup branch in
@@ -76,7 +76,7 @@ class TestChipSwimlane(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             "params": {},
             # Tiny 5-task graphs often seal before an idle drain, so post-seal
             # elision may drop every deferred release. Release E2E lives in
@@ -86,7 +86,7 @@ class TestChipSwimlane(SceneTestCase):
         {
             "name": "aicpu_threads_2",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             "config": {"aicpu_thread_num": 2},
             "params": {},
             "required_sched_phases": (),
@@ -158,7 +158,7 @@ class TestChipSwimlaneManyAdds(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             "params": {},
             "required_sched_phases": ("release",),
         },

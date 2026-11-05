@@ -265,6 +265,13 @@ Buffer identity. A Tensor snapshot does not retain allocation ownership or preve
 explicit Buffer close; submission still validates live registration. Constructing
 a new view from a closed Buffer is rejected.
 
+Domains expose the same Buffer/Tensor interface through `domain.member(rank).buffers[name]`.
+Across nodes, existing `REMOTE_SIDECAR` entries locate VMM backings while preserving canonical
+identity, access, extent and view geometry. Sender and receiver revalidate private registration,
+target chip and the complete descriptor; release or name reuse invalidates old references.
+The domain owns its windows; session entries only borrow them, so ordinary remote free/copy/export
+rejects these entries. Pass domain ref/rank explicitly for context, without inferring it from a Tensor.
+
 `buffer.tensor(shapes, dtype, ...)` is a compatibility forwarding method to this
 constructor. The existing descriptor-based constructor remains available for
 internal wire callers. Both use the same geometry validator.

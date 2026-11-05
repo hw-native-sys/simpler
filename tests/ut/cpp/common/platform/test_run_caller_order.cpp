@@ -179,7 +179,7 @@ TEST_F(CallerOrderTest, FailedExitWaitOrTailRecordStillPinsTheBoundary) {
 }
 
 TEST_F(CallerOrderTest, ArmingFailureAndStaleIdentityNeverQueueWork) {
-    EXPECT_NE(order.arm(kRun, cpu, cpu, core), 0);
+    EXPECT_NE(order.arm(kRun, core, cpu, core), 0);
     arm();
     LaunchProgressSink sink;
     EXPECT_NE(
@@ -196,6 +196,95 @@ TEST_F(CallerOrderTest, ArmingFailureAndStaleIdentityNeverQueueWork) {
     EXPECT_NE(order.arm(kNext, caller, cpu, core), 0);
     EXPECT_EQ(order.retire(kRun), 0);
     EXPECT_EQ(order.retire(kRun), 0);
+}
+
+TEST_F(CallerOrderTest, CallerCpuQueuesForkEvenWhenPublicationIsCached) {
+    caller = cpu;
+    ASSERT_EQ(fence.arm(kRun), 0);
+    ASSERT_EQ(order.arm(kRun, caller, cpu, core), 0);
+    EXPECT_EQ(created, 4);
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    EXPECT_TRUE(sink.submitted());
+    EXPECT_EQ(trace, (std::vector<std::string>{"record caller", "wait core"}));
+    publish_whole_boundary();
+    trace.clear();
+    ASSERT_EQ(order.join(kRun, fence), 0);
+    EXPECT_EQ(trace, (std::vector<std::string>{"record caller"}));
+    EXPECT_EQ(order.poll(kRun), RunCallerOrder::Completion::Pending);
+    EXPECT_NE(order.retire(kRun), 0);
+    completed = true;
+    trace.clear();
+    EXPECT_EQ(order.discharge(kRun, 100, true), 0);
+    EXPECT_EQ(trace, (std::vector<std::string>{"event_wait"}));
+    EXPECT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(fence.retire(kRun), 0);
+    EXPECT_EQ(order.release(), 0);
+    EXPECT_EQ(destroyed, 2);
+}
+
+TEST_F(CallerOrderTest, CallerCpuPartialForkDrainsEachDistinctStreamOnce) {
+    caller = cpu;
+    ASSERT_EQ(fence.arm(kRun), 0);
+    ASSERT_EQ(order.arm(kRun, caller, cpu, core), 0);
+    LaunchProgressSink sink;
+    fail_at = 1;
+    EXPECT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        -77
+    );
+    EXPECT_TRUE(sink.submitted());
+    trace.clear();
+    sync_error = -88;
+    EXPECT_EQ(order.discharge(kRun, 100), -88);
+    EXPECT_EQ(trace, (std::vector<std::string>{"sync caller", "sync private"}));
+    EXPECT_NE(order.retire(kRun), 0);
+    EXPECT_NE(order.release(), 0);
+    sync_error = 0;
+    EXPECT_EQ(order.discharge(kRun, 100), 0);
+    EXPECT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(fence.retire(kRun), 0);
+}
+
+TEST_F(CallerOrderTest, CallerCpuFailedTailRetainsTheOrderUntilDrain) {
+    caller = cpu;
+    ASSERT_EQ(fence.arm(kRun), 0);
+    ASSERT_EQ(order.arm(kRun, caller, cpu, core), 0);
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    publish_whole_boundary();
+    operation = 0;
+    fail_at = 1;
+    EXPECT_EQ(order.join(kRun, fence), -77);
+    EXPECT_EQ(order.poll(kRun), RunCallerOrder::Completion::Unfenced);
+    sync_error = -88;
+    EXPECT_EQ(order.discharge(kRun, 100), -88);
+    EXPECT_NE(order.retire(kRun), 0);
+    sync_error = 0;
+    EXPECT_EQ(order.discharge(kRun, 100), 0);
+    EXPECT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(fence.retire(kRun), 0);
 }
 
 TEST_F(CallerOrderTest, AbandonAfterFenceQuarantineMakesNoDeviceCalls) {

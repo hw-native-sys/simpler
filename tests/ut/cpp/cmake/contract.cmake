@@ -70,6 +70,24 @@ function(simpler_ut_includes arch runtime tier out_var)
         message(FATAL_ERROR "No such runtime tree: ${_rt}")
     endif()
     set(_dirs "${_rt}/orchestration")
+    if(arch STREQUAL "a5" AND runtime STREQUAL "tensormap_and_ringbuffer")
+        get_property(_pto_root GLOBAL PROPERTY SIMPLER_UT_PTO_ISA_ROOT)
+        if(NOT _pto_root)
+            find_package(Python3 COMPONENTS Interpreter REQUIRED)
+            execute_process(
+                COMMAND "${Python3_EXECUTABLE}" -c
+                    "from simpler_setup.pto_isa import ensure_pto_isa_root; print(ensure_pto_isa_root())"
+                WORKING_DIRECTORY "${SIMPLER_REPO_ROOT}"
+                OUTPUT_VARIABLE _pto_root
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _pto_result)
+            if(NOT _pto_result EQUAL 0)
+                message(FATAL_ERROR "Failed to resolve pinned PTO-ISA headers")
+            endif()
+            set_property(GLOBAL PROPERTY SIMPLER_UT_PTO_ISA_ROOT "${_pto_root}")
+        endif()
+        list(APPEND _dirs "${_pto_root}/include")
+    endif()
     # Only host_build_graph splits out a host/ directory.
     if(IS_DIRECTORY "${_rt}/host")
         list(APPEND _dirs "${_rt}/host")

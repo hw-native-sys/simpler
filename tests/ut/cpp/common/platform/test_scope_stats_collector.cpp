@@ -16,7 +16,13 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,10 +32,21 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
+
+namespace profiling_common {
+
+struct ProfilerBaseTestPeer {
+    static bool management_running(const ScopeStatsCollector &collector) {
+        return collector.mgmt_running_.load(std::memory_order_acquire);
+    }
+};
+
+}  // namespace profiling_common
 
 namespace {
 
-void *test_alloc(size_t size) { return std::calloc(1, size); }
+void *test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int test_free(void *ptr) {
     std::free(ptr);
@@ -158,6 +175,87 @@ uint64_t published_buffer_at(void *shm, uint32_t index) {
 }
 
 }  // namespace
+
+TEST(ScopeStatsCollectorTest, DeviceFailureJoinsReadersWithoutDrainingPendingDeviceQueue) {
+    for (const bool host_handed : {false, true}) {
+        SCOPED_TRACE(host_handed);
+        ScopeStatsCollector collector;
+        ASSERT_EQ(collector.init(1, test_alloc, nullptr, test_free, 0), 0);
+        void *shm = collector.get_scope_stats_shm_device_ptr();
+        auto *header = get_scope_stats_header(shm);
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool release_threads = false;
+        size_t entered = 0;
+        collector.start([&](std::function<void()> body) {
+            return std::thread([&, body = std::move(body)] {
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    ++entered;
+                    changed.notify_all();
+                    changed.wait(lock, [&] {
+                        return release_threads;
+                    });
+                }
+                body();
+            });
+        });
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            EXPECT_TRUE(changed.wait_for(lock, std::chrono::seconds(5), [&] {
+                return entered == 3;
+            }));
+        }
+        // The real producer leaves a valid ready entry. None of the real host
+        // readers can consume it until the fatal stop has closed device draining.
+        if (host_handed) {
+            set_platform_run_result(0, 81);
+            set_scope_stats_enabled(true);
+            set_platform_scope_stats_base(reinterpret_cast<uint64_t>(shm));
+            scope_stats_aicpu_set_orch_thread_idx(0);
+            scope_stats_set_pending_site("host_handed.cpp", 101);
+            scope_stats_begin(0, 1, 2, 1024, 2048, 1, 2, 3);
+            scope_stats_aicpu_flush_buffers();
+            ScopeStatsReadyQueueEntry entry{};
+            using Algorithms = profiling_common::ProfilerAlgorithms<ScopeStatsModule>;
+            auto *host_header = get_scope_stats_header(collector.manager().shared_mem_host());
+            EXPECT_TRUE(Algorithms::try_peek_aicpu_entry(collector.manager(), host_header, 0, entry, true));
+            EXPECT_EQ(
+                Algorithms::process_entry(collector.manager(), host_header, 0, entry, nullptr, false),
+                profiling_common::EntryOutcome::kDelivered
+            );
+            EXPECT_EQ(collector.total_collected(), 0u);
+            scope_stats_end(0, 1, 3, 1024, 3072, 1, 3, 4);
+            scope_stats_aicpu_flush_buffers();
+        } else {
+            produce_run(81, shm, 1, "failed_device.cpp");
+        }
+        const uint32_t head = header->queue_heads[0];
+        const uint32_t tail = header->queue_tails[0];
+        EXPECT_NE(head, tail);
+        bool stop_seen = false;
+        std::thread release_after_stop([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (profiling_common::ProfilerBaseTestPeer::management_running(collector) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            stop_seen = !profiling_common::ProfilerBaseTestPeer::management_running(collector);
+            std::lock_guard<std::mutex> lock(mutex);
+            release_threads = true;
+            changed.notify_all();
+        });
+        collector.stop_for_device_failure();
+        release_after_stop.join();
+        EXPECT_TRUE(stop_seen);
+        EXPECT_EQ(header->queue_heads[0], head) << "fatal stop read and consumed a device-owned queue";
+        EXPECT_EQ(header->queue_tails[0], tail);
+        EXPECT_EQ(collector.total_collected(), host_handed ? 1u : 0u);
+        // This CPU provider still owns valid backing. Its ordinary cleanup runs
+        // only after the no-drain assertion; no physical-device proof is claimed.
+        collector.finalize(nullptr, test_free);
+    }
+}
 
 TEST(ScopeStatsRunIdentityTest, LaggingConsumerKeepsEachRunsTailBufferIntact) {
     ScopeStatsCollector collector;

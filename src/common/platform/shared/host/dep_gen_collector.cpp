@@ -36,6 +36,18 @@
 #include "host/profiling_copy.h"
 #include "../../../worker/runtime_c_api.h"
 
+void DepGenCollector::stop_for_device_failure() {
+    stop_writer();
+    profiling_common::ProfilerBase<DepGenCollector, DepGenModule>::stop(false);
+}
+
+void DepGenCollector::abandon_after_device_reset() {
+    terminal_banks_.abandon_after_device_reset();
+    abandon_memory_after_device_reset();
+    shm_dev_ = nullptr;
+    initialized_ = false;
+}
+
 DepGenCollector::~DepGenCollector() {
     // The writer outlives the collector threads, so it is joined here too: a
     // joinable thread left behind at destruction terminates the process.

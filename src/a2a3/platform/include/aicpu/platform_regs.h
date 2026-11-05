@@ -148,12 +148,6 @@ void platform_signal_aicore_exit(uint64_t reg_addr);
  */
 uint64_t platform_aicore_exit_deadline();
 
-// Quiesce a core whose COND the caller has already observed as EXITED: dispatch
-// back to idle, fast path closed, and the posted close read back so it is
-// complete. Issues no fence of its own — a caller closing several windows owes
-// one rmb() after the last call and before it publishes any return gate.
-void platform_close_aicore_window(uint64_t reg_addr);
-
 struct AicoreTeardownControl;
 
 struct AicoreExitTarget {
@@ -170,6 +164,9 @@ struct AicoreExitTarget {
 // values against one shared deadline. Close/read back every acknowledged
 // window, drain the closes, then release only those cores. An unacknowledged
 // core is neither closed nor released; it remains owned by host recovery.
+// ACK arriving after return does not run another close/release pass. A failed
+// group remains retained until device-owner recovery proves it safe to retire;
+// repeating a kernel or publishing another request is not that proof.
 //
 // `released`, when non-null, receives one flag per target on every return,
 // including rejection. A count above PLATFORM_MAX_CORES is rejected and only

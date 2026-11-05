@@ -1,11 +1,12 @@
 # Installation and Runtime Environment
 
-> **Disclaimer**: due to scarce hardware resources, this repository **only
-> tracks and supports the two environments listed below** (A3 and A5).
-> Other driver / CANN versions may work, but they are outside our CI and
-> day-to-day validation, and issues against them will not be supported.
+> **Validation scope**: the environments below are the repository's routine
+> installation and CI baselines. Other driver/toolkit combinations require their
+> own validation. The framework test profile admits CANN 9.0 and newer version
+> lines; admission is separate from measured compatibility. See the
+> [framework environment contract](ci.md).
 
-## Supported Environments
+## CI Baselines
 
 A3 and A5 run **different CANN releases** (A3 on 9.0.0 community,
 A5 on 9.1.T500), and the NPU drivers are two separate releases as well.

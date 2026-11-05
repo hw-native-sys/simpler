@@ -66,6 +66,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 namespace runs = simpler::dfx::runs;
@@ -79,7 +80,7 @@ constexpr uint64_t kSecondRun = 7200;
 /** An identity no collector here was ever asked about. */
 constexpr uint64_t kForeignRun = 7999;
 
-void *settle_alloc(size_t size) { return std::calloc(1, size); }
+void *settle_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int settle_free(void *ptr) {
     std::free(ptr);

@@ -40,6 +40,12 @@ struct MpiDirectOutboundFrame {
     std::vector<uint8_t> frame;
 };
 
+struct MpiDirectSessionSnapshot {
+    bool closed{false};
+    std::string terminal_error;
+    std::vector<int32_t> unavailable_workers;
+};
+
 class MpiDirectTransportHub {
 public:
     explicit MpiDirectTransportHub(size_t max_pending_frame_bytes);
@@ -56,6 +62,7 @@ public:
     bool terminal() const;
     bool all_routes_shutdown() const;
     std::string terminal_error() const;
+    MpiDirectSessionSnapshot session_snapshot() const;
 
 private:
     friend class MpiDirectTransport;

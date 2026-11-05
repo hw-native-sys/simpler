@@ -22,7 +22,7 @@
  *   - Device lifecycle: `bind_current_thread`, `attach_current_thread`,
  *     `adopt_borrowed_device`, `configure_aicore_op_timeout`,
  *     `ensure_device_initialized`,
- *     `ensure_binaries_loaded`, persistent AICPU/AICore streams,
+ *     `ensure_aicpu_runtime_registered`, persistent AICPU/AICore streams,
  *     dispatcher/executor bytes, `LoadAicpuOp`, `KernelArgsHelper`.
  *   - block_dim resolution: `query_max_block_dim`, `resolve_block_dim`.
  *   - Debug: `print_handshake_results`, `create_thread`.
@@ -47,6 +47,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -257,6 +258,10 @@ public:
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
     );
     void release_native_run_reservation(const void *owner);
+    void release_native_run_observation(const void *owner);
+    bool owns_native_run_observation(const void *owner) const;
+    bool
+    retire_run_workspace(uint32_t slot, uint64_t run_epoch, bool retain_host_outputs, void **retired_unmanaged_staging);
     bool native_runs_outstanding() const;
 
     /**
@@ -326,6 +331,10 @@ public:
     /** True only after simpler_init succeeds and before teardown begins. */
     bool program_initialized() const { return program_initialized_; }
     void set_program_initialized(bool initialized) { program_initialized_ = initialized; }
+    const char *initialization_error() const {
+        return initialization_error_.empty() ? nullptr : initialization_error_.c_str();
+    }
+    void clear_initialization_error() { initialization_error_.clear(); }
 
     /** Context-lifetime streams and events, live only in kernel mode. */
     KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
@@ -976,23 +985,9 @@ public:
     int adopt_borrowed_device(int device_id);
 
     /**
-     * One-shot device initialization. Performs, in order:
-     *   1. attach_current_thread on device_id_
-     *   2. rtStreamCreate for AICPU + AICore streams (persistent, freed
-     *      by the subclass `finalize_impl()`).
-     *   3. Bootstrap the dispatcher + register the inner AICPU SO via
-     *      `ensure_binaries_loaded()`.
-     *   4. Provision the requested async-DMA workspaces via
-     *      `ensure_dma_workspace_provisioned()`.
-     *   5. Launch `simpler_aicpu_init` via `ensure_aicpu_init_launched()`,
-     *      which publishes step 4's addresses along with the other resident
-     *      invariants. Step 4 precedes it so that publication is one launch.
-     *   6. Warm the SDMA control path via `ensure_dma_workspace_warmed()`,
-     *      which needs both the live workspace and the AICore stream.
-     *
-     * Called from `simpler_init` after executor + dispatcher bytes and the
-     * async-DMA request have been cached on the runner. Idempotent: each step
-     * short-circuits on its own guard.
+     * Ensure the execution environment is usable on the calling thread.
+     * Program mode attaches the thread and initializes missing resources;
+     * kernel mode only validates the borrowed context and completed cold init.
      *
      * @return 0 on success, error code on failure.
      */
@@ -1026,7 +1021,7 @@ public:
      * when the caller provided a dispatcher path; the eager
      * `ensure_device_initialized()` in simpler_init hands the buffer to
      * `LoadAicpuOp::BootstrapDispatcher` at init time. Leaving this
-     * unset (empty buffer) makes `ensure_binaries_loaded()` fail with a
+     * unset (empty buffer) makes `ensure_aicpu_runtime_registered()` fail with a
      * clear message — callers that drive `_ChipWorker.init` directly
      * without a dispatcher path get a deterministic error at
      * `simpler_init` time rather than a confusing dladdr-derived path.
@@ -1082,20 +1077,18 @@ public:
     };
 
     /**
-     * This slot's last completed run's device timing. A slot's result is written
-     * by `read_device_wall_ns(slot)` at drain and consumed by finalize; the slot
-     * is not handed to another run in between, which is what makes the result
-     * this run's own. Returns a zeroed record before the slot has run, or when
-     * capture is off.
+     * This slot's last completed run's device timing. Physical retirement reads
+     * and emits it before releasing the execution slot; a late observer does
+     * not consume the successor's timing. Returns a zeroed record before the
+     * slot has run, or when capture is off.
      */
     const DeviceRunTiming &device_run_timing(uint32_t pipeline_slot) const;
 
     /**
      * Mark this slot's timing result consumed, so the slot may be armed again.
-     * Called by finalize on every path that ends a run, emitted or not: a run
-     * that never launched still owns its slot. Re-arming a slot that is still
-     * armed means a successor took storage whose result nobody read, and
-     * preparation refuses timing for that slot rather than overwriting it.
+     * Physical retirement consumes timing before slot reuse; finalization
+     * consumes it only when execution resources have not already retired.
+     * Preparation refuses to overwrite an armed slot.
      */
     void release_device_run_timing(uint32_t pipeline_slot);
 
@@ -1165,20 +1158,17 @@ public:
      * Absent carries no verdict. A producer attaches a payload only to a
      * failure, so a successful run, a run that reported no detail and a run
      * that never reached its publish point — one the op-execute watchdog
-     * reaped, say — all read as absent here. Whether the run succeeded is
-     * `device_run_terminal`'s answer, and it must not be inferred from the
-     * presence or absence of this payload, nor answered by reading shared
-     * device state, which by then may belong to a successor.
+     * reaped, say — all read as absent here. This payload and the cached terminal
+     * describe diagnostic claims; the explicit stream observer supplies the
+     * execution verdict. Shared device state may already belong to a successor.
      */
     const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
 
     /**
      * Copy this slot's result region into the host-side copy `device_run_result`
-     * and `device_run_terminal` read. Call after the run's own completion
-     * boundaries: what makes the record this run's rather than a successor's is
-     * that its device side published it before its kernel returned, so this read
-     * itself races nothing — the slot is not handed on until the run holding it
-     * finalizes.
+     * and `device_run_terminal` read. Public wait/finalize requests this only
+     * for error detail after the stream observer fails. The live call retains
+     * its original result allocation independently of execution-slot reuse.
      *
      * One read per run. A repeat call for an epoch already read is a no-op, so
      * every later consumer sees the same bytes and no path pays a second D2H —
@@ -1199,14 +1189,15 @@ public:
      * transfer happened.
      */
     int read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+    void release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved);
 
     /**
      * What this slot's cached region says about the run whose epoch is
      * `run_epoch`: succeeded, failed with the runtime's own signed code, or
      * undecided with the reason.
      *
-     * This is the run's execution outcome only. It does not say the device is
-     * healthy and it does not say the run's resources are retirable — a device
+     * This interprets the cached record, not the explicit stream verdict. It
+     * does not say the device is healthy or the resources are retirable — a device
      * can publish a failure and keep tearing down. Quiescence comes from the
      * run's completion boundaries and its outstanding wait references.
      */
@@ -1435,6 +1426,27 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
+     * Which device-side scheduler the most recent bind selected, as a
+     * SCHEDULER_RUNTIME_MODE_* value, or 0 when no bind has published one.
+     *
+     * Latched rather than read back from the runtime: the launch descriptor's
+     * copy is cleared when a run releases its bindings, so by the time a caller
+     * could look it is already 0. Never cleared here — a later bind overwrites
+     * it, and `scheduler_mode_publish_count()` is what distinguishes "this bind
+     * chose again" from "nothing has changed since the last one".
+     */
+    uint32_t last_scheduler_runtime_mode() const {
+        return last_scheduler_runtime_mode_.load(std::memory_order_relaxed);
+    }
+    size_t scheduler_mode_publish_count() const {
+        return scheduler_mode_publish_total_.load(std::memory_order_relaxed);
+    }
+    void record_scheduler_runtime_mode(uint32_t mode) {
+        last_scheduler_runtime_mode_.store(mode, std::memory_order_relaxed);
+        scheduler_mode_publish_total_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /**
      * Number of run stream generations this runner has created. AICPU streams
      * belong to pipeline slots, while an AICore stream is reused only for the
      * same AICore image. Arches whose runs use the persistent pair report 0.
@@ -1456,8 +1468,8 @@ public:
      * simpler_register_callable(): launches `simpler_aicpu_register_callable` with a
      * RegisterCallableArgs descriptor so the AICPU dlopens the callable's
      * orch SO. Host-orchestration callables are a no-op. On success, AICPU has
-     * populated orch_so_table_[callable_id] and subsequent runs only need to
-     * stamp the active callable_id.
+     * populated orch_so_table_[callable_id]; a later run validates that the
+     * active callable_id names this registered entry.
      */
     int launch_device_register(int32_t callable_id);
 
@@ -1497,6 +1509,14 @@ public:
      * safe to release normally.
      */
     bool accepts_new_run() const { return device_admits_new_run(!can_accept_run(), device_health_); }
+
+    /**
+     * Stop admission when submitted work has no completion proof. This path
+     * needs no current device/context and performs no RTS operation. The arch
+     * flag is set before fallible host bookkeeping; only owner recovery may
+     * retire it. The default is for runners with no device state.
+     */
+    virtual void mark_device_unusable(int /*runtime_rc*/) {}
 
     /**
      * An AICore launch or stream sync failed outside the per-run path. The arch
@@ -1542,6 +1562,7 @@ public:
             dfx(DfxRunConfig::from(config_in)),
             scope_stats_capacity(runtime_in.scope_stats_capacity()),
             pipeline_slot(pipeline_slot_in) {
+            kernel_args.set_entry_cache_epoch(identity.run_epoch);
             // Device publication and host export share one resolved selection.
             runtime_in.dev.pmu_event_type = dfx.pmu_enabled ? static_cast<uint32_t>(dfx.pmu_event_type) : 0;
         }
@@ -1558,12 +1579,16 @@ public:
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
             streams(std::exchange(other.streams, RunStreams{})),
+            stream_lifetime(std::move(other.stream_lifetime)),
             artifact_identity(other.artifact_identity),
             caller_stream(std::exchange(other.caller_stream, nullptr)),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
-            join(other.join) {}
+            join(other.join),
+            physical_complete(other.physical_complete),
+            retirement_diagnostics_rc(other.retirement_diagnostics_rc),
+            scheduler_runtime_mode(other.scheduler_runtime_mode) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
         NativeRunIdentity identity{};
@@ -1587,10 +1612,11 @@ public:
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
         // Bound before publication under the execution claim, unchanged through
-        // retirement. Handles are borrowed: A2/A3's pair retains submitted owners;
-        // A5's runner owns its streams until all runs retire. Neither preparation
-        // nor moving this state transfers ownership of the streams themselves.
+        // retirement. The runner retains its Core stream and the caller owns
+        // an aliased CPU stream. Neither preparation nor moving this state
+        // transfers ownership of the streams themselves.
         RunStreams streams{};
+        std::shared_ptr<void> stream_lifetime;
         /**
          * This run's whole published identity, copied from its descriptor.
          *
@@ -1622,6 +1648,9 @@ public:
          * decided at prepare would by then name a run that is gone.
          */
         NativeRunJoin join{};
+        bool physical_complete{false};
+        int retirement_diagnostics_rc{0};
+        uint32_t scheduler_runtime_mode{0};
     };
 
     // Reads host-owned run/registration state before device recovery or cleanup.
@@ -1793,10 +1822,14 @@ public:
      * SIMPLER_NATIVE_RUN_POLL_* values.
      */
     virtual int poll_execution(const ActiveExecution &active) = 0;
+    // Releases execution resources only after a nonblocking last-use proof.
+    // The live call retains its original streams and result storage for wait.
+    virtual int retire_completed_execution(ActiveExecution &active) { return poll_execution(active); }
+    int wait_execution_completion(ActiveExecution &active);
 
     /**
-     * Wait for the launched run, publish DFX, and release its execution
-     * resources. Called on the child progress path that performed launch.
+     * Observe the actual streams, publish any remaining DFX, and retire proved
+     * execution resources. Semantic observation is separate from physical poll.
      *
      * Returns the device result and this run's diagnostics result separately;
      * see `DrainOutcome` for which of them a caller owes each of its own
@@ -1809,6 +1842,10 @@ public:
      * The public entry is non-virtual; subclasses implement finalize_impl().
      */
     int finalize();
+    bool terminal_reset_confirmed() const {
+        return terminal_close_generation_.has_value() && device_health_.generation() != *terminal_close_generation_;
+    }
+    void abandon_native_run_owners_after_reset();
 
     virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
 
@@ -2050,6 +2087,22 @@ public:
 protected:
     virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
 
+    /**
+     * Program-mode initialization: attach the calling thread, create persistent
+     * streams, query core limits, register the AICPU runtime, provision DMA,
+     * complete AICPU initialization, then warm DMA. Resources are reused on
+     * subsequent calls. Executor/dispatcher bytes and the DMA request must
+     * already be installed on the runner.
+     */
+    int initialize_program_device();
+
+    /**
+     * Kernel-mode validation: require dispatch admission, AICPU registration
+     * and completed initialization, then validate this thread's borrowed
+     * context. Creates no resources and does not bind a device.
+     */
+    int validate_kernel_context_ready();
+
     // Ctor is protected: this class is for inheritance only — direct
     // instantiation (`new DeviceRunnerBase()`) is a compile error. The
     // public virtual dtor above lets the shared c_api delete through a
@@ -2057,6 +2110,11 @@ protected:
     DeviceRunnerBase();
 
     virtual int finalize_impl() = 0;
+    void begin_fatal_close() {
+        if (!terminal_close_generation_.has_value()) terminal_close_generation_ = device_health_.generation();
+    }
+    void stop_shared_collectors_for_device_failure();
+    void abandon_shared_collectors_after_device_reset();
 
     /**
      * `DeviceArena` callback trampolines bridging from C-style
@@ -2153,36 +2211,36 @@ protected:
      * timeout may differ from the requested value due to hardware timer
      * granularity.
      */
-    void configure_aicore_op_timeout();
+    int configure_aicore_op_timeout();
 
     PersistentArgsOps persistent_args_ops();
     int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
 
     /**
-     * Load AICPU SO and initialize device args. Called from
-     * `ensure_device_initialized()` after the persistent streams are
-     * created. Reads `aicpu_so_binary_` / `dispatcher_so_binary_` off
-     * the runner; releases both host buffers on success.
+     * Deploy and register the AICPU runtime SO and resolve its entry handles.
+     * Requires a live control stream. Reads `aicpu_so_binary_` /
+     * `dispatcher_so_binary_` off the runner; releases both host buffers on
+     * success. Device-side initialization is a separate operation.
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_binaries_loaded(rtStream_t control_stream);
+    int ensure_aicpu_runtime_registered(rtStream_t control_stream);
 
     /**
-     * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
-     * device id, log config, provisioned async-DMA workspace addresses) into the
-     * resident AICPU SO globals. Idempotent via `aicpu_init_launched_`; called
-     * from `ensure_device_initialized()` after the binaries are loaded and the
-     * workspaces are provisioned, so one launch publishes everything.
+     * Run `simpler_aicpu_init` and wait for completion on the control stream.
+     * Latches the device id, log config and provisioned async-DMA workspace
+     * addresses into the resident AICPU SO globals. Requires registered AICPU
+     * entry handles; `aicpu_initialized_` is set only after synchronization
+     * succeeds.
      *
      * @return 0 on success, error code on failure.
      */
-    int ensure_aicpu_init_launched(rtStream_t control_stream);
+    int ensure_aicpu_initialized(rtStream_t control_stream);
 
     /**
      * Provision the async-DMA workspaces this Worker asked for (see
      * `set_dma_workspace_request`) and record their device addresses in
-     * `dma_workspace_addr_`, ready for `ensure_aicpu_init_launched()` to
+     * `dma_workspace_addr_`, ready for `ensure_aicpu_initialized()` to
      * publish. Idempotent: a runner that already holds a provider handle, and
      * one whose request declined the only declinable engine on a device that
      * supports nothing else, both no-op. The handle is released by
@@ -2193,7 +2251,7 @@ protected:
     int ensure_dma_workspace_provisioned();
 
     /**
-     * Walk the SDMA control path once, after `ensure_aicpu_init_launched()` has
+     * Walk the SDMA control path once, after `ensure_aicpu_initialized()` has
      * published the workspace addresses. No-op without a provisioned workspace.
      * One-shot via `sdma_warmed_`, which also releases the warmup ELF bytes.
      *
@@ -2342,30 +2400,18 @@ protected:
      * queues are the only remaining evidence, and a partial launch is not a
      * path that has a successor queued behind it.
      *
-     * A run the boundaries prove complete is additionally checked against the
-     * streams' sticky error state, which keeps what a whole-pair query used to
-     * report about a stream left in error. That check is not a device-exception
-     * detector; see `wait_run_fence`.
+     * Event completion is only a physical fact. It never caches a semantic
+     * result or reads a private terminal record.
      */
     int poll_run_fence(const PreparedExecution &prepared);
 
     /**
-     * Establish that this run finished and what the device made of it.
-     *
-     * Completion comes from the run's own boundaries, waited with the resolved
-     * stream-sync timeout and the event-timeout sentinel logged with the same
-     * (device, block_dim) context `sync_stream_pair` logs. A run no boundary
-     * covers has no such proof and falls back to the bounded whole-stream wait;
-     * expiry proves nothing about quiescence either way, so the caller's
-     * recover-or-mark-unusable policy still owns the non-zero rc.
-     *
-     * The device's verdict is then read from this run's own published record
-     * where that record decides it, and from a stream synchronize on every other
-     * shape — the only call on this SDK that produces one, see the measurement
-     * in the definition. So the branch a successful run takes touches neither
-     * stream of the pair, which is what lets a successor stay queued behind it.
+     * Observe this call's original stream pair under the resolved timeout.
+     * A zero return proves stream quiescence and success of that observation;
+     * a nonzero return alone proves neither. Private result data supplies only
+     * optional error detail after a failed stream observation.
      */
-    int wait_run_fence(const PreparedExecution &prepared);
+    int wait_run_fence(PreparedExecution &prepared);
 
     /**
      * Give up this run's arming. Idempotent and a no-op for a run that never
@@ -2435,6 +2481,7 @@ protected:
      * marked unusable and the first error is returned.
      */
     int discharge_boundary_waits(const PreparedExecution &prepared, bool boundaries_complete);
+    int poll_boundary_waits(const PreparedExecution &prepared);
 
     /** The same ladder from a path that cannot report, poisoning on failure. */
     void discharge_boundary_waits_noexcept(const PreparedExecution &prepared, bool boundaries_complete) noexcept;
@@ -2478,7 +2525,7 @@ protected:
      * H2D the Runtime struct via the supplied per-execution kernel arguments. Log config
      * and device ordinal are NOT published here: they are per-device invariants
      * latched once into the AICPU SO globals by `simpler_aicpu_init`
-     * (`ensure_aicpu_init_launched`) at device init, not carried per-run on
+     * (`ensure_aicpu_initialized`) at device init, not carried per-run on
      * KernelArgs.
      *
      * @return 0 on success, the underlying prepare/publish rc on failure.
@@ -2680,7 +2727,7 @@ protected:
      * a5's `rtDeviceReset`). Everything else lives here:
      *
      *   - rtStreamDestroy for both persistent streams
-     *   - aicore_bin_handle_ + binaries_loaded_ reset
+     *   - aicore_bin_handle_ + aicpu_runtime_registered_ reset
      *   - chip_callable_buffers_ free + clear
      *   - callables_ dlclose-on-hbg + clear + aicpu counter reset
      *   - 3 arenas release + cached size reset
@@ -2726,17 +2773,21 @@ protected:
      */
     void retire_loader_after_device_teardown(bool reset_confirmed) {
         if (execution_mode_latch_.is_kernel()) return;
-        if (!load_aicpu_op_.has_live_resources()) return;
-        if (reset_confirmed) {
-            LOG_WARN("finalize: device reset ended the generation of the retained AICPU binary handle; forgetting it");
-        } else {
-            LOG_ERROR(
-                "finalize: device reset did not complete and the AICPU binary handle is still retained; forgetting it "
-                "without unloading — the binary may still be resident, and no further call is issued against this "
-                "device"
-            );
+        if (load_aicpu_op_.has_live_resources()) {
+            if (reset_confirmed) {
+                LOG_WARN("finalize: reset retired the retained AICPU registration; forgetting its handles");
+            } else {
+                LOG_ERROR("finalize: reset is unconfirmed; abandoning AICPU handles without another device call");
+            }
+            load_aicpu_op_.ForgetWithoutUnload();
         }
-        load_aicpu_op_.ForgetWithoutUnload();
+        if (common_cleanup_pending_) {
+            // Program's existing tail attempted its reset after common cleanup
+            // failed. No individual device release is legal past that boundary,
+            // including when the reset itself failed. Clear only bookkeeping.
+            (void)abandon_common_after_device_failure();
+            mark_teardown_unresolved();
+        }
     }
 
     void release_graph_definition_staging();
@@ -2778,16 +2829,11 @@ protected:
     int finalize_common_impl(bool abandon_device_resources);
 
     /**
-     * Stamp the active callable_id onto a Runtime so the AICPU knows which
-     * orch_so_table_ slot to dispatch. The orch SO itself was already delivered
-     * device-side at register time (launch_device_register), so nothing else
-     * needs rewriting per run.
-     *
-     * @param runtime  Runtime whose active callable_id will be set.
-     * @return 0 on success, non-zero on failure.
+     * Validate the callable selected by bind against this runner's registry.
+     * Registration owns the orchestration code: host-side for HBG and
+     * device-side for TMR. This check neither loads code nor changes Runtime.
      */
-    int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
+    int validate_active_callable(const Runtime &runtime) const;
 
     // ---- Group D state shared by both a2a3 and a5 -------------------------
     //
@@ -2857,7 +2903,7 @@ protected:
     // was created with SDMA enabled.
     void *dma_workspace_handle_{nullptr};
     // Provisioned async-DMA workspace device addresses, indexed by
-    // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_init_launched()
+    // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_initialized()
     // so the resident AICPU SO latches them into g_dma_workspace_addr; the
     // scheduler prefills each core's GlobalContext from there. All-zero until a
     // Worker opts into SDMA via set_dma_workspace_request().
@@ -2879,6 +2925,9 @@ protected:
     // Same re-register semantics as `aicpu_dlopen_total_`, but for hbg
     // variants.
     size_t host_dlopen_total_{0};
+    // Written on the bind path, read by the caller's thread.
+    std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
+    std::atomic<size_t> scheduler_mode_publish_total_{0};
     struct NativeRunReservation {
         const void *owner{nullptr};
         uint32_t pipeline_slot{0};
@@ -2887,6 +2936,8 @@ protected:
     };
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
+    std::unordered_set<const void *> native_run_observations_;
+    std::optional<uint64_t> terminal_close_generation_;
     struct NativeRunClaim {
         const void *owner{nullptr};
         NativeRunIdentity identity{};
@@ -2933,6 +2984,7 @@ protected:
     TeardownProof teardown_proof_{TeardownProof::NotAttempted};
     ExecutionModeLatch execution_mode_latch_;
     bool program_initialized_{false};
+    bool common_cleanup_pending_{false};
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
@@ -2948,6 +3000,9 @@ protected:
     uint32_t max_cube_cores_{0};
     uint32_t max_vector_cores_{0};
     HostRuntimeTimeoutConfig timeout_config_{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS};
+    // Owned execution retains the first configuration result until device close.
+    int timeout_configuration_rc_{PTO_RUNTIME_ERR_INVALID_STATE};
+    std::string initialization_error_;
 
     // Executor binaries — populated once via `set_executors()` during
     // simpler_init. `aicore_kernel_binary_` is consumed once by
@@ -2958,7 +3013,7 @@ protected:
     // another device-side copy of the ELF and quickly exhaust HBM
     // (manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with
     // a 507899 cascade at `rtStreamCreate`). `aicpu_so_binary_` is
-    // released by `ensure_binaries_loaded()` after bootstrap;
+    // released by `ensure_aicpu_runtime_registered()` after bootstrap;
     // bootstrap is the only consumer and per-task launches go through
     // the cached `rtFuncHandle` on `LoadAicpuOp`, not the host bytes.
     std::vector<uint8_t> aicpu_so_binary_;
@@ -2976,10 +3031,10 @@ protected:
     void *sdma_warmup_bin_handle_{nullptr};
     // Dispatcher SO bytes — populated once via `set_dispatcher_binary()`
     // during simpler_init. Consumed exclusively by
-    // `BootstrapDispatcher` on the first run and released by
-    // `ensure_binaries_loaded()` right after. Empty buffer is permitted
+    // `BootstrapDispatcher` during initialization and released by
+    // `ensure_aicpu_runtime_registered()` right after. Empty buffer is permitted
     // at init time (callers that drive `ChipWorker.init` without a
-    // dispatcher path); `ensure_binaries_loaded()` then fails fast
+    // dispatcher path); `ensure_aicpu_runtime_registered()` then fails fast
     // with a clear message if/when bootstrap is actually attempted.
     std::vector<uint8_t> dispatcher_so_binary_;
 
@@ -3008,10 +3063,10 @@ protected:
     // base and dropped by that allocation's free, which is what keeps a cached
     // host VA from outliving its pages.
     ChildMemoryHostViewCache child_memory_host_views_;
-    // Retained temporary buffer for device arguments, one per pipeline slot
-    // (see HostApi get/set_retained_temp_buffer). Just a remembered
-    // {addr, size} that the slot reuses across its runs and finalize frees;
-    // the grow/slice logic lives in utils/retained_temp_bump.h.
+    // Current staging block for each pipeline slot. A physically retired call
+    // with pending HOST outputs retains its original block through workspace
+    // references after this alias detaches. The grow/slice logic lives in
+    // utils/retained_temp_bump.h.
     RunResourceSlots<void *> retained_temp_addrs_;
     RunResourceSlots<std::size_t> retained_temp_sizes_;
     // One pipeline slot's Graph Definition staging: host bytes the recorders
@@ -3135,10 +3190,8 @@ protected:
         RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
         RunResourceSlots<bool>::Storage device_timing_armed;
         RunResourceSlots<void *>::Storage device_run_result_dev_ptrs;
-        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
         RunResourceSlots<bool>::Storage device_run_result_initialized;
         RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
-        RunRecordReadLedger::Storage device_run_result_reads;
         RunBoundaryLedger::Storage run_boundaries_observed;
         QueuedStreamWaits::Storage queued_waits;
         RunBoundaryMarks::Storage boundary_marks;
@@ -3239,7 +3292,7 @@ protected:
     PrebuiltRuntimeArenaCache prebuilt_runtime_arena_cache_;
 
     // Persistent AICPU / AICore streams created in
-    // `ensure_device_initialized()` and torn down in the subclass's
+    // `initialize_program_device()` and torn down in the subclass's
     // `finalize()`. A2A3 reserves these for bootstrap/control operations and
     // submits runs on its own per-slot stream sets; A5 submits runs on these.
     // `nullptr` before init.
@@ -3291,17 +3344,20 @@ protected:
     // Preparation cannot overwrite an armed slot. Failed publication leaves it
     // unarmed, so readback cannot misattribute a predecessor's timing.
     RunResourceSlots<bool> device_timing_armed_;
-    // One result region per pipeline slot: the device address handed to that
-    // slot's runs, and the host's copy of what the last such run published. Not
-    // gated on diagnostics — an error result must survive with capture off.
+    // Each live call owns its original result address and optional host read.
+    // An idle current-slot allocation is retained for sequential reuse.
+    struct RunResultStorage {
+        uint32_t pipeline_slot{UINT32_MAX};
+        void *device_ptr{nullptr};
+        DeviceRunResultRegion region{};
+        RunRecordRead read{RunRecordRead::NotAttempted};
+        int transfer_rc{0};
+        bool initialized{false};
+    };
+    // Owned by the live call, independently of its reusable execution slot.
+    std::unordered_map<uint64_t, RunResultStorage> run_result_storage_;
+    mutable std::mutex run_result_mu_;
     RunResourceSlots<void *> device_run_result_dev_ptrs_;
-    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
-    // Which run each cached copy was read for, and what that read left behind.
-    // Together they make the read once-per-run and keep the three read states
-    // apart: an empty copy read successfully is an absent record, an empty copy
-    // left by a failed D2H is no observation at all, and a slot with no region
-    // attempted no copy to lose.
-    RunRecordReadLedger device_run_result_reads_;
     // The boundary completion each run's own drain or poll observed, retained
     // because the drain's cleanup retires the fence that could otherwise be
     // asked. See host/run_evidence_retention.h.
@@ -3313,10 +3369,10 @@ protected:
     // epoch distinguishes it without another clear.
     RunResourceSlots<bool> device_run_result_initialized_;
 
-    // True after AICPU SO loaded; reset by the subclass's `finalize_impl()`.
-    bool binaries_loaded_{false};
-    // Per-device guard for the initial simpler_aicpu_init launch.
-    bool aicpu_init_launched_{false};
+    // AICPU runtime registration and entry handles are ready.
+    bool aicpu_runtime_registered_{false};
+    // The control stream has completed simpler_aicpu_init.
+    bool aicpu_initialized_{false};
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live

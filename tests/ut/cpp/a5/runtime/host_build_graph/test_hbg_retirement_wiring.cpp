@@ -66,6 +66,11 @@ void write_reg(uint64_t, RegId, uint64_t) {}
 // record whether this run's enable survived its tasks. No case here programs a
 // PMU window, so there is nothing for it to observe.
 uint64_t read_reg(uint64_t, RegId) { return 0; }
+uint64_t get_platform_regs() {
+    static std::array<uint64_t, PLATFORM_MAX_CORES> registers{};
+    return reinterpret_cast<uint64_t>(registers.data());
+}
+extern "C" int get_scheduler_timeout_ms() { return 0; }
 extern "C" bool is_dump_args_enabled() { return false; }
 // The shutdown partition settles its dump lane; this target links no args-dump
 // producer, and the stub above keeps either from being reached.
@@ -102,6 +107,14 @@ public:
     }
     static int32_t core_count(const AicoreLifecycle &lifecycle) { return lifecycle.core_count_; }
 
+    static void seed_discovered_cluster(AicoreLifecycle &lifecycle, const std::array<uint64_t, 3> &addrs) {
+        seed(lifecycle, addrs);
+        for (int i = 0; i < 3; ++i) {
+            lifecycle.cores_[i].core_type = i == 0 ? CoreType::AIC : CoreType::AIV;
+            lifecycle.cores_[i].physical_core_id = static_cast<uint32_t>(3 + 17 * i);
+        }
+    }
+
     static bool collect_pmu(AicoreLifecycle &lifecycle, Runtime *runtime, uint64_t *missing) {
         return lifecycle.collect_run_pmu_records(runtime, missing);
     }
@@ -135,9 +148,10 @@ struct MinimalSchedulerState {
         ctx->pmu_cells_offset = kCellsOffset;
         ctx->graph_task_count = 1;
         ctx->graph_storage_address = reinterpret_cast<uint64_t>(storage.data());
-        // One executable task with subtask slot 0 active.
+        // One executable task of one block with subtask slot 0 active.
         metadata()[0].flags = SCHEDULER_TASK_EXECUTABLE;
-        metadata()[0].active_mask = 1;
+        metadata()[0].active_mask = LaneMask::aic();
+        metadata()[0].logical_block_num = 1;
         metadata()[0].trace_index_base = 0;
         metadata()[0].kernel_ids[0] = 5;
         runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_READY, reinterpret_cast<uint64_t>(ctx));
@@ -236,6 +250,71 @@ TEST_F(HbgRetirementWiring, ConcurrentNormalAndEmergencyShutdownRetireEachCoreOn
     }
     EXPECT_EQ(target_count, kAddrs.size());
     EXPECT_EQ(claims, (std::array<int, 3>{1, 1, 1}));
+}
+
+struct DiscoveryProofState {
+    SchedulerRunControl run{};
+    SchedulerGraphSummary summary{};
+    std::array<SchedulerWorkerContext, 3> contexts{};
+    std::array<AicpuThreadLifecycleTrace, 1> traces{};
+
+    void bind(Runtime &runtime) {
+        runtime.set_worker_count(3);
+        runtime.dev.host_total_tasks = 0;
+        summary.worker_count = 3;
+        summary.cluster_count = 1;
+        for (uint64_t worker = 0; worker < contexts.size(); ++worker) {
+            auto &context = contexts[worker];
+            context.worker_index = worker;
+            context.scheduler_state_base_address = reinterpret_cast<uint64_t>(this);
+            context.run_control_offset = offsetof(DiscoveryProofState, run);
+            context.graph_summary_offset = offsetof(DiscoveryProofState, summary);
+            context.worker_contexts_offset = offsetof(DiscoveryProofState, contexts);
+            context.aicpu_lifecycle_traces_offset = offsetof(DiscoveryProofState, traces);
+            runtime.dev.workers[worker].aicpu_ready = 0;
+            runtime.dev.workers[worker].task = 0;
+        }
+        runtime.publish_scheduler_bootstrap(
+            SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(contexts.data())
+        );
+    }
+};
+
+TEST_F(HbgRetirementWiring, DiscoveryProofPrecedesEveryReadyReply) {
+    auto runtime = std::make_unique<Runtime>();
+    DiscoveryProofState state;
+    state.bind(*runtime);
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::seed_discovered_cluster(lifecycle, kAddrs);
+    ASSERT_EQ(lifecycle.post_handshake_init(runtime.get()), 0);
+    EXPECT_EQ(state.summary.topology_layout, SchedulerTopologyLayout::COMPACT_LAUNCH);
+    for (uint64_t worker = 0; worker < state.contexts.size(); ++worker) {
+        EXPECT_EQ(runtime->dev.workers[worker].aicpu_ready, 0u);
+        EXPECT_EQ(state.contexts[worker].worker_index, worker);
+        EXPECT_EQ(state.contexts[worker].cluster_worker_ids[0], 0u);
+        EXPECT_EQ(state.contexts[worker].cluster_worker_ids[1], 1u);
+        EXPECT_EQ(state.contexts[worker].cluster_worker_ids[2], 2u);
+    }
+    lifecycle.publish_context_partition(runtime.get(), 0);
+    for (uint64_t worker = 0; worker < state.contexts.size(); ++worker) {
+        EXPECT_EQ(runtime->dev.workers[worker].aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
+        EXPECT_EQ(runtime->dev.workers[worker].task, reinterpret_cast<uint64_t>(&state.contexts[worker]));
+    }
+}
+
+TEST_F(HbgRetirementWiring, InvalidCompactIdentityCannotPublishATopologyProof) {
+    for (uint64_t bad = 0; bad < 3; ++bad) {
+        auto runtime = std::make_unique<Runtime>();
+        DiscoveryProofState state;
+        state.bind(*runtime);
+        state.contexts[bad].worker_index = (bad + 1) % 3;
+        AicoreLifecycle lifecycle;
+        AicoreLifecycleTestPeer::seed_discovered_cluster(lifecycle, kAddrs);
+        EXPECT_EQ(lifecycle.post_handshake_init(runtime.get()), -1);
+        EXPECT_EQ(state.summary.topology_layout, SchedulerTopologyLayout::GENERAL);
+        for (uint64_t worker = 0; worker < 3; ++worker)
+            EXPECT_EQ(runtime->dev.workers[worker].aicpu_ready, 0u);
+    }
 }
 
 TEST_F(HbgRetirementWiring, ResidentShutdownSignalsAndRetiresTheSameGatedPartition) {

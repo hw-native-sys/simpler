@@ -121,19 +121,21 @@ runs:
           job_pids[$index]=""
         }
 
+        # Manual DFX cases run here whenever the Onboard scene job is selected.
+        # PR CI gates that job on architecture and scene-test changes; Daily runs it too.
         if [[ "$platform" == "a2a3" ]]; then
           start_job "dep_gen (tensormap_and_ringbuffer)" \
             tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
-            --enable-dep-gen
+            --manual include --enable-dep-gen
         else
           start_job "dep_gen" \
             tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
-            --enable-dep-gen
+            --manual include --enable-dep-gen
         fi
 
         start_job "chip_swimlane" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/chip_swimlane/" \
-          --enable-chip-swimlane --enable-dep-gen
+          --manual include --enable-chip-swimlane --enable-dep-gen
 
         if [[ "$platform" == "a5" ]]; then
           start_job "chip_swimlane (host_build_graph)" \
@@ -143,7 +145,7 @@ runs:
 
         start_job "PMU" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py" \
-          --enable-pmu 2
+          --manual include --enable-pmu 2
 
         # A second PMU job, and the only one that can see a counting window
         # stop. The smoke above runs microsecond-scale tasks, where the loss
@@ -167,7 +169,7 @@ runs:
         # they would become command substitution if it were ever unquoted.
         start_job "args_dump (full)" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py" \
-          --dump-args full
+          --manual include --dump-args full
 
         # The directory, not a named file: every case here needs --enable-dep-gen
         # to assert anything, so one this job does not select reports a pass
@@ -175,7 +177,7 @@ runs:
         # so neither is branched on.
         start_job "dep_gen (host_build_graph)" \
           "tests/st/$platform/host_build_graph/dfx/dep_gen/" \
-          --enable-dep-gen
+          --manual include --enable-dep-gen
 
         for index in "${!job_labels[@]}"; do
           wait_job "$index"

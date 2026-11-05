@@ -26,7 +26,8 @@ _NBYTES = _NUMEL * 4
 @pytest.mark.platforms(["a2a3sim", "a5sim", "a2a3", "a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(1)
-def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
+@pytest.mark.parametrize("cached", [False, True])
+def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids, cached):
     worker = Worker(
         level=3, platform=st_platform, runtime=_RUNTIME, device_ids=[int(st_device_ids[0])], num_sub_workers=0
     )
@@ -38,7 +39,7 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
         buffers=[CommBufferSpec("payload", "float32", _NUMEL, _NBYTES)],
         retain_after_run=True,
     )
-    saved = []
+    saved, cached_args = [], []
     try:
         worker.init()
         output = worker.create_buffer(_NBYTES)
@@ -47,26 +48,39 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids):
             domain = orch.get_or_allocate_domain(**request)
             orch.copy_to_domain(domain, 0, struct.pack(f"<{_NUMEL}f", *([35.0] * _NUMEL)), buffer="payload")
             saved.append(domain)
+            args = TaskArgs()
+            payload = domain.member(0).buffers["payload"]
+            for _ in range(2):
+                args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
+            args.add_tensor(output.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+            cached_args.append(args)
 
         worker.run(first)
         domain = saved[0]
 
         def second(orch, _args, cfg):
-            domain = orch.get_domain("tp")
+            domain = saved[0] if cached else orch.get_domain("tp")
             assert domain is saved[0]
             payload = domain.local_context(0).buffers["payload"]
             args = TaskArgs()
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(payload.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(output.tensor([_NUMEL], DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+            args = cached_args[0] if cached else args
             orch.submit_next_level(chip, args, cfg, worker=0)
-            resources = worker._building_run_resources
-            assert resources is not None and resources.live_domains.get("tp") is domain
-            assert resources.requires_ordered_cleanup
+            if not cached:
+                resources = worker._building_run_resources
+                assert resources is not None and resources.live_domains.get("tp") is domain
+                assert resources.requires_ordered_cleanup
+                domain.release()
+                assert domain.released and not domain.freed
+
+        run = worker.submit(second)
+        if cached:
+            assert run._resources.live_domains.get("tp") is domain and run._resources.requires_ordered_cleanup
             domain.release()
             assert domain.released and not domain.freed
-
-        worker.run(second)
+        run.wait()
         assert domain.freed
         assert struct.unpack_from(f"<{_NUMEL}f", output.shm.buf) == (70.0,) * _NUMEL
     finally:

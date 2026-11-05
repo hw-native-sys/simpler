@@ -121,19 +121,20 @@ inline void orch_profiling_mark_done() {
 // Only the host orchestrator reaches these sites, so only the Orch* half of HostPhaseKind
 // appears at them; the bind kinds never do.
 #define ORCH_PHASE_START() const uint64_t _orch_phase_t0 = host_phase_now_ns()
-#define ORCH_PHASE_END(phase, detail)                                                                         \
+#define ORCH_PHASE_END_WITH_INDEX(phase, detail, index)                                                       \
     do {                                                                                                      \
         host_phase_record(                                                                                    \
             _orch_phase_t0, host_phase_now_ns(), static_cast<uint32_t>(phase), static_cast<uint64_t>(detail), \
-            g_orch_submit_idx                                                                                 \
+            static_cast<uint32_t>(index)                                                                      \
         );                                                                                                    \
     } while (0)
+#define ORCH_PHASE_END(phase, detail) ORCH_PHASE_END_WITH_INDEX(phase, detail, g_orch_submit_idx)
 // For a phase that spans a submission rather than sitting inside one: the index
 // advances during the span, so the group is taken at the start or the record
 // files itself under the next submission.
-#define ORCH_PHASE_START_SPANNING() \
-    ORCH_PHASE_START();             \
-    const uint32_t _orch_phase_group = g_orch_submit_idx
+#define ORCH_PHASE_START_SPANNING(index) \
+    ORCH_PHASE_START();                  \
+    const uint32_t _orch_phase_group = static_cast<uint32_t>(index)
 #define ORCH_PHASE_END_SPANNING(phase, detail)                                                                \
     do {                                                                                                      \
         host_phase_record(                                                                                    \
@@ -143,10 +144,13 @@ inline void orch_profiling_mark_done() {
     } while (0)
 #else
 #define ORCH_PHASE_START()
+#define ORCH_PHASE_END_WITH_INDEX(phase, detail, index) \
+    do {                                                \
+    } while (0)
 #define ORCH_PHASE_END(phase, detail) \
     do {                              \
     } while (0)
-#define ORCH_PHASE_START_SPANNING()
+#define ORCH_PHASE_START_SPANNING(index)
 #define ORCH_PHASE_END_SPANNING(phase, detail) \
     do {                                       \
     } while (0)

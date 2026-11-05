@@ -8,17 +8,33 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import contextlib
+import ctypes
 import json
 import os
 import socket
 import struct
 import threading
 import time
-from typing import cast
+from dataclasses import replace
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
+from simpler import global_comm_domain as domain_wire
+from simpler import remote_l3_protocol as wire
 from simpler import remote_l3_session, remote_l3_worker
-from simpler.buffer import LocalEndpointBufferIdentityAllocator, create_host_shared_buffer, mint_owner_instance_id
+from simpler.buffer import (
+    BackendKind,
+    CanonicalIdentity,
+    LocalEndpointBufferIdentityAllocator,
+    buffer_reference,
+    create_host_shared_buffer,
+    mint_owner_instance_id,
+    remote_sidecar_tensor,
+    wrap_vmm_window,
+)
+from simpler.task_interface import DataType
 from simpler.worker import RunHandle, Worker, _RunResources, _SharedExclusiveLock
 
 
@@ -36,6 +52,56 @@ def _manifest(**extra):
     }
     manifest.update(extra)
     return manifest
+
+
+@pytest.mark.parametrize("command_fails", [False, True])
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_command_loop_preserves_runtime_error_and_collects_buffer_release_errors(
+    monkeypatch, command_fails, release_fails
+):
+    from simpler.remote_l3_protocol import ControlName, FrameHeader, FrameType  # noqa: PLC0415
+
+    command_error = RuntimeError("controller SLR3 frame identity mismatch")
+    release_error = RuntimeError("buffer release failed")
+    buffers = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
+    worker = Mock(create_buffer=Mock(side_effect=buffers))
+    requests = iter(
+        [SimpleNamespace(header=FrameHeader(FrameType.CONTROL, 1, 0, sequence), payload=b"") for sequence in (1, 2)]
+        + [command_error if command_fails else SimpleNamespace(header=FrameHeader(FrameType.SHUTDOWN, 1, 0, 0))]
+    )
+
+    def receive(_conn):
+        request = next(requests)
+        if isinstance(request, BaseException):
+            raise request
+        return request
+
+    released = []
+
+    def close(entry, **_kwargs):
+        released.append(entry.data)
+        if release_fails and entry.data is buffers[0]:
+            raise release_error
+
+    monkeypatch.setattr(remote_l3_session, "read_frame", receive)
+    monkeypatch.setattr(remote_l3_session, "send_frame", lambda *_args: None)
+    monkeypatch.setattr(
+        remote_l3_session,
+        "decode_control",
+        lambda _payload: SimpleNamespace(
+            control_name=ControlName.ALLOC_REMOTE_BUFFER, command_bytes=struct.pack("<Q", 8), control_version=1
+        ),
+    )
+    monkeypatch.setattr(remote_l3_session._RemoteBufferEntry, "close", close)
+    cleanup_errors = []
+    if command_fails:
+        with pytest.raises(RuntimeError) as raised:
+            remote_l3_session._run_command_loop(Mock(), _manifest(), worker, cleanup_errors=cleanup_errors)
+        assert raised.value is command_error
+    else:
+        remote_l3_session._run_command_loop(Mock(), _manifest(), worker, cleanup_errors=cleanup_errors)
+    assert released == buffers
+    assert cleanup_errors == ([release_error] if release_fails else [])
 
 
 def test_read_runner_ready_times_out_without_payload():
@@ -1055,3 +1121,170 @@ def test_session_scoped_buffer_entry_closes_its_own_backing():
 
     entry.close(unlink=True)
     assert buffer.shm is None
+
+
+@pytest.mark.parametrize("mutation", [None, "identity", "backend", "extent", "generation", "offset"])
+def test_remote_materializer_revalidates_borrowed_backing(mutation):
+    borrowed = wrap_vmm_window(0x12340000, 128, mint_owner_instance_id(), 7, owner_worker_id=0)
+    ordinary = create_host_shared_buffer(128, mint_owner_instance_id(), buffer_id=9)
+    reference = buffer_reference(borrowed)
+    changes = {
+        "identity": {"identity": CanonicalIdentity(mint_owner_instance_id(), 7, 1)},
+        "backend": {"backend_kind": BackendKind.VMM_WINDOW, "body": (0x12340000).to_bytes(8, "little")},
+        "extent": {"nbytes": 64},
+    }
+    entries = {
+        (1, 1): remote_l3_session._RemoteBufferEntry(
+            borrowed, 128, 1, wire.RemoteAddressSpace.REMOTE_DEVICE, borrowed_domain=(7, 1)
+        ),
+        (2, 1): remote_l3_session._RemoteBufferEntry(ordinary, 128, 1, wire.RemoteAddressSpace.REMOTE_DEVICE),
+    }
+    tensors = (
+        replace(reference, **changes.get(mutation, {})).tensor([32], DataType.UINT8, byte_offset=16),
+        remote_sidecar_tensor((32,), DataType.UINT8.value, 128, 0, 2, 1, ordinary.address_space, byte_offset=16),
+    )
+    desc = wire.RemoteTensorDesc(
+        wire.RemoteAddressSpace.REMOTE_DEVICE,
+        0,
+        1,
+        24 if mutation == "offset" else 16,
+        32,
+        0,
+        0,
+        2 if mutation == "generation" else 1,
+        0,
+        0,
+        0,
+    )
+    try:
+        with (
+            pytest.raises((ValueError, KeyError), match="registered descriptor|stale|byte_offset")
+            if mutation
+            else contextlib.nullcontext()
+        ):
+            args, inline = remote_l3_session._materialize_task_args(
+                wire.RemoteTaskArgsWire(
+                    tensors,
+                    (
+                        wire.RemoteTensorSidecar(True, desc),
+                        wire.RemoteTensorSidecar(True, replace(desc, buffer_id=2)),
+                    ),
+                    (42,),
+                    b"",
+                ),
+                entries,
+                0,
+                mint_inline_buffer=lambda _: pytest.fail("borrowed materialization allocated storage"),
+            )
+        if mutation is None:
+            assert inline == [] and args.tensor(0).buffer == borrowed.to_descriptor()
+            assert args.tensor(1).buffer == ordinary.to_descriptor()
+            assert (args.tensor(0).byte_offset, args.tensor(1).byte_offset, args.scalar(0)) == (16, 16, 42)
+            entries[(1, 1)].close(unlink=True)
+            assert not borrowed.closed
+    finally:
+        ordinary.close()
+
+
+@pytest.mark.parametrize("scenario", ["reuse", "conflict", "abort", "release", "missing", "reply"])
+def test_borrowed_session_commit_and_revocation(monkeypatch, scenario):
+    borrowed = wrap_vmm_window(0x12340000, 128, mint_owner_instance_id(), 7, owner_worker_id=0)
+    members = (domain_wire.GlobalDomainMember(0, 0, 0, 0),)
+    init = domain_wire.GlobalCommInitCommand("unit", "a" * 64, "sim", 0, 1, members)
+    command = domain_wire.GlobalDomainCommand(
+        domain_wire.GlobalDomainPhase.COMMIT,
+        7,
+        1,
+        "tp",
+        "sim",
+        128,
+        members,
+        (domain_wire.GlobalDomainBuffer("payload", 128),),
+        (domain_wire.GlobalDomainDescriptor(domain_wire.GLOBAL_DOMAIN_VERSION, 1, 0, 1, 4096, b"unit"),),
+        owner_instance_id=mint_owner_instance_id(),
+    )
+    releases, replies = [], {}
+
+    def commit(candidate):
+        if candidate != command:
+            raise ValueError("COMMIT differs from prepared domain")
+        if scenario == "missing":
+            raise ValueError("no registered backing")
+        return (borrowed,)
+
+    inner = SimpleNamespace(
+        _commit_global_domain_node=commit,
+        _release_global_domain_node=lambda _command, **_kwargs: releases.append(_command),
+    )
+    commands = {
+        "commit": (wire.ControlName.ALLOC_DOMAIN, domain_wire.encode_domain_command(command)),
+        "conflict": (wire.ControlName.ALLOC_DOMAIN, domain_wire.encode_domain_command(replace(command, name="other"))),
+        "abort": (
+            wire.ControlName.ALLOC_DOMAIN,
+            domain_wire.encode_domain_command(
+                replace(command, phase=domain_wire.GlobalDomainPhase.ABORT, descriptors=())
+            ),
+        ),
+        "release": (
+            wire.ControlName.RELEASE_DOMAIN,
+            domain_wire.encode_release_command(domain_wire.GlobalDomainReleaseCommand(7, 1)),
+        ),
+        "free": (wire.ControlName.FREE_REMOTE_BUFFER, struct.pack("<iQQ", 0, 1, 1)),
+        "copy_to": (wire.ControlName.COPY_TO_REMOTE, struct.pack("<iQQQQ", 0, 1, 1, 0, 4) + b"data"),
+        "copy_from": (wire.ControlName.COPY_FROM_REMOTE, struct.pack("<iQQQQ", 0, 1, 1, 0, 4)),
+        "export": (wire.ControlName.EXPORT_BUFFER, struct.pack("<iQQQQI", 0, 1, 1, 0, 4, 3) + struct.pack("<II", 0, 0)),
+    }
+    actions = {
+        "reuse": ["commit", "commit", "free", "copy_to", "copy_from", "export"],
+        "conflict": ["commit", "conflict", "copy_from", "commit"],
+        "abort": ["commit", "abort", "copy_from"],
+        "release": ["commit", "release", "copy_from"],
+        "missing": ["commit", "copy_from"],
+        "reply": ["commit", "copy_from"],
+    }[scenario]
+    controls = [(wire.ControlName.COMM_INIT, domain_wire.encode_comm_init(init))] + [
+        commands[action] for action in actions
+    ]
+    frames = [
+        SimpleNamespace(
+            header=wire.FrameHeader(wire.FrameType.CONTROL, 1, 0, sequence),
+            payload=struct.pack("<III", int(name), 1, len(payload)) + payload,
+        )
+        for sequence, (name, payload) in enumerate(controls, 1)
+    ]
+    frames.append(SimpleNamespace(header=wire.FrameHeader(wire.FrameType.SHUTDOWN, 1, 0, len(frames) + 1)))
+    frames = iter(frames)
+    interrupted = []
+
+    def send(_conn, header, payload):
+        if header.frame_type is wire.FrameType.CONTROL_REPLY:
+            _sequence, name, _version, error, size = struct.unpack_from("<QIIiI", payload)
+            if scenario == "reply" and not interrupted and name == wire.ControlName.ALLOC_DOMAIN and not error:
+                interrupted.append(True)
+                raise RuntimeError("reply interrupted")
+            replies[header.sequence] = error, payload[24 : 24 + size].decode(), payload[28 + size :]
+
+    monkeypatch.setattr(remote_l3_session, "read_frame", lambda _conn: next(frames))
+    monkeypatch.setattr(remote_l3_session, "send_frame", send)
+    for operation in ("memmove", "string_at"):
+        monkeypatch.setattr(remote_l3_session.ctypes, operation, lambda *_: pytest.fail("device address dereferenced"))
+    remote_l3_session._run_command_loop(
+        cast(Any, None), _manifest(cluster_id="unit", global_device_ranks=[0]), cast(Worker, inner)
+    )
+    results = [replies[sequence] for sequence in range(2, len(controls) + 1)]
+    assert not borrowed.closed
+    if scenario in ("missing", "reply"):
+        assert results[0][0] and results[1][0] and "unknown buffer" in results[1][1]
+    else:
+        refs = domain_wire.decode_domain_buffer_refs(results[0][2])
+        assert refs == ((buffer_reference(borrowed).to_descriptor(), 1, 1),)
+        if scenario in ("abort", "release"):
+            assert not results[1][0] and len(releases) == 1
+            assert results[2][0] and "unknown buffer" in results[2][1]
+        else:
+            repeated = 1 if scenario == "reuse" else 3
+            assert not results[repeated][0] and results[repeated][2] == results[0][2] and releases == []
+            assert all(
+                error and ("borrowed" in message or "differs" in message)
+                for error, message, _ in results[1:repeated] + results[repeated + 1 :]
+            )

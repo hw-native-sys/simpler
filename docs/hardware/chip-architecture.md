@@ -159,7 +159,10 @@ Properties:
   [cache-coherency.md](cache-coherency.md) for the COND / FIN
   protocol).
 - **Constraints**:
-  - Its own data cache, **not coherent** with host DMA writes — see
+  - Its own data cache: a2a3 retains maintenance for non-coherent Host DMA
+    and conservative SDMA reads; A5 GM accesses need no AICPU-side cache
+    clean/invalidate, and its cache helpers are empty. Callers supply
+    protocol ordering through barriers or acquire/release operations — see
     [cache-coherency.md](cache-coherency.md).
   - No virtual memory in the host sense; all GM addresses are physical
     handles supplied by the host via the `Runtime` struct.
@@ -219,8 +222,8 @@ A complete `Worker::run()` call traverses all three tiers:
    - a2a3: cache_invalidate_range over the Runtime descriptor (host DMA wrote it).
      The call sits in the executor's deinit, at the end of a run, so it precedes
      the *next* run's read — see cache-coherency.md
-   - a5: read the coherent Runtime header directly (a5 host_build_graph
-     nonetheless invalidates; unresolved, see cache-coherency.md)
+   - a5: read the coherent Runtime header directly; descriptor teardown
+     retains required completion ordering without cache clean/invalidate
    - reads task graph + buffer pointers
    - for each ready task, picks an idle AICore unit (AIC or AIV)
    - writes task descriptor to that unit over the on-chip bus

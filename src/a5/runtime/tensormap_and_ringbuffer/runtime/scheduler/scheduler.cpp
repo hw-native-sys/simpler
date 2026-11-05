@@ -186,8 +186,6 @@ void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, con
         detail.observed_available =
             cond != nullptr && cond->completion_type == COMPLETION_TYPE_COUNTER && cond->counter_addr != nullptr;
         if (detail.observed_available) {
-            uintptr_t line = reinterpret_cast<uintptr_t>(cond->counter_addr) & ~(uintptr_t(CHIP_ALIGN_SIZE) - 1u);
-            cache_invalidate_range(reinterpret_cast<const void *>(line), CHIP_ALIGN_SIZE);
             detail.observed_value = *cond->counter_addr;
         }
     };

@@ -10,6 +10,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -362,7 +363,7 @@ exec "$@"''',
     [
         ("_packaging.yml", "Install Linux C++ compiler tools"),
         ("_pre-commit.yml", "Install build and lint tools"),
-        ("_ut-no-hardware.yml", "Install GoogleTest"),
+        ("_ut-no-hardware.yml", "Install GoogleTest and AArch64 C++ compiler"),
     ],
 )
 def test_workflow_apt_sites_use_the_shared_action(workflow_name: str, step_name: str) -> None:
@@ -495,12 +496,21 @@ def test_scene_tests_request_graphviz(workflow_name: str) -> None:
 
 
 @pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml"])
-def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_path: Path, workflow_name: str) -> None:
+@pytest.mark.parametrize("has_gcc_15", [False, True])
+def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(
+    tmp_path: Path, workflow_name: str, has_gcc_15: bool
+) -> None:
     bin_dir = tmp_path / "preinstalled-bin"
     bin_dir.mkdir()
+    for command in ("bash", "mkdir", "ln"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (bin_dir / command).symlink_to(executable)
     for command in ("ninja", "dot"):
         _write_command(bin_dir / command)
     _write_command(bin_dir / "g++", 'if [ "${1:-}" = -dumpversion ]; then echo 12.3.0; fi')
+    if has_gcc_15:
+        _write_command(bin_dir / "g++-15", 'if [ "${1:-}" = -dumpversion ]; then echo 15.2.0; fi')
 
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
@@ -510,7 +520,7 @@ def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_
     env.update(
         {
             "GITHUB_PATH": str(github_path),
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "PATH": str(bin_dir),
             "RUNNER_TEMP": str(runner_temp),
         }
     )
@@ -524,7 +534,14 @@ def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (runner_temp / "bin/g++-15").resolve() == bin_dir / "g++"
+    alias = runner_temp / "bin/g++-15"
+    if has_gcc_15:
+        assert not alias.exists()
+        assert not github_path.exists()
+    else:
+        assert alias.is_symlink()
+        assert alias.resolve() == bin_dir / "g++"
+        assert github_path.read_text().splitlines() == [str(runner_temp / "bin")]
 
 
 @pytest.mark.parametrize("path", (ACTION_PATH, APT_ACTION_PATH, *WORKFLOW_PATHS), ids=lambda path: path.name)

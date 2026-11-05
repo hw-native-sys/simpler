@@ -14,12 +14,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <utility>
 
 #include "native_run_execution.h"
 #include "runtime_c_api.h"
+#include "common/host_span.h"
+#include "common/strace.h"
 
 /**
  * One launched run's completion boundary on the two streams it submits to.
@@ -210,6 +213,7 @@ public:
         }
         target.recorded = true;
         target.complete = false;
+        trace_record(role, target.event, stream);
         return 0;
     }
 
@@ -248,10 +252,14 @@ public:
         if (!owns(identity)) return Completion::Error;
         if (first_error() != 0) return Completion::Error;
         if (!fully_fenced()) return Completion::Unfenced;
-        for (Boundary &target : boundaries_) {
+        const unsigned cached = cached_completion_mask();
+        for (size_t index = 0; index != boundaries_.size(); ++index) {
+            Boundary &target = boundaries_[index];
+            const auto role = static_cast<StreamRole>(index);
             if (target.complete) continue;
             bool complete = false;
             int rc = ops_.query(target.event, &complete);
+            if (rc != 0 || complete) trace_observation(role, "query", rc, complete, cached, true);
             if (rc != 0) {
                 if (target.error == 0) target.error = rc;
                 return Completion::Error;
@@ -274,10 +282,12 @@ public:
         if (!owns(identity) || !fully_fenced()) return PTO_RUNTIME_ERR_INTERNAL;
         // AICPU first, mirroring the whole-stream wait this replaces, so an
         // op-timeout keeps surfacing on the same side.
+        const unsigned cached = cached_completion_mask();
         for (StreamRole role : {StreamRole::Aicpu, StreamRole::Aicore}) {
             Boundary &target = boundary(role);
             if (target.complete) continue;
             int rc = ops_.wait(target.event, timeout_ms);
+            trace_observation(role, "wait", rc, rc == 0, cached, true);
             if (rc != 0) {
                 if (target.error == 0) target.error = rc;
                 return rc;
@@ -312,7 +322,9 @@ public:
             *complete = true;
             return 0;
         }
-        return ops_.query(target.event, complete);
+        const int rc = ops_.query(target.event, complete);
+        if (rc != 0 || *complete) trace_observation(role, "query", rc, *complete, 0, false);
+        return rc;
     }
 
     /**
@@ -382,18 +394,11 @@ public:
 
     // ---- Cross-run join contract -----------------------------------------
     //
-    // A successor orders itself after this run by queueing, on each of its own
-    // streams, a wait for the opposite predecessor boundary:
-    //
-    //     successor AICore stream waits predecessor cpu_done
-    //     successor AICPU  stream waits predecessor core_done
-    //
-    // Together with each stream's own order, those two edges put both
-    // predecessor kernels ahead of either successor kernel. The reference
-    // protocol below is what keeps the predecessor's events alive for exactly
-    // as long as those queued waits can name them. Production insertion of the
-    // waits, and admitting a second launched run, belong to the change that
-    // opens admission.
+    // A successor waits on its actual CPU stream for this run's whole-operator
+    // CPU boundary before publication. Its fork orders Core behind that CPU
+    // dependency. A proof event behind the cross-run wait covers consumption
+    // without waiting for successor computation. Each queued wait holds its
+    // own boundary reference until the corresponding proof is observed.
     //
     // A reference is a count, and every guard below exists because there is
     // exactly one way to get a count wrong: decrement one that is not yours.
@@ -547,6 +552,58 @@ public:
     }
 
 private:
+    unsigned cached_completion_mask() const {
+        unsigned mask = 0;
+        for (size_t index = 0; index != boundaries_.size(); ++index)
+            if (boundaries_[index].complete) mask |= 1U << index;
+        return mask;
+    }
+
+    // These records describe existing operations; they neither query an event
+    // nor change the cache. The SDK adapter's raw return is paired by event,
+    // operation and thread, while this fence supplies its full owner identity.
+    void trace_record(StreamRole role, void *event, void *stream) const {
+        try {
+            if (!SIMPLER_HOST_STRACE || !unified_log_host_span_enabled()) return;
+            char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
+            const int size = std::snprintf(
+                attrs, sizeof(attrs), "f=%p e=%p s=%p role=%zu ep=%llu gen=%llu disp=%llu slot=%u",
+                static_cast<const void *>(this), event, stream, static_cast<size_t>(role),
+                static_cast<unsigned long long>(identity_.run_epoch),
+                static_cast<unsigned long long>(identity_.generation),
+                static_cast<unsigned long long>(identity_.dispatch_id), identity_.pipeline_slot
+            );
+            if (size < 0 || static_cast<size_t>(size) >= sizeof(attrs)) {
+                STRACE_HOST_SPAN_AT_A("chip.run.proof.invalid", STRACE_NOW_NS(), 0, 1, "truncated=1");
+                return;
+            }
+            STRACE_HOST_SPAN_AT_A("chip.run.proof.record", STRACE_NOW_NS(), 0, 1, attrs);
+        } catch (...) {}
+    }
+
+    void trace_observation(
+        StreamRole role, const char *operation, int rc, bool complete, unsigned cached, bool owner
+    ) const {
+        try {
+            if (!SIMPLER_HOST_STRACE || !unified_log_host_span_enabled()) return;
+            char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
+            const int size = std::snprintf(
+                attrs, sizeof(attrs),
+                "f=%p e=%p role=%zu ep=%llu gen=%llu disp=%llu slot=%u op=%s rc=%d c=%d cache=%u owner=%d",
+                static_cast<const void *>(this), boundary(role).event, static_cast<size_t>(role),
+                static_cast<unsigned long long>(identity_.run_epoch),
+                static_cast<unsigned long long>(identity_.generation),
+                static_cast<unsigned long long>(identity_.dispatch_id), identity_.pipeline_slot, operation, rc,
+                complete ? 1 : 0, cached, owner ? 1 : 0
+            );
+            if (size < 0 || static_cast<size_t>(size) >= sizeof(attrs)) {
+                STRACE_HOST_SPAN_AT_A("chip.run.proof.invalid", STRACE_NOW_NS(), 0, 1, "truncated=1");
+                return;
+            }
+            STRACE_HOST_SPAN_AT_A("chip.run.proof.consume", STRACE_NOW_NS(), 0, 1, attrs);
+        } catch (...) {}
+    }
+
     struct Boundary {
         void *event{nullptr};
         bool kernel_submitted{false};

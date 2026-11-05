@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_RUNTIME_TIMEOUT_CONFIG_H
-#define SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_RUNTIME_TIMEOUT_CONFIG_H
+#pragma once
 
 #include <cctype>
 #include <cerrno>
@@ -44,6 +43,8 @@ struct HostRuntimeTimeoutConfig {
     // override" — the device falls back to its compile-time default
     // (SCHEDULER_TIMEOUT_CYCLES). Latched once per device into InitArgs.
     int32_t scheduler_timeout_ms{0};
+    // Zero means no API-reported operator timeout is known on this context.
+    uint64_t actual_op_execute_timeout_us{0};
 };
 
 struct RuntimeTimeoutParseStatus {
@@ -202,5 +203,3 @@ validate_runtime_timeout_order_for_platform(const RuntimeTimeoutConfig &cfg, con
     }
     return validate_runtime_timeout_order(cfg);
 }
-
-#endif  // SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_RUNTIME_TIMEOUT_CONFIG_H

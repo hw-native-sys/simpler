@@ -330,8 +330,10 @@ void Orchestrator::activate_fifo_head() {
             run.reset();
             return;
         }
+        if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_ACTIVATION_LEASE_ACQUIRED);
         active_run_id_ = run->id;
         run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
+        if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_ACTIVATION_PUBLISHED);
         refresh_leases_locked();
         refresh_early_launch_locked();
     }
@@ -339,6 +341,10 @@ void Orchestrator::activate_fifo_head() {
     // successor blocked in copy_to must wake when it becomes the active run.
     runs_cv_.notify_all();
     if (ready_notify_cb_) ready_notify_cb_();
+    // A fast endpoint may already have ended every member of this successor
+    // while a predecessor still held another endpoint. Promotion is the last
+    // missing condition; no later END event is owed for those members.
+    retire_execution_if_ready(run);
     finish_run_if_ready(run);
 }
 
@@ -351,6 +357,7 @@ void Orchestrator::close_run_submission(RunId run_id) {
         }
         building_run_id_ = INVALID_RUN_ID;
     }
+    if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_CLOSE_BUILDER_RELEASED);
     {
         std::lock_guard<std::mutex> lk(run->completion_mu);
         if (run->submission_closed) {
@@ -358,7 +365,11 @@ void Orchestrator::close_run_submission(RunId run_id) {
         }
         run->submission_closed = true;
         if (run->phase.load(std::memory_order_acquire) == RunPhase::BUILDING) {
-            run->phase.store(RunPhase::PREPARED, std::memory_order_release);
+            if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_CLOSE_PHASE_OBSERVED);
+            // Activation uses runs_mu_, so completion_mu alone cannot protect
+            // this transition from overwriting a concurrent EXECUTING state.
+            RunPhase expected = RunPhase::BUILDING;
+            run->phase.compare_exchange_strong(expected, RunPhase::PREPARED, std::memory_order_acq_rel);
         }
     }
     run->completion_cv.notify_all();
@@ -375,6 +386,7 @@ void Orchestrator::close_run_submission(RunId run_id) {
     }
     if (ready_notify_cb_) ready_notify_cb_();
     activate_fifo_head();
+    retire_execution_if_ready(run);
     finish_run_if_ready(run);
 }
 
@@ -426,11 +438,23 @@ bool Orchestrator::run_accepted(RunId run_id) const {
     return acceptance_ready(run);
 }
 
+void Orchestrator::request_run_observation(const std::shared_ptr<RunState> &run) {
+    if (run->observation_requested.exchange(true, std::memory_order_acq_rel)) return;
+    if (manager_ == nullptr) return;
+    manager_->request_observation(run->id);
+    if (ready_notify_cb_) ready_notify_cb_();
+}
+
 void Orchestrator::wait_run(RunId run_id) {
     auto run = get_run(run_id);
     std::exception_ptr error;
     {
         std::unique_lock<std::mutex> lk(run->completion_mu);
+        if (!is_terminal(run->phase.load(std::memory_order_acquire))) {
+            lk.unlock();
+            request_run_observation(run);
+            lk.lock();
+        }
         run->completion_cv.wait(lk, [&run] {
             return is_terminal(run->phase.load(std::memory_order_acquire));
         });
@@ -440,15 +464,20 @@ void Orchestrator::wait_run(RunId run_id) {
 }
 
 bool Orchestrator::wait_run_for(RunId run_id, double timeout_seconds) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_seconds);
     auto run = get_run(run_id);
     std::exception_ptr error;
     {
         std::unique_lock<std::mutex> lk(run->completion_mu);
-        if (!run->completion_cv.wait_for(lk, std::chrono::duration<double>(timeout_seconds), [&run] {
-                return is_terminal(run->phase.load(std::memory_order_acquire));
-            })) {
-            return false;
+        if (!is_terminal(run->phase.load(std::memory_order_acquire)) && std::chrono::steady_clock::now() < deadline) {
+            lk.unlock();
+            request_run_observation(run);
+            lk.lock();
         }
+        if (!run->completion_cv.wait_until(lk, deadline, [&run] {
+                return is_terminal(run->phase.load(std::memory_order_acquire));
+            }))
+            return false;
         error = run->first_error;
     }
     if (error) std::rethrow_exception(error);
@@ -457,6 +486,11 @@ bool Orchestrator::wait_run_for(RunId run_id, double timeout_seconds) {
 
 bool Orchestrator::run_done(RunId run_id) const {
     return is_terminal(get_run(run_id)->phase.load(std::memory_order_acquire));
+}
+
+bool Orchestrator::run_observation_requested(RunId run_id) const noexcept {
+    const auto run = find_run(run_id);
+    return run != nullptr && run->observation_requested.load(std::memory_order_acquire);
 }
 
 bool Orchestrator::run_failed(RunId run_id) const {
@@ -539,6 +573,25 @@ bool Orchestrator::can_stage_run_on_worker(RunId run_id, int32_t worker_id) cons
 std::vector<RunId> Orchestrator::early_launch_run_ids() const {
     std::lock_guard<std::mutex> lk(runs_mu_);
     return early_launch_prefix_locked();
+}
+
+bool Orchestrator::run_activation_authorized(RunId run_id) const noexcept {
+    try {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        if (dispatchable_locked(run_id)) return true;
+        if (launch_depth_ < 2 || !dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 ||
+            run_fifo_.front() != active_run_id_) {
+            return false;
+        }
+        for (size_t index = 0; index + 1 < run_fifo_.size() && index + 1 < launch_depth_; ++index) {
+            const RunId candidate = early_launch_successor_locked(index);
+            if (candidate == INVALID_RUN_ID) break;
+            if (candidate == run_id) return true;
+        }
+    } catch (...) {
+        // Losing overlap is preferable to stranding an explicit observer.
+    }
+    return false;
 }
 
 std::vector<RunId> Orchestrator::early_launch_prefix_locked() const {
@@ -675,13 +728,19 @@ void Orchestrator::release_run(RunId run_id) {
 #endif
 }
 
-void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot) {
+void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot, size_t members) {
     std::lock_guard<std::mutex> lk(run->completion_mu);
     // Registration and the identity stamp are one step, paired with the
     // publication in `acquire_lease_locked`: whichever of the two runs second
     // sees the other's effect.
     TaskSlotState *state = allocator_->slot_state(slot);
     if (state != nullptr) state->pipeline_lease = run->lease;
+    // Allocate both ledgers before publishing ownership. END/terminal progress
+    // only sets existing member bytes, including under allocation pressure.
+    RunState::PhysicalTask physical{slot, std::vector<uint8_t>(members, 0)};
+    run->task_slots.reserve(run->task_slots.size() + 1);
+    run->physical_tasks.reserve(run->physical_tasks.size() + 1);
+    run->physical_tasks.push_back(std::move(physical));
     run->task_slots.push_back(slot);
     run->active_tasks.fetch_add(1, std::memory_order_relaxed);
 }
@@ -847,6 +906,47 @@ size_t Orchestrator::begin_run_waiter_count_for_test() const {
 void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) {
     TaskSlotState &task = slot_state(slot);
     record_run_error(task.run_id, std::make_exception_ptr(std::runtime_error(message)));
+}
+
+bool Orchestrator::execution_ended_locked(const RunState &run) {
+    if (!run.submission_closed) return false;
+    for (const auto &task : run.physical_tasks)
+        for (uint8_t ended : task.ended_members)
+            if (!ended) return false;
+    return true;
+}
+
+void Orchestrator::retire_execution_if_ready(const std::shared_ptr<RunState> &run) {
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (!execution_ended_locked(*run)) return;
+        const auto phase = run->phase.load(std::memory_order_acquire);
+        if (phase != RunPhase::EXECUTING && !run->submission_failed) return;
+    }
+    retire_terminal_run(run);
+}
+
+void Orchestrator::mark_task_ended(TaskSlot slot, int32_t group_index) {
+    const TaskSlotState *task = allocator_->slot_state(slot);
+    if (task == nullptr) return;
+    auto run = find_run(task->run_id);
+    if (run == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        auto physical = std::find_if(run->physical_tasks.begin(), run->physical_tasks.end(), [slot](const auto &entry) {
+            return entry.slot == slot;
+        });
+        if (physical == run->physical_tasks.end()) return;
+        if (group_index < 0) {
+            // Existing semantic consumption also covers cancelled unsubmitted
+            // tasks and skipped group members; it does not imply early END.
+            std::fill(physical->ended_members.begin(), physical->ended_members.end(), 1);
+        } else {
+            if (static_cast<size_t>(group_index) >= physical->ended_members.size()) return;
+            physical->ended_members[static_cast<size_t>(group_index)] = 1;
+        }
+    }
+    retire_execution_if_ready(run);
 }
 
 void Orchestrator::mark_task_accepted(TaskSlot slot) {
@@ -1099,7 +1199,7 @@ SubmitResult Orchestrator::submit_impl(
     s.state.store(TaskState::BUILDING, std::memory_order_release);
     try {
         if (test_hook_) test_hook_(OrchestratorTestPoint::SUBMIT_RUN_SLOT_REGISTERING);
-        register_run_slot(run, slot);
+        register_run_slot(run, slot, args_list.size());
     } catch (...) {
         // The run never acquired this slot, so cancellation cannot discover
         // it. Return the combined slot/HeapRing reservation directly.
@@ -1597,12 +1697,16 @@ void Orchestrator::infer_deps(
                     TensorAddressKind kind = desc.address_space == RemoteAddressSpace::HOST_INLINE ?
                                                  TensorAddressKind::HOST_INLINE :
                                                  TensorAddressKind::REMOTE_BUFFER;
-                    // A remote key already carries the view's offset, so every entry under one
-                    // of them denotes the same origin and a footprint adds nothing; the default
-                    // whole-backing one keeps this path's behaviour exactly as it was.
+                    const bool inline_payload = desc.address_space == RemoteAddressSpace::HOST_INLINE;
                     key = TensorKey::remote_buffer(
-                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, desc.offset
+                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, inline_payload ? desc.offset : 0
                     );
+                    if (!inline_payload) {
+                        view = tensor_footprint(r);
+                        // Imported ranges use the owner's byte origin, not the import's local origin.
+                        view.byte_offset = desc.offset;
+                        view.backing_nbytes = tensor_add_sat(desc.offset, desc.nbytes);
+                    }
                     has_key = true;
                 }
             }
@@ -1706,6 +1810,7 @@ bool Orchestrator::on_consumed(TaskSlot slot) {
     }
 
     RunId run_id = s.run_id;
+    mark_task_ended(slot);
     tensormap_->erase_task_outputs(run_id, slot, s.output_keys);
 
     // HeapRing-owned OUTPUT slabs are reclaimed implicitly when the allocator

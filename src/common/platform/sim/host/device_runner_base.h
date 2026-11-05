@@ -118,6 +118,9 @@ public:
     // (destroy_device_context entrypoint).
     virtual ~SimDeviceRunnerBase() = default;
 
+    // Unspecified runners cannot admit a fixed-family kernel image.
+    virtual const char *cpu_sim_target_family() const { return nullptr; }
+
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
     struct PreparedExecution {
         PreparedExecution(
@@ -298,6 +301,10 @@ public:
     bool reissue_launch_permit(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
     void release_native_run(const void *owner);
     bool native_run_active() const;
+    bool native_runs_outstanding() const;
+    void retain_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+    void release_run_result(uint64_t run_epoch);
+    DeviceRunTerminal device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const;
     /** Cleanup-only terminal storage keeps this context alive for close retry. */
     virtual bool terminal_backing_retained() const {
         return dump_collector_.terminal_backing_retained() || pmu_collector_.terminal_backing_retained() ||
@@ -333,6 +340,9 @@ public:
      * over a hundred of them share this factory — without a name every one
      * reports as the host process's own `comm` and a crash dump cannot say
      * which tier faulted.
+     *
+     * Returns only after binding succeeds. Failure joins the child without
+     * invoking fn and throws std::system_error; an unattached runner is rejected.
      */
     std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
@@ -582,8 +592,8 @@ public:
      * the collector's single resident copy.
      */
     bool host_orchestrated_for_slot(uint32_t pipeline_slot) const noexcept {
-        if (pipeline_slot >= host_phase_runs_.size()) return false;
-        return host_phase_runs_[pipeline_slot].host_orchestrated;
+        const auto *state = host_phase_runs_.find(pipeline_slot);
+        return state != nullptr && state->host_orchestrated;
     }
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
@@ -887,6 +897,27 @@ public:
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
+    /**
+     * Which device-side scheduler the most recent bind selected, as a
+     * SCHEDULER_RUNTIME_MODE_* value, or 0 when no bind has published one.
+     *
+     * Latched rather than read back from the runtime: the launch descriptor's
+     * copy is cleared when a run releases its bindings, so by the time a caller
+     * could look it is already 0. Never cleared here — a later bind overwrites
+     * it, and `scheduler_mode_publish_count()` is what distinguishes "this bind
+     * chose again" from "nothing has changed since the last one".
+     */
+    uint32_t last_scheduler_runtime_mode() const {
+        return last_scheduler_runtime_mode_.load(std::memory_order_relaxed);
+    }
+    size_t scheduler_mode_publish_count() const {
+        return scheduler_mode_publish_total_.load(std::memory_order_relaxed);
+    }
+    void record_scheduler_runtime_mode(uint32_t mode) {
+        last_scheduler_runtime_mode_.store(mode, std::memory_order_relaxed);
+        scheduler_mode_publish_total_.fetch_add(1, std::memory_order_relaxed);
+    }
+
 protected:
     virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
 
@@ -897,8 +928,8 @@ protected:
     // directly from CallableState by launch_device_register — no Runtime
     // round-trip.
     virtual int invoke_device_register(const RegisterCallableArgs &reg_args) = 0;
-    int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
+    // Registration owns orchestration code; validation leaves Runtime unchanged.
+    int validate_active_callable(const Runtime &runtime) const;
 
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
@@ -1134,7 +1165,10 @@ protected:
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};
-    // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
+    // Written on the bind path, read by the caller's thread.
+    std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
+    std::atomic<size_t> scheduler_mode_publish_total_{0};
+    // AICPU executor SO: load-once, matching onboard's aicpu_runtime_registered_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
     // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.
     bool aicpu_so_loaded_{false};
@@ -1200,6 +1234,8 @@ protected:
      * fails the epoch comparison rather than being mistaken for this run's.
      */
     RunResourceSlots<DeviceRunResultRegion> device_run_results_;
+    mutable std::mutex retained_result_mu_;
+    std::unordered_map<uint64_t, DeviceRunResultRegion> retained_run_results_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

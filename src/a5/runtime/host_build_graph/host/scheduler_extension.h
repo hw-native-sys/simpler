@@ -15,11 +15,11 @@
  * validates it, checks each kernel id against the callable table, and fills the
  * SchedulerTaskMetadata the device reads. That walk is the same whoever
  * schedules the cores, so an alternative scheduler takes its result rather than
- * repeating it — these two declarations are the whole of what it needs.
+ * repeating it — this declaration is the whole of what it needs.
  *
- * Both are defined weak and decline by default, so a build that links no
- * alternative behaves exactly as it did before they existed. A build that does
- * link one carries its strong definitions instead.
+ * It is defined weak and declines by default, so a build that links no
+ * alternative behaves exactly as it did before it existed. A build that does
+ * link one carries its strong definition instead.
  */
 
 #pragma once
@@ -43,15 +43,10 @@ enum class SchedulerExtensionResult : uint8_t {
 };
 
 /**
- * Whether GRAPH tasks reach the per-task walk rather than sending the run
- * straight to AICPU dispatch. An extension that answers true validates them
- * itself, through their Definitions, in scheduler_extension_select.
- */
-bool scheduler_extension_takes_graph_tasks();
-
-/**
- * Offered the walk's result, after it has rejected any malformed task. An
- * extension that takes the graph owns the rest of the bind.
+ * Offered the walk's result, after it has rejected any malformed task and
+ * before this runtime expands its own native Graph nodes, so GRAPH tasks reach
+ * an extension as the shells the task table holds. An extension that takes the
+ * graph owns the rest of the bind, including reading those shells' Definitions.
  */
 SchedulerExtensionResult scheduler_extension_select(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,

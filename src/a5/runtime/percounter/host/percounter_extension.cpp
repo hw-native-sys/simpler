@@ -24,10 +24,6 @@
 #include "percounter/percounter_state.h"
 #include "scheduler_extension.h"
 
-// Percounter validates GRAPH tasks itself, through their Definitions, in
-// select_percounter_state.
-bool scheduler_extension_takes_graph_tasks() { return true; }
-
 // Never DECLINED: percounter is the only scheduler this runtime carries, so a
 // graph it cannot run has nowhere to go and fails the bind instead.
 SchedulerExtensionResult scheduler_extension_select(

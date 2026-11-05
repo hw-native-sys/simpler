@@ -235,7 +235,9 @@ def test_both_worker_factories_preserve_exact_admission_kwargs(monkeypatch, auto
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         pool = SimpleNamespace(allocate=lambda count: [0], release=lambda ids: None)
-        fixture = module.st_worker.__wrapped__(SimpleNamespace(node=SimpleNamespace(cls=cls)), "a2a3", pool, {}, set())
+        fixture = module.st_worker.__wrapped__(
+            SimpleNamespace(node=SimpleNamespace(cls=cls)), "a2a3", pool, module._L2WorkerPool(), set()
+        )
         next(fixture)
         with pytest.raises(StopIteration):
             next(fixture)

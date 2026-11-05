@@ -66,6 +66,8 @@ size_t get_runtime_size(void) { return 0; }
 
 size_t get_runtime_alignment(void) { return 0; }
 
+const char *simpler_get_init_error_ctx(DeviceContextHandle) { return nullptr; }
+
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
@@ -102,7 +104,12 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PT
 
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
 
+int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
+
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) { return PTO_RUNTIME_ERR_INTERNAL; }
+int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int) {
+    return simpler_finalize_run(ctx, runtime);
+}
 
 int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
 
@@ -125,6 +132,8 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx) { return 0; }
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx) { return 0; }
 
 int finalize_device(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
+
+int simpler_execution_environment_releasable_ctx(DeviceContextHandle ctx) { return 0; }
 
 int ensure_acl_ready_ctx(void *, int) { return PTO_RUNTIME_ERR_INTERNAL; }
 
@@ -149,12 +158,17 @@ int comm_derive_context(
 
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
+    size_t *actual_window_size_out
 ) {
     return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+int comm_abort_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
     return PTO_RUNTIME_ERR_INTERNAL;
 }
 

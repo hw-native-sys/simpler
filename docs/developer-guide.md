@@ -96,8 +96,15 @@ Persistent cmake build directories under `build/cache/` enable incremental compi
 **Architecture note:** binaries are built separately for each architecture and
 backend. The onboard AICore targets are `dav-c220-cube/vec` for a2a3 and
 `dav-c310-cube/vec` for a5, so their artifacts are not interchangeable.
-`pip install .` builds both architectures when their toolchain is available;
-build-tool availability does not imply that the host has both kinds of NPU.
+`pip install .` selects architectures from the available toolchains. A5 additionally
+requires the HCCL channel-config API used by the pinned URMA provider (including
+`HcclChannelAcquireWithConfig`). If A5 is selected and these declarations are
+absent, the build fails with an SDK requirement error; it does not silently omit
+A5 or delete existing artifacts. Set `ASCEND_HOME_PATH` to a compatible SDK.
+For an intentionally A2/A3-only install, use
+`pip install --no-build-isolation . --config-settings=build.targets=build_package_a2a3`;
+use `build_package_sim` for simulation only. Build availability does not imply
+that the host has both kinds of NPU.
 Toolchain detection (`build_runtimes.py`):
 
 - **sim** (a2a3sim, a5sim): requires `gcc` + `g++` in `PATH`
@@ -190,7 +197,7 @@ This builds the nanobind `_task_interface` extension **and** pre-builds runtime 
 | Nothing — but `HEAD` moved (branch switch, rebase, pull, **or your own commit**) | Re-run `pip install ...`. You may have changed no compiled file, yet the tree moved out from under a binary frozen at install time. `simpler.task_interface` refuses to import on this skew (see below) rather than let struct fields read as 0. |
 | Python-only code (`python/*.py`, `simpler_setup/*.py`) | Nothing to recompile (editable install) — but see the row above: once you *commit* it, the import guard keys on `HEAD`, so reinstall before the next import. |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | Nothing to recompile, just re-run — same commit caveat as the row above |
-| `pto_isa.pin` changed | Re-run `pip install`. The cmake cache stamp and the `host_runtime` ccache key include the pinned PTO-ISA commit for a2a3 onboard (and a5 onboard when the SDMA overlay is enabled), so a pin bump invalidates stale runtime objects automatically. |
+| `pto_isa.pin` changed | Re-run `pip install`. The cmake cache stamp and the `host_runtime` ccache key include the pinned PTO-ISA commit for all a2a3 onboard and a5 onboard builds, so a pin bump invalidates stale runtime objects automatically. |
 
 `_task_interface` records the commit it was compiled from, and
 `simpler.task_interface` compares it against the working tree at import,
@@ -216,8 +223,11 @@ both read `pto_isa.pin`; use a different ISA revision by updating that file.
 
 The a5 RDMA workspace is an explicit opt-in overlay enabled with
 `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`. It requires a `pto_isa.pin` revision
-that provides the PTO-ISA RDMA/HNS1825 headers and is mutually exclusive with
-the SDMA and URMA workspace overlays.
+that provides the PTO-ISA RDMA/HNS1825 headers. SDMA and URMA are always compiled
+on A5; their resources are initialized only when requested by a domain. All three providers
+can be compiled together. A5 domains select resources with `workspace_engines`;
+RDMA uses a separate domain because its window has no mapped peer VAs. See
+[communication domains](comm-domain.md#4-backends).
 
 ### Runtime binary lookup
 
@@ -254,6 +264,24 @@ from simpler_setup.kernel_compiler import KernelCompiler
 compiler = KernelCompiler(platform="a2a3sim")
 kernel_binary = compiler.compile_incore("path/to/kernel.cpp", core_type="aiv")
 ```
+
+CPU simulator kernels select their PTO instruction family from the platform:
+`a2a3sim` defines `PTO_CPU_SIM_TARGET_A2A3`, and `a5sim` defines
+`PTO_CPU_SIM_TARGET_A5`. Both AIC and AIV compilation force-include
+`pto/cpu/target_config.hpp` from the supplied `pto_isa_root` checkout, or from
+the managed pinned checkout when `pto_isa_root` is omitted. An explicit root
+selects that checkout's headers and ISA revision. The selected family
+controls instruction semantics and the simulator memory profile, without a
+`PTO_CPU_SIM_ARCH` override or an initialization call in the kernel.
+An ISA checkout without this interface fails compilation. Compiler flags,
+compiler logic, and the ISA pin participate in the managed kernel cache keys;
+previous artifacts are rebuilt after the interface or pin changes.
+Each compiled kernel also exports `simpler_cpu_sim_target()` through
+`cpu_sim_target.h`, returning the platform name (`a2a3sim` or `a5sim`).
+The simulator loader checks this marker before resolving
+the kernel entry or registering hooks. It rejects prebuilt kernels from the
+other family, unknown families, and older kernels without a marker; rebuild
+those kernels for the destination platform.
 
 The compiled binaries are packed into a `ChipCallable` (orch SO + each
 child `CoreCallable`) and registered once via

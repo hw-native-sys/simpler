@@ -143,11 +143,22 @@ jobs:
   st-framework-eager-a2a3:
     needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-framework-eager-a2a3.yml
+    uses: ./.github/workflows/_st-framework-eager.yml
     with:
+      platform: a2a3
       repository: ${{ inputs.repository || github.repository }}
       ref: ${{ inputs.ref || github.sha }}
       runs_on: '["self-hosted","a2a3"]'
+
+  st-framework-eager-a5:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
+    uses: ./.github/workflows/_st-framework-eager.yml
+    with:
+      platform: a5
+      repository: ${{ inputs.repository || github.repository }}
+      ref: ${{ inputs.ref || github.sha }}
+      runs_on: '["self-hosted","a5"]'
 
   st-onboard-a2a3:
     needs: [detect-changes]

@@ -99,6 +99,11 @@ class MpiDirectTopology:
     heartbeat_interval_s: float
     max_pending_frame_bytes: int
     launcher_args: tuple[str, ...]
+    health_timeout_s: float | None = None
+
+    @property
+    def effective_health_timeout_s(self) -> float:
+        return self.session_timeout_s if self.health_timeout_s is None else self.health_timeout_s
 
     @property
     def world_size(self) -> int:
@@ -137,6 +142,11 @@ class MpiDirectTopology:
             heartbeat_interval_s=_positive_finite(data.get("heartbeat_interval_s", 1.0), "heartbeat_interval_s"),
             max_pending_frame_bytes=int(data.get("max_pending_frame_bytes", 64 * 1024 * 1024)),
             launcher_args=tuple(str(arg) for arg in data.get("launcher_args", ())),
+            health_timeout_s=(
+                None
+                if data.get("health_timeout_s") is None
+                else _positive_finite(data["health_timeout_s"], "health_timeout_s")
+            ),
         )
         topology.validate()
         return topology
@@ -173,8 +183,9 @@ class MpiDirectTopology:
             raise ValueError("global_device_ranks must be unique across all executors")
         if self.max_pending_frame_bytes < MAX_FRAME_BYTES:
             raise ValueError("max_pending_frame_bytes must fit one maximum SLR3 frame")
-        if self.heartbeat_interval_s >= self.session_timeout_s:
-            raise ValueError("heartbeat_interval_s must be shorter than session_timeout_s")
+        health_timeout = _positive_finite(self.effective_health_timeout_s, "health_timeout_s")
+        if self.heartbeat_interval_s >= health_timeout:
+            raise ValueError("heartbeat_interval_s must be shorter than the effective health_timeout_s")
 
     def runtime_manifest(self, session_id: int) -> dict[str, Any]:
         if int(session_id) == 0:

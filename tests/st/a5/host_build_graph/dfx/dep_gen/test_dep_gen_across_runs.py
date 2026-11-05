@@ -108,12 +108,14 @@ class TestHbgDepGenAcrossRuns(SceneTestCase):
         {
             "name": "chain",
             "platforms": ["a5sim", "a5"],
+            "manual": True,
             "config": {"device_count": 1, "num_sub_workers": 0},
             "params": {"graph_case": _CHAIN_CASE, "task_count": _CHAIN_TASKS},
         },
         {
             "name": "diamond",
             "platforms": ["a5sim", "a5"],
+            "manual": True,
             "config": {"device_count": 1, "num_sub_workers": 0},
             "params": {"graph_case": _DIAMOND_CASE, "task_count": _DIAMOND_TASKS},
         },

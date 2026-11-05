@@ -36,36 +36,9 @@ else()
 endif()
 set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
-option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
 option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE "Enable a5 PTO RDMA workspace overlay" OFF)
-# SDMA is the default a5 async-workspace backend. URMA and RDMA remain
-# explicit alternatives because CommContext exposes one workSpace/workSpaceSize
-# pair. SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is an internal compile marker, not a
-# user-configurable option.
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE OR SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
-else()
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
-endif()
-
-# Only one async-workspace overlay may be selected; CommContext carries a
-# single workSpace/workSpaceSize pair shared by every backend.
-set(SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT 0)
-foreach(OVERLAY
-        SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-        SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-        SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
-    if(${OVERLAY})
-        math(EXPR SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT "${SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT} + 1")
-    endif()
-endforeach()
-if(SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT GREATER 1)
-    message(FATAL_ERROR
-        "Only one PTO async workspace overlay may be enabled at a time "
-        "(SDMA=${SIMPLER_ENABLE_PTO_SDMA_WORKSPACE}, "
-        "URMA=${SIMPLER_ENABLE_PTO_URMA_WORKSPACE}, "
-        "RDMA=${SIMPLER_ENABLE_PTO_RDMA_WORKSPACE})")
-endif()
+# Async providers are available only to domains that explicitly request them.
+# SDMA is compiled in every a5 build; compilation creates no SDMA streams.
 
 # Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
 # (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
@@ -181,15 +154,7 @@ target_compile_definitions(host_runtime PRIVATE
     SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
 )
 
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
-endif()
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE
-        SIMPLER_ENABLE_PTO_URMA_WORKSPACE=1
-        PTO_URMA_SUPPORTED
-    )
-endif()
+target_compile_definitions(host_runtime PRIVATE PTO_URMA_SUPPORTED)
 if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE
         SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=1

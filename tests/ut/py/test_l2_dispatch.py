@@ -108,6 +108,7 @@ def test_l2_dispatch_adds_xdist_options_when_plugin_is_active(monkeypatch):
 
     assert cf._dispatch_test_phases(session, []) is True
     assert len(commands) == 1
+    assert "--resource-child" in commands[0]
     assert commands[0][-8:] == [
         "--runtime",
         "host_build_graph",
@@ -118,6 +119,46 @@ def test_l2_dispatch_adds_xdist_options_when_plugin_is_active(monkeypatch):
         "--dist",
         "loadfile",
     ]
+
+
+def test_l2_dispatch_replaces_parent_selection_in_child_command(monkeypatch):
+    cf = _load_root_conftest()
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cf.subprocess, "run", fake_run)
+    config = _Config(
+        xdist_active=False,
+        xdist_blocked=True,
+        extra_args=("--runtime=host_build_graph", "--level", "2"),
+    )
+    items = [SimpleNamespace(cls=SimpleNamespace(_st_runtime="host_build_graph", _st_level=2))]
+    session = SimpleNamespace(config=config, items=items, testsfailed=0, testscollected=0)
+
+    assert cf._dispatch_test_phases(session, []) is True
+    assert len(commands) == 1
+    assert commands[0].count("--runtime") == 1
+    assert "--runtime=host_build_graph" not in commands[0]
+    assert commands[0].count("--level") == 1
+    assert commands[0].count("--resource-child") == 1
+
+
+def test_l2_poison_retry_marks_its_fresh_process_as_a_child(monkeypatch):
+    cf = _load_root_conftest()
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cf.subprocess, "run", fake_run)
+
+    assert cf._l2_poison_retry(["python", "-m", "pytest"], "host_build_graph", ["TestScene::"], _ROOT) == 0
+    assert "--resource-child" in commands[0]
+    assert commands[0][commands[0].index("--runtime") + 1] == "host_build_graph"
 
 
 def test_l2_dispatch_warns_and_stays_serial_when_xdist_is_not_loaded(monkeypatch, capsys):
@@ -290,8 +331,8 @@ def test_a_standalone_resource_function_needs_no_runtime_marker():
 
 
 def test_a_runtime_less_resource_child_is_narrowed_by_nodeid_alone():
-    # --runtime is both the child's filter and the signal that puts it in child
-    # mode; a runtime-agnostic job has no value to pass, so it must not appear.
+    # The child marker is separate from runtime selection, so a runtime-agnostic
+    # job needs only its nodeid and the marker.
     cf = _load_root_conftest()
     spec = cf._ResourceJob(
         kind="standalone", nodeid="t.py::test_two_rank", label="test_two_rank", runtime=None, device_count=2
@@ -301,6 +342,7 @@ def test_a_runtime_less_resource_child_is_narrowed_by_nodeid_alone():
     command = cf._resource_child_command(spec, [4, 5], "a2a3", "exclude", config)
 
     assert "--runtime" not in command
+    assert "--resource-child" in command
     assert "t.py::test_two_rank" in command
 
 
@@ -443,6 +485,23 @@ def test_a_resource_child_does_not_dispatch_again(monkeypatch):
 
     assert cf.pytest_runtestloop(session) is None
     assert jobs == []
+
+
+@pytest.mark.parametrize("selection,value", [("--runtime", "host_build_graph"), ("--level", "3")])
+def test_selection_does_not_skip_resource_dispatch(monkeypatch, selection, value):
+    cf = _load_root_conftest()
+    jobs = []
+    monkeypatch.setattr(cf._ps, "run_jobs", lambda j, *a, **k: jobs.extend(j) or [])
+    config = _Config(xdist_active=False, xdist_blocked=False)
+    base = config.getoption
+    config.getoption = lambda name, default=None: value if name == selection else base(name, default)
+    items = [_Item("t.py::test_one_rank", markers=[_Marker("device_count", 1), _Marker("runtime", "host_build_graph")])]
+    session = SimpleNamespace(
+        config=config, items=items, testsfailed=0, testscollected=0, shouldfail=False, shouldstop=False
+    )
+
+    assert cf.pytest_runtestloop(session) is True
+    assert [job.nodeid for job in jobs] == ["t.py::test_one_rank"]
 
 
 def test_a_parent_narrowed_to_one_resource_item_still_schedules_its_job(monkeypatch):

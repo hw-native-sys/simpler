@@ -3561,7 +3561,9 @@ NB_MODULE(_task_interface, m) {
         .def("activate", &ChipRun::activate)
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
+        .def_prop_ro("_execution_ended", &ChipRun::execution_ended)
         .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
+        .def_prop_ro("_owner_recovery_required", &ChipRun::owner_recovery_required)
         .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
         .def(
             "wait",
@@ -4047,6 +4049,43 @@ NB_MODULE(_task_interface, m) {
             "Platforms using the persistent bootstrap pair report 0."
         )
         .def_prop_ro(
+            "scheduler_runtime_mode", &ChipWorker::last_scheduler_runtime_mode,
+            "Which device-side scheduler the most recent bind selected, as a "
+            "SCHEDULER_RUNTIME_MODE_* value: 1 = resident pending, 2 = resident "
+            "ready, 3 = legacy (graph task present), 4 = legacy (unsupported task "
+            "shape). 0 means no selection was ever published -- which is the "
+            "value every runtime other than the a5 host_build_graph one reports, "
+            "because only it selects between schedulers. Latched by the runner: "
+            "the runtime's own copy is cleared when a run releases its bindings."
+        )
+        .def_prop_ro(
+            "scheduler_mode_publish_count", &ChipWorker::scheduler_mode_publish_count,
+            "How many times this worker's binds have published a scheduler "
+            "selection. Tells 'this bind selected again' apart from 'the latch "
+            "still holds an earlier run's value', which the mode alone cannot."
+        )
+        .def_prop_ro(
+            "unobserved_completed_run_count", &ChipWorker::unobserved_completed_run_count,
+            "Calls whose completion this worker has recorded and whose result "
+            "has not been delivered yet, including one a finalization already "
+            "owns. Each holds a native carrier and, for Program, its staging, "
+            "so host footprint tracks this number rather than the pipeline "
+            "depth -- the depth bounds concurrent execution only. Nothing caps "
+            "it: these are results a caller is still entitled to, held by its "
+            "own handles, so a rising value means handles are being kept rather "
+            "than that anything leaked. Recorded, not probed: a call whose "
+            "device work has finished stays uncounted until a poll or wait "
+            "records it, so this is a lower bound on what the device finished."
+        )
+        .def_prop_ro(
+            "unobserved_completed_run_high_water", &ChipWorker::unobserved_completed_run_high_water,
+            "Largest unobserved_completed_run_count this worker has sampled. "
+            "Sampled at every preparation and at every read of either property, "
+            "so a backlog that grows and drains entirely between two samples is "
+            "not recorded. Monotonic, which is what makes it usable as a test "
+            "discriminator where the instantaneous count races the drain."
+        )
+        .def_prop_ro(
             "committed_device_memory", &ChipWorker::committed_device_memory,
             "Total device HBM (bytes) currently committed by this worker's "
             "MemoryAllocator (user tensors + pooled arenas + runtime buffers). "
@@ -4096,27 +4135,31 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_alloc_domain_windows",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
-               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address) {
+               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t workspace_mask) {
                 if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
                     throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
                 }
-                auto [device_ctx, local_window_base] =
-                    self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
-                __atomic_store_n(
-                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), uint64_t{1},
-                    __ATOMIC_RELEASE
+                auto [device_ctx, local_window_base, actual_window_size] = self.comm_alloc_domain_windows(
+                    comm_handle, allocation_id, rank_ids, domain_rank, window_size, workspace_mask,
+                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address))
                 );
-                return nb::make_tuple(device_ctx, local_window_base);
+                return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
-            nb::arg("window_size"), nb::arg("commit_flag_address"),
+            nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("workspace_mask") = 0,
             "Collectively allocate a fresh per-rank pool for a subset; returns "
-            "(device_ctx, local_window_base) for this rank and publishes the commit flag before result conversion."
+            "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
+            "responsibility before result conversion or an allocation error; it does not imply a usable context."
         )
         .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
+        )
+        .def(
+            "comm_abort_domain_windows", &ChipWorker::comm_abort_domain_windows, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
+            "Locally roll back a domain the coordinating owner has never published to device users."
         )
         .def(
             "comm_global_domain_prepare",

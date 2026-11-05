@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include "common/module_thread_value.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -63,9 +65,8 @@
 /**
  * Partial OrchContext definition for orchestration.
  *
- * Exposes the ops pointer (for runtime calls) and pending_scope_mode
- * (read directly by inline scope wrappers). The full struct (in
- * host/orchestrator.h) has the same first fields, so accessing them through
+ * Exposes the ops pointer for runtime calls. The full struct (in
+ * host/orchestrator.h) has the same first field, so accessing it through
  * this definition is well-defined (C struct layout guarantee). The full one
  * stays out of here because it names OrchestratorState and HostTensorAccessor,
  * which the orchestration .so has no link dependency on.
@@ -75,17 +76,13 @@
  */
 struct OrchContext {
     const OrchOps *ops;
-    ScopeMode pending_scope_mode;
 };
 
 // The host library compiles the full definition in host/orchestrator.h, which
-// carries three more members after these two. Both sides assert the same offsets
+// carries three more members after this one. Both sides assert the same offset
 // so a reorder on either one fails to compile rather than silently disagreeing
 // across the two translation units.
 static_assert(offsetof(OrchContext, ops) == 0, "OrchContext ops layout drift");
-static_assert(
-    offsetof(OrchContext, pending_scope_mode) == sizeof(const OrchOps *), "OrchContext pending_scope_mode layout drift"
-);
 
 // =============================================================================
 // Inline Convenience Wrappers (call through ops table)
@@ -105,8 +102,8 @@ struct RtSubmitPhaseState {
     uint64_t count;
 };
 
-inline RtSubmitPhaseState &rt_submit_phase_state() {
-    static thread_local RtSubmitPhaseState state{};
+inline __attribute__((visibility("hidden"))) simpler::ModuleThreadValue<RtSubmitPhaseState> &rt_submit_phase_state() {
+    static simpler::ModuleThreadValue<RtSubmitPhaseState> state;
     return state;
 }
 
@@ -274,8 +271,7 @@ static inline void rt_scope_begin(ScopeMode mode = ScopeMode::AUTO) {
     if (ctx->ops->is_fatal(ctx)) {
         return;
     }
-    ctx->pending_scope_mode = mode;
-    ctx->ops->scope_begin(ctx);
+    ctx->ops->scope_begin(ctx, mode);
 }
 
 static inline void rt_scope_end() {
@@ -288,8 +284,8 @@ static inline void rt_scope_end() {
 
 static inline void rt_orchestration_done() {
     rt_graph_commit();
-    rt_submit_phase_state() = RtSubmitPhaseState{};
     OrchContext *ctx = current_orch_context();
+    if (ctx->ops->record_orch_phase != nullptr) rt_submit_phase_state().cache({});
     ctx->ops->orchestration_done(ctx);
 }
 
@@ -418,8 +414,7 @@ public:
     explicit ScopeGuard(ScopeMode mode = ScopeMode::AUTO) :
         ctx_(current_orch_context()) {
         if (!ctx_->ops->is_fatal(ctx_)) {
-            ctx_->pending_scope_mode = mode;
-            ctx_->ops->scope_begin(ctx_);
+            ctx_->ops->scope_begin(ctx_, mode);
         }
     }
     ~ScopeGuard() {
@@ -467,13 +462,15 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
             "a Graph boundary cannot hold a runtime-allocated output (TensorCreateInfo)"
         );
     }
-    RtSubmitPhaseState &_phase = rt_submit_phase_state();
+    // No timing consumer means no per-module keys or per-submit TLS work.
+    const bool _trace_enabled = current_orch_context()->ops->record_orch_phase != nullptr;
+    RtSubmitPhaseState _phase = _trace_enabled ? rt_submit_phase_state().get() : RtSubmitPhaseState{};
     const uint64_t _entry_ns = rt_orch_phase_now_ns();
     // Only a gap inside one orchestration is this .so's own work.
     // rt_orchestration_done() clears the state, so the submitting thread cannot carry a
     // value across that boundary at all. The duration test below is the backstop for a
     // thread that submits without ever reaching that call — a recording worker, or an
-    // orchestration that fails before completing — where the state is thread_local and
+    // orchestration that fails before completing — where the state is thread-scoped and
     // outlives the bind. Real gaps here are single-digit microseconds, so a millisecond
     // separates the two cases by three orders of magnitude.
     constexpr uint64_t kBindBoundaryNs = 1000000;
@@ -561,8 +558,11 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
         // not reached its first sub-task yet.
         rt_record_orch_phase(HostPhaseKind::OrchRecordHandoff, _begun_ns, _exit_ns, graph_key);
     }
-    _phase.count++;
-    _phase.prev_exit_ns = _exit_ns;
+    if (_trace_enabled) {
+        _phase.count++;
+        _phase.prev_exit_ns = _exit_ns;
+        rt_submit_phase_state().cache(_phase);
+    }
     return result;
 }
 

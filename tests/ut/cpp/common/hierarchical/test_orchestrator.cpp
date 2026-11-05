@@ -636,7 +636,7 @@ TEST_F(OrchestratorFixture, RemoteOutputSidecarRegistersRemoteKey) {
         S(res.task_slot).task_args.tensor(0).buffer.backend_kind, static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR)
     );
 
-    TensorKey key = TensorKey::remote_buffer(TensorAddressKind::REMOTE_BUFFER, 3, 9, 2, 64);
+    TensorKey key = TensorKey::remote_buffer(TensorAddressKind::REMOTE_BUFFER, 3, 9, 2, 0);
     EXPECT_EQ(map_producer(tm, run_id, key), res.task_slot);
 }
 
@@ -688,6 +688,43 @@ TEST_F(OrchestratorFixture, RemoteInputSidecarUsesRemoteTensorMapKey) {
     EXPECT_EQ(S(consumer.task_slot).fanin_count, 1);
     ASSERT_EQ(S(consumer.task_slot).fanin_producers.size(), 1u);
     EXPECT_EQ(S(consumer.task_slot).fanin_producers[0], producer.task_slot);
+}
+
+TEST_F(OrchestratorFixture, RemoteViewsTrackOverlapInOwnerCoordinates) {
+    for (RemoteAddressSpace space : {RemoteAddressSpace::REMOTE_DEVICE, RemoteAddressSpace::REMOTE_WINDOW}) {
+        auto submit = [&](uint64_t offset, TensorArgType tag) {
+            Tensor tensor = remote_placeholder_args(tag).tensor(0);
+            tensor.buffer.nbytes = 256;
+            tensor.byte_offset = offset;
+            tensor.shapes[0] = 16;
+            TaskArgs args;
+            args.add_tensor(tensor, tag);
+            RemoteTaskArgsSidecar sidecar;
+            sidecar.tensors.resize(1);
+            auto &remote = sidecar.tensors[0];
+            remote.present = true;
+            remote.desc.address_space = space;
+            remote.desc.owner_worker_id = 3;
+            remote.desc.buffer_id = 9;
+            remote.desc.generation = static_cast<uint64_t>(space) + 1;
+            remote.desc.offset = offset + (space == RemoteAddressSpace::REMOTE_WINDOW ? 1024 : 0);
+            remote.desc.nbytes = 16;
+            return orch.submit_next_level(C(42), args, cfg, 3, {3}, sidecar);
+        };
+        auto producer = submit(64, TensorArgType::OUTPUT_EXISTING);
+        TaskSlot ready;
+        ASSERT_TRUE(rq_next_level.try_pop_single(3, ready));
+        ASSERT_EQ(ready, producer.task_slot);
+        auto overlapping = submit(72, TensorArgType::INPUT);
+        EXPECT_EQ(S(overlapping.task_slot).state.load(), TaskState::PENDING);
+        ASSERT_EQ(S(overlapping.task_slot).fanin_producers.size(), 1u);
+        EXPECT_EQ(S(overlapping.task_slot).fanin_producers[0], producer.task_slot);
+        auto disjoint = submit(96, TensorArgType::INPUT);
+        EXPECT_EQ(S(disjoint.task_slot).state.load(), TaskState::READY);
+        EXPECT_TRUE(S(disjoint.task_slot).fanin_producers.empty());
+        ASSERT_TRUE(rq_next_level.try_pop_single(3, ready));
+        ASSERT_EQ(ready, disjoint.task_slot);
+    }
 }
 
 TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
@@ -1634,4 +1671,130 @@ TEST_F(OrchestratorFixture, FailedPreparedConstructionReturnsAdmissionWithoutDis
     orch.release_run(run_id);
     orch.release_run(failed);
     orch.release_run(replacement_id);
+}
+
+// Arrange the phase publication after the lease lock has been released, while
+// close still holds completion_mu and has already observed BUILDING.
+static void check_close_activation_race(OrchestratorFixture &f, bool with_task) {
+    auto first = f.orch.submit_next_level(f.C(80), f.single_tensor_args(0x8000, TensorArgType::OUTPUT), f.cfg, 0);
+    f.orch.close_run_submission(f.run_id);
+    auto second = f.orch.begin_run();
+    TaskSlot second_slot = INVALID_SLOT;
+    if (with_task) {
+        second_slot =
+            f.orch.submit_next_level(f.C(81), f.single_tensor_args(0x8100, TensorArgType::OUTPUT), f.cfg, 0).task_slot;
+    }
+    std::promise<void> entered, leased, observed, activated;
+    auto entered_future = entered.get_future();
+    auto leased_future = leased.get_future();
+    auto observed_future = observed.get_future();
+    auto activated_future = activated.get_future();
+    std::atomic<bool> timed_out{false};
+    auto wait = [&](std::future<void> &future) {
+        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) timed_out.store(true);
+    };
+    f.orch.set_test_hook([&](OrchestratorTestPoint point) {
+        switch (point) {
+        case OrchestratorTestPoint::RUN_CLOSE_BUILDER_RELEASED:
+            entered.set_value();
+            wait(leased_future);
+            break;
+        case OrchestratorTestPoint::RUN_ACTIVATION_LEASE_ACQUIRED:
+            leased.set_value();
+            wait(observed_future);
+            break;
+        case OrchestratorTestPoint::RUN_CLOSE_PHASE_OBSERVED:
+            observed.set_value();
+            wait(activated_future);
+            break;
+        case OrchestratorTestPoint::RUN_ACTIVATION_PUBLISHED:
+            activated.set_value();
+            break;
+        default:
+            break;
+        }
+    });
+    auto close = std::async(std::launch::async, [&] {
+        f.orch.close_run_submission(second);
+    });
+    wait(entered_future);
+    f.S(first.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    EXPECT_TRUE(f.orch.on_consumed(first.task_slot));
+    close.get();
+    f.orch.set_test_hook({});
+    EXPECT_FALSE(timed_out.load());
+    EXPECT_TRUE(f.orch.run_done(f.run_id));
+    if (with_task) {
+        EXPECT_FALSE(f.orch.run_done(second));
+        f.S(second_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+        EXPECT_TRUE(f.orch.on_consumed(second_slot));
+    }
+    EXPECT_TRUE(f.orch.wait_run_for(second, 0.01));
+}
+
+TEST_F(OrchestratorFixture, ClosingEmptySuccessorCannotOverwriteActivation) {
+    check_close_activation_race(*this, false);
+}
+
+TEST_F(OrchestratorFixture, ClosingSuccessorPreservesActivationAndTaskFence) {
+    check_close_activation_race(*this, true);
+}
+
+TEST_F(OrchestratorFixture, PhysicalEndDoesNotRetireAnOpenSubmissionOrDeliverItsResult) {
+    auto first = orch.submit_next_level(C(180), TaskArgs{}, cfg, 0);
+    orch.mark_task_ended(first.task_slot, 0);
+    EXPECT_TRUE(orch.can_dispatch_run(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+    orch.close_run_submission(run_id);
+    EXPECT_FALSE(orch.can_dispatch_run(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+    RunId successor = orch.begin_run();
+    orch.close_run_submission(successor);
+    S(first.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    ASSERT_TRUE(orch.on_consumed(first.task_slot));
+    EXPECT_NO_THROW(orch.wait_run(run_id));
+    orch.release_run(run_id);
+    orch.release_run(successor);
+}
+
+TEST_F(OrchestratorFixture, PhysicalGroupCreditRequiresEachDistinctMember) {
+    auto group = orch.submit_next_level_group(C(184), {TaskArgs{}, TaskArgs{}}, cfg, {0, 1});
+    orch.close_run_submission(run_id);
+    RunId successor = orch.begin_run();
+    auto next = orch.submit_next_level(C(185), TaskArgs{}, cfg, 0);
+    orch.close_run_submission(successor);
+    orch.mark_task_ended(group.task_slot, 0);
+    orch.mark_task_ended(group.task_slot, 0);
+    orch.mark_task_ended(group.task_slot, 2);  // Not a member of this group.
+    EXPECT_FALSE(orch.can_dispatch_run(successor));
+    orch.mark_task_ended(group.task_slot, 1);
+    EXPECT_TRUE(orch.can_dispatch_run(successor));
+    EXPECT_FALSE(orch.run_done(run_id));
+    S(group.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    EXPECT_TRUE(orch.on_consumed(group.task_slot));
+    S(next.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    EXPECT_TRUE(orch.on_consumed(next.task_slot));
+    orch.release_run(run_id);
+    orch.release_run(successor);
+}
+
+TEST_F(OrchestratorFixture, AnAlreadyEndedSuccessorRetiresWhenItsSlowPredecessorEnds) {
+    auto first = orch.submit_next_level_group(C(186), {TaskArgs{}, TaskArgs{}}, cfg, {0, 1});
+    orch.close_run_submission(run_id);
+    RunId second = orch.begin_run();
+    auto next = orch.submit_next_level(C(187), TaskArgs{}, cfg, 0);
+    orch.close_run_submission(second);
+    // Worker0 finishes A then B, while A's worker1 member is still live.
+    orch.mark_task_ended(first.task_slot, 0);
+    orch.mark_task_ended(next.task_slot, 0);
+    EXPECT_FALSE(orch.can_dispatch_run(second));
+    orch.mark_task_ended(first.task_slot, 1);
+    EXPECT_FALSE(orch.can_dispatch_run(second)) << "already-ended B must not keep an execution lease after promotion";
+    EXPECT_FALSE(orch.run_done(second)) << "physical retirement must not fabricate semantic delivery";
+    for (TaskSlot slot : {first.task_slot, next.task_slot}) {
+        S(slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+        EXPECT_TRUE(orch.on_consumed(slot));
+    }
+    orch.release_run(run_id);
+    orch.release_run(second);
 }

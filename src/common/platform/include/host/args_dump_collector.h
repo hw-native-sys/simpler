@@ -206,6 +206,10 @@ class ArgsDumpCollector : public profiling_common::ProfilerBase<ArgsDumpCollecto
 public:
     ArgsDumpCollector() = default;
     ~ArgsDumpCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     ArgsDumpCollector(const ArgsDumpCollector &) = delete;
     ArgsDumpCollector &operator=(const ArgsDumpCollector &) = delete;
@@ -787,6 +791,7 @@ private:
         int cut_slot{-1};
         uint64_t cut_request{0};
         bool target_installed{false};
+        bool abandonment_recorded{false};
         // Set by the close once it has taken this run's cut proof under the
         // execution claim. The writer seals on what the close recorded and
         // never re-evaluates it: a later, more favourable reading of the same
@@ -898,6 +903,8 @@ private:
     void retained_bump_progress();
     void retained_start_writer();
     void retained_stop_writer();
+    void retained_drain_copied_payloads();
+    void retained_note_unpublished_runs_abandoned();
     void retained_finish();
     void retained_release_resources();
     void retained_release_quarantined();

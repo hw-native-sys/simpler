@@ -16,6 +16,7 @@ from .main import run
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim"])
 def test_child_memory(st_platform, st_device_ids):
     rc = run(st_platform, int(st_device_ids[0]))
     assert rc == 0

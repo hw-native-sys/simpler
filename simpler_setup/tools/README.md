@@ -223,10 +223,13 @@ See [the single-capture schema](../../docs/dfx/chip-swimlane-profiling.md#option
 
 Directory mode puts the Ranks on one axis by containment, not by calibration:
 each Rank's device work is placed inside the `chip.run.runner_run` window that
-held it, read from persistent or capture-local timing logs. Default lookup reads
-`host.*.log` and `host_clock_alignment.*.log` directly under the input directory,
-plus `rank*/d*/host_clock_alignment.*.log` (`--host-log` overrides this lookup)
-and works at any capture level. Device slices carry their Rank's `slack_ns`.
+held it, read from live session logs, derived capture logs, or legacy timing logs.
+SceneTest's automatic conversion writes selected `[STRACE]` records from its
+session logs into the L3 capture and links them from each `dispatch_identity.json`.
+Manual `--host-log` selects input without changing the capture's identity files.
+Offline lookup follows these relative links, then falls back to `host.*.log`
+and `host_clock_alignment.*.log` under the input directory and Rank captures.
+It works at any capture level. Device slices carry their Rank's `slack_ns`.
 Each Rank's metadata carries the full `placement` record, and the top level carries
 `cross_rank_uncertainty_ns` — the sum of the two widest slacks, bounding
 placement freedom between two Ranks for their selected joins. Phase-join freedom
@@ -234,13 +237,17 @@ is reported separately as `join.residual_ns` and must also be considered when
 interpreting cross-Rank gaps. See
 [`containment.py`](containment.py) for the mechanism.
 
-The merged trace also carries the processes that dispatched to the Ranks —
-the L3 scheduler's `node.*` lanes, and an L4's `network1.*` above them, listed
-in `metadata.dispatcher_pids`. Those are Host `CLOCK_MONOTONIC` and same-host
-cross-process comparable, so they are drawn directly and carry no `slack_ns`:
-containment is only needed where a device clock is. Only the invocations
-overlapping the Ranks' own span on the axis are drawn, since one log covers the
-whole run.
+`metadata.parent_dispatch_status` is `present`, `missing`, or `unknown`;
+`missing` means the Ranks were merged without their parent scheduler spans.
+Automatic conversion still saves the available Rank Host records for offline reopening.
+
+The merged trace also carries the L3 scheduler's `node.*` lanes, listed in
+`metadata.dispatcher_pids`. A Rank's parent dispatch identity identifies that
+L3 task; it does not identify an L4 task, so automatic conversion does not
+attach `network1.*` by timestamp alone. These lanes are Host `CLOCK_MONOTONIC`
+and same-host cross-process comparable, so they are drawn directly and carry no `slack_ns`:
+containment is only needed where a device clock is. A parent dispatch identity
+selects the matching L3 task; legacy captures without one use the Rank window.
 
 Ranks must report the same `metadata.host_clock_domain_id`, since two Hosts'
 windows are not on one axis; a capture from before that field existed is placed
@@ -316,7 +323,7 @@ SPMD tasks are present.
 | `--output` | `-o` | Output JSON file (default: `merged_swimlane.json` beside a file input, `l3_swimlane.json` inside a directory input) |
 | `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. A directory holding both a `chip_swimlane_records.json` and a retained `swimlane-*/` artifact offers two separate units, which are never merged — name one with `d0:fixed` or `d0:retained`. Mutually exclusive with `--dispatch-id` |
 | `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`, optionally suffixed `:fixed` or `:retained`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
-| `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows (repeatable). Single-file mode prefers sibling `host_clock_alignment.*.log`, falling back to `host.*.log`; directory mode reads both at the root plus `rank*/d*/host_clock_alignment.*.log`. An explicit argument recalculates single-file alignment |
+| `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows (repeatable). Single-file mode prefers sibling `host_clock_alignment.*.log`, falling back to `host.*.log`; directory mode reads linked derived logs, then legacy logs. An explicit argument selects the input and recalculates single-file alignment; only SceneTest's automatic flow publishes L3 derived logs |
 | `--rank-pid` | | Directory mode: pin one Rank's capture to the Host invocation that ran it, `RANK=PID` or `RANK=PID:INV` (repeatable). Only needed when the captures carry no `dispatch_identity.json` and Ranks running the same shape cannot be told apart by their device windows |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping. Rejected in directory mode |
 | `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping. Rejected in directory mode |

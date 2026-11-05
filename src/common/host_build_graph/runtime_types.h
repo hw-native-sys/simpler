@@ -685,7 +685,7 @@ struct alignas(64) ChipTaskSlotState {
     uint16_t ed_publish_scan_cursor{0};
 
     // --- Set per-submit (depend on task inputs) ---
-    ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
+    LaneMask active_mask;  // Bitmask of active subtask slots (set once)
     // Single per-task attributes byte (early-dispatch hint, sync_start,
     // has_predicate, selective timing tag). Lives on slot_state (not payload) so
     // fanin walks and the completion path read them off the already-hot producer
@@ -777,6 +777,7 @@ struct alignas(64) ChipTaskSlotState {
 };
 
 static_assert(sizeof(ChipTaskSlotState) == 64);
+static_assert(offsetof(ChipTaskSlotState, active_mask) == 56);
 // Pins the widest-first order that leaves the record padding-free: every member
 // before `reserved` is naturally aligned where the one before it ends.
 static_assert(

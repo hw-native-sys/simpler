@@ -91,6 +91,74 @@ tmr_case(test_dep_gen_replay.cpp
     SOURCES  ${TMR_SHARED_HOST_DIR}/dep_gen_replay.cpp
     INCLUDES ${TMR_SHARED_HOST_DIR})
 
+if(APPLE)
+    set(_mix_admission_gc -Wl,-dead_strip)
+else()
+    set(_mix_admission_gc -Wl,--gc-sections)
+endif()
+tmr_case(test_mix_admission.cpp
+    NO_OBJS
+    SOURCES
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/shared_memory.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/aicpu/inner_platform_regs.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK @arch@_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_mix_admission_gc}
+    TIMEOUT 30)
+
+tmr_case(test_scheduler_dispatch_diagnostics.cpp
+    NO_OBJS
+    SOURCES
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/shared_memory.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/tensormap.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
+        ${CMAKE_SOURCE_DIR}/support/device_time_stub.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/platform_regs.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK @arch@_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_mix_admission_gc}
+    TIMEOUT 30)
+
+tmr_case(test_early_dispatch_deferred_completion.cpp
+    NO_OBJS
+    SOURCES
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/shared_memory.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime_init.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/tensormap.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
+        ${CMAKE_SOURCE_DIR}/support/device_time_stub.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/platform_regs.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK @arch@_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_mix_admission_gc}
+    TIMEOUT 30)
+
 # Cross-run retention: admission, the boundary's seal, the background writer
 # and atomic publication. The device producer, the host collector and the
 # replay are all production code here, so a published deps.json is the real

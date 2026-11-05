@@ -23,13 +23,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -37,7 +42,6 @@
 #include <vector>
 
 #include "call_config.h"
-#include "orchestrator.h"
 #include "worker_manager.h"
 #include "run_resource_arena.h"
 #include "ring.h"
@@ -47,6 +51,13 @@
 #include "tensor.h"
 #include "tensormap.h"
 #include "types.h"
+
+// The activation hook holds runs_mu_; the locking public capacity getter
+// cannot be called from it. Only the existing protected value is read there.
+#define private public
+#include "orchestrator.h"
+#undef private
+#include "worker.h"
 
 #define private public
 #include "chip_worker.h"
@@ -78,7 +89,7 @@ uint32_t slot_of(void *runtime) { return g_slots.at(runtime); }
 int prepare_run(
     void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
 ) {
-    EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
+    g_slots[runtime] = descriptor->pipeline_slot;
     g_complete[descriptor->pipeline_slot] = false;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     return 0;
@@ -105,7 +116,12 @@ int wait_run(void *, void *runtime) {
     return 0;
 }
 
-int finalize_run(void *, void *runtime) {
+int wait_run_completion(void *, void *runtime) {
+    g_complete[slot_of(runtime)] = true;
+    return 0;
+}
+
+int finalize_run(void *, void *runtime, int) {
     const uint32_t slot = slot_of(runtime);
     g_events.push_back("finalize" + std::to_string(slot));
     return slot == g_finalize_fails_slot ? PTO_RUNTIME_ERR_INTERNAL : 0;
@@ -135,14 +151,12 @@ void prime_worker(ChipWorker &worker, uint32_t depth, unsigned launch_depth) {
     for (uint32_t slot = 0; slot < depth; ++slot) {
         worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     }
-    for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
-        g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
-    }
     worker.prepare_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;
     worker.launch_run_joined_fn_ = launch_run_joined;
     worker.poll_run_fn_ = poll_run;
     worker.wait_run_fn_ = wait_run;
+    worker.wait_run_completion_fn_ = wait_run_completion;
     worker.finalize_run_fn_ = finalize_run;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
     worker.supports_joined_native_launch_fn_ = supports_joined;
@@ -225,12 +239,56 @@ TEST(ThreeRunCapacityLaneTest, TheRunPastTheGrantedCapacityIsRefusedRatherThanQu
     worker.finalize();
 }
 
-TEST(ThreeRunCapacityLaneTest, AMiddleRunsFailureKeepsItsOwnReferencesAndLeavesThePredecessorAlone) {
-    // Failure attribution at three, where there is a run on each side of the failing one. The
-    // device error is injected at the native boundary rather than produced on hardware: the
-    // question here is which run owns the outcome and what its references do, and that is lane
-    // state. What a real device failure then publishes to a *Worker* is a separate contract, and
-    // the predecessor-outcome half of it is external PR #2532's — this case does not reach it.
+TEST(ThreeRunCapacityLaneTest, TheUnobservedCompletedBacklogIsCountedAndItsPeakRetained) {
+    // The backlog the pipeline depth deliberately does not bound: each run's
+    // execution has ended and its slot is refillable, while its result is still
+    // the caller's to take. The count is what makes that retention visible, and
+    // the peak survives the drain that empties the count.
+    ChipWorker worker;
+    prime_worker(worker, /*depth=*/3, /*launch_depth=*/3);
+    ChipRunLane lane(worker);
+
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 0u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 0u);
+
+    ChipRun first = submit_at(lane, 1, 0, CallConfig{}, /*activate=*/true);
+    ChipRun second = submit_at(lane, 2, 1, CallConfig{}, /*activate=*/false);
+    second.activate();
+    ChipRun third = submit_at(lane, 3, 2, CallConfig{}, /*activate=*/false);
+    third.activate();
+    // Launched, not ended: execution still owns all three.
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 0u);
+
+    g_complete = {true, true, true};
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.done());
+    EXPECT_TRUE(third.done());
+    // Ended and unobserved: three results the callers have not taken.
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 3u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 3u);
+
+    // Past the granted depth, which is the property being claimed: the first
+    // run's slot refilled while its result is still untaken, so a backlog
+    // capped at the pipeline depth would stop here. Submitting resets the
+    // slot's completion flag, so this run needs its own.
+    ChipRun fourth = submit_at(lane, 4, 0, CallConfig{}, /*activate=*/true);
+    g_complete[0] = true;
+    EXPECT_TRUE(fourth.done());
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 4u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 4u);
+
+    lane.close();
+    // Close delivers every accepted run, so the backlog empties while the peak
+    // stays readable — which is what a test can assert after the race is over.
+    EXPECT_EQ(worker.unobserved_completed_run_count(), 0u);
+    EXPECT_EQ(worker.unobserved_completed_run_high_water(), 4u);
+    worker.finalize();
+}
+
+TEST(ThreeRunCapacityLaneTest, AMiddleRunsResultFailurePreservesConfirmedResultsAndProvedLastUse) {
+    // Three live runs separate confirmed results from later unobserved outcomes.
+    // The native CPU leaf injects the result failure; each run still needs its
+    // own physical last-use proof and cleanup.
     ChipWorker worker;
     prime_worker(worker, /*depth=*/3, /*launch_depth=*/3);
     g_finalize_fails_slot = 1;
@@ -243,9 +301,10 @@ TEST(ThreeRunCapacityLaneTest, AMiddleRunsFailureKeepsItsOwnReferencesAndLeavesT
     third.activate();
 
     g_complete = {true, true, true};
-    // The predecessor completes on its own terms: its slot's finalize reported success, so its
-    // references are discharged rather than kept.
+    // Confirm the predecessor's result before observing the middle failure.
+    // done() alone proves physical completion, not successful finalization.
     EXPECT_TRUE(first.done());
+    EXPECT_TRUE(first.wait_until(ChipRun::Clock::now() + std::chrono::seconds(5)));
     ASSERT_EQ(g_releases.size(), 1u);
     EXPECT_FALSE(g_releases.front().second);
 
@@ -255,18 +314,26 @@ TEST(ThreeRunCapacityLaneTest, AMiddleRunsFailureKeepsItsOwnReferencesAndLeavesT
     const ChipRun::Deadline deadline = ChipRun::Clock::now() + std::chrono::seconds(5);
     EXPECT_THROW(second.wait_until(deadline), std::runtime_error);
     ASSERT_EQ(g_releases.size(), 2u);
-    // Kept, not released: an unproven finalize cannot establish that the device stopped reading
-    // those bytes, so the caller's release stays refused from here on.
-    EXPECT_TRUE(g_releases.back().second);
+    // Its own boundary already proved last use before the result failure.
+    EXPECT_FALSE(g_releases.back().second);
     EXPECT_NE(g_releases.back().first, g_releases.front().first);
 
-    // The run behind it had already crossed its own launch fence, so it owns device work only its
-    // own drain can retire: it reaches its own outcome and discharges its own references. What the
-    // failure took is the lane's ability to admit or serve anything further.
+    // The unobserved successor inherits the known lane failure. Its own drain
+    // still proves last use and discharges its references.
     EXPECT_TRUE(second.lane_poisoned());
-    EXPECT_TRUE(third.wait_until(ChipRun::Clock::now() + std::chrono::seconds(5)));
+    try {
+        (void)third.wait_until(ChipRun::Clock::now() + std::chrono::seconds(5));
+        FAIL() << "unobserved successor lost the middle run's lane failure";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("chip run lane is poisoned"), std::string::npos);
+        EXPECT_NE(std::string(error.what()).find("finalize_native_run failed with code -1000"), std::string::npos);
+        EXPECT_NE(std::string(error.what()).find("run_id=2"), std::string::npos);
+    }
     ASSERT_EQ(g_releases.size(), 3u);
     EXPECT_FALSE(g_releases.back().second);
+    const auto settled_events = g_events;
+    EXPECT_TRUE(first.wait_until(ChipRun::Clock::now() + std::chrono::seconds(5)));
+    EXPECT_EQ(g_events, settled_events) << "confirmed predecessor must remain cached";
 
     // Closing a poisoned lane reports the failure rather than swallowing it, so this is the
     // expected outcome of the close rather than an escaped error.
@@ -823,3 +890,440 @@ TEST(ThreeRunCapacityOrchestratorTest, ADepthOfTwoStillLeasesAndAuthorizesOneSuc
 }
 
 }  // namespace
+
+TEST(ThreeRunCapacityEndpointTest, PhysicalEndRetainsTheEntryUntilStrongTerminalDelivery) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    const TaskSlot first = capacity_progress_slot(allocator, 171, 0, 15);
+    const TaskSlot second = capacity_progress_slot(allocator, 172, 0, 16);
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 3);
+    endpoint.submit_progress(&allocator, WorkerDispatch{first, 0, 181, false});
+    capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+    auto *entry = capacity_entry(mailbox, 0);
+    const auto old_generation = entry->entry_generation;
+    __atomic_store_n(&entry->accepted, MAILBOX_TASK_ACCEPTED, __ATOMIC_RELEASE);
+    __atomic_store_n(&entry->admissible_run_resource_sets, 3, __ATOMIC_RELEASE);
+    set_capacity_entry_state(entry, MailboxState::TASK_ENDED);
+    WorkerEndpointProgress progress;
+    ASSERT_TRUE(endpoint.poll_progress(progress));
+    EXPECT_EQ(progress.kind, WorkerProgressKind::ACCEPTED);
+    ASSERT_TRUE(endpoint.poll_progress(progress));
+    EXPECT_EQ(progress.kind, WorkerProgressKind::ENDED);
+    EXPECT_EQ(progress.dispatch.dispatch_id, 181u);
+    EXPECT_EQ(progress.completion.task_slot, first);
+    EXPECT_EQ(progress.completion.group_index, 0);
+    EXPECT_EQ(progress.completion.worker_id, 0);
+    EXPECT_EQ(progress.completion.admissible_run_resource_sets, 3u);
+    EXPECT_FALSE(endpoint.poll_progress(progress));
+    EXPECT_EQ(entry->entry_generation, old_generation);
+    endpoint.request_observation(171);
+    EXPECT_EQ(__atomic_load_n(&entry->observation_requested, __ATOMIC_ACQUIRE), 1);
+    EXPECT_EQ(capacity_entry_state(entry), MailboxState::TASK_ENDED);
+    EXPECT_EQ(entry->accepted, MAILBOX_TASK_ACCEPTED);
+    set_capacity_entry_state(entry, MailboxState::TASK_DONE);
+    ASSERT_TRUE(endpoint.poll_progress(progress));
+    EXPECT_EQ(progress.kind, WorkerProgressKind::COMPLETED);
+    EXPECT_EQ(entry->entry_generation % 2, 0u);
+    endpoint.submit_progress(&allocator, WorkerDispatch{second, 0, 182, false});
+    ASSERT_NE(entry->entry_generation, old_generation);
+    EXPECT_EQ(entry->observation_requested, 0);
+    endpoint.request_observation(171);  // Old run identity cannot request its successor.
+    EXPECT_EQ(entry->observation_requested, 0);
+    allocator.shutdown();
+}
+
+TEST(ThreeRunCapacityEndpointTest, AWaitBeforePublicationPersistsWithoutPeriodicRequests) {
+    class CountingEndpoint : public LocalMailboxEndpoint {
+    public:
+        CountingEndpoint(void *mailbox, size_t bytes) :
+            LocalMailboxEndpoint(0, mailbox, bytes, -1, 1) {}
+        void request_observation(RunId id) override {
+            ++requests;
+            LocalMailboxEndpoint::request_observation(id);
+        }
+        size_t requests{0};
+    };
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/1ULL << 20);
+    TensorMap tm;
+    Scope scope;
+    ReadyQueue sub;
+    NextLevelReadyQueues next;
+    next.reset({0});
+    WorkerManager manager;
+    auto endpoint = std::make_unique<CountingEndpoint>(mailbox.data(), mailbox.size());
+    auto *const counter = endpoint.get();
+    manager.add_next_level_endpoint(std::move(endpoint));
+    Orchestrator orch;
+    manager.start(
+        &allocator, [](WorkerCompletion) {}, [](WorkerDispatch) {}, {}, {},
+        [&orch](RunId id) noexcept {
+            return orch.run_observation_requested(id);
+        }
+    );
+    orch.init(&tm, &allocator, &scope, &sub, &next, &manager);
+    const RunId run = orch.begin_run();
+    CallableIdentity callable;
+    callable.digest.fill(192);
+    const auto submitted = orch.submit_next_level(callable, TaskArgs{}, CallConfig{}, 0);
+    orch.close_run_submission(run);
+
+    // No entry exists yet. The caller deadline ends this wait, not its demand
+    // for a strong result once the actual dispatch is published.
+    EXPECT_FALSE(orch.wait_run_for(run, 0));
+    EXPECT_EQ(counter->requests, 0u);
+    EXPECT_FALSE(orch.wait_run_for(run, 0.01));
+    EXPECT_EQ(counter->requests, 1u) << "one persistent demand must replace timer-driven retries";
+    EXPECT_FALSE(orch.wait_run_for(run, 0.0001));
+    EXPECT_EQ(counter->requests, 1u) << "a later waiter shares the run's existing demand";
+    auto *const thread = manager.get_worker_by_id(WorkerType::NEXT_LEVEL, 0);
+    ASSERT_NE(thread, nullptr);
+    allocator.slot_state(submitted.task_slot)->state.store(TaskState::RUNNING);
+    thread->dispatch(WorkerDispatch{submitted.task_slot, 0, 0, false});
+    auto *const entry = capacity_entry(mailbox, 0);
+    EXPECT_EQ(entry->observation_requested, 1) << "the wait preceded this entry's publication";
+
+    capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+    set_capacity_entry_state(entry, MailboxState::TASK_DONE);
+    manager.progress();
+    allocator.slot_state(submitted.task_slot)->state.store(TaskState::COMPLETED);
+    EXPECT_TRUE(orch.on_consumed(submitted.task_slot));
+    orch.release_run(run);
+    EXPECT_FALSE(orch.run_observation_requested(run));
+    manager.stop();
+    allocator.shutdown();
+}
+
+namespace {
+
+void complete_capacity_requests(
+    std::array<char, MAILBOX_SIZE> &mailbox, uint32_t capacity,
+    std::array<uint64_t, MAILBOX_REQUEST_FRAMES> &consumed_generations
+) {
+    for (size_t frame_index = 0; frame_index < MAILBOX_REQUEST_FRAMES; ++frame_index) {
+        char *frame = capacity_task_frame(mailbox, frame_index);
+        const auto state = static_cast<MailboxState>(
+            __atomic_load_n(reinterpret_cast<int32_t *>(frame + MAILBOX_OFF_STATE), __ATOMIC_ACQUIRE)
+        );
+        if (state != MailboxState::TASK_READY && state != MailboxState::PREPARE_READY &&
+            state != MailboxState::ACTIVATE)
+            continue;
+        uint64_t generation = 0;
+        std::memcpy(&generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(generation));
+        if (generation == consumed_generations[frame_index]) continue;
+        consumed_generations[frame_index] = generation;
+        uint64_t index = 0;
+        std::memcpy(&index, frame + MAILBOX_OFF_FRAME_ENTRY_INDEX, sizeof(index));
+        capacity_consume_frame(mailbox, frame_index, MailboxPreparationDisposition::NATIVE_PREPARED);
+        auto *entry = capacity_entry(mailbox, index);
+        __atomic_store_n(&entry->accepted, MAILBOX_TASK_ACCEPTED, __ATOMIC_RELEASE);
+        __atomic_store_n(&entry->admissible_run_resource_sets, capacity, __ATOMIC_RELEASE);
+        set_capacity_entry_state(entry, MailboxState::TASK_DONE);
+    }
+}
+
+}  // namespace
+
+TEST(ThreeRunCapacityEndpointTest, PhysicalEndFoldsMeasuredCapacityBeforeSemanticDelivery) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Worker worker(3, 1ULL << 20);
+    worker.configure_pipeline_depth(3, 0, 3, 1);
+    worker.add_next_level_worker(0, mailbox.data(), mailbox.size(), -1, 3);
+    worker.init();
+    Orchestrator &orch = worker.get_orchestrator();
+    const RunId first = orch.begin_run();
+    CallableIdentity callable;
+    callable.digest.fill(219);
+    orch.submit_next_level(callable, TaskArgs{}, CallConfig{}, 0);
+    orch.close_run_submission(first);
+    auto *const entry = capacity_entry(mailbox, 0);
+    const bool dispatched = settled_within([&] {
+        return __atomic_load_n(
+                   reinterpret_cast<int32_t *>(capacity_task_frame(mailbox, 0) + MAILBOX_OFF_STATE), __ATOMIC_ACQUIRE
+               ) == static_cast<int32_t>(MailboxState::TASK_READY);
+    });
+    EXPECT_TRUE(dispatched);
+    if (dispatched) {
+        capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+        __atomic_store_n(&entry->accepted, MAILBOX_TASK_ACCEPTED, __ATOMIC_RELEASE);
+        __atomic_store_n(&entry->admissible_run_resource_sets, 3, __ATOMIC_RELEASE);
+        const uint64_t generation = __atomic_load_n(&entry->entry_generation, __ATOMIC_ACQUIRE);
+        set_capacity_entry_state(entry, MailboxState::TASK_ENDED);
+        const bool measured_before_delivery = settled_within([&] {
+            return orch.admissible_depth() == 3;
+        });
+        EXPECT_TRUE(measured_before_delivery)
+            << "the actual end callback returned execution credit without forwarding measured capacity";
+        EXPECT_EQ(__atomic_load_n(&entry->entry_generation, __ATOMIC_ACQUIRE), generation);
+        EXPECT_EQ(capacity_entry_state(entry), MailboxState::TASK_ENDED);
+        EXPECT_FALSE(orch.run_done(first));
+
+        std::vector<RunId> successors;
+        if (measured_before_delivery) {
+            for (int index = 0; index < 3; ++index) {
+                const RunId next = orch.begin_run();
+                orch.submit_next_level(callable, TaskArgs{}, CallConfig{}, 0);
+                orch.close_run_submission(next);
+                successors.push_back(next);
+            }
+            EXPECT_EQ(orch.active_run_id(), successors[0]);
+            EXPECT_EQ(orch.preparable_run_ids(), (std::vector<RunId>{successors[1], successors[2]}));
+            EXPECT_FALSE(orch.run_done(first));
+            EXPECT_EQ(capacity_entry_state(entry), MailboxState::TASK_ENDED);
+        }
+
+        // The terminal route remains a positive control for the same actual mailbox figure.
+        set_capacity_entry_state(entry, MailboxState::TASK_DONE);
+        EXPECT_TRUE(orch.wait_run_for(first, 5.0));
+        EXPECT_EQ(orch.admissible_depth(), 3u);
+        orch.release_run(first);
+        std::array<uint64_t, MAILBOX_REQUEST_FRAMES> consumed_generations{};
+        EXPECT_TRUE(settled_within([&] {
+            complete_capacity_requests(mailbox, 3, consumed_generations);
+            return std::all_of(successors.begin(), successors.end(), [&](RunId id) {
+                return orch.run_done(id);
+            });
+        }));
+        for (RunId id : successors) {
+            EXPECT_TRUE(orch.wait_run_for(id, 5.0));
+            orch.release_run(id);
+        }
+    }
+    worker.close();
+}
+
+TEST(ThreeRunCapacityEndpointTest, TerminalFallbackRegistersNarrowingBeforePromotingTheNextRun) {
+    for (uint32_t reported : {0u, 1u}) {
+        SCOPED_TRACE(reported);
+        alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+        Worker worker(3, 1ULL << 20);
+        worker.configure_pipeline_depth(3, 0, 3);
+        worker.add_next_level_worker(0, mailbox.data(), mailbox.size(), -1, 3);
+        worker.init();
+        auto &orch = worker.get_orchestrator();
+        CallableIdentity callable;
+        callable.digest.fill(221);
+        std::array<RunId, 2> runs{};
+        for (auto &run : runs) {
+            run = orch.begin_run();
+            orch.submit_next_level(callable, TaskArgs{}, CallConfig{}, 0);
+            orch.close_run_submission(run);
+        }
+        std::atomic<uint32_t> capacity_at_promotion{0};
+        orch.set_test_hook([&](OrchestratorTestPoint point) {
+            if (point == OrchestratorTestPoint::RUN_ACTIVATION_PUBLISHED)
+                capacity_at_promotion.store(orch.admission_depth_, std::memory_order_release);
+        });
+        auto *entry = capacity_entry(mailbox, 0);
+        EXPECT_TRUE(settled_within([&] {
+            return __atomic_load_n(
+                       reinterpret_cast<int32_t *>(capacity_task_frame(mailbox, 0) + MAILBOX_OFF_STATE),
+                       __ATOMIC_ACQUIRE
+                   ) == static_cast<int32_t>(MailboxState::TASK_READY);
+        }));
+        capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+        __atomic_store_n(&entry->accepted, MAILBOX_TASK_ACCEPTED, __ATOMIC_RELEASE);
+        __atomic_store_n(&entry->admissible_run_resource_sets, reported, __ATOMIC_RELEASE);
+        set_capacity_entry_state(entry, MailboxState::TASK_DONE);
+        EXPECT_TRUE(settled_within([&] {
+            return capacity_at_promotion.load(std::memory_order_acquire) != 0;
+        }));
+        EXPECT_EQ(capacity_at_promotion.load(std::memory_order_acquire), reported == 0 ? 3u : 1u);
+        EXPECT_TRUE(orch.wait_run_for(runs[0], 5.0));
+        orch.release_run(runs[0]);
+        std::array<uint64_t, MAILBOX_REQUEST_FRAMES> consumed_generations{};
+        EXPECT_TRUE(settled_within([&] {
+            complete_capacity_requests(mailbox, reported, consumed_generations);
+            return orch.run_done(runs[1]);
+        }));
+        EXPECT_TRUE(orch.wait_run_for(runs[1], 5.0));
+        orch.release_run(runs[1]);
+        worker.close();
+    }
+}
+
+TEST(ThreeRunCapacityEndpointTest, GroupCapacityWaitsForEveryPhysicalMemberAndClosedSubmission) {
+    for (uint32_t second_report : {0u, 2u}) {
+        SCOPED_TRACE(second_report);
+        alignas(8) std::array<char, MAILBOX_SIZE> first_mailbox{};
+        alignas(8) std::array<char, MAILBOX_SIZE> second_mailbox{};
+        Worker worker(3, 1ULL << 20);
+        worker.configure_pipeline_depth(3, 0, 3, 1);
+        worker.add_next_level_worker(0, first_mailbox.data(), first_mailbox.size(), -1, 3);
+        worker.add_next_level_worker(1, second_mailbox.data(), second_mailbox.size(), -1, 3);
+        worker.init();
+        auto &orch = worker.get_orchestrator();
+        const RunId run = orch.begin_run();
+        CallableIdentity callable;
+        callable.digest.fill(223);
+        orch.submit_next_level_group(callable, {TaskArgs{}, TaskArgs{}}, CallConfig{}, {0, 1});
+        std::array<std::array<char, MAILBOX_SIZE> *, 2> mailboxes{&first_mailbox, &second_mailbox};
+        for (size_t index = 0; index < mailboxes.size(); ++index) {
+            auto &mailbox = *mailboxes[index];
+            EXPECT_TRUE(settled_within([&] {
+                return __atomic_load_n(
+                           reinterpret_cast<int32_t *>(capacity_task_frame(mailbox, 0) + MAILBOX_OFF_STATE),
+                           __ATOMIC_ACQUIRE
+                       ) == static_cast<int32_t>(MailboxState::TASK_READY);
+            }));
+            capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+            auto *entry = capacity_entry(mailbox, 0);
+            __atomic_store_n(&entry->accepted, MAILBOX_TASK_ACCEPTED, __ATOMIC_RELEASE);
+            __atomic_store_n(&entry->admissible_run_resource_sets, index == 0 ? 3u : second_report, __ATOMIC_RELEASE);
+            set_capacity_entry_state(entry, MailboxState::TASK_ENDED);
+        }
+        EXPECT_TRUE(settled_within([&] {
+            std::shared_ptr<RunState> state;
+            {
+                std::lock_guard<std::mutex> lock(orch.runs_mu_);
+                state = orch.runs_.at(run);
+                auto first = orch.endpoint_capacity_.find(0);
+                if (first == orch.endpoint_capacity_.end() || first->second != 3) return false;
+                auto second = orch.endpoint_capacity_.find(1);
+                if (second_report != 0 && (second == orch.endpoint_capacity_.end() || second->second != second_report))
+                    return false;
+            }
+            std::lock_guard<std::mutex> lock(state->completion_mu);
+            return state->physical_tasks.size() == 1 &&
+                   state->physical_tasks[0].ended_members == std::vector<uint8_t>{1, 1};
+        }));
+        EXPECT_EQ(orch.admissible_depth(), 1u);
+        EXPECT_EQ(orch.active_run_id(), run);
+        EXPECT_FALSE(orch.run_done(run));
+        for (auto *mailbox : mailboxes) {
+            auto *entry = capacity_entry(*mailbox, 0);
+            EXPECT_EQ(capacity_entry_state(entry), MailboxState::TASK_ENDED);
+            EXPECT_EQ(__atomic_load_n(&entry->entry_generation, __ATOMIC_ACQUIRE) % 2, 1u);
+        }
+        orch.close_run_submission(run);
+        EXPECT_TRUE(settled_within([&] {
+            return orch.admissible_depth() == (second_report == 0 ? 3u : 2u);
+        }));
+        EXPECT_FALSE(orch.run_done(run));
+        for (auto *mailbox : mailboxes)
+            set_capacity_entry_state(capacity_entry(*mailbox, 0), MailboxState::TASK_DONE);
+        EXPECT_TRUE(orch.wait_run_for(run, 5.0));
+        EXPECT_EQ(orch.admissible_depth(), second_report == 0 ? 3u : 2u);
+        orch.release_run(run);
+        worker.close();
+    }
+}
+
+TEST(ThreeRunCapacityEndpointTest, PersistentDemandWaitsOnlyThroughAuthorizedActivationPublication) {
+    CapacityHarness h(2, 2);
+    const auto first = h.build_closed_run(301);
+    const auto second = h.build_closed_run(302);
+    h.accept(first);
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.set_observation_demand([&](RunId id) {
+        return h.orch.run_observation_requested(id);
+    });
+    endpoint.set_activation_permission([&](RunId id) {
+        return h.orch.run_activation_authorized(id);
+    });
+    endpoint.submit_progress(&h.allocator, WorkerDispatch{first.task.task_slot, 0, 1, false});
+    endpoint.submit_progress(&h.allocator, WorkerDispatch{second.task.task_slot, 0, 2, true});
+    auto *a = capacity_entry(mailbox, 0);
+    auto *b = capacity_entry(mailbox, 1);
+    EXPECT_TRUE(h.orch.run_activation_authorized(second.id));
+    EXPECT_FALSE(h.orch.wait_run_for(first.id, 0.0001));
+    ASSERT_TRUE(h.orch.run_observation_requested(first.id));
+    endpoint.progress_observations();
+    EXPECT_EQ(a->observation_requested, 0) << "installed eligible B is still being classified";
+    capacity_consume_frame(mailbox, 1, MailboxPreparationDisposition::NATIVE_PREPARED);
+    endpoint.progress_observations();
+    EXPECT_EQ(a->observation_requested, 0) << "native preparation is not parent ACTIVATE publication";
+    ASSERT_TRUE(endpoint.activate_progress(second.id));
+    endpoint.progress_observations();
+    EXPECT_EQ(capacity_entry_state(b), MailboxState::ACTIVATE);
+    EXPECT_EQ(a->observation_requested, 1) << "do not wait for B launch, admission or semantic result";
+}
+
+TEST(ThreeRunCapacityEndpointTest, ObservationRechecksInstallationsAcrossTheUnlockedPolicyQuery) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring ring;
+    ring.init(0);
+    const auto retired = capacity_progress_slot(ring, 400, 2, 40);
+    const auto a = capacity_progress_slot(ring, 401, 0, 41);
+    const auto b = capacity_progress_slot(ring, 402, 1, 42);
+    const auto c = capacity_progress_slot(ring, 403, 2, 43);
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 3);
+    endpoint.submit_progress(&ring, WorkerDispatch{retired, 0, 1, false});
+    endpoint.submit_progress(&ring, WorkerDispatch{a, 0, 2, false});
+    capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+    endpoint.submit_progress(&ring, WorkerDispatch{b, 0, 3, true});
+    set_capacity_entry_state(capacity_entry(mailbox, 0), MailboxState::TASK_DONE);
+    WorkerEndpointProgress terminal;
+    ASSERT_TRUE(endpoint.poll_progress(terminal));
+    ASSERT_EQ(terminal.kind, WorkerProgressKind::COMPLETED);
+    ASSERT_EQ(terminal.dispatch.dispatch_id, 1u);
+    // A remains in entry1 and B in entry2. C reuses the now-free entry0,
+    // which the observation scan has already passed before B's policy query.
+    capacity_consume_frame(mailbox, 1, MailboxPreparationDisposition::NATIVE_PREPARED);
+    bool installed = false;
+    endpoint.set_activation_permission([&](RunId id) {
+        if (!installed) {
+            installed = true;
+            endpoint.submit_progress(&ring, WorkerDispatch{c, 0, 4, true});
+        }
+        return id == 403;
+    });
+    endpoint.request_observation(401);
+    ASSERT_TRUE(installed);
+    EXPECT_EQ(capacity_entry(mailbox, 0)->run_id, 403u);
+    EXPECT_EQ(capacity_entry(mailbox, 1)->observation_requested, 0);
+    endpoint.request_observation(401);
+    EXPECT_EQ(capacity_entry(mailbox, 1)->observation_requested, 0) << "newly installed eligible C owns precedence";
+    capacity_consume_frame(mailbox, 1, MailboxPreparationDisposition::VALIDATED_ONLY);
+    endpoint.request_observation(401);
+    EXPECT_EQ(capacity_entry(mailbox, 1)->observation_requested, 1);
+    ring.shutdown();
+}
+
+TEST(ThreeRunCapacityEndpointTest, ClassificationFailureAndIneligibleSuccessorsNeverStrandObservation) {
+    for (int scenario = 0; scenario != 5; ++scenario) {
+        alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+        Ring ring;
+        ring.init(0);
+        const auto a = capacity_progress_slot(ring, 501, 0, 51);
+        const auto b = capacity_progress_slot(ring, 502, 1, 52);
+        LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+        endpoint.submit_progress(&ring, WorkerDispatch{a, 0, 1, false});
+        endpoint.submit_progress(&ring, WorkerDispatch{b, 0, 2, true});
+        endpoint.set_activation_permission([&](RunId) {
+            if (scenario == 4) throw std::runtime_error("policy unavailable");
+            return scenario != 0;
+        });
+        if (scenario == 1) capacity_consume_frame(mailbox, 1, MailboxPreparationDisposition::VALIDATED_ONLY);
+        if (scenario == 2) set_capacity_entry_state(capacity_entry(mailbox, 1), MailboxState::TASK_FAILED);
+        if (scenario == 3) set_capacity_entry_state(capacity_entry(mailbox, 1), MailboxState::TASK_DONE);
+        endpoint.request_observation(501);
+        EXPECT_EQ(capacity_entry(mailbox, 0)->observation_requested, 1) << scenario;
+        ring.shutdown();
+    }
+}
+
+TEST(ThreeRunCapacityEndpointTest, PublishedDemandIsNeverWithdrawnAndTerminalEntriesAreNeverWritten) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring ring;
+    ring.init(0);
+    const auto a = capacity_progress_slot(ring, 601, 0, 61);
+    const auto b = capacity_progress_slot(ring, 602, 1, 62);
+    LocalMailboxEndpoint endpoint(0, mailbox.data(), mailbox.size(), -1, 2);
+    endpoint.set_activation_permission([](RunId) {
+        return true;
+    });
+    endpoint.submit_progress(&ring, WorkerDispatch{a, 0, 1, false});
+    endpoint.request_observation(601);
+    EXPECT_EQ(capacity_entry(mailbox, 0)->observation_requested, 1);
+    endpoint.submit_progress(&ring, WorkerDispatch{b, 0, 2, true});
+    endpoint.request_observation(601);
+    EXPECT_EQ(capacity_entry(mailbox, 0)->observation_requested, 1);
+    set_capacity_entry_state(capacity_entry(mailbox, 1), MailboxState::TASK_DONE);
+    endpoint.request_observation(602);
+    EXPECT_EQ(capacity_entry(mailbox, 1)->observation_requested, 0);
+    ring.shutdown();
+}

@@ -13,7 +13,7 @@ image it is handed must be complete. ``KernelCompiler.compile_incore`` links
 each object with ``ld.lld`` first, which applies ``.rela.text`` and folds
 ``.text._Z*`` group sections in; these tests cover what the parser must still
 reject when that link leaves something behind — out-of-line code, surviving
-relocations, or a ``kernel_entry`` that is not first. Returning such bytes
+relocations, allocated read-only data, or a ``kernel_entry`` that is not first. Returning such bytes
 anyway causes CANN 507018 timeouts or silently-wrong partial output on device
 (issue #900, PR #830 / issue #831).
 
@@ -152,6 +152,24 @@ class TestRejectsTextRelocations:
         with pytest.raises(ValueError) as excinfo:
             extract_text_section(elf)
         assert "2 entries" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("name", (".rodata", ".rodata.cst4", ".rodata.str1.1"))
+@pytest.mark.parametrize("linked", (False, True))
+def test_rejects_allocated_read_only_data_that_text_only_loading_would_drop(name, linked):
+    elf = bytearray(_build_elf_with_extra_text_section(extra_name=name, extra_size=24))
+    struct.pack_into("<Q", elf, _EHDR_SIZE + 2 * _SHDR_SIZE + 8, _SHF_ALLOC)
+    if linked:
+        struct.pack_into("<H", elf, 16, 2)  # ET_EXEC; its text relocations have already been resolved.
+    with pytest.raises(ValueError, match=r"read-only data.*\.rodata"):
+        extract_text_section(bytes(elf))
+
+
+@pytest.mark.parametrize("size,flags", ((0, _SHF_ALLOC), (24, 0)))
+def test_empty_or_nonallocated_rodata_does_not_change_the_text_payload(size, flags):
+    elf = bytearray(_build_elf_with_extra_text_section(extra_name=".rodata", extra_size=size))
+    struct.pack_into("<Q", elf, _EHDR_SIZE + 2 * _SHDR_SIZE + 8, flags)
+    assert extract_text_section(bytes(elf)) == b"\x00" * 4
 
 
 class TestEntryPointMustBeFirst:

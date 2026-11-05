@@ -182,7 +182,7 @@ evidence that A2/A3 hardware cannot support those transports.
 | Capability | Default and requirements |
 | ---------- | ------------------------ |
 | COUNTER/SDMA | Registered on both platforms; requests still require valid counters or SDMA workspace/resources |
-| A5 URMA workspace | Host CMake option `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=OFF`; enabling it supplies `PTO_URMA_SUPPORTED` for the host workspace path. Kernel request issue is also guarded by `PTO_URMA_SUPPORTED` |
+| A5 URMA workspace | Host provider is always compiled with `PTO_URMA_SUPPORTED`; domains explicitly request URMA resources. Kernel request issue is also guarded by `PTO_URMA_SUPPORTED` |
 | A5 RDMA workspace | Host CMake option `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=OFF`; enabled host and kernel paths use `PTO_RDMA_SUPPORTED` and `PTO_RDMA_BACKEND_HNS_1825_SUPPORTED` |
 
 The [runtime builder][builder] propagates workspace options; the

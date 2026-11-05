@@ -239,6 +239,7 @@
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/aligned_allocation.h"
 #include "host/buffer_pool_manager.h"
 #include "host/chip_swimlane_runs.h"
 #include "host/profiling_copy.h"
@@ -274,7 +275,7 @@ using ProfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
 using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 
 // `default_host_shadow_register` was previously a free function; it has been
-// folded into `bind_manager_memory_context()` so its malloc'd shadow can
+// folded into `bind_manager_memory_context()` so its aligned host shadow can
 // be registered with the manager's `malloc_shadows_` set for
 // safe teardown via `clear_mappings()` / `release_all_owned()`. See
 // `ProfilerBase::bind_manager_memory_context()` for the inline definition.
@@ -284,7 +285,7 @@ using ProfFreeCallback = std::function<int(void *dev_ptr)>;
  * carry their own registration state.
  * RAII scope guard for collector `init()` rollback. On destruction (without
  * `commit()`) it (1) calls `manager.release_all_owned(release_fn)` to free
- * every framework-tracked device allocation and malloc shadow, and (2)
+ * every framework-tracked device allocation and host shadow, and (2)
  * releases any extra direct dev_ptrs the collector added via `add_direct_ptr()`
  * for caller-owned allocations not transferred to the manager.
  *
@@ -1143,9 +1144,9 @@ public:
      * Order matters: mgmt is started before collectors because mgmt is the only
      * writer to the host ready queue shards and collectors are the consumers. The
      * register slot defaults to identity on the SVM path (copy_to_device_
-     * is null) or to a host-shadow malloc lambda on the non-SVM path
+     * is null) or to a host-shadow allocation lambda on the non-SVM path
      * (copy_to_device_ installed) — so BufferPoolManager always has a
-     * valid reg path. The host-shadow lambda registers each malloc'd
+     * valid reg path. The host-shadow lambda registers each allocated
      * shadow with `manager_.add_malloc_shadow()` so teardown can free
      * exactly the framework-owned shadows and leave HAL mappings alone.
      */
@@ -1193,35 +1194,41 @@ public:
         // queues rely on.
         const int n = shard_count_;
 
-        drain_device_queues_on_stop_.store(true, std::memory_order_relaxed);
-        mgmt_running_.store(true, std::memory_order_release);
-        mgmt_drain_threads_.reserve(n);
-        for (int i = 0; i < n; i++) {
-            if (thread_factory) {
-                mgmt_drain_threads_.push_back(thread_factory([this, i, n]() {
-                    mgmt_drain_loop(i, n);
-                }));
-            } else {
-                mgmt_drain_threads_.emplace_back(&ProfilerBase::mgmt_drain_loop, this, i, n);
+        try {
+            drain_device_queues_on_stop_.store(true, std::memory_order_relaxed);
+            mgmt_drain_threads_.reserve(n);
+            collector_threads_.reserve(n);
+            mgmt_running_.store(true, std::memory_order_release);
+            for (int i = 0; i < n; i++) {
+                if (thread_factory) {
+                    mgmt_drain_threads_.push_back(thread_factory([this, i, n]() {
+                        mgmt_drain_loop(i, n);
+                    }));
+                } else {
+                    mgmt_drain_threads_.emplace_back(&ProfilerBase::mgmt_drain_loop, this, i, n);
+                }
             }
-        }
-        if (thread_factory) {
-            mgmt_replenish_thread_ = thread_factory([this]() {
-                mgmt_replenish_loop();
-            });
-        } else {
-            mgmt_replenish_thread_ = std::thread(&ProfilerBase::mgmt_replenish_loop, this);
-        }
+            if (thread_factory) {
+                mgmt_replenish_thread_ = thread_factory([this]() {
+                    mgmt_replenish_loop();
+                });
+            } else {
+                mgmt_replenish_thread_ = std::thread(&ProfilerBase::mgmt_replenish_loop, this);
+            }
 
-        collector_threads_.reserve(n);
-        for (int i = 0; i < n; i++) {
-            if (thread_factory) {
-                collector_threads_.push_back(thread_factory([this, i]() {
-                    poll_and_collect_loop(i);
-                }));
-            } else {
-                collector_threads_.emplace_back(&ProfilerBase::poll_and_collect_loop, this, i);
+            for (int i = 0; i < n; i++) {
+                if (thread_factory) {
+                    collector_threads_.push_back(thread_factory([this, i]() {
+                        poll_and_collect_loop(i);
+                    }));
+                } else {
+                    collector_threads_.emplace_back(&ProfilerBase::poll_and_collect_loop, this, i);
+                }
             }
+        } catch (...) {
+            // Missing collector shards cannot consume a final device-queue drain.
+            stop(false);
+            throw;
         }
     }
 
@@ -1298,6 +1305,12 @@ public:
             }
         }
         collector_threads_.clear();
+    }
+
+    /** Host readers are joined and a confirmed reset invalidated device backing. */
+    void abandon_memory_after_device_reset() {
+        manager_.release_all_owned([](void *) {});
+        clear_memory_context();
     }
 
     Manager &manager() { return manager_; }
@@ -1516,13 +1529,13 @@ protected:
             ops.reg = register_cb_;
         } else if (copy_to_device_) {
             // Non-SVM platform: host-shadow allocate + copy zeros to device.
-            // Capture `this` so the malloc'd shadow can be registered as
+            // Capture `this` so the aligned host shadow can be registered as
             // framework-owned via the manager.
             auto copy_to_device = copy_to_device_;
             ops.reg = [this,
                        copy_to_device](void *dev_ptr, size_t size, int /*device_id*/, void **host_ptr_out) -> int {
                 if (host_ptr_out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-                void *host_ptr = std::malloc(size);
+                void *host_ptr = simpler::platform::aligned_host_alloc(size);
                 if (host_ptr == nullptr) {
                     *host_ptr_out = nullptr;
                     return PTO_RUNTIME_ERR_INTERNAL;
@@ -1606,7 +1619,7 @@ protected:
      *     installs the halHostRegister mapping; host_ptr is the
      *     identity-mapped view of the same memory.
      *   - non-SVM platform (a5):   `copy_to_device_` is installed →
-     *     malloc a paired host shadow, zero it, push the zeros to the
+     *     allocate an aligned host shadow, zero it, push the zeros to the
      *     device side. The host shadow lives until BufferPoolManager teardown
      *     via `clear_mappings()` or `release_all_owned()`.
      *   - SVM platform (a2a3 sim): `register_cb_` null AND `copy_to_device_`
@@ -1643,7 +1656,7 @@ protected:
                     return nullptr;
                 }
             } else if (copy_to_device_) {
-                host_ptr = std::malloc(size);
+                host_ptr = simpler::platform::aligned_host_alloc(size);
                 if (host_ptr == nullptr) {
                     rollback();
                     return nullptr;
@@ -1722,8 +1735,8 @@ protected:
      *
      * `*host_out` is the address the host may dereference, and is null on a
      * platform that mirrors by copying: there is no host view of that memory,
-     * and a reader has to go through `copy_from_device`. It is **not** a
-     * malloc'd shadow here — a caller that needs host storage brings its own.
+     * and a reader has to go through `copy_from_device`. No host shadow is
+     * allocated here; a caller that needs host storage brings its own.
      */
     void *alloc_unmanaged_paired_buffer(size_t size, void **host_out) {
         if (host_out == nullptr) return nullptr;

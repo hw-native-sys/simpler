@@ -749,6 +749,42 @@ def test_a_reconciled_chip_resource_grant_is_taken_as_published():
     assert worker._granted_chip_run_resource_sets([2, 1], [2, 2]) == [2, 1]
 
 
+def test_the_unobserved_completed_backlog_reads_zero_without_an_l2_chip_worker():
+    """The backlog belongs to a bound L2 worker, so every other shape reports none.
+
+    A level-3 worker owns no native run table, and a level-2 one reports nothing
+    before `init` binds a ChipWorker. Both answer rather than raising: these are
+    diagnostic reads a caller may make at any point in a worker's life, including
+    while deciding whether that life has started.
+    """
+    hierarchical = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a5", runtime="host_build_graph")
+    assert hierarchical.unobserved_completed_run_count == 0
+    assert hierarchical.unobserved_completed_run_high_water == 0
+
+    unbound = Worker(level=2, platform="a5", runtime="host_build_graph", device_id=0)
+    assert unbound._chip_worker is None
+    assert unbound.unobserved_completed_run_count == 0
+    assert unbound.unobserved_completed_run_high_water == 0
+
+
+def test_the_unobserved_completed_backlog_forwards_each_value_from_the_chip_worker():
+    """Each property reports its own native value, so neither is stubbed or swapped.
+
+    The zero-return case above never reaches the forwarding return, so on its own
+    it would pass against a property hardcoded to 0. The two values here differ,
+    which also fails if the pair is transposed.
+    """
+
+    class StubChipWorker:
+        unobserved_completed_run_count = 2
+        unobserved_completed_run_high_water = 7
+
+    worker = Worker(level=2, platform="a5", runtime="host_build_graph", device_id=0)
+    worker._chip_worker = StubChipWorker()
+    assert worker.unobserved_completed_run_count == 2
+    assert worker.unobserved_completed_run_high_water == 7
+
+
 @pytest.mark.parametrize(("automatic", "undersized"), [(False, False), (True, False), (False, True)])
 def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkeypatch, automatic, undersized):
     class FakeParentWorker:
@@ -961,6 +997,21 @@ class _FakeChipRun:
     @property
     def lane_poisoned(self) -> bool:
         return self._lane._lane_poisoned
+
+    @property
+    def _execution_ended(self) -> bool:
+        # This collaborator completes observation atomically in _progress;
+        # real ENDED/result-pending behavior is covered by native fork tests.
+        return False
+
+    def wait(self, timeout: float = -1.0) -> bool:
+        deadline = time.monotonic() + (5.0 if timeout < 0 else timeout)
+        while not self.done():
+            if time.monotonic() >= deadline:
+                return False
+            self._lane.completed[self.submission.slot_id].wait(0.001)
+        self._raise_if_failed()
+        return True
 
     @property
     def preparation_disposition(self):
@@ -4199,6 +4250,131 @@ class TestRunHandle:
         assert observed == [True]
         assert wait_entered.is_set()
 
+    def test_known_done_stays_true_during_a_later_blocking_stream_observer(self):
+        observer_entered = threading.Event()
+        observer_release = threading.Event()
+        later_error = RuntimeError("later caller stream work failed")
+        polls: list[int] = []
+        waits: list[int] = []
+        errors: list[BaseException] = []
+
+        class FakeWorker:
+            def _run_handle_done(self, run_id):
+                assert not waits, "the native identity can be retiring during observation"
+                polls.append(run_id)
+                return True
+
+            def _wait_run_handle(self, run_id, timeout):
+                waits.append(run_id)
+                observer_entered.set()
+                assert observer_release.wait(5.0)
+                raise later_error
+
+            def _finalize_run_handle(self, handle, run_id, error):
+                return error
+
+        handle = RunHandle(cast(Worker, FakeWorker.__new__(FakeWorker)), 1, ())
+        assert handle.done
+
+        def observe():
+            try:
+                handle.wait()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        observer = threading.Thread(target=observe)
+        observer.start()
+        try:
+            assert observer_entered.wait(3.0)
+            assert handle.done
+            assert observer.is_alive()
+            assert polls == [1]
+        finally:
+            observer_release.set()
+            observer.join(5.0)
+        assert not observer.is_alive()
+        assert errors == [later_error]
+        assert handle.done
+        with pytest.raises(RuntimeError) as repeated:
+            handle.wait()
+        assert repeated.value is later_error
+        assert waits == [1]
+        assert polls == [1]
+
+    def test_completed_chip_run_context_refusal_preserves_public_wait_and_keepalives(self):
+        class Keepalive:
+            pass
+
+        class CompletedChipRun:
+            def __init__(self):
+                self.refuse = True
+                self.waits = 0
+                self.observations = 0
+
+            def done(self):
+                return True
+
+            def wait(self, timeout):
+                assert timeout == -1.0
+                self.waits += 1
+                if self.refuse:
+                    raise worker_mod.ExecutionContextRefused("borrowed context must be current")
+                self.observations += 1
+                return True
+
+        worker = Worker(level=3, num_sub_workers=0)
+        chip_run = CompletedChipRun()
+        worker._chip_runs[1] = chip_run
+        worker._chip_run_touched_identities[1] = set()
+        source_uses = (object(),)
+        released_uses = []
+        worker._chip_source_uses[1] = source_uses
+        worker._device_buffer_source = SimpleNamespace(release=released_uses.append)
+        keepalive = Keepalive()
+        retained = weakref.ref(keepalive)
+        handle = RunHandle(worker, 1, (keepalive,))
+        worker._accepted_run_handles.add(handle)
+        del keepalive
+        assert handle.done
+
+        with pytest.raises(worker_mod.ExecutionContextRefused, match="borrowed context"):
+            handle.wait()
+        gc.collect()
+        assert retained() is not None
+        assert handle.done
+        assert not handle._wait_in_progress
+        assert not handle._terminal
+        assert not handle._cleanup_published
+        assert handle._run_id == 1
+        assert worker._chip_runs[1] is chip_run
+        assert 1 in worker._chip_run_touched_identities
+        assert worker._chip_source_uses[1] is source_uses
+        assert released_uses == []
+        assert handle in worker._accepted_run_handles
+        assert not worker._source_context_failed
+        assert chip_run.observations == 0
+
+        chip_run.refuse = False
+        handle.result()
+        gc.collect()
+        assert retained() is None
+        assert handle._terminal
+        assert handle._cleanup_published
+        assert handle not in worker._accepted_run_handles
+        assert not worker._chip_runs
+        assert not worker._chip_run_touched_identities
+        assert not worker._chip_source_uses
+        assert released_uses == [source_uses]
+        assert not worker._source_context_failed
+        assert chip_run.observations == 1
+
+        chip_run.refuse = True
+        handle.wait()
+        handle.result()
+        assert chip_run.waits == 2
+        assert chip_run.observations == 1
+        worker.close()
+
     def test_interrupted_finalize_still_publishes_terminal_state(self):
         interrupt = KeyboardInterrupt()
 
@@ -4734,6 +4910,14 @@ class TestRunHandle:
         assert worker._abandoned_run_handles == [handle]
         assert isinstance(worker._ordered_cleanup_error, RuntimeError)
         assert worker._ordered_cleanup_error.__cause__ is interrupt
+        assert handle.done
+        with pytest.raises(KeyboardInterrupt) as repeated:
+            handle.wait()
+        assert repeated.value is interrupt
+        assert handle._keepalive == (keepalive, first_ref, second_ref)
+        assert worker._abandoned_run_handles == [handle]
+        assert released_refs == ["first"]
+        assert released_runs == []
 
         worker.close()
 
@@ -5160,8 +5344,13 @@ class TestRunHandle:
         assert caught.value is interrupt
         assert handle.released
         assert resources.live_domains == {handle.name: handle}
-        assert worker._live_domains == {handle.name: handle}
+        assert worker._live_domains == {} and not worker._cleanup_journal.empty
         assert resources.pending_release_domains == []
+        worker._worker = None
+        with pytest.raises(RuntimeError, match="unconfirmed"):
+            worker.close()
+        assert not handle.freed and not worker._cleanup_journal.empty
+        assert worker._worker is None and not worker._chip_pids and not worker._chip_shms
 
     def test_pending_domain_drain_does_not_clear_unclaimed_owners(self):
         class NoClearList(list):
@@ -5500,14 +5689,13 @@ class TestRunHandle:
         """The owner's failure reaches every later caller, so no path reports
         success for an allocation whose backend release did not happen.
 
-        ``_release_all_live_domains`` keeps an un-freed handle in
-        ``_live_domains`` precisely so ``close()`` reports it as a residual; a
-        second caller that returned success would erase that.
+        Failed releases remain journal-owned while close drains the tree;
+        later callers must still observe the same failure.
         """
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
         boom = RuntimeError("backend release failed")
-        _entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7, outcome=boom)
+        entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7, outcome=boom)
         let_go.set()
 
         resources = worker_mod._RunResources()
@@ -5518,13 +5706,16 @@ class TestRunHandle:
         assert in_backend.is_set()
         assert not contested.freed
 
-        # The sweep is the second caller: it must see the failure, keep the
-        # handle, leave `freed` false, and report the failure to its own caller
-        # rather than returning as if the domain were reclaimed.
-        with pytest.raises(RuntimeError, match="backend release failed"):
-            worker._release_all_live_domains()
+        worker._release_all_live_domains()
         assert not contested.freed, "a failed release must not be reported as freed"
-        assert "contested" in worker._live_domains, "a failed release must stay a detectable residual"
+        assert "contested" not in worker._live_domains and not worker._cleanup_journal.empty
+        replacement = self._retired_domain(worker, resources, "contested", 8)
+        with pytest.raises(RuntimeError, match="backend release failed"):
+            worker._free_domain_after_fence(contested)
+        assert worker._live_domains["contested"] is replacement
+        error = worker._cleanup_journal.drive_kinds({"domain-retirement"})
+        assert isinstance(error, RuntimeError) and "unconfirmed" in str(error)
+        assert not contested.freed and not worker._cleanup_journal.empty and entered == [7]
 
     def test_allocate_domain_outside_graph_construction_is_rejected(self):
         worker = Worker(level=3, num_sub_workers=0)
@@ -6279,22 +6470,23 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker._worker = cast(Any, object())
         return worker
 
-    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch):
-        """Two chips of three committed a window and no handle exists.
+    @pytest.mark.parametrize("failed_rank_owns", [False, True])
+    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch, failed_rank_owns):
+        """Abort every reported owner after all allocation requests finish.
 
-        The release has to reach exactly the two that allocated: driving it at
-        the third would fail on a debt it does not hold, and poison the worker
-        for a partial failure that was handled correctly.
+        A failed rank may retain an unpublished allocation for late import.
+        A rank that failed before acquiring ownership has no cleanup debt.
         """
         worker = self._worker()
         worker._config = {"device_ids": [0, 1, 2]}
         resources = worker_mod._RunResources()
         worker._building_run_resources = resources
         monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+        owners = (0, 1, 2) if failed_rank_owns else (0, 2)
 
         def partial_failure(*, reply_shms, **_kwargs):
             assert reply_shms is not None
-            for chip_idx in (0, 2):
+            for chip_idx in owners:
                 reply_buf = reply_shms[chip_idx].buf
                 assert reply_buf is not None
                 struct.pack_into("<Q", reply_buf, worker_mod._OFF_DOMAIN_REPLY_COMMITTED, 1)
@@ -6305,25 +6497,31 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             worker._allocate_domain(name="d", workers=(0, 1, 2), window_size=64, buffers=[])
 
         handle = resources.live_domains["d"]
-        assert handle.workers == (0, 2), "release would reach a chip that never allocated"
+        assert handle.workers == owners
+        assert handle.contexts == {}, "failed initialization must not publish usable contexts"
         assert worker._live_domains["d"] is handle
         assert resources.requires_ordered_cleanup, "a leaked window did not degrade the successor"
 
         release_headers = {}
+        abort_calls = []
+        cw = SimpleNamespace(comm_abort_domain_windows=lambda *args: abort_calls.append(args))
 
         def capture_release(*, workers, request_shms, **_kwargs):
             for chip_idx in workers:
                 request_buf = request_shms[chip_idx].buf
                 assert request_buf is not None
-                release_headers[chip_idx] = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request_buf, 0)[:3]
+                release_headers[chip_idx] = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request_buf, 0)[:4]
+                mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
+                encoded = request_shms[chip_idx].name.encode("utf-8")
+                mailbox[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + len(encoded)] = encoded
+                worker_mod._handle_ctrl_release_domain(cw, mailbox, base_comm_handle=1)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", capture_release)
         worker._release_domain_claimed(handle)
 
-        assert release_headers == {
-            0: (handle.allocation_id, 3, 0),
-            2: (handle.allocation_id, 3, 2),
-        }
+        assert release_headers == {rank: (handle.allocation_id, 3, rank, 1) for rank in owners}
+
+        assert abort_calls == [(1, handle.allocation_id, 3, rank) for rank in owners]
 
     def test_a_chip_that_committed_before_its_reply_failed_is_still_reclaimed(self):
         """The window exists before the reply is written.
@@ -6363,9 +6561,10 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
             cw = cast(Any, SimpleNamespace())
 
-            def committed(*args):
+            def committed(*args, workspace_mask):
+                assert workspace_mask == 0
                 ctypes.c_uint64.from_address(args[5]).value = 1
-                return 0xC7, 0xB000
+                return 0xC7, 0xB000, 64
 
             cw.comm_alloc_domain_windows = committed
             mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
@@ -6395,7 +6594,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             worker_mod._DOMAIN_REQ_HEADER.pack_into(req_buf, 0, 7, 1, 0, 64, 0)
             struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
 
-            def committed_then_failed(*args):
+            def committed_then_failed(*args, workspace_mask):
+                assert workspace_mask == 0
                 commit_address = args[5]
                 ctypes.c_uint64.from_address(commit_address).value = 1
                 raise MemoryError("tuple conversion failed")
@@ -6932,7 +7132,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 assert reply_shms is not None
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 4096, 0)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7029,7 +7229,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 interrupt_main()
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 4096, 0)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7704,7 +7904,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             staged_shms.extend(reply_shms.values())
             reply_buf = reply_shms[0].buf
             assert reply_buf is not None
-            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 0)
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 64, 0)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", successful_dispatch)
         real_close = worker_mod.os.close
@@ -8263,8 +8463,6 @@ class TestChipMainLoopDigestRegister:
         # so we hand it the absolute address and let it cast back inside.
         state_addr = _buffer_field_addr(buf, _OFF_STATE)
         _mailbox_store_i32(state_addr, _IDLE)
-        # `mailbox_addr` is only consumed by the TASK_READY branch, which we
-        # never reach in these tests; passing 0 keeps the harness lean.
         return shm, buf, state_addr
 
     @staticmethod
@@ -8362,7 +8560,17 @@ class TestChipMainLoopDigestRegister:
             identity_refs = {}
         t = threading.Thread(
             target=_run_chip_main_loop,
-            args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs, mint_owner_instance_id()),
+            args=(
+                cw,
+                buf,
+                worker_mod._buffer_field_addr(buf, 0),
+                state_addr,
+                0,
+                registry,
+                identity_table,
+                identity_refs,
+                mint_owner_instance_id(),
+            ),
             kwargs={
                 "chip_platform": "",
                 "provider_region_store": _chip_loop_provider_region_store(chip_platform=""),

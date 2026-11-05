@@ -195,9 +195,9 @@ int main(int argc, char **argv) {
             }
             check(aclmdlRIDestroy(graph), "graph destroy");
         }
+        check(loader.Finalize(state.hidden_stream(KernelStreamKind::Aicpu)), "loader close after graph destroy");
         check(state.close(), "context close after graph destroy");
         require(!state.has_live_resources(), "context handles released");
-        loader.Finalize();
         check(rtDevBinaryUnRegister(core_handle), "unregister AICore");
     }
     check(aclrtDestroyStream(caller), "destroy caller");

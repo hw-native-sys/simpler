@@ -1272,6 +1272,7 @@ def _run_swimlane_converter(
     dispatch: str | None = None,
     dispatch_id: str | None = None,
     output_path: Path | None = None,
+    publish_derived_host_logs: bool = False,
 ) -> bool:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -1304,6 +1305,8 @@ def _run_swimlane_converter(
         cmd += ["--output", str(output_path)]
     for host_log in host_logs or []:
         cmd += ["--host-log", str(host_log)]
+    if publish_derived_host_logs:
+        cmd.append("--publish-derived-host-logs")
     if enable_overhead:
         cmd.append("--overhead")
     try:
@@ -1424,6 +1427,7 @@ def _convert_rank_swimlanes(
             dispatch=target["dispatch"],
             dispatch_id=target["dispatch_id"],
             output_path=output_prefix / f"{target['output_stem']}.json" if len(targets) > 1 else None,
+            publish_derived_host_logs=bool(host_logs),
         )
         if not merged:
             # The files this target selected, never a fresh scan of its
@@ -1455,19 +1459,7 @@ def _convert_case_swimlane(
 
     logger = logging.getLogger(__name__)
     if _rank_dirs(output_prefix):
-        # A capture counts when it holds either shape: the fixed name the
-        # non-retained path writes, or a retained artifact its own dispatch
-        # identity names. The converter applies the same two rules.
-        from simpler_setup.tools.swimlane_converter import _capture_records_paths  # noqa: PLC0415, PLC2701
-
-        captures = [directory for directory in _rank_capture_dirs(output_prefix) if _capture_records_paths(directory)]
-        # Runtime-exported timing logs allow capture-local lookup when all are present.
-        # Other Rank merges use the bound persistent logs.
-        host_logs = (
-            None
-            if captures and all(list(path.glob("host_clock_alignment.*.log")) for path in captures)
-            else _bound_host_logs()
-        )
+        host_logs = _bound_host_logs()
         _convert_rank_swimlanes(
             case_label,
             output_prefix,
@@ -1688,6 +1680,11 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             _name_failing_case(exc, cls_name, case["name"])
             raise
         finally:
+            if enable_chip_swimlane and getattr(worker, "_config", {}).get("collect_across_runs"):
+                try:
+                    worker.flush_diagnostics()
+                except RuntimeError as error:
+                    logger.warning("[%s] diagnostic flush failed: %s", case_label, error)
             finalize_diagnostic_outputs(
                 case_label,
                 prefix,
@@ -2220,12 +2217,14 @@ class SceneTestCase:
         skip_golden = skip_golden or bool(case.get("skip_golden", self.SKIP_GOLDEN))
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
-        # The L2 entry point is `Worker.run(handle, args, cfg)`. Reuse the
-        # handle registered by the st_worker fixture / standalone path.
-        handle = getattr(type(self), "_st_l2_handle", None)
-        if handle is None:
+        # A registration belongs to one Worker and callable. Instance-local
+        # storage cannot inherit a parent's handle for a different signature.
+        registration = self.__dict__.get("_st_l2_registration")
+        if registration is None or registration[0] is not worker or registration[1] is not callable_obj:
             handle = worker.register(callable_obj)
-            type(self)._st_l2_handle = handle
+            self._st_l2_registration = (worker, callable_obj, handle)
+        else:
+            handle = registration[2]
 
         test_args = self.generate_args(params)
         with _child_memory_args(worker, test_args, orch_sig) as child_args:
@@ -2508,7 +2507,7 @@ class SceneTestCase:
         one device is provided (or any L3 case needs more than its single
         device), the outer invocation becomes a test dispatcher that spawns
         per-case subprocesses via ``parallel_scheduler``; each child re-enters
-        this function in single-group mode via ``--runtime`` + ``--level``.
+        this function in single-group mode via ``--resource-child``.
         """
         import argparse  # noqa: PLC0415
 
@@ -2600,7 +2599,7 @@ class SceneTestCase:
         parser.add_argument(
             "--runtime",
             default=None,
-            help="Only run classes with this _st_runtime (child-mode marker when combined with --level)",
+            help="Only run classes with this _st_runtime",
         )
         parser.add_argument(
             "--level",
@@ -2612,8 +2611,9 @@ class SceneTestCase:
             # rankN numbering is per L3 Worker and collides above it.
             choices=[2, 3],
             default=None,
-            help="Only run classes with this _st_level (child-mode marker when combined with --runtime)",
+            help="Only run classes with this _st_level",
         )
+        parser.add_argument("--resource-child", action="store_true", help=argparse.SUPPRESS)
         parser.add_argument(
             "-x", "--exitfirst", action="store_true", help="Stop on first failing case (matches pytest -x)"
         )
@@ -2715,8 +2715,7 @@ class SceneTestCase:
         module = sys.modules[module_name]
         test_classes = _discover_module_test_classes(module)
 
-        # Apply --runtime/--level filters (child mode sets both; parent may also
-        # use them when the user wants a narrow run).
+        # Apply --runtime/--level filters for both parent and child runs.
         if args.runtime is not None:
             test_classes = [c for c in test_classes if getattr(c, "_st_runtime", None) == args.runtime]
         if args.level is not None:
@@ -2739,10 +2738,8 @@ class SceneTestCase:
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
 
-        # Child mode: both --runtime and --level set. Run inline without
-        # spawning further subprocesses; this is the path dispatcher
-        # children take after we re-enter run_module.
-        child_mode = args.runtime is not None and args.level is not None
+        # A dispatcher child runs inline without spawning further subprocesses.
+        child_mode = args.resource_child
 
         if not child_mode:
             has_multi_dev_case = any(
@@ -2874,6 +2871,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                 _rt,
                 "--level",
                 "3",
+                "--resource-child",
             ]
 
         # Per-case output_prefix is chosen inside the child by run_class_cases,
@@ -2967,6 +2965,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                     _rt,
                     "--level",
                     "2",
+                    "--resource-child",
                 ]
                 for f in _filters:
                     cmd += ["--case", f]

@@ -152,14 +152,14 @@ static __aicore__ void lm_head_combine_push(
             // pto: %7
             int64_t v33 = (int64_t)((uint64_t)v26 + (uint64_t)v30);
             // pto: %16
-            int64_t v34 = (v5)[v18];
+            int64_t v34 = (v5)[v22];
             // pto: %17, %18, %19, %20
-            int64_t v35 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v34)) + (uint64_t)v14)];
+            int64_t v35 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v34)) + (uint64_t)v18)];
             // pto: %12, %13, %15, %21, %22
             int64_t v36 =
                 (v5)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) +
                                                     (uint64_t)i27)) +
-                               (uint64_t)v14)];
+                               (uint64_t)v18)];
             // pto: %lm_head_logits_window__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 8, 2048> v37 = pto::Shape<1, 1, 1, 8, 2048>();
             // pto: %lm_head_logits_window__ssa_v0_peer_pview
@@ -212,14 +212,14 @@ static __aicore__ void lm_head_combine_push(
             // pto: %29
             int64_t v46 = (int64_t)((uint64_t)v26 + (uint64_t)v12);
             // pto: %38
-            int64_t v47 = (v5)[v18];
+            int64_t v47 = (v5)[v22];
             // pto: %39, %40, %41, %42
-            int64_t v48 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v47)) + (uint64_t)v14)];
+            int64_t v48 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v47)) + (uint64_t)v18)];
             // pto: %34, %35, %37, %43, %44
             int64_t v49 =
                 (v5)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) +
                                                     (uint64_t)i27)) +
-                               (uint64_t)v14)];
+                               (uint64_t)v18)];
             // pto: %50
             pto::Shape<1, 1, 1, 8, 1152> v50 = pto::Shape<1, 1, 1, 8, 1152>();
             // pto: %50
@@ -260,14 +260,14 @@ static __aicore__ void lm_head_combine_push(
         // pto: %55
         if (i57 != v25) {
             // pto: %61
-            int64_t v58 = (v6)[v18];
+            int64_t v58 = (v6)[v22];
             // pto: %62, %63, %64, %65
-            int64_t v59 = (v6)[(int64_t)((uint64_t)((int64_t)((int32_t)v58)) + (uint64_t)v14)];
+            int64_t v59 = (v6)[(int64_t)((uint64_t)((int64_t)((int32_t)v58)) + (uint64_t)v18)];
             // pto: %57, %58, %60, %66, %67
             int64_t v60 =
                 (v6)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) +
                                                     (uint64_t)i57)) +
-                               (uint64_t)v14)];
+                               (uint64_t)v18)];
             // pto: %lm_head_logits_done__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v61 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %lm_head_logits_done__ssa_v0_peer_pview

@@ -28,7 +28,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "aicpu/cache_maintenance.h"
 #include "arg_with_deps.h"      // NOLINT(build/include_subdir)
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
@@ -57,9 +56,6 @@ static bool wait_for_blockers_started(const simpler::tmr::Tensor &out, int32_t b
     volatile float *data = out.data_as<float>() + out.start_offset;
     volatile float *statuses = data + BLOCKER_STATUS_BASE_CL * FLOATS_PER_CACHE_LINE;
     while (!rt_is_fatal()) {
-        cache_invalidate_range(
-            const_cast<float *>(statuses), static_cast<size_t>(blocker_count) * FLOATS_PER_CACHE_LINE * sizeof(float)
-        );
         bool all_started = true;
         for (int32_t block_idx = 0; block_idx < blocker_count; block_idx++) {
             float status = statuses[block_idx * FLOATS_PER_CACHE_LINE];

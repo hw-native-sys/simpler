@@ -30,8 +30,10 @@ collect without their optional backend; import it in fixtures or consumers.
 
 The `torch_npu` profile requires `--junitxml`: a single pytest invocation writes
 its final collection to the adjacent `.plan.json` file, executes it, then checks
-its actual JUnit against that plan. Source, environment and canonical nodeids
-must match, and every selected case must pass exactly once. Empty collection,
+its actual JUnit against that plan. The plan retains the actual preflight
+identity, including CANN manifest version and host architecture. Source,
+environment and canonical nodeids must match, and every selected case must pass
+exactly once. Empty collection,
 missing/foreign/duplicate cases and any skip/error/failure are errors. This
 strict mode supports direct execution only. SceneTestCase, resource dispatch
 and xdist are rejected; default sweeps keep their existing execution strategy.
@@ -42,6 +44,20 @@ The ScopeStats consumer uses the same declared environment and shared bridge.
 It checks off/on/on/off selection, per-call exports and nested scope attribution
 on TMR. HBG is explicitly metadata only; neither path treats allocation
 frontiers as live usage or claims performance.
+
+The diagnostic-selection consumer uses that environment and bridge to check
+per-call PMU and chip-swimlane snapshots and exports. Its off/on/on/off sequence
+mutates the original selectors and prefixes after submission, checks the original
+output destinations and rejects records for off calls or poison destinations.
+The CPU checker contracts exercise export validation; actual collector behavior
+requires the framework hardware cases. Diagnostic collection may wait, and this
+consumer does not qualify other DFX collectors or capture/replay.
+
+The framework eager tests live in `tests/st/worker/framework_eager` and run on
+`--platform a2a3` or `--platform a5`. Each consumer uses that platform for
+compilation, Worker construction and its result record; compile caches include
+the platform. A shared host bridge does not establish device compatibility.
+Each platform needs its own actual plan, JUnit and environment identity.
 
 The framework eager corpus shares one session-scoped optional bridge fixture.
 Its same-stream, cross-stream, alias/INOUT, callback-failure recovery and
@@ -55,11 +71,38 @@ handles are drained before workspace ownership can be released, without
 individual user waits. Native timeout/context refusals and retryable close debt
 are covered separately by CPU lifecycle contracts.
 
+The pre-admission consumer checks stale Buffer registration and a distinct
+caller-created RTS context in real queue callbacks. Each refusal is followed
+by healthy work on the same Worker. The wrong-context callback restores the
+caller context before its healthy submit, and a third healthy request follows.
+The allocation stays alive throughout; no invalid device access is issued.
+
+The argument-capture consumer is discovered in the same environment. It
+checks OFF/FULL/HYBRID/OFF snapshots and exact two-task argument payloads on
+A2/A3 (both runtimes) and A5 TMR, including a runtime-owned intermediate.
+A5 HBG instead exercises the existing typed unsupported refusal for FULL and
+HYBRID, verifies no accepted run, tensor writes or dump files, and checks healthy
+OFF calls before and after plus caller-stream reuse after Worker close. Its
+refusal result explicitly reports no verified payloads; actual A5 HBG per-task
+capture remains unimplemented and tracked under
+[#2666](https://github.com/hw-native-sys/simpler/issues/2666); refusal tests do not
+deliver that capability. A real Worker materialization CPU
+contract covers native geometry; CPU recording tests do not qualify device
+collection or framework ordering.
+
 The registry and verifier live in `simpler_setup/test_environments.py`. Package
-pins have one source in the profile's constraints file. Adding a test to an
-existing environment requires no workflow edit. A new environment requires an
-explicit registry entry and reviewed installation/runner strategy; profiles do
-not install arbitrary dependencies or infer new CI runners.
+pins have one source in the profile's constraints file. Selector and preflight
+share a minimum CANN version line of 9.0, without an architecture allowlist.
+They compare the numeric major/minor prefix of the actual install manifest;
+separated CANN release/build labels do not change admission. For example,
+9.0.RC1, 9.1.T500, 9.2.0-beta.2 and 10.0 are accepted; missing, malformed or
+lower version lines are rejected. Admission does not mean every combination
+has been tested. Framework execution evidence covers 9.0.0 on x86_64 and
+9.2.0-beta.2 on A3 ARM64 with the pinned Torch pair. See
+[the CI environment contract](ci.md) for the experiment link.
+Adding a test to an existing environment requires no workflow edit. A new
+environment requires an explicit registry entry and reviewed installation/runner
+strategy; profiles do not install arbitrary dependencies or infer new CI runners.
 
 ### Assertion principle: no wall-clock proxies
 
@@ -224,7 +267,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--rounds N` | | 1 | Run each case N times (reuses the same Worker across rounds) |
 | `--device IDS` | `-d` | `0` | Single id (`0`), range (`0-7`), or list (`0,2,5`). Sets the device-id pool for L3 cases and the available slots for L2 fanout. |
 | `--max-parallel N` | | `auto` | Max in-flight subprocesses (make-style). `auto` = `min(nproc, len(--device))` on sim, `len(--device)` on hardware. Decouples device-id pool size from parallelism; use to throttle sim on a CPU-constrained runner. |
-| `--runtime NAME` | | (all) | Restrict to one runtime (also used internally as the child-mode marker) |
+| `--runtime NAME` | | (all) | Restrict to one runtime; normal dispatch still applies. |
 | `--level {2,3,4}` | | (all) | Restrict to one scene-test level. Level 4 selects network1 wrappers. |
 | `--exclude-level {2,3,4}` | | (none) | Exclude tests explicitly carrying that scene-test level. Ordinary onboard lanes use `--exclude-level 4`. |
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
@@ -323,7 +366,7 @@ Worked examples:
 | `--exitfirst` | both | `-x` | pytest ships `-x` → standalone mirrors it so the flag behaves identically across entry points. |
 | `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
 | `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
-| `--runtime` / `--level` | both | **(none)** | Internal child-mode markers; users rarely type them. No short keeps them distinctive. |
+| `--runtime` / `--level` | both | **(none)** | Selection filters; no short keeps them distinctive. A hidden child marker controls dispatcher recursion. |
 | `--skip-golden`, `--enable-chip-swimlane`, `--dump-args`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
 
 Practical guidance when adding a new CLI option:
@@ -457,7 +500,7 @@ The dispatcher only takes over when there's actual work to parallelize or isolat
 
 - `--collect-only`
 - Only one runtime is present and no L3 cases are collected (single L2 batch)
-- Both `--runtime` and `--level` are set (child-mode marker — used internally by spawned subprocesses)
+- The internal `--resource-child` marker is set on a dispatcher subprocess
 
 ## Hardware Classification
 
@@ -856,6 +899,63 @@ Key fields:
   Unknown keys fail when the `@scene_test` class is imported instead of being
   silently ignored. Case-level extension keys outside `config` remain allowed.
 
+### Kernels That Wait for Siblings (Mix, sync_start)
+
+A Mix task's 1C2V and a sync_start cohort's blocks are co-residency
+requirements: the subtasks are meant to be on cores at the same instant, and a
+kernel that proves it does so by waiting for its siblings to arrive. Two rules
+govern such a kernel, and they pull in opposite directions — **bound the wait
+by time, but never decide the verdict by time.**
+
+**Bound the wait by elapsed time, not by a poll count.** A poll costs a
+different amount in the CPU-stub build than on silicon, and it costs more again
+when the machine is busy, so a count calibrated while the case runs alone can
+run out when it runs beside other work. What the case then reports is not its
+own give-up value but a device op-execute timeout — the op is killed, and the
+failure looks like a runtime hang rather than the missing rendezvous it is.
+Convert a millisecond budget with the platform's own tick rate, the way the
+runtime does:
+
+```cpp
+#ifdef PTO_CPUSTUB_HPP
+static uint64_t now_ticks() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+#else
+static __aicore__ uint64_t now_ticks() { return get_sys_cnt(); }
+#endif
+
+constexpr uint64_t WAIT_MS = 2000;
+const uint64_t deadline = WAIT_MS * (static_cast<uint64_t>(PLATFORM_PROF_SYS_CNT_FREQ) / 1000u);
+const uint64_t started = now_ticks();
+while (now_ticks() - started < deadline) { /* ... */ }
+```
+
+Note the host-side guard spelling. Select the stub path on
+`#ifdef PTO_CPUSTUB_HPP`, which is how the kernels in this tree already do it —
+**not** on `#ifndef dcci`. `dcci` is a *function* in both the CCE and
+`cpu_stub.hpp` builds, so `#ifndef dcci` is unconditionally true and silently
+compiles the whole cache-maintenance path out of the onboard build.
+
+**Write a poison value when the wait expires** so the give-up is visible to
+`compute_golden` (see [Output Validation](#output-validation)) rather than
+only to someone reading a log. A value no correct run can produce — `-99.0` in
+the existing cases — turns a missed rendezvous into a result mismatch naming
+the lane.
+
+**Do not judge co-residency by whether the wait expired.** That measures a race
+against a wall clock, so the verdict moves with machine load: the same build can
+report the defect when the case runs alone and report it fixed when the case
+runs after the rest of the suite. Decide from the run's own record instead —
+the `assert_cohorts_were_coresident` fixture in
+`tests/st/a5/host_build_graph/conftest.py` reads `chip_swimlane_records.json`
+and checks that each cohort's subtask intervals intersect (its latest start
+precedes its earliest end). Load shifts where the intervals sit, never whether
+they intersect. The bounded wait is what keeps a non-co-resident run from
+hanging; the interval check is what decides whether it was co-resident.
+
 ### Output Validation
 
 By default every output tensor is compared against `compute_golden` with
@@ -971,10 +1071,10 @@ For every collected resource job (L3 ``SceneTestCase`` classes and standalone py
 
 ```text
 # L3 class job
-pytest <nodeid> --runtime <rt> --level 3 --device <alloc-range>
+pytest <nodeid> --resource-child --runtime <rt> --level 3 --device <alloc-range>
 
 # Standalone resource function job
-pytest <nodeid> --runtime <rt> --device <alloc-range>
+pytest <nodeid> --resource-child --runtime <rt> --device <alloc-range>
 ```
 
 When a subprocess completes, its devices return to the free set and the queue is re-tried. Jobs that need more devices than currently free **wait**; jobs that need more than the whole pool **fail the batch up front**.
@@ -984,7 +1084,7 @@ When a subprocess completes, its devices return to the free set and the queue is
 After the Resource phase drains, one subprocess is spawned per runtime:
 
 ```text
-pytest --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
+pytest --resource-child --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
 ```
 
 `pytest-xdist` starts 4 workers (`gw0`..`gw3`). Each worker's `pytest_configure` slices `--device 8-11` down to a single id (`gw0` → `8`, `gw1` → `9`, ...), and `st_worker` is session-scoped, so the worker initializes exactly one `ChipWorker(device=N)` and reuses it for every L2 class routed to it. `--dist loadfile` keeps all cases from one test file on the same worker, amortizing any file-level setup cost.

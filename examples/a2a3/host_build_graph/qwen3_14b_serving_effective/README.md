@@ -1,310 +1,157 @@
-# Qwen3-14B Standalone HBG Decode
+# Qwen3-14B HBG Decode
 
-This example runs a post-prefill Qwen3-14B decode workload through Simpler's
-`host_build_graph` runtime. A caller-provided fixture supplies the KV snapshot
-and golden metadata; decode positions are overwritten on each run, which executes up to 127 decode
-dispatches. Single- and dual-slot execution use separate Python entry points.
+This directory contains a fixed-shape Torch-NPU eager adapter for the Qwen3-14B
+HBG release. It uses BF16 weights and KV on A3, the stage-0 25-argument ABI,
+one active request, the existing borrowed-context Worker API, caller-stream
+ordering, RunHandle retirement, and explicit close.
 
-## Build the HBG artifact
+The callable has no inactive-row mask. Row 0 carries the request. Rows 1–15
+execute the same token and position with private KV pages, and only row 0 logits
+are returned. Padding rows avoid every page reserved in the request's block
+table, including pages needed by later decode steps. A 32-column table is
+accepted only when columns beyond the 28-column ABI contain `-1`.
 
-The input is a generated Qwen decode artifact containing the distributed host
-wrapper and one chip callable. The adapter preserves the source in-core programs
-and converts the generated child runtime to `host_build_graph`. The adapter accepts
-the recognized per-layer Definition form and rejects incomplete or unrecognized
-orchestration:
+## Artifact
 
-```bash
-PYTHONPATH=/path/to/pypto/python:/path/to/simpler/python \
-python build_hbg_artifact.py \
-  --artifact-source /path/to/generated/artifact/qualification \
-  --output-dir /path/to/hbg_decode_artifact \
-  --platform a2a3
-```
+Obtain the sealed stage-0 `artifacts/qwen3-14b-hbg-release` bundle through
+[#2429](https://github.com/hw-native-sys/simpler/issues/2429), together with its
+producer source/environment manifests, source patches and artifact digest manifest. The producer
+compiles the PyPTO-lib `models/qwen3_14b` decode contract with PyPTO's
+`HOST_BUILD_GRAPH` pass context, then assembles the emitted `decode_fwd` child
+with prebuilt binaries. Reproduction uses the source revisions and patches
+recorded in those manifests, batch 16, maximum sequence length 3466, page size
+128, and the pinned 40-layer model config.
 
-The source may be an artifact root with a `manifest.json`, or the distributed
-decode directory itself. Both the 25-argument compatibility ABI and the current
-26-argument ABI with `sampled_ids_host` are accepted. The generated manifest
-records the source and output checksums, Definition shape, and whether all
-in-core binaries remain byte-identical.
-Both runners verify the copied metadata, orchestration source/shared library,
-and in-core binary checksums before preparing the runtime.
-
-Each decode frame executes the generated 40-layer orchestration, then final
-RMSNorm, LM Head, and greedy sampling. The adapter requires the recognized
-per-layer generated form and counts the emitted Definition tasks. Unrecognized
-or incomplete generated orchestration is rejected.
-
-## Run the benchmark
-
-`run_standalone_0p1.sh` is environment-driven. Supply the runtime dependencies,
-fixture, model, and HBG artifact explicitly:
+Set `ARTIFACT` to the extracted release root and verify its identity before
+running either smoke command:
 
 ```bash
-PYTHON_BIN=/path/to/python \
-PYPTO_ROOT=/path/to/pypto \
-PYPTO_LIB_ROOT=/path/to/pypto-lib \
-PTOAS_ROOT=/path/to/ptoas \
-FIXTURE_ROOT=/path/to/fixture/qualification \
-MODEL_DIR=/path/to/Qwen3-14B \
-ARTIFACT_SOURCE=/path/to/hbg_decode_artifact \
-bash run_standalone_0p1.sh DEVICE_ID OUTPUT_DIR [single|dual] [STEPS]
+export ARTIFACT=/path/to/qwen3-14b-hbg-release
+test ! -e "$ARTIFACT/hbg_artifact_manifest.json"
+printf '%s  %s\n' \
+  ea179cb8eec8623970ae38b8b9965470e070c5ef3f0f308fcd1834727dce8d92 \
+  "$ARTIFACT/distributed_meta.json" | sha256sum --check
 ```
 
-The default qualification uses zero warmups, one measured request, 127 decode
-dispatches, and steady skip 5. `STEPS` may be reduced for a short correctness
-run. Large model, fixture, artifact, and result files remain outside the source
-repository.
+Pass this directory as `--artifact "$ARTIFACT"`. Its layout selects the stage-0
+reader, which verifies metadata, sources, registration order, tensor directions,
+binary paths, sizes and SHA256 values before compiling against the current
+Simpler runtime. The release has 25 external tensors, 32 registered in-core kernels,
+40 Qwen layers, 128-token pages, BF16 KV in BSND storage, and FP32 logits with
+the valid vocabulary range `[0, 151936)`.
 
-Dual mode shares immutable weights, RoPE, and the autoregressive KV cache. It
-owns separate metadata, logits, hidden-state, and sampled-token storage for
-in-flight frames. The validator requires strict slot alternation, independent
-slot generations, prepared dispatches after the first frame, serialized device
-execution, and the full golden token digest.
+`build_hbg_artifact.py` handles the older 39-41-kernel input and writes
+`hbg_artifact_manifest.json`, selecting the manifest-backed reader. That output
+uses a separate artifact contract and cannot substitute for this stage-0 bundle.
 
-## Metrics
+The stage-0 release directory and its producer must be trusted: its
+`kernel_config.py` executes during inspection and its generated C++ sources
+are compiled. Binary manifests verify the declared binaries. Load-time hashes
+of the config and all compiled sources are recorded and rechecked before
+compilation; these snapshots do not authenticate initially supplied source.
 
-- `rts_completion_interval_ms`: consecutive `chip.run` completion timestamps,
-  used as the standalone decode TPOT proxy.
-- `runner_run_ms`: host child span around the runtime call.
-- `effective_ms`: `chip.run.runner_run.device_wall` for HBG.
-- `graph_build_ms`: host `node.graph_build` span.
-- `bind_ms`: HBG `chip.run.bind` span.
+## Torch-NPU smoke
 
-The steady set contains 122 rows after skipping the first five dispatches. HBG
-exposes the complete device wall window rather than TMR's separate `.sched`
-subspan, and records that source in `trace_summary.json`.
-With zero steady skip, completion intervals start at the second dispatch.
-A single-dispatch run has zero interval samples and null interval statistics.
+`run_torch_eager.py` loads the stage-0 checkpoint and release, allocates the
+fixed batch-16 KV backing, and submits two decode steps with one active request.
+It checks finite FP32 logits, every layer's active KV slot, completion, close, and caller
+stream use after close. The zero-prefix KV input validates execution and
+lifecycle wiring; it is not a prefill numerical reference.
 
-The native STRACE log is exported to
-`profile/simpler_strace_timeline.json`, which can be opened in Perfetto.
+Config, weight-index and consumed shard digests are checked against fixed pins
+and recorded in the receipt. Success and failure receipts include completed
+steps, the current step/position, and separate execution and cleanup errors.
+Smoke checks remain active under `python -O`.
 
-## Correctness contract
+When a completed run reports a terminal execution error, `close()` preserves
+that primary error while still attempting Worker and Buffer cleanup. Successful
+cleanup makes a later close a no-op; an uncertain timeout retains resources for
+a retry.
 
-A successful full run requires:
-
-- 127 decode dispatches on the selected slot configuration;
-- monotonically increasing generation and completion order;
-- every sampled token matching the fixture golden;
-- fixture, model, and artifact validation before device execution;
-- aligned native device STRACE spans;
-- an HBG artifact whose Definition contains fewer than 1024 tasks.
-
-The benchmark is a manual hardware entry point. Automated unit tests cover
-slot metadata isolation, HBG STRACE aggregation, artifact ABI validation, and
-source rewriting without requiring model weights or an NPU.
-
-## Worker.submit adapter
-
-`standalone_adapter.py` is the state boundary for a fixture-backed decode stream. It validates the sampled-token chain, advances `seq_lens`/`slot_mapping`/`block_table`, binds generated ABI buffers with explicit directions, and submits one `NEXT_LEVEL` callback per step. The caller waits for the returned `RunHandle`, reads the ABI-owned sampled output, and calls `complete_step` before requesting the next step. Synthetic hidden-state probes remain separate from this real-fixture adapter.
-
-## Qualify a sealed logical KV reference
-
-`reference_worker_submit.py` consumes a `qwen-reference-logical-kv-v1` bundle and
-an appended-KV reference identifying the same initial bundle. It verifies model
-hashes, materializes independent BSND pages for 16 requests and executes the real
-25-argument callable through `Worker.submit` at launch depth one.
+Run it through the shared device queue:
 
 ```bash
-python reference_worker_submit.py \
-  --fixture /path/to/reference-kv \
-  --kv-reference /path/to/reference-decode-kv \
-  --artifact /path/to/verified-hbg-artifact \
-  --model /path/to/Qwen3-14B \
-  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
+task-submit --device auto --device-num 1 --max-time 900 --run \
+  'eval "$(pypto-setup --export)" && source "$ASCEND_HOME_PATH/set_env.sh" && \
+   export TASK_QUEUE_ENABLE=1 && \
+   python /path/to/qwen3_14b_serving_effective/run_torch_eager.py \
+     --artifact /path/to/qwen3-14b-hbg-release \
+     --model /path/to/Qwen3-14B \
+     --prompt-ids /path/to/prompt-3338-token-ids.json \
+     --device "$TASK_DEVICE" --output /path/to/result.json'
 ```
 
-On shared hardware, run this command through `task-submit` after the architecture
-precheck and explicit CANN environment setup. The result directory must be new.
-The consumer checks exact tokens and finite logits/KV with relative L2 at most
-0.05 and cosine similarity at least 0.999. Initial prefixes must remain bitwise
-unchanged; unused capacity must stay zero. The next input is the actual previous
-sampled output after completion and readback. The report identifies the tested
-sources and runtime binaries. A failed gate stops the chain.
+The caller owns tensor backing, context, and stream. The adapter retains tensor
+backing through completion and closes its Buffer wrappers after retirement.
+Returned logits use reusable storage; consume or copy them before the next
+decode call.
 
-The original prefill bundle remains sealed. The appended-KV bundle contains
-`appended.safetensors` with `key_00`/`value_00` through `key_39`/`value_39`, each
-`[8, 127, 128]`, and a manifest recording `reference_sums_sha256`,
-`appended_sha256`, `steps`, `layers`, `layout`, and reference token/logit equality.
+RunHandle waits use a 120-second timeout, including the wait before close-time
+stream synchronization. A timeout latches failure and retains backing and
+Buffer wrappers until a later drain succeeds. `Worker.close()` uses its public
+cleanup budget; Torch-NPU stream synchronization has no timeout argument, so
+the RunHandle timeout is not an overall process deadline.
 
-### Reference workload and validation
+## Other qualification tools
 
-The reference workload uses Qwen3-14B's 40 layers, hidden size 5120, eight KV
-heads and head dimension 128. Weights and KV use BF16; logits use FP32 and
-sampling uses greedy argmax. The fixture contains one real 3338-token prompt,
-replicated across 16 requests with independent physical pages. It does not
-reproduce a vLLM scheduler's batch allocation history or qualify distinct prompts.
+The directory also contains longer fixture-driven qualification entry points:
 
-The initial KV snapshot covers prompt positions 0 through 3337. The first
-generated token has been sampled but is not cached. The 127 decode dispatches
-therefore produce 128 generated tokens including that prefill token. Every
-frozen token is compared, including EOS; EOS does not stop qualification early.
+- `run_standalone_0p1.sh` measures a sealed KV fixture through the standalone
+  Worker adapter.
+- `reference_worker_submit.py` compares a sealed logical-KV reference with
+  appended decode KV, logits, and greedy tokens.
+- `clone_worker_submit.py` exercises two request-private states.
+- `device_feedback_worker_submit.py` exercises a bounded DEVICE feedback chain.
+- `continuous_worker_submit.py` exercises bounded refill, retirement, and
+  failure recovery.
 
-Logical initial KV has shape `[1, 8, 3338, 128]`, with keys after Q/K normalization
-and RoPE. Each physical layer cache uses BSND shape `[448, 128, 8, 128]`, with
-28 pages per request and a 32-column block table. Both complete caches occupy
-8.75 GiB of device storage. Decode step 118 crosses a page boundary.
+Those tools use their own fixture manifests and acceptance contracts. Their
+reports identify the source, artifact, model, and runtime identities used for
+each run.
 
-The loader checks bundle checksums, model checkpoint hashes, supported geometry,
-finite KV values and reference restoration. `reference_fixture.py` translates
-the logical bundle into the standalone adapter contract; the
-`serving-tmr-standalone-fixture-v1` schema remains separate. The qualified
-25-argument artifact has 39 in-core kernels and 277 tasks per layer. The bridge
-recompiles verified sources against the selected Simpler headers and tools;
-historical binaries provide provenance. The bridge's 26-argument ABI with
-`sampled_ids_host` is outside this reference consumer's hardware qualification.
+## vLLM Engine Smoke
 
-The result records run IDs, positions, slots, artifact and consumer-source hashes,
-and loaded-runtime binary hashes. Hardware measurements are recorded in
-[PR #2447](https://github.com/hw-native-sys/simpler/pull/2447) and
-[PR #2456](https://github.com/hw-native-sys/simpler/pull/2456).
+`run_vllm_eager.py` supports vLLM 0.20.2 / vLLM-Ascend 0.20.2rc1 on a single
+A3 with Torch/Torch-NPU 2.10 and NNAL/ATB 9.0. Environment and integration CI
+are tracked by [#2715](https://github.com/hw-native-sys/simpler/issues/2715)
+and [#2748](https://github.com/hw-native-sys/simpler/pull/2748).
+Native vLLM owns prefill, scheduling, greedy
+sampling and output; `vllm_eager.SimplerWorker` dispatches decode through the
+stage0 bridge and the existing Torch backend. The release stays unchanged,
+including its 32 kernels, 25 tensors and `[3466,128]` FP32 RoPE tables.
 
-### Execution dependencies and lifetime
+Requests use the qualified 3338-token prompt, BF16, 128-token pages, eager
+execution and private KV. `--requests 16` (default) selects a complete clone
+cohort; `--requests 1` selects one active request with isolated fixed-shape
+padding. Chunked or mixed prefill, prefix sharing, non-greedy sampling, partial
+cohorts and arbitrary request replacement are refused. Each new round retires
+and closes the previous backend before starting the next request state.
 
-The reference consumer uses `Worker(level=3)` with A3 `host_build_graph` and one
-local chip child. Each step uploads the actual previous sampled token and step
-metadata, calls `Worker.submit`, waits for `RunHandle.result(timeout=120)`,
-explicitly copies sampled output and logits to the host, validates them, and
-calls `complete_step`. Reference tokens are comparison data, never substituted
-future inputs. `next_step()` rejects a second reservation while a step is in flight.
-
-- Weights and RoPE are read-only and uploaded before the first run.
-- KV is shared mutable device storage; the next step waits for the prior run's
-  completion. Metadata values may be prepared early, but their device buffers
-  cannot be reused before the previous consumer completes.
-- Logits, sampled output and scratch storage are reused only after completion
-  and required readback. Report-owned copies preserve consumed results.
-- Worker-owned device allocations remain resident through `Worker.close`.
-  Temporary host upload buffers close after synchronous copies complete. Run
-  handles remain available through the chain. Device completion, host visibility
-  and eligibility for release are separate events.
-
-The host feedback edge is serial. Passing `--depth2-probe` records
-`launch_depth_requested=2`, but keeps effective `launch_depth=1` and reports
-`depth2_conclusion=safe_serial_fallback_host_sampled_token_feedback`. It does not
-enable early enqueue. A dependent successor would require a device sampled-output
-to next-input dependency, per-run metadata/output storage, last-consumer lifetime
-guarantees, and runtime support for joined DEVICE-backed launches.
-
-A numerical mismatch, run error or timeout stops further submission. Registration
-and initialization failures also trigger Worker cleanup. The consumer closes the
-Worker before writing the final report, and cleanup failure marks the report
-failed. An execution error remains primary if cleanup or report writing also
-fails; secondary errors remain in its exception context.
-
-This reference qualification covers serial correctness on A3 HBG. It does not
-establish full vLLM serving, dynamic request admission, A5/TMR coverage,
-capture/replay, implicit host/device synchronization or a performance improvement.
-
-## Independent requests
-
-`clone_worker_submit.py` runs two logically independent requests with the same
-Qwen fixture on one A3 HBG Worker at `launch_depth=2`. Immutable weights and RoPE
-are shared; each live request owns its own KV, block table, metadata, sampled
-token, logits, hidden output and run handle. Decode metadata is host staged at
-bind time so a successor can prepare without a direct-control copy behind the
-predecessor. Within either request, the next decode step uses that request's
-actual sampled output after completion.
+Run both commands inside one exclusive `task-submit` allocation, with CANN and
+ATB sourced. Use `--requests 1` on both commands for the single-active gate:
 
 ```bash
-python clone_worker_submit.py \
-  --fixture /path/to/reference-kv \
-  --kv-reference /path/to/reference-decode-kv \
-  --artifact /path/to/verified-hbg-artifact \
-  --model /path/to/Qwen3-14B \
-  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
+python run_vllm_eager.py --backend native --model /path/to/Qwen3-14B \
+  --prompt-ids /path/to/prompt-3338-token-ids.json --device "$TASK_DEVICE" \
+  --requests 16 --max-tokens 2 --output /path/to/native.json
+python run_vllm_eager.py --backend simpler --model /path/to/Qwen3-14B \
+  --prompt-ids /path/to/prompt-3338-token-ids.json --device "$TASK_DEVICE" \
+  --requests 16 --max-tokens 2 --artifact /path/to/qwen3-14b-hbg-release \
+  --reference /path/to/native.json --output /path/to/simpler.json
 ```
 
-The runner checks free device memory before allocating the second request and
-records a capacity failure when both requests cannot remain resident. A pass
-requires exact sampled tokens, logits/KV numerical gates, request-private
-storage isolation, and an attributable joined-launch trace for every decode pair
-showing the second enqueue before the first operator ends while device execution
-remains serial.
+The runner validates fixed model/shard digests and prompt IDs. It checks the
+complete output count, native token equality, dispatch statistics and Engine
+close, and writes success or failure receipts with separate cleanup errors.
+Two generated tokens exercise prefill plus one Simpler dispatch. The 16-request
+and single-active results are separate smoke gates; they do not establish the
+full 128-token tensor/numerical qualification tracked by #2429.
 
-## DEVICE feedback chain
+Projection banks are shared with native prefill through input-major linear
+views to avoid retaining a second checkpoint on the device. Splitting packed
+projections changes the floating-point computation path; matching short-smoke
+tokens is not proof of exact native-prefill tensor equality.
 
-`device_feedback_worker_submit.py` qualifies continuous autoregressive feedback
-on one A3 HBG chip child with at most two pending runs. After completing the
-oldest handle, it refills the queue before waiting for its successor. Two frames
-hold metadata, hidden scratch and HOST logits. The bridge seeds the HOST logits
-as INOUT so HBG uploads a NaN sentinel and publishes the run's logits at its own
-completion. Each frame is read and validated before reuse.
-
-Sampled tokens use DEVICE buffers, initialized to a sentinel before submission.
-Each successor binds the actual preceding DEVICE output. The fixed-count audit
-retains these small token buffers until all consumers complete and host late
-readback validates every token. Device output capacity is checked before
-allocation; weights and KV remain resident. The submission loop performs no
-direct-control device copies.
-
-```bash
-python device_feedback_worker_submit.py \
-  --fixture /path/to/reference-kv \
-  --kv-reference /path/to/reference-decode-kv \
-  --artifact /path/to/verified-hbg-artifact \
-  --model /path/to/Qwen3-14B \
-  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
-```
-
-Native traces must identify every launch, match joined epochs and prove serial
-device boundaries for every adjacent pair. Qualification requires real joined
-launches, including a refill beyond the initial two submissions. Observed serial
-launches remain in `fallback_edges`; missing evidence and an all-fallback chain
-fail. Tokens, logits and appended KV must pass their gates.
-
-The report separates accepted submissions, prepare-only staged dispatches,
-native enqueues and successful handle completions. Retirement is recorded only
-after successful Worker close, with that basis stated explicitly. Failed reports
-retain accepted run IDs and distinguish incomplete trace observations from zero
-enqueues. Failed close leaves host buffers retained. The qualified scope is
-fixed-count A3 HBG decode with known layouts, one endpoint and diagnostics off.
-
-## Sustained request qualification
-
-`continuous_worker_submit.py` combines request-private storage with DEVICE
-feedback on one A3 HBG endpoint, with diagnostics disabled. The default sequence
-has six requests of 63, 127, 95, 127, 97 and 127 decode steps, two reusable
-request slots, eight run-resource sets and launch depth four. At most four
-handles are pending, with at most two for either request. Each request uses its
-own previous DEVICE sampled token; golden tokens are validation data.
-
-```bash
-python continuous_worker_submit.py \
-  --fixture /path/to/reference-kv \
-  --kv-reference /path/to/reference-decode-kv \
-  --artifact /path/to/verified-hbg-artifact \
-  --model /path/to/Qwen3-14B --device DEVICE_ID \
-  --output /path/to/new-result-directory
-```
-
-Run through `task-submit` on shared hardware after CANN setup and the A3
-architecture precheck. `--pipeline-depth 4 --launch-depth 2` exercises four
-pending runs with a smaller execution window. `--request-steps 5 11 7 13` is a
-short correctness control. `--inject-partial-at 3` raises after the fourth
-orchestration submission; this negative control must exit with an error, stop
-refill, drain returned handles and report the close outcome.
-
-Live requests have disjoint KV, metadata, staging, output and sampled-token
-storage. HOST logits are checked before their frame is reused. Sampled tokens
-remain resident through their DEVICE consumer and delayed HOST audit; attempted
-early release is required to fail while the consumer remains registered.
-
-Request replacement is an explicit drained checkpoint: complete outstanding
-runs, audit tokens and the finished request's KV, restore its slot's initial KV,
-then resume the surviving request before submitting the replacement. Arrival
-qualification requires the replacement's first run to join an executing
-predecessor. Checkpoint gaps are reported as serial edges. This bounded arrival
-schedule does not qualify arbitrary arrivals or concurrent device operators.
-
-The report separates attempts, accepted/staged/native-enqueued/completed/run-
-retired counts and request-slot retirement. It requires attributable native
-identities, serial device boundaries, joined arrival edges, request-local
-DEVICE feedback and joined refill. Serial fallback is counted; missing trace
-evidence fails qualification. Host buffers stay retained if Worker close fails.
-Transport-frame exhaustion/recovery and lease admission use the existing
-scheduler and pending-queue regression tests, alongside this workload test.
-
-The qualified scope is fixed-shape Qwen3-14B on one A3 HBG endpoint with
-diagnostics disabled, independent mutable request storage and a bounded
-sequence. Grant counts and device-memory capacity remain separate constraints.
+`VLLM_ADAPTER_ROOT` can point at the checkout containing this directory, or
+at this directory directly, for the integration harness in #2748. Pin the
+checkout commit and release identity together when configuring the watch.

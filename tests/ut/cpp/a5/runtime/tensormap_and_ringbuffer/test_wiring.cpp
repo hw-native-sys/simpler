@@ -84,7 +84,7 @@ protected:
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = ring_id;
-        slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+        slot.active_mask = LaneMask::aic();
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
@@ -316,7 +316,7 @@ TEST_F(WiringTest, SyncStartStagingFinalizeRetriesProducerFirstRendezvous) {
     init_slot(sync_consumer, CHIP_TASK_PENDING, 1, 1);
     init_slot(downstream, CHIP_TASK_PENDING, 1, 1);
 
-    sync_consumer.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask = LaneMask::aiv0();
     sync_consumer.task_attrs.set_sync_start();
     sync_consumer.task_attrs.set_early_resolve(true);
     sync_consumer.logical_block_num = 2;
@@ -351,7 +351,7 @@ TEST_F(WiringTest, SyncStartProducerReleaseCompletesStagerFirstRendezvous) {
     init_slot(sync_consumer, CHIP_TASK_PENDING, 1, 1);
     init_slot(downstream, CHIP_TASK_PENDING, 1, 1);
 
-    sync_consumer.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask = LaneMask::aiv0();
     sync_consumer.task_attrs.set_sync_start();
     sync_consumer.task_attrs.set_early_resolve(true);
     sync_consumer.logical_block_num = 2;
@@ -380,7 +380,7 @@ TEST_F(WiringTest, SyncStartProducerReleaseCompletesStagerFirstRendezvous) {
 TEST_F(WiringTest, EarlySyncFinishBetweenReleasePhasesRetainsOwnerCompleteState) {
     alignas(64) ChipTaskSlotState sync_consumer;
     init_slot(sync_consumer, CHIP_TASK_PENDING, 1, 1);
-    sync_consumer.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask = LaneMask::aiv0();
     sync_consumer.task_attrs.set_sync_start();
     sync_consumer.logical_block_num = 2;
     sync_consumer.payload->early_dispatch_state.store(EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
@@ -418,12 +418,12 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     // Consumer1: needs 1 more fanin to become ready
     init_slot(consumer1, CHIP_TASK_PENDING, 2, 1);
     consumer1.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer1.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+    consumer1.active_mask = LaneMask::aic();
 
     // Consumer2: this release will make it ready
     init_slot(consumer2, CHIP_TASK_PENDING, 2, 1);
     consumer2.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer2.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+    consumer2.active_mask = LaneMask::aic();
 
     // Build fanout chain: producer -> consumer2 -> consumer1
     DepListEntry dep_entries[2];
@@ -962,7 +962,7 @@ TEST_F(WiringTest, NoEdgePublishRecordsDepPoolMark) {
     EXPECT_EQ(task_slot.dep_pool_mark, before_top);
 }
 
-TEST_F(WiringTest, BatchPushReportsFullInsteadOfSpinning) {
+TEST_F(WiringTest, BatchRequeueReportsFullInsteadOfSpinning) {
     alignas(64) ChipTaskSlotState filler;
     init_slot(filler, CHIP_TASK_PENDING, 0, 1);
     auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
@@ -970,18 +970,18 @@ TEST_F(WiringTest, BatchPushReportsFullInsteadOfSpinning) {
         ASSERT_TRUE(queue.push_tagged(&filler, TaskId::make(0, static_cast<int32_t>(i))));
     }
 
-    ChipTaskSlotState *items[1] = {&filler};
+    LaneTaggedSlot items[1] = {queue.capture(&filler)};
     TaskId tags[1] = {TaskId::make(0, static_cast<int32_t>(queue.capacity))};
     // A full queue must end the call, not spin waiting for a consumer. Reaching
     // the next line at all is the assertion.
-    EXPECT_FALSE(queue.push_batch_tagged(items, tags, 1));
+    EXPECT_FALSE(queue.requeue_batch_tagged(items, tags, 1));
     EXPECT_EQ(queue.size(), queue.capacity);
 
     // A batch larger than the queue can never be satisfied and must not spin.
-    EXPECT_FALSE(queue.push_batch_tagged(items, tags, static_cast<int>(queue.capacity) + 1));
+    EXPECT_FALSE(queue.requeue_batch_tagged(items, tags, static_cast<int>(queue.capacity) + 1));
 }
 
-TEST_F(WiringTest, BatchPushSucceedsAfterSpaceIsReclaimed) {
+TEST_F(WiringTest, BatchRequeueSucceedsAfterSpaceIsReclaimed) {
     alignas(64) ChipTaskSlotState filler;
     init_slot(filler, CHIP_TASK_PENDING, 0, 1);
     auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
@@ -991,9 +991,9 @@ TEST_F(WiringTest, BatchPushSucceedsAfterSpaceIsReclaimed) {
     ASSERT_NE(queue.pop(), nullptr);
     ASSERT_NE(queue.pop(), nullptr);
 
-    ChipTaskSlotState *items[2] = {&filler, &filler};
+    LaneTaggedSlot items[2] = {queue.capture(&filler), queue.capture(&filler)};
     TaskId tags[2] = {TaskId::make(0, 7), TaskId::make(0, 8)};
-    EXPECT_TRUE(queue.push_batch_tagged(items, tags, 2));
+    EXPECT_TRUE(queue.requeue_batch_tagged(items, tags, 2));
     EXPECT_EQ(queue.size(), queue.capacity);
 }
 

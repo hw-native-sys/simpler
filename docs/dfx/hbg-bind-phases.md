@@ -29,7 +29,7 @@ the `chip.run.bind` span:
 | `args` | copying readable caller tensors in H2D, into slices of the pipeline slot's retained temporary buffer, and exposing their existing host buffers to orchestration; pure outputs skip both. The buffer grows to the high-water packed size and is reused, so a steady-state workload allocates no device memory here |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
 | `host_orch` | orchestration and recording: every task submitted and every sub-task recorded; excludes the later Definition packing and Graph task binding in `bind_graph_definitions` |
-| `graph_pack` | assembling this run's Definition section in `bind_graph_definitions` — staging growth, header writes, spill copies — and handing it to the AICPU launch package, which RTS copies with the launch. **No H2D of its own**: the Definition bytes travel as launch arguments, so there is no device Definition block to upload. Excludes Graph task binding. Absent when there is no Definition |
+| `graph_pack` | assembling this run's Definition section in `bind_graph_definitions` — staging growth, header writes, spill copies. Legacy Graph hands this section to the AICPU launch package; A5 native Graph retains it in the host plan and publishes a separate scheduler image later. This segment has no H2D of its own. Excludes Graph task binding. Absent when there is no Definition |
 | `arena_h2d` | one H2D of the arena's copied zone and the shared-memory image |
 | `host_view_close` | dropping the explicit HOST/NONE access registrations after host orchestration and recorder completion; no mapping or device-copy fallback is performed. Historical `count`, `bytes`, and `devcopy` attributes are no longer emitted |
 
@@ -76,6 +76,13 @@ descriptor and entry fork. CPU transports without a staging callback retain
 synchronous publication before `arena_h2d`. Neither route has a dedicated
 scheduler segment, and the onboard enqueue cost is outside `chip.run.bind`.
 The legacy A5 path has no separate resident scheduler publication.
+
+A5 native Graph includes the original Definitions, per-Definition plans and
+instance mappings in that scheduler image. It does not attach a Definition
+carrier to the AICPU launch package. Native planning and scheduler-image
+publication therefore remain outside `graph_pack`; that segment alone cannot
+measure the native Graph setup cost. The enclosing bind span and launch-side
+publication must be considered together.
 
 **Execution order, emission order and parser display order differ.** Each
 span's `ts` records execution time. The trace emits in `HostPhaseKind` order

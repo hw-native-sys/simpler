@@ -101,3 +101,7 @@ hierarchical_case(test_pipeline_contract_loader.cpp
         RUNTIME_LIBRARY_ROOT="${SIMPLER_REPO_ROOT}/build/lib")
 
 simpler_ut_glob_cases(hierarchical_case)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(test_device_execution_owners PRIVATE "LINKER:--wrap=pthread_atfork")
+endif()

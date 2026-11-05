@@ -421,9 +421,10 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
 }
 
 static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
-    if (runtime == nullptr || api == nullptr || host_header == nullptr) {
-        return 0;
-    }
+    if (api == nullptr || host_header == nullptr) return 0;
+    // The shared scheduler header can already belong to a successor.
+    if (const auto observed = api->observed_run_status(); observed.has_value()) return *observed;
+    if (runtime == nullptr) return 0;
 
     void *device_sm = runtime->get_gm_sm_ptr();
     if (device_sm == nullptr) {
@@ -692,9 +693,9 @@ bool bind_graph_definitions(
                 // singles out GRAPH and routes everything else by shape, and a Graph
                 // body member is never the shell, so the shape decides. Derived here
                 // the same way the device derives it, so the two cannot drift.
-                const ActiveMask mask(tasks[i].active_mask);
+                const LaneMask mask(tasks[i].active_mask);
                 packed_definition.ready_queue_populations.add_task(
-                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL
+                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL
                 );
             }
             packed_definition.populations_ready = true;
@@ -1743,7 +1744,7 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
  * @return 0 on success, -1 on failure
  */
 extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
-    if (runtime == nullptr) {
+    if (runtime == nullptr && execution_rc == 0) {
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1757,8 +1758,8 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    const TensorLease *tensor_leases = runtime->tensor_leases().data();
-    int tensor_lease_count = static_cast<int>(runtime->tensor_leases().size());
+    const TensorLease *tensor_leases = runtime != nullptr ? runtime->tensor_leases().data() : nullptr;
+    int tensor_lease_count = runtime != nullptr ? static_cast<int>(runtime->tensor_leases().size()) : 0;
 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
@@ -1767,14 +1768,18 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    // The shared-memory status is device state, readable only for a run that
-    // reached a stream.
+    // A common observer's status has no shared-header scheduler provenance.
+    // Only the legacy fallback reads the shared header of a launched run.
     if (execution_rc != 0 && launched != 0) {
         runtime_status = read_runtime_status(runtime, api, &host_header);
     }
     if (runtime_status != 0) {
-        int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
-        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);
+        if (api->observed_run_status().has_value()) {
+            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read)", runtime_status);
+        } else {
+            int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
+            LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);
+        }
     }
 
     if (skip_tensor_copy_back) {
@@ -1814,10 +1819,6 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     }
 
     LOG_INFO("=== Result Copy-Back Complete ===");
-
-    if (rc == 0 && runtime_status != 0) {
-        rc = runtime_status;
-    }
 
     return rc;
 }

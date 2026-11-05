@@ -14,12 +14,14 @@ ELF64 or Mach-O ``.o`` files for direct execution on AICore.
 
 The loader extracts only the literal ``.text`` section bytes and jumps to
 offset 0, so the payload must already be complete: no unapplied relocations,
-no code stranded outside ``.text``, and ``kernel_entry`` first.
+no code or allocated read-only data stranded outside ``.text``, and
+``kernel_entry`` first. Linked ``.rodata`` jump tables are not part of the
+loaded payload and are rejected even when their relocations are resolved.
 
 ``KernelCompiler.compile_incore`` links each object with ``ld.lld`` before it
-reaches this parser, which is what makes those properties hold — the linker
-applies ``.rela.text`` and folds ``.text.*`` COMDAT groups into the output
-``.text``. The checks below therefore run *after* linking: reaching one means
+reaches this parser. The linker applies ``.rela.text`` and folds ``.text.*``
+COMDAT groups into the output ``.text``, but may retain separate data sections.
+The checks below therefore run *after* linking: reaching one means
 the link did not produce a self-contained image, not that a kernel merely
 needs inlining. Returning the raw bytes anyway is what issue #900 and
 PR #830 / issue #831 record — CANN 507018 watchdog timeouts and
@@ -48,6 +50,10 @@ _RELA_SIZE = 24
 _SHT_PROGBITS = 1
 _SHT_SYMTAB = 2
 _SHT_RELA = 4
+_SHF_ALLOC = 2
+
+# Hardware incore cache keys include the validation contract of extracted text.
+ELF_TEXT_POLICY_VERSION = 2
 
 # Elf64_Sym: st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8) st_size(8)
 _SYM_SIZE = 24
@@ -104,7 +110,7 @@ def extract_text_section(obj_input: Union[str, Path, bytes]) -> bytes:
 
 
 def _extract_text_elf64(elf_data: bytes, source_name: str) -> bytes:
-    """Extract .text section from ELF64 data; reject out-of-line code."""
+    """Extract .text from ELF64 data; reject incomplete text-only images."""
     if len(elf_data) < 64:
         raise ValueError(f"Data too small to be a valid ELF: {source_name}")
 
@@ -142,11 +148,13 @@ def _extract_text_elf64(elf_data: bytes, source_name: str) -> bytes:
     text_addr = 0
     out_of_line: list[tuple[str, int]] = []
     text_relocs: list[tuple[str, int]] = []
+    read_only_data: list[tuple[str, int]] = []
 
     for i in range(e_shnum):
         section_offset = e_shoff + i * _SHDR_SIZE
         sh_name = struct.unpack("<I", elf_data[section_offset : section_offset + 4])[0]
         sh_type = struct.unpack("<I", elf_data[section_offset + 4 : section_offset + 8])[0]
+        sh_flags = struct.unpack("<Q", elf_data[section_offset + 8 : section_offset + 16])[0]
         sh_offset = struct.unpack("<Q", elf_data[section_offset + 24 : section_offset + 32])[0]
         sh_size = struct.unpack("<Q", elf_data[section_offset + 32 : section_offset + 40])[0]
         if sh_name >= len(strtab):
@@ -167,9 +175,24 @@ def _extract_text_elf64(elf_data: bytes, source_name: str) -> bytes:
             out_of_line.append((section_name, sh_size))
         elif sh_type == _SHT_RELA and section_name.startswith(".rela.text"):
             text_relocs.append((section_name, sh_size // _RELA_SIZE))
+        elif (
+            sh_type == _SHT_PROGBITS
+            and sh_flags & _SHF_ALLOC
+            and sh_size
+            and (section_name == ".rodata" or section_name.startswith(".rodata."))
+        ):
+            read_only_data.append((section_name, sh_size))
 
     if out_of_line or text_relocs:
         _raise_unresolved_text_error(source_name, out_of_line, text_relocs)
+
+    if read_only_data:
+        sections = ", ".join(f"{name} ({size} bytes)" for name, size in read_only_data)
+        raise ValueError(
+            f"AICore image has allocated read-only data outside .text: {sections} in {source_name}. "
+            "The text-only loader would discard it even after relocations are resolved. "
+            "Use a self-contained .text image without external jump tables or constant data."
+        )
 
     if text_data is None:
         raise ValueError(f".text section not found in: {source_name}")

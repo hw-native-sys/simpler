@@ -20,6 +20,7 @@
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "host/pmu_collector.h"
+#include "profiler_test_allocator.h"
 
 namespace {
 using Register = std::pair<uint64_t, RegId>;
@@ -100,7 +101,7 @@ protected:
     uint32_t physical_[2] = {1, 0};
     PmuCollector collector_;
 
-    static void *allocate(size_t size) { return std::calloc(1, size); }
+    static void *allocate(size_t size) { return profiler_test_calloc(size); }
     static int release(void *pointer) {
         std::free(pointer);
         return 0;

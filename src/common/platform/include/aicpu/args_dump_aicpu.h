@@ -28,6 +28,8 @@
 
 #ifdef __cplusplus
 #include <cinttypes>
+
+#include "common/lane_mask.h"
 #endif
 
 #include "common/memory_barrier.h"
@@ -101,13 +103,10 @@ int dump_arg_record(int thread_idx, const ArgsDumpInfo &info);
 // pointer, host_build_graph's storage by layout — and neither is this dump's concern,
 // so a caller passes what it already has in hand. The types differ per runtime too,
 // hence the deduced parameters.
-template <
-    int MaxSubtaskSlots, typename TaskDescriptorT, typename TaskPayloadT, typename ActiveMaskT,
-    typename IsSubtaskActiveFn, typename GetFunctionBinAddrFn>
+template <int MaxSubtaskSlots, typename TaskDescriptorT, typename TaskPayloadT, typename GetFunctionBinAddrFn>
 inline void dump_args_for_task(
-    int32_t thread_idx, const TaskDescriptorT &descriptor, const TaskPayloadT &pl, const ActiveMaskT &active_mask,
-    ArgsDumpStage stage, IsSubtaskActiveFn is_subtask_active, GetFunctionBinAddrFn get_function_bin_addr,
-    const ArgsDumpTaskMetadata *task_metadata = nullptr
+    int32_t thread_idx, const TaskDescriptorT &descriptor, const TaskPayloadT &pl, LaneMask active_mask,
+    ArgsDumpStage stage, GetFunctionBinAddrFn get_function_bin_addr, const ArgsDumpTaskMetadata *task_metadata = nullptr
 ) {
     // The record's func_ids[] must hold every active subtask's id. MaxSubtaskSlots
     // is SUBTASK_SLOT_COUNT at every call site, so this ties the record array
@@ -133,7 +132,7 @@ inline void dump_args_for_task(
     const CoreCallable *sig_src = nullptr;
 
     for (int raw_subtask_id = 0; raw_subtask_id < MaxSubtaskSlots; raw_subtask_id++) {
-        if (!is_subtask_active(active_mask, raw_subtask_id)) {
+        if (!active_mask.has(static_cast<SubtaskSlot>(raw_subtask_id))) {
             continue;
         }
         uint64_t callable_addr = get_function_bin_addr(descriptor.kernel_id[raw_subtask_id]);

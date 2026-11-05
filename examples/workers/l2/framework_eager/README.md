@@ -1,6 +1,6 @@
 # Framework queue → public Worker eager execution
 
-This bounded A3 reference consumer puts `Worker.submit` in torch_npu's actual
+These bounded reference consumers select A3 (`a2a3`) or A5 (`a5`) and put `Worker.submit` in torch_npu's actual
 host emission queue. Torch operations produce two DEVICE inputs; the ordinary
 public Worker launches one add kernel; a Torch tensor addition consumes its
 output on the same framework stream. TMR and HBG use the same consumer.
@@ -12,12 +12,37 @@ DEVICE-controlled updates to caller-owned storage.
 | Consumer | Executable assertions |
 | -------- | --------------------- |
 | `main.py` | Same-stream producers → Worker → successor; retained caller frames, observable callback error and close ordering |
+| `lifecycle.py` | Two sequential Worker generations, opposite X/Y registration order, eight checked calls and caller storage/context survival after each close |
 | `cross_stream.py` | Separate producer and consumer streams, caller A → B → A on one Worker, explicit framework event dependencies |
 | `alias_inout.py` | One Buffer backing full and partially overlapping strided views, INPUT plus INOUT, repeated updates and unchanged guards |
 | `scope_statistics.py` | Per-call ScopeStats selection with two nested task scopes; TMR records and allocation frontiers, HBG metadata only |
+| `diagnostic_selection.py` | Per-call PMU and chip-swimlane snapshots, original export destinations and enabled-run attribution |
 | `failure_recovery.py` | A Python callback fails after submit acceptance; later requests complete and init-thread Worker close retires all accepted runs |
+| `preflight_recovery.py` | Stale Buffer registration and wrong caller context are refused before acceptance; the same Worker then completes three healthy requests |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
+| `argument_capture.py` | OFF/FULL/HYBRID/OFF ArgsDump payloads on supported runtimes; explicit A5 HBG refusal and recovery |
+
+One process owns at most one onboard execution Worker per device. Program and
+Kernel use the same admission rule; another device and ordinary Torch operators
+remain usable. One Worker can register many callables and queue runs. A second
+same-device Worker must wait for a fully proven close or init rollback; unknown
+cleanup keeps the execution reservation.
+
+`lifecycle.py` closes its first Worker before initializing its successor in the
+same caller context. Each generation keeps its two original callable handles
+through four queued requests; registration order reverses across generations.
+The successor uses the same runtime by default. `--successor-runtime` selects
+`host_build_graph` or `tensormap_and_ringbuffer` for a transition in that same
+caller context, with freshly compiled X/Y callables for the selected backend.
+The scene tests cover both transition directions and same-runtime recreation
+under both queue modes. Before each close, native orchestration-load counters
+must show HBG `(host=2, AICPU=0)` or TMR `(host=0, AICPU=2)`.
+The full arithmetic chain is `[3, 7, 13, 17, 22, 34, 41, 57]`, with guarded,
+disjoint I/O and Torch successors. After each close a Torch operation still
+produces `17`; all earlier business tensors are checked again after both closes.
+This is an eager lifecycle check. External captured-graph lifetime is outside
+this contract.
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
@@ -50,6 +75,13 @@ Run hardware through the queue, after architecture detection:
 task-submit --timeout 600 --max-time 180 --device auto --device-num 1 --run   'TASK_QUEUE_ENABLE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=2 python examples/workers/l2/framework_eager/main.py --runtime tensormap_and_ringbuffer --device "$TASK_DEVICE"'
 ```
 
+Pass `--platform a5` to select A5 on a matching runner; the default is
+`a2a3`. The selected platform routes canonical compilation, public Worker
+construction and the PASS record together. Compile-cache keys include it, so
+A3 and A5 artifacts cannot alias. Keep the same platform in the architecture
+precheck and pytest invocation below. A5 execution requires its own successful
+CI qualification; existing A3 measurements do not establish A5 support.
+
 Select `host_build_graph` for HBG, and run `TASK_QUEUE_ENABLE=0` separately for
 the synchronous framework emission policy. A PASS record contains the actual
 caller/callback native thread IDs and the number of verified invocations.
@@ -63,9 +95,9 @@ CLIs load the unique existing artifact, building only when it is absent; the
 original same-stream CLI still checks its incremental build cache. All use
 the original `build_bridge` / `_load_bridge` helpers. The
 `test_environment("torch_npu")` marker selects an isolated framework venv in the
-dedicated `st-framework-eager-a2a3` PR and Daily job. The default environment
+dedicated `st-framework-eager-a2a3` and `st-framework-eager-a5` PR and Daily jobs. The default environment
 automatically deselects these tests; no directory exclusion is needed.
-Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3) for the pinned compatibility contract. Run this suite
+Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3-and-a5) for the pinned compatibility contract. Run this suite
 serially inside one exclusive `task-submit` allocation of one device, as below;
 resource-parallel dispatch and xdist are not qualified by this example:
 
@@ -135,6 +167,17 @@ they do not measure live allocations, overlap or performance. Retirement and
 export occur after the final framework completion boundary. Unknown outcomes
 retain the caller and runtime owners.
 
+`diagnostic_selection.py` queues four calls on one Worker: diagnostics off,
+swimlane level 1 / PMU event 2, level 3 / event 4, then off again. Each actual
+submit is followed by changes to the original CallConfig selectors and output
+prefix. After the final framework boundary, handle retirement exports the
+submitted selections to their original destinations. The checks require
+correct successors, distinct enabled-run epochs and matching PMU/swimlane
+attribution; off calls and the mutated poison destination produce no records.
+This covers PMU and chip swimlane only, not ScopeStats, args dump or dependency
+graph export. Native admission and diagnostic collection may wait; this is
+ordering and attribution evidence, not overlap or throughput.
+
 `alias_inout.py` uses one Torch allocation wrapped by one Buffer. Its distinct
 64 × 64 Tensor views have row stride 96 and nonzero byte offsets. Each mode
 performs successive INPUT + INOUT updates on that same backing: either full
@@ -154,6 +197,19 @@ caller stream. This covers ordinary Python callback failure and successful
 close after completion, not failed native drain, device faults or close while
 an unpublished framework callback is pending. An unproved failure retains the
 caller and runtime owners.
+
+`preflight_recovery.py` exercises two refusals inside the actual framework
+callback: an argument Tensor whose Buffer registration has closed, then a submit
+from a distinct caller-created RTS context. The backing allocations remain alive;
+the checks use the existing provenance liveness and `ExecutionContextRefused`
+contracts rather than an invalid device address or kernel fault. Each refusal
+is followed by healthy work on the same Worker. The wrong-context callback
+restores its original context before its healthy submit; a third
+healthy request follows.
+After the final framework boundary it checks independent golden results, retires
+runs, closes the Worker and Buffers, reuses the Torch stream, and destroys only
+the alternate caller-owned context. Unproved completion retains these owners.
+This covers pre-admission refusal recovery, not native partial-launch recovery.
 
 `value_arguments.py` submits fresh FLOAT32, INT8, UINT64 and FLOAT64 values for
 each call, then clears the TaskArgs and changes the scalar wrappers. High bits,
@@ -179,7 +235,45 @@ This is a bounded persistent-state/accepted-prefix reference, not a complete
 MTP model, dynamic host task generation or throughput result.
 
 These are bounded reference cases. Full framework process shutdown, arbitrary
-strides or cross-tile overlap, A5 and capture remain separate qualification.
+strides or cross-tile overlap and capture remain separate qualification.
 
 This is a reference consumer of the existing eager contract, not acceptance of
-PyPTO production dispatch, vLLM/model numerics, A5 or capture/replay.
+PyPTO production dispatch, vLLM/model numerics or capture/replay. Each platform
+requires its own actual environment, collection and execution receipts.
+
+## Per-call argument capture
+
+`argument_capture.py` submits two dependent vector-add tasks per call:
+`mid = A + B`, then `out = mid + B`. The intermediate is created by the runtime;
+only A, B and out are caller arguments. A is a contiguous one-dimensional view
+with a nonzero caller backing offset; B, out and mid have two-dimensional
+geometry. The L2 adapter folds the view offset into its address and exports
+zero native start offsets. Task attribution uses these materialized shapes,
+not an ordering of opaque task IDs.
+
+Four queued attempts select argument capture OFF/FULL/HYBRID/OFF. On A2/A3
+(both runtimes) and A5 TMR, all four calls are accepted. FULL checks all
+six task arguments; HYBRID checks the three marked arguments. Exact payload
+bytes, before/after stages, geometry, epoch and completeness are checked after
+the final framework boundary and retirement. Torch successors independently
+check final outputs and caller backing guards. Mutating the accepted caller
+config and prefix must not change the selected capture or export destination.
+Unknown outcomes retain every caller/runtime owner. This qualifies the bounded
+reference workload, not capture/replay or arbitrary task graphs.
+
+A5 HBG has no per-task argument-dump producer. Its same queue sequence requires
+the existing typed `RunPreparationRefused` with the native unsupported status
+`-1001` for FULL and HYBRID. Neither refused request may return an accepted run,
+launch work, change caller inputs or outputs, or create argument-dump files.
+The OFF calls before and after must produce the correct Torch successors and
+preserve guards on the same Worker. All caller owners remain alive through
+the final boundary, retirement and close; the caller stream is used again after
+Worker close. `FRAMEWORK_ARGUMENT_DUMP_REFUSAL_RECOVERY_PASS` reports two accepted
+calls and two refusals with `args_dump_supported=false` and
+`payloads_verified=false`; it is not a payload-capture result.
+
+Required A5 HBG per-task argument capture remains unimplemented and tracked under
+[#2666](https://github.com/hw-native-sys/simpler/issues/2666). This refusal and
+recovery qualification does not close it. The existing
+[task-boundary producer investigation](../../../../docs/investigations/2026-10-a5-resident-per-task-args-capture.md)
+describes that missing producer.

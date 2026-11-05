@@ -43,6 +43,17 @@ EXPECTED_MODEL_FILES: dict[str, str] = {
     "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
 }
 
+EXPECTED_SHARD_FILES = {
+    "model-00001-of-00008.safetensors": "e942bdbdf08857d16a8fef7d1dae9fceabeb4e84def6043485fe2f6f085dab0e",
+    "model-00002-of-00008.safetensors": "f7c9c6eee628f5ad831d2d1d292e120505e5fcadeb38f88b4d3c4cb86306ccf9",
+    "model-00003-of-00008.safetensors": "dfb8c5df9404b41ad6ae74e8b6b367135f017b4467b884cf71b17c71954f18a9",
+    "model-00004-of-00008.safetensors": "eab286fec759e3e59ab228621aefa0fef14ed56039e06f959e67257d5af7604d",
+    "model-00005-of-00008.safetensors": "97f0dc2992e59da95c466eff6f4fd0c8335843bbc36ed5c913a6f5150748c0e6",
+    "model-00006-of-00008.safetensors": "9e8e76a013cd5e253865b792991e0b410f869b136b3c500079b531b09198e99e",
+    "model-00007-of-00008.safetensors": "0aee70ee6e91dc00d818804fb47f124d13ee4ad5b4a64553e09dbf9391cd5750",
+    "model-00008-of-00008.safetensors": "0d6b92296e326d39bbbaeb32c3ec454ac606da843d4c8ffa8edf010b62b8c9e0",
+}
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -78,6 +89,19 @@ def validate_model(model_dir: Path) -> dict[str, str]:
     config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     if int(config.get("num_hidden_layers", 0)) != 40 or int(config.get("hidden_size", 0)) != 5120:
         raise ValueError("checkpoint geometry is not Qwen3-14B decode geometry")
+    return observed
+
+
+def validate_checkpoint(model_dir: Path) -> dict[str, str]:
+    """Verify pinned metadata and every shard named by the verified weight index."""
+    observed = validate_model(model_dir)
+    index = json.loads((model_dir / "model.safetensors.index.json").read_text())
+    for name in sorted(set(index["weight_map"].values())):
+        if name not in EXPECTED_SHARD_FILES:
+            raise ValueError(f"unpinned checkpoint shard: {name}")
+        observed[name] = sha256_file(model_dir / name)
+        if observed[name] != EXPECTED_SHARD_FILES[name]:
+            raise ValueError(f"checkpoint checksum mismatch: {name}")
     return observed
 
 

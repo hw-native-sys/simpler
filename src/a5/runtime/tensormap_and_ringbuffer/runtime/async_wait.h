@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PTO_ASYNC_WAIT_H
-#define PTO_ASYNC_WAIT_H
+#pragma once
 
 #include <atomic>
 #include <cstddef>
@@ -66,8 +65,6 @@ inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
     if (cond.counter_addr == nullptr) {
         return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
     }
-    uintptr_t line = reinterpret_cast<uintptr_t>(cond.counter_addr) & ~(uintptr_t(CHIP_ALIGN_SIZE) - 1u);
-    cache_invalidate_range(reinterpret_cast<const void *>(line), CHIP_ALIGN_SIZE);
     return {
         *cond.counter_addr >= cond.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING,
         SIMPLER_ERROR_NONE
@@ -85,7 +82,7 @@ inline void sdma_event_record_retire_op(CompletionCondition &cond) {
 }
 
 inline CompletionPollResult urma_event_handle_poll_op(const CompletionCondition &cond) {
-    return pto2::urma_backend::poll_urma_event_handle(cond.addr, cond.backend_cookie);
+    return pto2::urma_backend::poll_urma_event_handle(cond.addr, cond.backend_cookie, cond.expected_value);
 }
 
 inline void urma_event_handle_retire_op(CompletionCondition &cond) {
@@ -329,5 +326,3 @@ struct AsyncWaitList {
     // asked for the dump.
     void log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, const char *reason);
 };
-
-#endif  // PTO_ASYNC_WAIT_H

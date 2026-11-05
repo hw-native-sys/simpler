@@ -118,6 +118,21 @@ nav:
       - TMR A2/A3 vs A5: tensormap-and-ringbuffer-a2a3-vs-a5.md
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
       - Run completion fences: design/run-completion-fence.md
+      - A5 HBG Graph task 设计:
+          - 设计总览: zh-cn/design/a5-hbg-graph-task.md
+          - 数据布局与 Host 绑定: zh-cn/design/a5-hbg-graph-task/data-layout.md
+          - 调度与发布协议: zh-cn/design/a5-hbg-graph-task/protocol.md
+          - 全局与分级 ready 队列设计: zh-cn/design/a5-hbg-graph-task/ready-queue-design.md
+          - Ready 队列算法与竞争控制: zh-cn/design/a5-hbg-graph-task/ready-queue-algorithms.md
+          - 独立 block 调度待选方案: zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md
+          - 实施与功能验收: zh-cn/design/a5-hbg-graph-task/implementation.md
+          - 性能与自主迭代流程: zh-cn/design/a5-hbg-graph-task/performance.md
+          - 设计复审: zh-cn/design/a5-hbg-graph-task/review.md
+          - 已否定的性能尝试: zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md
+          - 无 Graph 性能实测: zh-cn/design/a5-hbg-graph-task/no-graph-performance.md
+          - Qwen 性能与正确性实测: zh-cn/design/a5-hbg-graph-task/qwen-performance.md
+          - 独立 block 原型历史测量: zh-cn/design/a5-hbg-graph-task/qwen-block-work.md
+          - Qwen 历史测量与排查: zh-cn/design/a5-hbg-graph-task/qwen-performance-history.md
       - Worker Manager: worker-manager.md
       - Hardware:
           - Overview: hardware/README.md
@@ -127,6 +142,7 @@ nav:
           - CANN source references: hardware/cann-source-references.md
   - Kernels:
       - AICore Kernel Programming: aicore-kernel-programming.md
+      - TMR task dependencies and progress: aicore-kernel-programming/task-progress.md
       - L2 Cache Bypass: l2-cache-bypass.md
       - a5 SIMT Launch: simt-launch.md
       - Manual Scope: manual-scope.md
@@ -188,4 +204,5 @@ nav:
       - macOS libomp collision: troubleshooting/macos-libomp-collision.md
       - cpput gtest ABI: troubleshooting/ut-cpp-gtest-abi.md
       - a2a3 worker retirement: troubleshooting/a2a3-worker-retirement.md
+      - AICore retirement recovery: troubleshooting/aicore-retirement-recovery.md
   - Investigations: investigations/README.md

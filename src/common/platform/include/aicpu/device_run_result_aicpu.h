@@ -20,10 +20,9 @@
  *     run's final state rather than one thread's view of it.
  *   - Run **before the kernel returns**, so the write precedes the fence that
  *     releases any successor to reset the shared state it was folded from.
- *   - Make the record visible to the host **before** the epoch that marks it
- *     valid. A thread-ordering fence does not do this: the host reads through a
- *     D2H copy of device memory, so the bytes have to leave this core's cache.
- *     Hence an explicit flush of payload and header words, then of the epoch.
+ *   - Write back the record on A2/A3 for the host's D2H read. A5 is coherent;
+ *     the host reads only after the run's kernel completion boundaries, so
+ *     the epoch is an identity check, not a flag polled during publication.
  *
  * A record is refused rather than clamped or repaired. A payload that outgrew
  * the capacity, a success carrying a code, and a failure carrying no code or no
@@ -34,8 +33,7 @@
  * back as undecided.
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_AICPU_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_AICPU_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -77,10 +75,9 @@ inline bool aicpu_publish_run_terminal(
     region->verdict = static_cast<uint32_t>(verdict);
     region->completion_code = completion_code;
     region->code_source = static_cast<uint32_t>(code_source);
-    // Record out of cache first; only then the epoch that says it is readable.
-    // A host that sees the epoch must already be able to see what it vouches
-    // for. The header words are contiguous from `payload_bytes`, so one flush
-    // covers them.
+    // The host reads after kernel completion, with the slot still reserved.
+    // A2/A3 needs writeback; A5 needs no additional publication barrier here.
+    // The header words are contiguous from `payload_bytes`.
     if (payload_bytes != 0) {
         cache_flush_range(region->payload, payload_bytes);
     }
@@ -115,6 +112,8 @@ public:
         payload_bytes_ = static_cast<uint32_t>(payload_bytes);
     }
 
+    bool snapshot_is_ok() const { return selection_.verdict == DeviceRunVerdict::Ok; }
+
     bool publish(uint64_t region_base, uint64_t run_epoch) {
         const RunTerminalSelection selection = selection_;
         const uint32_t payload_bytes = payload_bytes_;
@@ -132,5 +131,3 @@ private:
     uint32_t payload_bytes_{0};
     uint8_t payload_[DEVICE_RUN_RESULT_PAYLOAD_BYTES]{};
 };
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_AICPU_H_

@@ -173,6 +173,36 @@ def _require_owner_instance_id(nonce: object) -> bytes:
 
 
 @dataclass(frozen=True)
+class MpiSessionView:
+    owner_path: str
+    session_id: int
+    session_epoch: int
+    rank: int
+    worker_id: int
+    available: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner_path, str) or not self.owner_path:
+            raise ValueError("MPI owner_path must be a nonempty worker path")
+        root = _PATH_SEGMENT_RE.fullmatch(self.owner_path.split("/", 1)[0])
+        if root is None:
+            raise ValueError("MPI owner_path must start with a worker root")
+        parse_endpoint_path(self.owner_path, root_level=int(root.group("level")))
+        for name, value, minimum in (
+            ("session_epoch", self.session_epoch, 1),
+            ("rank", self.rank, 0),
+            ("worker_id", self.worker_id, 0),
+            ("session_id", self.session_id, 1),
+        ):
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"MPI {name} must be an integer >= {minimum}")
+        if self.session_id >= 1 << 64:
+            raise ValueError("MPI session_id must fit its uint64 wire identity")
+        if type(self.available) is not bool:
+            raise TypeError("MPI availability must be a bool")
+
+
+@dataclass(frozen=True)
 class _EndpointTopologyEntry:
     path: str
     deployment: EndpointDeployment
@@ -181,6 +211,7 @@ class _EndpointTopologyEntry:
     #: entries leave it absent. Allocator presence is a separate frozen startup fact.
     owner_instance_id: bytes | None = None
     has_buffer_identity_allocator: bool | None = None
+    mpi_session: MpiSessionView | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +264,8 @@ class EndpointResolveReason(str, Enum):
     INVALID_PATH = "INVALID_PATH"
     PROVIDER_NOT_SINGLE_ENDPOINT = "PROVIDER_NOT_SINGLE_ENDPOINT"
     OWNER_NOT_REGISTERED = "OWNER_NOT_REGISTERED"
+    REGISTRY_MISMATCH = "REGISTRY_MISMATCH"
+    MPI_SESSION_UNAVAILABLE = "MPI_SESSION_UNAVAILABLE"
 
 
 class EndpointResolveError(ValueError):
@@ -253,6 +286,7 @@ class EndpointRegistry:
         records: Sequence[EndpointRecord],
         owner_bindings: Mapping[bytes, EndpointId] = MappingProxyType({}),
         allocator_states: Mapping[EndpointId, bool | None] = MappingProxyType({}),
+        mpi_sessions: Mapping[EndpointId, MpiSessionView] = MappingProxyType({}),
     ) -> None:
         self.root_level = int(root_level)
         self.session_instance_id = bytes(session_instance_id)
@@ -269,6 +303,32 @@ class EndpointRegistry:
         self._buffer_identity_allocator_states = {
             int(endpoint_id): None if state is None else bool(state) for endpoint_id, state in allocator_states.items()
         }
+        sessions = dict(mpi_sessions)
+        sessions_by_owner: dict[tuple[str, int], int] = {}
+        ranks: dict[tuple[str, int, int], MpiSessionView] = {}
+        workers: dict[tuple[str, int], MpiSessionView] = {}
+        for endpoint_id, view in sessions.items():
+            if not isinstance(view, MpiSessionView):
+                raise TypeError("MPI endpoint requires a session view")
+            record = self._record_for(endpoint_id)
+            if (record.identity.session_instance_id, record.identity.registry_epoch) != (
+                self.session_instance_id,
+                self.registry_epoch,
+            ):
+                raise ValueError("MPI endpoint record does not belong to this registry identity")
+            self._parse(view.owner_path)
+            rank_path = _format_worker_path(3, parent_path=view.owner_path, index=view.worker_id)
+            if record.path != rank_path and not record.path.startswith(rank_path + "/"):
+                raise ValueError("MPI session view does not match its endpoint path")
+            session_key = (view.owner_path, view.session_id)
+            if sessions_by_owner.setdefault(session_key, view.session_epoch) != view.session_epoch:
+                raise ValueError("MPI session has inconsistent epoch")
+            rank_key = (*session_key, view.rank)
+            if ranks.setdefault(rank_key, view) != view:
+                raise ValueError("MPI rank has inconsistent session identity")
+            if workers.setdefault((view.owner_path, view.worker_id), view) != view:
+                raise ValueError("MPI worker has inconsistent session identity")
+        self._mpi_sessions = MappingProxyType(sessions)
 
     @classmethod
     def from_snapshot(
@@ -285,7 +345,10 @@ class EndpointRegistry:
         seen: set[tuple[str, EndpointDeployment]] = set()
         owner_bindings: dict[bytes, EndpointId] = {}
         allocator_states: dict[EndpointId, bool | None] = {}
+        mpi_sessions: dict[EndpointId, MpiSessionView] = {}
         for endpoint_id, entry in enumerate(entries):
+            if entry.mpi_session is not None:
+                mpi_sessions[endpoint_id] = entry.mpi_session
             deployment = EndpointDeployment(entry.deployment)
             key = (entry.path, deployment)
             if key in seen:
@@ -332,11 +395,27 @@ class EndpointRegistry:
             records=records,
             owner_bindings=owner_bindings,
             allocator_states=allocator_states,
+            mpi_sessions=mpi_sessions,
         )
 
     @property
     def records(self) -> tuple[EndpointRecord, ...]:
         return self._records
+
+    def mpi_session_for_endpoint(
+        self, endpoint: EndpointRecord | EndpointIdentity | EndpointId
+    ) -> MpiSessionView | None:
+        return self._mpi_sessions.get(self._record_for(endpoint).endpoint_id)
+
+    def require_mpi_sessions_available(self, members: Sequence[EndpointRecord]) -> None:
+        """Check snapshot availability; only the owner can validate a live generation."""
+        for member in members:
+            view = self.mpi_session_for_endpoint(member)
+            if view is not None and not view.available:
+                raise EndpointResolveError(
+                    EndpointResolveReason.MPI_SESSION_UNAVAILABLE,
+                    f"MPI session for {member.path} is not observed available",
+                )
 
     def resolve_members(self, selectors: Sequence[EndpointSelector]) -> tuple[EndpointRecord, ...]:
         resolved: list[EndpointRecord] = []
@@ -470,6 +549,10 @@ class EndpointRegistry:
 
     def _record_for(self, endpoint: EndpointRecord | EndpointIdentity | EndpointId) -> EndpointRecord:
         if isinstance(endpoint, EndpointRecord):
+            if self._by_identity.get(endpoint.identity) != endpoint:
+                raise EndpointResolveError(
+                    EndpointResolveReason.REGISTRY_MISMATCH, "foreign or altered endpoint record"
+                )
             return endpoint
         if isinstance(endpoint, EndpointIdentity):
             record = self._by_identity.get(endpoint)
@@ -835,6 +918,7 @@ class BackendResolver:
     def plan(self, resolved: ResolvedRegionSpec, layout: RegionLayoutSpec) -> BackendPlan | UnsupportedRegionPlan:
         self._validate_layout(layout)
         members = resolved.members
+        self._registry.require_mpi_sessions_available(members)
         provider = self._choose_provider(resolved)
         if isinstance(provider, UnsupportedRegionPlan):
             return provider

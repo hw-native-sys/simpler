@@ -1,8 +1,7 @@
 name: Clear the network1 staging tree
 description: >-
-  Remove this run's tree from the peer. Call once, with `if: always()`. The network1
-  pytest action already stopped its own daemon; the sweep here only catches a
-  run that died before reaching that step.
+  Remove the peer tree only after both owned reservations have retired and their
+  logs have been copied. Unknown ownership retains the tree for diagnosis.
 
 runs:
   using: composite
@@ -10,24 +9,19 @@ runs:
     - shell: bash
       working-directory: ${{ github.workspace }}
       run: |
-        set +e
+        set -euo pipefail
         # network1-stage may never have run, so assume nothing.
         [ -n "${REMOTE_WORKDIR:-}" ] || exit 0
         [ -r "${NETWORK1_SSH_HELPER:-}" ] || exit 0
+        if [ ! -r "$RUN_DIR/cleanup.json" ] || ! python3 -c \
+          'import json,sys; sys.exit(not json.load(open(sys.argv[1]))["complete"])' \
+          "$RUN_DIR/cleanup.json"; then
+          echo "::error::network1 retirement unproved; retaining peer tree $REMOTE_WORKDIR"
+          exit 1
+        fi
         source "$NETWORK1_SSH_HELPER"
-
-        network1_ssh "pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST}' || true"
-        # A run killed before Worker.close() (runner shutdown, job cancel)
-        # leaves mpirun and its simpler.mpi_l3_session ranks alive holding the
-        # fixed command/health ports, so the next run's rank bind fails. The
-        # runner is single-job, so any survivor on either machine is ours.
-        pkill -f 'simpler[.]mpi_l3_session'
-        network1_ssh "pkill -f 'simpler[.]mpi_l3_session' || true"
         if [ -n "${NETWORK1_MPI_PYTHON:-}" ]; then
           rm -f "$NETWORK1_MPI_PYTHON"
           network1_ssh "rm -f '$NETWORK1_MPI_PYTHON'"
         fi
-        # rm -rf on a tree a surviving chip child is still writing fails with
-        # ENOTEMPTY, so retry once after giving it a moment.
-        network1_ssh "rm -rf '$REMOTE_WORKDIR' 2>/dev/null || { sleep 5; rm -rf '$REMOTE_WORKDIR'; }"
-        exit 0
+        network1_ssh "rm -rf '$REMOTE_WORKDIR'"

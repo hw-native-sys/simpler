@@ -37,6 +37,24 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
+// Domain allocation failures that callers can distinguish from generic ACL errors.
+typedef enum CommDomainStatus {
+    COMM_DOMAIN_WORKSPACE_UNSUPPORTED = -2,
+    COMM_DOMAIN_URMA_CONFIG_INVALID = -3,
+    COMM_DOMAIN_URMA_INIT_FAILED = -4,
+    COMM_DOMAIN_URMA_WORKSPACE_INVALID = -5,
+} CommDomainStatus;
+
+// The backend still owns resources whose reclamation could not be confirmed.
+// Callers must retain the handle, its stream and device environment; retrying
+// destruction is not supported without a backend-specific recovery contract.
+enum { COMM_RECLAMATION_UNCONFIRMED = -6 };
+
+// Initialization failed but its unpublished allocation still owns resources.
+// Join every participant's allocation request before aborting these owners;
+// a peer may still be importing an exported handle. This is not a usable domain.
+enum { COMM_INITIALIZATION_ABORT_REQUIRED = -7 };
+
 #define COMM_GLOBAL_DOMAIN_VERSION 2U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
 #define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U
@@ -238,40 +256,54 @@ int comm_derive_context(
  * @param h                       Base handle from comm_init().
  * @param allocation_id           Caller-assigned unique id; scopes the
  *                                handshake / barrier filenames.  Must be
- *                                unique among currently-live allocations
- *                                on this handle.
+ *                                unique for the lifetime of this handle, including
+ *                                failed and released allocations (A5 enforces this).
  * @param rank_ids                Base-communicator rank ids in dense
  *                                domain order (length rank_count).
  * @param rank_count              Number of subset members.
  * @param domain_rank             This caller's dense rank in the subset.
- * @param window_size             Bytes per rank.  Backend must allocate
- *                                exactly this size; no auto-rounding.
+ * @param window_size             Requested bytes per rank. Backend may round
+ *                                up to its allocation granularity.
+ * @param workspace_mask          Requested async engines, bit N for CommWorkspaceKind N.
+ *                                Zero creates synchronous mapped windows only.
+ *                                All members must request the same mask.
+ *                                A5 accepts compiled engines; RDMA requires its
+ *                                own domain. A2/A3 and sim require zero.
  * @param device_ctx_out          Receives a device pointer to a new
  *                                CommContext for the subset.
  * @param local_window_base_out   Receives this rank's local window start
  *                                address (for buffer carving on the
  *                                caller side).
- * @return 0 on success, non-zero on failure.
+ * @param actual_window_size_out  Receives the allocated per-rank byte extent.
+ * @return 0 on success. COMM_INITIALIZATION_ABORT_REQUIRED means initialization
+ *         failed with an unpublished owner: join all allocation requests, then
+ *         call comm_abort_domain_windows for this allocation. Output pointers
+ *         are not published. Other non-zero values report failure; the retained
+ *         error contract also applies to COMM_RECLAMATION_UNCONFIRMED.
  */
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
+    size_t *actual_window_size_out
 );
 
 /**
  * Collectively release a domain window pool allocated by
  * comm_alloc_domain_windows().
  *
- * Frees the per-rank buffer (HCCL: aclrtFree; sim: munmap + shm_unlink)
- * and the device-side CommContext.  Synchronises subset members via a
+ * Frees domain-owned local/peer windows, communication resources and the
+ * device-side CommContext. Synchronises subset members via a
  * release barrier scoped by `allocation_id` + the caller's `domain_rank`
  * within the subset.  `rank_count` is the subset size — used only to
  * size the barrier wait, not the rank list (which was already established
  * during alloc).
  *
- * IPC import refs and EnablePeerAccess routes are NOT explicitly torn
- * down — they get reclaimed by aclrtResetDevice at DeviceRunner::finalize.
- * Mirrors the lifetime contract of comm_alloc_windows on HCCL.
+ * Domain VMM mappings and imported physical handles are released explicitly.
+ * Shared workspace borrows end here; process-wide EnablePeerAccess routes and
+ * communicator-owned workspaces remain owned by their enclosing lifetime.
+ * The caller must prove all domain users have stopped before invoking this API.
+ * COMM_RECLAMATION_UNCONFIRMED retains the domain on h, including on allocation
+ * rollback, and forbids further use or destruction of the enclosing session.
  *
  * @param h               Base handle from comm_init().
  * @param allocation_id   Same id passed to comm_alloc_domain_windows.
@@ -280,6 +312,14 @@ int comm_alloc_domain_windows(
  * @return 0 on success, non-zero on failure.
  */
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
+
+/**
+ * Roll back an unpublished domain without a release collective. The parent
+ * must have joined all allocation requests and proved the domain was never
+ * exposed to device users. Successful participants can abort even when another
+ * member failed initialization. Retained-error ownership matches release.
+ */
+int comm_abort_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
 
 /**
  * Create one local window for a Global CommDomain and export its transport
@@ -330,7 +370,8 @@ int comm_barrier(CommHandle h);
 /**
  * Destroy the communicator and release all resources.
  *
- * After this call the handle is invalid.
+ * The handle is consumed except when COMM_RECLAMATION_UNCONFIRMED is returned.
+ * That result retains the owner and its dependent stream/device environment.
  *
  * @param h  Handle from comm_init().
  * @return 0 on success, non-zero on failure.

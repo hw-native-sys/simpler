@@ -20,7 +20,7 @@ in its own kernel sources. The contract being verified:
       (``name=chip.run.runner_run.device_wall``) is present with a positive
       duration on the default SIMPLER_HOST_STRACE build.
 
-Markers go to stderr via the unified host logger, captured here with ``capfd``.
+Markers reach the unified host logger's active sink.
 """
 
 import re
@@ -80,7 +80,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_chip_swimlane: bool 
         config = CallConfig()
         config.enable_chip_swimlane = enable_chip_swimlane
 
-        # run() returns None; timing is emitted as [STRACE] markers on stderr.
+        # run() returns None; timing is emitted as [STRACE] host-log markers.
         assert worker.run(chip_handle, args, config) is None
 
         # Verify the output is sane (so we know the kernel actually ran and
@@ -103,14 +103,14 @@ def _drive_one_run(platform: str, device_id: int, *, enable_chip_swimlane: bool 
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim"])
-def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd):
+def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd, drain_host_log):
     _drive_one_run(st_platform, int(st_device_ids[0]))
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
 
     # Host wall: the chip.run root span. A real dispatch can't take 0 ns.
     host_durs = _strace_durs(err, "chip.run")
     assert host_durs, (
-        "no `[STRACE] ... name=chip.run` marker found on stderr; "
+        "no `[STRACE] ... name=chip.run` marker found in the host log; "
         "chip.run stopped emitting host-trace markers (SIMPLER_HOST_STRACE off, "
         "or the host logger TIMING level was suppressed)."
     )
@@ -129,7 +129,7 @@ def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd):
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim", "a5sim"])
-def test_sim_forwards_info_level_to_aicpu(st_platform, st_device_ids, capfd):
+def test_sim_forwards_info_level_to_aicpu(st_platform, st_device_ids, capfd, drain_host_log):
     previous_level = get_current_config()
     configure_logging("info")
     try:
@@ -137,5 +137,5 @@ def test_sim_forwards_info_level_to_aicpu(st_platform, st_device_ids, capfd):
     finally:
         configure_logging(previous_level)
 
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
     assert "AicpuExecutor: Initializing" in err, "AICPU sim SO did not receive the host INFO threshold"

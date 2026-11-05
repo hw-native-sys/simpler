@@ -37,6 +37,7 @@
 #include "common/unified_log.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
@@ -91,17 +92,15 @@ std::mutex g_device_key_mutex;
 pthread_key_t g_device_id_key{};
 std::atomic<bool> g_device_key_initialized{false};
 
-void ensure_device_key() {
-    if (g_device_key_initialized.load(std::memory_order_acquire)) {
-        return;
-    }
+int ensure_device_key() {
+    if (g_device_key_initialized.load(std::memory_order_acquire)) return 0;
     std::lock_guard<std::mutex> lock(g_device_key_mutex);
     if (!g_device_key_initialized.load(std::memory_order_relaxed)) {
-        if (pthread_key_create(&g_device_id_key, nullptr) != 0) {
-            return;
-        }
+        const int error = pthread_key_create(&g_device_id_key, nullptr);
+        if (error != 0) return error;
         g_device_key_initialized.store(true, std::memory_order_release);
     }
+    return 0;
 }
 
 int get_current_device_id() {
@@ -150,9 +149,17 @@ void ensure_identity_keys() {
 // Device lifecycle
 // ---------------------------------------------------------------------------
 
+extern "C" int pto_cpu_sim_bind_device_checked(int device_id) {
+    if (device_id < -1) return EINVAL;
+    if (const int error = ensure_device_key(); error != 0) return error;
+    return pthread_setspecific(
+        g_device_id_key, reinterpret_cast<void *>(static_cast<intptr_t>(device_id) + DEVICE_ID_OFFSET)
+    );
+}
+
 extern "C" void pto_cpu_sim_bind_device(int device_id) {
-    ensure_device_key();
-    pthread_setspecific(g_device_id_key, reinterpret_cast<void *>(static_cast<intptr_t>(device_id + DEVICE_ID_OFFSET)));
+    // The legacy ABI cannot report failure or safely continue with a stale binding.
+    if (pto_cpu_sim_bind_device_checked(device_id) != 0) std::abort();
 }
 
 extern "C" int pto_cpu_sim_get_bound_device(void) { return get_current_device_id(); }

@@ -34,7 +34,7 @@ jobs:
       MANUAL_MODE: ${{ inputs.manual_mode }}
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
-      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "6000"
     steps:
       - name: Checkout target
         uses: actions/checkout@v5

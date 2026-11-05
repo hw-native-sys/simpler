@@ -71,18 +71,171 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
-TEST(AicoreSchedulerState, ResidentAcceptsSingleBlockOrdinaryMix) {
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(2, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
+TEST(AicoreSchedulerState, ResidentAcceptsOrdinaryPureAndMixMultiBlock) {
+    for (uint32_t active : {1U, 2U, 3U}) {
+        SCOPED_TRACE(active);
+        const uint32_t max_blocks = static_cast<uint32_t>(INT16_MAX) / active;
+        for (uint32_t blocks : {1U, 2U, 3U, 31U, 32U, 33U, 64U, 65U, 97U, 512U, max_blocks}) {
+            SCOPED_TRACE(blocks);
+            uint32_t subtasks = 0;
+            ASSERT_TRUE(scheduler_subtask_count_checked(blocks, active, &subtasks));
+            EXPECT_EQ(subtasks, blocks * active);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, ResidentShapeRejectsSubtaskProductOverflowAndInvalidDimensions) {
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(0, 1, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(4, 1, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(UINT32_MAX, 1, false));
+    for (uint32_t active : {1U, 2U, 3U}) {
+        SCOPED_TRACE(active);
+        const uint32_t max_blocks = static_cast<uint32_t>(INT16_MAX) / active;
+        for (uint32_t blocks : {0U, max_blocks + 1, static_cast<uint32_t>(INT16_MAX) + 1, UINT32_MAX}) {
+            SCOPED_TRACE(blocks);
+            EXPECT_FALSE(scheduler_resident_task_shape_supported(active, blocks, false));
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, ResidentSyncStartShapeRequiresMultipleBlocksAndSeparateCapacityCheck) {
+    for (uint32_t active : {1U, 2U, 3U}) {
+        for (uint32_t blocks : {2U, 32U, 33U, 65U, 512U}) {
+            SCOPED_TRACE(active);
+            SCOPED_TRACE(blocks);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, true));
+        }
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 1, true));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 0, true));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, UINT32_MAX, true));
+    }
+}
+
+TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresInTheDeclaredResourceScope) {
+    for (uint64_t workers : {3U, 6U, 9U, 96U, 108U}) {
+        for (LaneMask mask :
+             {LaneMask::aic(), LaneMask::aiv0(), LaneMask::aiv1(),
+              LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false),
+              LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true), LaneMask::both_aiv(), LaneMask::all()}) {
+            SCOPED_TRACE(workers);
+            SCOPED_TRACE(mask.count());
+            const uint32_t positions =
+                static_cast<uint32_t>(workers / 3) * (mask.to_shape() == ResourceShape::AIV ? 2 : 1);
+            for (uint32_t blocks : {1U, 2U, positions, positions + 1, 512U, UINT32_MAX}) {
+                SCOPED_TRACE(blocks);
+                SchedulerMinimumWorkerDemand demand{};
+                const bool valid = blocks > 1 && blocks <= positions;
+                EXPECT_EQ(scheduler_resident_worker_demand_checked(mask, blocks, true, workers, &demand), valid);
+                if (valid) {
+                    const bool mix = mask.is_mix();
+                    EXPECT_EQ(demand.aic, (mix || mask.is_aic()) ? blocks : 0u);
+                    EXPECT_EQ(
+                        demand.aiv, mix ? blocks * (static_cast<uint32_t>(mask.has_aiv0()) +
+                                                    static_cast<uint32_t>(mask.has_aiv1())) :
+                                          (mask.is_aic() ? 0 : blocks)
+                    );
+                }
+            }
+            SchedulerMinimumWorkerDemand ordinary{};
+            ASSERT_TRUE(scheduler_resident_worker_demand_checked(mask, 512, false, workers, &ordinary));
+            const auto expected = scheduler_minimum_worker_demand(mask);
+            EXPECT_EQ(ordinary.aic, expected.aic);
+            EXPECT_EQ(ordinary.aiv, expected.aiv);
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, ResidentDemandRejectsInvalidTopologyMaskAndOutput) {
+    SchedulerMinimumWorkerDemand demand{};
+    for (uint64_t workers : {UINT64_C(0), UINT64_C(1), UINT64_C(5), UINT64_C(109), UINT64_C(111), UINT64_MAX})
+        EXPECT_FALSE(scheduler_resident_worker_demand_checked(LaneMask::aic(), 2, true, workers, &demand));
+    // An empty lane set is the only mask the demand check can still be asked
+    // about and must refuse: a byte with bits outside the three lanes is not a
+    // LaneMask any caller can construct.
+    EXPECT_FALSE(scheduler_resident_worker_demand_checked(LaneMask::none(), 2, true, 96, &demand));
+    EXPECT_FALSE(scheduler_resident_worker_demand_checked(LaneMask::aic(), 2, true, 96, nullptr));
+}
+
+TEST(AicoreSchedulerState, OrdinaryMixMasksCanExecuteMoreBlocksThanPhysicalClusters) {
+    for (LaneMask mask :
+         {LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true),
+          LaneMask::both_aiv(), LaneMask::all()}) {
+        SCOPED_TRACE(mask.count());
+        const uint32_t active = static_cast<uint32_t>(mask.count());
+        for (uint32_t blocks : {SCHEDULER_CLUSTER_CAPACITY + 1, 512U}) {
+            SCOPED_TRACE(blocks);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+            const auto demand = scheduler_minimum_worker_demand(mask);
+            EXPECT_EQ(demand.aic, 1u);
+            EXPECT_EQ(demand.aiv, mask.has_both_aiv() ? 2u : 1u);
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, OrdinaryPureAndMixShapeValidationIsSubmissionOrderIndependent) {
+    for (uint32_t mix_subtasks : {2U, 3U}) {
+        for (uint32_t mix_blocks : {1U, 2U, 33U, 512U}) {
+            for (bool mix_first : {false, true}) {
+                SCOPED_TRACE(mix_subtasks);
+                SCOPED_TRACE(mix_blocks);
+                SCOPED_TRACE(mix_first);
+                for (uint32_t index = 0; index < 2; ++index) {
+                    const bool mix = (index == 0) == mix_first;
+                    const uint32_t active = mix ? mix_subtasks : 1U;
+                    const uint32_t blocks = mix ? mix_blocks : 512U;
+                    EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+                }
+            }
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, OrdinaryDemandCountsOneExecutionPositionOrMixGroup) {
+    struct DemandCase {
+        LaneMask mask;
+        uint32_t aic;
+        uint32_t aiv;
+    };
+    for (const DemandCase &test : {
+             DemandCase{LaneMask::aic(), 1, 0},
+             DemandCase{LaneMask::aiv0(), 0, 1},
+             DemandCase{LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), 1, 1},
+             DemandCase{LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true), 1, 1},
+             DemandCase{LaneMask::both_aiv(), 1, 2},
+             DemandCase{LaneMask::all(), 1, 2},
+         }) {
+        SCOPED_TRACE(test.mask.count());
+        const auto demand = scheduler_minimum_worker_demand(test.mask);
+        EXPECT_EQ(demand.aic, test.aic);
+        EXPECT_EQ(demand.aiv, test.aiv);
+    }
 }
 
 TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
     EXPECT_FALSE(scheduler_watchdog_expired(100, UINT64_MAX, 0));
     EXPECT_FALSE(scheduler_watchdog_expired(100, 199, 100));
     EXPECT_TRUE(scheduler_watchdog_expired(100, 200, 100));
+    EXPECT_FALSE(scheduler_watchdog_expired(UINT64_MAX - 10, 3, 15));
     EXPECT_TRUE(scheduler_watchdog_expired(UINT64_MAX - 10, 4, 15));
+}
+
+TEST(AicoreSchedulerWatchdog, RejectsBackwardAndHalfRangeSamples) {
+    constexpr uint64_t half_range = uint64_t{1} << 63;
+    EXPECT_TRUE(scheduler_watchdog_expired(0, half_range - 1, 100));
+    EXPECT_FALSE(scheduler_watchdog_expired(0, half_range, 100));
+    EXPECT_FALSE(scheduler_watchdog_expired(0, UINT64_MAX, 100));
+    EXPECT_FALSE(scheduler_watchdog_expired(1000, 800, 0));
+}
+
+TEST(AicpuReadyWatchdog, SupervisorSeedAheadOfFirstSampleKeepsDeadline) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(1000);
+    const uint64_t last_progress = watchdog.last_progress();
+    EXPECT_FALSE(scheduler_watchdog_expired(last_progress, 800, 100));
+    EXPECT_FALSE(scheduler_watchdog_expired(last_progress, 1099, 100));
+    EXPECT_TRUE(scheduler_watchdog_expired(last_progress, 1100, 100));
+    EXPECT_EQ(watchdog.last_progress(), 1000);
 }
 
 TEST(AicpuReadyWatchdog, RealProgressAllowsTotalExecutionBeyondBudget) {
@@ -228,6 +381,52 @@ TEST(AicpuReadyWatchdog, RefreshDuringExpiryUsesNewClockSample) {
     EXPECT_EQ(samples, 2);
 }
 
+TEST(AicpuReadyWatchdog, ProgressPublicationAheadOfSampleDoesNotExpire) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(101);
+    uint64_t now = 100;
+    bool ready = false;
+    int relaxations = 0;
+    EXPECT_TRUE(watchdog.wait_until_ready(
+        [&] {
+            return ready;
+        },
+        [&] {
+            return now;
+        },
+        [&] {
+            now = 102;
+            ready = true;
+            ++relaxations;
+        },
+        2000
+    ));
+    EXPECT_EQ(relaxations, 1);
+}
+
+TEST(AicpuReadyWatchdog, OlderClockSampleStillExpiresAtProgressDeadline) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(101);
+    uint64_t now = 100;
+    int samples = 0;
+    EXPECT_FALSE(watchdog.wait_until_ready(
+        [] {
+            return false;
+        },
+        [&] {
+            ++samples;
+            return now;
+        },
+        [&] {
+            now = now == 100 ? 102 : 2101;
+        },
+        2000
+    ));
+    EXPECT_EQ(now, 2101u);
+    EXPECT_EQ(samples, 3);
+    EXPECT_EQ(watchdog.last_progress(), 101u);
+}
+
 TEST(AicpuReadyWatchdog, InvocationResetDropsPriorProgress) {
     AicpuReadyWatchdog watchdog;
     watchdog.reset(100);
@@ -318,8 +517,8 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
         EXPECT_EQ(controls[task].wake_list_head, SCHEDULER_WAKE_LIST_OPEN);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(storage.base(), layout.ready_inboxes_offset);
-    for (uint64_t inbox = 0; inbox < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++inbox)
-        EXPECT_EQ(ready[inbox].head, SCHEDULER_INBOX_EMPTY);
+    for (uint64_t inbox = 0; inbox < SCHEDULER_READY_INBOX_CAPACITY; ++inbox)
+        EXPECT_EQ(ready[inbox].endpoints, SCHEDULER_READY_ENDPOINTS_EMPTY);
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), layout.worker_contexts_offset);
     EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved0, 0u);
     EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved1, 0u);
@@ -344,14 +543,16 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 128u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
-    EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, dispatch[1]), 0x20u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, traces[0]), 0x40u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, traces[1]), 0x80u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, completion), 0xc0u);
+    // Both chain links belong to the atomic line: they are written as single
+    // device words, and nothing publishes that line as a whole, so no producer's
+    // writeback can restore a stale copy of another's link.
+    EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
+    EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_fanin_index) / 64);
+    EXPECT_EQ(offsetof(SchedulerSsbufLane, mix_completion), 0x00u);
+    EXPECT_EQ(sizeof(SchedulerSsbufLane), 0x40u);
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
     );
@@ -369,15 +570,15 @@ TEST(SchedulerSsbuf, InitializesDirtyMailboxWithoutTouchingUserStorage) {
     alignas(64) std::array<uint8_t, SCHEDULER_SSBUF_HARDWARE_SIZE> hardware{};
     hardware.fill(0xa5);
     auto *region = scheduler_ssbuf_region(reinterpret_cast<uint64_t>(hardware.data()));
-    scheduler_ssbuf_initialize(region, 1);
+    scheduler_ssbuf_initialize(region);
 
     EXPECT_EQ(reinterpret_cast<uint8_t *>(region) - hardware.data(), SCHEDULER_SSBUF_REGION_OFFSET);
-    EXPECT_TRUE(scheduler_ssbuf_is_initialized(region, 1));
+    EXPECT_TRUE(scheduler_ssbuf_is_initialized(region));
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].dispatch[slot].publication), 0u);
+        for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot) {
+            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->mix_dispatch[lane][slot].publication), 0u);
         }
-        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].completion.publication), 0u);
+        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].mix_completion.publication), 0u);
     }
     EXPECT_EQ(hardware[SCHEDULER_SSBUF_REGION_OFFSET - 1], 0xa5);
 }
@@ -388,7 +589,7 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
     attrs.set_predicate();
     attrs.set_timing_slot(7);
     const uint8_t flags = scheduler_task_metadata_flags_from_submit_state(
-        ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0), attrs, 2, true, false
+        LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), attrs, 2, true, false
     );
     EXPECT_TRUE(scheduler_task_is_executable(flags));
     EXPECT_TRUE(scheduler_task_has_fanin(flags));
@@ -400,7 +601,7 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
     EXPECT_EQ(attrs.timing_slot(), 7);
 
     const uint8_t inline_flags =
-        scheduler_task_metadata_flags_from_submit_state(ActiveMask(SUBTASK_MASK_AIV0), TaskAttrs{}, 1, false, true);
+        scheduler_task_metadata_flags_from_submit_state(LaneMask::aiv0(), TaskAttrs{}, 1, false, true);
     EXPECT_EQ(inline_flags, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE);
 }
 
@@ -416,7 +617,7 @@ TEST(SchedulerGraph, AddressesEveryTaskAtTheStorageStride) {
         std::array<ChipTaskStorage, kTasks> storage{};
     } image;
     auto &storage = image.storage;
-    SchedulerGraphView graph{reinterpret_cast<uint64_t>(storage.data()), 0, kTasks, kTasks - 1};
+    const auto graph = scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(storage.data()), kTasks, kTasks - 1);
 
     for (size_t task = 0; task < kTasks; ++task) {
         SCOPED_TRACE(testing::Message() << "task " << task);
@@ -453,14 +654,14 @@ TEST(SchedulerGraph, NonPowerOfTwoWindowKeepsDirectTaskIdIndexing) {
         storage[task].payload.bind_regions(nullptr, nullptr, fanins[task].data());
     }
     storage[1].task.kernel_id[0] = 1;
-    SchedulerGraphView graph{reinterpret_cast<uint64_t>(storage.data()), 0, 3, 2};
+    const auto graph = scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(storage.data()), 3, 2);
 
     // Both records of task 1 resolve from the one base, at that entry's stride.
     EXPECT_EQ(scheduler_graph_descriptor(graph, 1), reinterpret_cast<uint8_t *>(&storage[1].task));
     EXPECT_EQ(scheduler_graph_payload(graph, 1), reinterpret_cast<uint8_t *>(&storage[1].payload));
     SchedulerTaskShape shape{};
     EXPECT_EQ(scheduler_classify_task_shape(graph, 1, &shape), SchedulerGraphResult::OK);
-    EXPECT_EQ(shape.task_id, 1);
+    EXPECT_EQ(shape.task_ref, 1);
 }
 
 TEST(SchedulerGraph, ValidatesNonEmptyFanins) {

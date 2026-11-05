@@ -34,6 +34,10 @@ int unified_log_host_span_enabled() { return HostLogger::get_instance().is_enabl
 
 void unified_log_host_span(const SimplerHostSpan *span) { HostLogger::get_instance().log_host_span(span); }
 
+SimplerHostTraceState *unified_log_host_trace_state() { return HostLogger::get_instance().trace_state(); }
+
+uint64_t unified_log_host_trace_allocate_inv() { return HostLogger::get_instance().allocate_trace_invocation(); }
+
 void unified_log_error(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);

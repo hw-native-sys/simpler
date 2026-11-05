@@ -148,8 +148,6 @@ public:
 
         BitStates() = default;
 
-        explicit BitStates(Storage states) :
-            states_(states) {}
         void init() { states_ = 0; }
 
         // A mask with exactly `offset` set. The shift lives here so a caller
@@ -186,6 +184,8 @@ public:
         }
 
     private:
+        explicit BitStates(Storage states) :
+            states_(states) {}
         Storage states_{0};
     };
 
@@ -340,15 +340,15 @@ public:
     // already-running core takes its pending slot and executes after its in-flight
     // task. REJECT only when a used core's pending slot is already occupied (no free
     // slot) or the mask is empty.
-    MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
+    MixPlacement classify_mix_cluster(int32_t cluster_offset, LaneMask lanes) const {
         BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) {
+        if (lanes.has_aic()) {
             used |= BitStates::bit(cluster_offset);
         }
-        if (core_mask & SUBTASK_MASK_AIV0) {
+        if (lanes.has_aiv0()) {
             used |= BitStates::bit(cluster_offset + 1);
         }
-        if (core_mask & SUBTASK_MASK_AIV1) {
+        if (lanes.has_aiv1()) {
             used |= BitStates::bit(cluster_offset + 2);
         }
         if (!used.has_value() || (pending_occupied_ & used).has_value()) {
@@ -362,20 +362,20 @@ public:
         return MixPlacement::PENDING;
     }
 
-    BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
+    BitStates get_mix_running_cluster_offset_states(LaneMask lanes) const {
         BitStates result;
         BitStates candidates = get_cluster_offset_states();
         while (candidates.has_value()) {
             int32_t cluster_offset = candidates.pop_first();
-            if (classify_mix_cluster(cluster_offset, core_mask) == MixPlacement::RUNNING) {
+            if (classify_mix_cluster(cluster_offset, lanes) == MixPlacement::RUNNING) {
                 result |= BitStates::bit(cluster_offset);
             }
         }
         return result;
     }
 
-    int32_t count_mix_running_clusters(uint8_t core_mask) const {
-        return get_mix_running_cluster_offset_states(core_mask).count();
+    int32_t count_mix_running_clusters(LaneMask lanes) const {
+        return get_mix_running_cluster_offset_states(lanes).count();
     }
 
     // --- Gated MIX split placement ---
@@ -385,17 +385,17 @@ public:
     // Immediate dispatch instead uses classify_mix_cluster to require one
     // placement for the whole cluster.
 
-    // Cores of `cluster_offset` named by core_mask.
-    BitStates mix_used_cores(int32_t cluster_offset, uint8_t core_mask) const {
+    // Cores of `cluster_offset` named by lanes.
+    BitStates mix_used_cores(int32_t cluster_offset, LaneMask lanes) const {
         BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) used |= BitStates::bit(cluster_offset);
-        if (core_mask & SUBTASK_MASK_AIV0) used |= BitStates::bit(cluster_offset + 1);
-        if (core_mask & SUBTASK_MASK_AIV1) used |= BitStates::bit(cluster_offset + 2);
+        if (lanes.has_aic()) used |= BitStates::bit(cluster_offset);
+        if (lanes.has_aiv0()) used |= BitStates::bit(cluster_offset + 1);
+        if (lanes.has_aiv1()) used |= BitStates::bit(cluster_offset + 2);
         return used;
     }
 
-    bool mix_cluster_all_slots(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used = mix_used_cores(cluster_offset, core_mask);
+    bool mix_cluster_all_slots(int32_t cluster_offset, LaneMask lanes) const {
+        BitStates used = mix_used_cores(cluster_offset, lanes);
         if (!used.has_value()) return false;
         // A used core has no capacity only while both running and pending slots
         // are occupied.
@@ -404,25 +404,25 @@ public:
     }
 
     // Used idle cores take running slots and seed the rendezvous count.
-    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, uint8_t core_mask) const {
-        return (mix_used_cores(cluster_offset, core_mask) & core_states_).count();
+    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, LaneMask lanes) const {
+        return (mix_used_cores(cluster_offset, lanes) & core_states_).count();
     }
 
     // Clusters where every used core has a free slot.
-    BitStates get_mix_split_cluster_offset_states(uint8_t core_mask) const {
+    BitStates get_mix_split_cluster_offset_states(LaneMask lanes) const {
         BitStates result;
         BitStates candidates = get_cluster_offset_states();
         while (candidates.has_value()) {
             int32_t off = candidates.pop_first();
-            if (mix_cluster_all_slots(off, core_mask)) {
+            if (mix_cluster_all_slots(off, lanes)) {
                 result |= BitStates::bit(off);
             }
         }
         return result;
     }
 
-    int32_t count_mix_split_clusters(uint8_t core_mask) const {
-        return get_mix_split_cluster_offset_states(core_mask).count();
+    int32_t count_mix_split_clusters(LaneMask lanes) const {
+        return get_mix_split_cluster_offset_states(lanes).count();
     }
 
     BitStates get_pending_core_offset_states(ResourceShape shape) const {
@@ -451,9 +451,9 @@ public:
     // one core per block; MIX uses one active-mask-compatible cluster per block.
     // Gated early staging may use both idle running slots and free pending slots,
     // while a ready cohort is restricted to idle running slots.
-    int32_t count_available_blocks(ResourceShape shape, uint8_t core_mask, bool include_pending) const {
+    int32_t count_available_blocks(ResourceShape shape, LaneMask lanes, bool include_pending) const {
         if (shape == ResourceShape::MIX) {
-            return include_pending ? count_mix_split_clusters(core_mask) : count_mix_running_clusters(core_mask);
+            return include_pending ? count_mix_split_clusters(lanes) : count_mix_running_clusters(lanes);
         }
         if (shape != ResourceShape::AIC && shape != ResourceShape::AIV) return 0;
 
@@ -466,9 +466,20 @@ public:
 
     enum class DispatchPhase : uint8_t { IDLE, PENDING };
 
-    BitStates get_dispatchable_cores(ResourceShape shape, DispatchPhase phase) const {
-        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) :
-                                                get_pending_core_offset_states(shape);
+    BitStates without_reserved_cores(BitStates candidates, LaneMask reserved_mask) const {
+        if (reserved_mask.is_empty()) return candidates;
+        BitStates reserved;
+        if (reserved_mask.has_aic()) reserved |= aic_mask_;
+        if (reserved_mask.has_aiv0()) reserved |= aic_mask_ << 1;
+        if (reserved_mask.has_aiv1()) reserved |= aic_mask_ << 2;
+        return candidates & ~reserved;
+    }
+
+    BitStates
+    get_dispatchable_cores(ResourceShape shape, DispatchPhase phase, LaneMask reserved_mask = LaneMask::none()) const {
+        auto candidates =
+            (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) : get_pending_core_offset_states(shape);
+        return without_reserved_cores(candidates, reserved_mask);
     }
 
     // --- Bit offset <-> worker_id mapping ---
@@ -541,8 +552,8 @@ struct alignas(64) SchedChipSwimlaneCounters {
 // sync_start drain coordination
 // =============================================================================
 
-// When sync_start_pending != 0, all scheduler threads skip dispatch
-// (only process completions) until the fixed coordinator finishes launching all blocks.
+// Owners may fill unreserved idle V lanes before acknowledging the drain round.
+// Tracker state is quiescent from the current-round ACK through cohort staging.
 struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> sync_start_pending{0};              // 0=normal; -1=initializing; >0=active (value=block_num)
     std::atomic<ChipTaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
@@ -551,15 +562,19 @@ struct alignas(64) SyncStartDrainState {
     // Each scheduler stages its local cores, publishes its bit in
     // stage_done_mask, and contributes running-slot cores to running_staged.
     // The coordinator waits for all scheduler bits before seeding the rendezvous.
-    std::atomic<int32_t> drain_stage_go{0};          // 0=hold; 1=parallel staging enabled
-    std::atomic<uint32_t> drain_stage_done_mask{0};  // bit per scheduler thread
-    std::atomic<int32_t> drain_running_staged{0};    // total running-slot cores staged
-    int32_t _pad[7];
+    std::atomic<int32_t> drain_stage_go{0};                 // 0=hold; 1=parallel staging enabled
+    std::atomic<uint32_t> drain_stage_done_mask{0};         // bit per scheduler thread
+    std::atomic<int32_t> drain_running_staged{0};           // total running-slot cores staged
+    std::atomic<LaneMask> reserved_lanes{LaneMask::all()};  // physical lane demand of the held cohort
+    uint8_t _pad[27];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
 static_assert(offsetof(SyncStartDrainState, pending_task) == 8);
 static_assert(offsetof(SyncStartDrainState, drain_attempt) == 16);
 static_assert(offsetof(SyncStartDrainState, drain_stage_go) == 24);
+static_assert(offsetof(SyncStartDrainState, reserved_lanes) == 36);
+static_assert(offsetof(SyncStartDrainState, _pad) == 37);
+static_assert(std::atomic<LaneMask>::is_always_lock_free);
 
 constexpr uint64_t SYNC_START_DRAIN_ACK_SUBTREE_READY = uint64_t{1} << 63;
 constexpr uint64_t SYNC_START_DRAIN_ATTEMPT_MASK = ~SYNC_START_DRAIN_ACK_SUBTREE_READY;

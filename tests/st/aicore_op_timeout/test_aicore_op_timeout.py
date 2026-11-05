@@ -10,8 +10,8 @@
 """Negative ST for the AICore op-execution timeout chain (regression for PR #718).
 
 Hardware-only: dispatches an AIC kernel that spins forever. This test pins
-the CI-tight timeout chain (AICPU scheduler 2 s, STARS op watchdog 3 s,
-host stream sync 4 s) so the hang surfaces in single-digit seconds rather
+the CI-tight timeout chain (AICPU scheduler 2 s, requested STARS op watchdog
+3 s, host stream sync 6 s) so the hang surfaces in single-digit seconds rather
 than deadlocking. Sim variants are excluded
 because the simulator has no STARS watchdog — a ``while(true)`` kernel
 would wedge the sim.
@@ -60,7 +60,7 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
     configure_logging("error")
     monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", "2000")
     monkeypatch.setenv("SIMPLER_OP_EXECUTE_TIMEOUT_US", "3000000")
-    monkeypatch.setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "4000")
+    monkeypatch.setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "6000")
 
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(
@@ -90,7 +90,7 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
         # falls back to whichever stream-sync error surfaced first:
         #   -100   = scheduler timeout — the device classified the stalled
         #            AIC task before finalization read the shared header.
-        #   507046 = ACL_ERROR_RT_STREAM_SYNC_TIMEOUT — AICore stream's 4 s
+        #   507046 = ACL_ERROR_RT_STREAM_SYNC_TIMEOUT — AICore stream's 6 s
         #            sync budget fires before AICPU sync notices.
         #   507018 = ACL_ERROR_RT_AICPU_EXCEPTION — AICPU stream sync surfaces
         #            the AICore failure as an AICPU exception when the
@@ -108,6 +108,9 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
             # SDMA run stream early so reset precedes DEV_RUNNING_DOWN.
             error_codes = r"(-100|507(046|018|015|000))"
         native_run_error = rf"finalize_native_run failed with code {error_codes}\b"
+        if enable_sdma:
+            # An event wait can report the fault before native finalization.
+            native_run_error = rf"(?:{native_run_error}|wait_native_run_completion failed with code 507015\b)"
         with pytest.raises(RuntimeError, match=native_run_error):
             worker.run(handle, None, config)
         elapsed = time.monotonic() - t0
@@ -125,7 +128,7 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
     # reset there already blocks on the driver event a retry would multiply.
     # The ordinary case budgets the full kFatalResetAttempts=3, since each
     # attempt drains before resetting and can recover what the previous one
-    # could not. One attempt costs the stream-sync budget (4 s here) plus the
+    # could not. One attempt costs the stream-sync budget (6 s here) plus the
     # driver reset (~11 s on the a5 CI package) plus a small probe, so the
     # ceiling has to hold three of those — otherwise a retry that works
     # correctly, just slowly, is reported as an unbounded teardown.

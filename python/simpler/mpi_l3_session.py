@@ -171,6 +171,8 @@ class MpiGlobalDomainExchange:
             members=command.members,
             buffers=command.buffers,
             descriptors=descriptors,
+            owner_instance_id=command.owner_instance_id,
+            retain_after_run=command.retain_after_run,
         )
         import_ok = True
         import_error = ""

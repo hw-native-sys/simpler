@@ -32,12 +32,13 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
+#include "profiler_test_allocator.h"
 
 using Verdict = ChipSwimlaneCollector::RunTerminalVerdict;
 
 namespace {
 
-void *consistency_test_alloc(size_t size) { return std::calloc(1, size); }
+void *consistency_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int consistency_test_free(void *ptr) {
     std::free(ptr);

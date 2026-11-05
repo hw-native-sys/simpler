@@ -17,7 +17,7 @@
  * so multiple ChipWorkers can run concurrently without interference.
  *
  * All pto_sim_* functions operate on the context bound to the calling
- * thread's device_id (set via pto_cpu_sim_bind_device).
+ * thread's device_id (set via pto_cpu_sim_bind_device_checked or its legacy wrapper).
  *
  * Invariant: each simulated device_id has a single owner ChipWorker per
  * process. The owner calls acquire_device() inside DeviceRunner's
@@ -36,7 +36,14 @@
 extern "C" {
 #endif
 
-/** Bind the calling thread to a simulated device ID. */
+/**
+ * Bind a nonnegative device ID, or -1 to unbind. Returns 0 or a pthread error
+ * code (EINVAL for IDs below -1); failure leaves the previous binding intact.
+ * The key is owned by the process-resident sim context, not a runtime module.
+ */
+int pto_cpu_sim_bind_device_checked(int device_id);
+
+/** Legacy void ABI: aborts on failure rather than returning with a stale binding. */
 void pto_cpu_sim_bind_device(int device_id);
 
 /** Return the device ID bound to the calling thread, or -1 if unbound. */

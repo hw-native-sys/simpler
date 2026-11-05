@@ -71,6 +71,9 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
             "completed_tasks=%d, total_tasks=%d",
             thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
         );
+        if (orch_err == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT) {
+            log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
+        }
         if (begin_emergency_shutdown()) {
             log_shutdown_stall_snapshot(
                 thread_idx, 0, completed_tasks_.load(std::memory_order_relaxed), orchestrator_fatal_reason(orch_err)
@@ -116,6 +119,9 @@ LoopAction SchedulerContext::check_idle_fatal_error(
     int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
     if (orch_err != SIMPLER_ERROR_NONE) {
         LOG_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx, orch_err);
+        if (orch_err == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT) {
+            log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
+        }
         if (begin_emergency_shutdown()) {
             // An orchestrator fatal that lands here while tasks are still in
             // flight is a hang in the same sense the wall-clock budget catches
@@ -168,14 +174,9 @@ LoopAction SchedulerContext::check_idle_fatal_error(
 
 namespace {
 
-// Format a core's idle/busy state into a fixed buffer. Used inside CLUSTER lines.
-// Layout (idle):    coreN(idle)
-// Layout (busy):    coreN(busy kernel=K task=T cond_reg_state=ack)
-// Layout (anomaly): coreN(busy kernel=K task=T cond_reg_state=fin ANOMALY)
-//
-// Healthy busy: COND register reports ack (AICore still executing). fin means
-// AICore wrote completion but AICPU hasn't recycled the running slot yet —
-// either a completion-poll bug or the diagnostic raced the recycle.
+// COND and DMB are separate observations. FIN can belong to either slot;
+// DMB's low word reports publication, not pickup or the high-word doorbell.
+// Scheduler fields in a cross-thread shutdown dump are best-effort observations.
 void format_core_status(
     char *buf, size_t buf_size, int32_t core_id, bool idle, const CoreExecState *core_state, uint64_t reg_addr_for_cond
 ) {
@@ -185,28 +186,32 @@ void format_core_status(
     }
     int32_t kernel = -1;
     TaskId task_id = TaskId::invalid();
+    const int32_t running_token = core_state->running_reg_task_id;
+    const int32_t pending_token = core_state->pending_reg_task_id;
     if (core_state && core_state->running_slot_state) {
         int32_t subslot = static_cast<int32_t>(core_state->running_subslot);
         kernel = core_state->running_slot_state->task->kernel_id[subslot];
         task_id = core_state->running_slot_state->task->task_id;
     }
-    uint64_t cond_reg = read_reg(reg_addr_for_cond, RegId::COND);
+    const uint32_t cond_reg = static_cast<uint32_t>(read_reg(reg_addr_for_cond, RegId::COND));
+    const uint32_t dmb_low = static_cast<uint32_t>(read_reg(reg_addr_for_cond, RegId::DATA_MAIN_BASE));
+    const int32_t cond_token = EXTRACT_TASK_ID(cond_reg);
     int32_t hw_state = EXTRACT_TASK_STATE(cond_reg);
     const char *cond_reg_state_str = (hw_state == TASK_ACK_STATE) ? "ack" : "fin";
-    if (hw_state == TASK_ACK_STATE) {
-        snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=0x%" PRIx64 " cond_reg_state=%s)", core_id, kernel,
-            TaskId::to_uint64(task_id), cond_reg_state_str
-        );
-    } else {
-        snprintf(
-            buf, buf_size,
-            "core%d(busy kernel=%d task=0x%" PRIx64
-            " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
-            core_id, kernel, TaskId::to_uint64(task_id), cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
-            core_state->running_reg_task_id, core_state->pending_reg_task_id
-        );
+    const char *cond_match = "other";
+    if (running_token != AICPU_TASK_INVALID && cond_token == running_token) {
+        cond_match = "running";
+    } else if (pending_token != AICPU_TASK_INVALID && cond_token == pending_token) {
+        cond_match = "pending";
     }
+    snprintf(
+        buf, buf_size,
+        "core%d(busy kernel=%d task=0x%" PRIx64 " cond_reg_state=%s cond_raw=0x%" PRIx32
+        " cond_tok=%d running_tok=%d pending_tok=%d"
+        " cond_match=%s dmb_low=0x%" PRIx32 ")",
+        core_id, kernel, TaskId::to_uint64(task_id), cond_reg_state_str, cond_reg, cond_token, running_token,
+        pending_token, cond_match, dmb_low
+    );
 }
 
 }  // namespace
@@ -249,6 +254,34 @@ bool SchedulerContext::no_thread_owns_running_task() const {
             LOG_INFO(__VA_ARGS__);                   \
         }                                            \
     } while (0)
+
+void SchedulerContext::log_owned_dispatch_records(int32_t thread_idx, StallDumpReport report) {
+    if (thread_idx < 0 || thread_idx >= active_sched_threads_) return;
+    const CoreTracker &tracker = core_trackers_[thread_idx];
+    STALL_DUMP_LOG(
+        report, "[STALL thread=%d] publication_records=owner_local implicit_wait_metadata=unavailable", thread_idx
+    );
+    for (int32_t i = 0; i < tracker.core_num(); ++i) {
+        const int32_t core_id = tracker.core_ids()[i];
+        const CoreExecState &core = core_exec_states_[core_id];
+        const int32_t tokens[] = {core.running_reg_task_id, core.pending_reg_task_id};
+        for (int slot = 0; slot < 2; ++slot) {
+            if (tokens[slot] == AICPU_TASK_INVALID) continue;
+            const uint32_t bank = static_cast<uint32_t>(tokens[slot]) & 1u;
+            const DispatchPayload &payload = payload_per_core_[core_id][bank];
+            // The owner writes these control fields before publication. A gated
+            // AICore can fill args; args and pointed-to source data are not read.
+            STALL_DUMP_LOG(
+                report,
+                "[STALL thread=%d] SLOT core=%d slot=%s token=%d bank=%u task_id=0x%" PRIx64
+                " block=%d/%d function_bin_addr=0x%" PRIx64 " src_payload=0x%" PRIx64,
+                thread_idx, core_id, slot == 0 ? "running" : "pending", tokens[slot], bank,
+                TaskId::to_uint64(payload.local_context.async_ctx.task_token), payload.local_context.block_idx,
+                payload.local_context.block_num, payload.function_bin_addr, payload.src_payload
+            );
+        }
+    }
+}
 
 void SchedulerContext::log_global_stall_diagnostics(
     int32_t trigger_thread_idx, int32_t idle_iterations, int32_t last_progress_count
@@ -335,6 +368,7 @@ void SchedulerContext::log_global_stall_diagnostics(
 }
 
 void SchedulerContext::log_stall_diagnostics(int32_t thread_idx, int32_t idle_iterations, StallDumpReport report) {
+    if (report == StallDumpReport::Periodic) log_owned_dispatch_records(thread_idx, report);
     CoreTracker &tracker = core_trackers_[thread_idx];
 
     // CLUSTER lines: one per cluster this thread owns.
@@ -350,7 +384,7 @@ void SchedulerContext::log_stall_diagnostics(int32_t thread_idx, int32_t idle_it
         bool aiv0_idle = tracker.is_aiv0_core_idle(offset);
         bool aiv1_idle = tracker.is_aiv1_core_idle(offset);
         int32_t cluster_id = cli * ast + thread_idx;
-        char aic_buf[128], aiv0_buf[128], aiv1_buf[128];
+        char aic_buf[320], aiv0_buf[320], aiv1_buf[320];
         format_core_status(
             aic_buf, sizeof(aic_buf), aic_id, aic_idle, &core_exec_states_[aic_id], core_exec_states_[aic_id].reg_addr
         );
@@ -363,8 +397,9 @@ void SchedulerContext::log_stall_diagnostics(int32_t thread_idx, int32_t idle_it
             core_exec_states_[aiv1_id].reg_addr
         );
         STALL_DUMP_LOG(
-            report, "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
-            idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
+            report,
+            "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d snapshot=best_effort aic=%s aiv0=%s aiv1=%s",
+            thread_idx, idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
         );
     }
 }
@@ -493,6 +528,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         header->sched_stall_detail.store(cls.detail, std::memory_order_release);
     }
     if (begin_emergency_shutdown()) {
+        log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count, "scheduler_timeout");
 #if SIMPLER_DFX
         // Capture the in-flight kernels' partial output before signalling the
@@ -506,11 +542,7 @@ int32_t SchedulerContext::handle_timeout_exit(
                 [this, thread_idx](const ChipTaskSlotState &slot_state) {
                     dump_args_for_task<SUBTASK_SLOT_COUNT>(
                         thread_idx, *slot_state.task, *slot_state.payload, slot_state.active_mask,
-                        ArgsDumpStage::AFTER_COMPLETION,
-                        [](ActiveMask active_mask, int raw_subtask_id) {
-                            return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
-                        },
-                        [this](int32_t func_id) {
+                        ArgsDumpStage::AFTER_COMPLETION, [this](int32_t func_id) {
                             return get_function_bin_addr(func_id);
                         }
                     );
@@ -1473,6 +1505,7 @@ void SchedulerContext::deinit() {
     drain_state_.drain_stage_go.store(0, std::memory_order_release);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_release);
     drain_state_.drain_running_staged.store(0, std::memory_order_release);
+    drain_state_.reserved_lanes.store(LaneMask::all(), std::memory_order_release);
 
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);

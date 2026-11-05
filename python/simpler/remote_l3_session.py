@@ -38,6 +38,7 @@ from .buffer import (
     AddressSpace,
     BackendKind,
     Buffer,
+    buffer_reference,
     create_host_shared_buffer,
     intern_worker_path,
     mint_owner_instance_id,
@@ -64,6 +65,7 @@ from .global_comm_domain import (
     encode_comm_init_result,
     encode_copy_result,
     encode_descriptor_table,
+    encode_domain_buffer_refs,
     resolve_global_comm_capability,
 )
 from .remote_l3_protocol import (
@@ -143,6 +145,7 @@ class _RemoteBufferEntry:
     # An imported backing's owner lives in another process, so no ``Buffer`` of this session
     # describes it; ``_import_wire_buffer`` builds one at IMPORT_BUFFER and it is stored here.
     wire: Buffer | None = None
+    borrowed_domain: tuple[int, int] | None = None
 
     def wire_buffer(self) -> Buffer:
         """The owner-side ``Buffer`` every task arg over this backing views.
@@ -173,15 +176,17 @@ class _RemoteBufferEntry:
     @property
     def shm_name(self) -> str:
         if isinstance(self.data, Buffer):
-            # Every Buffer an entry holds is POSIX_SHM-backed, and its shm name is what an importer
-            # on another worker opens.
-            assert self.data.shm is not None
+            if self.data.shm is None:
+                raise ValueError("remote buffer is not backed by SharedMemory")
             return self.data.shm.name
         if not isinstance(self.data, shared_memory.SharedMemory):
             raise ValueError("remote buffer is not backed by SharedMemory")
         return self.data.name
 
     def close(self, *, unlink: bool = False) -> None:
+        if self.borrowed_domain is not None:
+            self.released = True
+            return
         if isinstance(self.data, Buffer):
             # A Buffer always unlinks its own backing on close, so ``unlink`` does not apply here.
             # Releasing through the owning Worker is what additionally drops its registry entry; a
@@ -614,7 +619,7 @@ def _materialize_task_args(
                 backing, byte_offset = _materialize_inline_payload(args, desc, mint_inline_buffer)
                 inline_backings.append(backing)
             else:
-                backing, byte_offset = _resolve_session_backing(desc, buffers, worker_id)
+                backing, byte_offset = _resolve_session_backing(desc, buffers, worker_id, placeholder=tensor.buffer)
             if int(tensor.byte_offset) != int(byte_offset):
                 raise ValueError("remote TASK tensor byte_offset disagrees with its sidecar range")
             task_args.add_tensor(
@@ -661,6 +666,8 @@ def _resolve_session_backing(
     desc: RemoteTensorDesc,
     buffers: dict[tuple[int, ...], _RemoteBufferEntry],
     worker_id: int,
+    *,
+    placeholder=None,
 ) -> tuple[Buffer, int]:
     if desc.owner_worker_id == worker_id and desc.address_space == RemoteAddressSpace.REMOTE_DEVICE:
         key = _buffer_key(desc.buffer_id, desc.generation)
@@ -673,6 +680,8 @@ def _resolve_session_backing(
         raise KeyError("remote TASK descriptor names an unknown or stale buffer/import generation")
     if entry.released:
         raise ValueError("remote TASK descriptor references a released buffer/import")
+    if entry.borrowed_domain is not None and buffer_reference(entry.wire_buffer()).to_descriptor() != placeholder:
+        raise ValueError("remote TASK borrowed backing does not match its registered descriptor")
     if desc.offset < entry.offset or desc.offset + desc.nbytes > entry.offset + entry.nbytes:
         raise ValueError("remote TASK descriptor range exceeds buffer/import")
     return entry.wire_buffer(), int(desc.offset - entry.offset)
@@ -685,7 +694,14 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     manifest_inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] | None = None,
     manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
     global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
+    *,
+    cleanup_errors: list[BaseException] | None = None,
 ) -> None:
+    """Collect release errors separately when the caller supplies a cleanup ledger.
+
+    With a collector, command exceptions propagate even when buffer release fails.
+    Without a collector, release errors propagate directly.
+    """
     session_id = int(manifest["session_id"])
     worker_id = int(manifest["worker_id"])
     dispatch_registry: dict[bytes, Callable[..., Any]] = dict(manifest_dispatch_registry or {})
@@ -700,6 +716,34 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     # (the inner Worker mints its own for the ones it owns).
     session_owner_instance_id = mint_owner_instance_id()
     global_comm_inits: dict[str, Any] = {}
+
+    def revoke_domain_buffers(domain_id: int, generation: int) -> None:
+        for key, entry in list(buffers.items()):
+            if entry.borrowed_domain == (domain_id, generation):
+                entry.close()
+                buffers.pop(key)
+
+    def register_domain_buffers(command: GlobalDomainCommand, backings: tuple[Buffer, ...]) -> bytes:
+        nonlocal next_buffer_id
+        domain_key = (command.domain_id, command.generation)
+        registered = {
+            entry.wire_buffer().identity: key for key, entry in buffers.items() if entry.borrowed_domain == domain_key
+        }
+        references = []
+        for backing in backings:
+            key = registered.get(backing.identity)
+            if key is None:
+                key = _buffer_key(next_buffer_id, command.generation)
+                next_buffer_id += 1
+                buffers[key] = _RemoteBufferEntry(
+                    backing,
+                    backing.nbytes,
+                    command.generation,
+                    RemoteAddressSpace.REMOTE_DEVICE,
+                    borrowed_domain=domain_key,
+                )
+            references.append((buffer_reference(backing).to_descriptor(), *key))
+        return encode_domain_buffer_refs(references)
 
     def mint_session_buffer(nbytes: int) -> Buffer:
         """A POSIX_SHM backing this loop owns, under a buffer_id no other one in the session reuses.
@@ -881,6 +925,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         key = _buffer_key(buffer_id, generation)
                         entry = buffers.get(key)
                         if entry is not None:
+                            if entry.borrowed_domain is not None:
+                                raise ValueError("FREE_REMOTE_BUFFER cannot free a borrowed communication domain slice")
                             entry.released = True
                             buffers.pop(key, None)
                             entry.close(unlink=True)
@@ -899,6 +945,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             raise KeyError("COPY_TO_REMOTE names unknown buffer")
                         if entry.released:
                             raise ValueError("COPY_TO_REMOTE names released buffer")
+                        if entry.borrowed_domain is not None:
+                            raise ValueError("COPY_TO_REMOTE requires copy_to_domain for a borrowed device slice")
                         if len(data) != size:
                             raise ValueError("COPY_TO_REMOTE payload size mismatch")
                         if offset + size > entry.nbytes:
@@ -921,6 +969,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             raise KeyError("COPY_FROM_REMOTE names unknown buffer")
                         if entry.released:
                             raise ValueError("COPY_FROM_REMOTE names released buffer")
+                        if entry.borrowed_domain is not None:
+                            raise ValueError("COPY_FROM_REMOTE requires copy_from_domain for a borrowed device slice")
                         if offset + size > entry.nbytes:
                             raise ValueError("COPY_FROM_REMOTE range exceeds buffer")
                         result = ctypes.string_at(entry.addr + offset, size)
@@ -942,6 +992,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             raise KeyError("EXPORT_BUFFER names unknown buffer")
                         if entry.released:
                             raise ValueError("EXPORT_BUFFER names released buffer")
+                        if entry.borrowed_domain is not None:
+                            raise ValueError("EXPORT_BUFFER does not support borrowed communication domain slices")
                         if request.offset + request.nbytes > entry.nbytes:
                             raise ValueError("EXPORT_BUFFER range exceeds buffer")
                         if request.transport_profile not in ("", HOST_TCP_TRANSPORT_PROFILE):
@@ -1034,6 +1086,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         entry = buffers.get(key)
                         if entry is None:
                             raise KeyError("RELEASE_IMPORT names unknown import")
+                        if entry.borrowed_domain is not None:
+                            raise ValueError("RELEASE_IMPORT cannot release a borrowed communication domain slice")
                         entry.released = True
                         buffers.pop(key, None)
                         entry.close(unlink=False)
@@ -1117,17 +1171,21 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 "",
                             )
                         elif command.phase is GlobalDomainPhase.COMMIT:
-                            inner_worker._commit_global_domain_node(command)  # noqa: SLF001
-                            _control_reply(
-                                conn,
-                                manifest,
-                                header.sequence,
-                                control.control_name,
-                                control.control_version,
-                                0,
-                                "",
-                            )
+                            backings = inner_worker._commit_global_domain_node(command)  # noqa: SLF001
+                            try:
+                                _control_result_reply(
+                                    conn,
+                                    manifest,
+                                    header.sequence,
+                                    control.control_name,
+                                    control.control_version,
+                                    register_domain_buffers(command, backings),
+                                )
+                            except BaseException:
+                                revoke_domain_buffers(command.domain_id, command.generation)
+                                raise
                         elif command.phase is GlobalDomainPhase.ABORT:
+                            revoke_domain_buffers(command.domain_id, command.generation)
                             inner_worker._release_global_domain_node(  # noqa: SLF001
                                 GlobalDomainReleaseCommand(command.domain_id, command.generation),
                                 suppress_errors=True,
@@ -1145,6 +1203,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             raise ValueError("ALLOC_DOMAIN phase is not supported")
                     elif control.control_name == ControlName.RELEASE_DOMAIN:
                         command = decode_release_command(control.command_bytes)
+                        revoke_domain_buffers(command.domain_id, command.generation)
                         inner_worker._release_global_domain_node(command)  # noqa: SLF001
                         _control_reply(
                             conn,
@@ -1240,7 +1299,12 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
             send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
     finally:
         for key, entry in list(buffers.items()):
-            entry.close(unlink=len(key) == 2)
+            try:
+                entry.close(unlink=len(key) == 2)
+            except BaseException as exc:
+                if cleanup_errors is None:
+                    raise
+                cleanup_errors.append(exc)
         buffers.clear()
         with _INNER_HANDLE_LOCK:
             _INNER_HANDLES.clear()

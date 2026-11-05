@@ -1,5 +1,8 @@
 # st-onboard-a2a3 mass 507899/507018 — AICPU shared-SO device fault
 
+This page records the historical shared-directory fault and its original fix.
+For current upload paths and session cleanup, see [the AICPU loader](../../src/common/aicpu_loader/README.md).
+
 ## Symptom
 
 `st-onboard-a2a3` fails intermittently (observed ~19% of runs after #870, vs

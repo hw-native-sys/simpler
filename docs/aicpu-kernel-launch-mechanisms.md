@@ -16,7 +16,7 @@ to be re-derived if anyone reaches for Path B again.
 | Method | Where the SO lands | Sudo? | Multi-runtime per process? | Iterative dev? | Status |
 | ------ | ------------------ | ----- | -------------------------- | -------------- | ------ |
 | **1. tar.gz pre-deployment** | `/usr/lib64/aicpu_kernels/.../` at CANN install time | Yes (root-owned) | Yes | No — redeploy per change | Works, but obsolete for this repo |
-| **2. Path A — dispatcher Mode A bootstrap** | `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so` written at runtime by the AICPU OS process | No | **No** (one SO per host process — see "Path A latch") | Yes | **Production runtime + reference tool** |
+| **2. Path A — dispatcher Mode A bootstrap** | `/usr/lib64/aicpu_kernels/<vf>/aicpu_kernels_device/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<dev>.so` written at runtime by the AICPU OS process | No | **No** (one SO per host process — see "Path A latch") | Yes | **Production runtime + reference tool** |
 | **3. Path B — `KERNEL_TYPE_AICPU_CUSTOM`** | `/home/CustAiCpuUser/cust_aicpu_<dev>_<vf>_<pid>/` written by the `aicpu_custom_scheduler` subprocess | No | Yes (latch lifted) | Yes | **Broken** — cust subprocess L1 stale on AICore HBM writes (#822) |
 
 The columns above frame the trade-offs. The rest of this doc explains
@@ -53,10 +53,14 @@ invokes
 CANN's preinstalled `libaicpu_extend_kernels.so` dlopens the dispatcher
 SO inside the AICPU OS process; the dispatcher writes the inner SO
 bytes to
-`/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<dev>.so`,
+`/usr/lib64/aicpu_kernels/<vf>/aicpu_kernels_device/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<dev>.so`,
 then returns. The host then issues a normal
 `rtsBinaryLoadFromFile(json, ...)` + `rtsFuncGetByName` +
 `rtsLaunchCpuKernel` sequence pointing at the preinstall basename.
+
+Each runner uploads again, including after a device reset. CANN's TSD removes
+the process directory at session teardown. Historical files in the shared root
+remain outside this cleanup; see [the loader contract](../src/common/aicpu_loader/README.md).
 
 - **Mechanism**: AICPU OS process has write access to the preinstall
   subtree even though the directory is root-owned (the AICPU OS runs

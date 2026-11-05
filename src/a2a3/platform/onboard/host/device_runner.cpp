@@ -282,7 +282,7 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
-// `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
+// `ensure_aicpu_runtime_registered`, `query_max_block_dim`, and `validate_block_dim`
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
@@ -375,6 +375,7 @@ int DeviceRunner::prepare_execution(
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     // Resolved from this run's own CallConfig rather than read off the runner:
     // apply_call_config() is skipped when this prepare overlaps an in-flight
     // predecessor, so the members still describe that predecessor.
@@ -498,11 +499,9 @@ int DeviceRunner::prepare_execution(
         );
     }
 
-    // Resolve the orchestration SO into a device-resident buffer and refresh
-    // runtime metadata before the Runtime struct is uploaded to device.
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
 
@@ -536,11 +535,40 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     });
 }
 
-DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
-    if (active.prepared == nullptr || !active.prepared->resources_owned) {
-        return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
-    }
+int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned)
+        return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const int poll_rc = poll_execution(active);
+    if (poll_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return poll_rc;
+    prepared.physical_complete = true;
+    const int wait_rc = poll_boundary_waits(prepared);
+    if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
+    const int diagnostics_rc =
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    prepared.retirement_diagnostics_rc = diagnostics_rc;
+    read_device_wall_ns(prepared.pipeline_slot);
+    emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
+    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
+    prepared.aicore_retirement_attempted = true;
+    const int retire_rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
+    if (retire_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    cleanup_execution(prepared, true);
+    return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
+DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
+    PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned) {
+        const int rc = wait_run_fence(prepared);
+        if (rc != 0) {
+            log_run_failure(prepared, rc);
+            recover_device_or_mark_unusable(rc);
+        }
+        return DrainOutcome{rc, prepared.retirement_diagnostics_rc, prepared.physical_complete};
+    }
     auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
         cleanup_execution(prepared, /*retire_aicore=*/true);
     });
@@ -553,7 +581,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     int rc = reap_run(prepared, &diagnostics_rc);
     if (rc != 0) {
         // The device/sync error remains authoritative over teardown errors.
-        return DrainOutcome::device_error(rc);
+        return DrainOutcome::device_error(rc, prepared.physical_complete);
     }
 
     // Both this run's boundaries completed, so every wait queued on one of them
@@ -561,14 +589,14 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // a fallible call can still report. Nothing waits on a successor's kernels:
     // a cross-run wait is proved by the event recorded immediately behind it.
     rc = discharge_boundary_waits(prepared, /*boundaries_complete=*/true);
-    if (rc != 0) return DrainOutcome::device_error(rc);
+    if (rc != 0) return DrainOutcome::device_error(rc, prepared.physical_complete);
 
     // A proven-complete stream is reusable until a code publication marks it
     // stale. Publish retirement so cleanup does not replace it with an
     // unproven state after the device result has already been established.
     prepared.aicore_retirement_attempted = true;
     rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
-    if (rc != 0) return DrainOutcome::device_error(rc);
+    if (rc != 0) return DrainOutcome::device_error(rc, prepared.physical_complete);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup. Sized
     // by this run's own core count rather than the runner's, which describes
@@ -745,6 +773,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
         return LaunchTransactionResult{};
     }
     prepared.streams = {static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
+    prepared.stream_lifetime = run_streams_.retain_aicore();
+    if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
     if (prepared.caller_stream != nullptr) {
         const int rc = validate_caller_stream(prepared.caller_stream);
@@ -845,12 +875,11 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 return rc;
             }
 
-            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
-
             if (prepared.join.predecessor_owner != nullptr) {
-                int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
+                const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
             }
+            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
             // After any cross-run wait and before the kernel: the instant this stream was
             // released to begin this run's AICore work. A record is not a wait and no stream
@@ -961,7 +990,7 @@ int DeviceRunner::queue_cross_run_wait(
     return record_cross_run_proof(prepared, waiter_stream);
 }
 
-int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_rc) {
+int DeviceRunner::reap_run(PreparedExecution &prepared, int *diagnostics_rc) {
     if (!prepared.streams.ready()) {
         LOG_ERROR("reap_run: this run has no stream binding");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1069,18 +1098,21 @@ void DeviceRunner::emit_device_dep_gen_graph(
     }
 }
 
-// `print_handshake_results`, `prepare_orch_so`, `register_callable`,
+// `print_handshake_results`, `validate_active_callable`, `register_callable`,
 // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 
-void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
-    // Admission is closed before recovery performs any fallible operation.
+void DeviceRunner::mark_device_unusable(int runtime_rc) {
     device_unusable_.store(true, std::memory_order_release);
+    if (execution_mode_latch_.is_kernel()) kernel_exec_state_.poison(runtime_rc);
+}
+
+void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
+    mark_device_unusable(aicore_rc);
     // A borrowed context cannot drain or reset the caller's entire device.
     // Poison stops this runner's admission; recovery belongs to the caller.
     if (execution_mode_latch_.is_kernel()) {
-        kernel_exec_state_.poison(aicore_rc);
         LOG_ERROR("Execution error %d: borrowed device context marked unusable", aicore_rc);
         return;
     }
@@ -1351,10 +1383,8 @@ int DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
 }
 
 int DeviceRunner::finalize_impl() {
-    // Fatal path: the ordinary stream completion/error boundary has already
-    // reaped the submitted run. Stop host collector threads locally, drain and
-    // force-reset the card, then forget old handles without per-resource
-    // RTS/HAL calls.
+    // Unknown device readers remain owned until the reset and probes confirm
+    // generation end; host readers stop without draining device queues.
     if (device_unusable_.load(std::memory_order_acquire)) {
         teardown_recorder_.begin(TEARDOWN_PATH_FATAL, device_id_);
         // A Worker that provisioned SDMA holds 48 CP-process streams, which is
@@ -1381,14 +1411,11 @@ int DeviceRunner::finalize_impl() {
             std::this_thread::sleep_for(std::chrono::milliseconds(reset_delay_ms));
         }
 
-        // Its result cannot displace the device failure that brought this path
-        // here, so it is folded in below only if nothing about the device
-        // itself was reported. It is sticky in the collector's own summary
-        // either way.
-        const int fatal_collector_rc = finalize_collectors(true);
-        if (fatal_collector_rc != 0) {
-            LOG_ERROR("Fatal teardown: diagnostics collectors reported %d while being released", fatal_collector_rc);
-        }
+        // Join host users before resetting their backing. Already admitted
+        // host entries may finish; no final device-queue drain is requested.
+        begin_fatal_close();
+        stop_shared_collectors_for_device_failure();
+        dep_gen_collector_.stop_for_device_failure();
 
         // force_reset_device() drains before it resets and returns 0 only when
         // its post-reset probe confirms the card, so a second pass runs against
@@ -1401,21 +1428,22 @@ int DeviceRunner::finalize_impl() {
         // once per attempt and then report a reset that "did not confirm
         // clean", which reads as a failed reset rather than the designed
         // refusal it is.
-        const bool owns_device_reset = !execution_mode_latch().is_kernel();
+        const bool owns_device_reset = execution_mode_latch().latched_mode() == SIMPLER_MODE_PROGRAM;
         if (!owns_device_reset) teardown_recorder_.note_stage(TEARDOWN_STAGE_REFUSED);
         constexpr int kFatalResetAttempts = 3;
-        int reset_rc = owns_device_reset ? attempt_fatal_reset(
-                                               [this]() {
-                                                   teardown_recorder_.note_recovery_attempt();
-                                                   return force_reset_device();
-                                               },
-                                               sdma_provisioned ? 1 : kFatalResetAttempts
-                                           ) :
-                                           0;
+        int reset_rc = owns_device_reset && !terminal_reset_confirmed() ?
+                           attempt_fatal_reset(
+                               [this]() {
+                                   teardown_recorder_.note_recovery_attempt();
+                                   return force_reset_device();
+                               },
+                               sdma_provisioned ? 1 : kFatalResetAttempts
+                           ) :
+                           0;
         // The wrapper's verdict, which the post-reset probe is part of, is a
         // different value from the reset call's own return.
         if (owns_device_reset) teardown_recorder_.note_recovery_sequence(reset_rc);
-        const bool reset_confirmed = owns_device_reset && reset_rc == 0;
+        const bool reset_confirmed = owns_device_reset && terminal_reset_confirmed();
         if (!reset_confirmed && owns_device_reset) {
             LOG_ERROR(
                 "Fatal teardown: force reset of device %d did not confirm clean (rc=%d); "
@@ -1424,57 +1452,42 @@ int DeviceRunner::finalize_impl() {
             );
         }
 
-        // Program mode abandons resource bookkeeping after the reset attempt.
-        // Kernel mode cannot reset the borrowed device, so it retains ownership
-        // and quarantines the context permanently. Later close calls cannot
-        // release these resources.
-        int abandon_rc = 0;
-        if (owns_device_reset) {
-            run_streams_.abandon();
-            abandon_rc = abandon_common_after_device_failure();
-        } else {
-            kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
+        if (!reset_confirmed) {
+            if (!owns_device_reset) {
+                kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
+                LOG_ERROR(
+                    "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
+                    "process lifetime; no later close can retire them",
+                    device_id_
+                );
+            }
+            teardown_recorder_.finish(owns_device_reset ? reset_rc : PTO_RUNTIME_ERR_INVALID_STATE);
+            return owns_device_reset && reset_rc != 0 ? reset_rc : PTO_RUNTIME_ERR_INVALID_STATE;
         }
+        abandon_shared_collectors_after_device_reset();
+        dep_gen_collector_.abandon_after_device_reset();
+        run_streams_.abandon();
+        int abandon_rc = abandon_common_after_device_failure();
 
         // Only finalize the ACL owner after force reset established a clean
         // generation. On reset failure, aclFinalize may itself walk poisoned
         // stream resources and enter the same remote-event timeout.
         if (acl_ready_) {
-            if (reset_confirmed) {
-                int finalize_rc = aclFinalize();
-                if (finalize_rc != 0) {
-                    LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
-                    if (abandon_rc == 0) abandon_rc = finalize_rc;
-                }
+            const int finalize_rc = aclFinalize();
+            if (finalize_rc != 0) {
+                LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
+                if (abandon_rc == 0) abandon_rc = finalize_rc;
             } else {
-                LOG_WARN("Fatal teardown: skipping aclFinalize because device reset was not confirmed");
+                acl_ready_ = false;
             }
-            acl_ready_ = false;
         }
 
-        // The quarantine is terminal: `device_unusable_` routes every later
-        // close onto this same branch, so these resources stay pinned for the
-        // process lifetime. No entry point retires them.
-        if (!owns_device_reset) {
-            LOG_ERROR(
-                "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
-                "process lifetime; no later close can retire them",
-                device_id_
-            );
-            const int quarantine_rc = abandon_rc != 0 ? abandon_rc : PTO_RUNTIME_ERR_INVALID_STATE;
-            teardown_recorder_.finish(quarantine_rc);
-            return quarantine_rc;
-        }
-
-        device_id_ = -1;
-        if (reset_confirmed) {
+        if (abandon_rc == 0) {
+            device_id_ = -1;
             device_unusable_.store(false, std::memory_order_release);
         }
         LOG_WARN("DeviceRunner finalized after fatal device failure");
         int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
-        // Last in priority: a diagnostics failure found while releasing the
-        // collectors is reported only when the device side reported nothing.
-        if (fatal_rc == 0) fatal_rc = fatal_collector_rc;
         teardown_recorder_.finish(fatal_rc);
         return fatal_rc;
     }
@@ -1485,7 +1498,7 @@ int DeviceRunner::finalize_impl() {
     // this thread needs no bind and the context owns no device state to adopt.
     int rc = 0;
     if (!execution_mode_latch().is_kernel()) {
-        rc = attach_current_thread(device_id_);
+        rc = bind_current_thread(device_id_);
         if (rc != 0) {
             LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
             teardown_recorder_.finish(rc);

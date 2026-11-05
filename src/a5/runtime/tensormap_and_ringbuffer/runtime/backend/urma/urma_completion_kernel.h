@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_
+#pragma once
 
 #include <stdint.h>
 
@@ -30,6 +29,7 @@
 #include "aicore_completion_mailbox_types.h"
 #include "intrinsic.h"
 #include "completion_token.h"
+#include <pto/comm/async/urma/urma_types.hpp>
 #include "runtime_status.h"
 
 #ifndef __aicore__
@@ -93,6 +93,14 @@ UrmaTput(const DstTensor &dst, const SrcTensor &src, __gm__ uint8_t *workspace, 
 
 namespace pto2::detail {
 
+inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code);
+
+inline __aicore__ void set_urma_error(AsyncCtx &ctx, int32_t error_code) {
+    if (ctx.completion_error_code != nullptr && *ctx.completion_error_code == SIMPLER_ERROR_NONE) {
+        defer_error(ctx, error_code);
+    }
+}
+
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_urma_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
@@ -102,11 +110,10 @@ inline __aicore__ bool register_urma_async_event(
 
 namespace pto2::urma_backend {
 
-inline constexpr uint64_t kUrmaMaxTransferBytes = 256ULL * 1024ULL * 1024ULL;
-
-#if defined(PTO_URMA_SUPPORTED)
-static_assert(kUrmaMaxTransferBytes == pto::comm::urma::kUrmaMaxWqeTransferBytes, "URMA transfer limit drift");
-#endif
+using pto::comm::urma::UrmaCqCtx;
+using pto::comm::urma::UrmaInfo;
+using pto::comm::urma::UrmaLayout;
+using pto::comm::urma::UrmaWQCtx;
 
 inline __aicore__ uint64_t peer_mr_base_addr(__gm__ uint8_t *workspace, uint32_t peer) {
 #if defined(__CPU_SIM)
@@ -137,7 +144,7 @@ inline __aicore__ uint64_t tensor_element_count(TensorT &tensor) {
 }
 
 inline __aicore__ uint64_t chunk_count(uint64_t total_bytes) {
-    return (total_bytes + kUrmaMaxTransferBytes - 1) / kUrmaMaxTransferBytes;
+    return total_bytes == 0 ? 0 : 1 + (total_bytes - 1) / pto::comm::urma::kUrmaMaxWqeTransferBytes;
 }
 
 template <typename TensorT>
@@ -160,46 +167,115 @@ inline __aicore__ bool is_flat_contiguous_1d(TensorT &tensor) {
     return packed_layout && one_dim_logical;
 }
 
+#if defined(PTO_URMA_SUPPORTED)
 template <typename TensorT>
-inline __aicore__ TensorT make_tensor_slice(TensorT &tensor, uint64_t elem_offset, uint64_t elem_count) {
-    using ShapeT = typename TensorT::Shape;
-    using StrideT = typename TensorT::Stride;
-    ShapeT shape(
-        tensor.GetShape(pto::GlobalTensorDim::DIM_0), tensor.GetShape(pto::GlobalTensorDim::DIM_1),
-        tensor.GetShape(pto::GlobalTensorDim::DIM_2), tensor.GetShape(pto::GlobalTensorDim::DIM_3),
-        static_cast<int64_t>(elem_count)
+inline __aicore__ auto make_tensor_slice(TensorT &tensor, uint64_t elem_offset, uint64_t elem_count) {
+    using Shape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
+    using Stride = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>;
+    using Slice = pto::GlobalTensor<typename TensorT::RawDType, Shape, Stride>;
+    return Slice(
+        tensor.data() + elem_offset, Shape(1, 1, 1, 1, elem_count),
+        Stride(elem_count, elem_count, elem_count, elem_count, 1)
     );
-    StrideT stride(
-        tensor.GetStride(pto::GlobalTensorDim::DIM_0), tensor.GetStride(pto::GlobalTensorDim::DIM_1),
-        tensor.GetStride(pto::GlobalTensorDim::DIM_2), tensor.GetStride(pto::GlobalTensorDim::DIM_3),
-        tensor.GetStride(pto::GlobalTensorDim::DIM_4)
-    );
-    return TensorT(tensor.data() + elem_offset, shape, stride);
+}
+#endif
+
+inline __aicore__ bool completion_capacity_available(const AsyncCtx &ctx, uint64_t required) {
+    return ctx.task_token.is_valid() && ctx.completion_count != nullptr && ctx.completion_entries != nullptr &&
+           ctx.completion_error_code != nullptr && *ctx.completion_error_code == SIMPLER_ERROR_NONE &&
+           *ctx.completion_count <= ctx.completion_capacity &&
+           required <= ctx.completion_capacity - *ctx.completion_count;
 }
 
-template <typename DstTensor, typename SrcTensor>
-inline __aicore__ bool submit_urma_request_once(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
-#if defined(PTO_URMA_SUPPORTED)
-    pto::comm::AsyncSession session;
-    if (!pto::comm::BuildAsyncSession<pto::comm::DmaEngine::URMA>(desc.workspace, desc.remote_rank, session)) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+inline __aicore__ bool queue_row_for(__gm__ uint8_t *workspace, uint32_t peer, uint32_t jetty, uint32_t &row) {
+    if (workspace == nullptr) return false;
+    auto *info = reinterpret_cast<__gm__ UrmaInfo *>(workspace);
+    if (peer >= info->rankCount || info->jettiesPerCore == 0 ||
+        info->jettiesPerCore > pto::comm::urma::kUrmaMaxJettiesPerCore || info->rowsPerPeer == 0)
+        return false;
+    if (info->layout == UrmaLayout::PER_PEER) {
+        if (jetty >= info->rowsPerPeer ||
+            static_cast<uint64_t>(info->rankCount) * info->rowsPerPeer != info->jettyCount)
+            return false;
+        row = peer * info->rowsPerPeer + jetty;
+    } else if (info->layout == UrmaLayout::SHARED_POOL) {
+        row = jetty;
+    } else {
         return false;
     }
+    return row < info->jettyCount && info->sqPtr != 0 && info->scqPtr != 0;
+}
 
+inline __aicore__ uint32_t load_urma_counter(uint64_t addr) {
+    auto *ptr = reinterpret_cast<__gm__ uint32_t *>(addr);
+#if defined(__CPU_SIM)
+    return *reinterpret_cast<volatile uint32_t *>(ptr);
+#else
+    return ld_dev(ptr, 0);
+#endif
+}
+
+template <typename Session>
+inline __aicore__ bool preflight_urma_request(AsyncCtx &ctx, const Session &session, uint64_t chunks) {
+    const uint32_t jetties = session.cfg.urma.qpCount;
+    if (jetties == 0 || jetties > pto::comm::urma::kUrmaMaxJettiesPerCore || chunks > UINT64_MAX / jetties ||
+        !completion_capacity_available(ctx, chunks * jetties)) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        return false;
+    }
+    if (!session.valid || session.engine != pto::comm::DmaEngine::URMA || session.contextGm == nullptr) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
+    // Serialized producers reserve the entire request; only AICPU advances tails.
+    for (uint32_t j = 0; j < jetties; ++j) {
+        uint32_t row = 0;
+        if (session.qpIdxBase > UINT32_MAX - j ||
+            !queue_row_for(session.contextGm, session.destRankId, session.qpIdxBase + j, row)) {
+            pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
+        auto *info = reinterpret_cast<__gm__ UrmaInfo *>(session.contextGm);
+        auto *wq = reinterpret_cast<__gm__ UrmaWQCtx *>(info->sqPtr) + row;
+        auto *cq = reinterpret_cast<__gm__ UrmaCqCtx *>(info->scqPtr) + row;
+        if (!wq->bufAddr || !wq->headAddr || !wq->tailAddr || !wq->dbAddr || !cq->bufAddr || !cq->tailAddr ||
+            !cq->dbAddr || wq->wqeShiftSize != 6 || cq->cqeShiftSize != 6 || wq->depth == 0 || cq->depth == 0 ||
+            (wq->depth & (wq->depth - 1)) != 0 || (cq->depth & (cq->depth - 1)) != 0 || wq->depth >= (1u << 31) ||
+            cq->depth >= (1u << 31) || chunks > wq->depth || chunks > cq->depth) {
+            pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
+        const uint32_t head = load_urma_counter(wq->headAddr);
+        const uint32_t bb_tail = load_urma_counter(wq->tailAddr);
+        const uint32_t cqe_tail = load_urma_counter(cq->tailAddr);
+        if (static_cast<uint64_t>(head - bb_tail) + chunks > wq->depth ||
+            static_cast<uint64_t>(wq->submittedWqeCount - cqe_tail) + chunks > cq->depth) {
+            pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename DstTensor, typename SrcTensor, typename Session>
+inline __aicore__ bool
+submit_urma_request_once(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc, const Session &session) {
+#if defined(PTO_URMA_SUPPORTED)
     pto::comm::AsyncEvent event;
     if (desc.op == UrmaOp::TGET) {
         event = pto::comm::TGET_ASYNC<pto::comm::DmaEngine::URMA>(desc.dst, desc.src, session);
     } else {
         event = pto::comm::TPUT_ASYNC<pto::comm::DmaEngine::URMA>(desc.dst, desc.src, session);
     }
-    if (!pto2::detail::register_urma_async_event(ctx, event, session, desc.workspace)) {
+    if (event.urmaJettyCount == 0 && !event.postFailed) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
-    pto2::detail::defer_flush(ctx);
-    return true;
+    return pto2::detail::register_urma_async_event(ctx, event, session, desc.workspace);
 #else
     (void)desc;
-    pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    (void)session;
+    pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     return false;
 #endif
 }
@@ -208,42 +284,41 @@ template <typename DstTensor, typename SrcTensor>
 inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
     using RawDType = typename DstTensor::RawDType;
     static_assert(std::is_same_v<RawDType, typename SrcTensor::RawDType>, "URMA transfer requires matching dtypes");
-
-    if (!is_flat_contiguous_1d(desc.dst) || !is_flat_contiguous_1d(desc.src)) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    if (!is_flat_contiguous_1d(desc.dst) || !is_flat_contiguous_1d(desc.src) ||
+        tensor_element_count(desc.dst) != tensor_element_count(desc.src)) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
-
     const uint64_t elem_count = tensor_element_count(desc.dst);
-    if (elem_count != tensor_element_count(desc.src)) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    if (elem_count == 0) return true;
+    if (elem_count > UINT64_MAX / sizeof(RawDType)) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
-    const uint64_t total_bytes = elem_count * sizeof(RawDType);
-    const uint64_t max_bytes = kUrmaMaxTransferBytes;
-    if (total_bytes <= max_bytes) {
-        return submit_urma_request_once(ctx, desc);
-    }
-
-    const uint64_t chunk_elems = max_bytes / sizeof(RawDType);
-    if (chunk_elems == 0 || (max_bytes % sizeof(RawDType)) != 0) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+#if defined(PTO_URMA_SUPPORTED)
+    pto::comm::AsyncSession session;
+    if (!pto::comm::BuildAsyncSession<pto::comm::DmaEngine::URMA>(desc.workspace, desc.remote_rank, session)) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
-
-    uint64_t offset = 0;
-    while (offset < elem_count) {
+    if (!preflight_urma_request(ctx, session, chunk_count(elem_count * sizeof(RawDType)))) return false;
+    const uint64_t chunk_elems = pto::comm::urma::kUrmaMaxWqeTransferBytes / sizeof(RawDType);
+    for (uint64_t offset = 0; offset < elem_count;) {
         const uint64_t remaining = elem_count - offset;
-        const uint64_t current_elems = (remaining < chunk_elems) ? remaining : chunk_elems;
-        auto chunk_desc = desc;
-        chunk_desc.dst = make_tensor_slice(desc.dst, offset, current_elems);
-        chunk_desc.src = make_tensor_slice(desc.src, offset, current_elems);
-        if (!submit_urma_request_once(ctx, chunk_desc)) {
-            return false;
-        }
+        const uint64_t current_elems = remaining < chunk_elems ? remaining : chunk_elems;
+        auto dst_slice = make_tensor_slice(desc.dst, offset, current_elems);
+        auto src_slice = make_tensor_slice(desc.src, offset, current_elems);
+        UrmaRequestDescriptor<decltype(dst_slice), decltype(src_slice)> chunk_desc{
+            desc.op, dst_slice, src_slice, desc.workspace, desc.remote_rank
+        };
+        if (!submit_urma_request_once(ctx, chunk_desc, session)) return false;
         offset += current_elems;
     }
     return true;
+#else
+    pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    return false;
+#endif
 }
 
 }  // namespace pto2::urma_backend
@@ -304,31 +379,49 @@ template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_urma_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
 ) {
-    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        (void)event.Wait(session);
+    using namespace pto2::urma_backend;
+    const uint32_t count = event.urmaJettyCount;
+    if (count == 0) {
+        if (event.postFailed || event.handle != 0) {
+            set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
         return true;
     }
-    if (event.handle == 0) {
-        return true;
-    }
-
-    const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) || workspace == nullptr) {
-        defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        (void)event.Wait(session);
+    if (!session.valid || session.contextGm != workspace || workspace == nullptr ||
+        static_cast<uint32_t>(event.engine) != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) ||
+        event.engine != session.engine || count > pto::comm::urma::kUrmaMaxJettiesPerCore ||
+        event.urmaJettyBase < session.qpIdxBase ||
+        static_cast<uint32_t>(event.urmaJettyBase) - session.qpIdxBase + count > session.cfg.urma.qpCount) {
+        set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
-
-    CompletionToken token{
-        event.handle,
-        0,
-        COMPLETION_ENGINE_URMA,
-        COMPLETION_TYPE_URMA_EVENT_HANDLE,
-        reinterpret_cast<uint64_t>(workspace),
-    };
-    if (!register_completion_condition(ctx, token)) {
-        defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
-        (void)event.Wait(session);
+    if (!completion_capacity_available(ctx, count)) {
+        set_urma_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        return false;
+    }
+    uint32_t rows[pto::comm::urma::kUrmaMaxJettiesPerCore];
+    for (uint32_t j = 0; j < count; ++j) {
+        if (!queue_row_for(workspace, session.destRankId, event.urmaJettyBase + j, rows[j])) {
+            set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
+    }
+    for (uint32_t j = 0; j < count; ++j) {
+        CompletionToken token{
+            (static_cast<uint64_t>(rows[j]) << 32) | event.urmaTargetBbPerJetty[j],
+            event.urmaTargetCqePerJetty[j],
+            COMPLETION_ENGINE_URMA,
+            COMPLETION_TYPE_URMA_EVENT_HANDLE,
+            reinterpret_cast<uint64_t>(workspace),
+        };
+        if (!register_completion_condition(ctx, token)) {
+            set_urma_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+            return false;
+        }
+    }
+    if (event.postFailed) {
+        set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
     return true;
@@ -338,7 +431,7 @@ inline __aicore__ bool register_urma_async_event(
 
 template <typename DstTensor, typename SrcTensor>
 inline __aicore__ bool send_request_entry(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
-    return pto2::urma_backend::submit_chunked_urma_request(ctx, desc);
+    const bool submitted = pto2::urma_backend::submit_chunked_urma_request(ctx, desc);
+    pto2::detail::defer_flush(ctx);
+    return submitted;
 }
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_

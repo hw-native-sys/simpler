@@ -43,6 +43,7 @@ void ready_queue_init_data_from_layout(ChipReadyQueue *queue, uint64_t capacity)
     queue->mask = capacity - 1;
     queue->enqueue_pos.store(0, std::memory_order_relaxed);
     queue->dequeue_pos.store(0, std::memory_order_relaxed);
+    queue->mixed_lanes.reset();
     queue->max_occupancy.store(0, std::memory_order_relaxed);
 }
 

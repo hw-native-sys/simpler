@@ -294,6 +294,17 @@ bool MpiDirectTransportHub::terminal() const {
     return !terminal_error_.empty();
 }
 
+MpiDirectSessionSnapshot MpiDirectTransportHub::session_snapshot() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    MpiDirectSessionSnapshot snapshot;
+    snapshot.closed = closed_;
+    snapshot.terminal_error = terminal_error_;
+    for (const auto &[worker_id, route] : routes_by_worker_) {
+        if (!route.terminal_error.empty()) snapshot.unavailable_workers.push_back(worker_id);
+    }
+    return snapshot;
+}
+
 bool MpiDirectTransportHub::all_routes_shutdown() const {
     std::lock_guard<std::mutex> lk(mu_);
     for (const auto &[worker_id, route] : routes_by_worker_) {

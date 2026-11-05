@@ -18,3 +18,5 @@
  */
 
 extern "C" void kernel_entry(void * /*args*/) {}
+
+extern "C" const char *simpler_cpu_sim_target() { return "a2a3sim"; }

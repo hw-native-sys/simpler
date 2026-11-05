@@ -81,7 +81,7 @@ enum class GraphRecordingStatus : uint8_t { RECORDING = 0, READY = 1, FAILED = 2
 // thread is handed this address at graph_begin and dereferences it without
 // taking recording_mutex.
 //
-// The entry carries the boundary and the status, not the recorded body: the body's
+// The entry carries the boundary, submit identity, and status, not the recorded body: the body's
 // storage belongs to the recorder thread that will fill it (recorder_recording()), so
 // nothing here is sized by the graph.
 struct GraphInflightRecording {
@@ -92,6 +92,8 @@ struct GraphInflightRecording {
     // main-thread burst of same-key submissions starve the thread before it can
     // bind its private recording state. Every other access holds the mutex.
     std::atomic<GraphRecordingStatus> recording_status{GraphRecordingStatus::RECORDING};
+    // The first outer Graph shell's submit position, fixed before the recorder starts.
+    uint32_t submit_idx{0};
 
     GraphRecordingStatus status() const { return recording_status.load(std::memory_order_acquire); }
     void set_status(GraphRecordingStatus next) { recording_status.store(next, std::memory_order_release); }

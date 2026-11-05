@@ -18,5 +18,7 @@
 #endif
 
 inline __aicore__ bool scheduler_watchdog_expired(uint64_t start, uint64_t now, uint64_t timeout_cycles) {
-    return timeout_cycles != 0 && now - start >= timeout_cycles;
+    const uint64_t elapsed = now - start;
+    // Forward elapsed intervals occupy the lower half of the counter range.
+    return timeout_cycles != 0 && elapsed < (uint64_t{1} << 63) && elapsed >= timeout_cycles;
 }

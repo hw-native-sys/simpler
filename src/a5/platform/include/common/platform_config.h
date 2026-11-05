@@ -353,6 +353,15 @@ constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
 
 /**
+ * PMU counters an A5 core reports per measured window.
+ *
+ * Here rather than beside the PMU record types: the scheduler state sizes its
+ * per-subtask cells by this count, and those layouts are reached from kernel
+ * translation units that must not pull in the records' `TaskId` dependency.
+ */
+constexpr int PMU_COUNTER_COUNT_A5 = 10;
+
+/**
  * Per-core PMU staging ring depth (AICore-side dual-issue slots).
  *
  * Constraints: ≥ in-flight task

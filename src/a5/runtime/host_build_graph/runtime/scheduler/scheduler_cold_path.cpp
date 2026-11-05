@@ -425,9 +425,6 @@ int32_t SchedulerContext::handle_timeout_exit(
                     dump_args_for_task<SUBTASK_SLOT_COUNT>(
                         thread_idx, slot_state.to_descriptor(), slot_state.to_payload(), slot_state.active_mask,
                         ArgsDumpStage::AFTER_COMPLETION,
-                        [](ActiveMask active_mask, int raw_subtask_id) {
-                            return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
-                        },
                         [this](int32_t func_id) {
                             return get_function_bin_addr(func_id);
                         },

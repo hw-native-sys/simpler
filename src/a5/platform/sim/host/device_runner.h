@@ -33,6 +33,8 @@ public:
     DeviceRunner();
     ~DeviceRunner() override;
 
+    const char *cpu_sim_target_family() const override { return "a5sim"; }
+
     int prepare_execution(
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared

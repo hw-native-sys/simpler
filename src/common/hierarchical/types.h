@@ -153,6 +153,9 @@ struct RunState {
     std::atomic<RunPhase> phase{RunPhase::RESERVED};
     std::atomic<int32_t> active_tasks{0};
     std::atomic<int32_t> pending_accepts{0};
+    // Explicit observation is a run-lifetime demand, including tasks not yet
+    // dispatched when the waiter arrives. Publication reads it once per entry.
+    std::atomic<bool> observation_requested{false};
     mutable std::mutex completion_mu;
     std::condition_variable completion_cv;
     std::exception_ptr first_error;
@@ -160,6 +163,13 @@ struct RunState {
     bool submission_closed{false};
     bool submission_failed{false};
     bool lease_released{false};
+    // Protected by completion_mu. Physical ends release execution admission;
+    // semantic active_tasks and IO references remain until normal delivery.
+    struct PhysicalTask {
+        TaskSlot slot;
+        std::vector<uint8_t> ended_members;
+    };
+    std::vector<PhysicalTask> physical_tasks;
     // When this run reached a terminal phase. `node.post_fence_retirement`
     // measures from here to the end of release_run, the only work this process
     // does outside every other span.
@@ -336,9 +346,9 @@ struct WorkerCompletion {
     /**
      * Run-resource sets that endpoint reports it can hold, or 0 for no report.
      *
-     * A count of identities, never a byte figure, and read only from an entry
-     * whose terminal state this side has already observed — which is what makes
-     * the word this side's to read at all.
+     * A count of identities, never a byte figure. Physical END carries an
+     * atomic snapshot while the child retains the entry; semantic terminal
+     * transfers ownership of the entry and its final capacity report.
      */
     uint32_t admissible_run_resource_sets{0};
 };

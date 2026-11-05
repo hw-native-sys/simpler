@@ -19,7 +19,9 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from simpler.mpi_direct_cleanup import MpiDirectCleanupReport
 from simpler.mpi_direct_supervisor import run_supervisor
+from simpler.mpi_direct_topology import MpiDirectTopology
 from simpler.remote_l3_session import get_inner_handle
 from simpler.task_interface import (
     ArgDirection,
@@ -178,6 +180,32 @@ def controller(context) -> None:
                 worker.remote_free(handle)
 
 
+def _check_cleanup_reports(topology: MpiDirectTopology, reports: dict[int, MpiDirectCleanupReport]) -> None:
+    expected = [(0, None, "L4"), *((spec.rank, spec.worker_id, "L3") for spec in topology.executors)]
+    if set(reports) != {rank for rank, _worker_id, _role in expected}:
+        raise AssertionError(f"incomplete cleanup report ranks: {sorted(reports)}")
+    reference = reports[0]
+    if not reference.job_id or reference.session_id <= 0:
+        raise AssertionError("invalid cleanup job/session identity")
+    for rank, worker_id, role in expected:
+        report = reports[rank]
+        if (report.rank, report.worker_id, report.role, report.job_id, report.session_id) != (
+            rank,
+            worker_id,
+            role,
+            reference.job_id,
+            reference.session_id,
+        ):
+            raise AssertionError(f"rank {rank} cleanup identity mismatch: {report}")
+        if report.sequence != 2:
+            raise AssertionError(f"rank {rank} incomplete cleanup report: sequence={report.sequence}")
+        expected_command = "not_observed" if rank == 0 else "observed"
+        if report.command != expected_command:
+            raise AssertionError(f"rank {rank} shutdown command mismatch: {report.command}")
+        if report.cleanup != "succeeded" or report.failures:
+            raise AssertionError(f"rank {rank} cleanup did not succeed: {report}")
+
+
 def run(  # noqa: PLR0913 -- mirrors the two-host CLI surface used by the other L4 examples
     *,
     local_host: str,
@@ -192,6 +220,7 @@ def run(  # noqa: PLR0913 -- mirrors the two-host CLI surface used by the other 
     session_timeout: float = 120.0,
     mpirun_path: str = "mpirun",
     launcher_family: str = "auto",
+    health_timeout: float | None = None,
 ) -> int:
     local_ids = _parse_devices(local_devices, label="local")
     remote_ids = _parse_devices(remote_devices, label="remote")
@@ -216,16 +245,24 @@ def run(  # noqa: PLR0913 -- mirrors the two-host CLI surface used by the other 
             for index, (host, devices) in enumerate(((local_host, local_ids), (remote_host, remote_ids)))
         ],
     }
+    if health_timeout is not None:
+        topology["health_timeout_s"] = float(health_timeout)
     with tempfile.TemporaryDirectory(prefix="simpler-mpi-direct-") as directory:
         topology_path = Path(directory) / "topology.json"
         topology_path.write_text(json.dumps(topology), encoding="utf-8")
-        return run_supervisor(
+        reports: dict[int, MpiDirectCleanupReport] = {}
+        result = run_supervisor(
             str(topology_path),
             CONTROLLER_TARGET,
             mpirun_path=mpirun_path,
             launcher_family=launcher_family,
             python_executable=python_executable,
+            cleanup_reports=reports,
         )
+        if result == 0:
+            _check_cleanup_reports(MpiDirectTopology.from_dict(topology), reports)
+            print("vector_add_mpi_direct_l3 cleanup reports passed")
+        return result
 
 
 def _parse_args() -> argparse.Namespace:
@@ -240,6 +277,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--comm-profile", default="a3-fabric-v1")
     parser.add_argument("--startup-timeout", type=float, default=180.0)
     parser.add_argument("--session-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--health-timeout", type=float, default=None, help="Missing-heartbeat timeout; defaults to --session-timeout"
+    )
     parser.add_argument("--mpirun-path", default="mpirun")
     parser.add_argument("--launcher-family", choices=("auto", "openmpi", "mpich"), default="auto")
     return parser.parse_args()

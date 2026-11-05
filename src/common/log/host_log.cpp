@@ -32,6 +32,7 @@
 #include <semaphore.h>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 #include <unistd.h>
 
@@ -483,8 +484,32 @@ private:
 // binds the process-owned state. Missing binding is therefore observable as an
 // absent module stream rather than output filtered at the wrong threshold.
 SimplerHostLogState g_module_log_state{
-    static_cast<int32_t>(LogLevel::NUL), 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
+    static_cast<int32_t>(LogLevel::NUL), 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0, 0, 0, 0,
 };
+
+static_assert(std::is_trivial_v<SimplerHostTraceState> && std::is_standard_layout_v<SimplerHostTraceState>);
+
+void report_trace_failure(SimplerHostLogState *state, const char *operation, int error) {
+    if (__atomic_exchange_n(&state->trace_error_reported, UINT64_C(1), __ATOMIC_RELAXED) == 0) {
+        std::fprintf(stderr, "simpler STRACE: %s failed (%d); trace state unavailable\n", operation, error);
+    }
+}
+
+void initialize_trace_key(SimplerHostLogState *state) {
+    // Only the process owner's set_level/adopt_state reaches this singleton.
+    // The key survives all consumer unloads and writer stop/fork cycles. Its
+    // values contain no module pointers and their destructor belongs to libc.
+    struct ProcessTraceKey {
+        pthread_key_t key{};
+        int error{pthread_key_create(&key, std::free)};
+    };
+    static const ProcessTraceKey owner;
+    if (owner.error != 0) {
+        report_trace_failure(state, "pthread_key_create", owner.error);
+        return;
+    }
+    __atomic_store_n(&state->trace_key_plus_one, static_cast<uint64_t>(owner.key) + 1, __ATOMIC_RELEASE);
+}
 
 int32_t atomic_load_i32(const int32_t *value) { return __atomic_load_n(value, __ATOMIC_ACQUIRE); }
 
@@ -552,6 +577,7 @@ int HostLogger::adopt_state(SimplerHostLogState *state) {
     if (state == nullptr || !simpler::log::is_valid_level(atomic_load_i32(&state->threshold))) {
         return -1;
     }
+    initialize_trace_key(state);
     state_.store(state, std::memory_order_release);
     state_owner_.store(true, std::memory_order_release);
     return 0;
@@ -560,8 +586,36 @@ int HostLogger::adopt_state(SimplerHostLogState *state) {
 SimplerHostLogState *HostLogger::state() const { return state_.load(std::memory_order_acquire); }
 
 void HostLogger::set_level(LogLevel level, bool defer_writer) {
+    if (state_owner_.load(std::memory_order_acquire)) initialize_trace_key(state());
     atomic_store_i32(&state()->threshold, static_cast<int32_t>(level));
     if (!defer_writer) (void)start_writer();
+}
+
+SimplerHostTraceState *HostLogger::trace_state() {
+    SimplerHostLogState *shared = state();
+    const uint64_t encoded = atomic_load_u64(&shared->trace_key_plus_one);
+    if (encoded == 0) return nullptr;
+    const auto key = static_cast<pthread_key_t>(encoded - 1);
+    auto *trace = static_cast<SimplerHostTraceState *>(pthread_getspecific(key));
+    if (trace != nullptr) return trace;
+    trace = static_cast<SimplerHostTraceState *>(std::calloc(1, sizeof(SimplerHostTraceState)));
+    if (trace == nullptr) {
+        report_trace_failure(shared, "calloc", ENOMEM);
+        return nullptr;
+    }
+    const int error = pthread_setspecific(key, trace);
+    if (error != 0) {
+        std::free(trace);
+        report_trace_failure(shared, "pthread_setspecific", error);
+        return nullptr;
+    }
+    return trace;
+}
+
+uint64_t HostLogger::allocate_trace_invocation() {
+    SimplerHostLogState *shared = state();
+    if (atomic_load_u64(&shared->trace_key_plus_one) == 0) return 0;
+    return __atomic_add_fetch(&shared->trace_next_invocation, UINT64_C(1), __ATOMIC_RELAXED);
 }
 
 bool HostLogger::start_writer() {

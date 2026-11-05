@@ -2,6 +2,8 @@
 
 Read this when starting, testing, stopping or recovering continuous maintenance.
 The client supplies wakeups; [maintainer](../SKILL.md) supplies the decisions.
+Resolve [invocation mode](../SKILL.md#invocation-mode) before configuring wakeups:
+an unspecified mode defaults to one pass only when no ongoing agreement exists.
 Use the capabilities actually exposed by the installed client, not its model name.
 Check current client help and the official references below before relying on
 version-sensitive scheduling behavior.
@@ -33,7 +35,8 @@ A suitable scheduled prompt, adapted with the resolved paths and scope, is:
 
 > Read the maintenance agreement and persistent action table at the agreed
 > location. Use the maintainer skill to perform exactly one iteration for the
-> recorded scope and authority. Reconcile current evidence and pending actions,
+> recorded scope and authority, following its first/subsequent-pass procedure.
+> Recompute membership, compare against the table, refresh changed and pending work,
 > update the same table, and raise only new actionable findings or decisions.
 > Keep unchanged/no-action items quiet. Preserve unassessed work and failures.
 > Do not create another schedule or broaden authorization. Return after this

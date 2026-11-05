@@ -30,7 +30,8 @@ def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
     original = scene_test_module.finalize_diagnostic_outputs
 
     def finalize(case_label, output_prefix, **kwargs):
-        for capture in output_prefix.rglob("chip_swimlane_records.json"):
+        captures = output_prefix.rglob("chip_swimlane_records.json") if kwargs.get("chip_swimlane", 0) else ()
+        for capture in captures:
             raw = json.loads(capture.read_text())
             logs = list(capture.parent.glob("host_clock_alignment.*.log"))
             has_host = raw["metadata"].get("orchestrator_source") == "host"
@@ -55,7 +56,10 @@ def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
 
 
 FANOUT_WIDTH = 32
-EXPECTED_PROFILED_TASKS = 1 + FANOUT_WIDTH + 1 + 1  # root + children + final + terminal dummy
+# The terminal dummy is dependency-only. Such a node routes as an inline
+# dispatch that owns no trace cell, so the subtask count the trace array is
+# sized by excludes it and no profiled row ever carries it.
+EXPECTED_PROFILED_TASKS = 1 + FANOUT_WIDTH + 1  # root + children + final
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -123,7 +127,7 @@ class TestSchedulerPhases(SceneTestCase):
             aicore_rows = raw["aicore_tasks"]
             assert len(aicore_rows) == EXPECTED_PROFILED_TASKS, (
                 f"task timing covers {len(aicore_rows)} tasks, expected {EXPECTED_PROFILED_TASKS} "
-                "for the fanout/fanin DAG and terminal dummy"
+                "for the fanout/fanin DAG"
             )
 
             if level >= 2:
@@ -168,7 +172,8 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all("runtime" not in stream for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
+                # Ready Inbox tasks can all be launched through worksteal.
+                required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "refill", "idle"}
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )
@@ -277,10 +282,10 @@ class TestConsecutiveClockAlignment(SceneTestCase):
             if not captured_outputs:
                 archived = archive_root / output_prefix.name
                 shutil.copytree(output_prefix, archived)
-                captured_outputs[case_label] = (archived, output_prefix)
+                captured_outputs[case_label] = archived
                 shutil.rmtree(output_prefix)
             else:
-                captured_outputs[case_label] = (output_prefix, output_prefix)
+                captured_outputs[case_label] = output_prefix
 
         _verify_runtime_clock_logs(
             monkeypatch,
@@ -294,7 +299,7 @@ class TestConsecutiveClockAlignment(SceneTestCase):
         invocations = []
         for case in self._matching_cases(st_platform, request):
             label = _sanitize_for_filename(f"TestConsecutiveClockAlignment_{case['name']}")
-            output_prefix, original_prefix = captured_outputs[label]
+            output_prefix = captured_outputs[label]
             captures = list(output_prefix.rglob("chip_swimlane_records.json"))
             assert len(captures) == 1
             capture = captures[0]
@@ -304,8 +309,7 @@ class TestConsecutiveClockAlignment(SceneTestCase):
             assert alignment["status"] == "bounded"
             rank_metadata = merged["metadata"]["ranks"]
             assert len(rank_metadata) == 1
-            expected_input = original_prefix / capture.relative_to(output_prefix)
-            assert rank_metadata[0]["input"] == str(expected_input)
+            assert rank_metadata[0]["input"] == str(capture.relative_to(output_prefix))
             placement = rank_metadata[0]["placement"]
             pid, inv = placement["outer_pid"], placement["outer_inv"]
             assert pid != os.getpid(), "the producer must be a forked ChipWorker"

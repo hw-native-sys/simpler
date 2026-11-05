@@ -321,6 +321,15 @@ public:
         return Release::Released;
     }
 
+    /** Forget backing invalidated by a confirmed device reset; no device calls. */
+    void abandon_after_device_reset() noexcept {
+        detach();
+        device_banks_ = nullptr;
+        host_banks_ = nullptr;
+        bytes_ = 0;
+        backing_retained_ = false;
+    }
+
     /**
      * True while an allocation this object made is still mapped after a close.
      *

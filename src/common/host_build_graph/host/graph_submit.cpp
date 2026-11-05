@@ -308,7 +308,7 @@ bool graph_submit_outer(
     );
     orch->tensor_pool_cursor += tensor_slots;
     orch->scalar_pool_cursor += scalar_span;
-    slot.active_mask = ActiveMask{};
+    slot.active_mask = LaneMask{};
     slot.task_attrs = TaskAttrs{};
     slot.total_required_subtasks = 0;
     // A shell places no block, but this must stay positive: an early-released
@@ -487,7 +487,7 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
 }  // namespace
 
 TaskOutputTensors graph_record_submit_sub_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     ORCH_PHASE_START();
@@ -544,8 +544,7 @@ TaskOutputTensors graph_record_submit_sub_task(
     // recording unsupported and makes commit fail-fast, rather than baking a
     // truncated or negative count into the cached Definition (which the device
     // would expand into a sub-task that never completes).
-    const int32_t required_subtasks =
-        static_cast<int32_t>(task.logical_block_num) * __builtin_popcount(active_mask.core_mask());
+    const int32_t required_subtasks = static_cast<int32_t>(task.logical_block_num) * active_mask.count();
     if (task.logical_block_num <= 0 || required_subtasks > std::numeric_limits<int16_t>::max()) {
         recording.unsupported = true;
         task.total_required_subtasks = 0;
@@ -777,7 +776,9 @@ TaskOutputTensors graph_record_submit_sub_task(
     // Published last: until this advances, the slot is not part of the recording, so
     // nothing that scans the recorded tasks can see the task being built.
     recording.task_count = task_index + 1;
-    ORCH_PHASE_END(HostPhaseKind::OrchRecordSubTask, TaskId::to_uint64(task_id));
+    ORCH_PHASE_END_WITH_INDEX(
+        HostPhaseKind::OrchRecordSubTask, TaskId::to_uint64(task_id), g_active_graph_entry->submit_idx
+    );
     return result;
 }
 
@@ -787,7 +788,7 @@ GraphScopeResult OrchestratorState::graph_begin(uint64_t graph_key, const GraphT
         rejected.has_error = true;
         return rejected;
     }
-    ORCH_PHASE_START_SPANNING();
+    ORCH_PHASE_START_SPANNING(g_active_graph_entry != nullptr ? g_active_graph_entry->submit_idx : g_orch_submit_idx);
     const GraphScopeResult result = graph_begin_inner(graph_key, args);
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphBegin, graph_key);
     return result;
@@ -908,6 +909,9 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
     // up here would sit on the submitting thread, between two outer shells.
     auto entry = std::make_unique<GraphInflightRecording>();
     entry->graph_key = graph_key;
+#if SIMPLER_DFX
+    entry->submit_idx = g_orch_submit_idx;
+#endif
     // The boundary is built once, here, and only read afterwards -- by the recorder that
     // picks this entry up, and by later same-key submissions comparing against it.
     //
@@ -1098,7 +1102,7 @@ bool OrchestratorState::graph_end() {
         // The counts are not copied: they are in the image, where the device checks this
         // invocation's argument counts against them.
         record.boundary_match_info = recording->bound_boundary().match_info;
-        ORCH_PHASE_END(HostPhaseKind::OrchBuildDefinition, recording->task_count);
+        ORCH_PHASE_END_WITH_INDEX(HostPhaseKind::OrchBuildDefinition, recording->task_count, entry->submit_idx);
     }
     const GraphDefinition *header = built ? graph_record_definition(*state, record) : nullptr;
     if (header == nullptr) {
@@ -1133,7 +1137,7 @@ bool OrchestratorState::graph_end() {
 // Join every recording in flight and back-patch all deferred shells in submit
 // order. Orchestration completion is the only normal-path barrier.
 void OrchestratorState::graph_commit() {
-    ORCH_PHASE_START_SPANNING();
+    ORCH_PHASE_START_SPANNING(g_active_graph_entry != nullptr ? g_active_graph_entry->submit_idx : g_orch_submit_idx);
     graph_commit_inner();
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphCommit, 0);
 }

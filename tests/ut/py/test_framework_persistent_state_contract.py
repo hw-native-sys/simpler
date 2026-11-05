@@ -24,7 +24,7 @@ from simpler.task_interface import DataType, TensorArgType, TensorTransfer
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CONSUMER = _ROOT / "examples/workers/l2/framework_eager/persistent_state.py"
-_ST = _ROOT / "tests/st/a2a3/framework_eager/test_persistent_state.py"
+_ST = _ROOT / "tests/st/worker/framework_eager/test_persistent_state.py"
 
 
 def _load(path, name):
@@ -246,6 +246,7 @@ def test_caller_frame_owns_all_backing_after_construction_scope_and_gc(consumer,
 
 def _summary(runtime, queue) -> dict:
     return dict(
+        platform="a2a3",
         runtime=runtime,
         task_queue=queue,
         calls=12,
@@ -277,7 +278,9 @@ def _invoke_st(tmp_path, monkeypatch, records, runtime, queue, code=0):
         return SimpleNamespace(returncode=code, stdout=stdout, stderr="")
 
     monkeypatch.setattr(module, "subprocess", SimpleNamespace(run=run))
-    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda _: "0"))
+    request = SimpleNamespace(
+        config=SimpleNamespace(getoption=lambda name: {"--device": "0", "--platform": "a2a3"}[name])
+    )
     module.test_framework_persistent_state(runtime, queue, tmp_path, tmp_path, request)
 
 

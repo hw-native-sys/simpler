@@ -242,3 +242,121 @@ def test_runtime_configuration_survives_bridge(bridge, artifact):
     manifest["callable_spec_sha256"] = _digest(path)
     manifest_path.write_text(json.dumps(manifest))
     assert bridge.inspect_artifact(artifact).runtime_config == {"runtime": "host_build_graph", "aicpu_thread_num": 6}
+
+
+@pytest.fixture
+def stage0_release(artifact):
+    (artifact / "hbg_artifact_manifest.json").unlink()
+    child = artifact / "next_levels/decode_fwd"
+    (child / "prebuilt").mkdir()
+    for index in range(32):
+        (child / f"prebuilt/kernel_{index}.bin").write_bytes((child / f"cache/incore_{index}.bin").read_bytes())
+    (child / "prebuilt/orchestration.bin").write_bytes((child / "orchestration/decode_fwd.so").read_bytes())
+    metadata_path = artifact / "distributed_meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["schema"] = 3
+    for index, param in enumerate(metadata["params"]):
+        param["direction"] = "Out" if index in (20, 23, 24) else "In"
+    for index, name in ((11, "k_cache"), (12, "v_cache")):
+        metadata["params"][index].update(name=name + "__ssa_v0", direction="InOut")
+    metadata_path.write_text(json.dumps(metadata))
+    signature = "[D.IN] * 11 + [D.INOUT, D.INOUT] + [D.IN] * 7 + [D.OUT, D.IN, D.IN, D.OUT, D.OUT]"
+    (child / "kernel_config.py").write_text(
+        "from pathlib import Path\nfrom simpler.task_interface import ArgDirection as D\n"
+        "R = Path(__file__).parent\n"
+        'RUNTIME_CONFIG = {"runtime": "host_build_graph"}\n'
+        'ORCHESTRATION = {"source": str(R / "orchestration/decode_fwd.cpp"), '
+        f'"function_name": "entry", "signature": {signature}}}\n'
+        'KERNELS = [{"func_id": i, "name": f"kernel_{i}", '
+        '"source": str(R / "kernels/vector.cpp"), "core_type": "aiv", '
+        '"signature": [D.IN, D.OUT]} for i in range(32)]\n'
+    )
+    registrations = [
+        {
+            "func_id": index,
+            "name": f"kernel_{index}",
+            "signature": ["IN", "OUT"],
+            "binary": {
+                "path": f"prebuilt/kernel_{index}.bin",
+                "sha256": _digest(child / f"cache/incore_{index}.bin"),
+                "size": 1,
+            },
+        }
+        for index in range(32)
+    ]
+    (child / "binary_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "platform": "a2a3",
+                "runtime_name": "host_build_graph",
+                "kernels": registrations,
+                "orchestration": {
+                    "binary": {
+                        "path": "prebuilt/orchestration.bin",
+                        "sha256": _digest(child / "orchestration/decode_fwd.so"),
+                        "size": 24,
+                    }
+                },
+            }
+        )
+    )
+    (child / "cache/binary_context.json").write_text(
+        json.dumps(
+            {
+                "context": {"runtime_name": "host_build_graph"},
+                "files": {"orchestration/decode_fwd.so": _digest(child / "orchestration/decode_fwd.so")},
+            }
+        )
+    )
+    return artifact
+
+
+def test_stage0_release_preserves_32_registrations_and_kv_inout(bridge, stage0_release):
+    inspected = bridge.inspect_artifact(stage0_release)
+    assert len(inspected.callable_spec["incores"]) == 32
+    assert inspected.callable_spec["orchestration"]["signature"][11:13] == [ArgDirection.INOUT] * 2
+
+
+@pytest.mark.parametrize("count", [31, 33])
+def test_stage0_release_rejects_incorrect_registration_count(bridge, stage0_release, count):
+    path = stage0_release / "next_levels/decode_fwd/binary_manifest.json"
+    binary = json.loads(path.read_text())
+    binary["kernels"] = (binary["kernels"] + binary["kernels"][:1])[:count]
+    path.write_text(json.dumps(binary))
+    with pytest.raises(ValueError, match="exactly 32"):
+        bridge.inspect_artifact(stage0_release)
+
+
+def test_stage0_release_rejects_metadata_direction_mismatch(bridge, stage0_release):
+    path = stage0_release / "distributed_meta.json"
+    metadata = json.loads(path.read_text())
+    metadata["params"][11]["direction"] = "In"
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="direction"):
+        bridge.inspect_artifact(stage0_release)
+
+
+def test_release_checks_manifest_named_binary(bridge, stage0_release):
+    (stage0_release / "next_levels/decode_fwd/prebuilt/kernel_0.bin").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="checksum"):
+        bridge.inspect_artifact(stage0_release)
+
+
+@pytest.mark.parametrize("name", ["kernel_config.py", "kernels/vector.cpp"])
+def test_stage0_compile_rejects_changed_sources(bridge, stage0_release, name):
+    inspected = bridge.inspect_artifact(stage0_release)
+    path = stage0_release / "next_levels/decode_fwd" / name
+    path.write_text(path.read_text() + "\n# changed\n")
+    with pytest.raises(ValueError, match="source changed"):
+        inspected.compile()
+
+
+def test_stage0_config_cannot_escape_the_release(bridge, stage0_release, tmp_path):
+    config = stage0_release / "next_levels/decode_fwd/kernel_config.py"
+    external = tmp_path.parent / f"{tmp_path.name}-external-config.py"
+    external.write_text("raise RuntimeError('must not execute')")
+    config.unlink()
+    config.symlink_to(external)
+    with pytest.raises(ValueError, match="escapes"):
+        bridge.inspect_artifact(stage0_release)

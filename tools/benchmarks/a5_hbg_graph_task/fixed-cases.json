@@ -1,0 +1,146 @@
+{
+  "source": "tools/benchmark_rounds.sh A5_HBG_EXAMPLE_CASES",
+  "scenes": [
+    {
+      "path": "tests/st/a5/host_build_graph/alternating_matmul_add/test_alternating_matmul_add.py",
+      "class": "TestAlternatingMatmulAddHostBuildGraph",
+      "case": "Case1",
+      "params": {
+        "batch": 500,
+        "M": 4,
+        "N": 4,
+        "matmul_batch": 4,
+        "add_batch": 4
+      },
+      "config": {},
+      "manual": true,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "固定 benchmark_rounds.sh 无 Graph 集合"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/paged_attention_unroll/test_paged_attention_unroll.py",
+      "class": "TestPagedAttentionUnrollHostBuildGraph",
+      "case": "Case1",
+      "params": {
+        "batch": 256,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": false,
+      "markers": [],
+      "measure": true,
+      "selection": "固定 benchmark_rounds.sh 无 Graph 集合"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/paged_attention_unroll/test_paged_attention_unroll.py",
+      "class": "TestPagedAttentionUnrollHostBuildGraph",
+      "case": "Case2",
+      "params": {
+        "batch": 64,
+        "num_heads": 64,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 64,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": true,
+      "markers": [],
+      "measure": true,
+      "selection": "固定 benchmark_rounds.sh 无 Graph 集合"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/batch_paged_attention/test_batch_paged_attention.py",
+      "class": "TestBatchPagedAttentionHostBuildGraph",
+      "case": "Case1",
+      "params": {
+        "batch": 256,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": false,
+      "markers": [],
+      "measure": true,
+      "selection": "固定 benchmark_rounds.sh 无 Graph 集合"
+    },
+    {
+      "path": "examples/a5/host_build_graph/benchmark_bgemm/test_benchmark_bgemm.py",
+      "class": "TestBenchmarkBgemmHostBuildGraph",
+      "case": "Case0",
+      "params": {
+        "matmul_add_task_num": 500,
+        "incore_data_size": 128,
+        "incore_loop": 4,
+        "grid_k": 2
+      },
+      "config": {},
+      "manual": [
+        "a5sim"
+      ],
+      "markers": [],
+      "measure": true,
+      "selection": "固定 benchmark_rounds.sh 无 Graph 集合"
+    },
+    {
+      "path": "examples/a5/host_build_graph/paged_attention_unroll_manual_scope/test_paged_attention_unroll_manual_scope.py",
+      "class": "TestPagedAttentionUnrollManualScopeHostBuildGraph",
+      "case": "Case1",
+      "params": {
+        "batch": 256,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": false,
+      "markers": [],
+      "measure": true,
+      "selection": "固定 benchmark_rounds.sh 无 Graph 集合"
+    },
+    {
+      "path": "examples/a5/host_build_graph/paged_attention_unroll_manual_scope/test_paged_attention_unroll_manual_scope.py",
+      "class": "TestPagedAttentionUnrollManualScopeHostBuildGraph",
+      "case": "Case2",
+      "params": {
+        "batch": 64,
+        "num_heads": 64,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 64,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": true,
+      "markers": [],
+      "measure": true,
+      "selection": "固定 benchmark_rounds.sh 无 Graph 集合"
+    }
+  ],
+  "exclusions": {
+    "spmd_paged_attention": "用户指定排除，无调度逻辑",
+    "qwen3_14b_decode": "Graph 模型单独采集主线基线与候选对照；两臂使用同一份已修复编译问题的 A5 产物，不计入无 Graph 集合"
+  }
+}

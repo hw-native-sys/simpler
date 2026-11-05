@@ -89,6 +89,12 @@ typedef struct SimplerHostLogState {
     uint64_t sink_producer_state;
     uint64_t dropped_by_reason[SIMPLER_HOST_LOG_DROP_REASON_COUNT];
     uint64_t reported_drop_count;
+    /* Process-lifetime pthread key plus one; zero means tracing is unavailable.
+     * Only the process owner creates it. Values use calloc and libc free at
+     * thread exit; consumer SOs neither own the key nor register callbacks. */
+    uint64_t trace_key_plus_one;
+    uint64_t trace_error_reported;
+    uint64_t trace_next_invocation;
 } SimplerHostLogState;
 
 typedef int (*SimplerHostLogBindStateFn)(SimplerHostLogState *state);

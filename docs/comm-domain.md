@@ -46,8 +46,9 @@ L3 and L4 use `allocate_domain(members=...)`, `get_or_allocate_domain(...)`,
 `get_domain(name)` and `release_domain(handle)`, returning the same
 `CommDomainHandle`. L3 members are logical chip worker ids, such as `[1, 0]`;
 L4 members are `(node_worker_id, chip_worker_id)` pairs. Order defines domain
-rank. `member(rank)` returns topology metadata; `local_context(rank)` returns
-an L3 creator's local mapping. Legacy `handle[chip_id]` keeps chip-id semantics.
+rank. `member(rank).buffers[name]` provides the same logical Buffer and `.tensor(...)`
+interface at both levels. `local_context(rank)` requires a mapping on the current node.
+Legacy `handle[chip_id]` keeps chip-id semantics.
 For L3 member metadata, `node_worker_id=-1` denotes the creator's own node.
 
 Handle attributes and context/buffer mappings are read-only metadata by contract;
@@ -61,8 +62,8 @@ domain = orch.get_or_allocate_domain(
     buffers=[CommBufferSpec("payload", "float32", 1024, 4096)],
     retain_after_run=True,
 )
-# L3 only: keep the existing node-local Buffer/Tensor access path.
-payload = domain.local_context(0).buffers["payload"]
+payload = domain.member(0).buffers["payload"]
+tensor = payload.tensor([1024], DataType.FLOAT32)
 ```
 
 `allocate_domain` rejects a live name. `get_or_allocate_domain` returns the
@@ -75,43 +76,51 @@ missing. `allocate_global_domain` and `release_global_domain` are compatibility
 wrappers; `workers=` remains the legacy L3 allocation spelling.
 
 Domain creation and configuration reuse occur in an orchestration callback.
-L3 creation, reuse and staging precede its first task submission and use the
-existing control admission gate. L4 retains its existing control-plane paths
-without adding a first-task restriction.
+L3 creation and staging precede its first submission; a reuse hit performs no device control and remains valid afterwards.
 A successful run preserves domains created with `retain_after_run=True`.
-Each subsequent run consuming domain Buffers must call `get_domain` or
-`get_or_allocate_domain`, then obtain its local Buffers again. Passing a
-previous run's domain Buffers as arguments or submitting them directly from
-a closure is unsupported.
+Later runs can submit cached Buffers/Tensors directly. Submission and ordinary copies enroll
+the current run; release waits for it and its descendants, while a failed run closes its used domains.
 Use `with` only when the scope should release the shared handle: context exit
 releases a reused handle too. After release, callers must not submit new uses
-of previously obtained Buffers; no additional per-submit domain check is made.
+of previously obtained Buffers; lookup, submission and local resolution reject revoked references.
 Physical release still waits for accepted tasks and their children to complete.
 After run completion, retained handles can be inspected, copied through a
-matching Orchestrator and released serially outside a callback; release then
+matching Orchestrator and released serially outside a callback; successful release
 reclaims the backend resources synchronously and repeated release is a no-op.
-Release follows the handle's existing callback to its creating Worker; callers
-must pair copy operations with the matching Orchestrator and handle.
-Concurrency follows the existing backend contracts; no additional
-concurrent-access or cross-Worker misuse checks are added.
-`Worker.close()` frees remaining owned domains after its existing lease/fence drain.
+Only the creating Worker owns release. Lookup, creation, publication and release share
+the callback serializer; concurrent matching requests share one transaction and conflicts fail.
+`Worker.close()` attempts to free remaining owned domains after its existing lease/fence drain.
+If device completion or reclamation is unconfirmed, the domain remains released
+but not freed; its cleanup obligation stays tracked and is reported, while
+independent worker-tree cleanup continues.
 `Worker.live_domains` includes both backends.
 
 `copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
-bounds checks. They synchronously stage data and do not wait for already queued
-DAG work. L3 staging precedes task submission and reuses ordinary VMM Buffer
+bounds checks. They synchronously stage data without issuing an implicit run/DAG
+fence. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
-returns the slice's window offset and byte size. `mapping_size` is the requested
-extent on the local L3 backend and the returned mapping extent on L4.
+returns the slice's window offset and byte size. `requested_window_size` preserves the request;
+`mapping_size` reports the backend's actual mapping extent. Complete buffer definitions remain available.
 
-This interface does not add transparent L4-created Tensor forwarding or a
-cross-session domain reference. L4 handles expose layout and topology, while
-receiving L3 code continues to call `get_global_domain(domain_id)` and obtains
-its existing local Buffer objects there. No device pointer from another node
-is exposed. Completion/error handling and native teardown keep the existing
-backend protocols; this interface adds no new proof of device quiescence for
-an ambiguous native failure.
+L4 Buffer/Tensor views reach their owning chip through local or remote L3s, preserving canonical
+identity without exposing remote device addresses. Pass an immutable `CommDomainRef` (creator instance,
+domain id, generation) across nodes; `get_domain(domain.ref)` borrows an established domain using the
+same handle type, with `release()` and `with` rejected. Pass ref/rank explicitly for kernel context
+and resolve it through `local_context(rank)`. Rebuilding a name creates new domain and Buffer identities.
+Scalar-only ref/context arguments require `get_domain(name_or_ref)` in the owner's current callback
+to enroll that run. A child lookup alone does not enroll the owner's run:
+
+```python
+# Owner callback, before forwarding ref/rank as control scalars:
+domain = orch.get_domain("tp")
+ref, rank = domain.ref, 0
+# Child callback, after decoding those scalars:
+context = child_orch.get_domain(ref).local_context(rank)
+```
+
+Failed or unknown release keeps cleanup debt visible and `freed=False` while transport/native teardown
+continues; child exit alone does not prove device reclamation.
 
 ### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
 
@@ -151,9 +160,10 @@ from `RemoteWorkerSpec`; a local L3 reads the same fields from its `Worker`
 configuration. All participating nodes must use the same profile.
 
 An MPI-launched group registered with `add_mpirun_worker_group` uses the same
-member contract. Rank 0 writes the group manifest before launch, every MPI rank
-must publish READY before the L4 parent exposes the returned worker ids, and
-the `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
+member contract. Registration returns configuration ids and publishes the group
+atomically; it does not establish readiness. The parent writes the manifest
+before launch, and every MPI rank must publish READY before native attach.
+The `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
 must include the complete returned group; their order still defines dense
 domain ranks. A full MPI group exchanges descriptors rank-side over an MPI
 collective, so the L4 import fanout is skipped; a partial group falls back to
@@ -181,6 +191,62 @@ The control flow is:
 `PREPARE_EXPORT`, `IMPORT`, `COMMIT`, and `ABORT`. Runtime data movement does
 not resend it: `COPY_TO_DOMAIN`/`COPY_FROM_DOMAIN` use
 `GlobalDomainCopyCommand`, and teardown uses `GlobalDomainReleaseCommand`.
+
+### MPI session identity and availability
+
+A Direct MPI controller associates one job-wide `session_id` with its static
+rank/worker topology and an owner-local `session_epoch`, initially one. The
+nonzero session identity occupies the full uint64 range and is shared by all
+executor ranks. All executor endpoints must attach successfully before that
+generation becomes available. Startup rollback and Worker close retire the
+session before native teardown.
+
+The endpoint registry stores an immutable `MpiSessionView` for each executor's
+host and device endpoints. It identifies the owner path, job session, epoch,
+rank and worker, together with snapshot availability. Records must match the
+registry's owner nonce and directory version. `session_epoch` versions the MPI
+session view; `registry_epoch` versions the owner's endpoint directory. A
+directory change alone does not advance the session epoch.
+
+Registry lookup, planning and region materialization observe a coherent native
+hub snapshot containing closure, failure and unavailable routes. A newly
+observed change advances the session epoch and invalidates the cached registry.
+Repeated observations do not advance it again. An observation captured for a
+different session object or epoch cannot overwrite the current state. Hub
+failure or closure makes the session unavailable; a cancelled route is refused
+when selected. Native errors can still terminate the entire MPI world.
+
+Planning and materialization recheck selected session identities and directory
+versions at their validation boundaries. Old snapshots must be refreshed after
+a change; an old session epoch is refused even if the directory version matches.
+A standalone resolver checks snapshot availability; live validation belongs to
+the owning Worker. Nested MPI configuration describes endpoints but does not
+establish their availability.
+
+Direct MPI topology accepts an optional positive finite `health_timeout_s`.
+When absent or `null`, it uses `session_timeout_s`. The periodic
+`heartbeat_interval_s` must be shorter than the effective health timeout. The
+controller checks each initialized, uncancelled route's health independently of
+pending commands, including idle periods. Command deadlines keep their own
+timeout; receiving heartbeats does not extend them. Changing the health timeout
+does not change startup or close wait budgets.
+
+Native hub failure, route cancellation and closure publish transport state and
+wake waiting requests independently of Python epoch observation. Region checks
+do not add a transport notification path or a heartbeat loop. Task and control
+admission retain their lifecycle and backend checks.
+
+After a valid delegated `ALLOCATED` reply, region materialization binds the
+release identity before rechecking session availability. A registry or session
+refusal aborts materialization through that release edge; refusal alone does
+not latch a fatal delegated-session error. Invalid allocation replies are
+fatal; incomplete release records an unreclaimable-resource error and prevents
+further work.
+
+Session invalidation does not establish that processes, device contexts or
+remote resources have been released. The epoch is an owner-local validation
+boundary; transport and domain commands carry their own identities. It does
+not implement same-session reconnection or cross-generation wire validation.
 
 ### Attachment axis
 
@@ -254,15 +320,16 @@ queues the backend free; the real free runs after the run fence, when every
 task that could reference the window has completed.
 
 When a retained domain is released serially after its run has completed,
-the backend free is synchronous: `release()` returns with `freed=True`,
+the backend free is synchronous: successful `release()` returns with `freed=True`,
 including release at context-manager exit. Repeated release is a no-op.
 Use `handle.released` to guard against accidental reuse; use `handle.freed`
 to check physical teardown.
 
 Cleanup is **failure-safe**: even if a chip task fails and the run wait
-re-raises, `Worker.run` still executes pending releases and sweeps any live
-domains the orch fn forgot to release (LIFO), so a failed run cannot strand
-backend allocations into the next run.
+re-raises, `Worker.run` still attempts pending releases and sweeps any live
+domains the orch fn forgot to release (LIFO). Failed or unconfirmed releases
+remain tracked and prevent a successor run from using unresolved device state;
+neither a failed wait nor child-process exit proves physical reclamation.
 
 ---
 
@@ -300,7 +367,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA or RDMA as an opt-in alternative |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; RDMA retains its optional build gate |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -347,7 +414,7 @@ and is warned about twice: by the runtime builder and again at Worker init. A
 warmup whose device launch or sync *fails* is not in this category at all — it
 fails Worker init, because the card it faulted on must not reach the first run.
 
-Communication-domain allocation does not create SDMA streams or carry the
+On a2a3, communication-domain allocation does not create SDMA streams or carry the
 workspace through `CommContext`. Because an SDMA-enabled Worker's 48 STARS
 streams sit in the device fault/sync domain, a fault on that Worker slows its
 teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
@@ -355,17 +422,127 @@ so ordinary workloads are unaffected — see
 [docs/investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md)
 and issue #1425. `enable_sdma` is honored by **both** a2a3 onboard runtimes: the
 PTO-SDMA provider is compiled into every a2a3 onboard `host_runtime.so`, so the
-gate is the platform, not the runtime. Only `tensormap_and_ringbuffer` is
-exercised with it, so host-build-graph's path from a provisioned address to a
-kernel's `get_dma_workspace` is unverified rather than closed. Simulation, a5,
-and provider-disabled builds fail Worker init fast when it is set. A5 provisions
-its communication-context SDMA workspace by default; this is separate from
+gate is the platform, not the runtime. Both schedulers copy the resident
+workspace addresses into every core's `GlobalContext`; kernels read them with
+`get_dma_workspace(args, kind)`. Invalid kinds and unprovisioned engines return
+`nullptr`. The HBG [prefetch demo](../examples/a2a3/host_build_graph/prefetch_async_demo/)
+reuses the TMR prefetch kernel to exercise address injection and event completion.
+A2/A3 simulation provisions inert scratch for address-injection tests without creating
+SDMA streams; its prefetch is a no-op. A5 onboard and provider-disabled builds fail Worker
+init fast when `enable_sdma` is set. A5 provisions
+its communication-context SDMA workspace only when a domain explicitly requests it;
+this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
 
-On a5, `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` selects the HNS1825 RDMA
-workspace overlay instead. RDMA is mutually exclusive with the SDMA and URMA
-overlays because `CommContext` exposes a single `workSpace`/`workSpaceSize`
-pair. The first RDMA integration only supports `orch.allocate_domain()`
+On a5, SDMA and URMA providers are always compiled. RDMA remains optional through
+`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`, defaulting to OFF. Compilation alone creates
+no streams or domain resources. `allocate_domain` and `get_or_allocate_domain`
+create synchronous mapped-window communication by default, without initializing
+any asynchronous provider. `workspace_engines=("sdma", "urma")` or `("rdma",)`
+adds the requested asynchronous resources. An omitted parameter and an empty
+sequence have identical meaning and can reuse the same retained domain.
+The native `comm_alloc_domain_windows` takes the corresponding bitmask directly;
+zero requests synchronous mappings only. Explicit asynchronous engine selection
+is supported on L3 A5; A2/A3 keeps its Worker-owned SDMA path. Simulation and L4
+domains support synchronous mappings, with no domain-owned asynchronous engines.
+
+Each `CommContext` stores a POD array `workspaces`, indexed by
+`CommWorkspaceKind::{SDMA, URMA, RDMA}`. Kernels use
+`comm_workspace<CommWorkspaceKind::URMA>(*ctx)` (or the corresponding engine),
+whose template argument is checked at compile time. Host publication rejects
+out-of-range enum values before indexing. An absent backend has zero address
+and size.
+
+Before submitting a URMA task, obtain its context through the checked host API:
+
+```python
+args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
+```
+
+The required engines must have been selected when allocating that live domain.
+For a mixed task use `workspace_engines=("sdma", "urma")`. A missing or different
+engine, a released domain, an unknown worker or a null context raises before
+submission. Scalar-only context use also retains the domain for the current run.
+The engine set records successful native initialization; it is not inferred from
+an environment variable. Native allocation rejects a null URMA workspace address
+or zero size before publishing the context, and propagates initialization failures
+as host errors. Callers must treat handle/context metadata as read-only and obtain
+the checked context in every orchestration run rather than caching its raw address.
+
+URMA requests require A5 TMR L3 domains with ranks in dense prefix order. Simpler
+does not impose a two-rank minimum: single-rank requests reach the provider and
+initialization failures are reported on the host. The currently pinned PTO URMA
+manager rejects single-rank initialization. The successful
+[single-device CANN Hcomm loopback probe](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)
+uses two endpoints and has not been integrated into that provider; the provider
+restriction is not a hardware limitation. HBG URMA completion, arbitrary subsets
+and L4 async domains are unsupported.
+The legacy `device_ctx` field remains a raw address for synchronous consumers;
+it does not declare or validate an asynchronous engine requirement. No compiled
+capability query or `enable_urma` initialization switch is needed.
+
+The context is simpler's own 1088-byte host/device ABI. Rank metadata starts
+at offset zero; there is no legacy workspace pair or PTO-compatible prefix.
+PTO session builders receive the chosen workspace address explicitly and do
+not parse this context.
+
+All runtime libraries, bindings, communication-context producers and compiled
+kernels must come from the same simpler build and be updated together. This
+follows the same-build contract used by `BufferDescriptor` and
+`SimplerKernelInvocationHeader`. There is no per-context ABI version check,
+layout negotiation or support for mixing old and new runtime artifacts, including
+on global-domain paths. Rebuild/reinstall the complete artifact set after a
+layout or C API change. The global-domain descriptor wire version is a separate
+protocol field and does not establish build compatibility.
+
+SDMA domains reference the shared CommHandle-owned manager; URMA/RDMA managers
+belong to individual dynamic domains. URMA/RDMA deferred-completion kernels
+remain specific to `tensormap_and_ringbuffer`; workspace storage does not add
+completion backends to `host_build_graph`. Domain cleanup does not release another
+domain's workspace or the shared SDMA resource.
+
+Each A5 URMA domain owns an HCCL subcommunicator, including its registrations
+and channels. The L2 host process keeps that owner from the first initialization
+step through rollback or release. After the run fence, release checks every
+active queue's BB and CQE completion counters, waits for peer quiescence, destroys
+the domain communicator, and then releases its workspace and windows. A healthy
+domain is reclaimed without waiting for the base communicator or Worker to close.
+The additional communicator costs initialization time and HCCL resources per live
+domain; synchronous and SDMA-only domains do not create it.
+
+If any allocation participant fails before the domain is published, the parent
+joins the allocation requests and locally aborts every reported A2/A3 or A5 owner,
+including failed participants. Failed initialization keeps exported physical
+memory alive until peers finish importing; its ownership flag does not publish
+a usable domain. This rollback does not use a normal release collective.
+The A2/A3 Fabric-to-IPC fallback can discard its temporary Fabric window only
+before publishing the export; failed initialization after publication keeps the
+window owned until abort.
+Allocation IDs cannot be reused during an A5 communicator's lifetime. Used-ID
+bookkeeping remains until communicator close; device windows and communication
+resources do not. Python allocates fresh IDs automatically.
+
+On A5, an unconfirmed drain, handshake or communication destruction is reported as an
+error. The affected owner, its stream and device environment remain retained,
+new work is refused, and later close does not blindly retry uncertain handles.
+This is a terminal failure of that Worker, not successful resource reclamation.
+
+The workspace coverage is split by platform and execution layer:
+
+| Platform / layer | Supported behavior | Coverage |
+| ---------------- | ------------------ | -------- |
+| A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
+| A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
+| A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
+| A2/A3 | Existing Worker-owned SDMA and `enable_sdma` behavior | Existing SDMA and single-card prefetch tests; domain allocation does not provision SDMA |
+| Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |
+
+The A5 mixed hardware examples use the full two-rank communicator. They do not
+qualify arbitrary URMA subset communicators or multiple producers sharing a
+peer queue. RDMA transfer examples exercise their own low-address domains;
+joint compilation alone does not qualify same-domain RDMA/SDMA/URMA requests.
+
+RDMA selection uses the HNS1825 backend. The RDMA integration only supports `orch.allocate_domain()`
 dynamic domains; it does not support `comm_derive_context()`, sim platforms,
 a2a3, or `host_build_graph`. RDMA kernels derive remote WQE addresses from the
 RDMA workspace peer MR base plus a local-window offset, not from
@@ -373,7 +550,7 @@ RDMA workspace peer MR base plus a local-window offset, not from
 `aclrtMalloc` buffer the HNS1825 NIC can DMA to, and peers are reached over
 RoCE by rkey + VA.
 
-**RDMA-only domain (caller precondition).** Under the RDMA overlay the domain
+**RDMA-only domain (caller precondition).** An RDMA domain's
 allocation path intentionally skips peer import and mapping: `windowsIn[peer]`
 stays zero for every remote rank, and there is no locally addressable mapped VA
 for a peer's window. A peer MR address (`rkey` + VA) is not a substitute — only

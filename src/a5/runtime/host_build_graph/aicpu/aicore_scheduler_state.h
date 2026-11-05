@@ -13,6 +13,7 @@
 
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler/scheduler_graph.h"
 
 inline bool aicore_scheduler_runtime_mode_is_resident(uint32_t mode) {
     return mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING || mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
@@ -90,4 +91,32 @@ inline SchedulerRunControl *aicore_scheduler_run_control(SchedulerWorkerContext 
     void *state_base = aicore_scheduler_state_base(context);
     return state_base == nullptr ? nullptr :
                                    scheduler_state_at<SchedulerRunControl>(state_base, context->run_control_offset);
+}
+
+inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerContext &context) {
+    return {
+        context.graph_storage_address,
+        context.graph_reserved_address,
+        context.graph_task_count,
+        context.task_window_last_index,
+        context.scheduler_state_base_address,
+        context.native_header_offset,
+        context.scheduler_state_bytes,
+        static_cast<uint32_t>(context.original_task_count),
+        static_cast<uint16_t>(context.graph_view_version),
+        static_cast<uint16_t>(context.graph_view_bytes),
+    };
+}
+
+inline TaskId aicore_scheduler_public_identity(const SchedulerGraphView &graph, uint64_t ref) {
+    uint64_t identity = UINT64_MAX;
+    if (scheduler_node_identity(graph, ref, &identity) != SchedulerGraphResult::OK) return TaskId::invalid();
+    const auto space = static_cast<TaskId::Space>(identity >> TaskId::SPACE_SHIFT);
+    if (space == TaskId::Space::GLOBAL) return TaskId::make_global(static_cast<int32_t>(identity));
+    if (space == TaskId::Space::SUB_TASK)
+        return TaskId::make_sub_task(
+            static_cast<int32_t>((identity >> TaskId::PARENT_SHIFT) & TaskId::PARENT_MASK),
+            static_cast<int32_t>(identity)
+        );
+    return TaskId::invalid();
 }

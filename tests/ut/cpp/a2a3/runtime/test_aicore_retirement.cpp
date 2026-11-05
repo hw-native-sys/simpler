@@ -437,6 +437,25 @@ TEST(ExitAckFreshnessRegression2520, PreviousExitedWithoutCurrentAckStaysUnrelea
     EXPECT_EQ(read_reg(stale_target.reg_addr, RegId::DATA_MAIN_BASE), AICORE_EXIT_SIGNAL);
 }
 
+TEST(AicoreRetirement, AckAfterDeadlineDoesNotCompleteRetirementWithoutAnOwner) {
+    alignas(64) std::array<uint8_t, 65536> regs{};
+    AicoreTeardownControl gate{};
+    const AicoreExitTarget target{reinterpret_cast<uint64_t>(regs.data()), &gate};
+    platform_init_aicore_regs(target.reg_addr);
+    bool released = true;
+    ASSERT_EQ(platform_retire_aicore_group(&target, 1, 0, &released), -1);
+    ASSERT_FALSE(released);
+    const uint32_t request = gate.exit_request;
+    ASSERT_TRUE(request == AICORE_EXIT_NONCE_0 || request == AICORE_EXIT_NONCE_1);
+
+    write_reg(target.reg_addr, RegId::COND, request);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::COND), request);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::DATA_MAIN_BASE), AICORE_EXIT_SIGNAL);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::FAST_PATH_ENABLE), REG_SPR_FAST_PATH_OPEN);
+    EXPECT_EQ(gate.post_close_release, 0U);
+    EXPECT_FALSE(released);
+}
+
 TEST(ExitAckFreshnessRegression2520, RetainedNoncesCannotReleaseASilentCore) {
     for (uint32_t old_cond : {AICORE_EXIT_NONCE_0, AICORE_EXIT_NONCE_1}) {
         alignas(64) std::array<uint8_t, 65536> stale_registers{};

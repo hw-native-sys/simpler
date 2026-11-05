@@ -220,6 +220,10 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
         reinterpret_cast<__gm__ Tensor *>(args[2])->shapes[0]);
     uint32_t rope_lane = block_idx * 2 + sub_block_idx;
     if (rope_lane < kQwenRopeCores) {
+      // Layer scratch reuses this 64-byte scalar input after each RMS task.
+      dcci(reinterpret_cast<__gm__ void *>(tensor_data<float>(args, 14)),
+           SINGLE_CACHE_LINE);
+      dsb(DSB_DDR);
       qwen_rope_gen::rope_qkv(
           reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 2)),
           reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 1)),

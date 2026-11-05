@@ -11,7 +11,10 @@
 // Allocation and transport faults; all admission decisions stay in production code.
 #pragma once
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <utility>
+#include <vector>
 namespace native_admission_transport {
 struct Control {
     size_t ceiling{std::numeric_limits<size_t>::max()};
@@ -19,10 +22,29 @@ struct Control {
     size_t allocations{0};
     size_t successful_allocations{0};
     size_t fail_allocation{0};
+    int loader_finalize_error{0};
+    size_t loader_finalize_calls{0};
+    int reset_error{0};
+    bool retired{false};
+    size_t calls_after_retire{0};
     int attach_rc{0};
+    int op_timeout_rc{0};
+    bool replace_op_timeout{false};
+    uint64_t actual_op_timeout_us{0};
+    uint64_t requested_op_timeout_us{0};
+    size_t op_timeout_calls{0};
     int copy_rc{0};
     size_t stream_create_calls{0};
     size_t fail_stream_create{0};
+    size_t d2h_calls{0};
+    size_t d2h_bytes{0};
+    std::vector<const void *> downloads;
+    int stream_sync_rc{0};
+    std::vector<void *> observed_streams;
+    bool events_complete{true};
+    int event_wait_rc{0};
+    std::vector<std::pair<void *, const void *>> uploads;
 };
 Control &control();
+void release_provider_state();
 }  // namespace native_admission_transport

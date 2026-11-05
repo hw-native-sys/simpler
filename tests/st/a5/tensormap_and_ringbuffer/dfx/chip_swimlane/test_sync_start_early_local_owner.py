@@ -77,7 +77,7 @@ class TestSyncStartEarlyLocalOwner(SceneTestCase):
         {
             "name": "single_scheduler_idle",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             # One orchestrator plus one scheduler. The scheduler owns every AIV
             # core, so this eight-block cohort fits its local idle capacity.
             "config": {"aicpu_thread_num": 2},
@@ -86,7 +86,7 @@ class TestSyncStartEarlyLocalOwner(SceneTestCase):
         {
             "name": "three_schedulers_idle",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             # One orchestrator plus three schedulers. The popping scheduler can
             # stage all four blocks without stopping either peer.
             "config": {"aicpu_thread_num": 4},
@@ -95,7 +95,7 @@ class TestSyncStartEarlyLocalOwner(SceneTestCase):
         {
             "name": "single_scheduler_pending_only",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             # Every blocker reports started before an ACK-sweep fence. A second
             # scheduler-loop fence completes during their measured one-second
             # hold, proving the consumer used pending rather than idle slots.

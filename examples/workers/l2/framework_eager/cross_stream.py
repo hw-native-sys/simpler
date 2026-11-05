@@ -27,7 +27,7 @@ _UNPROVEN = []
 _CALLERS = ("caller_A", "caller_B", "caller_A")
 
 
-def run(runtime: str, device: int, bridge_path: Path):
+def run(runtime: str, device: int, bridge_path: Path, *, platform="a2a3"):
     import torch  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415, F401 -- registers the NPU framework backend
     from simpler.worker import Worker  # noqa: PLC0415
@@ -45,8 +45,8 @@ def run(runtime: str, device: int, bridge_path: Path):
     frames, queued, runs, events, edges, submissions, weak_tensors = [], [], [], [], [], [], []
     retired = False
     try:
-        worker = Worker(level=2, device_id=device, platform="a2a3", runtime=runtime)
-        handle = worker.register(reference._compile(runtime))
+        worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
+        handle = worker.register(reference._compile(runtime, platform=platform))
         worker.init(borrowed_context_generation=1)
         for index, role in enumerate(_CALLERS):
             prepared, references = reference._prepare_frames(torch, worker, handle, streams[role], raw_streams[role], 1)
@@ -115,6 +115,7 @@ def run(runtime: str, device: int, bridge_path: Path):
                 buffer.close()
         retired = True
         summary = {
+            "platform": platform,
             "runtime": runtime,
             "task_queue": task_queue,
             "calls": len(_CALLERS),
@@ -143,6 +144,7 @@ def run(runtime: str, device: int, bridge_path: Path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=["tensormap_and_ringbuffer", "host_build_graph"], required=True)
+    parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--build-dir", type=Path, default=reference.ROOT / "build/framework_eager")
     options = parser.parse_args()
@@ -151,7 +153,7 @@ def main():
         parser.error("--build-dir contains multiple framework queue modules")
     path = modules[0] if modules else reference.build_bridge(options.build_dir)
     print("FRAMEWORK_QUEUE_MODULE " + str(path), flush=True)
-    run(options.runtime, options.device, path)
+    run(options.runtime, options.device, path, platform=options.platform)
 
 
 if __name__ == "__main__":

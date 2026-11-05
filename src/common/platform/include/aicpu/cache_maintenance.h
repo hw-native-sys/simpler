@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_CACHE_MAINTENANCE_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_CACHE_MAINTENANCE_H_
+#pragma once
 
 #include <stddef.h>
 
@@ -21,10 +20,10 @@ void flush_range_impl(const void *addr, size_t size);
 
 }  // namespace aicpu_cache_maintenance
 
+// A2/A3 onboard maintains cache lines and completes the maintenance.
+// Coherent A5 and sim are no-ops; callers provide their protocol's barriers.
 inline void cache_invalidate_range(const void *addr, size_t size) {
     aicpu_cache_maintenance::invalidate_range_impl(addr, size);
 }
 
 inline void cache_flush_range(const void *addr, size_t size) { aicpu_cache_maintenance::flush_range_impl(addr, size); }
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_CACHE_MAINTENANCE_H_

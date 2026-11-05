@@ -25,6 +25,12 @@ import time
 from itertools import groupby
 from typing import Any
 
+from .mpi_direct_cleanup import (
+    MpiDirectCleanupLedger,
+    MpiDirectCleanupReport,
+    _CleanupReceiver,
+    _print_cleanup_reports,
+)
 from .mpi_direct_protocol import MPI_DIRECT_STARTUP_TOKEN_ENV, _gate_recv, _gate_send
 from .mpi_direct_topology import MpiDirectTopology
 
@@ -278,6 +284,7 @@ def run_supervisor(
     mpirun_path: str = "mpirun",
     launcher_family: str = "auto",
     python_executable: str | None = None,
+    cleanup_reports: dict[int, MpiDirectCleanupReport] | None = None,
 ) -> int:
     topology = MpiDirectTopology.load(topology_path)
     if launcher_family == "auto":
@@ -290,41 +297,49 @@ def run_supervisor(
             "mpi4py with the launcher's MPI compiler"
         )
     session_id = secrets.randbits(64) or 1
-    manifest = topology.runtime_manifest(session_id)
-    manifest_json = base64.urlsafe_b64encode(json.dumps(manifest, separators=(",", ":")).encode("utf-8")).decode(
-        "ascii"
-    )
     gate_token = secrets.token_urlsafe(32)
-    with _job_termination_handlers():
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((topology.controller_host, 0))
-        listener.listen(topology.world_size)
-        gate_port = int(listener.getsockname()[1])
-        proc: subprocess.Popen[Any] | None = None
-        try:
-            with _launcher_hostfile(topology, launcher_family) as hostfile_path:
-                command = _build_command(
-                    topology,
-                    mpirun_path=mpirun_path,
-                    controller=controller,
-                    launcher_family=launcher_family,
-                    hostfile_path=hostfile_path,
-                    manifest_json=manifest_json,
-                    python_executable=python_executable,
-                    startup_port=gate_port,
-                )
-                proc = subprocess.Popen(
-                    command, start_new_session=True, env={**os.environ, MPI_DIRECT_STARTUP_TOKEN_ENV: gate_token}
-                )
-                _startup_gate(topology, gate_token, listener, proc)
-                return int(proc.wait())
-        except BaseException:
-            with contextlib.suppress(OSError):
-                listener.close()
-            if proc is not None:
-                _terminate_job(proc)
-            raise
+    job_id = secrets.token_hex(16)
+    ledger = MpiDirectCleanupLedger(topology, job_id, session_id)
+    try:
+        with _job_termination_handlers(), _CleanupReceiver(topology.controller_host, gate_token, ledger) as receiver:
+            manifest = topology.runtime_manifest(session_id)
+            manifest["cleanup_report"] = {"job_id": job_id, "port": receiver.port}
+            manifest_json = base64.urlsafe_b64encode(
+                json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((topology.controller_host, 0))
+            listener.listen(topology.world_size)
+            gate_port = int(listener.getsockname()[1])
+            proc: subprocess.Popen[Any] | None = None
+            try:
+                with _launcher_hostfile(topology, launcher_family) as hostfile_path:
+                    command = _build_command(
+                        topology,
+                        mpirun_path=mpirun_path,
+                        controller=controller,
+                        launcher_family=launcher_family,
+                        hostfile_path=hostfile_path,
+                        manifest_json=manifest_json,
+                        python_executable=python_executable,
+                        startup_port=gate_port,
+                    )
+                    proc = subprocess.Popen(
+                        command, start_new_session=True, env={**os.environ, MPI_DIRECT_STARTUP_TOKEN_ENV: gate_token}
+                    )
+                    _startup_gate(topology, gate_token, listener, proc)
+                    return int(proc.wait())
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    listener.close()
+                if proc is not None:
+                    _terminate_job(proc)
+                raise
+    finally:
+        if cleanup_reports is not None:
+            cleanup_reports.update(ledger.snapshot())
+        _print_cleanup_reports(ledger)
 
 
 def main(argv: list[str] | None = None) -> int:

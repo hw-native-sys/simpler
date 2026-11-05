@@ -59,6 +59,50 @@ endmacro()
 platform_single_case(test_kernel_execution_state.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
 
+platform_single_case(test_lane_mask.cpp)
+platform_single_case(test_lane_demand_counter.cpp)
+
+if(APPLE)
+    set(_mix_lane_gc -Wl,-dead_strip)
+else()
+    set(_mix_lane_gc -Wl,--gc-sections)
+endif()
+foreach(arch a2a3 a5)
+    simpler_ut_add_target(NAME test_${arch}_hbg_mix_lane_priority ARCH ${arch} RUNTIME host_build_graph TIER aicpu
+        SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
+            ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp
+            ${SIMPLER_SRC}/${arch}/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.cpp
+            ${SIMPLER_SRC}/${arch}/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        DEFINES SIMPLER_DFX=0 LINK ${arch}_ut_support
+        COMPILE_OPTIONS -ffunction-sections -fdata-sections LINK_OPTIONS ${_mix_lane_gc} TIMEOUT 30)
+endforeach()
+
+target_sources(test_a5_hbg_mix_lane_priority PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host_build_graph/support/scheduler_drain_a5_stubs.cpp)
+
+simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_priority ARCH a2a3 RUNTIME tensormap_and_ringbuffer TIER aicpu
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
+        ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+    DEFINES SIMPLER_DFX=0 LINK a2a3_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections LINK_OPTIONS ${_mix_lane_gc} TIMEOUT 30)
+
+
+
+foreach(arch a2a3 a5)
+    simpler_ut_add_target(NAME test_${arch}_hbg_mix_lane_profiling ARCH ${arch} RUNTIME host_build_graph TIER aicpu
+        SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_queue_profiling.cpp
+        DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK ${arch}_ut_support TIMEOUT 30)
+endforeach()
+simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_profiling ARCH a2a3 RUNTIME tensormap_and_ringbuffer TIER aicpu
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_queue_profiling.cpp
+    DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK a2a3_ut_support TIMEOUT 30)
+platform_single_case(test_comm_workspaces.cpp)
+platform_single_case(test_comm_sim_domain_cleanup.cpp)
+
 # The growth coordinator is production: the onboard host runtime links this
 # same translation unit, so the trim, the retry policy and the holder discovery
 # under test are the ones the device runner calls rather than a copy of them.
@@ -355,6 +399,7 @@ set(SIM_CALLABLE_POOL_INCLUDES
     ${SIMPLER_SRC}/common/worker)
 
 hbg_case(test_sim_callable_pool.cpp
+    TIMEOUT 90
     SOURCES  ${SIM_CALLABLE_POOL_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES ${SIM_CALLABLE_POOL_INCLUDES}
     # chip_swimlane_collector.cpp refuses to compile without the runtime name,
@@ -372,6 +417,7 @@ hbg_case(test_sim_callable_pool.cpp
 # at different levels of src, so there is no single path template — the same
 # reason test_runtime_workers_publication above is a pair.
 tmr_case(test_sim_callable_pool.cpp
+    TIMEOUT 90
     SOURCES
         ${SIM_CALLABLE_POOL_SOURCES}
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
@@ -381,6 +427,16 @@ tmr_case(test_sim_callable_pool.cpp
         FAKE_KERNEL_SO_PATH="$<TARGET_FILE:test_fake_child_kernel>"
     LINK    ${CMAKE_DL_LIBS}
     DEPENDS test_fake_child_kernel)
+
+# pthread failure injection uses the ELF linker's wrapping support.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        foreach(runtime hbg tmr)
+            target_link_options(test_${arch}_${runtime}_sim_callable_pool PRIVATE
+                "-Wl,--wrap=pthread_setspecific" "-Wl,--wrap=pthread_key_create")
+        endforeach()
+    endforeach()
+endif()
 
 # One source, three builds differing only in how capture is switched on: the
 # compile-time flag, the environment variable, and both. A separate process
@@ -590,6 +646,15 @@ tmr_case(test_diagnostic_capacity_refusal_phase.cpp
     INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
     DEFINES  SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK     ${CMAKE_DL_LIBS})
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        foreach(runtime hbg tmr)
+            target_link_options(test_${arch}_${runtime}_diagnostic_capacity_refusal_phase PRIVATE
+                "-Wl,--wrap=pthread_setspecific")
+        endforeach()
+    endforeach()
+endif()
 
 # What the preparation entry does with an argument dump the runtime beneath it
 # has no producer for. Takes the capacity case's closure for the same reason:
@@ -825,6 +890,11 @@ platform_case(test_chip_swimlane_aicore.cpp PER_ARCH PER_RUNTIME BARE
 file(GLOB NATIVE_ADMISSION_SHARED_HOST CONFIGURE_DEPENDS
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/*.cpp)
 set(NATIVE_ADMISSION_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_entry_cache_qualification.cpp
+    ${SIMPLER_SRC}/common/worker/chip_run_lane.cpp
+    ${SIMPLER_SRC}/common/worker/chip_worker.cpp
+    ${SIMPLER_SRC}/common/worker/runtime_module.cpp
+    ${SIMPLER_SRC}/common/worker/device_fault_monitor_host.cpp
     ${CMAKE_SOURCE_DIR}/support/native_admission/transport.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
@@ -860,6 +930,10 @@ hbg_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+if(TARGET test_a5_hbg_native_admission)
+    target_sources(test_a5_hbg_native_admission PRIVATE
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+endif()
 tmr_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}
         ${CMAKE_SOURCE_DIR}/support/native_admission/tmr_preparation.cpp
@@ -940,4 +1014,24 @@ macro(platform_case_without_axes src)
         "docs/testing/adding-a-cpp-unit-test.md — "
         "tests/lint/check_ut_cpp_axis.py checks it the same way.")
 endmacro()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    platform_single_case(test_module_thread_value.cpp)
+    target_link_options(test_module_thread_value PRIVATE
+        -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_key_delete -Wl,--wrap=pthread_setspecific)
+else()
+    simpler_ut_exclude_case(test_module_thread_value.cpp)
+endif()
+
+foreach(consumer module_thread_value_consumer module_thread_value_peer)
+    add_library(${consumer} SHARED ${CMAKE_SOURCE_DIR}/common/support/module_thread_value_consumer.cpp)
+    target_include_directories(${consumer} PRIVATE ${SIMPLER_COMMON_PLATFORM_DIR}/include)
+    target_compile_options(${consumer} PRIVATE -fvisibility=hidden
+        $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+    target_link_libraries(${consumer} PRIVATE pthread)
+endforeach()
+platform_single_case(test_module_thread_value_lifetime.cpp
+    DEFINES TEST_MODULE_THREAD_VALUE_PATH="$<TARGET_FILE:module_thread_value_consumer>"
+        TEST_MODULE_THREAD_VALUE_PEER_PATH="$<TARGET_FILE:module_thread_value_peer>"
+    LINK ${CMAKE_DL_LIBS} DEPENDS module_thread_value_consumer module_thread_value_peer)
+
 simpler_ut_glob_cases(platform_case_without_axes)

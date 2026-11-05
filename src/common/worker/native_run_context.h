@@ -71,13 +71,20 @@ struct NativeRunContext {
     CallConfig config{};
     NativeRunDescriptor descriptor{};
     HostApi host_api;
-    Runtime runtime{};
+    std::unique_ptr<Runtime> runtime{std::make_unique<Runtime>()};
     uint64_t trace_hid{0};
     uint64_t trace_inv{0};
     long long trace_start_ns{0};
     long long runner_trace_start_ns{0};
     uint64_t clock_log_offset{0};
     int completion_rc{-1};
+    bool result_observed{false};
+    bool physical_complete{false};
+    bool execution_retired{false};
+    // This call's finished host-phase export requirement, retained across slot reuse.
+    bool clock_alignment_log_required{false};
+    // Detached unmanaged HOST staging, owned until output delivery/release.
+    void *retired_host_staging{nullptr};
     std::atomic<NativeRunPhase> phase{NativeRunPhase::Prepared};
     std::unique_ptr<typename Runner::PreparedExecution> prepared_execution{};
     std::unique_ptr<typename Runner::ActiveExecution> active_execution{};

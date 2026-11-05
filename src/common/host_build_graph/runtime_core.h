@@ -233,10 +233,10 @@ void runtime_set_mode(RuntimeContext *rt, RuntimeMode mode);
  * submit_task requires at least one open scope. A MANUAL scope additionally makes
  * every submit inside it bypass TensorMap discovery and take its fanin from
  * CoreTaskArgs::set_dependencies() instead; an AUTO scope nested inside a MANUAL
- * one is rejected. The mode is read from OrchContext::pending_scope_mode, which
- * SIMPLER_SCOPE sets immediately before this call.
+ * one is rejected. The mode belongs to this call: the submitting thread and
+ * asynchronous Graph recorders can enter scopes on the same context concurrently.
  */
-void rt_scope_begin(OrchContext *ctx);
+void rt_scope_begin(OrchContext *ctx, ScopeMode mode = ScopeMode::AUTO);
 
 /**
  * End current scope

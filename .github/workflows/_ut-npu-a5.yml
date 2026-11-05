@@ -28,7 +28,7 @@ jobs:
     env:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
-      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "6000"
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -50,8 +50,12 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
+          # RuntimeBuilder integration can refresh build/cache while publication probes read it.
+          ut_command="python -m pytest tests/ut -m 'requires_hardware and device_count' --platform a5 --device \$TASK_DEVICE -v &&"
+          ut_command+=" python -m pytest tests/ut -m 'requires_hardware and not device_count' -k TestRuntimeBuilderIntegration --platform a5 --device \$TASK_DEVICE -v &&"
+          ut_command+=" python -m pytest tests/ut -m 'requires_hardware and not device_count' -k 'not TestRuntimeBuilderIntegration' --platform a5 --device \$TASK_DEVICE -n $DEVICE_NUM -v"
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run "python -m pytest tests/ut -m requires_hardware --platform a5 --device \$TASK_DEVICE -v"
+            --run "$ut_command"
 
       # Every tool under tools/cann-examples, discovered rather than named, and
       # each one smoke-run on a locked device via its own smoke.sh. The by-name

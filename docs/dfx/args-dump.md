@@ -1149,8 +1149,9 @@ still a dump?** Yes. The host exports the manifest even though `run()` returns
 the timeout error. Within the selected level's record scope, it contains task
 inputs captured at `BEFORE_DISPATCH`, outputs from tasks that completed before
 the hang, and any recoverable partial output from an in-flight task. This rests
-on the timeout ordering — the three budgets are tuned so the **AICPU detects the
-hang first**, dumps, and only then the hardware/host timeouts fire:
+on the opportunity for the AICPU to detect and dump the hang before a hardware
+watchdog or Host wait expires. The configured budgets express that intended
+relationship; they do not establish actual firing order:
 
 ```text
 SCHEDULER_TIMEOUT_MS (20 s)           <  PLATFORM_OP_EXECUTE_TIMEOUT_US (45 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (50 s)
@@ -1160,9 +1161,14 @@ SCHEDULER_TIMEOUT_MS (20 s)           <  PLATFORM_OP_EXECUTE_TIMEOUT_US (45 s)  
 
 These defaults can be overridden without rebuilding by setting
 `SIMPLER_SCHEDULER_TIMEOUT_MS`, `SIMPLER_OP_EXECUTE_TIMEOUT_US`, and
-`SIMPLER_STREAM_SYNC_TIMEOUT_MS`. Invalid values, or onboard combinations that
-break the ordering above, are ignored with a warning and fall back to the
-defaults. The onboard host also requires stream-sync to cover the scheduler
+`SIMPLER_STREAM_SYNC_TIMEOUT_MS`. Invalid requested values or requested onboard
+orderings are ignored with a warning and fall back to the defaults. Owned
+onboard initialization then checks the ACL-reported operator timeout. A successful
+setter with an invalid adjusted ordering emits a warning and continues with the
+original budgets; setter failure still rejects initialization. The host does
+not enlarge the stream budget automatically. Borrowed kernel contexts do
+not configure or validate the caller's external operator watchdog.
+The onboard host also requires stream-sync to cover the scheduler
 budget plus a 1.5 s scheduler-arming guard for cold init work before the
 no-progress timer starts. This guard covers fixed/cold costs such as kernel
 registration, orchestration SO dlopen, runtime init, and AICore handshake.
@@ -1172,8 +1178,9 @@ callers that raise scheduler/op timeouts must also size
 builds do not have STARS or ACL stream-sync timeouts, but scheduler overrides
 are still parsed and applied independently so slow CPU-sim kernels can raise
 the no-progress budget without onboard-only ordering limits. CI restores the
-old fast-fail values through these env vars: 2 s scheduler, 3 s op-execute,
-and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
+fast-fail values through these env vars: 2 s scheduler, 3 s requested op-execute,
+and 6 s stream-sync for onboard jobs; 10 s scheduler for sim jobs. ACL may adjust
+the operator value; its reported setting is not a measured firing deadline.
 
 - **Device-side graceful flush (primary).** At 20 s of no progress
   the AICPU declares the hang, runs the end-of-loop flush, *and*
@@ -1208,10 +1215,12 @@ and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
   device completion or authorize freeing device storage. Epoch and read checks
   alone do not establish quiescence.
 
-This ordering is load-bearing: if the timeouts were inverted (STARS
-reaping before the AICPU's budget, as in earlier versions), the
-device-side dump would never run on a real AICore hang and you would
-only recover what was already in the buffer. The chain lives in
+If STARS reaps the operator before the AICPU publishes its dump, recovery may
+be limited to records already available to Host collectors. Numeric timeout
+ordering alone does not prove that the device-side dump has run. Host waits use
+per-Event or per-Stream budgets rather than one deadline for the entire run;
+see [local timeout boundaries](../troubleshooting/local-timeout-defaults.md#what-the-host-wait-budget-measures).
+The configured chain lives in
 `platform_config.h`, which holds all three (`PLATFORM_SCHEDULER_TIMEOUT_MS`,
 surfaced as `SCHEDULER_TIMEOUT_MS` — 20 s, one value for onboard and sim,
 `PLATFORM_OP_EXECUTE_TIMEOUT_US` /

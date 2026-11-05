@@ -503,7 +503,7 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
 
         SubTaskDefinition &task = tasks[i];
         std::copy(source.kernel_ids.begin(), source.kernel_ids.end(), std::begin(task.kernel_id));
-        task.active_mask = source.active_mask.raw();
+        task.active_mask = source.active_mask;
         // The recorded attrs carry the caller's early-resolve intent, which the
         // qualification above consumes; no sub-task reaches the device with
         // that bit set.

@@ -179,9 +179,16 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
 | `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
 | `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False)` | Reuse the same live handle after full configuration validation, or create it |
-| `get_domain(name)` / `release_domain(handle)` | Creator-local lookup / deferred owning release |
+| `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
 | `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
+
+`domain.member(rank).buffers[name].tensor(...)` has the same L3/L4 semantics and routes to its owning chip.
+`domain.ref` is immutable across nodes; `local_context(rank)` requires a local mapping.
+Borrowed handles reject `release()` and `with`. Cached Tensor use enrolls later runs automatically;
+release waits for accepted tasks, and unknown cleanup remains tracked and reported with `freed=False`.
+For scalar-only ref/context tasks, the owner's callback must call `get_domain(name_or_ref)`;
+a child lookup does not enroll the owner's run.
 
 ## Callables and task args
 

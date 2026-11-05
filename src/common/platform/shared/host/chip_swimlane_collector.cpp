@@ -101,6 +101,31 @@ bool recycled_seed_capacity_is_sufficient(
 
 }  // namespace
 
+void ChipSwimlaneCollector::stop_for_device_failure() {
+    stop_run_writer();
+    profiling_common::ProfilerBase<ChipSwimlaneCollector, ChipSwimlaneModule>::stop(false);
+    size_t held = 0;
+    uint64_t first_epoch = 0;
+    for (const auto &bucket : retained_runs_) {
+        const int state = bucket.state.load(std::memory_order_acquire);
+        if (state == static_cast<int>(EpochState::Free) || state == static_cast<int>(EpochState::Quarantined)) continue;
+        if (held++ == 0) first_epoch = bucket.epoch.load(std::memory_order_acquire);
+    }
+    if (held != 0) {
+        char detail[192];
+        std::snprintf(
+            detail, sizeof(detail), "fatal stop left %zu unpublished run(s), first run %llu", held,
+            static_cast<unsigned long long>(first_epoch)
+        );
+        publish_fatal(detail);
+    }
+}
+
+void ChipSwimlaneCollector::abandon_after_device_reset() {
+    abandon_memory_after_device_reset();
+    perf_shared_mem_dev_ = nullptr;
+}
+
 ChipSwimlaneCollector::~ChipSwimlaneCollector() {
     stop();
     if (shm_host_ != nullptr) {
@@ -2406,6 +2431,9 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
     const std::string *aicore_tasks_extension = extension(ChipSwimlaneExtensionSection::AicoreTasks);
     const std::string *scheduler_tasks_extension = extension(ChipSwimlaneExtensionSection::SchedulerTasks);
     const std::string *aicpu_lifecycle_extension = extension(ChipSwimlaneExtensionSection::AicpuLifecycleRecords);
+    const std::string *execution_identity_extension =
+        extension(ChipSwimlaneExtensionSection::AicoreExecutionIdentities);
+    const std::string *protocol_extension = extension(ChipSwimlaneExtensionSection::AicoreProtocol);
 
     // Every stream is independently useful for DFX. In particular, a legal
     // HBG can contain only host-side dummy/hidden-allocation records and no
@@ -2671,6 +2699,12 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
             outfile << "]";
             LOG_INFO("  aicore_tasks: %zu records", total);
         }
+    }
+    if (execution_identity_extension != nullptr) {
+        outfile << ",\n  \"aicore_execution_identities\": " << *execution_identity_extension;
+    }
+    if (protocol_extension != nullptr) {
+        outfile << ",\n  \"aicore_protocol\": " << *protocol_extension;
     }
     if (data.level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
         outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerTasks)

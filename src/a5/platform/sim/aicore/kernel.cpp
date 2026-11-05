@@ -45,17 +45,49 @@ static pthread_key_t g_aicore_report_epoch_key;
 static pthread_key_t g_ssbuf_base_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
+static pthread_key_t *const g_tls_keys[] = {
+    &g_reg_base_key,
+    &g_core_id_key,
+    &g_block_idx_key,
+    &g_aicore_profiling_flag_key,
+    &g_chip_swimlane_aicore_head_slot_key,
+    &g_chip_swimlane_aicore_head_key,
+    &g_aicore_pmu_ring_key,
+    &g_pmu_reg_base_key,
+    &g_aicore_report_epoch_key,
+    &g_ssbuf_base_key,
+};
+static size_t g_tls_key_count = 0;
+static int g_tls_init_result = 0;
+
+static void release_tls_keys() {
+    while (g_tls_key_count != 0)
+        pthread_key_delete(*g_tls_keys[--g_tls_key_count]);
+}
+
+// DeviceRunner joins every AICore thread before unloading its per-run SO.
+// POSIX keys belong to the process and need explicit deletion at that boundary.
+namespace {
+struct SimTlsKeyOwner {
+    ~SimTlsKeyOwner() { release_tls_keys(); }
+};
+SimTlsKeyOwner g_tls_key_owner;
+}  // namespace
+
 static void create_tls_keys() {
-    pthread_key_create(&g_reg_base_key, nullptr);
-    pthread_key_create(&g_core_id_key, nullptr);
-    pthread_key_create(&g_block_idx_key, nullptr);
-    pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
-    pthread_key_create(&g_chip_swimlane_aicore_head_slot_key, nullptr);
-    pthread_key_create(&g_chip_swimlane_aicore_head_key, nullptr);
-    pthread_key_create(&g_aicore_pmu_ring_key, nullptr);
-    pthread_key_create(&g_pmu_reg_base_key, nullptr);
-    pthread_key_create(&g_aicore_report_epoch_key, nullptr);
-    pthread_key_create(&g_ssbuf_base_key, nullptr);
+    for (pthread_key_t *key : g_tls_keys) {
+        g_tls_init_result = pthread_key_create(key, nullptr);
+        if (g_tls_init_result != 0) {
+            release_tls_keys();
+            return;
+        }
+        ++g_tls_key_count;
+    }
+}
+
+extern "C" int initialize_aicore_sim_tls() {
+    const int result = pthread_once(&g_tls_once, create_tls_keys);
+    return result != 0 ? result : g_tls_init_result;
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
@@ -142,7 +174,7 @@ extern "C" void aicore_execute_wrapper(
     uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table, uint64_t aicore_pmu_ring_addrs,
     uint64_t report_epoch, uint64_t ssbuf_base
 ) {
-    pthread_once(&g_tls_once, create_tls_keys);
+    if (initialize_aicore_sim_tls() != 0) return;
 
     // Set up simulated register base for this thread.
     // regs points to an array of uint64_t base addresses (one per core).

@@ -35,6 +35,7 @@
 #endif
 
 struct SimplerHostSpan;
+struct SimplerHostTraceState;
 
 class SIMPLER_HOST_LOG_LOCAL HostLogger {
 public:
@@ -44,7 +45,8 @@ public:
     // Must happen during module init, before the module starts worker threads.
     int bind_state(SimplerHostLogState *state);
     // Internal owner-side counterpart used when an embedding executable
-    // supplies storage instead of this module's default state. Cross-DSO
+    // supplies storage instead of this module's default state. The executable
+    // must use the same build and state layout as all consumers. Cross-DSO
     // loaders must use bind_state(), so a transient consumer cannot own the
     // process writer across dlclose().
     int adopt_state(SimplerHostLogState *state);
@@ -113,6 +115,12 @@ public:
     // Fixed host-span adapter. The logger remains the sole STRACE grammar
     // owner even though its implementation is compiled into several DSOs.
     void log_host_span(const SimplerHostSpan *span);
+
+    // Borrow this thread's state, or nullptr if unavailable. Include
+    // common/host_span.h to access its fields.
+    SimplerHostTraceState *trace_state();
+    // Allocate a shared invocation ID starting at 1; zero means unavailable.
+    uint64_t allocate_trace_invocation();
 
 private:
     HostLogger();

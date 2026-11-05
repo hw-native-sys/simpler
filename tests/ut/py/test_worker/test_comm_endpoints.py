@@ -12,6 +12,7 @@ import dataclasses
 from typing import Any, cast
 
 import pytest
+from _task_interface import _MpiDirectTransportHub
 from simpler import comm_endpoints as ce
 from simpler.buffer import _RESOLVERS
 from simpler.buffer import BackendKind as BufferBackendKind
@@ -81,7 +82,10 @@ def _l4_with_mpi_direct(*, hosts: tuple[str, ...], device_ids_by_rank: tuple[tup
             ],
         }
     )
-    worker._configure_mpi_direct(topology, 1, object())  # type: ignore[arg-type]
+    hub = _MpiDirectTransportHub(topology.max_pending_frame_bytes)
+    for spec in topology.executors:
+        hub.register_route(spec.worker_id, spec.rank, 1, spec.comm_profile)
+    worker._configure_mpi_direct(topology, 1, hub)
     return _ready(worker)
 
 
@@ -570,6 +574,8 @@ def test_mpi_direct_registry_registers_rank_hosts_and_devices():
         device_ids_by_rank=((12, 13), (14,), (15,)),
     )
     registry = worker._get_endpoint_registry()
+    view = registry.mpi_session_for_endpoint(registry.resolve_members([ce.at("L4/L3[0]", ce.HOST_CPU)])[0])
+    assert view is not None and view.session_epoch == 1 and not view.available
     root = _record(worker, "L4", ce.HOST_CPU)
     local_device = _record(worker, "L4/L3[0]/L2[1]", ce.DEVICE_AICORE)
     remote_a = _record(worker, "L4/L3[1]", ce.HOST_CPU)

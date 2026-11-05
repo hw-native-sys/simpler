@@ -406,8 +406,7 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
     // cross-rank address-agreement assert is specifically an HCCL-GVA
     // invariant and is not expected to hold (nor intended to run) under sim.
     auto &ctx = h->host_ctx;
-    ctx.workSpace = 0;
-    ctx.workSpaceSize = 0;
+
     ctx.rankId = static_cast<uint32_t>(h->rank);
     ctx.rankNum = static_cast<uint32_t>(h->nranks);
     ctx.winSize = win_size;
@@ -482,8 +481,7 @@ extern "C" int comm_derive_context(
 
     auto *ctx = new (std::nothrow) CommContext{};
     if (ctx == nullptr) return -1;
-    ctx->workSpace = h->host_ctx.workSpace;
-    ctx->workSpaceSize = h->host_ctx.workSpaceSize;
+
     ctx->rankId = domain_rank;
     ctx->rankNum = static_cast<uint32_t>(rank_count);
     ctx->winSize = window_size;
@@ -555,9 +553,13 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
+    size_t *actual_window_size_out
 ) try {
-    if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr) return -1;
+    if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr ||
+        actual_window_size_out == nullptr)
+        return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         std::fprintf(
             stderr, "[comm_sim rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)\n",
@@ -660,8 +662,7 @@ extern "C" int comm_alloc_domain_windows(
     auto *win_base = static_cast<uint8_t *>(base) + HEADER_SIZE;
     alloc->host_ctx = std::make_unique<CommContext>();
     auto &ctx = *alloc->host_ctx;
-    ctx.workSpace = 0;
-    ctx.workSpaceSize = 0;
+
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(rank_count);
     ctx.winSize = window_size;
@@ -698,6 +699,7 @@ extern "C" int comm_alloc_domain_windows(
 
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->host_ctx.get());
     *local_window_base_out = reinterpret_cast<uint64_t>(local_window);
+    *actual_window_size_out = window_size;
     h->domain_allocations.emplace(allocation_id, std::move(alloc));
     return 0;
 } catch (const std::exception &e) {
@@ -770,6 +772,23 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 }
 
+extern "C" int
+comm_abort_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
+    if (h == nullptr) return -1;
+    const auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    auto &alloc = *it->second;
+    if (static_cast<size_t>(alloc.nranks) != rank_count || static_cast<uint32_t>(alloc.rank) != domain_rank) return -1;
+    // All allocation requests have joined; no member can import or use this name.
+    if (alloc.mmap_base != nullptr) {
+        if (munmap(alloc.mmap_base, alloc.mmap_size) != 0) return -1;
+        alloc.mmap_base = nullptr;
+    }
+    if (shm_unlink(alloc.shm_name.c_str()) != 0 && errno != ENOENT) return -1;
+    h->domain_allocations.erase(it);
+    return 0;
+}
+
 extern "C" int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
     CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
@@ -779,7 +798,7 @@ extern "C" int comm_global_domain_prepare(
         local_window_base_out == nullptr) {
         return -1;
     }
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     if (global_domain_allocations.count(domain_id) != 0) {
         return -1;
     }
@@ -839,7 +858,7 @@ extern "C" int comm_global_domain_prepare(
 extern "C" int comm_global_domain_import(
     uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
 ) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end() || descriptors == nullptr || device_ctx_out == nullptr) {
         return -1;
@@ -906,7 +925,7 @@ extern "C" int comm_global_domain_import(
 }
 
 extern "C" int comm_global_domain_release(uint64_t domain_id) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end()) {
         return 0;
@@ -925,20 +944,17 @@ extern "C" int comm_destroy(CommHandle h) try {
     if (h == nullptr) return -1;
 
     int rc = 0;
-    // Best-effort cleanup of any domain allocations still live at base
-    // destroy.  In normal use the caller releases them explicitly via
-    // comm_release_domain_windows; this guards against script bugs / exception
-    // paths that bypass release.  Each leftover does its own munmap +
-    // shm_unlink locally (skips the destroy barrier since the peer that would
-    // also be cleaning up may already be gone).
-    for (auto &kv : h->domain_allocations) {
-        auto &alloc = kv.second;
-        if (alloc->mmap_base != nullptr) {
-            munmap(alloc->mmap_base, alloc->mmap_size);
-            shm_unlink(alloc->shm_name.c_str());
+    // Leftover domains use local cleanup after the caller's reclamation guard.
+    // An unmapped allocation can still own a name whose unlink failed; abort
+    // erases its record only after both cleanup obligations are complete.
+    while (!h->domain_allocations.empty()) {
+        const auto &entry = *h->domain_allocations.begin();
+        if (comm_abort_domain_windows(
+                h, entry.first, static_cast<size_t>(entry.second->nranks), static_cast<uint32_t>(entry.second->rank)
+            ) != 0) {
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
     }
-    h->domain_allocations.clear();
     for (auto *ctx : h->derived_contexts) {
         delete ctx;
     }
