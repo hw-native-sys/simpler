@@ -46,6 +46,30 @@ static bool sum_ring_heap_sizes(const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], 
     return true;
 }
 
+bool build_prepared_run_layout(const ArenaSizingKey &sizing, PreparedRunLayout &out) {
+    // Host sizing bounds the sum of windows to INT32_MAX. Within that domain,
+    // every segment calculation and their sum fit uint64_t.
+    constexpr uint64_t max_window = static_cast<uint64_t>(INT32_MAX);
+    constexpr uint64_t segment_bytes = sizeof(TaskDescriptor) + sizeof(TaskPayload) + sizeof(ChipTaskSlotState);
+    static_assert(
+        max_window <=
+        (UINT64_MAX - sizeof(SharedMemoryHeader) - (3 * CHIP_MAX_RING_DEPTH + 1) * (CHIP_ALIGN_SIZE - 1)) /
+            (CHIP_MAX_RING_DEPTH * segment_bytes)
+    );
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+        if (sizing.task_window_sizes[r] > max_window) return false;
+    }
+    PreparedRunLayout next{};
+    if (!sum_ring_heap_sizes(sizing.heap_sizes, &next.heap_bytes)) return false;
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+        const auto off = sm_layout::ring_segment_offsets(sizing.task_window_sizes, r);
+        next.rings[r] = {off.descriptors, off.payloads, off.slot_states};
+        next.sm_bytes = off.end;
+    }
+    out = next;
+    return true;
+}
+
 // =============================================================================
 // Ready queue
 // =============================================================================
@@ -428,15 +452,18 @@ bool OrchestratorState::init_data_from_layout(
     return true;
 }
 
-bool OrchestratorState::reset_for_reuse(
-    const OrchestratorLayout &layout, void *sm_dev_base, void *gm_heap, const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH],
-    const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH]
+template <bool Prepared>
+static bool reset_orchestrator(
+    OrchestratorState *orch, const OrchestratorLayout &layout, void *sm_dev_base, void *gm_heap,
+    const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
+    const PreparedRunLayout *prepared
 ) {
-    auto *orch = this;
     orch->sm_header = reinterpret_cast<SharedMemoryHeader *>(sm_dev_base);
     orch->gm_heap_base = gm_heap;
     uint64_t total_heap_size = 0;
-    if (!sum_ring_heap_sizes(heap_sizes, &total_heap_size)) {
+    if constexpr (Prepared) {
+        total_heap_size = prepared->heap_bytes;
+    } else if (!sum_ring_heap_sizes(heap_sizes, &total_heap_size)) {
         return false;
     }
     orch->gm_heap_size = total_heap_size;
@@ -460,27 +487,45 @@ bool OrchestratorState::reset_for_reuse(
     orch->fanin_seen_current_epoch = next_epoch;
 
     auto *orch_err = sm_layout::orch_error_code_addr(sm_dev_base);
-    uint64_t heap_offset = 0;
-    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
-        void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + heap_offset;
-        auto *task_descs_dev = sm_layout::ring_task_descriptors_addr(sm_dev_base, task_window_sizes, r);
-        auto *slot_states_dev = sm_layout::ring_slot_states_addr(sm_dev_base, task_window_sizes, r);
-        auto *cur_idx_dev = sm_layout::ring_current_task_index_addr(sm_dev_base, r);
-        auto *last_alive_dev = sm_layout::ring_last_task_alive_addr(sm_dev_base, r);
+    if constexpr (!Prepared) {
+        uint64_t heap_offset = 0;
+        for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+            void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + heap_offset;
+            auto *task_descs_dev = sm_layout::ring_task_descriptors_addr(sm_dev_base, task_window_sizes, r);
+            auto *slot_states_dev = sm_layout::ring_slot_states_addr(sm_dev_base, task_window_sizes, r);
+            auto *cur_idx_dev = sm_layout::ring_current_task_index_addr(sm_dev_base, r);
+            auto *last_alive_dev = sm_layout::ring_last_task_alive_addr(sm_dev_base, r);
 
-        orch->rings[r].task_allocator.init(
-            task_descs_dev, static_cast<int32_t>(task_window_sizes[r]), cur_idx_dev, last_alive_dev, ring_heap_base,
-            heap_sizes[r], orch_err, slot_states_dev, 0, static_cast<uint8_t>(r)
-        );
-        heap_offset += heap_sizes[r];
-        orch->rings[r].fanin_pool.reset_for_reuse(orch_err);
+            orch->rings[r].task_allocator.init(
+                task_descs_dev, static_cast<int32_t>(task_window_sizes[r]), cur_idx_dev, last_alive_dev, ring_heap_base,
+                heap_sizes[r], orch_err, slot_states_dev, 0, static_cast<uint8_t>(r)
+            );
+            heap_offset += heap_sizes[r];
+            orch->rings[r].fanin_pool.reset_for_reuse(orch_err);
+        }
+    } else {
+        uint64_t heap_offset = 0;
+        char *sm = static_cast<char *>(sm_dev_base);
+        for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+            void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + heap_offset;
+            auto *task_descs_dev = reinterpret_cast<TaskDescriptor *>(sm + prepared->rings[r].descriptors);
+            auto *slot_states_dev = reinterpret_cast<ChipTaskSlotState *>(sm + prepared->rings[r].slot_states);
+            auto *cur_idx_dev = sm_layout::ring_current_task_index_addr(sm_dev_base, r);
+            auto *last_alive_dev = sm_layout::ring_last_task_alive_addr(sm_dev_base, r);
+            orch->rings[r].task_allocator.init(
+                task_descs_dev, static_cast<int32_t>(task_window_sizes[r]), cur_idx_dev, last_alive_dev, ring_heap_base,
+                heap_sizes[r], orch_err, slot_states_dev, 0, static_cast<uint8_t>(r)
+            );
+            heap_offset += heap_sizes[r];
+            orch->rings[r].fanin_pool.reset_for_reuse(orch_err);
+        }
     }
 
     orch->tensor_map.reset_for_reuse(layout.tensor_map);
-    orch->scope_tasks_size = 0;
     orch->scope_tasks_capacity = layout.scope_tasks_cap;
-    orch->scope_stack_top = -1;
     orch->scope_stack_capacity = layout.scope_stack_capacity;
+    orch->scope_tasks_size = 0;
+    orch->scope_stack_top = -1;
     orch->manual_begin_depth = CHIP_MAX_SCOPE_DEPTH;
     orch->total_cluster_count = 0;
     orch->total_aiv_count = 0;
@@ -490,6 +535,20 @@ bool OrchestratorState::reset_for_reuse(
     orch->bytes_allocated = 0;
 #endif
     return true;
+}
+
+bool OrchestratorState::reset_for_reuse(
+    const OrchestratorLayout &layout, void *sm_dev_base, void *gm_heap, const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH],
+    const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH]
+) {
+    return reset_orchestrator<false>(this, layout, sm_dev_base, gm_heap, heap_sizes, task_window_sizes, nullptr);
+}
+
+bool OrchestratorState::reset_for_reuse_prepared(
+    const OrchestratorLayout &layout, void *sm_dev_base, void *gm_heap, const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH],
+    const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH], const PreparedRunLayout &prepared
+) {
+    return reset_orchestrator<true>(this, layout, sm_dev_base, gm_heap, heap_sizes, task_window_sizes, &prepared);
 }
 
 void OrchestratorState::wire_arena_pointers(
@@ -617,8 +676,8 @@ void runtime_wire_arena_pointers(DeviceArena &arena, const RuntimeArenaLayout &l
     rt->scheduler.wire_arena_pointers(layout.offsets.sched, arena);
 }
 
-bool runtime_reset_for_reuse(DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeContext *rt) {
-    (void)arena;
+template <bool Prepared>
+static bool reset_runtime(const RuntimeArenaLayout &layout, RuntimeContext *rt) {
     if (rt == nullptr) {
         return false;
     }
@@ -628,19 +687,38 @@ bool runtime_reset_for_reuse(DeviceArena &arena, const RuntimeArenaLayout &layou
     rt->gm_heap_owned = false;
 
     uint64_t total_heap_size = 0;
-    if (!sum_ring_heap_sizes(layout.sizing.heap_sizes, &total_heap_size)) {
+    if constexpr (Prepared) {
+        total_heap_size = layout.prepared.heap_bytes;
+    } else if (!sum_ring_heap_sizes(layout.sizing.heap_sizes, &total_heap_size)) {
         return false;
     }
     rt->gm_heap_size = total_heap_size;
 
-    if (!rt->orchestrator.reset_for_reuse(
-            layout.offsets.orch, rt->sm_handle->sm_base, rt->gm_heap, layout.sizing.heap_sizes,
-            layout.sizing.task_window_sizes
-        )) {
-        return false;
+    if constexpr (Prepared) {
+        if (!rt->orchestrator.reset_for_reuse_prepared(
+                layout.offsets.orch, rt->sm_handle->sm_base, rt->gm_heap, layout.sizing.heap_sizes,
+                layout.sizing.task_window_sizes, layout.prepared
+            ))
+            return false;
+    } else {
+        if (!rt->orchestrator.reset_for_reuse(
+                layout.offsets.orch, rt->sm_handle->sm_base, rt->gm_heap, layout.sizing.heap_sizes,
+                layout.sizing.task_window_sizes
+            )) {
+            return false;
+        }
     }
     rt->scheduler.reset_for_reuse(layout.offsets.sched, rt->sm_handle->sm_base);
     return true;
+}
+
+bool runtime_reset_for_reuse(DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeContext *rt) {
+    (void)arena;
+    return reset_runtime<false>(layout, rt);
+}
+
+bool runtime_reset_for_reuse_prepared(const RuntimeArenaLayout &layout, RuntimeContext *rt) {
+    return reset_runtime<true>(layout, rt);
 }
 
 void runtime_destroy(RuntimeContext *rt, DeviceArena & /*arena*/) {
