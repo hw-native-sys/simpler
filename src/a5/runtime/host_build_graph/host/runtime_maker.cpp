@@ -69,6 +69,7 @@
 #include "native_graph_plan.h"
 #include "ready_pool_plan.h"
 #include "async_plan.h"
+#include "async_binding_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler_protocol_export.h"
@@ -1257,7 +1258,7 @@ void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
-    const AsyncHostDeclarations *async_declarations
+    const AsyncHostDeclarations *async_declarations, const AsyncBindingTaskImage &binding_image
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1654,6 +1655,7 @@ bool create_scheduler_state(
         std::min<uint64_t>(std::numeric_limits<uint64_t>::max(), std::numeric_limits<size_t>::max()) -
         (SCHEDULER_STATE_ALIGNMENT - 1);
     SchedulerAsyncLayout async_layout{};
+    AsyncBindingHostPlan async_bindings;
     std::vector<SchedulerAsyncCapabilities> async_capabilities;
     std::string async_error;
     if (has_deferred_callable) {
@@ -1677,8 +1679,13 @@ bool create_scheduler_state(
                 }
             }
         }
-        if (!scheduler_plan_async_layout(
-                task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, {}, &async_layout, &async_error
+        if (!scheduler_plan_async_bindings(
+                task_metadata, async_capabilities, binding_image, native_plan, *async_declarations, *api,
+                max_state_bytes, &async_bindings, &async_error
+            ) ||
+            !scheduler_plan_async_layout(
+                task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, async_bindings.auxiliary,
+                &async_layout, &async_error
             )) {
             LOG_ERROR("A5 HBG: async state planning failed: %s", async_error.c_str());
             return false;
@@ -1689,16 +1696,6 @@ bool create_scheduler_state(
             scheduler_prefix_bytes, async_layout, max_state_bytes, &async_offset, &layout.total_size, &async_error
         )) {
         LOG_ERROR("A5 HBG: async state placement failed: %s", async_error.c_str());
-        return false;
-    }
-    // A well-formed image is not a backend or consumer-visibility qualification.
-    // Refuse launch until the resident service and those contracts are connected.
-    if (async_layout.group_count != 0) {
-        LOG_ERROR(
-            "A5 HBG: deferred completion launch is unavailable: resident CHECK and resource/consumer qualification "
-            "are not connected (groups=%" PRIu64 ", async_bytes=%" PRIu64 ", scheduler_bytes=%" PRIu64 ")",
-            async_layout.group_count, async_layout.total_bytes, layout.total_size
-        );
         return false;
     }
 
@@ -1741,6 +1738,13 @@ bool create_scheduler_state(
             layout.total_size - async_offset, &async_error
         )) {
         LOG_ERROR("A5 HBG: async state initialization failed: %s", async_error.c_str());
+        return false;
+    }
+    if (async_offset != 0 && !scheduler_initialize_async_bindings(
+                                 async_bindings, async_layout, static_cast<std::byte *>(host_base) + async_offset,
+                                 layout.total_size - async_offset, &async_error
+                             )) {
+        LOG_ERROR("A5 HBG: async binding materialization failed: %s", async_error.c_str());
         return false;
     }
 
@@ -2008,7 +2012,11 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     }
     if (!create_scheduler_state(
             runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph,
-            plan.async_declarations.get()
+            plan.async_declarations.get(),
+            AsyncBindingTaskImage{
+                upload_base + copied_bytes, image_bytes, reinterpret_cast<uint64_t>(device_sm), device_segments.storage,
+                static_cast<uint32_t>(total_tasks)
+            }
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }

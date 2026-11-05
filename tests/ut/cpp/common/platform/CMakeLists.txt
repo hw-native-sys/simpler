@@ -932,6 +932,7 @@ hbg_case(test_native_admission.cpp
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
 if(TARGET test_a5_hbg_native_admission)
     target_sources(test_a5_hbg_native_admission PRIVATE
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_binding_plan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test_native_async_last_use.cpp
         ${SIMPLER_SRC}/a5/platform/onboard/host/device_runner.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp

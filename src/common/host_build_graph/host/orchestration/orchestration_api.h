@@ -189,28 +189,33 @@ static inline bool rt_declare_async_use(TaskId task, const AsyncUseDeclaration &
 
 // These positions refer to the submitted task's own tensor/scalar arguments,
 // including a recorded Graph child's parameter-backed arguments. Declaration
-// does not grant ownership or cache cleanliness: native preparation must resolve
-// the actual ranges through its retained owners before enabling the run.
+// does not grant ownership: preparation resolves the actual ranges through its
+// retained owners. The explicit cache contract is the native author's promise
+// about publication/clean aliases, checked against those whole-line ranges.
 static inline bool rt_declare_async_counter_payload(
-    TaskId task, uint32_t signal_arg, uint32_t payload_arg, uint32_t signal_record_stride
+    TaskId task, uint32_t signal_arg, uint32_t payload_arg, uint32_t signal_record_stride,
+    AsyncUseCacheContract cache_contract
 ) {
     return rt_declare_async_use(
         task, {AsyncUseDeclarationKind::COUNTER_PAYLOAD, signal_arg, payload_arg, UINT32_MAX, UINT32_MAX,
-               signal_record_stride}
+               signal_record_stride, cache_contract}
     );
 }
 
 // An explicit control-only wait has no payload acquisition obligation.
-static inline bool rt_declare_async_counter(TaskId task, uint32_t signal_arg, uint32_t signal_record_stride) {
+static inline bool rt_declare_async_counter(
+    TaskId task, uint32_t signal_arg, uint32_t signal_record_stride, AsyncUseCacheContract cache_contract
+) {
     return rt_declare_async_use(
-        task,
-        {AsyncUseDeclarationKind::COUNTER_ONLY, signal_arg, UINT32_MAX, UINT32_MAX, UINT32_MAX, signal_record_stride}
+        task, {AsyncUseDeclarationKind::COUNTER_ONLY, signal_arg, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+               signal_record_stride, cache_contract}
     );
 }
 
-static inline bool rt_declare_async_consumer(TaskId task, uint32_t payload_arg) {
+static inline bool rt_declare_async_consumer(TaskId task, uint32_t payload_arg, AsyncUseCacheContract cache_contract) {
     return rt_declare_async_use(
-        task, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, payload_arg, UINT32_MAX, UINT32_MAX, 0}
+        task, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, payload_arg, UINT32_MAX, UINT32_MAX, 0,
+               cache_contract}
     );
 }
 

@@ -46,6 +46,26 @@ void tensors(CoreTaskArgs &task, const Args &args) {
         task.add_no_dep(args.tensor(i).ref());
 }
 
+constexpr auto kCleanLines = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
+
+void declare_payload_consumer(TaskId task) {
+    // The shared argument signature includes payload even for actions that do
+    // not read it. Its lines are clean at entry; publishers flush payload before
+    // signalling, and consumers write results into a separate tensor.
+    if (!rt_declare_async_consumer(task, 1, kCleanLines))
+        throw std::runtime_error("async fixture payload declaration failed");
+}
+
+void declare_waiter(TaskId task, bool has_predicate = false) {
+    if (!rt_declare_async_counter_payload(task, 0, 1, async_case::kSignalStride * sizeof(int32_t), kCleanLines))
+        throw std::runtime_error("async fixture counter declaration failed");
+    declare_payload_consumer(task);
+    // The predicate reads a separate control line before kernel entry. Control
+    // updates use GM atomics, so this acquisition has no dirty scalar alias.
+    if (has_predicate && !rt_declare_async_consumer(task, 4, kCleanLines))
+        throw std::runtime_error("async fixture predicate declaration failed");
+}
+
 template <typename Args, typename Instance, typename Base, typename Record>
 TaskId action(
     const Args &args, const Plan &p, Action op, Instance instance, Base base, int64_t waiters, Record record,
@@ -60,13 +80,16 @@ TaskId action(
         task.launch_spec.set_block_num(rt_available_cluster_count());
         task.launch_spec.set_require_sync_start(true);
     }
-    if (op == Action::RESCUE) return rt_submit_aic_task(4, task).task_id();
-    if (op == Action::WARM) return rt_submit_aic_task(7, task).task_id();
-    if (op == Action::CONSUME) {
-        if (static_cast<Scenario>(p.scenario) == Scenario::VISIBILITY) return rt_submit_aic_task(8, task).task_id();
-        return rt_submit_aiv_task(5, task).task_id();
-    }
-    return rt_submit_aiv_task(op == Action::PREREQUISITE ? 6 : 3, task).task_id();
+    TaskId submitted;
+    if (op == Action::RESCUE) submitted = rt_submit_aic_task(4, task).task_id();
+    else if (op == Action::WARM) submitted = rt_submit_aic_task(7, task).task_id();
+    else if (op == Action::CONSUME) {
+        if (static_cast<Scenario>(p.scenario) == Scenario::VISIBILITY)
+            submitted = rt_submit_aic_task(8, task).task_id();
+        else submitted = rt_submit_aiv_task(5, task).task_id();
+    } else submitted = rt_submit_aiv_task(op == Action::PREREQUISITE ? 6 : 3, task).task_id();
+    declare_payload_consumer(submitted);
+    return submitted;
 }
 
 template <typename Args>
@@ -112,6 +135,7 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
             task.set_predicate(predicate);
         }
         const TaskId waited = rt_submit_task(kernels, task).task_id();
+        declare_waiter(waited, p.skip != 0);
         std::vector<TaskId> deps{waited};
         if (prerequisite.is_valid()) deps.push_back(prerequisite);
         action(
@@ -132,6 +156,7 @@ void graph_body(const GraphTaskArgs &args, const BodyConfig &config) {
     // freeze them into the shared Graph definition and invalidate this isolation test.
     waiter.add_scalar(args.scalar(1), p.conditions, p.expected, args.scalar(0), p.tail_ms);
     const TaskId waited = rt_submit_aiv_task(1, waiter).task_id();
+    declare_waiter(waited);
     action(args, p, Action::CONSUME, args.scalar(0), args.scalar(1), 1, args.scalar(2), 0, {waited});
 }
 }  // namespace

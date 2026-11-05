@@ -16,7 +16,7 @@
 #include "scheduler/scheduler_async_check.h"
 #include "scheduler/scheduler_async_cohort.h"
 
-inline constexpr uint64_t ASYNC_RESOURCE_VERSION = 1;
+inline constexpr uint64_t ASYNC_RESOURCE_VERSION = 2;
 inline constexpr uint64_t ASYNC_RESOURCE_NONE = UINT64_MAX;
 inline constexpr uint32_t ASYNC_CORE_AIC = 1;
 inline constexpr uint32_t ASYNC_CORE_AIV = 2;
@@ -43,15 +43,16 @@ struct AsyncResourceRange {
     uint64_t access{0};
 };
 
-// One declared condition capacity slot of an actual physical execution. The
-// payload relationship is explicit; an address in a workspace is insufficient.
+// One allowed use of an actual physical execution, independent of the order in
+// which its kernel registers conditions. Host sorts disjoint record spans by
+// address and coalesces aliases, preserving every associated payload range.
 // A record span contains exactly record_count scalar slots at record_stride.
 // SDMA's committed-post metadata following its public records is not a slot.
 struct AsyncConditionContract {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t block_idx{0};
     uint32_t subtask_slot{0};
-    uint32_t condition_index{0};
+    uint32_t use_index{0};
     uint32_t observer_cores{0};
     int32_t completion_type{-1};
     uint32_t payload_none{0};
@@ -60,6 +61,7 @@ struct AsyncConditionContract {
     uint64_t record_stride{0};
     uint64_t source_range{ASYNC_RESOURCE_NONE};
     uint64_t payload_range{ASYNC_RESOURCE_NONE};
+    uint64_t payload_count{1};
 };
 
 enum class AsyncConsumerMapKind : uint32_t { UNKNOWN, NONE, REQUIRED };
@@ -97,7 +99,7 @@ struct AsyncResourceHeader {
 };
 
 static_assert(sizeof(AsyncResourceHeader) == 64 && sizeof(AsyncRetainedSpan) == 16);
-static_assert(sizeof(AsyncResourceRange) == 32 && sizeof(AsyncConditionContract) == 72);
+static_assert(sizeof(AsyncResourceRange) == 32 && sizeof(AsyncConditionContract) == 80);
 static_assert(sizeof(AsyncConsumerTaskMap) == 24 && sizeof(AsyncConsumerContract) == 40);
 
 namespace async_resource_detail {
@@ -162,17 +164,18 @@ struct AsyncResourceTables {
             return false;
         if (layout.resources_bytes < sizeof(AsyncResourceHeader) ||
             !section(layout.total_bytes, layout.resources_offset, layout.resources_bytes) ||
-            !section(layout.total_bytes, layout.uses_offset, layout.uses_bytes) ||
+            (layout.uses_offset != 0 && !section(layout.total_bytes, layout.uses_offset, layout.uses_bytes)) ||
+            (layout.uses_bytes != 0 && layout.uses_offset == 0) ||
             !section(layout.total_bytes, layout.consumers_offset, layout.consumers_bytes))
             return false;
-        if (layout.resources_offset + layout.resources_bytes > layout.uses_offset ||
-            layout.uses_offset + layout.uses_bytes > layout.consumers_offset ||
+        if ((layout.uses_offset != 0 && (layout.resources_offset + layout.resources_bytes > layout.uses_offset ||
+                                         layout.uses_offset + layout.uses_bytes > layout.consumers_offset)) ||
+            layout.resources_offset + layout.resources_bytes > layout.consumers_offset ||
             layout.consumers_offset + layout.consumers_bytes > layout.scratch_offset)
             return false;
         const auto h = load(reinterpret_cast<__gm__ const AsyncResourceHeader *>(base + layout.resources_offset));
         if (h.version != ASYNC_RESOURCE_VERSION || h.run_epoch != layout.run_epoch || h.reserved != 0 ||
-            h.span_count == 0 || h.range_count == 0 || h.condition_count == 0 || layout.task_count == 0 ||
-            layout.task_count > INT32_MAX)
+            layout.task_count == 0 || layout.task_count > INT32_MAX)
             return false;
         uint64_t resource_bytes = sizeof(h), use_bytes = 0, consumer_bytes = 0;
         if (!add_rows(h.span_count, sizeof(AsyncRetainedSpan), resource_bytes) ||
@@ -246,10 +249,26 @@ public:
         const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
         SchedulerAsyncConditionBinding *out
     ) {
-        uint64_t index = 0;
+        uint64_t begin = 0, count = 0;
         AsyncConditionContract use{};
-        if (out == nullptr || !condition_contract(identity, condition, &index, &use) || !entry_valid(use, entry))
+        if (out == nullptr || condition >= identity.capacity || !use_bounds(identity, &begin, &count) || count == 0)
             return false;
+        // A uint64-sized sorted set requires at most 64 comparisons. No scan
+        // depends on the number of declared resources or on registration order.
+        uint64_t lower = 0, upper = count;
+        while (lower < upper) {
+            const uint64_t middle = lower + (upper - lower) / 2;
+            if (!condition_contract(identity, begin + middle, &use)) return false;
+            uint64_t address = 0, bytes = 0;
+            AsyncRetainedSpan retained{};
+            if (!range(use.record_range, ASYNC_RANGE_READ | ASYNC_RANGE_CONDITION_CLEAN, &address, &bytes, &retained))
+                return false;
+            if (address <= entry.addr) lower = middle + 1;
+            else upper = middle;
+        }
+        if (lower == 0) return false;
+        const uint64_t index = begin + lower - 1;
+        if (!condition_contract(identity, index, &use) || !entry_valid(use, entry)) return false;
         *out = {index, 0};
         return true;
     }
@@ -258,10 +277,9 @@ public:
         const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
         const SchedulerAsyncConditionBinding &binding
     ) {
-        uint64_t index = 0;
         AsyncConditionContract use{};
-        return binding.owner_generation == 0 && condition_contract(identity, condition, &index, &use) &&
-               binding.binding_index == index && entry_valid(use, entry);
+        return condition < identity.capacity && binding.owner_generation == 0 &&
+               condition_contract(identity, binding.binding_index, &use) && entry_valid(use, entry);
     }
 
     inline __aicore__ SchedulerAsyncConditionOutcome observe_once(
@@ -295,7 +313,8 @@ public:
     // The public event's actual records must still pass bind_condition at seal.
     inline __aicore__ bool prepare_sdma_submit(
         const SchedulerAsyncGroupIdentity &identity, AsyncCtx &ctx, uint64_t source, uint64_t destination,
-        uint64_t bytes, uint32_t record_upper_bound, AsyncCompletionAllowance *allowance
+        uint64_t bytes, uint32_t record_upper_bound, AsyncCompletionAllowance *allowance,
+        uint64_t allowed_use_index = ASYNC_RESOURCE_NONE
     ) {
         if (allowance != nullptr) *allowance = {};
         // A5's SDMA submit implementation is AIV-only. Observer qualification
@@ -306,19 +325,22 @@ public:
             return reject_submit(ctx);
         const uint32_t begin = *ctx.completion_count;
         if (begin > identity.capacity || record_upper_bound > identity.capacity - begin) return reject_submit(ctx);
-        for (uint32_t n = 0; n < record_upper_bound; ++n) {
-            uint64_t index = 0;
-            AsyncConditionContract use{};
-            AsyncRetainedSpan ignored{};
-            uint64_t address = 0, length = 0;
-            if (!condition_contract(identity, begin + n, &index, &use) ||
-                use.completion_type != COMPLETION_TYPE_SDMA_EVENT_RECORD || use.payload_none != 0 ||
-                !range(use.source_range, ASYNC_RANGE_READ, &address, &length, &ignored) ||
-                !async_resource_detail::contains(address, length, source, bytes) ||
-                !range(use.payload_range, ASYNC_RANGE_WRITE, &address, &length, &ignored) ||
-                !async_resource_detail::contains(address, length, destination, bytes))
-                return reject_submit(ctx);
+        uint64_t use_begin = 0, use_count = 0;
+        if (!use_bounds(identity, &use_begin, &use_count)) return reject_submit(ctx);
+        if (allowed_use_index == ASYNC_RESOURCE_NONE) {
+            if (use_count != 1) return reject_submit(ctx);
+            allowed_use_index = use_begin;
         }
+        AsyncConditionContract use{};
+        AsyncRetainedSpan ignored{};
+        uint64_t address = 0, length = 0;
+        if (!condition_contract(identity, allowed_use_index, &use) ||
+            use.completion_type != COMPLETION_TYPE_SDMA_EVENT_RECORD || use.payload_none != 0 ||
+            !range(use.source_range, ASYNC_RANGE_READ, &address, &length, &ignored) ||
+            !async_resource_detail::contains(address, length, source, bytes) ||
+            !range(use.payload_range, ASYNC_RANGE_WRITE, &address, &length, &ignored) ||
+            !async_resource_detail::contains(address, length, destination, bytes))
+            return reject_submit(ctx);
         return async_completion_reserve(ctx, record_upper_bound, allowance);
     }
 
@@ -410,11 +432,10 @@ private:
 
     inline __aicore__ bool valid_tables() const {
         return tables_.header.version == ASYNC_RESOURCE_VERSION && tables_.header.run_epoch != 0 &&
-               tables_.header.reserved == 0 && tables_.header.condition_count != 0 && tables_.task_count != 0 &&
-               tables_.cohorts.base != nullptr && tables_.cohorts.header.run_epoch == tables_.header.run_epoch &&
-               tables_.spans != nullptr && tables_.ranges != nullptr && tables_.conditions != nullptr &&
-               tables_.consumer_maps != nullptr && tables_.consumers != nullptr && tables_.consumer_ranges != nullptr &&
-               tables_.header.span_count != 0 && tables_.header.range_count != 0 &&
+               tables_.header.reserved == 0 && tables_.task_count != 0 && tables_.cohorts.base != nullptr &&
+               tables_.cohorts.header.run_epoch == tables_.header.run_epoch && tables_.spans != nullptr &&
+               tables_.ranges != nullptr && tables_.conditions != nullptr && tables_.consumer_maps != nullptr &&
+               tables_.consumers != nullptr && tables_.consumer_ranges != nullptr &&
                async_resource_detail::core(3, core_);
     }
 
@@ -460,24 +481,29 @@ private:
         return async_resource_detail::contains(retained.address, retained.bytes, *first, *length);
     }
 
-    inline __aicore__ bool condition_contract(
-        const SchedulerAsyncGroupIdentity &identity, uint32_t condition, uint64_t *index, AsyncConditionContract *use
-    ) const {
+    inline __aicore__ bool
+    use_bounds(const SchedulerAsyncGroupIdentity &identity, uint64_t *begin, uint64_t *count) const {
         using namespace async_resource_detail;
         if (!valid_tables() || identity.run_epoch != tables_.header.run_epoch || identity.task_ref < 0 ||
             static_cast<uint64_t>(identity.task_ref) >= tables_.task_count || identity.subtask_slot >= 3 ||
-            identity.capacity == 0 || identity.capacity > CORE_ASYNC_MAX_CONDITIONS || condition >= identity.capacity ||
-            identity.binding_use_count != identity.capacity || identity.binding_uses_offset < tables_.uses_offset)
+            identity.capacity == 0 || identity.capacity > CORE_ASYNC_MAX_CONDITIONS ||
+            identity.binding_uses_offset < tables_.uses_offset)
             return false;
         const uint64_t delta = identity.binding_uses_offset - tables_.uses_offset;
-        if (delta % sizeof(*use) != 0) return false;
-        const uint64_t begin = delta / sizeof(*use);
-        if (begin > tables_.header.condition_count || identity.capacity > tables_.header.condition_count - begin)
-            return false;
-        *index = begin + condition;
-        *use = load(tables_.conditions + *index);
+        if (delta % sizeof(AsyncConditionContract) != 0) return false;
+        *begin = delta / sizeof(AsyncConditionContract);
+        *count = identity.binding_use_count;
+        return *begin <= tables_.header.condition_count && *count <= tables_.header.condition_count - *begin;
+    }
+
+    inline __aicore__ bool
+    condition_contract(const SchedulerAsyncGroupIdentity &identity, uint64_t index, AsyncConditionContract *use) const {
+        using namespace async_resource_detail;
+        uint64_t begin = 0, count = 0;
+        if (!use_bounds(identity, &begin, &count) || index < begin || index - begin >= count) return false;
+        *use = load(tables_.conditions + index);
         if (use->task_ref != identity.task_ref || use->block_idx != identity.block_idx ||
-            use->subtask_slot != identity.subtask_slot || use->condition_index != condition ||
+            use->subtask_slot != identity.subtask_slot || use->use_index != index - begin ||
             !core(use->observer_cores, core_) || use->payload_none > 1)
             return false;
         AsyncRetainedSpan retained{};
@@ -495,9 +521,13 @@ private:
             (use->record_count - 1) * use->record_stride + width != bytes)
             return false;
         if (use->completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD &&
-            (use->payload_none != 0 || !range(use->source_range, ASYNC_RANGE_READ, &address, &bytes, &retained)))
+            (use->payload_none != 0 || use->payload_count != 1 ||
+             !range(use->source_range, ASYNC_RANGE_READ, &address, &bytes, &retained)))
             return false;
-        if (use->payload_none != 0) return use->payload_range == ASYNC_RESOURCE_NONE;
+        if (use->payload_none != 0) return use->payload_range == ASYNC_RESOURCE_NONE && use->payload_count == 0;
+        if (use->payload_count == 0 || use->payload_range >= tables_.header.range_count ||
+            use->payload_count > tables_.header.range_count - use->payload_range)
+            return false;
         return range(
             use->payload_range, use->completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD ? ASYNC_RANGE_WRITE : 0,
             &address, &bytes, &retained

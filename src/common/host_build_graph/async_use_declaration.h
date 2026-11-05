@@ -21,6 +21,16 @@ enum class AsyncUseDeclarationKind : uint32_t {
     COUNTER_ONLY
 };
 
+// Native author/compiler contract, not a cache probe: publishers complete
+// writeback and a publication barrier before signalling; every observer's
+// touched cache lines have no unpublished dirty alias when acquisition runs.
+// It covers whole cache lines, including bytes neighbouring the logical view.
+// Native code violating this contract is outside the declared interface.
+// A consumer may write after entry (INOUT); its writes retain the ordinary
+// kernel output-publication obligation. Clean is required before maintenance,
+// not forever after it.
+enum class AsyncUseCacheContract : uint32_t { UNQUALIFIED, PUBLISHED_CLEAN_LINES };
+
 // Host orchestration declaration, not a Tensor/Definition wire field. Argument
 // positions resolve against each invocation's actual task payload. No address,
 // captured owner or allocation generation is stored in a reusable declaration.
@@ -31,15 +41,19 @@ struct AsyncUseDeclaration {
     uint32_t source_arg{UINT32_MAX};
     uint32_t context_scalar{UINT32_MAX};
     uint32_t record_stride{0};
+    AsyncUseCacheContract cache_contract{AsyncUseCacheContract::UNQUALIFIED};
 
     bool operator==(const AsyncUseDeclaration &other) const {
         return kind == other.kind && condition_arg == other.condition_arg && payload_arg == other.payload_arg &&
                source_arg == other.source_arg && context_scalar == other.context_scalar &&
-               record_stride == other.record_stride;
+               record_stride == other.record_stride && cache_contract == other.cache_contract;
     }
 };
 
 inline bool async_use_declaration_valid(const AsyncUseDeclaration &use, uint32_t tensor_count, uint32_t scalar_count) {
+    if (use.cache_contract != AsyncUseCacheContract::UNQUALIFIED &&
+        use.cache_contract != AsyncUseCacheContract::PUBLISHED_CLEAN_LINES)
+        return false;
     switch (use.kind) {
     case AsyncUseDeclarationKind::COUNTER_PAYLOAD:
     case AsyncUseDeclarationKind::COUNTER_ONLY:
@@ -70,6 +84,9 @@ inline bool async_use_is_counter(AsyncUseDeclarationKind kind) {
 // argument positions remain distinct uses.
 inline bool async_use_declarations_conflict(const AsyncUseDeclaration &a, const AsyncUseDeclaration &b) {
     if (async_use_is_counter(a.kind) && async_use_is_counter(b.kind) && a.condition_arg == b.condition_arg)
-        return a.kind != b.kind || a.record_stride != b.record_stride;
+        return a.kind != b.kind || a.record_stride != b.record_stride || a.cache_contract != b.cache_contract;
+    if (a.kind == b.kind && a.payload_arg == b.payload_arg && a.source_arg == b.source_arg &&
+        a.context_scalar == b.context_scalar)
+        return a.cache_contract != b.cache_contract;
     return false;
 }

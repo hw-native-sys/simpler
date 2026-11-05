@@ -18,6 +18,8 @@ extern "C" int args_dump_capture_supported_impl(void);
 namespace native_admission_test {
 void *kernel_entry_points(bool in_graph);
 
+void *counter_entry_points(bool in_graph, uint32_t declaration);
+
 TEST_F(NativeAdmissionTest, AsyncRetentionQueryRequiresTheCurrentPreparingOwnerAndItsCallerBorrow) {
     Runner runner;
     auto *caller = runner.allocate_caller_buffer(64);
@@ -110,8 +112,9 @@ TEST_F(NativeAdmissionTest, AsyncRetentionQueryUsesThisPreparationsTemporaryAndC
 namespace {
 class CapabilityRunner : public Runner {
 public:
-    CapabilityRunner(CoreAsyncCapability capability, bool include_table, bool in_graph) {
-        callables_.at(1).host_orch_func_ptr = kernel_entry_points(in_graph);
+    CapabilityRunner(CoreAsyncCapability capability, bool include_table, bool in_graph, uint32_t declaration = 0) {
+        callables_.at(1).host_orch_func_ptr =
+            declaration == 0 ? kernel_entry_points(in_graph) : counter_entry_points(in_graph, declaration);
         callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, capability);
         reinterpret_cast<CoreCallable *>(callable_.data())->set_resolved_addr(0x1000);
         auto &tables = chip_callable_buffers_.at(1);
@@ -173,6 +176,45 @@ TEST_P(NativeAsyncCapabilityTest, ExplicitSynchronousDeclarationPreservesOrdinar
     EXPECT_NE(runner.last_scheduler_runtime_mode(), 0u);
     EXPECT_EQ(runner.launch_calls, 0);
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_P(NativeAsyncCapabilityTest, QualifiedCounterUsesRealRetainedStagingAndPublishesAnAsyncImage) {
+    for (uint32_t declaration : {1u, 4u}) {
+        CapabilityRunner runner(
+            {1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER}, true, GetParam(), declaration
+        );
+        Attempt attempt(runner, 1, 20, 128);
+        attempt.args.clear();
+        uint32_t shape[]{32};
+        attempt.args.add_tensor(
+            make_tensor_external(attempt.bytes.data(), shape, 1, DataType::INT32, AddressSpace::HOST)
+        );
+        ASSERT_EQ(attempt.prepare(), 0) << declaration;
+        EXPECT_GT(runner.scheduler_capacity(1), 0u);
+        EXPECT_NE(runner.last_scheduler_runtime_mode(), 0u);
+        EXPECT_EQ(runner.launch_calls, 0);
+        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    }
+}
+
+TEST_P(NativeAsyncCapabilityTest, MissingCleanOrConsumerContractRejectsBeforeSchedulerPublication) {
+    for (uint32_t declaration : {2u, 3u}) {
+        CapabilityRunner runner(
+            {1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER}, true, GetParam(), declaration
+        );
+        Attempt attempt(runner, 1, 20, 128);
+        attempt.args.clear();
+        uint32_t shape[]{32};
+        attempt.args.add_tensor(
+            make_tensor_external(attempt.bytes.data(), shape, 1, DataType::INT32, AddressSpace::HOST)
+        );
+        EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL) << declaration;
+        EXPECT_TRUE(attempt.consume_release());
+        EXPECT_TRUE(attempt.empty());
+        EXPECT_EQ(runner.scheduler_capacity(1), 0u);
+        EXPECT_EQ(runner.last_scheduler_runtime_mode(), 0u);
+        EXPECT_EQ(runner.launch_calls, 0);
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(OrdinaryAndNativeGraph, NativeAsyncCapabilityTest, ::testing::Bool());

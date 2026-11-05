@@ -113,7 +113,7 @@ struct Fixture {
         group.capacity = 2;
         group.condition_types = CORE_ASYNC_CONDITION_COUNTER | CORE_ASYNC_CONDITION_SDMA_POST_DONE;
         group.binding_uses_offset = layout.uses_offset;
-        group.binding_use_count = 2;
+        group.binding_use_count = 1;
         EXPECT_TRUE(AsyncResourceTables::mount(image.data(), layout, &tables));
     }
 
@@ -184,7 +184,7 @@ TEST(HbgAsyncResourceBinding, MountRequiresExactDisjointSectionsAndPreservesOutp
         Fixture f;
         switch (scenario) {
         case 0:
-            f.header().version = 2;
+            f.header().version = ASYNC_RESOURCE_VERSION + 1;
             break;
         case 1:
             ++f.header().run_epoch;
@@ -249,7 +249,7 @@ TEST(HbgAsyncResourceBinding, MissingTableAndWrongExecutionCannotReadACondition)
             ++group.binding_uses_offset;
             break;
         case 5:
-            --group.binding_use_count;
+            group.binding_use_count = UINT64_MAX;
             break;
         case 6:
             group.binding_uses_offset = UINT64_MAX;
@@ -283,6 +283,7 @@ TEST(HbgAsyncResourceBinding, PayloadRelationshipAndWholeCleanLineAreRequired) {
     f.conditions()[0].payload_range = ASYNC_RESOURCE_NONE;
     EXPECT_FALSE(backend.bind_condition(f.group, 0, f.counter(), &binding));
     f.conditions()[0].payload_none = 1;
+    f.conditions()[0].payload_count = 0;
     EXPECT_TRUE(backend.bind_condition(f.group, 0, f.counter(), &binding));
     f.ranges()[0].access = ASYNC_RANGE_READ;
     EXPECT_FALSE(backend.bind_condition(f.group, 0, f.counter(), &binding));
