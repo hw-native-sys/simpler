@@ -66,6 +66,31 @@ TEST(HbgAsyncPlan, PureSynchronousExecutionNeedsNoAsyncImage) {
     EXPECT_EQ(plan.layout.run_epoch, kEpoch);
 }
 
+TEST(HbgAsyncPlan, UnknownReserves64ForEveryPhysicalExecutionWithoutChangingDescriptor) {
+    for (uint8_t mask : {1, 2, 4, 7}) {
+        for (uint16_t blocks : {1, 4}) {
+            for (bool sync_start : {false, true}) {
+                if (sync_start && blocks == 1) continue;
+                const SchedulerAsyncCapabilities caps{};
+                SchedulerAsyncHostPlan plan;
+                ASSERT_TRUE(scheduler_plan_async_state(
+                    {task(mask, blocks, sync_start)}, {caps}, kEpoch, kBudget, {}, &plan, nullptr
+                ));
+                EXPECT_EQ(plan.layout.group_count, blocks * task(mask).active_mask.count());
+                EXPECT_EQ(plan.layout.condition_capacity, 64 * plan.layout.group_count);
+                for (uint64_t index = 0; index < plan.layout.group_count; ++index) {
+                    const auto identity =
+                        record<SchedulerAsyncGroupIdentity>(plan, plan.layout.group_identity_offset, index);
+                    EXPECT_EQ(identity.capacity, 64u);
+                    EXPECT_EQ(identity.condition_types, CORE_ASYNC_CONDITION_TYPES);
+                }
+                EXPECT_EQ(caps[0].mode, CoreAsyncMode::UNKNOWN);
+                EXPECT_EQ(caps[0].max_conditions, 0u);
+            }
+        }
+    }
+}
+
 TEST(HbgAsyncPlan, EveryActivePhysicalExecutionGetsAUniqueGroup) {
     for (uint8_t mask : {1, 2, 4, 3, 5, 6, 7}) {
         for (uint16_t blocks : {1, 4}) {
@@ -295,15 +320,12 @@ TEST(HbgAsyncPlan, ExactBudgetSucceedsAndRefusalPreservesPreviousImage) {
     }
 }
 
-TEST(HbgAsyncPlan, RejectsMalformedOrUnqualifiedCapabilityOnAnActiveLane) {
+TEST(HbgAsyncPlan, RejectsMalformedCapabilityOnAnActiveLane) {
     const CoreAsyncCapability invalid[] = {
-        {},
-        {2, CoreAsyncMode::DEFERRED, 1, 1},
-        {1, static_cast<CoreAsyncMode>(3), 0, 0},
-        {1, CoreAsyncMode::SYNCHRONOUS, 1, 0},
-        {1, CoreAsyncMode::DEFERRED, 0, 1},
-        {1, CoreAsyncMode::DEFERRED, 65, 1},
-        {1, CoreAsyncMode::DEFERRED, 1, 0},
+        {1, CoreAsyncMode::UNKNOWN, 1, 0},     {1, CoreAsyncMode::UNKNOWN, 0, 1},
+        {2, CoreAsyncMode::DEFERRED, 1, 1},    {1, static_cast<CoreAsyncMode>(3), 0, 0},
+        {1, CoreAsyncMode::SYNCHRONOUS, 1, 0}, {1, CoreAsyncMode::DEFERRED, 0, 1},
+        {1, CoreAsyncMode::DEFERRED, 65, 1},   {1, CoreAsyncMode::DEFERRED, 1, 0},
         {1, CoreAsyncMode::DEFERRED, 1, 4}
     };
     for (auto cap : invalid) {

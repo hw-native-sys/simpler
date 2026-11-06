@@ -214,6 +214,10 @@ public:
     ) {
         uint64_t begin = 0, count = 0;
         AsyncConditionContract use{};
+        if (out != nullptr && dynamic_condition_valid(identity, condition, entry)) {
+            *out = {SCHEDULER_ASYNC_BINDING_DYNAMIC, 0};
+            return true;
+        }
         if (out == nullptr || entry.completion_type != COMPLETION_TYPE_COUNTER || condition >= identity.capacity ||
             !use_bounds(identity, &begin, &count) || count == 0)
             return false;
@@ -248,7 +252,9 @@ public:
         const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
         const SchedulerSubmissionSealIdentity &sealing, SchedulerAsyncConditionBinding *out
     ) {
-        if (entry.completion_type == COMPLETION_TYPE_COUNTER) return bind_condition(identity, condition, entry, out);
+        if (entry.completion_type == COMPLETION_TYPE_COUNTER ||
+            identity.binding_uses_offset == SCHEDULER_ASYNC_USES_DYNAMIC)
+            return bind_condition(identity, condition, entry, out);
         if (out == nullptr || provenance_ == nullptr || condition >= identity.capacity ||
             sealing.run_epoch != identity.run_epoch || sealing.task_ref != identity.task_ref ||
             sealing.block_idx != identity.block_idx || sealing.subtask_slot != identity.subtask_slot)
@@ -268,6 +274,8 @@ public:
         const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
         const SchedulerAsyncConditionBinding &binding
     ) {
+        if (binding.binding_index == SCHEDULER_ASYNC_BINDING_DYNAMIC)
+            return binding.owner_generation == 0 && dynamic_condition_valid(identity, condition, entry);
         AsyncConditionContract use{};
         if (condition >= identity.capacity || binding.owner_generation != 0 ||
             !condition_contract(identity, binding.binding_index, &use) || !entry_valid(use, entry))
@@ -351,6 +359,25 @@ private:
     Reader reader_{};
     Cache cache_{};
     const SchedulerSubmissionProvenanceView *provenance_{nullptr};
+
+    // No guessed resource owner or generation: the kernel keeps its registered
+    // words and associated payload alive through task completion, as on AICPU.
+    // A declared set, including an empty one, cannot fall back to this contract.
+    inline __aicore__ bool dynamic_condition_valid(
+        const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry
+    ) const {
+        if (!valid_tables() || identity.run_epoch != tables_.header.run_epoch || identity.task_ref < 0 ||
+            static_cast<uint64_t>(identity.task_ref) >= tables_.task_count || identity.subtask_slot >= 3 ||
+            identity.capacity == 0 || identity.capacity > CORE_ASYNC_MAX_CONDITIONS || condition >= identity.capacity ||
+            identity.binding_uses_offset != SCHEDULER_ASYNC_USES_DYNAMIC || identity.binding_use_count != 0 ||
+            identity.condition_types == 0 || (identity.condition_types & ~CORE_ASYNC_CONDITION_TYPES) != 0 ||
+            !async_completion_entry_valid(entry))
+            return false;
+        const bool counter = entry.completion_type == COMPLETION_TYPE_COUNTER;
+        const uint32_t type = counter ? CORE_ASYNC_CONDITION_COUNTER : CORE_ASYNC_CONDITION_SDMA_POST_DONE;
+        return (identity.condition_types & type) != 0 &&
+               (counter || tables_.header.execution_contract == ASYNC_EXECUTION_UNQUALIFIED);
+    }
 
     inline __aicore__ bool valid_tables() const {
         return tables_.header.version == ASYNC_RESOURCE_VERSION && tables_.header.run_epoch != 0 &&

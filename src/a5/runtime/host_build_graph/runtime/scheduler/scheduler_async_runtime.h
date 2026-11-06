@@ -174,7 +174,7 @@ group_identity(const SchedulerAsyncRuntimeView &view, uint64_t index, SchedulerA
         ))
         return false;
     return out->binding_use_count == 0 ?
-               out->binding_uses_offset == 0 :
+               (out->binding_uses_offset == 0 || out->binding_uses_offset == SCHEDULER_ASYNC_USES_DYNAMIC) :
                contained(
                    view.layout.uses_offset, view.layout.uses_bytes, out->binding_uses_offset, out->binding_use_count, 1
                );

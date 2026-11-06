@@ -187,7 +187,7 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
 extern "C" int
 runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes, uint64_t epoch) noexcept {
     if (mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE)
-        return HBG_ASYNC_LAST_USE_NONE;  // Admission rejects deferred callables in either fallback.
+        return HBG_ASYNC_LAST_USE_NONE;  // UNKNOWN retains the legacy path's existing lifetime contract.
     if ((mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING && mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) ||
         host == nullptr || epoch == 0 || bytes < sizeof(SchedulerRunControl))
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -1287,6 +1287,7 @@ bool create_scheduler_state(
     const uint64_t node_count = native_graph ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
     bool legacy_graph_required = false;
     bool has_deferred_callable = false;
+    bool has_explicit_deferred_callable = false;
     for (const auto &definition : native_plan.definitions) {
         legacy_graph_required = legacy_graph_required || !definition.resident_supported;
         for (const auto &child : definition.children) {
@@ -1299,16 +1300,13 @@ bool create_scheduler_state(
                 if (!child.metadata.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
                 CoreAsyncCapability capability{};
                 const int kernel_id = child.metadata.kernel_ids[lane];
-                if (!runtime->get_function_async_capability(kernel_id, &capability) ||
-                    !core_async_capability_valid(capability) || capability.mode == CoreAsyncMode::UNKNOWN) {
-                    LOG_ERROR(
-                        "A5 HBG: Graph child kernel=%d lane=%u has missing, UNKNOWN, or invalid async capability; "
-                        "rebuild and register the callable with an explicit completion declaration",
-                        kernel_id, lane
-                    );
+                runtime->get_function_async_capability(kernel_id, &capability);
+                if (!core_async_capability_valid(capability)) {
+                    LOG_ERROR("A5 HBG: Graph child kernel=%d lane=%u has invalid async capability", kernel_id, lane);
                     return false;
                 }
-                has_deferred_callable = has_deferred_callable || capability.mode == CoreAsyncMode::DEFERRED;
+                has_explicit_deferred_callable |= capability.mode == CoreAsyncMode::DEFERRED;
+                has_deferred_callable |= capability.mode != CoreAsyncMode::SYNCHRONOUS;
             }
         }
     }
@@ -1426,16 +1424,16 @@ bool create_scheduler_state(
                 return false;
             }
             CoreAsyncCapability capability{};
-            if (!runtime->get_function_async_capability(kernel_id, &capability) ||
-                !core_async_capability_valid(capability) || capability.mode == CoreAsyncMode::UNKNOWN) {
+            runtime->get_function_async_capability(kernel_id, &capability);
+            if (!core_async_capability_valid(capability)) {
                 LOG_ERROR(
-                    "A5 HBG: task ref=%" PRId64 " kernel=%d lane=%u has missing, UNKNOWN, or invalid async "
-                    "capability; rebuild and register the callable with an explicit completion declaration",
-                    task_ref, kernel_id, subtask_slot
+                    "A5 HBG: task ref=%" PRId64 " kernel=%d lane=%u has invalid async capability", task_ref, kernel_id,
+                    subtask_slot
                 );
                 return false;
             }
-            has_deferred_callable = has_deferred_callable || capability.mode == CoreAsyncMode::DEFERRED;
+            has_explicit_deferred_callable |= capability.mode == CoreAsyncMode::DEFERRED;
+            has_deferred_callable |= capability.mode != CoreAsyncMode::SYNCHRONOUS;
         }
         const auto *predicate = scheduler_node_predicate(host_graph, task_ref);
         if (predicate == nullptr ||
@@ -1519,7 +1517,7 @@ bool create_scheduler_state(
         return false;
     }
     if (legacy_graph_required) {
-        if (has_deferred_callable) {
+        if (has_explicit_deferred_callable) {
             LOG_ERROR("A5 HBG: deferred completion is not qualified for legacy Graph scheduling");
             return false;
         }
@@ -1597,7 +1595,7 @@ bool create_scheduler_state(
         }
     }
     if (legacy_shape_task_ref >= 0) {
-        if (has_deferred_callable) {
+        if (has_explicit_deferred_callable) {
             LOG_ERROR("A5 HBG: deferred completion is not qualified for legacy task-shape scheduling");
             return false;
         }
@@ -1684,10 +1682,8 @@ bool create_scheduler_state(
         return false;
     }
     if (has_deferred_callable) {
-        if (async_declarations == nullptr) {
-            LOG_ERROR("A5 HBG: deferred callable has no explicit resource/payload declarations for this run");
-            return false;
-        }
+        const AsyncHostDeclarations empty_declarations;
+        const auto &declarations = async_declarations != nullptr ? *async_declarations : empty_declarations;
         // Registration-owned descriptors are projected onto the final expanded
         // nodes. A synchronous run needs neither these rows nor an async region.
         async_capabilities.resize(task_metadata.size());
@@ -1696,17 +1692,14 @@ bool create_scheduler_state(
             if (!scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags)) continue;
             for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
                 if (!task.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-                if (!runtime->get_function_async_capability(
-                        task.kernel_ids[lane], &async_capabilities[task_ref][lane]
-                    )) {
-                    LOG_ERROR("A5 HBG: task ref=%zu lane=%u lost its registered callable capability", task_ref, lane);
-                    return false;
-                }
+                // Older registration tables omit capabilities. Their callable
+                // was validated above and uses the same default as UNKNOWN.
+                runtime->get_function_async_capability(task.kernel_ids[lane], &async_capabilities[task_ref][lane]);
             }
         }
         if (!scheduler_plan_async_bindings(
-                task_metadata, async_capabilities, binding_image, native_plan, *async_declarations, *api,
-                max_state_bytes, &async_bindings, &async_error
+                task_metadata, async_capabilities, binding_image, native_plan, declarations, *api, max_state_bytes,
+                &async_bindings, &async_error
             ) ||
             !scheduler_plan_submission_bundles(
                 task_metadata, async_capabilities, async_bindings.submission_workspaces, async_bindings.submission_uses,

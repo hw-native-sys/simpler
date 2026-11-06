@@ -19,6 +19,10 @@
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
 inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 2;
+// A group without static resource declarations uses the kernel registration
+// contract. Zero remains an empty declared-use set, never dynamic permission.
+inline constexpr uint64_t SCHEDULER_ASYNC_USES_DYNAMIC = UINT64_MAX;
+inline constexpr uint64_t SCHEDULER_ASYNC_BINDING_DYNAMIC = UINT64_MAX - 1;
 
 enum class SchedulerAsyncFinishPhase : uint64_t {
     INITIALIZE,

@@ -430,6 +430,10 @@ public:
         if (include_table) tables.capability_table = {capability};
     }
 
+    void replace_capability(CoreAsyncCapability capability) {
+        chip_callable_buffers_.at(1).capability_table = {capability};
+    }
+
 private:
     std::vector<uint8_t> callable_;
     uint64_t entry_{0x1000};
@@ -445,31 +449,37 @@ protected:
 };
 }  // namespace
 
-TEST_P(NativeAsyncCapabilityTest, MissingAndUnknownDeclarationsAreRefusedBeforeSchedulerPublication) {
+TEST_P(NativeAsyncCapabilityTest, MissingAndUnknownCapabilitiesReserveWithoutDeclarations) {
     for (bool include_table : {false, true}) {
         CapabilityRunner runner(CoreAsyncCapability{}, include_table, GetParam());
         Attempt attempt(runner, 1, 20);
-        volatile int32_t accepted = 73;
-        attempt.descriptor.accepted_state = &accepted;
-        attempt.descriptor.accepted_value = 1;
-        EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL);
-        EXPECT_TRUE(attempt.consume_release());
-        EXPECT_TRUE(attempt.empty());
-        EXPECT_EQ(runner.scheduler_capacity(1), 0u);
-        EXPECT_EQ(runner.last_scheduler_runtime_mode(), 0u);
+        ASSERT_EQ(attempt.prepare(), 0);
+        EXPECT_FALSE(attempt.empty());
+        EXPECT_GT(runner.scheduler_capacity(1), 0u);
+        EXPECT_NE(runner.last_scheduler_runtime_mode(), 0u);
         EXPECT_EQ(runner.launch_calls, 0);
-        EXPECT_EQ(accepted, 73);
+        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     }
 }
 
-TEST_P(NativeAsyncCapabilityTest, DeferredDeclarationNeedsRealServiceQualificationBeforeLaunch) {
+TEST_P(NativeAsyncCapabilityTest, DeferredCapabilityNeedsNoResourceDeclaration) {
     CapabilityRunner runner({1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER}, true, GetParam());
+    Attempt attempt(runner, 1, 20);
+    ASSERT_EQ(attempt.prepare(), 0);
+    EXPECT_GT(runner.scheduler_capacity(1), 0u);
+    EXPECT_NE(runner.last_scheduler_runtime_mode(), 0u);
+    EXPECT_EQ(runner.launch_calls, 0);
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_P(NativeAsyncCapabilityTest, MalformedUnknownCapabilityStillRefusesBeforePublication) {
+    CapabilityRunner runner({}, true, GetParam());
+    runner.replace_capability({1, CoreAsyncMode::UNKNOWN, 1, 0});
     Attempt attempt(runner, 1, 20);
     EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_TRUE(attempt.consume_release());
     EXPECT_TRUE(attempt.empty());
     EXPECT_EQ(runner.scheduler_capacity(1), 0u);
-    EXPECT_EQ(runner.last_scheduler_runtime_mode(), 0u);
     EXPECT_EQ(runner.launch_calls, 0);
 }
 

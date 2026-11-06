@@ -1773,16 +1773,11 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
 
 
 def _incore_async_capability(kernel):
-    """Read the native source author's completion contract.
-
-    A scene spec compiles source owned by its author: absent an async declaration,
-    that source promises synchronous completion. This contract does not apply to
-    arbitrary binary imports or the public CoreCallable binary constructor.
-    """
+    """Preserve unknown completion behavior unless the source declares a contract."""
     from simpler.task_interface import CoreAsyncCapability, CoreAsyncMode  # noqa: PLC0415
 
     if "async_capability" not in kernel:
-        return CoreAsyncCapability(mode=CoreAsyncMode.SYNCHRONOUS)
+        return CoreAsyncCapability()
     declaration = kernel["async_capability"]
     if isinstance(declaration, CoreAsyncCapability):
         return declaration

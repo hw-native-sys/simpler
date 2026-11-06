@@ -55,8 +55,9 @@ bool scheduler_has_sdma_uses(
 
 // Queries only owners already selected by this native preparation. Explicit
 // PUBLISHED_CLEAN_LINES declarations provide the publication/clean-alias
-// contract; owner lookup alone supplies no such permission. Unsupported backend
-// qualification and unknown ownership are errors, never partial success.
+// contract; owner lookup alone supplies no such permission. Executions without
+// condition declarations use the existing kernel-owned live-address contract.
+// Invalid explicit declarations never fall back to dynamic registration.
 bool scheduler_plan_async_bindings(
     const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
     const AsyncBindingTaskImage &image, const NativeGraphHostPlan &native, const AsyncHostDeclarations &declarations,

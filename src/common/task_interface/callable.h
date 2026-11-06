@@ -269,7 +269,7 @@ static_assert(offsetof(CoreCallable, image_) == 0 && offsetof(ChipCallable, imag
 static_assert(offsetof(CoreCallable, async_capability_) == 16, "CoreCallable capability offset changed");
 
 // Validate untrusted bytes before casting/reading any signature or child.
-// UNKNOWN is a well-formed capability, but execution must qualify it separately.
+// UNKNOWN is valid; runtimes may reserve default completion capacity for it.
 template <typename Core = CoreCallable>
 inline bool core_callable_image_valid(const void *image, size_t size) {
     if (size < Core::binary_data_offset() || reinterpret_cast<uintptr_t>(image) % alignof(Core) != 0 ||

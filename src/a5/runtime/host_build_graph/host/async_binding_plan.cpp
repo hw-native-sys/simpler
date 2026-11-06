@@ -463,7 +463,7 @@ bool build(
         bool counter_lane = false, sdma_lane = false;
         for (uint32_t lane = 0; lane < 3; ++lane) {
             if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-            const auto &cap = capabilities[task][lane];
+            const auto cap = core_async_effective_capability(capabilities[task][lane]);
             counter_lane |=
                 cap.mode == CoreAsyncMode::DEFERRED && (cap.condition_types & CORE_ASYNC_CONDITION_COUNTER) != 0;
             sdma_lane |= lane != 0 && (cap.mode == CoreAsyncMode::SYNCHRONOUS ||
@@ -480,14 +480,12 @@ bool build(
         for (uint32_t block = 0; block < meta.logical_block_num; ++block)
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-                const auto &capability = capabilities[task][lane];
+                const auto capability = core_async_effective_capability(capabilities[task][lane]);
                 const bool deferred = capability.mode == CoreAsyncMode::DEFERRED;
                 const bool counter = deferred && (capability.condition_types & CORE_ASYNC_CONDITION_COUNTER) != 0;
                 const bool sdma =
                     lane != 0 && (capability.mode == CoreAsyncMode::SYNCHRONOUS ||
                                   (capability.condition_types & CORE_ASYNC_CONDITION_SDMA_POST_DONE) != 0);
-                if (deferred && !declared_wait)
-                    return fail(error, "deferred execution has no declared allowed condition uses");
                 const uint64_t use_count = (counter ? records.size() : 0) + (sdma ? sdma_uses.size() : 0);
                 if (use_count > UINT32_MAX) return fail(error, "allowed-use set exceeds its uint32 index contract");
                 if (!builder.budget.take(use_count, sizeof(AsyncConditionContract)))
@@ -538,7 +536,10 @@ bool build(
                          count}
                     );
                 }
-                if (deferred) plan.groups.push_back({begin, plan.conditions.size() - begin});
+                if (deferred)
+                    plan.groups.push_back(
+                        {declared_wait ? begin : SCHEDULER_ASYNC_USES_DYNAMIC, plan.conditions.size() - begin}
+                    );
             }
     }
     plan.execution_contract = core_only && has_execution && !submission_image ? ASYNC_EXECUTION_CORE_PIPELINES_ONLY :
@@ -651,7 +652,9 @@ bool scheduler_initialize_async_bindings(
         end = section.address + section.bytes;
     }
     for (const auto &group : plan.groups)
-        if (group.begin > plan.conditions.size() || group.count > plan.conditions.size() - group.begin)
+        if (group.begin == SCHEDULER_ASYNC_USES_DYNAMIC ?
+                group.count != 0 :
+                (group.begin > plan.conditions.size() || group.count > plan.conditions.size() - group.begin))
             return fail(error, "async group allowed-use range is invalid");
     auto *bytes = static_cast<std::byte *>(region);
     const auto copy = [&](uint64_t offset, const auto &values) {
@@ -670,6 +673,8 @@ bool scheduler_initialize_async_bindings(
         std::memcpy(&identity, record, sizeof(identity));
         identity.binding_use_count = plan.groups[index].count;
         identity.binding_uses_offset =
+            plan.groups[index].begin == SCHEDULER_ASYNC_USES_DYNAMIC ?
+                SCHEDULER_ASYNC_USES_DYNAMIC :
             identity.binding_use_count == 0 ?
                 0 :
                 layout.uses_offset + plan.groups[index].begin * sizeof(AsyncConditionContract);

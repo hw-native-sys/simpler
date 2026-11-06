@@ -228,6 +228,99 @@ struct Fixture {
     }
 };
 
+TEST(HbgAsyncResourceBinding, DynamicRegistrationChecksCounterAndSdmaWithoutStaticRows) {
+    for (uint32_t core : {ASYNC_CORE_AIC, ASYNC_CORE_AIV}) {
+        Fixture f;
+        f.group.binding_uses_offset = SCHEDULER_ASYNC_USES_DYNAMIC;
+        f.group.binding_use_count = 0;
+        auto backend = f.backend(core);
+        for (auto entry : {f.counter(), f.sdma(UINT64_C(1) << 40)}) {
+            SchedulerAsyncConditionBinding binding{};
+            ASSERT_TRUE(backend.bind_condition(f.group, 0, entry, &binding));
+            EXPECT_EQ(binding.binding_index, SCHEDULER_ASYNC_BINDING_DYNAMIC);
+            f.observed.value = 0;
+            EXPECT_EQ(backend.observe_once(f.group, 0, entry, binding).state, SchedulerAsyncConditionState::PENDING);
+            f.observed.value = entry.completion_type == COMPLETION_TYPE_COUNTER ? 1 : entry.backend_cookie;
+            EXPECT_EQ(backend.observe_once(f.group, 0, entry, binding).state, SchedulerAsyncConditionState::READY);
+        }
+    }
+}
+
+TEST(HbgAsyncResourceBinding, DynamicPermissionDoesNotBypassMalformedEntryOrIdentityChecks) {
+    for (uint32_t fault = 0; fault < 15; ++fault) {
+        Fixture f;
+        f.group.binding_uses_offset = SCHEDULER_ASYNC_USES_DYNAMIC;
+        f.group.binding_use_count = 0;
+        auto entry = f.counter();
+        uint32_t condition = 0;
+        switch (fault) {
+        case 0:
+            entry.addr = 0;
+            break;
+        case 1:
+            ++entry.addr;
+            break;
+        case 2:
+            entry.expected_value = UINT32_MAX;
+            break;
+        case 3:
+            entry.backend_cookie = 1;
+            break;
+        case 4:
+            entry._pad = 1;
+            break;
+        case 5:
+            entry.engine = 255;
+            break;
+        case 6:
+            entry.completion_type = 255;
+            break;
+        case 7:
+            ++f.group.run_epoch;
+            break;
+        case 8:
+            f.group.task_ref = f.tables.task_count;
+            break;
+        case 9:
+            f.group.subtask_slot = 3;
+            break;
+        case 10:
+            f.group.binding_use_count = 1;
+            break;
+        case 11:
+            f.group.binding_uses_offset = 0;
+            break;
+        case 12:
+            f.group.condition_types = CORE_ASYNC_CONDITION_SDMA_POST_DONE;
+            break;
+        case 13:
+            condition = f.group.capacity;
+            break;
+        case 14:
+            f.group.capacity = 65;
+            break;
+        }
+        auto backend = f.backend();
+        SchedulerAsyncConditionBinding binding{};
+        EXPECT_FALSE(backend.bind_condition(f.group, condition, entry, &binding)) << fault;
+        EXPECT_EQ(
+            backend.observe_once(f.group, condition, entry, {SCHEDULER_ASYNC_BINDING_DYNAMIC, 0}).state,
+            SchedulerAsyncConditionState::FAILED
+        ) << fault;
+        EXPECT_EQ(f.observed.reads, 0u);
+    }
+}
+
+TEST(HbgAsyncResourceBinding, DynamicSdmaCannotClaimCorePipelineOnlyRetirement) {
+    Fixture f;
+    f.group.binding_uses_offset = SCHEDULER_ASYNC_USES_DYNAMIC;
+    f.group.binding_use_count = 0;
+    f.tables.header.execution_contract = ASYNC_EXECUTION_CORE_PIPELINES_ONLY;
+    SchedulerAsyncConditionBinding binding{};
+    EXPECT_FALSE(f.backend().bind_condition(f.group, 0, f.sdma(1), &binding));
+    EXPECT_TRUE(f.backend().bind_condition(f.group, 0, f.counter(), &binding));
+}
+
 TEST(HbgAsyncResourceBinding, MountRequiresExactDisjointSectionsAndPreservesOutputOnFailure) {
     for (uint32_t scenario = 0; scenario < 10; ++scenario) {
         Fixture f;

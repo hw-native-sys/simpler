@@ -194,9 +194,9 @@ bool build(
                 execution.bundle_index = map.bundle_base + (sync ? 0 : block);
                 execution.block_idx = block;
                 execution.subtask_slot = lane;
-                const auto &capability = capabilities[task][lane];
-                if (!core_async_capability_valid(capability) || capability.mode == CoreAsyncMode::UNKNOWN)
-                    return fail(error, "submission execution requires an explicit registered callable capability");
+                const auto capability = core_async_effective_capability(capabilities[task][lane]);
+                if (!core_async_capability_valid(capability))
+                    return fail(error, "submission execution requires a valid registered callable capability");
                 execution.completion_mode = capability.mode;
                 execution.condition_capacity = capability.max_conditions;
                 execution.condition_types = capability.condition_types;

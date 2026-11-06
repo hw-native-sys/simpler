@@ -991,9 +991,10 @@ int DeviceRunner::qualify_async_last_use(PreparedExecution &prepared) {
     if (required == 0) return 0;
     int rc = PTO_RUNTIME_ERR_INVALID_STATE;
     const char *reason = "invalid or missing retained async image";
+    DeviceRunTerminal terminal;
     if (required > 0 && prepared.physical_complete) {
         rc = read_device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch);
-        const auto terminal = device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch);
+        terminal = device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch);
         // Ok includes full logical completion and core retirement. An Error
         // may qualify only through explicit core-pipelines-only admission plus
         // this epoch's independently published retirement acknowledgements.
@@ -1006,8 +1007,10 @@ int DeviceRunner::qualify_async_last_use(PreparedExecution &prepared) {
     }
     prepared.physical_complete = false;
     LOG_ERROR(
-        "A5 async last use unproved: epoch=%llu slot=%u: %s; retaining run, communication and workspace owners",
-        static_cast<unsigned long long>(prepared.identity.run_epoch), prepared.pipeline_slot, reason
+        "A5 async last use unproved: epoch=%llu slot=%u: %s; terminal_state=%u terminal_code=%d source=%u; "
+        "retaining run, communication and workspace owners",
+        static_cast<unsigned long long>(prepared.identity.run_epoch), prepared.pipeline_slot, reason,
+        static_cast<unsigned>(terminal.state), terminal.code, static_cast<unsigned>(terminal.source)
     );
     mark_device_unusable(rc);
     return rc;

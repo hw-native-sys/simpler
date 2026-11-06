@@ -376,6 +376,19 @@ TEST_F(AsyncProtocolExportFixture, EmptySealUsesActualExecutionIdentityAndLitera
     EXPECT_NE(json.find("\"terminal\":null"), std::string::npos);
 }
 
+TEST_F(AsyncProtocolExportFixture, DynamicRegistrationKeepsProtocolEvidenceWithoutAnAllowedUseTable) {
+    auto &identity = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset);
+    identity.binding_uses_offset = SCHEDULER_ASYNC_USES_DYNAMIC;
+    identity.binding_use_count = 0;
+    seal(0, 1);
+    auto &binding = async_at<SchedulerAsyncConditionBinding>(identity.condition_bindings_offset);
+    binding.binding_index = SCHEDULER_ASYNC_BINDING_DYNAMIC;
+    const auto json = dump_async();
+    EXPECT_NE(json.find("\"binding_index\":18446744073709551614,\"owner_generation\":null"), std::string::npos);
+    identity.binding_use_count = 1;
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+}
+
 TEST_F(AsyncProtocolExportFixture, ConditionsPreserveBindingScopeAndNullableAllocationGeneration) {
     seal(0, 2);
     const auto &id = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset);

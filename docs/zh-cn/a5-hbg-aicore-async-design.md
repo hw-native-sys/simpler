@@ -98,31 +98,43 @@ Host 将 `(task_ref, block_idx, subtask_slot)` 映射到固定组记录；映射
 声明过能力但本次分支没有登记条件时，实际 count=0 是合法完成，不分配活动检查工作。
 纯同步 kernel 使用既有路径；静态证明整 run 无异步能力时，不分配异步区、不探测目录。
 
-Host 从有版本的 callable 能力描述取得可信上界 `c_e`；合同至少包含 schema version、是否可能登记、
-最大条件数及允许的条件类型。PyPTO 接入时需自动导出 `deferred_completion_waiter` / `static_max_count`，
-原生 C++ kernel 走同一能力入口；scheduler 不识别 PyPTO IR，不要求模型作者重复手填，不增加全局开关。
-描述随二进制注册、序列化并进入身份/hash/cache key；Host 再结合 backend 核资格校验，运行期仍检查容量。
-当前使用 `CoreAsyncCapability v1`（version/mode/max_conditions/condition_types）与 `CallableImageHeader v1`，
-能力进入 callable 注册、序列化及身份/hash/cache key，不借用 padding；旧无版本镜像须重编译，UNKNOWN 不证明同步完成。
+能力声明用于减少预留成本，不是运行前提。省略能力描述或标为 `UNKNOWN` 的 kernel，
+每次物理执行默认预留 64 条条件，允许现有 COUNTER 和 SDMA post-done 类型；返回时读取实际登记数。
+count=0 正常完成且不发布 CHECK，count>0 进入现有 AsyncGroup/CHECK/FINISH 流程。
+明确 `SYNCHRONOUS` 的执行不预留；明确 `DEFERRED` 的执行按声明上界与类型预留并校验。
+PyPTO 可自动导出 `deferred_completion_waiter` / `static_max_count` 来节省空间，但 extern kernel
+和手写 kernel 无须新增能力或资源声明，也不增加全局开关。UNKNOWN 的默认成本按图中物理执行总数计算，
+不能当成按核数分配；静态同步和小容量信息仍有价值。
+
+当前使用 `CoreAsyncCapability v1`（version/mode/max_conditions/condition_types）与 `CallableImageHeader v1`。
+公开描述随二进制注册、序列化并进入身份/hash/cache key；默认预留不把该描述改成 SYNCHRONOUS 或改写其身份。
+缺少能力表的有效已注册 callable 采用相同默认值；错误版本、非法容量/类型仍拒绝，旧无版本二进制镜像仍须重编译。
 `ChipTensor`、`TensorData`、`GraphDefinition`、`AsyncCtx`、`LocalContext` 未扩展；这不表示 DSL 全范围已验收。
 
-每条条件关联 run 内不可变的资源范围、合法完成记录区间、backend 合同及使用关系索引；
-当前采用 `SchedulerAsyncConditionBinding` 旁表，由 run 与物理执行身份限定 binding_index，一个组可引用多个 peer/资源。
-既有 `CanonicalIdentity` 含 owner、buffer_id 和 allocation generation（字段名 generation）；当前异步条件不逐条传播它。
-run 固定绑定的 owner_generation=0 表示未携带分配代次，DFX 导出为 null；保活依赖既有 Host/run/domain owner。
-0 和 run_epoch 均不是分配代次。
-设备表使用 POD 与整数地址/索引，实际 owner 留在现有 Host/run/domain 体系；检查类型、宽度、对齐、
-索引、地址加法溢出及记录范围，不能仅检查地址落在某个通信窗口内。绑定和索引在 run 内不复用。
-登记 adapter 负责把条件解析到该执行允许的绑定；无法证明身份的裸地址明确失败，scheduler 不猜 owner。
-旁表已计入布局预算；要求逐条件分配代次证明的其他接入，不能据此宣称支持。
-旧 token 已用 64-bit `backend_cookie` 保存 SDMA post id；不能仅为支持 64-bit 阈值重定义整个公共 API。
-资源身份和持有证明不替代防覆写协议，后者见第 4 节。
+资源声明同样可选。没有条件资源声明的执行沿用动态登记合同：kernel 保证登记地址和关联 payload
+在任务完成前有效、发布顺序及缓存维护正确，默认路径校验条件格式、类型、宽度、对齐、容量和 run/执行身份。
+它不从裸地址猜 owner 或 allocation generation，也不要求 Host 穷举可能的信号地址。
+检查器仍通过公共观察入口维护条件 DCache；真正消费者的入口统一维护数据 DCache。
+未知外部副作用采用保守的失败保活策略，不能仅凭核退出就判定外部搬运停止。
+该路径出错时普通 close 可能因资源回收未获证明而失败；Host 仍输出已验证的原始终态错误码，
+不能让资源保留的诊断遮住条件溢出等运行错误。这层退出资格检查不属于旧 AICPU 默认登记机制。
+
+存在显式条件资源声明时，继续使用不可变范围、backend 合同及使用关系索引严格匹配；
+未匹配的条件不能回退为动态许可，空的显式集合也不是动态许可。
+`SchedulerAsyncConditionBinding` 旁表保存匹配结果。动态组使用独立的保留哨兵标记，
+无需扩展公共 Graph 或 tensor 结构；绑定由 run 与物理执行身份限定，run 内不复用。
+已有 `CanonicalIdentity` 的 allocation generation 不逐条传播；owner_generation=0 表示未携带分配代次，
+DFX 导出为 null，run_epoch 也不是分配代次。已有 Host/run/domain owner 继续保活所属资源。
+带声明的区间检查和 owner 查询不能替代防覆写协议，后者见第 4 节。
+旧 token 已用 64-bit `backend_cookie` 保存 SDMA post id；无需重定义整个公共 API。
 
 当前编译器上界、generated adapter 的 static_assert 和运行期 capacity 检查都固定为 64，
 扩大单上下文容量必须跨仓修改并重编译。多 block 的总条件数可以超过 64，由各组分别持有；
 不把 legacy 的单逻辑任务等待表或 `MAX_ASYNC_WAITS` 当作本实现的全局上限。
 
-SDMA adapter 在提交前预留足够条件槽并验证类型、workspace 与资源持有关系，再提交、填充和 commit。
+SDMA adapter 在提交前预留足够条件槽，再提交和登记实际记录。带声明的 args-aware 路径还验证
+workspace、资源范围和提交凭证；既有 AsyncCtx 路径不要求这些新增声明，调用方负责原有 SDK session/channel
+共享约束和资源有效期，不能把无声明兼容性当作共享通道并发已受调度器保护。
 预留按匹配 pin 的后端可证明的记录条数上界计算，不能把一个 DMA 请求假设为一个条件；
 event 返回后核对实际条数，归还本次未使用预留。无法得到可信上界的适配器先补齐合同，不能先提交再碰运气登记。
 提交前失败可归还未使用预留；已尝试提交而副作用不明时，锁存错误并保留资源，不能丢掉追踪依据。
@@ -350,7 +362,7 @@ Host 不生成消费者区间表，不要求消费者声明，不维护消费准
 `rt_declare_async_consumer` 仅保留源代码兼容，声明不产生设备侧消费计划。
 
 `async_plan` 仍预分配 AsyncGroup、条件和 FINISH 记录，并建立物理执行映射；
-`async_binding_plan` 仍验证条件记录及提交的合法资源范围、使用关系和已有 owner。
+`async_binding_plan` 对有声明的执行验证资源范围、使用关系和已有 owner；无声明的执行生成动态登记标记。
 这些检查服务于条件身份、提交合法性与资源生命周期，不用于决定消费者维护哪些缓存行。
 内部异步布局为 v2、资源表为 v5；二者不再包含消费者表，SDMA 提交区直接使用 scratch。
 零长度 scratch 可以保留 Host 规划出的对齐末尾偏移，挂载时仍验证偏移和区间边界。
@@ -454,7 +466,7 @@ FINISH 直接执行候选仅在最后 block 释放使汇合归零、安全服务
 | 大量预分配记录、极少在途、运行尾部仅剩少数等待 | 报告总规模对扫描、发现延迟和初始化的影响，不能只测紧凑活跃集合 |
 | publication 持续 RETRY、admission 反复失败、所有核长 kernel | 服务门可达、每轮最多一 slice、许可后直接进 kernel；明确不可抢占造成的延迟 |
 | 零登记、已满足、多 peer、64/65 编译上界、非法地址/类型/代次 | 保留前端与 runtime 拒绝；零登记不会悬挂或缺有效上下文 |
-| 旧二进制、缺失/错误能力描述、序列化与 cache 混用 | 只接受已定义的兼容资格；容量/类型参与身份，不能将未知产物当成同步执行 |
+| 旧二进制、缺失/错误能力描述、序列化与 cache 混用 | 有效缺省/UNKNOWN 按 64 条预留；错误描述仍拒绝，不能将未知产物当成同步执行 |
 | 普通分波、MIX 3/5/6/7、sync-start 容量边界 | block 唯一领取、局部资源释放与逻辑完成分离；不因检查扣住 cohort |
 | Graph 多实例、外部/内部 fanin、多个 sink、普通任务混排 | 事件不串实例，CHILD/EXIT 正确延后，完整 resolve drain |
 | peer 提前写下一 epoch、旧事件/窗口复用 | 无证明的重叠被拒绝或由资源协议阻止；payload 与 signal 的版本同时核对 |

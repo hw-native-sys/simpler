@@ -184,7 +184,8 @@ public:
                     capacity += identity.capacity;
                     require(
                         identity.binding_use_count == 0 ?
-                            identity.binding_uses_offset == 0 :
+                            (identity.binding_uses_offset == 0 ||
+                             identity.binding_uses_offset == SCHEDULER_ASYNC_USES_DYNAMIC) :
                             identity.binding_uses_offset % alignof(AsyncConditionContract) == 0 &&
                                 within(
                                     identity.binding_uses_offset, identity.binding_use_count,

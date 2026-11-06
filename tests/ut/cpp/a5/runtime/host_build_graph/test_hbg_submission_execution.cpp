@@ -541,7 +541,7 @@ TEST(HbgSubmissionExecution, SdmaTokenRequiresMatchingPublicRecordProvenanceAndA
     }
 }
 
-TEST(HbgSubmissionExecution, PlannerRejectsUnknownCapabilityAndBudgetsContextAndProvenanceRows) {
+TEST(HbgSubmissionExecution, PlannerDefaultsUnknownCapabilityAndBudgetsContextAndProvenanceRows) {
     Fixture f;
     const std::vector<SchedulerTaskMetadata> metadata(f.storage.metadata, f.storage.metadata + 4);
     const SchedulerSubmissionWorkspaceInput workspace{
@@ -551,6 +551,17 @@ TEST(HbgSubmissionExecution, PlannerRejectsUnknownCapabilityAndBudgetsContextAnd
     SchedulerSubmissionHostPlan result;
     auto caps = f.caps;
     caps[0][1] = {};
+    ASSERT_TRUE(scheduler_plan_submission_bundles(
+        metadata, caps, {workspace}, {{0, 0, 1, 0, 0}}, f.use_sets, kEpoch, kBudget, &result, nullptr
+    ));
+    EXPECT_EQ(result.header.provenance_count, 64u);
+    SchedulerSubmissionExecution execution{};
+    std::memcpy(&execution, result.image.data() + result.header.executions_offset, sizeof(execution));
+    EXPECT_EQ(execution.completion_mode, CoreAsyncMode::DEFERRED);
+    EXPECT_EQ(execution.condition_capacity, 64u);
+    EXPECT_EQ(execution.condition_types, CORE_ASYNC_CONDITION_TYPES);
+    result = {};
+    caps[0][1] = {1, CoreAsyncMode::UNKNOWN, 1, 0};
     EXPECT_FALSE(scheduler_plan_submission_bundles(
         metadata, caps, {workspace}, {{0, 0, 1, 0, 0}}, f.use_sets, kEpoch, kBudget, &result, nullptr
     ));
@@ -582,6 +593,41 @@ TEST(HbgSubmissionExecution, ImmutableUseMapMustAgreeWithTheDeferredGroupBeforeA
     EXPECT_FALSE(permit);
     EXPECT_EQ(f.busy(), 0u);
     EXPECT_EQ(f.payload(1)->async_submission_context, 0u);
+}
+
+TEST(HbgSubmissionExecution, DynamicExecutionCanShareARunWithQualifiedSubmissions) {
+    for (uint8_t type : {COMPLETION_TYPE_COUNTER, COMPLETION_TYPE_SDMA_EVENT_RECORD}) {
+        Fixture f;
+        f.execution_ref = 3;
+        const auto &view = f.submissions[0].view;
+        uint64_t execution = SCHEDULER_ASYNC_INDEX_NONE;
+        ASSERT_TRUE(scheduler_submission_execution_index(view, 3, 0, 0, &execution));
+        *scheduler_submission_detail::at<SchedulerSubmissionExecutionUseMap>(
+            view, view.header.execution_use_maps_offset, execution
+        ) = {};
+        SchedulerAsyncTaskMap map{};
+        ASSERT_TRUE(scheduler_async_runtime_detail::task_map(f.async, 3, &map));
+        auto *group = scheduler_async_runtime_detail::at<SchedulerAsyncGroupIdentity>(
+            f.async, f.async.layout.group_identity_offset, scheduler_async_group_index(map, 0, 0)
+        );
+        group->binding_uses_offset = SCHEDULER_ASYNC_USES_DYNAMIC;
+        group->binding_use_count = 0;
+        f.assign(0, 0, 0);
+        f.require_enter(0);
+        ASSERT_EQ(f.context(0), nullptr);
+        auto &ctx = f.payload(0)->local_context.async_ctx;
+        ASSERT_NE(ctx.completion_count, nullptr);
+        auto &entry = ctx.completion_entries[0];
+        entry.addr = f.backend.record_address;
+        entry.backend_cookie = type == COMPLETION_TYPE_COUNTER ? 0 : 1;
+        entry.expected_value = type == COMPLETION_TYPE_COUNTER ? 1 : 0;
+        entry.engine = COMPLETION_ENGINE_SDMA;
+        entry.completion_type = type;
+        *ctx.completion_count = 1;
+        ASSERT_TRUE(f.returned(0));
+        EXPECT_EQ(f.locals[0]->local_completed_generations[0], 7u);
+        EXPECT_EQ(f.busy(), 0u);
+    }
 }
 
 TEST(HbgSubmissionExecution, NativeChildFrameKeepsItsSubTaskIdentityThroughSealAndRelease) {

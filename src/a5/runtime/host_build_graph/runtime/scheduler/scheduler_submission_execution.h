@@ -120,8 +120,9 @@ inline __aicore__ bool frame(
             ctx.completion_capacity != execution.condition_capacity)
             return false;
         const uint64_t use_offset =
-            allowed.use_count == 0 ? 0 :
-                                     state.view.layout.uses_offset + allowed.use_begin * sizeof(AsyncConditionContract);
+            allowed.use_count == 0 ?
+                (out->group.binding_uses_offset == SCHEDULER_ASYNC_USES_DYNAMIC ? SCHEDULER_ASYNC_USES_DYNAMIC : 0) :
+                state.view.layout.uses_offset + allowed.use_begin * sizeof(AsyncConditionContract);
         if (out->group.binding_use_count != allowed.use_count || out->group.binding_uses_offset != use_offset)
             return false;
     } else if (group_index != SCHEDULER_ASYNC_INDEX_NONE || ctx.completion_count != nullptr ||
@@ -231,7 +232,8 @@ struct SealingPolicy {
         const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
         SchedulerAsyncConditionBinding *out
     ) {
-        if (entry.completion_type == COMPLETION_TYPE_COUNTER)
+        if (entry.completion_type == COMPLETION_TYPE_COUNTER ||
+            identity.binding_uses_offset == SCHEDULER_ASYNC_USES_DYNAMIC)
             return backend->bind_condition(identity, condition, entry, out);
         const auto &h = frame->header;
         const SchedulerSubmissionSealIdentity actual{

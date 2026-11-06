@@ -23,8 +23,8 @@
 #define __gm__
 #endif
 
-// Reads only the external condition word. The binding owner must first prove
-// its live range, type, run/domain identity and observer-core qualification.
+// Reads only the external condition word. Declared uses validate retained
+// ranges; otherwise the registering kernel owns the live-address contract.
 // The entire condition cache line must be read-only/clean on this observer:
 // invalidation cannot repair an old dirty line owned by some other use.
 //
@@ -57,6 +57,15 @@ struct AsyncCompletionScalarReader {
     inline __aicore__ uint64_t sdma_post_done(uint64_t address) const { return load<uint64_t>(address); }
 };
 
+inline __aicore__ bool async_completion_entry_valid(const DeferredCompletionEntry &entry) {
+    if (entry.addr == 0 || entry._pad != 0 || entry.engine != COMPLETION_ENGINE_SDMA) return false;
+    if (entry.completion_type == COMPLETION_TYPE_COUNTER)
+        return entry.addr % alignof(int32_t) == 0 && entry.expected_value <= INT32_MAX && entry.backend_cookie == 0;
+    if (entry.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD)
+        return entry.addr % alignof(uint64_t) == 0 && entry.backend_cookie != 0 && entry.expected_value == 0;
+    return false;
+}
+
 // Exactly one scalar observation for a valid entry; malformed metadata is
 // rejected without dereferencing addr. Resource validation belongs to the
 // caller's existing run/domain binding and cannot be inferred from this POD.
@@ -65,10 +74,8 @@ struct AsyncCompletionScalarReader {
 template <typename Reader>
 inline __aicore__ CompletionPollResult async_observe_once(const DeferredCompletionEntry &entry, Reader &reader) {
     constexpr CompletionPollResult invalid{CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
-    if (entry.addr == 0 || entry._pad != 0 || entry.engine != COMPLETION_ENGINE_SDMA) return invalid;
+    if (!async_completion_entry_valid(entry)) return invalid;
     if (entry.completion_type == COMPLETION_TYPE_COUNTER) {
-        if (entry.addr % alignof(int32_t) != 0 || entry.expected_value > INT32_MAX || entry.backend_cookie != 0)
-            return invalid;
         const int32_t value = reader.counter(entry.addr);
         // A negative sampled value remains below every supported threshold.
         // Converting it to uint32_t would incorrectly satisfy nonnegative waits.
@@ -79,8 +86,6 @@ inline __aicore__ CompletionPollResult async_observe_once(const DeferredCompleti
         };
     }
     if (entry.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
-        if (entry.addr % alignof(uint64_t) != 0 || entry.backend_cookie == 0 || entry.expected_value != 0)
-            return invalid;
         const uint64_t value = reader.sdma_post_done(entry.addr);
         return {
             value >= entry.backend_cookie ? CompletionPollState::READY : CompletionPollState::PENDING,

@@ -43,6 +43,17 @@ inline constexpr bool core_async_capability_valid(const CoreAsyncCapability &cap
     return false;
 }
 
+// Missing static knowledge keeps the public descriptor UNKNOWN, but reserves
+// the full registration capacity. Explicit declarations only reduce that cost.
+inline constexpr CoreAsyncCapability core_async_effective_capability(const CoreAsyncCapability &capability) {
+    return core_async_capability_valid(capability) && capability.mode == CoreAsyncMode::UNKNOWN ?
+               CoreAsyncCapability{
+                   CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::DEFERRED, CORE_ASYNC_MAX_CONDITIONS,
+                   CORE_ASYNC_CONDITION_TYPES
+               } :
+               capability;
+}
+
 static_assert(sizeof(CoreAsyncCapability) == 16, "CoreAsyncCapability wire ABI size changed");
 static_assert(
     std::is_trivially_copyable_v<CoreAsyncCapability> && std::is_standard_layout_v<CoreAsyncCapability>,

@@ -63,9 +63,9 @@ bool plan_async_layout(
         map.block_count = meta.logical_block_num;
         for (uint32_t lane = 0; lane < 3; ++lane) {
             if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-            const auto &cap = capabilities[task][lane];
-            if (!core_async_capability_valid(cap) || cap.mode == CoreAsyncMode::UNKNOWN)
-                return fail(error, "async plan requires a supported explicit callable capability");
+            const auto cap = core_async_effective_capability(capabilities[task][lane]);
+            if (!core_async_capability_valid(cap))
+                return fail(error, "async plan requires a valid callable capability");
             if (cap.mode != CoreAsyncMode::DEFERRED) continue;
             map.async_lane_mask |= 1u << lane;
             ++map.groups_per_block;
@@ -146,7 +146,7 @@ bool materialize_async_state(
         if (scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags)) {
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 if (meta.active_mask.has(static_cast<SubtaskSlot>(lane)) &&
-                    capabilities[task][lane].mode == CoreAsyncMode::DEFERRED) {
+                    core_async_effective_capability(capabilities[task][lane]).mode == CoreAsyncMode::DEFERRED) {
                     map.async_lane_mask |= 1u << lane;
                     ++map.groups_per_block;
                 }
@@ -191,7 +191,7 @@ bool materialize_async_state(
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 const uint64_t index = scheduler_async_group_index(map, block, lane);
                 if (index == SCHEDULER_ASYNC_INDEX_NONE) continue;
-                const auto &cap = capabilities[task][lane];
+                const auto cap = core_async_effective_capability(capabilities[task][lane]);
                 SchedulerAsyncGroupIdentity identity;
                 identity.run_epoch = layout.run_epoch;
                 identity.task_ref = static_cast<int64_t>(task);

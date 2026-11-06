@@ -183,6 +183,51 @@ struct Materialized {
     }
 };
 
+TEST(HbgAsyncBindingPlan, UnknownAndBoundedDeferredUseDynamicRegistrationWithoutDeclarations) {
+    for (bool unknown : {false, true}) {
+        Fixture f;
+        f.declarations = {};
+        if (unknown) f.capabilities[0][1] = {};
+        AsyncBindingHostPlan plan;
+        ASSERT_TRUE(f.build(&plan)) << f.error;
+        EXPECT_EQ(f.queries, 0u);
+        EXPECT_TRUE(plan.spans.empty());
+        EXPECT_TRUE(plan.ranges.empty());
+        EXPECT_TRUE(plan.conditions.empty());
+        EXPECT_EQ(plan.execution_contract, ASYNC_EXECUTION_UNQUALIFIED);
+        Materialized image;
+        ASSERT_TRUE(image.initialize(f, plan)) << f.error;
+        const auto group = image.group();
+        EXPECT_EQ(group.capacity, unknown ? 64u : 2u);
+        EXPECT_EQ(group.binding_uses_offset, SCHEDULER_ASYNC_USES_DYNAMIC);
+        EXPECT_EQ(group.binding_use_count, 0u);
+        AsyncResourceBindings<> backend(image.tables, ASYNC_CORE_AIC);
+        const auto entry = f.entry(f.address(0, 4));
+        SchedulerAsyncConditionBinding binding{};
+        ASSERT_TRUE(backend.bind_condition(group, 0, entry, &binding));
+        EXPECT_EQ(binding.binding_index, SCHEDULER_ASYNC_BINDING_DYNAMIC);
+        EXPECT_TRUE(backend.validate(group, 0, entry, binding));
+        EXPECT_EQ(backend.observe_once(group, 0, entry, binding).state, SchedulerAsyncConditionState::PENDING);
+        *reinterpret_cast<int32_t *>(f.address(0, 4)) = 1;
+        EXPECT_EQ(backend.observe_once(group, 0, entry, binding).state, SchedulerAsyncConditionState::READY);
+        EXPECT_FALSE(backend.bind_condition(group, group.capacity, entry, &binding));
+    }
+}
+
+TEST(HbgAsyncBindingPlan, UnknownWithDeclarationsKeepsTheirExactRangeRestrictions) {
+    Fixture f;
+    f.capabilities[0][1] = {};
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    Materialized image;
+    ASSERT_TRUE(image.initialize(f, plan)) << f.error;
+    AsyncResourceBindings<> backend(image.tables, ASYNC_CORE_AIC);
+    SchedulerAsyncConditionBinding binding{};
+    EXPECT_TRUE(backend.bind_condition(image.group(), 0, f.entry(f.address(0)), &binding));
+    EXPECT_FALSE(backend.bind_condition(image.group(), 0, f.entry(f.address(0, 8)), &binding));
+    EXPECT_FALSE(backend.validate(image.group(), 0, f.entry(f.address(0)), {SCHEDULER_ASYNC_BINDING_DYNAMIC, 0}));
+}
+
 TEST(HbgAsyncBindingPlan, NativeCounterPlanQueriesOwnersAndMaterializesTheRealPrivateTables) {
     Fixture f;
     AsyncBindingHostPlan plan;
