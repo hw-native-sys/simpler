@@ -1028,11 +1028,11 @@ class _CommContextStruct(ctypes.Structure):
         ("winSize", ctypes.c_uint64),
         ("windowsIn", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
         ("windowsOut", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
-        ("workspaces", _CommWorkspaceStruct * 3),
+        ("workspaces", _CommWorkspaceStruct * 4),
     ]
 
 
-assert ctypes.sizeof(_CommContextStruct) == 1088
+assert ctypes.sizeof(_CommContextStruct) == 1104
 
 
 def scalar_to_uint64(value) -> int:

@@ -1,0 +1,278 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include <gtest/gtest.h>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include "ccu_service_program.h"
+#include "host/ccu_device.h"
+#include "acl/acl.h"
+#include "hccl/hccl_ccu_res.h"
+#include "hccl/hccl_rank_graph.h"
+#include "hccl/hccl_res.h"
+#include "hcomm/ccu/ccu_launch.h"
+#include "hcomm/ccu/ccu_res.h"
+
+namespace {
+// Link-time SDK fault injection exercises the production adapter without a device.
+struct State {
+    std::map<void *, size_t> allocations;
+    uint64_t next_handle{100};
+    int registrations{}, launches{}, triggers{}, frees{}, fail_free_at{}, streams{}, communicators{};
+    bool complete{}, fail_thread{};
+} state;
+void *Handle() { return reinterpret_cast<void *>(++state.next_handle); }
+bool Covered(const void *address, size_t size) {
+    const auto addr = reinterpret_cast<uint64_t>(address);
+    for (const auto &entry : state.allocations) {
+        const auto base = reinterpret_cast<uint64_t>(entry.first);
+        if (addr >= base && addr - base <= entry.second && size <= entry.second - (addr - base)) return true;
+    }
+    return false;
+}
+CcuSessionConfig Config() {
+    CcuSessionConfig config;
+    config.allocation_id = 11;
+    config.epoch = 29;
+    config.device_id = 0;
+    config.parent_owner = std::make_shared<int>(9);
+    config.root_info.resize(sizeof(HcclRootInfo));
+    config.exchange = [](uint64_t, uint32_t phase, const void *local, uint32_t size, void *ranks, uint32_t stride,
+                         uint32_t) {
+        if (size != stride) return 1;
+        std::memcpy(ranks, local, size);
+        std::memcpy(static_cast<uint8_t *>(ranks) + stride, local, size);
+        if (phase == 2 || phase == 3) reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(ranks) + stride)[0] = 1;
+        return 0;
+    };
+    return config;
+}
+std::vector<CcuImageBlock> Image() {
+    std::vector<CcuImageBlock> image(5);
+    auto *header = reinterpret_cast<CcuDeviceContext *>(image.data());
+    header->abi_version = 1;
+    header->struct_size = sizeof(*header);
+    header->image_size = 640;
+    header->allocation_id = 11;
+    header->session_epoch = 29;
+    header->next_sequence = 1;
+    header->admission_offset = 128;
+    header->record_offset = 256;
+    header->arguments_offset = 512;
+    header->arguments_size = 56;
+    return image;
+}
+std::vector<CcuRegisteredFunction> Functions() {
+    CcuRegisteredFunction f;
+    f.spec.program_key.bytes[31] = 7;
+    f.argument_bytes = 56;
+    return {f};
+}
+class CcuSessionSdkTest : public testing::Test {
+protected:
+    void SetUp() override { state = {}; }
+    void TearDown() override {
+        EXPECT_TRUE(state.allocations.empty());
+        EXPECT_EQ(state.streams, 0);
+        EXPECT_EQ(state.communicators, 0);
+        for (const auto &entry : state.allocations)
+            std::free(entry.first);
+    }
+};
+}  // namespace
+
+bool ccu_device_available() { return true; }
+CcuResult CcuServiceProgram(const CcuServiceBuildArgs *) noexcept { return CCU_SUCCESS; }
+extern "C" {
+int memset_s(void *dst, size_t maximum, int value, size_t count) {
+    if (!dst || count > maximum) return 22;
+    std::memset(dst, value, count);
+    return 0;
+}
+aclError aclrtSetDevice(int32_t) { return ACL_SUCCESS; }
+aclError aclrtCreateStream(aclrtStream *out) {
+    *out = Handle();
+    ++state.streams;
+    return ACL_SUCCESS;
+}
+aclError aclrtDestroyStream(aclrtStream) {
+    --state.streams;
+    return ACL_SUCCESS;
+}
+aclError aclrtStreamQuery(aclrtStream, aclrtStreamStatus *out) {
+    *out = state.complete ? ACL_STREAM_STATUS_COMPLETE : ACL_STREAM_STATUS_NOT_READY;
+    return ACL_SUCCESS;
+}
+aclError aclrtMallocWithCfg(void **out, size_t size, aclrtMemMallocPolicy, aclrtMallocConfig *) {
+    *out = std::aligned_alloc(128, (size + 127) / 128 * 128);
+    if (!*out) return ACL_ERROR_BAD_ALLOC;
+    std::memset(*out, 0, size);
+    state.allocations.emplace(*out, size);
+    return ACL_SUCCESS;
+}
+aclError aclrtFree(void *ptr) {
+    if (++state.frees == state.fail_free_at) return ACL_ERROR_INTERNAL_ERROR;
+    if (!state.allocations.erase(ptr)) return ACL_ERROR_INVALID_PARAM;
+    std::free(ptr);
+    return ACL_SUCCESS;
+}
+aclError aclrtMemcpy(void *dst, size_t maximum, const void *src, size_t bytes, aclrtMemcpyKind kind) {
+    if (bytes > maximum || (kind == ACL_MEMCPY_HOST_TO_DEVICE && !Covered(dst, bytes)) ||
+        (kind == ACL_MEMCPY_DEVICE_TO_HOST && !Covered(src, bytes)))
+        return ACL_ERROR_INVALID_PARAM;
+    std::memcpy(dst, src, bytes);
+    return ACL_SUCCESS;
+}
+aclError aclrtPointerGetAttributes(const void *, aclrtPtrAttributes *out) {
+    out->location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    out->location.id = 0;
+    return ACL_SUCCESS;
+}
+aclError aclrtBinaryLoadFromFile(const char *, aclrtBinaryLoadOptions *, aclrtBinHandle *out) {
+    *out = Handle();
+    return ACL_SUCCESS;
+}
+aclError aclrtBinaryGetFunction(aclrtBinHandle, const char *, aclrtFuncHandle *out) {
+    *out = Handle();
+    return ACL_SUCCESS;
+}
+aclError aclrtBinaryUnLoad(aclrtBinHandle) { return ACL_SUCCESS; }
+aclError aclrtLaunchKernel(aclrtFuncHandle, uint32_t, const void *, size_t, aclrtStream) {
+    ++state.triggers;
+    return ACL_SUCCESS;
+}
+HcclResult HcclCommInitRootInfo(uint32_t, const HcclRootInfo *, uint32_t, HcclComm *out) {
+    *out = Handle();
+    ++state.communicators;
+    return HCCL_SUCCESS;
+}
+HcclResult HcclCommDestroy(HcclComm) {
+    --state.communicators;
+    return HCCL_SUCCESS;
+}
+HcclResult HcclThreadAcquireWithStream(HcclComm, CommEngine, aclrtStream, uint32_t, ThreadHandle *out) {
+    if (state.fail_thread) return HCCL_E_INTERNAL;
+    *out = ++state.next_handle;
+    return HCCL_SUCCESS;
+}
+HcclResult HcclRankGraphGetLinks(HcclComm, uint32_t, uint32_t, uint32_t, CommLink **out, uint32_t *count) {
+    static CommLink link{};
+    link.linkAttr.linkProtocol = COMM_PROTOCOL_UBC_CTP;
+    *out = &link;
+    *count = 1;
+    return HCCL_SUCCESS;
+}
+HcclResult HcclChannelAcquire(HcclComm, CommEngine, const HcclChannelDesc *, uint32_t, ChannelHandle *out) {
+    *out = ++state.next_handle;
+    return HCCL_SUCCESS;
+}
+HcclResult HcclCommQueryCcuIns(HcclComm, CcuInsHandle *out, uint32_t *count) {
+    *out = ++state.next_handle;
+    *count = 1;
+    return HCCL_SUCCESS;
+}
+CcuResult HcommCcuInsResDescCreate(uint32_t die, HcommCcuResDescHandle *out) {
+    *out = die + 1;
+    return CCU_SUCCESS;
+}
+CcuResult HcommCcuInsResDescDestroy(HcommCcuResDescHandle) { return CCU_SUCCESS; }
+CcuResult HcommCcuKernelQueryResReq(const void *, const void **, uint32_t, HcommCcuResDescHandle descriptor) {
+    return descriptor == 1 ? CCU_SUCCESS : CCU_E_UNAVAIL;
+}
+CcuResult HcommCcuEventAlloc(CcuInsHandle, uint8_t, uint32_t, CcuEventHandle *out) {
+    *out = ++state.next_handle;
+    return CCU_SUCCESS;
+}
+CcuResult HcommCcuEventGetAddr(CcuEventHandle, uint32_t, uint64_t *out) {
+    *out = 0x80000;
+    return CCU_SUCCESS;
+}
+CcuResult HcommCcuGetMemToken(uint64_t, uint64_t, uint64_t *out) {
+    *out = 17;
+    return CCU_SUCCESS;
+}
+CcuResult HcommCcuKernelRegisterStart(CcuInsHandle) { return CCU_SUCCESS; }
+CcuResult HcommCcuKernelRegister(
+    CcuInsHandle, uint32_t, const char *, const void *, const void **, uint32_t, CcuKernelHandle *out
+) {
+    ++state.registrations;
+    *out = ++state.next_handle;
+    return CCU_SUCCESS;
+}
+CcuResult HcommCcuKernelRegisterEnd(CcuInsHandle) { return CCU_SUCCESS; }
+CcuResult HcommCcuGetTaskArgsNum(CcuKernelHandle, uint32_t *out) {
+    *out = 9;
+    return CCU_SUCCESS;
+}
+CcuResult HcommCcuKernelLaunch(ThreadHandle, CcuKernelHandle, const void *, uint32_t) {
+    ++state.launches;
+    return CCU_SUCCESS;
+}
+CcuResult CcuNotifyWait(ChannelHandle, uint32_t, uint16_t) { return CCU_SUCCESS; }
+}
+
+TEST_F(CcuSessionSdkTest, StopRetryOnlyQueriesDrainAfterCommandOverwritesRequestProgram) {
+    auto backend = ccu_make_session_backend();
+    backend->Initialize(Config());
+    CcuDeviceContextView view{};
+    backend->Publish(Functions(), Image(), view);
+    auto *record = reinterpret_cast<CcuRequestRecord *>(view.addr + 256);
+    record->slot_state = CcuSlotState::SUBMITTED;
+    record->sequence = 7;
+    record->session_epoch = 29;
+    record->completed_sequence = 7;
+    record->completed_epoch = 29;
+    record->completed_state = CcuRequestState::SUCCEEDED;
+    EXPECT_FALSE(backend->Stop(0));
+    EXPECT_EQ(state.triggers, 1);
+    EXPECT_EQ(record->program_index, UINT64_MAX);
+    state.complete = true;
+    EXPECT_TRUE(backend->Stop(0));
+    EXPECT_EQ(state.triggers, 1);
+    backend->Close();
+}
+TEST_F(CcuSessionSdkTest, MemoryPublicationReusesProgramAndCarriesMonotonicSequence) {
+    auto backend = ccu_make_session_backend();
+    backend->Initialize(Config());
+    state.complete = true;
+    CcuDeviceContextView view{};
+    backend->Publish(Functions(), Image(), view);
+    reinterpret_cast<CcuDeviceContext *>(view.addr)->next_sequence = 11;
+    backend->Publish(Functions(), Image(), view);
+    EXPECT_EQ(state.registrations, 1);
+    EXPECT_EQ(state.launches, 2);
+    EXPECT_EQ(reinterpret_cast<CcuDeviceContext *>(view.addr)->next_sequence, 11U);
+    EXPECT_EQ(state.allocations.size(), 3U);
+    EXPECT_TRUE(backend->Stop(0));
+    backend->Close();
+}
+TEST_F(CcuSessionSdkTest, CloseCanRetryAfterImageFreedAndAnotherAllocationFreeFails) {
+    auto backend = ccu_make_session_backend();
+    backend->Initialize(Config());
+    state.complete = true;
+    CcuDeviceContextView view{};
+    backend->Publish(Functions(), Image(), view);
+    ASSERT_TRUE(backend->Stop(0));
+    state.fail_free_at = state.frees + 2;
+    EXPECT_THROW(backend->Close(), CcuSdkError);
+    EXPECT_NO_THROW(backend->PreventRequests());
+    state.fail_free_at = 0;
+    EXPECT_NO_THROW(backend->Close());
+}
+TEST_F(CcuSessionSdkTest, PartialInitializeKeepsStreamsAndCommunicatorUntilLocalClose) {
+    auto backend = ccu_make_session_backend();
+    state.fail_thread = true;
+    EXPECT_THROW(backend->Initialize(Config()), CcuSdkError);
+    EXPECT_EQ(state.streams, 2);
+    EXPECT_EQ(state.communicators, 1);
+    EXPECT_TRUE(backend->Stop(0));
+    backend->Close();
+}

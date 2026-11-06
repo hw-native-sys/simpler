@@ -510,10 +510,11 @@ The legacy `device_ctx` field remains a raw address for synchronous consumers;
 it does not declare or validate an asynchronous engine requirement. No compiled
 capability query or `enable_urma` initialization switch is needed.
 
-The context is simpler's own 1088-byte host/device ABI. Rank metadata starts
+The context is simpler's own 1104-byte host/device ABI. Rank metadata starts
 at offset zero; there is no legacy workspace pair or PTO-compatible prefix.
 PTO session builders receive the chosen workspace address explicitly and do
-not parse this context.
+not parse this context. The reserved CCU descriptor occupies slot 3; reserving
+the slot does not enable CCU domain allocation, which belongs to its provider.
 
 All runtime libraries, bindings, communication-context producers and compiled
 kernels must come from the same simpler build and be updated together. This
