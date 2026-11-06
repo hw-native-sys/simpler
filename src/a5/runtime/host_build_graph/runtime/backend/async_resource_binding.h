@@ -15,11 +15,10 @@
 #include "scheduler/scheduler_local_storage.h"
 #include "async_observer.h"
 #include "scheduler/scheduler_async_check.h"
-#include "scheduler/scheduler_async_cohort.h"
 #include "scheduler/scheduler_submission_provenance.h"
 #include "host_build_graph/async_retirement.h"
 
-inline constexpr uint64_t ASYNC_RESOURCE_VERSION = 4;
+inline constexpr uint64_t ASYNC_RESOURCE_VERSION = 5;
 inline constexpr uint64_t ASYNC_EXECUTION_UNQUALIFIED = HBG_ASYNC_CONTRACT_UNQUALIFIED;
 inline constexpr uint64_t ASYNC_EXECUTION_CORE_PIPELINES_ONLY = HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY;
 
@@ -34,7 +33,6 @@ enum AsyncRangeAccess : uint64_t {
     ASYNC_RANGE_READ = 1,
     ASYNC_RANGE_WRITE = 2,
     ASYNC_RANGE_CONDITION_CLEAN = 4,
-    ASYNC_RANGE_CONSUMER_CLEAN = 8,
 };
 
 // Host exports these ranges from owners already retained by this run/domain.
@@ -76,43 +74,18 @@ struct AsyncConditionContract {
     uint64_t sdma_workspace_address{0};
 };
 
-enum class AsyncConsumerMapKind : uint32_t { UNKNOWN, NONE, REQUIRED };
-
-struct AsyncConsumerTaskMap {
-    uint64_t contract_base{ASYNC_RESOURCE_NONE};
-    uint32_t block_count{0};
-    uint32_t lane_mask{0};
-    AsyncConsumerMapKind kind{AsyncConsumerMapKind::UNKNOWN};
-    uint32_t reserved{0};
-};
-
-struct AsyncConsumerContract {
-    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
-    uint32_t block_idx{0};
-    uint32_t subtask_slot{0};
-    uint64_t range_begin{0};
-    uint64_t range_count{0};
-    uint32_t consumer_cores{0};
-    uint32_t reserved{0};
-};
-
-// Private sections: resources = header, spans, ranges; uses = conditions;
-// consumers = task maps, execution contracts, uint64 range indices. All are
-// immutable after Host publication and share the existing scheduler owner.
+// Private immutable resources and condition contracts share the existing scheduler owner.
 struct AsyncResourceHeader {
     uint64_t version{ASYNC_RESOURCE_VERSION};
     uint64_t run_epoch{0};
     uint64_t span_count{0};
     uint64_t range_count{0};
     uint64_t condition_count{0};
-    uint64_t consumer_count{0};
-    uint64_t consumer_range_count{0};
     uint64_t execution_contract{ASYNC_EXECUTION_UNQUALIFIED};
 };
 
-static_assert(sizeof(AsyncResourceHeader) == 64 && sizeof(AsyncRetainedSpan) == 16);
+static_assert(sizeof(AsyncResourceHeader) == 48 && sizeof(AsyncRetainedSpan) == 16);
 static_assert(sizeof(AsyncResourceRange) == 32 && sizeof(AsyncConditionContract) == 88);
-static_assert(sizeof(AsyncConsumerTaskMap) == 24 && sizeof(AsyncConsumerContract) == 40);
 
 namespace async_resource_detail {
 template <typename T>
@@ -160,16 +133,12 @@ inline __aicore__ bool section(uint64_t total_bytes, uint64_t offset, uint64_t b
 }  // namespace async_resource_detail
 
 struct AsyncResourceTables {
-    SchedulerAsyncCohortView cohorts{};
     AsyncResourceHeader header{};
     uint64_t task_count{0};
     uint64_t uses_offset{0};
     __gm__ const AsyncRetainedSpan *spans{nullptr};
     __gm__ const AsyncResourceRange *ranges{nullptr};
     __gm__ const AsyncConditionContract *conditions{nullptr};
-    __gm__ const AsyncConsumerTaskMap *consumer_maps{nullptr};
-    __gm__ const AsyncConsumerContract *consumers{nullptr};
-    __gm__ const uint64_t *consumer_ranges{nullptr};
 
     // Mount checks format, not owner qualification. Only the retained-owner Host
     // exporter may populate this image. An absent table is never a permissive backend.
@@ -184,77 +153,44 @@ struct AsyncResourceTables {
             !section(layout.total_bytes, layout.resources_offset, layout.resources_bytes) ||
             (layout.uses_offset != 0 && !section(layout.total_bytes, layout.uses_offset, layout.uses_bytes)) ||
             (layout.uses_bytes != 0 && layout.uses_offset == 0) ||
-            !section(layout.total_bytes, layout.consumers_offset, layout.consumers_bytes))
+            (layout.scratch_offset != 0 && !section(layout.total_bytes, layout.scratch_offset, layout.scratch_bytes)) ||
+            (layout.scratch_bytes != 0 && layout.scratch_offset == 0))
             return false;
-        if ((layout.uses_offset != 0 && (layout.resources_offset + layout.resources_bytes > layout.uses_offset ||
-                                         layout.uses_offset + layout.uses_bytes > layout.consumers_offset)) ||
-            layout.resources_offset + layout.resources_bytes > layout.consumers_offset ||
-            layout.consumers_offset + layout.consumers_bytes > layout.scratch_offset)
+        const uint64_t resource_end = layout.resources_offset + layout.resources_bytes;
+        const uint64_t use_end = layout.uses_offset == 0 ? resource_end : layout.uses_offset + layout.uses_bytes;
+        if ((layout.uses_offset != 0 && resource_end > layout.uses_offset) ||
+            (layout.scratch_offset != 0 && use_end > layout.scratch_offset))
             return false;
         const auto h = load(reinterpret_cast<__gm__ const AsyncResourceHeader *>(base + layout.resources_offset));
         if (h.version != ASYNC_RESOURCE_VERSION || h.run_epoch != layout.run_epoch ||
             !async_execution_contract_valid(h.execution_contract) || layout.task_count == 0 ||
             layout.task_count > INT32_MAX)
             return false;
-        uint64_t resource_bytes = sizeof(h), use_bytes = 0, consumer_bytes = 0;
+        uint64_t resource_bytes = sizeof(h), use_bytes = 0;
         if (!add_rows(h.span_count, sizeof(AsyncRetainedSpan), resource_bytes) ||
             !add_rows(h.range_count, sizeof(AsyncResourceRange), resource_bytes) ||
             !add_rows(h.condition_count, sizeof(AsyncConditionContract), use_bytes) ||
-            !add_rows(layout.task_count, sizeof(AsyncConsumerTaskMap), consumer_bytes) ||
-            !add_rows(h.consumer_count, sizeof(AsyncConsumerContract), consumer_bytes) ||
-            !add_rows(h.consumer_range_count, sizeof(uint64_t), consumer_bytes) ||
-            resource_bytes != layout.resources_bytes || use_bytes != layout.uses_bytes ||
-            consumer_bytes != layout.consumers_bytes)
+            resource_bytes != layout.resources_bytes || use_bytes != layout.uses_bytes)
             return false;
-        SchedulerLocalStorage<AsyncResourceTables> next_storage;
-        auto &next = next_storage.get();
-        if (!SchedulerAsyncCohortView::mount(base, layout, &next.cohorts)) return false;
+        AsyncResourceTables next{};
         next.header = h;
         next.task_count = layout.task_count;
         next.uses_offset = layout.uses_offset;
         next.spans = reinterpret_cast<__gm__ const AsyncRetainedSpan *>(base + layout.resources_offset + sizeof(h));
         next.ranges = reinterpret_cast<__gm__ const AsyncResourceRange *>(next.spans + h.span_count);
         next.conditions = reinterpret_cast<__gm__ const AsyncConditionContract *>(base + layout.uses_offset);
-        next.consumer_maps = reinterpret_cast<__gm__ const AsyncConsumerTaskMap *>(base + layout.consumers_offset);
-        next.consumers = reinterpret_cast<__gm__ const AsyncConsumerContract *>(next.consumer_maps + layout.task_count);
-        next.consumer_ranges = reinterpret_cast<__gm__ const uint64_t *>(next.consumers + h.consumer_count);
         *out = next;
         return true;
     }
 };
 
-struct AsyncConsumerIdentity {
-    uint64_t run_epoch{0};
-    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
-    uint32_t block_idx{0};
-    uint32_t subtask_slot{0};
-    uint64_t dispatch_generation{0};
-    uint64_t core_write_serial{0};
-};
-
-struct AsyncConsumerCursor {
-    AsyncConsumerIdentity identity{};
-    SchedulerAsyncCohortCursor cohort{};
-    uint64_t range_index{0};
-    uint64_t line_offset{0};
-    bool initialized{false};
-};
-
-enum class AsyncConsumerResult : uint8_t { PENDING, READY, ERROR };
-
-struct AsyncConsumerScalarCache {
-    inline __aicore__ void invalidate_line(uint64_t address) {
-        scheduler_invalidate_cache_line(reinterpret_cast<__gm__ void *>(address));
-    }
+struct AsyncObservationBarrier {
     inline __aicore__ void finish() { scheduler_cache_barrier(); }
 };
 
-template <typename Reader = AsyncCompletionScalarReader, typename Cache = AsyncConsumerScalarCache>
+template <typename Reader = AsyncCompletionScalarReader, typename Cache = AsyncObservationBarrier>
 class AsyncResourceBindings {
 public:
-    using ConsumerIdentity = AsyncConsumerIdentity;
-    using ConsumerCursor = AsyncConsumerCursor;
-    using ConsumerResult = AsyncConsumerResult;
     inline __aicore__ AsyncResourceBindings(
         const AsyncResourceTables &tables, uint32_t core_kind,
         const SchedulerSubmissionProvenanceView *provenance = nullptr
@@ -367,7 +303,7 @@ public:
     ) {
         if (stage != 0 || offset != 0 || !validate(identity, condition, entry, binding)) return failed();
         // This completes observation-side ordering only. Payload acquisition
-        // belongs to prepare_consumer on the core that will actually read it.
+        // belongs to the common kernel entry on the core that will actually read it.
         cache_.finish();
         return {SchedulerAsyncConditionState::READY, 0};
     }
@@ -409,87 +345,7 @@ public:
         return async_completion_reserve(ctx, record_upper_bound, allowance);
     }
 
-    // The caller supplies a monotonically changing local write serial whenever
-    // a business kernel runs. Any such change discards partial/finished acquire
-    // work. READY must be followed by admission/kernel entry without another
-    // business kernel on this core. No cohort permit is held while PENDING.
-    inline __aicore__ AsyncConsumerResult
-    prepare_consumer(const AsyncConsumerIdentity &identity, AsyncConsumerCursor &cursor, uint32_t &line_budget) {
-        using namespace async_resource_detail;
-        if (!valid_tables() || identity.run_epoch != tables_.header.run_epoch || identity.task_ref < 0 ||
-            static_cast<uint64_t>(identity.task_ref) >= tables_.task_count || identity.dispatch_generation == 0 ||
-            identity.core_write_serial == UINT64_MAX || identity.subtask_slot >= 3)
-            return AsyncConsumerResult::ERROR;
-        const auto map = load(tables_.consumer_maps + identity.task_ref);
-        if (map.reserved != 0 || map.block_count == 0 || map.block_count > INT16_MAX ||
-            identity.block_idx >= map.block_count || map.lane_mask == 0 || (map.lane_mask & ~7u) != 0 ||
-            (map.lane_mask & (1u << identity.subtask_slot)) == 0)
-            return AsyncConsumerResult::ERROR;
-        if (cursor.cohort.arrived && (!cursor.initialized || !same_identity(cursor.identity, identity)))
-            return AsyncConsumerResult::ERROR;
-        if (!cursor.initialized || !same_identity(cursor.identity, identity)) {
-            cursor = {};
-            cursor.identity = identity;
-            cursor.initialized = true;
-        }
-        if (map.kind == AsyncConsumerMapKind::NONE) {
-            if (map.contract_base != ASYNC_RESOURCE_NONE) return AsyncConsumerResult::ERROR;
-            return prepare_cohort(identity, cursor, line_budget);
-        }
-        const uint64_t lanes = __builtin_popcount(map.lane_mask);
-        const uint64_t count = lanes * map.block_count;
-        if (map.kind != AsyncConsumerMapKind::REQUIRED || map.contract_base >= tables_.header.consumer_count ||
-            count > tables_.header.consumer_count - map.contract_base)
-            return AsyncConsumerResult::ERROR;
-        const uint64_t index = map.contract_base + identity.block_idx * lanes +
-                               __builtin_popcount(map.lane_mask & ((1u << identity.subtask_slot) - 1));
-        const auto use = load(tables_.consumers + index);
-        if (use.task_ref != identity.task_ref || use.block_idx != identity.block_idx ||
-            use.subtask_slot != identity.subtask_slot || use.reserved != 0 || !core(use.consumer_cores, core_) ||
-            use.range_count == 0 || use.range_begin > tables_.header.consumer_range_count ||
-            use.range_count > tables_.header.consumer_range_count - use.range_begin)
-            return AsyncConsumerResult::ERROR;
-        if (cursor.range_index > use.range_count || (cursor.line_offset & 63u) != 0 ||
-            (cursor.range_index == use.range_count && cursor.line_offset != 0))
-            return AsyncConsumerResult::ERROR;
-        uint32_t available = line_budget < 8 ? line_budget : 8;
-        while (cursor.range_index < use.range_count && available != 0) {
-            const uint64_t range_index = load(tables_.consumer_ranges + use.range_begin + cursor.range_index);
-            AsyncRetainedSpan retained{};
-            uint64_t address = 0, bytes = 0, first = 0, length = 0;
-            if (!range(range_index, ASYNC_RANGE_READ | ASYNC_RANGE_CONSUMER_CLEAN, &address, &bytes, &retained) ||
-                !cache_lines(retained, address, bytes, &first, &length) || cursor.line_offset >= length) {
-                cache_.finish();
-                return AsyncConsumerResult::ERROR;
-            }
-            cache_.invalidate_line(first + cursor.line_offset);
-            --available;
-            --line_budget;
-            cursor.line_offset += 64;
-            if (cursor.line_offset == length) {
-                cursor.line_offset = 0;
-                ++cursor.range_index;
-            }
-        }
-        cache_.finish();
-        if (cursor.range_index != use.range_count) return AsyncConsumerResult::PENDING;
-        const uint32_t before_cohort = available;
-        const auto result = prepare_cohort(identity, cursor, available);
-        line_budget -= before_cohort - available;
-        return result;
-    }
-
-    inline __aicore__ bool consumer_pinned(const ConsumerCursor &cursor) const { return cursor.cohort.arrived; }
-
 private:
-    inline __aicore__ AsyncConsumerResult
-    prepare_cohort(const AsyncConsumerIdentity &identity, AsyncConsumerCursor &cursor, uint32_t &budget) {
-        const auto result = scheduler_async_cohort_prepare(tables_.cohorts, identity, cursor.cohort, budget);
-        return result == SchedulerAsyncCohortResult::READY   ? AsyncConsumerResult::READY :
-               result == SchedulerAsyncCohortResult::PENDING ? AsyncConsumerResult::PENDING :
-                                                               AsyncConsumerResult::ERROR;
-    }
-
     AsyncResourceTables tables_;
     uint32_t core_;
     Reader reader_{};
@@ -499,9 +355,7 @@ private:
     inline __aicore__ bool valid_tables() const {
         return tables_.header.version == ASYNC_RESOURCE_VERSION && tables_.header.run_epoch != 0 &&
                async_execution_contract_valid(tables_.header.execution_contract) && tables_.task_count != 0 &&
-               tables_.cohorts.base != nullptr && tables_.cohorts.header.run_epoch == tables_.header.run_epoch &&
                tables_.spans != nullptr && tables_.ranges != nullptr && tables_.conditions != nullptr &&
-               tables_.consumer_maps != nullptr && tables_.consumers != nullptr && tables_.consumer_ranges != nullptr &&
                async_resource_detail::core(3, core_);
     }
 
@@ -514,18 +368,12 @@ private:
         return false;
     }
 
-    static inline __aicore__ bool same_identity(const AsyncConsumerIdentity &a, const AsyncConsumerIdentity &b) {
-        return a.run_epoch == b.run_epoch && a.task_ref == b.task_ref && a.block_idx == b.block_idx &&
-               a.subtask_slot == b.subtask_slot && a.dispatch_generation == b.dispatch_generation &&
-               a.core_write_serial == b.core_write_serial;
-    }
-
     inline __aicore__ bool
     range(uint64_t index, uint64_t access, uint64_t *address, uint64_t *bytes, AsyncRetainedSpan *retained) const {
         using namespace async_resource_detail;
         if (index >= tables_.header.range_count) return false;
         const auto row = load(tables_.ranges + index);
-        if (row.span_index >= tables_.header.span_count || row.bytes == 0 || (row.access & ~UINT64_C(15)) != 0 ||
+        if (row.span_index >= tables_.header.span_count || row.bytes == 0 || (row.access & ~UINT64_C(7)) != 0 ||
             (row.access & access) != access)
             return false;
         *retained = load(tables_.spans + row.span_index);

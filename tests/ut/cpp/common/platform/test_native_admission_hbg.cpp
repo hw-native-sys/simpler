@@ -502,24 +502,32 @@ TEST_P(NativeAsyncCapabilityTest, QualifiedCounterUsesRealRetainedStagingAndPubl
     }
 }
 
-TEST_P(NativeAsyncCapabilityTest, MissingCleanOrConsumerContractRejectsBeforeSchedulerPublication) {
-    for (uint32_t declaration : {2u, 3u}) {
-        CapabilityRunner runner(
-            {1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER}, true, GetParam(), declaration
-        );
-        Attempt attempt(runner, 1, 20, 128);
-        attempt.args.clear();
-        uint32_t shape[]{32};
-        attempt.args.add_tensor(
-            make_tensor_external(attempt.bytes.data(), shape, 1, DataType::INT32, AddressSpace::HOST)
-        );
-        EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL) << declaration;
-        EXPECT_TRUE(attempt.consume_release());
-        EXPECT_TRUE(attempt.empty());
-        EXPECT_EQ(runner.scheduler_capacity(1), 0u);
-        EXPECT_EQ(runner.last_scheduler_runtime_mode(), 0u);
-        EXPECT_EQ(runner.launch_calls, 0);
-    }
+TEST_P(NativeAsyncCapabilityTest, MissingPublicationCleanContractRejectsBeforeSchedulerPublication) {
+    CapabilityRunner runner({1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER}, true, GetParam(), 2);
+    Attempt attempt(runner, 1, 20, 128);
+    attempt.args.clear();
+    uint32_t shape[]{32};
+    attempt.args.add_tensor(make_tensor_external(attempt.bytes.data(), shape, 1, DataType::INT32, AddressSpace::HOST));
+    EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_TRUE(attempt.empty());
+    EXPECT_EQ(runner.scheduler_capacity(1), 0u);
+    EXPECT_EQ(runner.last_scheduler_runtime_mode(), 0u);
+    EXPECT_EQ(runner.launch_calls, 0);
+}
+
+TEST_P(NativeAsyncCapabilityTest, CounterPayloadWithoutConsumerDeclarationPublishesAnAsyncImage) {
+    CapabilityRunner runner({1, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER}, true, GetParam(), 3);
+    Attempt attempt(runner, 1, 20, 128);
+    attempt.args.clear();
+    uint32_t shape[]{32};
+    attempt.args.add_tensor(make_tensor_external(attempt.bytes.data(), shape, 1, DataType::INT32, AddressSpace::HOST));
+    ASSERT_EQ(attempt.prepare(), 0);
+    EXPECT_FALSE(attempt.empty());
+    EXPECT_GT(runner.scheduler_capacity(1), 0u);
+    EXPECT_NE(runner.last_scheduler_runtime_mode(), 0u);
+    EXPECT_EQ(runner.launch_calls, 0);
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
 }
 
 INSTANTIATE_TEST_SUITE_P(OrdinaryAndNativeGraph, NativeAsyncCapabilityTest, ::testing::Bool());

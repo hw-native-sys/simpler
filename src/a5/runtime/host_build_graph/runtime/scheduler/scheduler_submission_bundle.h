@@ -32,9 +32,9 @@ struct Atomics {
 };
 }  // namespace scheduler_submission_detail
 
-// This adapter reads the real executor's local preparation/generation and the
-// existing shared CPU cohort. Ordinary READY is only a provisional CPU fact;
-// its original ordered-admission check follows the fixed try-all transaction.
+// Ordinary READY precedes the strong ordered-admission gate in the fixed
+// try-all transaction. Cooperative slots already belong to the existing CPU
+// reservation; MIX RUNNING additionally proves all participating lanes arrived.
 template <typename Backend>
 struct SchedulerSubmissionCpuGate {
     const SchedulerAsyncExecutionState<Backend> *state{nullptr};
@@ -52,51 +52,38 @@ struct SchedulerSubmissionCpuGate {
             slot.task_ref != execution.task_ref || slot.block_idx != execution.block_idx ||
             slot.subtask_slot != execution.subtask_slot)
             return Result::ERROR;
-        if (state->prepared_generations[slot_index] == 0) return Result::PENDING;
-        if (state->prepared_generations[slot_index] != slot.generation ||
-            state->prepared_write_serials[slot_index] != state->core_write_serial)
-            return Result::ERROR;
+        if (state->bound_generations[slot_index] == 0) return Result::PENDING;
+        if (state->bound_generations[slot_index] != slot.generation) return Result::ERROR;
         if (bundle.kind == SchedulerSubmissionBundleKind::EXECUTION) return Result::READY;
-        if (state->pinned_slot == UINT32_MAX) return Result::PENDING;
-        if (state->pinned_slot != slot_index || state->pinned_generation != slot.generation || !slot.cooperative ||
-            local->admission == nullptr || local->admission->current_task_ref != slot.task_ref ||
-            local->admission->current_block_num != bundle.block_count || state->cohorts.base == nullptr ||
-            state->cohorts.header.run_epoch != bundle.run_epoch || slot.task_ref < 0 ||
-            static_cast<uint64_t>(slot.task_ref) >= state->cohorts.header.task_count)
+        const auto *admission = local->admission;
+        if (!slot.cooperative || admission == nullptr || !admission->initialized ||
+            admission->epoch != bundle.run_epoch || admission->current_task_ref != slot.task_ref ||
+            admission->current_block_num != bundle.block_count || slot.block_idx >= bundle.block_count)
             return Result::ERROR;
-        if (slot.gm_mix && (local->admission->gm_mix.phase != SchedulerGmMixPhase::RUNNING ||
-                            local->admission->gm_mix.slot_index != slot_index ||
-                            local->admission->gm_mix.slot_generation != slot.generation ||
-                            local->admission->gm_mix.block_idx != slot.block_idx ||
-                            local->admission->gm_mix.subtask_slot != slot.subtask_slot))
-            return Result::ERROR;
-        const auto map = scheduler_async_cohort_detail::load(
-            reinterpret_cast<__gm__ const SchedulerAsyncCohortTaskMap *>(
-                state->cohorts.base + state->cohorts.header.maps_offset
-            ) +
-            slot.task_ref
-        );
+        uint32_t mask = 0;
+        for (uint32_t lane = 0; lane < 3; ++lane)
+            if (admission->current_active_mask.has(static_cast<SubtaskSlot>(lane))) mask |= 1u << lane;
         const bool sync = bundle.kind == SchedulerSubmissionBundleKind::SYNC_TASK;
-        if (map.flags != local->admission->current_flags || map.block_count != bundle.block_count ||
-            map.lane_mask != bundle.lane_mask || scheduler_task_requires_sync_start(map.flags) != sync ||
-            map.expected != bundle.execution_count || map.cohort_count != (sync ? 1u : map.block_count) ||
-            map.cohort_base >= state->cohorts.header.cohort_count ||
-            map.cohort_count > state->cohorts.header.cohort_count - map.cohort_base)
+        const bool mix = scheduler_task_is_mix(admission->current_flags);
+        if (mask != bundle.lane_mask || scheduler_task_requires_sync_start(admission->current_flags) != sync ||
+            slot.gm_mix != mix || (!sync && !mix) ||
+            bundle.execution_count != admission->current_active_mask.count() * (sync ? bundle.block_count : 1))
             return Result::ERROR;
-        const uint64_t index = map.cohort_base + (sync ? 0 : execution.block_idx);
-        auto &counter = (reinterpret_cast<__gm__ SchedulerAsyncCohortCounter *>(
-                             state->cohorts.base + state->cohorts.header.counters_offset
-                         ) +
-                         index)
-                            ->ready;
-        const uint64_t count = scheduler_gm_fetch_add(counter, UINT64_C(0));
-        if (count > map.expected) return Result::ERROR;
-        return count == map.expected ? Result::READY : Result::PENDING;
+        if (mix) {
+            const auto &group = admission->gm_mix;
+            if (group.phase != SchedulerGmMixPhase::RUNNING || group.slot_index != slot_index ||
+                group.slot_generation != slot.generation || group.block_idx != slot.block_idx ||
+                group.subtask_slot != slot.subtask_slot)
+                return Result::ERROR;
+        } else if (!admission->sync_claimed) {
+            return Result::ERROR;
+        }
+        return Result::READY;
     }
 };
 
-// CpuGate is mandatory: observe_once(execution,bundle) checks the actual pinned
-// CPU reservation and performs at most one authoritative cohort-ready probe.
+// CpuGate is mandatory: observe_once(execution,bundle) checks the existing
+// committed CPU reservation and the execution slot that belongs to it.
 // A READY slot alone is not sufficient ordinary ordered-admission authority.
 template <typename CpuGate, typename Atomics = scheduler_submission_detail::Atomics>
 inline __aicore__ SchedulerSubmissionResult scheduler_submission_acquire(

@@ -86,22 +86,11 @@ struct WorkspaceInputs {
     }
 };
 
-struct CpuIdentity {
-    uint64_t run_epoch;
-    int64_t task_ref;
-    uint32_t block_idx;
-    uint32_t subtask_slot;
-    uint64_t dispatch_generation;
-    uint64_t core_write_serial;
-};
-struct ActorBackend {
-    using ConsumerCursor = SchedulerAsyncCohortCursor;
-};
+struct ActorBackend {};
 struct Actor {
     SchedulerLocalState local{};
     SchedulerAdmissionLocalState admission{};
     SchedulerAsyncExecutionState<ActorBackend> state{};
-    SchedulerAsyncCohortCursor preparation{};
     AsyncSubmissionEvidence evidence{};
 };
 
@@ -127,10 +116,6 @@ struct Fixture {
         cpu_image.reset(std::aligned_alloc(128, cpu_plan.image.size()));
         if (!cpu_image) throw std::bad_alloc();
         std::memcpy(cpu_image.get(), cpu_plan.image.data(), cpu_plan.image.size());
-        SchedulerAsyncCohortView cohorts{};
-        EXPECT_TRUE(
-            SchedulerAsyncCohortView::mount(static_cast<uint8_t *>(cpu_image.get()), cpu_plan.layout, &cohorts)
-        );
         actors.resize(plan.header.execution_count);
         for (uint64_t i = 0; i < actors.size(); ++i) {
             auto &actor = actors[i];
@@ -146,6 +131,9 @@ struct Fixture {
             slot.gm_mix = scheduler_task_is_mix(meta.flags);
             if (slot.cooperative) {
                 actor.local.admission = &actor.admission;
+                actor.admission.initialized = true;
+                actor.admission.epoch = kEpoch;
+                actor.admission.sync_claimed = scheduler_task_requires_sync_start(meta.flags) && !slot.gm_mix;
                 actor.admission.current_task_ref = slot.task_ref;
                 actor.admission.current_block_num = meta.logical_block_num;
                 actor.admission.current_flags = meta.flags;
@@ -157,7 +145,6 @@ struct Fixture {
                 actor.admission.gm_mix.subtask_slot = slot.subtask_slot;
             }
             actor.state.view = {static_cast<uint8_t *>(cpu_image.get()), cpu_plan.layout};
-            actor.state.cohorts = cohorts;
             auto &e = actor.evidence;
             e.run_epoch = kEpoch;
             e.task_ref = execution.task_ref;
@@ -187,24 +174,13 @@ struct Fixture {
             mask
         );
     }
-    void prepare(uint64_t index) {
+    void bind(uint64_t index) {
         auto &actor = actors[index];
-        const auto &slot = actor.local.slots[0];
-        const CpuIdentity identity{kEpoch, slot.task_ref, slot.block_idx, slot.subtask_slot, slot.generation, 0};
-        uint32_t budget = 8;
-        const auto result = scheduler_async_cohort_prepare(actor.state.cohorts, identity, actor.preparation, budget);
-        ASSERT_NE(result, SchedulerAsyncCohortResult::ERROR);
-        if (actor.preparation.arrived) {
-            actor.state.pinned_slot = 0;
-            actor.state.pinned_generation = 1;
-        }
-        if (result == SchedulerAsyncCohortResult::READY) actor.state.prepared_generations[0] = 1;
+        actor.state.bound_generations[0] = actor.local.slots[0].generation;
     }
-    void prepare_all() {
+    void bind_all() {
         for (uint64_t i = 0; i < actors.size(); ++i)
-            prepare(i);
-        for (uint64_t i = 0; i < actors.size(); ++i)
-            prepare(i);
+            bind(i);
     }
     SchedulerSubmissionCpuGate<ActorBackend> gate(uint64_t index) {
         return {&actors[index].state, &actors[index].local, 0};
@@ -304,13 +280,12 @@ TEST(HbgSubmissionBundle, UnknownOrUnimplementedSharedAuthorityCannotAllocateAPo
     EXPECT_FALSE(plan_bundles({task(2)}, {input}, {{0, 0, 1, 0, 0}}, kEpoch, kBudget, &plan, nullptr));
 }
 
-TEST(HbgSubmissionBundle, CpuCohortAndPinPrecedeAnyChannelReservationAndOnlySdmaLanesConsume) {
+TEST(HbgSubmissionBundle, ContextBindingPrecedesReservationAndOnlySdmaLanesConsume) {
     WorkspaceInputs workspace;
     Fixture fixture({task(3)}, {workspace.at(0)}, {{0, 0, 1, 0, 0}});
-    fixture.prepare(1);
     EXPECT_EQ(fixture.slice(1), Result::PENDING);
     EXPECT_EQ(fixture.busy(), 0u);
-    fixture.prepare_all();
+    fixture.bind_all();
     const auto request = fixture.row<SchedulerSubmissionRequest>(fixture.view.header.requests_offset);
     EXPECT_EQ(request.grant_count, 1u);
     fixture.grant_cooperative(0);
@@ -319,13 +294,40 @@ TEST(HbgSubmissionBundle, CpuCohortAndPinPrecedeAnyChannelReservationAndOnlySdma
     EXPECT_EQ(fixture.row<SchedulerSubmissionExecution>(fixture.view.header.executions_offset, 1).grant_count, 1u);
 }
 
+TEST(HbgSubmissionBundle, InvalidExistingCooperativeReservationCannotClaimChannels) {
+    WorkspaceInputs workspace;
+    for (uint32_t scenario = 0; scenario < 7; ++scenario) {
+        Fixture fixture({task(3)}, {workspace.at(0)}, {{0, 0, 1, 0, 0}});
+        fixture.bind_all();
+        auto &actor = fixture.actors[1];
+        if (scenario == 0) actor.admission.initialized = false;
+        if (scenario == 1) ++actor.admission.epoch;
+        if (scenario == 2) ++actor.admission.current_task_ref;
+        if (scenario == 3) ++actor.admission.current_block_num;
+        if (scenario == 4) actor.admission.current_active_mask = LaneMask::all();
+        if (scenario == 5) actor.admission.gm_mix.phase = SchedulerGmMixPhase::ARRIVED;
+        if (scenario == 6) ++actor.admission.gm_mix.slot_generation;
+        EXPECT_EQ(fixture.slice(1), Result::ERROR) << scenario;
+        EXPECT_EQ(fixture.busy(), 0u) << scenario;
+    }
+}
+
+TEST(HbgSubmissionBundle, NonMixSyncStartRequiresItsExistingBlockClaim) {
+    WorkspaceInputs workspace;
+    Fixture fixture({task(2, 2, true)}, {workspace.at(0)}, {{0, 0, 1, 0, 0}, {0, 1, 1, 0, 0}});
+    fixture.bind_all();
+    fixture.actors[0].admission.sync_claimed = false;
+    EXPECT_EQ(fixture.slice(0), Result::ERROR);
+    EXPECT_EQ(fixture.busy(), 0u);
+}
+
 TEST(HbgSubmissionBundle, CooperativePrefixIsOrderedAndNoPeerCanEnterAPartialBundle) {
     WorkspaceInputs workspace;
     Fixture fixture(
         {task(6)}, {workspace.at(1), workspace.at(0)},
         {{0, 0, 1, 0, 0}, {0, 0, 1, 1, 1}, {0, 0, 2, 0, 0}, {0, 0, 2, 1, 1}}
     );
-    fixture.prepare_all();
+    fixture.bind_all();
     fixture.occupy(1, (UINT64_C(1) << 48) - 1);
     for (uint32_t i = 0; i < 12; ++i)
         EXPECT_EQ(fixture.slice(i % 2, 3), Result::PENDING);
@@ -354,7 +356,7 @@ struct FailFirstClaim : scheduler_submission_detail::Atomics {
 TEST(HbgSubmissionBundle, ContendedCooperativeCasYieldsAndAnotherCoreResumesWithoutDuplicateReservation) {
     WorkspaceInputs workspace;
     Fixture fixture({task(6)}, {workspace.at(0)}, {{0, 0, 1, 0, 0}, {0, 0, 2, 0, 0}});
-    fixture.prepare_all();
+    fixture.bind_all();
     auto cpu = fixture.gate(0);
     SchedulerSubmissionBudget budget;
     uint32_t calls = 0;
@@ -373,7 +375,7 @@ TEST(HbgSubmissionBundle, ContendedCooperativeCasYieldsAndAnotherCoreResumesWith
 TEST(HbgSubmissionBundle, OrdinaryPartialClaimFailureReturnsEveryAcquiredWorkspaceBeforeYield) {
     WorkspaceInputs workspace;
     Fixture fixture({task(2)}, {workspace.at(0), workspace.at(1)}, {{0, 0, 1, 0, 0}, {0, 0, 1, 1, 1}});
-    fixture.prepare_all();
+    fixture.bind_all();
     fixture.occupy(1, (UINT64_C(1) << 48) - 1);
     SchedulerSubmissionProvisional transaction;
     SchedulerSubmissionTransactionStats stats;
@@ -392,7 +394,7 @@ TEST(HbgSubmissionBundle, OriginalOrderedAdmissionDenialRollsBackSoCooperativeWo
     WorkspaceInputs workspace;
     const std::vector<SchedulerTaskMetadata> metadata{task(2), task(2, 2, true)};
     Fixture fixture(metadata, {workspace.at(0)}, {{0, 0, 1, 0, 0}, {1, 0, 1, 0, 0}, {1, 1, 1, 0, 0}});
-    fixture.prepare_all();
+    fixture.bind_all();
     SchedulerSubmissionProvisional transaction;
     ASSERT_EQ(fixture.provisional(0, &transaction), Provisional::RESERVED);
     ASSERT_EQ(fixture.busy(), 1u);
@@ -438,7 +440,7 @@ TEST(HbgSubmissionBundle, MetadataCommitAndRuntimeSealEvidenceAreRequiredBeforeR
     WorkspaceInputs workspace;
     for (uint32_t scenario = 0; scenario < 5; ++scenario) {
         Fixture fixture({task(2)}, {workspace.at(0)}, {{0, 0, 1, 0, 0}});
-        fixture.prepare_all();
+        fixture.bind_all();
         fixture.grant_ordinary(0);
         auto &e = fixture.actors[0].evidence;
         fixture.sealed(0);
@@ -458,7 +460,7 @@ TEST(HbgSubmissionBundle, MetadataCommitAndRuntimeSealEvidenceAreRequiredBeforeR
 TEST(HbgSubmissionBundle, WriterReleaseIsExactlyOnceWhileItsEventMayRemainPending) {
     WorkspaceInputs workspace;
     Fixture fixture({task(6)}, {workspace.at(0)}, {{0, 0, 1, 0, 0}, {0, 0, 2, 0, 0}});
-    fixture.prepare_all();
+    fixture.bind_all();
     fixture.grant_cooperative(0);
     fixture.sealed(0);
     fixture.actors[0].evidence.attempted = fixture.actors[0].evidence.committed = 1;
@@ -477,7 +479,7 @@ TEST(HbgSubmissionBundle, WriterReleaseIsExactlyOnceWhileItsEventMayRemainPendin
 TEST(HbgSubmissionBundle, ZeroBudgetDoesNotAcquireLeaseOrChannels) {
     WorkspaceInputs workspace;
     Fixture fixture({task(6)}, {workspace.at(0)}, {{0, 0, 1, 0, 0}, {0, 0, 2, 0, 0}});
-    fixture.prepare_all();
+    fixture.bind_all();
     EXPECT_EQ(fixture.slice(0, 0), Result::PENDING);
     EXPECT_EQ(fixture.busy(), 0u);
     const auto lease = scheduler_async_lease_load(

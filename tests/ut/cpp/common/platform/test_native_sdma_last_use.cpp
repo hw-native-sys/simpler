@@ -250,17 +250,6 @@ private:
             declarations.add(false, 0, 0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1}),
             "SDMA declaration"
         );
-        require(
-            declarations.add(
-                false, 0, 0,
-                {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, 1, UINT32_MAX, UINT32_MAX, 0, kClean}
-            ) &&
-                declarations.add(
-                    false, 0, 1,
-                    {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, 0, UINT32_MAX, UINT32_MAX, 0, kClean}
-                ),
-            "consumer declarations"
-        );
         const AsyncBindingTaskImage image{
             &task_image_, sizeof(task_image_), reinterpret_cast<uint64_t>(&task_image_), offsetof(TaskImage, tasks), 2
         };
@@ -313,12 +302,8 @@ private:
             scheduler_initialize_async_bindings(bindings, plan.layout, base, plan.image.size(), &error), error.c_str()
         );
         async_ = {base, plan.layout};
-        SchedulerAsyncCohortView cohorts;
-        require(SchedulerAsyncCohortView::mount(base, plan.layout, &cohorts), "cohort mount");
-        std::memcpy(
-            cohorts.base + cohorts.header.auxiliary_offset, submissions_plan_.image.data(),
-            submissions_plan_.image.size()
-        );
+        require(plan.layout.scratch_bytes == submissions_plan_.image.size(), "exact submission storage");
+        std::memcpy(base + plan.layout.scratch_offset, submissions_plan_.image.data(), submissions_plan_.image.size());
         require(scheduler_submission_provenance_mount(base, plan.layout, &proof_), "submission provenance");
         require(AsyncResourceTables::mount(base, plan.layout, &tables_), "resource tables");
         require(tables_.header.execution_contract == ASYNC_EXECUTION_UNQUALIFIED, "no core-only promotion");
@@ -354,19 +339,14 @@ private:
         payload->args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload->global_context);
         SchedulerAsyncExecutionState<ExecutionBackend> state;
         state.view = async_;
-        state.cohorts = tables_.cohorts;
         SchedulerSubmissionExecutionView submissions;
         require(scheduler_submission_execution_mount(state, &submissions), "execution mount");
         ExecutionBackend resources(tables_, ASYNC_CORE_AIV, &proof_);
-        bool ready = false, permit = false;
-        for (uint32_t i = 0; i < 16 && !ready; ++i)
-            require(
-                scheduler_async_execution_prepare(
-                    &state, view, base, local, storage_.run_control, 0, resources, &ready
-                ),
-                "prepare consumer"
-            );
-        require(ready, "bounded consumer preparation");
+        require(
+            scheduler_async_execution_bind(&state, view, base, local, storage_.run_control, 0),
+            "execution context binding"
+        );
+        bool permit = false;
         for (uint32_t i = 0; i < 16 && !permit; ++i)
             require(
                 scheduler_submission_execution_admit(

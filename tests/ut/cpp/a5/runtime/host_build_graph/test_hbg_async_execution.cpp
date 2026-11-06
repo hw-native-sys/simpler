@@ -23,33 +23,12 @@
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_dispatch.h"
 #include "scheduler/scheduler_async_execution.h"
-#include "backend/async_resource_binding.h"
 
 namespace {
 constexpr uint64_t kEpoch = 47;
 
 struct ExecutionBackend {
-    using ConsumerIdentity = AsyncConsumerIdentity;
-    using ConsumerCursor = AsyncConsumerCursor;
-    using ConsumerResult = AsyncConsumerResult;
-    SchedulerAsyncCohortView cohorts{};
-    bool consumer_pending{false};
     bool allow_binding{true};
-    uint32_t prepare_calls{0};
-    ConsumerResult prepare_consumer(const ConsumerIdentity &identity, ConsumerCursor &cursor, uint32_t &budget) {
-        ++prepare_calls;
-        if (identity.run_epoch != kEpoch || identity.task_ref != 0 || identity.dispatch_generation == 0 || budget == 0)
-            return ConsumerResult::ERROR;
-        --budget;
-        cursor.identity = identity;
-        cursor.initialized = true;
-        if (consumer_pending) return ConsumerResult::PENDING;
-        const auto result = scheduler_async_cohort_prepare(cohorts, identity, cursor.cohort, budget);
-        return result == SchedulerAsyncCohortResult::READY   ? ConsumerResult::READY :
-               result == SchedulerAsyncCohortResult::PENDING ? ConsumerResult::PENDING :
-                                                               ConsumerResult::ERROR;
-    }
-    bool consumer_pinned(const ConsumerCursor &cursor) const { return cursor.cohort.arrived; }
     bool ready{false};
     uint32_t observations{0};
     bool bind_condition(
@@ -121,7 +100,6 @@ struct ExecutionFixture {
         EXPECT_TRUE(
             scheduler_initialize_async_state(tasks, caps, async.layout, async.base, async.layout.total_bytes, nullptr)
         );
-        EXPECT_TRUE(SchedulerAsyncCohortView::mount(async.base, async.layout, &backend.cohorts));
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, kEpoch));
         run()->active_worker_count = 6;
         run()->aic_active_worker_count = 2;
@@ -140,7 +118,6 @@ struct ExecutionFixture {
             EXPECT_TRUE(scheduler_initialize_admission(base(), local, &admissions[worker]));
             if (admissions[worker].capacity != 0) local->admission = &admissions[worker];
             execution_states[worker].view = async;
-            execution_states[worker].cohorts = backend.cohorts;
             discovery[worker].check = scheduler_async_directory_start(async.layout.group_count, worker);
             discovery[worker].finish = scheduler_async_directory_start(async.layout.finish_count, worker);
         }
@@ -175,21 +152,9 @@ struct ExecutionFixture {
         auto *local = locals[worker];
         uint32_t slot = 0;
         uint64_t publication = 0;
-        bool found = false;
-        if (!scheduler_async_execution_select(
-                &execution_states[worker], graph.graph(), local, run(), &slot, &publication, &found
-            ) ||
-            !found)
+        if (!scheduler_local_ready_pop(local, &slot, &publication)) return false;
+        if (!scheduler_async_execution_bind(&execution_states[worker], graph.graph(), base(), local, run(), slot))
             return false;
-        bool consumer_ready = false;
-        if (!scheduler_async_execution_prepare(
-                &execution_states[worker], graph.graph(), base(), local, run(), slot, backend, &consumer_ready
-            ))
-            return false;
-        if (!consumer_ready) {
-            scheduler_local_ready_publish(local, slot);
-            return false;
-        }
         bool permit = true;
         if (local->admission != nullptr &&
             !scheduler_ordered_can_enter_slot(graph.graph(), base(), local, run(), slot, &permit))
@@ -315,23 +280,49 @@ TEST(HbgAsyncExecution, DuplicateGenerationCannotReleaseAnotherSpmdBlock) {
     EXPECT_EQ(fixture.blocks_left(), 1u);
 }
 
-TEST(HbgAsyncExecution, PendingConsumerRetainsReadyGenerationBeforeAdmission) {
+TEST(HbgAsyncExecution, BindingCanRetryAtTheSameReadyGeneration) {
     ExecutionFixture fixture(2, LaneMask::aic());
     ASSERT_TRUE(fixture.fill(0));
-    const uint32_t generation = fixture.locals[0]->slots[0].generation;
-    fixture.backend.consumer_pending = true;
+    auto *local = fixture.locals[0];
+    auto &state = fixture.execution_states[0];
     uint32_t slot = 0;
-    EXPECT_FALSE(fixture.begin(0, &slot));
-    EXPECT_EQ(fixture.locals[0]->slots[0].generation, generation);
-    EXPECT_NE(fixture.locals[0]->local_ready_mask, 0);
-    EXPECT_EQ(fixture.execution_states[0].permitted_slot, UINT32_MAX);
-    EXPECT_EQ(fixture.execution_states[0].core_write_serial, 0u);
-    fixture.backend.consumer_pending = false;
+    uint64_t publication = 0;
+    ASSERT_TRUE(scheduler_local_ready_pop(local, &slot, &publication));
+    const uint32_t generation = local->slots[slot].generation;
+    ASSERT_TRUE(
+        scheduler_async_execution_bind(&state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot)
+    );
+    auto *payload = scheduler_state_at<DispatchPayload>(
+        fixture.base(), local->dispatch_payload_offset(local->config.self_lane, slot)
+    );
+    auto *entries = payload->local_context.async_ctx.completion_entries;
+    ASSERT_NE(entries, nullptr);
+    ASSERT_TRUE(
+        scheduler_async_execution_bind(&state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot)
+    );
+    EXPECT_EQ(payload->local_context.async_ctx.completion_entries, entries);
+    EXPECT_EQ(state.bound_generations[slot], generation);
+    EXPECT_EQ(state.permitted_slot, UINT32_MAX);
+    scheduler_local_ready_publish(local, slot);
     ASSERT_TRUE(fixture.begin(0, &slot));
-    EXPECT_EQ(fixture.execution_states[0].bound_generations[slot], generation);
-    EXPECT_EQ(fixture.execution_states[0].core_write_serial, 1u);
-    EXPECT_EQ(fixture.backend.prepare_calls, 2u);
     ASSERT_TRUE(fixture.retire(0));
+    EXPECT_EQ(fixture.blocks_left(), 1u);
+}
+
+TEST(HbgAsyncExecution, ANewSlotGenerationCannotUseAnOldContextBinding) {
+    ExecutionFixture fixture(1, LaneMask::aic());
+    ASSERT_TRUE(fixture.fill(0));
+    auto *local = fixture.locals[0];
+    auto &state = fixture.execution_states[0];
+    uint32_t slot = 0;
+    uint64_t publication = 0;
+    ASSERT_TRUE(scheduler_local_ready_pop(local, &slot, &publication));
+    ASSERT_TRUE(
+        scheduler_async_execution_bind(&state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot)
+    );
+    ++local->slots[slot].generation;
+    EXPECT_FALSE(scheduler_async_execution_permitted(&state, fixture.graph.graph(), local, fixture.run(), slot));
+    EXPECT_EQ(state.permitted_slot, UINT32_MAX);
     EXPECT_EQ(fixture.blocks_left(), 1u);
 }
 
@@ -346,11 +337,9 @@ TEST(HbgAsyncExecution, GrantedPermitSuppressesServiceAndOneIterationHasOnlyOneS
     auto &state = fixture.execution_states[3];
     uint64_t publication = 0;
     ASSERT_TRUE(scheduler_local_ready_pop(local, &slot, &publication));
-    bool prepared = false;
-    ASSERT_TRUE(scheduler_async_execution_prepare(
-        &state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, fixture.backend, &prepared
-    ));
-    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(
+        scheduler_async_execution_bind(&state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot)
+    );
     bool permit = false;
     ASSERT_TRUE(
         scheduler_ordered_can_enter_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, &permit)
@@ -427,7 +416,7 @@ TEST(HbgAsyncExecution, SealFailureDoesNotPublishExecutionReleaseOrSuccess) {
     EXPECT_NE(fixture.control()->state, static_cast<int64_t>(SchedulerTaskState::DONE));
 }
 
-TEST(HbgAsyncExecution, ErrorBetweenConsumerPreparationAndPermitStopsKernelEntry) {
+TEST(HbgAsyncExecution, ErrorBetweenBindingAndPermitStopsKernelEntry) {
     ExecutionFixture fixture(1, LaneMask::aic());
     ASSERT_TRUE(fixture.fill(0));
     auto *local = fixture.locals[0];
@@ -435,75 +424,25 @@ TEST(HbgAsyncExecution, ErrorBetweenConsumerPreparationAndPermitStopsKernelEntry
     uint32_t slot = 0;
     uint64_t publication = 0;
     ASSERT_TRUE(scheduler_local_ready_pop(local, &slot, &publication));
-    bool ready = false;
-    ASSERT_TRUE(scheduler_async_execution_prepare(
-        &state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, fixture.backend, &ready
-    ));
-    ASSERT_TRUE(ready);
+    ASSERT_TRUE(
+        scheduler_async_execution_bind(&state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot)
+    );
     scheduler_gm_store(fixture.run()->scheduler_error, UINT64_C(1));
     EXPECT_FALSE(scheduler_async_execution_permitted(&state, fixture.graph.graph(), local, fixture.run(), slot));
     EXPECT_EQ(state.permitted_slot, UINT32_MAX);
-    EXPECT_EQ(state.core_write_serial, 0u);
     EXPECT_EQ(fixture.blocks_left(), 1u);
 }
 
-TEST(HbgAsyncExecution, MixConsumerPendingMustKeepPeerLaneOutsideKernel) {
-    ExecutionFixture fixture(1, LaneMask(true, true, false));
-    for (uint32_t iteration = 0; iteration < 4; ++iteration) {
-        ASSERT_TRUE(fixture.fill(0));
-        ASSERT_TRUE(fixture.fill(1));
-    }
-    ASSERT_NE(fixture.locals[0]->local_ready_mask, 0);
-    ASSERT_NE(fixture.locals[1]->local_ready_mask, 0);
-    fixture.backend.consumer_pending = true;
-    uint32_t slot = 0;
-    EXPECT_FALSE(fixture.begin(0, &slot));
-    fixture.backend.consumer_pending = false;
-    EXPECT_FALSE(fixture.begin(1, &slot));
-    EXPECT_EQ(fixture.execution_states[1].core_write_serial, 0u);
-    EXPECT_NE(fixture.execution_states[1].pinned_slot, UINT32_MAX);
-    ASSERT_TRUE(fixture.begin(0, &slot));
-    ASSERT_TRUE(fixture.retire(0));
-    ASSERT_TRUE(fixture.begin(1, &slot));
-    ASSERT_TRUE(fixture.retire(1));
-    ASSERT_TRUE(fixture.fill(0));
-    fixture.drain(3);
-    EXPECT_EQ(fixture.run()->resolved_task_count, 1u);
-}
-
-TEST(HbgAsyncExecution, SyncStartConsumerPendingMustKeepPeerBlockOutsideKernel) {
-    ExecutionFixture fixture(2, LaneMask::aic(), true);
-    ASSERT_TRUE(fixture.fill(0));
-    ASSERT_TRUE(fixture.fill(3));
-    ASSERT_NE(fixture.locals[0]->local_ready_mask, 0);
-    ASSERT_NE(fixture.locals[3]->local_ready_mask, 0);
-    fixture.backend.consumer_pending = true;
-    uint32_t slot = 0;
-    EXPECT_FALSE(fixture.begin(0, &slot));
-    fixture.backend.consumer_pending = false;
-    EXPECT_FALSE(fixture.begin(3, &slot));
-    EXPECT_EQ(fixture.execution_states[3].core_write_serial, 0u);
-    EXPECT_NE(fixture.execution_states[3].pinned_slot, UINT32_MAX);
-    ASSERT_TRUE(fixture.begin(0, &slot));
-    ASSERT_TRUE(fixture.retire(0));
-    ASSERT_TRUE(fixture.begin(3, &slot));
-    ASSERT_TRUE(fixture.retire(3));
-    fixture.drain(4);
-    EXPECT_EQ(fixture.run()->resolved_task_count, 1u);
-}
-
-TEST(HbgAsyncExecution, InvalidCooperativeOwnershipCannotPublishCohortArrival) {
+TEST(HbgAsyncExecution, InvalidCooperativeOwnershipCannotBindTheExecution) {
     ExecutionFixture fixture(2, LaneMask::aic(), true);
     ASSERT_TRUE(fixture.fill(0));
     fixture.admissions[0].current_block_num = 3;
     uint32_t slot = 0;
     EXPECT_FALSE(fixture.begin(0, &slot));
     EXPECT_NE(scheduler_read_error(fixture.run()), 0);
-    EXPECT_EQ(fixture.backend.prepare_calls, 0u);
-    const auto &view = fixture.backend.cohorts;
-    auto *counter = reinterpret_cast<SchedulerAsyncCohortCounter *>(view.base + view.header.counters_offset);
-    EXPECT_EQ(scheduler_gm_fetch_add(counter->ready, UINT64_C(0)), 0u);
-    EXPECT_EQ(fixture.execution_states[0].pinned_slot, UINT32_MAX);
+    EXPECT_EQ(fixture.execution_states[0].bound_generations[slot], 0u);
+    EXPECT_EQ(fixture.execution_states[0].permitted_slot, UINT32_MAX);
+    EXPECT_EQ(fixture.blocks_left(), 2u);
 }
 
 struct AsyncShape {
@@ -533,10 +472,6 @@ TEST_P(HbgAsyncExecutionShapes, RealDispatchRetiresAllLanesAndBlocksExactlyOnce)
         }
     }
     EXPECT_EQ(executions.size(), shape.blocks * shape.lanes.count());
-    uint64_t returned = 0;
-    for (const auto &state : fixture.execution_states)
-        returned += state.core_write_serial;
-    EXPECT_EQ(returned, executions.size());
     EXPECT_EQ(fixture.blocks_left(), 0u);
     fixture.drain(4);
     EXPECT_EQ(fixture.run()->resolved_task_count, 1u);

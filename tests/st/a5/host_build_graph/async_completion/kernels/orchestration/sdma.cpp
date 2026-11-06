@@ -22,16 +22,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     task.add_scalar(args.scalar<int64_t>(0), args.scalar<int64_t>(1), args.scalar<int64_t>(2));
     const TaskId transfer = rt_submit_aiv_task(0, task).task_id();
     constexpr auto clean = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
-    if (!rt_declare_async_sdma_get(transfer, 0, 1, 0, 2, clean) || !rt_declare_async_consumer(transfer, 1, clean))
+    if (!rt_declare_async_sdma_get(transfer, 0, 1, 0, 2, clean))
         throw std::runtime_error("SDMA transfer resource declaration failed");
-    // The independent probe reads only the public event receipt. Giving it the
-    // payload would require consumer acquisition before it could observe PENDING.
+    // The independent probe observes only the public event receipt; it never
+    // reads a payload that may still be written by SDMA.
     CoreTaskArgs probe;
     probe.add_no_dep(args.tensor(3).ref());
     rt_submit_aiv_task(2, probe);
     task.set_dependencies(&transfer, 1);
-    const TaskId consumer = rt_submit_aiv_task(1, task).task_id();
-    if (!rt_declare_async_consumer(consumer, 1, clean))
-        throw std::runtime_error("SDMA consumer resource declaration failed");
+    rt_submit_aiv_task(1, task);
 }
 }

@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "scheduler_async_cohort.h"
+#include "scheduler_async_layout.h"
 #include "async_capability.h"
 
 inline constexpr uint64_t SCHEDULER_SUBMISSION_VERSION = 2;

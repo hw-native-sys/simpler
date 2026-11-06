@@ -26,8 +26,7 @@ using SchedulerAsyncCapabilities = std::array<CoreAsyncCapability, 3>;
 struct SchedulerAsyncAuxiliaryBytes {
     uint64_t resources{0};
     uint64_t uses{0};
-    uint64_t consumers{0};
-    // Backend scratch follows the separately budgeted consumer-cohort prefix.
+    // Backend submission storage shares the retained async allocation.
     uint64_t scratch{0};
 };
 

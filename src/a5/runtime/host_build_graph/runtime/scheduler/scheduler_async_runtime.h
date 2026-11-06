@@ -277,7 +277,6 @@ inline __aicore__ bool scheduler_async_runtime_mount(
         SCHEDULER_ASYNC_CHECK_REGION(condition_bindings_offset, l.condition_bindings_bytes, uint8_t) &&
         SCHEDULER_ASYNC_CHECK_REGION(resources_offset, l.resources_bytes, uint8_t) &&
         SCHEDULER_ASYNC_CHECK_REGION(uses_offset, l.uses_bytes, uint8_t) &&
-        SCHEDULER_ASYNC_CHECK_REGION(consumers_offset, l.consumers_bytes, uint8_t) &&
         SCHEDULER_ASYNC_CHECK_REGION(scratch_offset, l.scratch_bytes, uint8_t);
 #undef SCHEDULER_ASYNC_CHECK_REGION
     if (!valid) return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);

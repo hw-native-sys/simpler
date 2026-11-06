@@ -26,21 +26,8 @@ constexpr uint64_t kEpoch = 307;
 constexpr uint64_t kBudget = 1 << 24;
 
 struct Backend {
-    using ConsumerIdentity = AsyncConsumerIdentity;
-    using ConsumerCursor = AsyncConsumerCursor;
-    using ConsumerResult = AsyncConsumerResult;
-    SchedulerAsyncCohortView cohorts{};
     SchedulerSubmissionProvenanceView proof{};
     uint64_t record_address{0};
-    ConsumerResult prepare_consumer(const ConsumerIdentity &identity, ConsumerCursor &cursor, uint32_t &budget) {
-        cursor.identity = identity;
-        cursor.initialized = true;
-        const auto result = scheduler_async_cohort_prepare(cohorts, identity, cursor.cohort, budget);
-        return result == SchedulerAsyncCohortResult::READY   ? ConsumerResult::READY :
-               result == SchedulerAsyncCohortResult::PENDING ? ConsumerResult::PENDING :
-                                                               ConsumerResult::ERROR;
-    }
-    bool consumer_pinned(const ConsumerCursor &cursor) const { return cursor.cohort.arrived; }
     bool bind_condition(
         const SchedulerAsyncGroupIdentity &identity, uint32_t index, const DeferredCompletionEntry &entry,
         SchedulerAsyncConditionBinding *out
@@ -76,7 +63,8 @@ struct Fixture {
         execution_ref(native_child ? 1 : 0),
         storage(
             4, 6, blocks * 3 + 1,
-            {6, 2, 1u + (sync_start || __builtin_popcount(mask) > 1 ? 1u : 0u), __builtin_popcount(mask) > 1 ? 1u : 0u}
+            {6, 2, 1u + (blocks > 1 || sync_start || __builtin_popcount(mask) > 1 ? 1u : 0u),
+             __builtin_popcount(mask) > 1 ? 1u : 0u}
         ),
         image(nullptr, &std::free) {
         for (uint32_t task = 0; task < 4; ++task) {
@@ -143,10 +131,7 @@ struct Fixture {
         if (!image) throw std::bad_alloc();
         std::memcpy(image.get(), async_plan.image.data(), async_plan.image.size());
         async = {static_cast<uint8_t *>(image.get()), async_plan.layout};
-        EXPECT_TRUE(SchedulerAsyncCohortView::mount(async.base, async.layout, &backend.cohorts));
-        std::memcpy(
-            backend.cohorts.base + backend.cohorts.header.auxiliary_offset, plan.image.data(), plan.image.size()
-        );
+        std::memcpy(async.base + async.layout.scratch_offset, plan.image.data(), plan.image.size());
         EXPECT_TRUE(scheduler_submission_provenance_mount(async.base, async.layout, &backend.proof));
         for (uint64_t i = 0; i < async.layout.group_count; ++i) {
             auto *group = scheduler_async_runtime_detail::at<SchedulerAsyncGroupIdentity>(
@@ -167,7 +152,6 @@ struct Fixture {
             storage.test_graphs[worker] = view();
             locals[worker] = storage.local_context(&wire);
             states[worker].view = async;
-            states[worker].cohorts = backend.cohorts;
             EXPECT_TRUE(scheduler_submission_execution_mount(states[worker], &submissions[worker]));
         }
     }
@@ -275,6 +259,8 @@ struct Fixture {
             admission.current_block_num = meta.logical_block_num;
             admission.current_flags = meta.flags;
             admission.current_active_mask = meta.active_mask;
+            admission.sync_claimed =
+                scheduler_task_requires_sync_start(meta.flags) && (!slot.gm_mix || local->is_mix_coordinator());
             admission.gm_mix.phase = SchedulerGmMixPhase::RUNNING;
             admission.gm_mix.slot_index = 0;
             admission.gm_mix.slot_generation = slot.generation;
@@ -282,12 +268,8 @@ struct Fixture {
             admission.gm_mix.subtask_slot = lane;
         }
     }
-    bool prepare(uint32_t worker) {
-        bool ready = false;
-        EXPECT_TRUE(scheduler_async_execution_prepare(
-            &states[worker], view(), base(), locals[worker], run(), 0, backend, &ready
-        ));
-        return ready;
+    bool bind(uint32_t worker) {
+        return scheduler_async_execution_bind(&states[worker], view(), base(), locals[worker], run(), 0);
     }
     bool admit(uint32_t worker, bool *permit, SchedulerSubmissionTransactionStats *stats = nullptr) {
         return scheduler_submission_execution_admit(
@@ -316,7 +298,7 @@ struct Fixture {
         );
     }
     void require_enter(uint32_t worker) {
-        ASSERT_TRUE(prepare(worker));
+        ASSERT_TRUE(bind(worker));
         bool permit = false;
         for (uint32_t attempt = 0; attempt < 64 && !permit; ++attempt)
             ASSERT_TRUE(admit(worker, &permit));
@@ -392,7 +374,7 @@ TEST(HbgSubmissionExecution, ForeignContextPointerFailsBeforeAccessingThePointed
 TEST(HbgSubmissionExecution, OriginalOrdinaryAdmissionDenialAbortsBeforeReturningToService) {
     Fixture f;
     f.assign(1);
-    ASSERT_TRUE(f.prepare(1));
+    ASSERT_TRUE(f.bind(1));
     auto *local = f.locals[1];
     auto &admission = f.admissions[1];
     ASSERT_TRUE(scheduler_initialize_admission(f.base(), local, &admission));
@@ -411,18 +393,18 @@ TEST(HbgSubmissionExecution, OriginalOrdinaryAdmissionDenialAbortsBeforeReturnin
     EXPECT_EQ(f.busy(), 0u);
 }
 
-TEST(HbgSubmissionExecution, MixAllCpuPreparationPrecedesWholeBundleAndUsesPhysicalSubblock) {
+TEST(HbgSubmissionExecution, MixReservesWholeBundleUnderExistingAdmissionAndUsesPhysicalSubblock) {
     Fixture f(7);
     // The logical AIV slots can occupy either physical AIV within the cluster.
     f.assign(0, 0, 0);
     f.assign(1, 0, 2);
     f.assign(2, 0, 1);
-    EXPECT_FALSE(f.prepare(0));
-    EXPECT_FALSE(f.prepare(1));
+    ASSERT_TRUE(f.bind(0));
+    ASSERT_TRUE(f.bind(1));
     EXPECT_EQ(f.busy(), 0u);
-    ASSERT_TRUE(f.prepare(2));
-    ASSERT_TRUE(f.prepare(0));
-    ASSERT_TRUE(f.prepare(1));
+    ASSERT_TRUE(f.bind(2));
+    ASSERT_TRUE(f.bind(0));
+    ASSERT_TRUE(f.bind(1));
     bool permit = false;
     for (uint32_t round = 0; round < 64 && !permit; ++round)
         ASSERT_TRUE(f.admit(0, &permit));
@@ -463,10 +445,10 @@ TEST(HbgSubmissionExecution, SyncStartReservesBothBlocksTogetherBeforeEitherKern
     Fixture f(2, 2, true);
     f.assign(1, 0, 1);
     f.assign(4, 1, 1);
-    EXPECT_FALSE(f.prepare(1));
+    ASSERT_TRUE(f.bind(1));
     EXPECT_EQ(f.busy(), 0u);
-    ASSERT_TRUE(f.prepare(4));
-    ASSERT_TRUE(f.prepare(1));
+    ASSERT_TRUE(f.bind(4));
+    ASSERT_TRUE(f.bind(1));
     bool permit = false;
     for (uint32_t round = 0; round < 64 && !permit; ++round)
         ASSERT_TRUE(f.admit(1, &permit));
@@ -482,6 +464,33 @@ TEST(HbgSubmissionExecution, SyncStartReservesBothBlocksTogetherBeforeEitherKern
     EXPECT_EQ(f.busy(), 2u);
     ASSERT_TRUE(f.returned(4));
     EXPECT_EQ(f.busy(), 0u);
+}
+
+TEST(HbgSubmissionExecution, PureSpmdUsesPerExecutionSubmissionWhileKeepingOrderedCpuAdmission) {
+    Fixture f(2, 2);
+    f.assign(1, 0, 1);
+    f.assign(4, 1, 1);
+    ASSERT_TRUE(f.locals[1]->slots[0].cooperative);
+    f.require_enter(1);
+    EXPECT_EQ(f.busy(), 1u);
+    f.require_enter(4);
+    EXPECT_EQ(f.busy(), 3u);
+    ASSERT_TRUE(f.returned(1));
+    EXPECT_EQ(f.busy(), 2u);
+    ASSERT_TRUE(f.returned(4));
+    EXPECT_EQ(f.busy(), 0u);
+}
+
+TEST(HbgSubmissionExecution, MixSyncVectorLaneCanAcquireTheBundleWithoutCoordinatorClaimState) {
+    Fixture f(7, 2, true);
+    f.assign(1, 0, 1);
+    ASSERT_FALSE(f.admissions[1].sync_claimed);
+    f.require_enter(1);
+    EXPECT_EQ(__builtin_popcountll(f.busy()), 4);
+    EXPECT_EQ(f.context(1)->header.block_idx, 0u);
+    EXPECT_EQ(f.context(1)->header.frame_sub_block_id, 0u);
+    ASSERT_TRUE(f.returned(1));
+    EXPECT_EQ(__builtin_popcountll(f.busy()), 3);
 }
 
 TEST(HbgSubmissionExecution, PredicateSkippedKernelUsesTheSameZeroAttemptSealAndReleaseTail) {
@@ -563,7 +572,7 @@ TEST(HbgSubmissionExecution, PlannerRejectsUnknownCapabilityAndBudgetsContextAnd
 TEST(HbgSubmissionExecution, ImmutableUseMapMustAgreeWithTheDeferredGroupBeforeAdmission) {
     Fixture f;
     f.assign(1);
-    ASSERT_TRUE(f.prepare(1));
+    ASSERT_TRUE(f.bind(1));
     const auto &view = f.submissions[1].view;
     *scheduler_submission_detail::at<SchedulerSubmissionExecutionUseMap>(
         view, view.header.execution_use_maps_offset
@@ -589,4 +598,64 @@ TEST(HbgSubmissionExecution, NativeChildFrameKeepsItsSubTaskIdentityThroughSealA
     EXPECT_EQ(f.busy(), 0u);
     EXPECT_EQ(f.locals[1]->local_completed_generations[0], 7u);
 }
+struct CounterOnlyImage {
+    SchedulerAsyncHostPlan plan;
+    std::unique_ptr<void, decltype(&std::free)> image{nullptr, &std::free};
+    SchedulerAsyncExecutionState<Backend> state{};
+
+    CounterOnlyImage() {
+        SchedulerTaskMetadata task{};
+        task.flags = SCHEDULER_TASK_EXECUTABLE;
+        task.active_mask = LaneMask::aiv0();
+        task.logical_block_num = 1;
+        SchedulerAsyncCapabilities caps{};
+        caps[1] = {CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::DEFERRED, 1, CORE_ASYNC_CONDITION_COUNTER};
+        std::string error;
+        if (!scheduler_plan_async_state({task}, {caps}, kEpoch, kBudget, {}, &plan, &error))
+            throw std::runtime_error(error);
+        image.reset(std::aligned_alloc(128, plan.image.size()));
+        if (!image) throw std::bad_alloc();
+        std::memcpy(image.get(), plan.image.data(), plan.image.size());
+        state.view = {static_cast<uint8_t *>(image.get()), plan.layout};
+    }
+};
+
+TEST(HbgSubmissionExecution, CounterOnlyHostPlanMountsWithoutSubmissionScratch) {
+    CounterOnlyImage f;
+    ASSERT_EQ(f.plan.layout.scratch_bytes, 0u);
+    ASSERT_EQ(f.plan.layout.scratch_offset, f.plan.layout.total_bytes);
+    ASSERT_NE(f.plan.layout.scratch_offset, 0u);
+    SchedulerSubmissionExecutionView execution;
+    SchedulerSubmissionProvenanceView provenance;
+    ASSERT_TRUE(scheduler_submission_execution_mount(f.state, &execution));
+    ASSERT_TRUE(scheduler_submission_provenance_mount(f.state.view.base, f.state.view.layout, &provenance));
+    EXPECT_FALSE(execution.view.enabled());
+    EXPECT_FALSE(provenance.submissions.enabled());
+    EXPECT_EQ(execution.async_offset, 0u);
+    EXPECT_EQ(provenance.async_offset, 0u);
+}
+
+TEST(HbgSubmissionExecution, EmptySubmissionScratchStillRejectsInvalidOffsetsAndExtents) {
+    CounterOnlyImage f;
+    const uint64_t invalid_offsets[]{
+        1, 128, f.plan.layout.total_bytes - 1, f.plan.layout.total_bytes + 128, UINT64_MAX
+    };
+    for (const uint64_t offset : invalid_offsets) {
+        auto state = f.state;
+        state.view.layout.scratch_offset = offset;
+        SchedulerSubmissionExecutionView execution;
+        SchedulerSubmissionProvenanceView provenance;
+        EXPECT_FALSE(scheduler_submission_execution_mount(state, &execution)) << offset;
+        EXPECT_FALSE(scheduler_submission_provenance_mount(state.view.base, state.view.layout, &provenance)) << offset;
+        EXPECT_FALSE(execution.view.enabled());
+        EXPECT_FALSE(provenance.submissions.enabled());
+    }
+    auto state = f.state;
+    state.view.layout.scratch_bytes = 128;
+    SchedulerSubmissionExecutionView execution;
+    SchedulerSubmissionProvenanceView provenance;
+    EXPECT_FALSE(scheduler_submission_execution_mount(state, &execution));
+    EXPECT_FALSE(scheduler_submission_provenance_mount(state.view.base, state.view.layout, &provenance));
+}
+
 }  // namespace

@@ -490,12 +490,7 @@ __aicore__ bool run_ready_dispatch_loop(
             uint64_t local_generation = 0;
             // Every executable payload belongs to an own slot. Its ready bit,
             // slot state and non-zero generation identify the publication.
-            bool ready_found = false;
-            if (!scheduler_async_execution_select(
-                    &async_state, graph, context, run_control, &local_slot, &local_generation, &ready_found
-                ))
-                return false;
-            if (ready_found) {
+            if (scheduler_local_ready_pop(context, &local_slot, &local_generation)) {
                 if (scheduler_dispatch_state(local_generation) != SchedulerDispatchSlotState::READY ||
                     scheduler_dispatch_generation(local_generation) == 0) {
                     scheduler_record_error(
@@ -507,16 +502,10 @@ __aicore__ bool run_ready_dispatch_loop(
                 }
                 ready_slot = static_cast<int32_t>(local_slot);
                 ready_generation = scheduler_dispatch_generation(local_generation);
-                bool consumer_ready = false;
-                if (!scheduler_async_execution_prepare(
-                        &async_state, graph, scheduler_state_base, context, run_control, local_slot, async_backend,
-                        &consumer_ready
+                if (!scheduler_async_execution_bind(
+                        &async_state, graph, scheduler_state_base, context, run_control, local_slot
                     ))
                     return false;
-                if (!consumer_ready) {
-                    scheduler_local_ready_publish(context, local_slot);
-                    ready_slot = -1;
-                }
                 if (ready_slot >= 0) {
                     bool permit = false;
                     if (!scheduler_submission_execution_admit<WithProfiling>(
@@ -576,6 +565,9 @@ __aicore__ bool run_ready_dispatch_loop(
                 scheduler_capture_execution_identity(
                     scheduler_state_base, context, slot_index, ready_generation, payload
                 );
+            // Dependencies and final admission precede payload observation on
+            // every executing lane. Writers publish their dirty data before signalling.
+            if (payload->function_bin_addr != 0) scheduler_observe_data_cache(payload);
             OUT_OF_ORDER_STORE_BARRIER();
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (pmu_reg_base != 0) pmu_aicore_begin();

@@ -79,8 +79,6 @@ struct Fixture {
         }
         capabilities[0][1] = {CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_COUNTER};
         add(0, {AsyncUseDeclarationKind::COUNTER_PAYLOAD, 0, 1, UINT32_MAX, UINT32_MAX, 4, kClean});
-        consume(0, 1);
-        consume(1, 1);
     }
     void
     tensor(uint32_t task, uint32_t arg, uint32_t buffer, uint32_t elements, uint64_t offset = 0, uint32_t stride = 1) {
@@ -111,8 +109,6 @@ struct Fixture {
         image.scalars[0][1] = 1;
         tensor(0, 0, 0, 16);
         add(0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1});
-        consume(0, 1);
-        consume(1, 1);
         sdma_owner = {reinterpret_cast<uint64_t>(workspace.data()), workspace.size(), CommSdmaAccess::SDK_ONLY, 1};
         for (uint32_t i = 0; i < domains.size(); ++i) {
             domains[i].use = {CommDomainKind::LOCAL, 0, i, 0x10000 * (i + 1u)};
@@ -194,8 +190,6 @@ TEST(HbgAsyncBindingPlan, NativeCounterPlanQueriesOwnersAndMaterializesTheRealPr
     EXPECT_GT(f.queries, 0u);
     ASSERT_EQ(plan.groups.size(), 1u);
     ASSERT_EQ(plan.conditions.size(), 2u);
-    EXPECT_EQ(plan.consumer_maps[0].kind, AsyncConsumerMapKind::REQUIRED);
-    EXPECT_EQ(plan.consumer_maps[1].kind, AsyncConsumerMapKind::REQUIRED);
     Materialized image;
     ASSERT_TRUE(image.initialize(f, plan)) << f.error;
     AsyncResourceBindings<> backend(image.tables, ASYNC_CORE_AIC);
@@ -206,7 +200,7 @@ TEST(HbgAsyncBindingPlan, NativeCounterPlanQueriesOwnersAndMaterializesTheRealPr
     EXPECT_FALSE(backend.validate(image.group(), 2, f.entry(f.address(0, 4)), binding));
 }
 
-TEST(HbgAsyncBindingPlan, CounterOnlyHasNoSyntheticPayloadOrConsumer) {
+TEST(HbgAsyncBindingPlan, CounterOnlyHasNoSyntheticPayload) {
     Fixture f;
     f.metadata.resize(1);
     f.capabilities.resize(1);
@@ -215,8 +209,6 @@ TEST(HbgAsyncBindingPlan, CounterOnlyHasNoSyntheticPayloadOrConsumer) {
     f.add(0, {AsyncUseDeclarationKind::COUNTER_ONLY, 0, UINT32_MAX, UINT32_MAX, UINT32_MAX, 4, kClean});
     AsyncBindingHostPlan plan;
     ASSERT_TRUE(f.build(&plan)) << f.error;
-    EXPECT_TRUE(plan.consumers.empty());
-    EXPECT_EQ(plan.consumer_maps[0].kind, AsyncConsumerMapKind::NONE);
     for (const auto &use : plan.conditions) {
         EXPECT_EQ(use.payload_none, 1u);
         EXPECT_EQ(use.payload_count, 0u);
@@ -344,14 +336,31 @@ TEST(HbgAsyncBindingPlan, OwnerAndCleanContractsAreIndependentRequiredFacts) {
     }
 }
 
-TEST(HbgAsyncBindingPlan, MissingConsumerDeclarationCannotSilentlyBecomeNone) {
+TEST(HbgAsyncBindingPlan, OrdinaryConsumersNeedNoDeclarationOrPrivateTables) {
     Fixture f;
-    f.declarations = {};
-    f.add(0, {AsyncUseDeclarationKind::COUNTER_PAYLOAD, 0, 1, UINT32_MAX, UINT32_MAX, 4, kClean});
-    f.consume(0, 1);
     AsyncBindingHostPlan plan;
-    EXPECT_FALSE(f.build(&plan));
-    EXPECT_NE(f.error.find("consumer"), std::string::npos);
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    Materialized image;
+    ASSERT_TRUE(image.initialize(f, plan)) << f.error;
+    EXPECT_EQ(image.layout.scratch_bytes, 0u);
+    EXPECT_EQ(image.tables.header.condition_count, 2u);
+}
+
+TEST(HbgAsyncBindingPlan, LegacyConsumerDeclarationsDoNotAddResourcesOrStorage) {
+    Fixture f;
+    AsyncBindingHostPlan baseline, legacy;
+    ASSERT_TRUE(f.build(&baseline)) << f.error;
+    f.consume(0, 1);
+    f.consume(1, 1);
+    f.image.tasks[1].payload.tensor_count = 3;
+    f.consume(1, 2);
+    ASSERT_TRUE(f.build(&legacy)) << f.error;
+    EXPECT_EQ(legacy.spans.size(), baseline.spans.size());
+    EXPECT_EQ(legacy.ranges.size(), baseline.ranges.size());
+    EXPECT_EQ(legacy.conditions.size(), baseline.conditions.size());
+    EXPECT_EQ(legacy.auxiliary.resources, baseline.auxiliary.resources);
+    EXPECT_EQ(legacy.auxiliary.uses, baseline.auxiliary.uses);
+    EXPECT_EQ(legacy.auxiliary.scratch, baseline.auxiliary.scratch);
 }
 
 TEST(HbgAsyncBindingPlan, ActualSignalAliasesCannotClaimBothControlOnlyAndPayloadSemantics) {
@@ -386,19 +395,17 @@ TEST(HbgAsyncBindingPlan, CompleteBudgetIncludesSchedulerPrefixAndAllBindingRows
     EXPECT_FALSE(f.build(&plan, 0));
 }
 
-TEST(HbgAsyncBindingPlan, EarlierPredicateReadRequiresItsOwnQualifiedRange) {
+TEST(HbgAsyncBindingPlan, PredicateInputNeedsNoConsumerDeclaration) {
     Fixture f;
     f.metadata[1].flags |= SCHEDULER_TASK_HAS_PREDICATE;
     f.image.tasks[1].payload.tensor_count = 3;
     f.image.tasks[1].payload.predicate.addr = f.address(2);
     f.image.tasks[1].payload.predicate.elem_size = 4;
     AsyncBindingHostPlan plan;
-    EXPECT_FALSE(f.build(&plan));
-    f.consume(1, 2);
     EXPECT_TRUE(f.build(&plan)) << f.error;
 }
 
-TEST(HbgAsyncBindingPlan, MixedAndSyncStartConsumersIncludeSynchronousLanes) {
+TEST(HbgAsyncBindingPlan, MixedAndSyncStartConsumersNeedNoDeclarations) {
     Fixture f;
     f.metadata[0].active_mask = LaneMask::all();
     f.metadata[0].logical_block_num = 2;
@@ -406,8 +413,6 @@ TEST(HbgAsyncBindingPlan, MixedAndSyncStartConsumersIncludeSynchronousLanes) {
     AsyncBindingHostPlan plan;
     ASSERT_TRUE(f.build(&plan)) << f.error;
     EXPECT_EQ(plan.groups.size(), 2u);
-    EXPECT_EQ(plan.consumer_maps[0].lane_mask, 7u);
-    EXPECT_EQ(plan.consumers.size(), 7u);
     EXPECT_EQ(plan.conditions.size(), 4u);
 }
 
@@ -613,9 +618,6 @@ TEST(HbgAsyncBindingPlan, SdmaGraphUsesCurrentInheritedContextAndPeerScalars) {
     ASSERT_TRUE(
         f.declarations.add(true, 0x88, 0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1})
     );
-    ASSERT_TRUE(f.declarations.add(
-        true, 0x88, 0, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, 1, UINT32_MAX, UINT32_MAX, 0, kClean}
-    ));
     f.native.definitions.resize(1);
     auto &definition = f.native.definitions[0];
     auto &header = definition.definition;
@@ -759,9 +761,6 @@ TEST(HbgAsyncBindingPlan, GraphParamsAndBodyHeapUseEachInstancesActualBindings) 
     }
     ASSERT_TRUE(f.declarations.add(
         true, 0x77, 0, {AsyncUseDeclarationKind::COUNTER_PAYLOAD, 0, 1, UINT32_MAX, UINT32_MAX, 4, kClean}
-    ));
-    ASSERT_TRUE(f.declarations.add(
-        true, 0x77, 0, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, 1, UINT32_MAX, UINT32_MAX, 0, kClean}
     ));
     AsyncBindingHostPlan plan;
     ASSERT_TRUE(f.build(&plan)) << f.error;

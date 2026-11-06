@@ -40,9 +40,6 @@ struct AsyncBindingHostPlan {
     std::vector<AsyncRetainedSpan> spans;
     std::vector<AsyncResourceRange> ranges;
     std::vector<AsyncConditionContract> conditions;
-    std::vector<AsyncConsumerTaskMap> consumer_maps;
-    std::vector<AsyncConsumerContract> consumers;
-    std::vector<uint64_t> consumer_ranges;
     std::vector<AsyncBindingGroupUses> groups;
     std::vector<SchedulerSubmissionWorkspaceInput> submission_workspaces;
     std::vector<SchedulerSubmissionExecutionUse> submission_uses;

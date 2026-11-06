@@ -210,9 +210,8 @@ runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes
     if (layout.version != SCHEDULER_ASYNC_LAYOUT_VERSION || layout.run_epoch != epoch || layout.group_count == 0 ||
         layout.total_bytes < sizeof(layout) || !fits(summary.async_layout_offset, layout.total_bytes))
         return PTO_RUNTIME_ERR_INVALID_STATE;
-    // Reuse the exact private-table format checks. In particular, a legacy
-    // reserved word is never read as a core-only contract: version 4, this
-    // epoch, the complete section extents and cohort prefix must all agree.
+    // The versioned resource header, run epoch and complete section extents
+    // must agree before its execution contract can qualify retirement.
     AsyncResourceTables bindings{};
     if (!AsyncResourceTables::mount(
             static_cast<const uint8_t *>(host) + summary.async_layout_offset, layout, &bindings
@@ -1782,15 +1781,15 @@ bool create_scheduler_state(
         return false;
     }
     if (!submission_plan.image.empty()) {
-        SchedulerAsyncCohortView cohorts{};
         auto *async_base = static_cast<uint8_t *>(host_base) + async_offset;
-        if (async_offset == 0 || !SchedulerAsyncCohortView::mount(async_base, async_layout, &cohorts) ||
-            cohorts.header.auxiliary_bytes != submission_plan.image.size()) {
+        if (async_offset == 0 || async_layout.scratch_bytes != submission_plan.image.size() ||
+            async_layout.scratch_offset > async_layout.total_bytes ||
+            async_layout.scratch_bytes > async_layout.total_bytes - async_layout.scratch_offset) {
             LOG_ERROR("A5 HBG: submission image does not fit retained async auxiliary storage");
             return false;
         }
         std::memcpy(
-            cohorts.base + cohorts.header.auxiliary_offset, submission_plan.image.data(), submission_plan.image.size()
+            async_base + async_layout.scratch_offset, submission_plan.image.data(), submission_plan.image.size()
         );
     }
 

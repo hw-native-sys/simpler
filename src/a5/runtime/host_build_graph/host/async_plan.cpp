@@ -10,7 +10,6 @@
  */
 
 #include "async_plan.h"
-#include "scheduler/scheduler_async_cohort.h"
 
 #include <cstring>
 #include <limits>
@@ -35,32 +34,6 @@ bool reserve(uint64_t count, uint64_t stride, uint64_t &cursor, uint64_t &offset
     uint64_t bytes = 0;
     return scheduler_layout_checked_mul(count, stride, &bytes) &&
            scheduler_layout_reserve(&cursor, bytes, 128, &offset);
-}
-bool plan_cohorts(
-    const std::vector<SchedulerTaskMetadata> &metadata, uint64_t epoch, uint64_t auxiliary_bytes,
-    SchedulerAsyncCohortHeader *out, std::string *error
-) {
-    SchedulerAsyncCohortHeader header{};
-    header.run_epoch = epoch;
-    header.task_count = metadata.size();
-    header.auxiliary_bytes = auxiliary_bytes;
-    for (const auto &meta : metadata) {
-        if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
-        const uint64_t count = scheduler_task_requires_sync_start(meta.flags) ? 1 :
-                               scheduler_task_is_mix(meta.flags)              ? meta.logical_block_num :
-                                                                                0;
-        if (!scheduler_layout_checked_add(header.cohort_count, count, &header.cohort_count))
-            return fail(error, "async consumer cohort count overflows");
-    }
-    uint64_t cursor = sizeof(header);
-    if (!reserve(header.task_count, sizeof(SchedulerAsyncCohortTaskMap), cursor, header.maps_offset) ||
-        (header.cohort_count != 0 &&
-         !reserve(header.cohort_count, sizeof(SchedulerAsyncCohortCounter), cursor, header.counters_offset)) ||
-        !scheduler_layout_checked_align(cursor, 128, &header.auxiliary_offset) ||
-        !scheduler_layout_checked_add(header.auxiliary_offset, auxiliary_bytes, &header.total_bytes))
-        return fail(error, "async consumer cohort storage overflows");
-    *out = header;
-    return true;
 }
 
 bool plan_async_layout(
@@ -119,7 +92,7 @@ bool plan_async_layout(
             return fail(error, "async group count overflows");
     }
     if (layout.group_count == 0) {
-        if (auxiliary.resources != 0 || auxiliary.uses != 0 || auxiliary.consumers != 0 || auxiliary.scratch != 0)
+        if (auxiliary.resources != 0 || auxiliary.uses != 0 || auxiliary.scratch != 0)
             return fail(error, "synchronous plan cannot carry unowned async auxiliary storage");
         *out = layout;
         return true;
@@ -130,10 +103,7 @@ bool plan_async_layout(
     layout.condition_bindings_bytes = binding_bytes;
     layout.resources_bytes = auxiliary.resources;
     layout.uses_bytes = auxiliary.uses;
-    layout.consumers_bytes = auxiliary.consumers;
-    SchedulerAsyncCohortHeader cohorts{};
-    if (!plan_cohorts(metadata, run_epoch, auxiliary.scratch, &cohorts, error)) return false;
-    layout.scratch_bytes = cohorts.total_bytes;
+    layout.scratch_bytes = auxiliary.scratch;
     uint64_t cursor = sizeof(SchedulerAsyncLayout);
     if (!reserve(layout.task_count, sizeof(SchedulerAsyncTaskMap), cursor, layout.task_map_offset) ||
         !reserve(layout.group_count, sizeof(SchedulerAsyncGroupIdentity), cursor, layout.group_identity_offset) ||
@@ -154,7 +124,6 @@ bool plan_async_layout(
         !reserve(binding_bytes, 1, cursor, layout.condition_bindings_offset) ||
         !reserve(auxiliary.resources, 1, cursor, layout.resources_offset) ||
         !reserve(auxiliary.uses, 1, cursor, layout.uses_offset) ||
-        !reserve(auxiliary.consumers, 1, cursor, layout.consumers_offset) ||
         !reserve(layout.scratch_bytes, 1, cursor, layout.scratch_offset) ||
         !scheduler_layout_checked_align(cursor, 128, &layout.total_bytes) || layout.total_bytes > byte_budget ||
         layout.total_bytes > std::numeric_limits<size_t>::max())
@@ -169,32 +138,10 @@ bool materialize_async_state(
 ) {
     std::memset(image, 0, static_cast<size_t>(layout.total_bytes));
     write(image, 0, layout);
-    SchedulerAsyncCohortHeader cohorts{};
-    if (!plan_cohorts(metadata, layout.run_epoch, 0, &cohorts, error) || layout.scratch_bytes < cohorts.total_bytes)
-        return fail(error, "async cohort prefix exceeds its scratch section");
-    cohorts.auxiliary_bytes = layout.scratch_bytes - cohorts.total_bytes;
-    cohorts.total_bytes = layout.scratch_bytes;
-    write(image, layout.scratch_offset, cohorts);
-    uint64_t cohort_base = 0;
     uint64_t group_base = 0, finish_index = 0;
     uint64_t entry_cursor = layout.entries_offset, binding_cursor = layout.condition_bindings_offset;
     for (size_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
-        SchedulerAsyncCohortTaskMap cohort{};
-        if (scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags)) {
-            cohort.block_count = meta.logical_block_num;
-            cohort.flags = meta.flags;
-            for (uint32_t lane = 0; lane < 3; ++lane)
-                if (meta.active_mask.has(static_cast<SubtaskSlot>(lane))) cohort.lane_mask |= 1u << lane;
-            if (scheduler_task_requires_sync_start(meta.flags) || scheduler_task_is_mix(meta.flags)) {
-                const bool sync = scheduler_task_requires_sync_start(meta.flags);
-                cohort.cohort_base = cohort_base;
-                cohort.cohort_count = sync ? 1 : cohort.block_count;
-                cohort.expected = meta.active_mask.count() * (sync ? cohort.block_count : 1);
-                cohort_base += cohort.cohort_count;
-            }
-        }
-        write(image, layout.scratch_offset + cohorts.maps_offset + task * sizeof(cohort), cohort);
         SchedulerAsyncTaskMap map;
         if (scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags)) {
             for (uint32_t lane = 0; lane < 3; ++lane) {
@@ -283,7 +230,7 @@ bool materialize_async_state(
     }
     if (entry_cursor != layout.entries_offset + layout.entries_bytes ||
         binding_cursor != layout.condition_bindings_offset + layout.condition_bindings_bytes ||
-        group_base != layout.group_count || finish_index != layout.finish_count || cohort_base != cohorts.cohort_count)
+        group_base != layout.group_count || finish_index != layout.finish_count)
         return fail(error, "async image materialization does not match its size plan");
     return true;
 }
@@ -320,16 +267,7 @@ bool scheduler_initialize_async_state(
     const SchedulerAsyncLayout &layout, void *region, uint64_t region_bytes, std::string *error
 ) {
     SchedulerAsyncLayout expected{};
-    SchedulerAsyncCohortHeader cohorts{};
-    uint64_t auxiliary_scratch = layout.scratch_bytes;
-    if (layout.group_count != 0) {
-        if (!plan_cohorts(metadata, layout.run_epoch, 0, &cohorts, error) || auxiliary_scratch < cohorts.total_bytes)
-            return fail(error, "async scratch section omits its consumer cohort prefix");
-        auxiliary_scratch -= cohorts.total_bytes;
-    }
-    const SchedulerAsyncAuxiliaryBytes auxiliary{
-        layout.resources_bytes, layout.uses_bytes, layout.consumers_bytes, auxiliary_scratch
-    };
+    const SchedulerAsyncAuxiliaryBytes auxiliary{layout.resources_bytes, layout.uses_bytes, layout.scratch_bytes};
     if (!plan_async_layout(metadata, capabilities, layout.run_epoch, layout.total_bytes, auxiliary, &expected, error))
         return false;
     if (std::memcmp(&expected, &layout, sizeof(layout)) != 0 || region_bytes < layout.total_bytes)

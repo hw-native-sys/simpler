@@ -65,9 +65,6 @@ struct Fixture {
     AsyncRetainedSpan *spans() { return at<AsyncRetainedSpan>(layout.resources_offset + sizeof(AsyncResourceHeader)); }
     AsyncResourceRange *ranges() { return reinterpret_cast<AsyncResourceRange *>(spans() + 2); }
     AsyncConditionContract *conditions() { return at<AsyncConditionContract>(layout.uses_offset); }
-    AsyncConsumerTaskMap *maps() { return at<AsyncConsumerTaskMap>(layout.consumers_offset); }
-    AsyncConsumerContract &consumer() { return *reinterpret_cast<AsyncConsumerContract *>(maps() + 2); }
-    uint64_t *consumer_ranges() { return reinterpret_cast<uint64_t *>(&consumer() + header().consumer_count); }
     uint64_t record_address() const { return reinterpret_cast<uint64_t>(records.data()); }
     uint64_t payload_address() const { return reinterpret_cast<uint64_t>(payload.data()); }
 
@@ -80,36 +77,16 @@ struct Fixture {
             sizeof(AsyncResourceHeader) + 2 * sizeof(AsyncRetainedSpan) + 4 * sizeof(AsyncResourceRange);
         layout.uses_offset = 512;
         layout.uses_bytes = 2 * sizeof(AsyncConditionContract);
-        layout.consumers_offset = 768;
-        layout.consumers_bytes =
-            2 * sizeof(AsyncConsumerTaskMap) + sizeof(AsyncConsumerContract) + 2 * sizeof(uint64_t);
-        layout.scratch_offset = 896;
-        layout.scratch_bytes = 256;
-        layout.total_bytes = 1152;
-        auto *cohorts = at<SchedulerAsyncCohortHeader>(layout.scratch_offset);
-        *cohorts = {};
-        cohorts->total_bytes = layout.scratch_bytes;
-        cohorts->run_epoch = kEpoch;
-        cohorts->task_count = 2;
-        cohorts->maps_offset = sizeof(*cohorts);
-        cohorts->auxiliary_offset = cohorts->total_bytes;
-        auto *cohort_maps = at<SchedulerAsyncCohortTaskMap>(layout.scratch_offset + cohorts->maps_offset);
-        cohort_maps[0] = {SCHEDULER_ASYNC_INDEX_NONE, 1, 2, 0, 0, SCHEDULER_TASK_EXECUTABLE, 0};
-        cohort_maps[1] = {SCHEDULER_ASYNC_INDEX_NONE, 1, 1, 0, 0, SCHEDULER_TASK_EXECUTABLE, 0};
-        header() = {ASYNC_RESOURCE_VERSION, kEpoch, 2, 4, 2, 1, 2, 0};
+        layout.total_bytes = 768;
+        header() = {ASYNC_RESOURCE_VERSION, kEpoch, 2, 4, 2, 0};
         spans()[0] = {record_address(), records.size()};
         spans()[1] = {payload_address(), payload.size()};
         ranges()[0] = {0, 0, 132, ASYNC_RANGE_READ | ASYNC_RANGE_CONDITION_CLEAN};
-        ranges()[1] = {1, 64, 128, ASYNC_RANGE_READ | ASYNC_RANGE_WRITE | ASYNC_RANGE_CONSUMER_CLEAN};
+        ranges()[1] = {1, 64, 128, ASYNC_RANGE_READ | ASYNC_RANGE_WRITE};
         ranges()[2] = {1, 512, 256, ASYNC_RANGE_READ};
-        ranges()[3] = {1, 1024, 64, ASYNC_RANGE_READ | ASYNC_RANGE_CONSUMER_CLEAN};
+        ranges()[3] = {1, 1024, 64, ASYNC_RANGE_READ};
         for (uint32_t index = 0; index < 2; ++index)
             conditions()[index] = {0, 0, 1, index, 3, COMPLETION_TYPE_COUNTER, 0, 0, 2, 128, ASYNC_RESOURCE_NONE, 1};
-        maps()[0] = {ASYNC_RESOURCE_NONE, 1, 2, AsyncConsumerMapKind::NONE, 0};
-        maps()[1] = {0, 1, 1, AsyncConsumerMapKind::REQUIRED, 0};
-        consumer() = {1, 0, 0, 0, 2, 3, 0};
-        consumer_ranges()[0] = 1;
-        consumer_ranges()[1] = 3;
         group.run_epoch = kEpoch;
         group.task_ref = 0;
         group.subtask_slot = 1;
@@ -118,49 +95,6 @@ struct Fixture {
         group.binding_uses_offset = layout.uses_offset;
         group.binding_use_count = 1;
         EXPECT_TRUE(AsyncResourceTables::mount(image.data(), layout, &tables));
-    }
-
-    void enable_cohort(uint32_t task, uint32_t lanes, uint32_t blocks, bool sync) {
-        auto *h = at<SchedulerAsyncCohortHeader>(layout.scratch_offset);
-        *h = {};
-        h->run_epoch = kEpoch;
-        h->task_count = 2;
-        h->cohort_count = sync ? 1 : blocks;
-        h->maps_offset = 128;
-        h->counters_offset = 256;
-        h->auxiliary_offset = 256 + h->cohort_count * sizeof(SchedulerAsyncCohortCounter);
-        h->total_bytes = h->auxiliary_offset;
-        layout.scratch_bytes = h->total_bytes;
-        layout.total_bytes = layout.scratch_offset + layout.scratch_bytes;
-        auto *rows = at<SchedulerAsyncCohortTaskMap>(layout.scratch_offset + h->maps_offset);
-        rows[0] = {SCHEDULER_ASYNC_INDEX_NONE, 1, 2, 0, 0, SCHEDULER_TASK_EXECUTABLE, 0};
-        rows[1] = {SCHEDULER_ASYNC_INDEX_NONE, 1, 1, 0, 0, SCHEDULER_TASK_EXECUTABLE, 0};
-        const uint32_t active = __builtin_popcount(lanes);
-        rows[task] = {
-            0,
-            blocks,
-            lanes,
-            active * (sync ? blocks : 1),
-            static_cast<uint32_t>(h->cohort_count),
-            SCHEDULER_TASK_EXECUTABLE | (active > 1 ? SCHEDULER_TASK_MIX : 0u) |
-                (blocks > 1 ? SCHEDULER_TASK_SPMD : 0u) | (sync ? SCHEDULER_TASK_SYNC_START : 0u),
-            0
-        };
-        for (uint64_t i = 0; i < h->cohort_count; ++i)
-            *at<SchedulerAsyncCohortCounter>(layout.scratch_offset + h->counters_offset + i * 128) = {};
-        maps()[task].block_count = blocks;
-        maps()[task].lane_mask = lanes;
-        EXPECT_TRUE(AsyncResourceTables::mount(image.data(), layout, &tables));
-    }
-    uint64_t arrivals(uint32_t index = 0) {
-        const auto *h = at<SchedulerAsyncCohortHeader>(layout.scratch_offset);
-        return scheduler_gm_fetch_add(
-            at<SchedulerAsyncCohortCounter>(
-                layout.scratch_offset + h->counters_offset + index * sizeof(SchedulerAsyncCohortCounter)
-            )
-                ->ready,
-            UINT64_C(0)
-        );
     }
 
     AsyncResourceBindings<Reader, Cache> backend(uint32_t core = ASYNC_CORE_AIC) {
@@ -205,13 +139,11 @@ struct Fixture {
         reserve(2, sizeof(SchedulerSubmissionProvenance), h.provenance_offset);
         reserve(1, sizeof(SchedulerSubmissionExecutionUseMap), h.execution_use_maps_offset);
         EXPECT_TRUE(scheduler_layout_checked_align(cursor, 128, &h.total_bytes));
-        auto *cohort = at<SchedulerAsyncCohortHeader>(layout.scratch_offset);
-        cohort->auxiliary_bytes = h.total_bytes;
-        cohort->total_bytes = cohort->auxiliary_offset + h.total_bytes;
-        layout.scratch_bytes = cohort->total_bytes;
+        layout.scratch_offset = 768;
+        layout.scratch_bytes = h.total_bytes;
         layout.total_bytes = layout.scratch_offset + layout.scratch_bytes;
         ASSERT_LE(layout.total_bytes, image.size());
-        auto *base = image.data() + layout.scratch_offset + cohort->auxiliary_offset;
+        auto *base = image.data() + layout.scratch_offset;
         *reinterpret_cast<SchedulerSubmissionHeader *>(base) = h;
         SchedulerSubmissionView view{base, h};
         auto *maps = scheduler_submission_detail::at<SchedulerSubmissionTaskMap>(view, h.task_maps_offset);
@@ -294,7 +226,6 @@ struct Fixture {
             scheduler_submission_release_all(proof.submissions, {kEpoch, 0, 0, 9, 0, 1}, &context->evidence, &run)
         );
     }
-    AsyncConsumerIdentity identity() const { return {kEpoch, 1, 0, 0, 9, 4}; }
 };
 
 TEST(HbgAsyncResourceBinding, MountRequiresExactDisjointSectionsAndPreservesOutputOnFailure) {
@@ -317,13 +248,13 @@ TEST(HbgAsyncResourceBinding, MountRequiresExactDisjointSectionsAndPreservesOutp
             f.layout.uses_offset = f.layout.resources_offset;
             break;
         case 5:
-            --f.layout.consumers_bytes;
+            f.layout.scratch_bytes = 128;
             break;
         case 6:
             --f.layout.resources_bytes;
             break;
         case 7:
-            f.layout.total_bytes = f.layout.consumers_offset;
+            f.layout.total_bytes = f.layout.uses_offset;
             break;
         case 8:
             f.layout.uses_bytes = 0;
@@ -616,190 +547,17 @@ TEST(HbgAsyncResourceBinding, PreSubmitValidatesTransferAndReservesBeforeAnyBack
     EXPECT_EQ(error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
 }
 
-TEST(HbgAsyncResourceBinding, ConsumerAcquiresItsOwnRangesWithABoundedContinuation) {
+TEST(HbgAsyncResourceBinding, CounterBindingsNeedNoBackendScratch) {
     Fixture f;
+    ASSERT_EQ(f.layout.scratch_offset, 0u);
+    ASSERT_EQ(f.layout.scratch_bytes, 0u);
+    ASSERT_TRUE(AsyncResourceTables::mount(f.image.data(), f.layout, &f.tables));
+    ASSERT_TRUE(scheduler_submission_provenance_mount(f.image.data(), f.layout, &f.proof));
+    EXPECT_FALSE(f.proof.submissions.enabled());
     auto backend = f.backend();
-    AsyncConsumerCursor cursor;
-    uint32_t budget = 0;
-    EXPECT_EQ(backend.prepare_consumer(f.identity(), cursor, budget), AsyncConsumerResult::PENDING);
-    EXPECT_TRUE(f.observed.lines.empty());
-    budget = 1;
-    EXPECT_EQ(backend.prepare_consumer(f.identity(), cursor, budget), AsyncConsumerResult::PENDING);
-    EXPECT_EQ(budget, 0u);
-    EXPECT_EQ(f.observed.lines, std::vector<uint64_t>({f.payload_address() + 64}));
-    budget = 8;
-    EXPECT_EQ(backend.prepare_consumer(f.identity(), cursor, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(budget, 6u);
-    EXPECT_EQ(
-        f.observed.lines,
-        std::vector<uint64_t>({f.payload_address() + 64, f.payload_address() + 128, f.payload_address() + 1024})
-    );
-    EXPECT_EQ(f.observed.reads, 0u);
-    EXPECT_EQ(backend.prepare_consumer(f.identity(), cursor, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(f.observed.lines.size(), 3u);
-}
-
-TEST(HbgAsyncResourceBinding, InterveningKernelRestartsPartialAndCompletedAcquisition) {
-    Fixture f;
-    auto backend = f.backend();
-    AsyncConsumerCursor cursor;
-    auto identity = f.identity();
-    uint32_t budget = 1;
-    EXPECT_EQ(backend.prepare_consumer(identity, cursor, budget), AsyncConsumerResult::PENDING);
-    ++identity.core_write_serial;
-    budget = 8;
-    EXPECT_EQ(backend.prepare_consumer(identity, cursor, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(f.observed.lines.size(), 4u);
-    EXPECT_EQ(f.observed.lines[0], f.observed.lines[1]);
-    ++identity.core_write_serial;
-    EXPECT_EQ(backend.prepare_consumer(identity, cursor, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(f.observed.lines.size(), 7u);
-    ++identity.dispatch_generation;
-    budget = 8;
-    EXPECT_EQ(backend.prepare_consumer(identity, cursor, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(f.observed.lines.size(), 10u);
-}
-
-TEST(HbgAsyncResourceBinding, UnknownConsumerAndUncleanOrOutOfBoundsPayloadFailClosed) {
-    for (uint32_t scenario = 0; scenario < 7; ++scenario) {
-        Fixture f;
-        auto backend = f.backend();
-        AsyncConsumerCursor cursor;
-        auto identity = f.identity();
-        switch (scenario) {
-        case 0:
-            f.maps()[1].kind = AsyncConsumerMapKind::UNKNOWN;
-            break;
-        case 1:
-            f.ranges()[1].access &= ~ASYNC_RANGE_CONSUMER_CLEAN;
-            break;
-        case 2:
-            f.ranges()[1].byte_offset = UINT64_MAX;
-            break;
-        case 3:
-            f.consumer().range_begin = UINT64_MAX;
-            break;
-        case 4:
-            ++identity.run_epoch;
-            break;
-        case 5:
-            identity.dispatch_generation = 0;
-            break;
-        case 6:
-            identity.core_write_serial = UINT64_MAX;
-            break;
-        }
-        uint32_t budget = 8;
-        EXPECT_EQ(backend.prepare_consumer(identity, cursor, budget), AsyncConsumerResult::ERROR) << scenario;
-        EXPECT_TRUE(f.observed.lines.empty());
-    }
-}
-
-TEST(HbgAsyncResourceBinding, ExplicitNoneAndLargeRangeDoNotBypassTheWorkLimit) {
-    Fixture f;
-    auto backend = f.backend();
-    AsyncConsumerCursor cursor;
-    uint32_t budget = 100;
-    auto identity = f.identity();
-    identity.task_ref = 0;
-    identity.subtask_slot = 1;
-    EXPECT_EQ(backend.prepare_consumer(identity, cursor, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(budget, 100u);
-    f.ranges()[1].bytes = 1024;
-    EXPECT_EQ(backend.prepare_consumer(f.identity(), cursor, budget), AsyncConsumerResult::PENDING);
-    EXPECT_EQ(budget, 92u);
-    EXPECT_EQ(f.observed.lines.size(), 8u);
-}
-TEST(HbgAsyncResourceBinding, CohortIncludesExplicitNoneAndCountsEachCursorOnce) {
-    Fixture f;
-    f.enable_cohort(0, 6, 1, false);
-    auto backend = f.backend(ASYNC_CORE_AIV);
-    AsyncConsumerIdentity a{kEpoch, 0, 0, 1, 1, 0};
-    AsyncConsumerIdentity b{kEpoch, 0, 0, 2, 1, 0};
-    AsyncConsumerCursor first, second;
-    uint32_t budget = 0;
-    EXPECT_EQ(backend.prepare_consumer(a, first, budget), AsyncConsumerResult::PENDING);
-    EXPECT_FALSE(backend.consumer_pinned(first));
-    EXPECT_EQ(f.arrivals(), 0u);
-    budget = 8;
-    EXPECT_EQ(backend.prepare_consumer(a, first, budget), AsyncConsumerResult::PENDING);
-    EXPECT_TRUE(backend.consumer_pinned(first));
-    EXPECT_EQ(f.arrivals(), 1u);
-    EXPECT_EQ(backend.prepare_consumer(a, first, budget), AsyncConsumerResult::PENDING);
-    EXPECT_EQ(f.arrivals(), 1u);
-    EXPECT_EQ(backend.prepare_consumer(b, second, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(backend.prepare_consumer(a, first, budget), AsyncConsumerResult::READY);
-    EXPECT_EQ(f.arrivals(), 2u);
-    ++a.core_write_serial;
-    EXPECT_EQ(backend.prepare_consumer(a, first, budget), AsyncConsumerResult::ERROR);
-    EXPECT_EQ(f.arrivals(), 2u);
-}
-
-TEST(HbgAsyncResourceBinding, MixBlocksHaveIndependentCohortsButSyncStartUsesTheWholeTask) {
-    for (bool sync : {false, true}) {
-        Fixture f;
-        f.enable_cohort(0, 6, 2, sync);
-        auto backend = f.backend(ASYNC_CORE_AIV);
-        AsyncConsumerIdentity ids[]{
-            {kEpoch, 0, 0, 1, 1, 0}, {kEpoch, 0, 1, 2, 1, 0}, {kEpoch, 0, 0, 2, 1, 0}, {kEpoch, 0, 1, 1, 1, 0}
-        };
-        AsyncConsumerCursor cursors[4];
-        uint32_t budget = 8;
-        EXPECT_EQ(backend.prepare_consumer(ids[0], cursors[0], budget), AsyncConsumerResult::PENDING);
-        EXPECT_EQ(backend.prepare_consumer(ids[1], cursors[1], budget), AsyncConsumerResult::PENDING);
-        EXPECT_EQ(
-            backend.prepare_consumer(ids[2], cursors[2], budget),
-            sync ? AsyncConsumerResult::PENDING : AsyncConsumerResult::READY
-        );
-        EXPECT_EQ(backend.prepare_consumer(ids[3], cursors[3], budget), AsyncConsumerResult::READY);
-        EXPECT_EQ(f.arrivals(), sync ? 4u : 2u);
-        if (!sync) EXPECT_EQ(f.arrivals(1), 2u);
-    }
-}
-
-TEST(HbgAsyncResourceBinding, EightAcquireLinesConsumeTheSliceBeforeAtomicArrival) {
-    Fixture f;
-    f.header().consumer_count = 2;
-    f.layout.consumers_bytes += sizeof(AsyncConsumerContract);
-    f.layout.scratch_offset = 1024;
-    f.consumer().range_count = 1;
-    (&f.consumer())[1] = f.consumer();
-    (&f.consumer())[1].block_idx = 1;
-    f.consumer_ranges()[0] = 1;
-    f.consumer_ranges()[1] = 3;
-    f.ranges()[1].bytes = 512;
-    f.enable_cohort(1, 1, 2, true);
-    auto backend = f.backend();
-    AsyncConsumerCursor cursor;
-    uint32_t budget = 100;
-    EXPECT_EQ(backend.prepare_consumer(f.identity(), cursor, budget), AsyncConsumerResult::PENDING);
-    EXPECT_EQ(budget, 92u);
-    EXPECT_EQ(f.observed.lines.size(), 8u);
-    EXPECT_EQ(f.arrivals(), 0u);
-    EXPECT_FALSE(backend.consumer_pinned(cursor));
-    budget = 8;
-    EXPECT_EQ(backend.prepare_consumer(f.identity(), cursor, budget), AsyncConsumerResult::PENDING);
-    EXPECT_EQ(budget, 7u);
-    EXPECT_EQ(f.observed.lines.size(), 8u);
-    EXPECT_EQ(f.arrivals(), 1u);
-}
-
-TEST(HbgAsyncResourceBinding, CohortCorruptionIsRejectedBeforeAContribution) {
-    for (uint32_t scenario = 0; scenario < 4; ++scenario) {
-        Fixture f;
-        f.enable_cohort(0, 6, 1, false);
-        auto *h = f.at<SchedulerAsyncCohortHeader>(f.layout.scratch_offset);
-        auto *map = f.at<SchedulerAsyncCohortTaskMap>(f.layout.scratch_offset + h->maps_offset);
-        if (scenario == 0) ++map->expected;
-        if (scenario == 1) ++map->cohort_base;
-        if (scenario == 2) map->flags = SCHEDULER_TASK_EXECUTABLE;
-        if (scenario == 3) map->reserved = 1;
-        auto backend = f.backend(ASYNC_CORE_AIV);
-        AsyncConsumerCursor cursor;
-        uint32_t budget = 8;
-        EXPECT_EQ(backend.prepare_consumer({kEpoch, 0, 0, 1, 1, 0}, cursor, budget), AsyncConsumerResult::ERROR);
-        EXPECT_EQ(f.arrivals(), 0u);
-    }
+    SchedulerAsyncConditionBinding binding{};
+    ASSERT_TRUE(backend.bind_condition(f.group, 0, f.counter(), &binding));
+    EXPECT_EQ(backend.observe_once(f.group, 0, f.counter(), binding).state, SchedulerAsyncConditionState::PENDING);
 }
 
 }  // namespace

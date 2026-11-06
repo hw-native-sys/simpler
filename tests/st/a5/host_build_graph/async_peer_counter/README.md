@@ -53,10 +53,11 @@ assertion. The delay is fixture latency, not a performance threshold. The
 registration gate remains bounded at 2 seconds and the enclosing wait at
 30 seconds.
 
-Both channels explicitly declare COUNTER_PAYLOAD and CLEAN consumers. The
+Both channels explicitly declare COUNTER_PAYLOAD; consumers need no separate
+cache declaration. The
 publisher retires MTE3 and completes its release barriers before notify; actual
-consumers do not manually invalidate the payload to hide a missing runtime
-acquire. Shared communication allocations stay alive until the joint two-rank
+consumers rely on the common business-kernel entry for local DCache acquisition.
+Shared communication allocations stay alive until the joint two-rank
 invocation completes, and are not overwritten before the consumers finish.
 No COUNTER_ONLY inference, peer rescue from AIC, blocking comparison, extra
 communication workspace or additional test case is introduced.

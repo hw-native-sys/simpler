@@ -126,7 +126,6 @@ public:
         SchedulerAsyncAuxiliaryBytes auxiliary{};
         if (image_ != Image::SYNC && image_ != Image::NO_RESOURCES) {
             auxiliary.resources = sizeof(AsyncResourceHeader);
-            auxiliary.consumers = sizeof(AsyncConsumerTaskMap);
         }
         if (!scheduler_plan_async_state({task}, {capabilities}, identity.run_epoch, 1 << 20, auxiliary, &plan, nullptr))
             return PTO_RUNTIME_ERR_INTERNAL;
@@ -141,11 +140,6 @@ public:
             if (image_ == Image::BAD_RESOURCE_EPOCH) --resource.run_epoch;
             if (image_ == Image::BAD_CONTRACT) resource.execution_contract = 2;
             std::memcpy(plan.image.data() + plan.layout.resources_offset, &resource, sizeof(resource));
-            AsyncConsumerTaskMap consumer{};
-            consumer.block_count = 1;
-            consumer.lane_mask = 2;
-            consumer.kind = AsyncConsumerMapKind::NONE;
-            std::memcpy(plan.image.data() + plan.layout.consumers_offset, &consumer, sizeof(consumer));
         }
         const uint64_t summary_offset = sizeof(SchedulerRunControl);
         const uint64_t async_offset = summary_offset + sizeof(SchedulerGraphSummary);

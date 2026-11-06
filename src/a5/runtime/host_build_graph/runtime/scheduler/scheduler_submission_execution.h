@@ -262,14 +262,12 @@ inline __aicore__ bool scheduler_submission_execution_mount(
     if (out == nullptr) return false;
     scheduler_reset_local(out);
     if (!state.view.enabled()) return true;
-    const auto &cohorts = state.cohorts;
-    if (cohorts.base == nullptr || cohorts.header.run_epoch != state.view.layout.run_epoch) return false;
-    if (cohorts.header.auxiliary_bytes == 0) return true;
-    out->async_offset = state.view.layout.scratch_offset + cohorts.header.auxiliary_offset;
-    return scheduler_submission_mount(
-        cohorts.base + cohorts.header.auxiliary_offset, cohorts.header.auxiliary_bytes, state.view.layout.run_epoch,
-        state.view.layout.task_count, &out->view
-    );
+    SchedulerLocalStorage<SchedulerSubmissionProvenanceView> provenance_storage;
+    auto &provenance = provenance_storage.get();
+    if (!scheduler_submission_provenance_mount(state.view.base, state.view.layout, &provenance)) return false;
+    out->async_offset = provenance.async_offset;
+    out->view = provenance.submissions;
+    return true;
 }
 
 // One local transaction encloses the original CPU admission call. No ordinary

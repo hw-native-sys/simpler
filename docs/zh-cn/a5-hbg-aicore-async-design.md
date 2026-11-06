@@ -1,7 +1,8 @@
 # A5 HBG AICore 异步完成开发参考
 
 本文件是本功能唯一的开发参考，包含协议、接线、资源约束和验收要求。
-更新于 2026-11-06，状态为**已实现并完成本批功能验收**；本文区分实现合同与已验证范围，资格边界见末尾状态段。
+更新于 2026-11-06，异步完成及公共入口 DCache 简化已完成相关功能验收。
+本文区分实现合同与已验证范围，资格边界见末尾状态段。
 对应 [#2832](https://github.com/hw-native-sys/simpler/issues/2832)，父工作线为 [#2667](https://github.com/hw-native-sys/simpler/issues/2667)。
 
 ## 1. 范围、基线与完成语义
@@ -144,8 +145,8 @@ event 返回后核对实际条数，归还本次未使用预留。无法得到�
 ```text
 记录空间 = E*Sg + T*Sf + Σ align_up(slab_header + Sc*c_e, 128)
 目录空间 = 128*(ceil(E/64) + ceil(T/64))
-绑定与接线空间 = 资源绑定表 + 使用关系 + 消费者可见性计划 + 物理执行映射 + 条件旁表（如采用）
-核本地空间 = worker_count * (游标/预算状态 + 消费准备进度 + 后端观察 scratch)
+绑定与接线空间 = 资源绑定表 + 使用关系 + 物理执行映射 + 条件旁表（如采用）
+核本地空间 = worker_count * (游标/预算状态 + 后端观察 scratch)
 ```
 
 Host 在 launch 前检查算术溢出、任务上限和总预算，报告分配/初始化字节并拒绝不可容纳的 run。
@@ -328,7 +329,7 @@ backend adapter 负责下列合同，scheduler 只消费标准化状态和资源
 | validate_and_reserve / submit_and_commit | 发起核资格、资源与容量验证；提交前源数据发布和目标旧 dirty cache 处理；追踪实际副作用 |
 | observe_once | 合法观察核对单条件有限检查，返回 PENDING/READY/FAILED，不在内部等待条件变 READY |
 | acquire_completed | 检查核在归还条件贡献前完成观察侧所需动作；FINISH 通过汇合发布关系取得该证明，再发布 TaskDone |
-| before_consume | 实际消费核按资源范围执行本核缓存/获取动作，不能由检查核或 FINISH 核代替 |
+| 业务 kernel 入口 | 实际执行核在依赖和最终准入满足后，统一执行全 DCache 的 `dcci` 与完成屏障，再进入业务 kernel；更早的 predicate 读取沿用自己的缓存维护 |
 | prove_last_use | 现有资源 owner 依据实际 AICore、backend 和 peer 证据决定复用或释放 |
 
 每种条件分别列出 AIC/AIV 发起、观察、消费资格及指令、屏障、scratch、失败返回合同。
@@ -338,20 +339,25 @@ backend adapter 负责下列合同，scheduler 只消费标准化状态和资源
 使用公开完成记录接口；SDMA 必须证明“DMA → post-done → 检查核获取 → 汇合/TaskDone → 消费核获取 → payload 读取”，
 通知则证明“远端 payload 发布 → notify → 同样的本地获取链”。清旧 dirty cache 必须先于 DMA，完成后不能写回旧数据。
 
-消费者接线由 Host 在 native Graph 实例和实参绑定确定后建立，不在 FINISH 中临时复制资源集合：
+消费侧可见性使用统一业务入口合同。AICore DCache 的维护是普通跨核任务同样需要的责任，
+与等待条件由本核还是另一核检查无关。每个实际执行 lane 在依赖及最终准入满足后，
+执行 `scheduler_observe_data_cache`，完成全 DCache 的 `dcci` 和屏障，再开始本次业务执行。
+普通任务、SPMD、MIX、sync-start 和 Graph CHILD 使用相同入口；Graph 控制节点不读取业务 payload。
+调度期间更早执行的 predicate 判断继续对描述符和条件地址做原有的独立缓存维护，不依赖消费计划。
 
-1. 利用 callable 实参/别名和通信使用元数据，将完成条件关联到实际 payload、范围与 run 内固定绑定，生成每个
-   `(task_ref, block, subtask)` 的不可变消费计划。只有 `deps` 或 signal 地址不足以推出 payload 范围；无法解析就拒绝该组合。
-2. Graph ENTER/EXIT 等 control 节点只传递依赖，不执行数据获取；Host 将绑定落实到真正读数据的 CHILD 或外部消费者，
-   保留多 fanin、别名和既有资源身份，不能因跨 control 边而丢失可见性责任。
-3. 依赖已满足后，实际消费 lane 在本地预执行阶段调用 before_consume，准备状态绑定 slot generation。
-   工作较大时保存本地准备进度、分段并返回正常服务；未准备完成不提交 ordered/sync-start cohort 执行许可。
-   取得许可后直接执行 kernel，不夹入 WaitCheck 或无界缓存遍历。MIX/sync-start 需将各参与 lane 的准备完成纳入准入门槛。
-4. 准备期间的资源使用合同禁止新写者覆写；若中间执行其他工作会使本核准备失效，须在准入前重新获取。
-   不把“曾在另一个核做过获取”或任务曾使用过同一 slot 当作准备完成。
+Host 不生成消费者区间表，不要求消费者声明，不维护消费准备游标、写序号或额外的准备 cohort。
+原有 ordered/MIX/sync-start 准入以及 SDMA 提交资源预留继续负责各自的执行约束。
+`rt_declare_async_consumer` 仅保留源代码兼容，声明不产生设备侧消费计划。
 
-消费计划、准备状态和范围处理的成本均需测量；backend 若可证明无需额外本核操作，可提供经验证的空实现。
-不能通过每个任务无条件清整份 cache 来掩盖缺失的绑定和可见性证明。
+`async_plan` 仍预分配 AsyncGroup、条件和 FINISH 记录，并建立物理执行映射；
+`async_binding_plan` 仍验证条件记录及提交的合法资源范围、使用关系和已有 owner。
+这些检查服务于条件身份、提交合法性与资源生命周期，不用于决定消费者维护哪些缓存行。
+内部异步布局为 v2、资源表为 v5；二者不再包含消费者表，SDMA 提交区直接使用 scratch。
+零长度 scratch 可以保留 Host 规划出的对齐末尾偏移，挂载时仍验证偏移和区间边界。
+
+生产者仍须在通知前完成 payload 发布，上一执行不能留下会覆盖异步新数据的脏副本；
+统一入口不会修复违反发布、缓存行独占或资源复用合同的业务 kernel。
+全 DCache 维护的成本按普通任务入口统计，不按 payload 字节数生成分段调度工作；其性能尚需测量。
 
 **首版禁止对同一可写 payload/signal 槽重叠使用不同 epoch。**
 新写者只能在旧 epoch 的相关消费者及 peer 访问已结束后取得复用权；证明来自现有 run/通信资源 owner 的使用记录，
@@ -397,16 +403,16 @@ workspace 的 qualification_epoch 只标识本 run 的资格，不是 allocation
 
 | 范围 | 必须交付的接线 |
 | ---- | -------------- |
-| Host/callable | 版本化能力与可信 c_e、物理执行映射、资源绑定/消费计划、完整存储预算与旧 ABI 兼容 |
+| Host/callable | 版本化能力与可信 c_e、物理执行映射、条件及提交资源绑定、完整存储预算与旧 ABI 兼容 |
 | `async_kernel_api.h` / adapter | 有效上下文、非零/零登记、提交前预留、类型与代次校验、失败传播 |
 | backend | 发起/观察核支持矩阵、实际发布/获取指令、resident scratch、提交背压与最后访问证明 |
 | `scheduler_memory.h` | 一次性目录原语、lease 原子观察和实际屏障；CPU/sim 与 AICore 分别验证 |
-| `aicore_executor.cpp` | 返回封口、统一服务门及完整预算、消费准备与 slot generation、局部执行释放 |
-| ordered / GM MIX completion | 消费准备纳入准入，每组登记与每 block 释放唯一贡献；异步 task 不走旧直接 TaskDone |
+| `aicore_executor.cpp` | 返回封口、统一服务门及完整预算、业务入口 DCache 维护、局部执行释放 |
+| ordered / GM MIX completion | 保留协同执行准入，每组登记与每 block 释放唯一贡献；异步 task 不走旧直接 TaskDone |
 | ready / Graph control | 共享 resolver 步骤语义、可交接 FINISH、准确发布责任、body → EXIT 与 drain |
 | 生命周期 / DFX | 持有与防覆写依赖/peer 确认、错误退出、独立等待 span、业务完成数不含检查次数 |
 
-先确定能力/资源/消费计划 ABI，并验证观察资格、可见性、一次性目录原语与故障停止依据；再建立常驻记录、
+先确定能力/条件资源 ABI，并验证观察资格、统一入口可见性、一次性目录原语与故障停止依据；再建立常驻记录、
 共享 resolver 和统一服务门的基础实现。接通普通任务的 COUNTER 与真实 SDMA 后，扩展完整 SPMD/MIX/sync-start/Graph。
 各内部阶段不代表最终范围完成，同步路径和 main 调度优化须独立回归。未闭合的接口与硬件条件列为实施门槛，
 不改成 legacy、阻塞 fallback 或另一种核代跑来取得通过；类型名和参数布局不因本文出现而成为已确定公共 ABI。
@@ -452,7 +458,7 @@ FINISH 直接执行候选仅在最后 block 释放使汇合归零、安全服务
 | 普通分波、MIX 3/5/6/7、sync-start 容量边界 | block 唯一领取、局部资源释放与逻辑完成分离；不因检查扣住 cohort |
 | Graph 多实例、外部/内部 fanin、多个 sink、普通任务混排 | 事件不串实例，CHILD/EXIT 正确延后，完整 resolve drain |
 | peer 提前写下一 epoch、旧事件/窗口复用 | 无证明的重叠被拒绝或由资源协议阻止；payload 与 signal 的版本同时核对 |
-| 检查/FINISH/消费分处不同核，消费者已缓存旧值、目标含旧 dirty cache | 按核类型验证真实数据可见性；多 fanin/Graph control 不丢消费计划或准备责任 |
+| 检查/FINISH/消费分处不同核，消费者已缓存旧值、目标含旧 dirty cache | 按核类型验证真实数据可见性；多 fanin/Graph control 后的真实消费者均经过统一入口 |
 | 连续 SDMA 提交、flag 槽压力、session/workspace 复用 | 单独记录提交侧等待及完成侧重叠，核对实际登记条数、源数据与完成记录寿命 |
 | 提交前/后故障、pending 时 close、owner 故障 | 首错误保持；没有停止证明时不释放 backing，不宣称恢复成功 |
 | 原生单 block predicate 与 DSL waiter 禁止组合 | native skip 不发 DMA；保留 PyPTO predicate/early-resolve/嵌套 SPMD 负例 |
@@ -491,9 +497,17 @@ ArgsDump AFTER 若接入须位于实际数据完成之后；未验收的组合�
 硬件工作按仓库要求做架构检查、通过 task-submit 独占设备并隔离日志；复用构建缓存，先做相关检查。
 交付保存精确源码/库/依赖身份、构建和测试命令、原始 L1 与诊断证据；相关、全量、sim、硬件、故障结果分别报告。
 
-**本批验收：2026-11-06；native 构建为 `2172f462`，后续测试与文档提交复用同一套已核对的 native 输入和库。**
+**公共入口 DCache 简化回归：2026-11-06。**
 
-AsyncGroup/CHECK/FINISH、版本化能力、固定 run 资源绑定/消费计划，以及 native DFX producer/export、
+- 相关 C++ 20 个目标、2,054 个用例通过，包含真实 Host 规划的零长度 scratch 挂载、原准入及故障资源保留。
+- a5sim：40 项异步用例通过；另有 7 个同步测试项覆盖 27 个场景并通过。
+- A5：44 项异步用例通过，包含不声明 consumer 且不自行维护 payload 缓存的实际消费者、满容量 MIX/sync-start、跨卡 COUNTER、真实 SDMA 和连续提交复用；另有 7 个同步测试项覆盖 27 个场景并通过。
+- 使用当前源码重新构建 A5 与模拟运行时；构建期间源码未变，并记录了源码与产物摘要。没有运行全仓测试或 L1 性能测试。
+- 同步回归仍打印原有 nanobind 退出保留诊断，测试进程返回 0；本轮不扩大 Python 对象清理资格。
+
+**原异步实现验收：2026-11-06；native 构建为 `2172f462`，下列记录属于公共入口简化前的基线。**
+
+AsyncGroup/CHECK/FINISH、版本化能力、固定 run 资源绑定，以及 native DFX producer/export、
 schema10/11 reader 和真实事件时间线已接通。相关 CPU 18 targets / 2,247 项通过，
 另有两项 SDMA 提交前后故障到真实 Host 保留门的 CPU 集成用例通过；这些不是全仓测试结果。
 

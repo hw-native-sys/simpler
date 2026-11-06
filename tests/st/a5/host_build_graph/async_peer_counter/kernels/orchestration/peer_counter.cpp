@@ -49,18 +49,10 @@ void declare_core_only(TaskId task) {
     if (!rt_declare_async_core_only(task)) throw std::runtime_error("peer COUNTER core-only declaration failed");
 }
 
-void declare_consumer(TaskId task, uint32_t payload_argument) {
-    if (!rt_declare_async_consumer(task, payload_argument, clean))
-        throw std::runtime_error("peer COUNTER CLEAN consumer declaration failed");
-    declare_core_only(task);
-}
-
 void declare_waiter(TaskId task) {
     if (!rt_declare_async_counter_payload(task, 0, 1, kSignalWords * sizeof(int32_t), clean))
         throw std::runtime_error("peer COUNTER payload binding failed");
-    // The waiter's payload view is an intentional alias of its async payload,
-    // even though the finite registration kernel does not read that argument.
-    declare_consumer(task, 1);
+    declare_core_only(task);
 }
 
 void submit_source(const ChipTaskArgs &args, int64_t context, int64_t epoch, int64_t tag, int64_t pressure) {
@@ -87,7 +79,7 @@ void submit_source(const ChipTaskArgs &args, int64_t context, int64_t epoch, int
     publisher.args.add_scalar(pressure);
     publisher.args.set_dependencies(&ready_waiter, 1);
     const TaskId publication = rt_submit_aiv_task(3, publisher.args).task_id();
-    declare_consumer(publication, 3);
+    declare_core_only(publication);
 }
 
 void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, int64_t tag, int64_t pressure) {
@@ -117,7 +109,7 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
         consumer.args.add_scalar(INT64_C(0));
         consumer.args.set_dependencies(&main_waiter, 1);
         const TaskId consumption = rt_submit_aiv_task(4, consumer.args).task_id();
-        declare_consumer(consumption, 0);
+        declare_core_only(consumption);
     }
 
     // No waiter TaskDone dependency: the separate AIC checks only the test's
@@ -143,7 +135,7 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
     sender.args.add_scalar(static_cast<int64_t>(kMaxRows));
     sender.args.set_dependencies(&registration_gate, 1);
     const TaskId ready_sender = rt_submit_aiv_task(2, sender.args).task_id();
-    declare_consumer(ready_sender, 2);
+    declare_core_only(ready_sender);
 }
 }  // namespace
 

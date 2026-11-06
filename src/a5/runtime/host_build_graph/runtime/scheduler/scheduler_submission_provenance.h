@@ -287,17 +287,21 @@ inline __aicore__ bool scheduler_submission_provenance_mount(
     if (out == nullptr) return false;
     scheduler_reset_local(out);
     if (layout.total_bytes == 0) return async_base == nullptr;
-    SchedulerLocalStorage<SchedulerAsyncCohortView> cohorts_storage;
-    auto &cohorts = cohorts_storage.get();
-    if (!SchedulerAsyncCohortView::mount(async_base, layout, &cohorts)) return false;
-    if (cohorts.header.auxiliary_bytes == 0) return true;
+    if (async_base == nullptr || layout.version != SCHEDULER_ASYNC_LAYOUT_VERSION || layout.run_epoch == 0 ||
+        layout.total_bytes > UINT64_MAX - reinterpret_cast<uint64_t>(async_base))
+        return false;
+    if (layout.scratch_bytes == 0 && layout.scratch_offset == 0) return true;
+    if (layout.scratch_offset < sizeof(SchedulerAsyncLayout) || layout.scratch_offset % 128 != 0 ||
+        layout.scratch_offset > layout.total_bytes || layout.scratch_bytes > layout.total_bytes - layout.scratch_offset)
+        return false;
+    if (layout.scratch_bytes == 0) return true;
     SchedulerLocalStorage<SchedulerSubmissionProvenanceView> view_storage;
     auto &view = view_storage.get();
     view.async_base = async_base;
     view.async_bytes = layout.total_bytes;
-    view.async_offset = layout.scratch_offset + cohorts.header.auxiliary_offset;
+    view.async_offset = layout.scratch_offset;
     if (!scheduler_submission_mount(
-            cohorts.base + cohorts.header.auxiliary_offset, cohorts.header.auxiliary_bytes, layout.run_epoch,
+            const_cast<__gm__ uint8_t *>(async_base) + layout.scratch_offset, layout.scratch_bytes, layout.run_epoch,
             layout.task_count, &view.submissions
         ))
         return false;

@@ -34,12 +34,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         task.add_no_dep(args.tensor(3).ref());
         task.add_scalar(args.scalar<int64_t>(0), args.scalar<int64_t>(1), index, elements(index), posts);
         const TaskId transfer = rt_submit_aiv_task(0, task).task_id();
-        if (!rt_declare_async_sdma_get(transfer, 0, 1, 0, 1, clean) || !rt_declare_async_consumer(transfer, 1, clean))
+        if (!rt_declare_async_sdma_get(transfer, 0, 1, 0, 1, clean))
             throw std::runtime_error("SDMA series transfer declaration failed");
         task.set_dependencies(&transfer, 1);
-        const TaskId consumer = rt_submit_aiv_task(1, task).task_id();
-        if (!rt_declare_async_consumer(consumer, 1, clean))
-            throw std::runtime_error("SDMA series consumer declaration failed");
+        rt_submit_aiv_task(1, task);
     }
 }
 }

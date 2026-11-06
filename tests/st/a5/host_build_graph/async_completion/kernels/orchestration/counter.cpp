@@ -48,22 +48,14 @@ void tensors(CoreTaskArgs &task, const Args &args) {
 
 constexpr auto kCleanLines = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
 
-void declare_payload_consumer(TaskId task) {
-    // The shared argument signature includes payload even for actions that do
-    // not read it. Its lines are clean at entry; publishers flush payload before
-    // signalling, and consumers write results into a separate tensor.
-    if (!rt_declare_async_consumer(task, 1, kCleanLines) || !rt_declare_async_core_only(task))
-        throw std::runtime_error("async fixture payload declaration failed");
+void declare_core_only(TaskId task) {
+    if (!rt_declare_async_core_only(task)) throw std::runtime_error("async case core-only declaration failed");
 }
 
-void declare_waiter(TaskId task, bool has_predicate = false) {
+void declare_waiter(TaskId task) {
     if (!rt_declare_async_counter_payload(task, 0, 1, async_case::kSignalStride * sizeof(int32_t), kCleanLines))
         throw std::runtime_error("async fixture counter declaration failed");
-    declare_payload_consumer(task);
-    // The predicate reads a separate control line before kernel entry. Control
-    // updates use GM atomics, so this acquisition has no dirty scalar alias.
-    if (has_predicate && !rt_declare_async_consumer(task, 4, kCleanLines))
-        throw std::runtime_error("async fixture predicate declaration failed");
+    declare_core_only(task);
 }
 
 template <typename Args, typename Instance, typename Base, typename Record>
@@ -88,7 +80,7 @@ TaskId action(
             submitted = rt_submit_aic_task(8, task).task_id();
         else submitted = rt_submit_aiv_task(5, task).task_id();
     } else submitted = rt_submit_aiv_task(op == Action::PREREQUISITE ? 6 : 3, task).task_id();
-    declare_payload_consumer(submitted);
+    declare_core_only(submitted);
     return submitted;
 }
 
@@ -169,7 +161,7 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
         }
         const TaskId waited = scenario == Scenario::PROGRESS ? rt_submit_aiv_task(9, task).task_id() :
                                                                rt_submit_task(kernels, task).task_id();
-        declare_waiter(waited, p.skip != 0);
+        declare_waiter(waited);
         if (scenario == Scenario::PROGRESS) publisher_deps.push_back(registration_gate(args, execution + 1));
         if (scenario == Scenario::FULL_SYNC_START)
             for (int64_t block = 0; block < p.blocks; ++block)

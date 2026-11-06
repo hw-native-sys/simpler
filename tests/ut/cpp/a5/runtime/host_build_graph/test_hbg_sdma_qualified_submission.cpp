@@ -356,7 +356,6 @@ struct Mounted {
         SchedulerAsyncAuxiliaryBytes extra{};
         extra.resources = sizeof(AsyncResourceHeader) + 2 * sizeof(AsyncRetainedSpan) + 2 * sizeof(AsyncResourceRange);
         extra.uses = 2 * sizeof(AsyncConditionContract);
-        extra.consumers = sizeof(AsyncConsumerTaskMap);
         extra.scratch = plan.image.size();
         if (!scheduler_plan_async_state({task}, {caps}, 19, 1 << 20, extra, &async_plan, &error))
             throw std::runtime_error(error);
@@ -365,9 +364,7 @@ struct Mounted {
         std::memcpy(image.get(), async_plan.image.data(), async_plan.image.size());
         auto *base = static_cast<uint8_t *>(image.get());
         const auto &layout = async_plan.layout;
-        SchedulerAsyncCohortView cohort{};
-        if (!SchedulerAsyncCohortView::mount(base, layout, &cohort)) throw std::runtime_error("cohort mount");
-        std::memcpy(cohort.base + cohort.header.auxiliary_offset, plan.image.data(), plan.image.size());
+        std::memcpy(base + layout.scratch_offset, plan.image.data(), plan.image.size());
         if (!scheduler_submission_provenance_mount(base, layout, &proof)) throw std::runtime_error("proof mount");
         if (!scheduler_submission_detail::execution(proof.submissions, 0, &execution))
             throw std::runtime_error("execution");

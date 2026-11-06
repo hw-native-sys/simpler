@@ -104,7 +104,6 @@ public:
         region(layout.condition_bindings_offset, layout.condition_bindings_bytes, 1, end);
         region(layout.resources_offset, layout.resources_bytes, 1, end);
         region(layout.uses_offset, layout.uses_bytes, 1, end);
-        region(layout.consumers_offset, layout.consumers_bytes, 1, end);
         region(layout.scratch_offset, layout.scratch_bytes, 1, end);
     }
 

@@ -18,7 +18,7 @@
 #include "aicore_completion_mailbox_types.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 1;
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 2;
 
 enum class SchedulerAsyncFinishPhase : uint64_t {
     INITIALIZE,
@@ -163,8 +163,6 @@ struct SchedulerAsyncLayout {
     uint64_t resources_bytes{0};
     uint64_t uses_offset{0};
     uint64_t uses_bytes{0};
-    uint64_t consumers_offset{0};
-    uint64_t consumers_bytes{0};
     uint64_t scratch_offset{0};
     uint64_t scratch_bytes{0};
 };
@@ -180,7 +178,7 @@ static_assert(offsetof(SchedulerAsyncGroupProgress, terminal_at) == 88);
 static_assert(offsetof(SchedulerAsyncGroupProgress, active_cycles) == 120);
 static_assert(offsetof(SchedulerAsyncFinishProgress, drained_at) == 216);
 static_assert(offsetof(SchedulerAsyncFinishProgress, failure_code) == 240);
-static_assert(sizeof(SchedulerAsyncLayout) == 256);
+static_assert(sizeof(SchedulerAsyncLayout) == 240);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(std::is_standard_layout_v<SchedulerAsyncTaskMap> && std::is_trivially_copyable_v<SchedulerAsyncTaskMap>);
 static_assert(

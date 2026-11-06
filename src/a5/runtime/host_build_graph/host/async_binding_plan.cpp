@@ -76,7 +76,6 @@ struct TaskArguments {
     uint32_t scalar_count{0};
     std::vector<uint64_t> scalars;
     const AsyncHostDeclarations::Uses *uses{nullptr};
-    Interval predicate{};
 };
 
 bool decode_task(
@@ -102,7 +101,6 @@ bool decode_task(
         for (int32_t i = 0; i < payload.scalar_count; ++i)
             out->scalars.push_back(scalars[i]);
         out->uses = declarations.find(false, 0, original);
-        out->predicate = {payload.predicate.addr, payload.predicate.elem_size};
         return true;
     }
     if (binding->kind != SchedulerNodeKind::CHILD_KERNEL || binding->instance_index >= native.instances.size())
@@ -180,7 +178,6 @@ bool decode_task(
         const uint64_t element = bound.origin + predicate->elem_offset;
         if (bound.bytes < predicate->elem_size || element > (bound.bytes - predicate->elem_size) / predicate->elem_size)
             return false;
-        out->predicate = {bound.address + element * predicate->elem_size, predicate->elem_size};
     }
     return true;
 }
@@ -293,7 +290,7 @@ struct SdmaUse {
 
 bool bind_sdma_use(
     Builder &builder, const TaskArguments &actual, const AsyncUseDeclaration &use, uint64_t byte_budget,
-    std::vector<SdmaUse> *out, std::vector<Interval> *payloads, std::string *error
+    std::vector<SdmaUse> *out, std::string *error
 ) {
     if (use.source_peer_scalar == UINT32_MAX || use.source_peer_scalar >= actual.scalars.size() ||
         use.context_scalar >= actual.scalars.size() ||
@@ -362,7 +359,6 @@ bool bind_sdma_use(
             return fail(error, "SDMA declarations admit an ambiguous transfer within one workspace");
     }
     out->push_back({source, destination, workspace_index, {use.context_scalar}});
-    payloads->push_back(destinations[0]);
     return true;
 }
 
@@ -384,13 +380,8 @@ bool build(
     Builder builder{api, Budget{byte_budget}, {}, {}, {}};
     auto &plan = builder.plan;
     plan.run_epoch = api.run_epoch();
-    if (!builder.budget.take(1, sizeof(AsyncResourceHeader)) ||
-        !builder.budget.take(metadata.size(), sizeof(AsyncConsumerTaskMap)))
+    if (!builder.budget.take(1, sizeof(AsyncResourceHeader)))
         return fail(error, "async binding tables exceed byte budget");
-    plan.consumer_maps.resize(metadata.size());
-    std::vector<TaskArguments> args(metadata.size());
-    std::vector<std::vector<uint64_t>> consumer_inputs(metadata.size());
-    std::vector<Interval> payloads;
     bool submission_image = false;
     if (!scheduler_has_sdma_uses(metadata, native, declarations, &submission_image, error)) return false;
     bool core_only = true;
@@ -398,9 +389,9 @@ bool build(
     for (uint32_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
         if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
-        if (!decode_task(task, image, native, declarations, &args[task]))
+        TaskArguments actual{};
+        if (!decode_task(task, image, native, declarations, &actual))
             return fail(error, "async bindings cannot decode final ordinary/native Graph arguments");
-        auto &actual = args[task];
         has_execution = true;
         bool declared_core_only = false;
         std::map<uint64_t, RecordUse> records;
@@ -410,13 +401,14 @@ bool build(
             for (const auto &use : *actual.uses) {
                 if (!async_use_declaration_valid(use, actual.tensors.size(), actual.scalar_count))
                     return fail(error, "async declaration no longer matches this invocation's argument positions");
+                if (use.kind == AsyncUseDeclarationKind::CONSUMER_CLEAN_READ) continue;
                 if (use.kind == AsyncUseDeclarationKind::CORE_PIPELINES_ONLY) {
                     declared_core_only = true;
                     continue;
                 }
                 if (use.kind == AsyncUseDeclarationKind::SDMA_TRANSFER) {
                     declared_wait = true;
-                    if (!bind_sdma_use(builder, actual, use, byte_budget, &sdma_uses, &payloads, error)) return false;
+                    if (!bind_sdma_use(builder, actual, use, byte_budget, &sdma_uses, error)) return false;
                     continue;
                 }
                 if (use.cache_contract != AsyncUseCacheContract::PUBLISHED_CLEAN_LINES)
@@ -428,21 +420,14 @@ bool build(
                         return fail(error, "async payload has invalid or unbudgeted exact view geometry");
                     for (const auto span : runs) {
                         uint64_t index = 0;
-                        const uint64_t access =
-                            ASYNC_RANGE_READ |
-                            (use.kind == AsyncUseDeclarationKind::CONSUMER_CLEAN_READ ? ASYNC_RANGE_CONSUMER_CLEAN : 0);
-                        if (!builder.range(span, access, &index))
+                        if (!builder.range(span, ASYNC_RANGE_READ, &index))
                             return fail(
                                 error,
                                 "async payload/cache line has no retained owner for this preparation or exceeds budget"
                             );
                         use_payloads.push_back(index);
-                        if (use.kind == AsyncUseDeclarationKind::CONSUMER_CLEAN_READ)
-                            consumer_inputs[task].push_back(index);
-                        else payloads.push_back(span);
                     }
                 }
-                if (use.kind == AsyncUseDeclarationKind::CONSUMER_CLEAN_READ) continue;
                 declared_wait = true;
                 const auto &signal = actual.tensors[use.condition_arg];
                 std::vector<Interval> runs;
@@ -556,72 +541,11 @@ bool build(
                 if (deferred) plan.groups.push_back({begin, plan.conditions.size() - begin});
             }
     }
-    // Every potential payload reader must explicitly declare its acquisition.
-    // This is a conservative argument-alias check, not analysis of kernel code.
-    for (uint32_t task = 0; task < metadata.size(); ++task) {
-        const auto &meta = metadata[task];
-        if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
-        auto &inputs = consumer_inputs[task];
-        std::sort(inputs.begin(), inputs.end());
-        inputs.erase(std::unique(inputs.begin(), inputs.end()), inputs.end());
-        for (const auto &tensor : args[task].tensors) {
-            std::vector<Interval> runs;
-            if (!tensor_runs(tensor, byte_budget, &runs))
-                return fail(error, "task argument geometry is not valid for async alias qualification");
-            for (const auto run : runs)
-                for (const auto payload : payloads) {
-                    if (!overlaps(run, payload)) continue;
-                    const Interval overlap{
-                        std::max(run.address, payload.address),
-                        std::min(run.address + run.bytes, payload.address + payload.bytes) -
-                            std::max(run.address, payload.address)
-                    };
-                    if (std::none_of(inputs.begin(), inputs.end(), [&](uint64_t index) {
-                            return contains(builder.interval(index), overlap);
-                        }))
-                        return fail(
-                            error, "task aliases an async payload without an explicit clean-consumer declaration"
-                        );
-                }
-        }
-        if (scheduler_task_has_predicate(meta.flags)) {
-            const auto predicate = args[task].predicate;
-            if (predicate.bytes == 0 || std::none_of(inputs.begin(), inputs.end(), [&](uint64_t index) {
-                    return contains(builder.interval(index), predicate);
-                }))
-                return fail(error, "predicate's earlier scalar read has no declared retained clean input range");
-        }
-        uint32_t mask = 0;
-        for (uint32_t lane = 0; lane < 3; ++lane)
-            if (meta.active_mask.has(static_cast<SubtaskSlot>(lane))) mask |= 1u << lane;
-        auto &map = plan.consumer_maps[task];
-        map.block_count = meta.logical_block_num;
-        map.lane_mask = mask;
-        map.kind = inputs.empty() ? AsyncConsumerMapKind::NONE : AsyncConsumerMapKind::REQUIRED;
-        if (inputs.empty()) continue;
-        map.contract_base = plan.consumers.size();
-        const uint64_t executions = static_cast<uint64_t>(meta.logical_block_num) * meta.active_mask.count();
-        if (!builder.budget.take(executions, sizeof(AsyncConsumerContract)) ||
-            !builder.budget.take(inputs.size(), sizeof(uint64_t)))
-            return fail(error, "consumer execution tables exceed byte budget");
-        const uint64_t begin = plan.consumer_ranges.size();
-        plan.consumer_ranges.insert(plan.consumer_ranges.end(), inputs.begin(), inputs.end());
-        for (uint32_t block = 0; block < meta.logical_block_num; ++block)
-            for (uint32_t lane = 0; lane < 3; ++lane)
-                if (meta.active_mask.has(static_cast<SubtaskSlot>(lane)))
-                    plan.consumers.push_back(
-                        {static_cast<int64_t>(task), block, lane, begin, inputs.size(), ASYNC_CORE_AIC | ASYNC_CORE_AIV,
-                         0}
-                    );
-    }
     plan.execution_contract = core_only && has_execution && !submission_image ? ASYNC_EXECUTION_CORE_PIPELINES_ONLY :
                                                                                 ASYNC_EXECUTION_UNQUALIFIED;
     plan.auxiliary.resources = sizeof(AsyncResourceHeader) + plan.spans.size() * sizeof(AsyncRetainedSpan) +
                                plan.ranges.size() * sizeof(AsyncResourceRange);
     plan.auxiliary.uses = plan.conditions.size() * sizeof(AsyncConditionContract);
-    plan.auxiliary.consumers = plan.consumer_maps.size() * sizeof(AsyncConsumerTaskMap) +
-                               plan.consumers.size() * sizeof(AsyncConsumerContract) +
-                               plan.consumer_ranges.size() * sizeof(uint64_t);
     SchedulerAsyncLayout complete{};
     if (!scheduler_plan_async_layout(
             metadata, capabilities, api.run_epoch(), byte_budget, plan.auxiliary, &complete, error
@@ -686,7 +610,7 @@ bool scheduler_initialize_async_bindings(
     const AsyncBindingHostPlan &plan, const SchedulerAsyncLayout &layout, void *region, uint64_t region_bytes,
     std::string *error
 ) {
-    uint64_t resources = sizeof(AsyncResourceHeader), uses = 0, consumers = 0;
+    uint64_t resources = sizeof(AsyncResourceHeader), uses = 0;
     if (!async_execution_contract_valid(plan.execution_contract) ||
         (plan.execution_contract == ASYNC_EXECUTION_CORE_PIPELINES_ONLY &&
          (!plan.submission_uses.empty() ||
@@ -697,15 +621,11 @@ bool scheduler_initialize_async_bindings(
     if (!async_resource_detail::add_rows(plan.spans.size(), sizeof(AsyncRetainedSpan), resources) ||
         !async_resource_detail::add_rows(plan.ranges.size(), sizeof(AsyncResourceRange), resources) ||
         !async_resource_detail::add_rows(plan.conditions.size(), sizeof(AsyncConditionContract), uses) ||
-        !async_resource_detail::add_rows(plan.consumer_maps.size(), sizeof(AsyncConsumerTaskMap), consumers) ||
-        !async_resource_detail::add_rows(plan.consumers.size(), sizeof(AsyncConsumerContract), consumers) ||
-        !async_resource_detail::add_rows(plan.consumer_ranges.size(), sizeof(uint64_t), consumers) ||
-        resources != plan.auxiliary.resources || uses != plan.auxiliary.uses || consumers != plan.auxiliary.consumers)
+        resources != plan.auxiliary.resources || uses != plan.auxiliary.uses)
         return fail(error, "async binding vectors changed after sizing");
     if (region == nullptr || layout.total_bytes < sizeof(SchedulerAsyncLayout) || region_bytes < layout.total_bytes ||
         plan.run_epoch != layout.run_epoch || plan.groups.size() != layout.group_count ||
-        plan.consumer_maps.size() != layout.task_count || plan.auxiliary.resources != layout.resources_bytes ||
-        plan.auxiliary.uses != layout.uses_bytes || plan.auxiliary.consumers != layout.consumers_bytes)
+        plan.auxiliary.resources != layout.resources_bytes || plan.auxiliary.uses != layout.uses_bytes)
         return fail(error, "async binding image does not match its planned layout");
     if (layout.version != SCHEDULER_ASYNC_LAYOUT_VERSION ||
         layout.total_bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(region))
@@ -718,8 +638,7 @@ bool scheduler_initialize_async_bindings(
     uint64_t end = sizeof(SchedulerAsyncLayout);
     for (const auto section :
          {Interval{layout.group_identity_offset, layout.group_count * sizeof(SchedulerAsyncGroupIdentity)},
-          Interval{layout.resources_offset, layout.resources_bytes}, Interval{layout.uses_offset, layout.uses_bytes},
-          Interval{layout.consumers_offset, layout.consumers_bytes}}) {
+          Interval{layout.resources_offset, layout.resources_bytes}, Interval{layout.uses_offset, layout.uses_bytes}}) {
         if (section.bytes == 0) {
             if (section.address != 0 &&
                 (section.address % 128 != 0 || section.address < end || section.address > layout.total_bytes))
@@ -739,20 +658,12 @@ bool scheduler_initialize_async_bindings(
         using Value = typename std::decay_t<decltype(values)>::value_type;
         if (!values.empty()) std::memcpy(bytes + offset, values.data(), values.size() * sizeof(Value));
     };
-    AsyncResourceHeader header{ASYNC_RESOURCE_VERSION,      plan.run_epoch,         plan.spans.size(),
-                               plan.ranges.size(),          plan.conditions.size(), plan.consumers.size(),
-                               plan.consumer_ranges.size(), plan.execution_contract};
+    AsyncResourceHeader header{ASYNC_RESOURCE_VERSION, plan.run_epoch,         plan.spans.size(),
+                               plan.ranges.size(),     plan.conditions.size(), plan.execution_contract};
     std::memcpy(bytes + layout.resources_offset, &header, sizeof(header));
     copy(layout.resources_offset + sizeof(header), plan.spans);
     copy(layout.resources_offset + sizeof(header) + plan.spans.size() * sizeof(AsyncRetainedSpan), plan.ranges);
     copy(layout.uses_offset, plan.conditions);
-    copy(layout.consumers_offset, plan.consumer_maps);
-    copy(layout.consumers_offset + plan.consumer_maps.size() * sizeof(AsyncConsumerTaskMap), plan.consumers);
-    copy(
-        layout.consumers_offset + plan.consumer_maps.size() * sizeof(AsyncConsumerTaskMap) +
-            plan.consumers.size() * sizeof(AsyncConsumerContract),
-        plan.consumer_ranges
-    );
     for (uint64_t index = 0; index < plan.groups.size(); ++index) {
         SchedulerAsyncGroupIdentity identity{};
         auto *record = bytes + layout.group_identity_offset + index * sizeof(identity);

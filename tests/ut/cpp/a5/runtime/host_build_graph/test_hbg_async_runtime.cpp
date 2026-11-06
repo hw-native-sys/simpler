@@ -1072,9 +1072,7 @@ TEST(HbgAsyncProtocol, ExportsRealRecorderEvidenceForPythonRoundTrip) {
     }
 }
 
-struct ReturnedProtocolBackend {
-    struct ConsumerCursor {};
-};
+struct ReturnedProtocolBackend {};
 
 void ordinary_projection_returned_path() {
     RuntimeFixture fixture(1, 1, 1, 4, true);

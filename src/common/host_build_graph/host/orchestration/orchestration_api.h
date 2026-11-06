@@ -212,6 +212,8 @@ static inline bool rt_declare_async_counter(
     );
 }
 
+// Accepted for source compatibility. Every business-kernel entry acquires its
+// local data cache without a consumer declaration or a per-range Host plan.
 static inline bool rt_declare_async_consumer(TaskId task, uint32_t payload_arg, AsyncUseCacheContract cache_contract) {
     return rt_declare_async_use(
         task, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, payload_arg, UINT32_MAX, UINT32_MAX, 0,

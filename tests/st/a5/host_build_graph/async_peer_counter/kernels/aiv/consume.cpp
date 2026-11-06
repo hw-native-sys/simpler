@@ -30,7 +30,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         if (seen_signal < epoch) record(diagnostic, Field::EARLY);
         error(diagnostic, Error::EARLY_SIGNAL);
     }
-    // No payload DCCI here. The executing worker's declared consumer acquire
+    // No payload DCCI here. The executing worker's common kernel-entry acquire
     // must make these actual peer-written values visible.
     const auto *received = reinterpret_cast<volatile __gm__ const int32_t *>(payload);
     int64_t checksum = 0;
