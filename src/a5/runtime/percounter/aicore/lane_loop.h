@@ -29,7 +29,7 @@
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
-#include "scheduler/percounter_types.h"
+#include "scheduler/wire_types.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_memory.h"

@@ -105,7 +105,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
 所以 percounter 写自己的 host 入口不是重写难的部分：形状分类规则在共享头里，自己写的是一个
 约 80 行的循环，把分类结果填进 metadata。percounter 另有一套自己的形状校验
-（`percounter_graph.h` / `percounter_plan.h`），现在是重复校验，正好收归一处。
+（`host/graph_template.h` / `host/region_plan.h`），现在是重复校验，正好收归一处。
 
 **结论：不 fork 任何文件。**
 

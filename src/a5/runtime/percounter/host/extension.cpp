@@ -21,7 +21,7 @@
  * unit carries.
  */
 
-#include "percounter_state.h"
+#include "state.h"
 #include "scheduler_extension.h"
 
 // Never DECLINED: percounter is the only scheduler this runtime carries, so a

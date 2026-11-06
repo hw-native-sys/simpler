@@ -29,7 +29,7 @@
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu_executor.h"
 #include "common/platform_config.h"
-#include "percounter_aicpu.h"
+#include "supervisor.h"
 #include "runtime.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"

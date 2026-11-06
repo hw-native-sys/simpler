@@ -16,7 +16,7 @@
  * AicoreLifecycle) and replaces three resident-specific steps with the ones
  * here: publishing the discovered topology into the control block, telling
  * each reported core READY, and watching the progress count. The threads that
- * do not watch materialize the Graph bodies (percounter_graph_prepare.h).
+ * do not watch materialize the Graph bodies (graph_prepare.h).
  *
  * Header-only because aicpu_executor.cpp is included by name into a unit test.
  */
@@ -36,9 +36,9 @@
 #include "common/unified_log.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/shared_memory.h"
-#include "percounter_graph_prepare.h"
+#include "graph_prepare.h"
 #include "runtime.h"
-#include "scheduler/percounter_types.h"
+#include "scheduler/wire_types.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"

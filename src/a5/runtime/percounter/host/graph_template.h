@@ -29,8 +29,8 @@
 #include <vector>
 
 #include "graph_image_view.h"
-#include "percounter_plan.h"
-#include "scheduler/percounter_types.h"
+#include "region_plan.h"
+#include "scheduler/wire_types.h"
 
 namespace simpler::percounter {
 

@@ -41,8 +41,8 @@
 #include "host_build_graph/runtime.h"
 #include "host_build_graph/shared_memory.h"
 #include "intrinsic.h"
-#include "percounter_graph.h"
-#include "percounter_plan.h"
+#include "graph_template.h"
+#include "region_plan.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 
