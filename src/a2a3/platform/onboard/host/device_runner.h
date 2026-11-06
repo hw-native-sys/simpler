@@ -77,6 +77,10 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper);
  * - Runtime execution workflow
  */
 class DeviceRunner : public DeviceRunnerBase {
+public:
+    bool supports_scope_stats_capture() const override { return SIMPLER_DFX != 0; }
+
+private:
     // #2267's retention probe retires only this run's stream-pair ownership,
     // on real boundary completion and without the drain that normally
     // accompanies it, so its successor's `ensure()` is accepted while the
@@ -403,9 +407,9 @@ private:
      * @return 0 on success, error code on failure
      */
     // Resident pools may still have device/retained-writer users. Storage
-    // construction requires the execution claim until those pools have
-    // independent lifetimes; it does not acquire a run bank or start readers.
-    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared);
+    // construction holds the execution claim, or native_run_mu_ with no active
+    // claims during cold retention. It acquires no run bank and starts no readers.
+    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared) override;
     // Bind the per-run terminal bank after storage preparation succeeds.
     int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 

@@ -68,10 +68,12 @@ The exact native entry names are `simpler_prepare_run`,
 `simpler_release_run_resources`. Model operations belong to the caller's RTS API.
 
 Active recording requires Kernel mode, capture-purpose preparation, a matching
-retained reference and caller stream, diagnostics disabled, and no predecessor
-argument. Duplicate recording, invalidated capture and unsupported combinations
-are refused. A capture query or refusal does not prove that accepted device work
-has completed.
+retained reference and caller stream, and no predecessor argument. Diagnostics
+are disabled except for ScopeStats alone on native A3 TMR. That combination
+reserves and arms its collection window during retention, before capture; other
+diagnostic families and combinations remain refused. Duplicate recording,
+invalidated capture and unsupported combinations are refused. A capture query or
+refusal does not prove that accepted device work has completed.
 
 Publication precedes the entry fork. The AICore stream waits for that fork;
 completion events follow the corresponding device kernels, and the caller's
@@ -85,6 +87,18 @@ ends the original Host run without synchronizing recorded device execution or
 copying Program outputs. The retained reference remains responsible for future
 model uses. Resource and failed-release rules are specified in the
 [resource lifetime contract](native-hbg-prepared-lifetime.md).
+
+ScopeStats-enabled models and eager runs sharing one context's collector pool
+must execute in one caller-ordered domain, with no concurrent producers. Multiple
+resource references and collection windows may coexist. Before releasing any
+such reference, the caller must finish **all** ScopeStats producers sharing that
+pool and start none until release returns. Closing one window does not close
+another live window. Synchronizing the retained caller stream or counting
+references cannot prove that a raw model replay on another stream has stopped;
+the caller establishes that ordering. This contract adds neither a second owner
+nor a whole-context stream synchronization operation. Aggregate sample and
+publication semantics are specified in the
+[ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection).
 
 ## Completion and errors
 
@@ -114,17 +128,28 @@ device.
 
 ## Support and qualification limits
 
-The supplied end-to-end coverage is limited to A3 HBG: bounded dependency,
-early-dispatch and nested-Graph computations, changing device input contents,
-original Host-run finalization, and model/resource cleanup. Additional bounded
-capture-refusal, cancellation, partial-submission and timeout scenarios do not
-establish arbitrary device-fault recovery or kernel-stop guarantees.
+A3 HBG coverage exercises bounded dependency, early-dispatch and nested-Graph
+computations, changing device input contents, original Host-run finalization,
+multiple retained models with persistent INOUT tensors, and model/resource
+cleanup. Separate native TMR scenarios exercise cold replay, serial retained
+models, multiple prepared nodes, unexecuted-model destruction and a controlled
+RTS execution error. Neither runtime's coverage substitutes for the other's
+reconstruction and lifetime checks. Bounded capture-refusal, partial-submission
+and timeout cases do not establish arbitrary device-fault recovery or kernel-stop
+guarantees.
 
-A5 and TMR capture/replay hardware are not qualified by that A3 HBG coverage.
-Native CPU tests and SIM behavior do not establish RTS model support. DFX capture
-is refused; ordinary DFX support does not imply per-replay collection. Permanent
-missing handshake/callback, invalid register bindings and unknown physical exit
-remain outside the qualified recovery scope.
+ScopeStats alone is supported for native A3 TMR capture, under the serialized
+producer contract above. Its separate consumer checks actual replay-produced
+samples and a subsequent ordinary eager run; DFX-off capture tests and ordinary
+ScopeStats tests do not establish that combination. Recorded windows export
+aggregate raw boundary samples, not exact per-replay totals or paired scopes.
+HBG has no ScopeStats device producer; other capture diagnostic families remain
+unsupported.
+
+A3 qualification does not qualify A5 or framework graph integration. Native CPU
+tests and SIM behavior do not establish RTS model support. Permanent missing
+handshake/callback, invalid register bindings and unknown physical exit remain
+outside the qualified recovery scope.
 
 There is no in-place model address/scalar-update API here. A prepared model fixes
 those bindings and Host-derived controls; new bindings need separate preparation

@@ -192,16 +192,14 @@ int ScopeStatsCollector::init(
 void ScopeStatsCollector::begin_run(
     uint64_t run_epoch, const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities
 ) {
+    std::scoped_lock lock(records_mutex_);
     expected_producer_epoch_ = capacities == nullptr || capacities->required ? run_epoch : 0;
     device_snapshot_ = {};
     ordinary_capacities_ = capacities == nullptr ? simpler::dfx::scope_stats_runs::CapacityMetadata{} : *capacities;
     ordinary_run_epoch_ = run_epoch;
     ordinary_stop_unproved_ = false;
-    {
-        std::scoped_lock lock(records_mutex_);
-        const size_t charged = records_.release();
-        if (charged > 0) host_budget_.credit(charged);
-    }
+    const size_t charged = records_.release();
+    if (retain_across_runs_ && charged > 0) host_budget_.credit(charged);
     total_collected_ = 0;
     refused_records_ = 0;
     recovered_current_buf_ = 0;
@@ -221,6 +219,12 @@ void ScopeStatsCollector::on_buffer_collected(const ScopeStatsReadyBufferInfo &i
     }
 }
 
+void ScopeStatsCollector::on_handoff_retired(const profiling_common::RetiredHandoff<ScopeStatsModule> &) {
+    if (recorded_windows_open()) {
+        note_host_failure("a ready buffer was retired without delivery while a recorded window was open");
+    }
+}
+
 void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
     if (throw_in_collector_) throw std::bad_alloc();
     const ScopeStatsBuffer *buf = reinterpret_cast<const ScopeStatsBuffer *>(buf_host_ptr);
@@ -237,77 +241,42 @@ void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
     const uint64_t run_epoch = buf->run_epoch;
     const uint32_t local_seq = buf->local_seq;
 
-    // An unproven close can leave publications queued. A restarted ordinary
-    // collector may retire that transport entry but cannot adopt its records.
-    if (!terminal_banks_.opened() && ordinary_run_epoch_ && run_epoch != *ordinary_run_epoch_) {
+    RunReceipts *owner = nullptr;
+    bool receipts_open = false;
+    for (RunReceipts &entry : run_receipts_) {
+        receipts_open = receipts_open || entry.open;
+        if (entry.open && entry.run_epoch == run_epoch) owner = &entry;
+    }
+    const bool ordinary_match = ordinary_run_epoch_ && run_epoch == *ordinary_run_epoch_;
+    const bool foreign = owner == nullptr && ((terminal_banks_.opened() && retain_across_runs_) ||
+                                              ((receipts_open || ordinary_run_epoch_) && !ordinary_match));
+    if (foreign) {
         foreign_epoch_records_ += n;
+        total_collected_ += n;
         if (!foreign_epoch_reported_) {
             LOG_ERROR(
-                "scope_stats: %u records stamped 0x%llx do not belong to ordinary run 0x%llx; not exported", n,
-                static_cast<unsigned long long>(run_epoch), static_cast<unsigned long long>(*ordinary_run_epoch_)
+                "scope_stats: %u records arrived stamped 0x%llx, which names no admitted collection window", n,
+                static_cast<unsigned long long>(run_epoch)
             );
             foreign_epoch_reported_ = true;
             foreign_epoch_pending_report_ = true;
         }
         return;
     }
-
-    // Which run's receipts these records belong to. With a bank mapped the
-    // answer is the identity the producer stamped, because more than one run
-    // can be open: appending to a single accumulator would put a successor's
-    // records in its predecessor's artifact and count both against whichever
-    // was admitted last. Without one there is only ever one open run, and the
-    // accumulator is left exactly as it was so its artifact's bytes do not move.
-    simpler::dfx::scope_stats_runs::RecordBlocks *store = &records_;
-    uint64_t *received = &total_collected_;
-    uint64_t *refused = &refused_records_;
-    if (terminal_banks_.opened()) {
-        RunReceipts *owner = nullptr;
-        for (RunReceipts &entry : run_receipts_) {
-            if (entry.open && entry.run_epoch == run_epoch) {
-                owner = &entry;
-                break;
-            }
-        }
-        if (owner == nullptr) {
-            // A run this collector holds no open receipts for: already sealed,
-            // or never admitted. Counted against no run — adding it to one that
-            // does not own it is the misattribution this routing exists to stop
-            // — and reported, because a count nothing reads is not a loss
-            // anybody learns about. Sticky and one-shot: the condition is a
-            // collector-level ownership failure, and the receive path must not
-            // log per record.
-            foreign_epoch_records_ += n;
-            total_collected_ += n;
-            const bool first = !foreign_epoch_reported_;
-            foreign_epoch_reported_ = true;
-            if (first) {
-                LOG_ERROR(
-                    "scope_stats: %u records arrived stamped 0x%llx, which names no admitted run; they belong to no "
-                    "artifact and this collector reports the loss",
-                    n, static_cast<unsigned long long>(run_epoch)
-                );
-                // Recorded outside this lock by the caller's own path: a sticky
-                // host failure is the collector's error channel and takes
-                // `retained_mu_`, which the receive path must not take here.
-                foreign_epoch_pending_report_ = true;
-            }
-            return;
-        }
-        store = &owner->records;
-        received = &owner->received;
-        refused = &owner->refused;
-    }
+    auto *store = owner == nullptr ? &records_ : &owner->records;
+    uint64_t *received = owner == nullptr ? &total_collected_ : &owner->received;
+    uint64_t *refused = owner == nullptr ? &refused_records_ : &owner->refused;
+    const bool charged_store = owner != nullptr || retain_across_runs_;
 
     for (uint32_t i = 0; i < n; i++) {
         const CollectedScopeStatsRecord record{buf->records[i], run_epoch, local_seq, 0};
         const bool stored = store->append(
             record,
-            [this](size_t bytes) {
-                return charge_record_block(bytes);
+            [this, owner](size_t bytes) {
+                return owner != nullptr ? host_budget_.charge(bytes) : charge_record_block(bytes);
             },
-            [this](size_t bytes) {
-                host_budget_.credit(bytes);
+            [this, charged_store](size_t bytes) {
+                if (charged_store) host_budget_.credit(bytes);
             }
         );
         if (!stored) {
@@ -540,17 +509,22 @@ bool ScopeStatsCollector::reconcile_counters() {
         );
         clean = false;
     }
-    if (total_collected_ + dropped_device != total_device) {
+    uint64_t ordinary_received = 0;
+    {
+        std::scoped_lock lock(records_mutex_);
+        ordinary_received = records_.size() + refused_records_;
+    }
+    if (ordinary_received + dropped_device != total_device) {
         LOG_WARN(
             "scope_stats reconcile: record count mismatch (collected=%lu + dropped=%lu != device_total=%lu)",
-            static_cast<unsigned long>(total_collected_), static_cast<unsigned long>(dropped_device),
+            static_cast<unsigned long>(ordinary_received), static_cast<unsigned long>(dropped_device),
             static_cast<unsigned long>(total_device)
         );
         clean = false;
     } else {
         LOG_INFO(
             "scope_stats reconcile: counts match (collected=%lu, dropped=%lu, device_total=%lu)",
-            static_cast<unsigned long>(total_collected_), static_cast<unsigned long>(dropped_device),
+            static_cast<unsigned long>(ordinary_received), static_cast<unsigned long>(dropped_device),
             static_cast<unsigned long>(total_device)
         );
     }
@@ -695,6 +669,8 @@ int ScopeStatsCollector::render_jsonl_to(
         ) < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (extra != nullptr && extra->recorded_window && std::fprintf(fp, ", \"recorded_window\": true") < 0)
+        return PTO_RUNTIME_ERR_INTERNAL;
     if (std::fprintf(fp, "}\n") < 0) return PTO_RUNTIME_ERR_INTERNAL;
 
     LineSink sink(fp);
@@ -751,7 +727,9 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     }
 
     // This verdict describes only the host collection; it settles no device references.
-    const Collection unknown{simpler::dfx::runs::Verdict::CutUnknown, true, total_collected_, records_.size()};
+    const Collection unknown{
+        simpler::dfx::runs::Verdict::CutUnknown, true, records_.size() + refused_records_, records_.size()
+    };
     const int rc = render_jsonl_to(
         fp, device_snapshot_, records_, ordinary_stop_unproved_ ? &unknown : nullptr,
         ordinary_stop_unproved_ ? &ordinary_capacities_ : nullptr

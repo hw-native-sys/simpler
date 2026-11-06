@@ -17,8 +17,12 @@
 #include <array>
 #include <chrono>
 #include <future>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
+#include "aicpu/scope_stats_collector_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "callable.h"
 #include "fixture.h"
 #include "native_run_context.h"
@@ -2668,6 +2672,298 @@ TEST_F(NativeAdmissionTest, ExternalResourceReleaseRetriesOnlyItsFailedManagedBa
         else EXPECT_TRUE(larger.consume_release());
         control().selected_free = nullptr;
     }
+}
+
+namespace {
+class ScopeCaptureRunner : public FencedCompletionRunner {
+public:
+    ScopeCaptureRunner() {
+        static int binary;
+        aicore_bin_handle_ = &binary;
+    }
+    ~ScopeCaptureRunner() override {
+        if (emit_scope_records) {
+            set_scope_stats_enabled(false);
+            set_platform_scope_stats_base(0);
+            set_platform_scope_stats_run_terminal(0);
+            set_platform_run_result(0, 0);
+        }
+        scope_stats_collector_.finalize(nullptr, [this](void *pointer) {
+            return mem_alloc_.free(pointer);
+        });
+    }
+    bool supports_scope_stats_capture() const override { return supported; }
+    int prepare_collector_storage(const Runtime &, PreparedExecution &prepared) override {
+        ++arm_calls;
+        if (during_arm) during_arm();
+        const int rc = scope_stats_collector_.init(
+            1,
+            [this](size_t bytes) {
+                return mem_alloc_.alloc(bytes);
+            },
+            nullptr,
+            [this](void *pointer) {
+                return mem_alloc_.free(pointer);
+            },
+            0
+        );
+        prepared.kernel_args.args.scope_stats_data_base =
+            reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+        SIMPLER_SET_DFX_FLAG(prepared.kernel_args.args.enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
+        return rc;
+    }
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        if (refuse_eager) return {-887, LaunchProgress::NotStarted, {}};
+        if (emit_scope_records) {
+            const int bank_rc = open_run_terminal_banks_for_enabled_owners(prepared.dfx);
+            if (bank_rc != 0) return {bank_rc, LaunchProgress::NotStarted, {}};
+            const RunLocalDfxMetadata metadata{
+                nullptr, 0, false, &prepared.artifact_identity, &prepared.scope_stats_capacity
+            };
+            DiagnosticAdmission admission;
+            const int rc =
+                start_shared_collectors_for_run(prepared.dfx, prepared.identity.run_epoch, metadata, &admission);
+            if (rc != 0) return {rc, LaunchProgress::NotStarted, {}};
+            resolve_run_terminal_banks(prepared.dfx, prepared.identity.run_epoch, prepared.kernel_args);
+        }
+        auto result = FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+        if (result.rc == 0 && emit_scope_records) {
+            set_scope_stats_enabled(true);
+            set_platform_scope_stats_base(prepared.kernel_args.args.scope_stats_data_base);
+            set_platform_scope_stats_run_terminal(prepared.kernel_args.args.scope_stats_run_terminal_bank);
+            scope_stats_aicpu_set_orch_thread_idx(0);
+            set_platform_run_result(0, prepared.identity.run_epoch);
+            scope_stats_aicpu_begin_run();
+            scope_stats_set_pending_site("native-eager.cpp", 120);
+            scope_stats_begin(0, 1, 2, 1024, 2048, 1, 2, 3);
+            scope_stats_end(0, 1, 3, 1024, 3072, 1, 3, 4);
+            scope_stats_aicpu_flush_buffers();
+            scope_stats_aicpu_close_run();
+            EXPECT_EQ(queue_caller_exit(prepared), 0);
+            ++scope_submissions;
+        }
+        return result;
+    }
+    int retire_completed_execution(ActiveExecution &active) override {
+        const bool close_scope = emit_scope_records && active.prepared->resources_owned;
+        const int rc = FencedCompletionRunner::retire_completed_execution(active);
+        if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE && close_scope) {
+            auto &prepared = *active.prepared;
+            prepared.retirement_diagnostics_rc = teardown_shared_collectors_after_run(
+                prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, prepared.physical_complete
+            );
+        }
+        return rc;
+    }
+    bool emit_scope_records{false};
+    int scope_submissions{0};
+    bool refuse_eager{false};
+    bool window(uint64_t epoch) const { return scope_stats_collector_.recorded_window_open(epoch); }
+    bool ordinary_retention() const { return scope_stats_collector_.retains_runs(); }
+    bool flush(std::string *error) { return scope_stats_collector_.flush_retained_runs(5000, error); }
+    bool supported{true};
+    int arm_calls{0};
+    std::function<void()> during_arm;
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, CaptureScopeWindowSurvivesSourceAndFailedReleaseWithoutEnablingOrdinaryRetention) {
+    ScopeCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9600);
+    use_capture_preparation(attempt);
+    diagnostic_path = "native-scope-capture-lifetime";
+    attempt.config.enable_scope_stats = 1;
+    std::strncpy(attempt.config.output_prefix, diagnostic_path.c_str(), sizeof(attempt.config.output_prefix) - 1);
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    int caller;
+    RuntimeHandle reference = nullptr;
+    if (!state->prepared_execution->scope_stats_capacity.required) {
+        EXPECT_EQ(
+            simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_UNSUPPORTED
+        );
+        EXPECT_EQ(runner.arm_calls, 0);
+        EXPECT_EQ(reference, nullptr);
+        return;
+    }
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    auto release = RAIIScopeGuard([&] {
+        control().stream_sync_rc = 0;
+        (void)simpler_finalize_run(&runner, attempt.storage);
+        (void)simpler_release_run_resources(&runner, reference);
+    });
+    EXPECT_FALSE(runner.ordinary_retention());
+    EXPECT_TRUE(runner.window(9600));
+    EXPECT_NE(state->prepared_execution->kernel_args.args.scope_stats_data_base, 0u);
+    EXPECT_EQ(state->prepared_execution->kernel_args.args.scope_stats_run_terminal_bank, 0u);
+    RuntimeHandle duplicate = reinterpret_cast<void *>(1);
+    EXPECT_NE(simpler_retain_run_resources(&runner, attempt.storage, &caller, &duplicate), 0);
+    EXPECT_EQ(duplicate, nullptr);
+    EXPECT_TRUE(runner.window(9600)) << "a duplicate retain discarded the original receipt window";
+    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
+    state->recording = true;
+    state->completion_rc = 0;
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_TRUE(runner.window(9600));
+    control().stream_sync_rc = -996;
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), -996);
+    EXPECT_TRUE(runner.window(9600));
+    control().stream_sync_rc = 0;
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    release.dismiss();
+    EXPECT_FALSE(runner.window(9600));
+    std::string error;
+    EXPECT_TRUE(runner.flush(&error)) << error;
+    EXPECT_TRUE(std::filesystem::exists(std::filesystem::path(diagnostic_path) / "scope_stats/scope_stats.jsonl"));
+}
+
+TEST_F(NativeAdmissionTest, UnsupportedCaptureDiagnosticsRefuseBeforePoolMutation) {
+    for (bool other_diagnostic : {false, true}) {
+        ScopeCaptureRunner runner;
+        ASSERT_EQ(initialize_capture_runner(runner), 0);
+        Attempt attempt(runner, 0, 9601);
+        use_capture_preparation(attempt);
+        attempt.config.enable_scope_stats = 1;
+        attempt.config.enable_pmu = other_diagnostic ? 2 : 0;
+        std::strcpy(attempt.config.output_prefix, "unused-scope-refusal");
+        runner.supported = other_diagnostic;
+        ASSERT_EQ(attempt.prepare(), 0);
+        const auto allocations = control().allocations;
+        int caller;
+        RuntimeHandle reference = reinterpret_cast<void *>(1);
+        EXPECT_EQ(
+            simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_UNSUPPORTED
+        );
+        EXPECT_EQ(reference, nullptr);
+        EXPECT_EQ(runner.arm_calls, 0);
+        EXPECT_EQ(control().allocations, allocations);
+    }
+}
+
+TEST_F(NativeAdmissionTest, CaptureScopeArmingExcludesAContendingExecutionClaim) {
+    ScopeCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt first(runner, 0, 9602), second(runner, 1, 9603);
+    use_capture_preparation(first);
+    use_capture_preparation(second);
+    first.config.enable_scope_stats = 1;
+    std::strcpy(first.config.output_prefix, "native-scope-claim-exclusion");
+    diagnostic_path = first.config.output_prefix;
+    ASSERT_EQ(first.prepare(), 0);
+    ASSERT_EQ(second.prepare(), 0);
+    auto *first_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(first.storage);
+    auto *second_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(second.storage);
+    if (!first_state->prepared_execution->scope_stats_capacity.required) return;
+    std::promise<void> arming, continue_arm, contender_started;
+    auto continue_future = continue_arm.get_future();
+    runner.during_arm = [&] {
+        arming.set_value();
+        continue_future.wait();
+    };
+    int caller;
+    RuntimeHandle reference = nullptr;
+    auto retain = std::async(std::launch::async, [&] {
+        return simpler_retain_run_resources(&runner, first.storage, &caller, &reference);
+    });
+    arming.get_future().wait();
+    auto contender = std::async(std::launch::async, [&] {
+        contender_started.set_value();
+        LaunchPermit permit;
+        const bool acquired = runner.try_acquire_native_run(second.storage, second_state->identity(), &permit);
+        if (acquired) runner.release_native_run(second.storage);
+        return acquired;
+    });
+    contender_started.get_future().wait();
+    EXPECT_EQ(contender.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    continue_arm.set_value();
+    EXPECT_EQ(retain.get(), 0);
+    EXPECT_TRUE(contender.get());
+    ASSERT_EQ(simpler_finalize_run(&runner, first.storage), 0);
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    std::string error;
+    EXPECT_TRUE(runner.flush(&error)) << error;
+}
+
+TEST_F(NativeAdmissionTest, RetainedPreparationSuccessfullyCollectsItsEagerScopeRun) {
+    diagnostic_path = "native-scope-successful-eager";
+    for (bool retain : {false, true}) {
+        SCOPED_TRACE(retain);
+        ScopeCaptureRunner runner;
+        runner.set_retain_runs(retain);
+        runner.emit_scope_records = true;
+        ASSERT_EQ(initialize_capture_runner(runner), 0);
+        Attempt attempt(runner, 0, retain ? 9611 : 9610);
+        use_capture_preparation(attempt);
+        attempt.config.enable_scope_stats = 1;
+        const auto output = std::filesystem::path(diagnostic_path) / (retain ? "retained" : "ordinary");
+        std::strcpy(attempt.config.output_prefix, output.c_str());
+        ASSERT_EQ(attempt.prepare(), 0);
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+        if (!state->prepared_execution->scope_stats_capacity.required)
+            GTEST_SKIP() << "runtime has no ScopeStats producer";
+        int caller;
+        RuntimeHandle reference = nullptr;
+        ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+        auto release = RAIIScopeGuard([&] {
+            (void)simpler_finalize_run(&runner, attempt.storage);
+            (void)simpler_release_run_resources(&runner, reference);
+        });
+        ASSERT_TRUE(runner.window(state->identity().run_epoch));
+        ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+        EXPECT_FALSE(runner.window(state->identity().run_epoch));
+        EXPECT_EQ(runner.scope_submissions, 1);
+        ASSERT_EQ(simpler_poll_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+        ASSERT_EQ(simpler_wait_run(&runner, attempt.storage), 0);
+        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+        ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+        release.dismiss();
+        std::string error;
+        ASSERT_TRUE(runner.flush(&error)) << error;
+        std::ifstream artifact(output / "scope_stats/scope_stats.jsonl");
+        ASSERT_TRUE(artifact.is_open());
+        const std::string text{std::istreambuf_iterator<char>(artifact), std::istreambuf_iterator<char>()};
+        EXPECT_NE(text.find("native-eager.cpp"), std::string::npos) << text;
+        EXPECT_EQ(std::count(text.begin(), text.end(), '\n'), 3);
+        EXPECT_NE(text.find("\"total\": 2"), std::string::npos) << text;
+        if (retain) {
+            EXPECT_NE(text.find("\"host_received_records\": 2"), std::string::npos) << text;
+            EXPECT_NE(text.find("\"counts_unknown\": false"), std::string::npos) << text;
+        }
+        EXPECT_EQ(text.find("\"recorded_window\": true"), std::string::npos) << text;
+        EXPECT_EQ(runner.ordinary_retention(), retain);
+    }
+}
+
+TEST_F(NativeAdmissionTest, RetainedPreparationSwitchingToEagerWithdrawsItsUnusedScopeWindow) {
+    ScopeCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9604);
+    use_capture_preparation(attempt);
+    attempt.config.enable_scope_stats = 1;
+    diagnostic_path = "native-scope-unused-recording";
+    std::strcpy(attempt.config.output_prefix, diagnostic_path.c_str());
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    if (!state->prepared_execution->scope_stats_capacity.required) return;
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    auto release = RAIIScopeGuard([&] {
+        (void)simpler_finalize_run(&runner, attempt.storage);
+        (void)simpler_release_run_resources(&runner, reference);
+    });
+    EXPECT_TRUE(runner.window(9604));
+    // The backend refuses before submission; withdrawal belongs to common eager
+    // admission and does not depend on synthetic device-completion evidence.
+    runner.refuse_eager = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), -887);
+    EXPECT_FALSE(runner.window(9604));
+    EXPECT_FALSE(runner.ordinary_retention());
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    release.dismiss();
 }
 
 }  // namespace native_admission_test

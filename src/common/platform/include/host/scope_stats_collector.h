@@ -53,8 +53,7 @@
  *            "tensormap":int,"run_epoch":uint,"buf_seq":uint}
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -195,6 +194,8 @@ public:
 
     // Poll-thread hook: append the buffer's records to the in-memory vector.
     void on_buffer_collected(const ScopeStatsReadyBufferInfo &info);
+    // A retired unreadable payload has no trustworthy per-window record count.
+    void on_handoff_retired(const profiling_common::RetiredHandoff<ScopeStatsModule> &retired);
 
     // Ordinary close recovers producer-held records only with a completion or
     // independent producer-stop proof. Otherwise stop(false) joins host readers
@@ -246,14 +247,24 @@ public:
 
     // --- Cross-run retention -------------------------------------------------
     //
-    // Off unless `configure_retained_runs(true, ...)` is called before init, in
-    // which case the run boundary keeps its ownership steps — the receive drain
-    // and the terminal read — and hands only the rendering and the file write
-    // to a writer thread. Every entry point below is inert with retention off.
+    // Ordinary retention is off unless configured before init. Its run boundary
+    // keeps the receive drain and terminal read, handing rendering and file IO
+    // to the writer. Recorded windows use that writer independently of the
+    // ordinary retention setting.
 
     /** Latch retention and this collector's own host byte budget. */
     void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
     bool retains_runs() const { return retain_across_runs_; }
+
+    /** Open one lifetime window outside capture; its fixed tag may recur on replay. */
+    bool begin_recorded_window(
+        uint64_t run_epoch, const std::string &output_prefix,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata &capacities
+    );
+    /** After producer stop, settle pool readers; writer failure remains diagnostic loss. */
+    int close_recorded_window(uint64_t run_epoch);
+    bool recorded_window_open(uint64_t run_epoch) const;
+    bool recorded_windows_open() const;
 
     /**
      * Map the device bank array this collector's producer publishes its per-run
@@ -347,8 +358,9 @@ public:
     /**
      * Whether this collector holds no unpublished retained run.
      *
-     * True with retention off, and true once every admitted run's writer has
-     * published. What it answers is whether a writer may still be reading
+     * True once every admitted ordinary run or recorded window has settled.
+     * A recorded window holds its slot even with ordinary retention off.
+     * What it answers is whether a writer may still be reading
      * this collector's pools — which outlives a run's native retirement, so
      * it is not the same question as whether a run is executing.
      */
@@ -440,6 +452,7 @@ public:
     void fail_handoff_for_test(bool fail) { fail_handoff_ = fail; }
 
 private:
+    friend struct ScopeStatsCollectorTestPeer;
     bool initialized_ = false;
 
     // Shared memory region (ScopeStatsDataHeader + ScopeStatsBufferState).
@@ -562,6 +575,7 @@ private:
 
     struct Slot {
         SlotState state{SlotState::Free};
+        bool recorded_window{false};
         uint64_t run_epoch{0};
         std::string output_dir;
         simpler::dfx::scope_stats_runs::CapacityMetadata capacities;
@@ -600,6 +614,11 @@ private:
      * and a published buffer is never recovered twice.
      */
     bool recover_unpublished_buffer_checked();
+
+    bool open_run_slot(
+        uint64_t run_epoch, const std::string &output_prefix, simpler::dfx::runs::AdmissionRefusal *why,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities, bool recorded_window
+    );
 
     /** `run_close`'s body, wrapped by the boundary's exception guard. */
     void run_close_locked_path(uint64_t run_epoch, bool device_execution_complete);
@@ -640,7 +659,7 @@ private:
     ScopeStatsUnregisterCallback bank_unregister_cb_{nullptr};
 
     bool retain_across_runs_{false};
-    size_t retained_budget_bytes_{0};
+    std::optional<size_t> retained_budget_bytes_;
     bool retained_ready_{false};
     bool fail_terminal_copy_{false};
     bool throw_in_collector_{false};
@@ -662,5 +681,3 @@ private:
     std::thread writer_;
     RetainedRunStats stats_{};
 };
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_

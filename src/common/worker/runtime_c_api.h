@@ -1163,7 +1163,8 @@ int simpler_validate_execution_context(DeviceContextHandle ctx);
  * execution environment, stream and device tensors remain valid through all
  * model/external uses and resource-reference release. Prepare runs outside
  * capture. An active capture requires a resource reference retained before
- * CaptureBegin, no diagnostics, and no predecessor. The same task sequence is
+ * CaptureBegin and no predecessor. Diagnostics are disabled except for the
+ * supported A3 TMR ScopeStats-only recorded window. The same task sequence is
  * recorded once; an invalidated capture is refused before publication.
  * `predecessor`, when non-null outside capture, has the joined-launch contract.
  *
@@ -1289,9 +1290,11 @@ int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle ru
  * does not advertise capture/replay support on this backend.
  *
  * Onboard Program and Kernel retain their actual internal backing, including
- * Program input staging. Diagnostic backing is not yet covered and is refused;
- * sim returns UNSUPPORTED. Borrowed context, caller stream and device tensor
- * addresses must remain valid through successful release. Internal code,
+ * Program input staging; Program execution remains eager-only. Kernel A3 TMR
+ * additionally retains ScopeStats-only diagnostic windows. Other diagnostic
+ * families and platform/runtime combinations are refused; sim returns
+ * UNSUPPORTED. Borrowed context, caller stream and device tensor addresses
+ * must remain valid through successful release. Internal code,
  * workspace, staging, arguments, streams and events stay protected.
  */
 int simpler_retain_run_resources(

@@ -353,6 +353,14 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 
     LaunchTransactionResult transaction;
     try {
+        if (!outcome.prepared->recording && outcome.prepared->dfx.scope_stats_enabled) {
+            std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
+            for (auto &[key, reference] : external_run_references_) {
+                if (reference->identity != outcome.prepared->identity || !reference->scope_stats_window) continue;
+                scope_stats_collector_.abandon_run(reference->identity.run_epoch);
+                reference->scope_stats_window = false;
+            }
+        }
         transaction = launch_execution_impl(*outcome.prepared, std::move(permit));
     } catch (...) {
         // Backend exceptions carry no proof that the device saw no submission.
@@ -3860,8 +3868,16 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller, bool *recording)
     return 0;
 }
 
+bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &prepared) const {
+    const auto &dfx = prepared.dfx;
+    if (!dfx.diagnostics_any()) return true;
+    return supports_scope_stats_capture() && prepared.scope_stats_capacity.required &&
+           prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled && !dfx.chip_swimlane_enabled() &&
+           !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.dep_gen_enabled && !dfx.output_prefix.empty();
+}
+
 int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
-    if (!execution_mode_latch().is_kernel() || prepared.dfx.diagnostics_any() ||
+    if (!execution_mode_latch().is_kernel() || !capture_diagnostics_supported(prepared) ||
         prepared.join.predecessor_owner != nullptr)
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
@@ -3972,9 +3988,9 @@ int DeviceRunnerBase::retain_external_run_resources(
     if (out_reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     *out_reference = nullptr;
     if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    // Diagnostic pools still need their independent preparation/lifetime
-    // contract. Program input staging, however, is actual retained backing.
-    if (prepared.dfx.diagnostics_any()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (!capture_diagnostics_supported(prepared) ||
+        (prepared.dfx.diagnostics_any() && !execution_mode_latch().is_kernel()))
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
     int rc = validate_caller_stream(caller_stream);
     if (rc != 0) return rc;
@@ -3998,6 +4014,31 @@ int DeviceRunnerBase::retain_external_run_resources(
     if (resources->temporary_ && resources->temporary_->backing)
         reference->managed_backing.emplace_back(resources->temporary_->backing);
     reference->caller_stream = caller_stream;
+    // Holding this mutex through pool construction and window admission excludes
+    // a launch taking an execution claim between the idle check and allocation.
+    std::unique_lock<std::mutex> native_lock;
+    if (prepared.dfx.scope_stats_enabled) {
+        native_lock = std::unique_lock<std::mutex>(native_run_mu_);
+        if (active_native_run_count_ != 0 || scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch))
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        rc = prepare_collector_storage(*prepared.runtime, prepared);
+        if (rc != 0) return rc;
+        scope_stats_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        if (!scope_stats_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.scope_stats_capacity
+            ))
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        reference->scope_stats_window = true;
+        // Replay overwrites terminal counters; none can certify a window total.
+        prepared.kernel_args.args.scope_stats_run_terminal_bank = 0;
+    }
+    bool published = false;
+    RAIIScopeGuard rollback_window([&] {
+        if (!published && prepared.dfx.scope_stats_enabled)
+            scope_stats_collector_.abandon_run(prepared.identity.run_epoch);
+    });
     void *key = reference.get();
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
     auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
@@ -4016,6 +4057,7 @@ int DeviceRunnerBase::retain_external_run_resources(
     prebuilt_runtime_arena_cache_.invalidate();
     prepared.caller_stream = caller_stream;
     *out_reference = key;
+    published = true;
     return 0;
 }
 
@@ -4052,6 +4094,19 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
             if (rc == 0) rc = storage.caller_order->retire(reference->identity);
             if (rc == 0) rc = storage.fence->retire(reference->identity);
             if (rc != 0) return rc;
+        }
+        if (reference->scope_stats_window) {
+            // Raw replay is caller-ordered. Its drained stream plus the external
+            // end promise stops producers; the lock excludes a new native run
+            // while the collector establishes its reader-quiescence boundary.
+            std::lock_guard<std::mutex> native_lock(native_run_mu_);
+            for (size_t index = 0; index < active_native_run_count_; ++index) {
+                if (!reference->recording || active_native_runs_[index].identity != reference->identity)
+                    return PTO_RUNTIME_ERR_INVALID_STATE;
+            }
+            rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
+            if (rc != 0) return rc;
+            reference->scope_stats_window = false;
         }
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
         auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
@@ -5234,8 +5289,8 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
-            // The host window opens before its collector threads start;
-            // producer state is initialized at this run's device entry.
+            // Recorded windows can keep the collector threads resident.
+            // Producer state is initialized at this run's device entry.
             scope_stats_collector_.begin_run(run_epoch, run_metadata.scope_stats_capacity);
             scope_stats_collector_.start(thread_factory);
         }
