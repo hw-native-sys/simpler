@@ -21,7 +21,7 @@ DEVICE-controlled updates to caller-owned storage.
 | `preflight_recovery.py` | Stale Buffer registration and wrong caller context are refused before acceptance; the same Worker then completes three healthy requests |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
-| `argument_capture.py` | OFF/FULL/HYBRID/OFF ArgsDump payloads on supported runtimes; explicit A5 HBG refusal and recovery |
+| `argument_capture.py` | OFF/FULL/HYBRID/OFF ArgsDump payloads; A5 HBG verifies AICore scheduling |
 
 One process owns at most one onboard execution Worker per device. Program and
 Kernel use the same admission rule; another device and ordinary Torch operators
@@ -251,8 +251,8 @@ geometry. The L2 adapter folds the view offset into its address and exports
 zero native start offsets. Task attribution uses these materialized shapes,
 not an ordering of opaque task IDs.
 
-Four queued attempts select argument capture OFF/FULL/HYBRID/OFF. On A2/A3
-(both runtimes) and A5 TMR, all four calls are accepted. FULL checks all
+Four queued calls select argument capture OFF/FULL/HYBRID/OFF. On A2/A3 and A5,
+both runtimes accept all four calls. FULL checks all
 six task arguments; HYBRID checks the three marked arguments. Exact payload
 bytes, before/after stages, geometry, epoch and completeness are checked after
 the final framework boundary and retirement. Torch successors independently
@@ -261,22 +261,12 @@ config and prefix must not change the selected capture or export destination.
 Unknown outcomes retain every caller/runtime owner. This qualifies the bounded
 reference workload, not capture/replay or arbitrary task graphs.
 
-A5 HBG has no per-task argument-dump producer. Its same queue sequence requires
-the existing typed `RunPreparationRefused` with the native unsupported status
-`-1001` for FULL and HYBRID. Neither refused request may return an accepted run,
-launch work, change caller inputs or outputs, or create argument-dump files.
-The OFF calls before and after must produce the correct Torch successors and
-preserve guards on the same Worker. All caller owners remain alive through
-the final boundary, retirement and close; the caller stream is used again after
-Worker close. `FRAMEWORK_ARGUMENT_DUMP_REFUSAL_RECOVERY_PASS` reports two accepted
-calls and two refusals with `args_dump_supported=false` and
-`payloads_verified=false`; it is not a payload-capture result.
-
-Required A5 HBG per-task argument capture remains unimplemented and tracked under
-[#2666](https://github.com/hw-native-sys/simpler/issues/2666). This refusal and
-recovery qualification does not close it. The existing
-[task-boundary producer investigation](../../../../docs/investigations/2026-10-a5-resident-per-task-args-capture.md)
-describes that missing producer.
+A5 HBG uses the AICore scheduler for this workload. Each enabled capture checks
+a fresh scheduler selection with `RESIDENT_PENDING` mode, and the result reports
+`scheduler_modes=[null,1,1,null]`. AICPU fallback scheduling does not support
+argument dumping; it is not qualified by this reference. A refused supported
+call is a failure, not a successful capture result. The same exact payload and
+metadata checks apply to both runtimes and architectures.
 
 ## Native submission reference
 

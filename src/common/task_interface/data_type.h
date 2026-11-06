@@ -20,7 +20,7 @@
 #ifndef SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
 #define SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
 
-#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -100,9 +100,13 @@ static_assert(sizeof(DataType) == 1, "DataType must stay 1 byte");
  * @param dtype Data type
  * @return Size in bytes (0 for unknown types)
  */
+// Tensor geometry is used by host helpers and AICore output publication.
+#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
+__attribute__((cce_host, cce_aicore))
+#endif
 inline uint64_t get_element_size(DataType dtype) {
     // Order must match the enum definition exactly
-    constexpr static std::array<uint64_t, static_cast<int>(DataType::DATA_TYPE_NUM)> data_type_size = {
+    constexpr uint64_t data_type_size[static_cast<int>(DataType::DATA_TYPE_NUM)] = {
         4,  // case DataType::FLOAT32
         2,  // DataType::FLOAT16
         4,  // DataType::INT32
@@ -121,7 +125,7 @@ inline uint64_t get_element_size(DataType dtype) {
     };
     // Bounds-checked: `dtype` is a raw u8 on the wire, so a decoder can hand this any value.
     const auto index = static_cast<std::size_t>(dtype);
-    return index < data_type_size.size() ? data_type_size[index] : 0;
+    return index < sizeof(data_type_size) / sizeof(data_type_size[0]) ? data_type_size[index] : 0;
 }
 
 /**

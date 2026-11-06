@@ -57,6 +57,11 @@
 #include "host/platform_compile_info.h"
 #include "worker/runtime_c_api.h"
 #include "worker/native_run_context.h"
+#if __has_include("scheduler/scheduler_args_dump.h")
+#include "scheduler/scheduler_args_dump.h"
+#include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_graph_binding.h"
+#endif
 
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
@@ -454,6 +459,52 @@ void concurrent_graph_recording_orch_entry(const ChipTaskArgs &) {
     ASSERT_TRUE(probe.recorded[0]);
     ASSERT_TRUE(probe.recorded[1]);
     orch.graph_commit();
+}
+
+void scalar_dump_orch_entry(const ChipTaskArgs &) {
+    CoreTaskArgs args;
+    args.add_scalar(uint32_t{37});
+    args.launch_spec.set_block_num(5);
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+}
+
+void native_scalar_dump_orch_entry(const ChipTaskArgs &) {
+    auto &orch = *g_orch_runtime->orchestrator;
+    GraphTaskArgs boundary;
+    boundary.add_scalar(uint32_t{37});
+    const auto graph = orch.graph_begin(0x526, boundary);
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+    CoreTaskArgs child;
+    child.add_scalar(graph.params->scalar(0));
+    child.launch_spec.set_block_num(3);
+    MixedKernels kernels{};
+    kernels.aic_kernel_id = kernels.aiv0_kernel_id = kernels.aiv1_kernel_id = 0;
+    ASSERT_TRUE(orch.submit_task(kernels, child).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+    orch.graph_commit();
+}
+
+void pending_inline_dump_orch_entry(const ChipTaskArgs &) {
+    auto &orch = *g_orch_runtime->orchestrator;
+    CoreTaskArgs producer;
+    producer.add_scalar(uint32_t{13});
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    const auto producer_id = orch.submit_task(kernels, producer).task_id();
+    ASSERT_TRUE(producer_id.is_valid());
+    CoreTaskArgs control;
+    control.add_scalar(uint32_t{37});
+    control.set_dependencies(&producer_id, 1);
+    ASSERT_TRUE(orch.submit_dummy_task(control).task_id().is_valid());
+    EXPECT_FALSE(orch.sm_header->tasks.is_completed(1));
+}
+
+void native_inline_dump_orch_entry(const ChipTaskArgs &args) {
+    pending_inline_dump_orch_entry(args);
+    native_scalar_dump_orch_entry(args);
 }
 
 void ordinary_orch_entry(const ChipTaskArgs &) {
@@ -2789,3 +2840,146 @@ TEST_F(HbgBindLedgerTest, LaunchStagingLeavesOnlyTheLargeImageOnThePrepareCopyPa
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.copy_count, copies);
 }
+
+#if __has_include("scheduler/scheduler_args_dump.h")
+TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndChargedSchedulerPublication) {
+    api_ = HostApi(nullptr, 0, 0, 11, &fake_ops());
+    for (TestOrchEntryFunc entry : {scalar_dump_orch_entry, native_scalar_dump_orch_entry}) {
+        SCOPED_TRACE(entry == scalar_dump_orch_entry ? "ordinary" : "native-graph-mix");
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        install_callable_tables(runtime);
+        eps_ = {entry, capture_orch_bind};
+        runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
+        const auto &region = runtime.pending_publication().prerequisites.front();
+        const auto context_offset =
+            runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
+        const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+            static_cast<const uint8_t *>(region.source) + context_offset
+        );
+        ASSERT_NE(context->args_dump_address, 0u);
+        const uint64_t dump_offset = context->args_dump_address - reinterpret_cast<uint64_t>(region.device_target);
+        ASSERT_LT(dump_offset, region.bytes);
+        const auto *dump = reinterpret_cast<const SchedulerArgsDumpHeader *>(
+            static_cast<const uint8_t *>(region.source) + dump_offset
+        );
+        ASSERT_EQ(dump->selected_count, 1u);
+        EXPECT_EQ(dump->initialized_count, 1u);
+        EXPECT_LE(dump_offset + dump->total_size, region.bytes);
+        const auto *tasks = reinterpret_cast<const SchedulerArgsDumpTask *>(
+            reinterpret_cast<const uint8_t *>(dump) + dump->tasks_offset
+        );
+        EXPECT_EQ(tasks[0].scalar_count, 1u);
+        EXPECT_EQ(tasks[0].tensor_count, 0u);
+        EXPECT_EQ(
+            tasks[0].dump_metadata.scalar_dtypes[0],
+            static_cast<uint8_t>(entry == scalar_dump_orch_entry ? DataType::UINT32 : DataType::UINT64)
+        );
+        if (entry == scalar_dump_orch_entry) {
+            EXPECT_EQ(context->native_header_offset, 0u);
+            EXPECT_EQ(dump->task_count, 1u);
+            EXPECT_EQ(tasks[0].task_id, TaskId::make_global(0));
+            EXPECT_EQ(tasks[0].expected_participants, 5u);
+        } else {
+            EXPECT_NE(context->native_header_offset, 0u);
+            EXPECT_EQ(dump->task_count, 3u);
+            EXPECT_EQ(tasks[0].task_ref, 1u);
+            EXPECT_EQ(tasks[0].task_id, TaskId::make_sub_task(0, 0));
+            EXPECT_EQ(tasks[0].active_mask, 7u);
+            EXPECT_EQ(tasks[0].expected_participants, 9u);
+        }
+        const SchedulerArgsDumpTask expected = tasks[0];
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        const auto *published =
+            scheduler_args_dump_task(reinterpret_cast<void *>(context->args_dump_address), expected.task_ref);
+        ASSERT_NE(published, nullptr);
+        EXPECT_EQ(published->task_id, expected.task_id);
+        EXPECT_EQ(published->scalars_address, expected.scalars_address);
+        EXPECT_EQ(published->returned_participants, 0u);
+        EXPECT_EQ(published->before_state, 0u);
+        const auto *device_context =
+            reinterpret_cast<const SchedulerWorkerContext *>(runtime.dev.scheduler_bootstrap.worker_context_base);
+        SchedulerGraphView view{
+            device_context->graph_storage_address,
+            device_context->graph_reserved_address,
+            device_context->graph_task_count,
+            device_context->task_window_last_index,
+            device_context->scheduler_state_base_address,
+            device_context->native_header_offset,
+            device_context->scheduler_state_bytes,
+            static_cast<uint32_t>(device_context->original_task_count),
+            static_cast<uint16_t>(device_context->graph_view_version),
+            static_cast<uint16_t>(device_context->graph_view_bytes)
+        };
+        SchedulerGraphAccess graph(view);
+        if (entry != scalar_dump_orch_entry)
+            ASSERT_EQ(scheduler_bind_graph_arguments(graph, expected.task_ref), SchedulerGraphBindingError::NONE);
+        SchedulerTaskPayloadArguments actual{};
+        ASSERT_EQ(scheduler_parse_task_payload_arguments(graph, expected.task_ref, &actual), SchedulerGraphResult::OK);
+        EXPECT_EQ(actual.scalar_count, expected.scalar_count);
+        ASSERT_EQ(reinterpret_cast<uint64_t>(actual.scalars), expected.scalars_address);
+        EXPECT_EQ(actual.scalars[0], 37u);
+        uint64_t identity = UINT64_MAX;
+        ASSERT_EQ(scheduler_node_identity(graph, expected.task_ref, &identity), SchedulerGraphResult::OK);
+        EXPECT_EQ(identity, TaskId::to_uint64(expected.task_id));
+        ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    }
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpExcludesPendingInlineControlOperands) {
+    api_ = HostApi(nullptr, 0, 0, 11, &fake_ops());
+    for (TestOrchEntryFunc entry : {pending_inline_dump_orch_entry, native_inline_dump_orch_entry}) {
+        const bool native = entry == native_inline_dump_orch_entry;
+        SCOPED_TRACE(native ? "native-neighbor" : "ordinary");
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        install_callable_tables(runtime);
+        eps_ = {entry, capture_orch_bind};
+        runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
+        const auto &region = runtime.pending_publication().prerequisites.front();
+        const auto context_offset =
+            runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
+        const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+            static_cast<const uint8_t *>(region.source) + context_offset
+        );
+        ASSERT_NE(context->args_dump_address, 0u);
+        const auto *dump = reinterpret_cast<const SchedulerArgsDumpHeader *>(
+            static_cast<const uint8_t *>(region.source) + context->args_dump_address -
+            reinterpret_cast<uint64_t>(region.device_target)
+        );
+        const auto *tasks = reinterpret_cast<const SchedulerArgsDumpTask *>(
+            reinterpret_cast<const uint8_t *>(dump) + dump->tasks_offset
+        );
+        const auto *indices =
+            reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(dump) + dump->task_indices_offset);
+        EXPECT_EQ(dump->task_count, native ? 5u : 2u);
+        ASSERT_EQ(dump->selected_count, native ? 2u : 1u);
+        EXPECT_EQ(indices[0], 0u);
+        EXPECT_EQ(indices[1], UINT32_MAX);
+        EXPECT_EQ(tasks[0].task_ref, 0u);
+        EXPECT_EQ(tasks[0].task_id, TaskId::make_global(0));
+        EXPECT_EQ(tasks[0].kernel_id[1], 0u);
+        if (native) {
+            EXPECT_EQ(indices[2], UINT32_MAX);
+            EXPECT_EQ(indices[3], 1u);
+            EXPECT_EQ(indices[4], UINT32_MAX);
+            EXPECT_EQ(tasks[1].task_ref, 3u);
+            EXPECT_EQ(tasks[1].task_id, TaskId::make_sub_task(2, 0));
+            EXPECT_EQ(tasks[1].scalar_count, 1u);
+            EXPECT_EQ(tasks[1].expected_participants, 9u);
+        }
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        EXPECT_EQ(scheduler_args_dump_task(reinterpret_cast<void *>(context->args_dump_address), 1), nullptr);
+        ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    }
+}
+
+#endif
