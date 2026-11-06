@@ -803,13 +803,29 @@ inline __aicore__ void percounter_mix_tick(const LaneConfig &cfg, PercounterLane
  * have an owner, since a MIX cohort block is run by its cluster's rendezvous
  * rather than by the lane that took it. And a lane that owes a block never
  * leaves: the cohort is released the instant its last block is taken.
+ *
+ * `progress` takes the sum of the counts read here, which is what the caller
+ * watches the device by: both are monotone, so the sum advances exactly when
+ * one of them does. The reads are the ones this test already needs, taken
+ * before the short-circuit rather than after, since a graph still advancing
+ * its cohorts is advancing whether or not its MIX list is done.
  */
-inline __aicore__ bool percounter_lane_may_exit(const LaneConfig &cfg, const PercounterLaneState *state) {
-    if (state->sync.my_block >= 0) return false;
-    if (cfg.mix_order_count != 0 &&
-        scheduler_gm_query(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next) < cfg.mix_rendezvous_count)
-        return false;
-    return cfg.sync_cohort_count == 0 || scheduler_gm_query(cfg.sync_queue->completed) >= cfg.sync_block_total;
+inline __aicore__ bool
+percounter_lane_may_exit(const LaneConfig &cfg, const PercounterLaneState *state, uint64_t *progress) {
+    uint64_t done = 0;
+    bool complete = true;
+    if (cfg.mix_order_count != 0) {
+        const uint64_t mix_done = scheduler_gm_query(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next);
+        done += mix_done;
+        complete = complete && mix_done >= cfg.mix_rendezvous_count;
+    }
+    if (cfg.sync_cohort_count != 0) {
+        const uint64_t cohort_done = scheduler_gm_query(cfg.sync_queue->completed);
+        done += cohort_done;
+        complete = complete && cohort_done >= cfg.sync_block_total;
+    }
+    *progress = done;
+    return complete && state->sync.my_block < 0;
 }
 
 /**
@@ -984,8 +1000,13 @@ inline __aicore__ void percounter_flush_done(const LaneConfig &cfg, PercounterLa
 inline __aicore__ void
 percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles) {
     if (cfg.mix_order_count == 0 && cfg.sync_cohort_count == 0) return;
-    // Restarted whenever the lane serves, so the watchdog measures idleness.
+    // Restarted whenever this lane serves, and whenever the device completes a
+    // rendezvous or a cohort block. What this lane waits for is device-wide, so
+    // its own idleness is not evidence of a stall: a long task on another
+    // cluster leaves every spent lane here with nothing to serve, and a
+    // watchdog on that alone fails a run that is still advancing.
     uint64_t start = get_sys_cnt_aicore();
+    uint64_t last_progress = ~uint64_t{0};
     uint32_t checks = 0;
     while (true) {
         bool served = false;
@@ -1002,7 +1023,12 @@ percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
             bool took_served = false;
             if (!percounter_sync_take(cfg, state, timeout_cycles, &took_served)) return;
             if (took_served) start = get_sys_cnt_aicore();
-            if (percounter_lane_may_exit(cfg, state)) return;
+            uint64_t progress = 0;
+            if (percounter_lane_may_exit(cfg, state, &progress)) return;
+            if (progress != last_progress) {
+                last_progress = progress;
+                start = get_sys_cnt_aicore();
+            }
             if (scheduler_watchdog_expired(start, get_sys_cnt_aicore(), timeout_cycles)) {
                 percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
                 return;
