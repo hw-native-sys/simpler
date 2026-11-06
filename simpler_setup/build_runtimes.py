@@ -38,7 +38,12 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "python"))
 
-from simpler_setup.platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
+from simpler_setup.platform_info import (  # noqa: E402
+    PROJECT_ROOT,
+    discover_runtimes,
+    parse_platform,
+    runtime_builds_by_default,
+)
 from simpler_setup.runtime_builder import RuntimeBuilder, platform_embeds_pto_isa  # noqa: E402
 from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noqa: E402
 
@@ -137,12 +142,55 @@ def detect_buildable_platforms() -> list:
     return platforms
 
 
+def requested_runtimes(explicit: Optional[list] = None) -> list[str]:
+    """The runtimes a caller named, from the argument or SIMPLER_BUILD_RUNTIMES.
+
+    Empty means "whatever builds by default". Naming a runtime builds it even
+    when its build_config.py opts out of the default set.
+    """
+    if explicit:
+        return [name for name in explicit if name]
+    return [name for name in os.environ.get("SIMPLER_BUILD_RUNTIMES", "").replace(",", " ").split() if name]
+
+
+def select_runtimes(arch: str, discovered: list[str], only: Optional[list] = None) -> tuple[list[str], list[str]]:
+    """Split discovered runtimes into the ones to build and the ones left out.
+
+    A name the caller asked for is built whatever its build_config says, and an
+    unknown name is an error rather than a silent empty build -- a typo in a
+    runtime name would otherwise look like a runtime that needs no work.
+    """
+    named = requested_runtimes(only)
+    if named:
+        unknown = [name for name in named if name not in discovered]
+        if unknown:
+            raise ValueError(f"No runtime under src/{arch}/runtime/ goes by: {', '.join(sorted(unknown))}")
+        return [name for name in discovered if name in named], []
+    keep = [name for name in discovered if runtime_builds_by_default(arch, name)]
+    return keep, [name for name in discovered if name not in keep]
+
+
+def _platform_runtimes(platform: str, arch: str, only: Optional[list]) -> list[str]:
+    """The runtimes to build for one platform, naming the ones left out."""
+    discovered = discover_runtimes(arch)
+    if not discovered:
+        logger.warning(f"  {platform}: no runtimes found, skipping")
+        return []
+    selected, skipped = select_runtimes(arch, discovered, only)
+    if skipped:
+        logger.info(f"  {platform}: not built by default, name it to build it: {', '.join(skipped)}")
+    if not selected:
+        logger.warning(f"  {platform}: no runtime left to build, skipping")
+    return selected
+
+
 def build_all(
     lib_dir: Path,
     cache_dir: Path,
     platforms: Optional[list] = None,
     sanitizer: str = "none",
     profiling_config: Optional[dict[str, str]] = None,
+    only: Optional[list] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -155,6 +203,9 @@ def build_all(
             BuildTarget.gen_cmake_args.
         profiling_config: Complete profiling macro configuration for sim
             runtime targets. None keeps the source defaults.
+        only: Runtime names to build, overriding each one's BUILD_BY_DEFAULT.
+            None or empty falls back to SIMPLER_BUILD_RUNTIMES, then to the
+            default set.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -213,10 +264,8 @@ def build_all(
     tasks: list[tuple[str, str]] = []
     for platform in platforms:
         arch, variant = parse_platform(platform)
-        runtimes = discover_runtimes(arch)
-
+        runtimes = _platform_runtimes(platform, arch, only)
         if not runtimes:
-            logger.warning(f"  {platform}: no runtimes found, skipping")
             continue
 
         for runtime_name in runtimes:
@@ -290,6 +339,17 @@ def main():
         help="List buildable platforms and exit",
     )
     parser.add_argument(
+        "--runtime",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Build only this runtime, repeatable. Overrides BUILD_BY_DEFAULT, "
+            "so it is how a runtime that stays out of the default set gets "
+            "built. Also readable as SIMPLER_BUILD_RUNTIMES."
+        ),
+    )
+    parser.add_argument(
         "--sanitizer",
         default="none",
         help=(
@@ -316,7 +376,9 @@ def main():
             for p in platforms:
                 arch, variant = parse_platform(p)
                 runtimes = discover_runtimes(arch)
-                print(f"  {p}: {', '.join(runtimes) or '(no runtimes)'}")
+                opt_in = [name for name in runtimes if not runtime_builds_by_default(arch, name)]
+                shown = [f"{name} (names it to build)" if name in opt_in else name for name in runtimes]
+                print(f"  {p}: {', '.join(shown) or '(no runtimes)'}")
         else:
             print("No buildable platforms detected")
         return
@@ -326,6 +388,7 @@ def main():
         cache_dir=args.cache_dir,
         platforms=args.platforms,
         sanitizer=args.sanitizer,
+        only=args.runtime,
         profiling_config=_profiling_config(
             {
                 "SIMPLER_DFX": args.profiling_dfx,
