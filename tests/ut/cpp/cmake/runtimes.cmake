@@ -52,11 +52,23 @@ endfunction()
 # a directory that is not there. The intersection is what keeps that from
 # happening, and it is the whole of what this list is for.
 #
-# A runtime under one arch only is a real state, not a mistake to reject. It
-# is covered by that arch's own cases under <arch>/runtime/<name>/, which name
-# their include directories and so need no entry here. Those cases are the only
-# ones that see it, which is why the status line below names it: nothing else
-# reports that an arch-independent case skipped a runtime.
+# A runtime one arch lacks is still an error unless it says it meant to be:
+# dropping the arch-independent cases for it is exactly what a runtime added to
+# one arch by mistake needs to hear about, and a status line is not hearing
+# about it. The claim is `ARCH_EXCLUSIVE = True` in the runtime's own
+# build_config.py, beside the sources it names, rather than a list here that
+# would have to be edited from the other side of the tree.
+function(simpler_runtime_is_arch_exclusive arch runtime out_var)
+    set(_config "${SIMPLER_SRC}/${arch}/runtime/${runtime}/build_config.py")
+    set(${out_var} FALSE PARENT_SCOPE)
+    if(EXISTS "${_config}")
+        file(STRINGS "${_config}" _claim REGEX "^ARCH_EXCLUSIVE[ \t]*=[ \t]*True")
+        if(_claim)
+            set(${out_var} TRUE PARENT_SCOPE)
+        endif()
+    endif()
+endfunction()
+
 simpler_discover_runtimes(a2a3 _a2a3_runtimes)
 simpler_discover_runtimes(a5 _a5_runtimes)
 
@@ -64,6 +76,28 @@ set(_a2a3_only "${_a2a3_runtimes}")
 list(REMOVE_ITEM _a2a3_only ${_a5_runtimes})
 set(_a5_only "${_a5_runtimes}")
 list(REMOVE_ITEM _a5_only ${_a2a3_runtimes})
+
+set(_unclaimed "")
+foreach(_rt ${_a2a3_only})
+    simpler_runtime_is_arch_exclusive(a2a3 "${_rt}" _claimed)
+    if(NOT _claimed)
+        list(APPEND _unclaimed "a2a3/${_rt}")
+    endif()
+endforeach()
+foreach(_rt ${_a5_only})
+    simpler_runtime_is_arch_exclusive(a5 "${_rt}" _claimed)
+    if(NOT _claimed)
+        list(APPEND _unclaimed "a5/${_rt}")
+    endif()
+endforeach()
+if(_unclaimed)
+    message(FATAL_ERROR
+        "Runtime present under one arch only: [${_unclaimed}]. Add the missing "
+        "build_config.py under the other arch, or, if one arch is where it "
+        "belongs, put `ARCH_EXCLUSIVE = True` in its build_config.py. Until one "
+        "of those, the cases that repeat per runtime — the platform tree's — "
+        "are silently not built for it.")
+endif()
 
 set(SIMPLER_RUNTIMES "${_a2a3_runtimes}")
 if(_a2a3_only)

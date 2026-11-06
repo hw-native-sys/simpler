@@ -380,7 +380,7 @@ def case_of(entries: list[dict]) -> str | None:
     return None
 
 
-def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str]]], list[str]]:
+def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str]]], list[str], list[tuple[str, str]]]:
     by_target = read_targets(build_dir)
     cases = {name: case_of(entries) for name, entries in by_target.items()}
     covered = [name for name, case in cases.items() if case]
@@ -412,7 +412,7 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
     for name in covered:
         by_case[cases[name]].append(name)
 
-    gaps, unclassified = [], []
+    gaps, unclassified, unreachable = [], [], []
     for case, targets in sorted(by_case.items()):
         try:
             arch_axis, runtime_axis = applicable_axes(case)
@@ -425,6 +425,7 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
         # actually differs along it. Otherwise it collapses to whatever the
         # builds happen to use, and contributes one value rather than all.
         wanted = {}
+        dropped = {"arch": [], "runtime": []}
         for axis, values, applicable in (
             ("arch", ARCHES, arch_axis),
             ("runtime", RUNTIMES, runtime_axis),
@@ -432,6 +433,7 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
             if applicable and any(differs_across(f, axis) for f in opened):
                 builds = [per_target[t] for t in targets]
                 wanted[axis] = {value for value in values if reachable(builds, axis, value)}
+                dropped[axis] = sorted(set(values) - wanted[axis])
             else:
                 wanted[axis] = {None}
 
@@ -456,7 +458,19 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
         )
         for cell in missing:
             gaps.append((case, cell_name(cell), sorted(cell_name(b) for b in built)))
-    return gaps, unclassified
+
+        # A value left out of `wanted` that no build covers either. Left out
+        # means there is nothing under it for this case to compile, so it is
+        # not a gap -- but it is still a configuration the run does not cover,
+        # and the one thing this check must not do is decide that in silence.
+        # A value that was dropped and is built anyway says nothing: the
+        # coverage is there whether or not the cell was asked for.
+        covered = {value for _, value in built} | {value for value, _ in built}
+        for axis in ("arch", "runtime"):
+            for value in dropped[axis]:
+                if value not in covered:
+                    unreachable.append((case, f"{axis} {value}"))
+    return gaps, unclassified, unreachable
 
 
 def main() -> int:
@@ -470,11 +484,24 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=8, help="parallel preprocessor runs")
     args = parser.parse_args()
 
-    gaps, unclassified = find_gaps(args.build_dir, args.jobs)
+    gaps, unclassified, unreachable = find_gaps(args.build_dir, args.jobs)
     found = {(case, cell) for case, cell, _ in gaps}
 
     unwaived = [(case, cell, built) for case, cell, built in gaps if (case, cell) not in WAIVERS]
     stale = sorted(key for key in WAIVERS if key not in found)
+
+    # A value this check decided not to ask any case for. It is not a gap --
+    # there is nothing under that value for the case to compile -- but it is
+    # coverage the run does not have, and a check that drops it in silence is
+    # one nobody can audit. Printed whatever the verdict, and never fatal.
+    if unreachable:
+        by_value: dict[str, int] = {}
+        for _, value in unreachable:
+            by_value[value] = by_value.get(value, 0) + 1
+        print("Not asked for, nothing under it to compile:")
+        for value, count in sorted(by_value.items()):
+            print(f"  {value}: {count} case(s)")
+        print()
 
     if not unwaived and not stale and not unclassified:
         return 0

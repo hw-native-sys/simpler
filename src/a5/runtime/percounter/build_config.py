@@ -45,6 +45,20 @@
 # what keeps it honest.
 BUILD_BY_DEFAULT = False
 
+# Present under a5 and not under a2a3, and meant to be.
+#
+# The unit tests reject that state unless the runtime claims it here. The
+# arch-independent cases -- the platform tree's, which compile into every
+# runtime's image -- are built once per runtime under both archs, so a runtime
+# one arch lacks would send them looking for a directory that is not there.
+# They are therefore built for the runtimes both archs carry, and this one is
+# covered by its own cases under a5/runtime/percounter/ instead.
+#
+# Saying nothing is what a runtime added to one arch by mistake does, and that
+# is the case worth stopping: the build would otherwise drop those cases for it
+# and say so in a line nobody reads.
+ARCH_EXCLUSIVE = True
+
 HBG = "../host_build_graph"
 SHARED = "../../../common/host_build_graph"
 
