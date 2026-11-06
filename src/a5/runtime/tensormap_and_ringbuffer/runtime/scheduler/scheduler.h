@@ -1520,7 +1520,8 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     }
     result.completed += sink.inline_completed;
 
-    for (int32_t i = count - 1; i >= 0; --i) {
+    int32_t entry_count = count.load(std::memory_order_relaxed);
+    for (int32_t i = entry_count - 1; i >= 0; --i) {
         AsyncWaitEntry &entry = entries[i];
         for (int32_t c = 0; c < entry.condition_count; c++) {
             CompletionCondition &cond = entry.conditions[c];
@@ -1557,9 +1558,9 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
             result.completed++;
 
-            int32_t last = count - 1;
-            if (i != last) entries[i] = entries[last];
-            count = last;
+            --entry_count;
+            if (i != entry_count) entries[i] = entries[entry_count];
+            count.store(entry_count, std::memory_order_relaxed);
         }
     }
 

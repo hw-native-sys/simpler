@@ -132,7 +132,7 @@ void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, con
     // states and make head-tail appear to underflow.
     sample_mailbox();
 
-    int32_t entry_count = count;
+    int32_t entry_count = count.load(std::memory_order_relaxed);
     if (entry_count < 0) entry_count = 0;
     if (entry_count > MAX_ASYNC_WAITS) entry_count = MAX_ASYNC_WAITS;
 

@@ -1151,7 +1151,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
-            (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
+            sched_->async_wait_list.needs_poll(*rt_->aicore_mailbox)) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
                 rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count, DEFERRED_RELEASE_CAP
 #if SIMPLER_SCHED_PROFILING

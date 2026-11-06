@@ -136,6 +136,8 @@ tmr_case(test_scheduler_dispatch_diagnostics.cpp
     LINK_OPTIONS ${_mix_admission_gc}
     TIMEOUT 30)
 
+tmr_case(test_async_wait_poll_hint.cpp TIMEOUT 30)
+
 tmr_case(test_early_dispatch_deferred_completion.cpp
     NO_OBJS
     SOURCES
