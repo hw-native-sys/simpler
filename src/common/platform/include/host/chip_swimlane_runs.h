@@ -25,8 +25,8 @@
  * error summary.
  *
  * These are host-only and are reached exclusively through the swimlane
- * collector's retained-run path. With retention off none of them is
- * constructed against a budget and every collector behaves as it does today.
+ * collector's retained-run path, including explicitly retained model windows.
+ * Ordinary retention policy remains unchanged by those private windows.
  */
 namespace simpler::dfx::runs {
 
@@ -190,7 +190,9 @@ struct CollectionVerdict {
  */
 class ErrorSummary {
 public:
-    void record(uint64_t epoch, Verdict v, const char *detail) {
+    // Recorded windows report known loss as an error even when their partial
+    // artifact was published. Ordinary callers retain verdict-only partials.
+    void record(uint64_t epoch, Verdict v, const char *detail, bool partial_is_error = false) {
         std::lock_guard<std::mutex> lk(mu_);
         switch (v) {
         case Verdict::Published:
@@ -214,7 +216,7 @@ public:
         }
         if (verdict_publishes(v)) {
             if (epoch > highest_published_) highest_published_ = epoch;
-            return;
+            if (v != Verdict::PartialSafe || !partial_is_error) return;
         }
         if (!error_recorded_) {
             error_recorded_ = true;

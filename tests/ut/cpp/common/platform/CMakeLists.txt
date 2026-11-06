@@ -837,9 +837,26 @@ platform_cases(
     test_chip_swimlane_handoff_accounting.cpp
     test_chip_swimlane_handoff_identity.cpp
     test_chip_swimlane_joined_diagnostics.cpp
-    test_chip_swimlane_retained_runs.cpp
     PER_ARCH PER_RUNTIME TIER aicpu
     SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})
+
+# The raw-window converter consumes the same real producer/export fixture.
+platform_case(test_chip_swimlane_retained_runs.cpp
+    PER_ARCH PER_RUNTIME TIER aicpu
+    PYUT_EXPORT chip_swimlane_retained_runs
+    SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(_arch IN ITEMS a2a3 a5)
+        foreach(_rt IN ITEMS tmr hbg)
+            target_link_options(test_${_arch}_${_rt}_chip_swimlane_retained_runs PRIVATE
+                -Wl,--wrap=link
+                -Wl,--wrap=pthread_mutex_lock
+                -Wl,--wrap=_ZdlPvm
+                -Wl,--wrap=_ZdlPv
+                -Wl,--wrap=_ZnwmSt11align_val_t)
+        endforeach()
+    endforeach()
+endif()
 
 # Both axes, and neither is about what the case covers: the decision under test
 # is header-only and arch-independent, but it names `ChipSwimlaneLevel` and
@@ -910,6 +927,7 @@ set(NATIVE_ADMISSION_SOURCES
     ${SIMPLER_SRC}/common/worker/runtime_module.cpp
     ${SIMPLER_SRC}/common/worker/device_fault_monitor_host.cpp
     ${CMAKE_SOURCE_DIR}/support/native_admission/transport.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/chip_swimlane_collector_aicpu.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/c_api_shared.cpp
@@ -961,6 +979,9 @@ tmr_case(test_native_admission.cpp
 foreach(_arch IN ITEMS a2a3 a5)
     foreach(_rt IN ITEMS tmr hbg)
         set_target_properties(test_${_arch}_${_rt}_native_admission PROPERTIES ENABLE_EXPORTS ON)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            target_link_options(test_${_arch}_${_rt}_native_admission PRIVATE -Wl,--wrap=_ZnwmSt11align_val_t)
+        endif()
     endforeach()
 endforeach()
 

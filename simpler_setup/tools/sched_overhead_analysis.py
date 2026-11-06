@@ -818,6 +818,9 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         from .swimlane_converter import read_perf_data  # noqa: PLC0415
 
         data = read_perf_data(chip_swimlane_records_path)
+    if (data.get("timeline_metadata") or {}).get("recorded_window"):
+        print("Error: scheduler-overhead analysis is unsupported for recorded windows", file=sys.stderr)
+        return 1
     scheduler_producers = {
         stream.get("producer") for stream in data.get("scheduler_streams", []) if stream.get("producer")
     }

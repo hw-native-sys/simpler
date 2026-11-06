@@ -168,6 +168,23 @@ public:
     /** Records whose kind is a host-to-device transfer, in start-time order. */
     std::vector<HostPhaseRecord> device_upload_records() const;
 
+    /**
+     * Visit a finished pass without allocating a snapshot. Buffer order is not
+     * timestamp order. The caller must exclude the next arm()/resume() until
+     * the visit ends and quiesce all producers before calling finish().
+     */
+    template <typename Visitor>
+    void for_each_finished_record(Visitor &&visit) const {
+        if (!finished_) return;
+        for (const auto &buffer : buffers_) {
+            const uint32_t count = buffer.count < PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER ?
+                                       buffer.count :
+                                       static_cast<uint32_t>(PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER);
+            for (uint32_t index = 0; index < count; ++index)
+                visit(buffer.records[index]);
+        }
+    }
+
     bool armed() const { return armed_; }
     bool finished() const { return finished_; }
     uint64_t submitted_tasks() const { return submitted_tasks_; }

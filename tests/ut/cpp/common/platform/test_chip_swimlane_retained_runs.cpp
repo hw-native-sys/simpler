@@ -22,11 +22,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -39,7 +42,93 @@
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
 #include "host/run_boundary.h"
+#include "host/raii_scope_guard.h"
 #include "profiler_test_allocator.h"
+
+#if defined(__linux__)
+namespace {
+struct PublicationGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered{false};
+    bool released{false};
+    void arrive() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [this] {
+            return released;
+        });
+    }
+    bool wait_entered() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(8), [this] {
+            return entered;
+        });
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+};
+std::atomic<PublicationGate *> publication_gate{nullptr};
+std::atomic<PublicationGate *> retirement_gate{nullptr};
+std::atomic<void *> retirement_storage{nullptr};
+thread_local pthread_mutex_t *inspect_mutex = nullptr;
+thread_local PublicationGate *inspect_gate = nullptr;
+thread_local size_t fail_merge_allocation_bytes = 0;
+thread_local size_t failed_merge_allocation_bytes = 0;
+}  // namespace
+struct ChipSwimlaneCollectorTestPeer {
+    static void *preparation_storage(ChipSwimlaneCollector &collector, uint64_t epoch) {
+        std::lock_guard<std::mutex> lock(collector.retained_mu_);
+        const int slot = collector.find_run_slot(epoch);
+        if (slot < 0) return nullptr;
+        return collector.retained_runs_[static_cast<size_t>(slot)].pending.host_submit_records.data();
+    }
+    static std::mutex &admission_mutex(ChipSwimlaneCollector &collector) { return collector.retained_mu_; }
+    static void stop_writer(ChipSwimlaneCollector &collector) { collector.stop_run_writer(); }
+    static void start_writer(ChipSwimlaneCollector &collector) { collector.start_run_writer(); }
+    static void service_writer(ChipSwimlaneCollector &collector) { collector.service_retained_runs(); }
+};
+extern "C" int __real_pthread_mutex_lock(pthread_mutex_t *mutex);
+extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
+    if (mutex == inspect_mutex && inspect_gate != nullptr) {
+        auto *gate = inspect_gate;
+        inspect_gate = nullptr;
+        gate->arrive();
+    }
+    return __real_pthread_mutex_lock(mutex);
+}
+extern "C" void *__real__ZnwmSt11align_val_t(size_t size, std::align_val_t alignment);
+extern "C" void *__wrap__ZnwmSt11align_val_t(size_t size, std::align_val_t alignment) {
+    if (fail_merge_allocation_bytes != 0 && size == fail_merge_allocation_bytes) {
+        fail_merge_allocation_bytes = 0;
+        failed_merge_allocation_bytes = size;
+        throw std::bad_alloc{};
+    }
+    return __real__ZnwmSt11align_val_t(size, alignment);
+}
+extern "C" void __real__ZdlPv(void *storage) noexcept;
+extern "C" void __wrap__ZdlPv(void *storage) noexcept {
+    auto *gate = retirement_gate.load(std::memory_order_acquire);
+    if (gate != nullptr && storage == retirement_storage.load(std::memory_order_acquire)) gate->arrive();
+    __real__ZdlPv(storage);
+}
+extern "C" void __real__ZdlPvm(void *storage, size_t size) noexcept;
+extern "C" void __wrap__ZdlPvm(void *storage, size_t size) noexcept {
+    auto *gate = retirement_gate.load(std::memory_order_acquire);
+    if (gate != nullptr && storage == retirement_storage.load(std::memory_order_acquire)) gate->arrive();
+    __real__ZdlPvm(storage, size);
+}
+extern "C" int __real_link(const char *oldpath, const char *newpath);
+extern "C" int __wrap_link(const char *oldpath, const char *newpath) {
+    auto *gate = publication_gate.load(std::memory_order_acquire);
+    if (gate != nullptr && std::filesystem::path(newpath).filename() == "records_e57001.json") gate->arrive();
+    return __real_link(oldpath, newpath);
+}
+#endif
 
 namespace fs = std::filesystem;
 
@@ -2185,3 +2274,563 @@ TEST(ChipSwimlaneRetainedRunsTest, FatalLossSurvivesConfirmedResetWithoutInvokin
     EXPECT_NE(error.find("9303"), std::string::npos) << error;
     EXPECT_NE(error.find("collector fatal (1)"), std::string::npos) << error;
 }
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedWindowKeepsRepeatedProducerRowsAndOnePreparation) {
+    RetainedRunsFixture fx("recorded-window", 1, 1, 0, ChipSwimlaneLevel::SCHED_PHASES, true);
+    const int cores[] = {0};
+    constexpr uint64_t kEpoch = 52001;
+    fx.collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::SCHED_PHASES;
+    metadata.num_aicore = 1;
+    metadata.core_types = {CoreType::AIV};
+    metadata.host_orchestrated = true;
+    metadata.host_phase_records_present = true;
+    metadata.host_submit_records = host_submit_rows(1);
+    metadata.host_phase_submitted_tasks = 1;
+    metadata.host_phase_total_records = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(kEpoch, metadata));
+    EXPECT_FALSE(fx.collector.retains_runs());
+    EXPECT_FALSE(fx.collector.retained_runs_idle());
+    set_platform_run_result(0, kEpoch);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(fx.shm()));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    set_platform_chip_swimlane_run_terminal_bank(0);
+    for (int count : {2, 3}) {
+        chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::SCHED_PHASES);
+        chip_swimlane_aicpu_init_phase(1, 1, 0);
+        fx.dispatch(0, count);
+        for (int i = 0; i < count; ++i) {
+            chip_swimlane_aicpu_complete_task(0, 0, static_cast<uint32_t>(i + 1), 900 + i, 2100 + i);
+        }
+        chip_swimlane_aicpu_record_sched_phase(0, SchedPhaseKind::Dispatch, 800, 2200, 0, count);
+        chip_swimlane_aicpu_flush_sched_phase_buffer(0);
+        chip_swimlane_aicpu_flush(0, cores, 1);
+    }
+    fx.collector.set_host_phase_records(host_submit_rows(2), {}, 2, 2, 0);
+    ASSERT_TRUE(fx.collector.close_recorded_window(kEpoch, 8000));
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    const auto path = published_file_for_epoch(fx.dir.path(), kEpoch);
+    ASSERT_FALSE(path.empty());
+    const std::string body = read_file(path);
+    EXPECT_EQ(rows_for_epoch(body, kEpoch), 10u);
+    EXPECT_NE(body.find("\"recorded_window\": true"), std::string::npos);
+    EXPECT_NE(body.find("\"counts_unknown\": true"), std::string::npos);
+    EXPECT_NE(body.find("\"device_total\": null"), std::string::npos);
+    EXPECT_NE(body.find(recorded_records_field(1)), std::string::npos);
+    EXPECT_EQ(body.find(recorded_records_field(2)), std::string::npos);
+    EXPECT_NE(body.find("\"dropped\": null, \"truncated\": null"), std::string::npos);
+    // The existing Python exporter roundtrip reads this real writer output.
+    const auto export_dir =
+        fs::path("chip_swimlane_recorded_window") / CHIP_SWIMLANE_ARCHITECTURE_NAME / SIMPLER_RUNTIME_NAME;
+    fs::create_directories(export_dir);
+    fs::copy_file(path, export_dir / "records.json", fs::copy_options::overwrite_existing);
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedWindowsKeepPolicyOffAndUseOnlyExistingCredits) {
+    RetainedRunsFixture fx("recorded-credits", 1, 1);
+    fx.collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.num_aicore = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(53001, metadata));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(53002, metadata));
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 2u);
+    auto recorded_refusal = simpler::dfx::runs::AdmissionRefusal::None;
+    EXPECT_FALSE(fx.collector.begin_recorded_window(53004, metadata, nullptr, 0, nullptr, &recorded_refusal));
+    EXPECT_EQ(recorded_refusal, simpler::dfx::runs::AdmissionRefusal::Capacity);
+    EXPECT_FALSE(fx.collector.retains_runs());
+    EXPECT_FALSE(fx.collector.retained_runs_idle());
+    auto why = simpler::dfx::runs::AdmissionRefusal::None;
+    EXPECT_FALSE(fx.collector.run_begin(53003, fx.dir.str(), metadata.level, nullptr, 0, false, nullptr, &why));
+    EXPECT_EQ(why, simpler::dfx::runs::AdmissionRefusal::Capacity);
+    // Closing without any replay still detaches readers and publishes unknown totals.
+    ASSERT_TRUE(fx.collector.close_recorded_window(53001, 8000));
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    const auto first_path = published_file_for_epoch(fx.dir.path(), 53001);
+    ASSERT_FALSE(first_path.empty());
+    const auto first = read_file(first_path);
+    EXPECT_NE(first.find("\"received_records\": 0"), std::string::npos);
+    EXPECT_NE(first.find("\"device_total\": null"), std::string::npos);
+    // A diagnostics-requesting ordinary run uses a returned credit and its legacy destination.
+    const int cores[] = {0};
+    fx.begin(53003);
+    fx.dispatch(0, 1);
+    fx.close(53003, cores, 1);
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    const auto ordinary = fx.dir.path() / "chip_swimlane_records.json";
+    ASSERT_TRUE(fs::exists(ordinary));
+    EXPECT_EQ(rows_for_epoch(read_file(ordinary), 53003), 1u);
+    EXPECT_EQ(read_file(ordinary).find("\"recorded_window\""), std::string::npos);
+    EXPECT_EQ(read_file(first_path), first);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 1u);
+    ASSERT_TRUE(fx.collector.close_recorded_window(53002, 8000));
+    ASSERT_TRUE(fx.collector.close_recorded_window(53002, 8000));
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    EXPECT_TRUE(fx.collector.retained_runs_idle());
+    EXPECT_FALSE(fx.collector.retains_runs());
+    EXPECT_EQ(published_files(fx.dir.path()).size(), 2u);
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedWriteFailureDoesNotHoldDetachedPoolReferences) {
+    RetainedRunsFixture fx("recorded-write-failure", 1, 1);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(54001, metadata));
+    fs::path taken;
+    for (const auto &entry : fs::directory_iterator(fx.dir.path())) {
+        if (entry.is_directory()) taken = entry.path() / "records_e54001.json";
+    }
+    ASSERT_FALSE(taken.empty());
+    {
+        std::ofstream file(taken);
+        file << "existing artifact";
+    }
+    EXPECT_TRUE(fx.collector.close_recorded_window(54001, 8000));
+    std::string error;
+    EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error));
+    EXPECT_NE(error.find("write_failed"), std::string::npos);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
+    EXPECT_TRUE(fx.collector.close_recorded_window(54001, 8000));
+    EXPECT_EQ(read_file(taken), "existing artifact");
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedReaderUnknownKeepsTheOwnerUntilJoin) {
+    ReaderlessCollector fx("recorded-reader-unknown");
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    EXPECT_FALSE(fx.collector.begin_recorded_window(55001, metadata));
+    EXPECT_FALSE(fx.collector.close_recorded_window(55001, 8000));
+    EXPECT_FALSE(fx.collector.close_recorded_window(55001, 8000));
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 1u);
+    EXPECT_TRUE(fx.collector.retained_run_stats_for_test().release_deferred);
+    EXPECT_TRUE(published_files(fx.dir.path()).empty());
+    fx.collector.stop();
+    fx.collector.finalize(nullptr, retained_free);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedWindowKeepsEveryOrchestratorPhaseAcrossResets) {
+    RetainedRunsFixture fx("recorded-orch", 1, 1, 0, ChipSwimlaneLevel::ORCH_PHASES);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::ORCH_PHASES;
+    metadata.num_orch_phase_threads = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(56001, metadata));
+    set_platform_run_result(0, 56001);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(fx.shm()));
+    set_platform_chip_swimlane_run_terminal_bank(0);
+    for (int count : {2, 3}) {
+        chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::ORCH_PHASES);
+        chip_swimlane_aicpu_init_phase(1, 1, 1);
+        record_orch_phases(count);
+        chip_swimlane_aicpu_flush_orch_phase_buffer(0);
+        const int cores[] = {0};
+        chip_swimlane_aicpu_flush(0, cores, 1);
+    }
+    ASSERT_TRUE(fx.collector.close_recorded_window(56001, 8000));
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    const auto path = published_file_for_epoch(fx.dir.path(), 56001);
+    ASSERT_FALSE(path.empty());
+    const auto body = read_file(path);
+    EXPECT_EQ(orch_rows_for_epoch(body, 56001), 5u);
+    EXPECT_NE(
+        body.find("\"aicpu_orchestrator_phases\": {\"received_records\": 5, \"retained_records\": 5,"),
+        std::string::npos
+    );
+}
+
+#if defined(__linux__)
+TEST(ChipSwimlaneRetainedRunsTest, ABlockedPublicationDoesNotHoldAnotherRecordedWindowsReaders) {
+    PublicationGate gate;
+    RetainedRunsFixture fx("recorded-independent-close", 1, 1);
+    struct ReleaseGate {
+        PublicationGate &gate;
+        ~ReleaseGate() {
+            publication_gate.store(nullptr, std::memory_order_release);
+            gate.release();
+        }
+    } release{gate};
+    fx.collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.num_aicore = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(57001, metadata));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(57002, metadata));
+    publication_gate.store(&gate, std::memory_order_release);
+    ASSERT_TRUE(fx.collector.close_recorded_window(57001, 8000));
+    ASSERT_TRUE(gate.wait_entered()) << "the actual first file publication did not reach link";
+
+    set_platform_run_result(0, 57002);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(fx.shm()));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    set_platform_chip_swimlane_run_terminal_bank(0);
+    chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::TASK_TIMING);
+    fx.dispatch(0, 2);
+    const int cores[] = {0};
+    chip_swimlane_aicpu_flush(0, cores, 1);
+    EXPECT_TRUE(fx.collector.close_recorded_window(57002, 8000))
+        << "the second window's cut and reader acknowledgements must not require the first file";
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        EXPECT_FALSE(gate.released) << "the file gate must still hold the first publisher";
+    }
+    EXPECT_FALSE(fx.collector.retained_run_stats_for_test().release_deferred);
+    gate.release();
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    const auto second = published_file_for_epoch(fx.dir.path(), 57002);
+    ASSERT_FALSE(second.empty());
+    EXPECT_EQ(rows_for_epoch(read_file(second), 57002), 2u);
+}
+#endif
+
+#if defined(__linux__)
+TEST(ChipSwimlaneRetainedRunsTest, ARecordedSealAllocationFailureRemainsAnExplicitOwnedFailure) {
+    RetainedRunsFixture fx("recorded-seal-allocation", 1, 1);
+    struct ResetFault {
+        ChipSwimlaneCollector &collector;
+        ~ResetFault() {
+            fail_merge_allocation_bytes = 0;
+            // Keep teardown finite if an assertion leaves a failed boundary
+            // unreported. This runs after the checked behavior, never as part
+            // of the close under test.
+            if (!collector.retained_run_stats_for_test().fatal) collector.note_boundary_close_failed();
+        }
+    } reset{fx.collector};
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(58009, metadata));
+    set_platform_run_result(0, 58009);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(fx.shm()));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    set_platform_chip_swimlane_run_terminal_bank(0);
+    chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::TASK_TIMING);
+    fx.dispatch(0, 2);
+    const int cores[] = {0};
+    chip_swimlane_aicpu_flush(0, cores, 1);
+    constexpr size_t kMergeBytes = 2 * sizeof(CollectedRecord<ChipSwimlaneAicoreTaskRecord>);
+    failed_merge_allocation_bytes = 0;
+    fail_merge_allocation_bytes = kMergeBytes;
+    bool closed = false;
+    bool escaped = false;
+    try {
+        closed = fx.collector.close_recorded_window(58009, 8000);
+    } catch (const std::bad_alloc &) {
+        escaped = true;
+    }
+    fail_merge_allocation_bytes = 0;
+    RecordProperty("injected_allocation_bytes", std::to_string(failed_merge_allocation_bytes));
+    ASSERT_EQ(failed_merge_allocation_bytes, kMergeBytes) << "the actual caller-side merge must hit the fault";
+    EXPECT_FALSE(escaped);
+    EXPECT_FALSE(closed);
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_TRUE(stats.fatal);
+    EXPECT_TRUE(stats.release_deferred);
+    EXPECT_EQ(stats.open_slots, 1u);
+    EXPECT_GT(stats.host_charged, 0u);
+    EXPECT_TRUE(fx.collector.recorded_window_open(58009));
+    if (stats.fatal) {
+        EXPECT_FALSE(fx.collector.close_recorded_window(58009, 8000));
+        EXPECT_TRUE(fx.collector.recorded_window_open(58009));
+        std::string error;
+        EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error));
+        EXPECT_NE(error.find("recorded window sealing failed"), std::string::npos) << error;
+        EXPECT_EQ(error.find("timed out"), std::string::npos) << error;
+        std::string repeated;
+        EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &repeated));
+        EXPECT_EQ(error, repeated);
+    }
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RetiringMetadataIsExcludedFromAdmissionInspection) {
+    PublicationGate gate;
+    RetainedRunsFixture fx("recorded-retirement-lock", 1, 1);
+    struct ReleaseGate {
+        PublicationGate &gate;
+        ~ReleaseGate() {
+            retirement_gate.store(nullptr, std::memory_order_release);
+            gate.release();
+            retirement_storage.store(nullptr, std::memory_order_release);
+        }
+    } release{gate};
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::SCHED_PHASES;
+    metadata.host_phase_records_present = true;
+    metadata.host_phase_submitted_tasks = 1;
+    metadata.host_submit_records = host_submit_rows(1);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(58008, metadata));
+    void *storage = ChipSwimlaneCollectorTestPeer::preparation_storage(fx.collector, 58008);
+    ASSERT_NE(storage, nullptr);
+    retirement_storage.store(storage, std::memory_order_release);
+    retirement_gate.store(&gate, std::memory_order_release);
+    ASSERT_TRUE(fx.collector.close_recorded_window(58008, 8000));
+    ASSERT_TRUE(gate.wait_entered()) << "the actual detached metadata must reach deallocation";
+    auto &mutex = ChipSwimlaneCollectorTestPeer::admission_mutex(fx.collector);
+    const bool admission_can_inspect = mutex.try_lock();
+    if (admission_can_inspect) mutex.unlock();
+    EXPECT_FALSE(admission_can_inspect) << "admission must not inspect a metadata object being destroyed";
+    gate.release();
+    std::string error;
+    EXPECT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+}
+#endif
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedPreparationBudgetRefusesBeforeCopyingBorrowedHostRows) {
+    constexpr size_t kBudget = 18ull * 1024 * 1024;
+    RetainedRunsFixture fx("recorded-preparation-budget", 1, 1, kBudget);
+    fx.collector.configure_retained_runs(false, kBudget);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.host_phase_records_present = true;
+    metadata.host_phase_submitted_tasks = 1;
+    auto &source = metadata.host_submit_records;
+    source.reserve(kBudget / sizeof(HostPhaseRecord) + 1);
+    source.push_back(HostPhaseRecord{});
+    ASSERT_TRUE(fx.collector.begin_recorded_window(58001, metadata));
+    EXPECT_LE(fx.collector.retained_run_stats_for_test().host_charged, kBudget);
+    ASSERT_TRUE(fx.collector.close_recorded_window(58001, 8000));
+    std::string error;
+    EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error));
+    const auto path = published_file_for_epoch(fx.dir.path(), 58001);
+    ASSERT_FALSE(path.empty());
+    const auto body = read_file(path);
+    EXPECT_NE(body.find("\"metadata_complete\": false"), std::string::npos);
+    EXPECT_EQ(body.find("\"host_orchestrator_phases\""), std::string::npos);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
+    EXPECT_LE(fx.collector.retained_run_stats_for_test().host_charged, kBudget);
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedKnownPreparationLossFailsQualityWithoutHoldingResources) {
+    RetainedRunsFixture fx("recorded-host-loss", 1, 1);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.host_phase_records_present = true;
+    metadata.host_phase_submitted_tasks = 2;
+    metadata.host_phase_dropped_records = 1;
+    metadata.host_submit_records = host_submit_rows(1);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(58002, metadata));
+    ASSERT_TRUE(fx.collector.close_recorded_window(58002, 8000));
+    std::string error;
+    EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error));
+    const auto path = published_file_for_epoch(fx.dir.path(), 58002);
+    ASSERT_FALSE(path.empty());
+    EXPECT_NE(read_file(path).find("\"metadata_complete\": false"), std::string::npos);
+    EXPECT_TRUE(fx.collector.retained_runs_idle());
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedTransportLossSurvivesAnOrdinarySuccessor) {
+    RetainedRunsFixture fx("recorded-transport-loss", 1, 1);
+    fx.collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(58004, metadata));
+    // Exercise the real transport retirement callback with the identity that
+    // survives an unreadable payload. The transport protocol itself is tested
+    // separately by the handoff identity cases.
+    profiling_common::RetiredHandoff<ChipSwimlaneModule> retired;
+    retired.identified = true;
+    retired.info.type = ProfBufferType::AICORE_TASK;
+    retired.info.run_epoch = 58004;
+    retired.info.record_count = 7;
+    fx.collector.on_handoff_retired(retired);
+    fx.begin(58005);
+    fx.dispatch(0, 1);
+    const int cores[] = {0};
+    fx.close(58005, cores, 1);
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    ASSERT_TRUE(fx.collector.close_recorded_window(58004, 8000));
+    EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error));
+    EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error)) << "known loss must remain sticky";
+    const auto path = published_file_for_epoch(fx.dir.path(), 58004);
+    ASSERT_FALSE(path.empty());
+    const auto body = read_file(path);
+    EXPECT_NE(body.find("\"transport_retired\": 1"), std::string::npos);
+    EXPECT_NE(body.find("\"transport_retired_records\": 7"), std::string::npos);
+    EXPECT_TRUE(fx.collector.retained_runs_idle());
+    EXPECT_FALSE(fx.collector.retained_run_stats_for_test().release_deferred);
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RecordedOutputDirectoryIsFrozenAcrossCallerWorkingDirectoryChanges) {
+    RetainedRunsFixture fx("recorded-frozen-directory", 1, 1);
+    const auto original = fs::current_path();
+    const auto first = fx.dir.path() / "first";
+    const auto second = fx.dir.path() / "second";
+    fs::create_directories(first);
+    fs::create_directories(second);
+    struct RestoreDirectory {
+        fs::path original;
+        ~RestoreDirectory() { fs::current_path(original); }
+    } restore{original};
+    fs::current_path(first);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = "relative-output";
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(58003, metadata));
+    fs::current_path(second);
+    ASSERT_TRUE(fx.collector.close_recorded_window(58003, 8000));
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    EXPECT_FALSE(published_file_for_epoch(first / "relative-output", 58003).empty());
+    EXPECT_FALSE(fs::exists(second / "relative-output"));
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, OrdinaryPublicationReleasesItsUnusedDirectory) {
+    RetainedRunsFixture fx("legacy-directory-release", 1, 1);
+    fx.collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.num_aicore = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(59001, metadata));
+    ASSERT_TRUE(fx.collector.close_recorded_window(59001, 8000));
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    const int cores[] = {0};
+    for (uint64_t epoch : {59002, 59003}) {
+        fx.begin(epoch);
+        fx.dispatch(0, 1);
+        fx.close(epoch, cores, 1);
+        ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+        EXPECT_FALSE(fs::exists(fx.dir.path() / "swimlane-1"));
+        EXPECT_EQ(rows_for_epoch(read_file(fx.dir.path() / "chip_swimlane_records.json"), epoch), 1u);
+    }
+}
+
+#if defined(__linux__)
+TEST(ChipSwimlaneRetainedRunsTest, WriterInspectsReusedSlotUnderTheAdmissionMutex) {
+    RetainedRunsFixture fx("writer-slot-reuse", 1, 1);
+    const int cores[] = {0};
+    fx.begin(59011);
+    ChipSwimlaneCollectorTestPeer::stop_writer(fx.collector);
+    PublicationGate inspected;
+    std::thread writer([&] {
+        inspect_mutex = ChipSwimlaneCollectorTestPeer::admission_mutex(fx.collector).native_handle();
+        inspect_gate = &inspected;
+        ChipSwimlaneCollectorTestPeer::service_writer(fx.collector);
+        inspect_gate = nullptr;
+        inspect_mutex = nullptr;
+    });
+    auto join = RAIIScopeGuard([&] {
+        inspected.release();
+        writer.join();
+    });
+    ASSERT_TRUE(inspected.wait_entered());
+    ASSERT_TRUE(fx.collector.abandon_run(59011));
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.num_aicore = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(59012, metadata));
+    set_platform_run_result(0, 59012);
+    set_platform_chip_swimlane_run_terminal_bank(0);
+    chip_swimlane_aicpu_init(1, metadata.level);
+    fx.dispatch(0, 1);
+    chip_swimlane_aicpu_flush(0, cores, 1);
+    ASSERT_TRUE(fx.collector.close_recorded_window(59012, 8000));
+    inspected.release();
+    writer.join();
+    join.dismiss();
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+    const auto artifact = published_file_for_epoch(fx.dir.path(), 59012);
+    ASSERT_FALSE(artifact.empty());
+    EXPECT_EQ(rows_for_epoch(read_file(artifact), 59012), 1u);
+}
+#endif
+
+#if defined(__linux__)
+TEST(ChipSwimlaneRetainedRunsTest, OrdinaryPublicationWaitsOnlyForItsOwnClosedEpoch) {
+    PublicationGate gate;
+    RetainedRunsFixture fx("ordinary-publication-identity", 1, 1);
+    auto cleanup = RAIIScopeGuard([&] {
+        publication_gate.store(nullptr);
+        gate.release();
+    });
+    fx.collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.num_aicore = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(57001, metadata));
+    ChipSwimlaneCollectorTestPeer::stop_writer(fx.collector);
+    fx.begin(59021);
+    fx.dispatch(0, 1);
+    const int cores[] = {0};
+    fx.close(59021, cores, 1);
+    std::string error;
+    EXPECT_FALSE(fx.collector.flush_retained_runs(0, &error, 59021));
+    EXPECT_FALSE(fs::exists(fx.dir.path() / "chip_swimlane_records.json"));
+    ChipSwimlaneCollectorTestPeer::start_writer(fx.collector);
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error, 59021)) << error;
+    EXPECT_EQ(rows_for_epoch(read_file(fx.dir.path() / "chip_swimlane_records.json"), 59021), 1u);
+    publication_gate.store(&gate);
+    ASSERT_TRUE(fx.collector.close_recorded_window(57001, 8000));
+    ASSERT_TRUE(gate.wait_entered());
+    EXPECT_TRUE(fx.collector.flush_retained_runs(0, &error, 59021)) << error;
+    EXPECT_TRUE(fx.collector.recorded_window_open(57001));
+    publication_gate.store(nullptr);
+    gate.release();
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+}
+#endif
+
+#if defined(__linux__)
+TEST(ChipSwimlaneRetainedRunsTest, SealedWindowKeepsItsReleaseProofAfterAnotherWindowFails) {
+    PublicationGate gate;
+    RetainedRunsFixture fx("sealed-before-sibling-fatal", 1, 1);
+    auto cleanup = RAIIScopeGuard([&] {
+        fail_merge_allocation_bytes = 0;
+        publication_gate.store(nullptr);
+        gate.release();
+    });
+    ChipSwimlaneCollector::RunExport metadata;
+    metadata.output_prefix = fx.dir.str();
+    metadata.level = ChipSwimlaneLevel::TASK_TIMING;
+    metadata.num_aicore = 1;
+    ASSERT_TRUE(fx.collector.begin_recorded_window(57001, metadata));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(59032, metadata));
+    publication_gate.store(&gate);
+    ASSERT_TRUE(fx.collector.close_recorded_window(57001, 8000));
+    ASSERT_TRUE(gate.wait_entered());
+    set_platform_run_result(0, 59032);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(fx.shm()));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    set_platform_chip_swimlane_run_terminal_bank(0);
+    chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::TASK_TIMING);
+    fx.dispatch(0, 2);
+    const int cores[] = {0};
+    chip_swimlane_aicpu_flush(0, cores, 1);
+    constexpr size_t bytes = 2 * sizeof(CollectedRecord<ChipSwimlaneAicoreTaskRecord>);
+    failed_merge_allocation_bytes = 0;
+    fail_merge_allocation_bytes = bytes;
+    ASSERT_FALSE(fx.collector.close_recorded_window(59032, 8000));
+    fail_merge_allocation_bytes = 0;
+    ASSERT_EQ(failed_merge_allocation_bytes, bytes);
+    ASSERT_TRUE(fx.collector.retained_run_stats_for_test().fatal);
+    EXPECT_TRUE(fx.collector.close_recorded_window(57001, 8000));
+    EXPECT_FALSE(fx.collector.close_recorded_window(59032, 8000));
+    std::string error;
+    EXPECT_FALSE(fx.collector.flush_retained_runs(0, &error));
+    EXPECT_NE(error.find("recorded window sealing failed"), std::string::npos);
+}
+#endif
