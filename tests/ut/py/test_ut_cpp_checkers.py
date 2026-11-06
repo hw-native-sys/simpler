@@ -419,8 +419,19 @@ def test_a_database_where_nothing_resolves_is_an_error(tmp_path, monkeypatch):
 
 def test_runtimes_come_from_the_tree_rather_than_a_list():
     """The same rule platform_info and runtimes.cmake use, so a third runtime
-    needs no edit here to be classified."""
+    needs no edit here to be classified.
+
+    An arch carries a runtime or it does not, and discovery is the union over
+    them, so the tree each discovered name comes back from is the thing to
+    assert. Naming one arch here would hold the set of runtimes to whatever
+    that arch happens to carry.
+    """
     discovered = axis.discovered_runtimes()
     assert discovered, "no runtime discovered from src/"
     for runtime in discovered:
-        assert (_REPO_ROOT / "src" / "a2a3" / "runtime" / runtime / "build_config.py").exists()
+        carriers = [
+            arch
+            for arch in axis.ARCHES
+            if (_REPO_ROOT / "src" / arch / "runtime" / runtime / "build_config.py").exists()
+        ]
+        assert carriers, f"{runtime} was discovered but no arch under src/ carries it"
