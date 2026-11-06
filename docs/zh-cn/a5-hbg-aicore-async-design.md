@@ -1,19 +1,20 @@
 # A5 HBG AICore 异步完成开发参考
 
 本文件是本功能唯一的开发参考，包含协议、接线、资源约束和验收要求。
-更新于 2026-11-04，状态为**设计方案，尚未实现**；文中的新增记录和 helper 名称是实现约定。
+更新于 2026-11-06，状态为**已实现并完成本批功能验收**；本文区分实现合同与已验证范围，资格边界见末尾状态段。
 对应 [#2832](https://github.com/hw-native-sys/simpler/issues/2832)，父工作线为 [#2667](https://github.com/hw-native-sys/simpler/issues/2667)。
 
 ## 1. 范围、基线与完成语义
 
 ### 工作基线
 
-后续在本地 `main` 开发；本文核对提交为 `ed1fd4d9cdd5bd857974e2f6e4a74f85201944e6`，
+后续基于 `nalinaly/simpler` 的 `main` 开发；本文源码核对提交为 `ed1fd4d9cdd5bd857974e2f6e4a74f85201944e6`，
 PTO-ISA pin 为 `f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7`。本地 main 不等同于上游 main；
 开始实施和提交前重查基线、在途 PR、依赖 pin 与实际二进制身份，不迁移旧版本的测试资格。
+本轮 runtime 构建基线为 `2172f462`，PTO-ISA pin 为 `5487a6b0`；专项测试以各自记录的源码身份为准，上述历史基线不代表本轮资格。
 
 当前运行时有普通 TICKET/H8 ready pool、ordered/MIX/sync-start 准入、native Graph control 服务。
-Graph 使用 `SchedulerGraphAccess` 和 native image，协议为普通 v8 / Graph v9。
+Graph 使用 `SchedulerGraphAccess` 和 native image；旧普通 v8 / Graph v9 保持兼容，异步事件使用 v10 / v11。
 异步实现接入这些路径，不沿用旧分支的 `remaining_children`、分块物化或 v12 接线。
 
 ### 必须交付的范围
@@ -52,7 +53,7 @@ flowchart LR
 
 | 条件 | 判据 | 必须建立的发布关系 |
 | ---- | ---- | ------------------ |
-| SDMA post-done | 同一 workspace generation 中，64-bit completed post id 达到 expected post id | 数据搬运完成先于相应 post-done |
+| SDMA post-done | 同一已获资格并保活的 workspace 使用期内，64-bit completed post id 达到 expected post id | 数据搬运完成先于相应 post-done |
 | 通知 COUNTER | 本 rank 的信号槽达到 expected epoch | 远端 payload 发布先于 notify，本地消费者能看到相应 payload |
 
 `save_expected_notification_counter` 的历史 engine 标签也是 SDMA，但类型为 COUNTER。
@@ -89,17 +90,32 @@ main 的 [ticket 队列](../../src/a5/runtime/host_build_graph/runtime/scheduler
 Host 将 `(task_ref, block_idx, subtask_slot)` 映射到固定组记录；映射与 DFX 是否开启无关，
 不能依赖只在 profiling 时分配的 trace 数组。AsyncCtx 的有效 TaskId 也不替代这个组身份。
 
-### 条件容量与注册接口
+### 能力、容量与条件身份
 
-复用 `get_async_ctx`、`register_completion_condition`、`CompletionToken`；有效上下文满足 `1 <= capacity <= 64`。
+保留 `get_async_ctx`、条件登记 API 的语义；旧 `CompletionToken` 通过明确版本的 adapter 接入。
+有效上下文满足 `1 <= capacity <= 64`；未知布局不能与新记录直接混读。
 声明过能力但本次分支没有登记条件时，实际 count=0 是合法完成，不分配活动检查工作。
 纯同步 kernel 使用既有路径；静态证明整 run 无异步能力时，不分配异步区、不探测目录。
 
-Host 需要取得每次执行的已验证条件上界 `c_e`。优先自动传递 PyPTO 的
-`deferred_completion_waiter` 标记与 `static_max_count`；不要求模型作者重复手填，不增加全局开关。
-**容量元数据在 callable 注册/序列化中的承载方式仍待接口确认**，不可把提案写成已有参数。
-实现时须参与身份/hash/cache key，不占用 wire padding；缺字段不能证明旧 kernel 不含 defer_wait。
-旧异步生成物须显式兼容或重编译，不能保证自动识别、自动同步回退。
+Host 从有版本的 callable 能力描述取得可信上界 `c_e`；合同至少包含 schema version、是否可能登记、
+最大条件数及允许的条件类型。PyPTO 接入时需自动导出 `deferred_completion_waiter` / `static_max_count`，
+原生 C++ kernel 走同一能力入口；scheduler 不识别 PyPTO IR，不要求模型作者重复手填，不增加全局开关。
+描述随二进制注册、序列化并进入身份/hash/cache key；Host 再结合 backend 核资格校验，运行期仍检查容量。
+当前使用 `CoreAsyncCapability v1`（version/mode/max_conditions/condition_types）与 `CallableImageHeader v1`，
+能力进入 callable 注册、序列化及身份/hash/cache key，不借用 padding；旧无版本镜像须重编译，UNKNOWN 不证明同步完成。
+`ChipTensor`、`TensorData`、`GraphDefinition`、`AsyncCtx`、`LocalContext` 未扩展；这不表示 DSL 全范围已验收。
+
+每条条件关联 run 内不可变的资源范围、合法完成记录区间、backend 合同及使用关系索引；
+当前采用 `SchedulerAsyncConditionBinding` 旁表，由 run 与物理执行身份限定 binding_index，一个组可引用多个 peer/资源。
+既有 `CanonicalIdentity` 含 owner、buffer_id 和 allocation generation（字段名 generation）；当前异步条件不逐条传播它。
+run 固定绑定的 owner_generation=0 表示未携带分配代次，DFX 导出为 null；保活依赖既有 Host/run/domain owner。
+0 和 run_epoch 均不是分配代次。
+设备表使用 POD 与整数地址/索引，实际 owner 留在现有 Host/run/domain 体系；检查类型、宽度、对齐、
+索引、地址加法溢出及记录范围，不能仅检查地址落在某个通信窗口内。绑定和索引在 run 内不复用。
+登记 adapter 负责把条件解析到该执行允许的绑定；无法证明身份的裸地址明确失败，scheduler 不猜 owner。
+旁表已计入布局预算；要求逐条件分配代次证明的其他接入，不能据此宣称支持。
+旧 token 已用 64-bit `backend_cookie` 保存 SDMA post id；不能仅为支持 64-bit 阈值重定义整个公共 API。
+资源身份和持有证明不替代防覆写协议，后者见第 4 节。
 
 当前编译器上界、generated adapter 的 static_assert 和运行期 capacity 检查都固定为 64，
 扩大单上下文容量必须跨仓修改并重编译。多 block 的总条件数可以超过 64，由各组分别持有；
@@ -111,6 +127,11 @@ event 返回后核对实际条数，归还本次未使用预留。无法得到�
 提交前失败可归还未使用预留；已尝试提交而副作用不明时，锁存错误并保留资源，不能丢掉追踪依据。
 纯 COUNTER 登记不发起 DMA，不强加硬件提交事务；overflow/非法条件同样不能变成成功 TaskDone。
 
+预留条件存储不等于 SDMA 提交队列或 flag 槽可用。匹配 pin 的 `EnsureFlagPayloadSlotAvailable`
+会等待旧 post；该时间仍计入 kernel，验收必须覆盖连续提交、槽位压力及 session/workspace 复用。
+本功能不承诺非阻塞提交；若要支持它，须另有能判定副作用的 backend 合同与提交续接设计，
+不能在产生副作用后返回 WOULD_BLOCK 并重跑整个 kernel。
+
 ### 布局与成本
 
 记录分离为三种不共线的区域：immutable 身份/封口条件、atomic-only 领取/计数字、owner 独占的 mutable 进度。
@@ -118,17 +139,21 @@ event 返回后核对实际条数，归还本次未使用预留。无法得到�
 每组的变长 token 区按实际 `c_e` 分配，header/error 与 token 均单 writer；封口后不再修改 token。
 进度使用独占期间的 bypass 读写并在交权前完成发布，下一 owner 在成功 CAS 后执行必要读取屏障。
 
-设异步物理执行数为 E、对应逻辑任务数为 T，record 中不含 token 的固定 stride 为 Sg/Sf：
+设异步物理执行数为 E、对应逻辑任务数为 T，记录固定 stride 为 Sg/Sf，条件存储 stride 为 Sc：
 
 ```text
-记录空间 = E*Sg + T*Sf + Σ align_up(slab_header + 32*c_e, 128)
+记录空间 = E*Sg + T*Sf + Σ align_up(slab_header + Sc*c_e, 128)
 目录空间 = 128*(ceil(E/64) + ceil(T/64))
-核本地空间 = worker_count * 固定游标/预算状态
+绑定与接线空间 = 资源绑定表 + 使用关系 + 消费者可见性计划 + 物理执行映射 + 条件旁表（如采用）
+核本地空间 = worker_count * (游标/预算状态 + 消费准备进度 + 后端观察 scratch)
 ```
 
 Host 在 launch 前检查算术溢出、任务上限和总预算，报告分配/初始化字节并拒绝不可容纳的 run。
 第一版明确接受空间按总异步执行数增长；不引入运行中复用池及容量等待，避免检查资源反过来卡住发送任务。
-必须同时测量峰值在途数与总执行数，不能声称该方案空间只与并发度相关。Sg/Sf 由实现 `sizeof` 固定并审计。
+必须同时测量峰值在途数与总执行数、真实 sizeof/对齐字节、Host 初始化和 H2D 成本。
+例如 Sc=32 B 时，10 万组各 64 条条件仅条件内容就有 204.8 MB；这是十进制估算，不是实际布局或性能结果。
+65,536 个组有 1,024 个目录字，每次最多看 4 字时，单核全覆盖至少需 256 次 CHECK slice；
+记录稀疏不会自动缩短目录，不能直接将发现延迟除以核数。布局合并和页剪枝按第 5 节单独评估。
 
 ## 3. 领取、交接与调度服务
 
@@ -145,14 +170,32 @@ run 内身份不复用，lease generation 每次交权递增，溢出受控失�
 | OWNED → TERMINAL | 当前 owner | 完成全部共享写入和诊断发布，随后清除本记录活动位 |
 | OWNED → FAILED | 当前 owner | 锁存首错误和完整身份；保留 backing，停止新提交/新领取 |
 
-首次发布顺序为“内容与贡献 → 发布 RUNNABLE → atomic OR 活动位”。
+首次发布顺序为“内容与贡献 → 发布 RUNNABLE → publish_once 置活动位”。
 重试保持活动位为 1，只把 OWNED 改回 RUNNABLE；无需 enqueue、预留 ticket 或等待队列容量。
-终态发布后 atomic AND 清除自己的位；其他记录的并发 OR/AND 不互相覆盖。
+终态发布后 clear_once 清除自己的位；其他记录的并发贡献不得互相覆盖。
 尚未设置活动位的发布者不得进入业务 kernel；该发布尾部只有固定数量的非等待操作。
 
 同一记录只会首次置位、终态清位，不反复置位/清位来表达领取。因此不存在
 “检查失败重入队被另一核清位”窗口。目录暂空、读到 OWNED 或 CAS 失败都不代表全局完成。
 陈旧目录位最多导致一次无效探测；领取 CAS 必须包含完整版本，TERMINAL 不能重新领取。
+
+### 一次性目录原语
+
+现有 `scheduler_gm_fetch_or/and` 在 AICore 上包含 CAS 重试循环，不能作为固定一次操作计入尾部预算。
+首版优先验证专用的单次 unsigned 64-bit fetch-add 协议；通过资格验证后才接入，不能替换通用 OR/AND 语义：
+
+```text
+mask = uint64(1) << bit_index                 // 0 <= bit_index < 64
+publish_once: old = fetch_add(word, mask);     require (old & mask) == 0
+clear_once:   old = fetch_add(word, 0 - mask); require (old & mask) != 0
+```
+
+目录初始为零，每位由唯一发布者置位、唯一终态 owner 清位，各一次；`0 - mask` 按 unsigned 64-bit 模运算。
+合法操作不向邻位进位或借位，bit 63 同样成立。唯一性来自状态机和 lease，而非事后返回值检查。
+重复贡献可能已经破坏邻位，必须锁存协议错误并终止 run，不做反向补偿，不宣称错误检查前没有其他核继续执行。
+内容、终态与进度的实际屏障仍须保留，读取旧 bypass 值不能替代原子返回值校验。
+验证覆盖同字不同位交错、最高位、重复贡献及 A5 指令行为；若该实现不成立，须提供另一种有明确上界的实现。
+固定原子操作次数不等于固定纳秒延迟；已有 CAS helper 也不能仅因存在循环就被认定会死锁。
 
 ### 有界发现与进度交接
 
@@ -168,10 +211,15 @@ run 内身份不复用，lease generation 每次交权递增，溢出受控失�
 
 一次 slice 的初始内部预算为：最多 4 个目录字、2 个候选 lease 探测、2 次领取 CAS，以及 8 个工作单元。
 读到非 RUNNABLE 也消耗候选额度；成功领取一条后不再领取第二条，交权或终态后返回普通调度。
-工作单元是一次条件观察或一次依赖路由步骤；后继 fanin 检查和 link CAS 也计入，不能把整条链算一个单元。
+工作单元是一次条件观察、有界获取动作或依赖路由步骤；fanin 检查和 link CAS 也计入，不能把整条链算一个单元。
 所有失败尝试消耗预算，耗尽即返回调度循环。这些是可测的内部初值，不是用户配置或时间间隔。
+目录/lease 观察、CAS、数据屏障、进度交权、条件获取动作和发布尾部分别计价，不能只统计八次条件检查。
+每次领取或继续工作前保留最坏交权/收尾额度，预算不足就停止新增工作；大范围缓存处理须分段或另有上界。
+64 条均 PENDING 的组完整遍历至少需要 8 次成功领取/交权，即 16 次 lease CAS，另有扫描与发布成本。
 
 PENDING 保存未满足 mask 和循环游标，已满足位不再读取；条件必须在本 generation 内单调成立。
+仅在 observe_once 为 READY 且观察侧 acquire_completed 已完成后清除该位；分段获取的阶段与游标保存在组记录中，
+必须可跨核接手，不能依赖上一观察核的临时 UB、栈或局部缓存状态。
 同一 slice 中不对同一未满足条件反复读到预算耗尽。检查多于 8 条的组通过多次 slice 完成一次遍历。
 保存进度后交权不需要额外 CAS 重试循环：只有 owner 能改变 OWNED；单次交权 CAS 失败是状态损坏，走错误收敛。
 没有任何私有“待重新入队”任务跨越业务 kernel，固定的终态/贡献发布尾部也不等待 peer 或容量。
@@ -179,9 +227,11 @@ PENDING 保存未满足 mask 和循环游标，已满足位不再读取；条件
 ### 普通 ready 与检查工作的关系
 
 保留 main 的 TICKET/H8、类型/credit、ordered/MIX/sync-start 准入和 Graph control 服务。
-调度循环先处理退出/错误、完成回收、Graph control 与已有 ready 待发布工作；这些服务不能被 WaitCheck 绕过。
-所有正常、pending-publication、cohort 暂不可进入的循环路径都应到达异步安全服务点；
-审计现有 `continue`，尤其是 `scheduler_ready_pool_has_pending`，不能只在最后的 idle 分支加检查。
+调度循环先处理退出/错误、完成回收、Graph control 与已有 ready 待发布工作，然后经过统一异步服务门。
+门前服务须能返回或有独立上界；不能用内部无界 fanin/CAS 使服务门永久不可达。
+本地状态区分 BeforeAdmission、AdmissionDenied、PermitGranted，仅前两者允许异步服务；
+所有正常循环出口统一收口，helper 不直接控制外层 `continue`，错误/退出可直接结束。
+`scheduler_ready_pool_has_pending` 只禁止进入业务 kernel，不能绕过服务门；准入失败也回到服务状态。
 
 首版采用按业务忙闲分配工作额度：
 
@@ -194,7 +244,8 @@ PENDING 保存未满足 mask 和循环游标，已满足位不再读取；条件
 
 业务计数到额度后，无论本次探测成功与否均归零；没有异步能力的 run 跳过该分支。
 到额度的服务点放在领取本核 ready slot、调用可能提交 admission 的 `scheduler_ordered_can_enter_slot` 之前；
-已取得 cohort 执行许可就直接进入 kernel，不能夹入 WaitCheck。准入未成功时可执行 idle slice 后重试。
+已取得 cohort 执行许可就直接进入 kernel，不能夹入 WaitCheck。准入未成功时可执行 idle slice 后重试；
+每轮记录异步额度是否已用，避免 BeforeAdmission 和 AdmissionDenied 在同一轮各执行一个 slice。
 服务 CHECK/FINISH 的优先类型每次 slice 轮换，普通与异步均有机会，避免 idle 核在单一热点上连续用完无限预算。
 业务额度 4 和工作预算 8 需要 L1 对照；它们替代“一个完整检查 task 对一个业务 task”的粗粒度比例，
 不保证时间公平或固定微秒响应。所有核都执行长 kernel 时，条件发现仍必须等核返回，本功能不抢占 kernel。
@@ -244,7 +295,11 @@ CAS 失败说明另一核取得过相应版本，其他核可继续别的工作�
 首次 owner 核对汇合条件和 run 错误，完成数据可见性要求后，唯一发布原 task 的 DONE 并摘取 wake-list。
 发布 DONE 与记录摘链进度是有界且不让出的短事务；核故障走整个 run 的错误/隔离路径，不尝试盲目接管半写状态。
 之后按 slice 预算继续路由。借鉴现有 `scheduler_service_controls` 的 continuation，但需把异步 continuation
-变成可交接记录，并为 `scheduler_route_task` 增加真正可返回的步骤接口，不能在一个后继内部仍遍历无界 fanin/CAS。
+变成可交接记录。普通完成、Graph control 和异步完成共享 `resolve_step(graph, cursor, budget)` 的依赖语义，
+同步短路径可使用本地 cursor、直接完成/refill，不强制创建 GM FINISH；不能复制另一套 fanin/wake-list 算法。
+cursor 为仅含引用、索引和阶段的 POD；每步至多检查一个 fanin 或尝试一次挂链 CAS，失败也扣预算。
+结果明确区分 Linked、Ready、Yield、Drained、Error，不能用一个“完成”返回值混淆责任已经转移和仍由本记录持有。
+现有 `scheduler_route_task` 内部遍历/CAS 需要真实拆步，不能把调用整个函数包装成一个工作单元。
 从旧 wake-list 取节点时，先保存旧 `next_waiter`，再尝试将该节点挂到下一 producer。
 挂接 CAS 成功就是责任移交点：下一 producer 可以立即摘链并改写该节点，当前 FINISH 不再读写它；
 只推进自己保存的后继游标。挂接失败/预算耗尽才把未移交节点及 fanin/CAS 阶段留在 FINISH 中。
@@ -266,20 +321,53 @@ Graph CHILD 的完成通过当前 body → EXIT 边推进，EXIT 与其他 contr
 atomic-only 控制行上不做 cached store 或整行 dirty writeback；bypass-only 进度行不混入 RMW。
 状态字的唯一 CAS 权只解决所有权，不能代替条件、数据、trace 和后继发布的屏障。
 
-SDMA 要证明“数据 DMA → post-done → AICore 观察 → TaskDone → 消费者读数据”。
-通知要证明“远端 payload 发布 → notify → 本地观察 → TaskDone → 消费者读 payload”。
-目标旧 dirty cache 在交给 DMA 前处理，完成后不能把旧内容写回覆盖新数据；消费者缓存按后端合同处理。
-使用匹配 pin 的公共完成记录接口，不在新实现中猜私有队列布局；读取 flag 本身不证明 payload 新鲜。
+backend adapter 负责下列合同，scheduler 只消费标准化状态和资源索引；这些概念操作不是已经存在的 PTO-ISA API。
+
+| 操作 | 责任与接线 |
+| ---- | ---------- |
+| validate_and_reserve / submit_and_commit | 发起核资格、资源与容量验证；提交前源数据发布和目标旧 dirty cache 处理；追踪实际副作用 |
+| observe_once | 合法观察核对单条件有限检查，返回 PENDING/READY/FAILED，不在内部等待条件变 READY |
+| acquire_completed | 检查核在归还条件贡献前完成观察侧所需动作；FINISH 通过汇合发布关系取得该证明，再发布 TaskDone |
+| before_consume | 实际消费核按资源范围执行本核缓存/获取动作，不能由检查核或 FINISH 核代替 |
+| prove_last_use | 现有资源 owner 依据实际 AICore、backend 和 peer 证据决定复用或释放 |
+
+每种条件分别列出 AIC/AIV 发起、观察、消费资格及指令、屏障、scratch、失败返回合同。
+匹配 pin 的 `CheckPostDoneIds` 调用 `GetValue`，后者使用 GM→UB 和 pipeline barrier，不能直接视为任意核的标量读。
+若观察需要 scratch，必须为该观察核提供合法 resident scratch，不能引用原 kernel 的 UB；其空间和流水线影响计入预算。
+全部参与核均能检查是交付要求，核资格未验证时不得改成固定 AIV 代查并宣称全范围完成。
+使用公开完成记录接口；SDMA 必须证明“DMA → post-done → 检查核获取 → 汇合/TaskDone → 消费核获取 → payload 读取”，
+通知则证明“远端 payload 发布 → notify → 同样的本地获取链”。清旧 dirty cache 必须先于 DMA，完成后不能写回旧数据。
+
+消费者接线由 Host 在 native Graph 实例和实参绑定确定后建立，不在 FINISH 中临时复制资源集合：
+
+1. 利用 callable 实参/别名和通信使用元数据，将完成条件关联到实际 payload、范围与 run 内固定绑定，生成每个
+   `(task_ref, block, subtask)` 的不可变消费计划。只有 `deps` 或 signal 地址不足以推出 payload 范围；无法解析就拒绝该组合。
+2. Graph ENTER/EXIT 等 control 节点只传递依赖，不执行数据获取；Host 将绑定落实到真正读数据的 CHILD 或外部消费者，
+   保留多 fanin、别名和既有资源身份，不能因跨 control 边而丢失可见性责任。
+3. 依赖已满足后，实际消费 lane 在本地预执行阶段调用 before_consume，准备状态绑定 slot generation。
+   工作较大时保存本地准备进度、分段并返回正常服务；未准备完成不提交 ordered/sync-start cohort 执行许可。
+   取得许可后直接执行 kernel，不夹入 WaitCheck 或无界缓存遍历。MIX/sync-start 需将各参与 lane 的准备完成纳入准入门槛。
+4. 准备期间的资源使用合同禁止新写者覆写；若中间执行其他工作会使本核准备失效，须在准入前重新获取。
+   不把“曾在另一个核做过获取”或任务曾使用过同一 slot 当作准备完成。
+
+消费计划、准备状态和范围处理的成本均需测量；backend 若可证明无需额外本核操作，可提供经验证的空实现。
+不能通过每个任务无条件清整份 cache 来掩盖缺失的绑定和可见性证明。
 
 **首版禁止对同一可写 payload/signal 槽重叠使用不同 epoch。**
 新写者只能在旧 epoch 的相关消费者及 peer 访问已结束后取得复用权；证明来自现有 run/通信资源 owner 的使用记录，
 不从 `counter >= expected` 推导，不新增全局 Host barrier。需要并发时使用独立 payload 与 signal 槽，
 或消费已有且经验证的完成前缀协议；仅双缓冲 payload 而共享可乱序 notify 的 counter 仍不足以保证正确。
 不能提供所有权/代次证明的 raw-address 异步接入不纳入支持，须明确诊断或由调用者提供相应资源句柄。
+Available → Writing(epoch) → Published → Consuming → Available 仅说明防覆写责任，不要求另建统一资源状态机。
+已支持的 fixed-run 范围复用既有 owner、显式依赖及真实 peer 协议；保活不授予覆写权，当前不自动验证任意覆写，重叠 epoch 首版不支持。
+同 run 的下一写者必须依赖所有真实旧消费者，含其异步读取；跨 peer 复用使用通信协议实际提供的确认。
+没有确认能力时使用独立槽或拒绝复用，不能新增一个本地 ACK 标志假装远端已停止，也不另建生命周期账本。
+独立槽解决覆写冲突，最终释放仍需最后访问证明；依赖登记遗漏属于接入错误，不能以 allocation 尚存活代替检查。
 
 Counter 在一个 live generation 内单调，PyPTO 模型只发布非负 INT32 epoch。
-旧 run epoch、通信窗口 generation、通知 epoch 和 SDMA post id 分别校验；不能相互替代。
-到 INT32/post-id 上限后不得回绕复用，须待全部相关使用静止后建立新 generation。
+run epoch、既有 allocation generation、通知 epoch 和 SDMA post id 语义不同；当前条件表不逐条携带 allocation generation。
+workspace 的 qualification_epoch 只标识本 run 的资格，不是 allocation generation。
+到 INT32/post-id 上限后不得回绕复用，须待全部相关使用静止后按既有 owner/通信协议重建资源身份。
 检查器缓存某条件已经满足，仅在这个单调、不可提前重置的合同下成立。
 
 源数据保留至最后 DMA 读取结束；目标和 signal 保留至最后消费者结束；workspace、完成记录及通信窗口
@@ -309,18 +397,43 @@ Counter 在一个 live generation 内单调，PyPTO 模型只发布非负 INT32 
 
 | 范围 | 必须交付的接线 |
 | ---- | -------------- |
-| Host/callable | 取得可信 c_e、实例/物理执行映射、预分配记录和目录、预算检查、资源使用绑定 |
+| Host/callable | 版本化能力与可信 c_e、物理执行映射、资源绑定/消费计划、完整存储预算与旧 ABI 兼容 |
 | `async_kernel_api.h` / adapter | 有效上下文、非零/零登记、提交前预留、类型与代次校验、失败传播 |
-| `scheduler_memory.h` | 目录/lease 的原子观察，进度交权的实际屏障；CPU/sim 与 AICore 实现分别验证 |
-| `aicore_executor.cpp` | kernel 返回封口、局部执行释放、所有循环路径的安全服务点及忙闲额度 |
-| ordered / GM MIX completion | 每组登记与每 block 释放唯一贡献；异步 task 不走旧直接 TaskDone 分支 |
-| ready / Graph control | 可交接的 FINISH continuation、预算内路由与准确发布责任、body → EXIT 与 drain |
-| 生命周期 / DFX | run/domain 使用持有、错误退出、独立等待 span、业务完成数不含检查次数 |
+| backend | 发起/观察核支持矩阵、实际发布/获取指令、resident scratch、提交背压与最后访问证明 |
+| `scheduler_memory.h` | 一次性目录原语、lease 原子观察和实际屏障；CPU/sim 与 AICore 分别验证 |
+| `aicore_executor.cpp` | 返回封口、统一服务门及完整预算、消费准备与 slot generation、局部执行释放 |
+| ordered / GM MIX completion | 消费准备纳入准入，每组登记与每 block 释放唯一贡献；异步 task 不走旧直接 TaskDone |
+| ready / Graph control | 共享 resolver 步骤语义、可交接 FINISH、准确发布责任、body → EXIT 与 drain |
+| 生命周期 / DFX | 持有与防覆写依赖/peer 确认、错误退出、独立等待 span、业务完成数不含检查次数 |
 
-先实现常驻记录原语和跨核交接模型，再接通知 COUNTER 与单 lane 真 SDMA，随后扩展完整 SPMD/MIX/sync-start/Graph。
-各内部阶段不等于最终支持范围完成。同步路径和原 main 的调度优化应有独立回归。
-容量元数据的具体 ABI、AIC/AIV 发起/观察 SDMA 的实际资格、A5 数据可见性及故障停止证明仍是实施门槛；
-条件不足时报告具体缺口，不改成 legacy、阻塞 fallback 或另一种核代跑以获得通过。
+先确定能力/资源/消费计划 ABI，并验证观察资格、可见性、一次性目录原语与故障停止依据；再建立常驻记录、
+共享 resolver 和统一服务门的基础实现。接通普通任务的 COUNTER 与真实 SDMA 后，扩展完整 SPMD/MIX/sync-start/Graph。
+各内部阶段不代表最终范围完成，同步路径和 main 调度优化须独立回归。未闭合的接口与硬件条件列为实施门槛，
+不改成 legacy、阻塞 fallback 或另一种核代跑来取得通过；类型名和参数布局不因本文出现而成为已确定公共 ABI。
+
+### 可选优化及启用条件
+
+基础实现统一使用先发布目录、再领取 FINISH 的路径；保留常驻记录和无运行中回收。
+下列项目在可运行基线之后分别做 L1 对照，不一次加入全部优化，也不增加用户配置开关。
+
+| 候选 | 启用前必须证明 |
+| ---- | -------------- |
+| 合并发布区布局 | 同一物理执行写入的身份/header/token 可合并对齐；atomic-only 和可移交进度继续隔离，用 sizeof、初始化/H2D 实测证明节省 |
+| 软分片扫描 | shard 只是扫描偏好；CHECK/FINISH 与本地/远端均有有界访问机会，所有核仍可领取，无冷却或永久观察核 |
+| 已结束页剪枝 | 大量总记录、晚期少量活动时确有收益；页的未来发布已排除，上层扫描与新增结束计数成本可接受 |
+| FINISH 直接执行 | 减少发现/目录开销的收益覆盖额外状态与代码成本，所有提前完成和预算耗尽路径均有验证 |
+
+页剪枝候选以 64 个计划 group 为一页：Host 初始化 unsettled=计划数、上层位为一；尚未执行的组仍计入。
+每组只在证明不会再发布后结算一次，零登记和合法 skip 也须结算；最后结算者清上层位，页位不再置回。
+非零组顺序为“组终态/叶清位 → 页结算及必要上层清位 → 归还 pending 贡献”；
+零登记/skip 的页结算也先于相应 block 释放贡献。所有优化元数据的最后写入必须早于可能结束原 task 的贡献。
+上层位只是发现索引，空页不是退休证明，不提前回收内存；未执行页不能剪枝，空间仍按总执行数增长。
+
+FINISH 直接执行候选仅在最后 block 释放使汇合归零、安全服务点且本轮额度未用时，将 DORMANT → OWNED，
+消耗同一 slice 预算并运行共享 resolver。CHECK 触发的 FINISH 仍发布后交给后续 slice，不连续服务第二条记录。
+预算内完成时没有目录位可清；未完成必须保存进度、交权并首次置位，不能把私有 FINISH 带入业务 kernel。
+需要显式 directory_published：直接入口初始为 false；转为可发现路径时，在发布 RUNNABLE/目录前写成 true 并完成屏障，
+目录置位后原发布者不再写进度。终态只清已发布的位，避免接手核先完成而漏清；该入口状态变化必须单独验证。
 
 ### 必测反例
 
@@ -328,20 +441,28 @@ Counter 在一个 live generation 内单调，PyPTO 模型只发布非负 INT32 
 | ---- | ---- |
 | 一条记录反复 PENDING，次数远超记录数 | 无 ticket 消耗、无新分配、空间恒定；同核和其他核均可再次领取 |
 | 多核持旧 lease 竞争、owner 交权、终态清位与别组发布交错 | 至多一个 owner，无重复贡献、无漏活动位；CAS 失败立即返回正常服务 |
+| 一次性目录同字不同位、bit 63、错误重复贡献 | 合法加减不改变邻位；违规终止 run、不补偿；CPU/sim 与 A5 分别核对 |
 | 最后 block 与最后条件任意交错、暂停在终态/归还/激活边界 | 恰好一次 FINISH 激活，无提前 TaskDone 或 run 退休 |
 | FINISH 超长 fanout/fanin、发布 RETRY、预留后暂停 | 工作预算有效，续接不丢失/重复后继；业务与检查服务均能推进 |
 | 单个热点＋大量空闲核，1/64 条条件，持续业务 ready | 分开统计有效观察、CAS 失败、目录探测和完成发现延迟，不以轮询次数当进展 |
+| 大量预分配记录、极少在途、运行尾部仅剩少数等待 | 报告总规模对扫描、发现延迟和初始化的影响，不能只测紧凑活跃集合 |
+| publication 持续 RETRY、admission 反复失败、所有核长 kernel | 服务门可达、每轮最多一 slice、许可后直接进 kernel；明确不可抢占造成的延迟 |
 | 零登记、已满足、多 peer、64/65 编译上界、非法地址/类型/代次 | 保留前端与 runtime 拒绝；零登记不会悬挂或缺有效上下文 |
+| 旧二进制、缺失/错误能力描述、序列化与 cache 混用 | 只接受已定义的兼容资格；容量/类型参与身份，不能将未知产物当成同步执行 |
 | 普通分波、MIX 3/5/6/7、sync-start 容量边界 | block 唯一领取、局部资源释放与逻辑完成分离；不因检查扣住 cohort |
 | Graph 多实例、外部/内部 fanin、多个 sink、普通任务混排 | 事件不串实例，CHILD/EXIT 正确延后，完整 resolve drain |
 | peer 提前写下一 epoch、旧事件/窗口复用 | 无证明的重叠被拒绝或由资源协议阻止；payload 与 signal 的版本同时核对 |
+| 检查/FINISH/消费分处不同核，消费者已缓存旧值、目标含旧 dirty cache | 按核类型验证真实数据可见性；多 fanin/Graph control 不丢消费计划或准备责任 |
+| 连续 SDMA 提交、flag 槽压力、session/workspace 复用 | 单独记录提交侧等待及完成侧重叠，核对实际登记条数、源数据与完成记录寿命 |
 | 提交前/后故障、pending 时 close、owner 故障 | 首错误保持；没有停止证明时不释放 backing，不宣称恢复成功 |
 | 原生单 block predicate 与 DSL waiter 禁止组合 | native skip 不发 DMA；保留 PyPTO predicate/early-resolve/嵌套 SPMD 负例 |
+| 启用页剪枝或 FINISH 直接执行的候选 | 验证零登记/未执行页、最后结算与退休交错、直接完成/让出首次发布；未启用时不算基础资格 |
 
 真实 SDMA 场景为 A 提交搬运、B 依赖 A 消费输出、C 独立：必须观察 A 已返回而真实事件仍 PENDING，
 C 能推进，B 在条件满足前不能执行；同时校验搬运结果和 B 的结果。未观察到这个窗口不算异步重叠通过。
 通知另测真实 remote_store → notify → waiter → consumer，并让等待任务先达到实际 AIV 饱和压力、publisher 后提交。
-保留有界的阻塞负对照；已有 A5 四 waiter 用例不能替代饱和与当前 resident 证据。
+保留有界的阻塞负对照；预期失活应单独报告，不能把超时当正常延迟样本或修改依赖来制造可比负载。
+已有 A5 四 waiter 用例不能替代饱和与当前 resident 证据。
 至少一项有效负对照需使提前完成或跳过条件的生产 helper 变体失败；不能只测试与实现同构的计数加减。
 
 每次调用核对新鲜 mode publication、resident producer、实际 kernel/数据身份；sim 和 A5 onboard 分别报告。
@@ -352,23 +473,41 @@ meta waiter 不依赖本地 publish，而 finalize 依赖二者；保留这个 D
 
 ### 性能、协议与交付资格
 
-正式性能只用 **L1**：同机同卡、同输入和计算核，比较 main 与候选的同步 CSA/SWA/Qwen，以及等工作量的
-kernel 内等待与 deferred。建议 5 次预热、100 次正式调用、B/A/A/B，保留全部样本和异常，不挑最优结果。
+本批验收不设性能门槛；以下为后续性能测量约定。
+正式性能只用 **L1**：同机同卡、同输入和等量计算，主对照为同一 resident 运行时的 kernel 内等待与 deferred，
+另比较 main 与候选的同步 CSA/SWA/Qwen 回归。旧 AICPU 路径仅作辅助背景，其总耗时差不能全部归因于条件检查者。
+建议 5 次预热、100 次正式调用、B/A/A/B，保留全部样本和异常，不挑最优结果。
 L3/L4 用于因果诊断，不能混入 L1。报告完整 Device、kernel window、Host 端到端、P95 和资源成本。
-忙闲额度/预算可在固定算法下比较；记录每次调度新增成本、目录扫描和满足到发现延迟，再决定内部常量。
+忙闲额度/预算与各优化单独比较；记录提交等待、有效观察/碰撞、目录扫描、交权/路由、
+事件满足到发现及到消费者执行的延迟，另报总内存、初始化/H2D 和消费者获取成本，再决定内部常量。
 尚未约定可接受退化阈值，所有稳定退化需披露，不预先承诺固定加速比。
 
 协议区分 registration_sealed、execution_released、condition pending/ready/failed、logical_done、resolve_drained。
-保存 task/Graph/block/subtask、run 与资源 generation、lease、观察核和条件类型；PENDING 合并为 span/次数。
-跨核因果以发布/领取关系核对，不能仅靠不可比较时钟；旧 schema 保留读取，异步另分配新版本。
+保存 task/Graph/block/subtask、run、lease/dispatch generation、观察核及条件类型；真实资源 generation 缺失时明确记为缺失。
+PENDING 汇总服务片段次数与片段内活跃周期，不以跨核 seal→terminal 时间伪造连续忙等 span。
+跨核因果以发布/领取关系核对，不能仅靠不可比较时钟；旧 schema 保留读取，异步使用独立版本。
 ArgsDump AFTER 若接入须位于实际数据完成之后；未验收的组合明确拒绝。诊断截断不能补造缺失证据。
 
 硬件工作按仓库要求做架构检查、通过 task-submit 独占设备并隔离日志；复用构建缓存，先做相关检查。
 交付保存精确源码/库/依赖身份、构建和测试命令、原始 L1 与诊断证据；相关、全量、sim、硬件、故障结果分别报告。
 
-当前仅完成文档和源码核对。两组“登记、发布、终态、归还贡献、计算释放”的顺序一致抽象模型，
-枚举 2,268 种合法交错未出现提前汇合或重复激活；这不证明 A5 内存序、后继发布协议或实际 runtime 正确。
-新增功能的编译、单元/仿真、上板、故障与性能资格均尚未获得。
+**本批验收：2026-11-06；native 构建为 `2172f462`，后续测试与文档提交复用同一套已核对的 native 输入和库。**
+
+AsyncGroup/CHECK/FINISH、版本化能力、固定 run 资源绑定/消费计划，以及 native DFX producer/export、
+schema10/11 reader 和真实事件时间线已接通。相关 CPU 18 targets / 2,247 项通过，
+另有两项 SDMA 提交前后故障到真实 Host 保留门的 CPU 集成用例通过；这些不是全仓测试结果。
+
+- a5sim：原 36 项与跨 peer COUNTER 两项合计 38 项通过；漏登记负对照及原 NEVER 错误合同定点两项通过，满容量异步 sync-start 一项通过。
+- A5：主回归 42 项、满容量异步 sync-start 一项、连续 SDMA/复用一项均通过。满容量用例实际覆盖 32 blocks、96 个物理执行与成员。
+- 独立同步回归：a5sim 与 A5 均为 7 个 pytest items、27 个 workloads 通过。
+- 真实 SDMA 验证保留原 empty/minimum/4 MiB 数据、guard 和返回后 PENDING 断言；复用专项的两个 rank 均为 post-id 1–66 后续接 67–68，跨过 64 槽复用边界并观察到不同 AIV 提交者。
+- 同次 native 捕获完成 schema、序列、身份与因果审计；预期错误保留为失败诊断，漏登记负对照由原业务 oracle 拒绝提前进入。
+
+资格限制保持明确：复用专项未观察到 pending 期间的提交权交接，未证明超过 64 个请求同时在途或实际 SDK backpressure；
+真实 A5 独立引擎故障未注入，CPU 受控 I/O 故障用例不替代这一资格。同步回归退出时的 nanobind 诊断保留，
+不据此宣称所有 Python 对象清理均已验证。L1 性能未测，不作为本批门槛；不支持的并发覆写、后端或旧生成物组合仍按本文合同拒绝或排除。
+PyPTO 自动能力/静态上界导出及三处 MoE waiter 已有 IR 和生成物编译验证；其独立 runtime 子模块未在本轮迁移，
+不宣称 PyPTO 模型端到端执行已通过。
 
 ### 来源与接口同步
 
@@ -376,6 +515,8 @@ ArgsDump AFTER 若接入须位于实际数据完成之后；未验收的组合�
   [完成路径](../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h)、
   [Graph control 服务](../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h)、
   [公开异步 API](../../src/a5/runtime/host_build_graph/runtime/async_kernel_api.h)。
+- PTO-ISA `f83d4b7e`：[post-done 观察与 flag 槽背压](https://github.com/hw-native-sys/pto-isa/blob/f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7/include/pto/comm/async/sdma/sdma_async_detail_post.hpp)、
+  [GM→UB 观察实现](https://github.com/hw-native-sys/pto-isa/blob/f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7/include/pto/comm/async/sdma/sdma_async_detail_basic.hpp)。
 - PyPTO `be23606f`：[waiter 合同与 64 上界](https://github.com/hw-native-sys/pypto/blob/be23606f791fa2251d7fccabdb91c75582268fad/include/pypto/ir/transforms/utils/deferred_wait_contract.h)、
   [生成 adapter](https://github.com/hw-native-sys/pypto/blob/be23606f791fa2251d7fccabdb91c75582268fad/python/pypto/backend/pto_backend.py)、
   [既有分布式测试](https://github.com/hw-native-sys/pypto/blob/be23606f791fa2251d7fccabdb91c75582268fad/tests/st/distributed/test_l3_deferred_completion.py)。
