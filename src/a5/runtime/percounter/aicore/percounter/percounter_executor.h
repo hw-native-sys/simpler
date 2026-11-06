@@ -37,7 +37,7 @@
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_watchdog.h"
 
-namespace simpler::hbg::percounter {
+namespace simpler::percounter {
 
 typedef void (*PercounterKernelFunc)(__gm__ int64_t *);
 
@@ -178,7 +178,7 @@ struct PercounterMixClaim {
 
 /** What a lane carries between its loop and the waits it makes from it. */
 struct PercounterLaneState {
-    // Finished blocks not yet folded into `resolved_task_count`.
+    // Finished blocks not yet folded into `completed_block_count`.
     uint64_t local_done;
     // The last MIX generation this lane has looked at, served or not.
     uint32_t last_served;
@@ -980,7 +980,7 @@ percounter_checkpoint_serve(const LaneConfig &cfg, PercounterLaneState *state, u
 /** Fold this lane's finished blocks into the shared progress count. */
 inline __aicore__ void percounter_flush_done(const LaneConfig &cfg, PercounterLaneState *state) {
     if (state->local_done == 0) return;
-    scheduler_gm_fetch_add(cfg.control->resolved_task_count, state->local_done);
+    scheduler_gm_fetch_add(cfg.control->completed_block_count, state->local_done);
     state->local_done = 0;
 }
 
@@ -1466,4 +1466,4 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
     acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
 }
 
-}  // namespace simpler::hbg::percounter
+}  // namespace simpler::percounter

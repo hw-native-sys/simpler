@@ -117,9 +117,11 @@ struct AicpuExecutor {
     SIMPLER_SCHEDULER_STEP int32_t post_handshake_init(Runtime *runtime);
     // Hand this thread's slice of the worker contexts to the cores.
     SIMPLER_SCHEDULER_STEP void publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
-    // Whether this executor drives the cores at all. False sends the run down
-    // the legacy AICPU dispatch path instead, which owns its own teardown.
-    SIMPLER_SCHEDULER_STEP bool drives_cores(const Runtime *runtime) const;
+    // Whether the cores take their own work for this run. False sends it down
+    // the legacy path instead, where the AICPU dispatches each task and which
+    // owns its own teardown. Both paths drive the cores; what differs is which
+    // side decides what runs next.
+    SIMPLER_SCHEDULER_STEP bool schedules_on_aicore(const Runtime *runtime) const;
     // Whether the leader waits for the cores to acknowledge the bootstrap.
     SIMPLER_SCHEDULER_STEP bool awaits_bootstrap() const;
     // Watch the run to completion. Runs on the last thread, and its return

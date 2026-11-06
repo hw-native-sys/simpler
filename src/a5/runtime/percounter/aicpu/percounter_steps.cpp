@@ -48,18 +48,18 @@ uint64_t scheduler_timeout_cycles() {
 
 // A percounter graph is the only thing this runtime is built to run, so the
 // legacy dispatch path behind a false here is never the right answer.
-bool AicpuExecutor::drives_cores(const Runtime *runtime) const {
-    return simpler::hbg::percounter::percounter_mode_enabled(runtime);
+bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
+    return simpler::percounter::percounter_mode_enabled(runtime);
 }
 
 int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
-    return simpler::hbg::percounter::percounter_post_handshake_init(
+    return simpler::percounter::percounter_post_handshake_init(
         runtime, aicore_lifecycle_, scheduler_timeout_cycles()
     );
 }
 
 void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    simpler::hbg::percounter::percounter_publish_partition(runtime, aicore_lifecycle_, tidx, nthreads);
+    simpler::percounter::percounter_publish_partition(runtime, aicore_lifecycle_, tidx, nthreads);
 }
 
 // The lanes take their start from the control block the host published before
@@ -67,14 +67,14 @@ void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nt
 bool AicpuExecutor::awaits_bootstrap() const { return false; }
 
 int32_t AicpuExecutor::supervise(Runtime *runtime) {
-    return simpler::hbg::percounter::percounter_supervise(runtime, scheduler_timeout_cycles(), aicpu_thread_num_);
+    return simpler::percounter::percounter_supervise(runtime, scheduler_timeout_cycles(), aicpu_thread_num_);
 }
 
 // This thread first materializes any graph bodies the lanes will run, then
 // waits. The percounter supervisor's own progress watchdog bounds the wait;
 // the ready watchdog's stamp is never advanced in this runtime.
 bool AicpuExecutor::await_shutdown(Runtime *runtime) {
-    simpler::hbg::percounter::percounter_assist(runtime);
+    simpler::percounter::percounter_assist(runtime);
     while (!shutdown_ready_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
     }
@@ -84,5 +84,5 @@ bool AicpuExecutor::await_shutdown(Runtime *runtime) {
 // The default settles the resident scheduler's run control, which this runtime
 // does not have: its lanes report into the percounter control block instead.
 int32_t AicpuExecutor::settle_run_error(Runtime *runtime) {
-    return simpler::hbg::percounter::percounter_settle_run_error(runtime);
+    return simpler::percounter::percounter_settle_run_error(runtime);
 }

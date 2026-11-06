@@ -41,7 +41,7 @@
 // though the host_build_graph runtime never produces it.
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5;
 
-namespace simpler::hbg::percounter {
+namespace simpler::percounter {
 
 inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
 
@@ -517,7 +517,7 @@ struct alignas(128) PercounterControl {
     // Blocks a lane will actually run and fold into its progress. Under SPMD this
     // exceeds the task count, since a task with `block_num == N` runs N blocks;
     // inline-completed and off-lane tasks contribute none.
-    uint64_t executable_task_count;
+    uint64_t executable_block_count;
     uint64_t edge_count;
     uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT];
     uint64_t orders_offset[PERCOUNTER_CORE_TYPE_COUNT];
@@ -586,7 +586,7 @@ struct alignas(128) PercounterControl {
     uint8_t reserved[320 - 34 * sizeof(uint64_t)];
 
     // **Alone on the last line.** Lanes batch their completions into this, and
-    // the AICPU supervisor polls it against `executable_task_count`. It is the
+    // the AICPU supervisor polls it against `executable_block_count`. It is the
     // block's only writer during a run, so any field sharing its line would make
     // every reader of that field queue behind its atomics: `lane_error` read
     // beside it cost 919 cycles a task on paged_attention Case1, against 94
@@ -595,16 +595,16 @@ struct alignas(128) PercounterControl {
     // Not volatile, and nothing in this struct is: a wire struct has to stay
     // trivially copyable. Cross-core visibility uses the runtime's explicit
     // discipline -- an atomic add to write, ld_dev or an invalidate to read.
-    alignas(64) uint64_t resolved_task_count;
+    alignas(64) uint64_t completed_block_count;
     uint8_t resolved_reserved[56];
 };
 static_assert(sizeof(PercounterControl) == 384, "percounter control is three 128 B lines");
 static_assert(
-    offsetof(PercounterControl, resolved_task_count) % 64 == 0,
+    offsetof(PercounterControl, completed_block_count) % 64 == 0,
     "the one field lanes write must start a cache line, or every reader of its neighbours pays for it"
 );
 static_assert(
-    offsetof(PercounterControl, lane_error) / 64 != offsetof(PercounterControl, resolved_task_count) / 64,
+    offsetof(PercounterControl, lane_error) / 64 != offsetof(PercounterControl, completed_block_count) / 64,
     "lane_error is read every task; it must not share a line with the counter lanes increment"
 );
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
@@ -698,4 +698,4 @@ percounter_claim_range(uint64_t base, uint64_t batch, uint64_t group_size, uint6
     return true;
 }
 
-}  // namespace simpler::hbg::percounter
+}  // namespace simpler::percounter

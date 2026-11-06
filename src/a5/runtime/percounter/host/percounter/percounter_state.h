@@ -46,11 +46,11 @@
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 
-namespace simpler::hbg::percounter {
+namespace simpler::percounter {
 
 inline void log_unsupported(int32_t total_tasks, const char *reason, int64_t task_id) {
     LOG_ERROR(
-        "A5 HBG percounter: graph of %d tasks: task id=%" PRId64 " is %s, which percounter does not run", total_tasks,
+        "A5 percounter: graph of %d tasks: task id=%" PRId64 " is %s, which percounter does not run", total_tasks,
         task_id, reason
     );
 }
@@ -147,7 +147,7 @@ inline StateSelection select_percounter_state(
         gather_graph_inputs(api, host_sm_handle, total_tasks, &inputs, &graph, &graph_failed_task);
     if (graph_status.status == TemplateStatus::MALFORMED) {
         LOG_ERROR(
-            "A5 HBG percounter: Graph task id=%" PRId64 ": %s (body task %d)", graph_failed_task, graph_status.reason,
+            "A5 percounter: Graph task id=%" PRId64 ": %s (body task %d)", graph_failed_task, graph_status.reason,
             graph_status.body_index
         );
         return StateSelection::FAILED;
@@ -215,7 +215,7 @@ inline StateSelection select_percounter_state(
             task_count, block_total, edges.size(), order_count, &layout, mix_order_count, sync_cohort_count,
             graph.layout
         )) {
-        LOG_ERROR("A5 HBG percounter: state layout overflow");
+        LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;
     }
     void *device_state = nullptr;
@@ -225,7 +225,7 @@ inline StateSelection select_percounter_state(
             &host_base
         ) != 0 ||
         device_state == nullptr || host_base == nullptr) {
-        LOG_ERROR("A5 HBG percounter: failed to obtain %" PRIu64 " scheduler state bytes", layout.total_size);
+        LOG_ERROR("A5 percounter: failed to obtain %" PRIu64 " scheduler state bytes", layout.total_size);
         return StateSelection::FAILED;
     }
     const uint64_t device_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
@@ -241,7 +241,7 @@ inline StateSelection select_percounter_state(
     };
     if (!build_tables(inputs.data(), task_count, layout, host_base, device_base, external, &build, graph_plan)) {
         LOG_ERROR(
-            "A5 HBG percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status),
+            "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status),
             build.task_id, build.fanin_index
         );
         return StateSelection::FAILED;
@@ -267,7 +267,7 @@ inline StateSelection select_percounter_state(
         device_state, host_base, static_cast<size_t>(layout.upload_size), HostPhaseKind::Count, {}
     );
     LOG_INFO(
-        "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
+        "A5 percounter: selected for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
         " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
         " body tasks; %" PRIu64 " of %" PRIu64 " region bytes uploaded)",
         total_tasks, order_count[0], order_count[1], mix_order_count, sync_cohort_count, edges.size(),
@@ -277,4 +277,4 @@ inline StateSelection select_percounter_state(
     return StateSelection::PERCOUNTER;
 }
 
-}  // namespace simpler::hbg::percounter
+}  // namespace simpler::percounter

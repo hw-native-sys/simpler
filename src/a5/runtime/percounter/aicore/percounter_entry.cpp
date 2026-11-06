@@ -36,5 +36,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     scheduler_observe_cache_line(bootstrap);
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
     scheduler_observe_cache_line(handshake);
-    simpler::hbg::percounter::percounter_aicore_execute(runtime, block_idx, core_type);
+    simpler::percounter::percounter_aicore_execute(runtime, block_idx, core_type);
 }

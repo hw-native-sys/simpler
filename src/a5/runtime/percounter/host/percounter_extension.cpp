@@ -31,9 +31,9 @@ SchedulerExtensionResult scheduler_extension_select(
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
     const sm_layout::SegmentOffsets &device_segments
 ) {
-    const auto selection = simpler::hbg::percounter::select_percounter_state(
+    const auto selection = simpler::percounter::select_percounter_state(
         runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
     );
-    return selection == simpler::hbg::percounter::StateSelection::PERCOUNTER ? SchedulerExtensionResult::TAKEN :
+    return selection == simpler::percounter::StateSelection::PERCOUNTER ? SchedulerExtensionResult::TAKEN :
                                                                                SchedulerExtensionResult::FAILED;
 }

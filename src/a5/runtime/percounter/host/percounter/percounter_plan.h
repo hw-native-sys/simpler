@@ -28,7 +28,7 @@
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 
-namespace simpler::hbg::percounter {
+namespace simpler::percounter {
 
 /** Host-side plan of the percounter region. */
 struct PercounterLayout {
@@ -642,7 +642,7 @@ inline bool build_tables(
 
     control->task_count = layout.task_count;
     control->table_task_count = task_count;
-    control->executable_task_count = executable_blocks;
+    control->executable_block_count = executable_blocks;
     control->edge_count = layout.edge_count;
     control->tickets_offset = layout.tickets_offset;
     control->mix_order_count = layout.mix_order_count;
@@ -683,4 +683,4 @@ inline bool build_tables(
     return true;
 }
 
-}  // namespace simpler::hbg::percounter
+}  // namespace simpler::percounter

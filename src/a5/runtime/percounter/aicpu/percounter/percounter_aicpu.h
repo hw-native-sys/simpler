@@ -43,7 +43,7 @@
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
 
-namespace simpler::hbg::percounter {
+namespace simpler::percounter {
 
 inline bool percounter_mode_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
@@ -77,13 +77,13 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
         } else if (lifecycle.core_type(i) == CoreType::AIV) {
             ++aiv_count;
         } else {
-            LOG_ERROR("A5 HBG percounter: core %d reported invalid core type", i);
+            LOG_ERROR("A5 percounter: core %d reported invalid core type", i);
             return -1;
         }
     }
     if (aic_count <= 0 || aic_count > static_cast<int32_t>(SCHEDULER_CLUSTER_CAPACITY) ||
         aiv_count != aic_count * PLATFORM_AIV_CORES_PER_BLOCKDIM) {
-        LOG_ERROR("A5 HBG percounter: incomplete cluster topology AIC=%d AIV=%d", aic_count, aiv_count);
+        LOG_ERROR("A5 percounter: incomplete cluster topology AIC=%d AIV=%d", aic_count, aiv_count);
         return -1;
     }
 
@@ -96,7 +96,7 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     cache_flush_range(control, sizeof(*control));
     percounter_graph_prepare_init(control);
     wmb();
-    LOG_INFO("A5 HBG percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
+    LOG_INFO("A5 percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
     return 0;
 }
 
@@ -132,7 +132,7 @@ inline void percounter_assist(Runtime *runtime) { percounter_prepare_graphs(runt
  * error, or progress stops for the scheduler timeout. Returns the run status
  * to publish: 0, or the code latched into the shared header.
  *
- * The target is `executable_task_count`, not the task count: inline-completed
+ * The target is `executable_block_count`, not the task count: inline-completed
  * tasks are in no list, so no lane ever counts them.
  *
  * With no other AICPU thread to assist, the supervisor materializes the Graph
@@ -161,7 +161,7 @@ inline int32_t percounter_settle_run_error(Runtime *runtime) {
         uint64_t error = control->lane_error;
         if (error == 0) error = percounter_graph_prepare_error(control, false);
         if (error != 0) {
-            LOG_ERROR("A5 HBG percounter: run error %" PRIu64 " settled at the terminal", error);
+            LOG_ERROR("A5 percounter: run error %" PRIu64 " settled at the terminal", error);
             (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, error);
         }
     }
@@ -171,7 +171,7 @@ inline int32_t percounter_settle_run_error(Runtime *runtime) {
 inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_thread_count) {
     PercounterControl *control = percounter_control(runtime);
     if (control == nullptr || runtime->dev.host_total_tasks < 0 || runtime->get_gm_sm_ptr() == nullptr) {
-        LOG_ERROR("A5 HBG percounter: supervisor requires an initialized graph");
+        LOG_ERROR("A5 percounter: supervisor requires an initialized graph");
         return -1;
     }
     auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
@@ -179,14 +179,14 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
 
     cache_invalidate_range(control, sizeof(*control));
     if (aicpu_thread_count <= 1) percounter_prepare_graphs(runtime, control);
-    const uint64_t expected = control->executable_task_count;
+    const uint64_t expected = control->executable_block_count;
     uint64_t last_resolved = ~uint64_t{0};
     uint64_t last_progress_cycles = get_sys_cnt_aicpu();
     uint32_t error_poll_count = 0;
     uint64_t error = 0;
     while (true) {
-        cache_invalidate_range(&control->resolved_task_count, sizeof(control->resolved_task_count));
-        const uint64_t resolved = control->resolved_task_count;
+        cache_invalidate_range(&control->completed_block_count, sizeof(control->completed_block_count));
+        const uint64_t resolved = control->completed_block_count;
         const uint64_t now = get_sys_cnt_aicpu();
         if (resolved != last_resolved) {
             last_resolved = resolved;
@@ -199,7 +199,7 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
             if (control->lane_error != 0) {
                 error = control->lane_error;
                 LOG_ERROR(
-                    "A5 HBG percounter: lane reported error %" PRIu64 "; %" PRIu64 " of %" PRIu64 " blocks resolved",
+                    "A5 percounter: lane reported error %" PRIu64 "; %" PRIu64 " of %" PRIu64 " blocks resolved",
                     error, resolved, expected
                 );
                 break;
@@ -209,7 +209,7 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
         }
         if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
             error = static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
-            LOG_ERROR("A5 HBG percounter: no progress; %" PRIu64 " of %" PRIu64 " blocks resolved", resolved, expected);
+            LOG_ERROR("A5 percounter: no progress; %" PRIu64 " of %" PRIu64 " blocks resolved", resolved, expected);
             break;
         }
         SPIN_WAIT_HINT();
@@ -225,7 +225,7 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
         error = control->lane_error;
         if (error != 0) {
             LOG_ERROR(
-                "A5 HBG percounter: lane reported error %" PRIu64 " with all %" PRIu64 " blocks resolved", error,
+                "A5 percounter: lane reported error %" PRIu64 " with all %" PRIu64 " blocks resolved", error,
                 expected
             );
         } else {
@@ -243,4 +243,4 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
     return rc != 0 ? rc : -1;
 }
 
-}  // namespace simpler::hbg::percounter
+}  // namespace simpler::percounter

@@ -43,7 +43,7 @@
 #include "scheduler/percounter/percounter_types.h"
 #include "scheduler/scheduler_graph.h"
 
-namespace simpler::hbg::percounter {
+namespace simpler::percounter {
 
 template <typename T>
 inline T *percounter_region(PercounterControl *control, uint64_t offset) {
@@ -283,7 +283,7 @@ inline uint64_t percounter_graph_prepare_error(PercounterControl *control, bool 
     const uint64_t error = __atomic_load_n(&prepare->error, __ATOMIC_ACQUIRE);
     if (error != 0 && report) {
         LOG_ERROR(
-            "A5 HBG percounter: Graph invocation %" PRIu64 " (of %" PRIu64 ") failed to materialize: %" PRIu64,
+            "A5 percounter: Graph invocation %" PRIu64 " (of %" PRIu64 ") failed to materialize: %" PRIu64,
             __atomic_load_n(&prepare->error_invocation, __ATOMIC_ACQUIRE), control->graph_invocation_count, error
         );
     }
@@ -301,11 +301,11 @@ inline void percounter_graph_prepare_report(PercounterControl *control, uint64_t
         return static_cast<double>(cycles - start_cycles) * 1e6 / static_cast<double>(PLATFORM_PROF_SYS_CNT_FREQ);
     };
     LOG_INFO(
-        "A5 HBG percounter: %" PRIu64 " Graph invocations prepared %" PRIu64 "; first body published at +%.1f us, "
+        "A5 percounter: %" PRIu64 " Graph invocations prepared %" PRIu64 "; first body published at +%.1f us, "
         "last at +%.1f us",
         control->graph_invocation_count, __atomic_load_n(&prepare->prepared, __ATOMIC_ACQUIRE),
         first != 0 ? us(first) : -1.0, done != 0 ? us(done) : -1.0
     );
 }
 
-}  // namespace simpler::hbg::percounter
+}  // namespace simpler::percounter

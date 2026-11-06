@@ -32,7 +32,7 @@
 #include "percounter_plan.h"
 #include "scheduler/percounter/percounter_types.h"
 
-namespace simpler::hbg::percounter {
+namespace simpler::percounter {
 
 /** One body task, as read from its SubTaskDefinition. */
 struct BodyTaskShape {
@@ -227,4 +227,4 @@ inline TemplateResult read_graph_template(const GraphImageView &view, uint32_t i
     );
 }
 
-}  // namespace simpler::hbg::percounter
+}  // namespace simpler::percounter
