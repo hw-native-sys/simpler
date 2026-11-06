@@ -17,7 +17,14 @@ the repeated row index into separate destinations. A dependent consumer checks
 all eight URMA results, so early task completion or missing block output fails
 verification. This uses the stable resident URMA sender binding from #2886.
 
-Use an initialized project-local environment on an A5 machine and reserve two
+The four hardware cases pass on Ascend950DT_9581. On the A5 PR CI machine,
+Host-source URMA reports an ACK timeout despite successful Host mapping and
+segment registration. PCIe Host-memory reachability remains under investigation
+in [#2922](https://github.com/hw-native-sys/simpler/issues/2922#issuecomment-6681771862).
+These cases are manual and skipped in GitHub Actions, including runs that select
+manual tests. They remain available for explicit local DT validation.
+
+Use an initialized project-local environment on a validated A5 DT machine and reserve two
 devices through the device queue:
 
 ```bash
@@ -33,7 +40,7 @@ execution and one/four AIV blocks:
 ```bash
 .claude/skills/onboard-arch-precheck/check.sh a5
 task-submit --device auto --device-num 2 --run \
-  '.venv/bin/python -m pytest examples/a5/tensormap_and_ringbuffer/host_comm_domain --platform a5 --device "$TASK_DEVICE" -v'
+  '.venv/bin/python -m pytest examples/a5/tensormap_and_ringbuffer/host_comm_domain --platform a5 --manual include --device "$TASK_DEVICE" -v'
 ```
 
 `run.py --prepare` compiles the kernels without initializing devices. The source

@@ -10,6 +10,7 @@
 """Hardware coverage of retained Host-source A5 domains and Device-domain coexistence."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,11 @@ def _driver():
 
 
 @pytest.mark.platforms(["a5"])
+@pytest.mark.manual(["a5"])
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="A5 PCIe CI Host-source URMA ACK timeout; DT validation passes (issue #2922)",
+)
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 @pytest.mark.parametrize("staged", [False, True], ids=["serial", "staged"])
