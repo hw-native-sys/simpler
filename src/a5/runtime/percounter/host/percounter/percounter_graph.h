@@ -46,7 +46,7 @@ struct BodyTaskShape {
 enum class TemplateStatus : uint8_t {
     OK,
     MALFORMED,    // the Definition contradicts itself; fails the bind
-    UNSUPPORTED,  // a body task percounter does not run; the graph falls back
+    UNSUPPORTED,  // a body task percounter does not run; the bind fails
 };
 
 /** Why a template was not built, and on which body task (-1 when on none). */

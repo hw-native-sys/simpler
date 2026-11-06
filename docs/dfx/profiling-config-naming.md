@@ -131,7 +131,6 @@ simulator platforms.
 | --- | ----- | ----- | ----- |
 | `SIMPLER_DEVICE_STRACE_ENABLE` | host general | bool | device-domain `[STRACE]` capture/emission onboard; emission in sim |
 | `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE` | host runtime | bool | serial orch→scheduler transition (TMR subsystem) |
-| `SIMPLER_HBG_SCHEDULER_TYPE` | host runtime | enum | a5 host_build_graph scheduler: unset = default selection, `percounter` = the percounter scheduler where it accepts the graph |
 | `SIMPLER_PMU_EVENT_TYPE` | host platform | enum | which PMU event the PMU collector samples |
 | `SIMPLER_OP_EXECUTE_TIMEOUT_US` | host platform | µs | op-execute timeout (overrides the `platform_config.h` compile default) |
 | `SIMPLER_STREAM_SYNC_TIMEOUT_MS` | host platform | ms | stream-sync timeout |
