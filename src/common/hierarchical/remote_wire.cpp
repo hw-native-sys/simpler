@@ -373,6 +373,7 @@ std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
         put_u32(out, tensor.shapes[i]);
     for (uint32_t i = 0; i < tensor.ndims; ++i)
         put_u32(out, tensor.strides[i]);
+    ensure(!tensor.mapping_ref, "remote_wire: endpoint-mapped Tensor cannot be forwarded remotely");
     put_u32(out, static_cast<uint32_t>(tensor.dtype));
     return out;
 }

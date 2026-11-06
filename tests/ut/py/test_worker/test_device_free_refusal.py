@@ -18,7 +18,7 @@ So the scan runs without re-acquiring when this thread is inside one of this Wor
 callbacks, where the serialization the lock provides already holds — no other callback can be
 running to observe a partial set. From any other thread it is taken as before.
 
-``_refuse_free_while_in_flight`` reads only the run sets, the two locks and the L2 touched map, so
+``_refuse_free_while_in_flight`` reads only run sets, locks and source-context state, so
 these run against a Worker built with ``__new__`` — no fork, no device, no ``init()``. A watchdog
 thread bounds every call, because the defect being guarded is a hang rather than a wrong answer.
 """
@@ -46,6 +46,7 @@ def _bare_worker() -> Worker:
     w._accepted_run_handles = set()
     w._abandoned_run_handles = []
     w._chip_run_touched_identities = {}
+    w._source_context_failed = False
     w._owner_instance_id = mint_owner_instance_id()
     return w
 

@@ -11,7 +11,7 @@
 /**
  * HCCL backend for the comm_* distributed communication API.
  *
- * Implements the five functions declared in host/comm.h using Ascend
+ * Implements the comm_* and private Host backing APIs using Ascend
  * HCCL (bundled with CANN) for the bootstrap / barrier / teardown plane
  * and ACL VMM for the per-rank symmetric window pool. A3 uses Fabric V2
  * handles; platforms without Fabric support
@@ -26,7 +26,11 @@
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
+#include "host/host_backing.h"
 
+#include <algorithm>
+#include <array>
+#include <dlfcn.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +40,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -56,6 +61,106 @@ static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo
 }
 static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s) { return HcclBarrier(c, s); }
 static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(c); }
+
+// ============================================================================
+// Host backing ownership
+// ============================================================================
+
+namespace simpler::a3 {
+
+// Explicitly released after every imported view is acknowledged gone.
+// Destruction cannot prove that acknowledgement and does not free the backing.
+namespace {
+void check(int rc, const char *op) {
+    if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
+}
+
+class HostDeviceScope {
+public:
+    explicit HostDeviceScope(int device) {
+        if (device < 0) return;
+        if (aclrtGetCurrentContext(&previous_) != ACL_SUCCESS) previous_ = nullptr;
+        int32_t selected = -1;
+        changed_ = aclrtGetDevice(&selected) != ACL_SUCCESS || selected != device;
+        if (changed_) check(aclrtSetDevice(device), "aclrtSetDevice");
+    }
+    ~HostDeviceScope() {
+        if (changed_ && previous_ && aclrtSetCurrentContext(previous_) != ACL_SUCCESS)
+            LOG_ERROR("Host backing operation failed to restore the previous ACL context");
+    }
+    void restore() {
+        if (changed_ && previous_) check(aclrtSetCurrentContext(previous_), "restore Host backing ACL context");
+        changed_ = false;
+    }
+
+private:
+    aclrtContext previous_ = nullptr;
+    bool changed_ = false;
+};
+
+}  // namespace
+
+class HostRegistration {
+public:
+    void register_memory(int device, uint64_t base, uint64_t bytes) {
+        if (closing_ || host_ || !base || !bytes || base % 4096 || bytes > UINT64_MAX - base)
+            throw std::invalid_argument("Host registration requires an empty owner and page-aligned covered memory");
+        HostDeviceScope scope(device);
+        device_ = device;
+        host_ = reinterpret_cast<void *>(base);
+        check(aclrtHostRegister(host_, bytes, ACL_HOST_REGISTER_MAPPED, &mapped_), "aclrtHostRegister");
+        registered_ = true;
+        if (!mapped_) throw std::runtime_error("aclrtHostRegister returned no device address");
+        scope.restore();
+    }
+    uint64_t base() const {
+        if (closing_ || !registered_ || !mapped_) throw std::runtime_error("Host registration is not live");
+        return reinterpret_cast<uint64_t>(mapped_);
+    }
+    void release() {
+        closing_ = true;
+        HostDeviceScope scope(device_);
+        if (registered_) {
+            check(aclrtHostUnregister(host_), "aclrtHostUnregister");
+            registered_ = false;
+        }
+        host_ = mapped_ = nullptr;
+        scope.restore();
+    }
+
+private:
+    int device_ = -1;
+    void *host_ = nullptr;
+    void *mapped_ = nullptr;
+    bool registered_ = false;
+    bool closing_ = false;
+};
+}  // namespace simpler::a3
+
+extern "C" int
+host_register_memory(void **owner, int device, uint64_t host_base, uint64_t bytes, char *error, size_t capacity) {
+    return simpler::host::call_host_backing(error, capacity, [&] {
+        if (!owner) throw std::invalid_argument("Invalid Host registration owner");
+        if (!*owner) *owner = new simpler::a3::HostRegistration();
+        static_cast<simpler::a3::HostRegistration *>(*owner)->register_memory(device, host_base, bytes);
+    });
+}
+extern "C" int host_registration_base(void *owner, uint64_t *base, char *error, size_t capacity) {
+    return simpler::host::call_host_backing(error, capacity, [&] {
+        if (!owner || !base) throw std::invalid_argument("Invalid Host registration base output");
+        *base = static_cast<simpler::a3::HostRegistration *>(owner)->base();
+    });
+}
+extern "C" int host_registration_release(void **owner, char *error, size_t capacity) {
+    return simpler::host::call_host_backing(error, capacity, [&] {
+        if (!owner) throw std::invalid_argument("Invalid Host registration owner");
+        if (!*owner) return;
+        auto *registration = static_cast<simpler::a3::HostRegistration *>(*owner);
+        registration->release();
+        delete registration;
+        *owner = nullptr;
+    });
+}
 
 // ============================================================================
 // Internal state

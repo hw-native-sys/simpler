@@ -1049,6 +1049,7 @@ def _bare_l3_worker():
     w._owner_instance_id = mint_owner_instance_id()
     w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
     w._buffers = {}
+    w._host_buffers = {}
     w._hierarchical_start_mu = threading.Lock()
     w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)
     w._accepted_run_handles = set()
