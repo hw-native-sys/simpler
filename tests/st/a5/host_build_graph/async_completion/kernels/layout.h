@@ -24,7 +24,7 @@ constexpr int64_t kControlStride = 16;
 constexpr int64_t kControlCells = 16;
 constexpr int32_t kPoison = -1000000007;
 
-enum class Scenario : int64_t { BASIC, TWO_CONDITIONS, FANIN, PROGRESS, VISIBILITY, GRAPH, NEVER };
+enum class Scenario : int64_t { BASIC, TWO_CONDITIONS, FANIN, PROGRESS, VISIBILITY, GRAPH, NEVER, FULL_SYNC_START };
 enum class Action : int64_t { PUBLISH, CONSUME, PREREQUISITE, WARM, RESCUE };
 enum class Control : int64_t { ARRIVED, PUBLISHED, PREREQUISITE, WARMED, RESCUED, CAPACITY, EXECUTIONS, PENDING };
 enum class Observation : int64_t { VISITS = 0, BODY_DONE = 1, MISSING_CONTEXT = 2, EARLY = 3, TIMEOUT = 4 };

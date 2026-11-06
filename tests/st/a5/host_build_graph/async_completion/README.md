@@ -11,9 +11,9 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 # A5 resident async completion: behavioral acceptance cases
 
-These cases check functional behavior, with no performance thresholds. They are
-explicitly selected with `--manual include` while resident async integration is
-under development. An unavailable deferred context fails an executed case;
+These cases check functional behavior, with no performance thresholds, and are
+included in normal test discovery after A5 acceptance. An unavailable deferred
+context fails an executed case;
 there is no synchronous fallback or expected-failure marker.
 
 ## Coverage
@@ -23,6 +23,7 @@ there is no synchronous fallback or expected-failure marker.
 | `test_sdma_completion.py` | Two real peers; empty, one 32-byte tile, and 4 MiB SDMA. Check transferred data, dependent computation, guards, and an independent task observing a real event still pending after the submit kernel returned. |
 | `test_condition_boundaries.py` | 0/1/63/64 conditions; 65 must fail; `Ge` below/equal/above threshold, zero and signed-int32 maximum; the second condition arrives later; predicate skip must release the successor. |
 | `test_dependency_completion.py` | Ordinary fanin in both completion orders; two-block AIC, AIV and MIX masks 3/5/6/7; last computation versus last condition; a two-block sync-start MIX task. |
+| `test_sync_start_full_capacity.py` | One full-width async MIX/sync-start cohort, with public cluster capacity and finite registration gates; preserve the original data oracle and qualify actual topology, membership and unmet observations. |
 | `test_waiter_progress.py` | C-1/C/C+1 independent waiters, with the publisher submitted later. C comes from `rt_available_aiv_count()`. A bounded AIC rescue makes a blocking implementation fail without leaving an unbounded kernel spin. |
 | `test_consumer_visibility.py` | Every candidate AIC first reads the old payload; AIV publishes new data; a synchronous AIC consumer must read the new value without test-side payload invalidation. |
 | `test_run_reuse.py` | Two invocations of the same single-level Graph definition with different bindings, including consumers outside Graph EXIT; retained notification windows across increasing and repeated epochs. |
@@ -42,6 +43,19 @@ depends on the gates rather than on the business waiters' TaskDone. Business
 consumers still depend on their original waiters. This keeps the publisher's
 registration check from blocking a waiter prefetched onto the same AIV; the
 original registration-count, timeout, rescue and numerical checks remain.
+
+The full-capacity case first reuses the public VISIBILITY capacity probe, then
+submits one mask7 cohort with exactly that many blocks. Each of its3C physical
+executions publishes its own registration marker; the existing finite gates
+make the publisher runnable only after registration, while the consumer still
+depends on the main cohort's TaskDone. No blocking AIC gate or rescue is used.
+All markers start at zero. The20ms publisher delay exercises a pending window,
+not a speed requirement or a scheduling guarantee. The unchanged numerical
+oracle checks the business result; additional schema10 audit, actual worker and
+member coverage, one release per block, one main FINISH, and at least one main
+group with observations>registered_count qualify this resident implementation.
+The test does not multiply masks, and reuses existing ordinary N=1 and excess
+capacity tests for those generic boundaries.
 
 The SDMA probe uses the PTO-ISA event's public completion-record API. It neither
 derives private queue addresses nor atomically modifies an external completion
@@ -65,7 +79,7 @@ From the repository root:
 ```bash
 python -m pytest tests/st/a5/host_build_graph/async_completion \
   --platform a5sim --runtime host_build_graph --device 0 \
-  --manual include --max-parallel 1 --pto-session-timeout 600
+  --max-parallel 1 --pto-session-timeout 600
 ```
 
 Simulation selects the COUNTER/lifecycle cases. Real SDMA requires two A5
@@ -76,7 +90,7 @@ devices, the normal SDMA workspace, and the repository's hardware queue:
 task-submit --device auto --device-num 2 --timeout 1200 --max-time 1200 \
   --run 'python -m pytest tests/st/a5/host_build_graph/async_completion \
     --platform a5 --runtime host_build_graph --device "$TASK_DEVICE" \
-    --manual include --max-parallel 1 --pto-session-timeout 600'
+    --max-parallel 1 --pto-session-timeout 600'
 ```
 
 Every case owns its L3 Worker. Inputs/results crossing a fork use the public
@@ -93,18 +107,21 @@ the qualified submission API with reservation before submission. The resident
 runtime seals registrations after kernel return. These connections are required
 for the tests to execute, but compile success alone does not qualify them.
 
-Keep these cases explicitly selected until the implementation passes the A5
-acceptance suite; then remove the `manual` markers. Preserve the boundary
-inputs, business dependencies and numerical/causal verdicts. Record results
+The behavioral suite and its full-capacity extension have passed A5 acceptance;
+the temporary integration-only `manual` markers are removed. Preserve the
+boundary inputs, business dependencies and numerical/causal verdicts. Record results
 against the actual source, native libraries and repository PTO-ISA pin, and
 report simulator and onboard outcomes separately.
 
 This first batch does not qualify every backend failure phase, dirty-cache
-ownership, unsafe overlapping epochs, complete sync-start capacity boundaries,
+ownership, unsafe overlapping epochs, every async mask/capacity combination,
 or cross-peer COUNTER publication. The separate
 [`async_peer_counter`](../async_peer_counter/README.md) tests cover peer data,
 epoch reuse and C+1 progress, with additional implementation-specific native
 diagnostic assertions; they do not broaden this suite's evidence by implication.
+The separate [`async_sdma_reuse`](../async_sdma_reuse/README.md) qualification
+checks public receipt continuity across 64 slots and retained runs. It reports
+actual pending samples separately and does not claim unobserved SDK backpressure.
 The close case covers an accepted unfinished
 run; it does not prove close began in a particular internal check phase.
 Private state-machine races and instruction-level protocol tests belong in

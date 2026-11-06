@@ -21,7 +21,6 @@ from simpler_setup.tools.swimlane_converter import read_perf_data
 from .helpers import POISON, Case, CounterRunner, Scenario, _counter_callable_spec, l3_case, read_host_tensor
 
 pytestmark = [
-    pytest.mark.manual,
     pytest.mark.platforms(["a5sim", "a5"]),
     pytest.mark.runtime("host_build_graph"),
     pytest.mark.device_count(1),

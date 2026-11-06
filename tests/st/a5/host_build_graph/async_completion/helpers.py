@@ -10,6 +10,8 @@
 
 """Public-API workloads and independent numerical/causal oracles for resident completion."""
 
+from __future__ import annotations
+
 import json
 import sys
 import warnings
@@ -58,6 +60,7 @@ class Scenario(IntEnum):
     VISIBILITY = 4
     GRAPH = 5
     NEVER = 6
+    FULL_SYNC_START = 7
 
 
 @dataclass(frozen=True)
@@ -199,7 +202,7 @@ def _counter_callable_spec():
                     "max_conditions": 1 if index == 10 else CONDITION_LIMIT,
                     "condition_types": CORE_ASYNC_CONDITION_COUNTER,
                 }
-                if index < 3 or index in (9, 10)
+                if index < 3 or index in (9, 10, 11, 12)
                 else {"mode": "SYNCHRONOUS"},
             }
             for index, source, core in (
@@ -214,6 +217,8 @@ def _counter_callable_spec():
                 (8, "aic/action.cpp", "aic"),
                 (9, "aiv/graph_waiter.cpp", "aiv"),
                 (10, "aiv/registration_gate.cpp", "aiv"),
+                (11, "aic/registered_waiter.cpp", "aic"),
+                (12, "aiv/registered_waiter_1.cpp", "aiv"),
             )
         ],
     }
@@ -304,7 +309,7 @@ class CounterRunner:
         self.output.fill_(POISON)
         self.initial_signals.fill_(POISON)
         self.initial_signals[:, 0] = case.initial_signal
-        if case.scenario == Scenario.PROGRESS:
+        if case.scenario in (Scenario.PROGRESS, Scenario.FULL_SYNC_START):
             # The runtime chooses the actual width; every potential marker starts pending.
             self.initial_signals[CONDITION_LIMIT::CONDITIONS_PER_EXECUTION, 0] = 0
         elif case.scenario == Scenario.GRAPH:

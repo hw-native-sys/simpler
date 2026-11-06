@@ -116,7 +116,13 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
     if (scenario == Scenario::PROGRESS &&
         (p.mask != 2 || p.blocks != 1 || p.sync_start || p.skip || p.conditions > async_case::kConditionLimit))
         throw std::runtime_error("progress registration gates require ordinary AIV waiters with at most 64 conditions");
-    const int64_t capacity = scenario == Scenario::VISIBILITY ? rt_available_cluster_count() : rt_available_aiv_count();
+    if (scenario == Scenario::FULL_SYNC_START &&
+        (p.mask != 7 || p.blocks < 2 || p.blocks != rt_available_cluster_count() || p.waiters != 1 ||
+         p.instances != 1 || !p.sync_start || p.skip || p.conditions != 1))
+        throw std::runtime_error("full sync-start fixture requires one full-width three-lane COUNTER cohort");
+    const int64_t capacity = scenario == Scenario::VISIBILITY || scenario == Scenario::FULL_SYNC_START ?
+                                 rt_available_cluster_count() :
+                                 rt_available_aiv_count();
     const int64_t max_waiters = p.slots / (p.instances * p.blocks * 3);
     const int64_t waiters = scenario == Scenario::PROGRESS ? capacity + p.capacity_delta : p.waiters;
     if (waiters < 1 || waiters > max_waiters) throw std::runtime_error("async fixture allocation is too small");
@@ -136,6 +142,11 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
     if (p.mask & 1) kernels.aic_kernel_id = 0;
     if (p.mask & 2) kernels.aiv0_kernel_id = 1;
     if (p.mask & 4) kernels.aiv1_kernel_id = 2;
+    if (scenario == Scenario::FULL_SYNC_START) {
+        kernels.aic_kernel_id = 11;
+        kernels.aiv0_kernel_id = 9;
+        kernels.aiv1_kernel_id = 12;
+    }
     std::vector<TaskId> publisher_deps = warm;
     for (int64_t waiter = 0; waiter < waiters; ++waiter) {
         const int64_t execution = base + waiter * p.blocks * 3;
@@ -160,6 +171,10 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
                                                                rt_submit_task(kernels, task).task_id();
         declare_waiter(waited, p.skip != 0);
         if (scenario == Scenario::PROGRESS) publisher_deps.push_back(registration_gate(args, execution + 1));
+        if (scenario == Scenario::FULL_SYNC_START)
+            for (int64_t block = 0; block < p.blocks; ++block)
+                for (int64_t lane = 0; lane < 3; ++lane)
+                    publisher_deps.push_back(registration_gate(args, execution + block * 3 + lane));
         std::vector<TaskId> deps{waited};
         if (prerequisite.is_valid()) deps.push_back(prerequisite);
         action(
