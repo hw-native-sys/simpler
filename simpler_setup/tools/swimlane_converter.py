@@ -563,7 +563,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     Returns a dict shaped for `generate_chrome_trace_json`,
     `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
     `scheduler_records`, `aicpu_orchestrator_phases`,
-    `core_to_thread`.
+    `core_to_thread`. Audited async schemas also carry `native_async_view`:
+    individually mapped endpoints and logical links, without elapsed spans.
 
     The join logic that used to live in `export_swimlane_json` (host C++):
 
@@ -923,8 +924,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
 
     cycles_to_us_factor = 1_000_000.0 / float(clock_freq_hz)
 
-    def _to_us(cycles):
-        if cycles <= 0:
+    def _to_us(cycles, *, zero_is_missing=True):
+        if cycles <= 0 and zero_is_missing:
             return 0.0
         if placement is not None:
             return (placement.map_cycles_to_host_ns(cycles) - host_origin_ns) / 1000.0
@@ -1018,12 +1019,20 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         attach_execution_identities(data["aicore_execution_identities"], tasks, runtime_name)
 
     protocol_audit = None
+    native_async_view = None
     if "aicore_protocol" in data:
         from simpler_setup.tools.hbg.native_causality import audit_native_protocol  # noqa: PLC0415
 
         if runtime_name != "host_build_graph" or level != 4 or scheduler_task_producer != "aicore":
             raise ValueError("native protocol requires an AICore-produced HBG L4 capture")
         protocol_audit = audit_native_protocol(data["aicore_protocol"], tasks)
+        from simpler_setup.tools.hbg.async_lane import project_async_protocol  # noqa: PLC0415
+
+        native_async_view = project_async_protocol(
+            data["aicore_protocol"],
+            lambda _worker, cycles: _to_us(cycles, zero_is_missing=False),
+            protocol_verified=bool(protocol_audit["protocol_verified"]),
+        )
 
     # Sorting by task_id alone would interleave two runs' executions of the same
     # task. Epoch leads so each run's tasks stay contiguous.
@@ -1192,6 +1201,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         out["native_protocol"] = data["aicore_protocol"]
         out["protocol_audit"] = protocol_audit
         out.setdefault("timeline_metadata", {})["hbg_protocol_audit"] = protocol_audit
+    if native_async_view is not None:
+        out["native_async_view"] = native_async_view
     return out
 
 
@@ -2059,6 +2070,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     emit_overhead=False,
     host_device_uploads=None,
     aicpu_lifecycle_records=None,
+    native_async_view=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -2076,6 +2088,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         orchestrator_phases: Optional list of per-task orchestrator phase records (chip_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
         aicpu_lifecycle_records: Optional A5 HBG AICPU control-plane lifecycle records
+        native_async_view: Optional audited async endpoints and logical links from the decoder
 
     Generates processes in the trace:
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
@@ -2083,6 +2096,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         - pid=2 "AICPU/AICore Scheduler": scheduler record bars (chip_swimlane_level >= 3)
         - pid=3 "Scheduler View": dispatch_time_us to finish_time_us
         - pid=4 "Worker View": per-subtask kernel execution on physical cores
+        - pid=7 "Async Completion": recorded per-worker instants and logical links, not busy spans
     """
     if verbose:
         print("Generating Chrome Trace JSON...")
@@ -2125,6 +2139,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
     # Step 2: Generate JSON events
     events = []
+
+    if native_async_view is not None:
+        if runtime_name != "host_build_graph":
+            raise ValueError("native async presentation requires host_build_graph")
+        from simpler_setup.tools.hbg.async_lane import contribute_async_events  # noqa: PLC0415
+
+        events.extend(contribute_async_events(native_async_view, pid=7, tid_base=70000, display=task_display))
 
     if aicpu_lifecycle_records:
         events.append(
@@ -3531,6 +3552,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
     trace: dict[str, object] = {"traceEvents": events}
     metadata = dict(timeline_metadata) if timeline_metadata else {}
+    if native_async_view is not None:
+        metadata["hbg_async"] = native_async_view["summary"]
     # Downstream tools (critical_path) re-format task ids from this trace alone, so it
     # has to name the runtime whose TaskId layout its labels and ids follow. Always set:
     # resolve_runtime above already refused a caller that named none.
@@ -5143,6 +5166,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            native_async_view=data.get("native_async_view"),
             deps_edges=artifacts["deps_edges"],
             deps_kernel_map=artifacts["deps_kernel_map"],
             deps_block_map=artifacts["deps_block_map"],
@@ -5177,6 +5201,9 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
                 "dispatch_identity": dispatch_identity,
             }
         )
+        if data.get("native_async_view") is not None:
+            rank_metadata[-1]["hbg_async"] = data["native_async_view"]["summary"]
+            rank_metadata[-1]["hbg_protocol_audit"] = data["protocol_audit"]
 
     # One merged trace carries one TaskId layout, so Ranks naming different runtimes
     # have no single answer. Refused rather than left unnamed: an unnamed trace would
@@ -5315,6 +5342,7 @@ def main():
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            native_async_view=data.get("native_async_view"),
             deps_edges=deps_edges,
             deps_kernel_map=deps_kernel_map,
             deps_block_map=deps_block_map,
