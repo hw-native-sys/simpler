@@ -3,7 +3,7 @@
 Architecture and contracts for the host and device logging subsystem.
 
 For the user-facing level model and CLI flags, see
-[testing.md § Log levels](testing.md#log-levels). This document covers the
+[test CLI log levels](testing/cli.md#log-levels). This document covers the
 implementation, cross-DSO state ABI, build wiring, and output formats.
 
 ## Mental model
@@ -35,7 +35,9 @@ Device logging:
 ```
 
 One threshold controls `DEBUG / INFO / TIMING / WARN / ERROR`; `NUL` suppresses
-all output. The values match Python logging (`10 / 20 / 25 / 30 / 40 / 60`).
+these standard levels. Python still applies `level >= threshold`, so records at
+level 60 or higher can reach Python handlers even with `--log-level null`.
+The values match Python logging (`10 / 20 / 25 / 30 / 40 / 60`).
 CANN has no TIMING level, so onboard setup maps both TIMING and WARN to CANN
 WARN. The default TIMING threshold keeps host `[STRACE]` markers without
 opening CANN's INFO stream.
@@ -477,7 +479,7 @@ There is no logger build step or logger field in `RuntimeBinaries`. Instead:
 
 | You want to … | Look at |
 | ------------- | ------- |
-| Change the user-facing level model | `python/simpler/_log.py` and `docs/testing.md` |
+| Change the user-facing level model | `python/simpler/_log.py` and `docs/testing/cli.md` |
 | Change host output or STRACE grammar | `src/common/log/host_log.cpp` |
 | Change the shared-state ABI | `src/common/log/include/common/host_log_state.h` |
 | Change sim AICPU adaptation | `src/common/platform/sim/aicpu/device_log.cpp` |

@@ -15,11 +15,11 @@ Detection procedures referenced below live in
 4. Run:
 
    ```bash
-   pytest examples tests/st --platform <platform> --runtime $ARGUMENTS \
+   pytest examples tests/st --platform <platform> --runtime $ARGUMENTS --device 0-15 \
      --pto-session-timeout <timeout> -v
    ```
 
    xdist parallelism is auto-selected via `--max-parallel auto` (min of nproc
-   and device pool size on sim); see `docs/testing.md`.
+   and device pool size on sim); see `docs/testing/parallel-execution.md`.
 5. Report the results summary (pass/fail counts).
 6. If any tests fail, show the relevant error output.

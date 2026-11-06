@@ -541,56 +541,25 @@ unit.
 #### HBG host access and input readiness
 
 HBG reads control values while constructing the graph on the host. Those
-values must already exist when bind begins; ordering device launches on a
-stream cannot make an earlier host read wait for a kernel that has not run.
+values must exist before bind; ordering later device launches on a stream does
+not make an earlier host read wait for them.
 
-| Access during host construction | Contract |
-| ------------------------------- | -------- |
-| Host-backed `IN` / `INOUT` argument | Bind copies input bytes before calling the orchestration entry and exposes the caller's host view. A host scalar write updates that view and pushes the scalar to its device staging slice. |
-| Child-memory argument | The caller supplies ready device data. The accessor uses a host mapping when available, otherwise a device copy for each scalar access. |
-| Runtime-created output, or an alias the overlap checker cannot prove disjoint from a writer in this graph | Both `get_tensor_data` and `set_tensor_data` reject the access with `INVALID_ARGS`; they do not wait for the current graph to execute. |
-| A region the overlap checker proves disjoint, or an independent / shared read-only input | A writer elsewhere does not impose a wait on this host access. The data still has to satisfy the caller's cross-run contract. |
-| Host-backed pure `OUT` argument | It has no initialized input value or registered host view during bind. |
+Host scalar access requires explicit `HOST/NONE` arguments: reads require
+`IN`/`INOUT`, writes require `OUT`/`INOUT`, and both check registered bounds and
+Buffer grants. `HOST/H2D` arguments become device storage during bind, and
+`DEVICE/NONE` arguments retain device storage. Neither is accessible through
+these host scalar APIs. Supply distinct host controls and device operands when
+both construction and execution need a value.
 
-Disjointness is decided by `ChipTensorMap::lookup` and
-`ChipTensorMapEntry::check_overlap`, and it is proven two ways: the two views'
-flat element ranges do not intersect, which needs no shared layout, or both
-views share the same canonical row-major layout and the per-dimension check
-finds no intersection. When the flat ranges do intersect and that per-dimension
-check does not apply — a differing dtype or rank, a stride mismatch, a stepped
-or permuted view, a start offset that does not decompose, or a higher tensor
-version — the checker conservatively reports an overlap. A host access to such
-a view of a buffer this graph writes is therefore refused even where the two
-regions are in fact disjoint, and the refusal names a producer task.
+The caller completes earlier producers and any explicit device-to-host copy
+before submitting a consumer that needs those host bytes. Conflicting host
+writes must also be ordered against earlier readers. Host scalar access is
+not a synchronization barrier for the current graph's device tasks.
 
-Across runs, the caller owns readiness and conflicting access ordering. Before
-constructing a successor that reads or modifies a predecessor's output, wait
-for that predecessor and complete any required device-to-host copy-back. With
-the public API, finish the producer handle's `result()` before submitting the
-consumer whose host construction needs those bytes. A native device fence by
-itself is insufficient when the host view still holds the old value. For
-child memory, preserve the allocation and wait for the device writer; there
-is no host staging copy-back to substitute for that wait.
-
-An independent successor or one sharing only read-only inputs may prepare
-early. No global cross-run tensor reader/writer registry or implicit accessor
-wait enforces this caller contract. The current-graph producer check is local
-to that build and does not prove cross-run readiness. In particular, a host
-`set_tensor_data` must not race a predecessor device reader, even if a later
-kernel launch would be ordered behind that predecessor.
-
-`copy_in_run_inputs_impl` therefore remains a no-op for HBG: moving its input
-copy after bind would leave host construction without its promised input
-view. TMR's device-side ordering and WAR/INOUT dependency handling are separate
-contracts.
-
-`HbgHostAccessContractTest` exercises the real bind, scalar accessors and
-copy-back against a fake memory backend on both architectures. It covers
-ready host/child inputs, explicit predecessor copy-back, independent early
-preparation, producer and overlapping-writer rejection, and disjoint access.
-It models completed device writes; it does not prove hardware completion,
-cache visibility, or the public handle's scheduling behavior. Those boundaries
-must remain covered when native admission or `Worker.submit` changes.
+See [HBG host data access](hbg-host-data-access.md) for the shared location,
+transfer, error and readiness contract, and the
+[Buffer memory model](buffer-abi.md#why-tensor-and-chiptensor-are-two-types)
+for argument materialization.
 
 #### Two-frame endpoint staging lane
 

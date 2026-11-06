@@ -1,5 +1,20 @@
 # Testing
 
+Use this page for test principles and quick commands. The focused guides cover
+configuration, execution and authoring in detail.
+
+## Detailed guides
+
+| Guide | Contents |
+| ----- | -------- |
+| [Environments and hardware](testing/environments.md) | Dependency profiles, hardware markers and platform selection |
+| [CLI and logging reference](testing/cli.md) | Compile warm-up, command options, log levels and CLI conventions |
+| [Parallel execution](testing/parallel-execution.md) | Resource reuse, runtime isolation, device allocation and filtering |
+| [Test suites and unit tests](testing/unit-tests.md) | Suite roles, C++/Python execution, build coverage and CTest NPU resources |
+| [Writing scene tests](testing/writing-tests.md) | Scene template, sibling synchronization, output validation and manual cases |
+| [Adding a C++ unit test](testing/adding-a-cpp-unit-test.md) | Directory contracts, target declarations, support archives and checks |
+| [Scene-test device-memory fixtures](testing/child-memory.md) | Persistent test fixtures, round state and result readback |
+
 ## Design Principles
 
 Three axioms govern hardware classification across all test categories:
@@ -12,112 +27,31 @@ Three axioms govern hardware classification across all test categories:
 
 These principles apply uniformly to ut-py (pytest markers), ut-cpp (ctest labels), and st (`@scene_test(platforms=[...])`).
 
-### Test environments
-
-Tests requiring an isolated dependency set declare
-`@pytest.mark.test_environment("torch_npu")` on a module, class, function or
-parameter. Every inherited declaration applies: repeated identical names are
-idempotent, conflicting or unknown names are errors, even on skipped or
-otherwise deselected items. Unmarked tests belong to `default`.
-
-`--test-environment` selects one registered environment; its default is
-`default`. The same pytest selection applies to scene-test compile warm-up and
-resource/runtime children. Platform, runtime, `-m`, `-k` and `manual` remain
-independent filters. Environment classification is not dependency detection:
-missing or incompatible dependencies fail a selected environment; they never
-silently move tests or skip qualification. Test modules must remain safe to
-collect without their optional backend; import it in fixtures or consumers.
-
-The `torch_npu` profile requires `--junitxml`: a single pytest invocation writes
-its final collection to the adjacent `.plan.json` file, executes it, then checks
-its actual JUnit against that plan. The plan retains the actual preflight
-identity, including CANN manifest version and host architecture. Source,
-environment and canonical nodeids must match, and every selected case must pass
-exactly once. Empty collection,
-missing/foreign/duplicate cases and any skip/error/failure are errors. This
-strict mode supports direct execution only. SceneTestCase, resource dispatch
-and xdist are rejected; default sweeps keep their existing execution strategy.
-Collect-only and compile warm-up select environments without importing or
-checking optional dependencies and do not emit execution plans.
-
-The ScopeStats consumer uses the same declared environment and shared bridge.
-It checks off/on/on/off selection, per-call exports and nested scope attribution
-on TMR. HBG is explicitly metadata only; neither path treats allocation
-frontiers as live usage or claims performance.
-
-The diagnostic-selection consumer uses that environment and bridge to check
-per-call PMU and chip-swimlane snapshots and exports. Its off/on/on/off sequence
-mutates the original selectors and prefixes after submission, checks the original
-output destinations and rejects records for off calls or poison destinations.
-The CPU checker contracts exercise export validation; actual collector behavior
-requires the framework hardware cases. Diagnostic collection may wait, and this
-consumer does not qualify other DFX collectors or capture/replay.
-
-The framework eager tests live in `tests/st/worker/framework_eager` and run on
-`--platform a2a3` or `--platform a5`. Each consumer uses that platform for
-compilation, Worker construction and its result record; compile caches include
-the platform. A shared host bridge does not establish device compatibility.
-Each platform needs its own actual plan, JUnit and environment identity.
-
-The framework eager corpus shares one session-scoped optional bridge fixture.
-Its same-stream, cross-stream, alias/INOUT, callback-failure recovery and
-per-call-value and persistent-DEVICE-state modules are discovered by their
-environment declaration; adding
-a module does not require an expected-nodeid list or workflow path edit. Run the
-declared environment serially under one
-exclusive device allocation; a filtered plan proves only that filtered set.
-The recovery consumer also exercises the public direct-chip close path: accepted
-handles are drained before workspace ownership can be released, without
-individual user waits. Native timeout/context refusals and retryable close debt
-are covered separately by CPU lifecycle contracts.
-
-The pre-admission consumer checks stale Buffer registration and a distinct
-caller-created RTS context in real queue callbacks. Each refusal is followed
-by healthy work on the same Worker. The wrong-context callback restores the
-caller context before its healthy submit, and a third healthy request follows.
-The allocation stays alive throughout; no invalid device access is issued.
-
-The argument-capture consumer is discovered in the same environment. It
-checks OFF/FULL/HYBRID/OFF snapshots and exact two-task argument payloads on
-A2/A3 (both runtimes) and A5 TMR, including a runtime-owned intermediate.
-A5 HBG instead exercises the existing typed unsupported refusal for FULL and
-HYBRID, verifies no accepted run, tensor writes or dump files, and checks healthy
-OFF calls before and after plus caller-stream reuse after Worker close. Its
-refusal result explicitly reports no verified payloads; actual A5 HBG per-task
-capture remains unimplemented and tracked under
-[#2666](https://github.com/hw-native-sys/simpler/issues/2666); refusal tests do not
-deliver that capability. A real Worker materialization CPU
-contract covers native geometry; CPU recording tests do not qualify device
-collection or framework ordering.
-
-The registry and verifier live in `simpler_setup/test_environments.py`. Package
-pins have one source in the profile's constraints file. Selector and preflight
-share a minimum CANN version line of 9.0, without an architecture allowlist.
-They compare the numeric major/minor prefix of the actual install manifest;
-separated CANN release/build labels do not change admission. For example,
-9.0.RC1, 9.1.T500, 9.2.0-beta.2 and 10.0 are accepted; missing, malformed or
-lower version lines are rejected. Admission does not mean every combination
-has been tested. Framework execution evidence covers 9.0.0 on x86_64 and
-9.2.0-beta.2 on A3 ARM64 with the pinned Torch pair. See
-[the CI environment contract](ci.md) for the experiment link.
-Adding a test to an existing environment requires no workflow edit. A new
-environment requires an explicit registry entry and reviewed installation/runner
-strategy; profiles do not install arbitrary dependencies or infer new CI runners.
-
 ### Assertion principle: no wall-clock proxies
 
-Off-hardware tests (sim, ut-py/ut-cpp, github-hosted) must not assert wall-clock
-magnitude as a proxy for a non-temporal property. A wall-time bound used to infer
-"the workers ran concurrently," "the path is fast," or any other non-temporal
-claim polices the host scheduler and timer, not the code under test — and it
-flakes on loaded or virtualized CI hosts (the GHA macOS runner, for example,
-over-sleeps `time.sleep` under load). Assert the property directly — the
-functional result or an observable effect — instead.
+All CI correctness tests (ut-py/ut-cpp, simulation and onboard hardware) must
+establish the tested state and event ordering explicitly. Synchronize through
+handshakes, barriers, acknowledgements or observable state transitions, then
+assert the functional result. See the always-loaded
+[CI correctness rule](../.claude/rules/discipline.md#7-ci-correctness-tests-use-explicit-events).
 
-Exception: when wall-time *is* the subject under test (a timeout firing, a
-startup deadline being respected, a configured budget), asserting it is correct.
-Budget generously for CI variance, and prefer the mechanism's observable effect
-over a tight measured bound. See [#1496](https://github.com/hw-native-sys/simpler/issues/1496).
+Do not use wall-clock magnitude, sleeps, calibrated spin counts or relative
+execution speed as a proxy for concurrency, ordering or blocking. For example,
+hold a predecessor at an observable gate while checking successor preparation,
+then release it; do not assume preparation finishes inside an artificial delay.
+Such assumptions change with machine load, clock frequency and host scheduling.
+A fault test must confirm that its injected event occurred in the intended
+state. Waiting longer for background interference, or relying on repeated CI
+runs to eventually encounter it, does not establish fault coverage; keep such
+probabilistic stress experiments in explicitly requested diagnostics.
+
+Timeouts provide a finite failure backstop for event waits. Their expiry or
+non-expiry does not prove an unrelated correctness property. When wall-time
+*is* the subject under test (a timeout firing, a startup deadline being
+respected, a configured budget), asserting it is correct. Budget generously for
+CI variance, and check the mechanism's observable effect rather than relying
+only on a tight measured bound. Explicit performance benchmarks are separate
+from correctness tests. See [#1496](https://github.com/hw-native-sys/simpler/issues/1496).
 
 ## Quick Reference
 
@@ -136,8 +70,8 @@ ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
 ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on-failure
 
 # Scene tests (pytest, @scene_test classes)
-pytest examples tests/st                          # all sim platforms (auto-parametrized)
-pytest examples tests/st --platform a2a3sim       # specific sim
+pytest examples tests/st --platform a2a3sim       # A2/A3 simulation
+pytest examples tests/st --platform a5sim         # A5 simulation
 pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4          # hardware
 pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device 4-7  # hardware with device pool
 
@@ -184,422 +118,6 @@ Three test categories:
 If a module is exposed via nanobind (used by both C++ and Python), test in **ut-py** (`tests/ut/`).
 If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cpp/`).
 
-## Scene Test CLI Options
-
-### Lock-free kernel warm-up
-
-`python -m simpler_setup.tools.scene_test_compile` accepts the same pytest
-paths and selection arguments as the subsequent scene-test command. It runs
-pytest collection, compiles each selected `SceneTestCase` class once, and
-stores the resulting `ChipCallable` under `build/cache/kernels/`. It does not
-create a `Worker` or access an NPU. The default compiler budget is
-`min(8, max(1, available CPUs - 2))`; pass `--compile-workers N` to override it.
-The budget counts actual orchestration and incore compiler subprocesses rather
-than class threads. Compilation may proceed across classes and across the
-artifacts of one large callable, but all levels share the same process-local
-semaphore. Consequently class-level and per-callable parallelism do not
-multiply the number of active compilers within one process.
-simpler's two onboard CI jobs (a2a3, a5) explicitly use eight; the sim jobs have
-no warm-up step and use the same automatic token pool during cold pytest runs.
-
-The tool walks `SceneTestCase` classes, so it does not reach a standalone case
-that owns its own `Worker`. Such a case warms the same cache itself: the
-DeepSeek smokes and Qwen daily cases are compiled by their respective
-`examples/<arch>/<runtime>/<model>/main.py --compile-only` entry points. Those
-drivers call the same `scene_test.compile_chip_callable_spec` and take the same
-`--compile-workers` option.
-
-The persistent cache has two levels. An unchanged callable loads its complete
-`callable.bin` directly. When that entry misses, each incore kernel loads an
-independent artifact from `build/cache/kernels/incore/`; only missing or changed
-kernels are compiled before the new callable is assembled. The incore key is
-independent of orchestration source, callable ABI, `func_id`, signature, and
-the owning test class. It uses the same compiler-visible paths as the compiler:
-paths under the checkout are relative to its root, while paths outside it stay
-absolute. This keeps `__FILE__` and `__BASE_FILE__` correct while allowing a
-cache restored on another CI runner to hit. Callables
-across case directories still share an artifact when they reference the same
-physical kernel path with the same source closure and compilation inputs.
-
-A class that fails to compile is reported and skipped rather than aborting the
-pass, so the run that follows still recompiles it and reports the error against
-the case that owns it.
-
-Pass the same paths, `-m`, `--platform`, `--runtime`, `--level`, and
-`--exclude-level` selections to warm-up and execution. A normal pytest or
-standalone run loads matching
-artifacts from the persistent cache; changed orchestration, incore, or included
-source content, compiler identity, fixed compilation flags, compilation logic,
-or compilation schema produces the corresponding new cache entry automatically.
-Entries unused for 14 days are pruned. When `build/` is not writable — a wheel
-installed into a read-only `site-packages` — the cache is skipped with a warning
-and every callable is compiled in-process, exactly as before the cache existed.
-
-Scene tests support advanced CLI options for benchmarking, profiling, and runtime control. These work identically in both pytest and standalone mode.
-
-> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-chip-swimlane` (chip swimlane), `--dump-args` (unified argument dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
-
-### pytest
-
-```bash
-pytest --platform a2a3sim                                        # default: 1 round + golden
-pytest --platform a2a3 --rounds 100 --skip-golden                # benchmark mode
-pytest --platform a2a3 --enable-chip-swimlane                             # chip swimlane (single round)
-pytest --platform a2a3 --enable-pmu                              # PMU CSV
-pytest --platform a2a3sim --log-level debug                        # verbose C++ logging
-```
-
-### Standalone (test_*.py)
-
-```bash
-python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
-python test_xxx.py -p a2a3 -d 0 --rounds 100 --skip-golden       # benchmark mode
-python test_xxx.py -p a2a3 --enable-chip-swimlane                         # chip swimlane (single round)
-python test_xxx.py -p a2a3 --dump-args                         # dump unified argument artifacts
-python test_xxx.py -p a2a3 --enable-pmu 4                        # PMU CSV (MEMORY)
-python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
-```
-
-### Option Reference
-
-| Option | Short | Default | Description |
-| ------ | ----- | ------- | ----------- |
-| `--rounds N` | | 1 | Run each case N times (reuses the same Worker across rounds) |
-| `--device IDS` | `-d` | `0` | Single id (`0`), range (`0-7`), or list (`0,2,5`). Sets the device-id pool for L3 cases and the available slots for L2 fanout. |
-| `--max-parallel N` | | `auto` | Max in-flight subprocesses (make-style). `auto` = `min(nproc, len(--device))` on sim, `len(--device)` on hardware. Decouples device-id pool size from parallelism; use to throttle sim on a CPU-constrained runner. |
-| `--runtime NAME` | | (all) | Restrict to one runtime; normal dispatch still applies. |
-| `--level {2,3,4}` | | (all) | Restrict to one scene-test level. Level 4 selects network1 wrappers. |
-| `--exclude-level {2,3,4}` | | (none) | Exclude tests explicitly carrying that scene-test level. Ordinary onboard lanes use `--exclude-level 4`. |
-| `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
-| `--manual` | | `exclude` | `exclude`/`include`/`only` for manual scene-test cases and standalone pytest tests |
-| `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-chip-swimlane [PERF_LEVEL]` | | `0` | Enable chip swimlane collection. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/chip-swimlane-profiling.md](dfx/chip-swimlane-profiling.md#31-enable-chip-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `chip_swimlane_records.json` lands; parallel runs never collide. Disabled when `--rounds > 1`. |
-| `--dump-args` | | `0` | Dump tensors plus scalar args into unified runtime artifacts (bare flag = `1`; supports `0/1/2/3`) |
-| `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
-| `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
-| `--log-level LEVEL` | | `timing` | Simpler logger threshold. Accepts `debug` / `info` / `timing` / `warn` / `error` / `null` (case-insensitive). TIMING and NUL/NULL are registered with Python logging before pytest validates the option. The "simpler" Python logger is the single source of truth; `Worker.init()` snapshots it once and pushes the threshold to HostLogger, AICPU, and the onboard CANN mapping. Changing the Python logger afterwards does not affect an existing worker. See [Log levels](#log-levels). |
-
-Chip swimlane, args dump, PMU, dep-gen, scope stats, and swimlane-overhead analysis are disabled when `--rounds > 1` so benchmark rounds stay uninstrumented. Output tensors are reset to their initial values between rounds.
-
-## Log levels
-
-Simpler uses one integer threshold for host, simulation, and onboard device
-logging. For implementation details
-(cross-DSO shared state, self-contained logger consumers, host vs device
-backends, output formats), see [logging.md](logging.md).
-
-### Integer layout (Python-aligned)
-
-```text
-DEBUG   = 10                                          (Python logging.DEBUG)
-INFO    = 20                                          (Python logging.INFO)
-TIMING  = 25  ← default threshold
-WARN    = 30                                          (Python logging.WARNING)
-ERROR   = 40                                          (Python logging.ERROR)
-NUL     = 60                                          suppress all
-```
-
-The Python `simpler` logger filters by Python's standard `level >= threshold`
-rule; C++ and AICPU use the same single-axis rule.
-
-### Where each tier ends up
-
-| Macro | Level |
-| ----- | ----- |
-| `LOG_DEBUG` | DEBUG (`10`) — detailed diagnostics |
-| `LOG_INFO` | INFO (`20`) — lifecycle and summaries |
-| `LOG_TIMING` | TIMING (`25`) — stable performance markers such as `[STRACE]` |
-| `LOG_WARN` | WARN (`30`) |
-| `LOG_ERROR` | ERROR (`40`) |
-
-At the default TIMING threshold, `[STRACE]`, warnings, and errors are visible;
-ordinary INFO and DEBUG messages are silent.
-
-### Setting it
-
-```bash
-pytest --platform a2a3sim --log-level debug
-python test_xxx.py -p a2a3sim --log-level debug
-```
-
-The `simpler` Python logger (`logging.getLogger("simpler")`) is the single
-source of truth; `--log-level` sets it. Importing `simpler` puts it at TIMING
-unless you have already called `setLevel` — root-logger inheritance is
-deliberately not used, so `import simpler` keeps timing markers visible despite
-Python's default `WARNING`. `TIMING` and `NUL` are registered with
-`logging.addLevelName` at import, so name-based callers and `%(levelname)s`
-formatters accept them.
-
-Two consequences for test authors:
-
-- **The threshold is snapshotted once, at `Worker.init()`.** Calling
-  `logger.setLevel(...)` afterwards does not reach a live worker — recreate the
-  worker to change levels mid-run.
-- **Onboard AICPU severity comes from CANN, not from this threshold.**
-  `simpler_init` maps the snapshot onto `dlog_setlevel` for you, but an
-  `ASCEND_GLOBAL_LOG_LEVEL` already in the environment wins. Since CANN has no
-  TIMING level, the default threshold does not open CANN's INFO stream. If you
-  set it yourself, set it **before `Worker.init()`** — the AICPU latches CANN's
-  answer during that call and never re-reads it.
-
-All output goes to **stderr** for host and sim AICPU; onboard AICPU lands
-wherever CANN is configured to write.
-
-For the mechanism behind all of the above — the process-owned host-log state,
-module binding order, the CANN mapping table, and how forked chip subprocesses
-inherit the threshold — see
-[logging.md § Configuration flow](logging.md#configuration-flow).
-
-## CLI Design Principles
-
-The same set of flags must work in both pytest and standalone (`python test_*.py`). Two rules govern which short forms we register:
-
-1. **Mirror pytest.** If pytest (or a pytest plugin the project depends on) exposes a flag with a particular short form, standalone must register the same short for the same meaning. Users routinely copy commands between the two entry points; letter-level semantic drift is the fastest way to create confusing bugs.
-2. **Never create a collision with pytest's ecosystem.** If pytest (or one of its plugins) already uses a short letter for a *different* concept, standalone must not reuse that letter for anything else, even if pytest doesn't use that letter for the flag we're adding. The goal is that `-X` in both worlds either does the same thing or is unused.
-
-Worked examples:
-
-| Flag | Long form | Short | Why |
-| ---- | --------- | ----- | --- |
-| `--platform` | both | `-p` | No pytest collision; high-frequency user flag. |
-| `--device` | both | `-d` | Same. |
-| `--exitfirst` | both | `-x` | pytest ships `-x` → standalone mirrors it so the flag behaves identically across entry points. |
-| `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
-| `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
-| `--runtime` / `--level` | both | **(none)** | Selection filters; no short keeps them distinctive. A hidden child marker controls dispatcher recursion. |
-| `--skip-golden`, `--enable-chip-swimlane`, `--dump-args`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
-
-Practical guidance when adding a new CLI option:
-
-- First decide the long name and semantics. Register it on **both** `conftest.py::pytest_addoption` and `simpler_setup/scene_test.py::run_module`.
-- Check pytest's built-in shorts (`pytest --help`) and loaded plugins (`pytest-xdist`, `pytest-timeout`, etc.) for any letter you're considering.
-  - If pytest uses the letter for a matching concept → register the same short in standalone.
-  - If pytest uses the letter for anything else → pick a different short, or drop the short entirely.
-  - If the letter is free and the flag is high-frequency user-facing → a short is OK; otherwise skip it.
-
-## Parallel Test Execution and Resource Reuse
-
-Tests are dispatched through a **test dispatcher** (`conftest.py::_dispatch_test_phases` and `scene_test.py::_dispatch_test_phases_standalone`) that pipelines work along two complementary axes:
-
-1. **Resource reuse** — every `ChipWorker` init costs three `dlopen`s plus a device-context acquire. The dispatcher keeps one worker alive for the lifetime of a test group so every class, case, and round on that device reuses the same worker.
-2. **Parallelism** — when `--device` names more than one id, independent work is spread across subprocesses so N devices do N-way work.
-
-Both pytest and standalone (`python test_*.py`) walk the same 6-layer hierarchy:
-
-```text
-Layer 1  Level axis
-│
-├─ Resource phase (runs first)
-│   One isolated subprocess per job; scheduled by device_count, bin-packed
-│   against the --device pool. Two job kinds share this phase:
-│     - L3 SceneTestCase classes (one job per class)
-│     - Standalone pytest functions marked with @pytest.mark.device_count
-│       (one job per function). @pytest.mark.runtime is optional: a
-│       runtime-agnostic function gets the same devices and the same
-│       isolation, and its child is narrowed by nodeid alone.
-│   CANN isolation is automatic (each job is its own process). Cross-runtime
-│   jobs can overlap when their devices don't.
-│
-├─ L2 phase (runs after Resource drains)
-│   │
-│   ├─ Layer 2  Runtime — serial subprocess per runtime (CANN isolation)
-│   │   └─ Layer 3  Device — parallel subprocess per device (xdist for pytest,
-│   │               custom fanout for standalone). Capacity bounded by --device size
-│   │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
-│   │                   across every class assigned to that device
-│   │           └─ Layer 5  Case — serial within a class
-│   │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
-│   │                           L2 child memory is declared per tensor, independent of N
-│
-└─ Leftover phase (runs last, in the dispatching process)
-    Every selected item the first two phases do not claim — a plain
-    `requires_hardware` function, say, which matches neither a device_count
-    marker nor a SceneTestCase runtime. Running them here is what keeps
-    "selected" and "run" the same set: an item no phase claims used to be
-    reported in neither the passed nor the skipped count. A test that needs
-    a process of its own declares `@pytest.mark.device_count` and becomes a
-    Resource job instead.
-```
-
-### Quick examples
-
-```bash
-# Serial, single device — identical to pre-parallel behavior
-pytest tests/st --platform a2a3sim --device 0
-python test_foo.py -p a2a3sim -d 0
-
-# 8-device box: L3 cases bin-pack; L2 fanned out across 8 xdist workers
-# (hardware default: --max-parallel auto = 8)
-pytest tests/st --platform a2a3 --device 0-7
-python test_foo.py -p a2a3 -d 0-7
-
-# Non-contiguous devices (e.g. devices 0, 2, 5 free)
-pytest tests/st --platform a2a3 --device 0,2,5
-python test_foo.py -p a2a3 -d 0,2,5
-
-# CPU-constrained sim: pool of 16 virtual ids (needed by an L3 case with
-# device_count=8), but only 2 subprocesses running at once to avoid thrashing.
-# --max-parallel auto would pick this automatically on a 2-core CI runner.
-pytest tests/st --platform a2a3sim --device 0-15 --max-parallel 2
-python test_foo.py -p a2a3sim -d 0-15 --max-parallel 2
-
-# Fail-fast for CI: stop at the first failing case
-pytest tests/st --platform a2a3 --device 0-7 -x
-python test_foo.py -p a2a3 -d 0-7 -x
-
-# Narrow run: one level, one runtime, one case
-pytest tests/st --platform a2a3sim --level 2 --runtime tensormap_and_ringbuffer --case TestFoo::default
-python test_foo.py -p a2a3sim --level 2 --runtime tensormap_and_ringbuffer --case TestFoo::default
-```
-
-### Fail-fast (`-x` / `--exitfirst`)
-
-- Default: all cases run; the dispatcher summarizes pass/fail at the end. This is the right mode for local development — you want every failure surfaced at once.
-- With `-x` / `--exitfirst`: first failure cancels the pending queue, sends `SIGTERM` to running children, and **skips the L2 phase if L3 failed**. Intended for CI. The short form mirrors pytest's built-in `-x` so the flag behaves identically across pytest and standalone.
-
-### Device-count constraints
-
-If any L3 case declares `device_count > len(--device pool)` the dispatcher fails the whole batch up front rather than deadlocking the scheduler. Either widen `--device` or reduce the case's `device_count`. When `device_count` exceeds the *currently free* pool (but fits within the total), the case waits for an in-flight job to finish and then claims its slot.
-
-### `--device` vs `--max-parallel` (two separate knobs)
-
-On hardware these two concepts collapse: one device = one subprocess's worth of host CPU, so `--device 0-7` naturally implies 8-way parallelism. On sim they diverge:
-
-| `--device` controls | `--max-parallel` controls |
-| ------------------- | ------------------------- |
-| Size of the virtual device-id pool | Max simultaneous `subprocess.Popen` |
-| Must be ≥ any L3 case's `device_count` | Should be ~nproc on sim (CPU-bound) |
-
-This matters on CPU-constrained CI runners. Example: an L3 case needs `device_count=8` but the runner has 2 CPUs.
-
-- `--device 0-1` — can't run the L3 case; static check fails.
-- `--device 0-15` (no `--max-parallel`) — L3 case fits, but the dispatcher would also spawn 15 concurrent L2 xdist workers and potentially multiple concurrent L3 cases, thrashing the 2 CPUs.
-- `--device 0-15 --max-parallel 2` — L3 case fits in the pool; at most 2 subprocesses run at a time. This is what the `auto` default computes on a 2-core runner.
-
-`--max-parallel` counts top-level subprocesses, like `make -j`. A single L3 case subprocess internally forks N chip-processes for its `device_count`; those forks do **not** count toward `--max-parallel`. One case = one unit regardless of how many devices it uses.
-
-### Mixed L2 + L3 in one file
-
-A single file can declare both L2 and L3 classes; they're grouped by `(runtime, level)` internally. L3 classes run in the Resource phase (subprocess-per-case, alongside standalone resource-marked functions), L2 classes run in the L2 phase (shared Worker per device).
-
-### Profiling under parallelism
-
-Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
-
-- `outputs/<case>_<ts>/chip_swimlane_records.json` — swimlane (`--enable-chip-swimlane`)
-- `outputs/<case>_<ts>/args_dump/` — args dump (`--dump-args`)
-- `outputs/<case>_<ts>/pmu.csv` — PMU counters (`--enable-pmu`)
-
-Because each case gets its own directory, parallel runs (xdist workers, L3 case fanout, L2 device fanout) can never collide on filename — there is no per-file timestamp, no env-var scoping, and no post-run flatten step. `CallConfig::validate()` throws if any diagnostic flag is enabled but `output_prefix` is empty; `scene_test.py::run_class_cases` always fills it from the case label.
-
-Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/chip_swimlane_records.json` (sorted by mtime); pass `--input <path>` to override.
-
-### Dispatcher skip conditions (normal pytest runs)
-
-The dispatcher only takes over when there's actual work to parallelize or isolate. It falls through to plain pytest when:
-
-- `--collect-only`
-- Only one runtime is present and no L3 cases are collected (single L2 batch)
-- The internal `--resource-child` marker is set on a dispatcher subprocess
-
-## Hardware Classification
-
-The `--platform` flag is the single source of truth for hardware availability. No separate `-m` flags are needed.
-
-### Helper function
-
-```python
-def is_device(platform: str | None) -> bool:
-    """sim and None are both no-hardware."""
-    return platform is not None and not platform.endswith("sim")
-```
-
-### ut-py: `@pytest.mark.requires_hardware[(platform)]`
-
-| Declaration | no-hw runner | a2a3 runner | a5 runner |
-| ----------- | ------------ | ----------- | --------- |
-| *(no marker)* | run | skip | skip |
-| `@pytest.mark.requires_hardware` | skip | run | run |
-| `@pytest.mark.requires_hardware("a2a3")` | skip | run | skip |
-| `@pytest.mark.requires_hardware("a5")` | skip | skip | run |
-
-Skip logic (conftest.py):
-
-```python
-marker = item.get_closest_marker("requires_hardware")
-on_device = is_device(platform)
-if marker is None:
-    if on_device:
-        skip("no-hardware test, runs in no-hw job")
-elif marker.args:
-    if platform != marker.args[0]:
-        skip(f"requires --platform {marker.args[0]}")
-else:
-    if not on_device:
-        skip("requires hardware")
-```
-
-### ut-cpp: ctest labels
-
-| Declaration (CMakeLists.txt) | no-hw runner | a2a3 runner | a5 runner |
-| ---------------------------- | ------------ | ----------- | --------- |
-| *(no label)* | run | skip | skip |
-| `LABELS "requires_hardware"` | skip | run | run |
-| `LABELS "requires_hardware_a2a3"` | skip | run | skip |
-| `LABELS "requires_hardware_a5"` | skip | skip | run |
-
-Selection:
-
-| Runner | Command |
-| ------ | ------- |
-| No hardware | `ctest -LE requires_hardware` |
-| a2a3 | `ctest -L "^requires_hardware(_a2a3)?$"` |
-| a5 | `ctest -L "^requires_hardware(_a5)?$"` |
-
-`-LE` (exclude regex) on no-hw runner: `requires_hardware` matches all three label variants, so only unlabeled tests run.
-`-L` (include regex) on device runners: only labeled tests run, unlabeled ones are excluded.
-
-### st: `@scene_test(platforms=[...])`
-
-`platforms` lists all supported platform names (both sim and device).
-
-| `--platform` | Behavior |
-| ------------ | -------- |
-| `a2a3sim` | Run if `"a2a3sim"` in `platforms`, else skip |
-| `a2a3` | Run if `"a2a3"` in `platforms`, else skip |
-| *(none)* | Auto-parametrize over all `*sim` entries in `platforms`. Skip if no sim platform declared |
-
-Auto-parametrization logic (conftest.py `pytest_generate_tests`):
-
-```python
-def pytest_generate_tests(metafunc):
-    cls = metafunc.cls
-    if not (cls and hasattr(cls, "_scene_platforms")):
-        return
-    platform = metafunc.config.getoption("--platform")
-    if platform is None:
-        sims = [p for p in cls._scene_platforms if p.endswith("sim")]
-        if sims:
-            metafunc.parametrize("st_platform", sims, indirect=True)
-```
-
-Examples:
-
-```python
-@scene_test(level=2, platforms=["a2a3sim", "a2a3", "a5sim", "a5"], ...)
-class TestFoo(SceneTestCase): ...
-# --platform a2a3sim  → TestFoo[a2a3sim]
-# --platform a2a3     → TestFoo[a2a3]
-# (none)              → TestFoo[a2a3sim] + TestFoo[a5sim]
-
-@scene_test(level=2, platforms=["a2a3"], ...)
-class TestHwOnly(SceneTestCase): ...
-# --platform a2a3     → TestHwOnly[a2a3]
-# (none)              → skip (no sim in platforms)
-```
-
-No separate `st` or `requires_hardware` marker — `platforms` is the sole declaration.
-
 ## Test Directory Structure
 
 ```text
@@ -630,399 +148,9 @@ examples/              # Small examples (sim + onboard)
 conftest.py            # Root: --platform/--device options, ST fixtures
 ```
 
-## Test Types
+## Related guides
 
-### C++ Unit Tests (`tests/ut/cpp/`)
-
-GoogleTest-based tests for shared components (`src/common/task_interface/` and `src/{arch}/runtime/common/`):
-
-- `test_data_type.cpp` — DataType enum, get_element_size(), get_dtype_name()
-
-```bash
-cmake -B tests/ut/cpp/build -S tests/ut/cpp
-cmake --build tests/ut/cpp/build
-ctest --test-dir tests/ut/cpp/build --output-on-failure
-```
-
-#### How many times a case is built
-
-Most trees under `src/` are compiled more than once by the product: each arch's
-platform tree is its own code, and the arch-independent trees compile into every
-runtime's image, resolving their bare-name headers to that runtime's copy. A
-case covering such a tree therefore has to be built for each value of the axis
-it varies over, and the declaration says which:
-
-| Declaration | Builds |
-| ----------- | ------ |
-| `simpler_ut_platform_case(... PER_ARCH)` | one per arch |
-| `simpler_ut_platform_case(... PER_RUNTIME)` | one per runtime |
-| `simpler_ut_platform_case(... PER_ARCH PER_RUNTIME)` | one per pair |
-| `simpler_ut_platform_case(... SINGLE)` | one, and asserts the case reaches neither tree |
-| `hbg_case(...)` / `tmr_case(...)` | one per arch; `ARCHS` narrows it |
-
-None of these is a default — omitting the axis is a configure error, because a
-case built once looks exactly like a case that does not vary, and ctest reports
-both as passing.
-
-`tests/lint/check_ut_cpp_axis.py` keeps those declarations honest by
-measurement. It preprocesses every target's translation units with `-H`, reads
-which files each one opened, and reports a case whose code differs along an
-applicable axis but is not built for every value of it. Known gaps live in its
-`WAIVERS` table with a reason, and a waiver whose gap has been closed is an
-error, so the table only shrinks.
-
-It needs the compile lines, so configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`:
-
-```bash
-cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build tests/ut/cpp/build --parallel 4
-python tests/lint/check_ut_cpp_axis.py
-```
-
-CI runs it in the `ut` job, right after ctest, on the Linux leg only — the
-answer is a property of the include paths the CMakeLists compose rather than of
-the host, and the Linux build graph is the superset (a non-Linux configure drops
-`test_thread_scheduling.cpp`, whose wrapped `sched_*` symbols are a GNU ld
-feature). It is not a pre-commit hook — it reads a configured build, which
-pre-commit does not have.
-
-#### Where the stand-ins come from
-
-`tests/ut/cpp/support/` holds the stand-ins for the CANN platform API, built
-into one static archive per arch. A case takes what it needs and says nothing:
-an archive member is pulled only to resolve a symbol nothing else defined, so a
-case that compiles the real `unified_log_host.cpp`, `device_time.cpp` or
-`cache_ops.cpp` simply never pulls that stub.
-
-That is why each file there holds one group of symbols. The linker's unit is
-the object file, so a file bundling four groups is pulled for any one of them
-and brings the other three along — which is what forced a case wanting one real
-implementation to give up the rest.
-
-One thing defeats it: **a weak definition already satisfies the reference, so
-the linker never searches the archive.** Product code has such fallbacks on
-purpose — the tmr runtime defines `get_sys_cnt_aicpu` weakly as `return 0` so a
-host build links without the AICPU side. A test that takes that fallback
-compiles, links, and then hangs. Where that applies, the stub is compiled
-straight into the library that also compiles the weak definition, and left in
-the archive as well: the archive copy is not pulled there, and everything else
-still gets it.
-
-`tests/lint/check_ut_cpp_stub_linkage.py` holds that line. For every symbol the
-archive defines strongly, it fails if any test binary resolved it to a weak
-definition:
-
-```bash
-python tests/lint/check_ut_cpp_stub_linkage.py
-```
-
-### Python Unit Tests (`tests/ut/`)
-
-Tests for the nanobind extension and the Python build pipeline:
-
-- `test_task_interface.py` — DataType, Tensor, ChipStorageTaskArgs, torch integration
-- `test_runtime_builder.py` — RuntimeBuilder discovery, error handling, build logic (mocked), and real compilation integration tests
-
-```bash
-# No-hardware runner (hw tests auto-skip, no-hw tests run)
-pytest tests/ut
-
-# a2a3 hardware runner (no-hw tests skip, hw + a2a3-specific tests run)
-pytest tests/ut --platform a2a3
-```
-
-### Examples (`examples/{arch}/`)
-
-Small, fast examples that run on both simulation and real hardware. Organized by runtime:
-
-- `host_build_graph/` — HBG examples
-- `tensormap_and_ringbuffer/` — TMR examples
-
-Each example has a `golden.py` with `generate_inputs()` and `compute_golden()` for result validation.
-
-### Device Scene Tests (`tests/st/{arch}/`)
-
-Hardware-only scene tests for large-scale and feature-rich scenarios that are too slow or unsupported on simulation. Organized by runtime. Same structure as examples but focused on testing specific runtime behaviors and edge cases.
-
-| Attribute | `examples/` | `tests/st/` |
-| --------- | ----------- | ----------- |
-| Runs on sim | Yes | No |
-| Runs on device | Yes | Yes |
-| Scale | Small, fast | Large, thorough |
-| Purpose | Examples + basic regression | Deep functionality/performance |
-
-## Writing New Tests
-
-### New C++ Unit Test
-
-Put the file in the mirror of the tree it covers and stop: the directory gives
-it a target, a name, an include contract, and how many times it is built. A
-case that needs nothing beyond that is never named in a CMakeLists.
-
-[Adding a C++ unit test](testing/adding-a-cpp-unit-test.md) covers the rest —
-which directory, the per-directory macros and their keywords, how many builds
-a case gets and how to have that measured rather than guessed, and where the
-CANN stand-ins come from.
-
-#### C++ hardware tests needing NPU devices
-
-Tests that need specific NPU devices use CTest's [resource allocation](https://cmake.org/cmake/help/latest/prop_test/RESOURCE_GROUPS.html). The label and the devices are keywords on the case, usually already carried by the directory's macro:
-
-```cmake
-simpler_ut_add_target(NAME my_hw_test
-    SOURCES my_hw_test.cpp
-    LABEL requires_hardware_a2a3
-    RESOURCES "2,npus:1")    # 2 groups × 1 NPU slot each = 2 distinct devices
-```
-
-The CI generates a resource spec file from `${DEVICE_RANGE}` and passes it to ctest:
-
-```bash
-# Generate resource spec (CI does this automatically)
-python3 -c "
-import json
-npus = [{'id': str(i), 'slots': 1} for i in range(8)]
-json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
-          open('resources.json', 'w'))
-"
-
-# Run with resource allocation — CTest assigns devices, no oversubscription
-ctest --test-dir tests/ut/cpp/build \
-    -L "^requires_hardware(_a2a3)?$" \
-    --resource-spec-file resources.json \
-    -j$(nproc) --output-on-failure
-```
-
-CTest passes allocated device ids via environment variables:
-
-- `CTEST_RESOURCE_GROUP_COUNT` — number of groups
-- `CTEST_RESOURCE_GROUP_<n>_NPUS` — `"id:<device_id>,slots:1"` per group
-
-Tests read these to determine which devices to use. See `test_comm_lifecycle.cpp::read_ctest_devices()` for the parsing pattern.
-
-### New Scene Test
-
-An L3 scene that qualifies default automatic admission declares
-`@scene_test(level=3, runtime=..., automatic_admission=True)`. Both pytest and
-standalone factories then omit `pipeline_depth`, `launch_depth`,
-`pending_run_depth`, and `workspace_budget_bytes`; supplying any of them in its
-case config is an error, including `None` or zero. Existing scenes retain their
-explicit launch-depth policy. Each automatic class gets a fresh standalone
-Worker so cold-start assertions cannot inherit another class's capacity.
-This is scene metadata, not a Worker configuration option. Assert the actual
-Worker mode and use endpoint capacity/identity evidence in the scene.
-
-Create a `test_*.py` file using the `@scene_test` decorator:
-
-```python
-import torch
-from simpler.task_interface import ArgDirection as D
-
-from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-
-
-@scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestMyKernel(SceneTestCase):
-    CALLABLE = {
-        "orchestration": {
-            "source": "kernels/orchestration/my_orch.cpp",
-            "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.OUT],
-        },
-        "incores": [
-            {"func_id": 0, "source": "kernels/aiv/my_kernel.cpp", "core_type": "aiv"},
-        ],
-    }
-
-    CASES = [
-        {
-            "name": "default",
-            "platforms": ["a2a3sim", "a2a3"],
-            "params": {},
-        },
-    ]
-
-    def generate_args(self, params):
-        return TaskArgsBuilder(
-            TensorArg("x", torch.ones(1024, dtype=torch.float32)),
-            TensorArg("y", torch.zeros(1024, dtype=torch.float32)),
-        )
-
-    def compute_golden(self, args, params):
-        args.y[:] = args.x + 1
-
-if __name__ == "__main__":
-    SceneTestCase.run_module(__name__)
-```
-
-Run it:
-
-```bash
-# Via pytest (batch, ChipWorker reuse across tests)
-pytest examples tests/st --platform a2a3sim
-
-# Standalone (single case)
-python test_my_kernel.py -p a2a3sim
-
-# On hardware (SDMA demos and the isolated fault case use separate tasks)
-pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4
-pytest examples tests/st -m "sdma and not sdma_fault" --platform a2a3 --device 4-5
-pytest examples tests/st -m sdma_fault --platform a2a3 --device 4
-```
-
-Key fields:
-
-- `level`: 2 = single ChipWorker, 3 = distributed Worker (future)
-- `CASES[].platforms`: which platforms each case supports (sim names end in "sim")
-- `runtime`: which runtime to use
-- `CALLABLE.orchestration.source` / `CALLABLE.incores[].source`: paths relative to the test file
-- `CALLABLE.incores[].extra_include_dirs`: extra `-I` paths for that one kernel,
-  on top of the runtime/platform includes every kernel already gets. Entries may
-  be relative to the test file, or use `$VAR` — `$ASCEND_HOME_PATH/aarch64-linux/asc/include`
-  keeps a CANN-linked kernel off machine-specific paths. They are resolved when
-  the kernel is **compiled**, not when its module is imported, so a case that
-  declares an SDK dependency is still collectable on sim/macOS runners that do
-  not have that SDK. Paths that do not exist are dropped, letting one candidate
-  list span SDK layouts; an unset variable raises, and so does a declared set
-  where nothing survived (that means the SDK is missing). Used by
-  [`qwen3_14b_decode`](../examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/)
-  for its CANN attention extern.
-- `CASES[].config` is optional. Ordinary cases should omit `aicpu_thread_num`
-  and use the architecture default; set it only when the test specifically
-  exercises a thread-count or scheduler-topology behavior.
-- The framework owns the `config` namespace. Its keys are
-  `aicpu_thread_num`, `runtime_env`, `device_count`, and `num_sub_workers`;
-  `runtime_env` accepts `ring_task_window`, `ring_heap`, and `ring_dep_pool`.
-  Which of those the runtime under test reads differs: `host_build_graph` reads
-  only `ring_task_window` and warns when `ring_heap` is set, since it commits its
-  graph heap to the size orchestration measured.
-  Unknown keys fail when the `@scene_test` class is imported instead of being
-  silently ignored. Case-level extension keys outside `config` remain allowed.
-
-### Kernels That Wait for Siblings (Mix, sync_start)
-
-A Mix task's 1C2V and a sync_start cohort's blocks are co-residency
-requirements: the subtasks are meant to be on cores at the same instant, and a
-kernel that proves it does so by waiting for its siblings to arrive. Two rules
-govern such a kernel, and they pull in opposite directions — **bound the wait
-by time, but never decide the verdict by time.**
-
-**Bound the wait by elapsed time, not by a poll count.** A poll costs a
-different amount in the CPU-stub build than on silicon, and it costs more again
-when the machine is busy, so a count calibrated while the case runs alone can
-run out when it runs beside other work. What the case then reports is not its
-own give-up value but a device op-execute timeout — the op is killed, and the
-failure looks like a runtime hang rather than the missing rendezvous it is.
-Convert a millisecond budget with the platform's own tick rate, the way the
-runtime does:
-
-```cpp
-#ifdef PTO_CPUSTUB_HPP
-static uint64_t now_ticks() {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-#else
-static __aicore__ uint64_t now_ticks() { return get_sys_cnt(); }
-#endif
-
-constexpr uint64_t WAIT_MS = 2000;
-const uint64_t deadline = WAIT_MS * (static_cast<uint64_t>(PLATFORM_PROF_SYS_CNT_FREQ) / 1000u);
-const uint64_t started = now_ticks();
-while (now_ticks() - started < deadline) { /* ... */ }
-```
-
-Note the host-side guard spelling. Select the stub path on
-`#ifdef PTO_CPUSTUB_HPP`, which is how the kernels in this tree already do it —
-**not** on `#ifndef dcci`. `dcci` is a *function* in both the CCE and
-`cpu_stub.hpp` builds, so `#ifndef dcci` is unconditionally true and silently
-compiles the whole cache-maintenance path out of the onboard build.
-
-**Write a poison value when the wait expires** so the give-up is visible to
-`compute_golden` (see [Output Validation](#output-validation)) rather than
-only to someone reading a log. A value no correct run can produce — `-99.0` in
-the existing cases — turns a missed rendezvous into a result mismatch naming
-the lane.
-
-**Do not judge co-residency by whether the wait expired.** That measures a race
-against a wall clock, so the verdict moves with machine load: the same build can
-report the defect when the case runs alone and report it fixed when the case
-runs after the rest of the suite. Decide from the run's own record instead —
-the `assert_cohorts_were_coresident` fixture in
-`tests/st/a5/host_build_graph/conftest.py` reads `chip_swimlane_records.json`
-and checks that each cohort's subtask intervals intersect (its latest start
-precedes its earliest end). Load shifts where the intervals sit, never whether
-they intersect. The bounded wait is what keeps a non-co-resident run from
-hanging; the interval check is what decides whether it was co-resident.
-
-### Output Validation
-
-By default every output tensor is compared against `compute_golden` with
-`torch.allclose` at the class `RTOL` / `ATOL`. Two hooks cover the cases that
-don't fit:
-
-- **`CASES[].skip_golden`** (defaults to the class attribute `SKIP_GOLDEN`,
-  itself `False`) — the case has no host-computable expected output and passes
-  by running clean; `compute_golden` is never called for it. Use it when the
-  output depends on a shape only the device knows, such as the SPMD grid width
-  the runtime resolved. `--skip-golden` on the command line forces this on for
-  every case (benchmark mode).
-- **`compare_outputs(self, test_args, golden_args, output_names, params)`** —
-  override to compare a subset of the outputs, apply a per-tensor tolerance, or
-  derive the valid extent from the output itself (a task that writes one slot
-  per SPMD block reports the grid width it actually ran with, and only that
-  prefix is defined). Call `super().compare_outputs(...)` with the names you
-  still want checked the default way.
-
-Prefer a `compare_outputs` override to `skip_golden`: a self-describing output
-still gets checked, whereas a skipped case only proves the run didn't crash.
-
-### Case Selection and Manual Cases
-
-`--case` is repeatable and accepts compound forms (useful when a test file declares multiple `SceneTestCase` classes):
-
-| Form | Meaning |
-| ---- | ------- |
-| `--case Foo` | case named `Foo` in any class |
-| `--case ClassA::Foo` | `Foo` in `ClassA` only |
-| `--case ClassA::` | all cases in `ClassA` |
-| `--case A::x --case B::y` | multiple selectors (repeatable) |
-
-`--manual exclude` (default) skips `manual: True` cases and standalone tests
-marked `@pytest.mark.manual`; `--manual include` runs them alongside normal
-tests; `--manual only` runs only manual tests. The `only` filter applies to the
-entire pytest session, so it also deselects ordinary standalone tests without a
-`manual` marker. These compose orthogonally with `--case`: explicit selectors
-still respect the manual filter — to run a manual case by name, pass
-`--manual include`.
-
-The separate `daily.yml` workflow runs the full corpus with `--manual include`
-once per day on A2/A3 and A5, simulation and onboard. Mark a whole standalone
-pytest test with `@pytest.mark.manual`; mark only one case in a `SceneTestCase`
-by setting `"manual": True` on that `CASES` entry. The main Per-PR scene sweep
-excludes those tests, while Daily runs them together with the regular corpus.
-Dedicated DFX steps are the exception: they use `--manual include` in normal
-Per-PR and Daily jobs, so marking a case under their target path removes only
-its duplicate main-sweep execution. A caller selecting `--manual only` keeps
-that mode in the DFX steps. The A2/A3 `network1` cases run in the same Daily
-workflow through their existing two-machine job, and the DeepSeek smokes run
-Per-PR in their own parallel job (`st-deepseek-onboard-a2a3`, `--manual only`
-over the two `deepseek_v4_flash_decode` directories).
-
-To move only selected platforms, pass the platform list to the same marker:
-use `@pytest.mark.manual(["a2a3sim", "a5sim"])` (or the equivalent
-`@pytest.mark.manual(platforms=["a2a3sim", "a5sim"])`) for a standalone test,
-or `"manual": ["a2a3sim", "a5sim"]` for a scene-test case. Do not mix the two
-standalone marker forms. An onboard execution remains in the default Per-PR
-sweep only when that case also declares the corresponding onboard platform;
-otherwise the selected architecture becomes Daily-only.
-
-### Sharing an Example Between examples/ and tests/st/
-
-If similar coverage exists in both `examples/` and `tests/st/`, collapse it into a single `test_*.py`: small cases get `platforms: ["a2a3sim", "a2a3"]`; large benchmark cases get `platforms: ["a2a3"], "manual": True`.
-
-## Sanitizer builds (ASAN / UBSan / TSAN)
+### Sanitizer builds (ASAN / UBSan / TSAN)
 
 Opt-in `-fsanitize` instrumentation of host-compiled code via `--sanitizer`
 (build with `SIMPLER_SANITIZER=...`, run with the matching runtime preloaded).
@@ -1031,171 +159,69 @@ page — see **[sanitizers.md](sanitizers.md)**. The nightly CI job is in
 [ci.md](ci.md#nightly-sanitizer-sweep); the scoping rationale (macOS / TSAN / LSan) is in
 [investigations/2026-06-sanitizer-scope.md](investigations/2026-06-sanitizer-scope.md).
 
-## CI Pipeline
+### CI Pipeline
 
 See [ci.md](ci.md) for the full CI pipeline documentation, including the job matrix, runner constraints, and marker scheme.
 
-## Runtime Isolation Constraint (Onboard)
+### Previous section links
 
-**One device can only run one runtime per process.** Switching runtimes on the same device within a single process causes AICPU kernel hangs.
+Old links into this overview remain available here; follow the corresponding
+link for the full section.
 
-### Root Cause
+<!-- markdownlint-disable MD033 -->
 
-CANN's AICPU dispatch uses a framework SO (`libaicpu_extend_kernels.so`) with a global singleton `BackendServerHandleManager` that:
+| Previous section | Current location |
+| ---------------- | ---------------- |
+| <a id="test-environments"></a>Test environments | [Read section](testing/environments.md#test-environments) |
+| <a id="scene-test-cli-options"></a>Scene Test CLI Options | [Read section](testing/cli.md#scene-test-cli-options) |
+| <a id="lock-free-kernel-warm-up"></a>Lock-free kernel warm-up | [Read section](testing/cli.md#lock-free-kernel-warm-up) |
+| <a id="pytest"></a>pytest | [Read section](testing/cli.md#pytest) |
+| <a id="standalone-test_py"></a>Standalone (test_*.py) | [Read section](testing/cli.md#standalone-test_py) |
+| <a id="option-reference"></a>Option Reference | [Read section](testing/cli.md#option-reference) |
+| <a id="log-levels"></a>Log levels | [Read section](testing/cli.md#log-levels) |
+| <a id="integer-layout-python-aligned"></a>Integer layout (Python-aligned) | [Read section](testing/cli.md#integer-layout-python-aligned) |
+| <a id="where-each-tier-ends-up"></a>Where each tier ends up | [Read section](testing/cli.md#where-each-tier-ends-up) |
+| <a id="setting-it"></a>Setting it | [Read section](testing/cli.md#setting-it) |
+| <a id="cli-design-principles"></a>CLI Design Principles | [Read section](testing/cli.md#cli-design-principles) |
+| <a id="parallel-test-execution-and-resource-reuse"></a>Parallel Test Execution and Resource Reuse | [Read section](testing/parallel-execution.md#parallel-test-execution-and-resource-reuse) |
+| <a id="quick-examples"></a>Quick examples | [Read section](testing/parallel-execution.md#quick-examples) |
+| <a id="fail-fast-x-exitfirst"></a><a id="fail-fast--x----exitfirst"></a>Fail-fast (`-x` / `--exitfirst`) | [Read section](testing/parallel-execution.md#fail-fast-execution) |
+| <a id="device-count-constraints"></a>Device-count constraints | [Read section](testing/parallel-execution.md#device-count-constraints) |
+| <a id="-device-vs-max-parallel-two-separate-knobs"></a><a id="--device-vs---max-parallel-two-separate-knobs"></a>`--device` vs `--max-parallel` (two separate knobs) | [Read section](testing/parallel-execution.md#device-pool-size-and-maximum-parallelism) |
+| <a id="mixed-l2-l3-in-one-file"></a><a id="mixed-l2--l3-in-one-file"></a>Mixed L2 + L3 in one file | [Read section](testing/parallel-execution.md#mixed-l2-and-l3-in-one-file) |
+| <a id="profiling-under-parallelism"></a>Profiling under parallelism | [Read section](testing/parallel-execution.md#profiling-under-parallelism) |
+| <a id="dispatcher-skip-conditions-normal-pytest-runs"></a>Dispatcher skip conditions (normal pytest runs) | [Read section](testing/parallel-execution.md#dispatcher-skip-conditions-normal-pytest-runs) |
+| <a id="hardware-classification"></a>Hardware Classification | [Read section](testing/environments.md#hardware-classification) |
+| <a id="helper-function"></a>Helper function | [Read section](testing/environments.md#helper-function) |
+| <a id="ut-py-pytestmarkrequires_hardwareplatform"></a>ut-py: `@pytest.mark.requires_hardware[(platform)]` | [Read section](testing/environments.md#ut-py-pytestmarkrequires_hardwareplatform) |
+| <a id="ut-cpp-ctest-labels"></a>ut-cpp: ctest labels | [Read section](testing/environments.md#ut-cpp-ctest-labels) |
+| <a id="st-scene_testplatforms"></a>st: `@scene_test(platforms=[...])` | [Read section](testing/environments.md#st-scene_testplatforms) |
+| <a id="test-types"></a>Test Types | [Read section](testing/unit-tests.md#test-types) |
+| <a id="c-unit-tests-testsutcpp"></a>C++ Unit Tests (`tests/ut/cpp/`) | [Read section](testing/unit-tests.md#c-unit-tests-testsutcpp) |
+| <a id="how-many-times-a-case-is-built"></a>How many times a case is built | [Read section](testing/unit-tests.md#how-many-times-a-case-is-built) |
+| <a id="where-the-stand-ins-come-from"></a>Where the stand-ins come from | [Read section](testing/unit-tests.md#where-the-stand-ins-come-from) |
+| <a id="python-unit-tests-testsut"></a>Python Unit Tests (`tests/ut/`) | [Read section](testing/unit-tests.md#python-unit-tests-testsut) |
+| <a id="examples-examplesarch"></a>Examples (`examples/{arch}/`) | [Read section](testing/unit-tests.md#examples-examplesarch) |
+| <a id="device-scene-tests-testsstarch"></a>Device Scene Tests (`tests/st/{arch}/`) | [Read section](testing/unit-tests.md#device-scene-tests-testsstarch) |
+| <a id="writing-new-tests"></a>Writing New Tests | [Read section](testing/writing-tests.md#writing-new-tests) |
+| <a id="new-c-unit-test"></a>New C++ Unit Test | [Read section](testing/unit-tests.md#new-c-unit-test) |
+| <a id="c-hardware-tests-needing-npu-devices"></a>C++ hardware tests needing NPU devices | [Read section](testing/unit-tests.md#c-hardware-tests-needing-npu-devices) |
+| <a id="new-scene-test"></a>New Scene Test | [Read section](testing/writing-tests.md#new-scene-test) |
+| <a id="kernels-that-wait-for-siblings-mix-sync_start"></a>Kernels That Wait for Siblings (Mix, sync_start) | [Read section](testing/writing-tests.md#kernels-that-wait-for-siblings-mix-sync_start) |
+| <a id="output-validation"></a>Output Validation | [Read section](testing/writing-tests.md#output-validation) |
+| <a id="case-selection-and-manual-cases"></a>Case Selection and Manual Cases | [Read section](testing/writing-tests.md#case-selection-and-manual-cases) |
+| <a id="sharing-an-example-between-examples-and-testsst"></a>Sharing an Example Between examples/ and tests/st/ | [Read section](testing/writing-tests.md#sharing-an-example-between-examples-and-testsst) |
+| <a id="runtime-isolation-constraint-onboard"></a>Runtime Isolation Constraint (Onboard) | [Read section](testing/parallel-execution.md#runtime-isolation-constraint-onboard) |
+| <a id="root-cause"></a>Root Cause | [Read section](testing/parallel-execution.md#root-cause) |
+| <a id="impact"></a>Impact | [Read section](testing/parallel-execution.md#impact) |
+| <a id="mitigation"></a>Mitigation | [Read section](testing/parallel-execution.md#mitigation) |
+| <a id="device-allocation-orchestrator-xdist"></a><a id="device-allocation-orchestrator--xdist"></a>Device Allocation (Orchestrator + xdist) | [Read section](testing/parallel-execution.md#device-allocation-by-the-orchestrator-and-xdist) |
+| <a id="resource-phase-device-bin-packing"></a><a id="resource-phase--device-bin-packing"></a>Resource phase — device bin-packing | [Read section](testing/parallel-execution.md#resource-phase-and-device-bin-packing) |
+| <a id="l2-phase-xdist-fanout-per-device"></a><a id="l2-phase--xdist-fanout-per-device"></a>L2 phase — xdist fanout per device | [Read section](testing/parallel-execution.md#l2-phase-xdist-fanout-per-device) |
+| <a id="l2-phase-standalone-fanout"></a><a id="l2-phase--standalone-fanout"></a>L2 phase — standalone fanout | [Read section](testing/parallel-execution.md#l2-phase-standalone-fanout) |
+| <a id="sim-platforms"></a>Sim platforms | [Read section](testing/parallel-execution.md#sim-platforms) |
+| <a id="per-case-device-filtering"></a>Per-Case Device Filtering | [Read section](testing/parallel-execution.md#per-case-device-filtering) |
+| <a id="when-separate-directories-are-still-needed"></a>When separate directories are still needed | [Read section](testing/parallel-execution.md#when-separate-directories-are-still-needed) |
+| <a id="explicit-l2-child-memory"></a>Explicit L2 child memory | [Read section](testing/child-memory.md#explicit-l2-child-memory) |
 
-1. **`SaveSoFile`**: Writes the user AICPU .so to disk on first call, then sets `firstCreatSo_ = true` to skip all subsequent writes.
-2. **`SetTileFwkKernelMap`**: `dlopen`s the .so and caches function pointers on first call, then sets `firstLoadSo_ = true` to skip all subsequent loads.
-
-When a second runtime launches on the same device (same CANN process context), the first `simpler_aicpu_exec` launch hits the cached flags — the new AICPU .so is never written or loaded, so it calls function pointers from the first runtime's .so, which operates on incompatible data structures and hangs.
-
-### Impact
-
-| Scenario | Result |
-| -------- | ------ |
-| Same runtime, same device, sequential | Works (same .so, cached pointers valid) |
-| Different runtime, same device, sequential | **Hangs** (stale .so, wrong function pointers) |
-| Different runtime, different device | Works (separate CANN context per device) |
-| Different runtime, different process, same device | Works (`rtDeviceReset` between processes clears context) |
-
-### Mitigation
-
-The dispatcher spawns a separate subprocess per runtime for L2 work and a separate subprocess per job for Resource work (L3 classes and standalone resource functions). Every subprocess starts from a clean CANN state, so the stale-`.so` hang is structurally impossible.
-
-## Device Allocation (Orchestrator + xdist)
-
-When running `pytest --platform a2a3 --device 8-11`, the dispatcher does this:
-
-### Resource phase — device bin-packing
-
-For every collected resource job (L3 ``SceneTestCase`` classes and standalone pytest functions marked with ``@pytest.mark.device_count``), the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued job and, if the free set can cover its `device_count`, grabs that many ids and spawns:
-
-```text
-# L3 class job
-pytest <nodeid> --resource-child --runtime <rt> --level 3 --device <alloc-range>
-
-# Standalone resource function job
-pytest <nodeid> --resource-child --runtime <rt> --device <alloc-range>
-```
-
-When a subprocess completes, its devices return to the free set and the queue is re-tried. Jobs that need more devices than currently free **wait**; jobs that need more than the whole pool **fail the batch up front**.
-
-### L2 phase — xdist fanout per device
-
-After the Resource phase drains, one subprocess is spawned per runtime:
-
-```text
-pytest --resource-child --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
-```
-
-`pytest-xdist` starts 4 workers (`gw0`..`gw3`). Each worker's `pytest_configure` slices `--device 8-11` down to a single id (`gw0` → `8`, `gw1` → `9`, ...), and `st_worker` is session-scoped, so the worker initializes exactly one `ChipWorker(device=N)` and reuses it for every L2 class routed to it. `--dist loadfile` keeps all cases from one test file on the same worker, amortizing any file-level setup cost.
-
-An explicit `-p no:xdist` or `-n 0` is authoritative for the L2 children
-inherited from the top-level invocation. The dispatcher does not append xdist
-options in either case, so each L2 runtime subprocess executes serially. `--pdb`
-reaches the same state, and reaches it on its own gate rather than through the
-worker count: xdist zeroes that count only for `-n auto` / `-n logical`, while
-a bare `--pdb` leaves it unset — and since the L2 child inherits `--pdb`, an
-appended `-n` would make xdist reject the child with
-`--pdb is incompatible with distributing tests`. An explicit top-level `--dist`
-(or its `-d` shortcut) is preserved too; the dispatcher adds only the options
-the invocation left unset.
-
-A top-level `-n N` with N > 0 is a different case: it puts xdist in
-distribution mode, whose `pytest_runtestloop` claims the session before this
-dispatcher's hook runs, so the phase split does not happen at all and every
-collected level runs in one flat xdist fanout. Size L2 parallelism with
-`--max-parallel`, not with a top-level `-n`.
-
-Resource-phase subprocess concurrency continues to follow `--max-parallel`
-because it does not use pytest-xdist. If plugin autoloading is disabled without
-blocking xdist explicitly, the dispatcher warns before falling back to serial
-L2 execution.
-
-### L2 phase — standalone fanout
-
-Standalone (`python test_*.py -d 8-11`) uses the same scheduler module: classes are round-robin assigned to `len(device_ids)` chunks, one subprocess per chunk launched with a single device and explicit `--case ClassName::` selectors.
-
-### Sim platforms
-
-On sim (`a2a3sim`, `a5sim`), device IDs are virtual — no hardware state, no isolation constraint. All tests share a single virtual pool with auto-incrementing IDs. The same dispatcher + xdist path is used; speedup on sim comes from actual CPU parallelism, not hardware parallelism.
-
-## Per-Case Device Filtering
-
-The `@scene_test(platforms=[...])` decorator provides per-case platform filtering. A single test class declares which platforms it supports:
-
-```python
-@scene_test(level=2, platforms=["a2a3sim", "a2a3"], runtime="tensormap_and_ringbuffer")
-class TestSmallCase(SceneTestCase):
-    ...  # runs on sim and a2a3 hardware
-
-@scene_test(level=2, platforms=["a2a3"], runtime="tensormap_and_ringbuffer")
-class TestLargeCase(SceneTestCase):
-    ...  # hardware only (too slow for sim)
-```
-
-This eliminates the need for separate `examples/` (sim) and `tests/st/` (device) directories when only scale differs. Both cases can live in the same file.
-
-### When separate directories are still needed
-
-When kernels themselves differ (e.g., templated tile sizes tuned for device), separate test files remain the correct approach.
-
-## Explicit L2 child memory
-
-`TensorArg(name, value, child_memory=True)` keeps a case-owned device buffer
-across all rounds, including `--rounds 1`. `TaskArgsBuilder.add_tensor` accepts
-the same keyword. The default remains host memory; IN and INOUT tensors are copied in on every round, while pure OUT buffers skip the copy.
-
-| Declaration / direction | Setup | Between rounds | Validation |
-| ----------------------- | ----- | -------------- | ---------- |
-| Host memory (default) | Existing path | Restore OUT/INOUT host fixtures | Existing per-round copy-back |
-| Child-memory IN | Allocate and upload once | Keep device address and input contents | No output readback |
-| Child-memory OUT | Allocate without upload | Keep device contents; the case must define all compared elements | Final readback |
-| Child-memory INOUT | Allocate and upload once | Keep device state | Final readback |
-
-Golden evaluation follows the same state evolution: child-memory outputs retain
-state and host-memory outputs reset. Cases with child-memory outputs compare after
-the final round; other cases continue comparing every round.
-
-A tensor whose contents the HBG host orchestration reads (`get_tensor_data`) or
-writes (`set_tensor_data`) may be child memory. The declaration needs no extra
-opt-in: the runtime claims each child-memory span at bind and picks how to reach
-it only if an access actually lands there, so a tensor the orchestration never
-touches costs nothing.
-
-| Platform | Means | Per-access cost |
-| -------- | ----- | --------------- |
-| Host map available (a2a3 onboard, sim) | one mapping of the allocation, held by the runtime for the allocation's lifetime | none |
-| Host map unavailable (a5 onboard, or a 64 KiB-page host — issue #1531) | a device copy per access | one synchronous driver round trip, ~9.5 µs† |
-
-† Measured on a2a3 with 4 KiB host pages (CANN 9.0.0), which is neither
-configuration in that row — a2a3 on ordinary pages takes the mapping. It is
-what a small synchronous `aclrtMemcpy` costs against this driver; a5 and
-64 KiB-page hosts are unmeasured. See
-[the investigation](investigations/2026-09-hbg-per-run-host-view-rebuild.md).
-
-On the second row the cost is per access, not per tensor, so a tensor the
-orchestration reads thousands of times — `paged_attention`'s `block_table` is
-read once per (batch, block) pair, 16,384 times in Case1, which is ~156 ms — is
-better left in host memory there. The declaration is per argument, so a
-data-dependent case can mix freely. The bind's `BindHostViewClose` phase
-attributes report `devcopy=N` when this path was taken.
-
-Runtime-created tensors (graph-heap allocations the orchestration made itself)
-remain unreadable: they are uninitialized until a task writes them, and
-`get_tensor_data` rejects a tensor with a producer outright.
-
-Declarations currently require L2, contiguous CPU fixtures, and non-overlapping
-storage. Empty fixtures allocate no device buffer; the existing transport
-still rejects zero-shaped Tensor arguments. Clone and rehost operations preserve
-declaration metadata. An in-repo standalone driver that owns its own `Worker`
-reuses the same owner, `simpler_setup.scene_test.ChildMemoryTaskArgs`, as a
-context manager, adding one fixture at a time so each large fixture can be
-released before the next is materialized. It is a scene-test helper, not part of
-the `simpler_setup` public surface — it builds `TaskArgs` and copies back through
-a `TaskArgsBuilder`, so it has no meaning outside this corpus.
-
-The HBG `paged_attention_unroll_manual_scope` examples include matched manual
-`HostStaged` and `ChildMemory` cases, the latter declaring every tensor —
-including the two the orchestration reads. The HBG `paged_attention` scene tests
-carry the same pairing as non-manual cases, so CI covers an orchestration
-reading child memory on both arches. Existing default cases retain host memory.
+<!-- markdownlint-enable MD033 -->

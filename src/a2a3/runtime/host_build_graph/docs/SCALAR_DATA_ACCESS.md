@@ -1,74 +1,36 @@
 # Scalar Data Access During Host Graph Construction
 
-`host_build_graph` runs the orchestration function synchronously on the host,
-before that run's AICPU scheduler or AICore kernels start. `get_tensor_data`
-and `set_tensor_data` access ready external inputs through host views or
-child-memory scalar copies. An eligible successor may build while its
-predecessor executes; the caller owns ordering of conflicting accesses.
+`host_build_graph` builds the graph synchronously on the host before its device
+tasks execute. Both architectures use the shared
+[HBG host data access contract](../../../../../docs/hbg-host-data-access.md).
 
 ## Supported Uses
 
-| Tensor state | `get_tensor_data` | `set_tensor_data` |
-| ------------ | ----------------- | ----------------- |
-| Ready host-backed `IN` / `INOUT`, with no submitted producer | Reads the caller's host view | Updates the host view and device staging |
-| Ready child-memory argument, with no submitted producer | Uses a host mapping or device copy | Uses a host mapping or device copy |
-| Host-backed pure `OUT` argument | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
-| External tensor a submitted task writes (`OUTPUT`/`INOUT`) | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
-| Output of a submitted task | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
-| Runtime allocation (`alloc_tensors`) | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
-| Tensor with an invalid or stale owner task ID | Fails with `INVALID_ARGS` | Fails with `INVALID_ARGS` |
-
-A host-backed pure `OUT` has no input copy or registered host view during bind.
-For supported inputs, a host write changes the value the graph will consume;
-submit order does not turn the write into a barrier between kernels.
+Only explicit `HOST/NONE` arguments are eligible: `get_tensor_data` reads
+`IN`/`INOUT`, and `set_tensor_data` writes `OUT`/`INOUT`, within the registered
+bounds and Buffer grant. `HOST/H2D` becomes device storage at bind; it and
+`DEVICE/NONE` are refused by the host scalar accessors. Empty views have no
+readable or writable elements. Device values require an explicit copy before
+submission when graph construction needs their contents.
 
 ## API
 
 ```cpp
 uint32_t index[1] = {0};
-
-int32_t value = get_tensor_data<int32_t>(control, 1, index);
-set_tensor_data<int32_t>(layout, 1, index, value + 1);
+int32_t value = get_tensor_data<int32_t>(host_control, 1, index);
+set_tensor_data<int32_t>(host_layout, 1, index, value + 1);
 ```
 
-Both tensors must be ready external inputs with host views or child memory. A
-common use is to read an input control value or publish runtime geometry into an
-external layout tensor that no submitted task owns.
-
-If a previous run produces the value, finish its handle before submitting the
-consumer whose host construction needs it:
-
-```python
-producer = worker.submit(producer_callable, producer_args)
-producer.result()
-consumer = worker.submit(consumer_callable, consumer_args)
-consumer.wait()
-```
-
-Successful completion must include any required copy-back for host-backed
-outputs. For child memory, wait for the device writer and retain the allocation;
-there is no host staging copy-back. The same rule protects a predecessor's
-readers from a successor's host write. Independent and shared read-only inputs
-can prepare early when the backend supports it. Tensor tags do not supply an
-implicit cross-run accessor wait.
+The read argument must be a host-only input and the write argument a host-only
+output or input/output. Host writes do not update a device counterpart; use
+separate arguments for host construction and device execution.
 
 ## Why This Run's Device-Produced Values Cannot Be Read Here
 
-Within one run, the execution order is:
-
-1. The host loads and calls the orchestration shared object.
-2. Orchestration builds the entire task graph and returns.
-3. The host copies the graph image to device memory.
-4. AICPU schedulers boot and dispatch the graph.
-
-A producer submitted in step 1 cannot become `COMPLETED` until step 4, so a read
-of its output would see the buffer's pre-run content and a write would be
-overwritten by the producer itself. Both accessors therefore reject a tensor
-with a producer outright — there is no wait and no timeout.
-
-A runtime allocation is rejected on the same rule. Its creator completes on the
-host, but the buffer is uninitialized, lives in the graph heap, and has no
-host-view registration.
+The host completes orchestration and uploads the graph before AICPU schedulers
+dispatch its device tasks. Their outputs and graph-heap allocations have no
+registered host view during construction. Host scalar access cannot wait for
+those producers or initialize their device storage.
 
 ## No Initial-Value Fill on a Runtime Allocation
 
@@ -88,24 +50,16 @@ it derives for itself, from a heap block whose prior contents it never reads.
 
 ## Producer Rejection
 
-A producer reaches a tensor two ways, and either one rejects the call:
-
-- the tensor names a creator in `owner_task_id` — the task that allocated it,
-  whether an ordinary submit or `alloc_tensors`;
-- an entry in the TensorMap names a task that wrote a region overlapping this
-  one, which is how an external tensor passed as `OUTPUT`/`INOUT` acquires a
-  producer.
-
-An invalid or stale owner ID is rejected by the first rule like any other
-producer, so a forged ID cannot reach a task-table slot. A rejection latches
-`SIMPLER_ERROR_INVALID_ARGS` and names the producer task; the run returns status
-`-5`, reads return zero, and writes do not happen.
+The scalar accessors require an owner-free HOST tensor. A device tensor, an
+owner task ID, an incompatible direction or an out-of-bounds access latches
+`SIMPLER_ERROR_INVALID_ARGS`. Failed reads return zero and failed writes do
+not modify memory; an earlier fatal error remains the reported failure.
 
 ## Practical Rules
 
-- Use scalar access on ready host-backed inputs or child memory that no task in
-  the current graph produces. Include aliases when checking for conflicting uses.
-- Use tensor dependencies to order device tasks; do not use host scalar access
-  as a device synchronization barrier.
-- Pass values needed for graph construction as orchestration inputs or scalars.
-- Complete the producer run before building a consumer that needs its results.
+- Supply explicit `HOST/NONE` controls for graph construction.
+- Use device task dependencies for values produced within the graph.
+- Complete any earlier producer and the required explicit host copy before
+  submitting a construction that consumes those bytes.
+- Order conflicting host writes against earlier readers as well.
+- See the shared contract for location, transfer and readiness details.

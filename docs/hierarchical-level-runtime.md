@@ -325,7 +325,7 @@ function pointers are used, causing hangs.
 **Do not reuse a device across different runtimes within a single process.**
 Use separate processes (one per runtime), or partition devices so each
 runtime gets exclusive devices. See
-[testing.md](testing.md#runtime-isolation-constraint-onboard) for the pytest
+[test runtime isolation](testing/parallel-execution.md#runtime-isolation-constraint-onboard) for the pytest
 device allocation algorithm.
 
 ---
