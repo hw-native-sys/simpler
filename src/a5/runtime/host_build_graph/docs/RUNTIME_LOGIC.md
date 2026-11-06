@@ -615,14 +615,11 @@ latency from the recorded timestamps.
 
 ## 8. Scalar Access During Construction
 
-`get_tensor_data` and `set_tensor_data` operate on registered host views of
-external tensors, and only on tensors that no submitted task produces. A producer
-— named either by the tensor's `owner_task_id` or by an overlapping TensorMap
-entry — fails the call with `INVALID_ARGS`, because the device scheduler starts
-only after orchestration returns and nothing it produces exists yet. A runtime
-allocation is rejected by the same rule; its graph-heap buffer has no host view
-either. See [SCALAR_DATA_ACCESS.md](SCALAR_DATA_ACCESS.md) for the supported
-contract.
+`get_tensor_data` and `set_tensor_data` operate only on explicit `HOST/NONE`
+arguments with registered bounds and compatible directions. Device arguments
+and graph-heap allocations are refused; there is no implicit mapping or device
+copy fallback. See [SCALAR_DATA_ACCESS.md](SCALAR_DATA_ACCESS.md) and the shared
+[HBG host data access contract](../../../../../docs/hbg-host-data-access.md).
 
 ## 9. Errors and Diagnostics
 

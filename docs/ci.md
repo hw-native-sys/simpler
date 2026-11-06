@@ -276,10 +276,10 @@ pytest examples tests/st --platform a5 --exclude-level 4 --device 0-7 -x
 failure saves runner minutes. Local development usually wants the opposite
 (let every failure surface) — just drop the flag. The short form is the
 same in both pytest and standalone on purpose; see
-[testing.md §CLI Design Principles](testing.md#cli-design-principles).
+[CLI design principles](testing/cli.md#cli-design-principles).
 
 `pytest-xdist` is pulled in via the `test` extra. See
-[testing.md §Parallel Test Execution](testing.md#parallel-test-execution-and-resource-reuse)
+[Parallel test execution](testing/parallel-execution.md#parallel-test-execution-and-resource-reuse)
 for the full hierarchy, fail-fast semantics, and the
 profiling-vs-parallelism trade-off.
 
@@ -527,7 +527,7 @@ queueing entirely:
 
 ## Hardware Classification
 
-Three hardware tiers, applied to all test categories. See [testing.md](testing.md#hardware-classification) for the full table including per-category mechanisms (pytest markers, ctest labels, folder structure).
+Three hardware tiers, applied to all test categories. See [hardware classification](testing/environments.md#hardware-classification) for per-category selection mechanisms, and [Test Sources](#test-sources) for folder layouts.
 
 | Tier | CI Runner | Job examples |
 | ---- | --------- | ------------ |
@@ -649,7 +649,7 @@ passes exactly like one built for every configuration.
 weak fallback links fine and then hangs, so ctest only reaches it by timing
 out. The first reads the build's compile lines, so that job configures with
 `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`. See
-[testing.md](testing.md#how-many-times-a-case-is-built).
+[unit-test build coverage](testing/unit-tests.md#how-many-times-a-case-is-built).
 
 The two checks are scoped differently, by what decides their answer. The axis
 check reads which configurations each case is built for, which the include
@@ -730,7 +730,7 @@ set_tests_properties(test_a2a3_feature PROPERTIES LABELS "requires_hardware_a2a3
 Selection uses `-LE` (label exclude) on no-hw runner and `-L` (label include) on device runners:
 
 ```bash
-ctest -LE requires_hardware                 # no-hardware runner: only unlabeled
+ctest -LE requires_hardware                # no-hardware runner: unlabeled and no_hardware
 ctest -L "^requires_hardware(_a2a3)?$"      # a2a3 runner: hw + a2a3-specific
 ctest -L "^requires_hardware(_a5)?$"        # a5 runner: hw + a5-specific
 ```
@@ -747,9 +747,11 @@ class TestVectorExample(SceneTestCase):
 | ------------ | -------- |
 | `a2a3sim` | Run if `"a2a3sim"` in `platforms` |
 | `a2a3` | Run if `"a2a3"` in `platforms` |
-| *(none)* | Auto-parametrize over all `*sim` entries in `platforms` |
+| *(none)* | Skip with `--platform required` |
 
-No `--platform` means "run all sims" — tests with no sim in their `platforms` list are skipped. No additional markers are used.
+Select a platform explicitly for each invocation. The runner matches it against
+each case's supported platforms; it does not automatically parametrize over
+simulators. No additional markers are used.
 
 ## Platform notes
 
