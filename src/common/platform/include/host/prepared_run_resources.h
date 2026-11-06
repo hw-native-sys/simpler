@@ -233,8 +233,9 @@ public:
         }
     }
     void note_waits_consumed() { waits_ended_ = true; }
+    bool can_retain_external_use() const { return !external_registered_ && !host_ended_; }
     bool retain_external_use() {
-        if (external_registered_ || host_ended_) return false;
+        if (!can_retain_external_use()) return false;
         external_registered_ = true;
         external_ended_ = false;
         return true;

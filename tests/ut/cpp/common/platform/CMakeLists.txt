@@ -949,6 +949,13 @@ tmr_case(test_native_admission.cpp
     DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
 
+# Native capture lifetime cases drive the real PMU lease through exported fake driver symbols.
+foreach(_arch IN ITEMS a2a3 a5)
+    foreach(_rt IN ITEMS tmr hbg)
+        set_target_properties(test_${_arch}_${_rt}_native_admission PROPERTIES ENABLE_EXPORTS ON)
+    endforeach()
+endforeach()
+
 # The lease's own case. Declared apart from the bulk list below because it needs
 # the implementation compiled in, and because it resolves the driver's prof
 # entry points through `dlsym(RTLD_DEFAULT, ...)`: ENABLE_EXPORTS puts this

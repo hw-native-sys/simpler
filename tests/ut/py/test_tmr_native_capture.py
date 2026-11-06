@@ -112,7 +112,8 @@ class _Recording:
             == 0
         )
         if capture:
-            assert lib.simpler_retain_run_resources(ctx, self.run, caller, ctypes.byref(self.reference)) == 0
+            retain_rc = lib.simpler_retain_run_resources(ctx, self.run, caller, ctypes.byref(self.reference))
+            assert retain_rc == 0, f"simpler_retain_run_resources failed: {retain_rc}"
             assert self.reference.value is not None
         # The launch consumes its prepared snapshot, not this mutable source object.
         args.clear()

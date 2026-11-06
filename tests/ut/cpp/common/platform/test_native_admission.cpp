@@ -2967,3 +2967,205 @@ TEST_F(NativeAdmissionTest, RetainedPreparationSwitchingToEagerWithdrawsItsUnuse
 }
 
 }  // namespace native_admission_test
+
+namespace native_admission_test {
+namespace {
+class PmuCaptureRunner : public FencedCompletionRunner {
+public:
+    PmuCaptureRunner() {
+        static int binary;
+        aicore_bin_handle_ = &binary;
+    }
+    ~PmuCaptureRunner() override {
+        pmu_collector_.finalize(nullptr, [this](void *p) {
+            return mem_alloc_.free(p);
+        });
+    }
+    bool supports_pmu_capture() const override { return supported; }
+    bool supported{true};
+    int prepare_collector_storage(const Runtime &, PreparedExecution &prepared) override {
+        ++arm_calls;
+        const int rc = pmu_collector_.init(
+            1, 1,
+            [this](size_t n) {
+                return mem_alloc_.alloc(n);
+            },
+            nullptr,
+            [this](void *p) {
+                return mem_alloc_.free(p);
+            },
+            0
+        );
+        prepared.kernel_args.args.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
+        SIMPLER_SET_DFX_FLAG(prepared.kernel_args.args.enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
+        return rc;
+    }
+    bool flush(std::string *error) { return pmu_collector_.flush_retained_runs(5000, error); }
+    int arm_calls{0};
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, CapturePmuWindowLivesThroughSourceRetirementAndFailedRelease) {
+    PmuCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9700);
+    use_capture_preparation(attempt);
+    diagnostic_path = "native-pmu-capture-lifetime";
+    attempt.config.enable_pmu = 2;
+    std::strncpy(attempt.config.output_prefix, diagnostic_path.c_str(), sizeof(attempt.config.output_prefix) - 1);
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    auto release = RAIIScopeGuard([&] {
+        control().stream_sync_rc = 0;
+        (void)simpler_finalize_run(&runner, attempt.storage);
+        (void)simpler_release_run_resources(&runner, reference);
+    });
+    EXPECT_EQ(runner.arm_calls, 1);
+    EXPECT_EQ(control().pmu_start_calls, 1u);
+    EXPECT_EQ(control().pmu_stop_calls, 0u);
+    EXPECT_NE(state->prepared_execution->kernel_args.args.pmu_data_base, 0u);
+    EXPECT_EQ(state->prepared_execution->kernel_args.args.pmu_run_terminal_bank, 0u);
+    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
+    state->recording = true;
+    state->completion_rc = 0;
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_EQ(control().pmu_stop_calls, 0u) << "original retirement must not release model protection";
+    control().stream_sync_rc = -996;
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), -996);
+    EXPECT_EQ(control().pmu_stop_calls, 0u);
+    control().stream_sync_rc = 0;
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    release.dismiss();
+    EXPECT_EQ(control().pmu_stop_calls, 1u);
+    std::string error;
+    EXPECT_TRUE(runner.flush(&error)) << error;
+    EXPECT_TRUE(std::filesystem::exists(std::filesystem::path(diagnostic_path) / "pmu.collection.json"));
+}
+
+TEST_F(NativeAdmissionTest, UnsupportedPmuCaptureRefusesBeforePoolOrDriverMutation) {
+    for (bool mixed : {false, true}) {
+        PmuCaptureRunner runner;
+        runner.supported = mixed;
+        ASSERT_EQ(initialize_capture_runner(runner), 0);
+        Attempt attempt(runner, 0, 9701);
+        use_capture_preparation(attempt);
+        attempt.config.enable_pmu = 2;
+        attempt.config.enable_scope_stats = mixed;
+        std::strcpy(attempt.config.output_prefix, "unused-pmu-refusal");
+        ASSERT_EQ(attempt.prepare(), 0);
+        const auto allocations = control().allocations;
+        int caller;
+        RuntimeHandle reference = reinterpret_cast<void *>(1);
+        EXPECT_EQ(
+            simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_UNSUPPORTED
+        );
+        EXPECT_EQ(reference, nullptr);
+        EXPECT_EQ(runner.arm_calls, 0);
+        EXPECT_EQ(control().allocations, allocations);
+        EXPECT_EQ(control().pmu_start_calls, 0u);
+    }
+}
+
+TEST_F(NativeAdmissionTest, UnavailablePmuProtectionDoesNotRejectBusinessCapture) {
+    PmuCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9702);
+    use_capture_preparation(attempt);
+    diagnostic_path = "native-pmu-unprotected";
+    attempt.config.enable_pmu = 2;
+    std::strncpy(attempt.config.output_prefix, diagnostic_path.c_str(), sizeof(attempt.config.output_prefix) - 1);
+    ASSERT_EQ(attempt.prepare(), 0);
+    control().pmu_start_rc = -10;
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    EXPECT_EQ(control().pmu_start_calls, 1u);
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    std::string error;
+    EXPECT_TRUE(runner.flush(&error)) << error;
+    std::ifstream file(std::filesystem::path(diagnostic_path) / "pmu.collection.json");
+    std::string metadata{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    EXPECT_NE(metadata.find("occupied"), std::string::npos);
+}
+
+TEST_F(NativeAdmissionTest, TwoPmuModelsShareOneLeaseUntilBothReferencesEnd) {
+    PmuCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    diagnostic_path = "native-pmu-two-models";
+    int caller;
+    RuntimeHandle first_ref = nullptr, second_ref = nullptr;
+    Attempt first(runner, 0, 9703), second(runner, 1, 9704);
+    auto capture = [&](Attempt &attempt, const char *leaf, RuntimeHandle *reference) {
+        use_capture_preparation(attempt);
+        attempt.config.enable_pmu = 2;
+        const std::string prefix = diagnostic_path + "/" + leaf;
+        std::strncpy(attempt.config.output_prefix, prefix.c_str(), sizeof(attempt.config.output_prefix) - 1);
+        EXPECT_EQ(attempt.prepare(), 0);
+        EXPECT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, reference), 0);
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+        EXPECT_EQ(runner.admit_recording(*state->prepared_execution), 0);
+        state->recording = true;
+        state->completion_rc = 0;
+        EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    };
+    capture(first, "a", &first_ref);
+    capture(second, "b", &second_ref);
+    EXPECT_EQ(control().pmu_start_calls, 1u);
+    EXPECT_EQ(control().pmu_stop_calls, 0u);
+    EXPECT_EQ(simpler_release_run_resources(&runner, first_ref), 0);
+    EXPECT_EQ(control().pmu_stop_calls, 0u) << "the second model still protects its counting window";
+    EXPECT_EQ(simpler_release_run_resources(&runner, second_ref), 0);
+    EXPECT_EQ(control().pmu_stop_calls, 1u);
+    std::string error;
+    EXPECT_TRUE(runner.flush(&error)) << error;
+}
+
+TEST_F(NativeAdmissionTest, DuplicatePmuRetainAfterUnexecutedReleasePreservesPublishedEvidence) {
+    PmuCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9705);
+    use_capture_preparation(attempt);
+    diagnostic_path = "native-pmu-duplicate-after-release";
+    attempt.config.enable_pmu = 2;
+    std::strncpy(attempt.config.output_prefix, diagnostic_path.c_str(), sizeof(attempt.config.output_prefix) - 1);
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    std::string error;
+    ASSERT_TRUE(runner.flush(&error)) << error;
+    const auto path = std::filesystem::path(diagnostic_path) / "pmu.collection.json";
+    auto contents = [&] {
+        std::ifstream file(path);
+        return std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    };
+    const auto published = contents();
+    ASSERT_FALSE(published.empty());
+    const auto csv = std::filesystem::path(diagnostic_path) / "pmu.csv";
+    std::ifstream csv_before(csv);
+    const std::string published_csv{std::istreambuf_iterator<char>(csv_before), std::istreambuf_iterator<char>()};
+    const int arm_calls = runner.arm_calls;
+    const auto allocation_calls = control().allocations;
+    const auto lease_starts = control().pmu_start_calls;
+    reference = reinterpret_cast<void *>(1);
+    EXPECT_EQ(
+        simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    EXPECT_EQ(reference, nullptr);
+    EXPECT_EQ(contents(), published);
+    std::ifstream csv_after(csv);
+    EXPECT_EQ(
+        (std::string{std::istreambuf_iterator<char>(csv_after), std::istreambuf_iterator<char>()}), published_csv
+    );
+    EXPECT_EQ(control().allocations, allocation_calls);
+    EXPECT_EQ(runner.arm_calls, arm_calls);
+    EXPECT_EQ(control().pmu_start_calls, lease_starts);
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+}  // namespace native_admission_test

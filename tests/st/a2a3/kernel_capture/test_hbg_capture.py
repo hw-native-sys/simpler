@@ -222,3 +222,36 @@ if __name__ == "__main__":
     import sys
 
     print("\n".join(build_probe(Path(sys.argv[1]))))
+
+
+@pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
+def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
+    from collections import Counter  # noqa: PLC0415
+
+    from simpler_setup.tools.pmu_samples import read_pmu_samples  # noqa: PLC0415
+
+    binaries = build_probe(tmp_path, retained_models=True)
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    logs = tmp_path / "ascend-pmu"
+    logs.mkdir()
+    output = tmp_path / "pmu"
+    result = subprocess.run(
+        [binaries[0], device, *binaries[1:], str(output), str(replay)],
+        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    (tmp_path / "pmu-native.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "stage=pmu-flush rc=0" in result.stdout
+    ordinary = read_pmu_samples(output / "eager/pmu.csv")
+    assert ordinary["records"] and all(int(row["pmu_total_cycles"]) > 0 for row in ordinary["records"])
+    for leaf, event, rounds in (("a", 2, 2), ("b", 4, 4)):
+        captured = read_pmu_samples(output / leaf / "pmu.csv", recorded=True)
+        assert captured["collection"]["event_type"] == event
+        assert len(captured["records"]) == replay * rounds * len(ordinary["records"])
+        assert all(int(row["pmu_total_cycles"]) > 0 for row in captured["records"])
+        if replay:
+            assert max(Counter(row["task_id"] for row in captured["records"]).values()) >= rounds

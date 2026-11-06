@@ -18,6 +18,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -191,3 +192,96 @@ def _check_close_failure_cases(binary: Path):
                 f"standalone collector {scenario}: same-runner retry confirmed; original error=-739"
                 in failed_reset.stderr
             )
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.parametrize(("arch", "runtime"), _CASES)
+def test_onboard_pmu_metadata_invalidation(arch: str, runtime: str, tmp_path: Path):
+    """CPU-only check through the SDK-loaded runtime's collector admission."""
+    cache = _ROOT / "build/cache" / arch / "onboard" / runtime / "host"
+    library = _ROOT / "build/lib" / arch / "onboard" / runtime / "libhost_runtime.so"
+    assert library.is_file(), f"Build the {arch} onboard host runtime before this test: {library}"
+    entries = json.loads((cache / "compile_commands.json").read_text())
+    entry = next(
+        item for item in entries if Path(item["file"]) == _ROOT / f"src/{arch}/platform/onboard/host/device_runner.cpp"
+    )
+    arguments = entry.get("arguments") or shlex.split(entry["command"])
+    probe = tmp_path / "pmu_metadata.so"
+    command = []
+    arguments = iter(arguments)
+    for argument in arguments:
+        if argument == "-o":
+            next(arguments)
+        elif argument != "-c" and argument != entry["file"]:
+            command.append(argument)
+    command += [
+        "-shared",
+        str(_ROOT / "tests/ut/py/support/pmu_metadata_probe.cpp"),
+        str(library),
+        "-Wl,-z,defs",
+        f"-Wl,-rpath,{library.parent}",
+        "-ldl",
+        "-o",
+        str(probe),
+    ]
+    build = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    assert build.returncode == 0, build.stdout + build.stderr
+    code = r"""
+import ctypes
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / "tests/ut/py"))
+from test_tmr_pmu_capture import _load
+lib = _load(sys.argv[2], "onboard", sys.argv[3])
+probe = ctypes.CDLL(sys.argv[4], mode=ctypes.RTLD_LOCAL)
+probe.check_pmu_metadata_invalidation.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+probe.check_pmu_metadata_invalidation.restype = ctypes.c_int
+root = Path(sys.argv[5])
+metadata = root / "pmu.collection.json"
+csv = root / "pmu.csv"
+def invalidate(path=csv):
+    result = probe.check_pmu_metadata_invalidation(lib._handle, str(path).encode())
+    assert result >= 0, (result, "probe did not bind the selected runtime")
+    return bool(result)
+assert invalidate(), "a fresh output directory must accept absent metadata"
+metadata.write_text("old recorded descriptor")
+assert invalidate() and not metadata.exists()
+target = root / "target"
+target.write_text("preserved target")
+metadata.symlink_to(target)
+assert invalidate() and not metadata.is_symlink() and target.read_text() == "preserved target"
+metadata.symlink_to(root / "absent-target")
+assert invalidate() and not metadata.is_symlink()
+metadata.mkdir()
+(metadata / "evidence").write_text("preserve directory")
+assert not invalidate() and (metadata / "evidence").read_text() == "preserve directory"
+parent_file = root / "parent-file"
+parent_file.write_text("preserve parent")
+assert not invalidate(parent_file / "pmu.csv") and parent_file.read_text() == "preserve parent"
+if os.geteuid() != 0:
+    locked = root / "locked"
+    locked.mkdir()
+    (locked / "pmu.collection.json").write_text("preserve on unlink failure")
+    locked.chmod(0o500)
+    try:
+        assert not invalidate(locked / "pmu.csv")
+        assert (locked / "pmu.collection.json").read_text() == "preserve on unlink failure"
+    finally:
+        locked.chmod(0o700)
+print(
+    "PASS: PMU metadata absence, replacement and refusal through the SDK-loaded runtime; unlink_failure_checked=",
+    os.geteuid() != 0,
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(_ROOT), arch, runtime, str(probe), str(tmp_path)],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    (tmp_path / "pmu_metadata.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PASS: PMU metadata" in result.stdout

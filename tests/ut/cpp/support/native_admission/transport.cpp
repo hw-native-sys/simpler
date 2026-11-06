@@ -224,3 +224,19 @@ void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const Prep
     std::fputs("native admission CPU transport cannot adopt hardware drain ownership\n", stderr);
     std::abort();
 }
+
+// The native-admission binary exports these for the real PMU lease's dlsym.
+extern "C" int prof_drv_start(unsigned int, unsigned int, void *) {
+    auto &state = native_admission_transport::control();
+    ++state.pmu_start_calls;
+    return state.pmu_start_rc;
+}
+extern "C" int prof_stop(unsigned int, unsigned int) {
+    ++native_admission_transport::control().pmu_stop_calls;
+    return 0;
+}
+extern "C" int halProfDataFlush(unsigned int, unsigned int, unsigned int *bytes) {
+    *bytes = 0;
+    return 0;
+}
+extern "C" int prof_channel_read(unsigned int, unsigned int, char *, unsigned int) { return 0; }

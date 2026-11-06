@@ -327,3 +327,43 @@ TEST_F(PmuCountingWindowTest, NoRegisterTableLeavesEveryWindowAlone) {
 }
 
 }  // namespace
+
+TEST_F(PmuCountingWindowTest, RepeatedFixedIdentityReinitializesCountersAndReusesStableBacking) {
+    constexpr uint64_t window = 811;
+    uint64_t backing[kCores]{};
+    for (int replay = 0; replay < 3; ++replay) {
+        for (int core = 0; core < kCores; ++core) {
+            auto *state = get_pmu_buffer_state(shm_, core);
+            state->total_record_count = 17;
+            state->dropped_record_count = 3;
+            state->published_record_count = 13;
+            state->published_buffer_count = 1;
+#if defined(SIMPLER_TEST_PMU_ARCH_A5)
+            state->mismatch_record_count = 2;
+#endif
+        }
+        open_run(window, kCores, PmuEventType::MEMORY);
+        for (int core = 0; core < kCores; ++core) {
+            auto *state = get_pmu_buffer_state(shm_, core);
+            EXPECT_EQ(state->total_record_count, 0u);
+            EXPECT_EQ(state->dropped_record_count, 0u);
+            EXPECT_EQ(state->published_record_count, 0u);
+            EXPECT_EQ(state->published_buffer_count, 0u);
+#if defined(SIMPLER_TEST_PMU_ARCH_A5)
+            EXPECT_EQ(state->mismatch_record_count, 0u);
+#endif
+            ASSERT_NE(state->current_buf_ptr, 0u);
+            if (replay == 0) backing[core] = state->current_buf_ptr;
+            EXPECT_EQ(state->current_buf_ptr, backing[core]);
+            auto *buffer = reinterpret_cast<const PmuBuffer *>(state->current_buf_ptr);
+            EXPECT_EQ(buffer->run_epoch, window);
+            EXPECT_EQ(buffer->count, 0u);
+            for (int event = 0; event < kPmuCounterCount; ++event)
+                EXPECT_EQ(
+                    word(kPhysical[core], reg_index(RegId::PMU_CNT0_IDX, event)),
+                    events(PmuEventType::MEMORY).event_ids[event]
+                );
+        }
+        close_run();
+    }
+}
