@@ -32,10 +32,21 @@
 #include "common/dma_workspace.h"
 
 #ifdef __cplusplus
+#include <type_traits>
 extern "C" {
 #endif
 
 typedef struct CommHandle_ *CommHandle;
+
+// Host-side options copied through the domain-allocation control request.
+typedef struct CommWorkspaceConfig {
+    uint32_t urma_jetties_per_aiv;
+    uint32_t urma_sq_depth;
+} CommWorkspaceConfig;
+#ifdef __cplusplus
+static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
+static_assert(sizeof(CommWorkspaceConfig) == 8);
+#endif
 
 // Domain allocation failures that callers can distinguish from generic ACL errors.
 typedef enum CommDomainStatus {
@@ -275,6 +286,9 @@ int comm_derive_context(
  *                                address (for buffer carving on the
  *                                caller side).
  * @param actual_window_size_out  Receives the allocated per-rank byte extent.
+ * @param workspace_config       Optional engine configuration; null uses one URMA
+ *                               jetty per AIV and provider-default SQ depth.
+ *                               All members must request the same configuration.
  * @return 0 on success. COMM_INITIALIZATION_ABORT_REQUIRED means initialization
  *         failed with an unpublished owner: join all allocation requests, then
  *         call comm_abort_domain_windows for this allocation. Output pointers
@@ -284,7 +298,11 @@ int comm_derive_context(
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out
+    size_t *actual_window_size_out,
+    const CommWorkspaceConfig *workspace_config
+#ifdef __cplusplus
+    = nullptr
+#endif
 );
 
 /**
@@ -298,7 +316,11 @@ int comm_alloc_domain_windows(
 int comm_alloc_host_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
-    uint64_t *local_window_base_out, size_t *actual_window_size_out
+    uint64_t *local_window_base_out, size_t *actual_window_size_out,
+    const CommWorkspaceConfig *workspace_config
+#ifdef __cplusplus
+    = nullptr
+#endif
 );
 
 /**

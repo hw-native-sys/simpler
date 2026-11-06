@@ -10,9 +10,12 @@
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from simpler import RdmaConfig, SdmaConfig, UrmaConfig
+from simpler.buffer import AddressSpace
 from simpler.comm_domain import DomainConfig
 
 from simpler_setup.pto_isa import ensure_pto_isa_root
@@ -137,6 +140,7 @@ def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_re
     [
         "host_local",
         "host_urma",
+        "host_urma_config",
         "host_coexist",
         "host_register",
         "host_pointer",
@@ -212,3 +216,81 @@ def test_single_rank_urma_configuration_is_delegated_to_provider():
     config = worker._domain_config([0], 4096, [], False, ("urma",))
     assert config.members == (0,)
     assert config.workspace_engines == ("urma",)
+
+
+@pytest.mark.parametrize(
+    "names,configs",
+    [
+        (("sdma",), {"sdma": SdmaConfig()}),
+        (("urma",), {"urma": UrmaConfig()}),
+        (("rdma",), {"rdma": RdmaConfig()}),
+        (("urma", "sdma"), {"sdma": SdmaConfig(), "urma": UrmaConfig()}),
+    ],
+)
+def test_default_engine_configurations_equal_legacy_names(names, configs):
+    legacy = DomainConfig.capture([0, 1], 4096, [], True, (), names)
+    configured = DomainConfig.capture([0, 1], 4096, [], True, (), configs)
+    assert configured == legacy
+    assert configured.difference(legacy) == ""
+
+
+@pytest.mark.parametrize("memory_source", [AddressSpace.DEVICE, AddressSpace.HOST])
+def test_engine_configuration_is_snapshotted_and_changes_reuse_identity(memory_source):
+    engines = {"urma": UrmaConfig(jetties_per_aiv=2, sq_depth=512)}
+    saved = DomainConfig.capture([0, 1], 4096, [], True, (), engines, memory_source)
+    engines["urma"] = UrmaConfig()
+    replacement = DomainConfig.capture([0, 1], 4096, [], True, (), engines, memory_source)
+    assert saved.urma_config() == UrmaConfig(jetties_per_aiv=2, sq_depth=512)
+    assert saved.difference(replacement).startswith("workspace_configs:")
+    with pytest.raises(AttributeError):
+        saved.urma_config().sq_depth = 1024
+
+
+@pytest.mark.parametrize(
+    "engines",
+    [
+        {"urma": SdmaConfig()},
+        {"sdma": UrmaConfig()},
+        {"rdma": None},
+        {"urma": {"jetties_per_aiv": 2}},
+    ],
+)
+def test_engine_configuration_type_must_match_name(engines):
+    with pytest.raises(TypeError, match="requires"):
+        DomainConfig.capture([0, 1], 4096, [], True, (), engines)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"jetties_per_aiv": 0},
+        {"jetties_per_aiv": 9},
+        {"jetties_per_aiv": -1},
+        {"sq_depth": -1},
+        {"sq_depth": 3},
+        {"sq_depth": 2**31},
+    ],
+)
+def test_invalid_urma_queue_sizes_fail_before_domain_allocation(kwargs):
+    with pytest.raises(ValueError):
+        UrmaConfig(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"jetties_per_aiv": True}, {"jetties_per_aiv": 2.5}, {"sq_depth": "512"}])
+def test_urma_queue_sizes_require_integers(kwargs):
+    with pytest.raises(TypeError):
+        UrmaConfig(**kwargs)
+
+
+def test_engine_configs_are_available_when_native_bindings_are_missing():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.modules['_task_interface'] = None; "
+            "from simpler import UrmaConfig, SdmaConfig, RdmaConfig; "
+            "assert UrmaConfig().jetties_per_aiv == 1; SdmaConfig(); RdmaConfig(); "
+            "assert sys.modules['_task_interface'] is None",
+        ],
+        check=True,
+    )

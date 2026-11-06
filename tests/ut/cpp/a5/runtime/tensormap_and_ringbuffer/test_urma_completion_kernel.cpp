@@ -206,7 +206,13 @@ public:
     ) {
         context.sched_ = &scheduler;
         context.deferred_slab_per_core_[0][0] = slab;
-        context.complete_slot_task(producer, 0, SubtaskSlot::AIV0, 0, 0, nullptr, completed, release, release_count);
+        context.complete_slot_task(
+            producer, 0, SubtaskSlot::AIV0, 0, 0, nullptr, completed, release, release_count
+#if SIMPLER_DFX
+            ,
+            0, 0
+#endif
+        );
     }
 };
 
@@ -391,13 +397,13 @@ TEST(A5UrmaCompletionKernel, RepeatedEventsAppendWithoutLosingEarlierTargets) {
     EXPECT_EQ(fixture.slab.entries[2].expected_value, 4u);
 }
 
-TEST(A5UrmaCompletionKernel, CapacityBudgetAccountsForAllChunksAndJetties) {
+TEST(A5UrmaCompletionKernel, CapacityBudgetAccountsForEachParticipatingChunk) {
     RegistrationFixture fixture;
     fixture.ctx.completion_capacity = 8;
     fixture.slab.count = 3;
 
-    EXPECT_TRUE(pto2::urma_backend::completion_capacity_available(fixture.ctx, 2u * 2u));
-    EXPECT_FALSE(pto2::urma_backend::completion_capacity_available(fixture.ctx, 3u * 2u));
+    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 5));
+    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 6));
     EXPECT_EQ(fixture.slab.count, 3u);
 }
 
@@ -460,6 +466,55 @@ TEST(A5UrmaCompletionKernel, WholeRequestPreflightAcceptsRoomInEveryQueue) {
     EXPECT_EQ(fixture.sq[6].submittedWqeCount, 0u);
 }
 
+TEST(A5UrmaCompletionKernel, PreflightReservesOnlyTheChunksAssignedToEachQueue) {
+    RegistrationFixture fixture;
+    fixture.ctx.completion_capacity = 3;
+    fixture.sq_head[6] = 14;
+    fixture.sq[6].submittedWqeCount = 14;
+    fixture.sq_head[7] = 15;
+    fixture.sq[7].submittedWqeCount = 15;
+
+    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
+    EXPECT_EQ(fixture.slab.count, 0u);
+    EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(fixture.sq_doorbell[6], 0u);
+    EXPECT_EQ(fixture.sq_doorbell[7], 0u);
+}
+
+TEST(A5UrmaCompletionKernel, FullUnusedJettyDoesNotRejectSmallRequest) {
+    RegistrationFixture fixture;
+    fixture.sq_head[7] = 16;
+    fixture.sq[7].submittedWqeCount = 16;
+
+    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 1));
+    EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(fixture.sq_head[7], 16u);
+}
+
+TEST(A5UrmaCompletionKernel, SharedPoolKeepsFullGroupCompletionBudget) {
+    RegistrationFixture fixture;
+    fixture.info.layout = pto::comm::urma::UrmaLayout::SHARED_POOL;
+    fixture.info.rowsPerPeer = 1;
+    fixture.info.jettyCount = 4;
+    fixture.ctx.completion_capacity = 3;
+
+    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 2));
+    EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+    EXPECT_EQ(fixture.slab.count, 0u);
+}
+
+TEST(A5UrmaCompletionKernel, PerPeerCannotUseRailSelectedQueueOffsets) {
+    RegistrationFixture fixture;
+    fixture.info.railCycleLen = 1;
+    fixture.info.railCycle[0] = 1;
+
+    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 2));
+    EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(fixture.slab.count, 0u);
+    EXPECT_EQ(fixture.sq_doorbell[6], 0u);
+    EXPECT_EQ(fixture.sq_doorbell[7], 0u);
+}
+
 TEST(A5UrmaCompletionKernel, FullSqInOneJettyRejectsWholeRequest) {
     RegistrationFixture fixture;
     fixture.sq_head[6] = 16;
@@ -477,7 +532,7 @@ TEST(A5UrmaCompletionKernel, FullCqInAnotherJettyRejectsWholeRequest) {
     RegistrationFixture fixture;
     fixture.sq[7].submittedWqeCount = 16;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 1));
+    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 2));
     EXPECT_EQ(fixture.slab.count, 0u);
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(fixture.sq[7].submittedWqeCount, 16u);
@@ -490,7 +545,7 @@ TEST(A5UrmaCompletionKernel, PreflightReservesAllChunksBeforeFirstSubmission) {
     fixture.sq_head[6] = 14;
     fixture.sq[6].submittedWqeCount = 14;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
+    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 5));
     EXPECT_EQ(fixture.sq_head[6], 14u);
     EXPECT_EQ(fixture.sq[6].submittedWqeCount, 14u);
     EXPECT_EQ(fixture.slab.count, 0u);
@@ -501,7 +556,7 @@ TEST(A5UrmaCompletionKernel, ExactRemainingRingCapacityCanBeReserved) {
     fixture.sq_head[6] = 14;
     fixture.sq[6].submittedWqeCount = 14;
 
-    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 2));
+    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.sq_head[6], 14u);
     EXPECT_EQ(fixture.sq[6].submittedWqeCount, 14u);
@@ -522,7 +577,7 @@ TEST(A5UrmaCompletionKernel, PreflightUsesUnsignedDistancesAcrossCounterWrap) {
 
 TEST(A5UrmaCompletionKernel, CompletionBudgetRejectsBeforeReadingQueueTables) {
     RegistrationFixture fixture;
-    fixture.ctx.completion_capacity = 5;
+    fixture.ctx.completion_capacity = 2;
     fixture.info.sqPtr = 0;
     fixture.info.scqPtr = 0;
 
@@ -572,6 +627,10 @@ protected:
         return pto2::urma_backend::build_urma_session(ctx, workspace(), 1, bound);
     }
 
+    uint32_t completions_per_small_request() const {
+        return info.layout == pto::comm::urma::UrmaLayout::PER_PEER ? 1 : 2;
+    }
+
     uint32_t first_row() const { return info.layout == pto::comm::urma::UrmaLayout::PER_PEER ? 6 : 2; }
 
     void post_two_unretired_tasks(DeferredCompletionSlab &next_slab) {
@@ -592,13 +651,13 @@ protected:
         ASSERT_EQ(sq[row].submittedWqeCount, 16u);
         ASSERT_EQ(sq_tail[row], 14u);
         ASSERT_EQ(cq_tail[row], 14u);
-        ASSERT_EQ(slab.count, 2u);
+        ASSERT_EQ(slab.count, completions_per_small_request());
 
         AsyncCtx next = AsyncCtx::make(TaskId::make(0, 99), &next_slab);
         next.urma_sender_id = ctx.urma_sender_id;
         EXPECT_NE(TaskId::to_uint64(next.task_token), TaskId::to_uint64(ctx.task_token));
         ASSERT_TRUE(send_request_entry(next, UrmaTput(dst, src, workspace(), 1)));
-        ASSERT_EQ(next_slab.count, 2u);
+        ASSERT_EQ(next_slab.count, completions_per_small_request());
         EXPECT_EQ(script.activation_calls, 2u);
         EXPECT_EQ(sq_head[row], 17u);
         EXPECT_EQ(sq[row].submittedWqeCount, 17u);
@@ -628,7 +687,7 @@ protected:
 TEST_P(A5UrmaSessionBinding, CrossTaskReusePreservesOutstandingTargetsAcrossWrap) {
     DeferredCompletionSlab next_slab{};
     post_two_unretired_tasks(next_slab);
-    ASSERT_EQ(next_slab.count, 2u);
+    ASSERT_EQ(next_slab.count, completions_per_small_request());
     set_cqe(14, false);
     set_cqe(15, true);
     set_cqe(16, true);
@@ -638,9 +697,9 @@ TEST_P(A5UrmaSessionBinding, CrossTaskReusePreservesOutstandingTargetsAcrossWrap
 
     set_cqe(14, true);
     EXPECT_EQ(poll(next_slab.entries[0]).state, CompletionPollState::READY);
-    EXPECT_EQ(poll(next_slab.entries[1]).state, CompletionPollState::READY);
+    if (next_slab.count == 2) EXPECT_EQ(poll(next_slab.entries[1]).state, CompletionPollState::READY);
     EXPECT_EQ(poll(slab.entries[0]).state, CompletionPollState::READY);
-    EXPECT_EQ(poll(slab.entries[1]).state, CompletionPollState::READY);
+    if (slab.count == 2) EXPECT_EQ(poll(slab.entries[1]).state, CompletionPollState::READY);
     EXPECT_EQ(sq_tail[first_row()], 17u);
     EXPECT_EQ(cq_tail[first_row()], 17u);
     EXPECT_EQ(cq_doorbell[first_row()], 17u);
@@ -651,7 +710,7 @@ TEST_P(A5UrmaSessionBinding, CrossTaskReusePreservesOutstandingTargetsAcrossWrap
 TEST_P(A5UrmaSessionBinding, CrossTaskReuseCannotHideAnOlderRequestError) {
     DeferredCompletionSlab next_slab{};
     post_two_unretired_tasks(next_slab);
-    ASSERT_EQ(next_slab.count, 2u);
+    ASSERT_EQ(next_slab.count, completions_per_small_request());
     set_cqe(14, true);
     set_cqe(15, true, 7);
     set_cqe(16, true);
@@ -763,6 +822,8 @@ protected:
         for (uint32_t chunk = 0; chunk < 3; ++chunk) {
             TestEvent outcome = event;
             outcome.handle += chunk;
+            outcome.urmaJettyBase = 2 + chunk % 2;
+            outcome.urmaJettyCount = 1;
             for (uint32_t jetty = 0; jetty < 2; ++jetty) {
                 outcome.urmaTargetBbPerJetty[jetty] += chunk;
                 outcome.urmaTargetCqePerJetty[jetty] += chunk;
@@ -841,23 +902,256 @@ TEST_P(A5UrmaChunkedSubmission, PostsEveryChunkOnceWithExactOffsetsAndPackedExte
         EXPECT_EQ(post.shape, (std::array<int64_t, 5>{1, 1, 1, 1, lengths[i]}));
         EXPECT_EQ(post.stride, (std::array<int64_t, 5>{lengths[i], lengths[i], lengths[i], lengths[i], 1}));
     }
-    EXPECT_EQ(slab.count, 6u);
+    EXPECT_EQ(slab.count, 3u);
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(total_wait_calls, 0u);
 }
 
+TEST_P(A5UrmaChunkedSubmission, RotatesActualQueuePostsWithinOneLargeRequest) {
+    script.post_from_queue = true;
+    ASSERT_TRUE(submit());
+    ASSERT_EQ(script.submissions.size(), 3u);
+    EXPECT_EQ(sq_head[6], 2u);
+    EXPECT_EQ(sq[6].submittedWqeCount, 2u);
+    EXPECT_EQ(sq_doorbell[6], 2u);
+    EXPECT_EQ(sq_head[7], 1u);
+    EXPECT_EQ(sq[7].submittedWqeCount, 1u);
+    EXPECT_EQ(sq_doorbell[7], 1u);
+    ASSERT_EQ(slab.count, 3u);
+    EXPECT_EQ(slab.entries[0].addr, (uint64_t{6} << 32) | 1);
+    EXPECT_EQ(slab.entries[1].addr, (uint64_t{7} << 32) | 1);
+    EXPECT_EQ(slab.entries[2].addr, (uint64_t{6} << 32) | 2);
+    EXPECT_EQ(slab.entries[0].expected_value, 1u);
+    EXPECT_EQ(slab.entries[1].expected_value, 1u);
+    EXPECT_EQ(slab.entries[2].expected_value, 2u);
+    EXPECT_EQ(sq_tail[6], 0u);
+    EXPECT_EQ(sq_tail[7], 0u);
+    EXPECT_EQ(cq_tail[6], 0u);
+    EXPECT_EQ(cq_tail[7], 0u);
+}
+
+TEST_P(A5UrmaChunkedSubmission, QueueUsageMatchesChunkBoundariesAndTail) {
+    script.post_from_queue = true;
+    for (const uint64_t bytes :
+         {kLimit - sizeof(float), kLimit, kLimit + sizeof(float), 2 * kLimit, 2 * kLimit + 32768}) {
+        SCOPED_TRACE(bytes);
+        sq_head.fill(0);
+        for (auto &queue : sq)
+            queue.submittedWqeCount = 0;
+        slab.count = 0;
+        script.submissions.clear();
+        ASSERT_TRUE(submit(bytes / sizeof(float)));
+        const uint32_t chunks = bytes > 2 * kLimit ? 3 : (bytes > kLimit ? 2 : 1);
+        EXPECT_EQ(sq_head[6], (chunks + 1) / 2);
+        EXPECT_EQ(sq_head[7], chunks / 2);
+        EXPECT_EQ(slab.count, chunks);
+        ASSERT_EQ(script.submissions.size(), chunks);
+        uint64_t posted_bytes = 0;
+        for (const auto &post : script.submissions) {
+            const uint64_t length = post.shape[4] * sizeof(float);
+            EXPECT_LE(length, kLimit);
+            EXPECT_EQ(post.dst, kDstBase + posted_bytes);
+            EXPECT_EQ(post.src, kSrcBase + posted_bytes);
+            posted_bytes += length;
+        }
+        EXPECT_EQ(posted_bytes, bytes);
+    }
+}
+
+TEST_P(A5UrmaChunkedSubmission, ConsecutiveSmallRequestsStartAtFirstJetty) {
+    script.post_from_queue = true;
+    for (uint32_t request = 0; request < 3; ++request)
+        ASSERT_TRUE(submit(8));
+    EXPECT_EQ(sq_head[6], 3u);
+    EXPECT_EQ(sq[6].submittedWqeCount, 3u);
+    EXPECT_EQ(sq_head[7], 0u);
+    EXPECT_EQ(sq[7].submittedWqeCount, 0u);
+    ASSERT_EQ(slab.count, 3u);
+    for (uint32_t request = 0; request < 3; ++request) {
+        EXPECT_EQ(slab.entries[request].addr, (uint64_t{6} << 32) | (request + 1));
+        EXPECT_EQ(slab.entries[request].expected_value, request + 1);
+    }
+}
+
+TEST_P(A5UrmaChunkedSubmission, SingleJettyKeepsEveryChunkOnItsSenderQueue) {
+    script.post_from_queue = true;
+    info.jettiesPerCore = 1;
+    ASSERT_TRUE(submit());
+    EXPECT_EQ(sq_head[5], 3u);
+    ASSERT_EQ(slab.count, 3u);
+    for (uint32_t chunk = 0; chunk < 3; ++chunk) {
+        EXPECT_EQ(slab.entries[chunk].addr, (uint64_t{5} << 32) | (chunk + 1));
+        EXPECT_EQ(slab.entries[chunk].expected_value, chunk + 1);
+    }
+    EXPECT_EQ(sq_head[4], 0u);
+    EXPECT_EQ(sq_head[6], 0u);
+}
+
+TEST_P(A5UrmaChunkedSubmission, ThreeJettiesDistributeWholeChunksAndTail) {
+    script.post_from_queue = true;
+    info.jettiesPerCore = 3;
+    info.rowsPerPeer = 3;
+    info.jettyCount = 6;
+    ctx.urma_sender_id = 0;
+    ASSERT_TRUE(submit(3 * kLimit / sizeof(float) + 8192));
+    EXPECT_EQ(sq_head[3], 2u);
+    EXPECT_EQ(sq_head[4], 1u);
+    EXPECT_EQ(sq_head[5], 1u);
+    ASSERT_EQ(slab.count, 4u);
+    EXPECT_EQ(slab.entries[0].addr, (uint64_t{3} << 32) | 1);
+    EXPECT_EQ(slab.entries[1].addr, (uint64_t{4} << 32) | 1);
+    EXPECT_EQ(slab.entries[2].addr, (uint64_t{5} << 32) | 1);
+    EXPECT_EQ(slab.entries[3].addr, (uint64_t{3} << 32) | 2);
+}
+
+TEST_P(A5UrmaChunkedSubmission, NextTaskPreservesBothUnretiredQueueTargets) {
+    script.post_from_queue = true;
+    ASSERT_TRUE(submit());
+    DeferredCompletionSlab next_slab{};
+    ctx = AsyncCtx::make(TaskId::make(0, 99), &next_slab);
+    ctx.urma_sender_id = 1;
+    ASSERT_TRUE(submit());
+    ASSERT_EQ(slab.count, 3u);
+    ASSERT_EQ(next_slab.count, 3u);
+    EXPECT_EQ(slab.entries[2].addr, (uint64_t{6} << 32) | 2);
+    EXPECT_EQ(slab.entries[1].addr, (uint64_t{7} << 32) | 1);
+    EXPECT_EQ(next_slab.entries[0].addr, (uint64_t{6} << 32) | 3);
+    EXPECT_EQ(next_slab.entries[1].addr, (uint64_t{7} << 32) | 2);
+    EXPECT_EQ(next_slab.entries[2].addr, (uint64_t{6} << 32) | 4);
+    EXPECT_EQ(sq_head[6], 4u);
+    EXPECT_EQ(sq_head[7], 2u);
+    EXPECT_EQ(sq_tail[6], 0u);
+    EXPECT_EQ(sq_tail[7], 0u);
+    EXPECT_EQ(cq_tail[6], 0u);
+    EXPECT_EQ(cq_tail[7], 0u);
+}
+
+TEST_P(A5UrmaChunkedSubmission, BothQueueTargetsSurviveCounterWrap) {
+    script.post_from_queue = true;
+    for (uint32_t row : {6u, 7u}) {
+        sq_head[row] = UINT32_MAX;
+        sq[row].submittedWqeCount = UINT32_MAX;
+        sq_tail[row] = UINT32_MAX - 1;
+        cq_tail[row] = UINT32_MAX - 1;
+    }
+    ASSERT_TRUE(submit());
+    ASSERT_EQ(slab.count, 3u);
+    EXPECT_EQ(slab.entries[0].addr, uint64_t{6} << 32);
+    EXPECT_EQ(slab.entries[1].addr, uint64_t{7} << 32);
+    EXPECT_EQ(slab.entries[2].addr, (uint64_t{6} << 32) | 1);
+    EXPECT_EQ(slab.entries[0].expected_value, 0u);
+    EXPECT_EQ(slab.entries[1].expected_value, 0u);
+    EXPECT_EQ(slab.entries[2].expected_value, 1u);
+    EXPECT_EQ(sq_tail[6], UINT32_MAX - 1);
+    EXPECT_EQ(sq_tail[7], UINT32_MAX - 1);
+
+    DeviceArena sm_arena, sched_arena;
+    auto scheduler = std::make_unique<SchedulerState>();
+    auto *sm = SharedMemoryHandle::create_and_init_default(sm_arena);
+    ASSERT_NE(sm, nullptr);
+    const auto layout = SchedulerState::reserve_layout(sched_arena);
+    ASSERT_NE(sched_arena.commit(), nullptr);
+    ASSERT_TRUE(scheduler->init_data_from_layout(layout, sched_arena, sm->header));
+    scheduler->wire_arena_pointers(layout, sched_arena);
+    ChipTaskSlotState producer{}, consumer{};
+    TaskPayload payload{};
+    producer.task_state.store(CHIP_TASK_PENDING);
+    producer.active_mask = LaneMask::aiv0();
+    producer.total_required_subtasks = 1;
+    producer.logical_block_num = 1;
+    producer.payload = &payload;
+    TaskPayload consumer_payload{};
+    TaskDescriptor consumer_task{};
+    consumer.payload = &consumer_payload;
+    consumer.task = &consumer_task;
+    consumer.task_state.store(CHIP_TASK_PENDING);
+    consumer.active_mask = LaneMask::aiv0();
+    consumer.logical_block_num = 1;
+    consumer.total_required_subtasks = 1;
+    consumer.fanin_count = 1;
+    consumer.fanin_refcount.store(0);
+    auto &ready = scheduler->ready_queues[static_cast<int32_t>(consumer.active_mask.to_shape())];
+    DepListEntry edge{&consumer, nullptr};
+    producer.fanout_head = &edge;
+    producer.fanout_count = 1;
+    auto &waits = scheduler->async_wait_list;
+    waits.count = 1;
+    auto &entry = waits.entries[0];
+    entry.slot_state = &producer;
+    entry.task_token = ctx.task_token;
+    entry.normal_done = true;
+    int32_t error = SIMPLER_ERROR_NONE;
+    for (uint32_t i = 0; i < slab.count; ++i) {
+        const auto &condition = slab.entries[i];
+        ASSERT_TRUE(waits.append_condition_locked(
+            entry, condition.addr, condition.backend_cookie, condition.expected_value, ASYNC_ENGINE_URMA,
+            COMPLETION_TYPE_URMA_EVENT_HANDLE, error
+        ));
+    }
+    ASSERT_EQ(error, SIMPLER_ERROR_NONE);
+    auto set_cqe = [&](uint32_t row, uint32_t sequence, bool ready) {
+        const uint32_t phase = (sequence / 16) & 1u;
+        const uint32_t owner = ready ? phase ^ 1u : phase;
+        auto *dw0 = reinterpret_cast<uint32_t *>(cq_storage[row].data() + (sequence % 16) * 64);
+        *dw0 = owner << 2;
+    };
+    for (uint32_t row : {6u, 7u}) {
+        set_cqe(row, UINT32_MAX - 1, false);
+        set_cqe(row, UINT32_MAX, false);
+    }
+    set_cqe(6, 0, false);
+    ChipTaskSlotState *releases[1]{};
+    int32_t release_count = 0;
+    auto poll = [&] {
+        return waits.poll_and_complete<false>(nullptr, scheduler.get(), releases, release_count, 1);
+    };
+    auto expect_pending = [&](int32_t remaining) {
+        const auto result = poll();
+        EXPECT_EQ(result.error_code, SIMPLER_ERROR_NONE);
+        EXPECT_EQ(result.completed, 0);
+        EXPECT_EQ(release_count, 0);
+        EXPECT_EQ(producer.task_state.load(), CHIP_TASK_PENDING);
+        EXPECT_EQ(consumer.fanin_refcount.load(), 0);
+        EXPECT_EQ(ready.pop(), nullptr);
+        ASSERT_EQ(waits.count, 1);
+        EXPECT_EQ(waits.entries[0].waiting_completion_count, remaining);
+    };
+    expect_pending(3);
+    for (uint32_t sequence : {UINT32_MAX - 1, UINT32_MAX, 0u})
+        set_cqe(6, sequence, true);
+    expect_pending(1);
+    EXPECT_EQ(sq_tail[6], 1u);
+    EXPECT_EQ(cq_tail[6], 1u);
+    EXPECT_EQ(sq_tail[7], UINT32_MAX - 1);
+    EXPECT_EQ(cq_tail[7], UINT32_MAX - 1);
+    // Completing only the older CQE must not satisfy the wrapped zero target.
+    set_cqe(7, UINT32_MAX - 1, true);
+    expect_pending(1);
+    set_cqe(7, UINT32_MAX, true);
+    const auto complete = poll();
+    EXPECT_EQ(complete.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(complete.completed, 1);
+    EXPECT_EQ(release_count, 1);
+    EXPECT_EQ(releases[0], &producer);
+    EXPECT_EQ(producer.task_state.load(), CHIP_TASK_COMPLETED);
+    EXPECT_EQ(consumer.fanin_refcount.load(), 1);
+    EXPECT_EQ(ready.pop(), &consumer);
+    EXPECT_EQ(ready.pop(), nullptr);
+    EXPECT_EQ(sq_tail[7], 0u);
+    EXPECT_EQ(cq_tail[7], 0u);
+    EXPECT_EQ(waits.count, 0);
+    scheduler->destroy();
+}
+
 TEST_P(A5UrmaChunkedSubmission, SecondChunkPartialFailureRetainsTargetsAndBlocksConsumer) {
     script.events[1].postFailed = true;
-    script.events[1].urmaJettyCount = 1;
     ASSERT_FALSE(submit());
     ASSERT_EQ(script.submissions.size(), 2u);
-    ASSERT_EQ(slab.count, 3u);
+    ASSERT_EQ(slab.count, 2u);
     EXPECT_EQ(slab.entries[0].addr, (uint64_t{6} << 32) | 4);
     EXPECT_EQ(slab.entries[0].expected_value, 3u);
-    EXPECT_EQ(slab.entries[1].addr, (uint64_t{7} << 32) | 9);
-    EXPECT_EQ(slab.entries[1].expected_value, 7u);
-    EXPECT_EQ(slab.entries[2].addr, (uint64_t{6} << 32) | 5);
-    EXPECT_EQ(slab.entries[2].expected_value, 4u);
+    EXPECT_EQ(slab.entries[1].addr, (uint64_t{7} << 32) | 5);
+    EXPECT_EQ(slab.entries[1].expected_value, 4u);
     for (uint32_t i = 0; i < slab.count; ++i)
         EXPECT_EQ(slab.entries[i].backend_cookie, reinterpret_cast<uint64_t>(workspace()));
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
@@ -873,15 +1167,15 @@ TEST_P(A5UrmaChunkedSubmission, SecondChunkUnsubmittedFailureKeepsFirstChunkTarg
     script.events[1].urmaJettyCount = 0;
     ASSERT_FALSE(submit());
     ASSERT_EQ(script.submissions.size(), 2u);
-    ASSERT_EQ(slab.count, 2u);
+    ASSERT_EQ(slab.count, 1u);
     EXPECT_EQ(slab.entries[0].addr, (uint64_t{6} << 32) | 4);
-    EXPECT_EQ(slab.entries[1].expected_value, 7u);
+    EXPECT_EQ(slab.entries[0].expected_value, 3u);
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     expect_consumer_blocked();
 }
 
 TEST_P(A5UrmaChunkedSubmission, WholeRequestBudgetRejectsBeforeFirstPost) {
-    ctx.completion_capacity = 5;
+    ctx.completion_capacity = 2;
     EXPECT_FALSE(submit());
     EXPECT_EQ(script.activation_calls, 1u);
     EXPECT_TRUE(script.submissions.empty());
