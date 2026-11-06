@@ -28,6 +28,11 @@ from ._helpers import (
     make_l3_forward,
 )
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 
 def _l3(platform: str, device_id: int) -> Worker:
     worker = Worker(

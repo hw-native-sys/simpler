@@ -245,6 +245,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
             if prepared:
                 chip_worker.unregister_callable(_SLOT_PRIMARY)
 
+    @pytest.mark.coverage_skip(reason="unpublished host dlopen guard is validated on sim", platforms=["a5"])
     def test_failed_double_prepare_closes_unpublished_host_handle(self, st_platform, st_worker):
         if not st_platform.endswith("sim"):
             pytest.skip("unpublished host dlopen guard is validated on sim")

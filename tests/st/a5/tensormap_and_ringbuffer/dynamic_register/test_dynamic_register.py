@@ -35,6 +35,11 @@ from simpler_setup import TaskArgsBuilder, TensorArg
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _build_l3_task_args
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _RUNTIME = "tensormap_and_ringbuffer"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _KERNELS = os.path.join(

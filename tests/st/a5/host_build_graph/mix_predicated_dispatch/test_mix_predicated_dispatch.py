@@ -63,7 +63,11 @@ ELEMS = 16
 
 # Platform selection sits here rather than on the test so that a per-parameter
 # platforms mark is the closer one and can narrow a case to hardware.
-pytestmark = [pytest.mark.platforms(["a5sim", "a5"])]
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+    pytest.mark.platforms(["a5sim", "a5"]),
+]
 
 # 0b011 / 0b101 / 0b110 / 0b111 — every Mix shape. 0b110 is the one
 # where the AIC holds no subtask of its own.

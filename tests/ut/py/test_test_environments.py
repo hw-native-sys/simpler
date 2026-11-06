@@ -31,6 +31,7 @@ _HOOKS = (
     "pytest_collection_modifyitems",
     "pytest_collection_finish",
     "pytest_runtestloop",
+    "pytest_runtest_makereport",
     "pytest_sessionfinish",
 )
 _DIRECT = """
@@ -510,6 +511,35 @@ def _installed_toolchain(home, version, *, nested=False, script=True):
     if script:
         (home / "set_env.sh").write_text("# Selection tests never execute this script.\n")
     return home / "set_env.sh"
+
+
+@pytest.mark.parametrize("command", ["select", "preflight", "requirements"])
+def test_bootstrap_script_runs_without_installed_sdk(tmp_path, command):
+    home = tmp_path / "cann"
+    script = _installed_toolchain(home, "9.0.0")
+    output = tmp_path / "github-output"
+    env = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
+    env.update(ASCEND_HOME_PATH=str(home), GITHUB_OUTPUT=str(output))
+    # -S excludes site-packages and editable-install hooks, as before CI setup.
+    result = subprocess.run(
+        [sys.executable, "-S", str(_ROOT / "simpler_setup/test_environments.py"), command, "torch_npu"],
+        cwd=_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    if command == "select":
+        assert output.read_text() == f"cann_env={script}\n"
+    elif command == "preflight":
+        record = json.loads(result.stdout.removeprefix("TEST_ENVIRONMENT_TOOLCHAIN "))
+        assert record["cann_home"] == str(home)
+        assert "packages" not in record
+    else:
+        assert result.stdout.splitlines() == [
+            f"{name}=={version}" for name, version in test_environments.requirements("torch_npu").items()
+        ]
 
 
 def test_toolchain_selection_uses_installed_manifest_and_deduplicates_aliases(tmp_path, monkeypatch, capsys):

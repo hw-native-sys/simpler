@@ -25,6 +25,11 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _DRIVER_NAME = "_dsv4_flash_tmr_driver"
 
 

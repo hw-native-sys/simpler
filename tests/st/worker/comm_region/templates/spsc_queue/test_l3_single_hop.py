@@ -34,6 +34,11 @@ from ._helpers import (
     wrap_payload,
 )
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 
 @pytest.mark.platforms(SUCCESS_PLATFORMS)
 @pytest.mark.device_count(1)

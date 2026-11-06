@@ -23,6 +23,11 @@ from simpler.worker import Worker
 from simpler_setup.runtime_builder import RuntimeBuilder
 from simpler_setup.scene_test import compile_chip_callable_spec, l3_compile_cache_key
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _HERE = Path(__file__).resolve().parent
 _SIZE = 128 * 128
 _RUNTIME = "host_build_graph"

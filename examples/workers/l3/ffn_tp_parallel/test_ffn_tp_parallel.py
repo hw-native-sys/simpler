@@ -13,6 +13,11 @@ from importlib.machinery import SourceFileLoader
 
 import pytest
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _main = SourceFileLoader("ffn_tp_parallel_main", os.path.join(os.path.dirname(__file__), "main.py")).load_module()
 run = _main.run
 

@@ -18,6 +18,8 @@ from simpler_setup import SceneTestLevel, scene_level
 from tests.st.worker.comm_domain.test_domain_tensor_remote import exercise_domain_tensors
 
 pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
     pytest.mark.platforms(["a2a3"]),
     pytest.mark.runtime("tensormap_and_ringbuffer"),
     pytest.mark.device_count(2),

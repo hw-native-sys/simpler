@@ -24,6 +24,11 @@ from ._helpers import (
     run_two_lifecycles,
 )
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 
 @pytest.mark.platforms(SUCCESS_PLATFORMS)
 @pytest.mark.device_count(1)

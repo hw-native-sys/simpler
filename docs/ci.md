@@ -350,6 +350,95 @@ not need `--max-parallel` manually.
 
 - **SDMA tests run in isolated tasks inside `st-onboard-a2a3`.** Within the default test environment, three selections partition the corpus (`examples tests/st`): the ordinary sweep takes `-m "not sdma and not sdma_fault"` with `--exclude-level 4`, one queued task runs `-m "sdma and not sdma_fault"` for the demos, and a separate one-device task runs `-m sdma_fault` for the AICore fault-injection case. The three are disjoint and exhaustive over both markers, and all three name the same paths, so a case cannot land in two tasks or in none. Provisioning the SDMA workspace creates 48 device-only STARS streams that live in the device fault domain, and tearing them down once any AICore task has poisoned that card blocks minutes rather than milliseconds — whether the teardown is a device reset or an explicit stream destroy ([#1425](https://github.com/hw-native-sys/simpler/issues/1425)). The cost therefore falls on whichever process still holds those streams when the fault happens, which is why the fault-injection case gets a task containing nothing else. Separate `task-submit` tasks preserve that on every onboard runner, independent of pytest ordering. Network1 tests are selected by `--level 4` in `st-network1-onboard-a2a3` and explicitly excluded from ordinary onboard ST lanes.
 
+### Feature coverage verification
+
+`--environment-receipts --verify-feature-coverage --junitxml <result.xml>`
+checks feature declarations and execution evidence. The default onboard and
+framework reusable workflows enable these flags; this integration still requires
+validation on real CI runners. The scene
+corpus declares its features, and collect-only inventories can check the actual
+selection without running fixtures. CPU contract tests exercise the real collection hooks,
+dispatcher, xdist workers and JUnit verifier.
+
+The existing workflow triggers, job IDs, environment setup, device leases and
+SDMA isolation remain unchanged. Default A2/A3 writes independent `main`, `sdma`
+and `sdma_fault` plans and receipts under `outputs/default-ci`; A5 writes `main`.
+Framework results remain under `outputs/framework-eager-ci`. Each job's final
+verification step runs with `always()`, rechecks the original JUnit files against
+the plan, and writes `coverage-summary.md` plus the GitHub step summary. It fails
+if any expected partition is missing or its scope differs from the invocation.
+For A2/A3 manual-only runs, the two SDMA steps are outside scope; Daily retains
+their existing default manual exclusion. An empty framework manual-only run is
+not successful qualification.
+
+Artifacts retain plans, parent/child receipts, retry manifests and summaries,
+including partial evidence on failure. Default artifact names include platform,
+host architecture, run ID and attempt. Artifact upload failure does not override
+the test verdict. Sim, Network1, standalone model tests and DFX smokes keep their
+existing validation paths and are not covered by these new summaries.
+
+Tests declare `runtime_product("program"|"kernel"|"auxiliary")` and
+`execution_mode("eager"|"capture_replay")`. Runtime identity comes from the
+existing runtime marker, scene class or parameter instance; conflicting sources
+are errors. `SceneTestCase` explicitly defaults to Program eager through
+`_st_runtime_product` and `_st_execution_mode`; a marker overrides those class
+defaults for an exceptional method. Plain tests declare markers explicitly.
+`coverage_runtime` supplies classification for runtime-independent probes or
+legacy tests without a runtime selection marker, preserving `--runtime` filtering.
+Filenames do not classify graph capture. Borrowed-context parameter instances in
+the stateful eager tests are Kernel; owned-context instances are Program. The
+common stream-capture probe is separate from HBG end-to-end capture qualification.
+
+The policy in `simpler_setup/test_coverage.py` requires Program and Kernel eager
+for both runtimes in default onboard sweeps, plus native HBG capture on A2/A3.
+Framework sweeps require Kernel eager for both runtimes. Undelivered capture
+combinations remain explicit gaps. Manual-only, runtime/level and the existing
+SDMA partitions narrow the obligations. Ad-hoc `-k`/`-m` filtering cannot remove
+mandatory members from the collected applicable corpus. Deleting a test and its
+declaration entirely cannot be detected unless a required group disappears.
+
+An optional default-environment test may declare
+`coverage_skip(platforms=["a2a3"], reason="exact skip reason")`. This is a
+reviewable exemption for those platforms, not a runtime capability probe.
+The JUnit skip reason must match exactly; xfail is not an allowed skip. Exempt
+members cannot replace a group's required members. Framework skip policy stays
+strict. Summary counts distinguish selected tests, entry into the test body,
+passes and skips; setup skips do not count as executed or passed. Poison-sink
+retries retain both attempts and count each recovered node ID once.
+
+Collect the real corpus with its usual platform, environment and selection flags:
+
+```bash
+python -m pytest examples tests/st --collect-only --platform a2a3 \
+  --exclude-level 4 -m "not sdma and not sdma_fault" \
+  --environment-receipts --verify-feature-coverage \
+  -p simpler_setup.tools.collection_inventory --collection-inventory inventory.json
+```
+
+The inventory includes exact selected node IDs, duplicate/classification errors,
+feature declarations and policy obligations. Compare node IDs before and after
+a migration for each existing CI partition. Collection is not execution evidence;
+an empty manual-only framework selection remains empty, not a passing qualification.
+
+The scoped skip audit preserves these existing exceptions:
+
+| Existing condition | Coverage treatment |
+| ------------------ | ------------------ |
+| Early-enqueue classes' unused `test_run` placeholder | Explicit auxiliary test and exact skip reason; actual sequence tests remain required. |
+| HBG unpublished-dlopen validation runs only on sim | Exact skip exception on its onboard architecture. |
+| Quarantined A5 chunked URMA fetch | Exact existing quarantine reason on A2/A3 and A5: collection preserves explicit skip markers before platform filtering. It remains skipped and cannot satisfy required execution. |
+| Visible-device remapping receives the identity two-device grant `[0, 1]` | Exact reason allowed on A2/A3 and A5; other skips fail verification. |
+| A5 RDMA workspace build option disabled | Exact exception for that smoke only. |
+| A5 manual CSA frozen fixture absent | Exact exception; reported as skipped, never qualified. |
+| Sim-only branches, unavailable `/proc/self/maps`, missing matching run-completion case | No new onboard exemption; unexpected skips fail. |
+| L4 MPI/Network1 prerequisites missing | Outside these non-L4 sweeps; no blanket exemption for future L4 qualification. |
+
+MXFP cases are generated conditionally from available torch dtypes before pytest
+collection. Their absence cannot be detected by this inventory or by runtime-group
+coverage alone. Compare inventories under the CI dependency versions before enabling
+mandatory verification there. Platform-scoped exemptions permit the specified skip;
+they do not independently establish that the capability is absent.
+
 ### Framework eager qualification (a2a3 and a5)
 
 `st-framework-eager-a2a3` runs automatically on affected PRs. A5 framework

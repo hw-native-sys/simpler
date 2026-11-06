@@ -34,6 +34,11 @@ from simpler_setup.log_config import configure_logging
 
 from .main import N_COLS, N_ELEMS, N_ROWS, NBYTES, build_chip_callable
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _F32 = DataType.FLOAT32
 _STRACE_RE = re.compile(r"\[STRACE\] .*\bname=(?P<name>\S+)\b.*\bdur=(?P<dur>\d+)")
 

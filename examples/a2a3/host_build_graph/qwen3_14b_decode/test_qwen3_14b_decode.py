@@ -17,6 +17,11 @@ import pytest
 
 from simpler_setup.scene_test import standalone_pytest_options
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _DRIVER_NAME = "_qwen3_14b_a2a3_hbg_driver"
 
 

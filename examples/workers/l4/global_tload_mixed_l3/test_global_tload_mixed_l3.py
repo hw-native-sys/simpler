@@ -14,6 +14,11 @@ from simpler_setup import SceneTestLevel, scene_level
 
 from .main import run
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 
 def _device_spec(device_ids) -> str:
     return ",".join(str(device_id) for device_id in device_ids)
