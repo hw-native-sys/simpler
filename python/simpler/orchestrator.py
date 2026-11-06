@@ -359,7 +359,10 @@ class Orchestrator:
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
-                worker._record_touched_identities(c_args)
+                if needs_prov:
+                    worker._record_touched_identities_locked(c_args)
+                else:
+                    worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
             return self._o.submit_next_level(
                 digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
@@ -475,7 +478,10 @@ class Orchestrator:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
                 for c_args in c_args_list:
-                    worker._record_touched_identities(c_args)
+                    if member_checks:
+                        worker._record_touched_identities_locked(c_args)
+                    else:
+                        worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
             return self._o.submit_next_level_group(
                 digest, kind, target_namespace, c_args_list, cfg, worker_ids, worker_id_sets, remote_sidecars

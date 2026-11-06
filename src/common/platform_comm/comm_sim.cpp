@@ -34,6 +34,7 @@
  */
 
 #include "platform_comm/comm.h"
+#include "platform_comm/domain_allocation_views.h"
 #include "platform_comm/comm_context.h"
 
 #include <cerrno>
@@ -707,6 +708,37 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 } catch (...) {
     std::fprintf(stderr, "[comm_sim] alloc_domain: unknown exception\n");
+    return -1;
+}
+
+extern "C" int comm_query_domain_allocation(
+    CommHandle h, uint64_t allocation_id, CommAllocationSpan *spans, size_t capacity, size_t *count_out
+) try {
+    if (count_out == nullptr) return -1;
+    *count_out = 0;
+    if (h == nullptr) return -1;
+    const auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end() || !found->second) return -1;
+    const auto &owner = *found->second;
+    if (!owner.host_ctx || owner.mmap_base == nullptr || owner.nranks <= 0 ||
+        owner.nranks > static_cast<int>(COMM_MAX_RANK_NUM) || owner.mmap_size <= HEADER_SIZE)
+        return -1;
+    const size_t rank_count = static_cast<size_t>(owner.nranks);
+    const size_t payload_bytes = owner.mmap_size - HEADER_SIZE;
+    if (payload_bytes % rank_count != 0) return -1;
+    const size_t window_bytes = payload_bytes / rank_count;
+    std::vector<CommAllocationSpan> views;
+    views.reserve(rank_count + 1);
+    views.push_back({reinterpret_cast<uint64_t>(owner.host_ctx.get()), sizeof(CommContext)});
+    const auto mapping_base = reinterpret_cast<uint64_t>(owner.mmap_base);
+    if (owner.mmap_size > std::numeric_limits<uint64_t>::max() - mapping_base) return -1;
+    const auto base = mapping_base + HEADER_SIZE;
+    for (size_t rank = 0; rank < rank_count; ++rank) {
+        views.push_back({base + rank * window_bytes, window_bytes});
+    }
+    return simpler::comm::publish_domain_allocation_views(views, spans, capacity, count_out);
+} catch (...) {
+    if (count_out != nullptr) *count_out = 0;
     return -1;
 }
 

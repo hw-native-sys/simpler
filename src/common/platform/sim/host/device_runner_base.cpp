@@ -528,7 +528,7 @@ void *SimDeviceRunnerBase::allocate_caller_buffer(size_t bytes) {
     void *ptr = allocate_tensor(bytes);
     if (ptr == nullptr) return nullptr;
     try {
-        caller_device_buffers_.record(ptr, bytes);
+        device_buffer_owners_.record(ptr, bytes);
     } catch (...) {
         // Rolled back for the reason the onboard twin gives: the record is what makes the
         // allocation the caller's, so without it there is nothing to hand back.
@@ -543,11 +543,11 @@ int SimDeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
     if (dev_ptr == nullptr) return 0;
     // Same one-step check-and-forget as the onboard runner; see its comment for why the two are
     // one operation and why an unrecorded address passes through unchanged.
-    if (!caller_device_buffers_.forget_if_unborrowed(dev_ptr)) {
+    if (!device_buffer_owners_.forget_if_unborrowed(dev_ptr)) {
         LOG_ERROR(
             "free_caller_buffer: %p is still held by %zu borrowing run(s) and %zu retained "
             "reference(s); the caller's release is refused rather than performed",
-            dev_ptr, caller_device_buffers_.borrow_count(), caller_device_buffers_.retained_count()
+            dev_ptr, device_buffer_owners_.borrow_count(), device_buffer_owners_.retained_count()
         );
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
@@ -558,11 +558,11 @@ int SimDeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
 bool SimDeviceRunnerBase::borrow_caller_buffers(
     uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count
 ) {
-    return caller_device_buffers_.borrow(identity, spans, count);
+    return device_buffer_owners_.borrow(identity, spans, count);
 }
 
 void SimDeviceRunnerBase::release_caller_buffers(uint64_t identity, bool keep) {
-    caller_device_buffers_.release(identity, keep);
+    device_buffer_owners_.release(identity, keep);
 }
 
 void SimDeviceRunnerBase::free_tensor(void *dev_ptr) {

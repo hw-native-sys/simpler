@@ -30,6 +30,7 @@ import torch
 from simpler.task_interface import (
     MAILBOX_RUN_ENTRY_STRIDE,
     MAILBOX_RUN_ENTRY_TABLE_OFFSET,
+    CommBufferSpec,
     DataType,
     TaskArgs,
     TensorArgType,
@@ -38,7 +39,9 @@ from simpler.task_interface import (
 from simpler.task_interface import ArgDirection as D
 from simpler.worker import (
     _FRAME_STAGED,
+    _NATIVE_PREPARED,
     _OFF_ENTRY_ACCEPTED,
+    _OFF_ENTRY_PREPARATION_DISPOSITION,
     _OFF_ENTRY_STATE,
     _TASK_LAUNCHED,
     _mailbox_load_i32,
@@ -132,7 +135,9 @@ def _wait_for_release(_args):
         raise RuntimeError("whole-run FIFO test timed out waiting for the release fence")
 
 
-def _wait_for_backend_prepared_successor(worker, timeout: float, worker_indices=(0,)) -> None:
+def _wait_for_backend_prepared_successor(
+    worker, timeout: float, worker_indices=(0,), *, require_native: bool = False
+) -> None:
     mailboxes = []
     for worker_index in worker_indices:
         shm_buf = worker._chip_shms[worker_index].buf  # noqa: SLF001 -- white-box backend-prepare observation
@@ -146,11 +151,13 @@ def _wait_for_backend_prepared_successor(worker, timeout: float, worker_indices=
         ]
         state_addrs = [addr + _OFF_ENTRY_STATE for addr in entry_addrs]
         accepted_addrs = [addr + _OFF_ENTRY_ACCEPTED for addr in entry_addrs]
-        mailboxes.append((state_addrs, accepted_addrs))
+        disposition_addrs = [addr + _OFF_ENTRY_PREPARATION_DISPOSITION for addr in entry_addrs]
+        mailboxes.append((state_addrs, accepted_addrs, disposition_addrs))
+    observed_dispositions = {}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         all_prepared = True
-        for state_addrs, accepted_addrs in mailboxes:
+        for rank, (state_addrs, accepted_addrs, disposition_addrs) in enumerate(mailboxes):
             states = [_mailbox_load_i32(addr) for addr in state_addrs]
             staged_indices = [
                 index
@@ -161,10 +168,19 @@ def _wait_for_backend_prepared_successor(worker, timeout: float, worker_indices=
                 all_prepared = False
                 break
             assert _mailbox_load_i32(accepted_addrs[staged_indices[0]]) == 0
+            disposition = _mailbox_load_i32(disposition_addrs[staged_indices[0]])
+            observed_dispositions[rank] = disposition
+            if require_native and disposition != _NATIVE_PREPARED:
+                all_prepared = False
+                break
         if all_prepared:
             return
         time.sleep(0.001)
-    raise AssertionError("every successor rank did not finish backend preparation while its predecessor was launched")
+    raise AssertionError(
+        "successor preparation did not reach the required stage while predecessor was launched: "
+        f"require_native={require_native}, dispositions={observed_dispositions}, "
+        f"NATIVE_PREPARED={_NATIVE_PREPARED}"
+    )
 
 
 def _wait_for_active_device_run(worker, timeout: float, worker_indices=(0,)) -> None:
@@ -753,6 +769,123 @@ class TestWorkerAsyncWholeRunFifoTmrMultiRank(SceneTestCase):
             if all(handle is None or handle.done for handle in (first, second)):
                 for buffer in buffers:
                     buffer.close()
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestWorkerAsyncWholeRunFifoHbgMultiRank(TestWorkerAsyncWholeRunFifoTmrMultiRank):
+    """Apply the original all-rank preparation/FIFO assertions to HBG."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncWholeRunFifoTmrMultiRank.CASES)
+    CASES[0]["name"] = "whole_run_fifo_hbg_multi_rank"
+
+
+@scene_test(level=3, runtime="host_build_graph")
+class TestWorkerAsyncRetainedDomainFifoHbgMultiRank(TestWorkerAsyncWholeRunFifoHbgMultiRank):
+    """Retained VMM operands keep all-rank preparation and whole-parent FIFO."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncWholeRunFifoHbgMultiRank.CASES)
+    CASES[0]["name"] = "retained_domain_fifo_hbg_multi_rank"
+
+    def _validate_all_ranks_prepare_successor_while_predecessor_active(self, st_platform, st_worker):
+        assert st_platform == "a2a3"
+        _SUB_ENTERED.clear()
+        _SUB_RELEASE.clear()
+        request = {
+            "name": "fifo_retained",
+            "members": (0, 1),
+            "window_size": 6 * _SIZE * 4,
+            "buffers": [
+                CommBufferSpec(name, "float32", _SIZE, _SIZE * 4)
+                for name in ("first_a", "first_b", "first_out", "second_a", "second_b", "second_out")
+            ],
+            "retain_after_run": True,
+        }
+        saved = []
+        first = None
+        second_result = {}
+        submitter = None
+        second_built = threading.Event()
+        vector = type(self)._st_chip_handles["vector"]
+        signature = type(self)._st_chip_handles["vector_sig"]
+        sub = type(self)._st_sub_handles["wait_for_release"]
+        config = self._build_config(self.CASES[0]["config"])
+
+        def initialize(orch, _args, _cfg):
+            domain = orch.allocate_domain(**request)
+            saved.append(domain)
+            for rank in (0, 1):
+                for name, value in zip(
+                    ("first_a", "first_b", "first_out", "second_a", "second_b", "second_out"),
+                    (2.0 + rank, 3.0 + rank, 0.0, 5.0 + rank, 7.0 + rank, 0.0),
+                ):
+                    payload = torch.full((_SIZE,), value, dtype=torch.float32).numpy().tobytes()
+                    orch.copy_to_domain(domain, rank, payload, buffer=name)
+
+        def vectors(orch, prefix, *, hold_open=False):
+            domain = orch.get_or_allocate_domain(**request)
+            assert domain is saved[0]
+            for rank in (0, 1):
+                buffers = domain.local_context(rank).buffers
+                operands = [buffers[f"{prefix}_{suffix}"] for suffix in ("a", "b", "out")]
+                args = _chip_args(operands, signature, _MULTI_RANK_DEVICE_SPIN_ITERS if hold_open else 0)
+                orch.submit_next_level(vector, args, config, worker=rank)
+            if hold_open:
+                orch.submit_sub(sub)
+            else:
+                second_built.set()
+
+        def submit_second():
+            try:
+                second_result["handle"] = st_worker.submit(lambda orch, _args, _cfg: vectors(orch, "second"))
+            except BaseException as exc:
+                second_result["error"] = exc
+
+        try:
+            st_worker.run(initialize)
+            first = st_worker.submit(lambda orch, _args, _cfg: vectors(orch, "first", hold_open=True))
+            _wait_for_active_device_run(st_worker, 10.0, (0, 1))
+            assert _SUB_ENTERED.wait(10.0)
+            submitter = threading.Thread(target=submit_second, daemon=True)
+            submitter.start()
+            assert second_built.wait(10.0), "retained reuse serialized the successor callback behind the active parent"
+            _wait_for_backend_prepared_successor(
+                st_worker, 10.0, (0, 1), require_native=self._st_runtime == "host_build_graph"
+            )
+            assert not saved[0].released and not saved[0].freed
+            _SUB_RELEASE.set()
+            first.wait(30.0)
+            submitter.join(30.0)
+            assert not submitter.is_alive()
+            if "error" in second_result:
+                raise second_result["error"]
+            second_result["handle"].wait(30.0)
+            for rank in (0, 1):
+                for name, expected in (("first_out", 5.0 + 2 * rank), ("second_out", 12.0 + 2 * rank)):
+                    payload = st_worker._orch.copy_from_domain(saved[0], rank, _SIZE * 4, buffer=name)
+                    actual = torch.frombuffer(bytearray(payload), dtype=torch.float32)
+                    assert torch.allclose(actual, torch.full((_SIZE,), expected, dtype=torch.float32)), (rank, name)
+            saved[0].release()
+            assert saved[0].freed
+        finally:
+            _SUB_RELEASE.set()
+            if submitter is not None:
+                submitter.join(30.0)
+            handles = (first, second_result.get("handle"))
+            for handle in handles:
+                if handle is not None:
+                    with suppress(Exception):
+                        handle.wait(30.0)
+            if saved and all(handle is None or handle.done for handle in handles):
+                with suppress(Exception):
+                    saved[0].release()
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestWorkerAsyncRetainedDomainFifoTmrMultiRank(TestWorkerAsyncRetainedDomainFifoHbgMultiRank):
+    """Apply the same retained-domain FIFO contract to TMR."""
+
+    CASES = copy.deepcopy(TestWorkerAsyncRetainedDomainFifoHbgMultiRank.CASES)
+    CASES[0]["name"] = "retained_domain_fifo_tmr_multi_rank"
 
 
 if __name__ == "__main__":

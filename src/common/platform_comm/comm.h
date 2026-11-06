@@ -32,6 +32,7 @@
 #include "common/dma_workspace.h"
 
 #ifdef __cplusplus
+#include <type_traits>
 extern "C" {
 #endif
 
@@ -54,6 +55,22 @@ enum { COMM_RECLAMATION_UNCONFIRMED = -6 };
 // Join every participant's allocation request before aborting these owners;
 // a peer may still be importing an exported handle. This is not a usable domain.
 enum { COMM_INITIALIZATION_ABORT_REQUIRED = -7 };
+
+/** One published byte extent backed by a native communication allocation. */
+typedef struct CommAllocationSpan {
+    uint64_t addr;
+    uint64_t bytes;
+} CommAllocationSpan;
+
+/**
+ * Query all published context/window views of one live domain allocation.
+ * A null spans with zero capacity queries the required count. Insufficient
+ * capacity reports that count without writing any spans. Other failures set
+ * count_out to zero. The caller serializes this query with allocation/release.
+ */
+int comm_query_domain_allocation(
+    CommHandle h, uint64_t allocation_id, CommAllocationSpan *spans, size_t capacity, size_t *count_out
+);
 
 #define COMM_GLOBAL_DOMAIN_VERSION 2U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
@@ -394,4 +411,8 @@ int comm_destroy(CommHandle h);
 
 #ifdef __cplusplus
 }
+static_assert(
+    std::is_trivially_copyable_v<CommAllocationSpan> && std::is_standard_layout_v<CommAllocationSpan> &&
+    sizeof(CommAllocationSpan) == 16
+);
 #endif

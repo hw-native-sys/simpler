@@ -513,16 +513,43 @@ public:
     /**
      * Take `identity`'s borrow over the caller allocations covering `spans`.
      *
-     * All or nothing — see host/caller_device_buffers.h. A span that names no recorded caller
-     * allocation is what makes this refuse, which is the proof-of-owner the joined path needs.
+     * Known spans remain held on incomplete coverage. Caller allocations and explicitly
+     * registered native domain owners contribute; unknown external storage does not.
      */
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count);
 
     /** Drop `identity`'s borrow, or keep it for good when its last consumer is unproven. */
     void release_caller_buffers(uint64_t identity, bool keep);
 
+    bool register_domain_buffer_owner(
+        uint64_t session, uint64_t allocation, const CallerDeviceBuffers::Span *spans, std::size_t count
+    ) {
+        return device_buffer_owners_.register_domain_owner(session, allocation, spans, count);
+    }
+
+    bool has_domain_buffer_owner(uint64_t session, uint64_t allocation) const {
+        return device_buffer_owners_.has_domain_owner(session, allocation);
+    }
+
+    bool begin_domain_session_release(uint64_t session) {
+        return device_buffer_owners_.begin_domain_session_release(session);
+    }
+
+    bool finish_domain_session_release(uint64_t session, bool confirmed) {
+        return device_buffer_owners_.finish_domain_session_release(session, confirmed);
+    }
+
+    bool begin_domain_buffer_release(uint64_t session, uint64_t allocation) {
+        return device_buffer_owners_.begin_domain_release(session, allocation);
+    }
+
+    bool finish_domain_buffer_release(uint64_t session, uint64_t allocation, bool confirmed) {
+        return confirmed ? device_buffer_owners_.finish_domain_release(session, allocation) :
+                           device_buffer_owners_.mark_domain_release_unconfirmed(session, allocation);
+    }
+
     /**
-     * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
+     * Declare which recorded storage extents `identity` produces; see host/device_buffer_owners.h.
      *
      * @return false when the statement could not be recorded, which the declaring run's bind has
      *         to treat as its own failure: an undeclared producer reads as no producer.
@@ -531,18 +558,18 @@ public:
         uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count,
         std::size_t *unresolved_out = nullptr
     ) {
-        return caller_device_buffers_.declare_writes(identity, spans, count, unresolved_out);
+        return device_buffer_owners_.declare_writes(identity, spans, count, unresolved_out);
     }
 
     /** Whether `[addr, addr + bytes)` has no readable content for `identity` yet. */
     bool caller_buffer_written_by_other_run(uint64_t identity, uint64_t addr, uint64_t bytes) const {
-        return caller_device_buffers_.written_by_other_run(identity, addr, bytes);
+        return device_buffer_owners_.written_by_other_run(identity, addr, bytes);
     }
 
     /** The caller allocations this context has recorded, for teardown reporting and tests. */
-    std::size_t caller_buffer_count() const { return caller_device_buffers_.allocation_count(); }
-    std::size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
-    std::size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
+    std::size_t caller_buffer_count() const { return device_buffer_owners_.caller_allocation_count(); }
+    std::size_t caller_buffer_borrow_count() const { return device_buffer_owners_.borrow_count(); }
+    std::size_t caller_buffer_retained_count() const { return device_buffer_owners_.retained_count(); }
 
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
@@ -3057,7 +3084,7 @@ protected:
     // runs still hold them — see host/caller_device_buffers.h. Only the
     // caller-facing mint records here, so an address this runner allocated for
     // itself is absent and cannot be named by a run's arguments.
-    CallerDeviceBuffers caller_device_buffers_;
+    DeviceBufferOwners device_buffer_owners_;
 
     // One budget and one ownership ledger for this context's workspace
     // regions. Off unless a caller latches a budget.

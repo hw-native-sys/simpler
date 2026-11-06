@@ -78,6 +78,12 @@ wrappers; `workers=` remains the legacy L3 allocation spelling.
 Domain creation and configuration reuse occur in an orchestration callback.
 L3 creation and staging precede its first submission; a reuse hit performs no device control and remains valid afterwards.
 A successful run preserves domains created with `retain_after_run=True`.
+An L3 run that only reuses an existing retained domain can prepare ahead of
+its predecessor. Per-run use records keep the backing alive through every
+accepted consumer's native fence; whole-parent FIFO still orders execution.
+Initial allocation, nonretained domains and explicit release retain their
+ordered cleanup, and Host staging/reset follows the existing direct-control
+ordering. Failed uses revoke new submissions before deferred physical release.
 Later runs can submit cached Buffers/Tensors directly. Submission and ordinary copies enroll
 the current run; release waits for it and its descendants, while a failed run closes its used domains.
 Use `with` only when the scope should release the shared handle: context exit
@@ -741,3 +747,15 @@ simpler stays framework-free — torch/numpy appear only on the caller's side.
 - `examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/` — host
   staging via `copy_to` + cross-rank `SdmaTget`; the SDMA workspace is
   provisioned by constructing the `Worker` with `enable_sdma=True`.
+
+Native domain storage is enrolled in the device context only after the communication backend attests its allocation-owned context and window extents. Mutable CommContext fields are not allocation evidence. These grants share caller-storage run loans and producer fences, but cannot be freed through the caller allocator. Explicit allocation release and implicit session close revoke new uses before checking outstanding loans; unconfirmed backend release quarantines the grants instead of retrying a possibly consumed handle. Existing native-run reclamation checks and the separate live-communication joined-launch restriction remain in effect. Older runtime modules without the complete owner-query capability retain unknown-span serial fallback.
+
+### Retained-domain control ordering
+
+Retained-state preparation can overlap an active predecessor. Allocation and
+release RPC fanouts nevertheless complete one whole participating-chip round
+before the next round starts, including failure cleanup. This ordering prevents
+different ranks from entering different collectives; it does not serialize host
+preparation outside the control RPC. Initialization abort retires enrolled owner
+grants. A backend release or destruction exception leaves ownership unconfirmed
+and stops further worker admission instead of reusing uncertain storage.

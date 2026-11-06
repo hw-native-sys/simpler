@@ -495,7 +495,8 @@ declare_caller_device_writes(void *runner_ctx, uint64_t run_id, const CallerBuff
             // exactly as wide as what was recorded, so those bytes read as having no declared
             // producer — which is why this is said out loud rather than skipped silently.
             LOG_WARN(
-                "declare_caller_device_writes: %zu of %u produced span(s) name no caller allocation of this "
+                "declare_caller_device_writes: %zu of %u produced span(s) name no caller or native-domain allocation "
+                "of this "
                 "device context; their bytes carry no readable-yet fence for a concurrently preparing run",
                 unresolved, count
             );
@@ -629,6 +630,79 @@ int device_borrow_caller_buffers_ctx(
         const bool held =
             static_cast<SimDeviceRunnerBase *>(ctx)->borrow_caller_buffers(borrow_id, resolved.data(), resolved.size());
         return held ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_register_domain_owner_ctx(
+    DeviceContextHandle ctx, uint64_t session, uint64_t allocation, const CallerBufferSpan *spans, uint32_t count
+) {
+    if (ctx == nullptr || spans == nullptr || count == 0) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        std::vector<CallerDeviceBuffers::Span> views(count);
+        for (uint32_t i = 0; i < count; ++i)
+            views[i] = {spans[i].addr, spans[i].bytes};
+        return static_cast<SimDeviceRunnerBase *>(ctx)->register_domain_buffer_owner(
+                   session, allocation, views.data(), views.size()
+               ) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_domain_owner_registered_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->has_domain_buffer_owner(session, allocation) ? 1 : 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_begin_domain_session_release_ctx(DeviceContextHandle ctx, uint64_t session) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->begin_domain_session_release(session) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_finish_domain_session_release_ctx(DeviceContextHandle ctx, uint64_t session, int confirmed) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->finish_domain_session_release(session, confirmed != 0) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_begin_domain_release_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->begin_domain_buffer_release(session, allocation) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_finish_domain_release_ctx(DeviceContextHandle ctx, uint64_t session, uint64_t allocation, int confirmed) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->finish_domain_buffer_release(
+                   session, allocation, confirmed != 0
+               ) ?
+                   0 :
+                   PTO_RUNTIME_ERR_INVALID_STATE;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }

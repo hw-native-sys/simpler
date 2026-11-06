@@ -665,7 +665,8 @@ def test_retained_domain_serial_access_and_run_registration(domain_worker):
         assert current is domain
         assert current.buffer_range("payload") == (0, 64)
         resources = worker._building_run_resources
-        assert resources is not None and resources.requires_ordered_cleanup
+        assert resources is not None
+        assert resources.requires_ordered_cleanup is (worker.level != 3)
         table = resources.live_domains if worker.level == 3 else resources.live_global_domains
         assert table.get("tp") is current
 
@@ -792,7 +793,7 @@ def test_cached_domain_use_enrolls_current_run(domain_worker, use):
     else:
         run = worker.submit(consume)
         table = run._resources.live_domains if worker.level == 3 else run._resources.live_global_domains
-        assert run._resources.requires_ordered_cleanup
+        assert run._resources.requires_ordered_cleanup is (worker.level != 3 or use == "release_inside")
         if use == "release_inside":
             pending = (
                 run._resources.pending_release_domains
