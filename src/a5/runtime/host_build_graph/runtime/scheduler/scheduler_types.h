@@ -1158,6 +1158,9 @@ enum class SchedulerErrorSite : uint64_t {
     ASYNC_CHECK_FAILED = 142,
     ASYNC_FINISH_FAILED = 143,
     ASYNC_BLOCK_RELEASE_FAILED = 144,
+    ARGS_DUMP_BOUNDARY_TIMEOUT = 150,
+    ARGS_DUMP_REFUSED = 151,
+    ARGS_DUMP_ABORT_TIMEOUT = 152,
 };
 
 enum SchedulerErrorIdentityField : uint32_t {
@@ -1298,6 +1301,7 @@ struct alignas(128) SchedulerWorkerContext {
     // and consuming one of its words would make a context carrying this offset
     // read as malformed.
     uint64_t pmu_cells_offset;
+    uint64_t args_dump_address;
 
     alignas(128) uint64_t graph_summary_offset;
     uint64_t scheduler_count;

@@ -17,6 +17,14 @@ endmacro()
 a5_hbg_case(test_hbg_scheduler_contracts.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu)
 
+a5_hbg_case(test_hbg_args_dump_service.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/args_dump_service.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp)
+
+a5_hbg_case(test_hbg_args_dump_rendezvous.cpp)
+
 a5_hbg_case(test_hbg_graph_view.cpp)
 
 a5_hbg_case(test_hbg_async_directory.cpp NO_OBJS TIMEOUT 20)
@@ -124,13 +132,20 @@ else()
 endif()
 a5_hbg_case(test_hbg_resident_late_aicore_error.cpp
     INCLUDES        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
-    SOURCES         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/args_dump_service.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/aicpu_device_config.cpp
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS    ${_gc_link_option})
 
 a5_hbg_case(test_hbg_resident_entry_result.cpp TIMEOUT 30
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/args_dump_service.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp
         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/aicpu_device_config.cpp
