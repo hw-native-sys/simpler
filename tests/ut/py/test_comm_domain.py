@@ -12,10 +12,14 @@ from __future__ import annotations
 import copy
 import importlib
 import os
+import select
 import signal
 import struct
+import subprocess
+import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -1400,6 +1404,101 @@ def test_host_domain_wire_cpu_import_retention_and_rollback(
     assert domain.freed and owners == {}
     assert all(mapping.buf is None for mapping in imports)
     assert saved.shm.buf is None
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("before_reply", [True, False])
+def test_host_domain_creator_death_is_reclaimed_by_worker_close(
+    domain_worker, monkeypatch, native_host_memory, before_reply
+):
+    if not os.path.isdir("/dev/shm"):
+        pytest.skip("namespace scanning requires Linux /dev/shm")
+    posixshmem = pytest.importorskip("_posixshmem")
+    worker, _members = domain_worker
+    monkeypatch.setitem(worker._config, "platform", "a5")
+    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+    foreign = native_host_memory(name=worker_mod._shm_name(uuid.uuid4().hex, "host-test"))
+    names = []
+    creators = []
+    saved = []
+
+    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
+        if op == "release":
+            raise RuntimeError("Host window creator exited")
+        for chip in workers:
+            request = request_shms[chip].buf
+            _identity, count, _rank, size, buffer_count = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request)
+            tail = worker_mod._DOMAIN_REQ_HEADER.size + buffer_count * 8 + count * 4
+            name = worker_mod._read_shm_name(request, tail)
+            names.append(name)
+            # Direct POSIX creation has no Python resource tracker, matching the native allocator.
+            creator = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, sys, signal, _posixshmem; "
+                    "fd = _posixshmem.shm_open('/' + sys.argv[1], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600); "
+                    "os.ftruncate(fd, int(sys.argv[2])); os.close(fd); "
+                    "print('ready', flush=True); signal.pause()",
+                    name,
+                    str(size),
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            creators.append(creator)
+            assert creator.stdout is not None
+            assert select.select([creator.stdout], [], [], 10)[0]
+            assert creator.stdout.readline().strip() == "ready"
+            if not before_reply:
+                base = 0x100000 * (chip + 1)
+                response = reply_shms[chip].buf
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(response, 0, 1, base + size, base, size, buffer_count)
+                struct.pack_into("<Q", response, worker_mod._DOMAIN_REPLY_HEADER.size, base)
+        if before_reply:
+            for creator in creators:
+                creator.kill()
+                assert creator.wait(timeout=5) == -signal.SIGKILL
+            raise RuntimeError("Host window creator exited before reply")
+
+    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+
+    def allocate(orch, _args, _cfg):
+        saved.append(orch.allocate_domain(**_request([0, 1], memory_source=AddressSpace.HOST)))
+
+    try:
+        if before_reply:
+            with pytest.raises(RuntimeError, match="creator exited"):
+                worker.run(allocate)
+        else:
+            worker.run(allocate)
+            assert len(saved[0]._host_mappings) == 2
+            for creator in creators:
+                creator.kill()
+                assert creator.wait(timeout=5) == -signal.SIGKILL
+            for mapping in saved[0]._host_mappings:
+                mapping.close()
+        assert len(names) == 2 and len(set(names)) == 2
+        assert all(len(name) <= 30 for name in names)
+        assert all(Path("/dev/shm", name).exists() for name in names)
+        if before_reply:
+            worker.close()
+        else:
+            _close_with_domain_debt(worker)
+        assert all(not Path("/dev/shm", name).exists() for name in names)
+        assert Path("/dev/shm", foreign.name).exists()
+    finally:
+        for creator in creators:
+            if creator.poll() is None:
+                creator.kill()
+            creator.wait(timeout=5)
+            if creator.stdout is not None:
+                creator.stdout.close()
+        for name in names:
+            try:
+                posixshmem.shm_unlink("/" + name)
+            except FileNotFoundError:
+                pass
 
 
 @pytest.mark.parametrize("domain_worker", [3], indirect=True)

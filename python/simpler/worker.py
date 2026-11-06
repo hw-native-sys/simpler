@@ -10722,7 +10722,11 @@ class Worker:
         req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
         host_names = {}
         if memory_source == AddressSpace.HOST:
-            host_names = {chip: "sph_" + uuid.uuid4().hex[:24] for chip in workers}
+            # Host windows belong to this startup tree even before allocation replies arrive.
+            for chip in workers:
+                host_name = _shm_name(self._shm_token, f"h-{uuid.uuid4().hex[:16]}")
+                assert host_name is not None
+                host_names[chip] = host_name
             req_size += _CTRL_SHM_NAME_BYTES
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
         # Precompute worker → dense rank for O(1) lookup in the staging /
@@ -14874,7 +14878,7 @@ class Worker:
             raise errors[0]
 
     def _unlink_shm_namespace(self, protected_names: set[str]) -> None:
-        """Unlink orphan mailboxes belonging to this exact startup tree."""
+        """Unlink orphan shared memory belonging to this exact startup tree."""
         shm_dir = "/dev/shm"
         if not self._shm_tree_tokens or not os.path.isdir(shm_dir):
             return

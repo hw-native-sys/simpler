@@ -125,6 +125,11 @@ creation and unlink; L3 only borrows the mapping and does not register Python
 resource-tracker ownership. Use `domain.release()`, not `buf.close()` or
 `buf.shm.unlink()`.
 
+Host windows use the owning Worker's `sp-<token>-h-...` namespace. Worker
+teardown also unlinks orphan windows left by an abruptly terminated L2,
+including allocations that never returned a reply. Other Worker trees are
+outside that namespace and are not swept.
+
 Each `.shm.buf` access returns a managed, zero-copy memoryview. NumPy arrays
 created with either `np.ndarray(buffer=...)` or `np.frombuffer(...)`, including
 their slices, keep the borrow alive even after the original memoryview is
