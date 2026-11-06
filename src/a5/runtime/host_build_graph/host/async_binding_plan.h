@@ -12,6 +12,7 @@
 
 #include "async_plan.h"
 #include "native_graph_plan.h"
+#include "submission_bundle_plan.h"
 #include "backend/async_resource_binding.h"
 #include "common/host_api.h"
 #include "host_build_graph/host/async_declarations.h"
@@ -34,6 +35,7 @@ struct AsyncBindingGroupUses {
 
 struct AsyncBindingHostPlan {
     uint64_t run_epoch{0};
+    uint64_t execution_contract{ASYNC_EXECUTION_UNQUALIFIED};
     SchedulerAsyncAuxiliaryBytes auxiliary{};
     std::vector<AsyncRetainedSpan> spans;
     std::vector<AsyncResourceRange> ranges;
@@ -42,7 +44,17 @@ struct AsyncBindingHostPlan {
     std::vector<AsyncConsumerContract> consumers;
     std::vector<uint64_t> consumer_ranges;
     std::vector<AsyncBindingGroupUses> groups;
+    std::vector<SchedulerSubmissionWorkspaceInput> submission_workspaces;
+    std::vector<SchedulerSubmissionExecutionUse> submission_uses;
+    std::vector<SchedulerSubmissionExecutionUseSet> execution_use_sets;
 };
+
+// Inspect only declarations of this run's actual expanded executions. A cached
+// Graph definition that is not instantiated does not require a submission image.
+bool scheduler_has_sdma_uses(
+    const std::vector<SchedulerTaskMetadata> &metadata, const NativeGraphHostPlan &native,
+    const AsyncHostDeclarations &declarations, bool *out, std::string *error
+);
 
 // Queries only owners already selected by this native preparation. Explicit
 // PUBLISHED_CLEAN_LINES declarations provide the publication/clean-alias

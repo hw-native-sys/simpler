@@ -277,10 +277,13 @@ private:
     // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
-    // Stream completion proves that the cores stopped. Deferred work also
-    // needs this epoch's audited successful terminal before its owners end.
+    // Resource retirement is independent of execution success. A failed run
+    // needs explicit core-only admission plus this epoch's core retirement fact;
+    // independent/unknown backends still require the audited successful path.
     int qualify_async_last_use(PreparedExecution &prepared);
     int async_last_use_requirement(const PreparedExecution &prepared) const;
+    bool async_terminal_proves_last_use(const PreparedExecution &prepared, int requirement) const;
+    int qualified_async_execution_error(const PreparedExecution &prepared) const;
     bool retained_run_blocks_fatal_reset(
         const NativeRunIdentity &identity, const PreparedRunResources &resources
     ) const override;

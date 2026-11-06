@@ -46,6 +46,7 @@
 #include "host/host_graph_runs.h"
 #include "host/raii_scope_guard.h"
 #include "host/run_boundary.h"
+#include "host_build_graph/async_retirement.h"
 #include "utils/fatal_shutdown_latch.h"
 
 namespace {
@@ -823,7 +824,9 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             log_run_failure(prepared, rc);
             recover_device_or_mark_unusable(rc);
         }
-        return DrainOutcome{rc, prepared.retirement_diagnostics_rc, true};
+        return DrainOutcome{
+            rc != 0 ? rc : qualified_async_execution_error(prepared), prepared.retirement_diagnostics_rc, true
+        };
     }
     if (!prepared.resources_owned || run_progress_.state_of(prepared.identity) == RunProgressState::Idle) {
         LOG_ERROR(
@@ -940,7 +943,9 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // by this run's own core count: the runner-wide one describes whichever run
     // launched last, which at depth two is not necessarily this one.
     print_handshake_results(prepared.kernel_args, prepared.num_aicore);
-    return DrainOutcome::device_complete(teardown_rc);
+    // Qualifying resource retirement must not turn the original failed run
+    // into success when its stream boundary itself completed normally.
+    return DrainOutcome{qualified_async_execution_error(prepared), teardown_rc, true};
 }
 
 int DeviceRunner::async_last_use_requirement(const PreparedExecution &prepared) const {
@@ -960,8 +965,25 @@ bool DeviceRunner::run_origin_accesses_ended(const PreparedExecution &prepared) 
     if (prepared.recording || !prepared.physical_complete || prepared.resources_owned ||
         async_last_use_requirement(prepared) <= 0)
         return false;
-    return device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch).state ==
-           DeviceRunTerminalState::Succeeded;
+    return async_terminal_proves_last_use(prepared, async_last_use_requirement(prepared));
+}
+
+bool DeviceRunner::async_terminal_proves_last_use(const PreparedExecution &prepared, int requirement) const {
+    const auto terminal = device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch);
+    if (terminal.state == DeviceRunTerminalState::Succeeded) return true;
+    if (requirement != HBG_ASYNC_LAST_USE_CORE_PIPELINES_ONLY || terminal.state != DeviceRunTerminalState::Failed)
+        return false;
+    size_t bytes = 0;
+    const void *payload = device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch, &bytes);
+    return hbg_async_cores_retired(payload, bytes, prepared.identity.run_epoch);
+}
+
+int DeviceRunner::qualified_async_execution_error(const PreparedExecution &prepared) const {
+    const auto terminal = device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch);
+    return async_last_use_requirement(prepared) == HBG_ASYNC_LAST_USE_CORE_PIPELINES_ONLY &&
+                   terminal.state == DeviceRunTerminalState::Failed ?
+               terminal.code :
+               0;
 }
 
 int DeviceRunner::qualify_async_last_use(PreparedExecution &prepared) {
@@ -972,10 +994,11 @@ int DeviceRunner::qualify_async_last_use(PreparedExecution &prepared) {
     if (required > 0 && prepared.physical_complete) {
         rc = read_device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch);
         const auto terminal = device_run_terminal(prepared.pipeline_slot, prepared.identity.run_epoch);
-        // HBG publishes Ok only after resolved+inline==expected, the final
-        // scheduler-error fold, and acknowledged retirement of every AICore.
-        // Stream completion alone cannot establish any of those async facts.
-        if (rc == 0 && terminal.state == DeviceRunTerminalState::Succeeded) return 0;
+        // Ok includes full logical completion and core retirement. An Error
+        // may qualify only through explicit core-pipelines-only admission plus
+        // this epoch's independently published retirement acknowledgements.
+        // Stream completion and condition type alone establish neither fact.
+        if (rc == 0 && async_terminal_proves_last_use(prepared, required)) return 0;
         if (rc == 0) rc = terminal.code != 0 ? terminal.code : PTO_RUNTIME_ERR_INVALID_STATE;
         reason = terminal.reason != nullptr ? terminal.reason : "run terminal reports failure";
     } else if (required > 0) {

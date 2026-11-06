@@ -26,9 +26,14 @@ struct Fixture {
     struct alignas(64) Image {
         ChipTaskStorage tasks[3]{};
         simpler::hbg::Tensor tensors[3][4]{};
-        uint64_t scalars[3][2]{};
+        uint64_t scalars[3][4]{};
     } image;
     alignas(64) std::array<std::array<uint8_t, 512>, 4> buffers{};
+    alignas(64) std::array<uint8_t, 4096> workspace{};
+    std::array<CommDomainSnapshot, 2> domains{};
+    CommSdmaOwnerInfoV1 sdma_owner{};
+    CommDomainExecution domain_execution{CommDomainExecution::EXCLUSIVE_RUN};
+    bool refuse_sdma{false};
     HostApiOps ops{};
     HostApi api{this, 1, 1, kEpoch, &ops, std::nullopt, this};
     std::vector<SchedulerTaskMetadata> metadata{2};
@@ -95,6 +100,53 @@ struct Fixture {
     void add(uint32_t task, const AsyncUseDeclaration &use) { ASSERT_TRUE(declarations.add(false, 0, task, use)); }
     void consume(uint32_t task, uint32_t arg) {
         add(task, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, arg, UINT32_MAX, UINT32_MAX, 0, kClean});
+    }
+    void sdma() {
+        declarations = {};
+        capabilities[0][1] = {
+            CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::DEFERRED, 2, CORE_ASYNC_CONDITION_SDMA_POST_DONE
+        };
+        image.tasks[0].payload.scalar_count = 2;
+        image.scalars[0][0] = 0x10000;
+        image.scalars[0][1] = 1;
+        tensor(0, 0, 0, 16);
+        add(0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1});
+        consume(0, 1);
+        consume(1, 1);
+        sdma_owner = {reinterpret_cast<uint64_t>(workspace.data()), workspace.size(), CommSdmaAccess::SDK_ONLY, 1};
+        for (uint32_t i = 0; i < domains.size(); ++i) {
+            domains[i].use = {CommDomainKind::LOCAL, 0, i, 0x10000 * (i + 1u)};
+            auto &comm = domains[i].context;
+            comm.rankId = 0;
+            comm.rankNum = 2;
+            comm.winSize = buffers[0].size();
+            comm.windowsIn[0] = address(i * 2);
+            comm.windowsIn[1] = address(2 - i * 2);
+            comm_workspace<CommWorkspaceKind::SDMA>(comm) = {sdma_owner.workspace_addr, sdma_owner.workspace_bytes};
+        }
+        ops.query_async_domain_context = [](void *context, const void *owner, uint32_t, uint32_t, uint64_t epoch,
+                                            uint64_t address, CommDomainSnapshot *out, CommDomainExecution *execution) {
+            auto &self = *static_cast<Fixture *>(context);
+            if (owner != &self || epoch != kEpoch || self.refuse_sdma) return false;
+            for (const auto &domain : self.domains)
+                if (domain.use.device_context == address) {
+                    *out = domain;
+                    *execution = self.domain_execution;
+                    return true;
+                }
+            return false;
+        };
+        ops.query_async_sdma_owner = [](void *context, const void *owner, uint32_t, uint32_t, uint64_t epoch,
+                                        uint64_t address, CommSdmaOwnerInfoV1 *out) {
+            auto &self = *static_cast<Fixture *>(context);
+            if (owner != &self || epoch != kEpoch || self.refuse_sdma) return false;
+            for (const auto &domain : self.domains)
+                if (domain.use.device_context == address) {
+                    *out = self.sdma_owner;
+                    return true;
+                }
+            return false;
+        };
     }
     AsyncBindingTaskImage view() const {
         return {&image, sizeof(image), 0x100000, offsetof(Image, tasks), static_cast<uint32_t>(metadata.size())};
@@ -172,6 +224,37 @@ TEST(HbgAsyncBindingPlan, CounterOnlyHasNoSyntheticPayloadOrConsumer) {
     }
     Materialized image;
     EXPECT_TRUE(image.initialize(f, plan)) << f.error;
+}
+
+TEST(HbgAsyncBindingPlan, CorePipelineRetirementNeedsExplicitCoverageOfEveryExecution) {
+    Fixture f;
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    EXPECT_EQ(plan.execution_contract, ASYNC_EXECUTION_UNQUALIFIED);
+    f.add(0, {AsyncUseDeclarationKind::CORE_PIPELINES_ONLY});
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    EXPECT_EQ(plan.execution_contract, ASYNC_EXECUTION_UNQUALIFIED);
+    f.add(1, {AsyncUseDeclarationKind::CORE_PIPELINES_ONLY});
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    EXPECT_EQ(plan.execution_contract, ASYNC_EXECUTION_CORE_PIPELINES_ONLY);
+    Materialized image;
+    ASSERT_TRUE(image.initialize(f, plan)) << f.error;
+    EXPECT_EQ(image.tables.header.execution_contract, ASYNC_EXECUTION_CORE_PIPELINES_ONLY);
+    AsyncResourceBindings<> backend(image.tables, ASYNC_CORE_AIC);
+    SchedulerAsyncConditionBinding binding{};
+    EXPECT_TRUE(backend.bind_condition(image.group(), 0, f.entry(f.address(0)), &binding));
+}
+
+TEST(HbgAsyncBindingPlan, CorePipelineOnlyDeclarationCannotAuthorizeSdmaOrRetagItsImage) {
+    Fixture f;
+    f.sdma();
+    EXPECT_FALSE(f.declarations.add(false, 0, 0, {AsyncUseDeclarationKind::CORE_PIPELINES_ONLY}));
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    EXPECT_EQ(plan.execution_contract, ASYNC_EXECUTION_UNQUALIFIED);
+    plan.execution_contract = ASYNC_EXECUTION_CORE_PIPELINES_ONLY;
+    Materialized image;
+    EXPECT_FALSE(image.initialize(f, plan));
 }
 
 TEST(HbgAsyncBindingPlan, AllowedUseSelectionSupportsBranchesReverseRegistrationAndSeveralPayloads) {
@@ -336,6 +419,265 @@ TEST(HbgAsyncBindingPlan, SdmaNeedsRealDomainRecordAndChannelQualification) {
     AsyncBindingHostPlan plan;
     EXPECT_FALSE(f.build(&plan));
     EXPECT_NE(f.error.find("SDMA"), std::string::npos);
+}
+
+TEST(HbgAsyncBindingPlan, SdmaBindsOnlyTheSelectedPeersExactViewAndNoStaticRecordDirectory) {
+    Fixture f;
+    f.sdma();
+    f.tensor(0, 0, 0, 16, 8);
+    f.tensor(0, 1, 1, 16, 4);
+    // Every candidate reader explicitly declares the payload it can access.
+    f.tensor(1, 1, 1, 16, 4);
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    ASSERT_EQ(plan.conditions.size(), 1u);
+    const auto &use = plan.conditions[0];
+    const auto &source = plan.ranges[use.source_range];
+    const auto &destination = plan.ranges[use.payload_range];
+    EXPECT_EQ(plan.spans[source.span_index].address + source.byte_offset, f.address(2, 32));
+    EXPECT_EQ(source.bytes, 64u);
+    EXPECT_EQ(plan.spans[destination.span_index].address + destination.byte_offset, f.address(1, 16));
+    EXPECT_EQ(destination.bytes, 64u);
+    EXPECT_EQ(use.record_range, ASYNC_RESOURCE_NONE);
+    EXPECT_EQ(use.record_count, 0u);
+    EXPECT_EQ(use.record_stride, 0u);
+    EXPECT_EQ(use.sdma_workspace_address, f.sdma_owner.workspace_addr);
+    ASSERT_EQ(plan.submission_workspaces.size(), 1u);
+    EXPECT_EQ(plan.submission_workspaces[0].queue_num, 1u);
+    ASSERT_EQ(plan.submission_uses.size(), 1u);
+    EXPECT_EQ(plan.submission_uses[0].context_scalar, 0u);
+    ASSERT_EQ(plan.execution_use_sets.size(), 2u);
+    EXPECT_EQ(plan.execution_use_sets[0].use_count, 1u);
+    EXPECT_EQ(plan.execution_use_sets[1].use_count, 0u);
+    EXPECT_EQ(plan.execution_use_sets[1].use_begin, SCHEDULER_ASYNC_INDEX_NONE);
+    SchedulerSubmissionHostPlan submission;
+    ASSERT_TRUE(scheduler_plan_submission_bundles(
+        f.metadata, f.capabilities, plan.submission_workspaces, plan.submission_uses, plan.execution_use_sets, kEpoch,
+        kBudget, &submission, &f.error
+    )) << f.error;
+    EXPECT_GT(submission.image.size(), 0u);
+}
+
+TEST(HbgAsyncBindingPlan, SdmaRejectsUnknownOwnersWrongPeersAndUnqualifiedWorkspaceHistory) {
+    for (uint32_t fault = 0; fault < 9; ++fault) {
+        Fixture f;
+        f.sdma();
+        switch (fault) {
+        case 0:
+            f.refuse_sdma = true;
+            break;
+        case 1:
+            f.image.scalars[0][1] = 2;
+            break;
+        case 2:
+            f.image.scalars[0][1] = UINT64_MAX;
+            break;
+        case 3:
+            f.image.scalars[0][0] += 8;
+            break;
+        case 4:
+            f.domain_execution = CommDomainExecution::UNKNOWN;
+            break;
+        case 5:
+            f.sdma_owner.access = CommSdmaAccess::LEGACY;
+            f.sdma_owner.queue_num = 0;
+            break;
+        case 6:
+            ++f.sdma_owner.workspace_addr;
+            break;
+        case 7:
+            f.sdma_owner.queue_num = 49;
+            break;
+        case 8:
+            f.tensor(0, 0, 3, 16);
+            break;
+        }
+        AsyncBindingHostPlan plan;
+        plan.run_epoch = 123;
+        EXPECT_FALSE(f.build(&plan)) << fault;
+        EXPECT_EQ(plan.run_epoch, 123u) << fault;
+        EXPECT_NE(f.error.find("SDMA"), std::string::npos) << fault << ": " << f.error;
+    }
+}
+
+TEST(HbgAsyncBindingPlan, SdmaAllowedViewsDoNotRequireEqualSourceAndDestinationCapacities) {
+    Fixture f;
+    f.sdma();
+    f.tensor(0, 1, 1, 32);
+    f.tensor(1, 1, 1, 32);
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    ASSERT_EQ(plan.conditions.size(), 1u);
+    EXPECT_EQ(plan.ranges[plan.conditions[0].source_range].bytes, 64u);
+    EXPECT_EQ(plan.ranges[plan.conditions[0].payload_range].bytes, 128u);
+}
+
+TEST(HbgAsyncBindingPlan, SdmaSynchronousMixPeersReceiveTheirOwnUseAndSubmissionGrantInputs) {
+    Fixture f;
+    f.sdma();
+    f.metadata[0].active_mask = LaneMask::all();
+    f.metadata[0].logical_block_num = 2;
+    f.metadata[0].flags |= SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    EXPECT_EQ(plan.groups.size(), 2u);
+    EXPECT_EQ(plan.conditions.size(), 4u);
+    EXPECT_EQ(plan.submission_uses.size(), 4u);
+    ASSERT_EQ(plan.execution_use_sets.size(), 7u);
+    for (const auto &set : plan.execution_use_sets)
+        EXPECT_EQ(set.use_count, set.task_ref == 0 && set.subtask_slot != 0 ? 1u : 0u);
+    SchedulerSubmissionHostPlan submission;
+    ASSERT_TRUE(scheduler_plan_submission_bundles(
+        f.metadata, f.capabilities, plan.submission_workspaces, plan.submission_uses, plan.execution_use_sets, kEpoch,
+        kBudget, &submission, &f.error
+    )) << f.error;
+    EXPECT_EQ(submission.header.grant_count, 4u);
+}
+
+TEST(HbgAsyncBindingPlan, CounterOnlyRunsDoNotAllocateSubmissionMapsForLargeSynchronousSpmd) {
+    Fixture f;
+    f.declarations = {};
+    f.add(0, {AsyncUseDeclarationKind::COUNTER_PAYLOAD, 0, 1, UINT32_MAX, UINT32_MAX, 4, kClean});
+    f.consume(0, 1);
+    f.metadata[1].logical_block_num = INT16_MAX;
+    f.metadata[1].flags |= SCHEDULER_TASK_SPMD;
+    f.tensor(1, 1, 3, 16);
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan, 64 * 1024)) << f.error;
+    EXPECT_TRUE(plan.execution_use_sets.empty());
+    EXPECT_TRUE(plan.submission_uses.empty());
+    f.sdma();
+    EXPECT_FALSE(f.build(&plan, 64 * 1024));
+    EXPECT_NE(f.error.find("maps exceed byte budget"), std::string::npos) << f.error;
+}
+
+TEST(HbgAsyncBindingPlan, SdmaAliasesShareOnePermissionAndAmbiguousSubrangesAreRejected) {
+    Fixture f;
+    f.sdma();
+    f.image.tasks[0].payload.tensor_count = 4;
+    f.tensor(0, 2, 0, 16);
+    f.tensor(0, 3, 1, 16);
+    f.add(0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 3, 2, 0, 0, kClean, 1});
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    EXPECT_EQ(plan.conditions.size(), 1u);
+    EXPECT_EQ(plan.submission_uses.size(), 1u);
+    f.tensor(0, 2, 0, 8);
+    f.tensor(0, 3, 1, 8);
+    EXPECT_FALSE(f.build(&plan));
+    EXPECT_NE(f.error.find("ambiguous"), std::string::npos) << f.error;
+}
+
+TEST(HbgAsyncBindingPlan, SubmissionRequirementUsesOnlyInstantiatedDeclarations) {
+    Fixture f;
+    bool required = true;
+    ASSERT_TRUE(
+        f.declarations.add(true, 0xdead, 0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1})
+    );
+    ASSERT_TRUE(scheduler_has_sdma_uses(f.metadata, f.native, f.declarations, &required, &f.error));
+    EXPECT_FALSE(required);
+    f.sdma();
+    f.capabilities[0][1] = {CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::SYNCHRONOUS, 0, 0};
+    ASSERT_TRUE(scheduler_has_sdma_uses(f.metadata, f.native, f.declarations, &required, &f.error));
+    EXPECT_TRUE(required);
+}
+
+TEST(HbgAsyncBindingPlan, AliasedContextsKeepBothScalarBindingsAndShareOneWorkspaceGrant) {
+    Fixture f;
+    f.sdma();
+    f.image.tasks[0].payload.tensor_count = 3;
+    f.image.tasks[0].payload.scalar_count = 4;
+    f.tensor(0, 2, 2, 16);
+    f.image.scalars[0][2] = f.domains[1].use.device_context;
+    f.image.scalars[0][3] = 0;
+    f.add(0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 2, 2, 0, kClean, 3});
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    EXPECT_EQ(plan.conditions.size(), 1u);
+    ASSERT_EQ(plan.submission_uses.size(), 2u);
+    EXPECT_EQ(plan.submission_uses[0].context_scalar, 0u);
+    EXPECT_EQ(plan.submission_uses[1].context_scalar, 2u);
+    SchedulerSubmissionHostPlan submission;
+    ASSERT_TRUE(scheduler_plan_submission_bundles(
+        f.metadata, f.capabilities, plan.submission_workspaces, plan.submission_uses, plan.execution_use_sets, kEpoch,
+        kBudget, &submission, &f.error
+    )) << f.error;
+    EXPECT_EQ(submission.header.grant_count, 1u);
+}
+
+TEST(HbgAsyncBindingPlan, SdmaGraphUsesCurrentInheritedContextAndPeerScalars) {
+    Fixture f;
+    f.sdma();
+    f.capabilities[1][1] = f.capabilities[0][1];
+    f.declarations = {};
+    ASSERT_TRUE(
+        f.declarations.add(true, 0x88, 0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1})
+    );
+    ASSERT_TRUE(f.declarations.add(
+        true, 0x88, 0, {AsyncUseDeclarationKind::CONSUMER_CLEAN_READ, UINT32_MAX, 1, UINT32_MAX, UINT32_MAX, 0, kClean}
+    ));
+    f.native.definitions.resize(1);
+    auto &definition = f.native.definitions[0];
+    auto &header = definition.definition;
+    header.graph_key = 0x88;
+    header.task_count = 1;
+    header.tensor_arg_count = header.boundary_tensor_count = 2;
+    header.scalar_arg_count = header.boundary_scalar_count = 2;
+    header.off_sub_tasks = sizeof(GraphDefinition);
+    header.off_tensors = (header.off_sub_tasks + sizeof(SubTaskDefinition) + 7) & ~7u;
+    header.off_scalars = header.off_tensors + 2 * sizeof(simpler::hbg::TensorData);
+    header.off_scalar_inheritance = header.off_scalars + 2 * sizeof(uint64_t);
+    header.total_bytes = header.off_scalar_inheritance + 2 * sizeof(GraphScalarInheritance);
+    definition.image.resize(header.total_bytes);
+    SubTaskDefinition child{};
+    child.tensor_count = child.scalar_count = 2;
+    std::memcpy(definition.image.data() + header.off_sub_tasks, &child, sizeof(child));
+    for (uint32_t i = 0; i < 2; ++i) {
+        auto tensor = static_cast<simpler::hbg::TensorData>(f.image.tensors[0][i]);
+        tensor.owner_task_id = TaskId::make_param(i);
+        tensor.buffer.addr = 0;
+        std::memcpy(definition.image.data() + header.off_tensors + i * sizeof(tensor), &tensor, sizeof(tensor));
+        const auto inherited = GraphScalarInheritance::from_boundary(i);
+        std::memcpy(
+            definition.image.data() + header.off_scalar_inheritance + i * sizeof(inherited), &inherited,
+            sizeof(inherited)
+        );
+        // Captured bits must never be used for an inherited context or peer.
+        const uint64_t poison = UINT64_MAX;
+        std::memcpy(definition.image.data() + header.off_scalars + i * sizeof(poison), &poison, sizeof(poison));
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        f.tensor(i, 0, i * 2, 16, i * 4);
+        f.tensor(i, 1, i * 2 + 1, 16);
+        f.image.tasks[i].payload.scalar_count = 2;
+        f.image.scalars[i][0] = f.domains[i].use.device_context;
+        f.image.scalars[i][1] = 1;
+        SchedulerGraphInstance instance{};
+        instance.original_shell_id = i;
+        instance.boundary_tensor_count = instance.boundary_scalar_count = 2;
+        instance.heap_base = f.address(i * 2 + 1);
+        f.image.tasks[i].task.packed_buffer_base = reinterpret_cast<void *>(instance.heap_base);
+        instance.boundary_tensors_address = f.view().device_base + (reinterpret_cast<uint64_t>(&f.image.tensors[i]) -
+                                                                    reinterpret_cast<uint64_t>(&f.image));
+        instance.boundary_scalars_address = f.view().device_base + (reinterpret_cast<uint64_t>(&f.image.scalars[i]) -
+                                                                    reinterpret_cast<uint64_t>(&f.image));
+        f.native.instances.push_back(instance);
+        SchedulerNodeBinding binding{};
+        binding.kind = SchedulerNodeKind::CHILD_KERNEL;
+        binding.instance_index = i;
+        binding.source_index = 0;
+        f.native.bindings.push_back(binding);
+    }
+    AsyncBindingHostPlan plan;
+    ASSERT_TRUE(f.build(&plan)) << f.error;
+    ASSERT_EQ(plan.conditions.size(), 2u);
+    for (uint32_t i = 0; i < 2; ++i) {
+        const auto &source = plan.ranges[plan.conditions[i].source_range];
+        EXPECT_EQ(plan.spans[source.span_index].address + source.byte_offset, f.address(2 - i * 2, i * 16));
+        EXPECT_EQ(source.bytes, 64u);
+    }
+    f.image.scalars[1][1] = 2;
+    EXPECT_FALSE(f.build(&plan));
 }
 
 TEST(HbgAsyncBindingPlan, EmptyControlWaitAdmitsNoConditionAddresses) {

@@ -70,6 +70,17 @@ struct alignas(128) AsyncSubmissionContext {
     AsyncSubmissionEvidence evidence{};
 };
 
+template <typename Left, typename Right>
+inline __aicore__ bool async_submission_headers_equal(const Left &a, const Right &b) {
+    return a.version == b.version && a.context_bytes == b.context_bytes && a.run_epoch == b.run_epoch &&
+           a.task_token == b.task_token && a.region_address == b.region_address && a.region_bytes == b.region_bytes &&
+           a.submission_layout_offset == b.submission_layout_offset && a.execution_index == b.execution_index &&
+           a.use_begin == b.use_begin && a.use_count == b.use_count && a.provenance_offset == b.provenance_offset &&
+           a.provenance_capacity == b.provenance_capacity && a.dispatch_generation == b.dispatch_generation &&
+           a.frame_address == b.frame_address && a.block_idx == b.block_idx && a.subtask_slot == b.subtask_slot &&
+           a.frame_sub_block_id == b.frame_sub_block_id && a.completion_mode == b.completion_mode;
+}
+
 static_assert(sizeof(AsyncSubmissionEvidence) == 128 && sizeof(AsyncSubmissionContextHeader) == 128);
 static_assert(sizeof(AsyncSubmissionContext) == 256 && offsetof(AsyncSubmissionContext, evidence) == 128);
 static_assert(

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "scheduler_async_layout.h"
+#include "scheduler_local_storage.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_COHORT_VERSION = 1;
 
@@ -59,9 +60,8 @@ static_assert(
 
 namespace scheduler_async_cohort_detail {
 template <typename T>
-inline __aicore__ T load(__gm__ const T *source) {
+inline __aicore__ void load_into(__gm__ const T *source, T *destination) {
     static_assert(sizeof(T) % 8 == 0 && alignof(T) >= 8 && std::is_trivially_copyable_v<T>);
-    T value{};
     for (uint32_t offset = 0; offset < sizeof(T); offset += 8) {
         uint64_t word = 0;
 #if defined(__CCE_AICORE__)
@@ -72,8 +72,14 @@ inline __aicore__ T load(__gm__ const T *source) {
 #else
         __builtin_memcpy(&word, reinterpret_cast<const uint8_t *>(source) + offset, 8);
 #endif
-        __builtin_memcpy(reinterpret_cast<uint8_t *>(&value) + offset, &word, 8);
+        __builtin_memcpy(reinterpret_cast<uint8_t *>(destination) + offset, &word, 8);
     }
+}
+template <typename T>
+inline __aicore__ T load(__gm__ const T *source) {
+    static_assert(alignof(T) <= 8, "over-aligned local reads require SchedulerLocalStorage and load_into");
+    T value{};
+    load_into(source, &value);
     return value;
 }
 inline __aicore__ bool region(uint64_t bytes, uint64_t offset, uint64_t count, uint64_t stride, uint64_t *end) {
@@ -98,9 +104,10 @@ struct SchedulerAsyncCohortView {
             layout.scratch_bytes > layout.total_bytes - layout.scratch_offset ||
             layout.total_bytes > UINT64_MAX - reinterpret_cast<uint64_t>(async_base))
             return false;
-        SchedulerAsyncCohortView view{};
+        SchedulerLocalStorage<SchedulerAsyncCohortView> view_storage;
+        auto &view = view_storage.get();
         view.base = const_cast<__gm__ uint8_t *>(async_base) + layout.scratch_offset;
-        view.header = load(reinterpret_cast<__gm__ const SchedulerAsyncCohortHeader *>(view.base));
+        load_into(reinterpret_cast<__gm__ const SchedulerAsyncCohortHeader *>(view.base), &view.header);
         const auto &h = view.header;
         if (h.version != SCHEDULER_ASYNC_COHORT_VERSION || h.total_bytes != layout.scratch_bytes || h.run_epoch == 0 ||
             h.run_epoch != layout.run_epoch || h.task_count != layout.task_count || h.task_count == 0 ||

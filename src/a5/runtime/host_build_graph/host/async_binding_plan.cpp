@@ -74,6 +74,7 @@ const T *definition_element(const NativeGraphDefinitionPlan &plan, uint32_t offs
 struct TaskArguments {
     std::vector<simpler::hbg::TensorData> tensors;
     uint32_t scalar_count{0};
+    std::vector<uint64_t> scalars;
     const AsyncHostDeclarations::Uses *uses{nullptr};
     Interval predicate{};
 };
@@ -96,6 +97,10 @@ bool decode_task(
         for (int32_t i = 0; i < payload.tensor_count; ++i)
             out->tensors.push_back(tensors[i]);
         out->scalar_count = payload.scalar_count;
+        const auto *scalars = within(image, payload.scalar_data(), payload.scalar_count);
+        if (payload.scalar_count != 0 && scalars == nullptr) return false;
+        for (int32_t i = 0; i < payload.scalar_count; ++i)
+            out->scalars.push_back(scalars[i]);
         out->uses = declarations.find(false, 0, original);
         out->predicate = {payload.predicate.addr, payload.predicate.elem_size};
         return true;
@@ -137,7 +142,32 @@ bool decode_task(
         tensor.address_space = bound.address_space;
         out->tensors.push_back(tensor);
     }
+    if (child->scalar_count < 0 || child->scalar_count > CORE_MAX_SCALAR_ARGS || child->scalar_offset < 0 ||
+        child->scalar_offset > def.scalar_arg_count ||
+        child->scalar_count > def.scalar_arg_count - child->scalar_offset)
+        return false;
     out->scalar_count = child->scalar_count;
+    for (int32_t arg = 0; arg < child->scalar_count; ++arg) {
+        const auto *inheritance = definition_element<GraphScalarInheritance>(
+            plan, def.off_scalar_inheritance, def.scalar_arg_count, child->scalar_offset + arg
+        );
+        const auto *value =
+            definition_element<uint64_t>(plan, def.off_scalars, def.scalar_arg_count, child->scalar_offset + arg);
+        if (inheritance == nullptr || value == nullptr || !inheritance->valid()) return false;
+        if (inheritance->inherited()) {
+            if (shell->payload.scalar_count < 0 ||
+                instance.boundary_scalar_count != static_cast<uint32_t>(shell->payload.scalar_count) ||
+                inheritance->boundary_index() >= instance.boundary_scalar_count)
+                return false;
+            const auto *boundary_scalars = within(image, shell->payload.scalar_data(), instance.boundary_scalar_count);
+            if (boundary_scalars == nullptr ||
+                instance.boundary_scalars_address != image.device_base + (reinterpret_cast<uint64_t>(boundary_scalars) -
+                                                                          reinterpret_cast<uint64_t>(image.host_base)))
+                return false;
+            value = boundary_scalars + inheritance->boundary_index();
+        }
+        out->scalars.push_back(*value);
+    }
     out->uses = declarations.find(true, def.graph_key, binding->source_index);
     if (child->predicate_slot != 0) {
         const auto *predicate = definition_element<GraphPredicate>(
@@ -254,6 +284,88 @@ struct RecordUse {
     std::vector<uint64_t> payloads;
 };
 
+struct SdmaUse {
+    uint64_t source_range{ASYNC_RESOURCE_NONE};
+    uint64_t payload_range{ASYNC_RESOURCE_NONE};
+    uint64_t workspace_input{SCHEDULER_ASYNC_INDEX_NONE};
+    std::vector<uint32_t> context_scalars;
+};
+
+bool bind_sdma_use(
+    Builder &builder, const TaskArguments &actual, const AsyncUseDeclaration &use, uint64_t byte_budget,
+    std::vector<SdmaUse> *out, std::vector<Interval> *payloads, std::string *error
+) {
+    if (use.source_peer_scalar == UINT32_MAX || use.source_peer_scalar >= actual.scalars.size() ||
+        use.context_scalar >= actual.scalars.size() ||
+        use.cache_contract != AsyncUseCacheContract::PUBLISHED_CLEAN_LINES)
+        return fail(error, "SDMA TGET requires explicit peer scalar and PUBLISHED_CLEAN_LINES declaration");
+    const uint64_t context_address = actual.scalars[use.context_scalar];
+    const uint64_t peer = actual.scalars[use.source_peer_scalar];
+    CommDomainSnapshot domain{};
+    CommDomainExecution execution = CommDomainExecution::UNKNOWN;
+    CommSdmaOwnerInfoV1 owner{};
+    if (!builder.api.query_async_domain_context(context_address, &domain, &execution) ||
+        !comm_domain_snapshot_valid(domain) || domain.use.device_context != context_address ||
+        execution != CommDomainExecution::EXCLUSIVE_RUN ||
+        !builder.api.query_async_sdma_owner(context_address, &owner) || owner.access != CommSdmaAccess::SDK_ONLY ||
+        owner.queue_num == 0 || owner.queue_num > SCHEDULER_SUBMISSION_SDMA_CHANNELS)
+        return fail(error, "SDMA context lacks selected exclusive domain and fixed SDK-only workspace owner");
+    const auto &comm = domain.context;
+    const auto &workspace = comm_workspace<CommWorkspaceKind::SDMA>(comm);
+    if (peer >= comm.rankNum || comm.windowsIn[peer] == 0 || workspace.addr == 0 ||
+        workspace.addr != owner.workspace_addr || workspace.size != owner.workspace_bytes || workspace.addr % 64 != 0 ||
+        workspace.size < (SCHEDULER_SUBMISSION_SDMA_CHANNELS + 1) * 64)
+        return fail(error, "SDMA peer or workspace does not match the retained allocation");
+    std::vector<Interval> sources, destinations;
+    if (!tensor_runs(actual.tensors[use.source_arg], byte_budget, &sources) ||
+        !tensor_runs(actual.tensors[use.payload_arg], byte_budget, &destinations) ||
+        sources.size() != destinations.size() || sources.size() > 1)
+        return fail(error, "SDMA TGET currently requires one exact contiguous source and destination view");
+    if (sources.empty()) return true;
+    if (!contains({comm.windowsIn[comm.rankId], comm.winSize}, sources[0]))
+        return fail(error, "SDMA local source reference must fit its selected input window");
+    const uint64_t source_offset = sources[0].address - comm.windowsIn[comm.rankId];
+    const Interval remote{comm.windowsIn[peer] + source_offset, sources[0].bytes};
+    if (!contains({comm.windowsIn[peer], comm.winSize}, remote))
+        return fail(error, "SDMA peer source view exceeds its selected input window");
+    uint64_t source = 0, destination = 0;
+    if (!builder.range(remote, ASYNC_RANGE_READ, &source) ||
+        !builder.range(destinations[0], ASYNC_RANGE_READ | ASYNC_RANGE_WRITE, &destination))
+        return fail(error, "SDMA source/destination cache lines lack an existing retained owner");
+    uint64_t workspace_index = 0;
+    auto &workspaces = builder.plan.submission_workspaces;
+    for (; workspace_index < workspaces.size(); ++workspace_index) {
+        const auto &saved = workspaces[workspace_index];
+        if (saved.address != workspace.addr) continue;
+        if (saved.bytes != workspace.size || saved.queue_num != owner.queue_num)
+            return fail(error, "one SDMA workspace owner has conflicting retained configuration");
+        break;
+    }
+    if (workspace_index == workspaces.size()) {
+        if (!builder.budget.take(1, sizeof(SchedulerSubmissionWorkspaceInput)))
+            return fail(error, "SDMA workspace declarations exceed byte budget");
+        workspaces.push_back(
+            {workspace.addr, workspace.size, builder.api.run_epoch(), owner.queue_num,
+             SCHEDULER_SUBMISSION_SDMA_CHANNELS, SchedulerSubmissionPoolQualification::EXCLUSIVE_RUN}
+        );
+    }
+    for (auto &saved : *out) {
+        if (saved.workspace_input != workspace_index) continue;
+        if (saved.source_range == source && saved.payload_range == destination) {
+            if (std::find(saved.context_scalars.begin(), saved.context_scalars.end(), use.context_scalar) ==
+                saved.context_scalars.end())
+                saved.context_scalars.push_back(use.context_scalar);
+            return true;
+        }
+        if (overlaps(builder.interval(saved.source_range), remote) &&
+            overlaps(builder.interval(saved.payload_range), destinations[0]))
+            return fail(error, "SDMA declarations admit an ambiguous transfer within one workspace");
+    }
+    out->push_back({source, destination, workspace_index, {use.context_scalar}});
+    payloads->push_back(destinations[0]);
+    return true;
+}
+
 bool build(
     const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
     const AsyncBindingTaskImage &image, const NativeGraphHostPlan &native, const AsyncHostDeclarations &declarations,
@@ -279,23 +391,34 @@ bool build(
     std::vector<TaskArguments> args(metadata.size());
     std::vector<std::vector<uint64_t>> consumer_inputs(metadata.size());
     std::vector<Interval> payloads;
+    bool submission_image = false;
+    if (!scheduler_has_sdma_uses(metadata, native, declarations, &submission_image, error)) return false;
+    bool core_only = true;
+    bool has_execution = false;
     for (uint32_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
         if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
         if (!decode_task(task, image, native, declarations, &args[task]))
             return fail(error, "async bindings cannot decode final ordinary/native Graph arguments");
         auto &actual = args[task];
+        has_execution = true;
+        bool declared_core_only = false;
         std::map<uint64_t, RecordUse> records;
+        std::vector<SdmaUse> sdma_uses;
         bool declared_wait = false;
         if (actual.uses != nullptr)
             for (const auto &use : *actual.uses) {
                 if (!async_use_declaration_valid(use, actual.tensors.size(), actual.scalar_count))
                     return fail(error, "async declaration no longer matches this invocation's argument positions");
-                if (use.kind == AsyncUseDeclarationKind::SDMA_TRANSFER)
-                    return fail(
-                        error,
-                        "SDMA binding requires enrolled domain, public record, channel and submit-cache qualification"
-                    );
+                if (use.kind == AsyncUseDeclarationKind::CORE_PIPELINES_ONLY) {
+                    declared_core_only = true;
+                    continue;
+                }
+                if (use.kind == AsyncUseDeclarationKind::SDMA_TRANSFER) {
+                    declared_wait = true;
+                    if (!bind_sdma_use(builder, actual, use, byte_budget, &sdma_uses, &payloads, error)) return false;
+                    continue;
+                }
                 if (use.cache_contract != AsyncUseCacheContract::PUBLISHED_CLEAN_LINES)
                     return fail(error, "async use lacks an explicit PUBLISHED_CLEAN_LINES author/compiler contract");
                 std::vector<uint64_t> use_payloads;
@@ -351,21 +474,42 @@ bool build(
                     }
                 }
             }
+        core_only &= declared_core_only;
+        bool counter_lane = false, sdma_lane = false;
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+            const auto &cap = capabilities[task][lane];
+            counter_lane |=
+                cap.mode == CoreAsyncMode::DEFERRED && (cap.condition_types & CORE_ASYNC_CONDITION_COUNTER) != 0;
+            sdma_lane |= lane != 0 && (cap.mode == CoreAsyncMode::SYNCHRONOUS ||
+                                       (cap.condition_types & CORE_ASYNC_CONDITION_SDMA_POST_DONE) != 0);
+        }
+        if ((!records.empty() && !counter_lane) || (!sdma_uses.empty() && !sdma_lane))
+            return fail(error, "declared conditions have no compatible registered execution lane");
+        if (submission_image && !builder.budget.take(
+                                    static_cast<uint64_t>(meta.logical_block_num) * meta.active_mask.count(),
+                                    sizeof(SchedulerSubmissionExecutionUseSet)
+                                ))
+            return fail(error, "submission execution use maps exceed byte budget");
         std::map<std::vector<uint64_t>, std::pair<uint64_t, uint64_t>> sets;
         for (uint32_t block = 0; block < meta.logical_block_num; ++block)
             for (uint32_t lane = 0; lane < 3; ++lane) {
-                if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane)) ||
-                    capabilities[task][lane].mode != CoreAsyncMode::DEFERRED)
-                    continue;
-                if (!declared_wait) return fail(error, "deferred execution has no declared allowed condition uses");
-                if ((capabilities[task][lane].condition_types & CORE_ASYNC_CONDITION_COUNTER) == 0)
-                    return fail(error, "COUNTER use does not match the registered lane capability");
-                if (records.size() > UINT32_MAX)
-                    return fail(error, "allowed-use set exceeds its uint32 index contract");
-                if (!builder.budget.take(records.size(), sizeof(AsyncConditionContract)))
+                if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+                const auto &capability = capabilities[task][lane];
+                const bool deferred = capability.mode == CoreAsyncMode::DEFERRED;
+                const bool counter = deferred && (capability.condition_types & CORE_ASYNC_CONDITION_COUNTER) != 0;
+                const bool sdma =
+                    lane != 0 && (capability.mode == CoreAsyncMode::SYNCHRONOUS ||
+                                  (capability.condition_types & CORE_ASYNC_CONDITION_SDMA_POST_DONE) != 0);
+                if (deferred && !declared_wait)
+                    return fail(error, "deferred execution has no declared allowed condition uses");
+                const uint64_t use_count = (counter ? records.size() : 0) + (sdma ? sdma_uses.size() : 0);
+                if (use_count > UINT32_MAX) return fail(error, "allowed-use set exceeds its uint32 index contract");
+                if (!builder.budget.take(use_count, sizeof(AsyncConditionContract)))
                     return fail(error, "per-execution allowed-use sets exceed byte budget");
                 const uint64_t begin = plan.conditions.size();
                 for (const auto &[address, record] : records) {
+                    if (!counter) break;
                     (void)address;
                     uint64_t payload_begin = ASYNC_RESOURCE_NONE, payload_count = 0;
                     if (!record.control_only && !record.payloads.empty()) {
@@ -386,7 +530,30 @@ bool build(
                          record.record_range, 1, sizeof(int32_t), ASYNC_RESOURCE_NONE, payload_begin, payload_count}
                     );
                 }
-                plan.groups.push_back({begin, plan.conditions.size() - begin});
+                if (sdma)
+                    for (const auto &use : sdma_uses) {
+                        const auto &workspace = plan.submission_workspaces[use.workspace_input];
+                        plan.conditions.push_back(
+                            {static_cast<int64_t>(task), block, lane,
+                             static_cast<uint32_t>(plan.conditions.size() - begin), ASYNC_CORE_AIC | ASYNC_CORE_AIV,
+                             COMPLETION_TYPE_SDMA_EVENT_RECORD, 0, ASYNC_RESOURCE_NONE, 0, 0, use.source_range,
+                             use.payload_range, 1, workspace.address}
+                        );
+                        if (!builder.budget.take(use.context_scalars.size(), sizeof(SchedulerSubmissionExecutionUse)))
+                            return fail(error, "SDMA submission request inputs exceed byte budget");
+                        for (auto context : use.context_scalars)
+                            plan.submission_uses.push_back(
+                                {static_cast<int64_t>(task), block, lane, context, use.workspace_input}
+                            );
+                    }
+                if (submission_image) {
+                    const uint64_t count = plan.conditions.size() - begin;
+                    plan.execution_use_sets.push_back(
+                        {static_cast<int64_t>(task), block, lane, count == 0 ? SCHEDULER_ASYNC_INDEX_NONE : begin,
+                         count}
+                    );
+                }
+                if (deferred) plan.groups.push_back({begin, plan.conditions.size() - begin});
             }
     }
     // Every potential payload reader must explicitly declare its acquisition.
@@ -447,6 +614,8 @@ bool build(
                          0}
                     );
     }
+    plan.execution_contract = core_only && has_execution && !submission_image ? ASYNC_EXECUTION_CORE_PIPELINES_ONLY :
+                                                                                ASYNC_EXECUTION_UNQUALIFIED;
     plan.auxiliary.resources = sizeof(AsyncResourceHeader) + plan.spans.size() * sizeof(AsyncRetainedSpan) +
                                plan.ranges.size() * sizeof(AsyncResourceRange);
     plan.auxiliary.uses = plan.conditions.size() * sizeof(AsyncConditionContract);
@@ -463,6 +632,41 @@ bool build(
     return true;
 }
 }  // namespace
+
+bool scheduler_has_sdma_uses(
+    const std::vector<SchedulerTaskMetadata> &metadata, const NativeGraphHostPlan &native,
+    const AsyncHostDeclarations &declarations, bool *out, std::string *error
+) {
+    if (out == nullptr || metadata.size() > INT32_MAX ||
+        (!native.instances.empty() && native.bindings.size() != metadata.size()))
+        return fail(error, "submission declarations require the actual expanded task map");
+    bool found = false;
+    for (uint32_t task = 0; task < metadata.size(); ++task) {
+        if (!scheduler_task_is_executable(metadata[task].flags) || scheduler_task_is_inline(metadata[task].flags))
+            continue;
+        const AsyncHostDeclarations::Uses *uses = nullptr;
+        if (native.instances.empty()) uses = declarations.find(false, 0, task);
+        else {
+            const auto &binding = native.bindings[task];
+            if (binding.instance_index == SCHEDULER_NATIVE_NO_INSTANCE)
+                uses = declarations.find(false, 0, binding.source_index);
+            else {
+                if (binding.instance_index >= native.instances.size())
+                    return fail(error, "submission declaration references an invalid Graph instance");
+                const auto definition = native.instances[binding.instance_index].definition_index;
+                if (definition >= native.definitions.size() || binding.kind != SchedulerNodeKind::CHILD_KERNEL)
+                    return fail(error, "submission declaration references an invalid Graph definition");
+                uses =
+                    declarations.find(true, native.definitions[definition].definition.graph_key, binding.source_index);
+            }
+        }
+        if (uses != nullptr)
+            for (const auto &use : *uses)
+                found |= use.kind == AsyncUseDeclarationKind::SDMA_TRANSFER;
+    }
+    *out = found;
+    return true;
+}
 
 bool scheduler_plan_async_bindings(
     const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
@@ -483,6 +687,13 @@ bool scheduler_initialize_async_bindings(
     std::string *error
 ) {
     uint64_t resources = sizeof(AsyncResourceHeader), uses = 0, consumers = 0;
+    if (!async_execution_contract_valid(plan.execution_contract) ||
+        (plan.execution_contract == ASYNC_EXECUTION_CORE_PIPELINES_ONLY &&
+         (!plan.submission_uses.empty() ||
+          std::any_of(plan.conditions.begin(), plan.conditions.end(), [](const auto &use) {
+              return use.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD;
+          }))))
+        return fail(error, "async execution contract is invalid or contradicts its submission permissions");
     if (!async_resource_detail::add_rows(plan.spans.size(), sizeof(AsyncRetainedSpan), resources) ||
         !async_resource_detail::add_rows(plan.ranges.size(), sizeof(AsyncResourceRange), resources) ||
         !async_resource_detail::add_rows(plan.conditions.size(), sizeof(AsyncConditionContract), uses) ||
@@ -528,10 +739,9 @@ bool scheduler_initialize_async_bindings(
         using Value = typename std::decay_t<decltype(values)>::value_type;
         if (!values.empty()) std::memcpy(bytes + offset, values.data(), values.size() * sizeof(Value));
     };
-    AsyncResourceHeader header{ASYNC_RESOURCE_VERSION,      plan.run_epoch,
-                               plan.spans.size(),           plan.ranges.size(),
-                               plan.conditions.size(),      plan.consumers.size(),
-                               plan.consumer_ranges.size(), 0};
+    AsyncResourceHeader header{ASYNC_RESOURCE_VERSION,      plan.run_epoch,         plan.spans.size(),
+                               plan.ranges.size(),          plan.conditions.size(), plan.consumers.size(),
+                               plan.consumer_ranges.size(), plan.execution_contract};
     std::memcpy(bytes + layout.resources_offset, &header, sizeof(header));
     copy(layout.resources_offset + sizeof(header), plan.spans);
     copy(layout.resources_offset + sizeof(header) + plan.spans.size() * sizeof(AsyncRetainedSpan), plan.ranges);

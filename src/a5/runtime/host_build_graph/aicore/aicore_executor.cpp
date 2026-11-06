@@ -15,6 +15,7 @@
 // AICore dependency scheduling uses one device-side protocol.
 #include "scheduler/scheduler_dispatch.h"
 #include "scheduler/scheduler_async_execution.h"
+#include "scheduler/scheduler_submission_execution.h"
 #include "backend/async_resource_binding.h"
 #include "scheduler/scheduler_graph_control.h"
 #include "scheduler/scheduler_protocol_execute.h"
@@ -345,14 +346,28 @@ __aicore__ bool run_ready_dispatch_loop(
                               published_graph.task_window_last_index
                           );
     using AsyncBackend = AsyncResourceBindings<>;
-    SchedulerAsyncExecutionState<AsyncBackend> async_state{};
+    SchedulerLocalStorage<SchedulerAsyncExecutionState<AsyncBackend>> async_state_storage;
+    auto &async_state = async_state_storage.get();
     if (!scheduler_async_execution_mount(published_graph, scheduler_state_base, context, run_control, &async_state))
         return false;
-    AsyncResourceTables async_tables{};
+    SchedulerLocalStorage<SchedulerSubmissionExecutionView> submission_view_storage;
+    auto &submission_view = submission_view_storage.get();
+    if (!scheduler_submission_execution_mount(async_state, &submission_view))
+        return scheduler_async_runtime_detail::fail(graph, context, run_control, SCHEDULER_TASK_REF_INVALID);
+    SchedulerLocalStorage<AsyncResourceTables> async_tables_storage;
+    auto &async_tables = async_tables_storage.get();
     if (async_state.view.enabled() &&
         !AsyncResourceTables::mount(async_state.view.base, async_state.view.layout, &async_tables))
         return scheduler_async_runtime_detail::fail(graph, context, run_control, SCHEDULER_TASK_REF_INVALID);
-    AsyncBackend async_backend(async_tables, context->config.self_core_type == 0 ? ASYNC_CORE_AIC : ASYNC_CORE_AIV);
+    SchedulerLocalStorage<SchedulerSubmissionProvenanceView> submission_provenance_storage;
+    auto &submission_provenance = submission_provenance_storage.get();
+    if (async_state.view.enabled() &&
+        !scheduler_submission_provenance_mount(async_state.view.base, async_state.view.layout, &submission_provenance))
+        return scheduler_async_runtime_detail::fail(graph, context, run_control, SCHEDULER_TASK_REF_INVALID);
+    SchedulerLocalStorage<AsyncBackend> async_backend_storage(
+        async_tables, context->config.self_core_type == 0 ? ASYNC_CORE_AIC : ASYNC_CORE_AIV, &submission_provenance
+    );
+    auto &async_backend = async_backend_storage.get();
     const SchedulerAsyncRuntimeView *async_view = async_state.view.enabled() ? &async_state.view : nullptr;
     const uint32_t cluster_lane = context->config.self_lane;
     // Non-zero only when this run enabled PMU and this core has a PMU window;
@@ -502,10 +517,11 @@ __aicore__ bool run_ready_dispatch_loop(
                     scheduler_local_ready_publish(context, local_slot);
                     ready_slot = -1;
                 }
-                if (ready_slot >= 0 && context->admission != nullptr) {
+                if (ready_slot >= 0) {
                     bool permit = false;
-                    if (!scheduler_ordered_can_enter_slot<WithProfiling>(
-                            graph, scheduler_state_base, context, run_control, local_slot, &permit
+                    if (!scheduler_submission_execution_admit<WithProfiling>(
+                            submission_view, &async_state, graph, scheduler_state_base, context, run_control,
+                            local_slot, &permit
                         ))
                         return false;
                     if (!permit) {
@@ -581,8 +597,9 @@ __aicore__ bool run_ready_dispatch_loop(
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
             uint64_t completion_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-            if (!scheduler_async_execution_returned(
-                    &async_state, graph, scheduler_state_base, context, run_control, slot_index, async_backend
+            if (!scheduler_submission_execution_returned(
+                    submission_view, &async_state, graph, scheduler_state_base, context, run_control, slot_index,
+                    async_backend
                 ))
                 return false;
             // Own-slot retirement publishes a Mix lane's release after trace completion.

@@ -18,7 +18,8 @@ enum class AsyncUseDeclarationKind : uint32_t {
     COUNTER_PAYLOAD,
     CONSUMER_CLEAN_READ,
     SDMA_TRANSFER,
-    COUNTER_ONLY
+    COUNTER_ONLY,
+    CORE_PIPELINES_ONLY
 };
 
 // Native author/compiler contract, not a cache probe: publishers complete
@@ -42,11 +43,16 @@ struct AsyncUseDeclaration {
     uint32_t context_scalar{UINT32_MAX};
     uint32_t record_stride{0};
     AsyncUseCacheContract cache_contract{AsyncUseCacheContract::UNQUALIFIED};
+    // For TGET, source_arg is a view in the local input window. Rebase that
+    // exact view onto the selected peer's input window at preparation time.
+    // UINT32_MAX is the older unqualified declaration, not permission for all peers.
+    uint32_t source_peer_scalar{UINT32_MAX};
 
     bool operator==(const AsyncUseDeclaration &other) const {
         return kind == other.kind && condition_arg == other.condition_arg && payload_arg == other.payload_arg &&
                source_arg == other.source_arg && context_scalar == other.context_scalar &&
-               record_stride == other.record_stride && cache_contract == other.cache_contract;
+               record_stride == other.record_stride && cache_contract == other.cache_contract &&
+               source_peer_scalar == other.source_peer_scalar;
     }
 };
 
@@ -54,7 +60,12 @@ inline bool async_use_declaration_valid(const AsyncUseDeclaration &use, uint32_t
     if (use.cache_contract != AsyncUseCacheContract::UNQUALIFIED &&
         use.cache_contract != AsyncUseCacheContract::PUBLISHED_CLEAN_LINES)
         return false;
+    if (use.kind != AsyncUseDeclarationKind::SDMA_TRANSFER && use.source_peer_scalar != UINT32_MAX) return false;
     switch (use.kind) {
+    case AsyncUseDeclarationKind::CORE_PIPELINES_ONLY:
+        return use.condition_arg == UINT32_MAX && use.payload_arg == UINT32_MAX && use.source_arg == UINT32_MAX &&
+               use.context_scalar == UINT32_MAX && use.record_stride == 0 &&
+               use.cache_contract == AsyncUseCacheContract::UNQUALIFIED;
     case AsyncUseDeclarationKind::COUNTER_PAYLOAD:
     case AsyncUseDeclarationKind::COUNTER_ONLY:
         if (use.kind == AsyncUseDeclarationKind::COUNTER_ONLY ? use.payload_arg != UINT32_MAX :
@@ -67,7 +78,8 @@ inline bool async_use_declaration_valid(const AsyncUseDeclaration &use, uint32_t
                use.context_scalar == UINT32_MAX && use.record_stride == 0;
     case AsyncUseDeclarationKind::SDMA_TRANSFER:
         return use.payload_arg < tensor_count && use.condition_arg == UINT32_MAX && use.source_arg < tensor_count &&
-               use.context_scalar < scalar_count && use.record_stride == 0;
+               use.context_scalar < scalar_count && use.record_stride == 0 &&
+               (use.source_peer_scalar == UINT32_MAX || use.source_peer_scalar < scalar_count);
     default:
         return false;
     }
@@ -83,10 +95,13 @@ inline bool async_use_is_counter(AsyncUseDeclarationKind kind) {
 // selectors include their context argument, so peers sharing source/destination
 // argument positions remain distinct uses.
 inline bool async_use_declarations_conflict(const AsyncUseDeclaration &a, const AsyncUseDeclaration &b) {
+    if ((a.kind == AsyncUseDeclarationKind::CORE_PIPELINES_ONLY && b.kind == AsyncUseDeclarationKind::SDMA_TRANSFER) ||
+        (b.kind == AsyncUseDeclarationKind::CORE_PIPELINES_ONLY && a.kind == AsyncUseDeclarationKind::SDMA_TRANSFER))
+        return true;
     if (async_use_is_counter(a.kind) && async_use_is_counter(b.kind) && a.condition_arg == b.condition_arg)
         return a.kind != b.kind || a.record_stride != b.record_stride || a.cache_contract != b.cache_contract;
     if (a.kind == b.kind && a.payload_arg == b.payload_arg && a.source_arg == b.source_arg &&
-        a.context_scalar == b.context_scalar)
+        a.context_scalar == b.context_scalar && a.source_peer_scalar == b.source_peer_scalar)
         return a.cache_contract != b.cache_contract;
     return false;
 }

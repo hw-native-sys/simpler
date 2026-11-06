@@ -192,15 +192,15 @@ def compile_counter(platform: str):
                 "func_id": index,
                 "source": str(HERE / "kernels" / source),
                 "core_type": core,
-                "signature": [D.INOUT] * 5,
+                "signature": [D.INOUT] * (2 if index == 10 else 5),
                 # Zero-condition invocations retain this source-level bound;
                 # the 65-condition case must still exceed the declared 64 slots.
                 "async_capability": {
                     "mode": "DEFERRED",
-                    "max_conditions": CONDITION_LIMIT,
+                    "max_conditions": 1 if index == 10 else CONDITION_LIMIT,
                     "condition_types": CORE_ASYNC_CONDITION_COUNTER,
                 }
-                if index < 3
+                if index < 3 or index in (9, 10)
                 else {"mode": "SYNCHRONOUS"},
             }
             for index, source, core in (
@@ -213,6 +213,8 @@ def compile_counter(platform: str):
                 (6, "aiv/action.cpp", "aiv"),
                 (7, "aic/action.cpp", "aic"),
                 (8, "aic/action.cpp", "aic"),
+                (9, "aiv/graph_waiter.cpp", "aiv"),
+                (10, "aiv/registration_gate.cpp", "aiv"),
             )
         ],
     }
@@ -294,6 +296,10 @@ class CounterRunner:
         self.output.fill_(POISON)
         self.initial_signals.fill_(POISON)
         self.initial_signals[:, 0] = case.initial_signal
+        if case.scenario == Scenario.GRAPH:
+            # Registration starts pending even when business conditions are already satisfied.
+            for _, _, execution in _active_executions(case, self.capacity_waiters, case.waiters):
+                self.initial_signals[execution * CONDITIONS_PER_EXECUTION + CONDITION_LIMIT, 0] = 0
         self.initial_payload.fill_(POISON)
         if case.conditions == 0 or case.initial_signal >= case.expected or case.skip:
             for _, _, execution in _active_executions(case, self.capacity_waiters, case.waiters):
@@ -377,14 +383,15 @@ def compile_sdma(platform: str):
         "orchestration": {
             "source": str(HERE / "kernels/orchestration/sdma.cpp"),
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.INOUT, D.OUT, D.INOUT, D.SCALAR, D.SCALAR],
+            # Upload the result poison so unwritten guards have defined device contents.
+            "signature": [D.IN, D.INOUT, D.INOUT, D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR],
         },
         "incores": [
             {
                 "func_id": index,
                 "source": str(HERE / "kernels/aiv" / source),
                 "core_type": "aiv",
-                "signature": [D.IN, D.INOUT, D.OUT, D.INOUT],
+                "signature": [D.IN, D.INOUT, D.OUT, D.INOUT] if index != 2 else [D.INOUT],
                 "async_capability": {
                     "mode": "DEFERRED",
                     "max_conditions": CONDITION_LIMIT,
@@ -441,6 +448,7 @@ def run_sdma(platform: str, devices: list[int], directory: Path, elements: int):
             buffers=buffers,
             retain_after_run=True,
             workspace_engines=("sdma",),
+            sdma_sdk_queue_num=1,
         )
         for rank in range(2):
             stage_host_tensor(source_staging[rank], sources[rank])
@@ -453,12 +461,11 @@ def run_sdma(platform: str, devices: list[int], directory: Path, elements: int):
             args.add_tensor(
                 domain[rank].buffers["destination"].tensor((allocated,), DataType.FLOAT32), TensorArgType.INOUT
             )
-            args.add_tensor(
-                worker.make_tensor_arg(results[rank], (allocated,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING
-            )
+            args.add_tensor(worker.make_tensor_arg(results[rank], (allocated,), DataType.FLOAT32), TensorArgType.INOUT)
             args.add_tensor(worker.make_tensor_arg(metadata[rank], (256,), DataType.INT64), TensorArgType.INOUT)
             args.add_scalar(domain[rank].device_ctx)
             args.add_scalar(elements)
+            args.add_scalar(1 - rank)
             rank_config = CallConfig()
             rank_config.enable_chip_swimlane = 4
             rank_config.output_prefix = str(capture / f"rank_{rank}")

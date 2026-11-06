@@ -14,6 +14,7 @@
 #include "scheduler_async_check.h"
 #include "scheduler_async_discovery.h"
 #include "scheduler_async_finish.h"
+#include "scheduler_local_storage.h"
 #include "host_build_graph/runtime_status.h"
 
 // Local views only. No pointer or extra field enters the dispatch/wire ABI.
@@ -38,12 +39,16 @@ static_assert(sizeof(AsyncCtx) == 40 && sizeof(LocalContext) == 48);
 static_assert(sizeof(DispatchPayload) == 512 && offsetof(DispatchPayload, args) == 64);
 
 namespace scheduler_async_runtime_detail {
+struct NoAdditionalSealPublication {
+    inline __aicore__ bool after_seal(const SchedulerAsyncGroupIdentity &, const SchedulerAsyncGroupWriter &) {
+        return true;
+    }
+};
 // Owner progress and immutable metadata use bypass accesses. Atomic-only lease,
 // directory and join lines never pass through these helpers or cache writeback.
 template <typename T>
-inline __aicore__ T load(__gm__ const T *source) {
+inline __aicore__ void load_into(__gm__ const T *source, T *destination) {
     static_assert(std::is_trivially_copyable_v<T> && sizeof(T) % 8 == 0 && alignof(T) >= 8);
-    T result{};
     for (uint32_t offset = 0; offset < sizeof(T); offset += 8) {
         uint64_t word = 0;
 #if defined(__CCE_AICORE__)
@@ -54,8 +59,15 @@ inline __aicore__ T load(__gm__ const T *source) {
 #else
         __builtin_memcpy(&word, reinterpret_cast<const uint8_t *>(source) + offset, 8);
 #endif
-        __builtin_memcpy(reinterpret_cast<uint8_t *>(&result) + offset, &word, 8);
+        __builtin_memcpy(reinterpret_cast<uint8_t *>(destination) + offset, &word, 8);
     }
+}
+
+template <typename T>
+inline __aicore__ T load(__gm__ const T *source) {
+    static_assert(alignof(T) <= 8, "over-aligned local reads require SchedulerLocalStorage and load_into");
+    T result{};
+    load_into(source, &result);
     return result;
 }
 
@@ -134,7 +146,7 @@ inline __aicore__ bool task_map(const SchedulerAsyncRuntimeView &view, int64_t t
 inline __aicore__ bool
 finish_identity(const SchedulerAsyncRuntimeView &view, uint64_t index, SchedulerAsyncFinishIdentity *out) {
     if (index >= view.layout.finish_count) return false;
-    *out = load(at<SchedulerAsyncFinishIdentity>(view, view.layout.finish_identity_offset, index));
+    load_into(at<SchedulerAsyncFinishIdentity>(view, view.layout.finish_identity_offset, index), out);
     SchedulerAsyncTaskMap map{};
     return out->run_epoch == view.layout.run_epoch && task_map(view, out->task_ref, &map) &&
            map.finish_index == index && map.group_base == out->group_base && map.group_count == out->group_count;
@@ -143,7 +155,7 @@ finish_identity(const SchedulerAsyncRuntimeView &view, uint64_t index, Scheduler
 inline __aicore__ bool
 group_identity(const SchedulerAsyncRuntimeView &view, uint64_t index, SchedulerAsyncGroupIdentity *out) {
     if (index >= view.layout.group_count) return false;
-    *out = load(at<SchedulerAsyncGroupIdentity>(view, view.layout.group_identity_offset, index));
+    load_into(at<SchedulerAsyncGroupIdentity>(view, view.layout.group_identity_offset, index), out);
     SchedulerAsyncTaskMap map{};
     if (out->run_epoch != view.layout.run_epoch || !task_map(view, out->task_ref, &map) ||
         map.finish_index != out->finish_index ||
@@ -181,7 +193,8 @@ inline __aicore__ bool activate_finish(
     const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, SchedulerLocalState *local,
     __gm__ SchedulerRunControl *run, uint64_t index
 ) {
-    SchedulerAsyncFinishIdentity identity{};
+    SchedulerLocalStorage<SchedulerAsyncFinishIdentity> identity_storage;
+    auto &identity = identity_storage.get();
     if (!finish_identity(view, index, &identity) || scheduler_read_error(run) != 0)
         return fail(graph, local, run, identity.task_ref, &view, index);
     auto &join = *at<SchedulerAsyncTaskJoin>(view, view.layout.finish_join_offset, index);
@@ -222,8 +235,9 @@ inline __aicore__ bool scheduler_async_runtime_mount(
     if (base_address % 128 != 0 || graph.scheduler_state_address != base_address || bytes > UINT64_MAX - base_address ||
         !region(bytes, local->config.graph_summary_offset, 1, sizeof(SchedulerGraphSummary), 128, &end))
         return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
-    const auto summary =
-        load(scheduler_state_at<SchedulerGraphSummary>(scheduler_base, local->config.graph_summary_offset));
+    SchedulerLocalStorage<SchedulerGraphSummary> summary_storage;
+    auto &summary = summary_storage.get();
+    load_into(scheduler_state_at<SchedulerGraphSummary>(scheduler_base, local->config.graph_summary_offset), &summary);
     if (summary.async_layout_offset == 0) {
         *out = {};
         return true;
@@ -292,11 +306,14 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
     if (block >= map.block_count || subtask >= 3) return fail(graph, local, run, task, &view, map.finish_index);
     const uint64_t index = scheduler_async_group_index(map, block, subtask);
     if (index == SCHEDULER_ASYNC_INDEX_NONE) return true;
-    SchedulerAsyncGroupIdentity identity{};
+    SchedulerLocalStorage<SchedulerAsyncGroupIdentity> identity_storage;
+    auto &identity = identity_storage.get();
     TaskId token = TaskId::invalid();
     if (!group_identity(view, index, &identity) || !task_token(graph, task, &token))
         return fail(graph, local, run, task, &view, map.finish_index);
-    const auto writer = load(at<SchedulerAsyncGroupWriter>(view, view.layout.group_writer_offset, index));
+    SchedulerLocalStorage<SchedulerAsyncGroupWriter> writer_storage;
+    auto &writer = writer_storage.get();
+    load_into(at<SchedulerAsyncGroupWriter>(view, view.layout.group_writer_offset, index), &writer);
     const auto lease =
         scheduler_async_lease_load(*at<SchedulerAsyncLease>(view, view.layout.group_lease_offset, index));
     if (writer.sealed != 0 || writer.count != 0 || writer.error_code != 0 || writer.reserved_count != 0 ||
@@ -315,11 +332,11 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
 // Runs only on the original executing core after kernel return and before its
 // execution-release contribution. BindingPolicy must provide bounded
 // bind_condition(identity,index,entry,binding*) using existing run/domain proof.
-template <typename BindingPolicy>
+template <typename BindingPolicy, typename Publication = scheduler_async_runtime_detail::NoAdditionalSealPublication>
 inline __aicore__ bool scheduler_async_runtime_seal(
     const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, SchedulerLocalState *local,
     __gm__ SchedulerRunControl *run, int64_t task, uint32_t block, uint32_t subtask, __gm__ DispatchPayload *payload,
-    BindingPolicy &policy, bool *registered
+    BindingPolicy &policy, bool *registered, Publication publication = {}
 ) {
     using namespace scheduler_async_runtime_detail;
     if (registered == nullptr || payload == nullptr) return false;
@@ -331,7 +348,8 @@ inline __aicore__ bool scheduler_async_runtime_seal(
     if (block >= map.block_count || subtask >= 3) return fail(graph, local, run, task, &view, map.finish_index);
     const uint64_t index = scheduler_async_group_index(map, block, subtask);
     if (index == SCHEDULER_ASYNC_INDEX_NONE) return true;
-    SchedulerAsyncGroupIdentity identity{};
+    SchedulerLocalStorage<SchedulerAsyncGroupIdentity> identity_storage;
+    auto &identity = identity_storage.get();
     TaskId token = TaskId::invalid();
     if (!group_identity(view, index, &identity) || !task_token(graph, task, &token))
         return fail(graph, local, run, task, &view, map.finish_index);
@@ -377,8 +395,12 @@ inline __aicore__ bool scheduler_async_runtime_seal(
     for (uint64_t offset = 0; offset < sizeof(*writer); offset += 64)
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(writer) + offset);
     scheduler_cache_barrier();
-    auto progress = load(at<SchedulerAsyncGroupProgress>(view, view.layout.group_progress_offset, index));
-    const auto snapshot = load(writer);
+    SchedulerLocalStorage<SchedulerAsyncGroupProgress> progress_storage;
+    auto &progress = progress_storage.get();
+    load_into(at<SchedulerAsyncGroupProgress>(view, view.layout.group_progress_offset, index), &progress);
+    SchedulerLocalStorage<SchedulerAsyncGroupWriter> snapshot_storage;
+    auto &snapshot = snapshot_storage.get();
+    load_into(writer, &snapshot);
     const auto initialized = scheduler_async_check_initialize(identity, snapshot, &progress);
     publish(at<SchedulerAsyncGroupProgress>(view, view.layout.group_progress_offset, index), progress);
     if (!valid || initialized == SchedulerAsyncCheckResult::ERROR) {
@@ -386,6 +408,14 @@ inline __aicore__ bool scheduler_async_runtime_seal(
             lease, scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT), SchedulerAsyncPhase::FAILED
         );
         return fail(graph, local, run, task, &view, map.finish_index, writer_error_result(snapshot.error_code));
+    }
+    // The extra immutable facts must precede every CHECK discovery or join
+    // publication. A peer may claim immediately after the directory is set.
+    if (!publication.after_seal(identity, snapshot)) {
+        (void)scheduler_async_lease_try_transition(
+            lease, scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT), SchedulerAsyncPhase::FAILED
+        );
+        return fail(graph, local, run, task, &view, map.finish_index, SchedulerGraphResult::ASYNC_COMPLETION_INVALID);
     }
     if (count == 0) return true;
     auto &join = *at<SchedulerAsyncTaskJoin>(view, view.layout.finish_join_offset, map.finish_index);
@@ -420,7 +450,9 @@ inline __aicore__ bool scheduler_async_runtime_release_execution_block(
     for (uint32_t lane = 0; lane < 3; ++lane) {
         const auto index = scheduler_async_group_index(map, grant->block_idx, lane);
         if (index == SCHEDULER_ASYNC_INDEX_NONE) continue;
-        const auto writer = load(at<SchedulerAsyncGroupWriter>(view, view.layout.group_writer_offset, index));
+        SchedulerLocalStorage<SchedulerAsyncGroupWriter> writer_storage;
+        auto &writer = writer_storage.get();
+        load_into(at<SchedulerAsyncGroupWriter>(view, view.layout.group_writer_offset, index), &writer);
         if (writer.sealed != 1 || writer.error_code != 0 || writer.reserved_count != 0)
             return fail(graph, local, run, grant->task_ref, &view, map.finish_index);
     }
@@ -478,13 +510,18 @@ inline __aicore__ SchedulerAsyncRuntimeServiceResult scheduler_async_runtime_ser
     int64_t task = SCHEDULER_TASK_REF_INVALID;
     bool ok = true;
     if (check) {
-        SchedulerAsyncGroupIdentity identity{};
+        SchedulerLocalStorage<SchedulerAsyncGroupIdentity> identity_storage;
+        auto &identity = identity_storage.get();
         ok = group_identity(view, claim.index, &identity);
         task = identity.task_ref;
         finish = identity.finish_index;
         if (ok) {
-            const auto writer = load(at<SchedulerAsyncGroupWriter>(view, view.layout.group_writer_offset, claim.index));
-            auto progress = load(at<SchedulerAsyncGroupProgress>(view, view.layout.group_progress_offset, claim.index));
+            SchedulerLocalStorage<SchedulerAsyncGroupWriter> writer_storage;
+            auto &writer = writer_storage.get();
+            load_into(at<SchedulerAsyncGroupWriter>(view, view.layout.group_writer_offset, claim.index), &writer);
+            SchedulerLocalStorage<SchedulerAsyncGroupProgress> progress_storage;
+            auto &progress = progress_storage.get();
+            load_into(at<SchedulerAsyncGroupProgress>(view, view.layout.group_progress_offset, claim.index), &progress);
             SchedulerAsyncCheckView conditions{
                 at<DeferredCompletionEntry>(view, identity.entries_offset),
                 at<SchedulerAsyncConditionBinding>(view, identity.condition_bindings_offset), identity.capacity,
@@ -513,12 +550,16 @@ inline __aicore__ SchedulerAsyncRuntimeServiceResult scheduler_async_runtime_ser
             }
         }
     } else {
-        SchedulerAsyncFinishIdentity identity{};
+        SchedulerLocalStorage<SchedulerAsyncFinishIdentity> identity_storage;
+        auto &identity = identity_storage.get();
         ok = finish_identity(view, claim.index, &identity);
         task = identity.task_ref;
         if (ok) {
-            auto progress =
-                load(at<SchedulerAsyncFinishProgress>(view, view.layout.finish_progress_offset, claim.index));
+            SchedulerLocalStorage<SchedulerAsyncFinishProgress> progress_storage;
+            auto &progress = progress_storage.get();
+            load_into(
+                at<SchedulerAsyncFinishProgress>(view, view.layout.finish_progress_offset, claim.index), &progress
+            );
             auto &join = *at<SchedulerAsyncTaskJoin>(view, view.layout.finish_join_offset, claim.index);
             const auto result = scheduler_async_finish_step(
                 graph, scheduler_base, local, run, identity, &join, &progress, &slice.work_units, nullptr, nullptr,

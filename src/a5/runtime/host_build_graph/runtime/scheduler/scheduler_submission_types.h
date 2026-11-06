@@ -12,8 +12,9 @@
 #pragma once
 
 #include "scheduler_async_cohort.h"
+#include "async_capability.h"
 
-inline constexpr uint64_t SCHEDULER_SUBMISSION_VERSION = 1;
+inline constexpr uint64_t SCHEDULER_SUBMISSION_VERSION = 2;
 // Capacity of the pinned SDMA backend's per-workspace physical queue array.
 inline constexpr uint32_t SCHEDULER_SUBMISSION_SDMA_CHANNELS = 48;
 inline constexpr uint32_t SCHEDULER_SUBMISSION_MAX_EXECUTION_GRANTS = CORE_MAX_SCALAR_ARGS;
@@ -45,7 +46,11 @@ struct alignas(128) SchedulerSubmissionHeader {
     uint64_t grants_offset{0};
     uint64_t release_states_offset{0};
     uint64_t execution_grant_indices_offset{0};
-    uint64_t reserved[12]{};
+    uint64_t contexts_offset{0};
+    uint64_t provenance_offset{0};
+    uint64_t provenance_count{0};
+    uint64_t execution_use_maps_offset{0};
+    uint64_t reserved[8]{};
 };
 
 struct SchedulerSubmissionTaskMap {
@@ -96,8 +101,33 @@ struct SchedulerSubmissionExecution {
     uint64_t grant_count{0};
     uint32_t block_idx{0};
     uint32_t subtask_slot{0};
-    uint64_t reserved[3]{};
+    CoreAsyncMode completion_mode{CoreAsyncMode::UNKNOWN};
+    uint32_t condition_capacity{0};
+    uint32_t condition_types{0};
+    uint32_t provenance_capacity{0};
+    uint64_t provenance_begin{0};
 };
+
+struct SchedulerSubmissionExecutionUseMap {
+    uint64_t use_begin{SCHEDULER_ASYNC_INDEX_NONE};
+    uint64_t use_count{0};
+};
+static_assert(sizeof(SchedulerSubmissionExecutionUseMap) == 16);
+
+// Captured from the public event only after the qualified SDK submission.
+// The enclosing run/execution owns this row; zero version is never evidence.
+struct SchedulerSubmissionProvenance {
+    uint32_t version{0};
+    int32_t completion_type{0};
+    uint64_t address{0};
+    uint64_t backend_cookie{0};
+    uint64_t use_index{SCHEDULER_ASYNC_INDEX_NONE};
+    uint64_t workspace_index{SCHEDULER_ASYNC_INDEX_NONE};
+    uint64_t execution_index{SCHEDULER_ASYNC_INDEX_NONE};
+    uint64_t channel_group{SCHEDULER_ASYNC_INDEX_NONE};
+    uint64_t reserved{0};
+};
+static_assert(sizeof(SchedulerSubmissionProvenance) == 64);
 
 // Grant rows for one workspace are contiguous and contain distinct executions.
 // acquired_mask is written only by the bundle lease owner before GRANTED.
@@ -186,6 +216,8 @@ SCHEDULER_SUBMISSION_POD(SchedulerSubmissionWorkspace);
 SCHEDULER_SUBMISSION_POD(SchedulerSubmissionPool);
 SCHEDULER_SUBMISSION_POD(SchedulerSubmissionBundleIdentity);
 SCHEDULER_SUBMISSION_POD(SchedulerSubmissionExecution);
+SCHEDULER_SUBMISSION_POD(SchedulerSubmissionExecutionUseMap);
+SCHEDULER_SUBMISSION_POD(SchedulerSubmissionProvenance);
 SCHEDULER_SUBMISSION_POD(SchedulerSubmissionRequest);
 SCHEDULER_SUBMISSION_POD(SchedulerSubmissionGrant);
 SCHEDULER_SUBMISSION_POD(SchedulerSubmissionProgress);

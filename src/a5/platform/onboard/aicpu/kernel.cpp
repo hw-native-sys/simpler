@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "aicpu/native_invocation_entry.h"
+#include "async_transport_result.h"
 #include "aicpu_loader/finalize_args.h"
 #include "common/memory_barrier.h"
 
@@ -42,6 +43,8 @@
 // simpler_aicpu_register_callable is NOT declared/forwarded here: it is
 // exported directly by the TMARB runtime (host_build_graph does not export it).
 extern "C" int aicpu_execute(Runtime *arg);
+
+extern "C" __attribute__((weak)) bool aicpu_async_transport_enabled(const void *, uint64_t) { return false; }
 
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_query_topology(void *arg) {
     if (arg == nullptr) return -1;
@@ -151,17 +154,25 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     auto *runtime = args->runtime_args;
     if (runtime == nullptr) return -1;
     bind_platform_task(args);
+    const uint64_t result_base = args->run_result_data_base;
+    const uint64_t result_epoch = args->run_result_epoch;
+    const bool async_transport = aicpu_async_transport_enabled(runtime, result_epoch);
     NativeInvocationEntry invocation{
-        runtime->get_aicpu_launch_count(), args->run_result_data_base,  args->run_result_epoch,
-        aicpu_begin_native_invocation,     aicpu_reset_execution_entry, aicpu_finish_native_invocation
+        runtime->get_aicpu_launch_count(),
+        result_base,
+        result_epoch,
+        aicpu_begin_native_invocation,
+        aicpu_reset_execution_entry,
+        aicpu_finish_native_invocation
     };
     const auto entry = platform_aicpu_entry_gate_filter(
         runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), invocation.callbacks,
         invocation.initializer()
     );
-    return invocation.complete(entry, [arg] {
+    const int32_t rc = invocation.complete(entry, [arg] {
         return execute_platform_task(arg);
     });
+    return a5_async_transport_result(async_transport, result_base, result_epoch, rc);
 }
 
 /**

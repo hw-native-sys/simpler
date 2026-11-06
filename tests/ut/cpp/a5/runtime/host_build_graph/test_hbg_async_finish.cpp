@@ -274,6 +274,24 @@ struct FinishFixture {
     }
 };
 
+TEST(HbgAsyncFinish, CompletedCursorForAnotherTaskCannotSkipCurrentWaiter) {
+    FinishFixture fixture(2);
+    scheduler_gm_store(fixture.control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    scheduler_gm_store(fixture.control(0)->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
+    fixture.saved.phase = static_cast<uint64_t>(SchedulerAsyncFinishPhase::RESOLVE);
+    fixture.saved.current_waiter = 1;
+    fixture.saved.detached_next = SCHEDULER_TASK_REF_INVALID;
+    fixture.saved.resolve = scheduler_resolve_begin(0);
+    fixture.saved.resolve.phase = SchedulerResolvePhase::COMPLETED;
+
+    EXPECT_EQ(fixture.slice(0, 8), SchedulerAsyncFinishResult::ERROR);
+    EXPECT_EQ(fixture.saved.phase, static_cast<uint64_t>(SchedulerAsyncFinishPhase::FAILED));
+    EXPECT_NE(scheduler_read_error(fixture.run), 0u);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(1)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+    EXPECT_TRUE(fixture.take_all().empty());
+    EXPECT_EQ(fixture.completed(), 0u);
+}
+
 TEST(HbgAsyncFinish, ZeroBudgetAndEmptyFanoutRespectPublicationAndTerminalOrder) {
     FinishFixture fixture(1);
     EXPECT_EQ(fixture.slice(0, 0), SchedulerAsyncFinishResult::PENDING);

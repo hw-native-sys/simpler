@@ -12,11 +12,20 @@
 #pragma once
 
 #include "async_completion_writer.h"
+#include "scheduler/scheduler_local_storage.h"
 #include "async_observer.h"
 #include "scheduler/scheduler_async_check.h"
 #include "scheduler/scheduler_async_cohort.h"
+#include "scheduler/scheduler_submission_provenance.h"
+#include "host_build_graph/async_retirement.h"
 
-inline constexpr uint64_t ASYNC_RESOURCE_VERSION = 2;
+inline constexpr uint64_t ASYNC_RESOURCE_VERSION = 4;
+inline constexpr uint64_t ASYNC_EXECUTION_UNQUALIFIED = HBG_ASYNC_CONTRACT_UNQUALIFIED;
+inline constexpr uint64_t ASYNC_EXECUTION_CORE_PIPELINES_ONLY = HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY;
+
+inline __aicore__ bool async_execution_contract_valid(uint64_t contract) {
+    return contract == ASYNC_EXECUTION_UNQUALIFIED || contract == ASYNC_EXECUTION_CORE_PIPELINES_ONLY;
+}
 inline constexpr uint64_t ASYNC_RESOURCE_NONE = UINT64_MAX;
 inline constexpr uint32_t ASYNC_CORE_AIC = 1;
 inline constexpr uint32_t ASYNC_CORE_AIV = 2;
@@ -62,6 +71,9 @@ struct AsyncConditionContract {
     uint64_t source_range{ASYNC_RESOURCE_NONE};
     uint64_t payload_range{ASYNC_RESOURCE_NONE};
     uint64_t payload_count{1};
+    // SDMA use-to-owner association, never a directory of allowed records.
+    // COUNTER uses keep this zero and retain their exact static record slots.
+    uint64_t sdma_workspace_address{0};
 };
 
 enum class AsyncConsumerMapKind : uint32_t { UNKNOWN, NONE, REQUIRED };
@@ -95,18 +107,17 @@ struct AsyncResourceHeader {
     uint64_t condition_count{0};
     uint64_t consumer_count{0};
     uint64_t consumer_range_count{0};
-    uint64_t reserved{0};
+    uint64_t execution_contract{ASYNC_EXECUTION_UNQUALIFIED};
 };
 
 static_assert(sizeof(AsyncResourceHeader) == 64 && sizeof(AsyncRetainedSpan) == 16);
-static_assert(sizeof(AsyncResourceRange) == 32 && sizeof(AsyncConditionContract) == 80);
+static_assert(sizeof(AsyncResourceRange) == 32 && sizeof(AsyncConditionContract) == 88);
 static_assert(sizeof(AsyncConsumerTaskMap) == 24 && sizeof(AsyncConsumerContract) == 40);
 
 namespace async_resource_detail {
 template <typename T>
-inline __aicore__ T load(__gm__ const T *source) {
+inline __aicore__ void load_into(__gm__ const T *source, T *destination) {
     static_assert(std::is_trivially_copyable_v<T> && sizeof(T) % 8 == 0 && alignof(T) >= 8);
-    T result{};
     for (uint32_t offset = 0; offset < sizeof(T); offset += 8) {
         uint64_t word = 0;
 #if defined(__CCE_AICORE__)
@@ -117,8 +128,15 @@ inline __aicore__ T load(__gm__ const T *source) {
 #else
         __builtin_memcpy(&word, reinterpret_cast<const uint8_t *>(source) + offset, 8);
 #endif
-        __builtin_memcpy(reinterpret_cast<uint8_t *>(&result) + offset, &word, 8);
+        __builtin_memcpy(reinterpret_cast<uint8_t *>(destination) + offset, &word, 8);
     }
+}
+
+template <typename T>
+inline __aicore__ T load(__gm__ const T *source) {
+    static_assert(alignof(T) <= 8, "Over-aligned snapshots require qualified local storage and load_into");
+    T result{};
+    load_into(source, &result);
     return result;
 }
 
@@ -174,8 +192,9 @@ struct AsyncResourceTables {
             layout.consumers_offset + layout.consumers_bytes > layout.scratch_offset)
             return false;
         const auto h = load(reinterpret_cast<__gm__ const AsyncResourceHeader *>(base + layout.resources_offset));
-        if (h.version != ASYNC_RESOURCE_VERSION || h.run_epoch != layout.run_epoch || h.reserved != 0 ||
-            layout.task_count == 0 || layout.task_count > INT32_MAX)
+        if (h.version != ASYNC_RESOURCE_VERSION || h.run_epoch != layout.run_epoch ||
+            !async_execution_contract_valid(h.execution_contract) || layout.task_count == 0 ||
+            layout.task_count > INT32_MAX)
             return false;
         uint64_t resource_bytes = sizeof(h), use_bytes = 0, consumer_bytes = 0;
         if (!add_rows(h.span_count, sizeof(AsyncRetainedSpan), resource_bytes) ||
@@ -187,7 +206,8 @@ struct AsyncResourceTables {
             resource_bytes != layout.resources_bytes || use_bytes != layout.uses_bytes ||
             consumer_bytes != layout.consumers_bytes)
             return false;
-        AsyncResourceTables next{};
+        SchedulerLocalStorage<AsyncResourceTables> next_storage;
+        auto &next = next_storage.get();
         if (!SchedulerAsyncCohortView::mount(base, layout, &next.cohorts)) return false;
         next.header = h;
         next.task_count = layout.task_count;
@@ -235,15 +255,22 @@ public:
     using ConsumerIdentity = AsyncConsumerIdentity;
     using ConsumerCursor = AsyncConsumerCursor;
     using ConsumerResult = AsyncConsumerResult;
-    inline __aicore__ AsyncResourceBindings(const AsyncResourceTables &tables, uint32_t core_kind) :
+    inline __aicore__ AsyncResourceBindings(
+        const AsyncResourceTables &tables, uint32_t core_kind,
+        const SchedulerSubmissionProvenanceView *provenance = nullptr
+    ) :
         tables_(tables),
-        core_(core_kind) {}
-    inline __aicore__
-    AsyncResourceBindings(const AsyncResourceTables &tables, uint32_t core_kind, Reader reader, Cache cache) :
+        core_(core_kind),
+        provenance_(provenance) {}
+    inline __aicore__ AsyncResourceBindings(
+        const AsyncResourceTables &tables, uint32_t core_kind, Reader reader, Cache cache,
+        const SchedulerSubmissionProvenanceView *provenance = nullptr
+    ) :
         tables_(tables),
         core_(core_kind),
         reader_(reader),
-        cache_(cache) {}
+        cache_(cache),
+        provenance_(provenance) {}
 
     inline __aicore__ bool bind_condition(
         const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
@@ -251,13 +278,19 @@ public:
     ) {
         uint64_t begin = 0, count = 0;
         AsyncConditionContract use{};
-        if (out == nullptr || condition >= identity.capacity || !use_bounds(identity, &begin, &count) || count == 0)
+        if (out == nullptr || entry.completion_type != COMPLETION_TYPE_COUNTER || condition >= identity.capacity ||
+            !use_bounds(identity, &begin, &count) || count == 0)
             return false;
         // A uint64-sized sorted set requires at most 64 comparisons. No scan
         // depends on the number of declared resources or on registration order.
         uint64_t lower = 0, upper = count;
         while (lower < upper) {
             const uint64_t middle = lower + (upper - lower) / 2;
+            const auto candidate = async_resource_detail::load(tables_.conditions + begin + middle);
+            if (candidate.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
+                upper = middle;
+                continue;
+            }
             if (!condition_contract(identity, begin + middle, &use)) return false;
             uint64_t address = 0, bytes = 0;
             AsyncRetainedSpan retained{};
@@ -273,13 +306,44 @@ public:
         return true;
     }
 
+    // Only the original executor supplies this identity. CHECK never uses this
+    // method and cannot accept an unsealed context as a completed publication.
+    inline __aicore__ bool bind_condition_at_seal(
+        const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
+        const SchedulerSubmissionSealIdentity &sealing, SchedulerAsyncConditionBinding *out
+    ) {
+        if (entry.completion_type == COMPLETION_TYPE_COUNTER) return bind_condition(identity, condition, entry, out);
+        if (out == nullptr || provenance_ == nullptr || condition >= identity.capacity ||
+            sealing.run_epoch != identity.run_epoch || sealing.task_ref != identity.task_ref ||
+            sealing.block_idx != identity.block_idx || sealing.subtask_slot != identity.subtask_slot)
+            return false;
+        SchedulerSubmissionProvenance record{};
+        SchedulerSubmissionWorkspace workspace{};
+        AsyncConditionContract use{};
+        if (!scheduler_submission_read_seal_provenance(*provenance_, sealing, condition, entry, &record, &workspace) ||
+            !condition_contract(identity, record.use_index, &use) || !entry_valid(use, entry) ||
+            use.sdma_workspace_address != workspace.address)
+            return false;
+        *out = {record.use_index, 0};
+        return true;
+    }
+
     inline __aicore__ bool validate(
         const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry,
         const SchedulerAsyncConditionBinding &binding
     ) {
         AsyncConditionContract use{};
-        return condition < identity.capacity && binding.owner_generation == 0 &&
-               condition_contract(identity, binding.binding_index, &use) && entry_valid(use, entry);
+        if (condition >= identity.capacity || binding.owner_generation != 0 ||
+            !condition_contract(identity, binding.binding_index, &use) || !entry_valid(use, entry))
+            return false;
+        if (entry.completion_type == COMPLETION_TYPE_COUNTER) return true;
+        SchedulerSubmissionProvenance record{};
+        SchedulerSubmissionWorkspace workspace{};
+        return provenance_ != nullptr &&
+               scheduler_submission_read_sealed_provenance(
+                   *provenance_, identity, condition, entry, binding.binding_index, &record, &workspace
+               ) &&
+               use.sdma_workspace_address == workspace.address;
     }
 
     inline __aicore__ SchedulerAsyncConditionOutcome observe_once(
@@ -314,7 +378,7 @@ public:
     inline __aicore__ bool prepare_sdma_submit(
         const SchedulerAsyncGroupIdentity &identity, AsyncCtx &ctx, uint64_t source, uint64_t destination,
         uint64_t bytes, uint32_t record_upper_bound, AsyncCompletionAllowance *allowance,
-        uint64_t allowed_use_index = ASYNC_RESOURCE_NONE
+        uint64_t allowed_use_index = ASYNC_RESOURCE_NONE, uint64_t workspace_address = 0
     ) {
         if (allowance != nullptr) *allowance = {};
         // A5's SDMA submit implementation is AIV-only. Observer qualification
@@ -336,6 +400,7 @@ public:
         uint64_t address = 0, length = 0;
         if (!condition_contract(identity, allowed_use_index, &use) ||
             use.completion_type != COMPLETION_TYPE_SDMA_EVENT_RECORD || use.payload_none != 0 ||
+            workspace_address == 0 || use.sdma_workspace_address != workspace_address ||
             !range(use.source_range, ASYNC_RANGE_READ, &address, &length, &ignored) ||
             !async_resource_detail::contains(address, length, source, bytes) ||
             !range(use.payload_range, ASYNC_RANGE_WRITE, &address, &length, &ignored) ||
@@ -429,13 +494,14 @@ private:
     uint32_t core_;
     Reader reader_{};
     Cache cache_{};
+    const SchedulerSubmissionProvenanceView *provenance_{nullptr};
 
     inline __aicore__ bool valid_tables() const {
         return tables_.header.version == ASYNC_RESOURCE_VERSION && tables_.header.run_epoch != 0 &&
-               tables_.header.reserved == 0 && tables_.task_count != 0 && tables_.cohorts.base != nullptr &&
-               tables_.cohorts.header.run_epoch == tables_.header.run_epoch && tables_.spans != nullptr &&
-               tables_.ranges != nullptr && tables_.conditions != nullptr && tables_.consumer_maps != nullptr &&
-               tables_.consumers != nullptr && tables_.consumer_ranges != nullptr &&
+               async_execution_contract_valid(tables_.header.execution_contract) && tables_.task_count != 0 &&
+               tables_.cohorts.base != nullptr && tables_.cohorts.header.run_epoch == tables_.header.run_epoch &&
+               tables_.spans != nullptr && tables_.ranges != nullptr && tables_.conditions != nullptr &&
+               tables_.consumer_maps != nullptr && tables_.consumers != nullptr && tables_.consumer_ranges != nullptr &&
                async_resource_detail::core(3, core_);
     }
 
@@ -508,21 +574,25 @@ private:
             return false;
         AsyncRetainedSpan retained{};
         uint64_t address = 0, bytes = 0;
-        const uint64_t width = use->completion_type == COMPLETION_TYPE_COUNTER ? 4 : 8;
-        const uint32_t condition_type = use->completion_type == COMPLETION_TYPE_COUNTER ?
-                                            CORE_ASYNC_CONDITION_COUNTER :
-                                            CORE_ASYNC_CONDITION_SDMA_POST_DONE;
-        if ((use->completion_type != COMPLETION_TYPE_COUNTER &&
-             use->completion_type != COMPLETION_TYPE_SDMA_EVENT_RECORD) ||
-            (identity.condition_types & condition_type) == 0 ||
-            !range(use->record_range, ASYNC_RANGE_READ | ASYNC_RANGE_CONDITION_CLEAN, &address, &bytes, &retained) ||
-            address % width != 0 || use->record_count == 0 || use->record_stride < width ||
-            use->record_stride % width != 0 || use->record_count - 1 > (UINT64_MAX - width) / use->record_stride ||
-            (use->record_count - 1) * use->record_stride + width != bytes)
+        const bool counter = use->completion_type == COMPLETION_TYPE_COUNTER;
+        const uint32_t condition_type = counter ? CORE_ASYNC_CONDITION_COUNTER : CORE_ASYNC_CONDITION_SDMA_POST_DONE;
+        if ((!counter && use->completion_type != COMPLETION_TYPE_SDMA_EVENT_RECORD) ||
+            (identity.condition_types & condition_type) == 0)
             return false;
-        if (use->completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD &&
-            (use->payload_none != 0 || use->payload_count != 1 ||
-             !range(use->source_range, ASYNC_RANGE_READ, &address, &bytes, &retained)))
+        if (counter) {
+            constexpr uint64_t width = sizeof(int32_t);
+            if (use->sdma_workspace_address != 0 ||
+                !range(
+                    use->record_range, ASYNC_RANGE_READ | ASYNC_RANGE_CONDITION_CLEAN, &address, &bytes, &retained
+                ) ||
+                address % width != 0 || use->record_count == 0 || use->record_stride < width ||
+                use->record_stride % width != 0 || use->record_count - 1 > (UINT64_MAX - width) / use->record_stride ||
+                (use->record_count - 1) * use->record_stride + width != bytes)
+                return false;
+        } else if (tables_.header.execution_contract != ASYNC_EXECUTION_UNQUALIFIED ||
+                   use->record_range != ASYNC_RESOURCE_NONE || use->record_count != 0 || use->record_stride != 0 ||
+                   use->sdma_workspace_address == 0 || use->payload_none != 0 || use->payload_count != 1 ||
+                   !range(use->source_range, ASYNC_RANGE_READ, &address, &bytes, &retained))
             return false;
         if (use->payload_none != 0) return use->payload_range == ASYNC_RESOURCE_NONE && use->payload_count == 0;
         if (use->payload_count == 0 || use->payload_range >= tables_.header.range_count ||
@@ -540,6 +610,7 @@ private:
                  (entry.backend_cookie != 0 || entry.expected_value > INT32_MAX) :
                  (entry.backend_cookie == 0 || entry.expected_value != 0)))
             return false;
+        if (entry.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) return true;
         AsyncRetainedSpan retained{};
         uint64_t address = 0, bytes = 0, first = 0, length = 0;
         const uint64_t width = entry.completion_type == COMPLETION_TYPE_COUNTER ? 4 : 8;

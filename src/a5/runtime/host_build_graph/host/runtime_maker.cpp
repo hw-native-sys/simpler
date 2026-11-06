@@ -70,6 +70,7 @@
 #include "ready_pool_plan.h"
 #include "async_plan.h"
 #include "async_binding_plan.h"
+#include "host_build_graph/async_retirement.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler_protocol_export.h"
@@ -186,7 +187,7 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
 extern "C" int
 runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes, uint64_t epoch) noexcept {
     if (mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE)
-        return 0;  // Admission already rejects deferred callables in either fallback.
+        return HBG_ASYNC_LAST_USE_NONE;  // Admission rejects deferred callables in either fallback.
     if ((mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING && mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) ||
         host == nullptr || epoch == 0 || bytes < sizeof(SchedulerRunControl))
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -201,7 +202,7 @@ runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes
     SchedulerGraphSummary summary{};
     std::memcpy(&summary, static_cast<const std::byte *>(host) + run.graph_summary_offset, sizeof(summary));
     if (summary.run_epoch != epoch) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (summary.async_layout_offset == 0) return 0;
+    if (summary.async_layout_offset == 0) return HBG_ASYNC_LAST_USE_NONE;
     if (summary.async_layout_offset % 128 != 0 || !fits(summary.async_layout_offset, sizeof(SchedulerAsyncLayout)))
         return PTO_RUNTIME_ERR_INVALID_STATE;
     SchedulerAsyncLayout layout{};
@@ -209,7 +210,18 @@ runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes
     if (layout.version != SCHEDULER_ASYNC_LAYOUT_VERSION || layout.run_epoch != epoch || layout.group_count == 0 ||
         layout.total_bytes < sizeof(layout) || !fits(summary.async_layout_offset, layout.total_bytes))
         return PTO_RUNTIME_ERR_INVALID_STATE;
-    return 1;
+    // Reuse the exact private-table format checks. In particular, a legacy
+    // reserved word is never read as a core-only contract: version 4, this
+    // epoch, the complete section extents and cohort prefix must all agree.
+    AsyncResourceTables bindings{};
+    if (!AsyncResourceTables::mount(
+            static_cast<const uint8_t *>(host) + summary.async_layout_offset, layout, &bindings
+        ))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    static_assert(ASYNC_EXECUTION_CORE_PIPELINES_ONLY == HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY);
+    return bindings.header.execution_contract == ASYNC_EXECUTION_CORE_PIPELINES_ONLY ?
+               HBG_ASYNC_LAST_USE_CORE_PIPELINES_ONLY :
+               HBG_ASYNC_LAST_USE_EXTERNAL_OR_UNKNOWN;
 }
 
 extern "C" int joined_native_launch_supported_impl(void) {
@@ -1656,8 +1668,21 @@ bool create_scheduler_state(
         (SCHEDULER_STATE_ALIGNMENT - 1);
     SchedulerAsyncLayout async_layout{};
     AsyncBindingHostPlan async_bindings;
+    SchedulerSubmissionHostPlan submission_plan;
     std::vector<SchedulerAsyncCapabilities> async_capabilities;
     std::string async_error;
+    bool sdma_uses = false;
+    if (async_declarations != nullptr &&
+        !scheduler_has_sdma_uses(task_metadata, native_plan, *async_declarations, &sdma_uses, &async_error)) {
+        LOG_ERROR("A5 HBG: submission declaration lookup failed: %s", async_error.c_str());
+        return false;
+    }
+    if (sdma_uses && !has_deferred_callable) {
+        LOG_ERROR(
+            "A5 HBG: qualified SDMA submission requires an async-enabled run; synchronous-only image unsupported"
+        );
+        return false;
+    }
     if (has_deferred_callable) {
         if (async_declarations == nullptr) {
             LOG_ERROR("A5 HBG: deferred callable has no explicit resource/payload declarations for this run");
@@ -1683,7 +1708,15 @@ bool create_scheduler_state(
                 task_metadata, async_capabilities, binding_image, native_plan, *async_declarations, *api,
                 max_state_bytes, &async_bindings, &async_error
             ) ||
-            !scheduler_plan_async_layout(
+            !scheduler_plan_submission_bundles(
+                task_metadata, async_capabilities, async_bindings.submission_workspaces, async_bindings.submission_uses,
+                async_bindings.execution_use_sets, api->run_epoch(), max_state_bytes, &submission_plan, &async_error
+            )) {
+            LOG_ERROR("A5 HBG: async resource/submission planning failed: %s", async_error.c_str());
+            return false;
+        }
+        async_bindings.auxiliary.scratch = submission_plan.image.size();
+        if (!scheduler_plan_async_layout(
                 task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, async_bindings.auxiliary,
                 &async_layout, &async_error
             )) {
@@ -1746,6 +1779,18 @@ bool create_scheduler_state(
                              )) {
         LOG_ERROR("A5 HBG: async binding materialization failed: %s", async_error.c_str());
         return false;
+    }
+    if (!submission_plan.image.empty()) {
+        SchedulerAsyncCohortView cohorts{};
+        auto *async_base = static_cast<uint8_t *>(host_base) + async_offset;
+        if (async_offset == 0 || !SchedulerAsyncCohortView::mount(async_base, async_layout, &cohorts) ||
+            cohorts.header.auxiliary_bytes != submission_plan.image.size()) {
+            LOG_ERROR("A5 HBG: submission image does not fit retained async auxiliary storage");
+            return false;
+        }
+        std::memcpy(
+            cohorts.base + cohorts.header.auxiliary_offset, submission_plan.image.data(), submission_plan.image.size()
+        );
     }
 
     if (native_graph) {
@@ -2981,7 +3026,12 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     }
     if (runtime_status != 0) {
         if (api->observed_run_status().has_value()) {
-            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read)", runtime_status);
+            const int32_t named_status =
+                runtime_status < 0 && runtime_status != INT32_MIN ? -runtime_status : runtime_status;
+            LOG_ERROR(
+                "Observed runtime status: %d (%s; shared scheduler header not read)", runtime_status,
+                error_name(named_status)
+            );
         } else {
             int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
             LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);

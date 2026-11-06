@@ -19,6 +19,7 @@
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
+#include "scheduler_timeout_diagnostics.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
@@ -26,6 +27,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/device_time.h"
 #include "host_build_graph/runtime_status.h"
+#include "host_build_graph/async_retirement.h"
 #include "host_build_graph/shared_memory.h"
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
@@ -135,9 +137,8 @@ static bool wait_with_scheduler_timeout(Predicate predicate) {
     return true;
 }
 
-// A stalled run leaves its state still: the tasks that never finished keep the
-// fields that say what they were waiting for. Naming them is what separates a
-// waiter nobody woke from a task that was never routed at all.
+// These are live samples, not a consistent snapshot. Waiter metadata is
+// advisory: a task already routed to a ready queue can retain its last producer.
 static void log_unfinished_tasks(Runtime *runtime) {
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context == nullptr) return;
@@ -252,6 +253,8 @@ static void log_unfinished_tasks(Runtime *runtime) {
 }
 
 static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
+    if (error_site == SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT)
+        log_aicore_scheduler_timeout_checkpoints(runtime, get_platform_run_result_epoch());
     log_unfinished_tasks(runtime);
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context != nullptr) {
@@ -713,7 +716,15 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime, bool cores_retired) 
     // participant error whatever the audited-path answer is, which is why the
     // read stays and only the verdict is withheld.
     const bool normal_path = cores_retired && normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
-    terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
+    const HbgAsyncRetirementPayload retirement{
+        HBG_ASYNC_RETIREMENT_MAGIC, get_platform_run_result_epoch(), HBG_ASYNC_RETIREMENT_VERSION,
+        cores_retired ? HBG_ASYNC_CORES_RETIRED : 0u
+    };
+    // The publisher copies this only for Error; Ok retains its original empty
+    // payload. Retirement is an independent fact, never a fabricated success.
+    terminal_publisher_.take(
+        run_terminal_select(normal_path, header_status, terminal_), &retirement, sizeof(retirement)
+    );
 }
 
 void AicpuExecutor::handoff_run_terminal() {
@@ -758,6 +769,39 @@ void AicpuExecutor::deinit(Runtime * /*runtime*/) {
 }
 
 // ===== Public Entry Point =====
+
+// Host-published immutable extents identify an async invocation before entry.
+// Core retirement and successful terminal publication are checked separately
+// after the final native callback; this query grants no resource retirement.
+extern "C" bool aicpu_async_transport_enabled(const void *opaque_runtime, uint64_t epoch) {
+    const auto *runtime = static_cast<const Runtime *>(opaque_runtime);
+    if (epoch == 0 || !aicore_scheduler_runtime_enabled(runtime)) return false;
+    const uint64_t context_address = runtime->dev.scheduler_bootstrap.worker_context_base;
+    if (context_address == 0 || context_address % alignof(SchedulerWorkerContext) != 0 ||
+        context_address > UINT64_MAX - sizeof(SchedulerWorkerContext))
+        return false;
+    const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(context_address);
+    const uint64_t base = context->scheduler_state_base_address;
+    const uint64_t bytes = context->scheduler_state_bytes;
+    const uint64_t tasks = context->graph_task_count;
+    if (base == 0 || base % 128 != 0 || bytes > UINT64_MAX - base || tasks == 0 || tasks > INT32_MAX ||
+        context->runtime_worker_count != static_cast<uint64_t>(runtime->get_worker_count()))
+        return false;
+    const auto fits = [bytes](uint64_t offset, uint64_t size) {
+        return offset % 128 == 0 && offset <= bytes && size <= bytes - offset;
+    };
+    if (!fits(context->graph_summary_offset, sizeof(SchedulerGraphSummary))) return false;
+    const auto &summary = *reinterpret_cast<const SchedulerGraphSummary *>(base + context->graph_summary_offset);
+    if (summary.run_epoch != epoch || summary.worker_count != context->runtime_worker_count ||
+        summary.async_layout_offset == 0 || !fits(summary.async_layout_offset, sizeof(SchedulerAsyncLayout)))
+        return false;
+    SchedulerAsyncLayout layout{};
+    std::memcpy(&layout, reinterpret_cast<const void *>(base + summary.async_layout_offset), sizeof(layout));
+    return layout.version == SCHEDULER_ASYNC_LAYOUT_VERSION && layout.run_epoch == epoch &&
+           layout.task_count == tasks && layout.group_count != 0 && layout.finish_count != 0 &&
+           layout.finish_count <= tasks && layout.total_bytes >= sizeof(layout) &&
+           fits(summary.async_layout_offset, layout.total_bytes);
+}
 
 extern "C" int32_t aicpu_prewarm_callable(Runtime *runtime) {
     // host_build_graph host-orch: the orchestration .so is dlopen'd on the HOST

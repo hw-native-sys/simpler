@@ -184,3 +184,27 @@ TEST_F(ResidentFinalizer, LateDiagnosticIdentityIsLoggedByTheActualFinalizer) {
 }
 
 }  // namespace
+
+TEST_F(ResidentFinalizer, FailurePayloadPublishesIndependentRetirementAcknowledgements) {
+    executor.terminal_.record_participant(-17, 0);
+    const auto terminal = finalize_and_publish(true);
+    EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+    EXPECT_EQ(terminal.code, -17);
+    EXPECT_EQ(region.payload_bytes, sizeof(HbgAsyncRetirementPayload));
+    EXPECT_TRUE(hbg_async_cores_retired(region.payload, region.payload_bytes, kEpoch));
+    EXPECT_FALSE(hbg_async_cores_retired(region.payload, region.payload_bytes, kEpoch + 1));
+}
+
+TEST_F(ResidentFinalizer, FailureWithoutCoreRetirementDoesNotPublishStopProof) {
+    executor.terminal_.record_participant(-17, -23);
+    const auto terminal = finalize_and_publish(false);
+    EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+    EXPECT_EQ(terminal.code, -17);
+    EXPECT_EQ(region.payload_bytes, sizeof(HbgAsyncRetirementPayload));
+    EXPECT_FALSE(hbg_async_cores_retired(region.payload, region.payload_bytes, kEpoch));
+}
+
+TEST_F(ResidentFinalizer, SuccessfulTerminalKeepsTheOriginalEmptyPayloadContract) {
+    EXPECT_EQ(finalize_and_publish(true).state, DeviceRunTerminalState::Succeeded);
+    EXPECT_EQ(region.payload_bytes, 0u);
+}

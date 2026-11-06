@@ -168,3 +168,6 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
     pto2::detail::defer_flush(ctx);
     return registered;
 }
+
+// args-aware qualified path; the legacy AsyncCtx overload above is unchanged.
+#include "sdma_qualified_kernel.h"

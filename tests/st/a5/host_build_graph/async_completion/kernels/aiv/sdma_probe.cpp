@@ -13,7 +13,7 @@
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     using namespace async_case;
-    auto *meta = data<uint64_t>(args[3]);
+    auto *meta = data<uint64_t>(args[0]);
     if (!await_at_least(meta, 1)) {
         add(meta + 32, 1);
         return;

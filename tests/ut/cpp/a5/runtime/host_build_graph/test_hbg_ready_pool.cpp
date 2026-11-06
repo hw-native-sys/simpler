@@ -726,6 +726,52 @@ TEST(SchedulerResolveTest, ZeroBudgetDoesNotStartAndFaninBudgetSurvivesWorkerHan
     EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
 }
 
+TEST(SchedulerResolveTest, InvalidPersistedPhaseCannotFallThroughToLink) {
+    ResolveFixture fixture(2);
+    auto cursor = scheduler_resolve_begin(7);
+    cursor.producer_ref = 7;
+    cursor.phase = static_cast<SchedulerResolvePhase>(7);
+    SchedulerWakeStats stats{};
+    uint32_t budget = 8;
+    EXPECT_EQ(
+        scheduler_resolve_step(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+        ),
+        SchedulerRouteResult::ERROR
+    );
+    EXPECT_EQ(cursor.phase, SchedulerResolvePhase::ERROR);
+    EXPECT_EQ(budget, 8u);
+    EXPECT_NE(scheduler_read_error(fixture.run), 0u);
+    EXPECT_EQ(stats.wake_register_count, 0u);
+    EXPECT_EQ(stats.wake_cas_retry_count, 0u);
+    for (int64_t ref = 0; ref < 2; ++ref)
+        EXPECT_EQ(scheduler_gm_load(fixture.control(ref)->wake_list_head), SCHEDULER_WAKE_LIST_OPEN);
+}
+
+TEST(SchedulerResolveTest, PersistedLinkRejectsInvalidTaskOrProducerBeforeAccess) {
+    for (bool invalid_task : {false, true}) {
+        ResolveFixture fixture(2);
+        auto cursor = scheduler_resolve_begin(invalid_task ? 2 : 1);
+        cursor.producer_ref = invalid_task ? 0 : 2;
+        cursor.phase = SchedulerResolvePhase::LINK;
+        SchedulerWakeStats stats{};
+        uint32_t budget = 1;
+        EXPECT_EQ(
+            scheduler_resolve_step(
+                fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &cursor, &budget, &stats
+            ),
+            SchedulerRouteResult::ERROR
+        );
+        EXPECT_EQ(cursor.phase, SchedulerResolvePhase::ERROR);
+        EXPECT_EQ(budget, 0u);
+        EXPECT_NE(scheduler_read_error(fixture.run), 0u);
+        EXPECT_EQ(stats.wake_register_count, 0u);
+        EXPECT_EQ(stats.wake_cas_retry_count, 0u);
+        for (int64_t ref = 0; ref < 2; ++ref)
+            EXPECT_EQ(scheduler_gm_load(fixture.control(ref)->wake_list_head), SCHEDULER_WAKE_LIST_OPEN);
+    }
+}
+
 struct ContendedResolveLink {
     static int64_t compare_exchange(volatile int64_t &head, int64_t expected, int64_t desired) {
         // Model a competing publisher between our load and CAS, then use the

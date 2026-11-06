@@ -870,6 +870,16 @@ inline __aicore__ SchedulerRouteResult scheduler_resolve_step(
 ) {
     SchedulerFaninView fanin{};
     bool fanin_loaded = false;
+    // A persisted/local cursor is not a task-state enum. In particular an
+    // invalid phase must not fall through to LINK and index an arbitrary node.
+    if (static_cast<uint8_t>(cursor->phase) > static_cast<uint8_t>(SchedulerResolvePhase::ERROR)) {
+        scheduler_record_error(
+            run_control, cursor->task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+            SchedulerErrorSite::ROUTE_INVALID_STATE
+        );
+        cursor->phase = SchedulerResolvePhase::ERROR;
+        return SchedulerRouteResult::ERROR;
+    }
     for (;;) {
         // These branches only inspect the caller-owned cursor, including when
         // another core has already detached and reused a successfully linked node.
@@ -957,6 +967,14 @@ inline __aicore__ SchedulerRouteResult scheduler_resolve_step(
             continue;
         }
 
+        if (!scheduler_task_ref_valid(graph, task_ref) || !scheduler_task_ref_valid(graph, cursor->producer_ref)) {
+            scheduler_record_error(
+                run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context,
+                SchedulerErrorSite::ROUTE_INVALID_STATE
+            );
+            cursor->phase = SchedulerResolvePhase::ERROR;
+            return SchedulerRouteResult::ERROR;
+        }
         auto *producer_control = scheduler_task_control_at(scheduler_state_base, context, cursor->producer_ref);
         const int64_t observed = scheduler_gm_query(producer_control->wake_list_head);
         bool closed = observed == SCHEDULER_WAKE_LIST_CLOSED;

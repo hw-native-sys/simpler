@@ -393,10 +393,13 @@ TEST(HbgAsyncExecution, PredicateSkipSealsAnEmptyGroupBeforeRelease) {
     auto *payload =
         scheduler_state_at<DispatchPayload>(fixture.base(), fixture.locals[0]->dispatch_payload_offset(0, slot));
     EXPECT_EQ(payload->function_bin_addr, 0u);
-    const auto writer = scheduler_async_runtime_detail::load(
+    SchedulerLocalStorage<SchedulerAsyncGroupWriter> writer_storage;
+    const auto &writer = writer_storage.get();
+    scheduler_async_runtime_detail::load_into(
         scheduler_async_runtime_detail::at<SchedulerAsyncGroupWriter>(
             fixture.async, fixture.async.layout.group_writer_offset
-        )
+        ),
+        &writer_storage.get()
     );
     EXPECT_EQ(writer.sealed, 1u);
     EXPECT_EQ(writer.count, 0u);

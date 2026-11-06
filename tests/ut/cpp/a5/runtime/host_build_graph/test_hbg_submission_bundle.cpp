@@ -42,6 +42,36 @@ SchedulerTaskMetadata task(uint32_t mask, uint32_t blocks = 1, bool sync = false
     return meta;
 }
 
+std::vector<SchedulerAsyncCapabilities> explicit_capabilities(const std::vector<SchedulerTaskMetadata> &metadata) {
+    std::vector<SchedulerAsyncCapabilities> caps(metadata.size());
+    for (size_t task = 0; task < metadata.size(); ++task)
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            const bool active = metadata[task].active_mask.has(static_cast<SubtaskSlot>(lane));
+            caps[task][lane] = {
+                CORE_ASYNC_CAPABILITY_VERSION, active ? CoreAsyncMode::DEFERRED : CoreAsyncMode::SYNCHRONOUS,
+                active ? 1u : 0u, active ? CORE_ASYNC_CONDITION_TYPES : 0u
+            };
+        }
+    return caps;
+}
+
+bool plan_bundles(
+    const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<SchedulerSubmissionWorkspaceInput> &workspaces,
+    const std::vector<SchedulerSubmissionExecutionUse> &uses, uint64_t epoch, uint64_t budget,
+    SchedulerSubmissionHostPlan *plan, std::string *error
+) {
+    std::vector<SchedulerSubmissionExecutionUseSet> sets;
+    for (size_t task = 0; task < metadata.size(); ++task)
+        for (uint32_t block = 0; block < metadata[task].logical_block_num; ++block)
+            for (uint32_t lane = 0; lane < 3; ++lane)
+                if (metadata[task].active_mask.has(static_cast<SubtaskSlot>(lane)))
+                    sets.push_back({static_cast<int64_t>(task), block, lane, 0, 1});
+    return scheduler_plan_submission_bundles(
+        metadata, explicit_capabilities(metadata), workspaces, uses, sets, epoch, budget, plan, error
+    );
+}
+
 struct WorkspaceInputs {
     alignas(128) std::array<std::array<uint8_t, 256>, 16> storage{};
     SchedulerSubmissionWorkspaceInput at(uint32_t index, uint32_t queues = 1) {
@@ -84,23 +114,14 @@ struct Fixture {
         image(nullptr, &std::free),
         cpu_image(nullptr, &std::free) {
         std::string error;
-        if (!scheduler_plan_submission_bundles(metadata, workspaces, uses, kEpoch, kBudget, &plan, &error))
-            throw std::runtime_error(error);
+        if (!plan_bundles(metadata, workspaces, uses, kEpoch, kBudget, &plan, &error)) throw std::runtime_error(error);
         image.reset(std::aligned_alloc(128, plan.image.size()));
         if (!image) throw std::bad_alloc();
         std::memcpy(image.get(), plan.image.data(), plan.image.size());
         EXPECT_TRUE(scheduler_submission_mount(
             static_cast<uint8_t *>(image.get()), plan.image.size(), kEpoch, metadata.size(), &view
         ));
-        std::vector<SchedulerAsyncCapabilities> caps(metadata.size());
-        for (size_t i = 0; i < metadata.size(); ++i)
-            for (uint32_t lane = 0; lane < 3; ++lane) {
-                const bool active = metadata[i].active_mask.has(static_cast<SubtaskSlot>(lane));
-                caps[i][lane] = {
-                    CORE_ASYNC_CAPABILITY_VERSION, active ? CoreAsyncMode::DEFERRED : CoreAsyncMode::SYNCHRONOUS,
-                    active ? 1u : 0u, active ? CORE_ASYNC_CONDITION_COUNTER : 0u
-                };
-            }
+        const auto caps = explicit_capabilities(metadata);
         if (!scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, {}, &cpu_plan, &error))
             throw std::runtime_error(error);
         cpu_image.reset(std::aligned_alloc(128, cpu_plan.image.size()));
@@ -148,7 +169,9 @@ struct Fixture {
     }
     template <typename T>
     T row(uint64_t offset, uint64_t index = 0) {
-        return scheduler_submission_detail::load(scheduler_submission_detail::at<T>(view, offset, index));
+        T result{};
+        scheduler_submission_detail::load_into(scheduler_submission_detail::at<T>(view, offset, index), &result);
+        return result;
     }
     uint64_t busy(uint64_t workspace = 0) {
         return scheduler_gm_fetch_add(
@@ -237,9 +260,7 @@ TEST(HbgSubmissionBundle, PhysicalQueueCapacityRejectsWholeOverlargeSyncCohortBe
             uses.push_back({0, block, 1, 0, 0});
         SchedulerSubmissionHostPlan plan;
         EXPECT_EQ(
-            scheduler_plan_submission_bundles(
-                {task(2, blocks, true)}, {workspace.at(0, queues)}, uses, kEpoch, kBudget, &plan, nullptr
-            ),
+            plan_bundles({task(2, blocks, true)}, {workspace.at(0, queues)}, uses, kEpoch, kBudget, &plan, nullptr),
             accepted
         );
         if (!accepted) EXPECT_TRUE(plan.image.empty());
@@ -250,7 +271,7 @@ TEST(HbgSubmissionBundle, WorkspaceAliasesNormalizeAndConflictingQueueOrScalarCl
     WorkspaceInputs workspace;
     const auto owner = workspace.at(0);
     SchedulerSubmissionHostPlan plan;
-    ASSERT_TRUE(scheduler_plan_submission_bundles(
+    ASSERT_TRUE(plan_bundles(
         {task(2)}, {owner, owner}, {{0, 0, 1, 0, 0}, {0, 0, 1, 1, 1}, {0, 0, 1, 0, 0}}, kEpoch, kBudget, &plan, nullptr
     ));
     EXPECT_EQ(plan.header.workspace_count, 1u);
@@ -258,10 +279,10 @@ TEST(HbgSubmissionBundle, WorkspaceAliasesNormalizeAndConflictingQueueOrScalarCl
     EXPECT_EQ(plan.workspace_remap[0], plan.workspace_remap[1]);
     auto conflicting = owner;
     conflicting.queue_num = 2;
-    EXPECT_FALSE(scheduler_plan_submission_bundles(
+    EXPECT_FALSE(plan_bundles(
         {task(2)}, {owner, conflicting}, {{0, 0, 1, 0, 0}, {0, 0, 1, 1, 1}}, kEpoch, kBudget, &plan, nullptr
     ));
-    EXPECT_FALSE(scheduler_plan_submission_bundles(
+    EXPECT_FALSE(plan_bundles(
         {task(2)}, {owner, workspace.at(1)}, {{0, 0, 1, 0, 0}, {0, 0, 1, 0, 1}}, kEpoch, kBudget, &plan, nullptr
     ));
     EXPECT_EQ(plan.header.grant_count, 1u);
@@ -274,17 +295,13 @@ TEST(HbgSubmissionBundle, UnknownOrUnimplementedSharedAuthorityCannotAllocateAPo
         auto input = workspace.at(0);
         input.qualification = authority;
         SchedulerSubmissionHostPlan plan;
-        EXPECT_FALSE(
-            scheduler_plan_submission_bundles({task(2)}, {input}, {{0, 0, 1, 0, 0}}, kEpoch, kBudget, &plan, nullptr)
-        );
+        EXPECT_FALSE(plan_bundles({task(2)}, {input}, {{0, 0, 1, 0, 0}}, kEpoch, kBudget, &plan, nullptr));
         EXPECT_TRUE(plan.image.empty());
     }
     auto input = workspace.at(0);
     --input.qualification_epoch;
     SchedulerSubmissionHostPlan plan;
-    EXPECT_FALSE(
-        scheduler_plan_submission_bundles({task(2)}, {input}, {{0, 0, 1, 0, 0}}, kEpoch, kBudget, &plan, nullptr)
-    );
+    EXPECT_FALSE(plan_bundles({task(2)}, {input}, {{0, 0, 1, 0, 0}}, kEpoch, kBudget, &plan, nullptr));
 }
 
 TEST(HbgSubmissionBundle, CpuCohortAndPinPrecedeAnyChannelReservationAndOnlySdmaLanesConsume) {

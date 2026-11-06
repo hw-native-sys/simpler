@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "scheduler/scheduler_submission_types.h"
+#include "async_plan.h"
 
 // Qualification comes from the retained workspace owner and the real run
 // admission boundary. UNKNOWN and unimplemented OWNER_SHARED are rejected.
@@ -38,6 +39,14 @@ struct SchedulerSubmissionExecutionUse {
     uint64_t workspace_input{SCHEDULER_ASYNC_INDEX_NONE};
 };
 
+struct SchedulerSubmissionExecutionUseSet {
+    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
+    uint32_t block_idx{0};
+    uint32_t subtask_slot{0};
+    uint64_t use_begin{SCHEDULER_ASYNC_INDEX_NONE};
+    uint64_t use_count{0};
+};
+
 struct SchedulerSubmissionHostPlan {
     SchedulerSubmissionHeader header{};
     std::vector<std::byte> image;
@@ -48,8 +57,9 @@ struct SchedulerSubmissionHostPlan {
 // reserve whole CPU-cohort demands in stable workspace-address order, and
 // serialize the private image. Failure leaves out unchanged.
 bool scheduler_plan_submission_bundles(
-    const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
     const std::vector<SchedulerSubmissionWorkspaceInput> &workspaces,
-    const std::vector<SchedulerSubmissionExecutionUse> &uses, uint64_t run_epoch, uint64_t byte_budget,
+    const std::vector<SchedulerSubmissionExecutionUse> &uses,
+    const std::vector<SchedulerSubmissionExecutionUseSet> &use_sets, uint64_t run_epoch, uint64_t byte_budget,
     SchedulerSubmissionHostPlan *out, std::string *error
 );

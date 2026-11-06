@@ -22,6 +22,7 @@
 #include "ready_pool_plan.h"
 #include "scheduler/scheduler_async_runtime.h"
 #include "async_completion_writer.h"
+#include "async_submission_context.h"
 
 namespace {
 constexpr uint64_t kEpoch = 37;
@@ -531,6 +532,109 @@ TEST(HbgAsyncRuntime, AbortObserverCannotPublishAGenericErrorBeforeTheOriginalCa
     EXPECT_EQ(scheduler_read_error(fixture.run), static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW));
 }
 
+struct SealPublicationProbe {
+    RuntimeFixture *fixture;
+    AsyncSubmissionEvidence *evidence;
+    bool accept;
+    bool *called;
+    bool after_seal(const SchedulerAsyncGroupIdentity &, const SchedulerAsyncGroupWriter &writer) {
+        *called = true;
+        EXPECT_EQ(writer.sealed, 1u);
+        EXPECT_EQ(writer.error_code, 0);
+        EXPECT_EQ(
+            scheduler_async_directory_load(
+                *fixture->at<SchedulerAsyncDirectoryWord>(fixture->async.check_directory_offset)
+            ),
+            0u
+        );
+        EXPECT_EQ(
+            scheduler_async_lease_phase(
+                scheduler_async_lease_load(*fixture->at<SchedulerAsyncLease>(fixture->async.group_lease_offset))
+            ),
+            SchedulerAsyncPhase::DORMANT
+        );
+        EXPECT_EQ(
+            scheduler_async_join_groups(
+                scheduler_async_join_load(*fixture->at<SchedulerAsyncTaskJoin>(fixture->async.finish_join_offset))
+            ),
+            0u
+        );
+        if (!accept) return false;
+        evidence->flags = ASYNC_SUBMISSION_FLAGS;
+        return true;
+    }
+};
+
+TEST(HbgAsyncRuntime, EarliestCheckClaimObservesTheAdditionalSealedFacts) {
+    RuntimeFixture fixture;
+    fixture.bind(0);
+    fixture.condition();
+    AsyncSubmissionEvidence evidence{};
+    bool called = false;
+    std::atomic<bool> observing{false};
+    uint32_t observed_flags = 0;
+    bool claimed = false;
+    auto &lease = *fixture.at<SchedulerAsyncLease>(fixture.async.group_lease_offset);
+    auto &directory = *fixture.at<SchedulerAsyncDirectoryWord>(fixture.async.check_directory_offset);
+    std::thread peer([&] {
+        observing.store(true, std::memory_order_release);
+        while (scheduler_async_directory_load(directory) == 0 && scheduler_read_error(fixture.run) == 0) {}
+        if (scheduler_read_error(fixture.run) != 0) return;
+        const auto claim = scheduler_async_lease_try_claim(lease, scheduler_async_lease_load(lease));
+        claimed = claim.result == SchedulerAsyncLeaseResult::SUCCESS;
+        if (claimed) {
+            observed_flags = evidence.flags;
+            EXPECT_EQ(
+                scheduler_async_lease_handoff(lease, claim.word, SchedulerAsyncPhase::RUNNABLE).result,
+                SchedulerAsyncLeaseResult::SUCCESS
+            );
+        }
+    });
+    while (!observing.load(std::memory_order_acquire)) {}
+    bool registered = false;
+    const bool sealed = scheduler_async_runtime_seal(
+        fixture.views[0], fixture.graph, &fixture.locals[0], fixture.run, 0, 0, 0, &fixture.payload(0, 0),
+        fixture.backend, &registered, SealPublicationProbe{&fixture, &evidence, true, &called}
+    );
+    peer.join();
+    EXPECT_TRUE(sealed);
+    EXPECT_TRUE(registered);
+    EXPECT_TRUE(called);
+    EXPECT_TRUE(claimed);
+    EXPECT_EQ(observed_flags, ASYNC_SUBMISSION_FLAGS);
+}
+
+TEST(HbgAsyncRuntime, FailedAdditionalSealPublicationCannotPublishCheckOrAddASuccessfulJoin) {
+    RuntimeFixture fixture;
+    fixture.bind(0);
+    fixture.condition();
+    AsyncSubmissionEvidence evidence{};
+    bool called = false, registered = true;
+    EXPECT_FALSE(scheduler_async_runtime_seal(
+        fixture.views[0], fixture.graph, &fixture.locals[0], fixture.run, 0, 0, 0, &fixture.payload(0, 0),
+        fixture.backend, &registered, SealPublicationProbe{&fixture, &evidence, false, &called}
+    ));
+    EXPECT_TRUE(called);
+    EXPECT_FALSE(registered);
+    EXPECT_EQ(evidence.flags, ASYNC_SUBMISSION_METADATA_PUBLISHED);
+    EXPECT_EQ(
+        scheduler_async_directory_load(*fixture.at<SchedulerAsyncDirectoryWord>(fixture.async.check_directory_offset)),
+        0u
+    );
+    EXPECT_EQ(
+        scheduler_async_lease_phase(
+            scheduler_async_lease_load(*fixture.at<SchedulerAsyncLease>(fixture.async.group_lease_offset))
+        ),
+        SchedulerAsyncPhase::FAILED
+    );
+    EXPECT_NE(
+        scheduler_async_join_load(*fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset)) &
+            SCHEDULER_ASYNC_JOIN_FAILED,
+        0u
+    );
+    EXPECT_EQ(fixture.completed(), 0u);
+}
+
 TEST(HbgAsyncRuntime, BackendFailureKeepsFailedRecordAndNeverMakesTaskDone) {
     RuntimeFixture fixture;
     fixture.bind(0);
@@ -539,8 +643,10 @@ TEST(HbgAsyncRuntime, BackendFailureKeepsFailedRecordAndNeverMakesTaskDone) {
     ASSERT_TRUE(fixture.release(0, 0));
     fixture.backend.failed[0] = true;
     EXPECT_EQ(fixture.service(3), SchedulerAsyncRuntimeServiceResult::ERROR);
-    const auto progress = scheduler_async_runtime_detail::load(
-        fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset)
+    SchedulerLocalStorage<SchedulerAsyncGroupProgress> progress_storage;
+    const auto &progress = progress_storage.get();
+    scheduler_async_runtime_detail::load_into(
+        fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset), &progress_storage.get()
     );
     EXPECT_EQ(progress.failure_code, -913);
     EXPECT_EQ(
@@ -587,8 +693,10 @@ TEST(HbgAsyncRuntime, TwoAuthorizedBlockReleasesActivateOneFinishAndCompetingSer
     service_b.join();
     EXPECT_EQ(fixture.completed(), 1u);
     EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
-    const auto progress = scheduler_async_runtime_detail::load(
-        fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset)
+    SchedulerLocalStorage<SchedulerAsyncFinishProgress> progress_storage;
+    const auto &progress = progress_storage.get();
+    scheduler_async_runtime_detail::load_into(
+        fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset), &progress_storage.get()
     );
     EXPECT_EQ(progress.phase, static_cast<uint64_t>(SchedulerAsyncFinishPhase::CONTRIBUTED));
 }

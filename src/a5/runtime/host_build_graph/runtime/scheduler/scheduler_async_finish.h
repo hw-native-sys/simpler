@@ -313,6 +313,9 @@ inline __aicore__ SchedulerAsyncFinishResult scheduler_async_finish_step_impl(
         if (current_phase == SchedulerAsyncFinishPhase::DRAINED) return SchedulerAsyncFinishResult::DONE;
         if (*budget == 0) return SchedulerAsyncFinishResult::PENDING;
         if (current_phase == SchedulerAsyncFinishPhase::RESOLVE) {
+            if (!scheduler_task_ref_valid(graph, progress->current_waiter) ||
+                progress->resolve.task_ref != progress->current_waiter)
+                return fail(graph, local, run, identity.task_ref, *progress, SchedulerErrorSite::ROUTE_INVALID_STATE);
             const auto result =
                 scheduler_resolve_step<Link>(graph, base, local, run, &progress->resolve, budget, wake_stats);
             if (result == SchedulerRouteResult::ERROR) {
@@ -322,9 +325,13 @@ inline __aicore__ SchedulerAsyncFinishResult scheduler_async_finish_step_impl(
             if (result == SchedulerRouteResult::YIELD) return SchedulerAsyncFinishResult::PENDING;
             if (result == SchedulerRouteResult::READY_TO_ENQUEUE) {
                 phase(*progress, SchedulerAsyncFinishPhase::ENQUEUE);
-            } else {
+            } else if (result == SchedulerRouteResult::WAITING || result == SchedulerRouteResult::COMPLETED) {
                 progress->current_waiter = progress->detached_next;
                 phase(*progress, SchedulerAsyncFinishPhase::SELECT);
+            } else {
+                // Only an explicit transfer/already-completed result releases
+                // this successor. Unknown results cannot silently drain FINISH.
+                return fail(graph, local, run, identity.task_ref, *progress, SchedulerErrorSite::ROUTE_INVALID_STATE);
             }
             continue;
         }

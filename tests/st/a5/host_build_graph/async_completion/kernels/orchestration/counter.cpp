@@ -52,7 +52,7 @@ void declare_payload_consumer(TaskId task) {
     // The shared argument signature includes payload even for actions that do
     // not read it. Its lines are clean at entry; publishers flush payload before
     // signalling, and consumers write results into a separate tensor.
-    if (!rt_declare_async_consumer(task, 1, kCleanLines))
+    if (!rt_declare_async_consumer(task, 1, kCleanLines) || !rt_declare_async_core_only(task))
         throw std::runtime_error("async fixture payload declaration failed");
 }
 
@@ -155,7 +155,7 @@ void graph_body(const GraphTaskArgs &args, const BodyConfig &config) {
     // Forward parameter handles: reading an instance's values while recording would
     // freeze them into the shared Graph definition and invalidate this isolation test.
     waiter.add_scalar(args.scalar(1), p.conditions, p.expected, args.scalar(0), p.tail_ms);
-    const TaskId waited = rt_submit_aiv_task(1, waiter).task_id();
+    const TaskId waited = rt_submit_aiv_task(9, waiter).task_id();
     declare_waiter(waited);
     action(args, p, Action::CONSUME, args.scalar(0), args.scalar(1), 1, args.scalar(2), 0, {waited});
 }
@@ -173,11 +173,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                  args.scalar<int64_t>(12), args.scalar<int64_t>(13)};
     for (int64_t instance = 0; instance < p.instances; ++instance) {
         if (static_cast<Scenario>(p.scenario) == Scenario::GRAPH) {
+            if (p.conditions > async_case::kConditionLimit)
+                throw std::runtime_error("Graph fixture registration marker requires at most 64 business conditions");
             GraphTaskArgs graph;
             for (int32_t i = 0; i < 5; ++i)
                 graph.add_no_dep(args.tensor(i).ref());
             const int64_t max_waiters = p.slots / (p.instances * p.blocks * 3);
             const int64_t base = instance * max_waiters * p.blocks * 3;
+            const int64_t execution = base + 1;
             graph.add_scalar(instance, base, p.slots + instance * max_waiters);
             const auto invocation = rt_submit_graph(&graph_body, graph, BodyConfig{p});
             // A second consumer outside EXIT validates transitive completion and separate invocation bindings.
@@ -187,9 +190,24 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             );
             // Keep the publisher outside the Graph. Otherwise its own compute
             // completion could hold EXIT even if the async child retired early.
+            // Registration gates release their compute slot while the Graph
+            // waiter is pending; they do not wait for the waiter's TaskDone.
+            const uint32_t signal_shape[2]{1, 1};
+            const uint32_t signal_offset[2]{
+                static_cast<uint32_t>(execution * async_case::kConditionsPerExecution + async_case::kConditionLimit), 0
+            };
+            const auto registration_signal = args.tensor(0).ref().view(signal_shape, signal_offset);
+            CoreTaskArgs gate;
+            gate.add_no_dep(registration_signal);
+            gate.add_no_dep(args.tensor(2).ref());
+            gate.add_scalar(execution);
+            const TaskId registered = rt_submit_aiv_task(10, gate).task_id();
+            if (!rt_declare_async_counter(registered, 0, async_case::kSignalStride * sizeof(int32_t), kCleanLines) ||
+                !rt_declare_async_core_only(registered))
+                throw std::runtime_error("async fixture registration gate declaration failed");
             action(
                 args, p, Action::PUBLISH, instance, base, 1, p.slots + max_waiters * p.instances + instance,
-                rt_available_aiv_count(), {}, p.delay_ms
+                rt_available_aiv_count(), {registered}, p.delay_ms
             );
         } else {
             body_tasks(args, p, instance);

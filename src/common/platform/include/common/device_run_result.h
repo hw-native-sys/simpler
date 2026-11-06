@@ -32,12 +32,13 @@
  *
  * Each live call retains its original region through observation. A slot keeps
  * an idle allocation for sequential reuse; reuse of its execution resources
- * while an old call remains live requires another region. The platform interprets the header —
- * verdict, code and code source are a common vocabulary — but never the
- * payload, which is opaque diagnostic bytes whose layout the runtime picks
- * (`tensormap_and_ringbuffer` publishes the error tail of its
- * `SharedMemoryHeader`; `host_build_graph` keeps no such shared state and
- * publishes none). Late host reads follow the call's owner, independently of
+ * while an old call remains live requires another region. The common reader
+ * interprets the header's verdict, code and code source. Payload layout belongs
+ * to the runtime: `tensormap_and_ringbuffer` publishes its shared-header error
+ * tail; A5 resident `host_build_graph` publishes versioned core-retirement
+ * evidence on failure. Only the corresponding runtime-specific adapters
+ * interpret those bytes. Retirement evidence remains subject to the backend's
+ * last-use contract. Late host reads follow the call's owner, independently of
  * which run currently occupies its execution slot.
  *
  * **`published` carries the run's epoch, not a constant.** Staleness is then

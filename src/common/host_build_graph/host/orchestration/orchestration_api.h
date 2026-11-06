@@ -219,11 +219,31 @@ static inline bool rt_declare_async_consumer(TaskId task, uint32_t payload_arg, 
     );
 }
 
+// Author/compiler assertion over every lane and branch of this task: accesses
+// use only pipelines retired with the AICore. No independent SDMA/URMA/RDMA/CCU
+// submission, including legacy backend entry points, is permitted. COUNTER
+// registration alone never implies this property.
+static inline bool rt_declare_async_core_only(TaskId task) {
+    return rt_declare_async_use(task, {AsyncUseDeclarationKind::CORE_PIPELINES_ONLY});
+}
+
 static inline bool rt_declare_async_sdma_transfer(
     TaskId task, uint32_t source_arg, uint32_t destination_arg, uint32_t comm_context_scalar
 ) {
     return rt_declare_async_use(
         task, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, destination_arg, source_arg, comm_context_scalar, 0}
+    );
+}
+
+// TGET uses the same byte offset in the local and selected peer input windows.
+// The peer is an actual invocation scalar, including inherited Graph scalars.
+static inline bool rt_declare_async_sdma_get(
+    TaskId task, uint32_t local_source_arg, uint32_t destination_arg, uint32_t comm_context_scalar,
+    uint32_t source_peer_scalar, AsyncUseCacheContract cache_contract
+) {
+    return rt_declare_async_use(
+        task, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, destination_arg, local_source_arg,
+               comm_context_scalar, 0, cache_contract, source_peer_scalar}
     );
 }
 

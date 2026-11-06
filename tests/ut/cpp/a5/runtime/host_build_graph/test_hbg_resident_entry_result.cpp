@@ -24,6 +24,7 @@
 #include "aicpu/pmu_collector_aicpu.h"
 #include "common/args_dump.h"
 #include "common/native_invocation_evidence.h"
+#include "async_transport_result.h"
 
 namespace {
 
@@ -37,6 +38,7 @@ struct SchedulerImage {
     SchedulerGraphSummary summary{};
     std::array<AicpuThreadLifecycleTrace, kParticipants> traces{};
     SchedulerTaskMetadata metadata{};
+    alignas(128) SchedulerAsyncLayout async_layout{};
 };
 
 struct RegisterTransport {
@@ -166,6 +168,7 @@ protected:
         header.sched_error_code.store(SIMPLER_ERROR_NONE);
         result_storage = {};
         private_result = true;
+        expect_transport_normalized = false;
         runtime->set_worker_count(kParticipants);
         runtime->set_gm_sm_ptr(&header);
         runtime->dev.aicpu_thread_num = kParticipants;
@@ -180,6 +183,8 @@ protected:
             context.aicpu_lifecycle_traces_offset = offsetof(SchedulerImage, traces);
             context.task_metadata_offset = offsetof(SchedulerImage, metadata);
             context.graph_task_count = 1;
+            context.scheduler_state_bytes = sizeof(SchedulerImage);
+            context.runtime_worker_count = kParticipants;
             auto &report = runtime->dev.workers[i];
             report.physical_core_id = i;
             report.core_type = i == 0 ? CoreType::AIC : CoreType::AIV;
@@ -191,6 +196,7 @@ protected:
         image->control.resolved_task_count = 1;
         image->control.aic_worker_demand = 1;
         image->control.aiv_worker_demand = 2;
+        image->summary.run_epoch = kEpoch;
         image->summary.worker_count = kParticipants;
         image->summary.cluster_count = 1;
         image->metadata.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX;
@@ -206,7 +212,20 @@ protected:
         set_platform_run_result(reinterpret_cast<uint64_t>(&result), kEpoch);
     }
 
+    void enable_async_transport() {
+        image->summary.async_layout_offset = offsetof(SchedulerImage, async_layout);
+        image->async_layout.run_epoch = kEpoch;
+        image->async_layout.total_bytes = sizeof(SchedulerAsyncLayout);
+        image->async_layout.task_count = 1;
+        image->async_layout.group_count = 1;
+        image->async_layout.finish_count = 1;
+    }
+
     std::array<int32_t, kParticipants> execute() {
+        const uint64_t result_base = private_result ? reinterpret_cast<uint64_t>(&result_storage) : 0;
+        const uint64_t result_epoch = private_result ? kEpoch : 0;
+        const bool async_transport = aicpu_async_transport_enabled(runtime.get(), result_epoch);
+        std::array<int32_t, kParticipants> transport_statuses{};
         std::array<int32_t, kParticipants> statuses{};
         std::array<int32_t, kParticipants> native_statuses{};
         EXPECT_EQ(
@@ -225,6 +244,8 @@ protected:
                 // Keep the runtime's own status assertions and additionally
                 // exercise the production owner that publishes after teardown.
                 native_statuses[i] = aicpu_finish_native_invocation(i, statuses[i]);
+                transport_statuses[i] =
+                    a5_async_transport_result(async_transport, result_base, result_epoch, native_statuses[i]);
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     state->returned[i] = true;
@@ -256,6 +277,8 @@ protected:
         }
         EXPECT_EQ(failed_callbacks, expected_error != 0 ? 1 : 0);
         if (state->held_participant >= 0) EXPECT_EQ(native_statuses[state->held_participant], expected_error);
+        for (int32_t i = 0; i < kParticipants; ++i)
+            EXPECT_EQ(transport_statuses[i], expect_transport_normalized ? 0 : native_statuses[i]);
         return statuses;
     }
 
@@ -277,7 +300,84 @@ protected:
     NativeInvocationResultStorage result_storage{};
     DeviceRunResultRegion &result{result_storage.result};
     bool private_result{true};
+    bool expect_transport_normalized{false};
 };
+
+TEST_F(ResidentEntryResult, PublishedAsyncHeaderFailuresKeepSemanticStatusAndUseSuccessfulTransport) {
+    for (const int32_t code :
+         {SIMPLER_ERROR_SCHEDULER_TIMEOUT, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW,
+          SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED}) {
+        for (int32_t last = 0; last < kParticipants; ++last) {
+            SCOPED_TRACE(code);
+            SCOPED_TRACE(last);
+            configure(SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
+            enable_async_transport();
+            ASSERT_TRUE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+            state->held_participant = last;
+            header.sched_error_code.store(code);
+            expect_transport_normalized = true;
+            EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{-code, -code, -code}));
+            expect_normal_lifecycle();
+            EXPECT_TRUE(state->saw_held_owner);
+            EXPECT_TRUE(hbg_async_cores_retired(result.payload, result.payload_bytes, kEpoch));
+            EXPECT_EQ(device_run_result_terminal(result, kEpoch).source, DeviceRunCodeSource::Header);
+        }
+    }
+}
+
+TEST_F(ResidentEntryResult, AsyncTransportStillRefusesUnretiredUnknownAndMissingPrivateResult) {
+    enable_async_transport();
+    state->failed_participant = 0;
+    header.sched_error_code.store(SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{-102, -102, -102}));
+    EXPECT_FALSE(hbg_async_cores_retired(result.payload, result.payload_bytes, kEpoch));
+
+    configure(SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
+    enable_async_transport();
+    header.sched_error_code.store(999);
+    EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{-999, -999, -999}));
+
+    configure(SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
+    enable_async_transport();
+    private_result = false;
+    header.sched_error_code.store(SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{-102, -102, -102}));
+    EXPECT_EQ(result.published, 0u);
+}
+
+TEST_F(ResidentEntryResult, AsyncQualificationUsesOnlyThisInvocationsBoundedHostImage) {
+    EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+    enable_async_transport();
+    ASSERT_TRUE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+    EXPECT_FALSE(aicpu_async_transport_enabled(nullptr, kEpoch));
+    EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), 0));
+    EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), kEpoch + 1));
+    const auto saved_summary = image->summary;
+    const auto saved_layout = image->async_layout;
+    auto &context = image->contexts[0];
+    const uint64_t saved_bytes = context.scheduler_state_bytes;
+    context.scheduler_state_bytes = offsetof(SchedulerImage, async_layout) + sizeof(SchedulerAsyncLayout) - 1;
+    EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+    context.scheduler_state_bytes = saved_bytes;
+    image->summary.async_layout_offset += 8;
+    EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+    image->summary = saved_summary;
+    ++image->summary.run_epoch;
+    EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+    image->summary = saved_summary;
+    for (int field = 0; field < 5; ++field) {
+        image->async_layout = saved_layout;
+        if (field == 0) ++image->async_layout.version;
+        if (field == 1) ++image->async_layout.run_epoch;
+        if (field == 2) image->async_layout.group_count = 0;
+        if (field == 3) image->async_layout.total_bytes = UINT64_MAX;
+        if (field == 4) ++image->async_layout.task_count;
+        EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+    }
+    image->async_layout = saved_layout;
+    runtime->dev.scheduler_bootstrap.runtime_mode = SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH;
+    EXPECT_FALSE(aicpu_async_transport_enabled(runtime.get(), kEpoch));
+}
 
 TEST_F(ResidentEntryResult, BothResidentModesReturnSuccessThroughTheMixedTopologyLifecycle) {
     for (uint32_t mode : {SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, SCHEDULER_RUNTIME_MODE_RESIDENT_READY}) {
@@ -402,4 +502,75 @@ TEST(HbgResidentEntryInitialization, ClearsCoordinationBeforeRuntimeInitializati
     EXPECT_EQ(executor.shutdown_signaled_.load(), 0);
     EXPECT_EQ(executor.run_status_.load(), 0);
     EXPECT_EQ(executor.normal_path_claims_.load(), 0);
+}
+
+TEST(HbgAsyncTransportResult, NativeFinalOwnerPublicationDoesNotAuthorizeOtherErrorsOrMalformedEvidence) {
+    enum class Case {
+        VALID,
+        NOT_ASYNC,
+        NO_RESULT,
+        ZERO_EPOCH,
+        STALE_EPOCH,
+        UNPUBLISHED,
+        CODE_MISMATCH,
+        THREAD_SOURCE,
+        SHUTDOWN_SOURCE,
+        UNKNOWN_CODE,
+        SDK_CODE,
+        NO_RETIREMENT,
+        BAD_MAGIC,
+        BAD_VERSION,
+        OLD_PAYLOAD_EPOCH,
+        BAD_FLAGS,
+        SHORT_PAYLOAD,
+        LONG_PAYLOAD
+    };
+    for (Case test :
+         {Case::VALID, Case::NOT_ASYNC, Case::NO_RESULT, Case::ZERO_EPOCH, Case::STALE_EPOCH, Case::UNPUBLISHED,
+          Case::CODE_MISMATCH, Case::THREAD_SOURCE, Case::SHUTDOWN_SOURCE, Case::UNKNOWN_CODE, Case::SDK_CODE,
+          Case::NO_RETIREMENT, Case::BAD_MAGIC, Case::BAD_VERSION, Case::OLD_PAYLOAD_EPOCH, Case::BAD_FLAGS,
+          Case::SHORT_PAYLOAD, Case::LONG_PAYLOAD}) {
+        SCOPED_TRACE(static_cast<int>(test));
+        NativeInvocationResultStorage storage{};
+        const uint64_t base = test == Case::NO_RESULT ? 0 : reinterpret_cast<uint64_t>(&storage);
+        const uint64_t epoch = base == 0 ? 0 : kEpoch;
+        ASSERT_EQ(aicpu_begin_native_invocation(2, base, epoch), 0);
+        HbgAsyncRetirementPayload retirement{
+            HBG_ASYNC_RETIREMENT_MAGIC, kEpoch, HBG_ASYNC_RETIREMENT_VERSION, HBG_ASYNC_CORES_RETIRED
+        };
+        if (test == Case::NO_RETIREMENT) retirement.flags = 0;
+        if (test == Case::BAD_MAGIC) retirement.magic = 0;
+        if (test == Case::BAD_VERSION) ++retirement.version;
+        if (test == Case::OLD_PAYLOAD_EPOCH) --retirement.run_epoch;
+        if (test == Case::BAD_FLAGS) retirement.flags |= 2;
+        int32_t code = -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+        if (test == Case::UNKNOWN_CODE) code = -999;
+        if (test == Case::SDK_CODE) code = 507018;
+        const auto source = test == Case::THREAD_SOURCE   ? DeviceRunCodeSource::ThreadRc :
+                            test == Case::SHUTDOWN_SOURCE ? DeviceRunCodeSource::ShutdownRc :
+                                                            DeviceRunCodeSource::Header;
+        ASSERT_TRUE(
+            aicpu_accept_runtime_terminal({DeviceRunVerdict::Error, code, source}, &retirement, sizeof(retirement))
+        );
+        ASSERT_EQ(aicpu_finish_native_invocation(0, code), 0);
+        EXPECT_EQ(storage.result.published, 0u);
+        // A non-final callback must not inspect an untrusted/unpublished address.
+        EXPECT_EQ(a5_async_transport_result(true, 1, epoch, 0), 0);
+        const int32_t raw = aicpu_finish_native_invocation(1, code);
+        ASSERT_EQ(raw, code);
+        if (test == Case::UNPUBLISHED) storage.result.published = 0;
+        if (test == Case::CODE_MISMATCH) storage.result.completion_code = -SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+        if (test == Case::SHORT_PAYLOAD) --storage.result.payload_bytes;
+        if (test == Case::LONG_PAYLOAD) ++storage.result.payload_bytes;
+        const uint64_t observed_epoch = test == Case::ZERO_EPOCH ? 0 : test == Case::STALE_EPOCH ? epoch + 1 : epoch;
+        EXPECT_EQ(
+            a5_async_transport_result(test != Case::NOT_ASYNC, base, observed_epoch, raw), test == Case::VALID ? 0 : raw
+        );
+        if (test == Case::VALID) {
+            const auto terminal = device_run_result_terminal(storage.result, kEpoch);
+            EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+            EXPECT_EQ(terminal.code, -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+        }
+    }
+    set_platform_run_result(0, 0);
 }

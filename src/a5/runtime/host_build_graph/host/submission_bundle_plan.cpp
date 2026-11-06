@@ -10,6 +10,7 @@
  */
 
 #include "submission_bundle_plan.h"
+#include "async_submission_context.h"
 
 #include <algorithm>
 #include <cstring>
@@ -48,12 +49,13 @@ uint32_t lane_mask(LaneMask mask) {
 }
 
 bool build(
-    const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
     const std::vector<SchedulerSubmissionWorkspaceInput> &workspace_inputs,
-    const std::vector<SchedulerSubmissionExecutionUse> &uses, uint64_t epoch, uint64_t budget,
+    const std::vector<SchedulerSubmissionExecutionUse> &uses,
+    const std::vector<SchedulerSubmissionExecutionUseSet> &use_sets, uint64_t epoch, uint64_t budget,
     SchedulerSubmissionHostPlan *out, std::string *error
 ) {
-    if (out == nullptr || epoch == 0 || metadata.size() > INT32_MAX)
+    if (out == nullptr || epoch == 0 || metadata.size() > INT32_MAX || capabilities.size() != metadata.size())
         return fail(error, "submission plan requires a live epoch and bounded task references");
     SchedulerSubmissionHostPlan next;
     auto &header = next.header;
@@ -68,6 +70,24 @@ bool build(
 
     using ExecutionKey = std::tuple<int64_t, uint32_t, uint32_t>;
     using ContextKey = std::tuple<int64_t, uint32_t, uint32_t, uint32_t>;
+    std::map<ExecutionKey, SchedulerSubmissionExecutionUseMap> allowed_sets;
+    for (const auto &set : use_sets) {
+        if (set.task_ref < 0 || static_cast<uint64_t>(set.task_ref) >= metadata.size() || set.subtask_slot >= 3 ||
+            !metadata[set.task_ref].active_mask.has(static_cast<SubtaskSlot>(set.subtask_slot)) ||
+            set.block_idx >= metadata[set.task_ref].logical_block_num ||
+            !scheduler_task_is_executable(metadata[set.task_ref].flags) ||
+            scheduler_task_is_inline(metadata[set.task_ref].flags) || set.use_count > UINT32_MAX ||
+            (set.use_count == 0 ?
+                 set.use_begin != SCHEDULER_ASYNC_INDEX_NONE :
+                 (set.use_begin == SCHEDULER_ASYNC_INDEX_NONE || set.use_count > UINT64_MAX - set.use_begin)) ||
+            !allowed_sets
+                 .emplace(
+                     ExecutionKey{set.task_ref, set.block_idx, set.subtask_slot},
+                     SchedulerSubmissionExecutionUseMap{set.use_begin, set.use_count}
+                 )
+                 .second)
+            return fail(error, "submission allowed-use map must uniquely name real executions and bounded ranges");
+    }
     std::map<uint64_t, SchedulerSubmissionWorkspace> canonical;
     std::map<ContextKey, uint64_t> contexts;
     std::map<ExecutionKey, std::set<uint64_t>> execution_workspaces;
@@ -134,6 +154,7 @@ bool build(
         next.workspace_remap[input] = workspace_indices.at(workspace_inputs[input].address);
     std::vector<SchedulerSubmissionTaskMap> task_maps(metadata.size());
     std::vector<SchedulerSubmissionExecution> executions;
+    std::vector<SchedulerSubmissionExecutionUseMap> execution_use_maps;
     std::vector<SchedulerSubmissionBundleIdentity> bundles;
     for (size_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
@@ -173,6 +194,16 @@ bool build(
                 execution.bundle_index = map.bundle_base + (sync ? 0 : block);
                 execution.block_idx = block;
                 execution.subtask_slot = lane;
+                const auto &capability = capabilities[task][lane];
+                if (!core_async_capability_valid(capability) || capability.mode == CoreAsyncMode::UNKNOWN)
+                    return fail(error, "submission execution requires an explicit registered callable capability");
+                execution.completion_mode = capability.mode;
+                execution.condition_capacity = capability.max_conditions;
+                execution.condition_types = capability.condition_types;
+                const auto allowed = allowed_sets.find({static_cast<int64_t>(task), block, lane});
+                if (allowed == allowed_sets.end())
+                    return fail(error, "submission execution is missing its immutable allowed-use map");
+                execution_use_maps.push_back(allowed->second);
                 executions.push_back(execution);
             }
     }
@@ -211,6 +242,17 @@ bool build(
     for (size_t i = 0; i < executions.size(); ++i) {
         executions[i].grant_index_begin = grant_indices.size();
         executions[i].grant_count = execution_grants[i].size();
+        auto &execution = executions[i];
+        execution.provenance_begin = header.provenance_count;
+        if (execution.grant_count != 0 && execution.completion_mode == CoreAsyncMode::DEFERRED) {
+            if ((execution.condition_types & CORE_ASYNC_CONDITION_SDMA_POST_DONE) == 0)
+                return fail(error, "deferred SDMA submit lane has no registered SDMA completion capability");
+            execution.provenance_capacity = execution.condition_capacity;
+            if (!scheduler_layout_checked_add(
+                    header.provenance_count, execution.provenance_capacity, &header.provenance_count
+                ))
+                return fail(error, "submission provenance count overflows");
+        }
         grant_indices.insert(grant_indices.end(), execution_grants[i].begin(), execution_grants[i].end());
     }
     header.workspace_count = workspaces.size();
@@ -232,6 +274,11 @@ bool build(
         !reserve(header.grant_count, sizeof(SchedulerSubmissionGrant), cursor, header.grants_offset) ||
         !reserve(header.grant_count, sizeof(SchedulerSubmissionReleaseState), cursor, header.release_states_offset) ||
         !reserve(header.grant_count, sizeof(uint64_t), cursor, header.execution_grant_indices_offset) ||
+        !reserve(header.execution_count, sizeof(AsyncSubmissionContext), cursor, header.contexts_offset) ||
+        !reserve(header.provenance_count, sizeof(SchedulerSubmissionProvenance), cursor, header.provenance_offset) ||
+        !reserve(
+            header.execution_count, sizeof(SchedulerSubmissionExecutionUseMap), cursor, header.execution_use_maps_offset
+        ) ||
         !scheduler_layout_checked_align(cursor, 128, &header.total_bytes) || header.total_bytes > budget ||
         header.total_bytes > std::numeric_limits<size_t>::max())
         return fail(error, "submission image exceeds its byte budget or addressable storage");
@@ -244,6 +291,14 @@ bool build(
     write_rows(next.image, header.requests_offset, requests);
     write_rows(next.image, header.grants_offset, grants);
     write_rows(next.image, header.execution_grant_indices_offset, grant_indices);
+    write_rows(next.image, header.execution_use_maps_offset, execution_use_maps);
+    for (uint64_t index = 0; index < header.execution_count; ++index)
+        write(next.image, header.contexts_offset + index * sizeof(AsyncSubmissionContext), AsyncSubmissionContext{});
+    for (uint64_t index = 0; index < header.provenance_count; ++index)
+        write(
+            next.image, header.provenance_offset + index * sizeof(SchedulerSubmissionProvenance),
+            SchedulerSubmissionProvenance{}
+        );
     for (uint64_t index = 0; index < header.bundle_count; ++index) {
         const uint64_t lease = scheduler_async_lease_word(1, SchedulerAsyncPhase::RUNNABLE);
         write(next.image, header.bundle_leases_offset + index * sizeof(SchedulerAsyncLease), lease);
@@ -258,13 +313,14 @@ bool build(
 }  // namespace
 
 bool scheduler_plan_submission_bundles(
-    const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
     const std::vector<SchedulerSubmissionWorkspaceInput> &workspaces,
-    const std::vector<SchedulerSubmissionExecutionUse> &uses, uint64_t run_epoch, uint64_t byte_budget,
+    const std::vector<SchedulerSubmissionExecutionUse> &uses,
+    const std::vector<SchedulerSubmissionExecutionUseSet> &use_sets, uint64_t run_epoch, uint64_t byte_budget,
     SchedulerSubmissionHostPlan *out, std::string *error
 ) {
     try {
-        return build(metadata, workspaces, uses, run_epoch, byte_budget, out, error);
+        return build(metadata, capabilities, workspaces, uses, use_sets, run_epoch, byte_budget, out, error);
     } catch (const std::bad_alloc &) {
         return fail(error, "cannot allocate the submission bundle plan");
     } catch (const std::length_error &) {
