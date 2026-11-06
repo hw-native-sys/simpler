@@ -177,7 +177,7 @@ inline __aicore__ bool scheduler_async_execution_returned(
         scheduler_state_at<DispatchPayload>(base, local->dispatch_payload_offset(local->config.self_lane, slot_index));
     bool registered = false;
     if (!scheduler_async_runtime_seal(
-            state->view, graph, local, run, slot.task_ref, slot.block_idx, slot.subtask_slot, payload, backend,
+            state->view, graph, base, local, run, slot.task_ref, slot.block_idx, slot.subtask_slot, payload, backend,
             &registered, publication
         ))
         return false;

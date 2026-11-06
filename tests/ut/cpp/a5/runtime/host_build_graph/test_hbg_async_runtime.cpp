@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -22,6 +23,7 @@
 #include "ready_pool_plan.h"
 #include "scheduler_protocol_export.h"
 #include "scheduler/scheduler_async_runtime.h"
+#include "scheduler/scheduler_async_execution.h"
 #include "scheduler/scheduler_protocol_execution.h"
 #include "async_completion_writer.h"
 #include "async_submission_context.h"
@@ -234,7 +236,8 @@ struct RuntimeFixture {
     bool seal(uint32_t worker, uint32_t block = 0, uint32_t lane = 0, bool *registered_out = nullptr) {
         bool registered = false;
         const bool ok = scheduler_async_runtime_seal(
-            views[worker], graph, &locals[worker], run, 0, block, lane, &payload(block, lane), backend, &registered
+            views[worker], graph, base(), &locals[worker], run, 0, block, lane, &payload(block, lane), backend,
+            &registered
         );
         if (registered_out != nullptr) *registered_out = registered;
         return ok;
@@ -243,7 +246,7 @@ struct RuntimeFixture {
         SchedulerAsyncExecutionRelease grant{0, block, false};
         bool published = false;
         const bool ok = scheduler_async_runtime_release_execution_block(
-            views[worker], graph, &locals[worker], run, &grant, &published
+            views[worker], graph, base(), &locals[worker], run, &grant, &published
         );
         if (activated != nullptr) *activated = published;
         return ok;
@@ -495,10 +498,10 @@ TEST(HbgAsyncRuntime, ReleaseBeforeSealAndRepeatedGrantFailWithoutSuccessfulTask
         SchedulerAsyncExecutionRelease grant{0, 0, false};
         bool published = false;
         ASSERT_TRUE(scheduler_async_runtime_release_execution_block(
-            fixture.views[0], fixture.graph, &fixture.locals[0], fixture.run, &grant, &published
+            fixture.views[0], fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &grant, &published
         ));
         EXPECT_FALSE(scheduler_async_runtime_release_execution_block(
-            fixture.views[3], fixture.graph, &fixture.locals[3], fixture.run, &grant, &published
+            fixture.views[3], fixture.graph, fixture.base(), &fixture.locals[3], fixture.run, &grant, &published
         ));
         EXPECT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::ERROR);
         EXPECT_EQ(fixture.completed(), 0u);
@@ -655,8 +658,8 @@ TEST(HbgAsyncRuntime, EarliestCheckClaimObservesTheAdditionalSealedFacts) {
     while (!observing.load(std::memory_order_acquire)) {}
     bool registered = false;
     const bool sealed = scheduler_async_runtime_seal(
-        fixture.views[0], fixture.graph, &fixture.locals[0], fixture.run, 0, 0, 0, &fixture.payload(0, 0),
-        fixture.backend, &registered, SealPublicationProbe{&fixture, &evidence, true, &called}
+        fixture.views[0], fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, 0, 0,
+        &fixture.payload(0, 0), fixture.backend, &registered, SealPublicationProbe{&fixture, &evidence, true, &called}
     );
     peer.join();
     EXPECT_TRUE(sealed);
@@ -673,8 +676,8 @@ TEST(HbgAsyncRuntime, FailedAdditionalSealPublicationCannotPublishCheckOrAddASuc
     AsyncSubmissionEvidence evidence{};
     bool called = false, registered = true;
     EXPECT_FALSE(scheduler_async_runtime_seal(
-        fixture.views[0], fixture.graph, &fixture.locals[0], fixture.run, 0, 0, 0, &fixture.payload(0, 0),
-        fixture.backend, &registered, SealPublicationProbe{&fixture, &evidence, false, &called}
+        fixture.views[0], fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, 0, 0,
+        &fixture.payload(0, 0), fixture.backend, &registered, SealPublicationProbe{&fixture, &evidence, false, &called}
     ));
     EXPECT_TRUE(called);
     EXPECT_FALSE(registered);
@@ -1067,6 +1070,96 @@ TEST(HbgAsyncProtocol, ExportsRealRecorderEvidenceForPythonRoundTrip) {
         const char *names[] = {"native_ready", "native_empty", "native_skip", "native_partial_release"};
         RecordProperty(names[mode], json);
     }
+}
+
+struct ReturnedProtocolBackend {
+    struct ConsumerCursor {};
+};
+
+void ordinary_projection_returned_path() {
+    RuntimeFixture fixture(1, 1, 1, 4, true);
+    fixture.bind(0);
+    fixture.condition();
+    const auto *execution = fixture.record_execution(0);
+    auto &local = fixture.locals[0];
+    local.slots[0].state = SchedulerDispatchSlotState::READY;
+    local.config.dispatch_payloads_offset = static_cast<uint32_t>(fixture.layout.dispatch_payloads_offset);
+    auto *payload = scheduler_state_at<DispatchPayload>(fixture.base(), local.dispatch_payload_offset(0, 0));
+    std::memcpy(payload, &fixture.payload(0, 0), sizeof(*payload));
+    SchedulerAsyncExecutionState<ReturnedProtocolBackend> state{};
+    state.view = fixture.views[0];
+    state.permitted_slot = 0;
+    state.permitted_generation = local.slots[0].generation;
+    fixture.graph = scheduler_ordinary_graph_view(
+        fixture.graph.storage_address, static_cast<uint32_t>(fixture.graph.task_count),
+        fixture.graph.task_window_last_index
+    );
+    ASSERT_EQ(fixture.graph.scheduler_state_address, 0u);
+    ASSERT_EQ(fixture.graph.scheduler_state_bytes, 0u);
+    ASSERT_TRUE(scheduler_protocol_enabled(&local));
+    ASSERT_TRUE(scheduler_async_execution_returned(
+        &state, fixture.graph, fixture.base(), &local, fixture.run, 0, fixture.backend
+    ));
+    const auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
+    EXPECT_GT(writer->sealed_at.sequence, execution->visible.sequence);
+    ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    ASSERT_TRUE(fixture.release(0, 0));
+    fixture.backend.ready[0] = true;
+    ASSERT_EQ(fixture.service(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    fixture.drain();
+    EXPECT_NE(writer->release.before.sequence, 0u);
+    EXPECT_GT(writer->release.after.sequence, writer->release.before.sequence);
+    EXPECT_NE(fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset)->terminal_at.sequence, 0u);
+    EXPECT_NE(fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset)->drained_at.sequence, 0u);
+    EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
+}
+
+void ordinary_projection_release_path(bool mixed) {
+    RuntimeFixture fixture(1, mixed ? 7 : 1, mixed ? 6 : 1, 4, true);
+    for (uint32_t lane = mixed ? 1 : 0; lane < (mixed ? 3u : 1u); ++lane) {
+        fixture.bind(lane, 0, lane);
+        fixture.record_execution(lane, 0, lane);
+        ASSERT_TRUE(fixture.seal(lane, 0, lane));
+    }
+    fixture.graph = scheduler_ordinary_graph_view(
+        fixture.graph.storage_address, static_cast<uint32_t>(fixture.graph.task_count),
+        fixture.graph.task_window_last_index
+    );
+    ASSERT_EQ(fixture.graph.scheduler_state_address, 0u);
+    ASSERT_TRUE(scheduler_protocol_enabled(&fixture.locals[0]));
+    ASSERT_TRUE(fixture.release(0, 0));
+    const auto &release = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset)->release;
+    EXPECT_NE(release.before.sequence, 0u);
+    EXPECT_GT(release.after.sequence, release.before.sequence);
+    EXPECT_EQ(release.worker_index, 0u);
+    if (mixed) {
+        const auto &other = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset, 1)->release;
+        EXPECT_EQ(other.before.sequence + other.after.sequence, 0u);
+    } else {
+        fixture.drain();
+    }
+    EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
+}
+
+TEST(HbgAsyncProtocolDeathTest, OrdinaryProjectionUsesExplicitBackingThroughReturnedSealAndService) {
+    ASSERT_EXIT(
+        {
+            ordinary_projection_returned_path();
+            std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
+TEST(HbgAsyncProtocolDeathTest, OrdinaryProjectionUsesExplicitBackingForPureAndMixBlockRelease) {
+    ASSERT_EXIT(
+        {
+            ordinary_projection_release_path(false);
+            ordinary_projection_release_path(true);
+            std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
 }
 
 }  // namespace

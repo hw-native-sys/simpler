@@ -335,11 +335,12 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
 // Runs only on the original executing core after kernel return and before its
 // execution-release contribution. BindingPolicy must provide bounded
 // bind_condition(identity,index,entry,binding*) using existing run/domain proof.
+// Ordinary graph projections carry no scheduler backing address; it is passed separately.
 template <typename BindingPolicy, typename Publication = scheduler_async_runtime_detail::NoAdditionalSealPublication>
 inline __aicore__ bool scheduler_async_runtime_seal(
-    const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, SchedulerLocalState *local,
-    __gm__ SchedulerRunControl *run, int64_t task, uint32_t block, uint32_t subtask, __gm__ DispatchPayload *payload,
-    BindingPolicy &policy, bool *registered, Publication publication = {}
+    const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, __gm__ void *scheduler_base,
+    SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task, uint32_t block, uint32_t subtask,
+    __gm__ DispatchPayload *payload, BindingPolicy &policy, bool *registered, Publication publication = {}
 ) {
     using namespace scheduler_async_runtime_detail;
     if (registered == nullptr || payload == nullptr) return false;
@@ -404,9 +405,7 @@ inline __aicore__ bool scheduler_async_runtime_seal(
     scheduler_async_writer_snapshot(writer, &snapshot);
     const auto initialized = scheduler_async_check_initialize(identity, snapshot, &progress);
     publish(at<SchedulerAsyncGroupProgress>(view, view.layout.group_progress_offset, index), progress);
-    const bool recorded = scheduler_async_protocol_sealed(
-        reinterpret_cast<__gm__ void *>(graph.scheduler_state_address), local, identity, writer
-    );
+    const bool recorded = scheduler_async_protocol_sealed(scheduler_base, local, identity, writer);
     if (!recorded || !valid || initialized == SchedulerAsyncCheckResult::ERROR) {
         (void)scheduler_async_lease_try_transition(
             lease, scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT), SchedulerAsyncPhase::FAILED
@@ -438,8 +437,9 @@ inline __aicore__ bool scheduler_async_runtime_seal(
 }
 
 inline __aicore__ bool scheduler_async_runtime_release_execution_block(
-    const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, SchedulerLocalState *local,
-    __gm__ SchedulerRunControl *run, SchedulerAsyncExecutionRelease *grant, bool *finish_published
+    const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, __gm__ void *scheduler_base,
+    SchedulerLocalState *local, __gm__ SchedulerRunControl *run, SchedulerAsyncExecutionRelease *grant,
+    bool *finish_published
 ) {
     using namespace scheduler_async_runtime_detail;
     if (grant == nullptr || finish_published == nullptr) return false;
@@ -463,7 +463,6 @@ inline __aicore__ bool scheduler_async_runtime_release_execution_block(
             return fail(graph, local, run, grant->task_ref, &view, map.finish_index);
     }
     scheduler_cache_barrier();
-    auto *scheduler_base = reinterpret_cast<__gm__ void *>(graph.scheduler_state_address);
     const uint64_t release_index = map.group_base + static_cast<uint64_t>(grant->block_idx) * map.groups_per_block;
     auto &release = at<SchedulerAsyncGroupWriter>(view, view.layout.group_writer_offset, release_index)->release;
     if (!scheduler_async_protocol_point(

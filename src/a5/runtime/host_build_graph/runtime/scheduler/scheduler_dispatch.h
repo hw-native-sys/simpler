@@ -62,7 +62,7 @@ static inline __aicore__ bool scheduler_service_gm_mix(
                     SchedulerAsyncExecutionRelease grant{released_task, released_block, false};
                     bool finish_published = false;
                     if (!scheduler_async_runtime_release_execution_block(
-                            *async, graph, local, run, &grant, &finish_published
+                            *async, graph, base, local, run, &grant, &finish_published
                         ))
                         return false;
                 }

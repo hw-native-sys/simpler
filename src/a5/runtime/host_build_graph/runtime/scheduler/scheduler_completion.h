@@ -377,7 +377,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
             SchedulerAsyncExecutionRelease grant{task_ref, completed_block_idx, false};
             bool finish_published = false;
             if (!scheduler_async_runtime_release_execution_block(
-                    *async, graph, scheduler, run_control, &grant, &finish_published
+                    *async, graph, scheduler_state_base, scheduler, run_control, &grant, &finish_published
                 ))
                 return false;
         }
