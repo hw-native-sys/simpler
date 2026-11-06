@@ -1205,9 +1205,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // are loaded once by register_callable and consumed by every subsequent
     // run. The destructor releases them at process teardown.
 
-    // Clear file-scope RuntimeContext pointer (freed by orchestrator thread before deinit)
-    rt = nullptr;
-
     // Clear dep_gen file-local bookkeeping. No-op when dep_gen is disabled.
     dep_gen_aicpu_finalize();
 
