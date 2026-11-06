@@ -12,19 +12,25 @@ from __future__ import annotations
 import copy
 import importlib
 import os
+import select
 import signal
 import struct
+import subprocess
+import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import simpler.worker as worker_mod
-from simpler.buffer import AccessMode, buffer_reference, wrap_vmm_window
+from simpler.buffer import AccessMode, AddressSpace, buffer_reference, wrap_vmm_window
+from simpler.comm_domain import HostBufferMapping
 from simpler.orchestrator import _callback_run
 from simpler.task_interface import CommBufferSpec, CommDomainHandle, DataType, GlobalCommDomainHandle, TaskArgs
 from simpler.worker import Worker
@@ -1318,3 +1324,304 @@ def test_checked_device_context_validates_live_domain_and_scalar_use(domain_work
     handle.release()
     with pytest.raises(RuntimeError, match="released"):
         handle.device_context(handle.workers[0], workspace_engines=("urma",))
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("fail_second_import", [False, True])
+def test_host_domain_wire_cpu_import_retention_and_rollback(
+    domain_worker, monkeypatch, fail_second_import, native_host_memory
+):
+    worker, _members = domain_worker
+    # Exercise real parent transactions with a host-only stand-in for the A5 child allocator.
+    monkeypatch.setitem(worker._config, "platform", "a5")
+    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+    owners = {}
+    captured = []
+    imports = []
+
+    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
+        if op == "release":
+            for owner in owners.values():
+                owner.close()
+                owner.unlink()
+            owners.clear()
+            return
+        captured.append(worker._live_domains["host"])
+        for chip in workers:
+            request = request_shms[chip].buf
+            identity, count, rank, size, buffer_count = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request)
+            assert identity == allocation_id and rank == chip and count == 2
+            tail = worker_mod._DOMAIN_REQ_HEADER.size + buffer_count * 8 + count * 4
+            name = worker_mod._read_shm_name(request, tail)
+            owners[chip] = native_host_memory(name=name, size=size)
+            base = 0x100000 * (chip + 1)
+            response = reply_shms[chip].buf
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(response, 0, 1, base + size, base, size, buffer_count)
+            struct.pack_into("<2Q", response, worker_mod._DOMAIN_REPLY_HEADER.size, base, base + 64)
+
+    def import_mapping(name, size):
+        if fail_second_import and imports:
+            raise RuntimeError("injected CPU import failure")
+        mapping = HostBufferMapping(name, size)
+        imports.append(mapping)
+        return mapping
+
+    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+    monkeypatch.setattr(worker_mod, "HostBufferMapping", import_mapping)
+    request = _request(
+        [0, 1],
+        name="host",
+        memory_source=AddressSpace.HOST,
+        buffers=[CommBufferSpec("prefix", "uint8", 64, 64), CommBufferSpec("table", "uint8", 64, 64)],
+    )
+
+    def allocate(orch, _args, _cfg):
+        orch.get_or_allocate_domain(**request)
+
+    if fail_second_import:
+        with pytest.raises(RuntimeError, match="CPU import failure"):
+            worker.run(allocate)
+        assert captured[0].released and captured[0].freed
+        assert len(imports) == 1 and imports[0].buf is None
+        assert owners == {}
+        return
+
+    worker.run(allocate)
+    domain = captured[0]
+    offset, nbytes = domain.buffer_range("table")
+    table = domain.member(1).buffers["table"]
+    assert table.shm is domain.member(1).buffers["prefix"].shm
+    with table.shm.buf[offset : offset + nbytes] as view:
+        view[:] = bytes([37]) * 64
+    assert bytes(owners[1].buf[64:128]) == bytes([37]) * 64
+    assert bytes(owners[0].buf[64:128]) == bytes(64)
+    worker.run(allocate)
+    assert captured == [domain]  # Reuse does not allocate or clear the backing.
+    saved = domain.member(1).buffers["table"]
+    with saved.shm.buf[offset : offset + nbytes] as view:
+        assert bytes(view) == bytes([37]) * 64
+    domain.release()
+    assert domain.freed and owners == {}
+    assert all(mapping.buf is None for mapping in imports)
+    assert saved.shm.buf is None
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("before_reply", [True, False])
+def test_host_domain_creator_death_is_reclaimed_by_worker_close(
+    domain_worker, monkeypatch, native_host_memory, before_reply
+):
+    if not os.path.isdir("/dev/shm"):
+        pytest.skip("namespace scanning requires Linux /dev/shm")
+    posixshmem = pytest.importorskip("_posixshmem")
+    worker, _members = domain_worker
+    monkeypatch.setitem(worker._config, "platform", "a5")
+    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+    foreign = native_host_memory(name=worker_mod._shm_name(uuid.uuid4().hex, "host-test"))
+    names = []
+    creators = []
+    saved = []
+
+    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
+        if op == "release":
+            raise RuntimeError("Host window creator exited")
+        for chip in workers:
+            request = request_shms[chip].buf
+            _identity, count, _rank, size, buffer_count = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request)
+            tail = worker_mod._DOMAIN_REQ_HEADER.size + buffer_count * 8 + count * 4
+            name = worker_mod._read_shm_name(request, tail)
+            names.append(name)
+            # Direct POSIX creation has no Python resource tracker, matching the native allocator.
+            creator = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, sys, signal, _posixshmem; "
+                    "fd = _posixshmem.shm_open('/' + sys.argv[1], os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600); "
+                    "os.ftruncate(fd, int(sys.argv[2])); os.close(fd); "
+                    "print('ready', flush=True); signal.pause()",
+                    name,
+                    str(size),
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            creators.append(creator)
+            assert creator.stdout is not None
+            assert select.select([creator.stdout], [], [], 10)[0]
+            assert creator.stdout.readline().strip() == "ready"
+            if not before_reply:
+                base = 0x100000 * (chip + 1)
+                response = reply_shms[chip].buf
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(response, 0, 1, base + size, base, size, buffer_count)
+                struct.pack_into("<Q", response, worker_mod._DOMAIN_REPLY_HEADER.size, base)
+        if before_reply:
+            for creator in creators:
+                creator.kill()
+                assert creator.wait(timeout=5) == -signal.SIGKILL
+            raise RuntimeError("Host window creator exited before reply")
+
+    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+
+    def allocate(orch, _args, _cfg):
+        saved.append(orch.allocate_domain(**_request([0, 1], memory_source=AddressSpace.HOST)))
+
+    try:
+        if before_reply:
+            with pytest.raises(RuntimeError, match="creator exited"):
+                worker.run(allocate)
+        else:
+            worker.run(allocate)
+            assert len(saved[0]._host_mappings) == 2
+            for creator in creators:
+                creator.kill()
+                assert creator.wait(timeout=5) == -signal.SIGKILL
+            for mapping in saved[0]._host_mappings:
+                mapping.close()
+        assert len(names) == 2 and len(set(names)) == 2
+        assert all(len(name) <= 30 for name in names)
+        assert all(Path("/dev/shm", name).exists() for name in names)
+        if before_reply:
+            worker.close()
+        else:
+            _close_with_domain_debt(worker)
+        assert all(not Path("/dev/shm", name).exists() for name in names)
+        assert Path("/dev/shm", foreign.name).exists()
+    finally:
+        for creator in creators:
+            if creator.poll() is None:
+                creator.kill()
+            creator.wait(timeout=5)
+            if creator.stdout is not None:
+                creator.stdout.close()
+        for name in names:
+            try:
+                posixshmem.shm_unlink("/" + name)
+            except FileNotFoundError:
+                pass
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("release_path", ["explicit", "automatic", "worker_close"])
+def test_host_exports_fence_worker_domain_cleanup(domain_worker, native_host_memory, release_path):
+    worker, members = domain_worker
+    saved, views = [], []
+
+    def allocate(orch, _args, _cfg):
+        domain = orch.allocate_domain(**_request(members, retain_after_run=release_path != "automatic"))
+        saved.append(domain)
+        # The sim domain drives the real Worker lifecycle; CPU imports model
+        # the Host windows without requiring an A5 allocator on a UT runner.
+        for _ in members:
+            owner = native_host_memory()
+            domain._host_mappings.append(HostBufferMapping(owner.name, owner.size))
+        views.append(np.ndarray((8,), dtype=np.int32, buffer=domain._host_mappings[-1].buf)[1:3])
+
+    try:
+        if release_path == "automatic":
+            with pytest.raises(BufferError, match="export"):
+                worker.run(allocate)
+        else:
+            worker.run(allocate)
+            with pytest.raises(BufferError, match="export"):
+                saved[0].release() if release_path == "explicit" else worker.close()
+        domain = saved[0]
+        assert not domain.released and not domain.freed
+        assert worker._live_domains[domain.name] is domain
+        assert domain.allocation_id not in worker._domain_free_results
+        assert worker._worker is not None and worker._chip_pids
+        assert worker._lifecycle is worker_mod._Lifecycle.READY
+        with domain._host_mappings[0].buf as view:
+            view[0] = 19
+        views[0][0] = 23
+        assert views[0][0] == 23
+    finally:
+        views.clear()
+    if release_path == "explicit":
+        domain.release()
+    else:
+        worker.close()
+    assert domain.released and domain.freed
+    assert not domain._host_mappings
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_worker_close_checks_exports_before_releasing_any_domain(domain_worker, native_host_memory):
+    worker, members = domain_worker
+    domains = []
+
+    def allocate(orch, _args, _cfg):
+        for name in ("borrowed", "unborrowed"):
+            domain = orch.allocate_domain(**_request(members, name=name))
+            owner = native_host_memory()
+            domain._host_mappings.append(HostBufferMapping(owner.name, owner.size))
+            domains.append(domain)
+
+    worker.run(allocate)
+    with domains[0]._host_mappings[0].buf:
+        with pytest.raises(BufferError, match="export"):
+            worker.close()
+        assert all(not domain.released and not domain.freed for domain in domains)
+        assert not worker._domain_free_results
+        with domains[1]._host_mappings[0].buf as view:
+            view[0] = 31
+    worker.close()
+    assert all(domain.freed for domain in domains)
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_worker_close_rechecks_exports_created_by_admitted_run(domain_worker, native_host_memory):
+    worker, members = domain_worker
+    entered, resume = threading.Event(), threading.Event()
+    domains, views, errors = [], [], []
+    owner = native_host_memory()
+
+    def allocate(orch, _args, _cfg):
+        entered.set()
+        assert resume.wait(10)
+        domain = orch.allocate_domain(**_request(members))
+        mapping = HostBufferMapping(owner.name, owner.size)
+        domain._host_mappings.append(mapping)
+        domains.append(domain)
+        views.append(np.ndarray((8,), dtype=np.int32, buffer=mapping.buf)[1:3])
+
+    def run():
+        try:
+            worker.run(allocate)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def resume_after_close_claim():
+        try:
+            with worker._hierarchical_start_cv:
+                assert worker._hierarchical_start_cv.wait_for(
+                    lambda: worker._lifecycle is worker_mod._Lifecycle.CLOSED, timeout=10
+                )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            resume.set()
+
+    runner = threading.Thread(target=run)
+    observer = threading.Thread(target=resume_after_close_claim)
+    runner.start()
+    try:
+        assert entered.wait(10)
+        observer.start()
+        with pytest.raises(BufferError, match="export"):
+            worker.close()
+        assert worker._lifecycle is worker_mod._Lifecycle.CLOSED
+        assert not worker._teardown_attempted and worker._worker is not None
+        assert not domains[0].released and not domains[0].freed
+        assert worker._live_domains[domains[0].name] is domains[0]
+        views[0][0] = 41
+        assert views[0][0] == 41
+    finally:
+        resume.set()
+        runner.join(10)
+        if observer.ident is not None:
+            observer.join(10)
+        views.clear()
+    assert not runner.is_alive() and not observer.is_alive() and not errors
+    worker.close()
+    assert domains[0].freed

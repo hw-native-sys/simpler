@@ -42,7 +42,7 @@ from typing import Any, cast
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
-from .buffer import AccessMode, BackendKind, Buffer, wrap_fork_inherited
+from .buffer import AccessMode, AddressSpace, BackendKind, Buffer, wrap_fork_inherited
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -536,6 +536,7 @@ class Orchestrator:
         retain_after_run: bool = False,
         workers: Sequence[int] | None = None,
         workspace_engines: Sequence[str] = (),
+        memory_source: AddressSpace = AddressSpace.DEVICE,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -549,6 +550,9 @@ class Orchestrator:
         On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
         its own low-address window. Explicit selection is limited to L3 A5.
+        ``memory_source=AddressSpace.HOST`` creates independent Host windows on
+        L3 A5 TMR ranks, with local device access and optional URMA peer access.
+        Their named Buffers expose CPU bytes through ``buffer.buffer`` on L3.
         """
         if (members is None) == (workers is None):
             raise TypeError("provide exactly one of members or legacy workers")
@@ -561,6 +565,7 @@ class Orchestrator:
             buffers,
             retain_after_run,
             workspace_engines=workspace_engines,
+            memory_source=memory_source,
             reuse=False,
         )
 
@@ -573,6 +578,7 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         workspace_engines: Sequence[str] = (),
+        memory_source: AddressSpace = AddressSpace.DEVICE,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
@@ -580,10 +586,28 @@ class Orchestrator:
         A hit neither allocates nor initializes the existing window.
         """
         return self._domain(
-            name, members, window_size, buffers, retain_after_run, workspace_engines=workspace_engines, reuse=True
+            name,
+            members,
+            window_size,
+            buffers,
+            retain_after_run,
+            workspace_engines=workspace_engines,
+            memory_source=memory_source,
+            reuse=True,
         )
 
-    def _domain(self, name, members, window_size, buffers, retain_after_run, *, workspace_engines=(), reuse):
+    def _domain(
+        self,
+        name,
+        members,
+        window_size,
+        buffers,
+        retain_after_run,
+        *,
+        workspace_engines=(),
+        memory_source=AddressSpace.DEVICE,
+        reuse,
+    ):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -594,6 +618,7 @@ class Orchestrator:
             retain_after_run=retain_after_run,
             reuse=reuse,
             workspace_engines=workspace_engines,
+            memory_source=memory_source,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:

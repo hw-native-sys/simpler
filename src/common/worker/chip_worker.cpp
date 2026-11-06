@@ -455,6 +455,8 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
+        comm_alloc_host_domain_windows_fn_ =
+            module->optional<CommAllocHostDomainWindowsFn>("comm_alloc_host_domain_windows");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
@@ -928,6 +930,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
+    comm_alloc_host_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_abort_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
@@ -2557,7 +2560,7 @@ uint64_t ChipWorker::comm_derive_context(
 
 std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag
+    size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag, const std::string &host_shm_name
 ) {
     require_comm_cleanup_confirmed();
     if (comm_alloc_domain_windows_fn_ == nullptr) {
@@ -2575,10 +2578,19 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t device_ctx = 0;
     uint64_t local_window_base = 0;
     size_t actual_window_size = 0;
-    int rc = comm_alloc_domain_windows_fn_(
-        reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-        window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
-    );
+    if (!host_shm_name.empty() && comm_alloc_host_domain_windows_fn_ == nullptr) {
+        throw std::runtime_error("Host-source communication domains are not supported by this runtime");
+    }
+    const int rc =
+        host_shm_name.empty() ?
+            comm_alloc_domain_windows_fn_(
+                reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
+                window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
+            ) :
+            comm_alloc_host_domain_windows_fn_(
+                reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
+                window_size, workspace_mask, host_shm_name.c_str(), &device_ctx, &local_window_base, &actual_window_size
+            );
     if (ownership_flag != nullptr &&
         (rc == 0 || rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED)) {
         __atomic_store_n(ownership_flag, uint64_t{1}, __ATOMIC_RELEASE);

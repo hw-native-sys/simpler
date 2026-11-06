@@ -27,6 +27,10 @@ int physical_handles = 0;
 void *fail_free_once = nullptr;
 bool throw_hccl_destroy = false;
 bool fail_context_upload = false;
+bool fail_host_register = false;
+bool fail_host_pointer = false;
+bool fail_host_unregister = false;
+std::unordered_map<void *, int> registered_hosts;
 enum class PeerFailure { NONE, IMPORT, RESERVE, MAP, ACCESS };
 PeerFailure peer_failure = PeerFailure::NONE;
 bool peer_reserve_pending = false;
@@ -54,6 +58,26 @@ aclError unmap_buffer(void *p) {
 }
 }  // namespace
 
+extern "C" aclError aclrtHostRegisterV2(void *host, uint64_t bytes, uint32_t flags) {
+    assert(bytes > 0 && bytes % static_cast<size_t>(sysconf(_SC_PAGESIZE)) == 0);
+    assert(flags == ACL_HOST_REG_MAPPED);
+    if (fail_host_register) return ACL_ERROR_FAILURE;
+    assert(registered_hosts.emplace(host, workspace_fixture::live[1]).second);
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtHostGetDevicePointer(void *host, void **device, uint32_t) {
+    assert(registered_hosts.count(host) == 1);
+    if (fail_host_pointer) return ACL_ERROR_FAILURE;
+    *device = host;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtHostUnregister(void *host) {
+    assert(registered_hosts.count(host) == 1);
+    if (fail_host_unregister) return ACL_ERROR_FAILURE;
+    assert(workspace_fixture::live[1] <= registered_hosts.at(host));
+    registered_hosts.erase(host);
+    return ACL_SUCCESS;
+}
 extern "C" aclError aclrtGetDevice(int32_t *id) {
     *id = 0;
     return ACL_SUCCESS;
@@ -268,8 +292,137 @@ static void test_cleanup_failure(const std::string &scenario) {
     std::filesystem::remove_all(folder);
 }
 
+static void test_host_domain(const std::string &scenario) {
+    using namespace workspace_fixture;
+    char folder[] = "/tmp/simpler-host-domain-XXXXXX";
+    assert(mkdtemp(folder));
+    auto h = std::make_unique<CommHandle_>();
+    h->rank = 0;
+    h->nranks = 2;
+    h->rootinfo_path = std::string(folder) + "/root";
+    h->hccl_comm = reinterpret_cast<HcclComm>(1);
+    const std::string name = "simpler_host_" + std::to_string(getpid());
+    const std::string path = "/" + name;
+    const uint32_t ranks[] = {0, 1};
+    uint64_t ctx = 0, base = 0;
+    size_t size = 0;
+    const uint32_t mask = scenario == "host_local" ? 0 : 2;
+    uint64_t device_context = 0;
+    if (scenario == "host_coexist") {
+        assert(domain_write_announce(h->rootinfo_path, 2, 1, h->run_token, getpid(), 1, 42));
+        for (const char *phase : {"p2p_ready", "release"}) {
+            std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(2, phase), 1));
+            marker << "1";
+        }
+        assert(comm_alloc_domain_windows(h.get(), 2, ranks, 2, 0, 4096, 2, &device_context, &base, &size) == 0);
+        base = size = 0;
+        assert(live[1] == 1);
+    }
+    fail_host_register = scenario == "host_register";
+    fail_host_pointer = scenario == "host_pointer";
+    fail_host_unregister = scenario == "host_unregister";
+    fail_context_upload = scenario == "host_context";
+    fail_engine = scenario == "host_workspace" ? 1 : -1;
+    if (scenario == "host_collision") {
+        const int existing = shm_open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+        assert(existing >= 0);
+        assert(ftruncate(existing, 8192) == 0);
+        close(existing);
+    }
+    if (scenario == "host_invalid") {
+        for (const char *bad :
+             {"", "/already_absolute", "with/slash", "with space", "abcdefghijklmnopqrstuvwxyz0123456789"}) {
+            assert(comm_alloc_host_domain_windows(h.get(), 1, ranks, 2, 0, 64, 2, bad, &ctx, &base, &size) != 0);
+            assert(h->domain_allocations.empty());
+        }
+        for (uint32_t unsupported : {1U, 3U, 4U}) {
+            assert(
+                comm_alloc_host_domain_windows(
+                    h.get(), 1, ranks, 2, 0, 64, unsupported, name.c_str(), &ctx, &base, &size
+                ) == COMM_DOMAIN_WORKSPACE_UNSUPPORTED
+            );
+            assert(h->domain_allocations.empty());
+        }
+        std::filesystem::remove_all(folder);
+        return;
+    }
+    const int rc = comm_alloc_host_domain_windows(h.get(), 1, ranks, 2, 0, 64, mask, name.c_str(), &ctx, &base, &size);
+    if (scenario == "host_register" || scenario == "host_pointer" || scenario == "host_workspace" ||
+        scenario == "host_context" || scenario == "host_collision") {
+        assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && base == 0);
+        assert(h->domain_allocations.count(1) == 1);
+        assert(comm_abort_domain_windows(h.get(), 1, 2, 0) == 0);
+        assert(h->domain_allocations.empty() && mappings.empty() && registered_hosts.empty());
+        const int probe = shm_open(path.c_str(), O_RDWR, 0);
+        if (scenario == "host_collision") {
+            assert(probe >= 0);
+            struct stat st{};
+            assert(fstat(probe, &st) == 0 && st.st_size == 8192);
+            close(probe);
+            assert(shm_unlink(path.c_str()) == 0);
+        } else {
+            assert(probe < 0 && errno == ENOENT);
+        }
+        assert(live[1] == 0 && physical_handles == 0);
+        std::filesystem::remove_all(folder);
+        return;
+    }
+    assert(rc == 0 && ctx != 0 && base != 0 && size >= 64);
+    assert(physical_handles == (device_context != 0 ? 2 : 0));
+    assert(peer_import_calls == (device_context != 0 ? 1 : 0));
+    const auto *context = reinterpret_cast<const CommContext *>(ctx);
+    assert(context->windowsIn[0] == base && context->windowsOut[0] == base);
+    assert(context->windowsIn[1] == 0 && context->windowsOut[1] == 0);
+    assert((comm_workspace<CommWorkspaceKind::URMA>(*context).addr != 0) == (mask != 0));
+    const int fd = shm_open(path.c_str(), O_RDWR, 0);
+    assert(fd >= 0);
+    void *parent = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    assert(parent != MAP_FAILED && parent != reinterpret_cast<void *>(base));
+    auto *cpu = static_cast<uint32_t *>(parent);
+    auto *device = reinterpret_cast<uint32_t *>(base);
+    cpu[7] = 0x12345678;
+    assert(device[7] == 0x12345678);
+    device[9] = 0x98765432;
+    assert(cpu[9] == 0x98765432);
+    {
+        std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(1, "release"), 1));
+        marker << "1";
+    }
+    if (fail_host_unregister) {
+        assert(comm_release_domain_windows(h.get(), 1, 2, 0) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(h->cleanup_failed && h->domain_allocations.at(1)->host_registered);
+        assert(registered_hosts.size() == 1 && cpu[7] == 0x12345678);
+        const int retained = shm_open(path.c_str(), O_RDWR, 0);
+        assert(retained >= 0);
+        close(retained);
+        assert(comm_release_domain_windows(h.get(), 1, 2, 0) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(shm_unlink(path.c_str()) == 0);
+    } else {
+        assert(comm_release_domain_windows(h.get(), 1, 2, 0) == 0);
+        assert(registered_hosts.empty());
+        if (device_context != 0) {
+            assert(h->domain_allocations.size() == 1 && live[1] == 1);
+            const auto *device_view = reinterpret_cast<const CommContext *>(device_context);
+            assert(device_view->windowsIn[0] != 0 && device_view->windowsIn[1] != 0);
+            assert(comm_workspace<CommWorkspaceKind::URMA>(*device_view).addr != 0);
+            assert(comm_release_domain_windows(h.get(), 2, 2, 0) == 0);
+        }
+        assert(h->domain_allocations.empty() && mappings.empty() && physical_handles == 0);
+        assert(shm_open(path.c_str(), O_RDWR, 0) < 0 && errno == ENOENT);
+        // An exported CPU mapping retains the POSIX backing after native ownership ends.
+        assert(cpu[7] == 0x12345678 && cpu[9] == 0x98765432);
+    }
+    assert(munmap(parent, size) == 0);
+    std::filesystem::remove_all(folder);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
+        if (std::string(argv[1]).find("host_") == 0) {
+            test_host_domain(argv[1]);
+            return 0;
+        }
         test_cleanup_failure(argv[1]);
         return 0;
     }

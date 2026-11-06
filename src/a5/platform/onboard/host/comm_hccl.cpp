@@ -33,6 +33,11 @@
 #include <chrono>
 #include <cctype>
 #include <climits>
+#include <cerrno>
+#include <limits>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -77,10 +82,9 @@ static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(
 // ============================================================================
 
 // Per-domain dynamic allocation.  One of these per orch.allocate_domain call.
-// Tracks the local VMM window (mapped VA + its physical handle + the
-// granularity-aligned byte size) and every peer VMM import (mapped VA +
-// imported physical handle), all torn down in comm_release_domain_windows,
-// plus the device CommContext we materialise for the subset.  Only the
+// Owns either the local VMM window and peer VMM imports, or a POSIX Host
+// window with its local device registration. The allocation also owns its
+// device CommContext and optional communication resources. Only the
 // EnablePeerAccess routes are left to aclrtResetDevice at finalize: they are
 // process-global and per device-pair, so releasing them per allocation would
 // tear down a route a concurrent allocation still uses.
@@ -93,13 +97,17 @@ struct DomainPeerWindow {
 struct DomainAllocation {
     int rank = 0;                            // this rank's index within the subset (domain_rank)
     int nranks = 0;                          // subset size
-    void *local_buf = nullptr;               // VMM-mapped device VA
+    void *local_buf = nullptr;               // local window device VA
     aclrtDrvMemHandle own_handle = nullptr;  // physical handle backing local_buf
     // Per-peer imports: (mapped VA, imported physical handle).  allocate_domain
     // can cycle repeatedly within one comm handle before any device reset, so
     // these are released explicitly at domain teardown rather than left to reset.
     std::vector<DomainPeerWindow> peer_windows;
     bool local_mapped = false;
+    void *host_buf = nullptr;
+    std::string host_shm_name;
+    bool host_shm_owned = false;
+    bool host_registered = false;
     bool initialized = false;
     bool cleanup_failed = false;
     HcclComm urma_comm = nullptr;
@@ -955,7 +963,21 @@ static bool close_domain_resources(DomainAllocation &alloc) {
         if (!release_domain_window(it->address, it->handle, it->mapped)) return false;
     }
     alloc.peer_windows.clear();
-    if (!release_domain_window(alloc.local_buf, alloc.own_handle, alloc.local_mapped)) return false;
+    if (alloc.host_shm_owned) {
+        if (alloc.host_registered) {
+            if (aclrtHostUnregister(alloc.host_buf) != ACL_SUCCESS) return false;
+            alloc.host_registered = false;
+            alloc.local_buf = nullptr;
+        }
+        if (alloc.host_buf != nullptr) {
+            if (munmap(alloc.host_buf, alloc.mapping_size) != 0) return false;
+            alloc.host_buf = nullptr;
+        }
+        if (shm_unlink(alloc.host_shm_name.c_str()) != 0 && errno != ENOENT) return false;
+        alloc.host_shm_owned = false;
+    } else if (!release_domain_window(alloc.local_buf, alloc.own_handle, alloc.local_mapped)) {
+        return false;
+    }
     alloc.cleanup_failed = false;
     return true;
 }
@@ -1880,12 +1902,83 @@ extern "C" int comm_barrier(CommHandle h) {
     return 0;
 }
 
-extern "C" int comm_alloc_domain_windows(
+static bool valid_host_shm_name(const char *name) {
+    if (name == nullptr) return false;
+    const size_t length = strnlen(name, 32);
+    if (length == 0 || length > 31) return false;
+    for (size_t i = 0; i < length; ++i) {
+        const char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
+    }
+    return true;
+}
+
+static int domain_alloc_host(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out
+    size_t window_size, uint32_t workspace_mask, const char *host_shm_name, DomainAllocation &alloc
+) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return -1;
+    const size_t page = static_cast<size_t>(page_size);
+    if (window_size > std::numeric_limits<size_t>::max() - (page - 1)) return -1;
+    const size_t size = ((window_size + page - 1) / page) * page;
+    if (size > static_cast<size_t>(std::numeric_limits<off_t>::max())) return -1;
+    alloc.mapping_size = size;
+    alloc.host_shm_name = std::string("/") + host_shm_name;
+    const int fd = shm_open(alloc.host_shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    alloc.host_shm_owned = true;
+    if (ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        close(fd);
+        return -1;
+    }
+    void *host = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (host == MAP_FAILED) return -1;
+    alloc.host_buf = host;
+    aclError status = aclrtHostRegisterV2(host, size, ACL_HOST_REG_MAPPED);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] Host domain registration failed: %d", h->rank, static_cast<int>(status));
+        return -1;
+    }
+    alloc.host_registered = true;
+    status = aclrtHostGetDevicePointer(host, &alloc.local_buf, 0);
+    if (status != ACL_SUCCESS || alloc.local_buf == nullptr) return -1;
+
+    CommContext ctx{};
+    ctx.rankId = domain_rank;
+    ctx.rankNum = static_cast<uint32_t>(rank_count);
+    ctx.winSize = size;
+    ctx.windowsIn[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
+    ctx.windowsOut[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
+    // Remote MR addresses belong to the URMA workspace, not the local device address space.
+    if ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0) {
+        const int rc = init_urma_workspace(h, allocation_id, rank_ids, rank_count, domain_rank, alloc);
+        if (rc != 0) return rc;
+        set_comm_workspace(
+            ctx, CommWorkspaceKind::URMA, reinterpret_cast<uint64_t>(alloc.urma_workspace->GetWorkspaceAddr()),
+            alloc.urma_workspace->GetWorkspaceSize()
+        );
+    }
+    void *device_ctx = nullptr;
+    status = aclrtMalloc(&device_ctx, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (status != ACL_SUCCESS) return -1;
+    alloc.device_ctx = static_cast<CommContext *>(device_ctx);
+    return aclrtMemcpy(device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE) == ACL_SUCCESS ? 0 : -1;
+}
+
+static int allocate_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
+    uint64_t *local_window_base_out, size_t *actual_window_size_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
+    if (host_shm_name != nullptr) {
+        if (!valid_host_shm_name(host_shm_name)) return -1;
+        if ((workspace_mask & ~comm_workspace_bit(CommWorkspaceKind::URMA)) != 0)
+            return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    }
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
@@ -1935,9 +2028,14 @@ extern "C" int comm_alloc_domain_windows(
     alloc->nranks = static_cast<int>(rank_count);
     int rc = -1;
     try {
-        rc = domain_alloc_via_ipc(
-            h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, alloc.get()
-        );
+        rc = host_shm_name == nullptr ?
+                 domain_alloc_via_ipc(
+                     h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, alloc.get()
+                 ) :
+                 domain_alloc_host(
+                     h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, host_shm_name,
+                     *alloc
+                 );
     } catch (const std::exception &e) {
         LOG_ERROR("[comm] alloc_domain: exception: %s", e.what());
     } catch (...) {
@@ -1963,6 +2061,29 @@ extern "C" int comm_alloc_domain_windows(
     LOG_ERROR("[comm] alloc_domain: unknown exception");
     if (h) h->cleanup_failed = true;
     return COMM_RECLAMATION_UNCONFIRMED;
+}
+
+extern "C" int comm_alloc_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
+    size_t *actual_window_size_out
+) {
+    return allocate_domain_windows(
+        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, nullptr, device_ctx_out,
+        local_window_base_out, actual_window_size_out
+    );
+}
+
+extern "C" int comm_alloc_host_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
+    uint64_t *local_window_base_out, size_t *actual_window_size_out
+) {
+    if (!valid_host_shm_name(host_shm_name)) return -1;
+    return allocate_domain_windows(
+        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, host_shm_name, device_ctx_out,
+        local_window_base_out, actual_window_size_out
+    );
 }
 
 static int release_domain_windows(

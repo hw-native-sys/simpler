@@ -117,6 +117,7 @@ def host_resource_binary(request, tmp_path_factory):
             f"-I{ROOT}/tests/ut/py/support",
             str(ROOT / "tests/ut/py/support/comm_workspaces_host.cpp"),
             "-ldl",
+            "-lrt",
             "-o",
             str(binary),
         ],
@@ -129,6 +130,25 @@ def host_resource_binary(request, tmp_path_factory):
 
 def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_resource_binary):
     subprocess.run([str(host_resource_binary)], check=True, timeout=20)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "host_local",
+        "host_urma",
+        "host_coexist",
+        "host_register",
+        "host_pointer",
+        "host_workspace",
+        "host_context",
+        "host_collision",
+        "host_invalid",
+        "host_unregister",
+    ],
+)
+def test_host_domain_backing_and_native_failure_ownership(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
 
 
 @pytest.mark.parametrize("scenario", ["sdma_destroy", "urma_release", "urma_destroy", "destroy_exception"])

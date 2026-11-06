@@ -60,6 +60,7 @@ def urma_lifecycle_binary(tmp_path_factory):
             *[f"-I{p}" for p in includes],
             str(ROOT / "tests/ut/py/support/urma_lifecycle_host.cpp"),
             "-ldl",
+            "-lrt",
             "-pthread",
             "-o",
             str(binary),
