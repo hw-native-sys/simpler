@@ -819,6 +819,21 @@ inline __aicore__ bool percounter_lane_may_exit(const LaneConfig &cfg, const Per
  * false on EXIT, on another lane's error, or on the watchdog -- what a lane
  * spinning here can still see and a lane inside a kernel cannot, which is why
  * the gathering is a software spin rather than a channel wait.
+ *
+ * **Reached, not equal to.** A token holds the generation its lane last served,
+ * so it is monotone, and a later one says that lane passed this generation on
+ * the way: an entry is written once per generation its lane joins, in order,
+ * and the line cannot be rearmed before every participant has written this
+ * one. Equality would instead read a token that has moved on as one that never
+ * arrived, which is reachable on the way out: the line is freed once the
+ * entries are in, while the lowest participant is still gathering them, and the
+ * next task on this cluster need not hold the same lanes -- `0b011` followed by
+ * `0b110` runs without the lane still gathering and overwrites the entry it
+ * waits on. Under equality that lane waits for a value that never returns and
+ * its task's counter is never published; under this one it sees the peer is
+ * past, which is what it needed to know. The ordering carries with it: the
+ * later store is a release behind the earlier one, so observing it observes the
+ * subtask outputs of both.
  */
 inline __aicore__ bool percounter_mix_wait(
     const LaneConfig &cfg, SCHEDULER_SSBUF volatile uint32_t *tokens, uint32_t mask, uint32_t generation,
@@ -829,7 +844,7 @@ inline __aicore__ bool percounter_mix_wait(
     while (true) {
         bool complete = true;
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            if ((mask & (uint32_t{1} << lane)) != 0 && scheduler_ssbuf_load_acquire(&tokens[lane]) != generation) {
+            if ((mask & (uint32_t{1} << lane)) != 0 && scheduler_ssbuf_load_acquire(&tokens[lane]) < generation) {
                 complete = false;
                 break;
             }
