@@ -79,10 +79,6 @@ jobs:
         with:
           python-version: ${{ inputs.python_version }}
 
-      - name: Cache pip packages
-        if: inputs.setup_variant == 'self-cpu'
-        uses: ./.github/actions/cache-pip
-
       - name: Install build + runtime deps in venv
         uses: ./.github/actions/setup-venv
         with:
