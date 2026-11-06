@@ -137,6 +137,9 @@ def test_onboard_dfx_smokes_adapt_to_device_count_without_overlap(
     expected_jobs = 6
     assert len(invocations) == expected_jobs
     assert all("--manual include" in invocation for invocation in invocations)
+    counting_window = [invocation for invocation in invocations if "test_pmu_counting_window.py" in invocation]
+    assert len(counting_window) == (1 if platform == "a2a3" else 0)
+    assert all("--enable-pmu 1 " in invocation for invocation in counting_window)
     for device in range(7, 7 + device_count):
         expected_count = expected_jobs // device_count + (device - 7 < expected_jobs % device_count)
         assert sum(f"--device {device}" in invocation for invocation in invocations) == expected_count

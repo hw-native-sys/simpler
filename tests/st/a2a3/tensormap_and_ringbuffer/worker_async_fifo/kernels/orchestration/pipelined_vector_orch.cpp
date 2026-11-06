@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr uint64_t kDelayedAdd = 0;
+constexpr uint64_t kVectorAdd = 0;
 constexpr uint64_t kAddScalar = 1;
 constexpr int kChainLength = 512;
 
@@ -32,7 +32,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::tmr::Tensor &a = args.tensor(0).ref();
     const simpler::tmr::Tensor &b = args.tensor(1).ref();
     const simpler::tmr::Tensor &out = args.tensor(2).ref();
-    const uint64_t spin_iters = args.scalar(0);
+    const uint64_t gate_address = args.scalar(0);
     uint32_t shape[1] = {a.shapes[0]};
     TensorCreateInfo temporary(shape, 1, DataType::FLOAT32);
 
@@ -40,8 +40,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     add_args.add_input(a);
     add_args.add_input(b);
     add_args.add_output(temporary);
-    add_args.add_scalar(spin_iters);
-    TaskOutputTensors add_outputs = rt_submit_aiv_task(kDelayedAdd, add_args);
+    add_args.add_scalar(gate_address);
+    TaskOutputTensors add_outputs = rt_submit_aiv_task(kVectorAdd, add_args);
     simpler::tmr::Tensor current = add_outputs.get_ref(0);
 
     union {
