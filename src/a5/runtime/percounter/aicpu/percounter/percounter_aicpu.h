@@ -184,6 +184,24 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
         }
         SPIN_WAIT_HINT();
     }
+    // The loop leaves on the completion count as readily as on an error, and
+    // between its last error poll and that exit a lane can still fail -- a lane
+    // that fails after publishing its final block sets the word later than any
+    // poll inside the loop could read it. So both error words are read once
+    // more here: this run is a success only when they are clear at the moment
+    // the supervisor stops watching, not merely at its last poll.
+    if (error == 0) {
+        cache_invalidate_range(&control->lane_error, sizeof(control->lane_error));
+        error = control->lane_error;
+        if (error != 0) {
+            LOG_ERROR(
+                "A5 HBG percounter: lane reported error %" PRIu64 " with all %" PRIu64 " blocks resolved", error,
+                expected
+            );
+        } else {
+            error = percounter_graph_prepare_error(control);
+        }
+    }
     percounter_graph_prepare_report(control, start_cycles);
     if (error == 0) return 0;
     (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, error);
