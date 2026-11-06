@@ -296,7 +296,10 @@ class CounterRunner:
         self.output.fill_(POISON)
         self.initial_signals.fill_(POISON)
         self.initial_signals[:, 0] = case.initial_signal
-        if case.scenario == Scenario.GRAPH:
+        if case.scenario == Scenario.PROGRESS:
+            # The runtime chooses the actual width; every potential marker starts pending.
+            self.initial_signals[CONDITION_LIMIT::CONDITIONS_PER_EXECUTION, 0] = 0
+        elif case.scenario == Scenario.GRAPH:
             # Registration starts pending even when business conditions are already satisfied.
             for _, _, execution in _active_executions(case, self.capacity_waiters, case.waiters):
                 self.initial_signals[execution * CONDITIONS_PER_EXECUTION + CONDITION_LIMIT, 0] = 0

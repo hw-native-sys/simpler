@@ -11,7 +11,7 @@
 
 #include "../waiter.h"
 
-// Graph business registrations use indices 0..63. Index 64 is a separate
+// Business registrations use indices 0..63. Index 64 is a separate
 // registration acknowledgement and is never registered by this waiter.
 static_assert(async_case::kConditionLimit == 64);
 static_assert(async_case::kConditionsPerExecution == async_case::kConditionLimit + 1);

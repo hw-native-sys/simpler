@@ -35,6 +35,13 @@ early entry, missing context and bounded-producer failures. Each successful run
 also requires fresh swimlane evidence identifying the AICore resident producer.
 No assertion reads a scheduler directory, lease, check queue or join counter.
 
+The progress and Graph fixtures use a separate INT32 registration marker for
+each waiter. A finite deferred gate waits for that marker, and the publisher
+depends on the gates rather than on the business waiters' TaskDone. Business
+consumers still depend on their original waiters. This keeps the publisher's
+registration check from blocking a waiter prefetched onto the same AIV; the
+original registration-count, timeout, rescue and numerical checks remain.
+
 The SDMA probe uses the PTO-ISA event's public completion-record API. It neither
 derives private queue addresses nor atomically modifies an external completion
 record. A numerically correct large transfer without an observed post-return
@@ -70,26 +77,26 @@ in the never-ready case are scoped by pytest's `monkeypatch` fixture.
 
 ## Integration status and remaining qualification
 
-The initial baseline is `main` at `d57258765e9a145a8bd2545deff8ebd9e3f52a7d`,
-with PTO-ISA `f83d4b7e4be0a4ca9805944ae2d9ce8c84e581f7`. Its resident executor
-does not provide the deferred context needed by the positive cases. Compile
-success and the predicate-skip control therefore do not establish async
-correctness. Keep these cases explicitly selected until the implementation
-passes the acceptance suite; then remove the `manual` markers.
+The adapters now provide versioned deferred capabilities, finite condition
+bounds, and explicit Host resource/consumer declarations. COUNTER waiters use
+`get_async_ctx` and `save_expected_notification_counter`; the SDMA adapter uses
+the qualified submission API with reservation before submission. The resident
+runtime seals registrations after kernel return. These connections are required
+for the tests to execute, but compile success alone does not qualify them.
 
-The workload adapter currently uses the public `get_async_ctx`,
-`save_expected_notification_counter` and `register_completion_condition`
-interfaces present on that baseline. The capability manifest, resource
-bindings, reserve-before-submit and return/seal interfaces in the design are
-not available there. When those public interfaces land, wire them into
-`helpers.py`, `kernels/waiter.h` and `kernels/aiv/sdma_submit.cpp` before claiming
-qualification. Preserve the task graphs, boundary inputs and numerical/causal
-verdicts; do not fabricate a capability field, patch scheduler state, or teach
-the oracle an implementation's queue layout.
+Keep these cases explicitly selected until the implementation passes the A5
+acceptance suite; then remove the `manual` markers. Preserve the boundary
+inputs, business dependencies and numerical/causal verdicts. Record results
+against the actual source, native libraries and repository PTO-ISA pin, and
+report simulator and onboard outcomes separately.
 
 This first batch does not qualify every backend failure phase, dirty-cache
 ownership, unsafe overlapping epochs, complete sync-start capacity boundaries,
-or cross-peer COUNTER publication. The close case covers an accepted unfinished
+or cross-peer COUNTER publication. The separate
+[`async_peer_counter`](../async_peer_counter/README.md) tests cover peer data,
+epoch reuse and C+1 progress, with additional implementation-specific native
+diagnostic assertions; they do not broaden this suite's evidence by implication.
+The close case covers an accepted unfinished
 run; it does not prove close began in a particular internal check phase.
 Private state-machine races and instruction-level protocol tests belong in
 the implementation's unit tests. Neither suite substitutes for A5 hardware

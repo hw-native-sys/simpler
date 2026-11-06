@@ -93,8 +93,29 @@ TaskId action(
 }
 
 template <typename Args>
+TaskId registration_gate(const Args &args, int64_t execution) {
+    const uint32_t signal_shape[2]{1, 1};
+    const uint32_t signal_offset[2]{
+        static_cast<uint32_t>(execution * async_case::kConditionsPerExecution + async_case::kConditionLimit), 0
+    };
+    const auto registration_signal = args.tensor(0).ref().view(signal_shape, signal_offset);
+    CoreTaskArgs gate;
+    gate.add_no_dep(registration_signal);
+    gate.add_no_dep(args.tensor(2).ref());
+    gate.add_scalar(execution);
+    const TaskId registered = rt_submit_aiv_task(10, gate).task_id();
+    if (!rt_declare_async_counter(registered, 0, async_case::kSignalStride * sizeof(int32_t), kCleanLines) ||
+        !rt_declare_async_core_only(registered))
+        throw std::runtime_error("async fixture registration gate declaration failed");
+    return registered;
+}
+
+template <typename Args>
 void body_tasks(const Args &args, const Plan &p, int64_t instance) {
     const auto scenario = static_cast<Scenario>(p.scenario);
+    if (scenario == Scenario::PROGRESS &&
+        (p.mask != 2 || p.blocks != 1 || p.sync_start || p.skip || p.conditions > async_case::kConditionLimit))
+        throw std::runtime_error("progress registration gates require ordinary AIV waiters with at most 64 conditions");
     const int64_t capacity = scenario == Scenario::VISIBILITY ? rt_available_cluster_count() : rt_available_aiv_count();
     const int64_t max_waiters = p.slots / (p.instances * p.blocks * 3);
     const int64_t waiters = scenario == Scenario::PROGRESS ? capacity + p.capacity_delta : p.waiters;
@@ -115,6 +136,7 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
     if (p.mask & 1) kernels.aic_kernel_id = 0;
     if (p.mask & 2) kernels.aiv0_kernel_id = 1;
     if (p.mask & 4) kernels.aiv1_kernel_id = 2;
+    std::vector<TaskId> publisher_deps = warm;
     for (int64_t waiter = 0; waiter < waiters; ++waiter) {
         const int64_t execution = base + waiter * p.blocks * 3;
         CoreTaskArgs task;
@@ -134,8 +156,10 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
             predicate.target = 0;
             task.set_predicate(predicate);
         }
-        const TaskId waited = rt_submit_task(kernels, task).task_id();
+        const TaskId waited = scenario == Scenario::PROGRESS ? rt_submit_aiv_task(9, task).task_id() :
+                                                               rt_submit_task(kernels, task).task_id();
         declare_waiter(waited, p.skip != 0);
+        if (scenario == Scenario::PROGRESS) publisher_deps.push_back(registration_gate(args, execution + 1));
         std::vector<TaskId> deps{waited};
         if (prerequisite.is_valid()) deps.push_back(prerequisite);
         action(
@@ -144,7 +168,9 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
         );
     }
     if (scenario != Scenario::NEVER && !p.skip)
-        action(args, p, Action::PUBLISH, instance, base, waiters, publisher_record, capacity, warm, p.delay_ms);
+        action(
+            args, p, Action::PUBLISH, instance, base, waiters, publisher_record, capacity, publisher_deps, p.delay_ms
+        );
     if (scenario == Scenario::PROGRESS) action(args, p, Action::RESCUE, instance, base, waiters, int64_t{-1}, 0);
 }
 
@@ -192,19 +218,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             // completion could hold EXIT even if the async child retired early.
             // Registration gates release their compute slot while the Graph
             // waiter is pending; they do not wait for the waiter's TaskDone.
-            const uint32_t signal_shape[2]{1, 1};
-            const uint32_t signal_offset[2]{
-                static_cast<uint32_t>(execution * async_case::kConditionsPerExecution + async_case::kConditionLimit), 0
-            };
-            const auto registration_signal = args.tensor(0).ref().view(signal_shape, signal_offset);
-            CoreTaskArgs gate;
-            gate.add_no_dep(registration_signal);
-            gate.add_no_dep(args.tensor(2).ref());
-            gate.add_scalar(execution);
-            const TaskId registered = rt_submit_aiv_task(10, gate).task_id();
-            if (!rt_declare_async_counter(registered, 0, async_case::kSignalStride * sizeof(int32_t), kCleanLines) ||
-                !rt_declare_async_core_only(registered))
-                throw std::runtime_error("async fixture registration gate declaration failed");
+            const TaskId registered = registration_gate(args, execution);
             action(
                 args, p, Action::PUBLISH, instance, base, 1, p.slots + max_waiters * p.instances + instance,
                 rt_available_aiv_count(), {registered}, p.delay_ms
