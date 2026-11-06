@@ -14,8 +14,8 @@
  *
  * `init` and `run` carry the scaffolding every scheduler needs — thread index
  * assignment, the handshake barriers, the completion gate, the terminal record
- * — and reach the parts a scheduler decides for itself through the six steps
- * declared at the end. Those six are defined weak, so a runtime that schedules
+ * — and reach the parts a scheduler decides for itself through the steps
+ * declared at the end. Each is defined weak, so a runtime that schedules
  * AICore differently supplies its own and the linker drops this one's; the
  * scaffolding around them is shared rather than reimplemented.
  *
@@ -109,8 +109,8 @@ struct AicpuExecutor {
     //
     // Each default is what the AICPU-dispatched and resident schedulers do, and
     // each is weak: a replacement replaces that one step, and the code around it
-    // in init and run is the same either way. All six run once per thread per
-    // run, never per task.
+    // in init and run is the same either way. None runs per task; all but the
+    // last run once per thread per run, and the last once per run.
 
     // Configure the discovered cores and publish READY, between the handshake
     // and the bootstrap gate. Leader only.
@@ -128,4 +128,10 @@ struct AicpuExecutor {
     // Wait for the supervisor to declare shutdown. Runs on every other thread.
     // Returns whether the wait timed out.
     SIMPLER_SCHEDULER_STEP bool await_shutdown(Runtime *runtime);
+    // Settle this run's error into the shared header and return the status it
+    // then carries. Runs inside snapshot_run_terminal, on the last participant
+    // out, which is the first point at which every core has stopped writing:
+    // a scheduler whose lanes can fail after its supervisor returned has
+    // nowhere earlier to read them.
+    SIMPLER_SCHEDULER_STEP int32_t settle_run_error(Runtime *runtime);
 };

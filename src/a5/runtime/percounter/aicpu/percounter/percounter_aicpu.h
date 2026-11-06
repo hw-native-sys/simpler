@@ -138,6 +138,36 @@ inline void percounter_assist(Runtime *runtime) { percounter_prepare_graphs(runt
  * With no other AICPU thread to assist, the supervisor materializes the Graph
  * bodies itself before it starts watching.
  */
+/**
+ * This runtime's error, settled into the shared header at the terminal.
+ *
+ * The supervisor stops watching when the completion count is in, and a lane
+ * can fail after that: it publishes its last block and then fails on the way
+ * out, or fails while draining, which it does after its own list is spent. The
+ * terminal is the first point at which every core has stopped, so it is the
+ * only place the whole run's error can be read.
+ *
+ * The header outranks what the supervisor returned, and `latch` keeps the
+ * first error, so a run that already failed keeps the error it failed with.
+ * The prepare record is read without reporting: whatever first found it named
+ * the invocation already.
+ */
+inline int32_t percounter_settle_run_error(Runtime *runtime) {
+    if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
+    auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+    PercounterControl *control = percounter_control(runtime);
+    if (control != nullptr) {
+        cache_invalidate_range(&control->lane_error, sizeof(control->lane_error));
+        uint64_t error = control->lane_error;
+        if (error == 0) error = percounter_graph_prepare_error(control, false);
+        if (error != 0) {
+            LOG_ERROR("A5 HBG percounter: run error %" PRIu64 " settled at the terminal", error);
+            (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, error);
+        }
+    }
+    return runtime_status_from_error_code(header->sched_error_code.load(std::memory_order_acquire));
+}
+
 inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_thread_count) {
     PercounterControl *control = percounter_control(runtime);
     if (control == nullptr || runtime->dev.host_total_tasks < 0 || runtime->get_gm_sm_ptr() == nullptr) {

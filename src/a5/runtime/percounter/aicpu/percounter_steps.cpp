@@ -9,14 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * This runtime's six AicpuExecutor steps.
+ * This runtime's seven AicpuExecutor steps.
  *
  * Everything around them — the thread rendezvous, the handshake barriers, the
  * completion gate, the terminal record, teardown — is host_build_graph's and is
  * compiled into this runtime unchanged. These definitions are strong, so the
  * linker takes them over the weak ones that translation unit carries.
  *
- * Three of the six differ because percounter brings the cores up itself: it
+ * Three of them differ because percounter brings the cores up itself: it
  * publishes the discovered topology into the control block rather than handing
  * out per-worker contexts, and the lanes start from that block without the
  * bootstrap acknowledgement the resident scheduler waits for. The other three
@@ -79,4 +79,10 @@ bool AicpuExecutor::await_shutdown(Runtime *runtime) {
         SPIN_WAIT_HINT();
     }
     return false;
+}
+
+// The default settles the resident scheduler's run control, which this runtime
+// does not have: its lanes report into the percounter control block instead.
+int32_t AicpuExecutor::settle_run_error(Runtime *runtime) {
+    return simpler::hbg::percounter::percounter_settle_run_error(runtime);
 }

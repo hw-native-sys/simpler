@@ -567,6 +567,10 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime) {
     return supervisor_rc;
 }
 
+__attribute__((weak)) int32_t AicpuExecutor::settle_run_error(Runtime *runtime) {
+    return publish_aicore_scheduler_runtime_error(runtime, "terminal");
+}
+
 __attribute__((weak)) bool AicpuExecutor::await_shutdown(Runtime *runtime) {
     if (!ready_watchdog_.wait_until_ready(
             [this] {
@@ -673,7 +677,7 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime, bool cores_retired) 
     // zero, and the error carried by nothing. This is the boundary where every
     // participant has finished its shutdown partition, so one settle covers
     // every core.
-    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime, "terminal");
+    const int32_t header_status = settle_run_error(runtime);
     // The header is one cache line a core may still be writing when retirement
     // was not proved, so what it returns cannot make such a run Ok. It can
     // still make it worse: `run_terminal_select` reports a header or

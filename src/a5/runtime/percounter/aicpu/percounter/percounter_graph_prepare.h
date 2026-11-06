@@ -270,12 +270,18 @@ inline void percounter_graph_prepare_stop(PercounterControl *control, uint64_t e
     __atomic_compare_exchange_n(&prepare->error, &expected, error, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
-/** The first materialization failure, as a SchedulerGraphResult, or 0. */
-inline uint64_t percounter_graph_prepare_error(PercounterControl *control) {
+/**
+ * The first materialization failure, as a SchedulerGraphResult, or 0.
+ *
+ * `report` names the invocation it happened on, which only the first reader
+ * of a given failure should do: a second line for one failure reads as a
+ * second failure.
+ */
+inline uint64_t percounter_graph_prepare_error(PercounterControl *control, bool report = true) {
     if (control->graph_invocation_count == 0) return 0;
     auto *prepare = percounter_region<PercounterGraphPrepare>(control, control->graph_prepare_offset);
     const uint64_t error = __atomic_load_n(&prepare->error, __ATOMIC_ACQUIRE);
-    if (error != 0) {
+    if (error != 0 && report) {
         LOG_ERROR(
             "A5 HBG percounter: Graph invocation %" PRIu64 " (of %" PRIu64 ") failed to materialize: %" PRIu64,
             __atomic_load_n(&prepare->error_invocation, __ATOMIC_ACQUIRE), control->graph_invocation_count, error
