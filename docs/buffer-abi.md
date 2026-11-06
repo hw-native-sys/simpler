@@ -103,11 +103,12 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` |
+| `buffer.address_space` + selected mapping | ≈ | `address_space` of the resolved attachment |
+| `mapping_ref` (opaque endpoint-local mapping record) | ⟂ | resolved before the L2 boundary |
 | `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
 
 `AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
-only the backing descriptor and view geometry. `TensorTransfer` belongs to each
+the backing descriptor, view geometry, and an explicit mapping reference. `TensorTransfer` belongs to each
 TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
 and `D2H` is reserved and rejected. Callable direction still controls input copies
 and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
@@ -129,6 +130,38 @@ changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
 Mailbox slots preserve each request in byte 141, formerly reserved view padding;
 standalone Tensor values do not carry it. Re-export and L2 materialization preserve
 the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
+
+An explicit mapping uses byte 142 of the same 144-byte Tensor; zero selects the
+native view. The source descriptor and canonical identity remain unchanged.
+Host allocation preserves native CPU access without pre-registering device consumption
+grants. Host and registered local DEVICE sources share the Worker mapping entry
+point. Each `map_view` request issues a restricted record in the actual target's
+ImportRegistry. References increase monotonically from 1 through 255 per backing;
+they encode neither rank nor access, are never reused, and fail explicitly on
+exhaustion. The qualified adapter resolves `(identity, mapping_ref)` only against
+a confirmed, live record for the current execution environment, extent and access.
+A mapped Tensor cannot switch references through `_with_mapping_ref`; native ref 0
+remains available for explicit H2D. Mapped arguments require explicit `NONE` and
+resolve to DEVICE/NONE at the chip boundary. Local mapping references are rejected
+by the remote wire.
+
+`Worker.unmap_view(tensor)` refuses in-flight use before revocation. Only the
+target's last active record releases its physical Host import. Cleanup failure
+remains CLOSING and retryable; new maps never revive old references. Source
+release waits for mappings, accepted uses, CPU imports and exported views.
+
+L3 uses local next-level worker ids as mapping targets, with no domain required.
+Host Buffer mapping is independent of communication domain creation or release.
+Controls run before a callback's first submission or between completed runs.
+
+The same-build `CommContext` remains 1088 bytes and contains rank windows and
+workspaces only. Mapped operands resolve through TaskArgs and ImportRegistry;
+there is no Host-specific context field, mixed rank table or descriptor-version
+change. Public Buffer/Tensor/TaskArgs types remain shared. Platform mapping and
+cleanup use the private same-build runtime bridge; mixed Python/native builds
+are unsupported. See the [A3 Host guide](a3-host-domain.md) for ownership,
+qualification and explicit rejection boundaries.
+
 HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device
 orchestration returns UNSUPPORTED for it. Invalid location/transfer pairs return
 INVALID_ARGUMENT before tensor content copying or device allocation. HOST/H2D also requires canonical
@@ -234,14 +267,15 @@ type change rather than a silently wrong address.
 ## Allocating buffers
 
 ```python
-h  = worker.create_buffer(nbytes)                 # kind3: explicit shared host buffer (POSIX shm)
+h  = worker.create_buffer(nbytes)                 # ordinary shared Host buffer
 h  = worker.alloc_shared_tensor((M, N), dtype)    # kind3: shape-sized create_buffer
 # inside an orch fn, for device (chip-private) memory:
 d  = orch.alloc_child_tensor(worker, (M, N), dtype)  # kind4: DEVICE_MALLOC on that chip
 ```
 
-`create_buffer` returns a `Buffer` backed by a POSIX shm the consumer maps
-lazily on first receipt of a tensor over it (map-once, by identity);
+`create_buffer` retains POSIX backing and CPU map-once resolution. Explicit A3
+mapping registers the target process's local Host address for device access;
+registration and its shared-memory import stay live until unmap succeeds.
 `alloc_shared_tensor` returns a runtime-managed intermediate over a FORK_SHM ring
 VA. `alloc_child_tensor` allocates device memory on a specific next-level worker
 and wraps the pointer; its `.base` is the device pointer (the `orch.copy_to`
@@ -329,18 +363,15 @@ read outputs) or **inside a Python sub-worker** (a compute leaf):
 
 ```python
 h = worker.create_buffer(n * 4)
-torch.frombuffer(h.shm.buf, dtype=torch.float32, count=n).fill_(5.0)  # before run()
+torch.frombuffer(h.buffer, dtype=torch.float32, count=n).fill_(5.0)  # before run()
 worker.run(my_orch, ...)                                             # orch names tensors only
-result = torch.frombuffer(out_h.shm.buf, dtype=torch.float32, count=n)  # after run()
+result = torch.frombuffer(out_h.buffer, dtype=torch.float32, count=n)  # after run()
 ```
 
-> **`h.shm` is transitional — wrap it.** Byte access belongs on the view, not on the
-> backing object: a `POSIX_SHM` buffer has an `shm` and a device one never will, so
-> code written against `h.shm.buf` forks by backend and cannot be told "this backing
-> has no host mapping" — it just gets `None`. The accessor that replaces it lands with
-> the view algebra; until then, put `h.shm.buf` behind one helper of your own so the
-> switch is a one-line change. Note also that a `frombuffer` tensor keeps the
-> memoryview alive: drop it before `close()`, or the release raises `BufferError`.
+> Use `Buffer.buffer` for native Host bytes instead of depending on POSIX `.shm`.
+> A DEVICE Buffer without a native CPU mapping refuses this accessor. A Python
+> memoryview or `frombuffer` tensor can retain its exporter; release these objects
+> before physical Buffer cleanup. A failed release stays closed and retryable.
 
 ## How a tensor reaches its consumer (three-way split)
 
@@ -391,12 +422,12 @@ gates, or keys on it.
 
 | Backend | Materializes to | `body` must be | Used for |
 | ------- | --------------- | -------------- | -------- |
-| `POSIX_SHM` | a named shm mapped into the consumer | the shm name: 1–32 bytes of printable ASCII, no `/` | `create_buffer` / `alloc_shared_tensor` |
+| `POSIX_SHM` | a named shm mapped into the consumer | the shm name: 1–32 bytes of printable ASCII, no `/` | ordinary non-A3 `create_buffer` |
 | `FORK_SHM` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork `MAP_SHARED` host buffer (e.g. `share_memory_()`), writable from the child |
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
 | `DEVICE_MALLOC` | the device pointer, no map (chip-local) | exactly 8 bytes, a non-zero u64 LE base | `alloc_child_tensor` |
-| `REMOTE_SIDECAR` | (P2) resolved via the remote transport | empty | an arg to a remote L3; the descriptor rides in the sidecar |
+| `REMOTE_SIDECAR` | an explicit endpoint attachment or remote transport binding | empty | remote L3 arguments; generic descriptor-only mapping is refused |
 
 **The body rule is enforced, not advisory.** `backend_kind` is what selects how a
 consumer reads `body`, so a body that does not fit that reading is not a smaller

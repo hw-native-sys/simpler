@@ -6552,8 +6552,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         try:
             req_buf = cast(Any, request.buf)
             worker_mod._DOMAIN_REQ_HEADER.pack_into(
-                req_buf, 0, 7, 1, 0, 64, 1
-            )  # allocation_id, rank_count, domain_rank, window_size, buffer_count
+                req_buf, 0, 7, 1, 0, 64, 1, 0, 0
+            )  # allocation_id, rank_count, domain_rank, window_size, buffer_count, host_size, workspace_mask
             # One buffer larger than the window: the carve raises after the
             # collective has already committed.
             struct.pack_into("<Q", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 4096)
@@ -6591,7 +6591,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         reply = SharedMemory(create=True, size=worker_mod._DOMAIN_REPLY_HEADER.size)
         try:
             req_buf = cast(Any, request.buf)
-            worker_mod._DOMAIN_REQ_HEADER.pack_into(req_buf, 0, 7, 1, 0, 64, 0)
+            worker_mod._DOMAIN_REQ_HEADER.pack_into(req_buf, 0, 7, 1, 0, 64, 0, 0, 0)
             struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
 
             def committed_then_failed(*args, workspace_mask):

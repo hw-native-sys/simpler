@@ -881,6 +881,7 @@ class TestDomainReleaseOrdering:
             for buf in bufs:
                 w._record_device_alloc(buf, domain_allocation_id=9)
         handle = SimpleNamespace(
+            _host_resource=None,
             name="d",
             workers=(0, 1),
             allocation_id=9,

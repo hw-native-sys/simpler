@@ -17,6 +17,8 @@ cases that drive the ledger itself.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 _COMMON = {"platform": "a2a3", "runtime": "host_build_graph"}
@@ -194,7 +196,7 @@ def _l2_with_recording_chip(monkeypatch, **extra):
             pass
 
         def get_binaries(self, *_a, **_k):
-            return object()
+            return SimpleNamespace(host_path="/test/host_runtime.so")
 
     monkeypatch.setattr(worker_mod, "_ChipWorker", _RecordingChip)
     monkeypatch.setattr(
