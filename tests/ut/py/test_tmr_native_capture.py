@@ -81,7 +81,7 @@ def _bind(lib):
 
 
 class _Recording:
-    def __init__(self, lib, ctx, caller, config, epoch, slot):
+    def __init__(self, lib, ctx, caller, config, epoch, slot, *, capture=True):
         from simpler.task_interface import AddressSpace, ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
         self.lib, self.ctx, self.caller = lib, ctx, caller
@@ -101,14 +101,19 @@ class _Recording:
             args.add_tensor(ChipTensor.make(ptr.value, (_COUNT,), DataType.FLOAT32, address_space=AddressSpace.DEVICE))
         self.storage, self.run = _native_run_storage(lib)
         descriptor = NativeRunDescriptor(
-            pipeline_slot=slot, generation=1, dispatch_id=epoch, run_epoch=epoch, prepare_purpose=_PREPARE_CAPTURE
+            pipeline_slot=slot,
+            generation=1,
+            dispatch_id=epoch,
+            run_epoch=epoch,
+            prepare_purpose=_PREPARE_CAPTURE if capture else 0,
         )
         assert (
             lib.simpler_prepare_run(ctx, self.run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
             == 0
         )
-        assert lib.simpler_retain_run_resources(ctx, self.run, caller, ctypes.byref(self.reference)) == 0
-        assert self.reference.value is not None
+        if capture:
+            assert lib.simpler_retain_run_resources(ctx, self.run, caller, ctypes.byref(self.reference)) == 0
+            assert self.reference.value is not None
         # The launch consumes its prepared snapshot, not this mutable source object.
         args.clear()
         args.add_scalar(111)
@@ -139,7 +144,8 @@ class _Recording:
         assert all(result == expected for result in self.views[2]), (value, list(self.views[2][:8]), expected)
 
     def close(self):
-        assert self.lib.simpler_release_run_resources(self.ctx, self.reference) == 0
+        if self.reference.value:
+            assert self.lib.simpler_release_run_resources(self.ctx, self.reference) == 0
         for ptr in self.device:
             assert self.lib.aclrtFree(ptr) == 0
         for ptr in self.host:

@@ -2102,7 +2102,7 @@ int simpler_launch_run_on_stream(
     if (rc != 0) return rc;
     if (recording && (state->descriptor.prepare_purpose != SIMPLER_PREPARE_CAPTURE ||
                       !state->runner->execution_mode_latch().is_kernel() || predecessor != nullptr ||
-                      state->prepared_execution->dfx.diagnostics_any()))
+                      !state->runner->capture_diagnostics_supported(*state->prepared_execution)))
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     state->recording = recording;
     state->prepared_execution->caller_stream = caller_stream;

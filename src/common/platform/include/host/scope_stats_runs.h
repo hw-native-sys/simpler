@@ -32,12 +32,14 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "common/scope_stats.h"
 #include "host/chip_swimlane_runs.h"
 #include "host/diagnostic_run_credit.h"
+#include "host/scope_stats_capacity.h"
 #include "host/collected_record.h"
 
 namespace simpler::dfx::scope_stats_runs {
@@ -152,6 +154,7 @@ struct Collection {
     bool counts_unknown{false};
     uint64_t received{0};
     uint64_t retained{0};
+    bool recorded_window{false};
 };
 
 /**
@@ -162,6 +165,7 @@ struct Collection {
  */
 struct RunExport {
     uint64_t run_epoch{0};
+    std::optional<CapacityMetadata> aggregate_capacities;
     /** The export slot this run holds until its artifact is published. */
     size_t slot{0};
     std::string output_dir;

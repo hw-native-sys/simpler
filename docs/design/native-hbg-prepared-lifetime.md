@@ -47,9 +47,13 @@ run, including if that reference is released before the original run ends.
 The original run still requires its own finalization.
 
 Onboard retention covers actual non-DFX backing for Kernel and ordinary Program
-preparations. Program remains eager-only. SIM returns `UNSUPPORTED` and clears
-a supplied output reference. Retention success alone does not advertise a
-backend's device replay support; use the
+preparations. Native A3 TMR capture additionally retains ScopeStats-only backing
+and its collection window through the same prepared resource owner; see the
+[ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection)
+for shared-pool ordering and release obligations. Other diagnostic combinations,
+including HBG diagnostic retention, remain refused. Program remains eager-only.
+SIM returns `UNSUPPORTED` and clears a supplied output reference. Retention
+success alone does not advertise a backend's device replay support; use the
 [execution support limits](native-capture-common-contract.md#support-and-qualification-limits).
 
 Retaining code, internal streams and backing does not retain an external device

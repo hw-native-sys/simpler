@@ -178,6 +178,12 @@ platform_case(test_scope_stats_retained_runs.cpp PER_ARCH
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
     TIER aicpu)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        target_link_options(test_${arch}_scope_stats_retained_runs PRIVATE "-Wl,--wrap=pthread_mutex_lock")
+    endforeach()
+endif()
+
 # Who owns a host-built dependency graph between its thread and its file. Not
 # per-arch or per-runtime: the exporter names no runtime symbol — the hand-off
 # arrives as a function pointer — and holds nothing a device writes.

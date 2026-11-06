@@ -1681,6 +1681,8 @@ public:
         uint32_t scheduler_runtime_mode{0};
     };
 
+    virtual int prepare_collector_storage(const Runtime &, PreparedExecution &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
     // Reads host-owned run/registration state before device recovery or cleanup.
     void log_run_failure(const PreparedExecution &prepared, int rc) const;
 
@@ -1841,6 +1843,8 @@ public:
     int retain_external_run_resources(PreparedExecution &prepared, void *caller_stream, void **out_reference);
     int release_external_run_resources(void *reference);
     int admit_recording(PreparedExecution &prepared);
+    bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
+    virtual bool supports_scope_stats_capture() const { return false; }
     bool prepared_storage_in_use() const;
     bool prepared_resources_block_fatal_reset() const;
     bool prepared_resources_can_abandon() const;
@@ -2745,11 +2749,9 @@ protected:
      *
      * The release frees device memory the collectors are holding, so it is only
      * safe while no other run is executing against them. Nothing here enforces
-     * that. What guarantees it is the caller: `arm_collectors_for_run()` is the
-     * sole user, and it runs from the launch arming, under the execution claim.
-     * Do not move the call back into preparation — a prepared successor overlaps
-     * its predecessor's device window, so this would free pools that predecessor
-     * is still writing into.
+     * that. Ordinary arming holds the execution claim; cold diagnostic arming
+     * instead holds native_run_mu_ with no claim active until its retained
+     * window pins the shape. Both exclude a new execution during pool rebuild.
      */
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&
@@ -3154,6 +3156,7 @@ protected:
         std::vector<WorkspaceManager::BackingIdentity> managed_backing;
         void *caller_stream{nullptr};
         bool recording{false};
+        bool scope_stats_window{false};
         bool release_requested{false};
         bool closing{false};
     };
