@@ -160,9 +160,9 @@ _SIZE = 128 * 128
 _FRAME_COUNT = 2
 #: Consecutive submissions the refill case makes.
 _REFILL_RUNS = 16
-#: How long to keep draining the children's log files after their runs have finished. The writers
-#: are asynchronous, so this covers the lag between a record being accepted and written, not the
-#: run itself. Exhausting it is an absence, which the caller's assertion reports as one.
+#: How long to look for the trace records each case needs. The writers are asynchronous, so a
+#: record can become readable after the event it describes. Exhausting the budget is reported
+#: by the caller's evidence assertion.
 _EVIDENCE_BUDGET_S = 10.0
 #: Lines of each child's own log a failing numeric check carries, from the end of the sequence.
 _DIAGNOSTIC_LOG_LINES = 900
@@ -1730,6 +1730,7 @@ class TestA2a3TmrEarlyEnqueueLifetimes(_A2a3TmrEarlyEnqueueBase):
         handles: list = []
         failures: list = []
         trace = _RunTrace(st_worker)
+        records: list[dict] = []
         pid = self._endpoint_pid(st_worker)
         first_group, first_out, first_expected = self._three_buffers(st_worker, 2.0, 3.0)
         second_group, second_out, second_expected = self._three_buffers(st_worker, 5.0, 7.0)
@@ -1755,6 +1756,11 @@ class TestA2a3TmrEarlyEnqueueLifetimes(_A2a3TmrEarlyEnqueueBase):
                     handles.append(
                         self._submit_vector(st_worker, second_group, output_prefix, spin_iters=_DEVICE_SPIN_ITERS)
                     )
+                    # submit() can return before activation. The predecessor's result wait can
+                    # block the child while it still needs to activate the successor.
+                    _await_records(
+                        trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(_established_pairs(seen, case_runs, pid))
+                    )
                     for handle in handles:
                         handle.wait()
                 finally:
@@ -1763,9 +1769,8 @@ class TestA2a3TmrEarlyEnqueueLifetimes(_A2a3TmrEarlyEnqueueBase):
                     failures = _drain_handles(handles, "a2a3 TMR lifetimes")
         assert not failures, f"this case's runs did not settle: {failures}"
 
-        # The join for this pair, from the children's own records, before any value is read: a
-        # serial fallback records none and fails here.
-        records: list[dict] = []
+        # The child writes the trace asynchronously. A join that was not yet readable before
+        # the result waits can still appear in the trace after both runs retire.
         _await_records(trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(_established_pairs(seen, case_runs, pid)))
         pairs = _established_pairs(records, case_runs, pid)
         assert pairs, (
