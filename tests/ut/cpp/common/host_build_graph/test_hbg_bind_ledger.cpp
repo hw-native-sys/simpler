@@ -23,6 +23,7 @@
 // needed because bind takes the resolved host-orch entry points as a parameter.
 
 #include <gtest/gtest.h>
+#include "host/host_graph_capture_scope.h"
 
 #include <algorithm>
 #include <array>
@@ -2578,6 +2579,7 @@ TEST_F(HbgBindLedgerTest, AResourceWaitRetainsTheGraphAcrossRuntimeDestructionAn
     args.add_tensor(host_tensor(input));
     const ArgDirection signature[] = {ArgDirection::IN};
     {
+        HostGraphCaptureScope capture;
         Runtime attempt;
         init_runtime(attempt);
         EXPECT_EQ(bind(attempt, args, signature, 1), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
@@ -2592,6 +2594,7 @@ TEST_F(HbgBindLedgerTest, AResourceWaitRetainsTheGraphAcrossRuntimeDestructionAn
     EXPECT_EQ(callback_records, 1u);
     // Retrying an unchanged refusal preserves the same plan and source bytes.
     {
+        HostGraphCaptureScope capture;
         Runtime attempt;
         init_runtime(attempt);
         EXPECT_EQ(bind(attempt, args, signature, 1), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
@@ -2604,6 +2607,7 @@ TEST_F(HbgBindLedgerTest, AResourceWaitRetainsTheGraphAcrossRuntimeDestructionAn
     // The resumed attempt may run on a different lane thread. Capture belongs
     // to the saved plan, not to the original thread's diagnostic state.
     auto retry = std::async(std::launch::async, [&] {
+        HostGraphCaptureScope capture;
         const int rc = bind(resumed, args, signature, 1);
         if (rc != 0) return rc;
         const int published = publish_run_image_impl(&resumed, &api_);
@@ -2648,11 +2652,13 @@ TEST_F(HbgBindLedgerTest, AResumedUnpublishedImageHasOneOwnerEvenWhenPublication
     eps_ = {recording_orch_entry, capture_orch_bind};
     ChipStorageTaskArgs args;
     {
+        HostGraphCaptureScope capture;
         Runtime attempt;
         init_runtime(attempt);
         ASSERT_EQ(bind(attempt, args, nullptr, 0), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
     }
     fake_.arena_status = 0;
+    HostGraphCaptureScope resumed_capture;
     Runtime resumed;
     init_runtime(resumed);
     ASSERT_EQ(bind(resumed, args, nullptr, 0), 0);

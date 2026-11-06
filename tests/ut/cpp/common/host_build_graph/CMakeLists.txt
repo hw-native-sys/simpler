@@ -73,6 +73,48 @@ else()
     simpler_ut_exclude_case(test_hbg_host_phase_failure.cpp)
 endif()
 
+hbg_case(test_hbg_recorder_lifetime.cpp
+    SOURCES ${SIMPLER_SRC}/common/worker/runtime_module.cpp
+    INCLUDES ${SIMPLER_SRC}/common/worker
+    LINK ${CMAKE_DL_LIBS})
+foreach(arch a2a3 a5)
+    simpler_ut_includes(${arch} host_build_graph host recorder_includes)
+    add_library(${arch}_hbg_recorder_fixture SHARED
+        ${CMAKE_SOURCE_DIR}/common/support/hbg_recorder_fixture.cpp
+        ${HBG_HOST_DIR}/graph_recording.cpp
+        ${HBG_HOST_DIR}/graph_recorder_pool.cpp
+        ${HBG_HOST_DIR}/tensormap.cpp
+        ${CMAKE_SOURCE_DIR}/support/unified_log_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/support/assert_stubs.cpp)
+    target_include_directories(${arch}_hbg_recorder_fixture PRIVATE ${recorder_includes})
+    target_compile_options(${arch}_hbg_recorder_fixture PRIVATE $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+    target_link_libraries(${arch}_hbg_recorder_fixture PRIVATE pthread)
+    target_compile_definitions(test_${arch}_hbg_recorder_lifetime PRIVATE
+        HBG_RECORDER_FIXTURE_PATH="$<TARGET_FILE:${arch}_hbg_recorder_fixture>")
+    add_dependencies(test_${arch}_hbg_recorder_lifetime ${arch}_hbg_recorder_fixture)
+    set_tests_properties(test_${arch}_hbg_recorder_lifetime PROPERTIES TIMEOUT 30)
+endforeach()
+
+hbg_case(test_capture_prepare_lifetime.cpp LINK ${CMAKE_DL_LIBS})
+foreach(arch a2a3 a5)
+    simpler_ut_includes(${arch} host_build_graph host context_includes)
+    add_library(${arch}_context_fixture SHARED
+        ${CMAKE_SOURCE_DIR}/common/support/capture_prepare_fixture.cpp
+        ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+        ${CMAKE_SOURCE_DIR}/support/unified_log_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/support/assert_stubs.cpp)
+    target_include_directories(${arch}_context_fixture PRIVATE ${context_includes})
+    target_compile_options(${arch}_context_fixture PRIVATE $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+    target_link_libraries(${arch}_context_fixture PRIVATE pthread)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(${arch}_context_fixture PRIVATE
+            -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_key_delete -Wl,--wrap=pthread_setspecific)
+    endif()
+    target_compile_definitions(test_${arch}_hbg_capture_prepare_lifetime PRIVATE
+        CONTEXT_FIXTURE_PATH="$<TARGET_FILE:${arch}_context_fixture>")
+    add_dependencies(test_${arch}_hbg_capture_prepare_lifetime ${arch}_context_fixture)
+    set_tests_properties(test_${arch}_hbg_capture_prepare_lifetime PROPERTIES TIMEOUT 20)
+endforeach()
 
 
 # These drive the real orchestrator, so they link the orchestrator object
@@ -201,3 +243,10 @@ hbg_case(test_hbg_slot_claim.cpp ORCH
 # directory's own contract, built for both arches. Declaring one above takes it
 # out of this sweep, so the exceptions are the declarations themselves.
 simpler_ut_glob_cases(hbg_case)
+
+# Fault injection checks selector publication without leaving a borrowed pointer.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch IN ITEMS a2a3 a5)
+        target_link_options(test_${arch}_hbg_graph_recording_bounds PRIVATE -Wl,--wrap=pthread_setspecific)
+    endforeach()
+endif()

@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "common/module_thread_value.h"
 #include "host_build_graph/host/graph_submit.h"
 
 #include <stdint.h>
@@ -55,19 +56,32 @@ GraphHostState *graph_state_from(OrchestratorState *orch) {
     return orch == nullptr ? nullptr : static_cast<GraphHostState *>(orch->graph_host_state);
 }
 
-// The in-flight entry this thread is recording into, bound by graph_prepare and
-// cleared by graph_end / graph_abort.
-thread_local GraphInflightRecording *g_active_graph_entry = nullptr;
-thread_local GraphRecording *g_active_graph_recording = nullptr;
-// The recording a thread holds belongs to one GraphHostState. Recording into it
-// from a different orchestrator would silently mix two graphs, so the owner is
-// part of the thread-local identity rather than implied by it.
-thread_local GraphHostState *g_active_graph_owner = nullptr;
+// Borrowed identity for the recording currently bound on this thread. Storage
+// belongs to a worker scope or an in-flight fallback lease, never to TLS.
+struct ActiveGraphRecording {
+    GraphInflightRecording *entry{nullptr};
+    GraphRecording *recording{nullptr};
+    GraphHostState *owner{nullptr};
+};
+simpler::ModuleThreadValue<ActiveGraphRecording> active_graph_selector;
+ActiveGraphRecording active_graph() { return active_graph_selector.get(); }
 
 // Drop this thread's recording's view of an in-flight entry's boundary. Called where a
 // recording ends, because the entry does not outlive graph_commit while the storage does.
 void unbind_recorder_boundary() {
-    if (g_active_graph_recording != nullptr) g_active_graph_recording->boundary = nullptr;
+    if (active_graph().recording != nullptr) active_graph().recording->boundary = nullptr;
+}
+
+void recycle_fallback_storage(GraphHostState &state, GraphInflightRecording &entry) {
+    if (!entry.fallback_storage) return;
+    entry.fallback_storage->boundary = nullptr;
+    for (auto &cached : state.fallback_storage) {
+        if (!cached) {
+            cached = std::move(entry.fallback_storage);
+            return;
+        }
+    }
+    entry.fallback_storage.reset();
 }
 
 // Bind this thread's storage to one in-flight entry and empty it. Returns false when the
@@ -107,8 +121,8 @@ bool graph_recording_reset(GraphRecording &recording, const GraphInflightRecordi
 
 GraphRecording *active_graph_recording(OrchestratorState *orch) {
     GraphHostState *state = graph_state_from(orch);
-    if (state == nullptr || state != g_active_graph_owner) return nullptr;
-    return g_active_graph_recording;
+    if (state == nullptr || state != active_graph().owner) return nullptr;
+    return active_graph().recording;
 }
 
 namespace {
@@ -788,7 +802,7 @@ TaskOutputTensors graph_record_submit_sub_task(
     // nothing that scans the recorded tasks can see the task being built.
     recording.task_count = task_index + 1;
     ORCH_PHASE_END_WITH_INDEX(
-        HostPhaseKind::OrchRecordSubTask, TaskId::to_uint64(task_id), g_active_graph_entry->submit_idx
+        HostPhaseKind::OrchRecordSubTask, TaskId::to_uint64(task_id), active_graph().entry->submit_idx
     );
     return result;
 }
@@ -799,7 +813,7 @@ GraphScopeResult OrchestratorState::graph_begin(uint64_t graph_key, const GraphT
         rejected.has_error = true;
         return rejected;
     }
-    ORCH_PHASE_START_SPANNING(g_active_graph_entry != nullptr ? g_active_graph_entry->submit_idx : g_orch_submit_idx);
+    ORCH_PHASE_START_SPANNING(active_graph().entry != nullptr ? active_graph().entry->submit_idx : g_orch_submit_idx);
     const GraphScopeResult result = graph_begin_inner(graph_key, args);
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphBegin, graph_key);
     return result;
@@ -1016,7 +1030,7 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
 // against it.
 bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArgs &) {
     GraphHostState *state = graph_state_from(this);
-    if (state == nullptr || recording_handle == nullptr || g_active_graph_recording != nullptr) return false;
+    if (state == nullptr || recording_handle == nullptr || active_graph().recording != nullptr) return false;
     auto *entry = static_cast<GraphInflightRecording *>(recording_handle);
     // graph_begin published this entry before the private job was enqueued, and
     // the entry's address is stable for as long as the recording lives, so the
@@ -1029,18 +1043,28 @@ bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArg
     if (entry->status() != GraphRecordingStatus::RECORDING) {
         return false;
     }
-    // This thread's own storage, emptied rather than allocated -- see
-    // recorder_recording(). Failure is reachable only on this thread's first recording,
-    // where the hazard map is stood up; the caller then aborts the recording, and the
-    // outer shell it already submitted replays nothing.
-    GraphRecording &recording = recorder_recording();
+    GraphRecording *scratch = recorder_recording();
+    if (scratch == nullptr) {
+        std::scoped_lock lock(state->recording_mutex);
+        for (auto &cached : state->fallback_storage) {
+            if (cached) {
+                entry->fallback_storage = std::move(cached);
+                break;
+            }
+        }
+        if (!entry->fallback_storage) entry->fallback_storage = std::make_unique<GraphRecording>();
+        scratch = entry->fallback_storage.get();
+    }
+    GraphRecording &recording = *scratch;
     if (!graph_recording_reset(recording, *entry)) {
         LOG_WARN("%s", "[GraphExecution] recording hazard map allocation failed; recording abandoned");
         return false;
     }
-    g_active_graph_entry = entry;
-    g_active_graph_recording = &recording;
-    g_active_graph_owner = state;
+    if (const int error = active_graph_selector.try_set({entry, &recording, state})) {
+        recording.boundary = nullptr;
+        LOG_WARN("[GraphExecution] recording TLS binding failed: %d", error);
+        return false;
+    }
     return true;
 }
 
@@ -1048,20 +1072,23 @@ void OrchestratorState::graph_abort(void *recording_handle) {
     GraphHostState *state = graph_state_from(this);
     auto *entry = static_cast<GraphInflightRecording *>(recording_handle);
     if (state == nullptr || entry == nullptr) return;
-    {
-        std::scoped_lock lock(state->recording_mutex);
-        entry->set_status(GraphRecordingStatus::FAILED);
+    std::scoped_lock lock(state->recording_mutex);
+    // A failed graph_end can already have retired the handle. Match addresses
+    // before dereferencing it, and never clear another owner's active binding.
+    bool found = false;
+    for (const auto &item : state->inflight) {
+        if (item.second.get() == entry) {
+            found = true;
+            break;
+        }
     }
-    // The storage outlives the entry it was bound to, and graph_commit destroys the
-    // entries, so leaving the pointer behind parks a stale one in thread_local state for
-    // the rest of the process. The next graph_prepare rebinds before anything reads it,
-    // which is why this is hygiene rather than a fix -- but clearing it turns a dangling
-    // boundary into a null one, and null is the only state bound_boundary()'s assertion
-    // can catch a read outside a recording by.
-    unbind_recorder_boundary();
-    g_active_graph_entry = nullptr;
-    g_active_graph_recording = nullptr;
-    g_active_graph_owner = nullptr;
+    if (!found || entry->status() != GraphRecordingStatus::RECORDING) return;
+    if (active_graph().owner == state && active_graph().entry == entry) {
+        unbind_recorder_boundary();
+        active_graph_selector.restore({});
+    }
+    recycle_fallback_storage(*state, *entry);
+    entry->set_status(GraphRecordingStatus::FAILED);
     state->recording_cv.notify_all();
 }
 
@@ -1069,19 +1096,18 @@ void OrchestratorState::graph_abort(void *recording_handle) {
 // thread finalizes the already-submitted outer Graph tasks in graph_commit.
 //
 // Retires the entry it bound on every path below that has one, so a caller never has
-// to pair a `false` return with an abort — and must not: graph_commit frees a drained
-// entry after releasing recording_mutex, so a second abort would take that mutex and
-// still touch freed memory.
+// to pair a `false` return with an abort. graph_commit may free a retired entry,
+// so the caller must stop using the handle once graph_end has returned.
 bool OrchestratorState::graph_end() {
     GraphHostState *state = graph_state_from(this);
     GraphRecording *recording = active_graph_recording(this);
-    GraphInflightRecording *entry = g_active_graph_entry;
+    GraphInflightRecording *entry = active_graph().entry;
     if (state == nullptr || recording == nullptr || entry == nullptr) return false;
 
     // A fatal latched anywhere in the run ends this pass with no Definition, but the
     // entry still has to leave RECORDING: graph_commit's drain blocks until every
     // in-flight entry has, and nothing else transitions this one. Returning early
-    // instead would park the entry — and this thread's recorder thread_locals — for
+    // instead would park the entry — and this thread's recorder selectors — for
     // the rest of the process, and hang the bind that is already failing.
     if (is_fatal()) {
         graph_abort(entry);
@@ -1127,8 +1153,11 @@ bool OrchestratorState::graph_end() {
         header->task_count, header->total_bytes
     );
     bool ready = false;
+    unbind_recorder_boundary();
+    active_graph_selector.restore({});
     {
         std::scoped_lock lock(state->recording_mutex);
+        recycle_fallback_storage(*state, *entry);
         if (entry->status() != GraphRecordingStatus::RECORDING || entry->graph_key != header->graph_key) {
             entry->set_status(GraphRecordingStatus::FAILED);
         } else {
@@ -1137,10 +1166,6 @@ bool OrchestratorState::graph_end() {
         }
         ready = entry->status() == GraphRecordingStatus::READY;
     }
-    unbind_recorder_boundary();
-    g_active_graph_entry = nullptr;
-    g_active_graph_recording = nullptr;
-    g_active_graph_owner = nullptr;
     state->recording_cv.notify_all();
     return ready;
 }
@@ -1148,7 +1173,7 @@ bool OrchestratorState::graph_end() {
 // Join every recording in flight and back-patch all deferred shells in submit
 // order. Orchestration completion is the only normal-path barrier.
 void OrchestratorState::graph_commit() {
-    ORCH_PHASE_START_SPANNING(g_active_graph_entry != nullptr ? g_active_graph_entry->submit_idx : g_orch_submit_idx);
+    ORCH_PHASE_START_SPANNING(active_graph().entry != nullptr ? active_graph().entry->submit_idx : g_orch_submit_idx);
     graph_commit_inner();
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphCommit, 0);
 }

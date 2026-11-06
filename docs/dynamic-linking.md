@@ -225,6 +225,32 @@ keys only when the last loader reference is released and the module really unloa
 
 ### All TLS Variables
 
+HBG recorder storage is worker-owned. Borrowed worker-storage pointers and
+active-recording identities use module-owned pthread keys without thread-exit
+callbacks. Direct recordings borrow bounded reusable scratch from their graph
+state; no recording payload is owned by TLS.
+
+The prepare transaction owns its dependency capture session and workspace claim
+ledger through success, rollback and exception cleanup. Selectors only borrow
+these objects and are cleared before their storage dies. Recursive prepare on
+the same thread is rejected, including calls naming a different context. A failed
+selector binding leaves its previous value intact and fails the operation; a
+failed restore terminates rather than leaving a dangling borrowed pointer. Key
+initialization failures remain unavailable until module reload.
+
+`tests/lint/check_reloadable_tls.py` rejects new compiler TLS declarations and
+unreviewed pthread-key creation sites. Two exact AICPU declarations remain
+temporary exceptions pending #2859; remove those exceptions when that change
+lands. Third-party PTO ISA TLS is outside this source-tree check.
+
+HBG exports paired `simpler_runtime_acquire_host_services` and
+`simpler_runtime_release_host_services` hooks. RuntimeModule acquires one lease per
+loader owner; the last safe release closes admission, drains and joins the recorder
+pool before dlclose. Missing both hooks is supported for runtimes without these
+services; a partial pair or failed acquire rejects the load. Terminal abandonment
+retains the loader reference and lease together. Lifecycle release must run outside
+recorder workers, after the owner's binds and native runs have finished.
+
 | Variable | Storage | SO | Purpose |
 | -------- | ------- | -- | ------- |
 | host-phase lane/generation and thread ID | `ModuleThreadValue` | host runtime SO | Borrowed producer identity; generation rejects stale passes |
@@ -236,7 +262,10 @@ keys only when the last loader reference is released and the module really unloa
 | `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
 | `g_subblock_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread subblock identity (for TPUSH/TPOP) |
 | `g_cluster_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread cluster identity (for TPUSH/TPOP) |
-| `s_orch_thread_idx` | `__thread int` | AICPU SO | Profiling thread index (profiling off by default) |
+| recorder storage / active recording | `ModuleThreadValue` | host runtime SO | Borrowed worker scratch / recording identity |
+| dependency capture | module-owned pthread keys | host runtime SO | Prepare-owned graph and per-thread enable flag |
+| workspace plan / claims | `ModuleThreadValue` | onboard host runtime SO | Prepare-owned identity and rollback ledger |
+| `tl_exec_idx` / `tl_filter_exec_idx` | `thread_local int32_t` | AICPU SO | Temporary legacy selectors; replacement tracked in #2859 |
 | `g_platform_phase_base` | plain global + `extern "C"` setter | AICPU SO | Device-phase buffer base; published by host (onboard kernel.cpp / sim dlsym), read by the `[STRACE]` phase stamps. Per-thread slotting via the affinity pthread-key index, not TLS. |
 | strace `inv`/`depth`/`hid` | process-owned `pthread_key_t` (`SimplerHostTraceState`) | resident `_task_interface` host-log owner; borrowed by runtime/generated SOs | Scalar trace state allocated with `calloc`, freed by libc at thread exit. |
 | onboard prepare ownership | `pthread_key_t` | host runtime SO | Rejects same-thread recursive prepare across contexts; the key is deleted when the module unloads. |

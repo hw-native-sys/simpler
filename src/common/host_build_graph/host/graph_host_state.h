@@ -85,6 +85,7 @@ enum class GraphRecordingStatus : uint8_t { RECORDING = 0, READY = 1, FAILED = 2
 // storage belongs to the recorder thread that will fill it (recorder_recording()), so
 // nothing here is sized by the graph.
 struct GraphInflightRecording {
+    std::unique_ptr<GraphRecording> fallback_storage;
     uint64_t graph_key{0};
     GraphBoundary boundary;
     // Atomic because graph_prepare reads it on the recording thread without
@@ -120,6 +121,8 @@ struct GraphDefinitionRecord {
 };
 
 struct GraphHostState {
+    // Synchronous callers lease independent scratch; retired entries return it here.
+    std::array<std::unique_ptr<GraphRecording>, GRAPH_MAX_DEFINITIONS> fallback_storage;
     explicit GraphHostState(const GraphDefinitionArena &arena) :
         arena(arena) {}
 

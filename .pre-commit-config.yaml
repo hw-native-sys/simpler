@@ -119,6 +119,13 @@ repos:
         # isolated hook venv would technically work but triggers a full C++ build
         # (cmake + ninja + nanobind + build_runtimes for all sim variants) and
         # forces every Python-only contributor to install a C++ toolchain.
+        - id: check-reloadable-tls
+          name: check reloadable module TLS ownership
+          entry: python tests/lint/check_reloadable_tls.py
+          language: system
+          pass_filenames: false
+          files: ^(src/|tests/lint/check_reloadable_tls\.py$)
+
         - id: clang-tidy
           name: clang-tidy
           entry: python tests/lint/clang_tidy.py
