@@ -87,14 +87,14 @@ struct alignas(64) DispatchPayload {
     // === Cache line 0 (64B): control block, the only line written per dispatch ===
     // function_bin_addr, local_context.{block_idx,block_num,async_ctx.task_token}
     // and src_payload are the per-dispatch writes; async_ctx's slab pointers +
-    // capacity are cold (prefilled once at init) but ride this hot line for free.
+    // capacity/sender identity are cold (prefilled once at init) but ride this hot line for free.
     // Sized to exactly 64B so both dispatch paths write one control line: the
     // ready path (src_payload = 0) then also fills args[0..num_args); the gated
     // path (src_payload = &TaskPayload) leaves args[] to the idle AICore.
     uint64_t function_bin_addr; /**< Kernel entry address in GM (set by Scheduler). */
 
     /** Per-dispatch context: block_idx/block_num (hot) + async_ctx (task_token hot,
-     *  slab pointers + capacity prefilled once at init). args[SPMD_LOCAL_CONTEXT_INDEX]
+     *  slab pointers, capacity and sender identity prefilled once at init). args[SPMD_LOCAL_CONTEXT_INDEX]
      *  points here. */
     LocalContext local_context;
 

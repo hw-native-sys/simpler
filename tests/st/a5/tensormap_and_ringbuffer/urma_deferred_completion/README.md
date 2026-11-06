@@ -22,6 +22,8 @@ The PUT readback is issued by the sending rank after its deferred PUT task
 completes. It reads the destination region on the peer, so it does not depend
 on an unsynchronized peer-side consumer. Producers are serialized per actual
 queue; these cases do not claim multi-AIV shared-queue concurrency coverage.
+The [concurrent sender suite](../urma_concurrent_senders/README.md) covers
+independent AIV queue groups, MIX lanes, multiple peers, and physical ring reuse.
 The consumer processes full 8192-element tiles; the case builder rejects nonpositive
 or unaligned extents. Large cases use approximately 512 MiB of registered window per rank plus local
 output and consumer buffers. CPU regressions separately exercise counter wrap,
