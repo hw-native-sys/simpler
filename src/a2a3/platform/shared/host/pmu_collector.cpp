@@ -210,7 +210,7 @@ void PmuCollector::start(const profiling_common::ThreadFactory &thread_factory) 
     // A retaining collector owns no single-run shard state: its files, counters
     // and header belong to an epoch, and dropping them here would reset what a
     // predecessor is still publishing into.
-    if (!retains_runs()) {
+    if (!retains_runs() && !recorded_windows_open()) {
         reset_collector_shards();
     }
     profiling_common::ProfilerBase<PmuCollector, PmuModule>::start(thread_factory);
@@ -294,10 +294,17 @@ void PmuCollector::rebuild_csv_header() {
     csv_header_ = build_csv_header(pmu_resolve_event_config_a2a3(event_type_));
 }
 
-void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_type) {
+bool PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_type, uint64_t run_epoch) {
+    const auto destination = retained_runs_.available_destination(csv_path);
+    if (!destination) return false;
+    if (!simpler::dfx::pmu::invalidate_collection_metadata(*destination)) {
+        retained_runs_.note_collector_failure("ordinary CSV could not invalidate a previous recorded descriptor");
+        return false;
+    }
     // Before reset_collector_shards(): it rebuilds the shard paths from csv_path_.
-    csv_path_ = csv_path;
+    csv_path_ = *destination;
     event_type_ = event_type;
+    ordinary_run_epoch_ = run_epoch;
 
     reset_collector_shards();
     if (csv_file_.is_open()) {
@@ -306,6 +313,7 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
     execution_complete_.store(false, std::memory_order_release);
     rebuild_csv_header();
     set_run_config(event_type);
+    return true;
 }
 
 void *PmuCollector::bank_alloc(void *owner, size_t bytes, void **host_out) {
@@ -617,7 +625,13 @@ void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int colle
     // A retaining collector routes by the buffer's own run identity, so a
     // predecessor's late buffer lands in that run's file with that run's
     // columns rather than in whatever run is currently admitting.
-    if (retains_runs()) {
+    if (retained_runs_.route_known_buffer(
+            info.host_buffer_ptr, static_cast<int>(info.core_index), static_cast<int>(info.thread_index),
+            collector_shard
+        ))
+        return;
+    if (retains_runs() || (retained_runs_.ready() && buffer_run_epoch(info.host_buffer_ptr) !=
+                                                         ordinary_run_epoch_.load(std::memory_order_acquire))) {
         retained_runs_.route_buffer(
             info.host_buffer_ptr, static_cast<int>(info.core_index), static_cast<int>(info.thread_index),
             collector_shard
@@ -648,7 +662,7 @@ void PmuCollector::reconcile_counters() {
     // teardown rather than per run. Reaching here would read a successor's
     // counters and merge in place under a path an epoch owns.
     if (retains_runs()) return;
-    report_drain_drops();
+    retained_runs_.reconcile_transport();
 
     rmb();
     flush_collector_shards_to_csv();

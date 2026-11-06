@@ -69,9 +69,9 @@ The exact native entry names are `simpler_prepare_run`,
 
 Active recording requires Kernel mode, capture-purpose preparation, a matching
 retained reference and caller stream, and no predecessor argument. Diagnostics
-are disabled except for ScopeStats alone on native A3 TMR. That combination
-reserves and arms its collection window during retention, before capture; other
-diagnostic families and combinations remain refused. Duplicate recording,
+allow ScopeStats alone on native A3 TMR or PMU alone on native A3 TMR/HBG.
+Each supported family reserves and arms its collection window during retention,
+before capture; other diagnostic families and combinations remain refused. Duplicate recording,
 invalidated capture and unsupported combinations are refused. A capture query or
 refusal does not prove that accepted device work has completed.
 
@@ -88,17 +88,18 @@ copying Program outputs. The retained reference remains responsible for future
 model uses. Resource and failed-release rules are specified in the
 [resource lifetime contract](native-hbg-prepared-lifetime.md).
 
-ScopeStats-enabled models and eager runs sharing one context's collector pool
+Diagnostic-enabled models and eager runs sharing one context's collector pool
 must execute in one caller-ordered domain, with no concurrent producers. Multiple
 resource references and collection windows may coexist. Before releasing any
-such reference, the caller must finish **all** ScopeStats producers sharing that
+such reference, the caller must finish **all** producers sharing that
 pool and start none until release returns. Closing one window does not close
 another live window. Synchronizing the retained caller stream or counting
 references cannot prove that a raw model replay on another stream has stopped;
 the caller establishes that ordering. This contract adds neither a second owner
 nor a whole-context stream synchronization operation. Aggregate sample and
 publication semantics are specified in the
-[ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection).
+[ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection)
+and [PMU capture contract](../dfx/pmu-profiling.md#native-a3-capturereplay).
 
 ## Completion and errors
 
@@ -143,8 +144,11 @@ producer contract above. Its separate consumer checks actual replay-produced
 samples and a subsequent ordinary eager run; DFX-off capture tests and ordinary
 ScopeStats tests do not establish that combination. Recorded windows export
 aggregate raw boundary samples, not exact per-replay totals or paired scopes.
-HBG has no ScopeStats device producer; other capture diagnostic families remain
-unsupported.
+HBG has no ScopeStats device producer. PMU alone uses the real A3 AICPU
+task-completion producer on TMR and HBG; its aggregate raw rows carry frozen
+event columns and explicit unknown cumulative device accounting. Neither PMU
+rows nor fixed task IDs identify individual replays. Other capture diagnostic
+families and combinations remain unsupported.
 
 A3 qualification does not qualify A5 or framework graph integration. Native CPU
 tests and SIM behavior do not establish RTS model support. Permanent missing

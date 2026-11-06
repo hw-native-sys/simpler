@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <thread>
@@ -144,6 +145,20 @@ public:
         }
         install_credit_release_notifiers();
         return true;
+    }
+
+    bool stand_up_pmu(const fs::path &csv) {
+        if (attach_current_thread(kSimDeviceId) != 0) return false;
+        set_retain_runs(false);
+        if (pmu_collector_.init(1, 1, rollback_alloc, nullptr, rollback_free, kSimDeviceId) != 0) return false;
+        return pmu_collector_.begin_run(csv.string(), PmuEventType::PIPE_UTILIZATION, 5400);
+    }
+
+    bool pmu_readers_started() const { return pmu_collector_.collector_threads_started(); }
+
+    void shut_down_pmu() {
+        pmu_collector_.stop();
+        pmu_collector_.finalize(nullptr, rollback_free);
     }
 
     /** Join the reader shards, so no one is left to acknowledge a release. */
@@ -432,4 +447,41 @@ TEST(DiagnosticRollbackNotificationTest, ASuppressionEndsWithItsScope) {
     const uint64_t after_undo = signal.generation();
     signal.advance();
     EXPECT_EQ(signal.generation(), after_undo + 1) << "a suppression outlived the undo that took it";
+}
+
+TEST(DiagnosticRollbackNotificationTest, OrdinaryPmuDestinationRefusalStopsBeforeReadersStart) {
+    OutputRoot root("ordinary-pmu-destination-refusal");
+    const auto previous = root.base / "pmu.csv";
+    const auto refused = root.base / "refused";
+    ASSERT_TRUE(fs::create_directories(refused / "pmu.collection.json"));
+    {
+        std::ofstream csv(previous);
+        csv << "previous artifact";
+    }
+    RollbackRunner runner;
+    ASSERT_TRUE(runner.stand_up_pmu(previous));
+    CallConfig config;
+    config.enable_pmu = static_cast<int>(PmuEventType::MEMORY);
+    std::snprintf(config.output_prefix, sizeof(config.output_prefix), "%s", refused.c_str());
+    const int rc = runner.start_shared_collectors_for_run(DfxRunConfig::from(config), 5401, RunLocalDfxMetadata{});
+    EXPECT_NE(rc, 0);
+    EXPECT_FALSE(runner.pmu_readers_started());
+    EXPECT_TRUE(fs::is_directory(refused / "pmu.collection.json"));
+    runner.shut_down_pmu();
+    std::ifstream csv(previous);
+    std::string contents;
+    std::getline(csv, contents);
+    EXPECT_EQ(contents, "previous artifact");
+}
+
+TEST(DiagnosticRollbackNotificationTest, OrdinaryPmuAcceptedDestinationStartsReaders) {
+    OutputRoot root("ordinary-pmu-admitted");
+    RollbackRunner runner;
+    ASSERT_TRUE(runner.stand_up_pmu(root.base / "pmu.csv"));
+    CallConfig config;
+    config.enable_pmu = static_cast<int>(PmuEventType::MEMORY);
+    std::snprintf(config.output_prefix, sizeof(config.output_prefix), "%s", root.base.c_str());
+    EXPECT_EQ(runner.start_shared_collectors_for_run(DfxRunConfig::from(config), 5402, RunLocalDfxMetadata{}), 0);
+    EXPECT_TRUE(runner.pmu_readers_started());
+    runner.shut_down_pmu();
 }

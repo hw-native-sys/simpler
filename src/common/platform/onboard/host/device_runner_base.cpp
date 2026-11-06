@@ -353,12 +353,22 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 
     LaunchTransactionResult transaction;
     try {
-        if (!outcome.prepared->recording && outcome.prepared->dfx.scope_stats_enabled) {
+        if (!outcome.prepared->recording && outcome.prepared->dfx.diagnostics_any()) {
             std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
             for (auto &[key, reference] : external_run_references_) {
-                if (reference->identity != outcome.prepared->identity || !reference->scope_stats_window) continue;
-                scope_stats_collector_.abandon_run(reference->identity.run_epoch);
-                reference->scope_stats_window = false;
+                if (reference->identity != outcome.prepared->identity) continue;
+                if (reference->scope_stats_window) {
+                    scope_stats_collector_.abandon_run(reference->identity.run_epoch);
+                    reference->scope_stats_window = false;
+                }
+                if (reference->pmu_window) {
+                    if (!pmu_collector_.abandon_run(reference->identity.run_epoch)) {
+                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+                        return outcome;
+                    }
+                    pmu_lease_.release(reference->identity.run_epoch);
+                    reference->pmu_window = false;
+                }
             }
         }
         transaction = launch_execution_impl(*outcome.prepared, std::move(permit));
@@ -3871,9 +3881,11 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller, bool *recording)
 bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &prepared) const {
     const auto &dfx = prepared.dfx;
     if (!dfx.diagnostics_any()) return true;
+    if (dfx.chip_swimlane_enabled() || dfx.dump_args_enabled() || dfx.dep_gen_enabled || dfx.output_prefix.empty())
+        return false;
+    if (dfx.pmu_enabled) return supports_pmu_capture() && !dfx.scope_stats_enabled;
     return supports_scope_stats_capture() && prepared.scope_stats_capacity.required &&
-           prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled && !dfx.chip_swimlane_enabled() &&
-           !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.dep_gen_enabled && !dfx.output_prefix.empty();
+           prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled;
 }
 
 int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
@@ -4002,6 +4014,21 @@ int DeviceRunnerBase::retain_external_run_resources(
         resources->submission_->args.runtime_args == nullptr ||
         resources->submission_->args.runtime_upload_source == nullptr)
         return PTO_RUNTIME_ERR_INVALID_STATE;
+    // External -> native -> storage is the diagnostic admission lock order.
+    // Duplicate retention must be refused before pool allocation or replacement
+    // of an earlier successful artifact, including after that reference ended.
+    std::unique_lock<std::mutex> native_lock;
+    if (prepared.dfx.diagnostics_any()) {
+        native_lock = std::unique_lock<std::mutex>(native_run_mu_);
+        if (active_native_run_count_ != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    {
+        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
+        const auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
+            return entry.identity == prepared.identity;
+        });
+        if (use == prepared_uses_.end() || !use->use.can_retain_external_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     rc = prepare_submission_resources(prepared);
     if (rc != 0) return rc;
     auto reference = std::make_unique<ExternalRunReference>();
@@ -4014,15 +4041,39 @@ int DeviceRunnerBase::retain_external_run_resources(
     if (resources->temporary_ && resources->temporary_->backing)
         reference->managed_backing.emplace_back(resources->temporary_->backing);
     reference->caller_stream = caller_stream;
-    // Holding this mutex through pool construction and window admission excludes
-    // a launch taking an execution claim between the idle check and allocation.
-    std::unique_lock<std::mutex> native_lock;
-    if (prepared.dfx.scope_stats_enabled) {
-        native_lock = std::unique_lock<std::mutex>(native_run_mu_);
-        if (active_native_run_count_ != 0 || scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch))
+    // The native claim remains excluded throughout pool construction/window admission.
+    if (prepared.dfx.diagnostics_any()) {
+        if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+            pmu_collector_.recorded_window_open(prepared.identity.run_epoch))
             return PTO_RUNTIME_ERR_INVALID_STATE;
         rc = prepare_collector_storage(*prepared.runtime, prepared);
         if (rc != 0) return rc;
+    }
+    bool pmu_armed = false;
+    bool published = false;
+    RAIIScopeGuard rollback_window([&] {
+        if (published) return;
+        if (prepared.dfx.scope_stats_enabled) scope_stats_collector_.abandon_run(prepared.identity.run_epoch);
+        if (pmu_armed) {
+            pmu_collector_.abandon_run(prepared.identity.run_epoch);
+            pmu_lease_.release(prepared.identity.run_epoch);
+        }
+    });
+    if (prepared.dfx.pmu_enabled) {
+        pmu_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        (void)pmu_lease_.acquire(device_id(), prepared.identity.run_epoch);
+        pmu_armed = true;
+        if (!pmu_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, make_pmu_csv_path(prepared.dfx.output_prefix), prepared.dfx.pmu_event_type,
+                pmu_lease_.state_name()
+            ))
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        reference->pmu_window = true;
+        prepared.kernel_args.args.pmu_run_terminal_bank = 0;
+    }
+    if (prepared.dfx.scope_stats_enabled) {
         scope_stats_collector_.start([this](std::function<void()> function) {
             return create_thread(std::move(function));
         });
@@ -4034,11 +4085,6 @@ int DeviceRunnerBase::retain_external_run_resources(
         // Replay overwrites terminal counters; none can certify a window total.
         prepared.kernel_args.args.scope_stats_run_terminal_bank = 0;
     }
-    bool published = false;
-    RAIIScopeGuard rollback_window([&] {
-        if (!published && prepared.dfx.scope_stats_enabled)
-            scope_stats_collector_.abandon_run(prepared.identity.run_epoch);
-    });
     void *key = reference.get();
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
     auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
@@ -4095,7 +4141,7 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
             if (rc == 0) rc = storage.fence->retire(reference->identity);
             if (rc != 0) return rc;
         }
-        if (reference->scope_stats_window) {
+        if (reference->scope_stats_window || reference->pmu_window) {
             // Raw replay is caller-ordered. Its drained stream plus the external
             // end promise stops producers; the lock excludes a new native run
             // while the collector establishes its reader-quiescence boundary.
@@ -4104,9 +4150,17 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
                 if (!reference->recording || active_native_runs_[index].identity != reference->identity)
                     return PTO_RUNTIME_ERR_INVALID_STATE;
             }
-            rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
-            if (rc != 0) return rc;
-            reference->scope_stats_window = false;
+            if (reference->scope_stats_window) {
+                rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
+                if (rc != 0) return rc;
+                reference->scope_stats_window = false;
+            }
+            if (reference->pmu_window) {
+                rc = pmu_collector_.close_recorded_window(reference->identity.run_epoch);
+                if (rc != 0) return rc;
+                pmu_lease_.release(reference->identity.run_epoch);
+                reference->pmu_window = false;
+            }
         }
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
         auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
@@ -5266,7 +5320,10 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
         } else {
             // The default path keeps its order: the window is opened, then the
             // threads that serve it start.
-            pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
+            if (!pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, run_epoch)) {
+                decline("pmu");
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
             pmu_collector_.start(thread_factory);
         }
     }
@@ -5337,7 +5394,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     // it or is fatal answers no. The caller needs the distinction because only
     // the first is a restoration of what every waiter already saw.
     bool restored = true;
-    if (dfx.pmu_enabled && pmu_collector_.retains_runs()) {
+    if (dfx.pmu_enabled && pmu_collector_.retains_runs() && !pmu_collector_.recorded_window_open(run_epoch)) {
         // Nothing may escape a rollback path, for the reason given below. A
         // throw is not a proof of release, so it settles the way a refusal does.
         try {
@@ -5346,7 +5403,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
             restored = false;
         }
     }
-    if (dfx.pmu_enabled) {
+    if (dfx.pmu_enabled && !pmu_collector_.recorded_window_open(run_epoch)) {
         // Unconditional on purpose: the lease drops a reference only for an
         // epoch that holds one, so a run refused before the acquire ran and a
         // run whose acquire failed both give back nothing here.
@@ -5540,6 +5597,7 @@ int DeviceRunnerBase::close_args_dump_run_boundary(
 void DeviceRunnerBase::close_pmu_run_boundary(
     const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
+    if (pmu_collector_.recorded_window_open(run_epoch)) return;
     // The lease covers the device-side counting window, which this boundary
     // ends; the host-side writing that follows touches no PMU register. A
     // successor already past its own open holds its own reference, so the

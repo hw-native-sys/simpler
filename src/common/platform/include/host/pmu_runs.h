@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -35,9 +37,9 @@
  *
  * Both single-arch PMU collectors instantiate these, so the epoch state machine
  * and the failure classification exist once. Everything here is host-only and
- * is reached exclusively through a PMU collector that retains runs; with
- * retention off no epoch is ever claimed and every PMU path behaves as it does
- * today.
+ * serves both ordinary across-run collection and independent recorded windows.
+ * Ordinary retention remains a caller policy; recorded-window admission does
+ * not enable it.
  *
  * The policy constants are shared with the swimlane collector
  * (`simpler::dfx::runs`) rather than re-declared: two open epochs, a 4096 byte
@@ -55,23 +57,24 @@ using simpler::dfx::runs::kPathAllowanceBytes;
 /**
  * Why a retained PMU run's flush says what it says.
  *
- * Only the first two are successes. Every other verdict must fail the public
- * flush even when a readable CSV was published, because a PMU CSV has no field
- * in which to record that it is partial: the swimlane artifact carries
- * `metadata.collection`, and the flush conclusion is all PMU has. So this
+ * Ordinary CSV has no quality metadata, so an incomplete ordinary result fails the public
+ * flush even when readable rows were published. RecordedAggregate alone succeeds
+ * with unknown device totals because its mandatory collection descriptor makes
+ * that uncertainty explicit. So this
  * enumeration deliberately does *not* reuse `simpler::dfx::runs::Verdict`,
  * whose `verdict_publishes` treats a published partial as a non-error.
  */
 enum class Verdict {
-    Published,         // cut proved, records balanced, file published
-    PublishedEmpty,    // cut proved, provably zero records, no file — as today
-    PublishedShort,    // file published, content provably incomplete
-    CountsUnknown,     // rows may be published, record accounting unreadable
-    CutUnproved,       // cut unknown/failed, processing unsettled, or run unfinished
-    CounterExhausted,  // a transport counter has no headroom; no cut is trustworthy
-    WriteFailed,       // shard write, merge or rename failed; temps preserved
-    Quarantined,       // references or the cut slot not proved released
-    Abandoned,         // the collector was torn down before this run was published
+    Published,          // cut proved, records balanced, file published
+    PublishedEmpty,     // cut proved, provably zero records, no file — as today
+    PublishedShort,     // file published, content provably incomplete
+    CountsUnknown,      // rows may be published, record accounting unreadable
+    CutUnproved,        // cut unknown/failed, processing unsettled, or run unfinished
+    CounterExhausted,   // a transport counter has no headroom; no cut is trustworthy
+    WriteFailed,        // shard write, merge or rename failed; temps preserved
+    Quarantined,        // references or the cut slot not proved released
+    RecordedAggregate,  // raw samples published, cumulative device counts unknown
+    Abandoned,          // the collector was torn down before this run was published
 };
 
 inline const char *verdict_name(Verdict v) {
@@ -92,14 +95,18 @@ inline const char *verdict_name(Verdict v) {
         return "write_failed";
     case Verdict::Quarantined:
         return "quarantined";
+    case Verdict::RecordedAggregate:
+        return "aggregate_counts_unknown";
     case Verdict::Abandoned:
         return "abandoned";
     }
     return "unknown";
 }
 
-/** True only for the two verdicts a flush may report as success. */
-inline bool verdict_succeeds(Verdict v) { return v == Verdict::Published || v == Verdict::PublishedEmpty; }
+/** Ordinary complete/empty results and honestly published recorded aggregates succeed. */
+inline bool verdict_succeeds(Verdict v) {
+    return v == Verdict::Published || v == Verdict::PublishedEmpty || v == Verdict::RecordedAggregate;
+}
 
 /**
  * The cut proof, evaluated by the writer when an epoch reaches a terminal.
@@ -416,6 +423,19 @@ inline std::string publication_temp_path(const std::string &csv_path, uint64_t e
     return csv_path + ".e" + std::to_string(epoch) + ".part.tmp";
 }
 
+// Publication replaces the final directory entry, so resolve its directory
+// aliases without following an existing final-file symlink.
+inline std::optional<std::string> publication_destination(const std::string &csv_path) {
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(std::filesystem::path(csv_path), error);
+    if (error) return std::nullopt;
+    const auto parent = std::filesystem::weakly_canonical(absolute.parent_path(), error);
+    if (error) return std::nullopt;
+    auto key = (parent / absolute.filename()).string();
+    if (key.size() + 64 > kPathAllowanceBytes) return std::nullopt;
+    return key;
+}
+
 /**
  * True when a previous epoch's preserved failure artifacts are still present
  * for this destination.
@@ -435,7 +455,10 @@ inline bool failure_evidence_present(const std::string &csv_path) {
     if (ec) return false;
     for (const auto &entry : it) {
         const std::string name = entry.path().filename().string();
-        if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) continue;
+        const std::string metadata_prefix = "pmu.collection.json.e";
+        if (name.compare(0, prefix.size(), prefix) != 0 &&
+            name.compare(0, metadata_prefix.size(), metadata_prefix) != 0)
+            continue;
         if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) return true;
     }
     return false;
@@ -521,6 +544,24 @@ inline void remove_shard_temps(const std::vector<std::string> &shard_paths) {
     }
 }
 
+inline std::string collection_metadata_path(const std::string &csv_path) {
+    return (std::filesystem::path(csv_path).parent_path() / "pmu.collection.json").string();
+}
+
+// An ordinary writer invalidates a prior recorded descriptor too. Callers first
+// establish destination ownership; a failed preflight never erases old evidence.
+inline bool invalidate_collection_metadata(const std::string &csv_path) {
+    std::error_code error;
+    const auto path = collection_metadata_path(csv_path);
+    const auto status = std::filesystem::symlink_status(path, error);
+    // SDK DSOs can provide distinct error-category objects; filesystem errors carry native POSIX errno.
+    if (error.value() == ENOENT) return true;
+    if (error) return false;
+    if (std::filesystem::is_directory(status)) return false;
+    std::filesystem::remove(path, error);
+    return !error;
+}
+
 // ---------------------------------------------------------------------------
 // The epoch table
 // ---------------------------------------------------------------------------
@@ -550,6 +591,9 @@ struct Epoch {
 
     // Frozen at admission, before any callback can receive this run's data.
     Frozen frozen{};
+    bool recorded_window{false};
+    const char *protection_state{"not_acquired"};
+    std::atomic<uint64_t> clamped_buffers{0};
     std::string csv_path;
     std::string csv_header;
     std::vector<std::string> shard_paths;
@@ -669,14 +713,16 @@ public:
 
     bool run_begin(
         uint64_t run_epoch, const std::string &csv_path, EventType event_type,
-        simpler::dfx::runs::AdmissionRefusal *why = nullptr
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr, bool recorded_window = false
     ) {
         if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
         // A guard, not the configuration question's answer: a caller that
         // reaches here on a collector that retains nothing has already taken
         // the wrong path.
-        if (!retain_across_runs_) return false;
-        if (!ensure_ready()) {
+        if (!retain_across_runs_ && !recorded_window) return false;
+        const auto destination = publication_destination(csv_path);
+        if (!destination) return false;
+        if (!ensure_ready(recorded_window)) {
             LOG_ERROR(
                 "PmuCollector: run %llu refused, retention could not be prepared",
                 static_cast<unsigned long long>(run_epoch)
@@ -703,7 +749,7 @@ public:
         // A failed epoch's temps are its evidence and this contract never
         // deletes them, so a later run under the same destination is refused
         // rather than allowed to write beside them.
-        if (failure_evidence_present(csv_path)) {
+        if (failure_evidence_present(*destination)) {
             LOG_ERROR(
                 "PmuCollector: run %llu refused, %s still holds a failed run's temporary files; "
                 "read them and remove them to reuse this destination",
@@ -720,7 +766,7 @@ public:
                 if (epochs_[i].state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) {
                     // A destination an open epoch owns would have two writers
                     // and one publication point.
-                    if (epochs_[i].csv_path == csv_path) {
+                    if (epochs_[i].csv_path == *destination) {
                         LOG_ERROR(
                             "PmuCollector: run %llu refused, %s is still owned by run %llu",
                             static_cast<unsigned long long>(run_epoch), csv_path.c_str(),
@@ -746,37 +792,41 @@ public:
                 return false;
             }
 
+            simpler::dfx::credit::Reservation terminal_bank;
+            if (!recorded_window && owner_.device_publishes_run_terminal()) {
+                terminal_bank = owner_.reserve_run_terminal_bank(run_epoch);
+                if (!terminal_bank.held()) {
+                    if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
+                    LOG_ERROR(
+                        "PmuCollector: run %llu refused, every per-run terminal bank is in use",
+                        static_cast<unsigned long long>(run_epoch)
+                    );
+                    return false;
+                }
+            }
+            // Every admission reservation precedes invalidating a published descriptor.
+            // The local bank returns automatically if invalidation or initialization fails.
+            if (!invalidate_collection_metadata(*destination)) return false;
             Epoch<Frozen> &epoch = epochs_[slot];
             epoch.epoch.store(run_epoch, std::memory_order_relaxed);
+            epoch.recorded_window = recorded_window;
+            epoch.protection_state = "not_acquired";
             epoch.frozen = owner_.freeze_run_config(event_type);
-            epoch.csv_path = csv_path;
+            epoch.csv_path = *destination;
             epoch.csv_header = owner_.build_csv_header(epoch.frozen);
             const size_t shard_count = owner_.retained_shard_count();
             epoch.shard_paths.clear();
             epoch.shard_paths.reserve(shard_count);
             for (size_t shard = 0; shard < shard_count; shard++) {
-                epoch.shard_paths.push_back(shard_temp_path(csv_path, run_epoch, shard));
+                epoch.shard_paths.push_back(shard_temp_path(*destination, run_epoch, shard));
             }
             epoch.reset_run_state(shard_count);
+            epoch.clamped_buffers.store(0, std::memory_order_relaxed);
+            epoch.terminal_bank = std::move(terminal_bank);
             epoch.state.store(static_cast<int>(EpochState::Admitting), std::memory_order_release);
             progress_++;
         }
 
-        // Each admitted epoch holds its own terminal bank while its producers
-        // execute and its host readers settle their accounting.
-        if (owner_.device_publishes_run_terminal()) {
-            Epoch<Frozen> &admitted = epochs_[static_cast<size_t>(slot)];
-            admitted.terminal_bank = owner_.reserve_run_terminal_bank(run_epoch);
-            if (!admitted.terminal_bank.held()) {
-                if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
-                LOG_ERROR(
-                    "PmuCollector: run %llu refused, every per-run terminal bank is in use",
-                    static_cast<unsigned long long>(run_epoch)
-                );
-                withdraw_unpublished_slot(slot);
-                return false;
-            }
-        }
         owner_.set_run_config(event_type);
         // Every shard must see this epoch before the device can publish into
         // it, or its first buffers would belong to no epoch.
@@ -784,6 +834,53 @@ public:
             set_fatal("a collector shard did not acknowledge the epoch table in time");
         }
         return !fatal_.load(std::memory_order_acquire);
+    }
+
+    bool begin_recorded_window(uint64_t epoch, const std::string &path, EventType event) {
+        if (recorded_window_open(epoch)) return false;
+        return run_begin(epoch, path, event, nullptr, true);
+    }
+
+    bool recorded_window_open(uint64_t epoch) const {
+        std::lock_guard<std::mutex> lock(mu_);
+        const int slot = find_slot(epoch);
+        return slot >= 0 && epochs_[static_cast<size_t>(slot)].recorded_window;
+    }
+
+    bool recorded_windows_open() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto &epoch : epochs_)
+            if (epoch.recorded_window &&
+                epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free))
+                return true;
+        return false;
+    }
+
+    void note_recorded_protection(uint64_t epoch, const char *state) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const int found = find_slot(epoch);
+        if (found >= 0 && epochs_[static_cast<size_t>(found)].recorded_window)
+            epochs_[static_cast<size_t>(found)].protection_state = state;
+    }
+
+    // Caller has stopped every producer sharing this pool. The drain transfers
+    // all rows into host shards; file publication remains the background writer's.
+    int close_recorded_window(uint64_t epoch) {
+        if (!recorded_window_open(epoch)) return 0;
+        owner_.quiesce();
+        run_close(epoch, true);
+        return 0;
+    }
+
+    std::optional<std::string> available_destination(const std::string &path) const {
+        const auto destination = publication_destination(path);
+        if (!destination) return std::nullopt;
+        std::lock_guard<std::mutex> lock(mu_);
+        for (const auto &epoch : epochs_)
+            if (epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free) &&
+                epoch.csv_path == *destination)
+                return std::nullopt;
+        return failure_evidence_present(*destination) ? std::nullopt : destination;
     }
 
     /**
@@ -867,6 +964,15 @@ public:
         } catch (...) {}
     }
 
+    /** Whether no admitted epoch is still unpublished. */
+    bool retained_runs_idle() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const Epoch<Frozen> &epoch : epochs_) {
+            if (epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) return false;
+        }
+        return true;
+    }
+
     /**
      * Whether a further run could be admitted to the retained path.
      *
@@ -875,16 +981,6 @@ public:
      * not retaining proves nothing and a failed collector refuses admission
      * whatever its capacity.
      */
-
-    /** Whether no admitted epoch is still unpublished. */
-    bool retained_runs_idle() const {
-        if (!retains_runs()) return true;
-        std::lock_guard<std::mutex> lk(mu_);
-        for (const Epoch<Frozen> &epoch : epochs_) {
-            if (epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) return false;
-        }
-        return true;
-    }
 
     bool can_admit_retained_run() const {
         if (!retains_runs()) return false;
@@ -913,9 +1009,12 @@ public:
         // only because it has not — and the ready-queue tails the cut reads are
         // stable either way.
         epoch.records =
+            epoch.recorded_window ?
+                RecordProofs{} :
             owner_.device_publishes_run_terminal() ?
                 owner_.snapshot_run_records_from_terminal(device_execution_complete, epoch.terminal_bank, run_epoch) :
                 owner_.snapshot_run_records(device_execution_complete);
+        if (epoch.recorded_window) epoch.records.device_execution_complete = device_execution_complete;
 
         // Every buffer this run will ever publish is already in a device ready
         // queue at this instant, so each queue's target is finite and a
@@ -1048,6 +1147,7 @@ public:
             // A count past the buffer's capacity is a producer-side fault and
             // the records past it are unreachable, so the clamp is a loss.
             epoch.clamped.store(true, std::memory_order_relaxed);
+            epoch.clamped_buffers.fetch_add(1, std::memory_order_relaxed);
         }
         if (!shard_files_[static_cast<size_t>(slot)][shard].good()) {
             LOG_ERROR("PmuCollector: failed to write shard file %s", epoch.shard_paths[shard].c_str());
@@ -1055,6 +1155,13 @@ public:
             return;
         }
         epoch.shard_rows[shard] += rows;
+    }
+
+    bool route_known_buffer(const void *buffer, int core, int thread, int shard) {
+        if (buffer == nullptr || shard < 0 || static_cast<size_t>(shard) >= views_.size()) return false;
+        if (views_[static_cast<size_t>(shard)].slot_for(owner_.buffer_run_epoch(buffer)) < 0) return false;
+        route_buffer(buffer, core, thread, shard);
+        return true;
     }
 
     /** ProfilerBase hook: adopt the epoch table, then acknowledge it. */
@@ -1199,6 +1306,13 @@ public:
                 "the collector was torn down before this run was published"
             );
         }
+    }
+
+    // A live table observes the cumulative counter without resetting it under
+    // concurrent readers/writers. Final teardown consumes it after their joins.
+    void reconcile_transport() {
+        if (ready()) observe_transport();
+        else owner_.report_drain_drops();
     }
 
     /**
@@ -1348,9 +1462,9 @@ private:
         release_slot(slot);
     }
 
-    bool ensure_ready() {
+    bool ensure_ready(bool recorded_window = false) {
         if (ready_.load(std::memory_order_acquire)) return true;
-        if (!retain_across_runs_) return false;
+        if (!retain_across_runs_ && !recorded_window) return false;
         const size_t shard_count = owner_.retained_shard_count();
         if (shard_count == 0) return false;
         for (size_t slot = 0; slot < epochs_.size(); slot++) {
@@ -1520,7 +1634,12 @@ private:
             records.unflushed_records++;
         }
 
+        observe_transport();
         Verdict verdict = classify(epoch.cut, records, collected, io_failed);
+        if (epoch.recorded_window && verdict == Verdict::CountsUnknown) {
+            verdict = epoch.clamped.load(std::memory_order_relaxed) || errors_.has_error() ? Verdict::PublishedShort :
+                                                                                             Verdict::RecordedAggregate;
+        }
         char detail[kErrorMsgBytes];
         std::snprintf(
             detail, sizeof(detail),
@@ -1533,11 +1652,24 @@ private:
             epoch.cut.stage2_done ? 1 : 0, records.device_execution_complete ? 1 : 0
         );
 
-        if (verdict != Verdict::WriteFailed && collected > 0) {
+        if (epoch.recorded_window) {
+            std::snprintf(
+                detail, sizeof(detail),
+                "collected=%llu device_total=unknown dropped=unknown "
+                "mismatch=unknown fatal=unknown recorded_window=1 protection=%s cut_known=%d stage2=%d",
+                static_cast<unsigned long long>(collected), epoch.protection_state, epoch.cut.cut_known ? 1 : 0,
+                epoch.cut.stage2_done ? 1 : 0
+            );
+        }
+        if (verdict != Verdict::WriteFailed && (collected > 0 || epoch.recorded_window)) {
             if (merge_shards_and_publish(
                     epoch.csv_path, run_epoch, epoch.csv_header, epoch.shard_paths, epoch.shard_rows
                 )) {
-                remove_shard_temps(epoch.shard_paths);
+                if (epoch.recorded_window && !publish_collection_metadata(epoch, collected, verdict)) {
+                    verdict = Verdict::WriteFailed;
+                } else {
+                    remove_shard_temps(epoch.shard_paths);
+                }
             } else {
                 // A write failure keeps every temp it has: they are the
                 // evidence, and the next run under this destination is refused
@@ -1550,6 +1682,39 @@ private:
             remove_shard_temps(epoch.shard_paths);
         }
         finish_epoch(slot, verdict, detail);
+    }
+
+    bool publish_collection_metadata(const Epoch<Frozen> &epoch, uint64_t rows, Verdict verdict) {
+        const auto target = collection_metadata_path(epoch.csv_path);
+        const auto temporary = publication_temp_path(target, epoch.epoch.load(std::memory_order_acquire));
+        std::ofstream out(temporary, std::ios::out | std::ios::trunc);
+        const auto transport = errors_.counts();
+        out << "{\n  \"recorded_window\": true,\n  \"run_epoch\": " << epoch.epoch.load(std::memory_order_acquire)
+            << ",\n  \"event_type\": " << static_cast<uint32_t>(epoch.frozen.event_type)
+            << ",\n  \"collection_verdict\": \"" << verdict_name(verdict)
+            << "\",\n  \"counts_unknown\": true,\n  \"device_total_records\": null,\n"
+               "  \"device_dropped_records\": null,\n  \"device_fatal\": null,\n  \"written_records\": "
+            << rows << ",\n  \"transport_retired_buffers\": null,\n  \"collector_transport_retired_buffers\": "
+            << transport.transport_retired
+            << ",\n  \"collector_unknown_epoch_buffers\": " << transport.unknown_epoch_buffers
+            << ",\n  \"clamped_buffers\": " << epoch.clamped_buffers.load(std::memory_order_relaxed)
+            << ",\n  \"pmu_protection\": \"" << epoch.protection_state
+            << "\",\n  \"csv_file\": \"pmu.csv\",\n  \"columns\": [";
+        std::istringstream columns(epoch.csv_header);
+        std::string column;
+        bool first = true;
+        while (std::getline(columns, column, ',')) {
+            if (!column.empty() && column.back() == '\n') column.pop_back();
+            if (!first) out << ", ";
+            out << '\"' << column << '\"';
+            first = false;
+        }
+        out << "]\n}\n";
+        out.close();
+        if (out.fail()) return false;
+        std::error_code error;
+        std::filesystem::rename(temporary, target, error);
+        return !error;
     }
 
     void finish_epoch(size_t slot, Verdict verdict, const char *detail) {
@@ -1603,6 +1768,7 @@ private:
         Epoch<Frozen> &epoch = epochs_[slot];
         {
             std::lock_guard<std::mutex> lk(mu_);
+            epoch.recorded_window = false;
             epoch.csv_path.clear();
             epoch.csv_header.clear();
             epoch.shard_paths.clear();

@@ -29,6 +29,9 @@ struct Control {
     bool retired{false};
     size_t calls_after_retire{0};
     int attach_rc{0};
+    int pmu_start_rc{0};
+    size_t pmu_start_calls{0};
+    size_t pmu_stop_calls{0};
     int op_timeout_rc{0};
     bool replace_op_timeout{false};
     uint64_t actual_op_timeout_us{0};

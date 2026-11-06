@@ -41,7 +41,9 @@ std::vector<uint8_t> read(const char *path) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    require(argc == 6, "usage: device callable cpu core dispatcher");
+    require(argc == 6 || argc == 8, "usage: device callable cpu core dispatcher [pmu-output replay]");
+    const bool pmu = argc == 8;
+    const bool execute_models = !pmu || std::atoi(argv[7]) != 0;
     const int device = std::atoi(argv[1]);
     const auto callable = read(argv[2]), cpu = read(argv[3]), core = read(argv[4]), dispatcher = read(argv[5]);
     check(aclInit(nullptr), "acl-init");
@@ -101,6 +103,11 @@ int main(int argc, char **argv) {
     const auto original_run = run;
     uint64_t identity = 0;
     auto prepare = [&](int callable_id, size_t tensor, int32_t increment, bool capture) {
+        if (pmu) {
+            config.enable_pmu = capture ? (callable_id == 0 ? 2 : 4) : 7;
+            const char *leaf = capture ? (callable_id == 0 ? "a" : "b") : "eager";
+            std::snprintf(config.output_prefix, sizeof(config.output_prefix), "%s/%s", argv[6], leaf);
+        }
         std::memset(run, 0, runtime_size);
         uint32_t shape[]{elements};
         ChipStorageTaskArgs args;
@@ -145,17 +152,19 @@ int main(int argc, char **argv) {
     const auto model_b = record(reference_b);
     require(model_a != model_b && reference_a != reference_b, "independent-models-and-references");
     verify("b-recorded");
-    replay(model_b, 1, 5, "b1");
-    replay(model_a, 0, 3, "a1");
-    replay(model_b, 1, 5, "b2");
-    replay(model_a, 0, 3, "a2");
-    replay(model_b, 1, 5, "b3");
+    if (execute_models) {
+        replay(model_b, 1, 5, "b1");
+        replay(model_a, 0, 3, "a1");
+        replay(model_b, 1, 5, "b2");
+        replay(model_a, 0, 3, "a2");
+        replay(model_b, 1, 5, "b3");
+    }
     check(aclmdlRIDestroy(model_a), "destroy-a");
     check(simpler_release_run_resources(ctx, reference_a), "release-a");
     check(simpler_unregister_callable(ctx, 0), "unregister-a");
     require(simpler_unregister_callable(ctx, 1) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-callable");
     require(finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-context");
-    replay(model_b, 1, 5, "b-after-a-release");
+    if (execute_models) replay(model_b, 1, 5, "b-after-a-release");
     check(aclmdlRIDestroy(model_b), "destroy-b");
     check(simpler_release_run_resources(ctx, reference_b), "release-b");
     check(simpler_unregister_callable(ctx, 1), "unregister-b");
@@ -167,6 +176,12 @@ int main(int argc, char **argv) {
     for (auto &value : expected[2])
         value += 17;
     verify("eager");
+    if (pmu) {
+        std::array<char, 4096> error{};
+        const int flush_rc = simpler_flush_diagnostics_ctx(ctx, 60000, error.data(), error.size());
+        if (flush_rc != 0) std::fprintf(stderr, "PMU flush: %s\n", error.data());
+        check(flush_rc, "pmu-flush");
+    }
     check(simpler_unregister_callable(ctx, 0), "unregister-eager");
     check(finalize_device(ctx), "finalize-context");
     destroy_device_context(ctx);
