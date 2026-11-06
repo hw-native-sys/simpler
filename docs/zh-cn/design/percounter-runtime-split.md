@@ -148,7 +148,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 ### 实际的冲突面
 
 | 文件 | 冲突块 | 行数 | 成因 |
-| ---- | ---: | ---: | ---- |
+| ---- | -----: | ---: | ---- |
 | `aicpu_executor.cpp` | 1 | 108 | 上游改 supervisor body，本分支把它搬进了 `supervise()` |
 | `runtime_maker.cpp` | 4 | 155 | 调用点落在 `create_scheduler_state` 内，和上游新增的 509 行重叠 |
 

@@ -35,5 +35,5 @@ SchedulerExtensionResult scheduler_extension_select(
         runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
     );
     return selection == simpler::hbg::percounter::StateSelection::PERCOUNTER ? SchedulerExtensionResult::TAKEN :
-                                                                              SchedulerExtensionResult::FAILED;
+                                                                               SchedulerExtensionResult::FAILED;
 }

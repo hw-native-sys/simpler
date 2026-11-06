@@ -30,7 +30,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "scheduler/scheduler_types.h"
 
-struct Runtime;
+class Runtime;
 struct HostApi;
 namespace sm_layout {
 struct SegmentOffsets;

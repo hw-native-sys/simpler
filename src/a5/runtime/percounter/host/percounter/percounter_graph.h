@@ -207,8 +207,8 @@ inline TemplateResult read_graph_template(const GraphImageView &view, uint32_t i
             return TemplateResult{TemplateStatus::MALFORMED, "a body task does not decode", i};
         const TaskAttrs attrs(source.task_attrs);
         shapes[static_cast<size_t>(i)] = BodyTaskShape{
-            source.active_mask.raw(), attrs.requires_sync_start(), attrs.has_predicate(),
-            source.logical_block_num, source.total_required_subtasks
+            source.active_mask.raw(), attrs.requires_sync_start(), attrs.has_predicate(), source.logical_block_num,
+            source.total_required_subtasks
         };
     }
     std::vector<int32_t> rows(n + 1, 0);

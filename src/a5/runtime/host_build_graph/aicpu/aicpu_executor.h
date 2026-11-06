@@ -44,7 +44,7 @@
 // a graph the other runtime bound.
 #define SIMPLER_SCHEDULER_STEP __attribute__((visibility("hidden")))
 
-struct Runtime;
+class Runtime;
 
 struct AicpuExecutor {
     // ===== Thread management state =====

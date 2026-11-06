@@ -451,9 +451,7 @@ __attribute__((weak)) bool AicpuExecutor::drives_cores(const Runtime *runtime) c
     return aicore_scheduler_runtime_enabled(runtime);
 }
 
-__attribute__((weak)) bool AicpuExecutor::awaits_bootstrap() const {
-    return true;
-}
+__attribute__((weak)) bool AicpuExecutor::awaits_bootstrap() const { return true; }
 
 __attribute__((weak)) int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
     return aicore_lifecycle_.post_handshake_init(runtime);
@@ -496,8 +494,7 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime) {
                 const uint64_t resolved_task_count = run_control->resolved_task_count;
                 const bool tasks_resolved = resolved_task_count == executable_task_count;
                 const uint64_t now = get_sys_cnt_aicpu();
-                if (resolved_task_count != last_resolved_task_count ||
-                    bootstrap_complete != bootstrap_was_complete) {
+                if (resolved_task_count != last_resolved_task_count || bootstrap_complete != bootstrap_was_complete) {
                     last_resolved_task_count = resolved_task_count;
                     bootstrap_was_complete = bootstrap_complete;
                     last_progress_cycles = now;
@@ -551,8 +548,7 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime) {
             if (supervisor_rc == 0 &&
                 resolved_task_count + run_control->inline_completed_count != run_control->expected_task_count) {
                 LOG_ERROR(
-                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64
-                    " inline=%" PRIu64,
+                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64 " inline=%" PRIu64,
                     run_control->expected_task_count, resolved_task_count, run_control->inline_completed_count
                 );
                 supervisor_rc = -1;
