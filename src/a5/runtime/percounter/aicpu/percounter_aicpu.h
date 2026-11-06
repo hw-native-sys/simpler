@@ -38,7 +38,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "percounter_graph_prepare.h"
 #include "runtime.h"
-#include "scheduler/percounter/percounter_types.h"
+#include "scheduler/percounter_types.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
@@ -199,8 +199,8 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
             if (control->lane_error != 0) {
                 error = control->lane_error;
                 LOG_ERROR(
-                    "A5 percounter: lane reported error %" PRIu64 "; %" PRIu64 " of %" PRIu64 " blocks resolved",
-                    error, resolved, expected
+                    "A5 percounter: lane reported error %" PRIu64 "; %" PRIu64 " of %" PRIu64 " blocks resolved", error,
+                    resolved, expected
                 );
                 break;
             }
@@ -225,8 +225,7 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
         error = control->lane_error;
         if (error != 0) {
             LOG_ERROR(
-                "A5 percounter: lane reported error %" PRIu64 " with all %" PRIu64 " blocks resolved", error,
-                expected
+                "A5 percounter: lane reported error %" PRIu64 " with all %" PRIu64 " blocks resolved", error, expected
             );
         } else {
             error = percounter_graph_prepare_error(control);

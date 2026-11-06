@@ -241,8 +241,8 @@ inline StateSelection select_percounter_state(
     };
     if (!build_tables(inputs.data(), task_count, layout, host_base, device_base, external, &build, graph_plan)) {
         LOG_ERROR(
-            "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status),
-            build.task_id, build.fanin_index
+            "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status), build.task_id,
+            build.fanin_index
         );
         return StateSelection::FAILED;
     }

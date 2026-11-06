@@ -40,7 +40,7 @@
 #include "device/graph_image_source.h"
 #include "host_build_graph/graph_execution.h"
 #include "runtime.h"
-#include "scheduler/percounter/percounter_types.h"
+#include "scheduler/percounter_types.h"
 #include "scheduler/scheduler_graph.h"
 
 namespace simpler::percounter {

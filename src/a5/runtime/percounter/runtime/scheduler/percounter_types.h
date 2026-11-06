@@ -14,7 +14,7 @@
  * that read them.
  *
  * Host-only planning (the layout planner and the table builder) lives in
- * host/percounter/percounter_plan.h; this header is compiled by the AICore
+ * host/percounter_plan.h; this header is compiled by the AICore
  * target too, so it includes nothing host-only.
  *
  * Every offset here is from the region base, never a pointer, so the whole

@@ -24,7 +24,7 @@
 #include <cstring>
 #include <vector>
 
-#include "scheduler/percounter/percounter_types.h"
+#include "scheduler/percounter_types.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 

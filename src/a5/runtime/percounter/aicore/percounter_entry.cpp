@@ -24,7 +24,7 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-#include "percounter/percounter_executor.h"
+#include "percounter_executor.h"
 #include "runtime.h"
 #include "scheduler/scheduler_memory.h"
 

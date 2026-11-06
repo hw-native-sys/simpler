@@ -179,7 +179,8 @@ percounter 目录本身为空。产出与 hbg 等价的第三套二进制。
 
 ### 第 2 步：搬空 hbg
 
-把四个 percounter 子目录整体移到 `src/a5/runtime/percounter/` 下的对应位置，把模式常量移入
+把四个 percounter 子目录的内容移到 `src/a5/runtime/percounter/` 下对应的那一层——
+目录名由新 runtime 的根承担，所以 `aicore/percounter/` 的内容落在 `aicore/`——把模式常量移入
 percounter 自己的头，并**在同一步删掉 hbg 对它们的全部引用**——头文件一旦移走，hbg 的
 `#include` 就失效，所以搬运和拆接缝必须同时做，不能像本页最初写的那样分成两步。
 

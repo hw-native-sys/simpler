@@ -29,7 +29,7 @@
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu_executor.h"
 #include "common/platform_config.h"
-#include "percounter/percounter_aicpu.h"
+#include "percounter_aicpu.h"
 #include "runtime.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
@@ -53,9 +53,7 @@ bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
 }
 
 int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
-    return simpler::percounter::percounter_post_handshake_init(
-        runtime, aicore_lifecycle_, scheduler_timeout_cycles()
-    );
+    return simpler::percounter::percounter_post_handshake_init(runtime, aicore_lifecycle_, scheduler_timeout_cycles());
 }
 
 void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {

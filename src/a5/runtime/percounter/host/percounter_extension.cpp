@@ -21,7 +21,7 @@
  * unit carries.
  */
 
-#include "percounter/percounter_state.h"
+#include "percounter_state.h"
 #include "scheduler_extension.h"
 
 // Never DECLINED: percounter is the only scheduler this runtime carries, so a
@@ -35,5 +35,5 @@ SchedulerExtensionResult scheduler_extension_select(
         runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
     );
     return selection == simpler::percounter::StateSelection::PERCOUNTER ? SchedulerExtensionResult::TAKEN :
-                                                                               SchedulerExtensionResult::FAILED;
+                                                                          SchedulerExtensionResult::FAILED;
 }
