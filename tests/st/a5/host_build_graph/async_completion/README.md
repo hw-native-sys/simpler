@@ -27,6 +27,7 @@ there is no synchronous fallback or expected-failure marker.
 | `test_consumer_visibility.py` | Every candidate AIC first reads the old payload; AIV publishes new data; a synchronous AIC consumer must read the new value without test-side payload invalidation. |
 | `test_run_reuse.py` | Two invocations of the same single-level Graph definition with different bindings, including consumers outside Graph EXIT; retained notification windows across increasing and repeated epochs. |
 | `test_pending_close.py` | Close drains an accepted unfinished run; a never-satisfied condition reports a scheduler error and cannot run its consumer. Both negative/lifecycle cases first require a successful async probe. |
+| `test_oracle_negative_control.py` | A deliberately broken waiter omits condition registration. With no publisher, the original business oracle must reject the real consumer's premature entry. Additional native protocol assertions qualify the experiment for this implementation. |
 
 The numerical oracle derives expected executions from the input task graph.
 Every planned physical execution and consumer must occur exactly once; inactive
@@ -47,6 +48,14 @@ derives private queue addresses nor atomically modifies an external completion
 record. A numerically correct large transfer without an observed post-return
 pending interval does **not** qualify that scenario. Transfer size and delays
 are fixtures for exercising ordering, not speed requirements.
+
+The omitted-registration negative control first runs a normal COUNT1 probe.
+Its broken invocation must complete normally, with an audited EMPTY group and
+an actual consumer execution, before the unchanged oracle rejects EARLY entry.
+A runtime timeout, missing context or unrelated assertion cannot pass this
+control. The consumer's existing readiness guard prevents payload arithmetic;
+the experiment proves premature entry, not a stale-data read. The separate
+never-satisfied test remains the correct implementation's expected-error case.
 
 ## Run
 

@@ -179,9 +179,8 @@ def assert_resident_capture(path: Path) -> None:
         assert raw.get("aicore_tasks"), f"no kernel executions in {capture}"
 
 
-@cache
-def compile_counter(platform: str):
-    spec = {
+def _counter_callable_spec():
+    return {
         "orchestration": {
             "source": str(HERE / "kernels/orchestration/counter.cpp"),
             "function_name": "aicpu_orchestration_entry",
@@ -218,19 +217,28 @@ def compile_counter(platform: str):
             )
         ],
     }
+
+
+@cache
+def compile_counter(platform: str):
     return compile_chip_callable_spec(
-        spec, platform, "host_build_graph", (str(HERE), platform, "counter", _pto_isa_compile_cache_token())
+        _counter_callable_spec(),
+        platform,
+        "host_build_graph",
+        (str(HERE), platform, "counter", _pto_isa_compile_cache_token()),
     )
 
 
 class CounterRunner:
     """Own an L3 worker so close tests cannot terminate another case's pooled worker."""
 
+    _compile_callable = staticmethod(compile_counter)
+
     def __init__(self, platform: str, devices: list[int], directory: Path, case: Case):
         self.case = case
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.compiled = compile_counter(platform)
+        self.compiled = self._compile_callable(platform)
         # This is a fixture storage bound. Actual progress widths use rt_available_aiv_count().
         self.capacity_waiters = 256 if case.scenario == Scenario.PROGRESS else case.waiters
         self.slots = case.instances * self.capacity_waiters * case.blocks * 3

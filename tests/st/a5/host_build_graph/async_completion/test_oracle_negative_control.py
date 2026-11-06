@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+import json
+from functools import cache
+from pathlib import Path
+
+import pytest
+import torch
+
+from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
+from simpler_setup.tools.swimlane_converter import read_perf_data
+
+from .helpers import POISON, Case, CounterRunner, Scenario, _counter_callable_spec, l3_case, read_host_tensor
+
+pytestmark = [
+    pytest.mark.manual,
+    pytest.mark.platforms(["a5sim", "a5"]),
+    pytest.mark.runtime("host_build_graph"),
+    pytest.mark.device_count(1),
+]
+
+HERE = Path(__file__).resolve().parent
+
+
+@cache
+def _compile_omitted_registration(platform):
+    spec = _counter_callable_spec()
+    waiter = next(kernel for kernel in spec["incores"] if kernel["func_id"] == 1)
+    waiter["source"] = str(HERE / "kernels/aiv/waiter_omit_registration.cpp")
+    return compile_chip_callable_spec(
+        spec,
+        platform,
+        "host_build_graph",
+        (str(HERE), platform, "omitted_registration_negative_control", _pto_isa_compile_cache_token()),
+    )
+
+
+class _OmittedRegistrationRunner(CounterRunner):
+    _compile_callable = staticmethod(_compile_omitted_registration)
+
+
+def _require_completed_empty_capture(runner):
+    captures = list(runner.capture.rglob("chip_swimlane_records.json"))
+    assert len(captures) == 1, captures
+    raw = json.loads(captures[0].read_text())
+    protocol = raw["aicore_protocol"]
+    assert protocol["schema"] == "hbg-native-protocol-v10"
+    decoded = read_perf_data(captures[0])
+    assert decoded["protocol_audit"]["protocol_verified"]
+    assert protocol["scheduler_error"] == protocol["error_claimed"] == 0
+    assert all(worker["error_flags"] == 0 for worker in protocol["workers"])
+    tasks = protocol["tasks"]
+    assert len(tasks) == len(decoded["tasks"]) == len(protocol["executions"]) == 2
+    waiter, consumer = tasks
+    assert waiter["task_ref"] == 0 and waiter["kernel_ids"] == [65535, 1, 65535]
+    assert consumer["task_ref"] == 1 and consumer["kernel_ids"] == [65535, 5, 65535]
+    assert waiter["dependencies"] == [] and consumer["dependencies"] == [0]
+    assert {task["task_id"] for task in decoded["tasks"]} == {0, 1}
+    groups, finishes = protocol["async"]["groups"], protocol["async"]["finishes"]
+    assert len(groups) == len(finishes) == 1
+    group, finish = groups[0], finishes[0]
+    assert group["task_ref"] == 0 and group["state"] == "EMPTY"
+    assert group["capacity"] == 64 and group["registered_count"] == 0 and group["conditions"] == []
+    assert group["observations"] == group["pending_count"] == group["failure_code"] == 0
+    assert group["sealed"] is not None and group["terminal"] is None
+    assert finish["task_ref"] == 0 and finish["state"] == "DRAINED"
+    assert finish["group_indices"] == [group["index"]] and finish["failure_code"] == 0
+    (runner.capture / "omitted-registration-audit.json").write_text(
+        json.dumps(decoded["protocol_audit"], indent=2) + "\n"
+    )
+
+
+def _require_only_early_consumer_failure(runner):
+    expected_records = torch.zeros_like(runner.records)
+    expected_records[1, :2] = 1
+    expected_records[runner.slots, :2] = 1
+    expected_records[runner.slots, 3] = 1
+    torch.testing.assert_close(runner.records, expected_records, rtol=0, atol=0)
+    expected_control = torch.zeros_like(runner.control)
+    expected_control[0, 0, 0] = 1
+    torch.testing.assert_close(runner.control, expected_control, rtol=0, atol=0)
+    assert torch.all(runner.output == POISON)
+    domain = runner.worker.live_domains["async_completion_contract"]
+    for name, staging, initial in (
+        ("signals", runner.signal_staging, runner.initial_signals),
+        ("payload", runner.payload_staging, runner.initial_payload),
+    ):
+        runner.worker.copy_from(staging, domain[0].buffers[name])
+        torch.testing.assert_close(read_host_tensor(staging, initial), initial, rtol=0, atol=0)
+    with pytest.raises(AssertionError) as failure:
+        runner.check()
+    assert str(failure.value) == "a consumer entered before its conditions or dependencies"
+    (runner.capture / "business-oracle-rejection.txt").write_text(str(failure.value) + "\n")
+
+
+@l3_case
+def test_business_oracle_rejects_omitted_registration(st_platform, st_device_ids, tmp_path):
+    with CounterRunner(st_platform, st_device_ids, tmp_path / "normal_count1", Case()) as normal:
+        normal.run()
+    case = Case(scenario=Scenario.NEVER)
+    with _OmittedRegistrationRunner(st_platform, st_device_ids, tmp_path / "omitted_registration", case) as broken:
+        # NEVER has no publisher: 0 < 1 remains true independently of scheduling.
+        # Any runtime failure or timeout here fails the experiment, not its oracle.
+        broken.submit().wait(timeout=30)
+        _require_completed_empty_capture(broken)
+        _require_only_early_consumer_failure(broken)
