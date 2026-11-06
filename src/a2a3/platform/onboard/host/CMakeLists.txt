@@ -202,6 +202,7 @@ target_link_libraries(host_runtime
         -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
         dl
         pthread
+        rt
 )
 
 target_link_libraries(host_runtime PRIVATE nnopbase)

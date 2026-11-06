@@ -59,6 +59,7 @@ def a2a3_lifecycle_binary(tmp_path_factory):
             str(ROOT / "tests/ut/py/support/a2a3_domain_lifecycle_host.cpp"),
             "-ldl",
             "-pthread",
+            "-lrt",
             "-o",
             str(binary),
         ],
@@ -84,3 +85,8 @@ def test_a2a3_fallback_stops_when_cleanup_reports_an_error_after_consumption(a2a
 @pytest.mark.parametrize("transport", ["fabric", "ipc"])
 def test_a2a3_mapped_owner_needs_no_explicit_access_grant(a2a3_lifecycle_binary, transport):
     subprocess.run([str(a2a3_lifecycle_binary), transport, "map_grants_access"], check=True, timeout=5)
+
+
+@pytest.mark.parametrize("scenario", ["host_register_failure", "host_unregister_failure", "host_borrow_sdma"])
+def test_a2a3_host_domain_registration_lifecycle(a2a3_lifecycle_binary, scenario):
+    subprocess.run([str(a2a3_lifecycle_binary), "fabric", scenario], check=True, timeout=5)

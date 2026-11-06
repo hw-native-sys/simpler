@@ -22,6 +22,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from multiprocessing import shared_memory
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1359,10 +1360,10 @@ def test_host_domain_wire_cpu_import_retention_and_rollback(
             worker_mod._DOMAIN_REPLY_HEADER.pack_into(response, 0, 1, base + size, base, size, buffer_count)
             struct.pack_into("<2Q", response, worker_mod._DOMAIN_REPLY_HEADER.size, base, base + 64)
 
-    def import_mapping(name, size):
+    def import_mapping(name, size, **kwargs):
         if fail_second_import and imports:
             raise RuntimeError("injected CPU import failure")
-        mapping = HostBufferMapping(name, size)
+        mapping = HostBufferMapping(name, size, **kwargs)
         imports.append(mapping)
         return mapping
 
@@ -1625,3 +1626,184 @@ def test_worker_close_rechecks_exports_created_by_admitted_run(domain_worker, na
     assert not runner.is_alive() and not observer.is_alive() and not errors
     worker.close()
     assert domains[0].freed
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_a3_host_domain_sdma_requires_native_worker_opt_in(domain_worker, monkeypatch):
+    worker, members = domain_worker
+    monkeypatch.setitem(worker._config, "platform", "a2a3")
+    with pytest.raises(ValueError, match="requires Worker"):
+        worker.run(
+            lambda orch, _args, _cfg: orch.allocate_domain(
+                **_request(members, memory_source=AddressSpace.HOST, workspace_engines=("sdma",))
+            )
+        )
+    assert worker.live_domains == {}
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("abort_fails", [False, True])
+def test_a3_host_domain_reclaims_owned_backing_after_lost_reply(domain_worker, monkeypatch, abort_fails):
+    worker, members = domain_worker
+    monkeypatch.setitem(worker._config, "platform", "a2a3")
+    monkeypatch.setitem(worker._config, "enable_sdma", True)
+    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+    names = []
+    released = []
+
+    def backing_exists(name):
+        try:
+            fd = getattr(shared_memory, "_posixshmem").shm_open(f"/{name}", os.O_RDONLY, 0)
+        except FileNotFoundError:
+            return False
+        os.close(fd)
+        return True
+
+    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
+        if op == "release":
+            released.extend(workers)
+            if abort_fails:
+                raise RuntimeError("injected Host abort failure")
+            return
+        for chip in workers:
+            request = request_shms[chip].buf
+            _, rank_count, _, _, count = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request)
+            mask = struct.unpack_from("<I", request, worker_mod._DOMAIN_WORKSPACE_MASK_OFFSET)[0]
+            assert mask == 1
+            tail = worker_mod._DOMAIN_REQ_HEADER.size + count * 8 + rank_count * 4
+            assert len(request) >= tail + worker_mod._CTRL_SHM_NAME_BYTES
+            names.append(worker_mod._read_shm_name(request, tail))
+            assert backing_exists(names[-1])
+        struct.pack_into("<Q", reply_shms[workers[0]].buf, 0, 1)
+        if abort_fails:
+            os.kill(worker._chip_pids[workers[1]], signal.SIGKILL)
+        raise RuntimeError("injected Host registration failure")
+
+    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+    with pytest.raises(RuntimeError, match="injected Host registration failure"):
+        worker.run(
+            lambda orch, _args, _cfg: orch.get_or_allocate_domain(
+                **_request(members, memory_source=AddressSpace.HOST, workspace_engines=("sdma",))
+            )
+        )
+    assert len(set(names)) == len(members)
+    assert released == members[:1]
+    assert worker.live_domains == {}
+    if abort_fails:
+        assert all(backing_exists(name) for name in names)
+        worker._expected_domain_debt = True
+        with pytest.raises(RuntimeError, match="killed by signal"):
+            worker.close()
+    assert all(not backing_exists(name) for name in names)
+
+
+@pytest.fixture
+def retained_a3_host_domain(domain_worker, monkeypatch):
+    worker, members = domain_worker
+    monkeypatch.setitem(worker._config, "platform", "a2a3")
+    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+    released = []
+
+    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
+        if op == "release":
+            released.extend(workers)
+            return
+        for chip in workers:
+            reply = reply_shms[chip].buf
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply, 0, 1, 0xC0, 0x1000, 4096, 1)
+            struct.pack_into("<Q", reply, worker_mod._DOMAIN_REPLY_HEADER.size, 0x1000)
+
+    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+    domains = []
+    request = _request(members, memory_source=AddressSpace.HOST)
+    worker.run(lambda orch, _args, _cfg: domains.append(orch.allocate_domain(**request)))
+    return worker, members, domains[0], released
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_a3_host_domain_retries_only_failed_unlink_on_close(retained_a3_host_domain, monkeypatch):
+    worker, members, domain, released = retained_a3_host_domain
+    names = [domain.member(rank).buffers["payload"].shm.name for rank in range(2)]
+    calls = []
+    unlink = shared_memory.SharedMemory.unlink
+
+    def unlink_once_fails(shm):
+        if shm.name in names:
+            calls.append(shm.name)
+            if shm.name == names[0] and calls.count(shm.name) == 1:
+                raise PermissionError("injected Host unlink failure")
+        unlink(shm)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(shared_memory.SharedMemory, "unlink", unlink_once_fails)
+        with pytest.raises(PermissionError, match="injected Host unlink failure"):
+            worker.close()
+        assert calls == names
+        worker.close()
+        assert calls == [*names, names[0]]
+    assert released == members
+    assert domain.freed
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            getattr(shared_memory, "_posixshmem").shm_open(f"/{name}", os.O_RDONLY, 0)
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("action", ["release", "close"])
+def test_a3_host_domain_refuses_live_numpy_slice(retained_a3_host_domain, action):
+    np = pytest.importorskip("numpy")
+    worker, members, domain, released = retained_a3_host_domain
+    mapping = domain.member(1).buffers["payload"].shm
+    close = domain.release if action == "release" else worker.close
+    with mapping.buf as exported:
+        array = np.ndarray((8,), dtype=np.int32, buffer=exported)
+        view = array[1:3]
+    del array
+    try:
+        with pytest.raises(BufferError, match="live CPU exports"):
+            close()
+        assert not domain.released and released == []
+        with domain.member(0).buffers["payload"].shm.buf as other_rank:
+            other_rank[0] = 7
+        view[:] = 29
+    finally:
+        del view
+    close()
+    assert domain.freed and released == members
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_a3_host_domain_close_drains_admitted_cpu_access(retained_a3_host_domain, monkeypatch):
+    worker, members, domain, released = retained_a3_host_domain
+    callback_entered = threading.Event()
+    close_started = threading.Event()
+    errors = []
+    seal_exports = worker._seal_domain_cpu_exports
+
+    def observe_close(*, seal=True):
+        seal_exports(seal=seal)
+        close_started.set()
+
+    def access(_orch, _args, _cfg):
+        callback_entered.set()
+        assert close_started.wait(5)
+        with domain.member(0).buffers["payload"].shm.buf as view:
+            view[0] = 7
+
+    def run():
+        try:
+            worker.run(access)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(worker, "_seal_domain_cpu_exports", observe_close)
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert callback_entered.wait(5)
+        worker.close()
+    finally:
+        close_started.set()
+        thread.join(5)
+    assert not thread.is_alive() and not errors
+    assert domain.freed and released == members

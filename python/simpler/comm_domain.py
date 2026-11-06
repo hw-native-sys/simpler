@@ -128,15 +128,11 @@ class DomainConfig:
 
 
 class HostBufferMapping(SharedMemory):
-    """Borrow an L2-owned POSIX window through the standard SharedMemory API.
+    """Borrow a POSIX Host window while preserving the owner's tracking."""
 
-    L3 only closes its mapping. Creation and unlink belong to the native L2
-    domain, so Python's resource tracker must not claim the backing.
-    """
-
-    def __init__(self, name: str, size: int):
+    def __init__(self, name: str, size: int, *, owner_tracks_name: bool = False):
         self._export_lock = threading.RLock()
-        self._export_count = 0
+        self._exports: set[int] = set()
         self._closing = False
         if not name or len(name) > 31 or not all(c.isascii() and (c.isalnum() or c in "_-") for c in name):
             raise ValueError("invalid Host domain shared memory name")
@@ -144,13 +140,14 @@ class HostBufferMapping(SharedMemory):
             super().__init__(name=name, create=False, track=False)
         except TypeError:  # Python < 3.13 has no per-instance tracking switch.
             super().__init__(name=name, create=False)
-            resource_tracker.unregister(self._name, "shared_memory")
+            if not owner_tracks_name:
+                resource_tracker.unregister(self._name, "shared_memory")
         if size <= 0 or self.size < size:
             self.close()
             raise ValueError("Host domain shared memory is smaller than the mapped window")
 
     def unlink(self) -> None:
-        raise RuntimeError("Host domain shared memory belongs to L2; use domain.release()")
+        raise RuntimeError("Host domain shared memory belongs to the domain; use domain.release()")
 
     @property
     def buf(self) -> memoryview | None:
@@ -167,15 +164,17 @@ class HostBufferMapping(SharedMemory):
             backing = memoryview(self._mmap)
             address = ctypes.addressof(ctypes.c_ubyte.from_buffer(backing))
             carrier = (ctypes.c_ubyte * self.size).from_address(address)
-            finalizer = weakref.finalize(carrier, self._release_export, backing)
+            token = id(carrier)
+            finalizer = weakref.finalize(carrier, self._release_export, token, backing)
             finalizer.atexit = False
-            self._export_count += 1
+            self._exports.add(token)
             return memoryview(carrier).cast("B")
 
-    def _release_export(self, backing: memoryview) -> None:
+    def _release_export(self, token: int, backing: memoryview) -> None:
         with self._export_lock:
             backing.release()
-            self._export_count -= 1
+            # Finalization can run even if export publication was interrupted.
+            self._exports.discard(token)
 
     def close(self) -> None:
         with self._export_lock:
@@ -183,8 +182,8 @@ class HostBufferMapping(SharedMemory):
             super().close()
 
 
-def seal_host_mappings(mappings: Iterable[HostBufferMapping]) -> None:
-    """Reject live exports, then prevent new ones across the entire release set.
+def seal_host_mappings(mappings: Iterable[HostBufferMapping], *, seal: bool = True) -> None:
+    """Reject live exports and optionally prevent new ones across the release set.
 
     Nothing changes if any mapping is borrowed. Locks cover admission only;
     callers may wait for device fences and release native resources afterwards.
@@ -194,10 +193,11 @@ def seal_host_mappings(mappings: Iterable[HostBufferMapping]) -> None:
         for mapping in ordered:
             locks.enter_context(mapping._export_lock)
         for mapping in ordered:
-            if mapping._export_count:
+            if mapping._exports:
                 raise BufferError(
                     f"Host domain mapping {mapping.name!r} has live CPU exports; "
                     "drop arrays and release memoryviews before closing or releasing the domain"
                 )
-        for mapping in ordered:
-            mapping._closing = True
+        if seal:
+            for mapping in ordered:
+                mapping._closing = True

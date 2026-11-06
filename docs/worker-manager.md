@@ -420,9 +420,10 @@ It is observation only: no field asserts that device work has stopped, and a
 confirmed reset invalidates that device generation's allocations rather than
 making an old device pointer reusable. The onboard platform runner is shared
 by every runtime built on it, so publishing is gated on the runtime's own
-`teardown_report_supported_impl` — a2a3 `host_build_graph` opts in, and every
-other runtime answers "no observation", which reads back as an uncommitted
-record. Remote endpoints have no local mailbox and produce no entry at all.
+`teardown_report_supported_impl`. The a2a3 onboard `host_build_graph` and
+`tensormap_and_ringbuffer` runtimes opt in. Other runtimes report no observation
+through an uncommitted record. Remote endpoints have no local mailbox and
+produce no entry.
 
 A chip child that outlives the close deadline is handed to the cleanup
 journal, and its record is read there instead: inside the same retry closure,
