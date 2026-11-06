@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <new>
 #include <vector>
 
@@ -108,6 +109,7 @@ TEST_F(HbgTensorMapTest, EveryProducerOfARegionStaysVisible) {
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 3);
     std::vector<TaskId> producers;
+    producers.reserve(result.entries.size());
     for (const auto &e : result.entries) {
         producers.push_back(e.entry->producer_task_id);
     }
@@ -129,6 +131,7 @@ TEST_F(HbgTensorMapTest, DistinctLocalIdsGetDistinctTaskChains) {
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 2);
     std::vector<TaskId> producers;
+    producers.reserve(result.entries.size());
     for (const auto &e : result.entries) {
         producers.push_back(e.entry->producer_task_id);
     }
@@ -216,9 +219,9 @@ TEST_F(HbgTensorMapTest, ResetIsIdempotentAndKeepsReservedSizes) {
     EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make_global(LAST_TASK));
 }
 
-// Filling the pool drives free_entries() to zero. No device-completion watermark
-// can free it, so ensure_tensormap_capacity() must fail immediately instead of
-// waiting for asynchronous reclaim that HBG does not have.
+// Filling the current chunks leaves every producer visible. Device completion
+// cannot reclaim them; output registration must explicitly request stable growth
+// rather than wait for asynchronous reclaim.
 TEST_F(HbgTensorMapTest, ExhaustedPoolStaysExhausted) {
     for (int32_t i = 0; i < POOL_SIZE; i++) {
         tmap.insert(make_test_tensor(0x10000 + 0x100 * i, 64), TaskId::make_global(i % MAX_TASKS));
@@ -325,4 +328,145 @@ TEST(HbgTensorMapReuse, FailedFirstAllocationLeavesAnEmptyOwnerAndCanBeRetried) 
         ASSERT_TRUE(map.init(16, 64, 32));
         EXPECT_EQ(map.current_used(), 0);
     }
+}
+
+TEST(HbgTensorMapGrowth, ExtendsPastTheOldDefaultWithoutMovingProducers) {
+    ChipTensorMap map;
+    ASSERT_TRUE(map.init_default(32));
+    ASSERT_GT(map.pool_capacity(), 0);
+    auto *first = map.entry_pool.get();
+    const int32_t ENTRIES = map.pool_capacity() + 1;
+    for (int32_t i = 0; i < ENTRIES; ++i) {
+        ASSERT_TRUE(map.ensure_free_entries(1));
+        map.insert(make_test_tensor(0x10000ULL + 0x100ULL * i, 64), TaskId::make_global(0));
+    }
+    EXPECT_EQ(map.entry_pool.get(), first);
+    EXPECT_EQ(map.current_used(), ENTRIES);
+    EXPECT_EQ(map.valid_count(), ENTRIES);
+    TestLookupResult result;
+    run_lookup(map, make_test_tensor(0x10000, 64), result);
+    ASSERT_EQ(result.count, 1);
+    EXPECT_EQ(result.entries[0].entry, first);
+    EXPECT_EQ(first->producer_task_id, TaskId::make_global(0));
+}
+
+TEST(HbgTensorMapGrowth, PreservesTheFreeStackAcrossGrowth) {
+    ChipTensorMap map;
+    ASSERT_TRUE(map.init(16, 4, 32));
+    for (int32_t i = 0; i < 4; ++i) {
+        map.insert(make_test_tensor(0x10000 + 0x100 * i, 64), TaskId::make_global(i));
+    }
+    auto *first = map.entry_pool.get();
+    map.remove_from_task(first[0]);
+    map.free_entry(first[0]);
+    ASSERT_EQ(map.current_used(), 3);
+    ASSERT_TRUE(map.ensure_free_entries(3));
+    ASSERT_EQ(map.pool_capacity(), 8);
+    for (int32_t i = 0; i < 3; ++i) {
+        map.insert(make_test_tensor(0x20000 + 0x100 * i, 64), TaskId::make_global(8 + i));
+    }
+    EXPECT_EQ(map.current_used(), 6);
+    EXPECT_EQ(map.valid_count(), 6);
+    TestLookupResult reused;
+    run_lookup(map, make_test_tensor(0x20000, 64), reused);
+    ASSERT_EQ(reused.count, 1);
+    EXPECT_EQ(reused.entries[0].entry, first);
+    EXPECT_EQ(reused.entries[0].entry->producer_task_id, TaskId::make_global(8));
+    TestLookupResult retained;
+    run_lookup(map, make_test_tensor(0x10100, 64), retained);
+    ASSERT_EQ(retained.count, 1);
+    EXPECT_EQ(retained.entries[0].entry, first + 1);
+}
+
+TEST(HbgTensorMapGrowth, RetainsGrownChunksAcrossResetAndMatchingInit) {
+    ChipTensorMap map;
+    ASSERT_TRUE(map.init(16, 4, 32));
+    ASSERT_TRUE(map.ensure_free_entries(17));
+    const int32_t capacity = map.pool_capacity();
+    auto *entries = map.entry_pool.get();
+    auto *free_list = map.free_entry_list.get();
+    map.insert(make_test_tensor(0x10000, 64), TaskId::make_global(7));
+    map.reset();
+    fail_array_after = 0;
+    const bool reinitialized = map.init(16, 4, 8);
+    fail_array_after = -1;
+    ASSERT_TRUE(reinitialized);
+    EXPECT_EQ(map.pool_capacity(), capacity);
+    EXPECT_EQ(map.entry_pool.get(), entries);
+    EXPECT_EQ(map.free_entry_list.get(), free_list);
+    EXPECT_EQ(map.current_used(), 0);
+    EXPECT_EQ(map.valid_count(), 0);
+    EXPECT_EQ(map.task_entry_heads[7], nullptr);
+    for (int32_t i = 0; i < capacity; ++i) {
+        map.insert(make_test_tensor(0x20000 + 0x100 * i, 64), TaskId::make_global(0));
+    }
+    EXPECT_EQ(map.current_used(), capacity);
+    EXPECT_EQ(map.valid_count(), capacity);
+}
+
+TEST(HbgTensorMapGrowth, AllocationFailurePreservesAllReachableEntriesAndCanRetry) {
+    // Pending chunk owners, entry chunk, directory and free-list allocation.
+    for (int failure = 0; failure < 4; ++failure) {
+        ChipTensorMap map;
+        ASSERT_TRUE(map.init(16, 4, 32));
+        for (int32_t i = 0; i < 4; ++i) {
+            map.insert(make_test_tensor(0x10000 + 0x100 * i, 64), TaskId::make_global(i));
+        }
+        auto *entries = map.entry_pool.get();
+        auto *free_list = map.free_entry_list.get();
+        fail_array_after = failure;
+        const bool grew = map.ensure_free_entries(1);
+        fail_array_after = -1;
+        ASSERT_FALSE(grew) << failure;
+        EXPECT_EQ(map.pool_capacity(), 4);
+        EXPECT_EQ(map.current_used(), 4);
+        EXPECT_EQ(map.entry_pool.get(), entries);
+        EXPECT_EQ(map.free_entry_list.get(), free_list);
+        TestLookupResult result;
+        run_lookup(map, make_test_tensor(0x10000, 64), result);
+        ASSERT_EQ(result.count, 1);
+        EXPECT_EQ(result.entries[0].entry, entries);
+        EXPECT_EQ(map.task_entry_heads[0], entries);
+        ASSERT_TRUE(map.ensure_free_entries(1));
+        map.insert(make_test_tensor(0x20000, 64), TaskId::make_global(8));
+        EXPECT_EQ(map.valid_count(), 5);
+    }
+}
+
+TEST(HbgTensorMapGrowth, MultiChunkFailureDoesNotPartiallyPublishCapacity) {
+    // Four added chunks plus pending owners, directory and free-list allocation.
+    for (int failure = 0; failure < 7; ++failure) {
+        ChipTensorMap map;
+        ASSERT_TRUE(map.init(16, 4, 32));
+        map.insert(make_test_tensor(0x10000, 64), TaskId::make_global(0));
+        auto *entries = map.entry_pool.get();
+        fail_array_after = failure;
+        const bool grew = map.ensure_free_entries(16);
+        fail_array_after = -1;
+        ASSERT_FALSE(grew) << failure;
+        EXPECT_EQ(map.pool_capacity(), 4);
+        EXPECT_EQ(map.current_used(), 1);
+        EXPECT_EQ(map.entry_pool.get(), entries);
+        EXPECT_EQ(map.task_entry_heads[0], entries);
+        ASSERT_TRUE(map.ensure_free_entries(16));
+        EXPECT_GE(map.pool_capacity(), 17);
+    }
+}
+
+TEST(HbgTensorMapGrowth, InvalidDemandDoesNotAllocateOrChangeState) {
+    ChipTensorMap map;
+    ASSERT_TRUE(map.init(16, 4, 32));
+    map.insert(make_test_tensor(0x10000, 64), TaskId::make_global(0));
+    fail_array_after = 0;
+    const bool negative = map.ensure_free_entries(-1);
+    const bool overflow = map.ensure_free_entries(std::numeric_limits<int32_t>::max());
+    const bool available = map.ensure_free_entries(3);
+    const int remaining_failure_counter = fail_array_after;
+    fail_array_after = -1;
+    EXPECT_FALSE(negative);
+    EXPECT_FALSE(overflow);
+    EXPECT_TRUE(available);
+    EXPECT_EQ(remaining_failure_counter, 0);
+    EXPECT_EQ(map.pool_capacity(), 4);
+    EXPECT_EQ(map.current_used(), 1);
 }

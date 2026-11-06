@@ -473,34 +473,16 @@ void OrchestratorState::end_scope() {
 // Task Submission
 // =============================================================================
 
-// Ensure the tensormap entry pool has room for `needed` inserts before STEP 4
-// registers this task's outputs. Device completion never reclaims TensorMap
-// entries; only synchronous dependency computation can remove a covered
-// producer before this check. A pool that is still short here therefore cannot
-// become large enough while the host waits: latch
-// SIMPLER_ERROR_TENSORMAP_OVERFLOW and bail rather than letting new_entry()'s hard
-// assert fire mid-registration. Returns false when the pool is exhausted or a
-// fatal is already latched.
+// Reserve host-only hazard entries before output registration. Device progress
+// cannot reclaim them; demand growth preserves all reachable producer pointers.
 namespace simpler::hbg {
 bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed) {
+    if (orch->is_fatal()) return false;
     ChipTensorMap &tm = orch->tensor_map;
-    if (tm.free_entries() >= needed) {
-        return true;
-    }
-    if (orch->is_fatal()) {
-        return false;
-    }
-
-    LOG_ERROR("========================================");
-    LOG_ERROR("FATAL: TensorMap Entry Pool Exhausted!");
-    LOG_ERROR("========================================");
-    LOG_ERROR("Device completion does not reclaim HBG TensorMap entries.");
-    LOG_ERROR("  - Pool used:   %d / %d", tm.current_used(), tm.pool_capacity());
-    LOG_ERROR("  - Free:        %d entries", tm.free_entries());
-    LOG_ERROR("  - Needed:      %d entries", needed);
-    LOG_ERROR("Solution:");
-    LOG_ERROR("  Increase CHIP_TENSORMAP_POOL_SIZE (current: %d).", tm.pool_capacity());
-    LOG_ERROR("========================================");
+    if (tm.ensure_free_entries(needed)) return true;
+    LOG_ERROR(
+        "Unable to grow HBG TensorMap (used=%d, capacity=%d, needed=%d)", tm.current_used(), tm.pool_capacity(), needed
+    );
     orch_mark_fatal(orch, SIMPLER_ERROR_TENSORMAP_OVERFLOW);
     return false;
 }

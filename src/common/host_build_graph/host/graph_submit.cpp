@@ -711,13 +711,12 @@ TaskOutputTensors graph_record_submit_sub_task(
             // the low field TaskId::make_sub_task packs them into, so registering one
             // would key the map outside its task chains.
             recording.unsupported = true;
-        } else if (recording.tensor_map.free_entries() < count_registrable_outputs(dep_inputs, manual_scope)) {
-            // Recording one more task would assert inside new_entry(). Abandon the
-            // Definition instead, so the run fails by name at graph_commit rather
-            // than on a hard assert here.
+        } else if (!recording.tensor_map.ensure_free_entries(count_registrable_outputs(dep_inputs, manual_scope))) {
+            // Allocation failure preserves existing hazards. Abandon the Definition
+            // so graph_commit reports the named failure before upload.
             LOG_WARN(
-                "[GraphExecution] recording hazard map exhausted at sub-task %d (%d entries); Graph abandoned",
-                task_index, GRAPH_RECORD_TENSORMAP_POOL_SIZE
+                "[GraphExecution] unable to grow recording hazard map at sub-task %d (%d entries); Graph abandoned",
+                task_index, recording.tensor_map.pool_capacity()
             );
             recording.unsupported = true;
         } else {
