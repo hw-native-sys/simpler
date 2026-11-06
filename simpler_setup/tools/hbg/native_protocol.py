@@ -13,7 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 10))
+SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 12))
 
 ROOT_NUMBERS = frozenset(
     """
@@ -70,6 +70,8 @@ STAMPS = {
     ),
     "lane": "descriptor_ready arrive_before arrive_after arrivals_observed release_before release_after",
     "execution": "entry returned visible completion_consumed permit trace_published",
+    "async_point": "at",
+    "async_interval": "before after",
 }
 ARRAYS = {
     "task": {"kernel_ids": 3, "dependencies": None},
@@ -87,14 +89,18 @@ def protocol_version(section):
 
 
 def uses_resource_scoped_mix(section):
-    """Versions 8 and 9 coordinate only the declared Mix resource lanes."""
+    """Versions 8 and later coordinate only the declared Mix resource lanes."""
     return protocol_version(section) >= 8
 
 
 def has_native_graph(section):
     """Native Graph v6 is distinguished from claim-seal v6 by its source tables."""
     version = protocol_version(section)
-    return version == 9 or (version == 6 and ("node_map" in section or "graph_source" in section))
+    return version in (9, 11) or (version == 6 and ("node_map" in section or "graph_source" in section))
+
+
+def has_async_protocol(section):
+    return protocol_version(section) in (10, 11)
 
 
 def has_claim_seal(section):
@@ -163,6 +169,8 @@ def read_native_protocol(section):
     native = has_native_graph(section)
     root_numbers = ROOT_NUMBERS | ({"close_seal_stride"} if version >= 7 else set())
     extra = {"node_map", "graph_source"} if native else set()
+    if has_async_protocol(section):
+        extra.add("async")
     _object(section, root_numbers | ROOT_TABLES | {"schema", "producer", "first_error"} | extra, "root")
     if not version or section["producer"] != "aicore":
         _error("unknown schema or producer")
@@ -205,11 +213,19 @@ def read_native_protocol(section):
             extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" and has_claim_seal(section) else ()
             _record(row, kind, f"{table}[{row['index']}]", extra)
     _read_nested_events(section)
-    if native:
+    _read_extensions(section)
+    return section
+
+
+def _read_extensions(section):
+    if has_async_protocol(section):
+        from .native_async import read_async_protocol  # noqa: PLC0415
+
+        read_async_protocol(section["async"])
+    if has_native_graph(section):
         from .native_graph import read_graph_source  # noqa: PLC0415
 
         read_graph_source(section)
-    return section
 
 
 def _read_nested_events(section):
@@ -250,6 +266,10 @@ def _event_records(section):
     for table, kind in (("members", "member"), ("executions", "execution")):
         for row in section[table]:
             yield row, kind, f"{table}[{row['index']}]"
+    if has_async_protocol(section):
+        from .native_async import async_event_records  # noqa: PLC0415
+
+        yield from async_event_records(section["async"])
 
 
 def audit_protocol_sequences(section):

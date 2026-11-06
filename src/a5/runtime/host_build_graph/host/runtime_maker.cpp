@@ -548,6 +548,7 @@ struct SchedulerStateOwner {
     const HostApi *api;
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
     std::string protocol_source;
+    SchedulerProtocolAsyncPlan async_protocol;
 };
 
 std::mutex scheduler_state_owners_mutex;
@@ -600,7 +601,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         try {
             const auto payload = scheduler_export_protocol(
                 host_base, static_cast<size_t>(owner.layout.total_size), owner.layout, api->run_epoch(),
-                owner.protocol_tasks, owner.protocol_source
+                owner.protocol_tasks, owner.protocol_source, owner.async_protocol
             );
             if (!api->publish_chip_swimlane_extension(
                     ChipSwimlaneExtensionSection::AicoreProtocol, payload.c_str(), payload.size()
@@ -1920,8 +1921,12 @@ bool create_scheduler_state(
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
             runtime, SchedulerStateOwner{
-                         reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks),
-                         std::move(protocol_source)
+                         reinterpret_cast<void *>(aligned_address),
+                         layout,
+                         api,
+                         std::move(protocol_tasks),
+                         std::move(protocol_source),
+                         {async_offset, async_layout}
                      }
         );
     }

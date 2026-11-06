@@ -86,7 +86,8 @@ a5_hbg_case(test_hbg_native_graph_plan.cpp
     SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
 
 a5_hbg_case(test_hbg_protocol_export.cpp
-    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)
 
 a5_hbg_case(test_hbg_ordered_execution.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore

@@ -20,7 +20,9 @@
 #include "async_plan.h"
 #include "hbg_scheduler_test_support.h"
 #include "ready_pool_plan.h"
+#include "scheduler_protocol_export.h"
 #include "scheduler/scheduler_async_runtime.h"
+#include "scheduler/scheduler_protocol_execution.h"
 #include "async_completion_writer.h"
 #include "async_submission_context.h"
 
@@ -89,6 +91,9 @@ struct RuntimeFixture {
     scheduler_test::BasicGraphBuffer<2> graph_storage{2};
     SchedulerGraphView graph{};
     std::array<SchedulerLocalState, 6> locals;
+    std::array<SchedulerLocalProfilingState, 6> profiles{};
+    std::array<SchedulerWorkerContext, 6> wire_contexts{};
+    bool record_protocol{false};
     std::array<SchedulerAsyncRuntimeView, 6> views{};
     std::array<SchedulerAsyncDiscoveryState, 6> discovery{};
     std::array<DispatchPayload, 24> payloads{};
@@ -96,7 +101,11 @@ struct RuntimeFixture {
     SchedulerRunControl *run{nullptr};
     RuntimeBackend backend;
 
-    RuntimeFixture(uint32_t blocks = 1, uint32_t active_mask = 1, uint32_t async_mask = 1, uint32_t capacity = 4) {
+    RuntimeFixture(
+        uint32_t blocks = 1, uint32_t active_mask = 1, uint32_t async_mask = 1, uint32_t capacity = 4,
+        bool protocol = false
+    ) :
+        record_protocol(protocol) {
         for (auto &task : metadata) {
             task.flags = SCHEDULER_TASK_EXECUTABLE;
             task.active_mask = LaneMask::aic();
@@ -116,7 +125,15 @@ struct RuntimeFixture {
                 caps[0][lane] = {
                     CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::DEFERRED, capacity, CORE_ASYNC_CONDITION_COUNTER
                 };
-        EXPECT_TRUE(scheduler_plan_layout(2, 2, 0, &layout));
+        const bool cooperative = (metadata[0].flags & (SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX)) != 0;
+        metadata[1].trace_index_base = blocks * metadata[0].active_mask.count();
+        EXPECT_TRUE(scheduler_plan_layout(
+            2, 2, 0, &layout, false, metadata[1].trace_index_base + 1,
+            protocol ?
+                SchedulerSpmdRequirements{6, 2, cooperative ? 1u : 0u, metadata[0].active_mask.is_mix() ? 1u : 0u} :
+                SchedulerSpmdRequirements{},
+            protocol
+        ));
         EXPECT_TRUE(scheduler_plan_ready_pool(metadata, 2, 0, layout.total_size, &pool));
         layout.total_size = pool.total_size;
         EXPECT_TRUE(scheduler_plan_async_layout(metadata, caps, kEpoch, 1024 * 1024, {}, &async, nullptr));
@@ -132,6 +149,7 @@ struct RuntimeFixture {
             metadata.begin(), metadata.end(),
             scheduler_state_at<SchedulerTaskMetadata>(base(), layout.task_metadata_offset)
         );
+        if (protocol) EXPECT_TRUE(scheduler_init_spmd_task_records(base(), layout, kEpoch));
         run = scheduler_state_at<SchedulerRunControl>(base(), layout.run_control_offset);
         auto *summary = scheduler_state_at<SchedulerGraphSummary>(base(), layout.graph_summary_offset);
         summary->run_epoch = kEpoch;
@@ -142,7 +160,21 @@ struct RuntimeFixture {
         graph.scheduler_state_address = reinterpret_cast<uint64_t>(base());
         graph.scheduler_state_bytes = layout.total_size;
         for (uint32_t worker = 0; worker < locals.size(); ++worker) {
+            if (protocol) {
+                profiles[worker].protocol_layout_offset = layout.protocol_layout_offset;
+                locals[worker].profiling = &profiles[worker];
+            }
             auto &config = locals[worker].config;
+            wire_contexts[worker].cluster_index = worker / 3;
+            wire_contexts[worker].worker_index = worker;
+            wire_contexts[worker].physical_core_id = worker;
+            wire_contexts[worker].core_type = worker % 3 == 0 ? 0 : 1;
+            for (uint32_t lane = 0; lane < 3; ++lane)
+                wire_contexts[worker].cluster_worker_ids[lane] = (worker / 3) * 3 + lane;
+            if (protocol)
+                scheduler_state_at<SchedulerWorkerContext>(base(), layout.worker_contexts_offset)[worker] =
+                    wire_contexts[worker];
+            config.shared_context = &wire_contexts[worker];
             config.graph = &graph;
             config.graph_summary_offset = layout.graph_summary_offset;
             config.task_controls_offset = layout.task_controls_offset;
@@ -216,12 +248,42 @@ struct RuntimeFixture {
         if (activated != nullptr) *activated = published;
         return ok;
     }
+    template <typename Clock = SchedulerAsyncFinishClock>
     SchedulerAsyncRuntimeServiceResult service(uint32_t worker, SchedulerAsyncSliceBudget *provided = nullptr) {
         SchedulerAsyncSliceBudget budget{};
-        return scheduler_async_runtime_service(
+        return scheduler_async_runtime_service<RuntimeBackend, Clock>(
             views[worker], graph, base(), &locals[worker], run, &discovery[worker],
-            provided != nullptr ? provided : &budget, backend
+            provided != nullptr ? provided : &budget, backend, record_protocol ? 4 : 0
         );
+    }
+    SchedulerProtocolExecutionTrace *
+    record_execution(uint32_t worker, uint32_t block = 0, uint32_t lane = 0, bool skipped = false) {
+        auto &local = locals[worker];
+        auto &slot = local.slots[0];
+        slot.task_ref = 0;
+        slot.block_idx = block;
+        slot.subtask_slot = lane;
+        slot.generation = block + 1;
+        auto *trace = scheduler_protocol_execution_at(
+            base(), &local, scheduler_protocol_layout_at(base(), &local), 0, block, lane
+        );
+        trace->flags = SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED;
+        trace->run_epoch = kEpoch;
+        trace->task_ref = 0;
+        trace->block_idx = block;
+        trace->subtask_slot = lane;
+        trace->worker_index = worker;
+        trace->generation = slot.generation;
+        trace->pending_slot = 0;
+        scheduler_protocol_execution_permit(base(), &local, 0, 0, false);
+        auto &p = payload(block, lane);
+        p.function_bin_addr = skipped ? 0 : 1;
+        scheduler_protocol_execution_entry(base(), &local, 0, &p);
+        if (!skipped) scheduler_protocol_execution_returned(base(), &local, 0, 0, 0);
+        return trace;
+    }
+    SchedulerProtocolWorkerTrace *protocol_worker(uint32_t worker) {
+        return scheduler_state_at<SchedulerProtocolWorkerTrace>(base(), layout.protocol.workers_offset) + worker;
     }
     uint64_t completed() const {
         uint64_t count = 0;
@@ -744,4 +806,267 @@ TEST(HbgAsyncRuntime, LazyRecordValidationRejectsBadMapsAndAtomicRegionAliasingB
         EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
     }
 }
+
+struct AsyncProtocolCountingClock {
+    static inline uint64_t calls = 0;
+    static inline void (*inspect)() = nullptr;
+    static uint64_t now() {
+        ++calls;
+        if (inspect != nullptr) inspect();
+        return calls;
+    }
+};
+
+TEST(HbgAsyncProtocol, RealSealReleaseCheckAndFinishShareWorkerSequences) {
+    for (const bool ready_first : {false, true}) {
+        RuntimeFixture fixture(1, 1, 1, 4, true);
+        fixture.bind(0);
+        fixture.condition();
+        auto *execution = fixture.record_execution(0);
+        ASSERT_TRUE(fixture.seal(0));
+        auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
+        auto *progress = fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset);
+        EXPECT_EQ(writer->sealed_at.sequence, execution->visible.sequence + 1);
+        const auto before = fixture.protocol_worker(1)->next_sequence;
+        ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+        EXPECT_EQ(progress->pending_slice_count, 1u);
+        EXPECT_EQ(progress->slice_count, 1u);
+        EXPECT_EQ(fixture.protocol_worker(1)->next_sequence, before);
+        fixture.backend.ready[0] = true;
+        if (!ready_first) ASSERT_TRUE(fixture.release(0, 0));
+        ASSERT_EQ(fixture.service(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+        EXPECT_EQ(progress->terminal_at.sequence, 1u);
+        EXPECT_EQ(progress->terminal_worker_index, 2u);
+        if (ready_first) ASSERT_TRUE(fixture.release(0, 0));
+        EXPECT_EQ(writer->release.worker_index, 0u);
+        EXPECT_EQ(writer->release.before.sequence, writer->sealed_at.sequence + 1);
+        EXPECT_EQ(writer->release.after.sequence, writer->release.before.sequence + 1);
+        fixture.drain();
+        auto *finish = fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset);
+        EXPECT_EQ(finish->phase, static_cast<uint64_t>(SchedulerAsyncFinishPhase::CONTRIBUTED));
+        ASSERT_NE(finish->drained_at.sequence, 0u);
+        auto *actors =
+            scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.layout.protocol.tasks_offset);
+        EXPECT_NE(actors[0].completion.after.sequence, 0u);
+        EXPECT_EQ(
+            finish->drained_at.sequence,
+            fixture.protocol_worker(static_cast<uint32_t>(finish->drained_worker_index))->next_sequence
+        );
+        EXPECT_EQ(fixture.completed(), 1u);
+        for (uint32_t worker = 0; worker < 6; ++worker)
+            EXPECT_EQ(fixture.protocol_worker(worker)->error_flags, 0u);
+    }
+}
+
+TEST(HbgAsyncProtocol, EmptyAndPredicateSkipSealWithoutCheckTerminal) {
+    for (const bool skipped : {false, true}) {
+        RuntimeFixture fixture(1, 1, 1, 4, true);
+        fixture.bind(0);
+        auto *execution = fixture.record_execution(0, 0, 0, skipped);
+        bool registered = true;
+        ASSERT_TRUE(fixture.seal(0, 0, 0, &registered));
+        EXPECT_FALSE(registered);
+        auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
+        auto *progress = fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset);
+        EXPECT_EQ(writer->count, 0u);
+        EXPECT_EQ(writer->sealed_at.sequence, (skipped ? execution->entry.sequence : execution->visible.sequence) + 1);
+        EXPECT_EQ(progress->terminal_at.sequence, 0u);
+        EXPECT_EQ(progress->pending_slice_count, 0u);
+        EXPECT_EQ(progress->slice_count, 0u);
+        if (skipped) EXPECT_EQ(execution->returned.sequence + execution->visible.sequence, 0u);
+        ASSERT_TRUE(fixture.release(0, 0));
+        fixture.drain();
+        EXPECT_EQ(writer->release.after.sequence, writer->release.before.sequence + 1);
+    }
+}
+
+TEST(HbgAsyncProtocol, FailedSealRetainsActualSealAndNoRelease) {
+    RuntimeFixture fixture(1, 1, 1, 4, true);
+    fixture.bind(0);
+    fixture.condition();
+    fixture.record_execution(0);
+    fixture.backend.allow_binding = false;
+    EXPECT_FALSE(fixture.seal(0));
+    const auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
+    EXPECT_NE(writer->sealed_at.sequence, 0u);
+    EXPECT_NE(writer->error_code, 0);
+    EXPECT_EQ(writer->release.before.sequence + writer->release.after.sequence, 0u);
+    EXPECT_EQ(fixture.completed(), 0u);
+}
+
+TEST(HbgAsyncProtocol, MixedLanesHaveOnlyOneLogicalBlockReleaseInterval) {
+    RuntimeFixture fixture(1, 7, 6, 4, true);
+    for (uint32_t lane : {1u, 2u}) {
+        fixture.bind(lane, 0, lane);
+        fixture.record_execution(lane, 0, lane);
+        ASSERT_TRUE(fixture.seal(lane, 0, lane));
+    }
+    ASSERT_TRUE(fixture.release(0, 0));
+    const auto *first = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset, fixture.group(0, 1));
+    const auto *second = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset, fixture.group(0, 2));
+    EXPECT_NE(first->release.before.sequence, 0u);
+    EXPECT_EQ(first->release.after.sequence, first->release.before.sequence + 1);
+    EXPECT_EQ(first->release.worker_index, 0u);
+    EXPECT_EQ(second->release.before.sequence + second->release.after.sequence, 0u);
+}
+
+struct RegistrationPrefixReader {
+    static inline uintptr_t begin = 0;
+    static inline uint32_t reads = 0;
+    static uint64_t word(const uint8_t *address) {
+        EXPECT_GE(reinterpret_cast<uintptr_t>(address), begin);
+        EXPECT_LT(reinterpret_cast<uintptr_t>(address), begin + 64);
+        ++reads;
+        uint64_t result = 0;
+        std::memcpy(&result, address, sizeof(result));
+        return result;
+    }
+};
+
+TEST(HbgAsyncProtocol, WriterSnapshotDoesNotReadConcurrentReleaseLine) {
+    SchedulerAsyncGroupWriter source{};
+    source.count = 3;
+    source.sealed = 1;
+    source.sealed_at = {17, 4};
+    RegistrationPrefixReader::begin = reinterpret_cast<uintptr_t>(&source);
+    RegistrationPrefixReader::reads = 0;
+    std::thread releaser([&] {
+        for (uint64_t index = 1; index <= 1000; ++index)
+            __atomic_store_n(&source.release.worker_index, index, __ATOMIC_RELEASE);
+    });
+    for (uint32_t index = 0; index < 100; ++index) {
+        SchedulerAsyncGroupWriter snapshot{};
+        scheduler_async_writer_snapshot<RegistrationPrefixReader>(&source, &snapshot);
+        EXPECT_EQ(snapshot.count, 3u);
+        EXPECT_EQ(snapshot.sealed_at.sequence, 4u);
+        EXPECT_EQ(snapshot.release.worker_index, 0u);
+    }
+    releaser.join();
+    EXPECT_EQ(RegistrationPrefixReader::reads, 800u);
+    EXPECT_EQ(source.release.worker_index, 1000u);
+}
+
+TEST(HbgAsyncProtocol, DisabledProtocolAndLevelOneDoNotReadDiagnosticClock) {
+    RuntimeFixture fixture;
+    fixture.bind(0);
+    fixture.condition();
+    ASSERT_TRUE(fixture.seal(0));
+    AsyncProtocolCountingClock::calls = 0;
+    ASSERT_EQ(fixture.service<AsyncProtocolCountingClock>(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    fixture.backend.ready[0] = true;
+    ASSERT_TRUE(fixture.release(0, 0));
+    ASSERT_EQ(fixture.service<AsyncProtocolCountingClock>(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    SchedulerAsyncSliceBudget budget{};
+    ASSERT_EQ(
+        (scheduler_async_runtime_service<RuntimeBackend, AsyncProtocolCountingClock>(
+            fixture.views[3], fixture.graph, fixture.base(), &fixture.locals[3], fixture.run, &fixture.discovery[3],
+            &budget, fixture.backend, 1
+        )),
+        SchedulerAsyncRuntimeServiceResult::PROGRESS
+    );
+    EXPECT_EQ(AsyncProtocolCountingClock::calls, 0u);
+}
+
+TEST(HbgAsyncProtocol, AsyncAndOrdinaryStampsKeepDuplicateOverflowAndFinishGuards) {
+    RuntimeFixture fixture(1, 1, 1, 4, true);
+    auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
+    auto *layout = scheduler_protocol_layout_at(fixture.base(), &fixture.locals[0]);
+    ASSERT_TRUE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->sealed_at));
+    auto *actor = scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.layout.protocol.tasks_offset);
+    ASSERT_TRUE(scheduler_protocol_stamp_at(fixture.base(), &fixture.locals[0], layout, &actor->completion.before, 0));
+    EXPECT_EQ(writer->sealed_at.sequence, 1u);
+    EXPECT_EQ(actor->completion.before.sequence, 2u);
+    EXPECT_FALSE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->sealed_at));
+    EXPECT_EQ(fixture.protocol_worker(0)->next_sequence, 2u);
+    EXPECT_NE(fixture.protocol_worker(0)->error_flags & SCHEDULER_PROTOCOL_DUPLICATE, 0u);
+    fixture.protocol_worker(0)->next_sequence = UINT64_MAX;
+    EXPECT_FALSE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->release.before));
+    EXPECT_EQ(writer->release.before.sequence, 0u);
+    EXPECT_NE(fixture.protocol_worker(0)->error_flags & SCHEDULER_PROTOCOL_SEQUENCE_OVERFLOW, 0u);
+    fixture.protocol_worker(0)->next_sequence = 2;
+    scheduler_protocol_finish(fixture.base(), &fixture.locals[0], false);
+    EXPECT_FALSE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->release.before));
+    EXPECT_NE(fixture.protocol_worker(0)->error_flags & SCHEDULER_PROTOCOL_AFTER_FINISH, 0u);
+}
+
+RuntimeFixture *inspected_protocol_fixture = nullptr;
+
+TEST(HbgAsyncProtocol, TerminalPrecedesJoinAndDrainedFollowsPublishedContribution) {
+    RuntimeFixture fixture(1, 1, 1, 4, true);
+    fixture.bind(0);
+    fixture.condition();
+    fixture.record_execution(0);
+    ASSERT_TRUE(fixture.seal(0));
+    ASSERT_TRUE(fixture.release(0, 0));
+    fixture.backend.ready[0] = true;
+    inspected_protocol_fixture = &fixture;
+    AsyncProtocolCountingClock::calls = 0;
+    AsyncProtocolCountingClock::inspect = [] {
+        if (AsyncProtocolCountingClock::calls != 3) return;
+        auto &f = *inspected_protocol_fixture;
+        EXPECT_NE(scheduler_async_join_load(*f.at<SchedulerAsyncTaskJoin>(f.async.finish_join_offset)), 0u);
+        EXPECT_EQ(f.at<SchedulerAsyncGroupProgress>(f.async.group_progress_offset)->terminal_at.sequence, 0u);
+    };
+    EXPECT_EQ(fixture.service<AsyncProtocolCountingClock>(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    EXPECT_EQ(AsyncProtocolCountingClock::calls, 3u);
+    AsyncProtocolCountingClock::inspect = [] {
+        auto &f = *inspected_protocol_fixture;
+        if (f.completed() == 0) return;
+        const auto *progress = f.at<SchedulerAsyncFinishProgress>(f.async.finish_progress_offset);
+        EXPECT_EQ(progress->phase, static_cast<uint64_t>(SchedulerAsyncFinishPhase::CONTRIBUTED));
+        EXPECT_EQ(progress->pending_count, 0u);
+        EXPECT_EQ(progress->drained_at.sequence, 0u);
+    };
+    for (uint32_t iteration = 0; iteration < 32 && fixture.completed() == 0; ++iteration)
+        EXPECT_EQ(fixture.service<AsyncProtocolCountingClock>(3), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    AsyncProtocolCountingClock::inspect = nullptr;
+    inspected_protocol_fixture = nullptr;
+    EXPECT_EQ(fixture.completed(), 1u);
+    EXPECT_NE(fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset)->drained_at.sequence, 0u);
+}
+
+TEST(HbgAsyncProtocol, FailedReleasePreservesBeforeWithoutInventingAfter) {
+    RuntimeFixture fixture(1, 1, 1, 4, true);
+    fixture.bind(0);
+    fixture.record_execution(0);
+    ASSERT_TRUE(fixture.seal(0));
+    scheduler_async_join_abort(*fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset));
+    EXPECT_FALSE(fixture.release(0, 0));
+    const auto &release = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset)->release;
+    EXPECT_NE(release.before.sequence, 0u);
+    EXPECT_EQ(release.after.sequence, 0u);
+    EXPECT_EQ(fixture.completed(), 0u);
+}
+
+TEST(HbgAsyncProtocol, ExportsRealRecorderEvidenceForPythonRoundTrip) {
+    for (uint32_t mode = 0; mode < 4; ++mode) {
+        RuntimeFixture fixture(1, 1, 1, 4, true);
+        fixture.bind(0);
+        if (mode == 0) fixture.condition();
+        fixture.record_execution(0, 0, 0, mode == 2);
+        ASSERT_TRUE(fixture.seal(0));
+        if (mode == 3) {
+            scheduler_async_join_abort(*fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset));
+            ASSERT_FALSE(fixture.release(0, 0));
+        } else {
+            ASSERT_TRUE(fixture.release(0, 0));
+            if (mode == 0) {
+                ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+                fixture.backend.ready[0] = true;
+                ASSERT_EQ(fixture.service(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+            }
+            fixture.drain();
+        }
+        for (uint32_t worker = 0; worker < 6; ++worker)
+            scheduler_protocol_finish(fixture.base(), &fixture.locals[worker], mode != 3);
+        const auto tasks = scheduler_protocol_freeze_graph(fixture.graph, fixture.metadata);
+        const auto json = scheduler_export_protocol(
+            fixture.base(), fixture.layout.total_size, fixture.layout, kEpoch, tasks, {},
+            SchedulerProtocolAsyncPlan{fixture.async_offset, fixture.async}
+        );
+        const char *names[] = {"native_ready", "native_empty", "native_skip", "native_partial_release"};
+        RecordProperty(names[mode], json);
+    }
+}
+
 }  // namespace

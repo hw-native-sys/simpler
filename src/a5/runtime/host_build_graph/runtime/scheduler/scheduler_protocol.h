@@ -105,15 +105,11 @@ inline __aicore__ void scheduler_protocol_fail(
 }
 
 template <typename Local>
-inline __aicore__ bool scheduler_protocol_stamp_at(
-    __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout,
-    __gm__ SchedulerProtocolStamp *stamp, uint64_t cycles
+inline __aicore__ bool scheduler_protocol_reserve_stamp(
+    __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout, SchedulerProtocolStamp *stamp,
+    uint64_t cycles
 ) {
     auto *worker = scheduler_protocol_worker_at(base, local, layout);
-    if (stamp->sequence != 0) {
-        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_DUPLICATE);
-        return false;
-    }
     if (worker->finished != 0) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_AFTER_FINISH);
         return false;
@@ -123,9 +119,24 @@ inline __aicore__ bool scheduler_protocol_stamp_at(
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_SEQUENCE_OVERFLOW);
         return false;
     }
-    stamp->cycles = cycles;
-    stamp->sequence = sequence + 1;
+    *stamp = {cycles, sequence + 1};
     worker->next_sequence = sequence + 1;
+    return true;
+}
+
+template <typename Local>
+inline __aicore__ bool scheduler_protocol_stamp_at(
+    __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout,
+    __gm__ SchedulerProtocolStamp *stamp, uint64_t cycles
+) {
+    if (stamp->sequence != 0) {
+        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_DUPLICATE);
+        return false;
+    }
+    SchedulerProtocolStamp next{};
+    if (!scheduler_protocol_reserve_stamp(base, local, layout, &next, cycles)) return false;
+    stamp->cycles = next.cycles;
+    stamp->sequence = next.sequence;
     return true;
 }
 

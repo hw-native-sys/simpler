@@ -762,4 +762,53 @@ TEST(HbgAsyncFinish, DirectoryBitThatAppearsSetStillRequiresAtomicConfirmation) 
     fixture.terminal(3);
     ClearedDirectory::directory_word = nullptr;
 }
+struct ForeignAbortAfterTaskDoneBefore : SchedulerAsyncFinishProtocol {
+    static inline SchedulerRunControl *run = nullptr;
+    static void
+    task_done(void *base, const SchedulerLocalState *local, int64_t task, uint64_t order, uint32_t flags, bool before) {
+        SchedulerAsyncFinishProtocol::task_done(base, local, task, order, flags, before);
+        if (before) scheduler_record_error(run, 1, SchedulerGraphResult::INVALID_ARGUMENTS);
+    }
+};
+
+TEST(HbgAsyncFinish, ForeignAbortAfterRealTaskDoneBeforeDoesNotInventLocalFailureCode) {
+    scheduler_test::FixtureStorage storage(2, 6, 1, {6, 2, 0, 0}, true);
+    scheduler_test::BasicGraphBuffer<2> graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    auto *base = storage.scheduler_state->base();
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, kEpoch));
+    auto &context = storage.contexts[0];
+    context.scheduler_count = 6;
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        context.cluster_worker_ids[lane] = lane;
+    storage.test_graphs[0] = graph.graph();
+    auto *local = storage.local_context(&context);
+    ASSERT_TRUE(scheduler_protocol_bind(base, local));
+    SchedulerAsyncFinishIdentity identity{};
+    identity.run_epoch = kEpoch;
+    identity.task_ref = 0;
+    SchedulerAsyncTaskJoin join{};
+    SchedulerAsyncFinishProgress progress{};
+    uint32_t budget = 8;
+    ForeignAbortAfterTaskDoneBefore::run = storage.run_control;
+    const auto result = scheduler_async_finish_step<
+        SchedulerAsyncFinishQueueOps, SchedulerResolveLink, SchedulerAsyncFinishClock, ForeignAbortAfterTaskDoneBefore>(
+        graph.graph(), base, local, storage.run_control, identity, &join, &progress, &budget
+    );
+    ForeignAbortAfterTaskDoneBefore::run = nullptr;
+    EXPECT_EQ(result, SchedulerAsyncFinishResult::ERROR);
+    EXPECT_EQ(progress.phase, static_cast<uint64_t>(SchedulerAsyncFinishPhase::FAILED));
+    EXPECT_EQ(progress.failure_code, 0);
+    EXPECT_EQ(storage.run_control->error_task_ref, 1u);
+    EXPECT_EQ(local->pending_completed, 0u);
+    const auto *trace = scheduler_state_at<SchedulerProtocolTaskTrace>(base, storage.layout.protocol.tasks_offset);
+    EXPECT_NE(trace[0].completion.before.sequence, 0u);
+    EXPECT_EQ(trace[0].completion.after.sequence, 0u);
+    EXPECT_EQ(
+        scheduler_gm_load(scheduler_task_control_at(base, local, 0)->state),
+        static_cast<int64_t>(SchedulerTaskState::BLOCKED)
+    );
+}
+
 }  // namespace

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "hbg_scheduler_test_support.h"
+#include "async_plan.h"
 #include "scheduler_protocol_export.h"
 #include "scheduler_protocol_graph_source.h"
 
@@ -282,6 +283,242 @@ TEST(ProtocolGraphSnapshot, DependencyOnlyServiceRetainsRoutingWithoutRequiringA
     EXPECT_EQ(frozen[1].metadata.active_mask, LaneMask::aiv0());
     EXPECT_EQ(frozen[1].metadata.kernel_ids[1], UINT16_MAX);
     EXPECT_EQ(frozen[1].dependencies, std::vector<int32_t>({0}));
+}
+
+struct AsyncProtocolExportFixture : ProtocolExportFixture {
+    static constexpr uint64_t kEpoch = 17;
+    SchedulerProtocolAsyncPlan frozen;
+
+    void SetUp() override {
+        ProtocolExportFixture::SetUp();
+        std::vector<SchedulerTaskMetadata> metadata;
+        for (const auto &task : tasks)
+            metadata.push_back(task.metadata);
+        std::vector<SchedulerAsyncCapabilities> capabilities(tasks.size());
+        for (uint32_t lane = 0; lane < 3; ++lane)
+            capabilities[0][lane] = {
+                CORE_ASYNC_CAPABILITY_VERSION, lane == 1 ? CoreAsyncMode::SYNCHRONOUS : CoreAsyncMode::DEFERRED,
+                lane == 1 ? 0u : 3u, lane == 1 ? 0u : CORE_ASYNC_CONDITION_TYPES
+            };
+        SchedulerAsyncHostPlan plan;
+        std::string error;
+        ASSERT_TRUE(scheduler_plan_async_state(metadata, capabilities, kEpoch, 1 << 20, {}, &plan, &error)) << error;
+        std::vector<uint8_t> prefix(layout.total_size);
+        std::memcpy(prefix.data(), storage->base(), prefix.size());
+        uint64_t total = 0;
+        ASSERT_TRUE(
+            scheduler_append_async_layout(layout.total_size, plan.layout, 1 << 20, &frozen.offset, &total, &error)
+        );
+        frozen.layout = plan.layout;
+        layout.total_size = total;
+        storage = std::make_unique<scheduler_test::SchedulerStateBuffer>(layout);
+        std::memcpy(storage->base(), prefix.data(), prefix.size());
+        std::memcpy(static_cast<uint8_t *>(storage->base()) + frozen.offset, plan.image.data(), plan.image.size());
+        ASSERT_TRUE(scheduler_init_spmd_task_records(storage->base(), layout, kEpoch));
+        at<SchedulerGraphSummary>(layout.graph_summary_offset)->async_layout_offset = frozen.offset;
+    }
+
+    template <typename T>
+    T &async_at(uint64_t offset, uint64_t index = 0) {
+        return scheduler_state_at<T>(storage->base(), frozen.offset + offset)[index];
+    }
+    std::string dump_async(const std::string &source = {}) {
+        return scheduler_export_protocol(storage->base(), layout.total_size, layout, kEpoch, tasks, source, frozen);
+    }
+    void seal(uint64_t index, uint32_t count = 0) {
+        const auto &identity = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset, index);
+        auto &writer = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset, index);
+        writer.count = count;
+        writer.sealed = 1;
+        writer.sealed_at = {0, 2};
+        const uint64_t trace = identity.block_idx * 3 + identity.subtask_slot;
+        auto &execution = at<SchedulerProtocolExecutionTrace>(layout.protocol.executions_offset)[trace];
+        execution.run_epoch = kEpoch;
+        execution.task_ref = identity.task_ref;
+        execution.block_idx = identity.block_idx;
+        execution.subtask_slot = identity.subtask_slot;
+        execution.worker_index = identity.subtask_slot;
+        execution.generation = 9;
+        execution.publication_count = 1;
+        execution.entry = {0, 1};
+    }
+};
+
+size_t count_text(const std::string &text, const std::string &needle) {
+    size_t count = 0, cursor = 0;
+    while ((cursor = text.find(needle, cursor)) != std::string::npos) {
+        ++count;
+        cursor += needle.size();
+    }
+    return count;
+}
+
+TEST_F(AsyncProtocolExportFixture, DenseNeverRunGroupsAndFinishesKeepLayoutCounts) {
+    const auto json = dump_async();
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v10\""), std::string::npos);
+    EXPECT_NE(json.find("\"async\":{\"group_count\":4,\"finish_count\":1"), std::string::npos);
+    EXPECT_EQ(count_text(json, "\"state\":\"UNSEALED\""), 4u);
+    EXPECT_EQ(count_text(json, "\"publication\":null"), 2u);
+    EXPECT_EQ(count_text(json, "\"sealed\":null"), 4u);
+    EXPECT_NE(json.find("\"group_indices\":[0,1,2,3]"), std::string::npos);
+    EXPECT_NE(json.find("\"drained\":null"), std::string::npos);
+}
+
+TEST_F(AsyncProtocolExportFixture, EmptySealUsesActualExecutionIdentityAndLiteralZeroCycle) {
+    seal(1);
+    at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].trace_index_base = UINT32_MAX;
+    const auto json = dump_async();
+    EXPECT_NE(json.find("\"execution_index\":2,\"dispatch_generation\":9"), std::string::npos);
+    EXPECT_NE(
+        json.find("\"state\":\"EMPTY\",\"sealed\":{\"run_epoch\":17,\"worker_index\":2,\"at\":[0,2]}"),
+        std::string::npos
+    );
+    EXPECT_NE(json.find("\"terminal\":null"), std::string::npos);
+}
+
+TEST_F(AsyncProtocolExportFixture, ConditionsPreserveBindingScopeAndNullableAllocationGeneration) {
+    seal(0, 2);
+    const auto &id = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset);
+    for (uint32_t condition = 0; condition < 2; ++condition) {
+        async_at<DeferredCompletionEntry>(id.entries_offset, condition).completion_type = condition;
+        auto &binding = async_at<SchedulerAsyncConditionBinding>(id.condition_bindings_offset, condition);
+        binding.binding_index = 12;
+        binding.owner_generation = condition == 0 ? 0 : 27;
+    }
+    auto &progress = async_at<SchedulerAsyncGroupProgress>(frozen.layout.group_progress_offset);
+    progress.phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::DRAINED);
+    progress.terminal_at = {8, 4};
+    progress.terminal_worker_index = 1;
+    progress.observation_count = 2;
+    progress.slice_count = 3;
+    progress.pending_slice_count = 2;
+    progress.active_cycles = 11;
+    async_at<SchedulerAsyncLease>(frozen.layout.group_lease_offset).word =
+        scheduler_async_lease_word(7, SchedulerAsyncPhase::TERMINAL);
+    const auto json = dump_async();
+    EXPECT_NE(json.find("\"index\":0,\"type\":0,\"binding_index\":12,\"owner_generation\":null"), std::string::npos);
+    EXPECT_NE(json.find("\"index\":1,\"type\":1,\"binding_index\":12,\"owner_generation\":27"), std::string::npos);
+    EXPECT_NE(json.find("\"state\":\"READY\""), std::string::npos);
+    EXPECT_NE(json.find("\"terminal\":{\"run_epoch\":17,\"worker_index\":1,\"at\":[8,4]}"), std::string::npos);
+    EXPECT_NE(
+        json.find("\"observations\":2,\"pending_count\":2,\"slice_count\":3,\"active_cycles\":11"), std::string::npos
+    );
+}
+
+TEST_F(AsyncProtocolExportFixture, PartialLogicalBlockReleasePreservesItsBeforePointOnce) {
+    auto &release = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset).release;
+    release.before = {0, 5};
+    release.worker_index = 0;
+    const auto json = dump_async();
+    EXPECT_EQ(
+        count_text(json, "\"publication\":{\"run_epoch\":17,\"worker_index\":0,\"before\":[0,5],\"after\":null}"), 1u
+    );
+    EXPECT_EQ(count_text(json, "\"publication\":null"), 1u);
+    release.after = {10, 6};
+    EXPECT_NE(dump_async().find("\"before\":[0,5],\"after\":[10,6]"), std::string::npos);
+}
+
+TEST_F(AsyncProtocolExportFixture, DoesNotDiscardAnOrphanOrNonownerReleaseEvent) {
+    auto &release = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset).release;
+    release.after = {10, 6};
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+    release.after = {};
+    async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset, 1).release.before = {10, 6};
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+}
+
+TEST_F(AsyncProtocolExportFixture, FinishDrainRequiresContributionAndKeepsMissingEvidenceNull) {
+    auto &progress = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
+    progress.phase = static_cast<uint64_t>(SchedulerAsyncFinishPhase::DRAINED);
+    progress.visited_count = 5;
+    progress.slice_count = 2;
+    progress.active_slice_cycles = 31;
+    async_at<SchedulerAsyncLease>(frozen.layout.finish_lease_offset).word =
+        scheduler_async_lease_word(3, SchedulerAsyncPhase::TERMINAL);
+    auto json = dump_async();
+    EXPECT_NE(json.find("\"state\":\"PENDING\",\"group_indices\":[0,1,2,3],\"drained\":null"), std::string::npos);
+    progress.phase = static_cast<uint64_t>(SchedulerAsyncFinishPhase::CONTRIBUTED);
+    json = dump_async();
+    EXPECT_NE(json.find("\"state\":\"DRAINED\",\"group_indices\":[0,1,2,3],\"drained\":null"), std::string::npos);
+    progress.drained_at = {100, 7};
+    progress.drained_worker_index = 2;
+    json = dump_async();
+    EXPECT_NE(json.find("\"drained\":{\"run_epoch\":17,\"worker_index\":2,\"at\":[100,7]}"), std::string::npos);
+    EXPECT_NE(
+        json.find("\"waiter_count\":5,\"pending_count\":0,\"slice_count\":2,\"active_cycles\":31"), std::string::npos
+    );
+}
+
+TEST_F(AsyncProtocolExportFixture, ErrorEvidenceAndUnboundConditionsRemainReadable) {
+    seal(0, 1);
+    auto &writer = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset);
+    writer.error_code = -7;
+    auto &progress = async_at<SchedulerAsyncGroupProgress>(frozen.layout.group_progress_offset);
+    progress.phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::FAILED);
+    progress.failure_code = -2;
+    auto &finish = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
+    finish.phase = static_cast<uint64_t>(SchedulerAsyncFinishPhase::FAILED);
+    finish.failure_code = -19;
+    at<SchedulerRunControl>(layout.run_control_offset)->scheduler_error = 7;
+    const auto json = dump_async();
+    EXPECT_EQ(count_text(json, "\"state\":\"FAILED\""), 2u);
+    EXPECT_NE(json.find("\"failure_code\":-7"), std::string::npos);
+    EXPECT_NE(json.find("\"failure_code\":-19"), std::string::npos);
+    EXPECT_NE(json.find("\"binding_index\":18446744073709551615,\"owner_generation\":null"), std::string::npos);
+    EXPECT_EQ(count_text(json, "\"state\":\"UNSEALED\""), 3u);
+}
+
+TEST_F(AsyncProtocolExportFixture, GraphAsyncSchemaKeepsExistingNodeMapAndSource) {
+    tasks[0].kind = SchedulerNodeKind::CHILD_KERNEL;
+    tasks[0].original_task_id = 7;
+    tasks[0].local_child_id = 3;
+    tasks[0].public_task_id = TaskId::to_uint64(TaskId::make_sub_task(7, 3));
+    const auto json = dump_async("{\"tasks\":[],\"definitions\":[]}");
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v11\""), std::string::npos);
+    EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
+    EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
+}
+
+TEST_F(AsyncProtocolExportFixture, RejectsChangedImmutableCountsAndLocator) {
+    auto &wire = async_at<SchedulerAsyncLayout>(0);
+    --wire.group_count;
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+    wire = frozen.layout;
+    at<SchedulerGraphSummary>(layout.graph_summary_offset)->async_layout_offset += 128;
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+}
+
+TEST_F(AsyncProtocolExportFixture, RejectsConditionsRedirectedToAnotherSectionAndCapacityOverflow) {
+    auto &identity = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset);
+    const auto saved = identity;
+    identity.entries_offset = frozen.layout.group_writer_offset;
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+    identity = saved;
+    async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset).count = identity.capacity + 1;
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+}
+
+TEST_F(AsyncProtocolExportFixture, RejectsWrongMapOwnershipAndRecordedSealWithoutExecution) {
+    auto &map = async_at<SchedulerAsyncTaskMap>(frozen.layout.task_map_offset);
+    const auto saved = map;
+    map.group_base = 1;
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+    map = saved;
+    async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset).sealed_at = {10, 1};
+    EXPECT_THROW(dump_async(), std::invalid_argument);
+}
+
+TEST_F(AsyncProtocolExportFixture, RejectsOversizedFinishBatchWithoutClamping) {
+    auto &finish = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
+    finish.pending_count = 8;
+    EXPECT_NO_THROW(dump_async());
+    finish.pending_count = 9;
+    try {
+        (void)dump_async();
+        FAIL() << "oversized batch accepted";
+    } catch (const std::invalid_argument &error) {
+        EXPECT_NE(std::string(error.what()).find("finishes[0].pending_count out of range: 9"), std::string::npos);
+    }
 }
 
 }  // namespace

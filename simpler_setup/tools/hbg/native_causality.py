@@ -69,6 +69,7 @@ class NativeAudit:
         self.claim_seals = {}
         self.close_reads = {}
         self.payload_points = {}
+        self.async_tasks = set()
 
     def chain(self, record, *fields):
         points = [point(record, field) for field in fields]
@@ -700,7 +701,10 @@ class NativeAudit:
             done = self.actors[ref]["completion"]
             require(done is not None, "missing TaskDone")
             self.actor(done, ref)
-            if cooperative:
+            if ref in self.async_tasks:
+                if not cooperative:
+                    require(self.actors[ref]["admission"] is None, "ordinary async task has an admission event")
+            elif cooperative:
                 last = max(self.task_blocks[ref], key=lambda block: block["owner"]["completion_ticket"])
                 owner = last["owner"]
                 require(owner["worker_index"] == done["worker_index"], "TaskDone not owned by last contributor")
@@ -760,9 +764,12 @@ class NativeAudit:
         from .native_mix_audit import audit_mix  # noqa: PLC0415
 
         audit_mix(self)
+        from .native_async import audit_async_protocol  # noqa: PLC0415
+
+        self.async_tasks = audit_async_protocol(self)
         self.completions()
         self.causal.validate()
-        return dict(
+        result = dict(
             self.sequence_result,
             protocol_verified=True,
             device_logical_tasks=len(self.actors),
@@ -771,6 +778,9 @@ class NativeAudit:
             member_obligations=len(self.members),
             blocks=len(self.blocks),
         )
+        if self.async_tasks:
+            result.update(async_tasks=len(self.async_tasks), async_groups=self.raw["async"]["group_count"])
+        return result
 
 
 def audit_native_protocol(section, identities):

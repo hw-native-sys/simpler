@@ -24,6 +24,7 @@
 
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler_async_protocol_export.h"
 
 struct SchedulerProtocolTaskSpec {
     SchedulerTaskMetadata metadata;
@@ -359,18 +360,33 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
 
 inline std::string scheduler_export_protocol(
     const void *base, size_t size, const AicoreSchedulerLayout &layout, uint64_t epoch,
-    const std::vector<SchedulerProtocolTaskSpec> &tasks, const std::string &graph_source = {}
+    const std::vector<SchedulerProtocolTaskSpec> &tasks, const std::string &graph_source = {},
+    const SchedulerProtocolAsyncPlan &async_plan = {}
 ) {
     using namespace scheduler_protocol_export;
     if (size != layout.total_size || tasks.size() != layout.task_count || layout.protocol_layout_offset == 0)
         throw std::invalid_argument("protocol image size or frozen task count mismatch");
     const Image image(base, size);
     validate_layout(image, layout, epoch);
+    const auto &summary = *image.array<SchedulerGraphSummary>(layout.graph_summary_offset, 1);
+    scheduler_async_protocol_export::require(
+        summary.async_layout_offset == async_plan.offset, "locator disagrees with retained Host plan"
+    );
+    const bool asynchronous = async_plan.offset != 0;
+    if (asynchronous)
+        scheduler_async_protocol_export::require(
+            async_plan.offset >= layout.protocol.storage_end_offset && async_plan.offset <= layout.total_size &&
+                async_plan.layout.total_bytes == layout.total_size - async_plan.offset,
+            "retained async allocation is not the scheduler image tail"
+        );
     const auto &plan = layout.protocol;
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v8" : "hbg-native-protocol-v9");
+        root.string(
+            "schema", asynchronous ? (graph_source.empty() ? "hbg-native-protocol-v10" : "hbg-native-protocol-v11") :
+                                     (graph_source.empty() ? "hbg-native-protocol-v8" : "hbg-native-protocol-v9")
+        );
         root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
@@ -508,6 +524,12 @@ inline std::string scheduler_export_protocol(
             root, "executions", image.array<SchedulerProtocolExecutionTrace>(plan.executions_offset, plan.trace_count),
             plan.trace_count, execution
         );
+        if (asynchronous)
+            scheduler_async_protocol_export::emit(
+                root, image, async_plan, epoch, tasks,
+                image.array<SchedulerProtocolExecutionTrace>(plan.executions_offset, plan.trace_count),
+                plan.trace_count, plan.worker_count
+            );
     }
     return out.str();
 }

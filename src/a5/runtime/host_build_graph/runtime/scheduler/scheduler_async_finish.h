@@ -15,18 +15,6 @@
 #include "scheduler_ready.h"
 
 enum class SchedulerAsyncFinishResult : uint8_t { PENDING, DONE, ERROR };
-enum class SchedulerAsyncFinishPhase : uint64_t {
-    INITIALIZE,
-    SELECT,
-    RESOLVE,
-    ENQUEUE,
-    PREPARE,
-    PUBLISH,
-    PUBLISH_DIRECTORY,
-    DRAINED,
-    CONTRIBUTED,
-    FAILED
-};
 enum class SchedulerAsyncFinishQueue : uint64_t { INBOX, CONTROL, TICKET, LINKED, CHUNK };
 
 // The production policy never hides a retry loop. Tests can place a competing
@@ -46,6 +34,14 @@ struct SchedulerAsyncFinishQueueOps {
     }
 };
 
+struct SchedulerAsyncFinishProtocol {
+    inline __aicore__ static void task_done(
+        __gm__ void *base, const SchedulerLocalState *local, int64_t task, uint64_t order, uint32_t flags, bool before
+    ) {
+        scheduler_protocol_task_actor(base, local, task, order, flags, true, before);
+    }
+};
+
 namespace scheduler_async_finish_detail {
 inline __aicore__ SchedulerAsyncFinishPhase phase(const SchedulerAsyncFinishProgress &progress) {
     return static_cast<SchedulerAsyncFinishPhase>(progress.phase);
@@ -59,6 +55,8 @@ inline __aicore__ SchedulerAsyncFinishResult fail(
     SchedulerAsyncFinishProgress &progress,
     SchedulerErrorSite site = SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED
 ) {
+    if (progress.failure_code == 0)
+        progress.failure_code = static_cast<int64_t>(SchedulerGraphResult::INVALID_ARGUMENTS);
     phase(progress, SchedulerAsyncFinishPhase::FAILED);
     scheduler_record_error(run, task, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local, site);
     return SchedulerAsyncFinishResult::ERROR;
@@ -284,7 +282,9 @@ publish_directory(__gm__ void *base, SchedulerLocalState *local, SchedulerAsyncF
 // Each unit performs a fixed transition, one real resolver operation, one <=8
 // preparation, or one publication attempt. RETRY always hands control back.
 // DONE means all successors are public/drained, not that completion was counted.
-template <typename QueueOps = SchedulerAsyncFinishQueueOps, typename Link = SchedulerResolveLink>
+template <
+    typename QueueOps = SchedulerAsyncFinishQueueOps, typename Link = SchedulerResolveLink,
+    typename Protocol = SchedulerAsyncFinishProtocol>
 inline __aicore__ SchedulerAsyncFinishResult scheduler_async_finish_step_impl(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAsyncFinishIdentity &identity, __gm__ SchedulerAsyncTaskJoin *join,
@@ -348,14 +348,17 @@ inline __aicore__ SchedulerAsyncFinishResult scheduler_async_finish_step_impl(
                 !protocol_order(base, local, identity.task_ref, identity.run_epoch, metadata, &order))
                 return fail(graph, local, run, identity.task_ref, *progress);
             auto *control = scheduler_task_control_at(base, local, identity.task_ref);
-            scheduler_protocol_task_actor(base, local, identity.task_ref, order, metadata.flags, true, true);
-            if (scheduler_read_error(run) != 0) return fail(graph, local, run, identity.task_ref, *progress);
+            Protocol::task_done(base, local, identity.task_ref, order, metadata.flags, true);
+            if (scheduler_read_error(run) != 0) {
+                phase(*progress, SchedulerAsyncFinishPhase::FAILED);
+                return SchedulerAsyncFinishResult::ERROR;
+            }
             if (scheduler_gm_compare_exchange(
                     control->state, static_cast<int64_t>(SchedulerTaskState::BLOCKED),
                     static_cast<int64_t>(SchedulerTaskState::DONE)
                 ) != static_cast<int64_t>(SchedulerTaskState::BLOCKED))
                 return fail(graph, local, run, identity.task_ref, *progress, SchedulerErrorSite::ROUTE_INVALID_STATE);
-            scheduler_protocol_task_actor(base, local, identity.task_ref, order, metadata.flags, true, false);
+            Protocol::task_done(base, local, identity.task_ref, order, metadata.flags, false);
             const int64_t head = scheduler_gm_exchange(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
             if (head < SCHEDULER_WAKE_LIST_OPEN)
                 return fail(
@@ -446,7 +449,7 @@ inline __aicore__ void scheduler_async_finish_accumulate(uint64_t &total, uint64
 // owned counters independently; no common clock origin across cores is assumed.
 template <
     typename QueueOps = SchedulerAsyncFinishQueueOps, typename Link = SchedulerResolveLink,
-    typename Clock = SchedulerAsyncFinishClock>
+    typename Clock = SchedulerAsyncFinishClock, typename Protocol = SchedulerAsyncFinishProtocol>
 inline __aicore__ SchedulerAsyncFinishResult scheduler_async_finish_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAsyncFinishIdentity &identity, __gm__ SchedulerAsyncTaskJoin *join,
@@ -456,7 +459,7 @@ inline __aicore__ SchedulerAsyncFinishResult scheduler_async_finish_step(
     const bool measured = scheduler_phase_timing_enabled(profiling_level) && progress != nullptr;
     const uint64_t start = measured ? Clock::now() : 0;
     const uint32_t initial_budget = budget == nullptr ? 0 : *budget;
-    const auto result = scheduler_async_finish_step_impl<QueueOps, Link>(
+    const auto result = scheduler_async_finish_step_impl<QueueOps, Link, Protocol>(
         graph, base, local, run, identity, join, progress, budget, wake_stats, ready_stats
     );
     if (measured) {
