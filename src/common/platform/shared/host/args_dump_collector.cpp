@@ -49,14 +49,8 @@
 // =============================================================================
 
 void ArgsDumpCollector::stop_for_device_failure() {
-    retained_stop_writer();
     profiling_common::ProfilerBase<ArgsDumpCollector, DumpModule>::stop(false);
-    // Only collector threads create the ordinary writer lazily. Join those
-    // producers before reading its thread object, then finish copied payloads.
-    if (writer_thread_.joinable()) {
-        request_writer_stop();
-        writer_thread_.join();
-    }
+    stop_payload_writer();
     retained_drain_copied_payloads();
     retained_note_unpublished_runs_abandoned();
 }
@@ -68,17 +62,9 @@ void ArgsDumpCollector::abandon_after_device_reset() {
 }
 
 ArgsDumpCollector::~ArgsDumpCollector() {
-    // Both threads this collector can own, in the order that cannot leave one
-    // joinable: a `std::thread` destroyed while joinable terminates the
-    // process, and the retained writer is started by an admission rather than
-    // by `start()`, so a collector destroyed without a finalize — a test that
-    // unwound, a runner that failed before teardown — must still join it here.
-    retained_stop_writer();
-    if (writer_thread_.joinable()) {
-        request_writer_stop();
-        writer_thread_.join();
-    }
     stop();
+    stop_payload_writer();
+    retained_drain_copied_payloads();
 }
 
 static int64_t steady_clock_ms(std::chrono::steady_clock::time_point tp) {
@@ -86,7 +72,8 @@ static int64_t steady_clock_ms(std::chrono::steady_clock::time_point tp) {
 }
 
 size_t ArgsDumpCollector::normalize_collector_shard(int collector_shard) const {
-    const size_t shard_count = collected_by_collector_.size();
+    // Transport geometry remains fixed when ordinary output storage is empty.
+    const size_t shard_count = static_cast<size_t>(manager_.shard_count());
     const bool valid_shard = collector_shard >= 0 && static_cast<size_t>(collector_shard) < shard_count;
     if (!valid_shard) {
         assert(false && "collector_shard out of range");
@@ -96,34 +83,30 @@ size_t ArgsDumpCollector::normalize_collector_shard(int collector_shard) const {
 }
 
 void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level, uint64_t run_epoch) {
-    output_prefix_ = output_prefix;
+    std::scoped_lock<std::mutex> configuration(writer_start_mutex_);
+    if (retain_across_runs_) {
+        LOG_ERROR("Args dump: begin_run reached on a collector that retains runs; run_begin owns admission");
+        return;
+    }
+    auto run_dir = resolve_run_directory(output_prefix);
+    if (!destination_available(run_dir))
+        throw std::runtime_error("Args dump destination is owned by an open collection window");
+    std::filesystem::remove(run_dir / "args_dump.json");
+    run_dir_ = std::move(run_dir);
     run_epoch_ = run_epoch;
     dump_args_level_ = dump_args_level;
     reset_collector_shards();
     total_dropped_record_count_.store(0, std::memory_order_relaxed);
     dropped_records_complete_ = false;
     ordinary_drain_loss_ = false;
+    ordinary_artifact_failed_.store(false, std::memory_order_relaxed);
+    ordinary_discarded_args_.store(0, std::memory_order_relaxed);
+    ordinary_discarded_metadata_.store(0, std::memory_order_relaxed);
     recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
     total_truncated_count_.store(0, std::memory_order_relaxed);
-    last_progress_ms_.store(0, std::memory_order_relaxed);
-    // The lane counters are the one piece of per-run state a retained run must
-    // not reset: a predecessor's writer is still acknowledging payloads against
-    // them, and zeroing them here would make its residual progress land in this
-    // run's generation. `run_begin` is the retained path's admission and this
-    // function is not on it, so the guard only documents which path owns them.
-    if (retain_across_runs_) {
-        LOG_ERROR("Args dump: begin_run reached on a collector that retains runs; run_begin owns admission");
-        return;
-    }
-    for (auto &count : written_payload_counts_) {
-        count.store(0, std::memory_order_relaxed);
-    }
-    for (auto &count : discarded_payload_counts_) {
-        count.store(0, std::memory_order_relaxed);
-    }
-    for (auto &count : received_payload_counts_) {
-        count.store(0, std::memory_order_relaxed);
-    }
+    run_start_time_ = std::chrono::steady_clock::now();
+    last_progress_ms_.store(steady_clock_ms(run_start_time_), std::memory_order_relaxed);
+    // Physical arena receipt/discard credits span all invocation boundaries.
 }
 
 void ArgsDumpCollector::reset_collector_shards() {
@@ -252,10 +235,8 @@ int ArgsDumpCollector::initialize(
     ordinary_drain_loss_ = false;
     recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
     total_truncated_count_.store(0, std::memory_order_relaxed);
-    last_progress_ms_.store(0, std::memory_order_relaxed);
-    for (auto &count : written_payload_counts_) {
-        count.store(0, std::memory_order_relaxed);
-    }
+    run_start_time_ = std::chrono::steady_clock::now();
+    last_progress_ms_.store(steady_clock_ms(run_start_time_), std::memory_order_relaxed);
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
@@ -365,19 +346,19 @@ int ArgsDumpCollector::initialize(
 
 void ArgsDumpCollector::start(const profiling_common::ThreadFactory &thread_factory) {
     if (shm_host_ == nullptr) return;
-    reset_collector_shards();
+    {
+        std::scoped_lock<std::mutex> configuration(writer_start_mutex_);
+        reset_collector_shards();
+    }
     profiling_common::ProfilerBase<ArgsDumpCollector, DumpModule>::start(thread_factory);
 }
 
 void ArgsDumpCollector::start_writer_thread_once() {
-    std::scoped_lock<std::mutex> lock(writer_start_mutex_);
     if (writer_started_) return;
     writer_started_ = true;
 
-    // `output_prefix_` is bound by begin_run() and is the per-task uniqueness
-    // boundary; the dump dir name is fixed (`<prefix>/args_dump`).
-    std::string run_dir_name = "args_dump";
-    run_dir_ = std::filesystem::path(output_prefix_) / run_dir_name;
+    // Admission freezes the resolved output directory before a callback can
+    // publish, so aliases cannot reopen a live window's destination.
     std::filesystem::create_directories(run_dir_);
     // Hybrid Level 3 opens args.bin lazily if an Arg::dump()-selected tensor
     // emits payload; an unmarked run remains metadata-only.
@@ -386,16 +367,19 @@ void ArgsDumpCollector::start_writer_thread_once() {
     }
     next_bin_offset_ = 0;
 
-    writer_done_.store(false);
+    ordinary_artifact_failed_.store(false, std::memory_order_relaxed);
+    ordinary_discarded_args_.store(0, std::memory_order_relaxed);
+    ordinary_discarded_metadata_.store(0, std::memory_order_relaxed);
     bytes_written_.store(0);
     run_start_time_ = std::chrono::steady_clock::now();
     last_progress_ms_.store(steady_clock_ms(run_start_time_), std::memory_order_relaxed);
 
-    writer_thread_ = std::thread(&ArgsDumpCollector::writer_loop, this);
+    start_payload_writer();
 }
 
 void ArgsDumpCollector::process_dump_buffer(
-    const DumpReadyBufferInfo &info, int collector_shard, RetainedEpoch *forced_epoch, size_t forced_bucket
+    const DumpReadyBufferInfo &info, int collector_shard, RetainedEpoch *forced_epoch, size_t forced_bucket,
+    bool transport_published
 ) {
     DumpMetaBuffer *buf = reinterpret_cast<DumpMetaBuffer *>(info.host_buffer_ptr);
     uint32_t count = buf->count;
@@ -405,33 +389,32 @@ void ArgsDumpCollector::process_dump_buffer(
     const uint64_t run_epoch = buf->run_epoch;
     const uint32_t local_seq = buf->local_seq;
 
-    // On the retained path the epoch is resolved from the buffer's own stamp,
-    // and the receipt is folded in **before** any record is read: the ledger
-    // must see every delivery this lane made, including one that carried no
-    // record, or the sequence it expects next would drift and the close could
-    // not tell a handed-over buffer from an unpublished one.
+    // The buffer stamp selects its retained or recorded window before any
+    // record is read. Ordinary retained runs fold every delivery into their
+    // receipt ledger, including empty buffers, to distinguish published and
+    // producer-held data at close. Recorded windows only compare the delivery
+    // witness with the buffer header: sequences repeat across graph replays.
     RetainedEpoch *epoch = forced_epoch;
     size_t shard = forced_bucket;
     if (forced_epoch == nullptr) {
         shard = normalize_collector_shard(collector_shard);
-        if (retain_across_runs_) {
-            if (shard >= shard_views_.size()) {
-                LOG_ERROR("Args dump: collected buffer carried shard index %d", collector_shard);
-                return;
-            }
-            const int slot = shard_views_[shard].slot_for(run_epoch);
-            if (slot < 0) {
-                // Sealed or never admitted: these records cannot be attributed
-                // to a run whose verdict is already published, and a bounded
-                // collector-scoped error is what replaces rewriting one.
-                retained_errors_.record_unknown_epoch(run_epoch, count);
-                return;
-            }
+        if (shard >= shard_views_.size()) return;
+        const int slot = shard_views_[shard].slot_for(run_epoch);
+        if (slot >= 0) {
             epoch = &retained_epochs_[static_cast<size_t>(slot)];
-            const int lane = static_cast<int>(info.thread_index);
-            if (lane >= 0 && static_cast<size_t>(lane) < epoch->receipts.size()) {
-                epoch->receipts[static_cast<size_t>(lane)].observe(info.buffer_seq, local_seq);
+            const auto lane = static_cast<size_t>(info.thread_index);
+            if (lane < epoch->receipts.size()) {
+                if (epoch->recorded_window) {
+                    if (info.buffer_seq != local_seq)
+                        epoch->recorded_transport_loss.store(true, std::memory_order_release);
+                } else {
+                    epoch->receipts[lane].observe(info.buffer_seq, local_seq);
+                }
             }
+        } else if (retain_across_runs_ ||
+                   (retained_ready_.load(std::memory_order_acquire) && run_epoch != run_epoch_)) {
+            retained_errors_.record_unknown_epoch(run_epoch, count);
+            return;
         } else if (shard >= collected_by_collector_.size()) {
             return;
         }
@@ -470,7 +453,7 @@ void ArgsDumpCollector::process_dump_buffer(
     // A recovered record is output evidence, not a transport acknowledgement.
     // It is counted in this run's own record and loss accounting below and in
     // nothing else.
-    const bool transport_published = (forced_epoch == nullptr);
+    transport_published = transport_published && forced_epoch == nullptr;
     // Charge one payload's disposition to this lane's transport credit, for a
     // payload that has one. Every failure path in the loop settles through
     // here rather than touching the counter directly, so none of them can
@@ -571,8 +554,7 @@ void ArgsDumpCollector::process_dump_buffer(
         if (dt.truncated) {
             if (epoch != nullptr) {
                 epoch->truncated_records.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (total_truncated_count_.fetch_add(1, std::memory_order_relaxed) == 0) {
+            } else if (total_truncated_count_.fetch_add(1, std::memory_order_relaxed) == 0) {
                 LOG_WARN("Args dump truncation detected. Increase PLATFORM_DUMP_AVG_TENSOR_BYTES.");
             }
         }
@@ -603,16 +585,23 @@ void ArgsDumpCollector::process_dump_buffer(
             settle_transport_discard(true);
         }
         bool payload_charged = false;
-        if (epoch != nullptr && payload_size > 0) {
+        if (payload_size > 0) {
             // The owned copy and the queue node it will travel in are charged
             // together, so a payload that is admitted can always be handed to
             // the writer.
-            if (retained_budget_.charge(static_cast<size_t>(payload_size) + kRetainedQueueNodeBytes)) {
+            if (ensure_host_budget() &&
+                retained_budget_.charge(static_cast<size_t>(payload_size) + kRetainedQueueNodeBytes)) {
                 payload_charged = true;
             } else {
                 payload_size = 0;
                 dt.host_discarded = true;
-                epoch->discarded_args.fetch_add(1, std::memory_order_relaxed);
+                if (epoch != nullptr) {
+                    epoch->discarded_args.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    ordinary_discarded_args_.fetch_add(1, std::memory_order_relaxed);
+                    ordinary_drain_loss_.store(true, std::memory_order_release);
+                    ordinary_artifact_failed_.store(true, std::memory_order_release);
+                }
                 settle_transport_discard(true);
             }
         }
@@ -635,8 +624,12 @@ void ArgsDumpCollector::process_dump_buffer(
                 }
                 if (epoch != nullptr) {
                     epoch->discarded_args.fetch_add(1, std::memory_order_relaxed);
-                    settle_transport_discard(true);
+                } else {
+                    ordinary_discarded_args_.fetch_add(1, std::memory_order_relaxed);
+                    ordinary_drain_loss_.store(true, std::memory_order_release);
+                    ordinary_artifact_failed_.store(true, std::memory_order_release);
                 }
+                settle_transport_discard(true);
             }
             if (payload_size > 0) {
                 uint64_t pos = rec.payload_offset % arena_sz;
@@ -665,18 +658,38 @@ void ArgsDumpCollector::process_dump_buffer(
         }
         if (has_payload) {
             PayloadWriteRequest writer_item{info.thread_index, -1, 0, std::move(dt.bytes)};
-            {
+            bool queued = false;
+            try {
                 std::scoped_lock<std::mutex> lock(write_mutex_);
                 dt.bin_offset = next_bin_offset_;
-                next_bin_offset_ += dt.payload_size;
                 write_queue_.push(std::move(writer_item));
+                next_bin_offset_ += dt.payload_size;
+                ordinary_queued_payloads_.fetch_add(1, std::memory_order_relaxed);
+                queued = true;
+            } catch (const std::bad_alloc &) {
+                std::vector<uint8_t>().swap(writer_item.bytes);
+                retained_budget_.credit(static_cast<size_t>(dt.payload_size) + kRetainedQueueNodeBytes);
+                dt.payload_size = 0;
+                dt.host_discarded = true;
+                ordinary_discarded_args_.fetch_add(1, std::memory_order_relaxed);
+                ordinary_drain_loss_.store(true, std::memory_order_release);
+                ordinary_artifact_failed_.store(true, std::memory_order_release);
+                settle_transport_discard(true);
             }
-            collected_by_collector_[shard].push_back(std::move(dt));
-            write_cv_.notify_one();
+            // A queued copy owns the transport credit even when its metadata
+            // cannot be retained. The writer still drains and releases it.
+            if (queued && transport_published)
+                received_payload_counts_[info.thread_index].fetch_add(1, std::memory_order_release);
+            write_cv_.notify_all();
         } else {
             dt.bin_offset = 0;
-            dt.bytes.clear();
+        }
+        try {
             collected_by_collector_[shard].push_back(std::move(dt));
+        } catch (const std::bad_alloc &) {
+            ordinary_discarded_metadata_.fetch_add(1, std::memory_order_relaxed);
+            ordinary_drain_loss_.store(true, std::memory_order_release);
+            ordinary_artifact_failed_.store(true, std::memory_order_release);
         }
         records_appended++;
     }
@@ -692,10 +705,13 @@ void ArgsDumpCollector::process_dump_buffer(
 }
 
 void ArgsDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info, int collector_shard) {
+    std::scoped_lock<std::mutex> configuration(writer_start_mutex_);
     // The retained path opens each run's own payload file at admission, so the
     // one lazily-opened `args.bin` and its shared cursor belong to the default
     // path alone.
-    if (!retain_across_runs_) start_writer_thread_once();
+    if (!retain_across_runs_ && static_cast<const DumpMetaBuffer *>(info.host_buffer_ptr)->run_epoch == run_epoch_ &&
+        !recorded_window_open(run_epoch_))
+        start_writer_thread_once();
     process_dump_buffer(info, collector_shard);
 
     auto now = std::chrono::steady_clock::now();
@@ -731,6 +747,7 @@ int ArgsDumpCollector::close_ordinary_run(bool producer_stop_proved) {
 }
 
 void ArgsDumpCollector::reconcile_counters() {
+    std::scoped_lock<std::mutex> configuration(writer_start_mutex_);
     // The retained path decides a leftover buffer at its own close, under that
     // run's execution claim and against that run's receipt ledger. Reaching
     // this bulk read afterwards would copy the whole shared region back over
@@ -744,7 +761,10 @@ void ArgsDumpCollector::reconcile_counters() {
 
     // Producer stop precedes this snapshot. quiesce() drains published records
     // but leaves host transport threads resident.
-    if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
+    const bool shared_readers = retained_ready_.load(std::memory_order_acquire);
+    std::vector<DumpBufferState> lane_snapshots;
+    if (shared_readers) lane_snapshots.resize(static_cast<size_t>(num_dump_threads_));
+    if (!shared_readers && manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
         if (profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_) != 0) {
             LOG_ERROR("Args dump: cannot read device state for run %llu", static_cast<unsigned long long>(run_epoch_));
             return;
@@ -760,6 +780,17 @@ void ArgsDumpCollector::reconcile_counters() {
     // copies; a failed fence alone supplies none of the stop proof.
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *state = get_dump_buffer_state(shm_host_, t);
+        if (shared_readers) {
+            // Host free-queue/ack cursors remain owned by resident readers.
+            // A stopped invocation is inspected in separate storage rather
+            // than copying device state back over those live host fields.
+            state = &lane_snapshots[static_cast<size_t>(t)];
+            if (profiling_copy_from_device(state, get_dump_buffer_state(dump_shared_mem_dev_, t), sizeof(*state)) !=
+                0) {
+                counts_complete = false;
+                continue;
+            }
+        }
         if (state->run_epoch != run_epoch_) {
             // The pool includes non-scheduler AICPU lanes that never initialize.
             // A prior held buffer or loss count still needs an attributable run.
@@ -811,7 +842,8 @@ void ArgsDumpCollector::reconcile_counters() {
         info.dev_buffer_ptr = reinterpret_cast<void *>(cur_ptr);
         info.host_buffer_ptr = host_ptr;
         info.buffer_seq = current_seq;
-        on_buffer_collected(info, static_cast<int>(t));
+        start_writer_thread_once();
+        process_dump_buffer(info, static_cast<int>(t), nullptr, 0, false);
         recovered = {cur_ptr, current_seq};
         recovered_threads++;
         LOG_WARN(
@@ -825,7 +857,8 @@ void ArgsDumpCollector::reconcile_counters() {
     total_dropped_record_count_.store(
         static_cast<uint32_t>(std::min(dropped_total, max_count)), std::memory_order_relaxed
     );
-    dropped_records_complete_ = counts_complete && dropped_total <= max_count;
+    dropped_records_complete_ =
+        counts_complete && !ordinary_drain_loss_.load(std::memory_order_acquire) && dropped_total <= max_count;
     if (dropped_total > 0) {
         LOG_WARN(
             "Dump reconcile: %llu records dropped on device side. "
@@ -846,58 +879,6 @@ void ArgsDumpCollector::reconcile_counters() {
 // Writer thread + export
 // ---------------------------------------------------------------------------
 
-void ArgsDumpCollector::request_writer_stop() {
-    // The stop flag must change under `write_mutex_`, not merely be atomic.
-    //
-    // `writer_loop` evaluates its predicate while holding that mutex and only
-    // then blocks, releasing the mutex as it registers on the condition
-    // variable. A stop that sets the flag without the mutex can land in the
-    // window between those two steps: the waiter has already read
-    // `writer_done_ == false`, is not yet registered, so `notify_one()` reaches
-    // nobody and the waiter blocks on a condition that is already true. The
-    // subsequent `join()` then never returns.
-    //
-    // Setting it under the mutex closes the window, because the waiter holds the
-    // mutex across its own check-then-block. This is the same rule
-    // `BufferPoolManager::notify_ready_waiters()` follows, and the reason the
-    // producer side at the payload-enqueue site is already correct: it pushes
-    // under the mutex and notifies afterwards.
-    {
-        std::scoped_lock<std::mutex> lock(write_mutex_);
-        writer_done_.store(true);
-    }
-    write_cv_.notify_one();
-}
-
-void ArgsDumpCollector::writer_loop() {
-    while (true) {
-        PayloadWriteRequest request;
-        {
-            std::unique_lock<std::mutex> lock(write_mutex_);
-            write_cv_.wait(lock, [this] {
-                return !write_queue_.empty() || writer_done_.load();
-            });
-            if (write_queue_.empty() && writer_done_.load()) {
-                break;
-            }
-            request = std::move(write_queue_.front());
-            write_queue_.pop();
-        }
-
-        if (!request.bytes.empty()) {
-            if (!bin_file_.is_open()) {
-                bin_file_.open(run_dir_ / "args.bin", std::ios::binary);
-            }
-            bin_file_.write(
-                reinterpret_cast<const char *>(request.bytes.data()), static_cast<std::streamsize>(request.bytes.size())
-            );
-            written_payload_counts_[request.thread_index].fetch_add(1, std::memory_order_release);
-        }
-
-        bytes_written_ += request.bytes.size();
-    }
-}
-
 void ArgsDumpCollector::publish_arena_acks() {
     if (shm_host_ == nullptr || dump_shared_mem_dev_ == nullptr) {
         return;
@@ -909,52 +890,17 @@ void ArgsDumpCollector::publish_arena_acks() {
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *host_state = get_dump_buffer_state(shm_host_, t);
         DumpBufferState *device_state = get_dump_buffer_state(dump_shared_mem_dev_, t);
-        constexpr size_t kOrdinaryCounterSpan = offsetof(DumpBufferState, run_epoch) + sizeof(uint64_t) -
-                                                offsetof(DumpBufferState, published_payload_count);
-        const size_t counter_bytes =
-            retain_across_runs_ ? sizeof(host_state->published_payload_count) : kOrdinaryCounterSpan;
         if (profiling_copy_from_device(
-                &host_state->published_payload_count, &device_state->published_payload_count, counter_bytes
-            ) != 0) {
+                &host_state->published_payload_count, &device_state->published_payload_count,
+                sizeof(host_state->published_payload_count)
+            ) != 0)
             continue;
-        }
-        if (!retain_across_runs_ && host_state->run_epoch != run_epoch_) continue;
         const uint64_t published = host_state->published_payload_count;
-        // What releases this lane's arena differs by path, and the difference is
-        // the whole point of the retained one.
-        //
-        // Ordinary collection: the writer bumps `written_payload_counts_[t]`
-        // once `args.bin` accepted the bytes, and that equality is the proof.
-        // One run owns the file for its whole boundary, so tying reuse to disk
-        // costs that run nothing. Its host window starts at zero while the
-        // device's initialization baseline anchors it in the lifetime cursor.
-        // Recovery requires a producer-stop proof. An unproven close joins the
-        // host transport before export and excludes unpublished payloads from
-        // this count.
-        //
-        // `written_payload_counts_[t]` is deliberately **not** part of the
-        // retained equation: the writer advances it for recovered payloads too,
-        // which the device never counted, so using it there would be the same
-        // over-credit this comment exists to prevent.
-        //
-        // Retained path: reuse is released by **host ownership**, not by disk.
-        // `received_payload_counts_[t]` counts the payloads copied out of the
-        // arena into storage this host owns, and
-        // `discarded_payload_counts_[t]` the ones deliberately written off;
-        // their sum reaching `published` means the first `published` payloads of
-        // this lane are no longer in the arena, which is exactly what the
-        // producer's barrier waits for. Receipt is FIFO per lane, so the sum
-        // cannot run ahead of the bytes it describes. A slow or failing disk
-        // therefore no longer holds a producer behind bytes the host already
-        // has — the write failure stays a sticky error and fails that run's
-        // flush, and disk completion is proved by `flush_diagnostics` alone.
-        uint64_t taken = 0;
-        if (retain_across_runs_) {
-            taken = received_payload_counts_[t].load(std::memory_order_acquire) +
-                    discarded_payload_counts_[t].load(std::memory_order_acquire);
-        } else {
-            taken = host_state->run_published_payload_base + written_payload_counts_[t].load(std::memory_order_acquire);
-        }
+        // Every credit names a published payload already copied into owned host
+        // storage or deliberately discarded. Recovered unpublished bytes never
+        // contribute; disk completion is proved separately by diagnostic flush.
+        const uint64_t taken = received_payload_counts_[t].load(std::memory_order_acquire) +
+                               discarded_payload_counts_[t].load(std::memory_order_acquire);
         if (taken < published) {
             continue;
         }
@@ -977,47 +923,24 @@ int ArgsDumpCollector::export_dump_files() {
     // that run's own exclusively owned file pair. Running this here would join
     // the wrong writer and write a second manifest over the published one.
     if (retain_across_runs_) return 0;
-    // Stop the writer thread (started lazily in on_buffer_collected). Safe
-    // to skip when writer_started_ is false (collector ran but produced no
-    // buffers, or never started at all).
     if (writer_started_) {
-        request_writer_stop();
-        while (writer_thread_.joinable()) {
-            size_t remaining = 0;
-            {
-                std::scoped_lock<std::mutex> lock(write_mutex_);
-                remaining = write_queue_.size();
-            }
-            if (remaining == 0) {
-                writer_thread_.join();
-                break;
-            }
-            auto elapsed_s =
-                std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - run_start_time_)
-                    .count();
-            LOG_INFO(
-                "Writing to disk: %.1f GB written, %zu args remaining (%lds)", bytes_written_.load() / 1e9, remaining,
-                elapsed_s
-            );
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-
+        std::unique_lock<std::mutex> lock(write_mutex_);
+        write_cv_.wait(lock, [this] {
+            return ordinary_queued_payloads_.load(std::memory_order_acquire) == 0;
+        });
+        lock.unlock();
         if (bin_file_.is_open()) {
+            bin_file_.flush();
+            if (!bin_file_.good()) ordinary_artifact_failed_.store(true, std::memory_order_relaxed);
             bin_file_.close();
+            if (bin_file_.fail()) ordinary_artifact_failed_.store(true, std::memory_order_relaxed);
+            bin_file_.clear();
         }
-
-        auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start_time_)
-                .count();
-        LOG_INFO(
-            "Collected %lu args, wrote %.1f GB to disk (%.1fs)",
-            static_cast<unsigned long>(total_metadata_collected_.load(std::memory_order_relaxed)),
-            bytes_written_.load() / 1e9, elapsed_ms / 1000.0
-        );
     }
+    const bool artifact_failed = ordinary_artifact_failed_.load(std::memory_order_acquire);
 
     merge_collector_shards();
-    if (collected_.empty()) {
+    if (collected_.empty() && ordinary_discarded_metadata_.load(std::memory_order_relaxed) == 0) {
         LOG_WARN("No args dump data to export");
         reset_collector_shards();
         total_dropped_record_count_.store(0, std::memory_order_relaxed);
@@ -1026,7 +949,8 @@ int ArgsDumpCollector::export_dump_files() {
         recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
         total_truncated_count_.store(0, std::memory_order_relaxed);
         writer_started_ = false;
-        return 0;
+        if (artifact_failed) retained_errors_.record_fatal("ordinary ArgsDump artifact publication failed");
+        return artifact_failed ? PTO_RUNTIME_ERR_INTERNAL : 0;
     }
     auto export_start = std::chrono::steady_clock::now();
 
@@ -1074,6 +998,8 @@ int ArgsDumpCollector::export_dump_files() {
     meta.output_args = num_output_args;
     meta.inout_args = num_inout_args;
     meta.truncated_args = total_truncated_count_.load(std::memory_order_relaxed);
+    meta.host_discarded_args = ordinary_discarded_args_.load(std::memory_order_relaxed);
+    meta.metadata_discarded_records = ordinary_discarded_metadata_.load(std::memory_order_relaxed);
     meta.dropped_records = total_dropped_record_count_.load(std::memory_order_relaxed);
     meta.dropped_records_complete = dropped_records_complete_;
     if (dump_args_level_ != DumpArgsLevel::HYBRID || bytes_written_.load() != 0) {
@@ -1092,7 +1018,12 @@ int ArgsDumpCollector::export_dump_files() {
     }
 
     simpler::dfx::args_dump::write_manifest_epilogue(json);
+    json.flush();
+    const bool manifest_failed = !json.good();
     json.close();
+    const bool publication_failed = manifest_failed || json.fail();
+    if (artifact_failed || publication_failed)
+        retained_errors_.record_fatal("ordinary ArgsDump artifact publication failed");
 
     auto export_end = std::chrono::steady_clock::now();
     auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(export_end - export_start).count();
@@ -1116,14 +1047,14 @@ int ArgsDumpCollector::export_dump_files() {
     recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
     total_truncated_count_.store(0, std::memory_order_relaxed);
     writer_started_ = false;
-    return 0;
+    return artifact_failed || publication_failed ? PTO_RUNTIME_ERR_INTERNAL : 0;
 }
 
 int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const DumpFreeCallback &free_cb) {
     if (shm_host_ == nullptr) return 0;
 
     int retained_rc = 0;
-    if (retain_across_runs_) {
+    if (retained_ready_.load(std::memory_order_acquire)) {
         // Publish whatever the writer can still publish, for a caller that
         // never reached `finish_retained_runs()`. It runs **before** the
         // collector threads are joined because the reference release a seal
@@ -1131,7 +1062,7 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
         // acknowledge it.
         retained_finish();
         // Then the writer, before the threads whose references it asks about.
-        retained_stop_writer();
+        stop_payload_writer();
     }
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
@@ -1158,7 +1089,7 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    if (retain_across_runs_) {
+    if (retained_ready_.load(std::memory_order_acquire)) {
         // Only now: the shards whose references a quarantined run could not
         // prove released are joined, so its host records are unreachable by any
         // reader. The files stay on disk as evidence.
@@ -1174,19 +1105,8 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
         }
     }
 
-    // ProfilerBase::stop() only joins the mgmt + poll threads. The writer
-    // thread is also joined by export_dump_files() and fatal stop. A path
-    // that reaches neither — e.g. drain bailing on a device error before its
-    // collector-teardown block — would leak it: left blocked on write_cv_ with
-    // writer_done_ == false while writer_thread_ stays joinable, which trips
-    // std::terminate when the collector is destroyed or re-run. finalize() is
-    // reached via device-runner active-run cleanup on every exit path, so join
-    // the writer here too. Idempotent: export_dump_files() clears writer_started_
-    // on the success path, and fatal stop joins it too, making this a no-op.
-    if (writer_started_ && writer_thread_.joinable()) {
-        request_writer_stop();
-        writer_thread_.join();
-    }
+    stop_payload_writer();
+    retained_drain_copied_payloads();
 
     // The writer thread opens bin_file_ in start_writer_thread_once() and it is
     // normally closed by export_dump_files(). Close it here too so an
@@ -1270,9 +1190,6 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
     total_truncated_count_.store(0, std::memory_order_relaxed);
     writer_started_ = false;
     clear_memory_context();
-    for (auto &count : written_payload_counts_) {
-        count.store(0, std::memory_order_relaxed);
-    }
     for (auto &count : discarded_payload_counts_) {
         count.store(0, std::memory_order_relaxed);
     }

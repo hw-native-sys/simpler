@@ -134,15 +134,17 @@ struct ManifestMeta {
     uint32_t output_args{0};
     uint32_t inout_args{0};
     uint64_t truncated_args{0};
-    uint64_t dropped_records{0};
+    std::optional<uint64_t> dropped_records{0};
+    bool recorded_window{false};
     // Ordinary runs only: completeness of record-loss accounting, not payloads.
     std::optional<bool> dropped_records_complete;
     // Empty means `null`: the level selected no payload, so no payload file
     // was produced and there is nothing for the offsets to refer to.
     std::string bin_file;
-    // Retained path only, and diagnostic only: they explain an incomplete
-    // result and never excuse one, because each also fails that run's flush.
+    // Retained publication includes the aggregate-count verdict below.
     bool retained{false};
+    // Known host losses apply to both ordinary and retained output and fail
+    // diagnostic flush; unknown aggregate totals are a separate fact.
     uint64_t host_discarded_args{0};
     uint64_t metadata_discarded_records{0};
     bool counts_unknown{false};
@@ -164,13 +166,19 @@ inline void write_manifest_prologue(std::ostream &json, const ManifestMeta &meta
     json << "  \"output_args\": " << meta.output_args << ",\n";
     json << "  \"inout_args\": " << meta.inout_args << ",\n";
     json << "  \"truncated_args\": " << meta.truncated_args << ",\n";
-    json << "  \"dropped_records\": " << meta.dropped_records << ",\n";
+    json << "  \"dropped_records\": ";
+    if (meta.dropped_records) json << *meta.dropped_records;
+    else json << "null";
+    json << ",\n";
+    if (meta.recorded_window) json << "  \"recorded_window\": true,\n";
     if (meta.dropped_records_complete.has_value()) {
         json << "  \"dropped_records_complete\": " << (*meta.dropped_records_complete ? "true" : "false") << ",\n";
     }
-    if (meta.retained) {
+    if (meta.retained || meta.host_discarded_args != 0 || meta.metadata_discarded_records != 0) {
         json << "  \"host_discarded_args\": " << meta.host_discarded_args << ",\n";
         json << "  \"metadata_discarded_records\": " << meta.metadata_discarded_records << ",\n";
+    }
+    if (meta.retained) {
         json << "  \"counts_unknown\": " << (meta.counts_unknown ? "true" : "false") << ",\n";
         json << "  \"collection_verdict\": \"" << meta.verdict << "\",\n";
     }

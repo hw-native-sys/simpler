@@ -90,6 +90,16 @@ def _reconstruct(manifest):
     return tensor_count, kargs
 
 
+def test_recorded_aggregate_cannot_reconstruct_one_task_invocation(tmp_path):
+    manifest = _write_dump(tmp_path, [_tensor_record(), _tensor_record(bin_offset=4)], b"12345678")
+    data = json.loads(manifest.read_text())
+    data["recorded_window"] = True
+    data["dropped_records"] = None
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="recorded.*single invocation"):
+        core_swimlane.reconstruct_task_args(manifest, [0, 1])
+
+
 def test_restore_arg_loads_before_dispatch_payload_and_emits_memcpy(tmp_path):
     before = _tensor_record(bin_offset=0, bin_size=4)
     after = _tensor_record(

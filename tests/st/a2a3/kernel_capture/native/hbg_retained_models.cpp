@@ -41,9 +41,14 @@ std::vector<uint8_t> read(const char *path) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    require(argc == 6 || argc == 8, "usage: device callable cpu core dispatcher [pmu-output replay]");
+    require(
+        argc == 6 || argc == 8 || argc == 9, "usage: device callable cpu core dispatcher [output replay [argsdump]]"
+    );
     const bool pmu = argc == 8;
-    const bool execute_models = !pmu || std::atoi(argv[7]) != 0;
+    const bool args_dump = argc == 9;
+    require(!args_dump || std::strcmp(argv[8], "argsdump") == 0, "diagnostic-mode");
+    const bool execute_models = !(pmu || args_dump) || std::atoi(argv[7]) != 0;
+    require(!args_dump || std::atoi(argv[7]) == 0 || std::atoi(argv[7]) == 3, "argsdump-replays");
     const int device = std::atoi(argv[1]);
     const auto callable = read(argv[2]), cpu = read(argv[3]), core = read(argv[4]), dispatcher = read(argv[5]);
     check(aclInit(nullptr), "acl-init");
@@ -103,8 +108,9 @@ int main(int argc, char **argv) {
     const auto original_run = run;
     uint64_t identity = 0;
     auto prepare = [&](int callable_id, size_t tensor, int32_t increment, bool capture) {
-        if (pmu) {
-            config.enable_pmu = capture ? (callable_id == 0 ? 2 : 4) : 7;
+        if (pmu || args_dump) {
+            if (pmu) config.enable_pmu = capture ? (callable_id == 0 ? 2 : 4) : 7;
+            if (args_dump) config.enable_dump_args = capture ? 3 : 1;
             const char *leaf = capture ? (callable_id == 0 ? "a" : "b") : "eager";
             std::snprintf(config.output_prefix, sizeof(config.output_prefix), "%s/%s", argv[6], leaf);
         }
@@ -140,8 +146,17 @@ int main(int argc, char **argv) {
             value += increment;
         verify(stage);
     };
+    auto replay_dump = [&](aclmdlRI model, size_t tensor, int32_t increment, int round, const char *stage) {
+        for (size_t element = 0; element < elements; ++element)
+            expected[tensor][element] = initial[tensor] + 100 * round + static_cast<int32_t>(element * 7);
+        check(
+            aclrtMemcpy(buffers[tensor], bytes, expected[tensor].data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+            "change-input"
+        );
+        replay(model, tensor, increment + 7, stage);
+    };
     RuntimeHandle reference_a = nullptr, reference_b = nullptr;
-    prepare(0, 0, 3, true);
+    prepare(0, 0, args_dump ? -3 : 3, true);
     verify("a-prepared");
     const auto model_a = record(reference_a);
     verify("a-recorded");
@@ -152,7 +167,12 @@ int main(int argc, char **argv) {
     const auto model_b = record(reference_b);
     require(model_a != model_b && reference_a != reference_b, "independent-models-and-references");
     verify("b-recorded");
-    if (execute_models) {
+    if (args_dump && execute_models) {
+        for (int round = 0; round < 3; ++round) {
+            replay_dump(model_a, 0, -3, round, "argsdump-a");
+            if (round < 2) replay_dump(model_b, 1, 5, round, "argsdump-b");
+        }
+    } else if (execute_models) {
         replay(model_b, 1, 5, "b1");
         replay(model_a, 0, 3, "a1");
         replay(model_b, 1, 5, "b2");
@@ -164,23 +184,32 @@ int main(int argc, char **argv) {
     check(simpler_unregister_callable(ctx, 0), "unregister-a");
     require(simpler_unregister_callable(ctx, 1) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-callable");
     require(finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-context");
-    if (execute_models) replay(model_b, 1, 5, "b-after-a-release");
-    check(aclmdlRIDestroy(model_b), "destroy-b");
-    check(simpler_release_run_resources(ctx, reference_b), "release-b");
-    check(simpler_unregister_callable(ctx, 1), "unregister-b");
+    if (!args_dump) {
+        if (execute_models) replay(model_b, 1, 5, "b-after-a-release");
+        check(aclmdlRIDestroy(model_b), "destroy-b");
+        check(simpler_release_run_resources(ctx, reference_b), "release-b");
+        check(simpler_unregister_callable(ctx, 1), "unregister-b");
+    }
     check(simpler_kernel_mode_prepare_callable(ctx, 0, callable.data(), callable.size()), "register-eager");
     prepare(0, 2, 17, false);
     check(simpler_launch_run_on_stream(ctx, run, caller, nullptr), "eager-launch");
     check(aclrtSynchronizeStreamWithTimeout(caller, 10000), "eager-sync");
     check(simpler_finalize_run(ctx, run), "eager-finalize");
     for (auto &value : expected[2])
-        value += 17;
+        value += args_dump ? 24 : 17;
     verify("eager");
-    if (pmu) {
+    if (args_dump) {
+        // B's final replay follows an eager call with a different frozen dump level.
+        if (execute_models) replay_dump(model_b, 1, 5, 2, "argsdump-b-after-eager");
+        check(aclmdlRIDestroy(model_b), "destroy-b");
+        check(simpler_release_run_resources(ctx, reference_b), "release-b");
+        check(simpler_unregister_callable(ctx, 1), "unregister-b");
+    }
+    if (pmu || args_dump) {
         std::array<char, 4096> error{};
         const int flush_rc = simpler_flush_diagnostics_ctx(ctx, 60000, error.data(), error.size());
-        if (flush_rc != 0) std::fprintf(stderr, "PMU flush: %s\n", error.data());
-        check(flush_rc, "pmu-flush");
+        if (flush_rc != 0) std::fprintf(stderr, "%s flush: %s\n", pmu ? "PMU" : "ArgsDump", error.data());
+        check(flush_rc, pmu ? "pmu-flush" : "argsdump-flush");
     }
     check(simpler_unregister_callable(ctx, 0), "unregister-eager");
     check(finalize_device(ctx), "finalize-context");
@@ -191,5 +220,7 @@ int main(int argc, char **argv) {
     check(aclrtDestroyContext(owner), "destroy-owner");
     check(aclrtResetDevice(device), "reset-device");
     check(aclFinalize(), "acl-finalize");
-    std::printf("hbg_retained_models PASS models=2 references=2 replays=6 eager=1 elements=16\n");
+    if (args_dump)
+        std::printf("argsdump_retained_models PASS models=2 replays=%d eager=1 elements=16\n", execute_models ? 6 : 0);
+    else std::printf("hbg_retained_models PASS models=2 references=2 replays=6 eager=1 elements=16\n");
 }

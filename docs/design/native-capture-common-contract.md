@@ -69,7 +69,8 @@ The exact native entry names are `simpler_prepare_run`,
 
 Active recording requires Kernel mode, capture-purpose preparation, a matching
 retained reference and caller stream, and no predecessor argument. Diagnostics
-allow ScopeStats alone on native A3 TMR or PMU alone on native A3 TMR/HBG.
+allow ScopeStats alone on native A3 TMR, or PMU alone or ArgsDump alone on native
+A3 TMR/HBG.
 Each supported family reserves and arms its collection window during retention,
 before capture; other diagnostic families and combinations remain refused. Duplicate recording,
 invalidated capture and unsupported combinations are refused. A capture query or
@@ -98,8 +99,9 @@ references cannot prove that a raw model replay on another stream has stopped;
 the caller establishes that ordering. This contract adds neither a second owner
 nor a whole-context stream synchronization operation. Aggregate sample and
 publication semantics are specified in the
-[ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection)
-and [PMU capture contract](../dfx/pmu-profiling.md#native-a3-capturereplay).
+[ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection),
+the [PMU capture contract](../dfx/pmu-profiling.md#native-a3-capturereplay) and
+[ArgsDump capture contract](../dfx/args-dump.md#35-native-a3-capturereplay-collection).
 
 ## Completion and errors
 
@@ -147,8 +149,11 @@ aggregate raw boundary samples, not exact per-replay totals or paired scopes.
 HBG has no ScopeStats device producer. PMU alone uses the real A3 AICPU
 task-completion producer on TMR and HBG; its aggregate raw rows carry frozen
 event columns and explicit unknown cumulative device accounting. Neither PMU
-rows nor fixed task IDs identify individual replays. Other capture diagnostic
-families and combinations remain unsupported.
+rows nor fixed task IDs identify individual replays. ArgsDump alone samples
+actual task input/output boundaries on A3 TMR/HBG, retaining each occurrence
+and its payload independently. Its recorded manifest explicitly leaves
+aggregate device totals unknown; task IDs do not define replay boundaries.
+Other capture diagnostic families and combinations remain unsupported.
 
 A3 qualification does not qualify A5 or framework graph integration. Native CPU
 tests and SIM behavior do not establish RTS model support. Permanent missing

@@ -1846,6 +1846,7 @@ public:
     bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
     virtual bool supports_scope_stats_capture() const { return false; }
     virtual bool supports_pmu_capture() const { return false; }
+    virtual bool supports_args_dump_capture() const { return false; }
     bool prepared_storage_in_use() const;
     bool prepared_resources_block_fatal_reset() const;
     bool prepared_resources_can_abandon() const;
@@ -3159,6 +3160,7 @@ protected:
         bool recording{false};
         bool scope_stats_window{false};
         bool pmu_window{false};
+        bool args_dump_window{false};
         bool release_requested{false};
         bool closing{false};
     };

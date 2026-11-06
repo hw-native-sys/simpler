@@ -59,6 +59,7 @@ enum class Verdict {
     Abandoned,       // torn down before this run was published
     CounterExhausted,
     NameUnavailable,
+    RecordedAggregate,  // raw records published; aggregate device counts are unavailable
 };
 
 inline const char *verdict_name(Verdict v) {
@@ -81,12 +82,16 @@ inline const char *verdict_name(Verdict v) {
         return "counter_exhausted";
     case Verdict::NameUnavailable:
         return "name_unavailable";
+    case Verdict::RecordedAggregate:
+        return "aggregate_counts_unknown";
     }
     return "unknown";
 }
 
 /** True when this verdict lets `flush_diagnostics` report success. */
-inline bool verdict_succeeds(Verdict v) { return v == Verdict::Published || v == Verdict::PublishedEmpty; }
+inline bool verdict_succeeds(Verdict v) {
+    return v == Verdict::Published || v == Verdict::PublishedEmpty || v == Verdict::RecordedAggregate;
+}
 
 /**
  * True when this verdict still publishes a manifest.
@@ -97,7 +102,7 @@ inline bool verdict_succeeds(Verdict v) { return v == Verdict::Published || v ==
  */
 inline bool verdict_publishes(Verdict v) {
     return v == Verdict::Published || v == Verdict::PublishedEmpty || v == Verdict::PublishedShort ||
-           v == Verdict::CountsUnknown;
+           v == Verdict::CountsUnknown || v == Verdict::RecordedAggregate;
 }
 
 /**
@@ -284,7 +289,8 @@ public:
         return counts_[static_cast<size_t>(Verdict::Published)] +
                counts_[static_cast<size_t>(Verdict::PublishedEmpty)] +
                counts_[static_cast<size_t>(Verdict::PublishedShort)] +
-               counts_[static_cast<size_t>(Verdict::CountsUnknown)];
+               counts_[static_cast<size_t>(Verdict::CountsUnknown)] +
+               counts_[static_cast<size_t>(Verdict::RecordedAggregate)];
     }
 
     /** One bounded line for a flush or close failure. Never empty on error. */
@@ -293,11 +299,13 @@ public:
         char buf[kErrorMsgBytes * 3];
         int n = std::snprintf(
             buf, sizeof(buf),
-            "published=%llu empty=%llu short=%llu counts_unknown=%llu write_failed=%llu quarantined=%llu "
+            "published=%llu empty=%llu recorded_aggregate=%llu short=%llu counts_unknown=%llu write_failed=%llu "
+            "quarantined=%llu "
             "abandoned=%llu counter_exhausted=%llu name_unavailable=%llu",
-            count_of(Verdict::Published), count_of(Verdict::PublishedEmpty), count_of(Verdict::PublishedShort),
-            count_of(Verdict::CountsUnknown), count_of(Verdict::WriteFailed), count_of(Verdict::Quarantined),
-            count_of(Verdict::Abandoned), count_of(Verdict::CounterExhausted), count_of(Verdict::NameUnavailable)
+            count_of(Verdict::Published), count_of(Verdict::PublishedEmpty), count_of(Verdict::RecordedAggregate),
+            count_of(Verdict::PublishedShort), count_of(Verdict::CountsUnknown), count_of(Verdict::WriteFailed),
+            count_of(Verdict::Quarantined), count_of(Verdict::Abandoned), count_of(Verdict::CounterExhausted),
+            count_of(Verdict::NameUnavailable)
         );
         if (n < 0) return {};
         size_t used = static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n) : sizeof(buf) - 1;
@@ -330,6 +338,7 @@ public:
     /** Every per-verdict count, read as one consistent set under the lock. */
     struct Counts {
         uint64_t published{0};
+        uint64_t recorded_aggregate{0};
         uint64_t published_empty{0};
         uint64_t published_short{0};
         uint64_t counts_unknown{0};
@@ -345,6 +354,7 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         Counts c;
         c.published = count_of(Verdict::Published);
+        c.recorded_aggregate = count_of(Verdict::RecordedAggregate);
         c.published_empty = count_of(Verdict::PublishedEmpty);
         c.published_short = count_of(Verdict::PublishedShort);
         c.counts_unknown = count_of(Verdict::CountsUnknown);
@@ -359,7 +369,7 @@ public:
     }
 
 private:
-    static constexpr size_t kVerdictCount = static_cast<size_t>(Verdict::NameUnavailable) + 1;
+    static constexpr size_t kVerdictCount = static_cast<size_t>(Verdict::RecordedAggregate) + 1;
 
     unsigned long long count_of(Verdict v) const {
         return static_cast<unsigned long long>(counts_[static_cast<size_t>(v)]);

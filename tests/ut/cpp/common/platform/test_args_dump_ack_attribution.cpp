@@ -31,9 +31,13 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -48,6 +52,34 @@
 #include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
+
+struct ArgsDumpCollectorTestPeer {
+    static int transport_shards(const ArgsDumpCollector &collector) { return collector.manager_.shard_count(); }
+    static size_t ordinary_shards(const ArgsDumpCollector &collector) {
+        return collector.collected_by_collector_.size();
+    }
+    static bool wait_for_release(ArgsDumpCollector &collector, uint64_t epoch) {
+        std::unique_lock lock(collector.retained_mu_);
+        return collector.retained_cv_.wait_for(lock, std::chrono::seconds(5), [&] {
+            return collector.retained_find_slot(epoch) < 0;
+        });
+    }
+    static size_t charged(const ArgsDumpCollector &collector) { return collector.retained_budget_.charged(); }
+    static size_t fixed(const ArgsDumpCollector &collector) { return collector.retained_budget_.fixed(); }
+    static uint64_t ordinary_pending(const ArgsDumpCollector &collector) {
+        return collector.ordinary_queued_payloads_.load();
+    }
+    // The caller has quiesced the collectors and has not closed this window.
+    static std::vector<uint32_t> bucket_arguments(ArgsDumpCollector &collector, uint64_t epoch, size_t bucket) {
+        std::scoped_lock lock(collector.retained_mu_);
+        const int slot = collector.retained_find_slot(epoch);
+        if (slot < 0) return {};
+        std::vector<uint32_t> indices;
+        for (const auto &arg : collector.retained_epochs_[static_cast<size_t>(slot)].buckets[bucket])
+            indices.push_back(arg.arg_index);
+        return indices;
+    }
+};
 
 namespace {
 
@@ -96,7 +128,9 @@ struct OutputRoot {
         fs::remove_all(base);
         EXPECT_TRUE(fs::create_directories(base));
     }
-    ~OutputRoot() { fs::remove_all(base); }
+    ~OutputRoot() {
+        if (std::getenv("SIMPLER_UT_KEEP_OUTPUTS") == nullptr) fs::remove_all(base);
+    }
 
     fs::path prefix(const char *run) const { return base / run; }
     fs::path run_dir(const char *run) const { return prefix(run) / "args_dump"; }
@@ -109,17 +143,18 @@ struct AttributionFixture {
     void *shm = nullptr;
     DumpDataHeader *header = nullptr;
     std::vector<int32_t> tensor;
+    int lane_count;
 
-    explicit AttributionFixture(const char *name) :
+    explicit AttributionFixture(const char *name, bool retaining = true, int lanes = 1) :
         root(name),
-        tensor(kTensorElements) {
+        tensor(kTensorElements),
+        lane_count(lanes) {
         for (size_t i = 0; i < tensor.size(); i++)
             tensor[i] = static_cast<int32_t>(i + 1);
-        collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+        collector.configure_retained_runs(retaining, simpler::dfx::runs::kDefaultBudgetBytes);
         EXPECT_EQ(
             collector.initialize(
-                /*num_dump_threads=*/1, /*device_id=*/0, DumpArgsLevel::FULL, attribution_alloc, nullptr,
-                attribution_free
+                lane_count, /*device_id=*/0, DumpArgsLevel::FULL, attribution_alloc, nullptr, attribution_free
             ),
             0
         );
@@ -153,7 +188,7 @@ struct AttributionFixture {
     }
     ArgsDumpCollector::RetainedRunStats stats() const { return collector.retained_run_stats_for_test(); }
 
-    void record_tensor(int32_t task_id, uint32_t arg_index) {
+    void record_tensor(int32_t task_id, uint32_t arg_index, int lane = kLane) {
         ArgsDumpInfo info{};
         info.task_id = simpler::ut::test_task_id(task_id);
         info.role = ArgsDumpRole::INPUT;
@@ -168,13 +203,13 @@ struct AttributionFixture {
         info.ndims = 1;
         info.shapes[0] = static_cast<uint32_t>(kTensorElements);
         info.strides[0] = 1;
-        ASSERT_EQ(dump_arg_record(kLane, info), 0);
+        ASSERT_EQ(dump_arg_record(lane, info), 0);
     }
 
     /** One run that records `args` tensors and never flushes them to a queue. */
     void produce_unpublished(uint64_t epoch, int args) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
+        dump_args_init(lane_count, DumpArgsLevel::FULL);
         for (int i = 0; i < args; i++)
             record_tensor(0xB00 + i, static_cast<uint32_t>(i));
     }
@@ -195,7 +230,359 @@ struct AttributionFixture {
     }
 };
 
+void verify_destination_alias(bool symlink, bool retaining) {
+    AttributionFixture fx("live-destination-alias", retaining);
+    const auto owner = fx.root.prefix("owner");
+    ASSERT_TRUE(fs::create_directories(fx.root.run_dir("owner")));
+    fs::path alias = owner / ".";
+    if (symlink) {
+        alias = fx.root.prefix("alias");
+        ASSERT_TRUE(fs::create_directories(alias));
+        std::error_code error;
+        fs::create_directory_symlink(fx.root.run_dir("owner"), alias / "args_dump", error);
+        if (error == std::errc::operation_not_permitted || error == std::errc::function_not_supported)
+            GTEST_SKIP() << "Directory symlinks unavailable: " << error.message();
+        ASSERT_FALSE(error) << error.message();
+    }
+    ASSERT_TRUE(fx.collector.begin_recorded_window(4001, owner.string(), DumpArgsLevel::FULL));
+    ASSERT_EQ(fx.stats().open_collected_records, 0u);
+    {
+        std::ofstream previous(fx.root.manifest("owner"));
+        previous << "owner evidence";
+    }
+    if (retaining) {
+        EXPECT_FALSE(fx.begin(4002, alias));
+    } else {
+        EXPECT_THROW(fx.collector.begin_run(alias.string(), DumpArgsLevel::FULL, 4002), std::runtime_error);
+    }
+    EXPECT_FALSE(fx.collector.begin_recorded_window(4002, alias.string(), DumpArgsLevel::FULL));
+    EXPECT_EQ(read_file(fx.root.manifest("owner")), "owner evidence");
+    EXPECT_TRUE(fx.collector.recorded_window_open(4001));
+    EXPECT_EQ(fx.stats().open_epochs, 1u);
+
+    ASSERT_TRUE(fx.collector.begin_recorded_window(4003, fx.root.prefix("distinct").string(), DumpArgsLevel::FULL));
+    ASSERT_EQ(fx.collector.close_recorded_window(4003), 0);
+    std::fill(fx.tensor.begin(), fx.tensor.end(), 711);
+    fx.produce_published(4001, 1);
+    ASSERT_EQ(fx.collector.close_recorded_window(4001), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto manifest = read_file(fx.root.manifest("owner"));
+    ASSERT_EQ(manifest_number(manifest, "total_args"), 1);
+    const auto bytes = read_file(fx.root.run_dir("owner") / manifest_string(manifest, "bin_file"));
+    ASSERT_EQ(bytes.size(), kTensorBytes);
+    EXPECT_EQ(std::memcmp(bytes.data(), fx.tensor.data(), kTensorBytes), 0);
+}
+
 }  // namespace
+
+TEST(ArgsDumpAckAttribution, DotDestinationAliasCannotReplaceARecordedOwner) { verify_destination_alias(false, false); }
+
+TEST(ArgsDumpAckAttribution, SymlinkDestinationAliasCannotReplaceARecordedOwner) {
+    verify_destination_alias(true, false);
+}
+
+TEST(ArgsDumpAckAttribution, DotDestinationAliasPreservesRetainedAdmissionRefusal) {
+    verify_destination_alias(false, true);
+}
+
+TEST(ArgsDumpAckAttribution, SymlinkDestinationAliasPreservesRetainedAdmissionRefusal) {
+    verify_destination_alias(true, true);
+}
+
+TEST(ArgsDumpAckAttribution, OrdinaryPayloadCreditProvesHostOwnershipBeforeDiskAndSurvivesRunReset) {
+    AttributionFixture fx("ordinary-owned-before-disk", false);
+    fx.collector.begin_run(fx.root.prefix("run-a").string(), DumpArgsLevel::FULL, 3201);
+    fx.collector.hold_retained_writer_for_test(true);
+    auto resume = [&] {
+        fx.collector.hold_retained_writer_for_test(false);
+    };
+    struct ResumeWriter {
+        std::function<void()> resume;
+        ~ResumeWriter() { resume(); }
+    } guard{resume};
+    fx.produce_published(3201, 1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fx.credit() != 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ASSERT_EQ(fx.credit(), 1u) << "the physical receipt must count ordinary copied bytes before disk completion";
+    fx.collector.publish_arena_acks();
+    ASSERT_EQ(fx.state()->completed_payload_count, 1u);
+    EXPECT_FALSE(fx.collector.retains_runs());
+    EXPECT_EQ(fx.stats().open_epochs, 0u);
+    ASSERT_TRUE(fs::exists(fx.root.run_dir("run-a") / "args.bin"));
+    EXPECT_EQ(fs::file_size(fx.root.run_dir("run-a") / "args.bin"), 0u);
+    std::memset(reinterpret_cast<void *>(fx.state()->arena_base), 0xee, kTensorBytes);
+    resume();
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    const std::string bytes = read_file(fx.root.run_dir("run-a") / "args.bin");
+    ASSERT_EQ(bytes.size(), kTensorBytes);
+    EXPECT_EQ(std::memcmp(bytes.data(), fx.tensor.data(), kTensorBytes), 0);
+
+    fx.collector.begin_run(fx.root.prefix("run-b").string(), DumpArgsLevel::FULL, 3202);
+    EXPECT_EQ(fx.credit(), 1u) << "ordinary metadata reset must not reset physical arena ownership";
+    fx.produce_published(3202, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_EQ(fx.credit(), 2u);
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->completed_payload_count, 2u);
+}
+
+TEST(ArgsDumpAckAttribution, RecordedReplaysKeepEveryPayloadAcrossOrdinaryTrafficAndIndependentClose) {
+    AttributionFixture fx("recorded-with-ordinary", false);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3301, fx.root.prefix("model-a").string(), DumpArgsLevel::FULL));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3302, fx.root.prefix("model-b").string(), DumpArgsLevel::FULL));
+    EXPECT_FALSE(fx.collector.begin_recorded_window(3303, fx.root.prefix("no-slot").string(), DumpArgsLevel::FULL));
+    EXPECT_FALSE(fx.collector.retains_runs());
+    const size_t fixed_charge = fx.stats().charged_bytes;
+    ASSERT_GT(fixed_charge, 0u);
+    auto replay = [&](uint64_t epoch, int before, int after) {
+        set_platform_run_result(0, epoch);
+        set_dump_args_enabled(true);
+        dump_args_init(1, DumpArgsLevel::FULL);
+        ArgsDumpInfo info{};
+        info.task_id = simpler::ut::test_task_id(0xB00);
+        info.role = ArgsDumpRole::INOUT;
+        info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+        info.dtype = static_cast<uint8_t>(DataType::INT32);
+        info.capture_payload = 1;
+        info.buffer_addr = reinterpret_cast<uint64_t>(fx.tensor.data());
+        info.func_count = 1;
+        info.func_ids[0] = 5;
+        info.ndims = 1;
+        info.shapes[0] = kTensorElements;
+        info.strides[0] = 1;
+        std::fill(fx.tensor.begin(), fx.tensor.end(), before);
+        info.stage = ArgsDumpStage::BEFORE_DISPATCH;
+        EXPECT_EQ(dump_arg_record(kLane, info), 0);
+        std::fill(fx.tensor.begin(), fx.tensor.end(), after);
+        info.stage = ArgsDumpStage::AFTER_COMPLETION;
+        EXPECT_EQ(dump_arg_record(kLane, info), 0);
+        dump_args_flush(kLane);
+    };
+    replay(3301, 100, 200);
+    replay(3302, 500, 600);
+    ASSERT_TRUE(fx.wait_for_collected(4));
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 3304);
+    fx.produce_published(3304, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_FALSE(fx.collector.retains_runs());
+    EXPECT_EQ(fx.stats().open_epochs, 2u);
+    replay(3301, 101, 201);
+    replay(3301, 102, 202);
+    ASSERT_TRUE(fx.wait_for_collected(8));
+    ASSERT_EQ(fx.collector.close_recorded_window(3301), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_TRUE(fx.collector.recorded_window_open(3302));
+    replay(3302, 501, 601);
+    ASSERT_TRUE(fx.wait_for_collected(4));
+    ASSERT_EQ(fx.collector.close_recorded_window(3302), 0);
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    for (const char *name : {"model-a", "model-b"}) {
+        const std::string manifest = read_file(fx.root.manifest(name));
+        EXPECT_NE(manifest.find("\"recorded_window\": true"), std::string::npos);
+        EXPECT_NE(manifest.find("\"dropped_records\": null"), std::string::npos);
+        EXPECT_EQ(manifest_string(manifest, "collection_verdict"), "aggregate_counts_unknown");
+        EXPECT_EQ(manifest_number(manifest, "host_discarded_args"), 0);
+        EXPECT_EQ(manifest_number(manifest, "metadata_discarded_records"), 0);
+        const std::string bytes = read_file(fx.root.run_dir(name) / manifest_string(manifest, "bin_file"));
+        const std::vector<int32_t> expected = std::string(name) == "model-a" ?
+                                                  std::vector<int32_t>{100, 200, 101, 201, 102, 202} :
+                                                  std::vector<int32_t>{500, 600, 501, 601};
+        ASSERT_EQ(bytes.size(), expected.size() * kTensorBytes);
+        EXPECT_EQ(manifest_number(manifest, "total_args"), static_cast<long>(expected.size()));
+        std::set<size_t> observed_offsets;
+        std::istringstream lines(manifest);
+        std::string entry;
+        while (std::getline(lines, entry)) {
+            if (entry.find("\"run_epoch\":") == std::string::npos) continue;
+            const long offset = manifest_number(entry, "bin_offset");
+            ASSERT_GE(offset, 0);
+            ASSERT_EQ(static_cast<size_t>(offset) % kTensorBytes, 0u);
+            ASSERT_EQ(manifest_number(entry, "bin_size"), static_cast<long>(kTensorBytes));
+            const size_t sample = static_cast<size_t>(offset) / kTensorBytes;
+            ASSERT_LT(sample, expected.size());
+            EXPECT_TRUE(observed_offsets.insert(static_cast<size_t>(offset)).second);
+            EXPECT_EQ(manifest_string(entry, "stage"), sample % 2 == 0 ? "before_dispatch" : "after_completion");
+            std::vector<int32_t> expected_tensor(kTensorElements, expected[sample]);
+            EXPECT_EQ(std::memcmp(bytes.data() + offset, expected_tensor.data(), kTensorBytes), 0) << entry;
+        }
+        EXPECT_EQ(observed_offsets.size(), expected.size());
+    }
+    EXPECT_EQ(fx.credit(), 11u);
+    EXPECT_EQ(fx.stats().errors.recorded_aggregate, 2u);
+    EXPECT_EQ(fx.stats().open_epochs, 0u);
+    EXPECT_EQ(fx.stats().charged_bytes, fixed_charge);
+}
+
+TEST(ArgsDumpAckAttribution, OrdinaryExportPreservesEachRecordedTransportShard) {
+    AttributionFixture fx("recorded-two-shards-after-ordinary", false, 2);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3311, fx.root.prefix("recorded").string(), DumpArgsLevel::FULL));
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 3312);
+    fx.produce_published(3312, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    ASSERT_EQ(ArgsDumpCollectorTestPeer::ordinary_shards(fx.collector), 0u);
+    ASSERT_EQ(ArgsDumpCollectorTestPeer::transport_shards(fx.collector), 2);
+
+    set_platform_run_result(0, 3311);
+    dump_args_init(2, DumpArgsLevel::FULL);
+    for (int lane : {1, 0}) {
+        std::fill(fx.tensor.begin(), fx.tensor.end(), 110 + lane * 101);
+        fx.record_tensor(0xB00 + lane, static_cast<uint32_t>(lane), lane);
+        dump_args_flush(lane);
+        fx.collector.quiesce();
+        EXPECT_EQ(
+            ArgsDumpCollectorTestPeer::bucket_arguments(fx.collector, 3311, static_cast<size_t>(lane)),
+            std::vector<uint32_t>({static_cast<uint32_t>(lane)})
+        );
+        EXPECT_EQ(fx.credit(lane), lane == 0 ? 2u : 1u);
+    }
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::bucket_arguments(fx.collector, 3311, 0), std::vector<uint32_t>({0}));
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::bucket_arguments(fx.collector, 3311, 1), std::vector<uint32_t>({1}));
+    ASSERT_EQ(fx.collector.close_recorded_window(3311), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto manifest = read_file(fx.root.manifest("recorded"));
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 2);
+    const auto bytes = read_file(fx.root.run_dir("recorded") / manifest_string(manifest, "bin_file"));
+    ASSERT_EQ(bytes.size(), 2 * kTensorBytes);
+    for (size_t sample = 0; sample < 2; ++sample) {
+        const std::vector<int32_t> expected(kTensorElements, sample == 0 ? 211 : 110);
+        EXPECT_EQ(std::memcmp(bytes.data() + sample * kTensorBytes, expected.data(), kTensorBytes), 0);
+    }
+}
+
+TEST(ArgsDumpAckAttribution, RecordedCollectionKeepsOrdinaryRetainedAccountingStrict) {
+    AttributionFixture fx("recorded-with-retaining-ordinary");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3401, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    fx.produce_published(3401, 1);
+    ASSERT_TRUE(fx.wait_for_collected(1));
+    ASSERT_TRUE(fx.begin(3402, fx.root.prefix("ordinary")));
+    fx.produce_published(3402, 1);
+    ASSERT_EQ(fx.close(3402), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_EQ(manifest_string(read_file(fx.root.manifest("ordinary")), "collection_verdict"), "published");
+    EXPECT_TRUE(fx.collector.retains_runs());
+    EXPECT_TRUE(fx.collector.recorded_window_open(3401));
+    fx.produce_published(3401, 1);
+    ASSERT_TRUE(fx.wait_for_collected(2));
+    ASSERT_EQ(fx.collector.close_recorded_window(3401), 0);
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_EQ(manifest_number(read_file(fx.root.manifest("model")), "total_args"), 2);
+    EXPECT_EQ(fx.stats().errors.published, 1u);
+    EXPECT_EQ(fx.stats().errors.recorded_aggregate, 1u);
+    EXPECT_EQ(fx.credit(), 3u);
+}
+
+TEST(ArgsDumpAckAttribution, RecordedPayloadBudgetLossAcknowledgesDiscardButFailsDiagnosticFlush) {
+    AttributionFixture fx("recorded-payload-pressure", false);
+    fx.collector.configure_retained_runs(false, 17 * 1024 * 1024);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3501, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    fx.tensor.assign(8 * 1024 * 1024, 42);
+    set_platform_run_result(0, 3501);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    ArgsDumpInfo info{};
+    info.task_id = simpler::ut::test_task_id(0xB00);
+    info.role = ArgsDumpRole::INPUT;
+    info.stage = ArgsDumpStage::BEFORE_DISPATCH;
+    info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+    info.dtype = static_cast<uint8_t>(DataType::INT32);
+    info.capture_payload = 1;
+    info.buffer_addr = reinterpret_cast<uint64_t>(fx.tensor.data());
+    info.ndims = 1;
+    info.shapes[0] = fx.tensor.size();
+    info.strides[0] = 1;
+    ASSERT_EQ(dump_arg_record(kLane, info), 0);
+    dump_args_flush(kLane);
+    ASSERT_TRUE(fx.wait_for_collected(1));
+    EXPECT_EQ(fx.stats().open_discarded_args, 1u);
+    EXPECT_EQ(fx.credit(), 1u);
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->completed_payload_count, 1u);
+    ASSERT_EQ(fx.collector.close_recorded_window(3501), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    EXPECT_EQ(fx.stats().errors.published_short, 1u);
+    EXPECT_EQ(manifest_number(read_file(fx.root.manifest("model")), "host_discarded_args"), 1);
+}
+
+TEST(ArgsDumpAckAttribution, RecordedPublicationFailureDoesNotReopenSettledDeviceOwnership) {
+    AttributionFixture fx("recorded-manifest-failure", false);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3601, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    fx.produce_published(3601, 1);
+    ASSERT_TRUE(fx.wait_for_collected(1));
+    ASSERT_TRUE(fs::create_directory(fx.root.manifest("model")));
+    ASSERT_EQ(fx.collector.close_recorded_window(3601), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    EXPECT_EQ(fx.stats().errors.write_failed, 1u);
+    EXPECT_EQ(fx.stats().open_epochs, 0u);
+    EXPECT_FALSE(fx.collector.recorded_window_open(3601));
+}
+
+TEST(ArgsDumpAckAttribution, RecordedTransportLossSurvivesOrdinaryReconciliation) {
+    AttributionFixture fx("recorded-malformed-handoff", false);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3701, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    fx.collector.stop(false);
+    fx.produce_published(3701, 1);
+    const uint32_t head = fx.header->queue_heads[kLane];
+    ASSERT_NE(head, fx.header->queue_tails[kLane]);
+    ASSERT_NE(fx.header->queues[kLane][head].buffer_ptr, 0u);
+    fx.header->queues[kLane][head].thread_index = UINT32_MAX;
+    fx.collector.start(attribution_thread_factory);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fx.collector.drain_dropped_buffers() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    ASSERT_EQ(fx.collector.drain_dropped_buffers(), 1u);
+    EXPECT_EQ(fx.credit(), 0u) << "an unresolvable payload has no host-owned bytes to acknowledge";
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 3702);
+    set_platform_run_result(0, 3702);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    EXPECT_EQ(fx.collector.close_ordinary_run(true), 0);
+    ASSERT_EQ(fx.collector.close_recorded_window(3701), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    EXPECT_EQ(fx.stats().errors.counts_unknown, 1u);
+    EXPECT_EQ(fx.stats().errors.recorded_aggregate, 0u);
+    EXPECT_EQ(manifest_string(read_file(fx.root.manifest("model")), "collection_verdict"), "counts_unknown");
+}
+
+TEST(ArgsDumpAckAttribution, OrdinaryWriterFailureRemainsVisibleAfterItsSinkCloses) {
+    AttributionFixture fx("ordinary-write-failure", false);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 3801);
+    ASSERT_TRUE(fs::create_directories(fx.root.run_dir("ordinary")));
+    if (fs::exists("/dev/full")) fs::create_symlink("/dev/full", fx.root.run_dir("ordinary") / "args.bin");
+    else ASSERT_TRUE(fs::create_directory(fx.root.run_dir("ordinary") / "args.bin"));
+    fx.produce_published(3801, 1);
+    EXPECT_NE(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_EQ(fx.credit(), 1u) << "the copied payload remains host-owned even when its file failed";
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error)) << "closing an ordinary sink must not erase its writer failure";
+}
+
+TEST(ArgsDumpAckAttribution, RecordedZeroWindowPublishesFreshUnknownCountsAndOrdinaryReuseClearsTheMarker) {
+    AttributionFixture fx("zero-window-destination-reuse", false);
+    ASSERT_TRUE(fs::create_directories(fx.root.run_dir("shared")));
+    {
+        std::ofstream old(fx.root.manifest("shared"));
+        old << "old successful artifact";
+    }
+    ASSERT_TRUE(fx.collector.begin_recorded_window(3901, fx.root.prefix("shared").string(), DumpArgsLevel::FULL));
+    EXPECT_EQ(read_file(fx.root.manifest("shared")), "old successful artifact");
+    ASSERT_EQ(fx.collector.close_recorded_window(3901), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const std::string manifest = read_file(fx.root.manifest("shared"));
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 0);
+    EXPECT_NE(manifest.find("\"bin_file\": null"), std::string::npos);
+    EXPECT_NE(manifest.find("\"dropped_records\": null"), std::string::npos);
+    EXPECT_EQ(manifest_string(manifest, "collection_verdict"), "aggregate_counts_unknown");
+    fx.collector.begin_run(fx.root.prefix("shared").string(), DumpArgsLevel::PARTIAL, 3902);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_FALSE(fs::exists(fx.root.manifest("shared")));
+}
 
 /**
  * A recovered payload is output, not an acknowledgement — so the successor's
@@ -314,4 +701,107 @@ TEST(ArgsDumpAckAttribution, ALostRecoveredPayloadCreditsNothingToTheLane) {
     EXPECT_FALSE(fx.flush(&error));
     EXPECT_EQ(fx.stats().errors.published_short, 1u);
     EXPECT_EQ(fx.stats().errors.published, 1u);
+}
+
+TEST(ArgsDumpAckAttribution, OrdinaryPayloadPressureDiscardsBeforeAcknowledgingWithoutUnboundedCopies) {
+    AttributionFixture fx("ordinary-payload-pressure", false);
+    fx.collector.configure_retained_runs(false, 17 * 1024 * 1024);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 9901);
+    fx.collector.hold_retained_writer_for_test(true);
+    auto resume = [&] {
+        fx.collector.hold_retained_writer_for_test(false);
+    };
+    struct ResumeWriter {
+        std::function<void()> resume;
+        ~ResumeWriter() { resume(); }
+    } guard{resume};
+    fx.tensor.assign(2 * 1024 * 1024, 42);
+    set_platform_run_result(0, 9901);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    ArgsDumpInfo info{};
+    info.task_id = simpler::ut::test_task_id(0xB00);
+    info.role = ArgsDumpRole::INPUT;
+    info.stage = ArgsDumpStage::BEFORE_DISPATCH;
+    info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+    info.dtype = static_cast<uint8_t>(DataType::INT32);
+    info.capture_payload = 1;
+    info.buffer_addr = reinterpret_cast<uint64_t>(fx.tensor.data());
+    info.ndims = 1;
+    info.shapes[0] = fx.tensor.size();
+    info.strides[0] = 1;
+    for (uint32_t index = 0; index < 3; ++index) {
+        info.arg_index = index;
+        ASSERT_EQ(dump_arg_record(kLane, info), 0);
+    }
+    dump_args_flush(kLane);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (fx.credit() != 3 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    ASSERT_EQ(fx.credit(), 3u);
+    EXPECT_GT(ArgsDumpCollectorTestPeer::charged(fx.collector), 16 * 1024 * 1024u);
+    EXPECT_LE(ArgsDumpCollectorTestPeer::charged(fx.collector), 17 * 1024 * 1024u);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_pending(fx.collector), 2u);
+    EXPECT_GT(fx.stats().budget_refusals, 0u);
+    EXPECT_EQ(fx.credit(), 3u);
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->completed_payload_count, 3u);
+    resume();
+    EXPECT_NE(fx.collector.close_ordinary_run(true), 0);
+    const auto manifest = read_file(fx.root.manifest("ordinary"));
+    EXPECT_EQ(manifest_number(manifest, "host_discarded_args"), 1);
+    EXPECT_NE(manifest.find("\"host_discarded\": true"), std::string::npos);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::charged(fx.collector), ArgsDumpCollectorTestPeer::fixed(fx.collector));
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 3);
+    const auto bytes = read_file(fx.root.run_dir("ordinary") / "args.bin");
+    ASSERT_EQ(bytes.size(), 16 * 1024 * 1024u);
+    EXPECT_EQ(std::memcmp(bytes.data(), fx.tensor.data(), fx.tensor.size() * sizeof(int32_t)), 0);
+    EXPECT_EQ(std::memcmp(bytes.data() + 8 * 1024 * 1024, fx.tensor.data(), fx.tensor.size() * sizeof(int32_t)), 0);
+}
+
+TEST(ArgsDumpAckAttribution, RecordedTruncationDoesNotPolluteTheOrdinarySuccessor) {
+    AttributionFixture fx("recorded-truncation", false);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(9911, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 9912);
+    fx.collector.stop(false);
+    fx.produce_published(9911, 1);
+    const auto &entry = fx.header->queues[kLane][fx.header->queue_heads[kLane]];
+    reinterpret_cast<DumpMetaBuffer *>(entry.buffer_ptr)->records[0].truncated = 1;
+    fx.collector.start(attribution_thread_factory);
+    ASSERT_TRUE(fx.wait_for_collected(1));
+    fx.produce_published(9912, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_EQ(manifest_number(read_file(fx.root.manifest("ordinary")), "truncated_args"), 0);
+    ASSERT_EQ(fx.collector.close_recorded_window(9911), 0);
+    std::string error;
+    (void)fx.flush(&error);
+    EXPECT_EQ(manifest_number(read_file(fx.root.manifest("model")), "truncated_args"), 1);
+}
+
+TEST(ArgsDumpAckAttribution, RefusedRecordedAdmissionPreservesThePreviousPublishedManifest) {
+    AttributionFixture fx("preserve-published-on-refusal", false);
+    fs::create_directories(fx.root.run_dir("model"));
+    {
+        std::ofstream old(fx.root.manifest("model"));
+        old << "previous published manifest";
+    }
+    fx.collector.stop(false);
+    EXPECT_FALSE(fx.collector.begin_recorded_window(9921, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    EXPECT_EQ(read_file(fx.root.manifest("model")), "previous published manifest");
+}
+
+TEST(ArgsDumpAckAttribution, UnrelatedAdmissionFailureDoesNotPinAStoppedRecordedModel) {
+    AttributionFixture fx("unrelated-admission-fatal", false);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(9971, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    fx.produce_published(9971, 1);
+    ASSERT_TRUE(fx.wait_for_collected(1));
+    fx.collector.stop(false);
+    ASSERT_FALSE(fx.collector.begin_recorded_window(9972, fx.root.prefix("refused").string(), DumpArgsLevel::FULL));
+    ASSERT_TRUE(fx.stats().fatal);
+    fx.collector.start(attribution_thread_factory);
+    EXPECT_EQ(fx.collector.close_recorded_window(9971), 0);
+    EXPECT_TRUE(ArgsDumpCollectorTestPeer::wait_for_release(fx.collector, 9971));
+    EXPECT_FALSE(fx.collector.recorded_window_open(9971));
+    EXPECT_EQ(manifest_number(read_file(fx.root.manifest("model")), "total_args"), 1);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
 }
