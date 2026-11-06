@@ -224,6 +224,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -513,6 +514,13 @@ struct ProfilerAlgorithms {
         return M::resolve_entry(shm, header, q, entry);
     }
 
+    // The mapping preserves cursor word alignment even when it does not
+    // preserve the containing wire header's stronger alignment.
+    static volatile uint32_t *ready_queue_cursor(DataHeader *header, size_t offset, int q) {
+        auto *bytes = reinterpret_cast<unsigned char *>(header);
+        return reinterpret_cast<volatile uint32_t *>(bytes + offset + q * sizeof(uint32_t));
+    }
+
     // Read the entry at the head of the per-thread ready queue without
     // acknowledging it. Returns false if the queue is empty (or the device wrote
     // an out-of-range head/tail, which is treated as empty and reported).
@@ -534,16 +542,18 @@ struct ProfilerAlgorithms {
     template <typename Mgr>
     static bool
     try_peek_aicpu_entry(Mgr &mgr, DataHeader *header, int q, ReadyEntry &out, bool refresh_indices = false) {
+        auto *head_cursor = ready_queue_cursor(header, offsetof(DataHeader, queue_heads), q);
+        auto *tail_cursor = ready_queue_cursor(header, offsetof(DataHeader, queue_tails), q);
         if (refresh_indices) {
-            if (mgr.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
-                mgr.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
+            if (mgr.read_range_from_device(head_cursor, sizeof(*head_cursor)) != 0 ||
+                mgr.read_range_from_device(tail_cursor, sizeof(*tail_cursor)) != 0) {
                 LOG_ERROR("%s: failed to refresh ready_queue indices for thread %d", Module::kSubsystemName, q);
                 return false;
             }
             rmb();
         }
-        uint32_t head = header->queue_heads[q];
-        uint32_t tail = header->queue_tails[q];
+        uint32_t head = *head_cursor;
+        uint32_t tail = *tail_cursor;
         if (head >= Module::kReadyQueueSize || tail >= Module::kReadyQueueSize) {
             LOG_ERROR(
                 "%s: invalid queue indices for thread %d: head=%u tail=%u (max=%u)", Module::kSubsystemName, q, head,
@@ -560,12 +570,15 @@ struct ProfilerAlgorithms {
         // race described above. If the entry's `buffer_ptr` is still 0 the
         // producer hasn't finished publishing — treat the queue as empty
         // for this tick.
-        if (mgr.read_range_from_device(&header->queues[q][head], sizeof(header->queues[q][head])) != 0) {
+        // The host mapping need not preserve ReadyEntry's device alignment.
+        auto *entry = reinterpret_cast<unsigned char *>(header) + offsetof(DataHeader, queues) +
+                      q * sizeof(header->queues[0]) + head * sizeof(ReadyEntry);
+        if (mgr.read_range_from_device(entry, sizeof(out)) != 0) {
             LOG_ERROR("%s: failed to refresh ready_queue entry for thread %d", Module::kSubsystemName, q);
             return false;
         }
         rmb();
-        out = header->queues[q][head];
+        std::memcpy(&out, entry, sizeof(out));
         return out.buffer_ptr != 0;
     }
 
@@ -573,7 +586,7 @@ struct ProfilerAlgorithms {
     // advancing the consumer index.
     //
     // a5: the head advance is written back to device immediately via
-    // `mgr.write_range_to_device(&header->queue_heads[q], ...)` so AICPU sees
+    // `mgr.write_range_to_device(head_cursor, ...)` so AICPU sees
     // the consumer-side update without us bulk-mirroring the whole shm region
     // (which would clobber AICPU-owned fields elsewhere in the shm). A failed
     // write-back leaves the host-side index where the device has it, so the
@@ -611,16 +624,17 @@ struct ProfilerAlgorithms {
      */
     template <typename Mgr>
     static AckOutcome ack_aicpu_entry_checked(Mgr &mgr, DataHeader *header, int q) {
-        const uint32_t old_head = header->queue_heads[q];
+        auto *head_cursor = ready_queue_cursor(header, offsetof(DataHeader, queue_heads), q);
+        const uint32_t old_head = *head_cursor;
         const uint32_t expected_head = (old_head + 1) % Module::kReadyQueueSize;
-        header->queue_heads[q] = expected_head;
+        *head_cursor = expected_head;
         wmb();
-        if (mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) == 0) {
+        if (mgr.write_range_to_device(head_cursor, sizeof(*head_cursor)) == 0) {
             return AckOutcome::kConsumed;
         }
         LOG_ERROR("%s: failed to advance ready_queue head for thread %d", Module::kSubsystemName, q);
 
-        if (mgr.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0) {
+        if (mgr.read_range_from_device(head_cursor, sizeof(*head_cursor)) != 0) {
             // Cannot be decided either way. Leave the shadow where the failed
             // write left it rather than asserting a value, and say so.
             LOG_ERROR(
@@ -636,9 +650,9 @@ struct ProfilerAlgorithms {
             return AckOutcome::kUnknown;
         }
         rmb();
-        const uint32_t device_head = header->queue_heads[q];
+        const uint32_t device_head = *head_cursor;
         if (device_head == old_head) {
-            header->queue_heads[q] = old_head;
+            *head_cursor = old_head;
             return AckOutcome::kNotConsumed;
         }
         if (device_head == expected_head) {
@@ -653,7 +667,7 @@ struct ProfilerAlgorithms {
             "%s: ready_queue head for thread %d is %u, neither %u nor %u; this queue has no single-consumer reading",
             Module::kSubsystemName, q, device_head, old_head, expected_head
         );
-        header->queue_heads[q] = expected_head;
+        *head_cursor = expected_head;
         return AckOutcome::kUnknown;
     }
 
@@ -2498,14 +2512,17 @@ private:
     /** Narrow, owner-issued refresh of one queue's cursors. */
     bool capture_run_queue(DataHeader *header, int q, uint32_t *head_out, uint32_t *tail_out) {
         if (header == nullptr) return false;
-        if (manager_.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
-            manager_.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
+        using Alg = ProfilerAlgorithms<Module>;
+        auto *head_cursor = Alg::ready_queue_cursor(header, offsetof(DataHeader, queue_heads), q);
+        auto *tail_cursor = Alg::ready_queue_cursor(header, offsetof(DataHeader, queue_tails), q);
+        if (manager_.read_range_from_device(head_cursor, sizeof(*head_cursor)) != 0 ||
+            manager_.read_range_from_device(tail_cursor, sizeof(*tail_cursor)) != 0) {
             LOG_ERROR("%s: cut could not refresh ready_queue cursors for thread %d", Module::kSubsystemName, q);
             return false;
         }
         rmb();
-        const uint32_t head = header->queue_heads[q];
-        const uint32_t tail = header->queue_tails[q];
+        const uint32_t head = *head_cursor;
+        const uint32_t tail = *tail_cursor;
         if (head >= Module::kReadyQueueSize || tail >= Module::kReadyQueueSize) return false;
         *head_out = head;
         *tail_out = tail;

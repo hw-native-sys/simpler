@@ -126,15 +126,15 @@ struct AckMgr {
     bool read_fails{false};
     uint32_t forced_device_head{UINT32_MAX};  // UINT32_MAX = report `device_head`
 
-    int write_range_to_device(void *src, size_t bytes) {
+    int write_range_to_device(const volatile void *src, size_t bytes) {
         if (write_fails) return -1;
-        std::memcpy(&device_head, src, bytes);
+        std::memcpy(&device_head, const_cast<const void *>(src), bytes);
         return 0;
     }
-    int read_range_from_device(void *dst, size_t bytes) {
+    int read_range_from_device(volatile void *dst, size_t bytes) {
         if (read_fails) return -1;
         const uint32_t value = forced_device_head == UINT32_MAX ? device_head : forced_device_head;
-        std::memcpy(dst, &value, bytes);
+        std::memcpy(const_cast<void *>(dst), &value, bytes);
         return 0;
     }
 };

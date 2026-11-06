@@ -99,9 +99,10 @@ struct TestFreeQueue {
     volatile uint64_t buffer_ptrs[kSlotCount]{};
 };
 
-struct TestReadyEntry {
+struct alignas(32) TestReadyEntry {
     uint64_t buffer_ptr{0};
     uint32_t buffer_seq{0};
+    uint32_t reserved[5]{};
 };
 
 // Mirrors the real subsystems: the ready-queue array is dimensioned by the
@@ -182,8 +183,8 @@ public:
     uint32_t last_producer_queue() const { return last_producer_queue_.load(std::memory_order_relaxed); }
     int last_shard() const { return last_shard_.load(std::memory_order_relaxed); }
 
-    void init_shadow(void *device, void *host) {
-        this->set_aicpu_thread_num(1);
+    void init_shadow(void *device, void *host, int aicpu_thread_num = 1) {
+        this->set_aicpu_thread_num(aicpu_thread_num);
         auto copy = [](void *dst, const void *src, size_t size) {
             std::memcpy(dst, src, size);
             return 0;
@@ -247,6 +248,43 @@ bool wait_for_collected(const Collector &c, int expected, std::chrono::milliseco
 }
 
 }  // namespace
+
+TEST(ProfilerBaseTest, PeekReadsOveralignedEntryFromByteMappedStorage) {
+    TestHeader expected{};
+    expected.queue_heads[1] = 3;
+    expected.queue_tails[1] = 4;
+    expected.queues[1][3].buffer_ptr = 0x1234;
+    expected.queues[1][3].buffer_seq = 42;
+    expected.queues[1][3].reserved[4] = 17;
+    TestHeader stale{};
+    stale.queues[1][3].buffer_ptr = 0xdead;
+    stale.queues[1][3].buffer_seq = 7;
+    alignas(TestHeader) unsigned char storage[sizeof(TestHeader) + alignof(TestHeader)]{};
+    auto *mapping = storage + alignof(uint64_t);
+    std::memcpy(mapping, &stale, sizeof(stale));
+    ASSERT_NE(reinterpret_cast<uintptr_t>(mapping) % alignof(TestReadyEntry), 0u);
+
+    TestCollector<PerThreadModule> collector;
+    collector.init_shadow(&expected, mapping, 2);
+    TestReadyEntry entry{};
+    ASSERT_TRUE(
+        profiling_common::ProfilerAlgorithms<PerThreadModule>::try_peek_aicpu_entry(
+            collector.manager(), reinterpret_cast<TestHeader *>(mapping), 1, entry, true
+        )
+    );
+    EXPECT_EQ(entry.buffer_ptr, 0x1234u);
+    EXPECT_EQ(entry.buffer_seq, 42u);
+    EXPECT_EQ(entry.reserved[4], 17u);
+    EXPECT_TRUE(
+        profiling_common::ProfilerAlgorithms<PerThreadModule>::ack_aicpu_entry(
+            collector.manager(), reinterpret_cast<TestHeader *>(mapping), 1
+        )
+    );
+    TestHeader observed{};
+    std::memcpy(&observed, mapping, sizeof(observed));
+    EXPECT_EQ(observed.queue_heads[1], 4u);
+    EXPECT_EQ(expected.queue_heads[1], 4u) << "acknowledgement did not reach the device head";
+}
 
 TEST(ProfilerBaseTest, ReinitializedContextIsAvailableBeforeStart) {
     TestHeader previous{};

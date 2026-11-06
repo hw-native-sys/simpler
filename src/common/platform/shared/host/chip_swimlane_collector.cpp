@@ -25,7 +25,9 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
+#include <type_traits>
 
 #include <algorithm>
 #include <array>
@@ -61,6 +63,34 @@
 // the source of truth).
 
 namespace {
+
+template <typename T>
+T read_buffer_field(const void *buffer, size_t offset) {
+    T value{};
+    std::memcpy(&value, static_cast<const unsigned char *>(buffer) + offset, sizeof(value));
+    return value;
+}
+
+struct BufferMetadata {
+    uint64_t run_epoch;
+    uint32_t count;
+    uint32_t local_seq;
+};
+
+template <typename Buffer>
+BufferMetadata read_buffer_metadata(const void *buffer) {
+    return {
+        read_buffer_field<uint64_t>(buffer, offsetof(Buffer, run_epoch)),
+        read_buffer_field<uint32_t>(buffer, offsetof(Buffer, count)),
+        read_buffer_field<uint32_t>(buffer, offsetof(Buffer, local_seq)),
+    };
+}
+
+template <typename Buffer>
+auto read_buffer_record(const void *buffer, uint32_t index) {
+    using Record = std::remove_extent_t<decltype(Buffer::records)>;
+    return read_buffer_field<Record>(buffer, offsetof(Buffer, records) + index * sizeof(Record));
+}
 
 std::string linux_boot_clock_domain_id() {
     std::ifstream boot_id_file("/proc/sys/kernel/random/boot_id");
@@ -810,9 +840,11 @@ void ChipSwimlaneCollector::merge_epoch_store(size_t slot) {
 }
 
 void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot) {
-    ChipSwimlaneAicpuTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(info.host_buffer_ptr);
+    using Buffer = ChipSwimlaneAicpuTaskBuffer;
+    const auto *buf = info.host_buffer_ptr;
     rmb();
-    uint32_t count = buf->count;
+    const auto metadata = read_buffer_metadata<Buffer>(buf);
+    uint32_t count = metadata.count;
     if (count > PLATFORM_PROF_BUFFER_SIZE) {
         count = PLATFORM_PROF_BUFFER_SIZE;
     }
@@ -822,7 +854,7 @@ void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int co
         auto &dst = store(slot).perf[shard][core_index];
         if (!reserve_run_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
+            dst.push_back({read_buffer_record<Buffer>(buf, i), metadata.run_epoch, metadata.local_seq, 0});
         }
         if (!simpler::dfx::runs::checked_increment(store(slot).counters[shard].total_perf_collected, count)) {
             set_fatal("aicpu-task record counter is out of headroom");
@@ -831,9 +863,11 @@ void ChipSwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int co
 }
 
 void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot) {
-    auto *buf = reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(info.host_buffer_ptr);
+    using Buffer = ChipSwimlaneAicpuSchedPhaseBuffer;
+    const auto *buf = info.host_buffer_ptr;
     rmb();
-    uint32_t count = buf->count;
+    const auto metadata = read_buffer_metadata<Buffer>(buf);
+    uint32_t count = metadata.count;
     if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
         count = PLATFORM_PHASE_RECORDS_PER_THREAD;
     }
@@ -843,7 +877,7 @@ void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info,
         auto &dst = store(slot).sched_phase[shard][tidx];
         if (!reserve_run_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
+            dst.push_back({read_buffer_record<Buffer>(buf, i), metadata.run_epoch, metadata.local_seq, 0});
         }
         if (!simpler::dfx::runs::checked_increment(store(slot).counters[shard].total_sched_phase_collected, count)) {
             set_fatal("sched-phase record counter is out of headroom");
@@ -855,9 +889,11 @@ void ChipSwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info,
 }
 
 void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard, size_t slot) {
-    auto *buf = reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(info.host_buffer_ptr);
+    using Buffer = ChipSwimlaneAicpuOrchPhaseBuffer;
+    const auto *buf = info.host_buffer_ptr;
     rmb();
-    uint32_t count = buf->count;
+    const auto metadata = read_buffer_metadata<Buffer>(buf);
+    uint32_t count = metadata.count;
     if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
         count = PLATFORM_PHASE_RECORDS_PER_THREAD;
     }
@@ -867,7 +903,7 @@ void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, 
         auto &dst = store(slot).orch_phase[shard][tidx];
         if (!reserve_run_records(dst, count, slot)) return;
         for (uint32_t i = 0; i < count; i++) {
-            dst.push_back({buf->records[i], buf->run_epoch, buf->local_seq, 0});
+            dst.push_back({read_buffer_record<Buffer>(buf, i), metadata.run_epoch, metadata.local_seq, 0});
         }
         if (!simpler::dfx::runs::checked_increment(store(slot).counters[shard].total_orch_phase_collected, count)) {
             set_fatal("orch-phase record counter is out of headroom");
@@ -900,8 +936,10 @@ void ChipSwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, 
 void ChipSwimlaneCollector::copy_aicore_buffer(
     const ReadyBufferInfo &info, int collector_shard, size_t slot, uint64_t expected_epoch
 ) {
-    ChipSwimlaneAicoreTaskBuffer *buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(info.host_buffer_ptr);
+    using Buffer = ChipSwimlaneAicoreTaskBuffer;
+    const auto *buf = info.host_buffer_ptr;
     rmb();
+    const auto metadata = read_buffer_metadata<Buffer>(buf);
     uint32_t core_index = info.index;
     // A shard index outside `store(slot).counters` is a contract violation, not
     // an accountable loss class: the counters are per-shard and non-atomic, so
@@ -917,10 +955,10 @@ void ChipSwimlaneCollector::copy_aicore_buffer(
         return;
     }
     if (core_index >= static_cast<uint32_t>(num_aicore_)) {
-        store(slot).counters[shard].aicore_skipped_bad_core += buf->count;
+        store(slot).counters[shard].aicore_skipped_bad_core += metadata.count;
         return;
     }
-    uint32_t count = buf->count;
+    uint32_t count = metadata.count;
     uint32_t overflow = 0;
     if (count > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) {
         overflow = count - static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
@@ -934,7 +972,7 @@ void ChipSwimlaneCollector::copy_aicore_buffer(
     // while a run is retained is the successor of every late predecessor buffer.
     // The caller passes that field itself when no run is retained, so the
     // default path compares against the only identity it has.
-    const uint64_t buffer_epoch = buf->run_epoch;
+    const uint64_t buffer_epoch = metadata.run_epoch;
     const bool identity_matches = expected_epoch != 0 && buffer_epoch == expected_epoch;
 
     uint32_t skipped = 0;
@@ -947,14 +985,14 @@ void ChipSwimlaneCollector::copy_aicore_buffer(
         return;
     }
     for (uint32_t i = 0; i < count; i++) {
-        const ChipSwimlaneAicoreTaskRecord &r = buf->records[i];
+        const auto r = read_buffer_record<Buffer>(buf, i);
         if (r.start_time == 0) {
             skipped++;
             continue;
         }
         // Collected either way, with its own stamp: the artifact keeps every
         // record the device produced, and the export reads these vectors.
-        dst.push_back({r, buffer_epoch, buf->local_seq, 0});
+        dst.push_back({r, buffer_epoch, metadata.local_seq, 0});
         accepted++;
     }
 
@@ -1030,41 +1068,31 @@ bool ChipSwimlaneCollector::read_buffer_identity(
 ) const {
     if (info.host_buffer_ptr == nullptr) return false;
     rmb();
+    BufferMetadata metadata;
     switch (info.type) {
-    case ProfBufferType::AICPU_TASK: {
-        auto *b = reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(info.host_buffer_ptr);
-        *epoch_out = b->run_epoch;
-        *count_out = b->count;
+    case ProfBufferType::AICPU_TASK:
+        metadata = read_buffer_metadata<ChipSwimlaneAicpuTaskBuffer>(info.host_buffer_ptr);
         *capacity_out = PLATFORM_PROF_BUFFER_SIZE;
-        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
-        return true;
-    }
-    case ProfBufferType::AICORE_TASK: {
-        auto *b = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(info.host_buffer_ptr);
-        *epoch_out = b->run_epoch;
-        *count_out = b->count;
+        break;
+    case ProfBufferType::AICORE_TASK:
+        metadata = read_buffer_metadata<ChipSwimlaneAicoreTaskBuffer>(info.host_buffer_ptr);
         *capacity_out = PLATFORM_AICORE_BUFFER_SIZE;
-        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
-        return true;
-    }
-    case ProfBufferType::AICPU_SCHED_PHASE: {
-        auto *b = reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(info.host_buffer_ptr);
-        *epoch_out = b->run_epoch;
-        *count_out = b->count;
+        break;
+    case ProfBufferType::AICPU_SCHED_PHASE:
+        metadata = read_buffer_metadata<ChipSwimlaneAicpuSchedPhaseBuffer>(info.host_buffer_ptr);
         *capacity_out = PLATFORM_PHASE_RECORDS_PER_THREAD;
-        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
-        return true;
-    }
-    case ProfBufferType::AICPU_ORCH_PHASE: {
-        auto *b = reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(info.host_buffer_ptr);
-        *epoch_out = b->run_epoch;
-        *count_out = b->count;
+        break;
+    case ProfBufferType::AICPU_ORCH_PHASE:
+        metadata = read_buffer_metadata<ChipSwimlaneAicpuOrchPhaseBuffer>(info.host_buffer_ptr);
         *capacity_out = PLATFORM_PHASE_RECORDS_PER_THREAD;
-        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
-        return true;
+        break;
+    default:
+        return false;
     }
-    }
-    return false;
+    *epoch_out = metadata.run_epoch;
+    *count_out = metadata.count;
+    if (local_seq_out != nullptr) *local_seq_out = metadata.local_seq;
+    return true;
 }
 
 // Transport observation and run-owned receipt, before any copy decision.
