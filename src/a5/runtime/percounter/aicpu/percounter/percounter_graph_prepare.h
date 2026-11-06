@@ -159,6 +159,11 @@ inline bool percounter_prepare_invocation(
     uint64_t published[PERCOUNTER_LIST_COUNT] = {0, 0, 0};
     int32_t materialized = 0;
     while (true) {
+        // At the slice boundary, so a failure anywhere stops this invocation
+        // too rather than only the taking of the next one. A graph's
+        // invocations are many slices each, which is most of what a cancelled
+        // teardown would otherwise still wait for.
+        if (__atomic_load_n(&prepare->error, __ATOMIC_ACQUIRE) != 0) return false;
         int32_t made = 0;
         const GraphMaterializeResult result =
             graph_execution_materialize_slice(outer, *execution, view, PERCOUNTER_GRAPH_SLICE_TASKS, &made);
@@ -241,6 +246,28 @@ inline void percounter_prepare_graphs(Runtime *runtime, PercounterControl *contr
         if (__atomic_add_fetch(&prepare->prepared, uint64_t{1}, __ATOMIC_ACQ_REL) == invocation_count)
             __atomic_store_n(&prepare->prepared_cycles, get_sys_cnt_aicpu(), __ATOMIC_RELEASE);
     }
+}
+
+/**
+ * Stop the assistants from taking further work, for a run that has failed
+ * elsewhere.
+ *
+ * They take the next invocation only while `error` reads zero, so a failure
+ * this record does not carry leaves them preparing every invocation that is
+ * left. The completion gate waits for each of them, so that work is added to
+ * a teardown the scheduler watchdog no longer bounds -- long enough, on a
+ * graph of any size, for the op-execute timeout to fire and bury the error
+ * that started it.
+ *
+ * First writer wins, as in percounter_graph_prepare_fail: a materialization
+ * failure already here names the invocation it happened on, which this does
+ * not, so it is the better record of the two.
+ */
+inline void percounter_graph_prepare_stop(PercounterControl *control, uint64_t error) {
+    if (control->graph_invocation_count == 0 || error == 0) return;
+    auto *prepare = percounter_region<PercounterGraphPrepare>(control, control->graph_prepare_offset);
+    uint64_t expected = 0;
+    __atomic_compare_exchange_n(&prepare->error, &expected, error, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
 /** The first materialization failure, as a SchedulerGraphResult, or 0. */

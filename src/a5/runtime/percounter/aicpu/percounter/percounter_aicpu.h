@@ -202,6 +202,10 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
             error = percounter_graph_prepare_error(control);
         }
     }
+    // After the reads above, so the settle reports what failed rather than
+    // reading this back, and before the report, so an assistant still holding
+    // an invocation stops at its next slice.
+    percounter_graph_prepare_stop(control, error);
     percounter_graph_prepare_report(control, start_cycles);
     if (error == 0) return 0;
     (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, error);
