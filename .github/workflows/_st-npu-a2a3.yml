@@ -128,3 +128,14 @@ jobs:
         uses: ./.github/actions/run-onboard-dfx-smokes
         with:
           platform: a2a3
+
+      - name: Retain native HBG capture logs
+        if: always()
+        # Artifact service failures do not change the scene-test verdict.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbg-capture-a2a3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/hbg-capture
+          if-no-files-found: warn
+          retention-days: 7

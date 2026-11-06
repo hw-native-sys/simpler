@@ -46,6 +46,7 @@
 #include "common/unified_log.h"
 #include "host/profiling_copy.h"
 #include "host/scheduler_profiling_json.h"
+#include "host/raii_scope_guard.h"
 #include "../../../worker/runtime_c_api.h"
 
 #ifndef SIMPLER_RUNTIME_NAME
@@ -140,7 +141,7 @@ bool ChipSwimlaneCollector::set_json_extension(
     const std::string_view payload_view(json_value, json_size);
     if (!chip_swimlane_extension_has_expected_root(section, payload_view)) return false;
     const size_t index = static_cast<size_t>(section);
-    if (!retains_runs()) {
+    if (!retains_runs() && !retained_ready_.load(std::memory_order_acquire)) {
         // One run reaches the device at a time on this path, and `begin_run`
         // clears these with the rest of that run's state, so the resident slot
         // is this run's by construction.
@@ -163,6 +164,7 @@ bool ChipSwimlaneCollector::set_json_extension(
         // A publication that arrived then would be a second writer on it.
         if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) continue;
         if (bucket.epoch.load(std::memory_order_acquire) != run_epoch) continue;
+        if (bucket.recorded_window) return false;
         std::string &slot = bucket.pending.json_extensions[index];
         if (!slot.empty()) {
             LOG_ERROR(
@@ -2529,13 +2531,48 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         // Additive: a reader that does not know this key is unaffected, and the
         // default path never emits it.
         outfile << "    \"collection\": {\n";
+        if (data.recorded_window) {
+            outfile << "      \"recorded_window\": true,\n";
+            outfile << "      \"counts_unknown\": true,\n";
+            outfile << "      \"device_total\": null,\n";
+            outfile << "      \"device_dropped\": null,\n";
+            outfile << "      \"fatal\": null,\n";
+            outfile << "      \"reconciliation\": null,\n";
+            outfile << "      \"host_receipts\": {";
+            const std::array<const HandoffClassReport *, 4> reports = {
+                &data.handoff.aicpu_task, &data.handoff.aicore_task, &data.handoff.sched_phase, &data.handoff.orch_phase
+            };
+            const std::array<const char *, 4> names = {
+                "scheduler_tasks", "aicore_tasks", "scheduler_records", "aicpu_orchestrator_phases"
+            };
+            const std::array<uint64_t, 4> retained = {
+                data.total_perf_collected, data.total_aicore_collected, data.total_sched_phase_collected,
+                data.total_orch_phase_collected
+            };
+            for (size_t i = 0; i < reports.size(); ++i) {
+                if (i != 0) outfile << ", ";
+                outfile << "\"" << names[i] << "\": {\"received_records\": " << reports[i]->received_records
+                        << ", \"retained_records\": " << retained[i]
+                        << ", \"received_buffers\": " << reports[i]->received_buffers
+                        << ", \"observed_buffers\": " << reports[i]->observed_buffers
+                        << ", \"invalid_index_buffers\": " << reports[i]->invalid_index_buffers
+                        << ", \"foreign_epoch_buffers\": " << reports[i]->foreign_epoch_buffers
+                        << ", \"malformed_count_buffers\": " << reports[i]->malformed_count_buffers << "}";
+            }
+            outfile << "},\n";
+        }
         outfile << "      \"run_epoch\": " << data.collection.run_epoch << ",\n";
         outfile << "      \"session_id\": " << data.collection.session_id << ",\n";
         outfile << "      \"processing_complete\": " << (data.collection.processing_complete ? "true" : "false")
                 << ",\n";
         outfile << "      \"metadata_complete\": " << (data.collection.metadata_complete ? "true" : "false") << ",\n";
-        outfile << "      \"not_received_buffers\": " << data.collection.not_received_buffers << ",\n";
-        outfile << "      \"unpublished_loss\": " << data.collection.unpublished_loss << ",\n";
+        if (data.recorded_window) {
+            outfile << "      \"not_received_buffers\": null,\n";
+            outfile << "      \"unpublished_loss\": null,\n";
+        } else {
+            outfile << "      \"not_received_buffers\": " << data.collection.not_received_buffers << ",\n";
+            outfile << "      \"unpublished_loss\": " << data.collection.unpublished_loss << ",\n";
+        }
         outfile << "      \"transport_retired\": " << data.collection.transport_retired << ",\n";
         // Both stay numeric, including when they are zero: a reader that sees
         // `transport_retired: 0` and `unattributable_handoffs: 0` is being told
@@ -2593,6 +2630,10 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         outfile << "        \"pipeline_generation\": " << who.generation << "\n";
         outfile << "      }\n";
         outfile << "    },\n";
+    }
+    if (data.recorded_window) {
+        outfile << "    \"clock_alignment\": {\"status\": \"unavailable\", \"reason\": \"recorded window has no "
+                   "replay-local Host anchors\"},\n";
     }
     outfile << "    \"clock_freq_hz\": " << PLATFORM_PROF_SYS_CNT_FREQ << ",\n";
     outfile << "    \"num_cores\": " << data.num_aicore << ",\n";
@@ -2737,7 +2778,9 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         if (scheduler_extension != nullptr) {
             outfile << *scheduler_extension;
         } else {
-            chip_swimlane_write_scheduler_records(outfile, data.sched_phase_records, data.sched_phase_dropped_records);
+            chip_swimlane_write_scheduler_records(
+                outfile, data.sched_phase_records, data.sched_phase_dropped_records, data.recorded_window
+            );
         }
 
         if (has_aicpu_orch_phases) {
@@ -3533,12 +3576,53 @@ bool ChipSwimlaneCollector::run_begin(
     int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity,
     simpler::dfx::runs::AdmissionRefusal *why
 ) {
+    if (!retain_across_runs_ && !retained_ready_.load(std::memory_order_acquire)) return false;
+    return begin_run_window(
+        run_epoch, output_prefix, level, core_types, core_type_count, host_orchestrated, artifact_identity, why, nullptr
+    );
+}
+
+bool ChipSwimlaneCollector::begin_recorded_window(
+    uint64_t run_epoch, const RunExport &metadata, const CoreType *core_types, int core_type_count,
+    const simpler::dfx::HostPhaseRecordStore *host_records, simpler::dfx::runs::AdmissionRefusal *why
+) {
     if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
-    // Nothing to admit a run into on a collector configured not to retain one.
-    // A caller that reaches here in that state has already chosen the wrong
-    // path, so this is a guard and not the configuration question's answer.
-    if (!retain_across_runs_) return false;
-    if (!ensure_retained_runs_ready(output_prefix)) return false;
+    if (metadata.num_aicore < 0 || metadata.num_aicore > num_aicore_ ||
+        metadata.core_types.size() > static_cast<size_t>(num_aicore_) ||
+        metadata.core_to_thread.size() > static_cast<size_t>(PLATFORM_MAX_CORES) ||
+        metadata.level < ChipSwimlaneLevel::TASK_TIMING || metadata.level > ChipSwimlaneLevel::ORCH_PHASES)
+        return false;
+    if (!metadata.perf_records.empty() || !metadata.aicore_records.empty() || !metadata.sched_phase_records.empty() ||
+        !metadata.orch_phase_records.empty() ||
+        std::any_of(metadata.json_extensions.begin(), metadata.json_extensions.end(), [](const auto &extension) {
+            return !extension.empty();
+        }))
+        return false;
+    if (core_types == nullptr) {
+        core_types = metadata.core_types.data();
+        core_type_count = static_cast<int>(metadata.core_types.size());
+    }
+    if (core_type_count < 0 || core_type_count > num_aicore_) return false;
+    return begin_run_window(
+        run_epoch, metadata.output_prefix, metadata.level, core_types, core_type_count, metadata.host_orchestrated,
+        &metadata.artifact_identity, why, &metadata, host_records
+    );
+}
+
+bool ChipSwimlaneCollector::begin_run_window(
+    uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
+    int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity,
+    simpler::dfx::runs::AdmissionRefusal *why, const RunExport *recorded_metadata,
+    const simpler::dfx::HostPhaseRecordStore *host_records
+) {
+    if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
+    std::error_code path_error;
+    const auto absolute_root = std::filesystem::absolute(output_prefix, path_error);
+    if (path_error) return false;
+    const auto resolved_root = std::filesystem::weakly_canonical(absolute_root, path_error);
+    if (path_error) return false;
+    const std::string frozen_prefix = resolved_root.string();
+    if (!ensure_retained_runs_ready(frozen_prefix)) return false;
     // Refused before a slot is claimed or a byte copied: the path an admitted
     // run retains is reserved, not charged, so a prefix the reservation
     // cannot hold has to be turned away here rather than discovered later by a
@@ -3547,10 +3631,10 @@ bool ChipSwimlaneCollector::run_begin(
     // The allowance has to cover the appended suffix too, not just the prefix:
     // this run's artifact is `<prefix>/swimlane-<k>/records_e<epoch>.json`, so
     // 64 bytes of headroom is what makes every later path reservable.
-    if (output_prefix.size() + 64 > simpler::dfx::runs::kPathAllowanceBytes) {
+    if (frozen_prefix.size() + 64 > simpler::dfx::runs::kPathAllowanceBytes) {
         LOG_ERROR(
             "ChipSwimlane: run %lu refused, its output prefix of %zu bytes exceeds the %zu byte allowance",
-            static_cast<unsigned long>(run_epoch), output_prefix.size(), simpler::dfx::runs::kPathAllowanceBytes
+            static_cast<unsigned long>(run_epoch), frozen_prefix.size(), simpler::dfx::runs::kPathAllowanceBytes
         );
         return false;
     }
@@ -3561,7 +3645,7 @@ bool ChipSwimlaneCollector::run_begin(
     // the bucket, so every refusal below gives it back and nothing else owns
     // it; from installation on it is the bucket's.
     std::string reserved_dir;
-    if (!reserve_artifact_directory(output_prefix, &reserved_dir)) return false;
+    if (!reserve_artifact_directory(frozen_prefix, &reserved_dir)) return false;
     // Given back by `rmdir` alone, never recursively and never by unlinking a
     // file: nothing has published into it yet, and anything that has is not
     // this reservation's to remove.
@@ -3572,6 +3656,9 @@ bool ChipSwimlaneCollector::run_begin(
         }
         reserved_dir.clear();
     };
+    auto reservation_guard = RAIIScopeGuard([&] {
+        if (!reserved_dir.empty()) (void)::rmdir(reserved_dir.c_str());
+    });
     size_t slot = 0;
     {
         std::unique_lock<std::mutex> lk(retained_mu_);
@@ -3586,6 +3673,16 @@ bool ChipSwimlaneCollector::run_begin(
             LOG_ERROR("ChipSwimlane: run %lu refused, the collector is fatal", static_cast<unsigned long>(run_epoch));
             discard_reservation();
             return false;
+        }
+        if (!retain_across_runs_ && recorded_metadata == nullptr) {
+            for (const auto &existing : retained_runs_) {
+                if (existing.state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) continue;
+                if (existing.pending.legacy_destination && existing.pending.output_prefix == frozen_prefix) {
+                    if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
+                    discard_reservation();
+                    return false;
+                }
+            }
         }
         bool found = false;
         for (size_t i = 0; i < active_epoch_limit_; i++) {
@@ -3606,6 +3703,16 @@ bool ChipSwimlaneCollector::run_begin(
         }
 
         EpochBucket &bucket = retained_runs_[slot];
+        auto admission_guard = RAIIScopeGuard([&] {
+            bucket.pending = RunExport{};
+            if (!bucket.artifact_dir.empty()) (void)::rmdir(bucket.artifact_dir.c_str());
+            bucket.artifact_dir.clear();
+            host_budget_.credit(bucket.charged_bytes.exchange(0, std::memory_order_acq_rel));
+            bucket.epoch.store(0, std::memory_order_release);
+            std::lock_guard<std::mutex> loss_lock(bucket.loss_mu);
+            bucket.loss_state = LossState::Free;
+            bucket.loss_epoch = 0;
+        });
         {
             // The identity this bucket's loss is charged against moves to the
             // new run in the same critical section that zeroes its counters and
@@ -3622,12 +3729,15 @@ bool ChipSwimlaneCollector::run_begin(
         bucket.epoch.store(run_epoch, std::memory_order_release);
         bucket.retain.store(true, std::memory_order_relaxed);
         bucket.target_installed = false;
+        bucket.recorded_window = recorded_metadata != nullptr;
         bucket.cut_slot = -1;
         bucket.cut_request = 0;
         bucket.pending = RunExport{};
-        bucket.pending.output_prefix = output_prefix;
+        bucket.pending.output_prefix = frozen_prefix;
         bucket.pending.level = level;
         bucket.pending.armed_run_epoch = run_epoch;
+        bucket.pending.recorded_window = recorded_metadata != nullptr;
+        bucket.pending.legacy_destination = !retain_across_runs_ && recorded_metadata == nullptr;
         // The submission this run's records belong to, owned by the export the
         // writer publishes from. A caller with none to state leaves the
         // all-zero nonce, which is the only value a reader may not match on.
@@ -3671,13 +3781,75 @@ bool ChipSwimlaneCollector::run_begin(
                 );
             }
         }
-        bucket.state.store(static_cast<int>(EpochState::Admitting), std::memory_order_release);
+        if (recorded_metadata != nullptr) {
+            // The snapshot owns preparation-only metadata. No delayed shared
+            // header, terminal or resident Host publication can replace it.
+            const auto &source = *recorded_metadata;
+            const auto &submit = source.host_submit_records;
+            const auto &upload = source.host_upload_records;
+            size_t submit_count = submit.size();
+            size_t upload_count = upload.size();
+            if (host_records != nullptr) {
+                submit_count = 0;
+                upload_count = 0;
+                host_records->for_each_finished_record([&](const HostPhaseRecord &record) {
+                    const auto kind = static_cast<HostPhaseKind>(record.kind);
+                    if (host_phase_kind_submits_task(kind)) ++submit_count;
+                    if (host_phase_kind_is_device_upload(kind)) ++upload_count;
+                });
+            }
+            size_t bytes = 0;
+            auto add = [&bytes](size_t count, size_t size) {
+                size_t term = 0;
+                if (!simpler::dfx::runs::checked_bytes(count, size, &term) || term > SIZE_MAX - bytes) return false;
+                bytes += term;
+                return true;
+            };
+            bool fits = add(source.core_to_thread.capacity(), sizeof(int8_t)) &&
+                        add(host_records ? submit_count : submit.capacity(), sizeof(HostPhaseRecord)) &&
+                        add(host_records ? upload_count : upload.capacity(), sizeof(HostPhaseRecord));
+            if (fits && charge_run_bytes(slot, bytes)) {
+                bucket.pending.num_aicore = source.num_aicore;
+                bucket.pending.num_orch_phase_threads = source.num_orch_phase_threads;
+                bucket.pending.core_to_thread = source.core_to_thread;
+                bucket.pending.host_phase_records_present = source.host_phase_records_present;
+                if (host_records != nullptr) {
+                    auto &saved_submit = bucket.pending.host_submit_records;
+                    auto &saved_upload = bucket.pending.host_upload_records;
+                    saved_submit.reserve(submit_count);
+                    saved_upload.reserve(upload_count);
+                    host_records->for_each_finished_record([&](const HostPhaseRecord &record) {
+                        const auto kind = static_cast<HostPhaseKind>(record.kind);
+                        if (host_phase_kind_submits_task(kind)) saved_submit.push_back(record);
+                        if (host_phase_kind_is_device_upload(kind)) saved_upload.push_back(record);
+                    });
+                    // In-place sorting has no payload-sized temporary allocation.
+                    auto earlier = [](const HostPhaseRecord &a, const HostPhaseRecord &b) {
+                        return a.start_ns < b.start_ns;
+                    };
+                    std::sort(saved_submit.begin(), saved_submit.end(), earlier);
+                    std::sort(saved_upload.begin(), saved_upload.end(), earlier);
+                } else {
+                    bucket.pending.host_submit_records = submit;
+                    bucket.pending.host_upload_records = upload;
+                }
+                bucket.pending.host_phase_submitted_tasks = source.host_phase_submitted_tasks;
+                bucket.pending.host_phase_total_records = source.host_phase_total_records;
+                bucket.pending.host_phase_dropped_records = source.host_phase_dropped_records;
+            } else {
+                bucket.admission_metadata_complete = false;
+            }
+            if (source.host_phase_records_present &&
+                (source.host_phase_dropped_records != 0 || submit_count != source.host_phase_submitted_tasks))
+                bucket.admission_metadata_complete = false;
+            bucket.verdict.metadata_complete = bucket.admission_metadata_complete;
+        }
         reset_epoch_store(slot, /*reset_merged_view=*/false);
 
         // The per-run collector state a producer and an exporter both read.
         // Deliberately not `begin_run`: that clears the one record store, which
         // is exactly what a predecessor's still-arriving buffers need to keep.
-        output_prefix_ = output_prefix;
+        output_prefix_ = frozen_prefix;
         chip_swimlane_level_ = level;
         json_extensions_.fill({});
         // Host-side per-run state, cleared for the same reason the extensions
@@ -3694,6 +3866,8 @@ bool ChipSwimlaneCollector::run_begin(
         host_phase_total_records_ = 0;
         host_phase_dropped_records_ = 0;
         host_state_incomplete_ = false;
+        bucket.state.store(static_cast<int>(EpochState::Admitting), std::memory_order_release);
+        admission_guard.dismiss();
     }
     validate_run_pool();
     // Every shard must see this epoch before the device can publish into it,
@@ -3841,6 +4015,12 @@ void ChipSwimlaneCollector::run_close(
         }
     }
 
+    install_run_cut(slot);
+}
+
+void ChipSwimlaneCollector::install_run_cut(size_t slot) {
+    EpochBucket &bucket = retained_runs_[slot];
+    const uint64_t run_epoch = bucket.epoch.load(std::memory_order_acquire);
     // Arm the per-queue cut. Every buffer this run will ever publish is already
     // in a device ready queue at this instant, so each queue's target is finite
     // and a successor's later traffic cannot discharge it.
@@ -3868,6 +4048,56 @@ void ChipSwimlaneCollector::run_close(
     }
     retained_cv_.notify_all();
     if (credit_notifier_) credit_notifier_();
+}
+
+bool ChipSwimlaneCollector::recorded_window_open(uint64_t run_epoch) const {
+    std::lock_guard<std::mutex> lock(retained_mu_);
+    const int slot = find_run_slot(run_epoch);
+    return slot >= 0 && retained_runs_[static_cast<size_t>(slot)].recorded_window;
+}
+
+bool ChipSwimlaneCollector::close_recorded_window(uint64_t run_epoch, int timeout_ms) {
+    if (timeout_ms < 0) return false;
+    std::unique_lock<std::mutex> lock(retained_mu_);
+    const int found = find_run_slot(run_epoch);
+    if (found < 0) return true;
+    const size_t slot = static_cast<size_t>(found);
+    EpochBucket &bucket = retained_runs_[slot];
+    if (!bucket.recorded_window) return true;
+    const auto state = static_cast<EpochState>(bucket.state.load(std::memory_order_acquire));
+    if (state == EpochState::Sealed) return true;
+    if (fatal_.load(std::memory_order_acquire)) {
+        release_deferred_.store(true, std::memory_order_release);
+        return false;
+    }
+    if (state != EpochState::Admitting) return false;
+    if (!bucket.target_installed) {
+        lock.unlock();
+        install_run_cut(slot);
+        lock.lock();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+        int failed = 0;
+        if (bucket.cut_slot < 0 || cut_counters_exhausted() ||
+            !cut_failed_queues(bucket.cut_slot, bucket.cut_request, &failed) || failed != 0)
+            return false;
+        if (cut_stage2_done(bucket.cut_slot)) break;
+        if (retained_cv_.wait_until(lock, deadline) == std::cv_status::timeout && !cut_stage2_done(bucket.cut_slot))
+            return false;
+    }
+    lock.unlock();
+    // File publication never owns this phase: another model can detach while
+    // the publisher is blocked on a predecessor's filesystem operation.
+    try {
+        return seal_run_for_export(slot, simpler::dfx::runs::Verdict::Published);
+    } catch (...) {
+        // Caller-side sealing failures retain the window and publish a
+        // permanent error before waking waiters, using a fixed reason.
+        release_deferred_.store(true, std::memory_order_release);
+        publish_fatal("recorded window sealing failed");
+        return false;
+    }
 }
 
 bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
@@ -3981,6 +4211,9 @@ void ChipSwimlaneCollector::refresh_retained_run_view(int collector_shard) {
 
 void ChipSwimlaneCollector::release_run_slot(size_t slot) {
     EpochBucket &bucket = retained_runs_[slot];
+    // Legacy output lives outside this reservation. The owning close/publisher
+    // keeps the slot non-Free during this empty-directory removal.
+    if (bucket.pending.legacy_destination && !bucket.artifact_dir.empty()) (void)::rmdir(bucket.artifact_dir.c_str());
     {
         // Accounting authority is retired before anything else, and under the
         // same lock a charge takes: every path back to `Free` passes here, so
@@ -3994,19 +4227,19 @@ void ChipSwimlaneCollector::release_run_slot(size_t slot) {
         bucket.transport_retired = 0;
         bucket.transport_retired_records = 0;
     }
-    // Free the storage first, then give its bytes back: a credit ahead of the
-    // release would let an admission see headroom that does not exist yet.
-    bucket.pending = RunExport{};
-    // The path is dropped, never the directory: a published run's artifact lives
-    // in it. Only a withdrawal that proved its references released removes one,
-    // and it does so before reaching here.
-    bucket.artifact_dir.clear();
-    const size_t charged = bucket.charged_bytes.exchange(0, std::memory_order_acq_rel);
-    if (charged > 0) host_budget_.credit(charged);
-    // Published under `retained_mu_` so an admission waiting for capacity cannot
-    // miss the transition between its scan and its wait.
     {
+        // Admission inspects destination metadata under this mutex. Retire the
+        // same metadata and publish Free atomically with respect to that scan.
+        // Destruction only frees detached Host containers; no reader ACK, file
+        // operation or callback occurs while the table is locked.
         std::lock_guard<std::mutex> lk(retained_mu_);
+        // Published retained artifacts remain in their reserved directory.
+        bucket.artifact_dir.clear();
+        bucket.pending = RunExport{};
+        // Credit follows actual deallocation, so a new admission never spends
+        // headroom still occupied by its predecessor.
+        const size_t charged = bucket.charged_bytes.exchange(0, std::memory_order_acq_rel);
+        if (charged > 0) host_budget_.credit(charged);
         bucket.state.store(static_cast<int>(EpochState::Free), std::memory_order_release);
         progress_++;
     }
@@ -4015,6 +4248,11 @@ void ChipSwimlaneCollector::release_run_slot(size_t slot) {
 }
 
 int ChipSwimlaneCollector::publish_run_file(RunExport &data, const std::string &path) {
+    if (data.legacy_destination) {
+        data.artifact_path = path;
+        return write_swimlane_json(data);
+    }
+
     const std::string tmp = path + ".tmp";
     // Exclusive create: no other writer can share this temp file, and a stale
     // one from an earlier crash is an error rather than a silent reuse.
@@ -4046,7 +4284,8 @@ int ChipSwimlaneCollector::publish_run_file(RunExport &data, const std::string &
     return 0;
 }
 
-bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs::Verdict verdict) {
+bool ChipSwimlaneCollector::seal_run_for_export(size_t slot, simpler::dfx::runs::Verdict verdict) {
+    std::lock_guard<std::mutex> seal_lock(seal_mutex_);
     EpochBucket &bucket = retained_runs_[slot];
     const uint64_t epoch = bucket.epoch.load(std::memory_order_acquire);
 
@@ -4060,6 +4299,18 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
             slot, simpler::dfx::runs::Verdict::Quarantined, "a collector shard still holds a reference"
         );
         return false;
+    }
+
+    if (bucket.pending.recorded_window && bucket.cut_slot >= 0) {
+        if (!cut_release(bucket.cut_slot, simpler::dfx::runs::kCutAckBudgetMs)) {
+            bucket.state.store(static_cast<int>(EpochState::Quarantined), std::memory_order_release);
+            finish_retained_run(
+                slot, simpler::dfx::runs::Verdict::Quarantined, "a drain owner still holds the recorded window cut"
+            );
+            return false;
+        }
+        bucket.cut_slot = -1;
+        bucket.cut_request = 0;
     }
 
     // The merged copy every record needs here was charged when the record was
@@ -4108,6 +4359,27 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
     data.terminal_snapshot = bucket.terminal;
     data.terminal_reported = bucket.terminal_ok;
     const HandoffReport report = build_handoff_report(bucket.terminal, slot);
+    data.handoff = report;
+    if (data.recorded_window) {
+        // Receipts are Host facts even when the window has no device terminal
+        // denominator. The single-invocation report intentionally leaves its
+        // classes Unknown without that denominator.
+        auto received = [this](ProfBufferType kind) {
+            const auto &receipt = merged_receipt_[static_cast<size_t>(kind)];
+            HandoffClassReport result;
+            result.received_buffers = receipt.received_buffers;
+            result.received_records = receipt.received_records;
+            result.observed_buffers = receipt.observed_buffers;
+            result.invalid_index_buffers = receipt.invalid_index_buffers;
+            result.foreign_epoch_buffers = receipt.foreign_epoch_buffers;
+            result.malformed_count_buffers = receipt.malformed_count_buffers;
+            return result;
+        };
+        data.handoff.aicpu_task = received(ProfBufferType::AICPU_TASK);
+        data.handoff.aicore_task = received(ProfBufferType::AICORE_TASK);
+        data.handoff.sched_phase = received(ProfBufferType::AICPU_SCHED_PHASE);
+        data.handoff.orch_phase = received(ProfBufferType::AICPU_ORCH_PHASE);
+    }
     // The merged view's records have been moved out, so it describes no slot.
     // The next epoch's merge tests this, and a stale slot number would make it
     // short-circuit and seal an empty artifact.
@@ -4138,15 +4410,36 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
         report.aicore_task.published_buffers > report.aicore_task.received_buffers ?
             report.aicore_task.published_buffers - report.aicore_task.received_buffers :
             0;
+    bool recorded_host_loss = false;
+    if (data.recorded_window) {
+        const std::array<const HandoffClassReport *, 4> classes = {
+            &data.handoff.aicpu_task, &data.handoff.aicore_task, &data.handoff.sched_phase, &data.handoff.orch_phase
+        };
+        const std::array<uint64_t, 4> kept = {
+            data.total_perf_collected, data.total_aicore_collected, data.total_sched_phase_collected,
+            data.total_orch_phase_collected
+        };
+        for (size_t i = 0; i < classes.size(); ++i) {
+            const auto &receipt = *classes[i];
+            recorded_host_loss = recorded_host_loss || receipt.invalid_index_buffers != 0 ||
+                                 receipt.foreign_epoch_buffers != 0 || receipt.malformed_count_buffers != 0 ||
+                                 receipt.received_records != kept[i];
+        }
+    }
     if (verdict == simpler::dfx::runs::Verdict::Published &&
-        (data.collection.transport_retired != 0 || data.collection.not_received_buffers != 0 ||
+        (recorded_host_loss || data.collection.transport_retired != 0 || data.collection.not_received_buffers != 0 ||
          data.collection.unattributable_handoffs != 0 || data.collection.unpublished_loss != 0 ||
          !data.collection.metadata_complete || !bucket.retain.load(std::memory_order_acquire))) {
         verdict = simpler::dfx::runs::Verdict::PartialSafe;
     }
     data.collection.verdict = verdict;
 
-    bucket.state.store(static_cast<int>(EpochState::Sealed), std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(retained_mu_);
+        bucket.state.store(static_cast<int>(EpochState::Sealed), std::memory_order_release);
+        ++progress_;
+    }
+    retained_cv_.notify_all();
 
     // A verdict that leaves no artifact still has to come through here: the
     // records were only safe to move because the handshake above proved every
@@ -4157,10 +4450,20 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
         return false;
     }
 
+    return true;
+}
+
+bool ChipSwimlaneCollector::publish_sealed_run(size_t slot) {
+    EpochBucket &bucket = retained_runs_[slot];
+    RunExport &data = bucket.pending;
+    const uint64_t epoch = bucket.epoch.load(std::memory_order_acquire);
+    const auto verdict = data.collection.verdict;
     // This run's own reserved directory, taken at its admission from its own
     // output prefix, so the artifact lands beside the dispatch companions that
     // submission produced.
-    const std::string path = bucket.artifact_dir + "/records_e" + std::to_string(epoch) + ".json";
+    const std::string path = data.legacy_destination ?
+                                 data.output_prefix + "/chip_swimlane_records.json" :
+                                 bucket.artifact_dir + "/records_e" + std::to_string(epoch) + ".json";
     const int rc = publish_run_file(data, path);
     if (rc != 0) {
         finish_retained_run(slot, simpler::dfx::runs::Verdict::WriteFailed, path.c_str());
@@ -4173,7 +4476,10 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
 void ChipSwimlaneCollector::finish_retained_run(size_t slot, simpler::dfx::runs::Verdict verdict, const char *detail) {
     EpochBucket &bucket = retained_runs_[slot];
     const uint64_t epoch = bucket.epoch.load(std::memory_order_acquire);
-    run_errors_.record(epoch, verdict, detail);
+    // Recorded windows cannot infer complete device totals, but known Host
+    // loss still fails diagnostic quality without holding reader resources.
+    // Ordinary published-partial accounting keeps its existing policy.
+    run_errors_.record(epoch, verdict, detail, bucket.recorded_window);
     if (bucket.cut_slot >= 0) {
         // Retiring waits for every drain owner to prove it is out of this
         // slot's arrays. A failure leaves the slot retired for good rather than
@@ -4221,13 +4527,20 @@ void ChipSwimlaneCollector::finish_retained_run(size_t slot, simpler::dfx::runs:
 void ChipSwimlaneCollector::service_retained_runs() {
     for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
         EpochBucket &bucket = retained_runs_[slot];
-        if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) continue;
-        bool ready = false;
+        EpochState state;
         {
             std::lock_guard<std::mutex> lk(retained_mu_);
-            ready = bucket.target_installed;
+            state = static_cast<EpochState>(bucket.state.load(std::memory_order_acquire));
+            if (state != EpochState::Sealed &&
+                (state != EpochState::Admitting || bucket.recorded_window || !bucket.target_installed))
+                continue;
+            // A closed ordinary run cannot be abandoned or reused. A sealed
+            // run belongs exclusively to this publisher until retirement.
         }
-        if (!ready) continue;
+        if (state == EpochState::Sealed) {
+            (void)publish_sealed_run(slot);
+            continue;
+        }
 
         // Every terminal input acts, not only a pass: a cut that can never
         // settle still has to release its slot, or two failed epochs would
@@ -4247,10 +4560,10 @@ void ChipSwimlaneCollector::service_retained_runs() {
             if (waited < std::chrono::milliseconds(simpler::dfx::runs::kCutAckBudgetMs * 4)) continue;
             verdict = simpler::dfx::runs::Verdict::CutUnknown;
         }
-        if (!bucket.terminal_ok && verdict == simpler::dfx::runs::Verdict::Published) {
+        if (!bucket.recorded_window && !bucket.terminal_ok && verdict == simpler::dfx::runs::Verdict::Published) {
             verdict = simpler::dfx::runs::Verdict::CutUnknown;
         }
-        (void)seal_and_publish_run(slot, verdict);
+        if (seal_run_for_export(slot, verdict)) (void)publish_sealed_run(slot);
     }
 }
 
@@ -4264,7 +4577,7 @@ std::optional<std::chrono::steady_clock::time_point> ChipSwimlaneCollector::next
     for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
         const EpochBucket &bucket = retained_runs_[slot];
         if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) continue;
-        if (!bucket.target_installed) continue;
+        if (bucket.recorded_window || !bucket.target_installed) continue;
         const auto expiry = bucket.closed_at + std::chrono::milliseconds(simpler::dfx::runs::kCutAckBudgetMs * 4);
         if (!earliest.has_value() || expiry < earliest.value()) earliest = expiry;
     }
@@ -4301,7 +4614,7 @@ void ChipSwimlaneCollector::writer_main() {
     }
 }
 
-bool ChipSwimlaneCollector::flush_retained_runs(int timeout_ms, std::string *error) {
+bool ChipSwimlaneCollector::flush_retained_runs(int timeout_ms, std::string *error, uint64_t run_epoch) {
     // Readiness gates the wait and nothing else: a collector whose retention
     // was reconfigured off, or whose resources a rebuild already released, has
     // no epoch to wait for but may still hold a failure recorded while it did.
@@ -4320,6 +4633,7 @@ bool ChipSwimlaneCollector::flush_retained_runs(int timeout_ms, std::string *err
                     if (state == static_cast<int>(EpochState::Free)) continue;
                     if (state == static_cast<int>(EpochState::Quarantined)) continue;  // terminal, reported below
                     const uint64_t epoch = retained_runs_[slot].epoch.load(std::memory_order_acquire);
+                    if (run_epoch != 0 && epoch != run_epoch) continue;
                     if (epoch <= watermark && retained_runs_[slot].target_installed) pending = true;
                 }
                 if (!pending) break;
@@ -4360,7 +4674,7 @@ bool ChipSwimlaneCollector::flush_retained_runs(int timeout_ms, std::string *err
 bool ChipSwimlaneCollector::can_admit_retained_run() const {
     // Configuration first: a plain read, owned by the lane that serializes
     // every reconfiguration and rebuild.
-    if (!retain_across_runs_) return false;
+    if (!retain_across_runs_ && !retained_ready_.load(std::memory_order_acquire)) return false;
     // Readiness, fatality and capacity are read together under the one mutex
     // that moves them, so the answer describes a state this collector was
     // actually in. A free bucket alone proves neither of the other two, and a
@@ -4407,7 +4721,7 @@ ChipSwimlaneCollector::RetainedRunStats ChipSwimlaneCollector::retained_run_stat
 }
 
 bool ChipSwimlaneCollector::retained_runs_idle() const {
-    if (!retain_across_runs_) return true;
+    if (!retained_ready_.load(std::memory_order_acquire)) return true;
     std::lock_guard<std::mutex> lk(retained_mu_);
     for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
         if (retained_runs_[slot].state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) {

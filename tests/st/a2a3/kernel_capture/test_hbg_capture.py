@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import struct
 import subprocess
+import tempfile
 from collections import Counter
+from itertools import chain
 from pathlib import Path
 
 import pytest
@@ -135,6 +138,35 @@ def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
     assert "stage=same-carrier-and-slot rc=0" in result.stdout
 
 
+def _run_capture_probe(command, run, env):
+    # Streams reach disk before subprocess.run returns or raises TimeoutExpired.
+    try:
+        with (run / "stdout.log").open("w") as stdout, (run / "stderr.log").open("w") as stderr:
+            result = subprocess.run(
+                command,
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+    finally:
+        # task-submit can run as root; the artifact uploader runs as the runner user.
+        try:
+            for path in chain((run,), run.rglob("*")):
+                try:
+                    if not path.is_symlink():
+                        path.chmod(0o755 if path.is_dir() else 0o644)
+                except OSError as error:
+                    logging.warning("Capture log permission normalization failed for %s: %s", path, error)
+        except OSError as error:
+            logging.warning("Capture log permission normalization traversal failed for %s: %s", run, error)
+    result.stdout = (run / "stdout.log").read_text(errors="replace")
+    result.stderr = (run / "stderr.log").read_text(errors="replace")
+    return result
+
+
 @pytest.mark.parametrize(
     "scenario",
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
@@ -156,9 +188,12 @@ def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
     ],
 )
 def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scenario):
-    build, binaries = hbg_capture_probe
+    _, binaries = hbg_capture_probe
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
-    logs = build / f"ascend-{scenario}"
+    output = _ROOT / "outputs/hbg-capture"
+    output.mkdir(parents=True, exist_ok=True)
+    run = Path(tempfile.mkdtemp(prefix=f"scenario-{scenario}-device-{device}-", dir=output))
+    logs = run / "ascend"
     logs.mkdir()
     env = dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs))
     if scenario == 12:
@@ -167,15 +202,7 @@ def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scena
             SIMPLER_OP_EXECUTE_TIMEOUT_US="3000000",
             SIMPLER_STREAM_SYNC_TIMEOUT_MS="6000",
         )
-    result = subprocess.run(
-        [binaries[0], device, str(scenario), *binaries[1:]],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
-    (build / f"run-{scenario}.log").write_text(result.stdout + result.stderr)
+    result = _run_capture_probe([binaries[0], device, str(scenario), *binaries[1:]], run, env)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}\nDevice logs: {logs}"
     if scenario == 4:
         assert "stage=reject-duplicate-capture-launch rc=0" in result.stdout
@@ -268,6 +295,78 @@ def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
         assert all(int(row["pmu_total_cycles"]) > 0 for row in captured["records"])
         if replay:
             assert max(Counter(row["task_id"] for row in captured["records"]).values()) >= rounds
+
+
+@pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
+def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, replay):
+    import sys  # noqa: PLC0415
+    from collections import Counter  # noqa: PLC0415
+
+    binaries = build_probe(tmp_path, retained_models=True)
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    logs = tmp_path / "ascend-swimlane"
+    logs.mkdir()
+    output = tmp_path / "swimlane"
+    result = subprocess.run(
+        [binaries[0], device, *binaries[1:], str(output), str(replay), "swimlane"],
+        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    (tmp_path / "swimlane-native.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "stage=swimlane-flush rc=0" in result.stdout
+    if replay:
+        assert result.stdout.index("state=eager verified=48") < result.stdout.index(
+            "state=b-after-a-release verified=48"
+        )
+    ordinary = json.loads((output / "eager/chip_swimlane_records.json").read_text())
+    assert ordinary["aicore_tasks"] and not ordinary["metadata"].get("collection", {}).get("recorded_window")
+    assert not (output / "unused").exists()
+    for leaf, rounds in (("a", 2), ("b", 4)):
+        [path] = (output / leaf).glob("swimlane-*/records_e*.json")
+        before = path.read_bytes()
+        raw = json.loads(before)
+        collection = raw["metadata"]["collection"]
+        assert raw["chip_swimlane_level"] == 4
+        assert collection["recorded_window"] is True and collection["counts_unknown"] is True
+        assert collection["processing_complete"] and collection["metadata_complete"], collection
+        assert all(collection[key] is None for key in ("device_total", "device_dropped", "fatal", "reconciliation"))
+        # This fixed one-kernel graph has one task per replay; this is not an exported replay denominator.
+        assert len(raw["aicore_tasks"]) == replay * rounds * len(ordinary["aicore_tasks"])
+        if replay:
+            assert max(Counter(row[1] for row in raw["aicore_tasks"]).values()) >= rounds
+        trace_path = path.with_name("observations.json")
+        converted = subprocess.run(
+            [sys.executable, "-m", "simpler_setup.tools.swimlane_converter", str(path), "-o", str(trace_path)],
+            cwd=_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        (path.parent / "converter.log").write_text(converted.stdout + converted.stderr)
+        assert converted.returncode == 0, converted.stdout + converted.stderr
+        assert path.read_bytes() == before
+        trace = json.loads(trace_path.read_text())
+        assert trace["metadata"]["clock_domain"] == "device_syscnt_cycles"
+        assert trace["metadata"]["clock_alignment"]["status"] == "unavailable"
+        assert trace["metadata"]["collection"] == collection
+        events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+        assert all(event["ph"] in ("M", "X") for event in trace["traceEvents"])
+        observed = [event for event in events if event["args"]["population"] == "aicore_tasks"]
+        assert len(observed) == len(raw["aicore_tasks"])
+        assert [event["args"]["record_index"] for event in observed] == list(range(len(raw["aicore_tasks"])))
+        host = json.loads((path.parent / trace["metadata"]["host_preparation_file"]).read_text())
+        assert host["metadata"]["clock_domain"] == "host_monotonic_ns" and host["metadata"]["preparation_only"] is True
+        # Frozen preparation exists once even for zero replay; no Host rows are multiplied by rounds.
+        preparation_count = sum(len(stream) for stream in raw.get("host_orchestrator_phases", [])) + len(
+            raw.get("host_device_uploads", [])
+        )
+        assert preparation_count > 0
+        assert len([event for event in host["traceEvents"] if event["ph"] == "X"]) == preparation_count
 
 
 def check_args_dump_output(output: Path, replays: int):
