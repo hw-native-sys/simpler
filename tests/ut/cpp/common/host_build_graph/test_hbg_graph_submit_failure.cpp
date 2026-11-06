@@ -131,8 +131,12 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     EXPECT_GT(orch.task_allocator.heap_top(), 0u);
     const std::optional<GraphHostUpload> first_upload = graph_host_upload(*graph_state, 0);
     const std::optional<GraphHostUpload> second_upload = graph_host_upload(*graph_state, 1);
-    ASSERT_TRUE(first_upload.has_value());
-    ASSERT_TRUE(second_upload.has_value());
+    if (!first_upload.has_value()) {
+        FAIL() << "first_upload must exist";
+    }
+    if (!second_upload.has_value()) {
+        FAIL() << "second_upload must exist";
+    }
     EXPECT_EQ(first_upload->graph_key, 0x1715u);
     EXPECT_EQ(second_upload->graph_key, first_upload->graph_key) << "both shells replay one Graph";
     // Distinct bases alone would still pass if finalization handed out a wrong
@@ -261,7 +265,9 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     std::vector<std::pair<const char *, const char *>> ranges;
     for (size_t i = 0; i < 3; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
-        ASSERT_TRUE(upload.has_value());
+        if (!upload.has_value()) {
+            FAIL() << "upload must exist";
+        }
         EXPECT_EQ(upload->graph_key, definition->graph_key) << "shell " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_end);
@@ -911,7 +917,9 @@ TEST_F(HbgGraphSubmitFailureTest, ConcurrentDefinitionsFinalizeInSubmissionOrder
     const char *previous_end = nullptr;
     for (size_t i = 0; i < kGraphCount; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
-        ASSERT_TRUE(upload.has_value()) << "Graph " << i;
+        if (!upload.has_value()) {
+            FAIL() << "upload must exist" << "Graph " << i;
+        }
         EXPECT_EQ(upload->graph_key, graph_keys[i]) << "Graph " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_end);
@@ -1125,8 +1133,12 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
     orch.begin_scope();
     const std::optional<BoundaryRecording> heap_recording = record_with(heap_resident, 0x1801);
     const std::optional<BoundaryRecording> caller_recording = record_with(storage.data(), 0x1802);
-    ASSERT_TRUE(heap_recording.has_value());
-    ASSERT_TRUE(caller_recording.has_value());
+    if (!heap_recording.has_value()) {
+        FAIL() << "heap_recording must exist";
+    }
+    if (!caller_recording.has_value()) {
+        FAIL() << "caller_recording must exist";
+    }
 
     // Two distinct Definitions, so the comparison below is between two recordings
     // rather than one Definition against itself.
@@ -1191,4 +1203,56 @@ TEST_F(HbgGraphSubmitFailureTest, AHiddenAllocTaskLeavesItsDispatchPredicateDefi
     ASSERT_LT(slot, kPoisonedSlots) << "the submitted slot must be one this test poisoned";
     EXPECT_EQ(storage[slot].payload.predicate.op, PredicateOp::NONE);
     EXPECT_EQ(storage[slot].payload.predicate.addr, 0u);
+}
+
+TEST(HbgGraphDefinitionClaims, PublishedAndRetainedInflightKeyClaimsOneDefinition) {
+    GraphHostState state(GraphDefinitionArena{});
+    state.inflight.emplace(17, std::make_unique<GraphInflightRecording>());
+    EXPECT_EQ(state.claimed_definitions(), 1u);
+    state.definitions.try_emplace(17);
+    EXPECT_EQ(state.claimed_definitions(), 1u);
+    state.inflight.clear();
+    EXPECT_EQ(state.claimed_definitions(), 1u);
+}
+
+TEST(HbgGraphDefinitionClaims, MixedPublishedAndUnpublishedKeysPreserveSixteenDefinitionLimit) {
+    GraphHostState state(GraphDefinitionArena{});
+    for (uint64_t key = 0; key < 11; ++key) {
+        state.definitions.try_emplace(key);
+        state.inflight.emplace(key, std::make_unique<GraphInflightRecording>());
+    }
+    EXPECT_EQ(state.claimed_definitions(), 11u);
+    for (uint64_t key = 11; key < GRAPH_MAX_DEFINITIONS; ++key) {
+        state.inflight.emplace(key, std::make_unique<GraphInflightRecording>());
+    }
+    EXPECT_EQ(state.claimed_definitions(), GRAPH_MAX_DEFINITIONS);
+    state.inflight.emplace(GRAPH_MAX_DEFINITIONS, std::make_unique<GraphInflightRecording>());
+    EXPECT_EQ(state.claimed_definitions(), GRAPH_MAX_DEFINITIONS + 1);
+}
+
+TEST_F(HbgGraphSubmitFailureTest, PublishedRetainedKeysAdmitSixteenthDefinitionOnly) {
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    auto boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    orch.begin_scope();
+    for (uint64_t key = 1; key <= GRAPH_MAX_DEFINITIONS; ++key) {
+        const auto graph = orch.graph_begin(key, args);
+        ASSERT_FALSE(graph.has_error) << key;
+        ASSERT_TRUE(graph.recording) << key;
+        ASSERT_TRUE(graph.task_id.is_valid()) << key;
+        ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, args));
+        CoreTaskArgs task_args;
+        task_args.add_input(graph.params->tensor(0).ref());
+        ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
+        ASSERT_TRUE(orch.graph_end());
+        EXPECT_EQ(graph_state->claimed_definitions(), key);
+        EXPECT_EQ(graph_state->definitions.size(), key);
+        EXPECT_EQ(graph_state->inflight.size(), key);
+    }
+    const auto rejected = orch.graph_begin(GRAPH_MAX_DEFINITIONS + 1, args);
+    EXPECT_TRUE(rejected.has_error);
+    EXPECT_FALSE(rejected.task_id.is_valid());
+    EXPECT_EQ(graph_state->claimed_definitions(), GRAPH_MAX_DEFINITIONS);
 }
