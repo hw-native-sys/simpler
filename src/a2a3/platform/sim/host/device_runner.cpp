@@ -100,7 +100,7 @@ struct DeviceRunner::ActiveRun {
 
     void reset_startup() {
         // The launch owner serializes reset with thread creation and join.
-        // A joinable thread may not have reached startup.wait() yet.
+        // A joinable thread may not have reached startup.arrive_and_wait() yet.
         assert(std::all_of(aicpu_threads.begin(), aicpu_threads.end(), [](const std::thread &thread) {
             return !thread.joinable();
         }));
@@ -171,7 +171,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         auto load_sym = [this](const char *name, void **out) -> bool {
             void *sym = dlsym(aicpu_so_handle_, name);
             if (sym == nullptr) {
-                LOG_ERROR("dlsym failed for %s: %s", name, dlerror());
+                LOG_ERROR("dlsym failed for %s: %s; rebuild AICPU SO with the matching host build", name, dlerror());
                 return false;
             }
             *out = sym;
@@ -186,6 +186,8 @@ int DeviceRunner::ensure_binaries_loaded() {
         if (!load_sym("aicpu_execute", reinterpret_cast<void **>(&aicpu_execute_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!native_invocation_functions_.load(load_sym)) return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym("platform_aicpu_affinity_bind_thread", reinterpret_cast<void **>(&bind_aicpu_thread_func_)))
+            return PTO_RUNTIME_ERR_INTERNAL;
         load_optional_sym("simpler_aicpu_register_callable", reinterpret_cast<void **>(&aicpu_register_callable_func_));
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
@@ -326,26 +328,54 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
 
-        aicore_execute_func_ =
-            reinterpret_cast<void (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t)>(
-                dlsym(aicore_so_handle_, "aicore_execute_wrapper")
+        auto initialize_tls = reinterpret_cast<int (*)()>(dlsym(aicore_so_handle_, "initialize_aicore_sim_tls"));
+        if (initialize_tls == nullptr) {
+            LOG_ERROR(
+                "dlsym failed for initialize_aicore_sim_tls: %s; rebuild kernel SOs with the matching host build",
+                dlerror()
             );
-        if (aicore_execute_func_ == nullptr) {
-            LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
+        if (int error = initialize_tls(); error != 0) {
+            LOG_ERROR("AICore SO failed to create TLS keys: %d", error);
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+
+        aicore_execute_func_ = reinterpret_cast<decltype(aicore_execute_func_)>(
+            dlsym(aicore_so_handle_, "aicore_execute_wrapper_checked")
+        );
+        if (aicore_execute_func_ == nullptr) {
+            LOG_ERROR(
+                "dlsym failed for aicore_execute_wrapper_checked: %s; rebuild kernel SOs with the matching host build",
+                dlerror()
+            );
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper_checked from %s", aicore_so_path_.c_str());
 
         // Pass core identity setter function pointers to the AICore SO so it can
         // set per-thread subblock_id and cluster_id for pto-isa's TPUSH/TPOP hooks.
-        auto set_identity_helpers =
-            reinterpret_cast<void (*)(void *, void *)>(dlsym(aicore_so_handle_, "set_sim_core_identity_helpers"));
-        if (set_identity_helpers != nullptr) {
-            set_identity_helpers(
-                reinterpret_cast<void *>(sim_context_set_subblock_id),
-                reinterpret_cast<void *>(sim_context_set_cluster_id)
+        auto set_identity_helpers = reinterpret_cast<SimIdentityHelpersInstallFn>(
+            dlsym(aicore_so_handle_, "sim_install_core_identity_setters")
+        );
+        if (set_identity_helpers == nullptr) {
+            LOG_ERROR(
+                "dlsym failed for sim_install_core_identity_setters: %s; rebuild kernel SOs with the matching host "
+                "build",
+                dlerror()
             );
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            aicore_execute_func_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
+        set_identity_helpers(sim_context_set_subblock_id, sim_context_set_cluster_id);
     }
 
     return 0;
@@ -560,14 +590,14 @@ int DeviceRunner::prepare_execution(
     }
     kernel_args_.pmu_reg_addrs = reinterpret_cast<uint64_t>(pmu_regs_array);
 
-    if (aicpu_execute_func_ == nullptr || !native_invocation_functions_.ready() || aicore_execute_func_ == nullptr ||
-        set_platform_regs_func_ == nullptr || set_platform_dump_base_func_ == nullptr ||
-        set_platform_phase_base_func_ == nullptr || set_platform_run_result_func_ == nullptr ||
-        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
-        set_platform_pmu_reg_addrs_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
-        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
-        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr ||
-        set_platform_chip_swimlane_base_func_ == nullptr ||
+    if (aicpu_execute_func_ == nullptr || !native_invocation_functions_.ready() || bind_aicpu_thread_func_ == nullptr ||
+        aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
+        set_platform_dump_base_func_ == nullptr || set_platform_phase_base_func_ == nullptr ||
+        set_platform_run_result_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
+        set_platform_pmu_base_func_ == nullptr || set_platform_pmu_reg_addrs_func_ == nullptr ||
+        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
+        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
+        set_platform_scope_stats_base_func_ == nullptr || set_platform_chip_swimlane_base_func_ == nullptr ||
         set_platform_chip_swimlane_run_terminal_bank_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
         set_chip_swimlane_enabled_func_ == nullptr || set_platform_dump_args_run_terminal_func_ == nullptr ||
@@ -604,6 +634,7 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
         run->join();
         // Includes workers never created and those cancelled before execution.
         run_completion_.abandon(startup_error);
+        LOG_INFO("Simulated startup cancelled; all created core threads joined");
     });
     std::chrono::steady_clock::time_point sim_t0;
 
@@ -715,18 +746,19 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
                 run->aicore_threads.push_back(create_thread(
                     [this, run, i, core_type, physical_core_id]() {
-                        // Cancelled startup is joined and abandoned by the launch owner;
-                        // only released workers contribute task_finished().
-                        if (!run->startup.wait()) return;
-                        aicore_execute_func_(
+                        const int rc = aicore_execute_func_(
                             run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
                             kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table,
-                            kernel_args_.run_result_epoch
+                            kernel_args_.run_result_epoch, &SimThreadStartGate::report_ready_and_wait, &run->startup
                         );
-                        run_completion_.task_finished();
+                        run_completion_.task_finished(rc == 0 ? 0 : PTO_RUNTIME_ERR_INTERNAL);
                     },
                     std::string("sim-") + (core_type == CoreType::AIC ? "aic" : "aiv") + "-" + std::to_string(i)
                 ));
+            }
+            if (int error = run->startup.wait_for_arrivals_or_error(static_cast<size_t>(num_aicore)); error != 0) {
+                LOG_ERROR("AICore thread TLS binding failed: %d", error);
+                return PTO_RUNTIME_ERR_INTERNAL;
             }
             return 0;
         },
@@ -738,7 +770,12 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                      result_base = run_result_region_base(prepared.pipeline_slot)]() {
                         // Cancelled startup is joined and abandoned by the launch owner;
                         // only released workers contribute task_finished().
-                        if (!run->startup.wait()) return;
+                        int32_t affinity_index = -1;
+                        const int affinity_error = bind_aicpu_thread_func_(&affinity_index);
+                        auto unbind = RAIIScopeGuard([this]() {
+                            bind_aicpu_thread_func_(nullptr);
+                        });
+                        if (!run->startup.arrive_and_wait(affinity_error)) return;
                         auto invocation =
                             native_invocation_functions_.bind(over_launch, result_base, kernel_args_.run_result_epoch);
                         const auto entry = run->entry_gate.enter(launch_aicpu_num, invocation.initializer());
@@ -757,6 +794,13 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                     },
                     "sim-aicpu-" + std::to_string(i)
                 ));
+            }
+            if (int error = run->startup.wait_for_arrivals_or_error(
+                    static_cast<size_t>(num_aicore) + static_cast<size_t>(over_launch)
+                );
+                error != 0) {
+                LOG_ERROR("AICPU affinity TLS binding failed: %d", error);
+                return PTO_RUNTIME_ERR_INTERNAL;
             }
             return 0;
         }
@@ -967,6 +1011,7 @@ void DeviceRunner::unload_executor_binaries() {
         aicpu_so_handle_ = nullptr;
         aicpu_execute_func_ = nullptr;
         native_invocation_functions_ = {};
+        bind_aicpu_thread_func_ = nullptr;
         aicpu_register_callable_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
         set_orch_device_id_func_ = nullptr;

@@ -60,6 +60,7 @@
 #if defined(__linux__)
 static std::atomic<bool> reject_device_bind{false};
 static std::atomic<bool> reject_device_key{false};
+static std::atomic<int> reject_identity_key_after{-1};
 static std::atomic<bool> reject_thread_create{false};
 extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg) {
     if (reject_thread_create.exchange(false)) return EAGAIN;
@@ -74,7 +75,7 @@ extern "C" int __wrap_pthread_setspecific(pthread_key_t key, const void *value) 
     return __real_pthread_setspecific(key, value);
 }
 extern "C" int __wrap_pthread_key_create(pthread_key_t *key, void (*destroy)(void *)) {
-    if (reject_device_key.exchange(false)) return EAGAIN;
+    if (reject_device_key.exchange(false) || reject_identity_key_after.fetch_sub(1) == 0) return EAGAIN;
     return __real_pthread_key_create(key, destroy);
 }
 
@@ -800,3 +801,57 @@ TEST(SimDeviceBinding, SuccessfulLegacyBindingAndCheckedValidation) {
     pto_cpu_sim_bind_device(-1);
     EXPECT_EQ(pto_cpu_sim_get_bound_device(), -1);
 }
+
+#if defined(__linux__)
+TEST(SimIdentityDeathTest, PartialKeyFailureRollsBackAndRetriesWithoutTouchingOtherKeys) {
+    for (int position : {0, 1}) {
+        ASSERT_EXIT(
+            {
+                auto budget = [] {
+                    std::vector<pthread_key_t> keys;
+                    pthread_key_t key;
+                    while (pthread_key_create(&key, nullptr) == 0)
+                        keys.push_back(key);
+                    for (auto k : keys)
+                        pthread_key_delete(k);
+                    return keys.size();
+                };
+                pthread_key_t sentinel;
+                int value = 11;
+                if (pthread_key_create(&sentinel, nullptr) != 0 || pthread_setspecific(sentinel, &value) != 0) _exit(1);
+                const auto before = budget();
+                reject_identity_key_after = position;
+                if (sim_context_set_subblock_id(1) != EAGAIN) _exit(2);
+                reject_identity_key_after = -1;
+                if (budget() != before || pthread_getspecific(sentinel) != &value) _exit(3);
+                if (sim_context_set_subblock_id(1) != 0 || sim_context_set_cluster_id(7) != 0) _exit(4);
+                if (pto_sim_get_subblock_id() != 1) _exit(5);
+                if (budget() != before - 2 || pthread_getspecific(sentinel) != &value) _exit(6);
+                pthread_key_delete(sentinel);
+                _exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+TEST(SimIdentity, FailedUpdatesPreserveIdentityAndAllowRetry) {
+    ASSERT_EQ(sim_context_set_subblock_id(1), 0);
+    pto_cpu_sim_acquire_device(971);
+    ASSERT_EQ(pto_cpu_sim_bind_device_checked(971), 0);
+    ASSERT_EQ(sim_context_set_cluster_id(7), 0);
+    void *original = pto_sim_get_pipe_shared_state(1, 8);
+    ASSERT_NE(original, nullptr);
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_set_subblock_id(0), ENOMEM);
+    EXPECT_EQ(pto_sim_get_subblock_id(), 1u);
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_set_cluster_id(9), ENOMEM);
+    EXPECT_EQ(pto_sim_get_pipe_shared_state(1, 8), original);
+    ASSERT_EQ(sim_context_set_subblock_id(0), 0);
+    ASSERT_EQ(sim_context_set_cluster_id(9), 0);
+    EXPECT_EQ(pto_sim_get_subblock_id(), 0u);
+    EXPECT_NE(pto_sim_get_pipe_shared_state(1, 8), original);
+    pto_cpu_sim_bind_device(-1);
+    pto_cpu_sim_release_device(971);
+}
+#endif

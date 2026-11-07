@@ -125,22 +125,19 @@ pthread_key_t g_subblock_id_key{};
 pthread_key_t g_cluster_id_key{};
 std::atomic<bool> g_identity_keys_initialized{false};
 
-void ensure_identity_keys() {
-    if (g_identity_keys_initialized.load(std::memory_order_acquire)) {
-        return;
-    }
+int ensure_identity_keys() {
+    if (g_identity_keys_initialized.load(std::memory_order_acquire)) return 0;
     std::lock_guard<std::mutex> lock(g_identity_key_mutex);
-    if (g_identity_keys_initialized.load(std::memory_order_relaxed)) {
-        return;
-    }
-    if (pthread_key_create(&g_subblock_id_key, nullptr) != 0) {
-        return;
-    }
-    if (pthread_key_create(&g_cluster_id_key, nullptr) != 0) {
+    if (g_identity_keys_initialized.load(std::memory_order_relaxed)) return 0;
+    int error = pthread_key_create(&g_subblock_id_key, nullptr);
+    if (error != 0) return error;
+    error = pthread_key_create(&g_cluster_id_key, nullptr);
+    if (error != 0) {
         pthread_key_delete(g_subblock_id_key);
-        return;
+        return error;
     }
     g_identity_keys_initialized.store(true, std::memory_order_release);
+    return 0;
 }
 
 }  // namespace
@@ -220,14 +217,20 @@ void clear_cpu_sim_shared_storage() {
 // Per-thread core identity setters (called by sim aicore platform code)
 // ---------------------------------------------------------------------------
 
-void sim_context_set_subblock_id(uint32_t subblock_id) {
-    ensure_identity_keys();
-    pthread_setspecific(g_subblock_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(subblock_id)));
+int sim_context_set_subblock_id(uint32_t subblock_id) {
+    if (const int error = ensure_identity_keys(); error != 0) return error;
+    const int error =
+        pthread_setspecific(g_subblock_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(subblock_id)));
+    if (error != 0) LOG_ERROR("Sim subblock identity binding failed: %d", error);
+    return error;
 }
 
-void sim_context_set_cluster_id(uint32_t cluster_id) {
-    ensure_identity_keys();
-    pthread_setspecific(g_cluster_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(cluster_id)));
+int sim_context_set_cluster_id(uint32_t cluster_id) {
+    if (const int error = ensure_identity_keys(); error != 0) return error;
+    const int error =
+        pthread_setspecific(g_cluster_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(cluster_id)));
+    if (error != 0) LOG_ERROR("Sim cluster identity binding failed: %d", error);
+    return error;
 }
 
 // ---------------------------------------------------------------------------

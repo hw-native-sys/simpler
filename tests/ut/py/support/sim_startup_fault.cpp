@@ -21,6 +21,8 @@ namespace {
 // Substituted by the test before compilation; no production configuration.
 constexpr const char *trigger = "@THREAD@";
 constexpr bool fail_creation = false;
+constexpr int skip_bindings = 0;
+std::atomic<int> matching_bindings{0};
 std::atomic<bool> triggered{false};
 std::atomic<bool> reject_next_create{false};
 pthread_t target_creator{};
@@ -44,7 +46,8 @@ extern "C" int pthread_setspecific(pthread_key_t key, const void *value) noexcep
     static auto real = reinterpret_cast<Set>(dlsym(RTLD_NEXT, "pthread_setspecific"));
     char name[16]{};
     pthread_getname_np(pthread_self(), name, sizeof(name));
-    if (value && std::strcmp(name, trigger) == 0 && !triggered.exchange(true)) {
+    if (std::strcmp(name, trigger) == 0 && matching_bindings.fetch_add(1) >= skip_bindings &&
+        !triggered.exchange(true)) {
         if (!fail_creation) {
             const char message[] = "SIM_STARTUP_BIND_ENOMEM\n";
             (void)write(2, message, sizeof(message) - 1);

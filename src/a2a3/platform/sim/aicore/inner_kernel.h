@@ -139,7 +139,7 @@ inline uint64_t get_sys_cnt_aicore() { return sys_cnt_now_ticks(); }
  * Per-thread simulated register base address and physical core ID.
  * Stored in pthread TLS (not C++ thread_local) to avoid glibc TLSDESC
  * issues when this SO is loaded with RTLD_LOCAL on aarch64.
- * Set by aicore_execute_wrapper, read by read_reg/write_reg.
+ * Set by aicore_execute_wrapper_checked, read by read_reg/write_reg.
  */
 volatile uint8_t *sim_get_reg_base();
 uint32_t sim_get_physical_core_id();

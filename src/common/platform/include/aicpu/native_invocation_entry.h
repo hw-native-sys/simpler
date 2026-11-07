@@ -31,12 +31,20 @@ struct NativeInvocationEntry {
     }
     AicpuEntryGateInitializer initializer() { return {initialize, this}; }
 
-    template <typename Work>
-    int32_t complete(AicpuEntryGateResult gate, Work work) const {
+    template <typename Work, typename Reject>
+    int32_t complete(AicpuEntryGateResult gate, Work work, Reject reject) const {
         if (gate.callback_index < 0) return gate.status;
+        // A cohort-wide rejection has no execution owner. Callback 0 owns
+        // cancellation independently of TLS and holds its finish contribution
+        // until cleanup ends, so the final result cannot overtake retirement.
+        if (gate.callback_index == 0 && gate.status != 0) reject();
         const int32_t rc = gate.execute ? work() : gate.status;
         // Work has left all local cleanup scopes before its unique contribution.
         return finish != nullptr ? finish(gate.callback_index, rc) : -1;
+    }
+    template <typename Work>
+    int32_t complete(AicpuEntryGateResult gate, Work work) const {
+        return complete(gate, work, [] {});
     }
 };
 
