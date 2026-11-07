@@ -99,6 +99,7 @@ jobs:
           python-version: ${{ inputs.python_version }}
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
 
       - name: Set up environment

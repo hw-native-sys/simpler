@@ -69,6 +69,7 @@ jobs:
             echo "::warning::brew could not install ccache; the C++ build will compile from scratch"
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
 
       # Self-hosted runners keep one checkout and one home directory across
