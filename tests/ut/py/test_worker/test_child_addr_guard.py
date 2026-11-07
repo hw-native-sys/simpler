@@ -888,6 +888,7 @@ class TestDomainReleaseOrdering:
             _domain_ranks={0: 0, 1: 1},
             _allocation_pending=False,
             _host_mappings=[],
+            _host_window_owner=None,
         )
         return w, handle, bufs
 

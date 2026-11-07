@@ -116,6 +116,8 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) { return 1; }
 
+extern "C" int teardown_report_supported_impl(void) { return 1; }
+
 /**
  * One run's native submission may be ordered behind another's on this platform.
  *

@@ -22,6 +22,9 @@
 namespace {
 std::unordered_map<void *, size_t> mappings;
 int physical_handles = 0;
+std::unordered_set<void *> registered_hosts;
+bool fail_host_register = false;
+bool fail_host_unregister = false;
 bool fail_get_device = false;
 int device_calls = 0;
 bool fail_physical_free = false;
@@ -62,6 +65,18 @@ aclError unmap_buffer(void *p) {
     return ACL_SUCCESS;
 }
 }  // namespace
+
+extern "C" aclError aclrtHostRegister(void *cpu, uint64_t, aclrtHostRegisterType, void **device) {
+    if (fail_host_register) return ACL_ERROR_FAILURE;
+    assert(registered_hosts.insert(cpu).second);
+    *device = cpu;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtHostUnregister(void *cpu) {
+    if (fail_host_unregister) return ACL_ERROR_FAILURE;
+    assert(registered_hosts.erase(cpu) == 1);
+    return ACL_SUCCESS;
+}
 
 extern "C" aclError aclrtGetDevice(int32_t *id) {
     ++device_calls;
@@ -201,11 +216,66 @@ static void prepare_peer(CommHandle h, uint64_t id, bool release_marker) {
     }
 }
 
+static void test_host_registration_lifecycle(bool fail_init, bool sdma) {
+    auto h = std::make_unique<CommHandle_>();
+    h->rank = 0;
+    h->nranks = sdma ? 1 : 2;
+    char folder[] = "/tmp/simpler-host-lifecycle-XXXXXX";
+    if (sdma) {
+        assert(mkdtemp(folder));
+        h->rootinfo_path = std::string(folder) + "/root";
+    }
+    const auto size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const auto name = "simpler_host_ut_" + std::to_string(getpid());
+    const auto path = "/" + name;
+    const int fd = shm_open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0 && ftruncate(fd, static_cast<off_t>(size)) == 0);
+    assert(close(fd) == 0);
+    uint64_t ctx = 0, base = 0;
+    size_t mapped = 0;
+    const uint32_t ranks[] = {0, 1};
+    fail_host_register = fail_init;
+    const uint32_t mask = sdma ? comm_workspace_bit(CommWorkspaceKind::SDMA) : 0;
+    const int rc =
+        comm_alloc_host_domain_windows(h.get(), 1, ranks, h->nranks, 0, size, mask, name.c_str(), &ctx, &base, &mapped);
+    if (fail_init) {
+        assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && registered_hosts.empty());
+        assert(comm_abort_domain_windows(h.get(), 1, 2, 0) == 0);
+    } else {
+        assert(rc == 0 && mapped == size && registered_hosts.size() == 1);
+        const auto *context = reinterpret_cast<const CommContext *>(ctx);
+        assert(context->windowsIn[0] == base && context->windowsIn[1] == 0);
+        assert(comm_workspace<CommWorkspaceKind::SDMA>(*context).addr == 0);
+        if (!sdma) {
+            fail_host_unregister = true;
+            assert(comm_destroy(h.get()) == COMM_RECLAMATION_UNCONFIRMED);
+            assert(h->domain_allocations.count(1) == 1 && registered_hosts.size() == 1);
+            fail_host_unregister = false;
+        }
+        assert(comm_release_domain_windows(h.get(), 1, h->nranks, 0) == 0);
+    }
+    assert(h->domain_allocations.empty() && registered_hosts.empty() && mappings.empty());
+    const int owner_fd = shm_open(path.c_str(), O_RDWR, 0);
+    assert(owner_fd >= 0);
+    assert(close(owner_fd) == 0);
+    assert(shm_unlink(path.c_str()) == 0);
+    if (sdma) {
+        const auto marker =
+            barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(1, "host_window"), 0);
+        assert(std::remove(marker.c_str()) == 0 && rmdir(folder) == 0);
+    }
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     fabric_supported = std::string(argv[1]) == "fabric";
     reject_explicit_access = std::string(argv[2]) == "map_grants_access";
     const std::string scenario = reject_explicit_access ? "success" : argv[2];
+    if (scenario == "host_register_failure" || scenario == "host_unregister_failure" ||
+        scenario == "host_borrow_sdma") {
+        test_host_registration_lifecycle(scenario == "host_register_failure", scenario == "host_borrow_sdma");
+        return 0;
+    }
     fail_physical_free = scenario == "fallback_cleanup";
     fail_context_upload = scenario == "late_import";
     fail_get_device = scenario == "early_get_device";

@@ -40,7 +40,9 @@ def test_memory_source_is_part_of_reuse_identity():
         ("a5", "tensormap_and_ringbuffer", (), True),
         ("a5", "tensormap_and_ringbuffer", ("urma",), True),
         ("a5", "host_build_graph", ("urma",), False),
-        ("a2a3", "tensormap_and_ringbuffer", (), False),
+        ("a2a3", "tensormap_and_ringbuffer", (), True),
+        ("a2a3", "tensormap_and_ringbuffer", ("urma",), False),
+        ("a2a3sim", "tensormap_and_ringbuffer", (), False),
         ("a5sim", "tensormap_and_ringbuffer", (), False),
         ("a5", "tensormap_and_ringbuffer", ("sdma",), False),
         ("a5", "tensormap_and_ringbuffer", ("rdma",), False),
@@ -78,7 +80,7 @@ def test_cpu_window_exports_prevent_domain_release(native_host_memory):
         assert exported[2] == 42
         with pytest.raises(ValueError, match="domain.release"):
             buf.close()
-        with pytest.raises(RuntimeError, match="belongs to L2"):
+        with pytest.raises(RuntimeError, match="belongs to the domain"):
             buf.shm.unlink()
         assert not buf.closed and buf.shm.buf is not None
         with pytest.raises(BufferError, match="export"):

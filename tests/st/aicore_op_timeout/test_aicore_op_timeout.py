@@ -19,9 +19,11 @@ would wedge the sim.
 
 import os
 import time
+from pathlib import Path
 
 import pytest
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable
+from simpler.task_interface import AddressSpace, CallConfig, ChipCallable, CommBufferSpec, CoreCallable, TaskArgs
+from simpler.teardown_report import TeardownPath
 from simpler.worker import Worker
 
 from simpler_setup.elf_parser import extract_text_section
@@ -56,12 +58,15 @@ def _build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, *, enable_sdma: bool):
+def _configure_timeout_fault(monkeypatch):
     configure_logging("error")
     monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", "2000")
     monkeypatch.setenv("SIMPLER_OP_EXECUTE_TIMEOUT_US", "3000000")
     monkeypatch.setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "6000")
 
+
+def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, *, enable_sdma: bool):
+    _configure_timeout_fault(monkeypatch)
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(
         level=2,
@@ -160,3 +165,57 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids,
 def test_sdma_worker_aicore_fault_teardown_is_bounded(st_platform, st_device_ids, monkeypatch, tmp_path):
     """Real SDMA provisioning must not turn one AICore fault into a five-minute close."""
     _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, enable_sdma=True)
+
+
+@pytest.mark.sdma
+@pytest.mark.sdma_fault
+@pytest.mark.platforms(["a2a3"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(RUNTIME)
+@pytest.mark.timeout(90)
+def test_host_domain_uses_native_sdma_fault_recovery(st_platform, st_device_ids, monkeypatch):
+    _configure_timeout_fault(monkeypatch)
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=RUNTIME,
+        device_ids=[int(st_device_ids[0])],
+        num_sub_workers=0,
+        enable_sdma=True,
+    )
+    chip = worker.register(_build_chip_callable(st_platform))
+    worker.init()
+    config = CallConfig()
+    config.aicpu_thread_num = 2
+    backing_names = []
+
+    def run(orch, _args, cfg):
+        host = orch.allocate_domain(
+            name="host",
+            members=[0],
+            window_size=4096,
+            buffers=[CommBufferSpec("table", "uint8", 64, 64)],
+            memory_source=AddressSpace.HOST,
+            workspace_engines=("sdma",),
+            retain_after_run=True,
+        )
+        backing_names.append(host.member(0).buffers["table"].shm.name)
+        orch.submit_next_level(chip, TaskArgs(), cfg, worker=0)
+
+    try:
+        with pytest.raises(RuntimeError, match=r"(finalize_native_run|wait_native_run_completion) failed with code"):
+            worker.run(run, config=config)
+    finally:
+        started = time.monotonic()
+        try:
+            worker.close()
+        except RuntimeError as exc:
+            # The parent can report the skipped domain release even after
+            # the chip's reset ends the device generation.
+            assert "window reclamation is unconfirmed" in str(exc)
+        assert time.monotonic() - started < 30
+    (report,) = worker.teardown_reports().values()
+    assert report.committed and report.path == TeardownPath.FATAL
+    assert report.recovery_attempts_total == 1 and report.probe_confirmed
+    (backing,) = backing_names
+    assert not Path("/dev/shm", backing).exists()

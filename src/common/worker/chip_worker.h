@@ -1091,6 +1091,7 @@ private:
     // that drives this worker's control commands and its run lane.
     bool exported_device_regions_live_ = false;
     bool comm_reclamation_unconfirmed_ = false;
+    bool worker_sdma_enabled_ = false;
     // A backend retained communication references; device reset is not a cleanup proof.
     bool comm_cleanup_unconfirmed_ = false;
     std::unique_ptr<ChipRunLane> run_lane_;

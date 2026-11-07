@@ -288,12 +288,14 @@ int comm_alloc_domain_windows(
 );
 
 /**
- * Allocate an A5 Host-backed domain. The runtime owns the exclusive POSIX shm
- * named by host_shm_name (a bare name of at most 31 ASCII letters/digits/_/-).
- * The mapping extent is page-aligned. Only the local windowsIn/windowsOut entry
- * is directly addressable; peers are reached through the URMA workspace.
- * workspace_mask accepts zero or URMA. Ownership and abort/release semantics
- * match comm_alloc_domain_windows. This symbol is optional on other backends.
+ * Initialize a Host-backed domain window identified by host_shm_name, a bare
+ * name of at most 31 ASCII letters, digits, underscores or hyphens.
+ * On A5, the runtime creates and unlinks the POSIX backing, and peers are
+ * reached through an optional domain-owned URMA workspace. On A2/A3, the
+ * caller owns the backing and unlink, and the SDMA bit enables peer mappings
+ * for the Worker-owned SDMA workspace. Local mappings support MTE.
+ * Abort and release use the same entry points as comm_alloc_domain_windows.
+ * This symbol is optional on other backends.
  */
 int comm_alloc_host_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
