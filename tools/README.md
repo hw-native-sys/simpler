@@ -7,6 +7,13 @@ End-user profiling / debug CLIs live in
 [`simpler_setup/tools/`](../simpler_setup/tools/) and ship with the wheel —
 invoke them via `python -m simpler_setup.tools.<name>`.
 
+## framework_queue_gil
+
+[Controlled Torch NPU queue/GIL probe](framework_queue_gil/README.md) for
+`query()` and `empty_cache()` with pending Python callbacks. It includes native
+and released-GIL positive controls and captures bounded subprocess failures.
+It is a diagnostic, not a Simpler runtime acceptance test.
+
 ## benchmark_rounds.sh
 
 Batch-run a predefined set of scene tests on hardware and report per-round
