@@ -56,6 +56,7 @@ class SchedulerContext {
     friend class MixAdmissionTestPeer;
     friend class SchedulerRetirementTestPeer;
     friend class SchedulerDispatchTestPeer;
+    friend class CompletionBatchTestPeer;
 
 public:
     // =========================================================================
@@ -425,12 +426,20 @@ private:
         ,
         uint64_t dispatch_ts, uint64_t finish_ts
 #endif
+        ,
+        int16_t *deferred_completion_count = nullptr, bool flush_completion_count = true
     );
 
     static void promote_pending_to_running(CoreExecState &core);
     static void clear_running_slot(CoreExecState &core);
 
     void check_running_cores_for_completion(
+        int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
+        bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+    );
+
+    template <bool Batched>
+    void poll_running_cores(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
     );

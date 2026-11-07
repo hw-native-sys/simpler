@@ -80,6 +80,34 @@ else()
     target_link_options(test_a5_tmr_urma_completion_kernel PRIVATE -Wl,--gc-sections)
 endif()
 
+# Real polling and completion code with observable COND and doorbell sinks.
+# Each target compiles its production TUs with the same profiling definitions
+# as the fixture; the shared object library has a different Context layout.
+function(a5_completion_batch_case suffix dfx sched_profiling)
+    set(target test_a5_tmr_completion_batch${suffix})
+    simpler_ut_add_target(NAME ${target}
+        ARCH a5 RUNTIME tensormap_and_ringbuffer TIER aicpu
+        SOURCES test_completion_batch.cpp
+            ${A5_RUNTIME_DIR}/scheduler/scheduler.cpp
+            ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        DEFINES SIMPLER_PLATFORM_NAME="a5sim" SIMPLER_DFX=${dfx}
+            SIMPLER_SCHED_PROFILING=${sched_profiling}
+        LINK a5_ut_support
+        COMPILE_OPTIONS -ffunction-sections -fdata-sections
+        LABEL no_hardware PRIVATE_WORKDIR TIMEOUT 20)
+    if(APPLE)
+        target_link_options(${target} PRIVATE -Wl,-dead_strip)
+    else()
+        target_link_options(${target} PRIVATE -Wl,--gc-sections)
+    endif()
+endfunction()
+a5_completion_batch_case("" 0 0)
+a5_completion_batch_case(_dfx 1 0)
+a5_completion_batch_case(_profiling 1 1)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it
