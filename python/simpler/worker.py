@@ -5913,10 +5913,10 @@ class Worker:
     def _comm_plan_rootinfo_path(self) -> str:
         """Per-Worker rootinfo path used by HCCL/sim base comm_init.
 
-        Namespaced by parent pid + Python id(self) so two concurrent L3
-        Workers in the same process do not collide on the handshake file.
+        The owner UUID isolates concurrent and successive Worker lifetimes,
+        including predecessors whose handshake files are still present.
         """
-        tag = f"pto_multi_comm_{os.getpid()}_{id(self):x}.bin"
+        tag = f"pto_multi_comm_{os.getpid()}_{self._owner_id}.bin"
         return os.path.join("/tmp", tag)
 
     def _allocate_next_level_worker_id(self) -> int:
