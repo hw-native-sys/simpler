@@ -126,12 +126,6 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     return success ? 0 : -1;
 }
 
-// This fixture owns no enabled argument-dump producer.
-extern "C" bool is_dump_args_enabled() { return false; }
-void dump_args_flush(int) {}
-void dump_args_close_run(int) {}
-void dump_args_init(int, DumpArgsLevel) {}
-
 extern "C" void aicpu_reset_legacy_execution_entry() {}
 
 extern "C" int32_t legacy_aicpu_execute(Runtime *) {

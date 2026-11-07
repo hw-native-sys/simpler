@@ -41,18 +41,19 @@ saw, without the timing distortion of inline printing.
 
 ### Which runtimes capture
 
-Capture needs a thread that observes each task's own dispatch and completion,
-so it is a property of the runtime rather than of the platform:
+Capture requires each task's own entry and completion boundaries. The runtime
+supplies these through its scheduler or the A5 HBG task-time copy service:
 
 | Platform | Runtime | Per-task capture | Request for it |
 | -------- | ------- | ---------------- | -------------- |
 | a2a3 | `host_build_graph` | yes — AICPU scheduler dispatches and reaps | served |
 | a2a3 | `tensormap_and_ringbuffer` | yes | served |
 | a5 | `tensormap_and_ringbuffer` | yes | served |
-| a5 | `host_build_graph` | **no** — on-core schedulers dispatch and reap | **refused at `simpler_prepare_run` with `PTO_RUNTIME_ERR_UNSUPPORTED`** |
+| a5 | `host_build_graph` | yes — AICore task boundaries with AICPU copy service | served for AICore-scheduled graphs; fallback shapes refused with `PTO_RUNTIME_ERR_UNSUPPORTED` |
 
-The last row is the same on the onboard and the simulated backend. §3.1.1 is why,
-what the refusal looks like to a caller, and which entrypoints check it.
+The table describes ordinary runs, including native graph child tasks, on both
+onboard and simulated backends. It does not add ArgsDump to retained Kernel
+capture/replay. See §3.1.1 for the A5 HBG task boundary contract.
 
 Enable in one line (`full` = every task, every arg):
 
@@ -107,9 +108,9 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-args        # partial
 
 # pytest
 pytest tests/st/<case> --platform a5sim --dump-args full
-# a5 host_build_graph has no per-task capture: every scene under it is refused
-# with -1001 while this flag is set (§3.1.1). Use the a2a3 mirror for an HBG
-# capture, or a5 tensormap_and_ringbuffer for an a5 one.
+# A5 HBG argument dumping requires an AICore-scheduled graph (§3.1.1).
+# A graph selecting the AICPU fallback is refused while dumping is enabled.
+pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args full
 pytest tests/st/a2a3/host_build_graph/dump_args --platform a2a3sim --dump-args full
 pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump --platform a5sim --dump-args hybrid
 pytest tests/st/<case> --platform a2a3sim --dump-args full
@@ -146,82 +147,52 @@ submission order. AICore executors read the same `SIMPLER_DFX_FLAG_DUMP_ARGS`
 bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 `AFTER_COMPLETION` snapshots see the kernel's final writes.
 
-### 3.1.1 The capture instant is the task's, and where that is unavailable
+### 3.1.1 Task-time boundaries on A5 HBG
 
-A record is taken at the task's own instant: `BEFORE_DISPATCH` as the
-scheduler hands the task to a core, and `AFTER_COMPLETION` as it reaps the
-FIN. That is what makes an intermediate tensor's recorded content the one
-that task actually read or wrote, which is what replay and localization
-need. Every AICPU-dispatching path captures there.
+A record describes the task's own data: inputs before any participant executes,
+outputs after all its participants return. A run-boundary snapshot cannot supply
+this contract when tasks reuse an intermediate buffer.
 
-**A5 `host_build_graph` has no such instant available to the AICPU, and
-therefore has no per-task argument capture at all.** Its route is the AICore
-Scheduler, where the on-core schedulers dispatch *and* complete tasks, so no
-AICPU thread observes an individual task start or finish. The only instants the
-AICPU owns are the run's — before the DMB gate opens and after every core
-has retired — and a snapshot taken there is not the task's data:
+A5 `host_build_graph` captures at its AICore scheduler's selected task
+boundaries. The existing AICPU participants provide bounded copy service; they
+do not dispatch or complete these tasks. Control-only nodes have no kernel
+argument records, including ordinary inline dependency nodes and native graph
+control nodes.
 
-- task A produces X and task B consumes it, so B's input read at the
-  pre-run boundary holds whatever X was *before A ran*;
-- two tasks write the same buffer in turn, so the post-run read gives the
-  later write as *both* their outputs.
+1. The first participant requests the BEFORE copy. Every participant waits for
+   that task's seal before entering the kernel. It does not wait for blocks
+   that have not been dispatched, so a task can span several waves.
+2. Each returning participant completes its output writes and publishes the
+   selected physical cache lines before incrementing the returned count.
+3. Earlier blocks retire normally. The last returning participant requests the
+   AFTER copy and holds the task's existing final completion until it is sealed.
+   Dependents therefore cannot overwrite the bytes being copied.
 
-#### What a request for it does
+Ordinary tasks and native Graph children use the same path. Records preserve
+native children's public parent/local `TaskId`, rather than their private
+scheduler index. Mix tasks include all active AIC/AIV participants and emit one
+argument set per task, rather than one per block or core.
 
-`args_dump_capture_supported_impl` is the per-runtime answer, declared beside
-the other `*_supported_impl` capability predicates in the platform's
-`c_api_shared.cpp` and defined in each runtime's `runtime_maker.cpp`. a2a3
-`host_build_graph` and both `tensormap_and_ringbuffer` runtimes answer 1; a5
-`host_build_graph` answers 0.
+The runtime answers `args_dump_capture_supported_impl = 1`. A dump-enabled bind
+requires an AICore-scheduled graph; an unsupported scheduler shape returns
+`PTO_RUNTIME_ERR_UNSUPPORTED` before publication. Requests with argument dumping
+disabled retain their normal scheduling behavior. The AICPU-scheduled fallback
+is outside the argument-dump support contract.
 
-**`simpler_prepare_run` refuses a request this answer cannot serve**, returning
-`PTO_RUNTIME_ERR_UNSUPPORTED` (-1001) before any state is read — so before the
-bind, before any device resource is provisioned, and on both the onboard and the
-simulated backend, which run the same AICPU and AICore sources. The two public
-entrypoints that carry a per-run `CallConfig` are `simpler_prepare_run` and
-`simpler_run`, and the second delegates to the first, so one check covers both;
-through the Python API that is every `Worker.submit` / `run()` whose
-`CallConfig.enable_dump_args` is non-zero. A caller sees the run fail with
-`prepare_native_run failed with code -1001`, nothing is written under its
-`output_prefix`, and the lane is not stopped — the next run is served normally.
+The copy service uses the existing bounded metadata buffers and payload arena.
+One reservation per AICPU lane prevents partially copied records from being
+published. A service step copies at most 64 KiB; back-pressure is retried without
+inventing dropped records, while actual copy/publication progress extends the
+wait budget. Abort abandons the open record and acknowledges failure; it never
+publishes a successful seal. Unproven core retirement leaves producer accounting
+unsettled rather than reading or closing a possibly active producer.
 
-Three properties are the point of refusing there rather than later:
-
-- an empty `args_dump.json` would be indistinguishable from a capture that
-  found nothing there was to capture;
-- a run admitted and then found unable to settle this owner's accounting has
-  already executed and already held a terminal bank and a pipeline slot;
-- only this owner is a term. A request that does not name it reaches the device
-  unchanged, and a request that names it alongside the swimlane and PMU is
-  refused for *it* — those two remain available on this runtime and are asserted
-  there by `tests/st/a5/host_build_graph/test_dfx_joined_launch_attribution.py`,
-  which also asserts this refusal.
-
-The answer is the runtime's and not a bind's. a5 `host_build_graph` also keeps
-an AICPU-scheduled fallback, selected inside its bind from the graph's own task
-kinds and from nothing a caller states, so an answer that followed the selection
-would make the capture available or not depending on whether a graph happened to
-hold a task the resident route declines.
-
-**No default or bundled diagnostic set may include it there.** `--dump-args`
-defaults to `off` and no scene, example or CI lane turns it on implicitly, so a
-request is always an explicit one — but a *sweep* is a request for every scene
-it covers: `pytest tests/st/a5 --dump-args partial` now fails every a5
-`host_build_graph` scene instead of running them and collecting nothing. Select
-by path. Likewise, a suite that enables "every owner this backend has" must read
-that set per backend rather than per owner list; the joined-launch suites do
-this through their own `DEVICE_OWNERS`, and the a5 `host_build_graph` copy
-names the unsupported one in `UNSUPPORTED_OWNERS` instead of enabling it.
-
-Closing the gap needs a capture at the real task boundary, which on that route
-means either an AICore↔AICPU rendezvous per task (the AICore publishes
-"about to execute N" and waits for the host's acknowledgement, and again
-after it completes) or AICore-side payload staging. The first adds a device
-round-trip to every task's dispatch path; the second adds per-task payload
-storage. The bounded design is
-[`docs/investigations/2026-10-a5-resident-per-task-args-capture.md`](../investigations/2026-10-a5-resident-per-task-args-capture.md);
-the capability is deferred to its own change, and until then the request is
-refused rather than partly served.
+`tests/st/a5/host_build_graph/dump_args` checks intermediate values, native child
+identities, a 73-block Mix child and empty views in FULL, HYBRID and PARTIAL.
+The A5 DFX smoke action explicitly selects these cases when `/run-a5` or a
+scheduled sweep requests its DFX jobs; default PR CI does not acquire an A5.
+See [the boundary and storage contract](../investigations/2026-10-a5-resident-per-task-args-capture.md)
+for memory ownership and failure details.
 
 ### 3.2 Partial Dump — Select Specific Args
 
@@ -471,9 +442,9 @@ the Tensor object and needs no explicit per-task registration.
 
 Full template:
 [`tests/st/a2a3/host_build_graph/dump_args`](../../tests/st/a2a3/host_build_graph/dump_args/).
-The a5 mirror at `tests/st/a5/host_build_graph/dump_args` demonstrates the same
-two registration APIs and asserts its computation, but collects nothing: that
-runtime has no capture (§3.1.1).
+The A5 mirror at `tests/st/a5/host_build_graph/dump_args` checks the same
+intermediate payloads through the AICore-scheduled ordinary and native Graph
+paths, including Mix waves and ranked empty views (§3.1.1).
 
 ### 3.5 Native A3 capture/replay collection
 
@@ -974,7 +945,7 @@ the dropped-record count incomplete.
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
 | Arena access | direct via SVM | targeted `copy_from_device` inside `on_buffer_collected` |
 | Tensor-payload support | Supported | Supported |
-| Per-task capture by runtime | both runtimes | `tensormap_and_ringbuffer` only; `host_build_graph` has none and refuses the request (§3.1.1) |
+| Per-task capture by runtime | both runtimes | both runtimes; `host_build_graph` requires AICore scheduling (§3.1.1) |
 | `reconcile_counters` | recover held buffers and snapshot loss counts only after producer-stop proof and host quiescence | identical |
 | Ordinary close | proof: `quiesce` → reconcile → export; unknown: `stop(false)` → export host-owned records | identical |
 
@@ -1007,10 +978,11 @@ device.
 
 ## 7. Limitations
 
-The runtime-level one comes first: **a5 `host_build_graph` has no per-task
-capture, and a request for it is refused at `simpler_prepare_run`** rather than
-served partly or emptily. §3.1.1 is the full account; the table in §2 is the
-per-runtime answer.
+On A5 `host_build_graph`, argument dumping requires AICore scheduling. A graph
+that selects the AICPU fallback returns `PTO_RUNTIME_ERR_UNSUPPORTED` before
+launch publication. With dumping disabled, the normal scheduler choice is
+unchanged. This task-time copy service does not add ArgsDump support to retained
+Kernel capture/replay (§3.1.1).
 
 Three pressure or failure conditions then exist, on the runtimes that do
 capture, when dump buffers run out of space. Successful arena backpressure
@@ -1133,7 +1105,7 @@ host hand-off queue).
 
 | Condition | Flag | Metadata | Payload | a2a3 | a5 |
 | --------- | ---- | -------- | ------- | ---- | -- |
-| Runtime has no per-task capture | request refused `-1001`, nothing prepared | None | None | — | a5 `host_build_graph` (§3.1.1) |
+| A5 HBG graph selects the AICPU fallback with dumping enabled | request refused `-1001` before launch | None | None | — | AICore scheduling is required (§3.1.1) |
 | Tensor > arena | `truncated` | Preserved | Partial (`arena/2` bytes) | Same | Same |
 | Arena host writer falls behind | none on success | Preserved | Preserved after bounded wait for this thread's ack | Same | Same |
 | Record buffer full, no free buffer | `dropped_records`; `dropped_records_complete` states accounting confidence | Lost | Lost | After gate timeout | Same |

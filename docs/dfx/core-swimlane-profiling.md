@@ -69,12 +69,12 @@ captured args — zero hand-written shapes or scalars.
   idiom (e.g. a manual `prod.record()`) compiles only for the device.
   Tensor restoration is currently an a2a3-only capability; a5 metadata-only
   and zero-filled replays remain available.
-- **The case's runtime must capture arguments.** The dump this tool replays
-  from is the args dump, and a5 `host_build_graph` has no per-task capture: a
-  case under `tests/st/a5/host_build_graph/` is refused at preparation with
-  `-1001` and produces no dump. See
-  [args-dump.md §3.1.1](args-dump.md#311-the-capture-instant-is-the-tasks-and-where-that-is-unavailable).
-  The other three backends are unaffected.
+- **The case's runtime must capture arguments.** A5 `host_build_graph`
+  provides per-task argument capture for AICore-scheduled graphs. A graph
+  selecting the AICPU fallback is refused with `-1001` when dumping is enabled;
+  dumping disabled keeps its normal scheduler choice. This support describes
+  ordinary runs, not retained Kernel capture/replay. See
+  [args-dump.md §3.1.1](args-dump.md#311-task-time-boundaries-on-a5-hbg).
 - **Two trace outputs** — a native Insight `trace.json` and an
   auto-generated Perfetto-friendly variant (sub-laned + atomic flags;
   see [§3.4](#34-viewing-insight-vs-perfetto)).

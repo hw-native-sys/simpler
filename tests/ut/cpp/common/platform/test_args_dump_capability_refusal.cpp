@@ -29,8 +29,8 @@
  * definition below rather than a production runtime's. Which answer each of the
  * four runtimes actually gives is stated in its own `runtime_maker.cpp` and
  * qualified by that backend's `test_dfx_joined_launch_attribution.py`: the
- * three that capture assert the records' content, and a5 `host_build_graph`
- * asserts this refusal over the real public API.
+ * four qualify their records through real task-time consumers. A5 HBG
+ * additionally refuses unsupported scheduler shapes during binding.
  */
 
 #include "runtime_c_api.h"

@@ -1147,6 +1147,9 @@ enum class SchedulerErrorSite : uint64_t {
     GROUP_CLOSE_INVALID = 124,
     ORDERED_EXIT_IN_FLIGHT = 125,
     ORDERED_EXIT_TIMEOUT = 126,
+    ARGS_DUMP_BOUNDARY_TIMEOUT = 140,
+    ARGS_DUMP_REFUSED = 141,
+    ARGS_DUMP_ABORT_TIMEOUT = 142,
     GRAPH_BIND_NODE = 130,
     GRAPH_BIND_DEFINITION = 131,
     GRAPH_BIND_INSTANCE = 132,
@@ -1293,6 +1296,7 @@ struct alignas(128) SchedulerWorkerContext {
     // and consuming one of its words would make a context carrying this offset
     // read as malformed.
     uint64_t pmu_cells_offset;
+    uint64_t args_dump_address;
 
     alignas(128) uint64_t graph_summary_offset;
     uint64_t scheduler_count;
