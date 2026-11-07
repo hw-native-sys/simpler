@@ -61,6 +61,7 @@ flags in [`simpler_setup/tools/README.md`](../../../simpler_setup/tools/README.m
 | `strace_timing` | run log | host/device wall-clock breakdown; `--rounds-table` for per-round |
 | `swimlane_converter` | `chip_swimlane_records_*.json` | Perfetto trace + per-function task summary; `--overhead` adds the scheduler-overhead counters (needs `deps.json`) |
 | `sched_overhead_analysis` | swimlane + deps | scheduler bottleneck vs starvation verdict |
+| `scheduler_benchmark` | swimlane + deps | a run's dispatch cost and schedule cost, against a near-optimal schedule and a lower bound |
 | `core_swimlane` | args dump | intra-core pipeline trace for one task |
 | `deps_viewer` | `deps.json` | the dependency graph |
 | `critical_path` | `deps.json` | critical path through the graph |

@@ -88,6 +88,34 @@ TEST(DepGenReplayTest, RejectsUnknownExplicitDepFlagBits) {
     EXPECT_FALSE(std::filesystem::exists(path));
 }
 
+TEST(DepGenReplayTest, EachTaskCarriesTheLaunchAttributesItsRecordFlags) {
+    const std::filesystem::path path = chain_output_path("launch_attrs");
+    std::filesystem::remove(path);
+
+    const uint32_t flags[3] = {0u, DEP_GEN_FLAG_SYNC_START, DEP_GEN_FLAG_PREDICATED};
+    DepGenRecord records[3]{};
+    for (uint32_t i = 0; i < 3; ++i) {
+        records[i].task_id = TaskId::make(0, i);
+        records[i].flags = flags[i];
+        records[i].block_num = 1;
+    }
+    ASSERT_EQ(dep_gen_replay_emit_deps_json(records, 3, path.c_str()), 0);
+
+    const std::string json = read_file(path);
+    // A task's attributes: from its "sync_start" key up to its args.
+    const auto attrs_of = [&json](uint32_t local) {
+        const size_t task = json.find("\"task_id\":\"" + std::to_string(local) + "\"");
+        if (task == std::string::npos) return std::string();
+        const size_t from = json.find("\"sync_start\"", task);
+        if (from == std::string::npos) return std::string();
+        return json.substr(from, json.find(",\"args\"", from) - from);
+    };
+    EXPECT_EQ(attrs_of(0), "\"sync_start\":false,\"predicated\":false") << json;
+    EXPECT_EQ(attrs_of(1), "\"sync_start\":true,\"predicated\":false") << json;
+    EXPECT_EQ(attrs_of(2), "\"sync_start\":false,\"predicated\":true") << json;
+    std::filesystem::remove(path);
+}
+
 // Zero records is a valid graph, not a reason to write nothing: a run that
 // submitted no task has an empty graph, and suppressing the file would make that
 // indistinguishable from a collection failure. The host emit path relies on this

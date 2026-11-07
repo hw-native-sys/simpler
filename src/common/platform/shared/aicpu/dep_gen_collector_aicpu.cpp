@@ -273,8 +273,8 @@ void dep_gen_aicpu_init() {
 }
 
 void dep_gen_aicpu_record_submit(
-    TaskId task_id, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
-    const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, bool sync_start, bool predicated, int tensor_count,
+    const void *const *tensor_ptrs, const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
     const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind, int block_num, const int32_t kernel_ids[3]
 ) {
     if (!g_enable_dep_gen) {
@@ -403,6 +403,12 @@ void dep_gen_aicpu_record_submit(
     uint32_t base_flags = in_manual_scope ? static_cast<uint32_t>(DEP_GEN_FLAG_IN_MANUAL_SCOPE) : 0u;
     if (early_dispatch) {
         base_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_EARLY_DISPATCH);
+    }
+    if (sync_start) {
+        base_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_SYNC_START);
+    }
+    if (predicated) {
+        base_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_PREDICATED);
     }
     if (needed > 1) {
         base_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_HAS_OVERFLOW);

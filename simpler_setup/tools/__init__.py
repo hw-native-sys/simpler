@@ -13,6 +13,7 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 - ``swimlane_converter``   : perf JSON -> Perfetto/Chrome trace
 - ``sched_overhead_analysis``: scheduler overhead deep-dive
 - ``critical_path``          : chip swimlane critical-path compute/stall analysis
+- ``scheduler_benchmark``    : chip swimlane + deps.json -> a run's dispatch cost and schedule cost
 - ``deps_viewer``           : deps.json -> text or pan/zoom HTML dependency graph
 - ``wait_reduction_sim``   : deps.json -> bounded-bitmap WAIT reduction coverage vs full-DAG bound
 - ``dump_viewer``           : inspect args dumps

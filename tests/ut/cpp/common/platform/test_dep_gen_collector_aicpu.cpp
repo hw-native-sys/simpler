@@ -92,7 +92,8 @@ protected:
     ) {
         const int32_t kernel_ids[3] = {-1, -1, -1};
         dep_gen_aicpu_record_submit(
-            task_id, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
+            task_id, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*sync_start=*/false, /*predicated=*/false,
+            /*tensor_count=*/0,
             /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, explicit_dep_count, explicit_deps, explicit_dep_kinds_raw,
             default_explicit_dep_kind, /*block_num=*/1, kernel_ids
         );
@@ -132,6 +133,26 @@ TEST_F(DepGenCollectorAicpuTest, SubmitAfterOrchThreadIdxIsRecordedAndFlushed) {
     EXPECT_EQ(header_->queue_tails[0], 1u);
     EXPECT_EQ(header_->queues[0][0].buffer_ptr, reinterpret_cast<uint64_t>(buffer_));
     EXPECT_EQ(state_->current_buf_ptr, 0u);
+}
+
+TEST_F(DepGenCollectorAicpuTest, LaunchAttributesSetTheirOwnFlagBits) {
+    dep_gen_aicpu_set_orch_thread_idx(0);
+    const int32_t kernel_ids[3] = {-1, -1, -1};
+    const bool attrs[3][2] = {{false, false}, {true, false}, {false, true}};  // {sync_start, predicated}
+    for (int i = 0; i < 3; ++i) {
+        dep_gen_aicpu_record_submit(
+            simpler::ut::test_task_id(0x10 + i), /*in_manual_scope=*/false, /*early_dispatch=*/false, attrs[i][0],
+            attrs[i][1], /*tensor_count=*/0, /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, /*explicit_dep_count=*/0,
+            /*explicit_deps=*/nullptr, /*explicit_dep_kinds_raw=*/nullptr, kCreatorEdgeDepKinds, /*block_num=*/1,
+            kernel_ids
+        );
+    }
+
+    ASSERT_EQ(buffer_->count, 3u);
+    const uint32_t launch_bits = DEP_GEN_FLAG_SYNC_START | DEP_GEN_FLAG_PREDICATED;
+    EXPECT_EQ(buffer_->records[0].flags & launch_bits, 0u);
+    EXPECT_EQ(buffer_->records[1].flags & launch_bits, static_cast<uint32_t>(DEP_GEN_FLAG_SYNC_START));
+    EXPECT_EQ(buffer_->records[2].flags & launch_bits, static_cast<uint32_t>(DEP_GEN_FLAG_PREDICATED));
 }
 
 TEST_F(DepGenCollectorAicpuTest, NullKindsUseDefaultForEveryDependency) {

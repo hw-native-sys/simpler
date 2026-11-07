@@ -12,7 +12,7 @@ A task_id carries whichever TaskId layout its runtime uses, and nothing in the v
 itself says which -- the layout is chosen from the runtime name a document carries
 (``metadata.runtime`` / a top-level ``runtime`` key), never guessed. Common tooling
 (swimlane_converter, deps_viewer, critical_path, wait_reduction_sim,
-sched_overhead_analysis) resolves that name once and calls ``get(name)`` for the
+sched_overhead_analysis, scheduler_benchmark) resolves that name once and calls ``get(name)`` for the
 per-runtime implementation, rather than importing ``tools.hbg`` / ``tools.tmr``
 directly.
 """
