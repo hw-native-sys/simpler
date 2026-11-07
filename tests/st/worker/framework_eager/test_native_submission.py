@@ -91,6 +91,7 @@ def test_native_submission(runtime, queue, framework_module, tmp_path, request):
         "expected": [8, 22, 50],
         "cancelled_refused": True,
         "duplicate_refused": True,
+        "failure_propagated": True,
     }
 
 

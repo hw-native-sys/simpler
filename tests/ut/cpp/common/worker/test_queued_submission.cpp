@@ -52,17 +52,15 @@ TEST(QueuedSubmissionTest, PreparationDoesNotExecuteAndSubmitIsOneShot) {
     EXPECT_TRUE(submission.wait_until(FakeRun::Deadline::max()));
 }
 
-TEST(QueuedSubmissionTest, CancelBeforeSubmitNeverCallsExecutorAndWakesWaiter) {
+TEST(QueuedSubmissionTest, CancelBeforeSubmitNeverCallsExecutorAndFailsWait) {
     bool called = false;
     Submission submission([&] {
         called = true;
         return FakeRun{};
     });
-    auto result = std::async(std::launch::async, [&] {
-        EXPECT_THROW(submission.wait_until(FakeRun::Deadline::max()), std::runtime_error);
-    });
+    EXPECT_FALSE(submission.wait_until(std::chrono::steady_clock::now()));
     EXPECT_TRUE(submission.cancel(std::make_exception_ptr(std::runtime_error("cancelled"))));
-    result.get();
+    EXPECT_THROW(submission.wait_until(FakeRun::Deadline::max()), std::runtime_error);
     EXPECT_THROW(submission.submit(), std::logic_error);
     EXPECT_FALSE(called);
     EXPECT_TRUE(submission.done());

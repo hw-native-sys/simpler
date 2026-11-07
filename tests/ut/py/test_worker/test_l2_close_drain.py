@@ -61,6 +61,7 @@ def chip(monkeypatch, request):
 
     class NativeRun:
         wait_count = 0
+        _owner_recovery_required = True
 
         def done(self):
             return self not in live

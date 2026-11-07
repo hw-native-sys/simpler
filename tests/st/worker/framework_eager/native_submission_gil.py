@@ -70,10 +70,10 @@ def main():
     torch.npu.set_device(args.device)
     stream = torch.npu.Stream(device=args.device)
     worker = Worker(level=2, device_id=args.device, platform=args.platform, runtime=args.runtime)
-    callable = worker.register(helpers._compile(args.runtime, args.platform))
-    worker.init(borrowed_context_generation=1)
     tickets = []
     try:
+        callable = worker.register(helpers._compile(args.runtime, args.platform))
+        worker.init(borrowed_context_generation=1)
         with torch.npu.stream(stream):
             frames, _ = helpers._prepare_frames(torch, worker, callable, stream, stream.npu_stream, 1)
             frame = frames[0]
@@ -98,9 +98,7 @@ def main():
         worker.close()
         print("NATIVE_GIL_PASS " + json.dumps({"gil_drain_calls": drain_calls, "native_reference_released": True}))
     finally:
-        for ticket in tickets:
-            ticket.cancel()
-        worker.close()
+        helpers._close_with_tickets(worker, tickets)
 
 
 if __name__ == "__main__":

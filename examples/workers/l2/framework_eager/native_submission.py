@@ -30,6 +30,58 @@ def _helpers():
     return load("native_submit_helpers", Path(__file__).with_name("main.py"))
 
 
+def _check_refusals(worker, bridge, callable, stream, args, tickets, queue):
+    """Check duplicate refusal, then that a failed native submission fails its framework operator."""
+    try:
+        bridge.submit_native(tickets[0].native_handle)
+    except RuntimeError as error:
+        assert "consumed" in str(error)
+    else:
+        raise AssertionError("native token was submitted twice")
+
+    # A failed native submission fails its framework operator; with the host
+    # queue enabled, torch_npu discards all later queued work and raises at the
+    # next framework call, so no framework call precedes the expected error.
+    raw_stream = stream.npu_stream
+    cancelled = worker.prepare_submission(callable, args, caller_stream=raw_stream)
+    tickets.append(cancelled)
+    successor = worker.prepare_submission(callable, args, caller_stream=raw_stream)
+    tickets.append(successor)
+    assert cancelled.cancel()
+    assert cancelled.safe_to_release
+    if queue == "1":
+        # The gate holds the queue thread, so both callbacks are queued before the
+        # failing one runs and the successor is discarded rather than refused.
+        gate = bridge.enqueue_gate()
+        try:
+            failed = bridge.enqueue_native(cancelled.native_handle)
+            bridge.enqueue_native(successor.native_handle)
+        finally:
+            gate.release()
+        try:
+            stream.synchronize()
+        except RuntimeError as error:
+            assert "SimplerNativeSubmit" in str(error)
+        else:
+            raise AssertionError("framework queue accepted a failed native submission")
+        try:
+            failed.check()
+        except RuntimeError as error:
+            assert "cancelled" in str(error)
+        else:
+            raise AssertionError("cancelled native token was accepted")
+        assert successor.cancel(), "a queued successor of the failed submission was executed"
+        assert successor.safe_to_release
+    else:
+        try:
+            bridge.enqueue_native(cancelled.native_handle)
+        except RuntimeError as error:
+            assert "cancelled" in str(error)
+        else:
+            raise AssertionError("cancelled native token was accepted")
+        assert successor.cancel()
+
+
 def run(runtime, device, bridge_path, *, platform="a2a3"):
     import torch  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415, F401
@@ -40,11 +92,11 @@ def run(runtime, device, bridge_path, *, platform="a2a3"):
     torch.npu.set_device(device)
     stream = torch.npu.Stream(device=device)
     worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
-    callable = worker.register(helpers._compile(runtime, platform))
-    worker.init(borrowed_context_generation=1)
     tickets, queued = [], []
     queue = os.environ.get("TASK_QUEUE_ENABLE", "1")
     try:
+        callable = worker.register(helpers._compile(runtime, platform))
+        worker.init(borrowed_context_generation=1)
         with torch.npu.stream(stream):
             raw_stream = stream.npu_stream
             frames, _ = helpers._prepare_frames(torch, worker, callable, stream, raw_stream, 3)
@@ -87,27 +139,10 @@ def run(runtime, device, bridge_path, *, platform="a2a3"):
                     frame["result"].cpu(), torch.full(helpers.SHAPE, frame["expected"], dtype=torch.float32)
                 )
 
-            cancelled = worker.prepare_submission(callable, frames[0]["args"], caller_stream=raw_stream)
-            assert cancelled.cancel()
-            assert cancelled.safe_to_release
-            failed = bridge.enqueue_native(cancelled.native_handle)
-            stream.synchronize()
-            try:
-                failed.check()
-            except RuntimeError as error:
-                assert "cancelled" in str(error)
-            else:
-                raise AssertionError("cancelled native token was accepted")
-            duplicate = bridge.enqueue_native(tickets[0].native_handle)
-            stream.synchronize()
-            try:
-                duplicate.check()
-            except RuntimeError as error:
-                assert "consumed" in str(error)
-            else:
-                raise AssertionError("native token was submitted twice")
+            _check_refusals(worker, bridge, callable, stream, frames[0]["args"], tickets, queue)
         worker.close()
-        assert stream.query()
+        if queue != "1":
+            assert stream.query()
         print(
             "NATIVE_SUBMISSION_PASS "
             + json.dumps(
@@ -119,14 +154,13 @@ def run(runtime, device, bridge_path, *, platform="a2a3"):
                     "expected": [frame["expected"] for frame in frames],
                     "cancelled_refused": True,
                     "duplicate_refused": True,
+                    "failure_propagated": True,
                 }
             ),
             flush=True,
         )
     finally:
-        for ticket in tickets:
-            ticket.cancel()
-        worker.close()
+        helpers._close_with_tickets(worker, tickets)
 
 
 def main():
