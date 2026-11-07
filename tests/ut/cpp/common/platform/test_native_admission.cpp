@@ -115,7 +115,8 @@ public:
     }
     ~TimeoutEnvironment() {
         for (size_t i = 0; i < names_.size(); ++i) {
-            if (saved_[i]) setenv(names_[i], saved_[i]->c_str(), 1);
+            const auto &saved = saved_[i];
+            if (saved.has_value()) setenv(names_[i], saved.value().c_str(), 1);
             else unsetenv(names_[i]);
         }
     }
@@ -2966,6 +2967,60 @@ TEST_F(NativeAdmissionTest, RetainedPreparationSwitchingToEagerWithdrawsItsUnuse
     EXPECT_TRUE(attempt.consume_release());
     EXPECT_EQ(simpler_release_run_resources(&runner, reference), 0);
     release.dismiss();
+}
+
+TEST_F(NativeAdmissionTest, NativeDomainViewsShareLoansAndProducerFencesWithCallerStorage) {
+    Runner runner;
+    void *caller = runner.allocate_caller_buffer(64);
+    ASSERT_NE(caller, nullptr);
+    const CallerDeviceBuffers::Span views[] = {{0x10000, 0x1000}, {0x20000, 0x100}};
+    const CallerBufferSpan wire_views[] = {{0x10000, 0x1000}, {0x20000, 0x100}};
+    ASSERT_EQ(device_register_domain_owner_ctx(&runner, 7, 11, wire_views, 2), 0);
+    EXPECT_EQ(runner.caller_buffer_count(), 1u);
+    const CallerDeviceBuffers::Span used[] = {{reinterpret_cast<uint64_t>(caller), 64}, views[0], views[1]};
+    EXPECT_TRUE(runner.borrow_caller_buffers(23, used, 3));
+    EXPECT_TRUE(runner.declare_caller_buffer_writes(23, views, 1));
+    EXPECT_TRUE(runner.caller_buffer_written_by_other_run(24, 0x10000, 1));
+    EXPECT_FALSE(runner.caller_buffer_written_by_other_run(24, 0x20000, 1));
+    EXPECT_NE(runner.free_caller_buffer(caller), 0);
+    EXPECT_NE(device_begin_domain_release_ctx(&runner, 7, 11), 0);
+    EXPECT_THROW(runner.borrow_caller_buffers(24, views, 2), std::runtime_error);
+    runner.release_caller_buffers(23, false);
+    EXPECT_EQ(device_begin_domain_release_ctx(&runner, 7, 11), 0);
+    EXPECT_EQ(device_finish_domain_release_ctx(&runner, 7, 11, 1), 0);
+    EXPECT_EQ(runner.free_caller_buffer(caller), 0);
+}
+
+TEST_F(NativeAdmissionTest, NativeDomainSessionCloseChecksLoansAndClearsAllGrants) {
+    Runner runner;
+    const CallerBufferSpan views[] = {{0x10000, 0x1000}};
+    ASSERT_EQ(device_register_domain_owner_ctx(&runner, 7, 11, views, 1), 0);
+    ASSERT_EQ(device_domain_owner_registered_ctx(&runner, 7, 11), 1);
+    EXPECT_EQ(device_domain_owner_registered_ctx(&runner, 7, 12), 0);
+    const CallerDeviceBuffers::Span loan[] = {{0x10000, 64}};
+    ASSERT_TRUE(runner.borrow_caller_buffers(23, loan, 1));
+    EXPECT_NE(device_begin_domain_session_release_ctx(&runner, 7), 0);
+    EXPECT_THROW(runner.borrow_caller_buffers(24, loan, 1), std::runtime_error);
+    runner.release_caller_buffers(23, false);
+    ASSERT_EQ(device_begin_domain_session_release_ctx(&runner, 7), 0);
+    EXPECT_NE(device_begin_domain_release_ctx(&runner, 7, 11), 0);
+    ASSERT_EQ(device_finish_domain_session_release_ctx(&runner, 7, 1), 0);
+    EXPECT_EQ(device_domain_owner_registered_ctx(&runner, 7, 11), 0);
+    EXPECT_FALSE(runner.borrow_caller_buffers(24, loan, 1));
+    runner.release_caller_buffers(24, false);
+}
+
+TEST_F(NativeAdmissionTest, NativeDomainSessionFailureRetainsRevokedViews) {
+    Runner runner;
+    const CallerBufferSpan views[] = {{0x10000, 0x1000}};
+    ASSERT_EQ(device_register_domain_owner_ctx(&runner, 7, 11, views, 1), 0);
+    ASSERT_EQ(device_begin_domain_session_release_ctx(&runner, 7), 0);
+    ASSERT_EQ(device_finish_domain_session_release_ctx(&runner, 7, 0), 0);
+    EXPECT_EQ(device_domain_owner_registered_ctx(&runner, 7, 11), 1);
+    EXPECT_NE(device_begin_domain_session_release_ctx(&runner, 7), 0);
+    const CallerDeviceBuffers::Span loan[] = {{0x10000, 64}};
+    EXPECT_THROW(runner.borrow_caller_buffers(24, loan, 1), std::runtime_error);
+    EXPECT_LT(device_domain_owner_registered_ctx(nullptr, 7, 11), 0);
 }
 
 }  // namespace native_admission_test

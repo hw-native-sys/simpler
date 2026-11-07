@@ -21,6 +21,7 @@
  */
 
 #include "platform_comm/comm.h"
+#include "platform_comm/domain_allocation_views.h"
 #include "platform_comm/comm_context.h"
 #include "runtime_c_api.h"
 
@@ -1121,12 +1122,12 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
                 aclrtFree(workspace_addr) != ACL_SUCCESS) {
                 LOG_ERROR("dma_workspace_provision: freeing unbound workspace failed");
             }
-            (void)manager.release();
+            (void)manager.release();  // NOLINT(bugprone-unused-return-value): retain unconfirmed device resources
             return -1;
         }
         const uint64_t addr = reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr());
         if (addr == 0) {
-            (void)manager.release();
+            (void)manager.release();  // NOLINT(bugprone-unused-return-value): retain unconfirmed device resources
             LOG_ERROR("dma_workspace_provision: manager returned a null workspace address");
             return -1;
         }
@@ -1483,6 +1484,30 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 } catch (...) {
     LOG_ERROR("[comm] alloc_domain: unknown exception");
+    return -1;
+}
+
+extern "C" int comm_query_domain_allocation(
+    CommHandle h, uint64_t allocation_id, CommAllocationSpan *spans, size_t capacity, size_t *count_out
+) try {
+    if (count_out == nullptr) return -1;
+    *count_out = 0;
+    if (h == nullptr) return -1;
+    const auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end() || !found->second) return -1;
+    const auto &owner = *found->second;
+    if (owner.device_ctx == nullptr || !owner.initialized || owner.release_failed) return -1;
+    std::vector<CommAllocationSpan> views;
+    views.reserve(owner.peer_windows.size() + 2);
+    views.push_back({reinterpret_cast<uint64_t>(owner.device_ctx), sizeof(CommContext)});
+    if (owner.release_failed) return -1;
+    views.push_back({reinterpret_cast<uint64_t>(owner.local_window.base), owner.local_window.size});
+    for (const auto &peer : owner.peer_windows) {
+        views.push_back({reinterpret_cast<uint64_t>(peer.base), peer.size});
+    }
+    return simpler::comm::publish_domain_allocation_views(views, spans, capacity, count_out);
+} catch (...) {
+    if (count_out != nullptr) *count_out = 0;
     return -1;
 }
 

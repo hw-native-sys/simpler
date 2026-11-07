@@ -4904,6 +4904,8 @@ class _RunResources:
     remote_slot_refs: list[_RemoteSlotRefClaim | RemoteBufferHandle] = field(default_factory=list)
     live_domains: dict[str, CommDomainHandle] = field(default_factory=dict)
     pending_release_domains: list[CommDomainHandle] = field(default_factory=list)
+    retained_domain_uses: dict[int, CommDomainHandle] = field(default_factory=dict)
+    domains_fenced: bool = False
     live_global_domains: dict[str, GlobalCommDomainHandle] = field(default_factory=dict)
     pending_release_global_domains: list[GlobalCommDomainHandle] = field(default_factory=list)
     worker_chip_orch_comm_host_buffers: dict[int, int] = field(default_factory=dict)
@@ -5889,6 +5891,9 @@ class Worker:
         # before the first one finishes would let close() tear the mailboxes
         # down under an in-flight release.
         self._domain_free_mu = threading.Lock()
+        # One collective control round must finish on every chip before the next.
+        # This gate covers RPC fanout only; retained preparation remains concurrent.
+        self._domain_control_mu = threading.Lock()
         self._domain_free_results: dict[int, BaseException | None] = {}
         self._global_domain_free_mu = threading.Lock()
         self._global_domain_free_results: dict[int, BaseException | None] = {}
@@ -10674,10 +10679,19 @@ class Worker:
         if handle.released:
             raise RuntimeError(f"domain {handle.name!r} is already released")
         local = self.level == 3
+        if local and handle.retain_after_run:
+            with handle._run_use_lock:
+                if handle.released:
+                    raise RuntimeError(f"domain {handle.name!r} is already released")
+                # The run owns the retirement path before the domain publishes
+                # its use; interruption cannot strand a domain-only reference.
+                resources.retained_domain_uses[handle.allocation_id] = handle
+                handle._run_uses[id(resources)] = resources
         with resources.domain_lock:
             table = resources.live_domains if local else resources.live_global_domains
             table[handle.name] = handle
-            resources.requires_ordered_cleanup = True
+            if not (local and handle.retain_after_run):
+                resources.requires_ordered_cleanup = True
         release = self._release_domain_handle if local else self._release_global_domain_handle
         handle._release_fn = lambda released, owner=resources: release(released, owner)
 
@@ -10993,7 +11007,8 @@ class Worker:
         # the backend call runs; exact-once free removes the global entry only
         # after it commits, and the run entry is retired below.
         try:
-            self._free_domain_after_fence(handle)
+            if self._free_domain_after_fence(handle) is False:
+                return
         except BaseException:
             self._defer_domain_retirement(handle)
             raise
@@ -11011,6 +11026,7 @@ class Worker:
         retirement and frees itself.
         """
         with resources.domain_lock:
+            resources.domains_fenced = True
             resources.retired = True
             stragglers = list(resources.pending_release_domains)
             global_stragglers = list(resources.pending_release_global_domains)
@@ -11018,13 +11034,20 @@ class Worker:
             resources.live_domains.clear()
         self._drain_pending_domain_snapshot(resources, stragglers)
         self._drain_pending_global_domain_snapshot(resources, global_stragglers)
+        for handle in list(resources.retained_domain_uses.values()):
+            if handle.released:
+                self._free_domain_after_fence(handle)
+            with handle._run_use_lock:
+                handle._run_uses.pop(id(resources), None)
+            resources.retained_domain_uses.pop(handle.allocation_id, None)
 
     def _drain_pending_domain_snapshot(self, resources: _RunResources, pending: list[CommDomainHandle]) -> None:
         """Free a snapshot while each source-queue claim stays durable."""
 
         def _release(handle: CommDomainHandle) -> None:
             try:
-                self._free_domain_after_fence(handle)
+                if self._free_domain_after_fence(handle) is False:
+                    return
             except BaseException:
                 self._defer_domain_retirement(handle)
                 raise
@@ -11083,7 +11106,7 @@ class Worker:
             if table.get(handle.name) is handle:
                 table.pop(handle.name)
 
-    def _free_domain_after_fence(self, handle: CommDomainHandle) -> None:
+    def _free_domain_after_fence(self, handle: CommDomainHandle) -> bool:
         """Back-end free for a handle whose owning run has retired.
 
         Tolerates a handle the end-of-run sweep already freed: the sweep works
@@ -11096,23 +11119,38 @@ class Worker:
         state nobody can describe.
         """
         if handle.freed:
-            return
+            return True
         seal_host_mappings(handle._host_mappings)
+        try:
+            allocation_id = (
+                handle.allocation_id if self.level == 3 else self._global_domain_provenance_id(handle.domain_id)
+            )
+            self._drop_domain_allocs(allocation_id)
+        except BaseException:
+            self._defer_domain_retirement(handle)
+            raise
+        with handle._run_use_lock:
+            if any(not use.domains_fenced for use in handle._run_uses.values()):
+                return False
+        # Release has revoked new use. Backend reclamation takes provenance
+        # locks, so it cannot run while holding the per-domain use lock.
+        return self._free_domain_without_active_uses(handle)
+
+    def _free_domain_without_active_uses(self, handle: CommDomainHandle) -> bool:
+        if handle.freed:
+            return True
         try:
             results = self._domain_free_results if self.level == 3 else self._global_domain_free_results
             key = handle.allocation_id if self.level == 3 else handle.domain_id
             if self._worker is None and results.get(key, False) is not None:
                 raise RuntimeError(f"domain {handle.name!r}: window reclamation is unconfirmed")
-            allocation_id = (
-                handle.allocation_id if self.level == 3 else self._global_domain_provenance_id(handle.domain_id)
-            )
-            self._drop_domain_allocs(allocation_id)
             release = self._release_domain_now if self.level == 3 else self._release_global_domain_now
             release(handle)
         except BaseException:
             self._defer_domain_retirement(handle)
             raise
         handle._freed = True  # noqa: SLF001 -- runtime owns this transition
+        return True
 
     def _execute_pending_domain_releases(self, resources: _RunResources) -> None:
         """Drive CTRL_RELEASE_DOMAIN for every queued handle.  Must run
@@ -11268,7 +11306,8 @@ class Worker:
             except BaseException as e:  # noqa: BLE001
                 errors[chip_idx] = e
 
-        _start_and_join_threads(workers, dispatch, name_prefix=f"{op}_domain_chip_")
+        with self._domain_control_mu:
+            _start_and_join_threads(workers, dispatch, name_prefix=f"{op}_domain_chip_")
 
         if errors:
             first = next(iter(errors.items()))
@@ -12294,7 +12333,8 @@ class Worker:
             if not handle.released:
                 handle._released = True  # noqa: SLF001 -- runtime owns the transition
             try:
-                self._free_domain_after_fence(handle)
+                if self._free_domain_after_fence(handle) is False:
+                    return
             except BaseException:
                 self._defer_domain_retirement(handle)
                 if resources is not None:
@@ -12712,6 +12752,19 @@ class Worker:
         if resources is None:
             return
         resources.touched_identities.update(self._identities_in_args(args))
+
+    def _record_touched_identities_locked(self, args: Any) -> None:
+        """Register cached domain uses before native submit; provenance is held."""
+        self._record_touched_identities(args)
+        resources = self._building_run_resources
+        if resources is None or self.level != 3:
+            return
+        for handle in tuple(self._live_domains.values()):
+            if resources.live_domains.get(handle.name) is handle:
+                continue
+            identities = self._domain_members.get(handle.allocation_id, ())
+            if not resources.touched_identities.isdisjoint(identities):
+                self._use_domain(handle)
 
     def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.
@@ -14309,6 +14362,7 @@ class Worker:
         outer_error: BaseException | None = None
         try:
             resources = handle._resources
+            resources.domains_fenced = True
             orch = self._orch
 
             def _poison_endpoint() -> None:

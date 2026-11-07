@@ -23,6 +23,7 @@
  */
 
 #include "platform_comm/comm.h"
+#include "platform_comm/domain_allocation_views.h"
 #include "platform_comm/comm_context.h"
 
 #include "common/unified_log.h"
@@ -2061,6 +2062,29 @@ static int allocate_domain_windows(
     LOG_ERROR("[comm] alloc_domain: unknown exception");
     if (h) h->cleanup_failed = true;
     return COMM_RECLAMATION_UNCONFIRMED;
+}
+
+extern "C" int comm_query_domain_allocation(
+    CommHandle h, uint64_t allocation_id, CommAllocationSpan *spans, size_t capacity, size_t *count_out
+) try {
+    if (count_out == nullptr) return -1;
+    *count_out = 0;
+    if (h == nullptr) return -1;
+    const auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end() || !found->second) return -1;
+    const auto &owner = *found->second;
+    if (owner.device_ctx == nullptr || !owner.initialized || owner.cleanup_failed || h->cleanup_failed) return -1;
+    std::vector<CommAllocationSpan> views;
+    views.reserve(owner.peer_windows.size() + 2);
+    views.push_back({reinterpret_cast<uint64_t>(owner.device_ctx), sizeof(CommContext)});
+    views.push_back({reinterpret_cast<uint64_t>(owner.local_buf), owner.mapping_size});
+    for (const auto &peer : owner.peer_windows) {
+        views.push_back({reinterpret_cast<uint64_t>(peer.address), owner.mapping_size});
+    }
+    return simpler::comm::publish_domain_allocation_views(views, spans, capacity, count_out);
+} catch (...) {
+    if (count_out != nullptr) *count_out = 0;
+    return -1;
 }
 
 extern "C" int comm_alloc_domain_windows(

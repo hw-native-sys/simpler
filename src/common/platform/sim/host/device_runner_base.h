@@ -367,8 +367,36 @@ public:
 
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count);
     void release_caller_buffers(uint64_t identity, bool keep);
+
+    bool register_domain_buffer_owner(
+        uint64_t session, uint64_t allocation, const CallerDeviceBuffers::Span *spans, std::size_t count
+    ) {
+        return device_buffer_owners_.register_domain_owner(session, allocation, spans, count);
+    }
+
+    bool has_domain_buffer_owner(uint64_t session, uint64_t allocation) const {
+        return device_buffer_owners_.has_domain_owner(session, allocation);
+    }
+
+    bool begin_domain_session_release(uint64_t session) {
+        return device_buffer_owners_.begin_domain_session_release(session);
+    }
+
+    bool finish_domain_session_release(uint64_t session, bool confirmed) {
+        return device_buffer_owners_.finish_domain_session_release(session, confirmed);
+    }
+
+    bool begin_domain_buffer_release(uint64_t session, uint64_t allocation) {
+        return device_buffer_owners_.begin_domain_release(session, allocation);
+    }
+
+    bool finish_domain_buffer_release(uint64_t session, uint64_t allocation, bool confirmed) {
+        return confirmed ? device_buffer_owners_.finish_domain_release(session, allocation) :
+                           device_buffer_owners_.mark_domain_release_unconfirmed(session, allocation);
+    }
+
     /**
-     * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
+     * Declare which recorded storage extents `identity` produces; see host/device_buffer_owners.h.
      *
      * @return false when the statement could not be recorded, which the declaring run's bind has
      *         to treat as its own failure: an undeclared producer reads as no producer.
@@ -376,16 +404,16 @@ public:
     [[nodiscard]] bool declare_caller_buffer_writes(
         uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count, size_t *unresolved_out = nullptr
     ) {
-        return caller_device_buffers_.declare_writes(identity, spans, count, unresolved_out);
+        return device_buffer_owners_.declare_writes(identity, spans, count, unresolved_out);
     }
 
     /** Whether `[addr, addr + bytes)` has no readable content for `identity` yet. */
     bool caller_buffer_written_by_other_run(uint64_t identity, uint64_t addr, uint64_t bytes) const {
-        return caller_device_buffers_.written_by_other_run(identity, addr, bytes);
+        return device_buffer_owners_.written_by_other_run(identity, addr, bytes);
     }
-    size_t caller_buffer_count() const { return caller_device_buffers_.allocation_count(); }
-    size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
-    size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
+    size_t caller_buffer_count() const { return device_buffer_owners_.caller_allocation_count(); }
+    size_t caller_buffer_borrow_count() const { return device_buffer_owners_.borrow_count(); }
+    size_t caller_buffer_retained_count() const { return device_buffer_owners_.retained_count(); }
 
     int device_memset(void *dev_ptr, int value, size_t bytes);
 
@@ -980,7 +1008,7 @@ protected:
     MemoryAllocator mem_alloc_;
     // The device allocations a caller minted through this context, and which runs still hold them
     // — see host/caller_device_buffers.h.
-    CallerDeviceBuffers caller_device_buffers_;
+    DeviceBufferOwners device_buffer_owners_;
     RunResourceSlots<void *> retained_temp_addrs_;
     RunResourceSlots<size_t> retained_temp_sizes_;
     // One pipeline slot's Graph Definition bytes: `staging` is what the

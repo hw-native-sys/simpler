@@ -389,6 +389,7 @@ public:
     /// retaining every known allocation even if another span is external.
     /// True proves every span's owner; false refuses joined admission but can
     /// still hold references until `release_caller_device_borrow`.
+    /// Other native errors reject admission rather than granting a serial fallback.
     ///
     /// The three `device_*_caller_buffer(s)_ctx` entries are mandatory C ABI,
     /// like the rest of the `device_*_ctx` family: `init` resolves them with
@@ -592,6 +593,14 @@ private:
     using DeviceFreeCallerBufferCtxFn = decltype(&device_free_caller_buffer_ctx);
     using DeviceBorrowCallerBuffersCtxFn = decltype(&device_borrow_caller_buffers_ctx);
     using DeviceReleaseCallerBuffersCtxFn = decltype(&device_release_caller_buffers_ctx);
+    using DeviceRegisterDomainOwnerCtxFn = decltype(&device_register_domain_owner_ctx);
+    using DeviceDomainOwnerRegisteredCtxFn = decltype(&device_domain_owner_registered_ctx);
+    using DeviceBeginDomainReleaseCtxFn = decltype(&device_begin_domain_release_ctx);
+    using DeviceFinishDomainReleaseCtxFn = decltype(&device_finish_domain_release_ctx);
+    using DeviceBeginDomainSessionReleaseCtxFn = decltype(&device_begin_domain_session_release_ctx);
+    using DeviceFinishDomainSessionReleaseCtxFn = decltype(&device_finish_domain_session_release_ctx);
+    using CommQueryDomainAllocationFn = decltype(&comm_query_domain_allocation);
+
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
@@ -667,6 +676,9 @@ private:
     CommSession *find_comm_session(uint64_t comm_handle);
     CommSession *create_comm_session(void *handle, void *stream, bool is_base);
     int destroy_comm_session(CommSession &session);
+    void release_domain_windows(
+        uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool abort_initialization
+    );
     uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
     void clear_comm_sessions();
     void retain_unconfirmed_comm_cleanup() noexcept;
@@ -682,6 +694,14 @@ private:
     DeviceFreeCallerBufferCtxFn device_free_caller_buffer_ctx_fn_ = nullptr;
     DeviceBorrowCallerBuffersCtxFn device_borrow_caller_buffers_ctx_fn_ = nullptr;
     DeviceReleaseCallerBuffersCtxFn device_release_caller_buffers_ctx_fn_ = nullptr;
+    DeviceRegisterDomainOwnerCtxFn device_register_domain_owner_ctx_fn_ = nullptr;
+    DeviceDomainOwnerRegisteredCtxFn device_domain_owner_registered_ctx_fn_ = nullptr;
+    DeviceBeginDomainReleaseCtxFn device_begin_domain_release_ctx_fn_ = nullptr;
+    DeviceFinishDomainReleaseCtxFn device_finish_domain_release_ctx_fn_ = nullptr;
+    DeviceBeginDomainSessionReleaseCtxFn device_begin_domain_session_release_ctx_fn_ = nullptr;
+    DeviceFinishDomainSessionReleaseCtxFn device_finish_domain_session_release_ctx_fn_ = nullptr;
+    CommQueryDomainAllocationFn comm_query_domain_allocation_fn_ = nullptr;
+
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;

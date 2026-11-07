@@ -455,6 +455,31 @@ void ChipWorker::init(
         comm_get_local_window_base_fn_ = module->required<CommGetLocalWindowBaseFn>("comm_get_local_window_base");
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
+        device_register_domain_owner_ctx_fn_ =
+            module->optional<DeviceRegisterDomainOwnerCtxFn>("device_register_domain_owner_ctx");
+        device_domain_owner_registered_ctx_fn_ =
+            module->optional<DeviceDomainOwnerRegisteredCtxFn>("device_domain_owner_registered_ctx");
+        device_begin_domain_release_ctx_fn_ =
+            module->optional<DeviceBeginDomainReleaseCtxFn>("device_begin_domain_release_ctx");
+        device_finish_domain_release_ctx_fn_ =
+            module->optional<DeviceFinishDomainReleaseCtxFn>("device_finish_domain_release_ctx");
+        device_begin_domain_session_release_ctx_fn_ =
+            module->optional<DeviceBeginDomainSessionReleaseCtxFn>("device_begin_domain_session_release_ctx");
+        device_finish_domain_session_release_ctx_fn_ =
+            module->optional<DeviceFinishDomainSessionReleaseCtxFn>("device_finish_domain_session_release_ctx");
+        comm_query_domain_allocation_fn_ =
+            module->optional<CommQueryDomainAllocationFn>("comm_query_domain_allocation");
+        const unsigned domain_owner_symbols =
+            static_cast<unsigned>(device_register_domain_owner_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_domain_owner_registered_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_begin_domain_release_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_finish_domain_release_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_begin_domain_session_release_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(device_finish_domain_session_release_ctx_fn_ != nullptr) +
+            static_cast<unsigned>(comm_query_domain_allocation_fn_ != nullptr);
+        if (domain_owner_symbols != 0 && domain_owner_symbols != 7) {
+            throw std::runtime_error("runtime exports an incomplete native domain owner capability");
+        }
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
         comm_alloc_host_domain_windows_fn_ =
             module->optional<CommAllocHostDomainWindowsFn>("comm_alloc_host_domain_windows");
@@ -800,7 +825,7 @@ void ChipWorker::finalize() {
                 lane_error = std::make_exception_ptr(std::runtime_error("native close retained an unproved run"));
             }
             run_lane_->detach_after_failed_teardown(lane_error);
-            (void)run_lane_.release();
+            (void)run_lane_.release();  // NOLINT(bugprone-unused-return-value): retain unproven device-use snapshots
         }
         if (device_ctx_ == nullptr || finalize_device_fn_ == nullptr || runtime_module_ == nullptr) {
             throw std::runtime_error("ChipWorker::finalize: native owners retained without an owner-close entry");
@@ -930,6 +955,13 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_local_window_base_fn_ = nullptr;
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
+    device_register_domain_owner_ctx_fn_ = nullptr;
+    device_domain_owner_registered_ctx_fn_ = nullptr;
+    device_begin_domain_release_ctx_fn_ = nullptr;
+    device_finish_domain_release_ctx_fn_ = nullptr;
+    device_begin_domain_session_release_ctx_fn_ = nullptr;
+    device_finish_domain_session_release_ctx_fn_ = nullptr;
+    comm_query_domain_allocation_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_alloc_host_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
@@ -1399,9 +1431,9 @@ void ChipWorker::validate_execution_context() const {
 
 void ChipWorker::abandon_after_failed_teardown(std::exception_ptr error) noexcept {
     if (run_lane_ != nullptr) {
-        run_lane_->detach_after_failed_teardown(error);
+        run_lane_->detach_after_failed_teardown(std::move(error));
         // The retained lane keeps any run-side host snapshots alive as well.
-        (void)run_lane_.release();
+        (void)run_lane_.release();  // NOLINT(bugprone-unused-return-value): retain unproven device-use snapshots
     }
     for (auto &storage : runtime_bufs_)
         storage.abandon();
@@ -2327,11 +2359,33 @@ ChipWorker::CommSession *ChipWorker::create_comm_session(void *handle, void *str
 int ChipWorker::destroy_comm_session(CommSession &session) {
     if (comm_cleanup_unconfirmed_) return COMM_RECLAMATION_UNCONFIRMED;
     int rc = 0;
+    const uint64_t session_id = reinterpret_cast<uint64_t>(session.handle);
+    const bool guarded = session.handle != nullptr && device_begin_domain_session_release_ctx_fn_ != nullptr;
+    if (guarded && device_begin_domain_session_release_ctx_fn_(device_ctx_, session_id) != 0) {
+        throw std::runtime_error("communication session is revoked or still in use");
+    }
     if (session.handle != nullptr && comm_destroy_fn_ != nullptr) {
-        rc = comm_destroy_fn_(session.handle);
+        try {
+            rc = comm_destroy_fn_(session.handle);
+        } catch (...) {
+            comm_reclamation_unconfirmed_ = true;
+            retain_unconfirmed_comm_cleanup();
+            if (guarded) (void)device_finish_domain_session_release_ctx_fn_(device_ctx_, session_id, 0);
+            throw;
+        }
         if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            if (guarded) (void)device_finish_domain_session_release_ctx_fn_(device_ctx_, session_id, 0);
+            comm_reclamation_unconfirmed_ = true;
             retain_unconfirmed_comm_cleanup();
             return rc;
+        }
+    }
+    if (guarded) {
+        const int settled = device_finish_domain_session_release_ctx_fn_(device_ctx_, session_id, rc == 0);
+        if (rc != 0 || settled != 0) {
+            comm_reclamation_unconfirmed_ = true;
+            retain_unconfirmed_comm_cleanup();
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
     }
     if (reinterpret_cast<uint64_t>(session.handle) == base_comm_handle_) {
@@ -2464,9 +2518,11 @@ bool ChipWorker::borrow_caller_device_spans(uint64_t borrow_id, const CallerDevi
     for (size_t i = 0; i < count; ++i) {
         wire[i] = CallerBufferSpan{spans[i].addr, spans[i].bytes};
     }
-    return device_borrow_caller_buffers_ctx_fn_(
-               device_ctx_, wire.data(), static_cast<uint32_t>(wire.size()), borrow_id
-           ) == 0;
+    const int rc =
+        device_borrow_caller_buffers_ctx_fn_(device_ctx_, wire.data(), static_cast<uint32_t>(wire.size()), borrow_id);
+    if (rc == 0) return true;
+    if (rc == PTO_RUNTIME_ERR_INVALID_STATE) return false;
+    throw std::runtime_error("borrow_caller_device_spans failed with code " + std::to_string(rc));
 }
 
 void ChipWorker::release_caller_device_borrow(uint64_t borrow_id, bool keep) noexcept {
@@ -2637,6 +2693,8 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         case COMM_DOMAIN_URMA_WORKSPACE_INVALID:
             reason = "URMA manager returned a null workspace address or zero workspace size";
             break;
+        default:
+            break;
         }
         throw std::runtime_error(
             "comm_alloc_domain_windows: " + std::string(reason) + " (code " + std::to_string(rc) + ")"
@@ -2645,36 +2703,86 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     if (device_ctx == 0 || local_window_base == 0) {
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
     }
+
+    if (comm_query_domain_allocation_fn_ != nullptr) {
+        // Query the backend's allocation record, never mutable device CommContext contents.
+        size_t count = 0;
+        const auto handle = reinterpret_cast<CommHandle>(comm_handle);
+        int query_rc = comm_query_domain_allocation_fn_(handle, allocation_id, nullptr, 0, &count);
+        if (query_rc != 0 || count == 0 || count > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("comm allocation owner query failed");
+        }
+        std::vector<CommAllocationSpan> views(count);
+        const size_t capacity = count;
+        query_rc = comm_query_domain_allocation_fn_(handle, allocation_id, views.data(), capacity, &count);
+        if (query_rc != 0 || count != capacity) {
+            throw std::runtime_error("comm allocation owner changed during query");
+        }
+        std::vector<CallerBufferSpan> wire;
+        wire.reserve(count);
+        for (const auto &view : views)
+            wire.push_back({view.addr, view.bytes});
+        query_rc = device_register_domain_owner_ctx_fn_(
+            device_ctx_, comm_handle, allocation_id, wire.data(), static_cast<uint32_t>(wire.size())
+        );
+        if (query_rc != 0) {
+            // Do not introduce an unmatched collective rollback on one rank.
+            // The backend still owns this allocation and session close will reclaim it.
+            throw std::runtime_error("comm allocation owner registration failed with code " + std::to_string(query_rc));
+        }
+    }
     return {device_ctx, local_window_base, actual_window_size};
 }
 
 void ChipWorker::comm_release_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
-    require_comm_reclamation_safe();
-    if (comm_release_domain_windows_fn_ == nullptr) {
-        throw std::runtime_error("comm_release_domain_windows is not supported by this runtime");
-    }
-    int rc =
-        comm_release_domain_windows_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
-    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
-    if (rc != 0) {
-        throw std::runtime_error("comm_release_domain_windows failed with code " + std::to_string(rc));
-    }
+    release_domain_windows(comm_handle, allocation_id, rank_count, domain_rank, false);
 }
 
 void ChipWorker::comm_abort_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
+    release_domain_windows(comm_handle, allocation_id, rank_count, domain_rank, true);
+}
+
+void ChipWorker::release_domain_windows(
+    uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool abort_initialization
+) {
     require_comm_reclamation_safe();
-    if (comm_abort_domain_windows_fn_ == nullptr) {
-        throw std::runtime_error("comm_abort_domain_windows is not supported by this runtime");
+    const auto release = abort_initialization ? comm_abort_domain_windows_fn_ : comm_release_domain_windows_fn_;
+    const char *operation = abort_initialization ? "comm_abort_domain_windows" : "comm_release_domain_windows";
+    if (release == nullptr) {
+        throw std::runtime_error(std::string(operation) + " is not supported by this runtime");
     }
-    int rc =
-        comm_abort_domain_windows_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
+    bool enrolled = false;
+    if (device_domain_owner_registered_ctx_fn_ != nullptr) {
+        const int registered = device_domain_owner_registered_ctx_fn_(device_ctx_, comm_handle, allocation_id);
+        if (registered != 0 && registered != 1) throw std::runtime_error("comm allocation owner lookup failed");
+        enrolled = registered == 1;
+        if (enrolled && device_begin_domain_release_ctx_fn_(device_ctx_, comm_handle, allocation_id) != 0)
+            throw std::runtime_error("comm allocation is revoked or still in use");
+    }
+    int rc = 0;
+    try {
+        rc = release(reinterpret_cast<void *>(comm_handle), allocation_id, rank_count, domain_rank);
+    } catch (...) {
+        comm_reclamation_unconfirmed_ = true;
+        retain_unconfirmed_comm_cleanup();
+        if (enrolled) (void)device_finish_domain_release_ctx_fn_(device_ctx_, comm_handle, allocation_id, 0);
+        throw;
+    }
     if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
+    if (enrolled) {
+        const int settled = device_finish_domain_release_ctx_fn_(device_ctx_, comm_handle, allocation_id, rc == 0);
+        if (rc != 0 || settled != 0) {
+            comm_reclamation_unconfirmed_ = true;
+            retain_unconfirmed_comm_cleanup();
+            throw std::runtime_error("comm allocation release is unconfirmed");
+        }
+    }
     if (rc != 0) {
-        throw std::runtime_error("comm_abort_domain_windows failed with code " + std::to_string(rc));
+        throw std::runtime_error(std::string(operation) + " failed with code " + std::to_string(rc));
     }
 }
 
@@ -2754,10 +2862,11 @@ void ChipWorker::comm_destroy(uint64_t comm_handle) {
     require_comm_reclamation_safe();
     CommSession *session = find_comm_session(comm_handle);
     if (session == nullptr) {
-        int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
+        CommSession untracked;
+        untracked.handle = reinterpret_cast<void *>(comm_handle);
+        const int rc = destroy_comm_session(untracked);
         if (rc == COMM_RECLAMATION_UNCONFIRMED) {
-            retain_unconfirmed_comm_cleanup();
-            create_comm_session(reinterpret_cast<void *>(comm_handle), nullptr, false);
+            create_comm_session(reinterpret_cast<void *>(comm_handle), untracked.stream, false);
         }
         if (rc != 0) {
             throw std::runtime_error("comm_destroy failed with code " + std::to_string(rc));

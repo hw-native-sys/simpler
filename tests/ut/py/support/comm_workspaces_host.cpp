@@ -10,6 +10,7 @@
  */
 #include <sys/mman.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <fstream>
@@ -19,7 +20,7 @@
 #include <vector>
 
 #include "comm_workspace_managers.h"
-#include "comm_hccl.cpp"
+#include "comm_hccl.cpp"  // NOLINT(bugprone-suspicious-include): exercise backend owners with fake ACL
 
 namespace {
 std::unordered_map<void *, size_t> mappings;
@@ -176,6 +177,29 @@ extern "C" HcclResult HcclCommDestroy(HcclComm) {
     return HCCL_SUCCESS;
 }
 
+static void
+assert_domain_allocation_views(CommHandle h, uint64_t id, uint64_t context, uint64_t local_base, size_t local_bytes) {
+    size_t count = 0;
+    assert(comm_query_domain_allocation(h, id, nullptr, 0, &count) == 0);
+    const auto &owner = *h->domain_allocations.at(id);
+    assert(count == owner.peer_windows.size() + 2);
+    std::vector<CommAllocationSpan> views(count);
+    assert(comm_query_domain_allocation(h, id, views.data(), views.size(), &count) == 0);
+    auto contains = [&](uint64_t addr, uint64_t bytes) {
+        return std::any_of(views.begin(), views.end(), [&](const auto &view) {
+            return view.addr == addr && view.bytes == bytes;
+        });
+    };
+    assert(contains(context, sizeof(CommContext)));
+    assert(contains(local_base, local_bytes));
+    for (const auto &peer : owner.peer_windows) {
+        assert(contains(reinterpret_cast<uint64_t>(peer.address), owner.mapping_size));
+    }
+    CommAllocationSpan sentinel{123, 456};
+    assert(comm_query_domain_allocation(h, id, &sentinel, 1, &count) != 0);
+    assert(count == views.size() && sentinel.addr == 123 && sentinel.bytes == 456);
+}
+
 static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     using namespace workspace_fixture;
     const int old_nranks = h->nranks;
@@ -193,7 +217,9 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
         }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mask, &ctx, &base, &size);
+        const int rc = comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mask, &ctx, &base, &size);
+        if (rc == 0) assert_domain_allocation_views(h, id, ctx, base, size);
+        return rc;
     };
     uint64_t held_id = 0, held_ctx = 0;
     assert(allocate(1, held_id, held_ctx) == 0);
@@ -219,6 +245,9 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
             assert(injected_peer_failures == old_failures + (failure != PeerFailure::NONE));
             assert(ctx == 0 && h->domain_allocations.count(rejected) == 1);
             assert(comm_abort_domain_windows(h, rejected, 2, 0) == 0);
+            size_t rejected_count = 99;
+            assert(comm_query_domain_allocation(h, rejected, nullptr, 0, &rejected_count) != 0);
+            assert(rejected_count == 0);
             assert(h->domain_allocations.size() == held_domains);
             assert(mappings.size() == held_mappings && physical_handles == held_physical);
             assert(imported_handles.size() == held_imports && peer_mappings.size() == held_peers);
@@ -454,20 +483,23 @@ int main(int argc, char **argv) {
         }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size);
+        const int rc = comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size);
+        if (rc == 0) assert_domain_allocation_views(h, id, ctx, base, size);
+        return rc;
     };
     auto release = [&](uint64_t id) {
         const auto count = h->domain_allocations.at(id)->nranks;
         assert(comm_release_domain_windows(h, id, count, 0) == 0);
+        size_t view_count = 99;
+        assert(comm_query_domain_allocation(h, id, nullptr, 0, &view_count) != 0 && view_count == 0);
     };
     uint64_t first = 0, first_ctx = 0;
     uint64_t base = 0;
     size_t size = 0;
     const uint32_t sparse_ranks[] = {0, 2};
-    assert(
-        comm_alloc_domain_windows(h, next_id++, sparse_ranks, 2, 0, 4096, 2, &first_ctx, &base, &size) ==
-        COMM_DOMAIN_URMA_CONFIG_INVALID
-    );
+    const int sparse_rc =
+        comm_alloc_domain_windows(h, next_id++, sparse_ranks, 2, 0, 4096, 2, &first_ctx, &base, &size);
+    assert(sparse_rc == COMM_DOMAIN_URMA_CONFIG_INVALID);
     assert(mappings.empty() && started[1] == 0);
     assert(allocate(0, first, first_ctx) == 0);
     assert(started[0] == 0 && started[1] == 0 && started[2] == 0);

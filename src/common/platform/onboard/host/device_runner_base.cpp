@@ -569,7 +569,7 @@ void *DeviceRunnerBase::allocate_caller_buffer(std::size_t bytes) {
     void *ptr = allocate_tensor(bytes);
     if (ptr == nullptr) return nullptr;
     try {
-        caller_device_buffers_.record(ptr, bytes);
+        device_buffer_owners_.record(ptr, bytes);
     } catch (...) {
         // Recording allocates, and the entry is what makes this allocation the caller's. Without
         // it the caller would be handed nothing while the device memory stayed committed to no
@@ -588,11 +588,11 @@ int DeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
     // question and its release cannot be missed, and the address leaves the table before its pages
     // can go. An address the table never recorded is held by nothing and passes straight through,
     // which is what keeps this from changing anything for an allocation no caller minted.
-    if (!caller_device_buffers_.forget_if_unborrowed(dev_ptr)) {
+    if (!device_buffer_owners_.forget_if_unborrowed(dev_ptr)) {
         LOG_ERROR(
             "free_caller_buffer: %p is still held by %zu borrowing run(s) and %zu retained "
             "reference(s); the caller's release is refused rather than performed",
-            dev_ptr, caller_device_buffers_.borrow_count(), caller_device_buffers_.retained_count()
+            dev_ptr, device_buffer_owners_.borrow_count(), device_buffer_owners_.retained_count()
         );
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
@@ -603,11 +603,11 @@ int DeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
 bool DeviceRunnerBase::borrow_caller_buffers(
     uint64_t identity, const CallerDeviceBuffers::Span *spans, std::size_t count
 ) {
-    return caller_device_buffers_.borrow(identity, spans, count);
+    return device_buffer_owners_.borrow(identity, spans, count);
 }
 
 void DeviceRunnerBase::release_caller_buffers(uint64_t identity, bool keep) {
-    caller_device_buffers_.release(identity, keep);
+    device_buffer_owners_.release(identity, keep);
 }
 
 void DeviceRunnerBase::free_tensor(void *dev_ptr) {
