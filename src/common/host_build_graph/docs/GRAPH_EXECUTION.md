@@ -849,7 +849,8 @@ slower path:
   each other within a partition;
 - a boundary naming an empty buffer, or naming one address at two buffer sizes;
 - runtime-allocated boundary outputs;
-- more than `GRAPH_MAX_DEFINITIONS` (16) Definitions;
+- more than `GRAPH_MAX_DEFINITIONS` (16) distinct Definition keys, including
+  unpublished recordings; a published key retained in flight counts once;
 - insufficient task-window or known cache-hit heap capacity;
 - a boundary drawing more than the argument pools hold, or a Definition owning
   more than `INT32_MAX` heap bytes;

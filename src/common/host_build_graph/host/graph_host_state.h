@@ -166,9 +166,15 @@ struct GraphHostState {
     // Where an object's image starts, for a record the arena holds.
     std::byte *image_at(size_t object_offset) const { return arena.base + object_offset + arena.object_prefix_bytes; }
 
-    // Definitions this run can still admit: published plus in flight, against
-    // the per-worker cache limit.
-    size_t claimed_definitions() const { return definitions.size() + inflight.size(); }
+    // Distinct admitted keys, including unpublished recordings. Published
+    // entries remain in inflight until graph_commit drains their owners.
+    size_t claimed_definitions() const {
+        size_t claimed = definitions.size();
+        for (const auto &entry : inflight) {
+            if (definitions.find(entry.first) == definitions.end()) ++claimed;
+        }
+        return claimed;
+    }
     bool any_recording() const {
         for (const auto &entry : inflight) {
             if (entry.second->status() == GraphRecordingStatus::RECORDING) return true;
