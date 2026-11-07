@@ -43,6 +43,7 @@ changing simpler's own internals.
 | [Buffer Memory Model](buffer-abi.md) | How L3+ tasks name data: canonical identity, backend descriptor, strided view |
 | [Orchestrator](orchestrator.md) | DAG submission: TensorMap, Scope, Ring, task state machine |
 | [Scheduler](scheduler.md) | DAG dispatch: wiring / ready / completion queues, dispatch loop |
+| [A2/A3 Ready Sync-Start Prestaging Proposal](design/a2a3-ready-sync-prestaging.md) | Draft mechanism: overlap ready-cohort preparation with existing running work; admission, ordering and lifetime review gates |
 | [`tensormap_and_ringbuffer`: A2/A3 vs A5](tensormap-and-ringbuffer-a2a3-vs-a5.md) | Per-file comparison split into hardware/PTO-ISA architecture differences and implementation differences |
 | [Worker Manager](worker-manager.md) | Worker pool, THREAD/PROCESS modes, fork + mailbox mechanics |
 | [hardware/](hardware/README.md) | Hardware substrate: chip architecture, cache coherency, MMIO performance, CANN source references |
