@@ -57,6 +57,25 @@ jobs:
             --config-settings=cmake.define.SIMPLER_SANITIZER=${{ matrix.sanitizer }} \
             --config-settings=build.targets=build_package_${{ matrix.platform }} '.[test]'
 
+      - name: Install GoogleTest for the TSAN regression
+        if: matrix.sanitizer == 'tsan'
+        uses: ./.github/actions/apt-install
+        with:
+          required-packages: libgtest-dev
+
+      - name: Check the TMR async wait poll hint with TSAN
+        if: matrix.sanitizer == 'tsan'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          target="test_${PLATFORM%sim}_tmr_async_wait_poll_hint"
+          cmake -S tests/ut/cpp -B build/cpput-tsan -G Ninja \
+            -DCMAKE_CXX_COMPILER=g++-15 \
+            '-DCMAKE_CXX_FLAGS=-fsanitize=thread -g -O1 -fno-omit-frame-pointer'
+          cmake --build build/cpput-tsan --target "$target" --parallel 4
+          ctest --test-dir build/cpput-tsan -R "^${target}$" --no-tests=error --output-on-failure
+
       - name: Run sanitized scene tests (${{ matrix.sanitizer }}, ${{ matrix.platform }})
         run: |
           # Sim unifies host compilation on g++-15, so preload g++-15's runtime.
