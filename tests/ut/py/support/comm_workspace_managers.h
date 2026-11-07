@@ -28,6 +28,9 @@ inline int zero_size_engine = -1;
 inline int throw_engine = -1;
 inline int invalid_addr_engine = -1;
 inline int invalid_size_engine = -1;
+inline uint32_t device_aiv_count = 2;
+inline uint32_t sized_jetties = 0, initialized_jetties = 0, initialized_sq_depth = 0;
+inline uint32_t sized_aivs = 0, initialized_aivs = 0;
 
 class Manager {
 public:
@@ -79,7 +82,13 @@ public:
     UrmaWorkspaceManager() :
         Manager(1) {}
     using Manager::GetWorkspaceSize;
-    static aclError GetWorkspaceSize(uint32_t, uint64_t *size) {
+    static uint32_t QueryDeviceAivCount() { return workspace_fixture::device_aiv_count; }
+    static aclError GetWorkspaceSize(
+        uint32_t, uint64_t *size, UrmaLayout layout = UrmaLayout::PER_PEER, uint32_t aivs = kUrmaAutoAivCount,
+        uint32_t jetties = 1
+    ) {
+        workspace_fixture::sized_jetties = jetties;
+        workspace_fixture::sized_aivs = aivs;
         if (workspace_fixture::zero_size_engine == 1) {
             *size = 0;
             return ACL_ERROR_INVALID_PARAM;
@@ -87,18 +96,26 @@ public:
         *size = 8192;
         return ACL_SUCCESS;
     }
-    bool Init(void *, uint32_t, uint32_t ranks, void *, uint64_t, void *addr, uint64_t size) {
+    bool Init(
+        void *, uint32_t, uint32_t ranks, void *, uint64_t, void *addr, uint64_t size,
+        UrmaLayout layout = UrmaLayout::PER_PEER, uint32_t aivs = kUrmaAutoAivCount, uint32_t jetties = 1,
+        uint32_t depth = 0
+    ) {
+        workspace_fixture::initialized_jetties = jetties;
+        workspace_fixture::initialized_sq_depth = depth;
+        workspace_fixture::initialized_aivs = aivs;
         const bool ok = create(addr, size);
         auto *info = static_cast<UrmaInfo *>(GetWorkspaceAddr());
         if (info == nullptr) return ok;
         info->rankCount = ranks;
-        info->rowsPerPeer = 1;
-        info->jettyCount = ranks;
+        info->jettiesPerCore = jetties;
+        info->rowsPerPeer = (aivs == kUrmaAutoAivCount ? QueryDeviceAivCount() : aivs) * jetties;
+        info->jettyCount = ranks * info->rowsPerPeer;
         info->sqPtr = reinterpret_cast<uint64_t>(info + 1);
-        info->scqPtr = info->sqPtr + ranks * sizeof(UrmaWQCtx);
+        info->scqPtr = info->sqPtr + info->jettyCount * sizeof(UrmaWQCtx);
         auto *sq = reinterpret_cast<UrmaWQCtx *>(info->sqPtr);
         auto *cq = reinterpret_cast<UrmaCqCtx *>(info->scqPtr);
-        for (uint32_t row = 0; row < ranks; ++row) {
+        for (uint32_t row = 0; row < info->jettyCount; ++row) {
             sq[row].headAddr = sq[row].tailAddr = reinterpret_cast<uint64_t>(&sq[row].submittedWqeCount);
             cq[row].tailAddr = sq[row].headAddr;
         }

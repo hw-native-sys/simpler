@@ -412,3 +412,73 @@ TEST_P(A5MixedCompletionTest, CompletedEngineCannotHideOtherEngineFailure) {
 }
 
 INSTANTIATE_TEST_SUITE_P(EngineOrder, A5MixedCompletionTest, ::testing::Bool());
+
+class A5MultiJettyCompletionTest : public A5MixedCompletionTest {
+protected:
+    void SetUp() override {
+        A5MixedCompletionTest::SetUp();
+        auto &waits = sched->async_wait_list;
+        auto &entry = waits.entries[0];
+        entry.condition_count = 0;
+        entry.waiting_completion_count = 0;
+        int32_t error = SIMPLER_ERROR_NONE;
+        const std::array<uint64_t, 3> targets{1, (uint64_t{1} << 32) | 1, 2};
+        for (uint32_t i = 0; i < targets.size(); ++i) {
+            const uint64_t target = targets[GetParam() ? i : targets.size() - 1 - i];
+            ASSERT_TRUE(waits.append_condition_locked(
+                entry, target, urma.addr(), static_cast<uint32_t>(target), ASYNC_ENGINE_URMA,
+                COMPLETION_TYPE_URMA_EVENT_HANDLE, error
+            ));
+        }
+        ASSERT_EQ(error, SIMPLER_ERROR_NONE);
+    }
+};
+
+TEST_P(A5MultiJettyCompletionTest, CompletedFirstJettyDoesNotReleaseConsumer) {
+    ChipTaskSlotState consumer{};
+    consumer.fanin_count = 2;
+    consumer.fanin_refcount.store(0);
+    DepListEntry edge{&consumer, nullptr};
+    producer.fanout_head = &edge;
+    urma.set_cqe(0, 0, true);
+    urma.set_cqe(0, 1, true);
+    urma.set_cqe(1, 0, false);
+
+    const auto pending = poll();
+    EXPECT_EQ(pending.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(pending.completed, 0);
+    EXPECT_EQ(release_count, 0);
+    EXPECT_EQ(producer.task_state.load(), CHIP_TASK_PENDING);
+    EXPECT_EQ(consumer.fanin_refcount.load(), 0);
+    EXPECT_EQ(urma.cq_tail[0], 2u);
+    EXPECT_EQ(urma.cq_tail[1], 0u);
+    ASSERT_EQ(sched->async_wait_list.count, 1);
+    EXPECT_EQ(sched->async_wait_list.entries[0].waiting_completion_count, 1);
+
+    urma.set_cqe(1, 0, true);
+    const auto complete = poll();
+    EXPECT_EQ(complete.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(complete.completed, 1);
+    EXPECT_EQ(release_count, 1);
+    EXPECT_EQ(producer.task_state.load(), CHIP_TASK_COMPLETED);
+    EXPECT_EQ(consumer.fanin_refcount.load(), 1);
+    EXPECT_EQ(urma.cq_tail[1], 1u);
+}
+
+TEST_P(A5MultiJettyCompletionTest, CompletedFirstJettyCannotHideSecondJettyError) {
+    urma.set_cqe(0, 0, true);
+    urma.set_cqe(0, 1, true);
+    urma.set_cqe(1, 0, false);
+    ASSERT_EQ(poll().error_code, SIMPLER_ERROR_NONE);
+    urma.set_cqe(1, 0, true, 7);
+
+    const auto failed = poll();
+    EXPECT_EQ(failed.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(failed.failed_slot_state, &producer);
+    EXPECT_EQ(failed.completed, 0);
+    EXPECT_EQ(release_count, 0);
+    EXPECT_EQ(producer.task_state.load(), CHIP_TASK_PENDING);
+    EXPECT_EQ(urma.cq_tail[1], 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(ConditionOrder, A5MultiJettyCompletionTest, ::testing::Bool());

@@ -389,18 +389,17 @@ int main(int argc, char **argv) {
         std::filesystem::remove_all(folder);
         return 0;
     }
-    assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0);
-    assert(h->domain_allocations.count(id) == 1);
-    assert(destroy_calls == 0 && unsafe_frees == 0);
     if (scenario == "early_get_device") {
+        assert(rc == COMM_DOMAIN_URMA_CONFIG_INVALID && ctx == 0);
         assert(mappings.empty() && registrations.empty() && physical_handles == 0);
-        fail_get_device = false;
-        assert(comm_abort_domain_windows(h, id, 2, 0) == 0);
-        assert(h->domain_allocations.empty() && destroy_calls == 0);
+        assert(h->domain_allocations.empty() && destroy_calls == 0 && unsafe_frees == 0);
         delete h;
         std::filesystem::remove_all(folder);
         return 0;
     }
+    assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0);
+    assert(h->domain_allocations.count(id) == 1);
+    assert(destroy_calls == 0 && unsafe_frees == 0);
     assert(!mappings.empty() && !registrations.empty());
     aclrtDrvMemHandle late_import = nullptr;
     if (scenario == "late_import") {

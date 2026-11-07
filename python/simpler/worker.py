@@ -927,13 +927,16 @@ _PY_CALLABLE_HEADER = struct.Struct("<4sBBHQ")
 # uses only the first slot.
 _CTRL_SHM_NAME_BYTES = 32
 
-# Domain-allocation request shm layout: 32-byte header + buffer_nbytes (u64) +
+# Domain-allocation request shm layout: 40-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
-_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
+_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI12x")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
-#         window_size (u64), buffer_count (u32), workspace_mask (u32)
-assert _DOMAIN_REQ_HEADER.size == 32
+#         window_size (u64), buffer_count (u32), workspace_mask (u32),
+#         urma_jetties_per_aiv (u32), urma_sq_depth (u32)
+assert _DOMAIN_REQ_HEADER.size == 40
+_DOMAIN_URMA_CONFIG_OFFSET = 32
+_DOMAIN_URMA_CONFIG = struct.Struct("<II")
 _DOMAIN_WORKSPACE_MASK_OFFSET = struct.calcsize("<QIIQI")
 
 # Domain-allocation reply shm layout: 40-byte header + buffer_ptrs (u64).
@@ -2885,6 +2888,7 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
     try:
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
         workspace_mask = struct.unpack_from("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET)[0]
+        urma_jetties, urma_sq_depth = _DOMAIN_URMA_CONFIG.unpack_from(req_buf, _DOMAIN_URMA_CONFIG_OFFSET)
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
@@ -2918,6 +2922,8 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
             workspace_mask=workspace_mask,
             **({"host_shm_name": host_shm_name} if host_shm_name else {}),
+            urma_jetties_per_aiv=urma_jetties,
+            urma_sq_depth=urma_sq_depth,
         )
 
         # Carve buffer pointers sequentially inside the local window.
@@ -10574,6 +10580,8 @@ class Worker:
                         **(
                             {"memory_source": config.memory_source} if config.memory_source == AddressSpace.HOST else {}
                         ),
+                        urma_jetties_per_aiv=config.urma_config().jetties_per_aiv,
+                        urma_sq_depth=config.urma_config().sq_depth,
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -10699,6 +10707,8 @@ class Worker:
         buffers: list[CommBufferSpec],
         workspace_mask: int = 0,
         memory_source: AddressSpace = AddressSpace.DEVICE,
+        urma_jetties_per_aiv: int = 1,
+        urma_sq_depth: int = 0,
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -10763,6 +10773,9 @@ class Worker:
                         req_buf,
                         _DOMAIN_WORKSPACE_MASK_OFFSET,
                         workspace_mask,
+                    )
+                    _DOMAIN_URMA_CONFIG.pack_into(
+                        req_buf, _DOMAIN_URMA_CONFIG_OFFSET, urma_jetties_per_aiv, urma_sq_depth
                     )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:

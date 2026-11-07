@@ -346,7 +346,15 @@ static void test_host_domain(const std::string &scenario) {
         std::filesystem::remove_all(folder);
         return;
     }
-    const int rc = comm_alloc_host_domain_windows(h.get(), 1, ranks, 2, 0, 64, mask, name.c_str(), &ctx, &base, &size);
+    const bool configured = scenario == "host_urma_config";
+    const CommWorkspaceConfig config{2, 512};
+    const int rc = comm_alloc_host_domain_windows(
+        h.get(), 1, ranks, 2, 0, 64, mask, name.c_str(), &ctx, &base, &size, configured ? &config : nullptr
+    );
+    if (configured) {
+        assert(sized_jetties == 2 && initialized_jetties == 2 && initialized_sq_depth == 512);
+        assert(sized_aivs == device_aiv_count && initialized_aivs == device_aiv_count);
+    }
     if (scenario == "host_register" || scenario == "host_pointer" || scenario == "host_workspace" ||
         scenario == "host_context" || scenario == "host_collision") {
         assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && base == 0);
@@ -439,7 +447,7 @@ int main(int argc, char **argv) {
     setenv("PTO_ROCE_LOCAL_IP", "127.0.0.1", 1);
     uint64_t next_id = 1;
     const uint32_t ranks[] = {0, 1};
-    auto allocate = [&](uint32_t mask, uint64_t &id, uint64_t &ctx) {
+    auto allocate = [&](uint32_t mask, uint64_t &id, uint64_t &ctx, const CommWorkspaceConfig *config = nullptr) {
         id = next_id++;
         const size_t count = (mask & 2) ? 2 : 1;
         if (count == 2) {
@@ -454,7 +462,7 @@ int main(int argc, char **argv) {
         }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size);
+        return comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size, config);
     };
     auto release = [&](uint64_t id) {
         const auto count = h->domain_allocations.at(id)->nranks;
@@ -508,6 +516,28 @@ int main(int argc, char **argv) {
     assert(live[1] == 0 && h->domain_allocations.empty());
     assert(mappings.empty() && physical_handles == 0);
     fail_engine = -1;
+
+    for (const CommWorkspaceConfig config : {CommWorkspaceConfig{0, 0}, {9, 0}, {2, 3}, {2, 1u << 31}}) {
+        const int starts = started[1];
+        assert(allocate(2, first, first_ctx, &config) == COMM_DOMAIN_URMA_CONFIG_INVALID);
+        assert(started[1] == starts && h->domain_allocations.empty());
+        assert(mappings.empty() && physical_handles == 0);
+    }
+    const CommWorkspaceConfig multi{2, 512};
+    assert(allocate(0, first, first_ctx, &multi) == COMM_DOMAIN_URMA_CONFIG_INVALID);
+    device_aiv_count = 129;
+    assert(allocate(2, first, first_ctx, &multi) == COMM_DOMAIN_URMA_CONFIG_INVALID);
+    assert(h->domain_allocations.empty());
+    device_aiv_count = 2;
+    assert(allocate(2, first, first_ctx, &multi) == 0);
+    assert(sized_jetties == 2 && initialized_jetties == 2 && initialized_sq_depth == 512);
+    assert(sized_aivs == 2 && initialized_aivs == 2);
+    auto *multi_info = reinterpret_cast<const pto::comm::urma::UrmaInfo *>(
+        comm_workspace<CommWorkspaceKind::URMA>(*reinterpret_cast<CommContext *>(first_ctx)).addr
+    );
+    assert(multi_info->rowsPerPeer == 4 && multi_info->jettyCount == 8);
+    release(first);
+    assert(mappings.empty() && physical_handles == 0);
 
     if ((compiled_comm_workspaces() & 2) != 0) {
         uint64_t second = 0, second_ctx = 0;

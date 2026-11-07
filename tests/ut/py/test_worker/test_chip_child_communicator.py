@@ -41,7 +41,17 @@ def shared_memory_granularity(monkeypatch, request):
     monkeypatch.setattr(f"{__name__}.SharedMemory", allocate)
 
 
-def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0, abort_initialization=False):
+def _run_controls(
+    _monkeypatch,
+    init_results,
+    commands,
+    *,
+    workspace_mask=0,
+    urma_jetties=1,
+    urma_sq_depth=0,
+    host_shm_name="",
+    abort_initialization=False,
+):
     cw = MagicMock(
         spec_set=(
             "comm_init",
@@ -75,12 +85,17 @@ def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0, abo
         worker_mod._COMM_INIT_HEADER.pack_into(init_buf, 0, 0, 1)
         path_offset = worker_mod._COMM_INIT_HEADER.size
         init_buf[path_offset : path_offset + len(rootinfo_path)] = rootinfo_path
-        domain_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size + 4)
+        domain_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size + 4 + (32 if host_shm_name else 0))
         domain_buf = domain_request.buf
         assert domain_buf is not None
         worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_WORKSPACE_MASK_OFFSET, workspace_mask)
+        worker_mod._DOMAIN_URMA_CONFIG.pack_into(
+            domain_buf, worker_mod._DOMAIN_URMA_CONFIG_OFFSET, urma_jetties, urma_sq_depth
+        )
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
+        if host_shm_name:
+            struct.pack_into("32s", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size + 4, host_shm_name.encode("ascii"))
         release_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size)
         release_buf = release_request.buf
         assert release_buf is not None
@@ -183,7 +198,11 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
     allocated = cw.comm_alloc_domain_windows.call_args.args
     assert allocated[:5] == (0x1234, 7, [0], 0, 64)
     assert allocated[5] != 0
-    assert cw.comm_alloc_domain_windows.call_args.kwargs == {"workspace_mask": 0}
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {
+        "workspace_mask": 0,
+        "urma_jetties_per_aiv": 1,
+        "urma_sq_depth": 0,
+    }
     cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
     assert published == (1, 0xC7, 0xB000, 4096, 0)
 
@@ -203,7 +222,11 @@ def test_async_workspace_mask_reaches_native_unmodified(monkeypatch, workspace_m
         workspace_mask=workspace_mask,
     )
     assert responses == [(0, "")] * 2
-    assert cw.comm_alloc_domain_windows.call_args.kwargs == {"workspace_mask": workspace_mask}
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {
+        "workspace_mask": workspace_mask,
+        "urma_jetties_per_aiv": 1,
+        "urma_sq_depth": 0,
+    }
 
 
 @pytest.mark.parametrize("failed_init", [0, RuntimeError("init failed")])
@@ -252,3 +275,23 @@ def test_failed_reinitialization_preserves_the_established_handle(monkeypatch, f
     assert responses[2:] == [(0, "")] * 2
     assert cw.comm_alloc_domain_windows.call_args.args[0] == 0x3456
     cw.comm_release_domain_windows.assert_called_once_with(0x3456, 7, 1, 0)
+
+
+@pytest.mark.parametrize("host_shm_name", ["", "host_config_window"])
+def test_urma_queue_configuration_survives_child_control(monkeypatch, host_shm_name):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [0x1234],
+        [worker_mod._CTRL_COMM_INIT, worker_mod._CTRL_ALLOC_DOMAIN],
+        workspace_mask=3,
+        urma_jetties=2,
+        urma_sq_depth=512,
+        host_shm_name=host_shm_name,
+    )
+    assert responses == [(0, "")] * 2
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {
+        **({"host_shm_name": host_shm_name} if host_shm_name else {}),
+        "workspace_mask": 3,
+        "urma_jetties_per_aiv": 2,
+        "urma_sq_depth": 512,
+    }
