@@ -1887,8 +1887,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         );
     }
 
-    // Prepared, not published: `publish_run_image_impl` performs this write, and
-    // records the BindArenaH2d segment that measures it. The pool counters travel
+    // Prepared, not published: `publish_run_image_impl` stages this write for
+    // the launch-owned upload and records its host staging cost. The pool counters travel
     // with the record because only this bind knows them; the rest of that
     // segment's attributes the publication rebuilds from `dev` and the length.
     runtime->set_pending_publication(
@@ -2678,9 +2678,9 @@ extern "C" int bind_callable_to_runtime_impl(
 }
 
 /**
- * Consume this run's metadata in dependency order, synchronously.
- * A failed copy stops publication and consumes the remaining sources. Device
- * destinations remain owned until the failed-prepare cleanup releases them.
+ * Stage this run's metadata in dependency order for the existing launch owner.
+ * A failed stage consumes the pending sources. Device destinations remain
+ * owned until the failed-prepare cleanup releases them.
  */
 extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     if (runtime == nullptr || api == nullptr) {
@@ -2695,28 +2695,19 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // The slot owns snapshots before this local record is destroyed. Onboard launch
-    // publishes them on its AICPU stream before the descriptor and entry fork;
-    // the large execution image stays on the prepare path to overlap execution.
+    // The slot snapshots prerequisites and image before this local record dies.
+    // Onboard launch publishes the same pinned sources in this order before the
+    // descriptor and entry fork. Synchronous backends use the HostApi fallback.
     std::vector<HostMetadataRegion> metadata;
-    metadata.reserve(publication.prerequisites.size());
+    metadata.reserve(publication.prerequisites.size() + 1);
     for (const auto &region : publication.prerequisites)
         metadata.push_back({region.device_target, region.source, region.bytes});
+    metadata.push_back({publication.device_target, publication.source, publication.bytes});
+    const BindPhaseMark staging_phase = bind_phase_begin();
     const int metadata_rc = api->stage_launch_metadata(metadata.data(), metadata.size());
     if (metadata_rc != 0) {
         LOG_ERROR("host-orch: launch metadata staging failed: %d", metadata_rc);
         return metadata_rc;
-    }
-    const BindPhaseMark h2d_phase = bind_phase_begin();
-    if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {
-        // A failed copy is not a copy that did nothing: how much of the
-        // destination it modified is unknown, so the bytes there are neither
-        // this run's image nor whatever preceded it.
-        LOG_ERROR(
-            "host-orch: H2D of the runtime image failed; [%p, +%" PRIu64 ") is left in an unknown state",
-            publication.device_target, publication.bytes
-        );
-        return PTO_RUNTIME_ERR_INTERNAL;
     }
     {
         // The image size and the task count are on the descriptor this bind
@@ -2737,11 +2728,11 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
             publication.device_target, static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes,
             copied_bytes, image_bytes, publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
         );
-        record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, publication.bytes);
+        record_bind_phase(HostPhaseKind::BindImageStage, staging_phase, attrs, publication.bytes);
     }
     if (auto saved = api->get_prepare_plan()) {
         // Keep diagnostics owned by the plan until publication succeeds. An
-        // unpublished abort or failed copy must not strand its graph in TLS.
+        // unpublished abort or failed stage must not strand its graph in TLS.
         const auto plan = std::static_pointer_cast<HostPreparePlan>(saved);
         dep_gen_host_graph_restore_for_export(&plan->diagnostic_graph, plan->diagnostic_outcome);
     }

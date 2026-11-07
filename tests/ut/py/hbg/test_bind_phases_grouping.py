@@ -15,6 +15,11 @@ express: two ranks writing one stream, whose segment bursts interleave.
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
+from simpler_setup.tools.hbg import bind_phases
 from simpler_setup.tools.hbg.bind_phases import cold_binds, parse_binds
 
 SEGMENTS = ("args", "host_orch", "graph_pack", "arena_h2d")
@@ -96,3 +101,77 @@ def test_orchestrator_operations_are_not_segments(tmp_path):
 
     assert len(binds) == 1
     assert sorted(k for k in binds[0] if k not in ("pid", "inv", "ts")) == ["host_orch"]
+
+
+def test_report_counts_image_staging_without_claiming_a_device_upload(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "staged.log"
+    _write(
+        log,
+        [
+            _span(11, 1, phase, 1_000 + i, 1_000_000)
+            for i, phase in enumerate(("host_orch", "graph_pack", "image_stage"))
+        ],
+    )
+    monkeypatch.setattr(sys, "argv", ["hbg_bind_phases", str(log), "--keep-first"])
+
+    assert bind_phases.main() == 0
+
+    output = capsys.readouterr().out
+    assert "*image_stage" in output
+    total = next(line for line in output.splitlines() if line.strip().startswith("total "))
+    assert total.split()[1:4] == ["3.000", "3.000", "3.000"]
+    assert "image_stage is host staging" in output
+    assert "not comparable" in output
+
+
+def _image_scope_logs(tmp_path, phase_keys, separate_files):
+    logs = []
+    combined = []
+    for index, (image_phase, (pid, inv)) in enumerate(phase_keys):
+        lines = [
+            _span(pid, inv, phase, 1_000 + 100 * index + i, 1_000_000)
+            for i, phase in enumerate(("host_orch", "graph_pack", image_phase))
+        ]
+        if separate_files:
+            logs.extend(_write(tmp_path / f"run-{index}.log", lines))
+        else:
+            combined.extend(lines)
+    return logs if separate_files else _write(tmp_path / "run.log", combined)
+
+
+@pytest.mark.parametrize("second_key", [(11, 1), (11, 2), (22, 1), (22, 2)])
+@pytest.mark.parametrize("separate_files", [False, True])
+def test_mixed_image_scopes_are_rejected_before_grouping(tmp_path, second_key, separate_files):
+    logs = _image_scope_logs(tmp_path, [("arena_h2d", (11, 1)), ("image_stage", second_key)], separate_files)
+
+    with pytest.raises(ValueError, match="arena_h2d.*image_stage.*separately"):
+        parse_binds(logs)
+
+
+@pytest.mark.parametrize("second_key", [(11, 1), (11, 2), (22, 1), (22, 2)])
+@pytest.mark.parametrize("separate_files", [False, True])
+def test_mixed_image_scope_cli_prints_no_subtotal(tmp_path, second_key, separate_files, monkeypatch, capsys):
+    logs = _image_scope_logs(tmp_path, [("arena_h2d", (11, 1)), ("image_stage", second_key)], separate_files)
+    monkeypatch.setattr(sys, "argv", ["hbg_bind_phases", *map(str, logs), "--keep-first"])
+
+    assert bind_phases.main() == 1
+
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "arena_h2d" in output.err
+    assert "image_stage" in output.err
+    assert "separately" in output.err
+
+
+@pytest.mark.parametrize("image_phase", ["arena_h2d", "image_stage"])
+@pytest.mark.parametrize("separate_files", [False, True])
+def test_single_image_scope_cli_keeps_valid_subtotals(tmp_path, image_phase, separate_files, monkeypatch, capsys):
+    logs = _image_scope_logs(tmp_path, [(image_phase, (11, 1)), (image_phase, (22, 2))], separate_files)
+    monkeypatch.setattr(sys, "argv", ["hbg_bind_phases", *map(str, logs), "--keep-first"])
+
+    assert bind_phases.main() == 0
+
+    output = capsys.readouterr()
+    assert output.err == ""
+    total = next(line for line in output.out.splitlines() if line.strip().startswith("total "))
+    assert total.split()[1:5] == ["3.000", "3.000", "3.000", "2"]
