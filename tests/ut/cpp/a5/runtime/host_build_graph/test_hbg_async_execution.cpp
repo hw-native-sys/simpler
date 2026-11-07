@@ -75,13 +75,12 @@ struct ExecutionFixture {
             };
         }
         std::vector<SchedulerTaskMetadata> tasks{metadata};
-        EXPECT_TRUE(scheduler_plan_async_layout(tasks, caps, kEpoch, 1 << 20, {}, &async.layout, nullptr));
-        image.reset(std::aligned_alloc(128, async.layout.total_bytes));
+        SchedulerAsyncLayout layout{};
+        EXPECT_TRUE(scheduler_plan_async_layout(tasks, caps, kEpoch, 1 << 20, {}, &layout, nullptr));
+        image.reset(std::aligned_alloc(128, layout.total_bytes));
         EXPECT_NE(image, nullptr);
         async.base = static_cast<uint8_t *>(image.get());
-        EXPECT_TRUE(
-            scheduler_initialize_async_state(tasks, caps, async.layout, async.base, async.layout.total_bytes, nullptr)
-        );
+        EXPECT_TRUE(scheduler_initialize_async_state(tasks, caps, layout, async.base, layout.total_bytes, nullptr));
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, kEpoch));
         run()->active_worker_count = 6;
         run()->aic_active_worker_count = 2;
@@ -100,8 +99,8 @@ struct ExecutionFixture {
             EXPECT_TRUE(scheduler_initialize_admission(base(), local, &admissions[worker]));
             if (admissions[worker].capacity != 0) local->admission = &admissions[worker];
             execution_states[worker].view = async;
-            discovery[worker].check = scheduler_async_directory_start(async.layout.group_count, worker);
-            discovery[worker].finish = scheduler_async_directory_start(async.layout.finish_count, worker);
+            discovery[worker].check = scheduler_async_directory_start(async.layout().group_count, worker);
+            discovery[worker].finish = scheduler_async_directory_start(async.layout().finish_count, worker);
         }
         auto *publisher = locals[0];
         EXPECT_EQ(
@@ -119,7 +118,7 @@ struct ExecutionFixture {
     SchedulerRunControl *run() { return storage.run_control; }
     SchedulerTaskControl *control() { return scheduler_task_control_at(base(), locals[0], 0); }
     SchedulerAsyncTaskJoin &join() {
-        return *scheduler_async_runtime_detail::at<SchedulerAsyncTaskJoin>(async, async.layout.finish_join_offset);
+        return *scheduler_async_runtime_detail::at<SchedulerAsyncTaskJoin>(async, async.layout().finish_join_offset);
     }
     uint64_t blocks_left() { return scheduler_async_join_blocks(scheduler_async_join_load(join())); }
     bool fill(uint32_t worker) {
@@ -368,7 +367,7 @@ TEST(HbgAsyncExecution, PredicateSkipSealsAnEmptyGroupBeforeRelease) {
     const auto &writer = writer_storage.get();
     scheduler_async_runtime_detail::load_into(
         scheduler_async_runtime_detail::at<SchedulerAsyncGroupWriter>(
-            fixture.async, fixture.async.layout.group_writer_offset
+            fixture.async, fixture.async.layout().group_writer_offset
         ),
         &writer_storage.get()
     );
@@ -390,7 +389,7 @@ TEST(HbgAsyncExecution, SealFailureDoesNotPublishExecutionReleaseOrSuccess) {
     EXPECT_NE(scheduler_async_join_load(fixture.join()) & SCHEDULER_ASYNC_JOIN_FAILED, 0u);
     EXPECT_EQ(fixture.locals[0]->local_completed_generations[slot], 0u);
     auto *finish = scheduler_async_runtime_detail::at<SchedulerAsyncLease>(
-        fixture.async, fixture.async.layout.finish_lease_offset
+        fixture.async, fixture.async.layout().finish_lease_offset
     );
     EXPECT_EQ(scheduler_async_lease_load(*finish), scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT));
     EXPECT_FALSE(fixture.retire(0));

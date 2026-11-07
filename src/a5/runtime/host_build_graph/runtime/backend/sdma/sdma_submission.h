@@ -46,7 +46,9 @@ inline __aicore__ bool sdma_submit(
     uint64_t bytes, uint32_t physical_cluster, Backend &backend, Cache &cache, Sink &sink, Metadata metadata = {}
 ) {
     const bool deferred = writer.task_token.is_valid();
-    if ((deferred && !async_completion_open(writer)) ||
+    // Nonempty deferred submissions validate writer state when reserving capacity.
+    // Zero-work calls have no reservation, but must still reject an invalid writer.
+    if ((deferred && bytes == 0 && !async_completion_open(writer)) ||
         (writer.completion_error_code != nullptr && *writer.completion_error_code != 0))
         return sdma_submit_error(writer, cache);
     AsyncBackendView declarations{};

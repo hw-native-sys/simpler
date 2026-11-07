@@ -390,7 +390,7 @@ static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 144, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 816, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 776, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248, "64-bit local profiling size changed"
 );
@@ -1266,54 +1266,40 @@ scheduler_ready_push_target(const SchedulerLocalState *context, uint32_t core_ty
     return context->config.cluster_type_ranks[0];
 }
 
-// Append a locally built batch to the target core's ready queue.
-//
-// Any core may publish to any inbox, so the queue is a CAS-updated FIFO rather
-// than a slot only its owner may store into. That is what retires the
-// owner-pending list: it existed because a sole publisher could not append to a
-// chain concurrent consumers were walking, and had to stage new work locally
-// until its own inbox drained. Appending under CAS leaves nothing to stage.
-//
-// The order is append, not push-down: a consumer serves the oldest task first.
-// Taking the newest instead would let a task that arrived later overtake queued
-// work, and the mix path relies on the head being the oldest placeable task.
-//
-// Publication is two steps -- claim the tail, then link the old tail to the
-// batch -- because the new tail is not known until the CAS lands. A consumer
-// standing on the old tail therefore spins for that link instead of reading an
-// unpublished one as the end of the queue.
+#include "scheduler_ready_publication.h"
+
+// The chain is already private and linked. Its endpoints are enough to commit
+// it; the publisher never traverses a chain after transferring ownership.
 inline __aicore__ bool scheduler_ready_batch_push_queue(
-    __gm__ void *scheduler_state_base, SchedulerLocalState *context, __gm__ SchedulerReadyInbox *inbox,
+    __gm__ void *base, SchedulerLocalState *local, SchedulerCompletionQueue kind, uint64_t queue, uint64_t target,
     SchedulerReadyBatch *batch, SchedulerReadyStats *stats
 ) {
-    if (batch == nullptr || context == nullptr || inbox == nullptr) return false;
+    using namespace scheduler_completion_detail;
+    if (batch == nullptr || local == nullptr) return false;
     if (batch->head == SCHEDULER_INBOX_EMPTY) return true;
-    if (batch->tail < 0 || batch->head < 0) return false;
-    if (!scheduler_ready_endpoint_fits(batch->head) || !scheduler_ready_endpoint_fits(batch->tail)) return false;
-
-    for (uint32_t attempt = 0; attempt < 64; ++attempt) {
-        const uint64_t packed = scheduler_gm_query(inbox->endpoints);
-        if (!scheduler_ready_endpoints_consistent(packed)) return false;
-        const int64_t head = scheduler_ready_endpoints_head(packed);
-        const int64_t tail = scheduler_ready_endpoints_tail(packed);
-        const bool was_empty = scheduler_ready_endpoints_empty(packed);
-        const uint64_t next_packed = scheduler_ready_endpoints_pack(was_empty ? batch->head : head, batch->tail);
-        if (scheduler_gm_compare_exchange(inbox->endpoints, packed, next_packed) != packed) {
+    if (base == nullptr || local->config.graph == nullptr) return false;
+    SchedulerReadyPublication publication{};
+    publication.pending_kind = static_cast<uint64_t>(kind);
+    publication.pending_queue = queue;
+    publication.pending_target = target;
+    publication.pending_count = batch->count;
+    publication.pending_first = batch->head;
+    publication.pending_last = batch->tail;
+    publication.resume_phase = static_cast<uint64_t>(SchedulerCompletionPhase::DRAINED);
+    phase(publication, SchedulerCompletionPhase::PUBLISH);
+    uint32_t retries = 0;
+    for (;;) {
+        const auto result = advance_publication(*local->config.graph, base, local, publication);
+        if (result == PublishResult::ERROR) return false;
+        if (result == PublishResult::RETRY) {
             if (stats != nullptr) ++stats->cas_retry_count;
-            continue;
+            if (++retries == 64) return false;
         }
-        if (!was_empty) {
-            __gm__ SchedulerTaskControl *old_tail = scheduler_task_control_at(scheduler_state_base, context, tail);
-            scheduler_gm_store(old_tail->next_waiter, batch->head);
-        }
-        scheduler_cache_barrier();
+        if (result != PublishResult::PUBLISHED) continue;
         scheduler_ready_batch_reset(batch);
         if (stats != nullptr) ++stats->batch_count;
         return true;
     }
-    // The batch is still linked only to itself, so an exhausted retry budget
-    // leaves no partially published chain behind; the caller reports it.
-    return false;
 }
 
 inline __aicore__ bool scheduler_ready_pool_has_pending(const SchedulerLocalState *local) {
@@ -1328,17 +1314,27 @@ inline __aicore__ bool scheduler_ready_pool_flush_pending(
     auto &pending = local->pending_publications[type];
     if (pending.count == 0) return true;
     const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
-    const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
-    const auto result = scheduler_linked_try_push(queue, &pending, retry_budget);
-    if (result == SchedulerLinkedResult::SUCCESS) {
-        if (stats != nullptr) ++stats->batch_count;
-        return true;
+    using namespace scheduler_completion_detail;
+    SchedulerReadyPublication publication{};
+    publication.pending_kind = static_cast<uint64_t>(SchedulerCompletionQueue::LINKED);
+    publication.pending_queue = type;
+    publication.pending_target = pool.queue_begins[type];
+    publication.pending_count = pending.count;
+    publication.pending_first = pending.first;
+    publication.pending_last = pending.last;
+    publication.pending_link_count = pending.count;
+    phase(publication, SchedulerCompletionPhase::PUBLISH);
+    for (uint32_t attempt = 0; attempt < retry_budget; ++attempt) {
+        const auto result = advance_publication(*local->config.graph, base, local, publication);
+        if (result == PublishResult::PUBLISHED) {
+            pending = {};
+            if (stats != nullptr) ++stats->batch_count;
+            return true;
+        }
+        if (result != PublishResult::RETRY) return false;
     }
-    if (result == SchedulerLinkedResult::RETRY) {
-        if (stats != nullptr) ++stats->contention_giveup_count;
-        return true;
-    }
-    return false;
+    if (stats != nullptr) ++stats->contention_giveup_count;
+    return true;
 }
 
 // Private publications survive bootstrap and completion calls in local state.
@@ -1383,25 +1379,35 @@ inline __aicore__ bool scheduler_ready_pool_push_batch(
             current = next;
         } while (remaining != 0 && count < 8 && current >= 0 &&
                  scheduler_ready_pool_ref_group(current, pool.group_counts[type]) == group);
+        using namespace scheduler_completion_detail;
+        SchedulerReadyPublication publication{};
+        Destination target{};
+        if (!destination(*local->config.graph, base, local, refs[0], &target)) return false;
+        publication.pending_kind = static_cast<uint64_t>(target.kind);
+        publication.pending_queue = type;
+        publication.pending_target = target.target;
+        publication.pending_count = count;
+        for (uint32_t i = 0; i < count; ++i)
+            publication.pending_tasks[i] = refs[i];
+        phase(publication, SchedulerCompletionPhase::PREPARE);
+        if (advance_publication(*local->config.graph, base, local, publication) != PublishResult::ADVANCED)
+            return false;
         if (pool.kind != SchedulerReadyPoolKind::TICKET) {
-            const auto queue = scheduler_ready_pool_linked_queue(base, pool, pool.queue_begins[type]);
-            SchedulerLinkedBatch prepared{};
-            const auto result =
-                pool.kind == SchedulerReadyPoolKind::CHUNK ?
-                    scheduler_chunk_prepare(
-                        scheduler_ready_pool_chunk_queue(base, pool, pool.queue_begins[type]), refs, count, &prepared
-                    ) :
-                    scheduler_linked_prepare(queue, refs, count, &prepared);
-            if (result != SchedulerLinkedResult::SUCCESS ||
-                scheduler_linked_append_private(queue, &local->pending_publications[type], &prepared) !=
-                    SchedulerLinkedResult::SUCCESS)
+            const auto queue = scheduler_ready_pool_linked_queue(base, pool, target.target);
+            SchedulerLinkedBatch prepared{
+                publication.pending_first, publication.pending_last,
+                static_cast<uint32_t>(publication.pending_link_count)
+            };
+            if (scheduler_linked_append_private(queue, &local->pending_publications[type], &prepared) !=
+                SchedulerLinkedResult::SUCCESS)
                 return false;
         } else {
-            const auto queue = scheduler_ready_pool_queue(base, pool, pool.queue_begins[type] + group);
-            SchedulerTicketRange range{};
-            if (scheduler_ticket_reserve(queue, count, &range) != SchedulerTicketResult::SUCCESS ||
-                scheduler_ticket_publish(queue, range, refs) != SchedulerTicketResult::SUCCESS)
-                return false;
+            PublishResult result;
+            do {
+                result = advance_publication(*local->config.graph, base, local, publication);
+                if (result == PublishResult::RETRY && stats != nullptr) ++stats->cas_retry_count;
+            } while (result == PublishResult::RETRY);
+            if (result != PublishResult::PUBLISHED) return false;
             if (stats != nullptr) ++stats->batch_count;
         }
     }
@@ -1421,10 +1427,9 @@ inline __aicore__ bool scheduler_ready_batch_push(
     if (target >= scheduler_ready_queue_owner_count(context, core_type_index) ||
         target >= scheduler_ready_queue_capacity(core_type_index))
         return false;
-    auto *inbox = scheduler_ready_inbox_at(scheduler_state_base, context, core_type_index, target);
-    if (!scheduler_ready_batch_push_queue(scheduler_state_base, context, inbox, batch, stats)) return false;
-    scheduler_ready_directory_set(scheduler_ready_directory_at(scheduler_state_base, context), core_type_index, target);
-    return true;
+    return scheduler_ready_batch_push_queue(
+        scheduler_state_base, context, SchedulerCompletionQueue::INBOX, core_type_index, target, batch, stats
+    );
 }
 
 inline __aicore__ bool scheduler_control_enqueue(
@@ -1438,10 +1443,11 @@ inline __aicore__ bool scheduler_control_enqueue(
         scheduler_read_error(run) != 0)
         return false;
     SchedulerReadyBatch batch{};
-    auto *inbox =
-        scheduler_state_at<SchedulerReadyInbox>(base, local->config.control_inboxes_offset) + local->worker_id();
     if (!scheduler_ready_batch_append(base, local, ref, &batch, nullptr) ||
-        !scheduler_ready_batch_push_queue(base, local, inbox, &batch, nullptr)) {
+        !scheduler_ready_batch_push_queue(
+            base, local, SchedulerCompletionQueue::CONTROL, SCHEDULER_READY_QUEUE_COUNT, local->worker_id(), &batch,
+            nullptr
+        )) {
         scheduler_record_error(
             run, ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
             SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED

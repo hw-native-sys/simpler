@@ -350,9 +350,17 @@ __aicore__ bool run_ready_dispatch_loop(
     if (!scheduler_async_execution_mount(published_graph, scheduler_state_base, context, run_control, &async_state))
         return false;
     AsyncBackendView declarations{};
-    if (async_state.view.enabled() && !declarations.mount(async_state.view.base, async_state.view.layout))
-        return scheduler_async_runtime_detail::fail(graph, context, run_control, SCHEDULER_TASK_REF_INVALID);
-    SchedulerLocalStorage<AsyncBackend> async_backend_storage(declarations, async_state.view.layout.execution_contract);
+    uint64_t execution_contract = HBG_ASYNC_CONTRACT_UNQUALIFIED;
+    if (async_state.view.enabled()) {
+        const auto &layout = async_state.view.layout();
+        if (!declarations.mount(
+                layout.backend_bytes == 0 ? nullptr : async_state.view.base + layout.backend_offset,
+                layout.backend_bytes
+            ))
+            return scheduler_async_runtime_detail::fail(graph, context, run_control, SCHEDULER_TASK_REF_INVALID);
+        execution_contract = layout.execution_contract;
+    }
+    SchedulerLocalStorage<AsyncBackend> async_backend_storage(declarations, execution_contract);
     auto &async_backend = async_backend_storage.get();
     const SchedulerAsyncRuntimeView *async_view = async_state.view.enabled() ? &async_state.view : nullptr;
     const uint32_t cluster_lane = context->config.self_lane;

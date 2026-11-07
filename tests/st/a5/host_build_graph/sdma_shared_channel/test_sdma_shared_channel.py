@@ -21,8 +21,10 @@ def peer_fetch_orchestration(orch, callables, task_args, config):
     ranks = int(task_args.ranks)
     count = int(task_args.elements)
     nbytes = count * 4
+    queues = int(task_args.queues)
     with orch.allocate_domain(
         workspace_engines=("sdma",),
+        sdma_sdk_queue_num=queues if queues > 1 else None,
         name="peer_fetch",
         workers=list(range(ranks)),
         window_size=max(nbytes, 4096),
@@ -42,6 +44,8 @@ def peer_fetch_orchestration(orch, callables, task_args, config):
             args.add_tensor(_rehosted_ref_for(task_args, getattr(task_args, f"stamps_{rank}")), TensorArgType.INOUT)
             args.add_scalar(domain.device_context(rank, workspace_engines=("sdma",)))
             args.add_scalar(int(task_args.transfer_elements))
+            args.add_scalar((rank + 1) % ranks)
+            args.add_scalar(queues)
             orch.submit_next_level(callables.peer_fetch, args, config, worker=rank)
 
 
@@ -56,14 +60,14 @@ class _PeerFetchBase(SceneTestCase):
                 "orchestration": {
                     "source": "kernels/orchestration/peer_fetch.cpp",
                     "function_name": "aicpu_orchestration_entry",
-                    "signature": [D.IN, D.INOUT, D.OUT, D.INOUT, D.SCALAR, D.SCALAR],
+                    "signature": [D.IN, D.INOUT, D.OUT, D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR, D.SCALAR],
                 },
                 "incores": [
                     {
                         "func_id": 0,
                         "source": "kernels/aiv/peer_fetch.cpp",
                         "core_type": "aiv",
-                        "signature": [D.IN, D.OUT, D.INOUT, D.SCALAR, D.SCALAR],
+                        "signature": [D.IN, D.OUT, D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR],
                     },
                     {
                         "func_id": 1,
@@ -90,6 +94,7 @@ class _PeerFetchBase(SceneTestCase):
         return TaskArgsBuilder(
             *specs,
             Scalar("ranks", params["ranks"]),
+            Scalar("queues", params.get("queues", 1)),
             Scalar("elements", count),
             Scalar("transfer_elements", 0 if params.get("zero") else params.get("transfer_elements", count)),
         )
@@ -109,20 +114,30 @@ class _PeerFetchBase(SceneTestCase):
             stamps = getattr(test_args, f"stamps_{rank}")
             assert int(stamps[0]) == 16 and int(stamps[16]) == 16, stamps[:32].tolist()
             assert int(stamps[1]) == int(stamps[17]), "The two AIVs did not select the same SDK channel group"
-            assert int(stamps[2]) == 16 and int(stamps[18]) == 16, f"lost registration count: {stamps[:32].tolist()}"
-            ids = [int(stamps[32 + iteration * 32 + lane * 16]) for iteration in range(16) for lane in range(2)]
-            print("SDMA_PAIRED_POST_IDS", rank, ids, flush=True)
-            # A reused workspace can resume its committed sequence. The batch
-            # must own 32 distinct consecutive posts, regardless of its start.
-            ordered = sorted(ids)
-            assert ordered[0] > 0 and ordered == list(range(ordered[0], ordered[0] + 32)), (
-                f"rank {rank}: duplicate/lost SDMA post IDs: {ids}"
+            queues = params.get("queues", 1)
+            expected = 16 * queues
+            assert int(stamps[2]) == expected and int(stamps[18]) == expected, (
+                f"lost registration count: {stamps[:32].tolist()}"
             )
-            for lane in range(2):
-                posts = ids[lane::2]
-                assert all(left < right for left, right in zip(posts, posts[1:])), (
-                    f"rank {rank}, lane {lane}: SDMA post IDs regressed: {posts}"
+            assert int(stamps[3]) == queues and int(stamps[19]) == queues, "not every configured queue submitted"
+            for channel in range(queues):
+                ids = [
+                    int(stamps[32 + iteration * 32 + lane * 16 + channel])
+                    for iteration in range(16)
+                    for lane in range(2)
+                ]
+                print("SDMA_PAIRED_POST_IDS", rank, channel, ids, flush=True)
+                # Each queue owns an independent sequence; a reused workspace may
+                # resume it. Every iteration has a distinct payload interval.
+                ordered = sorted(ids)
+                assert ordered[0] > 0 and ordered == list(range(ordered[0], ordered[0] + 32)), (
+                    f"rank {rank}, queue {channel}: duplicate/lost SDMA post IDs: {ids}"
                 )
+                for lane in range(2):
+                    posts = ids[lane::2]
+                    assert all(left < right for left, right in zip(posts, posts[1:])), (
+                        f"rank {rank}, queue {channel}, lane {lane}: SDMA post IDs regressed: {posts}"
+                    )
 
 
 def cases(ranks):
@@ -144,6 +159,21 @@ def cases(ranks):
 @scene_test(level=3, runtime="host_build_graph")
 class TestSdmaSharedChannelTwoRanks(_PeerFetchBase):
     CASES = cases(2)
+
+
+@pytest.mark.sdma(worker_workspace=False)
+@scene_test(level=3, runtime="host_build_graph")
+class TestSdmaSharedChannelMultiQueue(_PeerFetchBase):
+    # A communicator's SDMA owner keeps its access mode and queue count for its
+    # lifetime. SDK-only multi-queue cases need a Worker separate from legacy.
+    CASES = [
+        {
+            "name": "peer_fetch_per_submit_payload_queues2",
+            "platforms": ["a5"],
+            "config": {"device_count": 2, "num_sub_workers": 0},
+            "params": {"ranks": 2, "elements": 16 * 1048576, "transfer_elements": 1048576, "queues": 2},
+        }
+    ]
 
 
 @pytest.mark.sdma(worker_workspace=False)

@@ -299,8 +299,13 @@ private:
         auto *base = static_cast<uint8_t *>(scheduler_host_) + async_offset_;
         std::memcpy(base, plan.image.data(), plan.image.size());
         std::memcpy(base + plan.layout.backend_offset, bindings.image.data(), bindings.image.size());
-        async_ = {base, plan.layout};
-        require(declarations_.mount(base, plan.layout), "backend declarations");
+        async_ = {base};
+        require(
+            declarations_.mount(
+                plan.layout.backend_bytes == 0 ? nullptr : base + plan.layout.backend_offset, plan.layout.backend_bytes
+            ),
+            "backend declarations"
+        );
         require(plan.layout.execution_contract == HBG_ASYNC_CONTRACT_UNQUALIFIED, "no core-only promotion");
     }
     void run_sdk_fault() {
@@ -334,13 +339,13 @@ private:
         payload->args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload->global_context);
         SchedulerAsyncExecutionState<ExecutionBackend> state;
         state.view = async_;
-        ExecutionBackend resources(declarations_, async_.layout.execution_contract);
+        ExecutionBackend resources(declarations_, async_.layout().execution_contract);
         require(
             scheduler_async_execution_bind(&state, view, base, local, storage_.run_control, 0), "execution binding"
         );
         require(scheduler_async_execution_permitted(&state, view, local, storage_.run_control, 0), "kernel permission");
         canonical = &payload->async_context;
-        writer = reinterpret_cast<SchedulerAsyncGroupWriter *>(async_.base + async_.layout.group_writer_offset);
+        writer = reinterpret_cast<SchedulerAsyncGroupWriter *>(async_.base + async_.layout().group_writer_offset);
         AsyncCtx verified_writer;
         require(async_execution_context_load(*payload, &verified_writer), "canonical execution context");
         require(
@@ -392,7 +397,7 @@ private:
             "actual scheduler first-error authority"
         );
         auto *guards = reinterpret_cast<AsyncSdmaSubmissionGuard *>(
-            async_.base + async_.layout.sdma_guard_context_offset + sizeof(AsyncSdmaGuardContext)
+            async_.base + async_.layout().sdma_guard_context_offset + sizeof(AsyncSdmaGuardContext)
         );
         require(
             scheduler_gm_query(guards[0].word) == (fault_ == SdmaFault::PREFLIGHT ? 0u : 2u),

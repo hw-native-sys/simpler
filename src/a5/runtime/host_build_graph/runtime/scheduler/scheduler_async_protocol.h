@@ -33,13 +33,12 @@ struct SchedulerAsyncProtocolLoad {
     }
 };
 
-// The release owner may publish the second line while CHECK reads the first.
+// Read only sealed registration fields; writer padding and diagnostics are excluded.
 template <typename Reader = SchedulerAsyncProtocolLoad>
 inline __aicore__ void scheduler_async_writer_snapshot(
-    __gm__ const SchedulerAsyncGroupWriter *source, SchedulerAsyncGroupWriter *destination
+    __gm__ const SchedulerAsyncGroupWriter *source, SchedulerAsyncWriterSnapshot *destination
 ) {
-    scheduler_reset_local(destination);
-    for (uint32_t offset = 0; offset < offsetof(SchedulerAsyncGroupWriter, release); offset += sizeof(uint64_t)) {
+    for (uint32_t offset = 0; offset < sizeof(SchedulerAsyncWriterSnapshot); offset += sizeof(uint64_t)) {
         const uint64_t word = Reader::word(reinterpret_cast<__gm__ const uint8_t *>(source) + offset);
         __builtin_memcpy(reinterpret_cast<uint8_t *>(destination) + offset, &word, sizeof(word));
     }
@@ -60,7 +59,7 @@ inline __aicore__ bool scheduler_async_protocol_point(
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return true;
-    if (layout->run_epoch != epoch) {
+    if (stamp == nullptr || layout->run_epoch != epoch) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return false;
     }
@@ -80,7 +79,7 @@ inline __aicore__ bool scheduler_async_protocol_point(
 template <typename Local>
 inline __aicore__ bool scheduler_async_protocol_sealed(
     __gm__ void *base, const Local *local, const SchedulerAsyncGroupIdentity &identity,
-    __gm__ SchedulerAsyncGroupWriter *writer
+    __gm__ SchedulerAsyncGroupTrace *trace
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return true;
@@ -101,5 +100,7 @@ inline __aicore__ bool scheduler_async_protocol_sealed(
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return false;
     }
-    return scheduler_async_protocol_point(base, local, identity.run_epoch, &writer->sealed_at);
+    return scheduler_async_protocol_point(
+        base, local, identity.run_epoch, trace == nullptr ? nullptr : &trace->sealed_at
+    );
 }

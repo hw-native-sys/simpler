@@ -61,6 +61,7 @@ class Scenario(IntEnum):
     GRAPH = 5
     NEVER = 6
     FULL_SYNC_START = 7
+    SPARSE_READY = 8
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,10 @@ def assert_observations(case: Case, capacity_waiters: int, records, output, cont
     if not case.skip:
         expected_executions = actual_waiters * case.blocks * case.mask.bit_count()
         assert torch.all(control[:, 0, 0] == expected_executions), "registration attempt missing or duplicated"
+    if case.scenario == Scenario.SPARSE_READY:
+        assert torch.all(control[:, 2, 0] == 1024), "ordinary tasks were lost or executed twice"
+        assert torch.all(control[:, 9, 0] > 0), "ordinary work did not overlap the pending wait"
+        assert torch.all((control[:, 8, 0] >= 0) & (control[:, 8, 0] <= 1024))
     if case.scenario == Scenario.VISIBILITY:
         assert torch.all(control[:, 3, 0] == control[:, 5, 0]), "not every consumer-capable lane warmed its cache"
 
@@ -239,8 +244,9 @@ class CounterRunner:
 
     _compile_callable = staticmethod(compile_counter)
 
-    def __init__(self, platform: str, devices: list[int], directory: Path, case: Case):
+    def __init__(self, platform: str, devices: list[int], directory: Path, case: Case, *, profiling_level: int = 4):
         self.case = case
+        self.profiling_level = profiling_level
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         self.compiled = self._compile_callable(platform)
@@ -321,7 +327,7 @@ class CounterRunner:
         self.capture = self.directory / f"run_{self.iteration}"
         self.capture.mkdir()
         config = CallConfig()
-        config.enable_chip_swimlane = 4
+        config.enable_chip_swimlane = self.profiling_level
         config.output_prefix = str(self.capture)
 
         def orchestrate(orch, _args, _config):

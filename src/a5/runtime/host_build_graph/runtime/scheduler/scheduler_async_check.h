@@ -62,8 +62,8 @@ fail(SchedulerAsyncGroupProgress &progress, SchedulerAsyncCheckError error) {
     return fail(progress, static_cast<int64_t>(error));
 }
 
-inline __aicore__ bool
-group_valid(const SchedulerAsyncGroupIdentity &identity, const SchedulerAsyncGroupWriter &writer) {
+template <typename Writer>
+inline __aicore__ bool group_valid(const SchedulerAsyncGroupIdentity &identity, const Writer &writer) {
     return identity.run_epoch != 0 && identity.task_ref >= 0 && identity.finish_index != SCHEDULER_ASYNC_INDEX_NONE &&
            identity.subtask_slot < 3 && identity.capacity >= 1 && identity.capacity <= CORE_ASYNC_MAX_CONDITIONS &&
            identity.condition_types != 0 && (identity.condition_types & ~CORE_ASYNC_CONDITION_TYPES) == 0 &&
@@ -115,9 +115,9 @@ inline __aicore__ bool outcome_valid(const SchedulerAsyncConditionOutcome &outco
 // The sealing owner initializes progress once, before publishing its CHECK lease
 // and directory bit. Reinitializing a live/drained record is an error, not a way
 // to rebuild its mask from count and accidentally observe completed entries again.
+template <typename Writer>
 inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_initialize(
-    const SchedulerAsyncGroupIdentity &identity, const SchedulerAsyncGroupWriter &writer,
-    SchedulerAsyncGroupProgress *progress
+    const SchedulerAsyncGroupIdentity &identity, const Writer &writer, SchedulerAsyncGroupProgress *progress
 ) {
     using namespace scheduler_async_check_detail;
     if (progress == nullptr) return SchedulerAsyncCheckResult::ERROR;
@@ -136,10 +136,10 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_initialize(
 // ordering. READY is monotonic for the run and is never polled again. The backend
 // returns immediately; it cannot retain a continuation, a core, or a payload.
 // The caller publishes this cursor before releasing the CHECK lease.
-template <typename Backend>
+template <typename Backend, typename Writer>
 inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
-    const SchedulerAsyncGroupIdentity &identity, const SchedulerAsyncGroupWriter &writer,
-    const SchedulerAsyncCheckView &view, Backend &backend, SchedulerAsyncGroupProgress *progress, uint32_t *budget
+    const SchedulerAsyncGroupIdentity &identity, const Writer &writer, const SchedulerAsyncCheckView &view,
+    Backend &backend, SchedulerAsyncGroupProgress *progress, uint32_t *budget, SchedulerAsyncCheckStats *stats = nullptr
 ) {
     using namespace scheduler_async_check_detail;
     if (progress == nullptr || budget == nullptr) return SchedulerAsyncCheckResult::ERROR;
@@ -159,7 +159,7 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
         return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
     if (view.entries == nullptr || view.entry_capacity < identity.capacity)
         return fail(*progress, SchedulerAsyncCheckError::INVALID_ENTRY);
-    increment(progress->slice_count);
+    if (stats != nullptr) increment(stats->slice_count);
     uint32_t units = *budget < SCHEDULER_ASYNC_CHECK_WORK_LIMIT ? *budget : SCHEDULER_ASYNC_CHECK_WORK_LIMIT;
     uint64_t observed = 0;
     while (units != 0) {
@@ -169,12 +169,12 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
         const uint32_t index = static_cast<uint32_t>(__builtin_ctzll(suffix != 0 ? suffix : eligible));
         --units;
         --*budget;
-        increment(progress->work_units);
+        if (stats != nullptr) increment(stats->work_units);
         const auto condition = entry(view, index);
         if (!entry_valid(identity, condition)) return fail(*progress, SchedulerAsyncCheckError::INVALID_ENTRY);
         observed |= UINT64_C(1) << index;
         progress->next_condition = index + 1 == count ? 0 : index + 1;
-        increment(progress->observation_count);
+        if (stats != nullptr) increment(stats->observation_count);
         const auto outcome = backend.observe_once(identity, index, condition);
         if (!outcome_valid(outcome)) return fail(*progress, SchedulerAsyncCheckError::INVALID_BACKEND_RESULT);
         if (outcome.state == SchedulerAsyncConditionState::FAILED) return fail(*progress, outcome.error_code);

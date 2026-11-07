@@ -1698,7 +1698,7 @@ bool create_scheduler_state(
         }
         const SchedulerAsyncAuxiliaryBytes auxiliary{
             async_backend.image.size(), async_backend.needs_sdma_guards ? ASYNC_SDMA_CHANNELS : 0,
-            async_backend.execution_contract
+            async_backend.execution_contract, scheduler_phase_timing_enabled(runtime->dev.chip_swimlane_level)
         };
         if (!scheduler_plan_async_layout(
                 task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, auxiliary, &async_layout,

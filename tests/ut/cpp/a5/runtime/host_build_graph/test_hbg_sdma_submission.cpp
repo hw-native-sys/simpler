@@ -186,6 +186,26 @@ TEST(HbgSdmaSubmission, CapacityAndPreflightFailuresPreventSdkSideEffects) {
     }
 }
 
+TEST(HbgSdmaSubmission, InvalidWriterCannotReachSdkForEmptyOrNonemptyTransfers) {
+    for (uint64_t bytes : {0u, 64u}) {
+        for (uint32_t fault = 0; fault < 4; ++fault) {
+            SubmissionData data;
+            auto ctx = data.ctx();
+            if (fault == 0) ctx.completion_count = nullptr;
+            if (fault == 1) ctx.completion_capacity = 0;
+            if (fault == 2) data.writer.reservation.sealed = 1;
+            if (fault == 3) data.writer.error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+            Sink sink{&data, {}};
+            EXPECT_FALSE(submit(data, ctx, sink, bytes));
+            EXPECT_EQ(data.builds, 0u);
+            EXPECT_EQ(data.submits, 0u);
+            EXPECT_EQ(data.writer.count, 0u);
+            EXPECT_TRUE(sink.values.empty());
+            if (fault == 3) EXPECT_EQ(data.writer.error_code, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+        }
+    }
+}
+
 TEST(HbgSdmaSubmission, SdkOrRecordFailuresPoisonHeldQueuesAndKeepTheFirstError) {
     for (uint32_t fault = 2; fault <= 10; ++fault) {
         SubmissionData data;

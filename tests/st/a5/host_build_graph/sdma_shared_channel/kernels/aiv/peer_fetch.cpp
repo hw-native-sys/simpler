@@ -69,14 +69,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         const uint64_t iteration_offset = capacity == count ? 0 : iteration * count;
         Data source(remote + iteration_offset, Shape(1, 1, 1, 1, count), Stride(count, count, count, count, 1));
         Data target(destination + iteration_offset, Shape(1, 1, 1, 1, count), Stride(count, count, count, count, 1));
+        const uint32_t before = *ctx.completion_count;
         if (!send_request_entry(ctx, SdmaTget(target, source, scratch, workspace))) return;
         const uint32_t registered = *ctx.completion_count;
-        if (registered == 0 || registered > ctx.completion_capacity) {
+        if (registered <= before || registered - before > 2 || registered > ctx.completion_capacity) {
             pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             return;
         }
-        const auto &entry = ctx.completion_entries[registered - 1];
-        publish_stamp(stamps + 32 + iteration * 32 + lane * 16, entry.backend_cookie);
+        for (uint32_t record = 0; record < registered - before; ++record)
+            publish_stamp(
+                stamps + 32 + iteration * 32 + lane * 16 + record,
+                ctx.completion_entries[before + record].backend_cookie
+            );
+        publish_stamp(stamps + lane * 16 + 3, registered - before);
         publish_stamp(stamps + lane * 16 + 2, registered);
     }
 }

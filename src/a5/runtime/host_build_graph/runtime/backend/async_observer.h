@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-#include "aicore_completion_mailbox_types.h"
+#include "async_completion_format.h"
 #include "host_build_graph/completion_token.h"
 
 #ifndef __aicore__
@@ -58,12 +58,7 @@ struct AsyncCompletionScalarReader {
 };
 
 inline __aicore__ bool async_completion_entry_valid(const DeferredCompletionEntry &entry) {
-    if (entry.addr == 0 || entry._pad != 0 || entry.engine != COMPLETION_ENGINE_SDMA) return false;
-    if (entry.completion_type == COMPLETION_TYPE_COUNTER)
-        return entry.addr % alignof(int32_t) == 0 && entry.expected_value <= INT32_MAX && entry.backend_cookie == 0;
-    if (entry.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD)
-        return entry.addr % alignof(uint64_t) == 0 && entry.backend_cookie != 0 && entry.expected_value == 0;
-    return false;
+    return entry._pad == 0 && async_completion_format_valid(entry);
 }
 
 // Exactly one scalar observation for a valid entry; malformed metadata is

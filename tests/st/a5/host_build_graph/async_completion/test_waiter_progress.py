@@ -23,3 +23,8 @@ pytestmark = [
 @l3_case
 def test_waiters_leave_capacity_for_the_publisher(run_case, delta):
     run_case(Case(scenario=Scenario.PROGRESS, capacity_delta=delta))
+
+
+@l3_case
+def test_sparse_wait_completes_alongside_ordinary_ready_chains(run_case):
+    run_case(Case(scenario=Scenario.SPARSE_READY, conditions=1, delay_ms=1))

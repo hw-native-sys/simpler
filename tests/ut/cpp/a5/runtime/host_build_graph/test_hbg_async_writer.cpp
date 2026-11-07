@@ -142,16 +142,59 @@ struct RecordingCache {
     void finish() { ++fences; }
 };
 
-TEST(HbgAsyncWriter, MissingCountStillPublishesTheAvailableErrorField) {
+TEST(HbgAsyncWriter, ResidentRegistrationKeepsDirtyWriterPrivateUntilSeal) {
+    for (uint32_t count : {0u, 1u, 8u, 64u}) {
+        Writer writer;
+        auto ctx = writer.context();
+        RecordingCache cache;
+        for (uint32_t index = 0; index < count; ++index) {
+            ASSERT_TRUE(async_completion_append(ctx, token(index + 1)));
+            async_completion_flush(ctx, cache);
+        }
+        EXPECT_TRUE(cache.ranges.empty());
+        EXPECT_EQ(cache.fences, 0u);
+        EXPECT_EQ(writer.count, count);
+        ASSERT_TRUE(async_completion_seal(ctx));
+        EXPECT_EQ(writer.reservation.sealed, 1u);
+    }
+}
+
+TEST(HbgAsyncWriter, MalformedTokensFailBeforeWritingAndRemainStickyAtSeal) {
+    for (uint32_t fault = 0; fault < 8; ++fault) {
+        Writer writer;
+        auto ctx = writer.context();
+        auto value = token();
+        if (fault == 0) value.addr = 0;
+        if (fault == 1) value.addr += 4;
+        if (fault == 2) value.engine = UINT32_MAX;
+        if (fault == 3) value.completion_type = -1;
+        if (fault == 4) value.backend_cookie = 0;
+        if (fault == 5) value.expected_value = 1;
+        if (fault == 6 || fault == 7) {
+            value.completion_type = COMPLETION_TYPE_COUNTER;
+            value.backend_cookie = fault == 6 ? 1 : 0;
+            value.expected_value = fault == 7 ? UINT32_MAX : 1;
+        }
+        EXPECT_FALSE(async_completion_append(ctx, value));
+        EXPECT_EQ(writer.count, 0u);
+        EXPECT_EQ(writer.entries[0].addr, 0u);
+        EXPECT_EQ(writer.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        EXPECT_FALSE(async_completion_append(ctx, token()));
+        EXPECT_FALSE(async_completion_seal(ctx));
+    }
+}
+
+TEST(HbgAsyncWriter, MissingLegacyCountStillPublishesTheAvailableErrorField) {
     Writer writer;
     auto ctx = writer.context();
     ctx.completion_count = nullptr;
+    ctx.completion_reservation = nullptr;
     AsyncCompletionReservation grant;
     EXPECT_FALSE(async_completion_reserve(ctx, 1, &grant));
     ASSERT_EQ(writer.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     RecordingCache cache;
     async_completion_flush(ctx, cache);
-    ASSERT_EQ(cache.ranges.size(), 2u);
+    ASSERT_EQ(cache.ranges.size(), 1u);
     EXPECT_EQ(cache.ranges.front().first, reinterpret_cast<uintptr_t>(&writer.error));
     EXPECT_EQ(cache.ranges.front().second, sizeof(writer.error));
     EXPECT_EQ(cache.fences, 1u);

@@ -681,7 +681,8 @@ struct ResolveFixture : PoolFixture {
         locals[0].config.control_inboxes_offset = layout.ready_inboxes_offset;
         locals[0].control_resolve.producer_ref = producer;
         locals[0].control_resolve.completion.current_waiter = head;
-        locals[0].control_resolve.completion.phase = static_cast<uint64_t>(SchedulerCompletionPhase::SELECT);
+        locals[0].control_resolve.completion.publication.phase =
+            static_cast<uint64_t>(SchedulerCompletionPhase::SELECT);
         scheduler_gm_store(run->bootstrap_scan_complete, uint64_t{1});
     }
 };

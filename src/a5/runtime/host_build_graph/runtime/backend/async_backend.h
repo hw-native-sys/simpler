@@ -80,13 +80,6 @@ struct AsyncBackendView {
     __gm__ const uint8_t *base{nullptr};
     AsyncBackendLayout layout{};
 
-    inline __aicore__ bool mount(__gm__ const uint8_t *region, const SchedulerAsyncLayout &async) {
-        if (async.version != SCHEDULER_ASYNC_LAYOUT_VERSION || async.backend_offset > async.total_bytes ||
-            async.backend_bytes > async.total_bytes - async.backend_offset)
-            return false;
-        return mount(async.backend_bytes == 0 ? nullptr : region + async.backend_offset, async.backend_bytes);
-    }
-
     inline __aicore__ bool mount(__gm__ const uint8_t *address, uint64_t bytes) {
         base = nullptr;
         layout = {};

@@ -39,6 +39,7 @@ struct FinishFixture {
     SchedulerAsyncLease lease{};
     SchedulerAsyncDirectoryWord directory{};
     SchedulerAsyncFinishProgress saved{};
+    SchedulerAsyncFinishStats stats{};
     SchedulerWakeStats wake{};
     SchedulerReadyStats ready{};
     SchedulerCompletionStats completion{};
@@ -189,7 +190,8 @@ struct FinishFixture {
         owned = claim.word;
         auto progress = saved;
         const auto result = scheduler_async_finish_step<Ops, SchedulerResolveLink, Clock>(
-            graph, base(), &locals[worker], run, identity, &join, &progress, &budget, &wake, &ready, profiling_level
+            graph, base(), &locals[worker], run, identity, &join, &progress, &budget, &wake, &ready, profiling_level,
+            &stats
         );
         saved = progress;
         for (const auto &local : locals)
@@ -278,14 +280,14 @@ TEST(HbgAsyncFinish, CompletedCursorForAnotherTaskCannotSkipCurrentWaiter) {
     FinishFixture fixture(2);
     scheduler_gm_store(fixture.control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     scheduler_gm_store(fixture.control(0)->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
-    fixture.saved.completion.phase = static_cast<uint64_t>(SchedulerCompletionPhase::RESOLVE);
+    fixture.saved.completion.publication.phase = static_cast<uint64_t>(SchedulerCompletionPhase::RESOLVE);
     fixture.saved.completion.current_waiter = 1;
     fixture.saved.completion.detached_next = SCHEDULER_TASK_REF_INVALID;
     fixture.saved.completion.resolve = scheduler_resolve_begin(0);
     fixture.saved.completion.resolve.phase = SchedulerResolvePhase::COMPLETED;
 
     EXPECT_EQ(fixture.slice(0, 8), SchedulerCompletionResult::ERROR);
-    EXPECT_EQ(fixture.saved.completion.phase, static_cast<uint64_t>(SchedulerCompletionPhase::FAILED));
+    EXPECT_EQ(fixture.saved.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::FAILED));
     EXPECT_NE(scheduler_read_error(fixture.run), 0u);
     EXPECT_EQ(scheduler_gm_load(fixture.control(1)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
     EXPECT_TRUE(fixture.take_all().empty());
@@ -374,14 +376,14 @@ TEST(HbgAsyncFinish, TicketRetryRetainsBatchAndSuccessfulReservationPublishesBef
     RetryReserve::largest = 0;
     for (uint32_t worker : {0u, 3u, 1u}) {
         ASSERT_EQ(fixture.slice<RetryReserve>(worker, 200), SchedulerCompletionResult::PENDING);
-        EXPECT_EQ(fixture.saved.completion.pending_count, 8u);
-        EXPECT_EQ(fixture.saved.completion.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH));
+        EXPECT_EQ(fixture.saved.completion.publication.pending_count, 8u);
+        EXPECT_EQ(fixture.saved.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH));
         EXPECT_EQ(RetryReserve::reservations, 0u);
         EXPECT_TRUE(fixture.take_all().empty());
     }
     // One unit remains: reservation and all eight stores must complete together.
     ASSERT_EQ(fixture.slice<RetryReserve>(4, 1), SchedulerCompletionResult::PENDING);
-    EXPECT_EQ(fixture.saved.completion.pending_count, 0u);
+    EXPECT_EQ(fixture.saved.completion.publication.pending_count, 0u);
     EXPECT_EQ(RetryReserve::reservations, 1u);
     EXPECT_EQ(fixture.take_all().size(), 8u);
     ASSERT_EQ(fixture.slice<RetryReserve>(2, 200), SchedulerCompletionResult::DONE);
@@ -416,10 +418,12 @@ TEST(HbgAsyncFinish, LinkedAndChunkRetryKeepPreparedBatchOutsideWorkerPrivateSta
         );
         for (uint32_t worker : {0u, 3u, 1u}) {
             ASSERT_EQ(fixture.slice(worker, 200), SchedulerCompletionResult::PENDING);
-            EXPECT_EQ(fixture.saved.completion.pending_count, 8u);
-            EXPECT_EQ(fixture.saved.completion.pending_first, 1);
-            EXPECT_EQ(fixture.saved.completion.pending_last, kind == SchedulerReadyPoolKind::CHUNK ? 1 : 8);
-            EXPECT_EQ(fixture.saved.completion.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH));
+            EXPECT_EQ(fixture.saved.completion.publication.pending_count, 8u);
+            EXPECT_EQ(fixture.saved.completion.publication.pending_first, 1);
+            EXPECT_EQ(fixture.saved.completion.publication.pending_last, kind == SchedulerReadyPoolKind::CHUNK ? 1 : 8);
+            EXPECT_EQ(
+                fixture.saved.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH)
+            );
         }
         ASSERT_EQ(fixture.slice(4, 200), SchedulerCompletionResult::DONE);
         auto actual = fixture.take_all();
@@ -496,7 +500,7 @@ TEST(HbgAsyncFinish, LegacyInboxTargetAndBatchSurviveRetryOnAnotherCluster) {
     fixture.fanout(1, 4);
     RetryInbox::remaining = 1;
     ASSERT_EQ(fixture.slice<RetryInbox>(0, 100), SchedulerCompletionResult::PENDING);
-    EXPECT_EQ(fixture.saved.completion.pending_target, 0u);
+    EXPECT_EQ(fixture.saved.completion.publication.pending_target, 0u);
     ASSERT_EQ(fixture.slice<RetryInbox>(3, 100), SchedulerCompletionResult::DONE);
     EXPECT_TRUE(scheduler_ready_endpoints_empty(
         scheduler_gm_query(scheduler_ready_inbox_at(fixture.base(), &fixture.locals[0], 0, 1)->endpoints)
@@ -513,8 +517,10 @@ TEST(HbgAsyncFinish, ControlSuccessorKeepsItsTargetAcrossRetryThenUsesExistingCo
     scheduler_gm_store(fixture.control(1)->wake_list_head, int64_t{2});
     RetryInbox::remaining = 1;
     ASSERT_EQ(fixture.slice<RetryInbox>(0, 100), SchedulerCompletionResult::PENDING);
-    EXPECT_EQ(fixture.saved.completion.pending_kind, static_cast<uint64_t>(SchedulerCompletionQueue::CONTROL));
-    EXPECT_EQ(fixture.saved.completion.pending_target, 0u);
+    EXPECT_EQ(
+        fixture.saved.completion.publication.pending_kind, static_cast<uint64_t>(SchedulerCompletionQueue::CONTROL)
+    );
+    EXPECT_EQ(fixture.saved.completion.publication.pending_target, 0u);
     ASSERT_EQ(fixture.slice<RetryInbox>(3, 100), SchedulerCompletionResult::DONE);
     auto *inboxes =
         scheduler_state_at<SchedulerReadyInbox>(fixture.base(), fixture.locals[0].config.control_inboxes_offset);
@@ -536,11 +542,11 @@ TEST(HbgAsyncFinish, ErrorAfterPrivatePreparationNeverPublishesOrContributes) {
     FinishFixture fixture(2, SchedulerReadyPoolKind::CHUNK);
     fixture.fanout(1, 2);
     SchedulerCompletionResult result = SchedulerCompletionResult::PENDING;
-    for (uint32_t slice = 0;
-         slice < 20 && fixture.saved.completion.phase != static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH);
+    for (uint32_t slice = 0; slice < 20 && fixture.saved.completion.publication.phase !=
+                                               static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH);
          ++slice)
         ASSERT_EQ(result = fixture.slice(slice % 6, 1), SchedulerCompletionResult::PENDING);
-    ASSERT_EQ(fixture.saved.completion.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH));
+    ASSERT_EQ(fixture.saved.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH));
     scheduler_record_error(fixture.run, 0, SchedulerGraphResult::INVALID_ARGUMENTS, &fixture.graph, &fixture.locals[0]);
     EXPECT_EQ(fixture.slice(3, 100), SchedulerCompletionResult::ERROR);
     EXPECT_TRUE(fixture.take_all().empty());
@@ -653,7 +659,9 @@ TEST(HbgAsyncFinish, DirectoryContentionYieldsAfterPublicationWithoutTouchingTra
     ContendedDirectory::remaining = 3;
     ContendedDirectory::endpoint_attempts = ContendedDirectory::directory_attempts = 0;
     ASSERT_EQ(fixture.slice<ContendedDirectory>(0, 100), SchedulerCompletionResult::PENDING);
-    ASSERT_EQ(fixture.saved.completion.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH_DIRECTORY));
+    ASSERT_EQ(
+        fixture.saved.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH_DIRECTORY)
+    );
     EXPECT_EQ(ContendedDirectory::endpoint_attempts, 1u);
     EXPECT_EQ(ContendedDirectory::directory_attempts, 1u);
     EXPECT_EQ(fixture.take_all(), std::vector<int64_t>{1});
@@ -703,9 +711,9 @@ TEST(HbgAsyncFinish, PhaseTimingAccumulatesActualSlicesWithoutCrossCoreBusySpan)
         result = fixture.slice<SchedulerCompletionQueueOps, OffsetSliceClock>(
             worker, calls == 0 ? 0 : 1, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
         );
-        EXPECT_EQ(fixture.saved.active_slice_cycles, 7 * (calls + 1));
-        EXPECT_EQ(fixture.saved.slice_count, calls + 1);
-        EXPECT_EQ(fixture.saved.work_units, calls);
+        EXPECT_EQ(fixture.stats.active_slice_cycles, 7 * (calls + 1));
+        EXPECT_EQ(fixture.stats.slice_count, calls + 1);
+        EXPECT_EQ(fixture.stats.work_units, calls);
     }
     ASSERT_EQ(result, SchedulerCompletionResult::DONE);
     EXPECT_GT(calls, 6u);
@@ -717,9 +725,9 @@ TEST(HbgAsyncFinish, PhaseTimingAccumulatesActualSlicesWithoutCrossCoreBusySpan)
 
     FinishFixture unprofiled(1);
     ASSERT_EQ(unprofiled.slice(0, 8), SchedulerCompletionResult::DONE);
-    EXPECT_EQ(unprofiled.saved.active_slice_cycles, 0u);
-    EXPECT_EQ(unprofiled.saved.slice_count, 0u);
-    EXPECT_EQ(unprofiled.saved.work_units, 0u);
+    EXPECT_EQ(unprofiled.stats.active_slice_cycles, 0u);
+    EXPECT_EQ(unprofiled.stats.slice_count, 0u);
+    EXPECT_EQ(unprofiled.stats.work_units, 0u);
     uint64_t saturated = UINT64_MAX - 3;
     scheduler_async_finish_accumulate(saturated, 7);
     EXPECT_EQ(saturated, UINT64_MAX);
@@ -753,7 +761,9 @@ TEST(HbgAsyncFinish, DirectoryBitThatAppearsSetStillRequiresAtomicConfirmation) 
     ClearedDirectory::clear_before_confirmation = true;
     ClearedDirectory::confirmations = 0;
     ASSERT_EQ(fixture.slice<ClearedDirectory>(0, 100), SchedulerCompletionResult::PENDING);
-    EXPECT_EQ(fixture.saved.completion.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH_DIRECTORY));
+    EXPECT_EQ(
+        fixture.saved.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::PUBLISH_DIRECTORY)
+    );
     EXPECT_EQ(ClearedDirectory::confirmations, 1u);
     EXPECT_EQ(scheduler_gm_fetch_add(word, uint64_t{0}), 0u);
     ASSERT_EQ(fixture.slice<ClearedDirectory>(3, 100), SchedulerCompletionResult::DONE);
@@ -799,7 +809,7 @@ TEST(HbgAsyncFinish, ForeignAbortAfterRealTaskDoneBeforeDoesNotInventLocalFailur
     );
     ForeignAbortAfterTaskDoneBefore::run = nullptr;
     EXPECT_EQ(result, SchedulerCompletionResult::ERROR);
-    EXPECT_EQ(progress.completion.phase, static_cast<uint64_t>(SchedulerCompletionPhase::FAILED));
+    EXPECT_EQ(progress.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::FAILED));
     EXPECT_EQ(progress.failure_code, 0);
     EXPECT_EQ(storage.run_control->error_task_ref, 1u);
     EXPECT_EQ(local->pending_completed, 0u);

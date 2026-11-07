@@ -21,83 +21,98 @@
 #include "host_build_graph/async_retirement.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 5;
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 6;
 
 // All offsets are relative to the async region; only external resources may
 // carry absolute device addresses in backend declarations.
 struct SchedulerAsyncTaskMap {
     uint64_t group_base{SCHEDULER_ASYNC_INDEX_NONE};
     uint64_t finish_index{SCHEDULER_ASYNC_INDEX_NONE};
-    uint32_t block_count{0};
-    uint32_t groups_per_block{0};
-    uint32_t async_lane_mask{0};
+    uint16_t block_count{0};
+    uint8_t groups_per_block{0};
+    uint8_t async_lane_mask{0};
     uint32_t group_count{0};
 };
 
-struct alignas(128) SchedulerAsyncGroupIdentity {
+struct SchedulerAsyncGroupIdentity {
     uint64_t run_epoch{0};
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint64_t finish_index{SCHEDULER_ASYNC_INDEX_NONE};
     uint64_t entries_offset{0};
-    uint32_t block_idx{0};
-    uint32_t subtask_slot{0};
-    uint32_t capacity{0};
+    uint16_t block_idx{0};
+    uint8_t subtask_slot{0};
+    uint8_t capacity{0};
     uint32_t condition_types{0};
-    uint8_t reserved[80]{};
 };
 
-struct SchedulerAsyncProtocolRelease {
-    SchedulerProtocolStamp before{};
-    SchedulerProtocolStamp after{};
-    uint64_t worker_index{0};
-    uint8_t reserved[24]{};
-};
-static_assert(sizeof(SchedulerAsyncProtocolRelease) == 64);
-
-// The first cache line has one kernel writer and is sealed before its lease is published.
-// It is separate from the atomic-only lease and the later owner's progress.
-struct alignas(128) SchedulerAsyncGroupWriter {
+struct alignas(64) SchedulerAsyncGroupWriter {
     volatile uint32_t count{0};
     volatile int32_t error_code{0};
     AsyncCompletionReservationState reservation{};
-    SchedulerProtocolStamp sealed_at{};
-    uint8_t reserved_first[16]{};
-    SchedulerAsyncProtocolRelease release{};
 };
 
-struct alignas(128) SchedulerAsyncGroupProgress {
+// A local registration view excludes cache-line padding.
+struct SchedulerAsyncWriterSnapshot {
+    uint32_t count{0};
+    int32_t error_code{0};
+    AsyncCompletionReservationState reservation{};
+};
+static_assert(sizeof(SchedulerAsyncWriterSnapshot) == 32);
+static_assert(offsetof(SchedulerAsyncGroupWriter, reservation) == offsetof(SchedulerAsyncWriterSnapshot, reservation));
+
+// CHECK owns these words under its lease. They use bypass loads/stores only.
+struct SchedulerAsyncGroupProgress {
     uint64_t remaining_mask{0};
     uint64_t next_condition{0};
-    uint64_t observation_count{0};
     uint64_t phase{0};
-    uint64_t work_units{0};
-    uint64_t slice_count{0};
     int64_t failure_code{0};
-    SchedulerProtocolStamp terminal_at{};
-    uint64_t terminal_worker_index{0};
-    uint64_t pending_slice_count{0};
-    uint64_t active_cycles{0};
-    uint8_t reserved[32]{};
 };
 
-struct alignas(128) SchedulerAsyncFinishIdentity {
+struct SchedulerAsyncFinishIdentity {
     uint64_t run_epoch{0};
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint64_t group_base{SCHEDULER_ASYNC_INDEX_NONE};
     uint64_t group_count{0};
-    uint8_t reserved[96]{};
 };
 
-struct alignas(128) SchedulerAsyncFinishProgress {
+struct SchedulerAsyncFinishProgress {
     SchedulerCompletionCursor completion{};
-    uint64_t active_slice_cycles{0};
-    uint64_t slice_count{0};
-    uint64_t work_units{0};
-    SchedulerProtocolStamp drained_at{};
-    uint64_t drained_worker_index{0};
     int64_t failure_code{0};
     bool contributed{false};
     uint8_t reserved[7]{};
+};
+
+struct SchedulerAsyncCheckStats {
+    uint64_t observation_count{0};
+    uint64_t work_units{0};
+    uint64_t slice_count{0};
+    uint64_t pending_slice_count{0};
+    uint64_t active_cycles{0};
+};
+struct SchedulerAsyncFinishStats {
+    uint64_t active_slice_cycles{0};
+    uint64_t slice_count{0};
+    uint64_t work_units{0};
+};
+struct alignas(64) SchedulerAsyncProtocolRelease {
+    SchedulerProtocolStamp before{};
+    SchedulerProtocolStamp after{};
+    uint64_t worker_index{0};
+};
+
+// Existing DFX levels allocate these records. CHECK writes only check/terminal;
+// the execution-release owner has a separate line and no CHECK reads it.
+struct alignas(64) SchedulerAsyncGroupTrace {
+    SchedulerAsyncCheckStats check{};
+    SchedulerProtocolStamp sealed_at{};
+    SchedulerProtocolStamp terminal_at{};
+    uint64_t terminal_worker_index{0};
+    SchedulerAsyncProtocolRelease release{};
+};
+struct SchedulerAsyncFinishTrace {
+    SchedulerAsyncFinishStats finish{};
+    SchedulerProtocolStamp drained_at{};
+    uint64_t drained_worker_index{0};
 };
 
 struct SchedulerAsyncLayout {
@@ -128,19 +143,18 @@ struct SchedulerAsyncLayout {
     uint64_t execution_contract{HBG_ASYNC_CONTRACT_UNQUALIFIED};
     uint64_t sdma_guard_context_offset{0};
     uint64_t sdma_guard_count{0};
+    uint64_t group_trace_offset{0};
+    uint64_t finish_trace_offset{0};
 };
 
-static_assert(sizeof(SchedulerAsyncTaskMap) == 32);
-static_assert(sizeof(SchedulerAsyncGroupIdentity) == 128 && sizeof(SchedulerAsyncGroupWriter) == 128);
-static_assert(sizeof(SchedulerAsyncGroupProgress) == 128 && sizeof(SchedulerAsyncFinishIdentity) == 128);
-static_assert(sizeof(SchedulerAsyncFinishProgress) == 256);
-static_assert(offsetof(SchedulerAsyncGroupWriter, sealed_at) == 32);
-static_assert(offsetof(SchedulerAsyncGroupWriter, release) == 64);
-static_assert(offsetof(SchedulerAsyncGroupProgress, terminal_at) == 56);
-static_assert(offsetof(SchedulerAsyncGroupProgress, active_cycles) == 88);
-static_assert(offsetof(SchedulerAsyncFinishProgress, drained_at) == 216);
-static_assert(offsetof(SchedulerAsyncFinishProgress, failure_code) == 240);
-static_assert(sizeof(SchedulerAsyncLayout) == 216);
+static_assert(sizeof(SchedulerAsyncTaskMap) == 24);
+static_assert(sizeof(SchedulerAsyncGroupIdentity) == 40 && sizeof(SchedulerAsyncGroupWriter) == 64);
+static_assert(sizeof(SchedulerAsyncGroupProgress) == 32 && sizeof(SchedulerAsyncFinishIdentity) == 32);
+static_assert(sizeof(SchedulerAsyncFinishProgress) == 168);
+static_assert(sizeof(SchedulerAsyncCheckStats) == 40 && sizeof(SchedulerAsyncFinishStats) == 24);
+static_assert(sizeof(SchedulerAsyncGroupTrace) == 192 && sizeof(SchedulerAsyncFinishTrace) == 48);
+static_assert(offsetof(SchedulerAsyncGroupTrace, release) == 128);
+static_assert(sizeof(SchedulerAsyncLayout) == 232);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(std::is_standard_layout_v<SchedulerAsyncTaskMap> && std::is_trivially_copyable_v<SchedulerAsyncTaskMap>);
 static_assert(

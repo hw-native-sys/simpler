@@ -225,7 +225,7 @@ TEST(HbgAsyncPlan, ImageBeginsDormantEmptyAndUnbound) {
     const auto finish = record<SchedulerAsyncFinishProgress>(plan, plan.layout.finish_progress_offset);
     EXPECT_EQ(finish.completion.resolve.task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(finish.completion.detached_next, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(finish.completion.pending_count, 0u);
+    EXPECT_EQ(finish.completion.publication.pending_count, 0u);
     for (uint64_t i = 0; i < plan.layout.group_count; ++i) {
         const auto id = record<SchedulerAsyncGroupIdentity>(plan, plan.layout.group_identity_offset, i);
         const auto writer = record<SchedulerAsyncGroupWriter>(plan, plan.layout.group_writer_offset, i);
@@ -292,15 +292,14 @@ TEST(HbgAsyncPlan, DirectoryWordBoundaryAndUnusedRecordBytesAreDeterministic) {
         EXPECT_EQ(plan.layout.check_directory_words, groups == 64 ? 1u : 2u);
         for (uint64_t index = 0; index < groups; ++index) {
             const auto id = record<SchedulerAsyncGroupIdentity>(plan, plan.layout.group_identity_offset, index);
-            for (uint8_t byte : id.reserved)
-                EXPECT_EQ(byte, 0u);
+            EXPECT_EQ(id.block_idx, index);
+            EXPECT_EQ(id.run_epoch, kEpoch);
             const uint64_t lease = plan.layout.group_lease_offset + index * sizeof(SchedulerAsyncLease);
             for (uint64_t byte = sizeof(uint64_t); byte < sizeof(SchedulerAsyncLease); ++byte)
                 EXPECT_EQ(plan.image[lease + byte], std::byte{0});
         }
         const auto finish = record<SchedulerAsyncFinishIdentity>(plan, plan.layout.finish_identity_offset);
-        for (uint8_t byte : finish.reserved)
-            EXPECT_EQ(byte, 0u);
+        EXPECT_EQ(finish.group_count, groups);
         const auto progress = record<SchedulerAsyncFinishProgress>(plan, plan.layout.finish_progress_offset);
         for (uint8_t byte : progress.completion.resolve.reserved)
             EXPECT_EQ(byte, 0u);
@@ -312,6 +311,30 @@ TEST(HbgAsyncPlan, DirectoryWordBoundaryAndUnusedRecordBytesAreDeterministic) {
         );
         EXPECT_EQ(duplicate.image, plan.image);
     }
+}
+
+TEST(HbgAsyncPlan, DiagnosticsUseOptionalRunStorageWithoutChangingDefaultCapacity) {
+    SchedulerAsyncHostPlan plain, measured, synchronous;
+    const SchedulerAsyncAuxiliaryBytes diagnostics{0, 0, HBG_ASYNC_CONTRACT_UNQUALIFIED, true};
+    ASSERT_TRUE(scheduler_plan_async_state({task(2, 8)}, {capabilities(2, 64)}, kEpoch, kBudget, {}, &plain, nullptr));
+    ASSERT_TRUE(scheduler_plan_async_state(
+        {task(2, 8)}, {capabilities(2, 64)}, kEpoch, kBudget, diagnostics, &measured, nullptr
+    ));
+    EXPECT_EQ(plain.layout.group_trace_offset, 0u);
+    EXPECT_EQ(plain.layout.finish_trace_offset, 0u);
+    EXPECT_EQ(plain.layout.condition_capacity, measured.layout.condition_capacity);
+    EXPECT_EQ(plain.layout.group_count, measured.layout.group_count);
+    EXPECT_GT(measured.layout.total_bytes, plain.layout.total_bytes);
+    EXPECT_GE(measured.layout.group_trace_offset, plain.layout.total_bytes);
+    EXPECT_GE(
+        measured.layout.finish_trace_offset,
+        measured.layout.group_trace_offset + measured.layout.group_count * sizeof(SchedulerAsyncGroupTrace)
+    );
+    ASSERT_TRUE(
+        scheduler_plan_async_state({task(2)}, {capabilities()}, kEpoch, kBudget, diagnostics, &synchronous, nullptr)
+    );
+    EXPECT_TRUE(synchronous.image.empty());
+    EXPECT_EQ(synchronous.layout.group_trace_offset, 0u);
 }
 
 TEST(HbgAsyncPlan, ExactBudgetSucceedsAndRefusalPreservesPreviousImage) {

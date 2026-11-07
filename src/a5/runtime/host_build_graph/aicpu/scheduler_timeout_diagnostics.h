@@ -122,6 +122,12 @@ inline void async_checkpoints(const View &backing, const SchedulerGraphSummary &
         LOG_ERROR("A5 HBG live sample: invalid async table extent");
         return;
     }
+    const bool diagnostics = layout.group_trace_offset != 0 && layout.finish_trace_offset != 0;
+    if (diagnostics && (!rows(layout.group_trace_offset, layout.group_count, sizeof(SchedulerAsyncGroupTrace)) ||
+                        !rows(layout.finish_trace_offset, layout.finish_count, sizeof(SchedulerAsyncFinishTrace)))) {
+        LOG_ERROR("A5 HBG live sample: invalid optional diagnostics extent");
+        return;
+    }
     LOG_ERROR(
         "A5 HBG live sample async: groups=%" PRIu64 " finishes=%" PRIu64 " per_table_limit=8", layout.group_count,
         layout.finish_count
@@ -130,11 +136,13 @@ inline void async_checkpoints(const View &backing, const SchedulerGraphSummary &
         SchedulerAsyncGroupIdentity identity{};
         SchedulerAsyncGroupWriter writer{};
         SchedulerAsyncGroupProgress progress{};
+        SchedulerAsyncGroupTrace trace{};
         SchedulerAsyncLease lease{};
         SchedulerAsyncDirectoryWord directory{};
         if (!view.read(layout.group_identity_offset, &identity, index) ||
             !view.read(layout.group_writer_offset, &writer, index) ||
             !view.read(layout.group_progress_offset, &progress, index) ||
+            (diagnostics && !view.read(layout.group_trace_offset, &trace, index)) ||
             !view.read(layout.group_lease_offset, &lease, index) ||
             !view.read(layout.check_directory_offset, &directory, index / 64))
             return;
@@ -142,22 +150,25 @@ inline void async_checkpoints(const View &backing, const SchedulerGraphSummary &
             "A5 HBG live sample CHECK[%" PRIu64 "] epoch=%" PRIu64 " task=%" PRId64 " block=%u lane=%u"
             " finish=%" PRIu64 " lease=0x%" PRIx64 " directory[%" PRIu64 "]=0x%" PRIx64 " bit=%u"
             " sealed=%u count=%u writer_error=%d phase=%" PRIu64 " remaining=0x%" PRIx64 " next=%" PRIu64
-            " observations=%" PRIu64 " slices=%" PRIu64 " failure=%" PRId64,
+            " diagnostics=%u observations=%" PRIu64 " slices=%" PRIu64 " failure=%" PRId64,
             index, identity.run_epoch, identity.task_ref, identity.block_idx, identity.subtask_slot,
             identity.finish_index, lease.word, index / 64, directory.bits,
             static_cast<unsigned>((directory.bits >> (index % 64)) & 1), writer.reservation.sealed, writer.count,
             writer.error_code, progress.phase, progress.remaining_mask, progress.next_condition,
-            progress.observation_count, progress.slice_count, progress.failure_code
+            static_cast<unsigned>(diagnostics), trace.check.observation_count, trace.check.slice_count,
+            progress.failure_code
         );
     }
     for (uint64_t index = 0; index < std::min<uint64_t>(layout.finish_count, 8); ++index) {
         SchedulerAsyncFinishIdentity identity{};
         SchedulerAsyncFinishProgress progress{};
+        SchedulerAsyncFinishTrace trace{};
         SchedulerAsyncLease lease{};
         SchedulerAsyncTaskJoin join{};
         SchedulerAsyncDirectoryWord directory{};
         if (!view.read(layout.finish_identity_offset, &identity, index) ||
             !view.read(layout.finish_progress_offset, &progress, index) ||
+            (diagnostics && !view.read(layout.finish_trace_offset, &trace, index)) ||
             !view.read(layout.finish_lease_offset, &lease, index) ||
             !view.read(layout.finish_join_offset, &join, index) ||
             !view.read(layout.finish_directory_offset, &directory, index / 64))
@@ -167,15 +178,19 @@ inline void async_checkpoints(const View &backing, const SchedulerGraphSummary &
             " join=0x%" PRIx64 " directory[%" PRIu64 "]=0x%" PRIx64 " bit=%u phase=%" PRIu64 " waiter=%" PRId64
             " detached=%" PRId64 " visited=%" PRIu64 " pending=%" PRIu64 " kind=%" PRIu64 " queue=%" PRIu64
             " target=%" PRIu64 " resume=%" PRIu64 " resolve_task=%" PRId64 " resolve_producer=%" PRId64
-            " resolve_fanin=%u/%u resolve_phase=%u slices=%" PRIu64 " contributed=%u",
+            " resolve_fanin=%u/%u resolve_phase=%u diagnostics=%u slices=%" PRIu64 " contributed=%u",
             index, identity.run_epoch, identity.task_ref, lease.word, join.word, index / 64, directory.bits,
-            static_cast<unsigned>((directory.bits >> (index % 64)) & 1), progress.completion.phase,
-            progress.completion.current_waiter, progress.completion.detached_next, progress.completion.visited_count,
-            progress.completion.pending_count, progress.completion.pending_kind, progress.completion.pending_queue,
-            progress.completion.pending_target, progress.completion.resume_phase, progress.completion.resolve.task_ref,
+            static_cast<unsigned>((directory.bits >> (index % 64)) & 1),
+            static_cast<uint64_t>(progress.completion.publication.phase), progress.completion.current_waiter,
+            progress.completion.detached_next, progress.completion.visited_count,
+            static_cast<uint64_t>(progress.completion.publication.pending_count),
+            static_cast<uint64_t>(progress.completion.publication.pending_kind),
+            static_cast<uint64_t>(progress.completion.publication.pending_queue),
+            static_cast<uint64_t>(progress.completion.publication.pending_target),
+            static_cast<uint64_t>(progress.completion.publication.resume_phase), progress.completion.resolve.task_ref,
             progress.completion.resolve.producer_ref, progress.completion.resolve.next_fanin,
             progress.completion.resolve.fanin_count, static_cast<unsigned>(progress.completion.resolve.phase),
-            progress.slice_count, static_cast<unsigned>(progress.contributed)
+            static_cast<unsigned>(diagnostics), trace.finish.slice_count, static_cast<unsigned>(progress.contributed)
         );
     }
 }

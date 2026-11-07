@@ -121,6 +121,9 @@ bool plan_async_layout(
         !reserve(layout.backend_bytes, 1, cursor, layout.backend_offset) ||
         (layout.sdma_guard_count != 0 &&
          !reserve(layout.sdma_guard_count + 1, 128, cursor, layout.sdma_guard_context_offset)) ||
+        (auxiliary.diagnostics &&
+         (!reserve(layout.group_count, sizeof(SchedulerAsyncGroupTrace), cursor, layout.group_trace_offset) ||
+          !reserve(layout.finish_count, sizeof(SchedulerAsyncFinishTrace), cursor, layout.finish_trace_offset))) ||
         !scheduler_layout_checked_align(cursor, 128, &layout.total_bytes) || layout.total_bytes > byte_budget ||
         layout.total_bytes > std::numeric_limits<size_t>::max())
         return fail(error, "async state exceeds the byte budget or addressable storage");
@@ -260,7 +263,7 @@ bool scheduler_initialize_async_state(
 ) {
     SchedulerAsyncLayout expected{};
     const SchedulerAsyncAuxiliaryBytes auxiliary{
-        layout.backend_bytes, layout.sdma_guard_count, layout.execution_contract
+        layout.backend_bytes, layout.sdma_guard_count, layout.execution_contract, layout.group_trace_offset != 0
     };
     if (!plan_async_layout(metadata, capabilities, layout.run_epoch, layout.total_bytes, auxiliary, &expected, error))
         return false;

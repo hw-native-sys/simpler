@@ -20,12 +20,12 @@
 #include <type_traits>
 #include <utility>
 
-#include "scheduler/scheduler_async_layout.h"
+#include "scheduler/scheduler_async_runtime.h"
 #include "scheduler/scheduler_local_storage.h"
 
 namespace {
 using FinishStorage = SchedulerLocalStorage<SchedulerAsyncFinishProgress>;
-static_assert(alignof(SchedulerAsyncFinishProgress) == 128);
+static_assert(alignof(SchedulerAsyncFinishProgress) == 8);
 static_assert(alignof(FinishStorage) <= 8);
 static_assert(!std::is_copy_constructible_v<FinishStorage>);
 static_assert(!std::is_copy_assignable_v<FinishStorage>);
@@ -77,23 +77,20 @@ void fill_finish(SchedulerAsyncFinishProgress &value) {
     value.completion.resolve.validate_current_state = false;
     value.completion.current_waiter = 23;
     value.completion.detached_next = 29;
-    value.completion.pending_count = 8;
-    value.completion.pending_queue = 31;
-    value.completion.pending_target = 37;
-    value.completion.pending_kind = 41;
-    value.completion.resume_phase = 43;
-    value.completion.pending_first = 47;
-    value.completion.pending_last = 53;
-    value.completion.pending_link_count = 59;
+    value.completion.publication.pending_count = 8;
+    value.completion.publication.pending_queue = 31;
+    value.completion.publication.pending_target = 37;
+    value.completion.publication.pending_kind = 41;
+    value.completion.publication.resume_phase = 43;
+    value.completion.publication.pending_first = 47;
+    value.completion.publication.pending_last = 53;
+    value.completion.publication.pending_link_count = 59;
     value.completion.visited_count = 61;
     for (size_t i = 0; i < 8; ++i)
-        value.completion.pending_tasks[i] = 100 + i;
-    value.active_slice_cycles = 67;
-    value.slice_count = 71;
-    value.work_units = 73;
+        value.completion.publication.pending_tasks[i] = 100 + i;
     // Writing the outer FINISH phase must preserve the nested resolver cursor
     // and both cache lines of the pending publication.
-    value.completion.phase = 7;
+    value.completion.publication.phase = 7;
 }
 
 void expect_finish_defaults(const SchedulerAsyncFinishProgress &value) {
@@ -105,21 +102,18 @@ void expect_finish_defaults(const SchedulerAsyncFinishProgress &value) {
     EXPECT_EQ(value.completion.resolve.fanin_count, 0u);
     EXPECT_EQ(value.completion.current_waiter, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(value.completion.detached_next, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.completion.pending_first, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.completion.pending_last, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.completion.phase, 0u);
-    EXPECT_EQ(value.completion.pending_count, 0u);
-    EXPECT_EQ(value.completion.pending_queue, 0u);
-    EXPECT_EQ(value.completion.pending_target, 0u);
-    EXPECT_EQ(value.completion.pending_kind, 0u);
-    EXPECT_EQ(value.completion.resume_phase, 0u);
-    EXPECT_EQ(value.completion.pending_link_count, 0u);
+    EXPECT_EQ(value.completion.publication.pending_first, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.publication.pending_last, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.publication.phase, 0u);
+    EXPECT_EQ(value.completion.publication.pending_count, 0u);
+    EXPECT_EQ(value.completion.publication.pending_queue, 0u);
+    EXPECT_EQ(value.completion.publication.pending_target, 0u);
+    EXPECT_EQ(value.completion.publication.pending_kind, 0u);
+    EXPECT_EQ(value.completion.publication.resume_phase, 0u);
+    EXPECT_EQ(value.completion.publication.pending_link_count, 0u);
     EXPECT_EQ(value.completion.visited_count, 0u);
-    for (const auto task : value.completion.pending_tasks)
+    for (const auto task : value.completion.publication.pending_tasks)
         EXPECT_EQ(task, 0);
-    EXPECT_EQ(value.active_slice_cycles, 0u);
-    EXPECT_EQ(value.slice_count, 0u);
-    EXPECT_EQ(value.work_units, 0u);
 }
 
 struct alignas(128) ConstructedValue {
@@ -163,23 +157,33 @@ TEST(HbgLocalStorage, EveryScalarAlignedBasePreservesFinishFieldsAndGuards) {
         EXPECT_FALSE(observed.completion.resolve.validate_current_state);
         EXPECT_EQ(observed.completion.current_waiter, 23);
         EXPECT_EQ(observed.completion.detached_next, 29);
-        EXPECT_EQ(observed.completion.phase, 7u);
-        EXPECT_EQ(observed.completion.pending_count, 8u);
-        EXPECT_EQ(observed.completion.pending_queue, 31u);
-        EXPECT_EQ(observed.completion.pending_target, 37u);
-        EXPECT_EQ(observed.completion.pending_kind, 41u);
-        EXPECT_EQ(observed.completion.resume_phase, 43u);
-        EXPECT_EQ(observed.completion.pending_first, 47);
-        EXPECT_EQ(observed.completion.pending_last, 53);
-        EXPECT_EQ(observed.completion.pending_link_count, 59u);
+        EXPECT_EQ(observed.completion.publication.phase, 7u);
+        EXPECT_EQ(observed.completion.publication.pending_count, 8u);
+        EXPECT_EQ(observed.completion.publication.pending_queue, 31u);
+        EXPECT_EQ(observed.completion.publication.pending_target, 37u);
+        EXPECT_EQ(observed.completion.publication.pending_kind, 41u);
+        EXPECT_EQ(observed.completion.publication.resume_phase, 43u);
+        EXPECT_EQ(observed.completion.publication.pending_first, 47);
+        EXPECT_EQ(observed.completion.publication.pending_last, 53);
+        EXPECT_EQ(observed.completion.publication.pending_link_count, 59u);
         EXPECT_EQ(observed.completion.visited_count, 61u);
         for (size_t i = 0; i < 8; ++i)
-            EXPECT_EQ(observed.completion.pending_tasks[i], 100 + i);
-        EXPECT_EQ(observed.active_slice_cycles, 67u);
-        EXPECT_EQ(observed.slice_count, 71u);
-        EXPECT_EQ(observed.work_units, 73u);
+            EXPECT_EQ(observed.completion.publication.pending_tasks[i], 100 + i);
         EXPECT_TRUE(placed.guards_intact());
     }
+}
+
+TEST(HbgLocalStorage, OptionalFinishDiagnosticsPreserveOwnedCounters) {
+    SchedulerLocalStorage<SchedulerAsyncFinishTrace> trace;
+    trace->finish = {67, 71, 73};
+    SchedulerAsyncFinishTrace stored{};
+    scheduler_async_runtime_detail::publish(&stored, trace.get());
+    trace.reset();
+    EXPECT_EQ(trace->finish.slice_count, 0u);
+    scheduler_async_runtime_detail::load_into(&stored, &trace.get());
+    EXPECT_EQ(trace->finish.active_slice_cycles, 67u);
+    EXPECT_EQ(trace->finish.slice_count, 71u);
+    EXPECT_EQ(trace->finish.work_units, 73u);
 }
 
 TEST(HbgLocalStorage, ResetRestoresNonzeroSentinelsAtEveryScalarAlignedBase) {

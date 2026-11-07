@@ -183,8 +183,18 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
         if (prerequisite.is_valid()) deps.push_back(prerequisite);
         action(
             args, p, Action::CONSUME, instance, execution, 1, p.slots + instance * max_waiters + waiter,
-            p.skip ? 2 : (scenario == Scenario::FANIN ? 1 : 0), deps
+            p.skip ? 2 : (scenario == Scenario::FANIN ? 1 : (scenario == Scenario::SPARSE_READY ? 3 : 0)), deps
         );
+    }
+    if (scenario == Scenario::SPARSE_READY) {
+        // Four independent chains keep ordinary work available while one wait is pending.
+        TaskId chains[4]{TaskId::invalid(), TaskId::invalid(), TaskId::invalid(), TaskId::invalid()};
+        for (int64_t index = 0; index < 1024; ++index) {
+            const int64_t chain = index % 4;
+            std::vector<TaskId> deps;
+            if (chains[chain].is_valid()) deps.push_back(chains[chain]);
+            chains[chain] = action(args, p, Action::PREREQUISITE, instance, base, waiters, int64_t{-1}, 3, deps);
+        }
     }
     if (scenario != Scenario::NEVER && !p.skip)
         action(

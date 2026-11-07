@@ -85,7 +85,7 @@ struct RuntimeFixture {
 
     RuntimeFixture(
         uint32_t blocks = 1, uint32_t active_mask = 1, uint32_t async_mask = 1, uint32_t capacity = 4,
-        bool protocol = false, uint32_t sdma_guards = 0
+        bool protocol = false, uint32_t sdma_guards = 0, bool diagnostics = false
     ) :
         record_protocol(protocol) {
         for (auto &task : metadata) {
@@ -120,6 +120,7 @@ struct RuntimeFixture {
         layout.total_size = pool.total_size;
         SchedulerAsyncAuxiliaryBytes auxiliary{};
         auxiliary.sdma_guard_count = sdma_guards;
+        auxiliary.diagnostics = protocol || diagnostics;
         EXPECT_TRUE(scheduler_plan_async_layout(metadata, caps, kEpoch, 1024 * 1024, auxiliary, &async, nullptr));
         EXPECT_TRUE(scheduler_append_async_layout(
             layout.total_size, async, 1024 * 1024, &async_offset, &layout.total_size, nullptr
@@ -135,6 +136,7 @@ struct RuntimeFixture {
         );
         if (protocol) EXPECT_TRUE(scheduler_init_spmd_task_records(base(), layout, kEpoch));
         run = scheduler_state_at<SchedulerRunControl>(base(), layout.run_control_offset);
+        run->chip_swimlane_level = protocol ? 4 : (diagnostics ? 3 : 0);
         auto *summary = scheduler_state_at<SchedulerGraphSummary>(base(), layout.graph_summary_offset);
         summary->run_epoch = kEpoch;
         summary->async_layout_offset = async_offset;
@@ -187,6 +189,12 @@ struct RuntimeFixture {
     template <typename T>
     T *at(uint64_t offset, uint64_t index = 0) {
         return scheduler_async_runtime_detail::at<T>(views[0], offset, index);
+    }
+    SchedulerAsyncGroupTrace *group_trace(uint64_t index = 0) {
+        return at<SchedulerAsyncGroupTrace>(async.group_trace_offset, index);
+    }
+    SchedulerAsyncFinishTrace *finish_trace(uint64_t index = 0) {
+        return at<SchedulerAsyncFinishTrace>(async.finish_trace_offset, index);
     }
     uint64_t group(uint32_t block, uint32_t lane) {
         return scheduler_async_group_index(*at<SchedulerAsyncTaskMap>(async.task_map_offset), block, lane);
@@ -328,7 +336,7 @@ TEST(HbgAsyncRuntime, MountRejectsCorruptEnvelopeBeforeRecordAccess) {
         EXPECT_FALSE(
             scheduler_async_runtime_mount(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &previous)
         );
-        EXPECT_EQ(previous.layout.version, SCHEDULER_ASYNC_LAYOUT_VERSION);
+        EXPECT_EQ(previous.base, fixture.views[0].base);
         EXPECT_NE(scheduler_read_error(fixture.run), 0u);
     }
 }
@@ -418,7 +426,7 @@ TEST(HbgAsyncRuntime, PendingThenReadyAcrossCoresActivatesFinishForALaterSliceEx
     bool activated = true;
     ASSERT_TRUE(fixture.release(0, 0, &activated));
     EXPECT_FALSE(activated);
-    ASSERT_EQ(fixture.service(3), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    ASSERT_EQ(fixture.service(3), SchedulerAsyncRuntimeServiceResult::IDLE);
     EXPECT_EQ(fixture.backend.observations[0], 1u);
     EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
     const auto lease = scheduler_async_lease_load(*fixture.at<SchedulerAsyncLease>(fixture.async.group_lease_offset));
@@ -442,6 +450,79 @@ TEST(HbgAsyncRuntime, PendingThenReadyAcrossCoresActivatesFinishForALaterSliceEx
     EXPECT_EQ(fixture.completed(), 1u);
     EXPECT_EQ(fixture.backend.observations[0], 2u);
     EXPECT_EQ(fixture.backend.acquisitions, 1u);
+}
+
+TEST(HbgAsyncRuntime, PendingCursorRotationAndLeaseHandoffDoNotReportProgress) {
+    RuntimeFixture fixture(1, 1, 1, 16);
+    fixture.bind(0);
+    for (uint32_t condition = 0; condition < 16; ++condition)
+        fixture.condition(0, 0, condition);
+    ASSERT_TRUE(fixture.seal(0));
+    ASSERT_TRUE(fixture.release(0, 0));
+    for (uint32_t slice = 0; slice < 8; ++slice) {
+        SchedulerAsyncSliceBudget budget{4, 2, 2, 8};
+        EXPECT_EQ(fixture.service(slice % 6, &budget), SchedulerAsyncRuntimeServiceResult::IDLE);
+        EXPECT_EQ(budget.work_units, 0u);
+    }
+    for (uint32_t condition = 0; condition < 16; ++condition)
+        EXPECT_EQ(fixture.backend.observations[condition], 4u);
+    EXPECT_EQ(fixture.completed(), 0u);
+    fixture.backend.ready[0] = true;
+    EXPECT_EQ(fixture.service(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    EXPECT_EQ(fixture.service(3), SchedulerAsyncRuntimeServiceResult::IDLE);
+    fixture.backend.ready.fill(true);
+    fixture.drain();
+    EXPECT_EQ(fixture.completed(), 1u);
+}
+
+TEST(HbgAsyncRuntime, PendingServiceDoesNotResetExecutorProgress) {
+    RuntimeFixture fixture;
+    fixture.bind(0);
+    fixture.condition();
+    ASSERT_TRUE(fixture.seal(0));
+    SchedulerAsyncExecutionState<RuntimeBackend> execution{};
+    execution.view = fixture.views[3];
+    for (bool already_progressing : {false, true}) {
+        execution.gate.begin_iteration();
+        bool progress = already_progressing;
+        ASSERT_TRUE(scheduler_async_execution_service(
+            &execution, fixture.graph, fixture.base(), &fixture.locals[3], fixture.run, fixture.backend,
+            SchedulerAsyncAdmission::BEFORE_ADMISSION, false, &progress
+        ));
+        EXPECT_EQ(progress, already_progressing);
+    }
+    EXPECT_EQ(fixture.backend.observations[0], 2u);
+}
+
+struct RuntimeRetryReserve : SchedulerCompletionQueueOps {
+    static inline bool retry = true;
+    static SchedulerTicketResult
+    reserve(const SchedulerTicketQueueView &queue, uint64_t count, SchedulerTicketRange *range) {
+        return retry ? SchedulerTicketResult::RETRY : SchedulerCompletionQueueOps::reserve(queue, count, range);
+    }
+};
+
+TEST(HbgAsyncRuntime, FinishRetryDoesNotReportProgressButTraversalAndPublicationDo) {
+    RuntimeFixture fixture;
+    fixture.bind(0);
+    ASSERT_TRUE(fixture.seal(0));
+    ASSERT_TRUE(fixture.release(0, 0));
+    RuntimeRetryReserve::retry = true;
+    auto service = [&](uint32_t worker) {
+        SchedulerAsyncSliceBudget budget{};
+        return scheduler_async_runtime_service<RuntimeBackend, SchedulerAsyncFinishClock, RuntimeRetryReserve>(
+            fixture.views[worker], fixture.graph, fixture.base(), &fixture.locals[worker], fixture.run,
+            &fixture.discovery[worker], &budget, fixture.backend
+        );
+    };
+    EXPECT_EQ(service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    EXPECT_EQ(service(2), SchedulerAsyncRuntimeServiceResult::IDLE);
+    EXPECT_EQ(service(3), SchedulerAsyncRuntimeServiceResult::IDLE);
+    EXPECT_EQ(fixture.completed(), 0u);
+    RuntimeRetryReserve::retry = false;
+    EXPECT_EQ(service(4), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    fixture.drain();
+    EXPECT_EQ(fixture.completed(), 1u);
 }
 
 TEST(HbgAsyncRuntime, ZeroConditionGroupDoesNotActivateCheckAndLastBlockActivatesFinish) {
@@ -549,7 +630,7 @@ TEST(HbgAsyncRuntime, SixtyFifthWriterAppendPublishesOverflowAsTheFirstScheduler
     auto ctx = AsyncCtx::from_storage(fixture.payload(0, 0).local_context.async_ctx);
     ctx.completion_reservation =
         reinterpret_cast<AsyncCompletionReservationState *>(fixture.payload(0, 0).async_context.writer_state);
-    const CompletionToken token{kRecords, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, kCookie};
+    const CompletionToken token{kRecords, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
     for (uint32_t condition = 0; condition < 64; ++condition)
         ASSERT_TRUE(async_completion_append(ctx, token));
     ASSERT_FALSE(async_completion_append(ctx, token));
@@ -751,7 +832,7 @@ TEST(HbgAsyncRuntime, ZeroWorkDoesNotClaimAndOversizedBudgetStillServicesOneReco
         1u
     );
     SchedulerAsyncSliceBudget large{100, 100, 100, 100};
-    EXPECT_EQ(fixture.service(3, &large), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    EXPECT_EQ(fixture.service(3, &large), SchedulerAsyncRuntimeServiceResult::IDLE);
     EXPECT_EQ(large.work_units, 92u);
     EXPECT_GE(large.directory_words, 96u);
     EXPECT_GE(large.claim_attempts, 98u);
@@ -790,6 +871,66 @@ struct AsyncProtocolCountingClock {
     }
 };
 
+TEST(HbgAsyncRuntime, DiagnosticTablesCannotAliasHotOrAtomicRecords) {
+    for (uint32_t fault = 0; fault < 4; ++fault) {
+        RuntimeFixture fixture(1, 1, 1, 4, true);
+        auto *layout = reinterpret_cast<SchedulerAsyncLayout *>(fixture.views[0].base);
+        if (fault == 0) layout->group_trace_offset = 0;
+        if (fault == 1) layout->finish_trace_offset = 0;
+        if (fault == 2) layout->group_trace_offset = layout->group_writer_offset;
+        if (fault == 3) layout->finish_trace_offset = layout->group_trace_offset;
+        SchedulerAsyncRuntimeView mounted{};
+        EXPECT_FALSE(
+            scheduler_async_runtime_mount(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &mounted)
+        );
+        EXPECT_FALSE(mounted.enabled());
+    }
+}
+
+TEST(HbgAsyncProtocol, CheckStatisticsDoNotOverwriteConcurrentReleaseEvidence) {
+    RuntimeFixture fixture(1, 1, 1, 4, true);
+    fixture.bind(0);
+    fixture.condition();
+    fixture.record_execution(0);
+    ASSERT_TRUE(fixture.seal(0));
+    auto *trace = fixture.group_trace();
+    std::thread release([&] {
+        for (uint64_t sequence = 1; sequence <= 1000; ++sequence)
+            __atomic_store_n(&trace->release.worker_index, sequence, __ATOMIC_RELEASE);
+    });
+    for (uint32_t slice = 0; slice < 1000; ++slice)
+        EXPECT_EQ(fixture.service(slice % 6), SchedulerAsyncRuntimeServiceResult::IDLE);
+    release.join();
+    EXPECT_EQ(trace->release.worker_index, 1000u);
+    EXPECT_EQ(trace->check.slice_count, 1000u);
+    EXPECT_EQ(trace->check.observation_count, 1000u);
+    EXPECT_EQ(trace->terminal_at.sequence, 0u);
+}
+
+TEST(HbgAsyncProtocol, LevelThreeKeepsStatisticsWithoutProtocolStamps) {
+    RuntimeFixture fixture(1, 1, 1, 4, false, 0, true);
+    fixture.bind(0);
+    fixture.condition();
+    ASSERT_TRUE(fixture.seal(0));
+    AsyncProtocolCountingClock::calls = 0;
+    SchedulerAsyncSliceBudget budget{};
+    EXPECT_EQ(
+        (scheduler_async_runtime_service<RuntimeBackend, AsyncProtocolCountingClock>(
+            fixture.views[1], fixture.graph, fixture.base(), &fixture.locals[1], fixture.run, &fixture.discovery[1],
+            &budget, fixture.backend, 3
+        )),
+        SchedulerAsyncRuntimeServiceResult::IDLE
+    );
+    const auto *trace = fixture.group_trace();
+    EXPECT_EQ(trace->check.observation_count, 1u);
+    EXPECT_EQ(trace->check.pending_slice_count, 1u);
+    EXPECT_EQ(trace->check.active_cycles, 1u);
+    EXPECT_EQ(AsyncProtocolCountingClock::calls, 2u);
+    EXPECT_EQ(trace->sealed_at.sequence, 0u);
+    EXPECT_EQ(trace->terminal_at.sequence, 0u);
+    EXPECT_EQ(trace->release.before.sequence, 0u);
+}
+
 TEST(HbgAsyncProtocol, RealSealReleaseCheckAndFinishShareWorkerSequences) {
     for (const bool ready_first : {false, true}) {
         RuntimeFixture fixture(1, 1, 1, 4, true);
@@ -799,31 +940,31 @@ TEST(HbgAsyncProtocol, RealSealReleaseCheckAndFinishShareWorkerSequences) {
         ASSERT_TRUE(fixture.seal(0));
         auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
         auto *progress = fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset);
-        EXPECT_EQ(writer->sealed_at.sequence, execution->visible.sequence + 1);
+        EXPECT_EQ(fixture.group_trace()->sealed_at.sequence, execution->visible.sequence + 1);
         const auto before = fixture.protocol_worker(1)->next_sequence;
-        ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
-        EXPECT_EQ(progress->pending_slice_count, 1u);
-        EXPECT_EQ(progress->slice_count, 1u);
+        ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::IDLE);
+        EXPECT_EQ(fixture.group_trace()->check.pending_slice_count, 1u);
+        EXPECT_EQ(fixture.group_trace()->check.slice_count, 1u);
         EXPECT_EQ(fixture.protocol_worker(1)->next_sequence, before);
         fixture.backend.ready[0] = true;
         if (!ready_first) ASSERT_TRUE(fixture.release(0, 0));
         ASSERT_EQ(fixture.service(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
-        EXPECT_EQ(progress->terminal_at.sequence, 1u);
-        EXPECT_EQ(progress->terminal_worker_index, 2u);
+        EXPECT_EQ(fixture.group_trace()->terminal_at.sequence, 1u);
+        EXPECT_EQ(fixture.group_trace()->terminal_worker_index, 2u);
         if (ready_first) ASSERT_TRUE(fixture.release(0, 0));
-        EXPECT_EQ(writer->release.worker_index, 0u);
-        EXPECT_EQ(writer->release.before.sequence, writer->sealed_at.sequence + 1);
-        EXPECT_EQ(writer->release.after.sequence, writer->release.before.sequence + 1);
+        EXPECT_EQ(fixture.group_trace()->release.worker_index, 0u);
+        EXPECT_EQ(fixture.group_trace()->release.before.sequence, fixture.group_trace()->sealed_at.sequence + 1);
+        EXPECT_EQ(fixture.group_trace()->release.after.sequence, fixture.group_trace()->release.before.sequence + 1);
         fixture.drain();
         auto *finish = fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset);
         EXPECT_TRUE(finish->contributed);
-        ASSERT_NE(finish->drained_at.sequence, 0u);
+        ASSERT_NE(fixture.finish_trace()->drained_at.sequence, 0u);
         auto *actors =
             scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.layout.protocol.tasks_offset);
         EXPECT_NE(actors[0].completion.after.sequence, 0u);
         EXPECT_EQ(
-            finish->drained_at.sequence,
-            fixture.protocol_worker(static_cast<uint32_t>(finish->drained_worker_index))->next_sequence
+            fixture.finish_trace()->drained_at.sequence,
+            fixture.protocol_worker(static_cast<uint32_t>(fixture.finish_trace()->drained_worker_index))->next_sequence
         );
         EXPECT_EQ(fixture.completed(), 1u);
         for (uint32_t worker = 0; worker < 6; ++worker)
@@ -842,14 +983,17 @@ TEST(HbgAsyncProtocol, EmptyAndPredicateSkipSealWithoutCheckTerminal) {
         auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
         auto *progress = fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset);
         EXPECT_EQ(writer->count, 0u);
-        EXPECT_EQ(writer->sealed_at.sequence, (skipped ? execution->entry.sequence : execution->visible.sequence) + 1);
-        EXPECT_EQ(progress->terminal_at.sequence, 0u);
-        EXPECT_EQ(progress->pending_slice_count, 0u);
-        EXPECT_EQ(progress->slice_count, 0u);
+        EXPECT_EQ(
+            fixture.group_trace()->sealed_at.sequence,
+            (skipped ? execution->entry.sequence : execution->visible.sequence) + 1
+        );
+        EXPECT_EQ(fixture.group_trace()->terminal_at.sequence, 0u);
+        EXPECT_EQ(fixture.group_trace()->check.pending_slice_count, 0u);
+        EXPECT_EQ(fixture.group_trace()->check.slice_count, 0u);
         if (skipped) EXPECT_EQ(execution->returned.sequence + execution->visible.sequence, 0u);
         ASSERT_TRUE(fixture.release(0, 0));
         fixture.drain();
-        EXPECT_EQ(writer->release.after.sequence, writer->release.before.sequence + 1);
+        EXPECT_EQ(fixture.group_trace()->release.after.sequence, fixture.group_trace()->release.before.sequence + 1);
     }
 }
 
@@ -861,9 +1005,9 @@ TEST(HbgAsyncProtocol, FailedSealRetainsActualSealAndNoRelease) {
     fixture.backend.allow_registration = false;
     EXPECT_FALSE(fixture.seal(0));
     const auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
-    EXPECT_NE(writer->sealed_at.sequence, 0u);
+    EXPECT_NE(fixture.group_trace()->sealed_at.sequence, 0u);
     EXPECT_NE(writer->error_code, 0);
-    EXPECT_EQ(writer->release.before.sequence + writer->release.after.sequence, 0u);
+    EXPECT_EQ(fixture.group_trace()->release.before.sequence + fixture.group_trace()->release.after.sequence, 0u);
     EXPECT_EQ(fixture.completed(), 0u);
 }
 
@@ -875,8 +1019,8 @@ TEST(HbgAsyncProtocol, MixedLanesHaveOnlyOneLogicalBlockReleaseInterval) {
         ASSERT_TRUE(fixture.seal(lane, 0, lane));
     }
     ASSERT_TRUE(fixture.release(0, 0));
-    const auto *first = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset, fixture.group(0, 1));
-    const auto *second = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset, fixture.group(0, 2));
+    const auto *first = fixture.at<SchedulerAsyncGroupTrace>(fixture.async.group_trace_offset, fixture.group(0, 1));
+    const auto *second = fixture.at<SchedulerAsyncGroupTrace>(fixture.async.group_trace_offset, fixture.group(0, 2));
     EXPECT_NE(first->release.before.sequence, 0u);
     EXPECT_EQ(first->release.after.sequence, first->release.before.sequence + 1);
     EXPECT_EQ(first->release.worker_index, 0u);
@@ -888,7 +1032,7 @@ struct RegistrationPrefixReader {
     static inline uint32_t reads = 0;
     static uint64_t word(const uint8_t *address) {
         EXPECT_GE(reinterpret_cast<uintptr_t>(address), begin);
-        EXPECT_LT(reinterpret_cast<uintptr_t>(address), begin + 64);
+        EXPECT_LT(reinterpret_cast<uintptr_t>(address), begin + sizeof(SchedulerAsyncWriterSnapshot));
         ++reads;
         uint64_t result = 0;
         std::memcpy(&result, address, sizeof(result));
@@ -900,23 +1044,23 @@ TEST(HbgAsyncProtocol, WriterSnapshotDoesNotReadConcurrentReleaseLine) {
     SchedulerAsyncGroupWriter source{};
     source.count = 3;
     source.reservation.sealed = 1;
-    source.sealed_at = {17, 4};
+    SchedulerAsyncGroupTrace trace{};
+    trace.sealed_at = {17, 4};
     RegistrationPrefixReader::begin = reinterpret_cast<uintptr_t>(&source);
     RegistrationPrefixReader::reads = 0;
     std::thread releaser([&] {
         for (uint64_t index = 1; index <= 1000; ++index)
-            __atomic_store_n(&source.release.worker_index, index, __ATOMIC_RELEASE);
+            __atomic_store_n(&trace.release.worker_index, index, __ATOMIC_RELEASE);
     });
     for (uint32_t index = 0; index < 100; ++index) {
-        SchedulerAsyncGroupWriter snapshot{};
+        SchedulerAsyncWriterSnapshot snapshot{};
         scheduler_async_writer_snapshot<RegistrationPrefixReader>(&source, &snapshot);
         EXPECT_EQ(snapshot.count, 3u);
-        EXPECT_EQ(snapshot.sealed_at.sequence, 4u);
-        EXPECT_EQ(snapshot.release.worker_index, 0u);
+        EXPECT_EQ(snapshot.reservation.sealed, 1u);
     }
     releaser.join();
-    EXPECT_EQ(RegistrationPrefixReader::reads, 800u);
-    EXPECT_EQ(source.release.worker_index, 1000u);
+    EXPECT_EQ(RegistrationPrefixReader::reads, 400u);
+    EXPECT_EQ(trace.release.worker_index, 1000u);
 }
 
 TEST(HbgAsyncProtocol, DisabledProtocolAndLevelOneDoNotReadDiagnosticClock) {
@@ -925,7 +1069,7 @@ TEST(HbgAsyncProtocol, DisabledProtocolAndLevelOneDoNotReadDiagnosticClock) {
     fixture.condition();
     ASSERT_TRUE(fixture.seal(0));
     AsyncProtocolCountingClock::calls = 0;
-    ASSERT_EQ(fixture.service<AsyncProtocolCountingClock>(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    ASSERT_EQ(fixture.service<AsyncProtocolCountingClock>(1), SchedulerAsyncRuntimeServiceResult::IDLE);
     fixture.backend.ready[0] = true;
     ASSERT_TRUE(fixture.release(0, 0));
     ASSERT_EQ(fixture.service<AsyncProtocolCountingClock>(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
@@ -944,21 +1088,29 @@ TEST(HbgAsyncProtocol, AsyncAndOrdinaryStampsKeepDuplicateOverflowAndFinishGuard
     RuntimeFixture fixture(1, 1, 1, 4, true);
     auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
     auto *layout = scheduler_protocol_layout_at(fixture.base(), &fixture.locals[0]);
-    ASSERT_TRUE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->sealed_at));
+    ASSERT_TRUE(
+        scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &fixture.group_trace()->sealed_at)
+    );
     auto *actor = scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.layout.protocol.tasks_offset);
     ASSERT_TRUE(scheduler_protocol_stamp_at(fixture.base(), &fixture.locals[0], layout, &actor->completion.before, 0));
-    EXPECT_EQ(writer->sealed_at.sequence, 1u);
+    EXPECT_EQ(fixture.group_trace()->sealed_at.sequence, 1u);
     EXPECT_EQ(actor->completion.before.sequence, 2u);
-    EXPECT_FALSE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->sealed_at));
+    EXPECT_FALSE(
+        scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &fixture.group_trace()->sealed_at)
+    );
     EXPECT_EQ(fixture.protocol_worker(0)->next_sequence, 2u);
     EXPECT_NE(fixture.protocol_worker(0)->error_flags & SCHEDULER_PROTOCOL_DUPLICATE, 0u);
     fixture.protocol_worker(0)->next_sequence = UINT64_MAX;
-    EXPECT_FALSE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->release.before));
-    EXPECT_EQ(writer->release.before.sequence, 0u);
+    EXPECT_FALSE(scheduler_async_protocol_point(
+        fixture.base(), &fixture.locals[0], kEpoch, &fixture.group_trace()->release.before
+    ));
+    EXPECT_EQ(fixture.group_trace()->release.before.sequence, 0u);
     EXPECT_NE(fixture.protocol_worker(0)->error_flags & SCHEDULER_PROTOCOL_SEQUENCE_OVERFLOW, 0u);
     fixture.protocol_worker(0)->next_sequence = 2;
     scheduler_protocol_finish(fixture.base(), &fixture.locals[0], false);
-    EXPECT_FALSE(scheduler_async_protocol_point(fixture.base(), &fixture.locals[0], kEpoch, &writer->release.before));
+    EXPECT_FALSE(scheduler_async_protocol_point(
+        fixture.base(), &fixture.locals[0], kEpoch, &fixture.group_trace()->release.before
+    ));
     EXPECT_NE(fixture.protocol_worker(0)->error_flags & SCHEDULER_PROTOCOL_AFTER_FINISH, 0u);
 }
 
@@ -978,7 +1130,7 @@ TEST(HbgAsyncProtocol, TerminalPrecedesJoinAndDrainedFollowsPublishedContributio
         if (AsyncProtocolCountingClock::calls != 3) return;
         auto &f = *inspected_protocol_fixture;
         EXPECT_NE(scheduler_async_join_load(*f.at<SchedulerAsyncTaskJoin>(f.async.finish_join_offset)), 0u);
-        EXPECT_EQ(f.at<SchedulerAsyncGroupProgress>(f.async.group_progress_offset)->terminal_at.sequence, 0u);
+        EXPECT_EQ(f.group_trace()->terminal_at.sequence, 0u);
     };
     EXPECT_EQ(fixture.service<AsyncProtocolCountingClock>(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
     EXPECT_EQ(AsyncProtocolCountingClock::calls, 3u);
@@ -987,15 +1139,15 @@ TEST(HbgAsyncProtocol, TerminalPrecedesJoinAndDrainedFollowsPublishedContributio
         if (f.completed() == 0) return;
         const auto *progress = f.at<SchedulerAsyncFinishProgress>(f.async.finish_progress_offset);
         EXPECT_TRUE(progress->contributed);
-        EXPECT_EQ(progress->completion.pending_count, 0u);
-        EXPECT_EQ(progress->drained_at.sequence, 0u);
+        EXPECT_EQ(progress->completion.publication.pending_count, 0u);
+        EXPECT_EQ(f.finish_trace()->drained_at.sequence, 0u);
     };
     for (uint32_t iteration = 0; iteration < 32 && fixture.completed() == 0; ++iteration)
         EXPECT_EQ(fixture.service<AsyncProtocolCountingClock>(3), SchedulerAsyncRuntimeServiceResult::PROGRESS);
     AsyncProtocolCountingClock::inspect = nullptr;
     inspected_protocol_fixture = nullptr;
     EXPECT_EQ(fixture.completed(), 1u);
-    EXPECT_NE(fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset)->drained_at.sequence, 0u);
+    EXPECT_NE(fixture.finish_trace()->drained_at.sequence, 0u);
 }
 
 TEST(HbgAsyncProtocol, FailedReleasePreservesBeforeWithoutInventingAfter) {
@@ -1005,7 +1157,7 @@ TEST(HbgAsyncProtocol, FailedReleasePreservesBeforeWithoutInventingAfter) {
     ASSERT_TRUE(fixture.seal(0));
     scheduler_async_join_abort(*fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset));
     EXPECT_FALSE(fixture.release(0, 0));
-    const auto &release = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset)->release;
+    const auto &release = fixture.at<SchedulerAsyncGroupTrace>(fixture.async.group_trace_offset)->release;
     EXPECT_NE(release.before.sequence, 0u);
     EXPECT_EQ(release.after.sequence, 0u);
     EXPECT_EQ(fixture.completed(), 0u);
@@ -1024,7 +1176,7 @@ TEST(HbgAsyncProtocol, ExportsRealRecorderEvidenceForPythonRoundTrip) {
         } else {
             ASSERT_TRUE(fixture.release(0, 0));
             if (mode == 0) {
-                ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+                ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::IDLE);
                 fixture.backend.ready[0] = true;
                 ASSERT_EQ(fixture.service(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
             }
@@ -1072,16 +1224,16 @@ void ordinary_projection_returned_path() {
         &state, fixture.graph, fixture.base(), &local, fixture.run, 0, fixture.backend
     ));
     const auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
-    EXPECT_GT(writer->sealed_at.sequence, execution->visible.sequence);
-    ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    EXPECT_GT(fixture.group_trace()->sealed_at.sequence, execution->visible.sequence);
+    ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::IDLE);
     ASSERT_TRUE(fixture.release(0, 0));
     fixture.backend.ready[0] = true;
     ASSERT_EQ(fixture.service(2), SchedulerAsyncRuntimeServiceResult::PROGRESS);
     fixture.drain();
-    EXPECT_NE(writer->release.before.sequence, 0u);
-    EXPECT_GT(writer->release.after.sequence, writer->release.before.sequence);
-    EXPECT_NE(fixture.at<SchedulerAsyncGroupProgress>(fixture.async.group_progress_offset)->terminal_at.sequence, 0u);
-    EXPECT_NE(fixture.at<SchedulerAsyncFinishProgress>(fixture.async.finish_progress_offset)->drained_at.sequence, 0u);
+    EXPECT_NE(fixture.group_trace()->release.before.sequence, 0u);
+    EXPECT_GT(fixture.group_trace()->release.after.sequence, fixture.group_trace()->release.before.sequence);
+    EXPECT_NE(fixture.group_trace()->terminal_at.sequence, 0u);
+    EXPECT_NE(fixture.finish_trace()->drained_at.sequence, 0u);
     EXPECT_EQ(scheduler_read_error(fixture.run), 0u);
 }
 
@@ -1099,12 +1251,12 @@ void ordinary_projection_release_path(bool mixed) {
     ASSERT_EQ(fixture.graph.scheduler_state_address, 0u);
     ASSERT_TRUE(scheduler_protocol_enabled(&fixture.locals[0]));
     ASSERT_TRUE(fixture.release(0, 0));
-    const auto &release = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset)->release;
+    const auto &release = fixture.at<SchedulerAsyncGroupTrace>(fixture.async.group_trace_offset)->release;
     EXPECT_NE(release.before.sequence, 0u);
     EXPECT_GT(release.after.sequence, release.before.sequence);
     EXPECT_EQ(release.worker_index, 0u);
     if (mixed) {
-        const auto &other = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset, 1)->release;
+        const auto &other = fixture.at<SchedulerAsyncGroupTrace>(fixture.async.group_trace_offset, 1)->release;
         EXPECT_EQ(other.before.sequence + other.after.sequence, 0u);
     } else {
         fixture.drain();

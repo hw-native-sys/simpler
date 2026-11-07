@@ -32,8 +32,12 @@ inline __aicore__ bool scheduler_async_execution_mount(
     SchedulerAsyncExecutionState<Backend> *state
 ) {
     if (state == nullptr || !scheduler_async_runtime_mount(graph, base, local, run, &state->view)) return false;
-    state->discovery.check = scheduler_async_directory_start(state->view.layout.group_count, local->worker_id());
-    state->discovery.finish = scheduler_async_directory_start(state->view.layout.finish_count, local->worker_id());
+    if (!state->view.enabled()) {
+        state->discovery = {};
+        return true;
+    }
+    state->discovery.check = scheduler_async_directory_start(state->view.layout().group_count, local->worker_id());
+    state->discovery.finish = scheduler_async_directory_start(state->view.layout().finish_count, local->worker_id());
     return true;
 }
 

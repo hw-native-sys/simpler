@@ -302,7 +302,9 @@ struct AsyncProtocolExportFixture : ProtocolExportFixture {
             };
         SchedulerAsyncHostPlan plan;
         std::string error;
-        ASSERT_TRUE(scheduler_plan_async_state(metadata, capabilities, kEpoch, 1 << 20, {}, &plan, &error)) << error;
+        ASSERT_TRUE(scheduler_plan_async_state(
+            metadata, capabilities, kEpoch, 1 << 20, {0, 0, HBG_ASYNC_CONTRACT_UNQUALIFIED, true}, &plan, &error
+        )) << error;
         std::vector<uint8_t> prefix(layout.total_size);
         std::memcpy(prefix.data(), storage->base(), prefix.size());
         uint64_t total = 0;
@@ -330,7 +332,7 @@ struct AsyncProtocolExportFixture : ProtocolExportFixture {
         auto &writer = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset, index);
         writer.count = count;
         writer.reservation.sealed = 1;
-        writer.sealed_at = {0, 2};
+        async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset, index).sealed_at = {0, 2};
         const uint64_t trace = identity.block_idx * 3 + identity.subtask_slot;
         auto &execution = at<SchedulerProtocolExecutionTrace>(layout.protocol.executions_offset)[trace];
         execution.run_epoch = kEpoch;
@@ -393,12 +395,12 @@ TEST_F(AsyncProtocolExportFixture, ConditionsKeepTypesWithoutInventingResourceBi
     }
     auto &progress = async_at<SchedulerAsyncGroupProgress>(frozen.layout.group_progress_offset);
     progress.phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::DRAINED);
-    progress.terminal_at = {8, 4};
-    progress.terminal_worker_index = 1;
-    progress.observation_count = 2;
-    progress.slice_count = 3;
-    progress.pending_slice_count = 2;
-    progress.active_cycles = 11;
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).terminal_at = {8, 4};
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).terminal_worker_index = 1;
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).check.observation_count = 2;
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).check.slice_count = 3;
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).check.pending_slice_count = 2;
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).check.active_cycles = 11;
     async_at<SchedulerAsyncLease>(frozen.layout.group_lease_offset).word =
         scheduler_async_lease_word(7, SchedulerAsyncPhase::TERMINAL);
     const auto json = dump_async();
@@ -412,7 +414,7 @@ TEST_F(AsyncProtocolExportFixture, ConditionsKeepTypesWithoutInventingResourceBi
 }
 
 TEST_F(AsyncProtocolExportFixture, PartialLogicalBlockReleasePreservesItsBeforePointOnce) {
-    auto &release = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset).release;
+    auto &release = async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).release;
     release.before = {0, 5};
     release.worker_index = 0;
     const auto json = dump_async();
@@ -425,20 +427,20 @@ TEST_F(AsyncProtocolExportFixture, PartialLogicalBlockReleasePreservesItsBeforeP
 }
 
 TEST_F(AsyncProtocolExportFixture, DoesNotDiscardAnOrphanOrNonownerReleaseEvent) {
-    auto &release = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset).release;
+    auto &release = async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).release;
     release.after = {10, 6};
     EXPECT_THROW(dump_async(), std::invalid_argument);
     release.after = {};
-    async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset, 1).release.before = {10, 6};
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset, 1).release.before = {10, 6};
     EXPECT_THROW(dump_async(), std::invalid_argument);
 }
 
 TEST_F(AsyncProtocolExportFixture, FinishDrainRequiresContributionAndKeepsMissingEvidenceNull) {
     auto &progress = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
-    progress.completion.phase = static_cast<uint64_t>(SchedulerCompletionPhase::DRAINED);
+    progress.completion.publication.phase = static_cast<uint64_t>(SchedulerCompletionPhase::DRAINED);
     progress.completion.visited_count = 5;
-    progress.slice_count = 2;
-    progress.active_slice_cycles = 31;
+    async_at<SchedulerAsyncFinishTrace>(frozen.layout.finish_trace_offset).finish.slice_count = 2;
+    async_at<SchedulerAsyncFinishTrace>(frozen.layout.finish_trace_offset).finish.active_slice_cycles = 31;
     async_at<SchedulerAsyncLease>(frozen.layout.finish_lease_offset).word =
         scheduler_async_lease_word(3, SchedulerAsyncPhase::TERMINAL);
     auto json = dump_async();
@@ -446,8 +448,8 @@ TEST_F(AsyncProtocolExportFixture, FinishDrainRequiresContributionAndKeepsMissin
     progress.contributed = true;
     json = dump_async();
     EXPECT_NE(json.find("\"state\":\"DRAINED\",\"group_indices\":[0,1,2,3],\"drained\":null"), std::string::npos);
-    progress.drained_at = {100, 7};
-    progress.drained_worker_index = 2;
+    async_at<SchedulerAsyncFinishTrace>(frozen.layout.finish_trace_offset).drained_at = {100, 7};
+    async_at<SchedulerAsyncFinishTrace>(frozen.layout.finish_trace_offset).drained_worker_index = 2;
     json = dump_async();
     EXPECT_NE(json.find("\"drained\":{\"run_epoch\":17,\"worker_index\":2,\"at\":[100,7]}"), std::string::npos);
     EXPECT_NE(
@@ -463,7 +465,7 @@ TEST_F(AsyncProtocolExportFixture, ErrorEvidenceAndUnboundConditionsRemainReadab
     progress.phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::FAILED);
     progress.failure_code = -2;
     auto &finish = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
-    finish.completion.phase = static_cast<uint64_t>(SchedulerCompletionPhase::FAILED);
+    finish.completion.publication.phase = static_cast<uint64_t>(SchedulerCompletionPhase::FAILED);
     finish.failure_code = -19;
     at<SchedulerRunControl>(layout.run_control_offset)->scheduler_error = 7;
     const auto json = dump_async();
@@ -510,15 +512,15 @@ TEST_F(AsyncProtocolExportFixture, RejectsWrongMapOwnershipAndRecordedSealWithou
     map.group_base = 1;
     EXPECT_THROW(dump_async(), std::invalid_argument);
     map = saved;
-    async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset).sealed_at = {10, 1};
+    async_at<SchedulerAsyncGroupTrace>(frozen.layout.group_trace_offset).sealed_at = {10, 1};
     EXPECT_THROW(dump_async(), std::invalid_argument);
 }
 
 TEST_F(AsyncProtocolExportFixture, RejectsOversizedFinishBatchWithoutClamping) {
     auto &finish = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
-    finish.completion.pending_count = 8;
+    finish.completion.publication.pending_count = 8;
     EXPECT_NO_THROW(dump_async());
-    finish.completion.pending_count = 9;
+    finish.completion.publication.pending_count = 9;
     try {
         (void)dump_async();
         FAIL() << "oversized batch accepted";

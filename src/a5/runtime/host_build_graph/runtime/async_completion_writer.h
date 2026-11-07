@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "intrinsic.h"
+#include "async_completion_format.h"
 #include "host_build_graph/completion_token.h"
 
 template <typename Context>
@@ -111,6 +111,10 @@ template <typename Context>
 inline __aicore__ bool
 async_completion_commit(Context &ctx, const AsyncCompletionReservation &reservation, const CompletionToken &token) {
     if (!async_completion_reservation_valid(ctx, reservation)) return false;
+    if (!async_completion_format_valid(token)) {
+        async_completion_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
     const uint32_t index = *ctx.completion_count;
     if (index - reservation.begin == reservation.limit) {
         async_completion_error(ctx, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
@@ -173,15 +177,15 @@ inline __aicore__ bool async_completion_seal(Context &ctx) {
 // to other cores. Cache supplies flush_range(address,bytes) and finish().
 template <typename Context, typename Cache>
 inline __aicore__ void async_completion_flush(Context &ctx, Cache &cache) {
-    if (!ctx.task_token.is_valid()) return;
+    // Resident writers publish once at seal, before their CHECK lease is visible.
+    // Legacy mailbox registration still needs publication at the API boundary.
+    if (!ctx.task_token.is_valid() || ctx.completion_reservation != nullptr) return;
     uint32_t count = ctx.completion_count != nullptr ? *ctx.completion_count : 0;
     if (count > ctx.completion_capacity) count = ctx.completion_capacity;
     if (count > MAX_COMPLETIONS_PER_TASK) count = MAX_COMPLETIONS_PER_TASK;
     if (ctx.completion_count != nullptr) cache.flush_range(ctx.completion_count, sizeof(*ctx.completion_count));
     if (ctx.completion_error_code != nullptr)
         cache.flush_range(ctx.completion_error_code, sizeof(*ctx.completion_error_code));
-    if (ctx.completion_reservation != nullptr)
-        cache.flush_range(ctx.completion_reservation, sizeof(*ctx.completion_reservation));
     if (ctx.completion_entries != nullptr && count != 0)
         cache.flush_range(ctx.completion_entries, count * sizeof(DeferredCompletionEntry));
     cache.finish();

@@ -9,11 +9,12 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <cstdint>
+#include <stdexcept>
 
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 6};
+    return OrchestrationConfig{.expected_arg_count = 8};
 }
 
 extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
@@ -24,8 +25,11 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     producer.add_input(input);
     producer.add_output(out);
     producer.add_inout(args.tensor(3).ref());
-    producer.add_scalar(args.scalar<uint64_t>(0), args.scalar<uint64_t>(1));
-    rt_submit_task({INVALID_KERNEL_ID, 0, 0}, producer);
+    producer.add_scalar(args.scalar<uint64_t>(0), args.scalar<uint64_t>(1), args.scalar<uint64_t>(2));
+    const auto transfer = rt_submit_task({INVALID_KERNEL_ID, 0, 0}, producer).task_id();
+    if (args.scalar<uint64_t>(3) > 1 &&
+        !rt_declare_async_sdma_get(transfer, 0, 1, 0, 2, AsyncUseCacheContract::PUBLISHED_CLEAN_LINES))
+        throw std::runtime_error("shared SDMA transfer declaration failed");
     CoreTaskArgs consumer;
     consumer.add_input(out);
     consumer.add_output(result);

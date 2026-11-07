@@ -107,6 +107,11 @@ public:
         if (layout.sdma_guard_count != 0)
             region(layout.sdma_guard_context_offset, layout.sdma_guard_count + 1, 128, end);
         else require(layout.sdma_guard_context_offset == 0, "empty SDMA guard section has an offset");
+        require(
+            layout.group_trace_offset != 0 && layout.finish_trace_offset != 0, "protocol diagnostics were not allocated"
+        );
+        region(layout.group_trace_offset, layout.group_count, sizeof(SchedulerAsyncGroupTrace), end);
+        region(layout.finish_trace_offset, layout.finish_count, sizeof(SchedulerAsyncFinishTrace), end);
     }
 
     template <typename T>
@@ -153,7 +158,7 @@ public:
                     const uint64_t index = scheduler_async_group_index(map, block, slot);
                     const auto &identity = at<SchedulerAsyncGroupIdentity>(layout.group_identity_offset, index);
                     if (index != map.group_base + static_cast<uint64_t>(block) * map.groups_per_block) {
-                        const auto &release = at<SchedulerAsyncGroupWriter>(layout.group_writer_offset, index).release;
+                        const auto &release = at<SchedulerAsyncGroupTrace>(layout.group_trace_offset, index).release;
                         require(
                             release.before.cycles == 0 && release.before.sequence == 0 && release.after.cycles == 0 &&
                                 release.after.sequence == 0,
@@ -234,10 +239,10 @@ group_state(const SchedulerAsyncGroupWriter &writer, const SchedulerAsyncGroupPr
 
 inline const char *finish_state(const SchedulerAsyncFinishProgress &progress, uint64_t lease_word) {
     require(
-        progress.completion.phase <= static_cast<uint64_t>(SchedulerCompletionPhase::FAILED),
+        progress.completion.publication.phase <= static_cast<uint64_t>(SchedulerCompletionPhase::FAILED),
         "invalid FINISH progress phase"
     );
-    if (progress.completion.phase == static_cast<uint64_t>(SchedulerCompletionPhase::FAILED) ||
+    if (progress.completion.publication.phase == static_cast<uint64_t>(SchedulerCompletionPhase::FAILED) ||
         scheduler_async_lease_phase(lease_word) == SchedulerAsyncPhase::FAILED)
         return "FAILED";
     return progress.contributed ? "DRAINED" : "PENDING";
@@ -285,10 +290,11 @@ inline void groups(
         const auto &identity = view.template at<SchedulerAsyncGroupIdentity>(view.layout.group_identity_offset, index);
         const auto &writer = view.template at<SchedulerAsyncGroupWriter>(view.layout.group_writer_offset, index);
         const auto &progress = view.template at<SchedulerAsyncGroupProgress>(view.layout.group_progress_offset, index);
+        const auto &trace_record = view.template at<SchedulerAsyncGroupTrace>(view.layout.group_trace_offset, index);
         const uint64_t lease = view.template at<SchedulerAsyncLease>(view.layout.group_lease_offset, index).word;
         const uint64_t trace = execution_index(identity, tasks[identity.task_ref].metadata, trace_count);
         const auto &execution = executions[trace];
-        execution_identity(identity, execution, writer.sealed_at, workers);
+        execution_identity(identity, execution, trace_record.sealed_at, workers);
         require(
             writer.count <= identity.capacity, "groups[" + std::to_string(index) + "].registered_count exceeds capacity"
         );
@@ -315,12 +321,12 @@ inline void groups(
         }
         out << ']';
         row.string("state", group_state(writer, progress, lease));
-        point(row, "sealed", writer.sealed_at, identity.run_epoch, execution.worker_index);
-        point(row, "terminal", progress.terminal_at, identity.run_epoch, progress.terminal_worker_index);
-        row.number("observations", progress.observation_count);
-        row.number("pending_count", progress.pending_slice_count);
-        row.number("slice_count", progress.slice_count);
-        row.number("active_cycles", progress.active_cycles);
+        point(row, "sealed", trace_record.sealed_at, identity.run_epoch, execution.worker_index);
+        point(row, "terminal", trace_record.terminal_at, identity.run_epoch, trace_record.terminal_worker_index);
+        row.number("observations", trace_record.check.observation_count);
+        row.number("pending_count", trace_record.check.pending_slice_count);
+        row.number("slice_count", trace_record.check.slice_count);
+        row.number("active_cycles", trace_record.check.active_cycles);
         row.number(
             "failure_code", writer.error_code != 0 ? static_cast<int64_t>(writer.error_code) : progress.failure_code
         );
@@ -340,12 +346,13 @@ inline void releases(Object &root, const View<Image> &view) {
             if (!first) out << ',';
             first = false;
             const uint64_t index = map.group_base + static_cast<uint64_t>(block) * map.groups_per_block;
-            const auto &writer = view.template at<SchedulerAsyncGroupWriter>(view.layout.group_writer_offset, index);
+            const auto &trace_record =
+                view.template at<SchedulerAsyncGroupTrace>(view.layout.group_trace_offset, index);
             Object row(out);
             row.number("task_ref", task);
             row.number("block_idx", block);
             row.number("run_epoch", view.layout.run_epoch);
-            interval(row, writer.release, view.layout.run_epoch);
+            interval(row, trace_record.release, view.layout.run_epoch);
         }
     }
     out << ']';
@@ -361,11 +368,12 @@ inline void finishes(Object &root, const View<Image> &view) {
             view.template at<SchedulerAsyncFinishIdentity>(view.layout.finish_identity_offset, index);
         const auto &progress =
             view.template at<SchedulerAsyncFinishProgress>(view.layout.finish_progress_offset, index);
+        const auto &trace_record = view.template at<SchedulerAsyncFinishTrace>(view.layout.finish_trace_offset, index);
         const uint64_t lease = view.template at<SchedulerAsyncLease>(view.layout.finish_lease_offset, index).word;
         require(
-            progress.completion.pending_count <= 8,
+            progress.completion.publication.pending_count <= 8,
             "finishes[" + std::to_string(index) +
-                "].pending_count out of range: " + std::to_string(progress.completion.pending_count)
+                "].pending_count out of range: " + std::to_string(progress.completion.publication.pending_count)
         );
         Object row(out);
         row.number("index", index);
@@ -379,11 +387,11 @@ inline void finishes(Object &root, const View<Image> &view) {
             out << identity.group_base + group;
         }
         out << ']';
-        point(row, "drained", progress.drained_at, identity.run_epoch, progress.drained_worker_index);
+        point(row, "drained", trace_record.drained_at, identity.run_epoch, trace_record.drained_worker_index);
         row.number("waiter_count", progress.completion.visited_count);
-        row.number("pending_count", progress.completion.pending_count);
-        row.number("slice_count", progress.slice_count);
-        row.number("active_cycles", progress.active_slice_cycles);
+        row.number("pending_count", progress.completion.publication.pending_count);
+        row.number("slice_count", trace_record.finish.slice_count);
+        row.number("active_cycles", trace_record.finish.active_slice_cycles);
         row.number("failure_code", progress.failure_code);
     }
     out << ']';

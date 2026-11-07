@@ -26,6 +26,7 @@ struct SchedulerAsyncAuxiliaryBytes {
     uint64_t backend{0};
     uint64_t sdma_guard_count{0};
     uint64_t execution_contract{HBG_ASYNC_CONTRACT_UNQUALIFIED};
+    bool diagnostics{false};
 };
 
 struct SchedulerAsyncHostPlan {

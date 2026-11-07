@@ -120,18 +120,18 @@ inline __aicore__ SchedulerCompletionResult scheduler_async_finish_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAsyncFinishIdentity &identity, __gm__ SchedulerAsyncTaskJoin *join,
     SchedulerAsyncFinishProgress *progress, uint32_t *budget, SchedulerWakeStats *wake_stats = nullptr,
-    SchedulerReadyStats *ready_stats = nullptr, uint64_t profiling_level = 0
+    SchedulerReadyStats *ready_stats = nullptr, uint64_t profiling_level = 0, SchedulerAsyncFinishStats *stats = nullptr
 ) {
-    const bool measured = scheduler_phase_timing_enabled(profiling_level) && progress != nullptr;
+    const bool measured = scheduler_phase_timing_enabled(profiling_level) && progress != nullptr && stats != nullptr;
     const uint64_t start = measured ? Clock::now() : 0;
     const uint32_t initial_budget = budget == nullptr ? 0 : *budget;
     const auto result = scheduler_async_finish_step_impl<QueueOps, Link, Protocol>(
         graph, base, local, run, identity, join, progress, budget, wake_stats, ready_stats
     );
     if (measured) {
-        scheduler_async_finish_accumulate(progress->active_slice_cycles, Clock::now() - start);
-        scheduler_async_finish_accumulate(progress->slice_count, 1);
-        scheduler_async_finish_accumulate(progress->work_units, budget == nullptr ? 0 : initial_budget - *budget);
+        scheduler_async_finish_accumulate(stats->active_slice_cycles, Clock::now() - start);
+        scheduler_async_finish_accumulate(stats->slice_count, 1);
+        scheduler_async_finish_accumulate(stats->work_units, budget == nullptr ? 0 : initial_budget - *budget);
     }
     return result;
 }
