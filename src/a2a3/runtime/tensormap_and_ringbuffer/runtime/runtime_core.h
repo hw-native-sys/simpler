@@ -144,6 +144,7 @@ struct ArenaOffsets {
 struct RuntimeArenaLayout {
     ArenaSizingKey sizing;
     ArenaOffsets offsets;
+    PreparedRunLayout prepared;
 };
 
 /**
@@ -238,6 +239,9 @@ RuntimeContext *runtime_init_data_from_layout(
  */
 void runtime_wire_arena_pointers(DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeContext *rt);
 bool runtime_reset_for_reuse(DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeContext *rt);
+// Requires a Host-validated prepared layout matching this image's sizing.
+bool runtime_reset_for_reuse_prepared(const RuntimeArenaLayout &layout, RuntimeContext *rt);
+bool build_prepared_run_layout(const ArenaSizingKey &sizing, PreparedRunLayout &out);
 
 /**
  * AICPU-only Phase 4 — fill in the few fields the host could not know at
