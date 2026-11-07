@@ -2003,6 +2003,11 @@ class SceneTestCase:
     Subclasses declare CALLABLE, CASES, generate_args(), compute_golden().
     """
 
+    # The standard runner owns its Worker environment and submits eager runs.
+    # Tests using a different execution contract must override these declarations.
+    _st_runtime_product = "program"
+    _st_execution_mode = "eager"
+
     CALLABLE: dict = {}
     CASES: list[dict] = []
     RTOL: float = 1e-5

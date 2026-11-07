@@ -16,6 +16,11 @@ import pytest
 
 from .main import run
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 
 # a2a3 only, which is what this demo's own README and CLI default document.
 # The algorithm itself runs on a5 — tests/st/worker/collectives/allreduce

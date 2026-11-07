@@ -270,7 +270,12 @@ def _check(st_platform, st_device_ids, runtime, borrowed, host_controls, workspa
         assert "the configured workspace budget has no room for it" in result.stdout + result.stderr
 
 
-_OWNERSHIP = (False, True)
+pytestmark = [pytest.mark.execution_mode("eager")]
+
+_OWNERSHIP = (
+    pytest.param(False, marks=pytest.mark.runtime_product("program")),
+    pytest.param(True, marks=pytest.mark.runtime_product("kernel")),
+)
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
@@ -300,6 +305,7 @@ def test_hbg_empty_and_active_calls_retain_state(st_platform, st_device_ids, bor
     ],
 )
 @pytest.mark.parametrize("budget", [0, 1024, 128 << 20], ids=["unlimited", "refused", "bounded"])
+@pytest.mark.runtime_product("kernel")
 def test_borrowed_workspace_budget_preserves_caller_resources(st_platform, st_device_ids, runtime, budget):
     _check(st_platform, st_device_ids, runtime, True, False, budget)
 

@@ -29,6 +29,11 @@ from ._helpers import (
     submit_queue,
 )
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 
 def _exception_text(exc: BaseException) -> str:
     parts = [str(exc)]

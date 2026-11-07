@@ -24,6 +24,8 @@ from simpler.worker import Worker
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
     pytest.mark.platforms(["a5sim", "a5"]),
     pytest.mark.device_count(1),
     pytest.mark.runtime("host_build_graph"),

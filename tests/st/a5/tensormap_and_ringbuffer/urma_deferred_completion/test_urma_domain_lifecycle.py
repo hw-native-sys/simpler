@@ -22,6 +22,11 @@ from tests.st.a5.tensormap_and_ringbuffer.urma_deferred_completion.test_urma_def
     _UrmaRegression,
 )
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _NBYTES = SMALL_ELEMS * 4
 _RUNTIME = "tensormap_and_ringbuffer"
 

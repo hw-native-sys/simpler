@@ -30,6 +30,11 @@ from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 from examples.workers.l3.multi_chip_dispatch.main import N_COLS, N_ROWS, build_chip_callable
 from examples.workers.l4.global_tload_mixed_l3.main import COUNT, _build_tload_callable
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _NUMEL = N_ROWS * N_COLS
 _NBYTES = _NUMEL * 4
 _RUNTIME = "tensormap_and_ringbuffer"

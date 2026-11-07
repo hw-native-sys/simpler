@@ -19,6 +19,8 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/lifecycle.py"
 pytestmark = [
+    pytest.mark.runtime_product("kernel"),
+    pytest.mark.execution_mode("eager"),
     pytest.mark.requires_hardware,
     pytest.mark.platforms(["a2a3", "a5"]),
     pytest.mark.test_environment("torch_npu"),

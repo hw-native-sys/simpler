@@ -22,6 +22,9 @@ else:
     import workload
 
 
+@pytest.mark.coverage_skip(
+    reason="CSA frozen data is not installed; run this case's fixture.py first", platforms=["a5"]
+)
 @pytest.mark.skipif(
     not workload.fixture.DATA_DIR.is_dir(), reason="CSA frozen data is not installed; run this case's fixture.py first"
 )

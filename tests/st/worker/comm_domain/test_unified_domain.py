@@ -18,6 +18,11 @@ from simpler.worker import Worker
 
 from examples.workers.l3.multi_chip_dispatch.main import N_COLS, N_ROWS, build_chip_callable
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _RUNTIME = "tensormap_and_ringbuffer"
 _NUMEL = N_ROWS * N_COLS
 _NBYTES = _NUMEL * 4

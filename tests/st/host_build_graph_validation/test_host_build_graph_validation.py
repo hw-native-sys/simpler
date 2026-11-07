@@ -29,6 +29,11 @@ from simpler.worker import Worker
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "host_build_graph"
 ORCHESTRATION_SOURCE = os.path.join(HERE, "kernels", "orchestration", "validation_orch.cpp")

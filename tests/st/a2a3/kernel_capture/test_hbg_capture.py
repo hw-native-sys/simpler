@@ -25,7 +25,13 @@ from simpler_setup.pto_isa import ensure_pto_isa_root
 
 _ROOT = Path(__file__).resolve().parents[4]
 _NATIVE = Path(__file__).with_name("native")
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.runtime("host_build_graph")]
+pytestmark = [
+    pytest.mark.runtime_product("kernel"),
+    pytest.mark.execution_mode("capture_replay"),
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3"]),
+    pytest.mark.runtime("host_build_graph"),
+]
 
 
 def build_probe(build: Path, *, retained_models: bool = False):

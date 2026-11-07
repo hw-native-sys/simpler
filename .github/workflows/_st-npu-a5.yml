@@ -123,10 +123,25 @@ jobs:
           QUEUE_TIMEOUT_S=$((MAX_TIME_S + 1500))
           task-submit --timeout "$QUEUE_TIMEOUT_S" --max-time "$MAX_TIME_S" --device auto --device-num "$DEVICE_NUM" \
             --env SIMPLER_ENABLE_PTO_RDMA_WORKSPACE \
-            --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE'"
+            --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE' --environment-receipts --verify-feature-coverage --junitxml outputs/default-ci/main.xml"
 
       - name: DFX smokes (a5)
         if: inputs.include_dfx_smokes
         uses: ./.github/actions/run-onboard-dfx-smokes
         with:
           platform: a5
+
+      - name: Verify and summarize default environment coverage
+        if: always()
+        run: |
+          .venv/bin/python -m simpler_setup.tools.feature_coverage_report \
+            --root outputs/default-ci --environment default --platform a5 --manual "$MANUAL_MODE"
+
+      - name: Retain default environment plans and receipts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: default-a5-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/default-ci
+          if-no-files-found: warn

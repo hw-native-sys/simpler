@@ -12,6 +12,11 @@ import pytest
 
 from .main import run
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.manual(["a2a3sim", "a5sim"])

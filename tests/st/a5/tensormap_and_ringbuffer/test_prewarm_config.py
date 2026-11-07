@@ -13,6 +13,11 @@ import pytest
 from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
+pytestmark = [
+    pytest.mark.runtime_product("program"),
+    pytest.mark.execution_mode("eager"),
+]
+
 _RUNTIME = "tensormap_and_ringbuffer"
 
 
