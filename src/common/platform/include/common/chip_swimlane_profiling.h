@@ -818,6 +818,8 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "arena_h2d";
     case HostPhaseKind::BindHostViewClose:
         return "host_view_close";
+    case HostPhaseKind::BindImageStage:
+        return "image_stage";
     case HostPhaseKind::OrchSubmitTask:
         return "submit_task";
     case HostPhaseKind::OrchAllocTensors:

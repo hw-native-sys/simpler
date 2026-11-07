@@ -15,6 +15,9 @@ express: two ranks writing one stream, whose segment bursts interleave.
 
 from __future__ import annotations
 
+import sys
+
+from simpler_setup.tools.hbg import bind_phases
 from simpler_setup.tools.hbg.bind_phases import cold_binds, parse_binds
 
 SEGMENTS = ("args", "host_orch", "graph_pack", "arena_h2d")
@@ -96,3 +99,24 @@ def test_orchestrator_operations_are_not_segments(tmp_path):
 
     assert len(binds) == 1
     assert sorted(k for k in binds[0] if k not in ("pid", "inv", "ts")) == ["host_orch"]
+
+
+def test_report_counts_image_staging_without_claiming_a_device_upload(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "staged.log"
+    _write(
+        log,
+        [
+            _span(11, 1, phase, 1_000 + i, 1_000_000)
+            for i, phase in enumerate(("host_orch", "graph_pack", "image_stage"))
+        ],
+    )
+    monkeypatch.setattr(sys, "argv", ["hbg_bind_phases", str(log), "--keep-first"])
+
+    assert bind_phases.main() == 0
+
+    output = capsys.readouterr().out
+    assert "*image_stage" in output
+    total = next(line for line in output.splitlines() if line.strip().startswith("total "))
+    assert total.split()[1:4] == ["3.000", "3.000", "3.000"]
+    assert "image_stage is host staging" in output
+    assert "not comparable" in output

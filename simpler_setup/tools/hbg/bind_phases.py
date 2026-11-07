@@ -54,9 +54,11 @@ TORCH_AUTOLOAD_LINE = re.compile(
 # Instrumented subtotal, not the full interval before device execution.
 # Graph task binding, compact execution-image preparation and A5 scheduler work
 # have no segment in this sum; Definition packing is inside `graph_pack`.
+# `image_stage` is a host snapshot; historical `arena_h2d` measured synchronous
+# image copying. Keep both names distinct rather than equating their costs.
 # `args` is a per-byte staging cost. `host_view_close` remains excluded for
 # comparison with historical mapped-view logs; current binds close no mappings.
-CONTROL_PLANE = ("host_orch", "graph_pack", "arena_h2d")
+CONTROL_PLANE = ("host_orch", "graph_pack", "arena_h2d", "image_stage")
 
 # Historical display order; spans carry timestamps for the actual execution order.
 PHASE_ORDER = (
@@ -69,6 +71,7 @@ PHASE_ORDER = (
     "shared_mem",
     "gm_heap",
     "arena_h2d",
+    "image_stage",
     "host_view_close",
 )
 
@@ -202,6 +205,9 @@ def main() -> int:
         print("  (no `torch_backend_autoload` record: backend-autoload state")
         print("   must be established before comparing this log)")
     print(f"  {len(binds)} binds, {len(warm)} warm ({len(cold)} cold dropped, ranks={ranks})\n")
+    if any("image_stage" in bind for bind in warm):
+        print("  image_stage is host staging; asynchronous H2D enqueue and completion are outside this span.")
+        print("  Its scope and subtotal are not comparable with historical arena_h2d measurements.\n")
     print(f"  {'phase':<18}{'min':>10}{'median':>10}{'max':>10}   n")
     for phase in PHASE_ORDER:
         values = [b[phase] for b in warm if phase in b]

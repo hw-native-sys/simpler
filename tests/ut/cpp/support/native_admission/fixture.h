@@ -228,6 +228,8 @@ struct Attempt {
     NativeRunDescriptor descriptor{};
 };
 
+std::unique_ptr<Runner> make_fenced_completion_runner();
+
 class NativeAdmissionTest : public ::testing::Test {
 protected:
     void SetUp() override {
