@@ -78,6 +78,26 @@ else()
     target_link_options(test_a5_tmr_urma_completion_kernel PRIVATE -Wl,--gc-sections)
 endif()
 
+# Real polling and completion code with observable COND and doorbell sinks.
+# NO_OBJS: the object library's TUs carry neither SIMPLER_DFX nor
+# SIMPLER_PLATFORM_NAME, so mixing them with this case's TUs links two
+# layouts of SchedulerContext and then faults at run time.
+a5_tmr_case(test_completion_batch.cpp
+    NO_OBJS
+    SOURCES
+        ${A5_RUNTIME_DIR}/scheduler/scheduler.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK a5_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    TIMEOUT 20)
+if(APPLE)
+    target_link_options(test_a5_tmr_completion_batch PRIVATE -Wl,-dead_strip)
+else()
+    target_link_options(test_a5_tmr_completion_batch PRIVATE -Wl,--gc-sections)
+endif()
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it
