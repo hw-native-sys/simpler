@@ -181,7 +181,10 @@ void drain_in_flight_records(TraceState &s) {
     }
 }
 
-bool is_bind_kind(uint32_t kind) { return kind < static_cast<uint32_t>(HostPhaseKind::OrchSubmitTask); }
+bool is_bind_kind(uint32_t kind) {
+    return kind < static_cast<uint32_t>(HostPhaseKind::OrchSubmitTask) ||
+           kind == static_cast<uint32_t>(HostPhaseKind::BindImageStage);
+}
 
 // Segment names are stable for log consumers. Records use their
 // measured timestamps; flush occurs after publication, outside chip.run.bind.

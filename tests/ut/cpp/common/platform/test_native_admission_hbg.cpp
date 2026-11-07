@@ -9,9 +9,12 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "fixture.h"
+#include "kernel_platform_ops.h"
+#include "host/raii_scope_guard.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
 extern "C" int args_dump_capture_supported_impl(void);
+extern "C" int publish_run_image_impl(Runtime *, const HostApi *);
 
 namespace native_admission_test {
 TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunState) {
@@ -233,8 +236,9 @@ TEST_F(NativeAdmissionTest, RealHbgCallbackAndOwnedInputsSurviveNativeParkExactl
     EXPECT_TRUE(candidate.empty());
 }
 
-TEST_F(NativeAdmissionTest, RealHbgCallbackSurvivesNativeParkAndPublicationFailureExactlyOnce) {
-    Runner runner;
+TEST_F(NativeAdmissionTest, RealHbgCallbackSurvivesNativeParkAndLaunchPublicationFailureExactlyOnce) {
+    auto owned_runner = make_fenced_completion_runner();
+    Runner &runner = *owned_runner;
     ASSERT_EQ(staging(runner, 0, 10, 20 * kUnit), 0);
     launched(runner, 0, 10);
     refuse_after_callback = true;
@@ -250,16 +254,17 @@ TEST_F(NativeAdmissionTest, RealHbgCallbackSurvivesNativeParkAndPublicationFailu
     EXPECT_EQ(runner.reservations(), 0u);
     runner.retire(0, 10);
     control().ceiling = std::numeric_limits<size_t>::max();
-    control().copy_rc = -88;
     candidate.descriptor.run_epoch = 21;
-    EXPECT_EQ(candidate.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    ASSERT_EQ(candidate.prepare(), 0);
+    control().copy_rc = -88;
+    EXPECT_EQ(simpler_launch_run(&runner, candidate.storage), -88);
     control().copy_rc = 0;
-    EXPECT_FALSE(std::filesystem::exists(diagnostic_path + "/deps.json"));
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), -88);
+    EXPECT_TRUE(std::filesystem::exists(diagnostic_path + "/deps.json"));
     simpler::dfx::host_graph::HostGraphExport graph;
     EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(simpler::dfx::host_graph::TakeOutcome::NotCaptured));
     EXPECT_EQ(callbacks, 1);
     EXPECT_EQ(runner.retained_temp_addr(1), staging_address);
-    EXPECT_TRUE(candidate.consume_release());
     EXPECT_TRUE(candidate.empty());
     EXPECT_EQ(runner.get_prepare_plan(1), nullptr);
     EXPECT_TRUE(saved.expired());
@@ -345,6 +350,226 @@ TEST_F(NativeAdmissionTest, RecursiveUnsupportedArgsDumpDoesNotAcquireOrCertifyA
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);
     EXPECT_EQ(simpler_finalize_run(&runner, outer.storage), 0);
+}
+
+namespace {
+class HbgImageCaptureRunner : public Runner {
+public:
+    HbgImageCaptureRunner() {
+        static int binary;
+        aicore_bin_handle_ = &binary;
+    }
+    int initialize_kernel() {
+        int rc = execution_mode_latch().latch(SIMPLER_MODE_KERNEL);
+        if (rc == 0) rc = kernel_execution_state().initialize(0, make_onboard_kernel_context_ops());
+        return rc == 0 ? kernel_execution_state().mark_ready_enqueued() : rc;
+    }
+    int prepare_execution(
+        Runtime &runtime, const CallConfig &config, uint32_t slot, const NativeRunIdentity &identity,
+        std::unique_ptr<PreparedExecution> *out
+    ) override {
+        int rc = Runner::prepare_execution(runtime, config, slot, identity, out);
+        if (rc == 0) rc = ensure_device_run_result_region(slot, identity.run_epoch, (*out)->kernel_args);
+        return rc == 0 ? (*out)->kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot_persistent_args(slot)) : rc;
+    }
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        prepared.streams = borrowed_run_streams();
+        prepared.streams.aicpu = prepared.caller_stream;
+        const int rc = arm_run_fence(prepared);
+        if (rc != 0) return {rc, LaunchProgress::NotStarted, {}};
+        return exact_launch_transaction(
+            prepared.identity, std::move(permit),
+            [&](LaunchProgressSink &sink) {
+                const int entry_rc = queue_run_entry(prepared, sink);
+                if (entry_rc != 0) return entry_rc;
+                copies_before_entry = control().deferred_copies.size();
+                sink.mark_submitted();
+                return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore);
+            },
+            [&](LaunchProgressSink &sink) {
+                sink.mark_submitted();
+                const int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
+                return boundary_rc != 0 ? boundary_rc : queue_caller_exit(prepared);
+            }
+        );
+    }
+    int prepare_upload(Runtime &runtime, KernelArgsHelper &helper) {
+        return helper.prepare_runtime_args(runtime, mem_alloc_, slot_persistent_args(0));
+    }
+    size_t copies_before_entry{0};
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, CapturedHbgImageUsesPinnedLaunchSourceThroughOriginalRunRetirement) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt attempt(runner, 0, 9990);
+    attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    auto reset_recording = RAIIScopeGuard([] {
+        control().recording_active = false;
+    });
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    auto publication = state->runtime->prepared_publication();
+    ASSERT_NE(publication, nullptr);
+    ASSERT_GT(publication->bytes, 0u);
+    const auto synchronous_images = std::count_if(control().uploads.begin(), control().uploads.end(), [&](auto &copy) {
+        return copy.first == publication->device_target;
+    });
+    EXPECT_EQ(synchronous_images, 0) << "the image must be staged without a synchronous device copy";
+    const auto *source = static_cast<const uint8_t *>(publication->source);
+    const std::vector<uint8_t> expected(source, source + publication->bytes);
+    std::memset(const_cast<void *>(publication->source), 0xe7, publication->bytes);
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    control().recording_active = true;
+    auto cleanup = RAIIScopeGuard([&] {
+        control().recording_active = false;
+        (void)simpler_finalize_run(&runner, attempt.storage);
+        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
+    });
+    const void *descriptor_target = state->prepared_execution->kernel_args.args.runtime_args;
+    const std::weak_ptr<const PreparedRunResources> backing = state->prepared_execution->prepared_resources;
+    control().defer_async_copies = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+    auto image = std::find_if(control().deferred_copies.begin(), control().deferred_copies.end(), [&](auto &copy) {
+        return copy.destination == publication->device_target;
+    });
+    ASSERT_NE(image, control().deferred_copies.end());
+    EXPECT_NE(image->source, publication->source);
+    EXPECT_EQ(std::memcmp(image->source, expected.data(), expected.size()), 0);
+    auto descriptor = std::find_if(control().deferred_copies.begin(), control().deferred_copies.end(), [&](auto &copy) {
+        return copy.destination == descriptor_target;
+    });
+    ASSERT_NE(descriptor, control().deferred_copies.end());
+    EXPECT_LT(image, descriptor);
+    EXPECT_EQ(runner.copies_before_entry, control().deferred_copies.size());
+    control().recording_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_FALSE(backing.expired());
+    EXPECT_EQ(std::memcmp(image->source, expected.data(), expected.size()), 0);
+    for (const auto &copy : control().deferred_copies)
+        std::memcpy(copy.destination, copy.source, copy.bytes);
+    EXPECT_EQ(std::memcmp(publication->device_target, expected.data(), expected.size()), 0);
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    reference = nullptr;
+    EXPECT_TRUE(backing.expired());
+    cleanup.dismiss();
+}
+
+TEST_F(NativeAdmissionTest, HbgPrerequisitesAndImagePublishBeforeTheDescriptorFromOwnedSnapshots) {
+    HbgImageCaptureRunner runner;
+    auto runtime = std::make_unique<Runtime>();
+    std::array<uint8_t, 4> first_source{1, 2, 3, 4}, second_source{5, 6, 7, 8}, image_source{9, 10, 11, 12};
+    std::array<uint8_t, 4> first_target{}, second_target{}, image_target{};
+    const auto expected_first = first_source, expected_second = second_source, expected_image = image_source;
+    runtime->add_pending_metadata(
+        first_target.data(), first_source.data(), first_source.size(), HostPhaseKind::BindArenaH2d, {}
+    );
+    runtime->add_pending_metadata(
+        second_target.data(), second_source.data(), second_source.size(), HostPhaseKind::BindArenaH2d, {}
+    );
+    runtime->set_pending_publication(image_target.data(), image_source.data(), image_source.size(), 0, 0, 0);
+    HostApiOps ops{};
+    ops.stage_launch_metadata = [](void *context, uint32_t slot, const HostMetadataRegion *regions, size_t count) {
+        return static_cast<HbgImageCaptureRunner *>(context)->stage_launch_metadata(slot, regions, count);
+    };
+    ops.copy_to_device = [](void *, void *, const void *, size_t) {
+        ADD_FAILURE() << "unexpected synchronous image copy";
+        return -4291;
+    };
+    HostApi api(&runner, 0, 0, 0, &ops);
+    ASSERT_EQ(publish_run_image_impl(runtime.get(), &api), 0);
+    first_source.fill(0xe1);
+    second_source.fill(0xe2);
+    image_source.fill(0xe3);
+    KernelArgsHelper helper;
+    ASSERT_EQ(runner.prepare_upload(*runtime, helper), 0);
+    int caller;
+    LaunchProgressSink sink;
+    control().defer_async_copies = true;
+    ASSERT_EQ(publish_for_launch(helper, &caller, sink, true), 0);
+    ASSERT_EQ(control().deferred_copies.size(), 4u);
+    EXPECT_EQ(control().deferred_copies[0].destination, first_target.data());
+    EXPECT_EQ(control().deferred_copies[1].destination, second_target.data());
+    EXPECT_EQ(control().deferred_copies[2].destination, image_target.data());
+    EXPECT_EQ(control().deferred_copies[3].destination, helper.args.runtime_args);
+    EXPECT_EQ(first_target, (std::array<uint8_t, 4>{}));
+    EXPECT_EQ(second_target, (std::array<uint8_t, 4>{}));
+    EXPECT_EQ(image_target, (std::array<uint8_t, 4>{}));
+    for (const auto &copy : control().deferred_copies)
+        std::memcpy(copy.destination, copy.source, copy.bytes);
+    EXPECT_EQ(first_target, expected_first);
+    EXPECT_EQ(second_target, expected_second);
+    EXPECT_EQ(image_target, expected_image);
+}
+
+TEST_F(NativeAdmissionTest, SynchronousHbgBackendKeepsPrerequisiteAndImagePublicationOrder) {
+    auto runtime = std::make_unique<Runtime>();
+    uint32_t first = 1, second = 2, image = 3;
+    uint32_t first_target = 0, second_target = 0, image_target = 0;
+    runtime->add_pending_metadata(&first_target, &first, sizeof(first), HostPhaseKind::BindArenaH2d, {});
+    runtime->add_pending_metadata(&second_target, &second, sizeof(second), HostPhaseKind::BindArenaH2d, {});
+    runtime->set_pending_publication(&image_target, &image, sizeof(image), 0, 0, 0);
+    HostApiOps ops{};
+    ops.copy_to_device = [](void *, void *target, const void *source, size_t bytes) {
+        return rtMemcpy(target, bytes, source, bytes, RT_MEMCPY_HOST_TO_DEVICE);
+    };
+    HostApi api(nullptr, 0, 0, 0, &ops);
+    ASSERT_EQ(publish_run_image_impl(runtime.get(), &api), 0);
+    ASSERT_EQ(control().uploads.size(), 3u);
+    EXPECT_EQ(control().uploads[0].first, &first_target);
+    EXPECT_EQ(control().uploads[1].first, &second_target);
+    EXPECT_EQ(control().uploads[2].first, &image_target);
+    EXPECT_EQ(first_target, first);
+    EXPECT_EQ(second_target, second);
+    EXPECT_EQ(image_target, image);
+}
+
+TEST_F(NativeAdmissionTest, FailedCapturedHbgImageUploadPreservesBackingThroughCheckedRelease) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt attempt(runner, 0, 9991);
+    attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(attempt.prepare(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    const auto publication = state->runtime->prepared_publication();
+    ASSERT_NE(publication, nullptr);
+    const std::weak_ptr<const PreparedRunResources> backing = state->prepared_execution->prepared_resources;
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    auto cleanup = RAIIScopeGuard([&] {
+        control().recording_active = false;
+        control().stream_sync_rc = 0;
+        (void)simpler_finalize_run(&runner, attempt.storage);
+        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
+    });
+    control().recording_active = true;
+    control().defer_async_copies = true;
+    control().failed_async_destination = publication->device_target;
+    control().async_copy_rc = -4288;
+    EXPECT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), -4288);
+    EXPECT_EQ(runner.copies_before_entry, 0u);
+    ASSERT_TRUE(std::any_of(control().deferred_copies.begin(), control().deferred_copies.end(), [&](auto &copy) {
+        return copy.destination == publication->device_target;
+    }));
+    control().recording_active = false;
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), -4288);
+    EXPECT_FALSE(backing.expired());
+    control().stream_sync_rc = -4290;
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), -4290);
+    EXPECT_FALSE(backing.expired());
+    control().stream_sync_rc = 0;
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    reference = nullptr;
+    EXPECT_TRUE(backing.expired());
+    cleanup.dismiss();
 }
 
 }  // namespace native_admission_test

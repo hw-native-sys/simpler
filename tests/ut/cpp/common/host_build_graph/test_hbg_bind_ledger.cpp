@@ -931,14 +931,10 @@ TEST_F(HbgBindLedgerTest, PreparingTheRunImageDoesNotPublishIt) {
     EXPECT_EQ(initial->bytes, bytes);
 }
 
-// One trace spans preparation and publication. The image's H2D segment is the
-// publication's to record, and the trace the bind armed has to still be open when
-// it does — a trace that ended at the bind's return would drop the segment
-// silently, leaving the timeline with no host-to-device handover for the run's
-// largest transfer. Asserted against a real record pool: the kind has to be
-// present with the published byte count, and other segments have to be there too,
-// so a recorder that was never armed cannot pass this by recording nothing.
-TEST_F(HbgBindLedgerTest, ThePublicationRecordsTheArenaH2dSegment) {
+// Preparation and metadata staging share one trace. The staging segment names
+// the host work even on a synchronous fallback backend; it is not a device
+// upload anchor. The actual launch-owned enqueue is outside the bind interval.
+TEST_F(HbgBindLedgerTest, ThePublicationRecordsTheImageStagingSegment) {
     Runtime runtime;
     init_runtime(runtime);
     std::vector<uint8_t> payload(64, 0x33);
@@ -952,19 +948,51 @@ TEST_F(HbgBindLedgerTest, ThePublicationRecordsTheArenaH2dSegment) {
 
     // The bind recorded its own segments, so the pool is live and armed.
     EXPECT_GT(fake_.phase_records_total(), 0u) << "no phase records at all: the recorder was never armed";
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d), 0u) << "the bind recorded a copy it did not perform";
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindImageStage), 0u)
+        << "the bind recorded image staging it did not perform";
 
     ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
 
     uint64_t recorded_bytes = 0;
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d, &recorded_bytes), 1u)
-        << "the publication's host-to-device segment was dropped";
-    EXPECT_EQ(recorded_bytes, published_bytes) << "the segment's byte count is not the one published";
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindImageStage, &recorded_bytes), 1u)
+        << "the publication's host staging segment was dropped";
+    EXPECT_EQ(recorded_bytes, published_bytes) << "the segment's byte count is not the staged image size";
     // The trace closes once, over preparation and publication together.
     EXPECT_EQ(fake_.phase_finish_calls, 1u);
 
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.phase_finish_calls, 1u) << "releasing a published run closed a second trace";
+}
+
+TEST_F(HbgBindLedgerTest, StagedImageRecordsHostWorkWithoutAnUploadAnchor) {
+    Runtime runtime;
+    init_runtime(runtime);
+    std::vector<uint8_t> payload(64, 0x33);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    const auto copies_before = fake_.copies.size();
+    std::vector<HostMetadataRegion> staged;
+    HostApiOps ops = fake_ops();
+    ops.stage_launch_metadata = [](void *context, uint32_t, const HostMetadataRegion *regions, size_t count) {
+        auto &snapshot = *static_cast<std::vector<HostMetadataRegion> *>(context);
+        snapshot.assign(regions, regions + count);
+        return 0;
+    };
+    HostApi api(&staged, 0, 0, 0, &ops);
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api), 0);
+    ASSERT_FALSE(staged.empty());
+    EXPECT_EQ(fake_.copies.size(), copies_before);
+    EXPECT_TRUE(fake_.phase_records.device_upload_records().empty());
+    size_t stages = 0;
+    for (const auto &record : fake_.phase_records.records())
+        if (std::strcmp(host_phase_kind_name(static_cast<HostPhaseKind>(record.kind)), "image_stage") == 0) {
+            ++stages;
+            EXPECT_EQ(record.payload, runtime.prepared_publication()->bytes);
+        }
+    EXPECT_EQ(stages, 1u);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
 // A preparation nobody publishes still closes its trace exactly once, at the
@@ -1530,7 +1558,7 @@ TEST_F(HbgBindLedgerTest, OldReleaseDoesNotCloseSuccessorTrace) {
     ASSERT_EQ(release_run_bindings_impl(&predecessor, &api_), 0);
     EXPECT_EQ(fake_.phase_finish_calls, finishes_before);
     ASSERT_EQ(publish_run_image_impl(&successor, &successor_api), 0);
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d), 1u);
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindImageStage), 1u);
     EXPECT_EQ(release_run_bindings_impl(&successor, &successor_api), 0);
 }
 
@@ -2710,7 +2738,7 @@ TEST_F(HbgBindLedgerTest, ABackendWithoutPlanRetentionCannotRetryAnExecutedCallb
     EXPECT_EQ(fake_.prepare_plan, nullptr);
 }
 
-TEST_F(HbgBindLedgerTest, LaunchStagingLeavesOnlyTheLargeImageOnThePrepareCopyPath) {
+TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDeviceCopies) {
     Runtime runtime;
     init_runtime(runtime);
     auto cleanup = cleanup_runtime(runtime);
@@ -2760,13 +2788,13 @@ TEST_F(HbgBindLedgerTest, LaunchStagingLeavesOnlyTheLargeImageOnThePrepareCopyPa
         void *image_target = pending.device_target;
         const auto *image_source = static_cast<const uint8_t *>(pending.source);
         const std::vector<uint8_t> image(image_source, image_source + pending.bytes);
+        expected.push_back({image_target, image});
+        std::memset(image_target, 0xa5, pending.bytes);
         const int copies = fake_.copy_count;
         const int calls = staging.calls;
         ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
-        ASSERT_EQ(staging.calls, calls + 1) << "empty batches must clear a previous resident run";
-        ASSERT_EQ(fake_.copy_count, copies + 1);
-        EXPECT_EQ(fake_.copies.back().dst, image_target);
-        EXPECT_EQ(std::memcmp(image_target, image.data(), image.size()), 0);
+        ASSERT_EQ(staging.calls, calls + 1) << "each batch replaces the previous run's metadata";
+        ASSERT_EQ(fake_.copy_count, copies);
         ASSERT_EQ(staging.captured.size(), expected.size());
         for (size_t i = 0; i < expected.size(); ++i) {
             EXPECT_EQ(staging.captured[i].target, expected[i].target);

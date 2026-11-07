@@ -85,6 +85,12 @@ int rtFreeHost(void *ptr) {
     return 0;
 }
 int rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
+    auto &c = native_admission_transport::control();
+    if (c.defer_async_copies && kind == RT_MEMCPY_HOST_TO_DEVICE) {
+        if (bytes > capacity || (bytes != 0 && (dst == nullptr || src == nullptr))) return -2;
+        c.deferred_copies.push_back({dst, src, static_cast<size_t>(bytes)});
+        return dst == c.failed_async_destination ? c.async_copy_rc : 0;
+    }
     return rtMemcpy(dst, capacity, src, bytes, kind);
 }
 int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
@@ -213,7 +219,32 @@ int LoadAicpuOp::Init(const std::vector<std::string> &) { return -1; }
 int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &) { return -1; }
 }  // namespace host
 
-KernelContextOps make_onboard_kernel_context_ops() { return {}; }
+KernelContextOps make_onboard_kernel_context_ops() {
+    return {
+        nullptr,
+        [](void *, int *device) noexcept {
+            *device = 0;
+            return 0;
+        },
+        [](void *, void **context) noexcept {
+            static int token;
+            *context = &token;
+            return 0;
+        },
+        [](void *, void **stream) noexcept {
+            return rtStreamCreate(stream, 0);
+        },
+        [](void *, void *stream) noexcept {
+            return rtStreamDestroy(stream);
+        },
+        [](void *, void **event) noexcept {
+            return aclrtCreateEventExWithFlag(event, ACL_EVENT_SYNC);
+        },
+        [](void *, void *event) noexcept {
+            return aclrtDestroyEvent(event);
+        }
+    };
+}
 
 // The late-read hardware probe needs real stream-pair ownership. This transport
 // cannot retire that ownership; native admission/close uses the real base runner.

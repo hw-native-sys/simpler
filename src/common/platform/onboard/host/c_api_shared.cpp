@@ -1984,11 +1984,9 @@ int simpler_prepare_run(
             if (is_resource_wait(rc)) return park_prepare(state, rc);
             return cleanup_failed_prepare(state, rc);
         }
-        // The bind prepared this run's device image into staging the slot owns;
-        // this publishes it, before anything else touches the device arena. Two
-        // calls rather than one because the write is orderable on its own: the
-        // bytes are ready when the bind returns, and shipping them is this
-        // caller's decision.
+        // Bind owns the source image. Snapshot it into this run's launch
+        // metadata. Launch publishes those pinned bytes before the descriptor
+        // and entry.
         {
             STRACE("chip.run.publish_image");
             rc = publish_run_image_impl(state->runtime.get(), &state->host_api);
@@ -2054,7 +2052,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
         return PTO_RUNTIME_ERR_INTERNAL;
     // TEMPORARY (host_build_graph dsv4 bring-up): stop after prepare so the host
-    // side — orchestration, graph construction, image relocation and H2D — can be
+    // side — orchestration, graph construction and image staging — can be
     // measured while the device execution of that graph still stalls. Sitting in
     // launch (not simpler_run) covers the split prepare/launch/wait entry points
     // the chip subprocess uses, which never call simpler_run. Outputs are never
