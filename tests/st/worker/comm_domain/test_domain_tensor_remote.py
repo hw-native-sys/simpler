@@ -192,10 +192,11 @@ def exercise_domain_tensors(worker, members, platform, *, local=None, cached=Tru
             host = ctypes.create_string_buffer(_NBYTES)
             if isinstance(output, RemoteBufferHandle):
                 worker.remote_copy_from(output, host, _NBYTES)
-            raw = host.raw if isinstance(output, RemoteBufferHandle) else output.shm.buf
-            assert struct.unpack_from(f"<{_NUMEL}f", raw) == tuple(
-                float(rank * 200 + 48 + index * 2) for index in range(_NUMEL)
-            )
+                values = struct.unpack_from(f"<{_NUMEL}f", host.raw)
+            else:
+                with output.shm.buf as raw:
+                    values = struct.unpack_from(f"<{_NUMEL}f", raw)
+            assert values == tuple(float(rank * 200 + 48 + index * 2) for index in range(_NUMEL))
 
         def rebuild(orch, _args, cfg):
             replacement = orch.get_or_allocate_domain(**request)
