@@ -176,6 +176,18 @@ extern "C" HcclResult HcclCommDestroy(HcclComm) {
     return HCCL_SUCCESS;
 }
 
+// A failed initializer keeps admission closed until its owner is aborted.
+static void check_failed_admission(CommHandle h, uint64_t failed_id, uint64_t &next_id) {
+    if (!h->last_allocation_id || *h->last_allocation_id != failed_id) return;
+    assert(h->domain_admission_stopped);
+    const uint32_t ranks[] = {0, 1};
+    uint64_t ctx = 0, base = 0;
+    size_t size = 0;
+    assert(comm_alloc_domain_windows(h, next_id++, ranks, h->nranks, 0, 4096, 0, &ctx, &base, &size) != 0);
+    assert(ctx == 0 && base == 0 && size == 0);
+    assert(*h->last_allocation_id == failed_id);
+}
+
 static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     using namespace workspace_fixture;
     const int old_nranks = h->nranks;
@@ -186,14 +198,16 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
         // Rank 1 is represented by its real announce/barrier file formats;
         // rank 0 runs the production two-rank allocation and cleanup path.
         assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, 42));
-        for (const char *phase : {"p2p_ready", "release"}) {
+        for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
             std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1));
             marker << "1";
             assert(marker.good());
         }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mask, &ctx, &base, &size);
+        const int rc = comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mask, &ctx, &base, &size);
+        if (rc != 0) check_failed_admission(h, id, next_id);
+        return rc;
     };
     uint64_t held_id = 0, held_ctx = 0;
     assert(allocate(1, held_id, held_ctx) == 0);
@@ -444,7 +458,7 @@ int main(int argc, char **argv) {
         const size_t count = (mask & 2) ? 2 : 1;
         if (count == 2) {
             assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, 42));
-            for (const char *phase : {"p2p_ready", "release"}) {
+            for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
                 std::ofstream marker(
                     barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1)
                 );
@@ -454,7 +468,9 @@ int main(int argc, char **argv) {
         }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size);
+        const int rc = comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size);
+        if (rc != 0) check_failed_admission(h, id, next_id);
+        return rc;
     };
     auto release = [&](uint64_t id) {
         const auto count = h->domain_allocations.at(id)->nranks;

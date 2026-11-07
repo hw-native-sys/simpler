@@ -32,6 +32,7 @@ the C ABI.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -39,11 +40,12 @@ import pytest
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
-def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
+@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids, runtime):
     """End-to-end 2-rank hardware alloc + release round trip.
 
-    A3 performs two sequential allocations on the same base communicator to
-    check Fabric mapping release. A5 keeps the existing single allocation.
+    Both onboard backends perform eight sequential allocations on one base
+    communicator and retire each allocation before the next Worker.run.
     """
     from simpler.task_interface import CallConfig, CommBufferSpec
     from simpler.worker import Worker
@@ -51,12 +53,13 @@ def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
     from simpler_setup.runtime_builder import RuntimeBuilder
 
     build = bool(os.environ.get("PTO_UT_BUILD"))
-    _ = RuntimeBuilder(platform=st_platform).get_binaries("tensormap_and_ringbuffer", build=build)
+    _ = RuntimeBuilder(platform=st_platform).get_binaries(runtime, build=build)
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     device_ids = [int(d) for d in st_device_ids[:2]]
     nranks = len(device_ids)
 
     captures: list[dict[str, object]] = []
+    marker_counts: list[int] = []
 
     def orch_fn(orch, _args, _cfg):
         captured: dict[str, object] = {}
@@ -69,6 +72,12 @@ def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
                 CommBufferSpec(name="signal", dtype="uint32", count=4, nbytes=64),
             ],
         ) as tp:
+            rootinfo = Path(worker._comm_plan_rootinfo_path())
+            announcements = list(rootinfo.parent.glob(f"barrier_{rootinfo.name}_alloc_{tp.allocation_id}_*announce*"))
+            assert len(announcements) == nranks
+            backend = "fabric" if "_fabric_announce_" in announcements[0].name else "ipc"
+            captured["backend"] = backend
+            print(f"runtime={runtime} backend={backend} allocation_id={tp.allocation_id}", flush=True)
             captured["workers"] = tuple(tp.workers)
             captured["alloc_id"] = tp.allocation_id
             captured["contexts"] = {
@@ -87,21 +96,27 @@ def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
     worker = Worker(
         level=3,
         platform=st_platform,
-        runtime="tensormap_and_ringbuffer",
+        runtime=runtime,
         device_ids=device_ids,
         num_sub_workers=0,
     )
     try:
         worker.init()
-        repetitions = 2 if st_platform == "a2a3" else 1
+        repetitions = 8
         for _ in range(repetitions):
             worker.run(orch_fn, args=None, config=CallConfig())
+            root = Path(worker._comm_plan_rootinfo_path())
+            count = len(list(root.parent.glob(f"barrier_{root.name}_alloc_*")))
+            marker_counts.append(count)
+            print(f"allocation_round={len(captures)} residual_markers={count}", flush=True)
     finally:
         worker.close()
 
+    assert marker_counts == [0] * repetitions
+    if st_platform in ("a2a3", "a5"):
+        assert not root.parent.exists(), "closed Worker must reclaim its managed generation"
     assert len(captures) == repetitions
-    if repetitions == 2:
-        assert captures[0]["alloc_id"] != captures[1]["alloc_id"]
+    assert len({captured["alloc_id"] for captured in captures}) == repetitions
     for captured in captures:
         assert captured["released_after_with"] is True
         assert captured["workers"] == tuple(range(nranks))
