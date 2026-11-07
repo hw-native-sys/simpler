@@ -96,7 +96,7 @@ class Tree:
 
 def _gaps(tree: Tree, monkeypatch) -> list[tuple[str, str]]:
     build = tree.install(monkeypatch)
-    found, unclassified = axis.find_gaps(build, jobs=4)
+    found, unclassified, _ = axis.find_gaps(build, jobs=4)
     assert not unclassified, f"the synthetic tree should classify cleanly: {unclassified}"
     return [(case, cell) for case, cell, _ in found]
 
@@ -419,8 +419,32 @@ def test_a_database_where_nothing_resolves_is_an_error(tmp_path, monkeypatch):
 
 def test_runtimes_come_from_the_tree_rather_than_a_list():
     """The same rule platform_info and runtimes.cmake use, so a third runtime
-    needs no edit here to be classified."""
+    needs no edit here to be classified.
+
+    An arch carries a runtime or it does not, and discovery is the union over
+    them, so the tree each discovered name comes back from is the thing to
+    assert. Naming one arch here would hold the set of runtimes to whatever
+    that arch happens to carry.
+    """
     discovered = axis.discovered_runtimes()
     assert discovered, "no runtime discovered from src/"
     for runtime in discovered:
-        assert (_REPO_ROOT / "src" / "a2a3" / "runtime" / runtime / "build_config.py").exists()
+        configs = {arch: _REPO_ROOT / "src" / arch / "runtime" / runtime / "build_config.py" for arch in axis.ARCHES}
+        carriers = [arch for arch, path in configs.items() if path.exists()]
+        assert carriers, f"{runtime} was discovered but no arch under src/ carries it"
+        if len(carriers) == len(axis.ARCHES):
+            continue
+        # One arch only, which the cpput build rejects unless the runtime says
+        # it meant to be: the cases that repeat per runtime are built for the
+        # runtimes both archs carry, so this one silently loses them. Asserted
+        # here as well as in runtimes.cmake because the claim is what keeps a
+        # runtime added to one arch by mistake from passing as deliberate, and
+        # a claim only cmake reads is one a Python-only run never checks.
+        claimed = any(
+            "ARCH_EXCLUSIVE" in line and "True" in line
+            for line in configs[carriers[0]].read_text(encoding="utf-8").splitlines()
+        )
+        assert claimed, (
+            f"{runtime} is under {carriers[0]} only. Add its build_config.py under the "
+            f"other arch, or put `ARCH_EXCLUSIVE = True` in the one it has."
+        )

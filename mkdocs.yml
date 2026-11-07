@@ -60,6 +60,7 @@ not_in_nav: |
   investigations/*
   remote-l3-worker-design/*
   troubleshooting/device-error-codes/*
+  zh-cn/design/percounter-runtime-split.md
 
 hooks:
   - docs/_hooks/repo_links.py

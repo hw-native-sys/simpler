@@ -59,6 +59,13 @@ public:
     bool cores_retired() const {
         return core_count_ > 0 && retired_core_count_.load(std::memory_order_acquire) == core_count_;
     }
+    // This run's discovered cores, for a scheduler mode that configures them
+    // itself. Valid once every thread has finished handshake_partition.
+    int32_t core_count() const { return core_count_; }
+    CoreType core_type(int32_t worker) const { return cores_[worker].core_type; }
+    // Whether `worker` reported to this run: only an accepted report fills its
+    // register address, so a silent worker must not be told READY.
+    bool core_reported(int32_t worker) const { return cores_[worker].reg_addr != 0; }
     void deinit();
 
 private:
