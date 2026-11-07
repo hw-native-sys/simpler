@@ -24,7 +24,7 @@ from simpler_setup.scene_test import compile_chip_callable_spec
 
 _RUNTIME = "tensormap_and_ringbuffer"
 _SDMA_DIAGNOSTIC = re.compile(
-    r"TIMEOUT_EXIT|\[ASYNC_WAIT|ProcessStarsSdmaErrorInfo|SMMU|\bCQE\b|(?:sched|orch)_error_code=", re.IGNORECASE
+    r"TIMEOUT_EXIT|\[ASYNC_WAIT|SdmaErrorInfo|SMMU|CQE|(?:sched|orch)_error_code=", re.IGNORECASE
 )
 
 
