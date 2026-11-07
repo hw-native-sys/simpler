@@ -1040,12 +1040,14 @@ int32_t run_host_orchestration(
     }
 
     ReadyQueueCapacities ready_queue_capacities{};
-    const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);
+    const uint64_t queue_reservation = layout.sched.capacities.dummy;
+    const int32_t ready_queue_status =
+        derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities, queue_reservation);
     if (ready_queue_status != 0) {
         LOG_ERROR(
             "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
             ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph_prepare=%" PRIu64 ")",
-            READY_QUEUE_CAPACITY_LIMIT, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
+            queue_reservation, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
             ready_queue_populations.ready[2], ready_queue_populations.ready_sync[0],
             ready_queue_populations.ready_sync[1], ready_queue_populations.ready_sync[2], ready_queue_populations.dummy,
             ready_queue_populations.graph_prepare

@@ -143,8 +143,8 @@ inline constexpr uint64_t GRAPH_RECORD_BASE = PACKED_OUTPUT_ALIGN;
 // Scope management
 #define CHIP_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
 
-// Per-queue arena reservation ceiling. Bind configures each queue to the next
-// power of two covering the tasks that can reach it and rejects a larger graph.
+// Minimum per-queue arena reservation. The configured task window can raise it;
+// bind sizes logical queues to the next power of two covering their population.
 inline constexpr uint64_t READY_QUEUE_CAPACITY_LIMIT = 32768;
 // Graph preparation keeps one extra rounded population of recycling headroom.
 inline constexpr uint64_t GRAPH_PREPARE_QUEUE_CAPACITY_LIMIT = 2 * READY_QUEUE_CAPACITY_LIMIT;

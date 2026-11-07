@@ -547,3 +547,132 @@ TEST(HbgReadyQueueSeed, DirtyDeviceRebindPreservesThePopulatedGraphAndExternalIn
         EXPECT_EQ(output_heap, heap_image);
     }
 }
+
+TEST(HbgReadyQueueSizing, RuntimeReservationCoversConfiguredTaskWindow) {
+    struct WindowCase {
+        uint64_t tasks;
+        uint64_t expected;
+    };
+    const WindowCase cases[] = {{32769, 65536}, {65536, 65536}, {65537, 131072}, {262144, 262144}};
+    for (const auto &example : cases) {
+        SCOPED_TRACE(example.tasks);
+        DeviceArena arena;
+        const RuntimeArenaLayout layout = runtime_reserve_layout(arena, example.tasks);
+        const uint64_t expected = example.expected;
+        EXPECT_EQ(layout.sched.capacities.ready[0], expected);
+        EXPECT_EQ(layout.sched.capacities.ready_sync[2], expected);
+        EXPECT_EQ(layout.sched.capacities.dummy, expected);
+        EXPECT_EQ(layout.sched.capacities.graph_prepare, 2 * expected);
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+            EXPECT_EQ(arena.region_size(layout.sched.off_ready_queue_slots[i]), expected * sizeof(ChipReadyQueueSlot));
+            EXPECT_EQ(
+                arena.region_size(layout.sched.off_ready_sync_queue_slots[i]), expected * sizeof(ChipReadyQueueSlot)
+            );
+        }
+        EXPECT_EQ(
+            arena.region_size(layout.sched.off_graph_prepare_queue_slots), 2 * expected * sizeof(ChipReadyQueueSlot)
+        );
+        EXPECT_LE(
+            layout.sched.off_graph_prepare_queue_slots + 2 * expected * sizeof(ChipReadyQueueSlot),
+            layout.off_copied_begin
+        );
+    }
+}
+
+TEST(HbgReadyQueueSizing, SmallTaskWindowRetainsDefaultAndGraphHeadroom) {
+    DeviceArena arena;
+    const RuntimeArenaLayout layout = runtime_reserve_layout(arena, 16384);
+    EXPECT_EQ(layout.sched.capacities.ready[0], READY_QUEUE_CAPACITY_LIMIT);
+    EXPECT_EQ(layout.sched.capacities.dummy, READY_QUEUE_CAPACITY_LIMIT);
+    EXPECT_EQ(layout.sched.capacities.graph_prepare, GRAPH_PREPARE_QUEUE_CAPACITY_LIMIT);
+}
+
+TEST(HbgReadyQueueSizing, ExpandedReservationCoversRoundedPopulationsAndGraphHeadroom) {
+    DeviceArena arena;
+    const RuntimeArenaLayout layout = runtime_reserve_layout(arena, 100000);
+    ASSERT_EQ(layout.sched.capacities.dummy, 131072);
+    ReadyQueuePopulations populations{};
+    TaskAttrs sync_start;
+    sync_start.set_sync_start();
+    populations.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, 70000);
+    populations.add_task(LaneMask::aiv0(), sync_start, TaskKind::KERNEL, 65537);
+    populations.add_task(LaneMask{}, TaskAttrs{}, TaskKind::DUMMY, 70000);
+    populations.add_task(LaneMask{}, TaskAttrs{}, TaskKind::GRAPH, 65537);
+    ReadyQueueCapacities capacities{};
+    ASSERT_EQ(derive_ready_queue_capacities(populations, &capacities, layout.sched.capacities.dummy), 0);
+    EXPECT_EQ(capacities.ready[static_cast<int32_t>(ResourceShape::AIC)], 131072);
+    EXPECT_EQ(capacities.ready_sync[static_cast<int32_t>(ResourceShape::AIV)], 131072);
+    EXPECT_EQ(capacities.dummy, 131072);
+    EXPECT_EQ(capacities.graph_prepare, 262144);
+}
+
+TEST(HbgReadyQueueSizing, ExpandedGraphHeadroomDoesNotRaisePopulationAcceptance) {
+    ReadyQueuePopulations populations{};
+    populations.add_task(LaneMask{}, TaskAttrs{}, TaskKind::GRAPH, 65536);
+    ReadyQueueCapacities capacities{};
+    ASSERT_EQ(derive_ready_queue_capacities(populations, &capacities, 65536), 0);
+    EXPECT_EQ(capacities.graph_prepare, 131072);
+    populations.add_task(LaneMask{}, TaskAttrs{}, TaskKind::GRAPH);
+    EXPECT_EQ(derive_ready_queue_capacities(populations, &capacities, 65536), -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    populations = ReadyQueuePopulations{};
+    populations.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, 65537);
+    EXPECT_EQ(derive_ready_queue_capacities(populations, &capacities, 65536), -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+}
+
+TEST(HbgReadyQueueSizing, RejectsInvalidReservationsAndPopulationOverflow) {
+    ReadyQueuePopulations populations{};
+    ReadyQueueCapacities capacities{};
+    const std::array<uint64_t, 5> invalid = {
+        0, 1, 3, static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM) + 1, UINT64_MAX
+    };
+    for (uint64_t reservation : invalid) {
+        EXPECT_FALSE(populations.derive_capacities(&capacities, reservation));
+    }
+    EXPECT_FALSE(populations.derive_capacities(nullptr, 65536));
+    populations.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, UINT64_MAX);
+    ReadyQueuePopulations other{};
+    other.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, UINT64_MAX);
+    populations.add(other);
+    EXPECT_EQ(
+        populations.ready[static_cast<int32_t>(ResourceShape::AIC)],
+        static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM) + 1
+    );
+    EXPECT_EQ(
+        derive_ready_queue_capacities(populations, &capacities, TaskId::GLOBAL_TASK_MAX_NUM),
+        -SIMPLER_ERROR_READY_QUEUE_OVERFLOW
+    );
+}
+
+TEST(HbgReadyQueueSizing, LargestTaskWindowRetainsGraphHeadroom) {
+    DeviceArena arena;
+    const RuntimeArenaLayout layout = runtime_reserve_layout(arena, TaskId::GLOBAL_TASK_MAX_NUM);
+    EXPECT_EQ(layout.sched.capacities.dummy, TaskId::GLOBAL_TASK_MAX_NUM);
+    EXPECT_EQ(layout.sched.capacities.graph_prepare, 2 * static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM));
+    ReadyQueuePopulations populations{};
+    populations.add_task(LaneMask{}, TaskAttrs{}, TaskKind::GRAPH, TaskId::GLOBAL_TASK_MAX_NUM);
+    ReadyQueueCapacities capacities{};
+    ASSERT_TRUE(populations.derive_capacities(&capacities, layout.sched.capacities.dummy));
+    EXPECT_EQ(capacities.graph_prepare, layout.sched.capacities.graph_prepare);
+}
+
+TEST(HbgReadyQueueSeed, ExpandedQueueWrapsAtFullCapacity) {
+    constexpr uint64_t reservation = 65536;
+    DeviceArena arena;
+    const size_t slots = ready_queue_reserve_layout(arena, reservation);
+    ASSERT_NE(arena.commit(DeviceArena::kDefaultBaseAlign), nullptr);
+    ChipReadyQueue queue{};
+    ready_queue_init_data_from_layout(&queue, reservation);
+    ready_queue_wire_arena_pointers(&queue, arena, slots);
+    std::memset(queue.slots, 0xAA, reservation * sizeof(ChipReadyQueueSlot));
+    queue.seed_slots();
+    std::vector<ChipTaskSlotState> states(reservation);
+    for (int lap = 0; lap < 2; ++lap) {
+        for (uint64_t i = 0; i < reservation; ++i)
+            ASSERT_TRUE(queue.push(&states[i]));
+        EXPECT_FALSE(queue.push(&states[0]));
+        for (uint64_t i = 0; i < reservation; ++i)
+            ASSERT_EQ(queue.pop(), &states[i]);
+        EXPECT_EQ(queue.pop(), nullptr);
+    }
+    EXPECT_EQ(queue.max_occupancy.load(std::memory_order_relaxed), reservation);
+}

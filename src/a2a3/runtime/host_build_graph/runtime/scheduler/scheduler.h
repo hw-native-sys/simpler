@@ -1697,7 +1697,7 @@ struct SchedulerState {
     // the supplied arena.
     // Capacities are baked into the returned layout; init_data_from_layout uses
     // the same values.
-    static SchedulerLayout reserve_layout(DeviceArena &arena);
+    static SchedulerLayout reserve_layout(DeviceArena &arena, uint64_t task_capacity = CHIP_DEFAULT_GRAPH_TASKS);
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // `sm_dev_base` is the device address of the SM (only stored, never

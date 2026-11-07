@@ -22,11 +22,6 @@ struct ReadyQueuePopulations {
     uint64_t graph_prepare{0};
 
     void add_task(LaneMask active_mask, TaskAttrs task_attrs, TaskKind task_kind, uint64_t count = 1) {
-        auto add_population = [](uint64_t *population, uint64_t count) {
-            constexpr uint64_t limit = READY_QUEUE_CAPACITY_LIMIT + 1;
-            *population =
-                (*population >= limit || count >= limit || count > limit - *population) ? limit : *population + count;
-        };
         if (task_kind == TaskKind::GRAPH) {
             add_population(&graph_prepare, count);
             return;
@@ -43,7 +38,18 @@ struct ReadyQueuePopulations {
         add_population(&population[static_cast<int32_t>(shape)], count);
     }
     void add(const ReadyQueuePopulations &other);
-    bool derive_capacities(ReadyQueueCapacities *capacities) const;
+    bool derive_capacities(ReadyQueueCapacities *capacities, uint64_t reservation = READY_QUEUE_CAPACITY_LIMIT) const;
+
+private:
+    static void add_population(uint64_t *population, uint64_t count) {
+        // Keep one overflow value beyond every supported task-window reservation.
+        constexpr uint64_t limit = static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM) + 1;
+        *population =
+            (*population >= limit || count >= limit || count > limit - *population) ? limit : *population + count;
+    }
 };
 
-int32_t derive_ready_queue_capacities(const ReadyQueuePopulations &populations, ReadyQueueCapacities *capacities);
+int32_t derive_ready_queue_capacities(
+    const ReadyQueuePopulations &populations, ReadyQueueCapacities *capacities,
+    uint64_t reservation = READY_QUEUE_CAPACITY_LIMIT
+);

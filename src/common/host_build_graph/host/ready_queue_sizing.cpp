@@ -15,17 +15,6 @@
 
 namespace {
 
-constexpr uint64_t READY_QUEUE_POPULATION_OVER_LIMIT = READY_QUEUE_CAPACITY_LIMIT + 1;
-
-void add_population(uint64_t *population, uint64_t count) {
-    if (*population >= READY_QUEUE_POPULATION_OVER_LIMIT || count >= READY_QUEUE_POPULATION_OVER_LIMIT ||
-        count > READY_QUEUE_POPULATION_OVER_LIMIT - *population) {
-        *population = READY_QUEUE_POPULATION_OVER_LIMIT;
-        return;
-    }
-    *population += count;
-}
-
 uint64_t capacity_for_population(uint64_t population) {
     uint64_t capacity = 2;
     while (capacity < population)
@@ -44,12 +33,15 @@ void ReadyQueuePopulations::add(const ReadyQueuePopulations &other) {
     add_population(&graph_prepare, other.graph_prepare);
 }
 
-bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities) const {
-    if (capacities == nullptr) return false;
-    for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
-        if (ready[i] > READY_QUEUE_CAPACITY_LIMIT || ready_sync[i] > READY_QUEUE_CAPACITY_LIMIT) return false;
+bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities, uint64_t reservation) const {
+    if (capacities == nullptr || reservation < 2 || reservation > static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM) ||
+        (reservation & (reservation - 1)) != 0) {
+        return false;
     }
-    if (dummy > READY_QUEUE_CAPACITY_LIMIT || graph_prepare > READY_QUEUE_CAPACITY_LIMIT) {
+    for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+        if (ready[i] > reservation || ready_sync[i] > reservation) return false;
+    }
+    if (dummy > reservation || graph_prepare > reservation) {
         return false;
     }
 
@@ -63,8 +55,10 @@ bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities) 
     return true;
 }
 
-int32_t derive_ready_queue_capacities(const ReadyQueuePopulations &populations, ReadyQueueCapacities *capacities) {
-    if (populations.derive_capacities(capacities)) return 0;
+int32_t derive_ready_queue_capacities(
+    const ReadyQueuePopulations &populations, ReadyQueueCapacities *capacities, uint64_t reservation
+) {
+    if (populations.derive_capacities(capacities, reservation)) return 0;
 
     return runtime_status_from_error_code(SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
 }
