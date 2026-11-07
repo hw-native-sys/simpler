@@ -51,6 +51,7 @@ struct Frame {
     SchedulerAsyncGroupIdentity group{};
     __gm__ DispatchPayload *payload{nullptr};
     __gm__ AsyncSubmissionContext *context{nullptr};
+    uint64_t default_guard_context{0};
     AsyncSubmissionContextHeader header{};
 };
 
@@ -69,6 +70,11 @@ inline __aicore__ bool frame(
         return false;
     out->payload =
         scheduler_state_at<DispatchPayload>(base, local->dispatch_payload_offset(local->config.self_lane, slot_index));
+    if (state.view.enabled() && state.view.layout.sdma_guard_count != 0) {
+        const uint64_t address =
+            reinterpret_cast<uint64_t>(state.view.base) + state.view.layout.sdma_guard_context_offset;
+        if (out->payload->async_submission_context == address) out->default_guard_context = address;
+    }
     if (out->execution_index == SCHEDULER_ASYNC_INDEX_NONE) return true;
     if (!state.view.enabled() || submissions.view.header.run_epoch != state.view.layout.run_epoch ||
         !scheduler_submission_detail::execution(submissions.view, out->execution_index, &out->execution))
@@ -143,7 +149,7 @@ inline __aicore__ bool frame(
 }
 
 inline __aicore__ bool bound(const Frame &frame) {
-    if (frame.context == nullptr) return frame.payload->async_submission_context == 0;
+    if (frame.context == nullptr) return frame.payload->async_submission_context == frame.default_guard_context;
     if (frame.payload->async_submission_context != reinterpret_cast<uint64_t>(frame.context)) return false;
     SchedulerLocalStorage<AsyncSubmissionContextHeader> actual_storage;
     load_into(&frame.context->header, &actual_storage.get());
@@ -152,7 +158,7 @@ inline __aicore__ bool bound(const Frame &frame) {
 }
 
 inline __aicore__ bool bind(const Frame &frame) {
-    if (frame.context == nullptr) return frame.payload->async_submission_context == 0;
+    if (frame.context == nullptr) return frame.payload->async_submission_context == frame.default_guard_context;
     SchedulerLocalStorage<AsyncSubmissionContext> saved_storage;
     load_into(frame.context, &saved_storage.get());
     const auto &saved = saved_storage.get();

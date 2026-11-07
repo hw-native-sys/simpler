@@ -80,7 +80,8 @@ struct Publisher {
 };
 
 TEST(HbgAsyncSubmissionContext, ExplicitCarrierPreservesExistingWireOffsetsAndSizes) {
-    EXPECT_EQ(sizeof(AsyncCtx), 40u);
+    EXPECT_EQ(sizeof(AsyncCtxStorage), 40u);
+    EXPECT_EQ(sizeof(AsyncCtx), 48u);
     EXPECT_EQ(sizeof(LocalContext), 48u);
     EXPECT_EQ(sizeof(DispatchPayload), 512u);
     EXPECT_EQ(offsetof(DispatchPayload, args), 64u);

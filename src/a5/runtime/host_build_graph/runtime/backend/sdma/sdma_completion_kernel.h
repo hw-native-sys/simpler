@@ -15,6 +15,7 @@
 
 #include "async_kernel_api.h"
 #include "sdma_submission_contract.h"
+#include "sdma_submission_guard.h"
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/runtime_status.h"
 
@@ -135,6 +136,12 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
         pto2::detail::defer_flush(ctx);
         return false;
     }
+    if (transfer_bytes == 0) return true;
+    pto2::detail::SdmaSubmissionScope submission;
+    if (!submission.acquire(ctx, static_cast<uint32_t>(get_block_idx()))) {
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
     pto::comm::AsyncSession session;
     if (!pto::comm::BuildAsyncSession(desc.scratch, desc.workspace, session, desc.sync_id)) {
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
@@ -164,10 +171,16 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
         pto2::detail::defer_flush(ctx);
         return false;
     }
+    if (!ctx.task_token.is_valid()) return submission.release(true, desc.workspace) && event.Wait(session);
     const bool registered = pto2::detail::register_pto_async_event(ctx, event, session, allowance);
+    if (!submission.release(registered, desc.workspace)) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
+        return false;
+    }
     pto2::detail::defer_flush(ctx);
     return registered;
 }
 
-// args-aware qualified path; the legacy AsyncCtx overload above is unchanged.
+// The args-aware path retains its scheduler-granted channel and resource checks.
 #include "sdma_qualified_kernel.h"

@@ -14,12 +14,14 @@
 #include "intrinsic.h"
 #include "host_build_graph/completion_token.h"
 
-inline __aicore__ void async_completion_error(AsyncCtx &ctx, int32_t error) {
+template <typename Context>
+inline __aicore__ void async_completion_error(Context &ctx, int32_t error) {
     if (ctx.task_token.is_valid() && ctx.completion_error_code != nullptr && *ctx.completion_error_code == 0)
         *ctx.completion_error_code = error;
 }
 
-inline __aicore__ bool async_completion_writer_valid(const AsyncCtx &ctx) {
+template <typename Context>
+inline __aicore__ bool async_completion_writer_valid(const Context &ctx) {
     return ctx.task_token.is_valid() && ctx.completion_count != nullptr && ctx.completion_error_code != nullptr &&
            ctx.completion_entries != nullptr && ctx.completion_capacity >= 1 &&
            ctx.completion_capacity <= MAX_COMPLETIONS_PER_TASK;
@@ -34,8 +36,9 @@ struct AsyncCompletionAllowance {
     bool valid{false};
 };
 
+template <typename Context>
 inline __aicore__ bool
-async_completion_reserve(AsyncCtx &ctx, uint32_t upper_bound, AsyncCompletionAllowance *allowance) {
+async_completion_reserve(Context &ctx, uint32_t upper_bound, AsyncCompletionAllowance *allowance) {
     if (allowance != nullptr) *allowance = {};
     if (allowance == nullptr || !async_completion_writer_valid(ctx)) {
         async_completion_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
@@ -51,8 +54,9 @@ async_completion_reserve(AsyncCtx &ctx, uint32_t upper_bound, AsyncCompletionAll
     return true;
 }
 
+template <typename Context>
 inline __aicore__ bool
-async_completion_accept_count(AsyncCtx &ctx, const AsyncCompletionAllowance &allowance, uint32_t actual_count) {
+async_completion_accept_count(Context &ctx, const AsyncCompletionAllowance &allowance, uint32_t actual_count) {
     if (!async_completion_writer_valid(ctx) || !allowance.valid || actual_count > allowance.limit ||
         *ctx.completion_count != allowance.begin || allowance.begin > ctx.completion_capacity ||
         allowance.limit > ctx.completion_capacity - allowance.begin) {
@@ -62,7 +66,8 @@ async_completion_accept_count(AsyncCtx &ctx, const AsyncCompletionAllowance &all
     return *ctx.completion_error_code == 0;
 }
 
-inline __aicore__ bool async_completion_append(AsyncCtx &ctx, const CompletionToken &token) {
+template <typename Context>
+inline __aicore__ bool async_completion_append(Context &ctx, const CompletionToken &token) {
     if (!async_completion_writer_valid(ctx)) {
         async_completion_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
@@ -87,8 +92,8 @@ inline __aicore__ bool async_completion_append(AsyncCtx &ctx, const CompletionTo
 // Count/error and tokens can occupy separate allocations/cache lines. Never
 // flush the gap: it may hold atomic-only leases and directory words belonging
 // to other cores. Cache supplies flush_range(address,bytes) and finish().
-template <typename Cache>
-inline __aicore__ void async_completion_flush(AsyncCtx &ctx, Cache &cache) {
+template <typename Context, typename Cache>
+inline __aicore__ void async_completion_flush(Context &ctx, Cache &cache) {
     if (!ctx.task_token.is_valid()) return;
     uint32_t count = ctx.completion_count != nullptr ? *ctx.completion_count : 0;
     if (count > ctx.completion_capacity) count = ctx.completion_capacity;

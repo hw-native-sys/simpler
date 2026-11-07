@@ -36,7 +36,7 @@ struct SchedulerAsyncExecutionRelease {
 
 enum class SchedulerAsyncRuntimeServiceResult : uint8_t { IDLE, PROGRESS, ERROR };
 
-static_assert(sizeof(AsyncCtx) == 40 && sizeof(LocalContext) == 48);
+static_assert(sizeof(AsyncCtxStorage) == 40 && sizeof(LocalContext) == 48);
 static_assert(sizeof(DispatchPayload) == 512 && offsetof(DispatchPayload, args) == 64);
 
 namespace scheduler_async_runtime_detail {
@@ -279,7 +279,17 @@ inline __aicore__ bool scheduler_async_runtime_mount(
         SCHEDULER_ASYNC_CHECK_REGION(uses_offset, l.uses_bytes, uint8_t) &&
         SCHEDULER_ASYNC_CHECK_REGION(scratch_offset, l.scratch_bytes, uint8_t);
 #undef SCHEDULER_ASYNC_CHECK_REGION
-    if (!valid) return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
+    if (!valid || l.sdma_guard_count > ASYNC_SDMA_CHANNELS ||
+        (l.sdma_guard_count == 0 ?
+             l.sdma_guard_context_offset != 0 :
+             !region(l.total_bytes, l.sdma_guard_context_offset, l.sdma_guard_count + 1, 128, 128, &end)))
+        return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
+    if (l.sdma_guard_count != 0) {
+        const auto *context = at<AsyncSdmaGuardContext>(next, l.sdma_guard_context_offset);
+        if (!async_sdma_guard_context_valid(context) || context->run_epoch != l.run_epoch ||
+            context->guard_count != l.sdma_guard_count)
+            return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
+    }
     *out = next;
     return true;
 }
@@ -327,6 +337,10 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
     ctx.completion_entries = at<DeferredCompletionEntry>(view, identity.entries_offset);
     ctx.completion_capacity = identity.capacity;
     TaskId::assign(ctx.task_token, token);
+    if (subtask != 0 && identity.binding_uses_offset == SCHEDULER_ASYNC_USES_DYNAMIC &&
+        (identity.condition_types & CORE_ASYNC_CONDITION_SDMA_POST_DONE) != 0 && view.layout.sdma_guard_count != 0)
+        payload->async_submission_context =
+            reinterpret_cast<uint64_t>(view.base) + view.layout.sdma_guard_context_offset;
     *bound = true;
     return true;
 }

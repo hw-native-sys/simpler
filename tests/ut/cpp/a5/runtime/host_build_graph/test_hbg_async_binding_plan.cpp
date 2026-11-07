@@ -199,6 +199,7 @@ TEST(HbgAsyncBindingPlan, UnknownAndBoundedDeferredUseDynamicRegistrationWithout
         ASSERT_TRUE(image.initialize(f, plan)) << f.error;
         const auto group = image.group();
         EXPECT_EQ(group.capacity, unknown ? 64u : 2u);
+        EXPECT_EQ(plan.needs_default_sdma_guards, unknown);
         EXPECT_EQ(group.binding_uses_offset, SCHEDULER_ASYNC_USES_DYNAMIC);
         EXPECT_EQ(group.binding_use_count, 0u);
         AsyncResourceBindings<> backend(image.tables, ASYNC_CORE_AIC);

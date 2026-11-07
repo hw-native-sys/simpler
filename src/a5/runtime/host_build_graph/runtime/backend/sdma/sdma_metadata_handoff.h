@@ -136,6 +136,7 @@ public:
     }
 
     inline __aicore__ bool publish_backend_metadata() {
+        if (published_) return true;
         SdmaMetadataHandoffRange range{};
         if (!sdma_metadata_handoff_preflight(
                 layout_, workspace_index_, workspace_, grant_, identity_, session_, &range
@@ -143,6 +144,7 @@ public:
             return false;
         cache_.flush_range(reinterpret_cast<volatile __gm__ void *>(range.address), range.bytes);
         cache_.finish();
+        published_ = true;
         return true;
     }
 
@@ -159,4 +161,5 @@ private:
     const SchedulerSubmissionExecutionIdentity &identity_;
     SdmaMetadataSession session_;
     Cache &cache_;
+    bool published_{false};
 };

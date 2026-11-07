@@ -536,6 +536,7 @@ bool build(
                          count}
                     );
                 }
+                if (deferred && !declared_wait && sdma) plan.needs_default_sdma_guards = true;
                 if (deferred)
                     plan.groups.push_back(
                         {declared_wait ? begin : SCHEDULER_ASYNC_USES_DYNAMIC, plan.conditions.size() - begin}

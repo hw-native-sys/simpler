@@ -111,7 +111,7 @@ inline __aicore__ bool async_submission_context_valid(__gm__ const AsyncSubmissi
 }
 
 // Only a scheduler-published pointer can provide this context. Old/synchronous
-// dispatch without a qualified submission contract has zero in the named field.
+// dispatch has zero or a separately tagged default SDMA guard context there.
 // The caller still validates its requested resource and granted channel before
 // touching a backend; obtaining this identity view is not a submit permission.
 inline __aicore__ __gm__ AsyncSubmissionContext *get_async_submission_context(__gm__ int64_t *args) {

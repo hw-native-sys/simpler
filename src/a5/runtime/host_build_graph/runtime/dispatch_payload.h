@@ -126,8 +126,8 @@ struct alignas(64) DispatchPayload {
      *  the legacy scheduler seeds the equivalent per-core value at startup.
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
-    // Versioned per-execution submission contract in the retained async image.
-    // Zero means no qualified contract. Existing argument/context offsets stay fixed.
+    // Qualified per-execution context or tagged default SDMA guard context in
+    // the retained async image. Zero means neither. Argument offsets stay fixed.
     uint64_t async_submission_context;
     // No explicit tail padding: alignas(64) rounds sizeof up to 512 (8 cache lines).
 

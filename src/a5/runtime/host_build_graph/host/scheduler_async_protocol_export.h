@@ -105,6 +105,10 @@ public:
         region(layout.resources_offset, layout.resources_bytes, 1, end);
         region(layout.uses_offset, layout.uses_bytes, 1, end);
         region(layout.scratch_offset, layout.scratch_bytes, 1, end);
+        require(layout.sdma_guard_count <= ASYNC_SDMA_CHANNELS, "invalid SDMA guard count");
+        if (layout.sdma_guard_count != 0)
+            region(layout.sdma_guard_context_offset, layout.sdma_guard_count + 1, 128, end);
+        else require(layout.sdma_guard_context_offset == 0, "empty SDMA guard section has an offset");
     }
 
     template <typename T>

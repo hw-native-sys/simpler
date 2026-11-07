@@ -34,7 +34,8 @@ CompletionToken token(uint64_t post = (UINT64_C(1) << 44) + 7) {
 }
 
 TEST(HbgAsyncWriter, ExistingContextAndPayloadWireLayoutsArePreserved) {
-    EXPECT_EQ(sizeof(AsyncCtx), 40u);
+    EXPECT_EQ(sizeof(AsyncCtxStorage), 40u);
+    EXPECT_EQ(sizeof(AsyncCtx), 48u);
     EXPECT_EQ(sizeof(LocalContext), 48u);
     EXPECT_EQ(sizeof(DispatchPayload), 512u);
     EXPECT_EQ(offsetof(DispatchPayload, args), 64u);

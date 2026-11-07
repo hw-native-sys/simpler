@@ -16,7 +16,7 @@
 
 inline constexpr uint64_t SCHEDULER_SUBMISSION_VERSION = 2;
 // Capacity of the pinned SDMA backend's per-workspace physical queue array.
-inline constexpr uint32_t SCHEDULER_SUBMISSION_SDMA_CHANNELS = 48;
+inline constexpr uint32_t SCHEDULER_SUBMISSION_SDMA_CHANNELS = ASYNC_SDMA_CHANNELS;
 inline constexpr uint32_t SCHEDULER_SUBMISSION_MAX_EXECUTION_GRANTS = CORE_MAX_SCALAR_ARGS;
 static_assert(SCHEDULER_SUBMISSION_MAX_EXECUTION_GRANTS == 16);
 

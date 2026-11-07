@@ -66,6 +66,31 @@ TEST(HbgAsyncPlan, PureSynchronousExecutionNeedsNoAsyncImage) {
     EXPECT_EQ(plan.layout.run_epoch, kEpoch);
 }
 
+TEST(HbgAsyncPlan, SdmaGuardStorageIsRunOwnedZeroedAndIncludedInTheBudget) {
+    SchedulerAsyncHostPlan baseline, guarded;
+    const std::vector<SchedulerTaskMetadata> metadata{task(6)};
+    const std::vector<SchedulerAsyncCapabilities> caps(1);
+    ASSERT_TRUE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, {}, &baseline, nullptr));
+    SchedulerAsyncAuxiliaryBytes extra{};
+    extra.sdma_guard_count = ASYNC_SDMA_CHANNELS;
+    ASSERT_TRUE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, extra, &guarded, nullptr));
+    const auto offset = guarded.layout.sdma_guard_context_offset;
+    const auto header = record<AsyncSdmaGuardContext>(guarded, offset);
+    EXPECT_EQ(header.run_epoch, kEpoch);
+    EXPECT_EQ(header.guard_count, ASYNC_SDMA_CHANNELS);
+    EXPECT_EQ(header.bytes, (ASYNC_SDMA_CHANNELS + 1) * 128u);
+    EXPECT_EQ(guarded.image.size() - baseline.image.size(), header.bytes);
+    for (uint64_t queue = 0; queue < header.guard_count; ++queue)
+        EXPECT_EQ(record<AsyncSdmaSubmissionGuard>(guarded, offset + sizeof(header), queue).word, 0u);
+    EXPECT_FALSE(
+        scheduler_plan_async_state(metadata, caps, kEpoch, guarded.image.size() - 1, extra, &baseline, nullptr)
+    );
+    extra.sdma_guard_count = ASYNC_SDMA_CHANNELS + 1;
+    EXPECT_FALSE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, extra, &baseline, nullptr));
+    extra.sdma_guard_count = 1;
+    EXPECT_FALSE(scheduler_plan_async_state({task(2)}, {capabilities()}, kEpoch, kBudget, extra, &baseline, nullptr));
+}
+
 TEST(HbgAsyncPlan, UnknownReserves64ForEveryPhysicalExecutionWithoutChangingDescriptor) {
     for (uint8_t mask : {1, 2, 4, 7}) {
         for (uint16_t blocks : {1, 4}) {

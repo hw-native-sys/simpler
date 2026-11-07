@@ -36,6 +36,7 @@ struct AsyncBindingGroupUses {
 struct AsyncBindingHostPlan {
     uint64_t run_epoch{0};
     uint64_t execution_contract{ASYNC_EXECUTION_UNQUALIFIED};
+    bool needs_default_sdma_guards{false};
     SchedulerAsyncAuxiliaryBytes auxiliary{};
     std::vector<AsyncRetainedSpan> spans;
     std::vector<AsyncResourceRange> ranges;

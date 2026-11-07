@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "inner_kernel.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -130,6 +131,16 @@ struct Driver {
     std::vector<SdmaCompletionReceiptRecord> receipts;
     uint32_t built{0}, posted{0}, waited{0};
     int failure{0};
+    struct GuardImage {
+        AsyncSdmaGuardContext header;
+        AsyncSdmaSubmissionGuard queues[8];
+    } guards;
+    void enable_guards() {
+        guards.header.run_epoch = 19;
+        guards.header.guard_count = 8;
+        guards.header.bytes = 9 * 128;
+        writer.sdma_guard_context = reinterpret_cast<uint64_t>(&guards);
+    }
     struct Backend {
         Driver &d;
         bool preflight() const { return d.failure != 1; }
@@ -138,6 +149,10 @@ struct Driver {
             EXPECT_EQ(queues, 2u);
             EXPECT_EQ(group, 3u);
             EXPECT_EQ(d.ctx().evidence.attempted, d.ctx().evidence.committed + 1);
+            if (d.writer.sdma_guard_context != 0) {
+                EXPECT_EQ(d.guards.queues[6].word, 1u);
+                EXPECT_EQ(d.guards.queues[7].word, 1u);
+            }
             return d.failure != 2;
         }
         SdmaMetadataSession metadata_session() const {
@@ -157,6 +172,8 @@ struct Driver {
         }
         bool wait() {
             ++d.waited;
+            EXPECT_EQ(d.guards.queues[6].word, 0u);
+            EXPECT_EQ(d.guards.queues[7].word, 0u);
             return d.failure != 12;
         }
     } backend{*this};
@@ -315,6 +332,27 @@ TEST(HbgSdmaQualifiedSubmission, SynchronousUseStillWaitsAndPublishesMetadata) {
     EXPECT_TRUE(failed.receipts.empty());
 }
 
+TEST(HbgSdmaQualifiedSubmission, DefaultAndQualifiedSubmissionsUseTheSamePhysicalQueueGuards) {
+    for (bool synchronous : {false, true}) {
+        Driver d;
+        if (synchronous) d.synchronous();
+        d.enable_guards();
+        ASSERT_TRUE(d.submit());
+        EXPECT_EQ(sdma_guard_try_acquire(d.guards.queues[6]), SdmaGuardResult::ACQUIRED);
+        EXPECT_EQ(sdma_guard_try_acquire(d.guards.queues[7]), SdmaGuardResult::ACQUIRED);
+        EXPECT_TRUE(sdma_guard_release(d.guards.queues[6], true));
+        EXPECT_TRUE(sdma_guard_release(d.guards.queues[7], true));
+        const auto metadata = d.access.workspace.address + kLayout.header_bytes + 6 * kLayout.channel_bytes;
+        EXPECT_EQ(std::count(d.cache.events.begin(), d.cache.events.end(), metadata), 1);
+    }
+    Driver failed;
+    failed.enable_guards();
+    failed.failure = 4;
+    EXPECT_FALSE(failed.submit());
+    EXPECT_EQ(sdma_guard_try_acquire(failed.guards.queues[6]), SdmaGuardResult::FAILED);
+    EXPECT_EQ(sdma_guard_try_acquire(failed.guards.queues[7]), SdmaGuardResult::FAILED);
+}
+
 TEST(HbgSdmaQualifiedSubmission, StickyNativeErrorNeverBecomesSuccessfulRetry) {
     Driver d;
     d.ctx().evidence.error_code = -37;
@@ -334,7 +372,7 @@ struct Mounted {
     AsyncSubmissionContext *context{nullptr};
     SchedulerSubmissionExecution execution{};
     Ranges resource;
-    Mounted() {
+    Mounted(bool default_guards = false) {
         SchedulerTaskMetadata task{};
         task.active_mask = LaneMask::aiv0();
         task.logical_block_num = 1;
@@ -357,6 +395,7 @@ struct Mounted {
         extra.resources = sizeof(AsyncResourceHeader) + 2 * sizeof(AsyncRetainedSpan) + 2 * sizeof(AsyncResourceRange);
         extra.uses = 2 * sizeof(AsyncConditionContract);
         extra.scratch = plan.image.size();
+        extra.sdma_guard_count = default_guards ? ASYNC_SDMA_CHANNELS : 0;
         if (!scheduler_plan_async_state({task}, {caps}, 19, 1 << 20, extra, &async_plan, &error))
             throw std::runtime_error(error);
         image.reset(std::aligned_alloc(128, async_plan.image.size()));
@@ -437,6 +476,23 @@ struct Mounted {
         );
     }
 };
+
+TEST(HbgSdmaQualifiedSubmission, QualifiedFrameGetsTheRunGuardPoolWithoutChangingItsResourceGrant) {
+    Mounted m(true);
+    SdmaQualifiedAccess access;
+    AsyncCtx writer;
+    AsyncSubmissionContext *context = nullptr;
+    ASSERT_TRUE(m.access(&access, &writer, &context));
+    EXPECT_EQ(
+        writer.sdma_guard_context,
+        reinterpret_cast<uint64_t>(m.image.get()) + m.async_plan.layout.sdma_guard_context_offset
+    );
+    EXPECT_EQ(context, m.context);
+    EXPECT_EQ(access.grant.group_index, 3u);
+    auto *header = reinterpret_cast<AsyncSdmaGuardContext *>(writer.sdma_guard_context);
+    ++header->run_epoch;
+    EXPECT_FALSE(m.access(&access, &writer, &context));
+}
 
 TEST(HbgSdmaQualifiedSubmission, RealRetainedImageMountsCanonicalWriterAndActiveGrant) {
     Mounted m;

@@ -43,6 +43,8 @@ bool plan_async_layout(
 ) {
     if (out == nullptr || run_epoch == 0 || metadata.size() != capabilities.size() || metadata.size() > INT32_MAX)
         return fail(error, "async plan requires a live run epoch and matching capability rows");
+    if (auxiliary.sdma_guard_count > ASYNC_SDMA_CHANNELS)
+        return fail(error, "default SDMA guard count exceeds physical queue capacity");
     SchedulerAsyncLayout layout{};
     layout.run_epoch = run_epoch;
     layout.task_count = metadata.size();
@@ -92,7 +94,8 @@ bool plan_async_layout(
             return fail(error, "async group count overflows");
     }
     if (layout.group_count == 0) {
-        if (auxiliary.resources != 0 || auxiliary.uses != 0 || auxiliary.scratch != 0)
+        if (auxiliary.resources != 0 || auxiliary.uses != 0 || auxiliary.scratch != 0 ||
+            auxiliary.sdma_guard_count != 0)
             return fail(error, "synchronous plan cannot carry unowned async auxiliary storage");
         *out = layout;
         return true;
@@ -104,6 +107,7 @@ bool plan_async_layout(
     layout.resources_bytes = auxiliary.resources;
     layout.uses_bytes = auxiliary.uses;
     layout.scratch_bytes = auxiliary.scratch;
+    layout.sdma_guard_count = auxiliary.sdma_guard_count;
     uint64_t cursor = sizeof(SchedulerAsyncLayout);
     if (!reserve(layout.task_count, sizeof(SchedulerAsyncTaskMap), cursor, layout.task_map_offset) ||
         !reserve(layout.group_count, sizeof(SchedulerAsyncGroupIdentity), cursor, layout.group_identity_offset) ||
@@ -125,6 +129,8 @@ bool plan_async_layout(
         !reserve(auxiliary.resources, 1, cursor, layout.resources_offset) ||
         !reserve(auxiliary.uses, 1, cursor, layout.uses_offset) ||
         !reserve(layout.scratch_bytes, 1, cursor, layout.scratch_offset) ||
+        (layout.sdma_guard_count != 0 &&
+         !reserve(layout.sdma_guard_count + 1, 128, cursor, layout.sdma_guard_context_offset)) ||
         !scheduler_layout_checked_align(cursor, 128, &layout.total_bytes) || layout.total_bytes > byte_budget ||
         layout.total_bytes > std::numeric_limits<size_t>::max())
         return fail(error, "async state exceeds the byte budget or addressable storage");
@@ -138,6 +144,13 @@ bool materialize_async_state(
 ) {
     std::memset(image, 0, static_cast<size_t>(layout.total_bytes));
     write(image, 0, layout);
+    if (layout.sdma_guard_count != 0) {
+        AsyncSdmaGuardContext context{};
+        context.run_epoch = layout.run_epoch;
+        context.guard_count = layout.sdma_guard_count;
+        context.bytes = (layout.sdma_guard_count + 1) * 128;
+        write(image, layout.sdma_guard_context_offset, context);
+    }
     uint64_t group_base = 0, finish_index = 0;
     uint64_t entry_cursor = layout.entries_offset, binding_cursor = layout.condition_bindings_offset;
     for (size_t task = 0; task < metadata.size(); ++task) {
@@ -267,7 +280,9 @@ bool scheduler_initialize_async_state(
     const SchedulerAsyncLayout &layout, void *region, uint64_t region_bytes, std::string *error
 ) {
     SchedulerAsyncLayout expected{};
-    const SchedulerAsyncAuxiliaryBytes auxiliary{layout.resources_bytes, layout.uses_bytes, layout.scratch_bytes};
+    const SchedulerAsyncAuxiliaryBytes auxiliary{
+        layout.resources_bytes, layout.uses_bytes, layout.scratch_bytes, layout.sdma_guard_count
+    };
     if (!plan_async_layout(metadata, capabilities, layout.run_epoch, layout.total_bytes, auxiliary, &expected, error))
         return false;
     if (std::memcmp(&expected, &layout, sizeof(layout)) != 0 || region_bytes < layout.total_bytes)

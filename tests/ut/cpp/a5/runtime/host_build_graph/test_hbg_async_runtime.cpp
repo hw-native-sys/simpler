@@ -105,7 +105,7 @@ struct RuntimeFixture {
 
     RuntimeFixture(
         uint32_t blocks = 1, uint32_t active_mask = 1, uint32_t async_mask = 1, uint32_t capacity = 4,
-        bool protocol = false
+        bool protocol = false, uint32_t sdma_guards = 0
     ) :
         record_protocol(protocol) {
         for (auto &task : metadata) {
@@ -138,7 +138,9 @@ struct RuntimeFixture {
         ));
         EXPECT_TRUE(scheduler_plan_ready_pool(metadata, 2, 0, layout.total_size, &pool));
         layout.total_size = pool.total_size;
-        EXPECT_TRUE(scheduler_plan_async_layout(metadata, caps, kEpoch, 1024 * 1024, {}, &async, nullptr));
+        SchedulerAsyncAuxiliaryBytes auxiliary{};
+        auxiliary.sdma_guard_count = sdma_guards;
+        EXPECT_TRUE(scheduler_plan_async_layout(metadata, caps, kEpoch, 1024 * 1024, auxiliary, &async, nullptr));
         EXPECT_TRUE(scheduler_append_async_layout(
             layout.total_size, async, 1024 * 1024, &async_offset, &layout.total_size, nullptr
         ));
@@ -374,6 +376,40 @@ TEST(HbgAsyncRuntime, ZeroLocatorDisablesPollingAndClearsStalePayloadContextWith
         EXPECT_EQ(value, UINT64_C(0xdeadbeef));
     EXPECT_EQ(fixture.service(0), SchedulerAsyncRuntimeServiceResult::IDLE);
     EXPECT_EQ(fixture.backend.bindings, 0u);
+}
+
+TEST(HbgAsyncRuntime, DefaultAivSubmissionsShareRunGuardsWhileOtherContextsStaySeparate) {
+    RuntimeFixture f(1, 7, 7, 4, false, 2);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        auto *identity = f.at<SchedulerAsyncGroupIdentity>(f.async.group_identity_offset, f.group(0, lane));
+        identity->binding_uses_offset = SCHEDULER_ASYNC_USES_DYNAMIC;
+        identity->condition_types |= CORE_ASYNC_CONDITION_SDMA_POST_DONE;
+        f.bind(lane, 0, lane);
+    }
+    const auto address = reinterpret_cast<uint64_t>(f.views[0].base) + f.async.sdma_guard_context_offset;
+    EXPECT_EQ(f.payload(0, 0).async_submission_context, 0u);
+    EXPECT_EQ(f.payload(0, 1).async_submission_context, address);
+    EXPECT_EQ(f.payload(0, 2).async_submission_context, address);
+    auto *declared = f.at<SchedulerAsyncGroupIdentity>(f.async.group_identity_offset, f.group(0, 1));
+    declared->binding_uses_offset = 0;
+    f.bind(1, 0, 1);
+    EXPECT_EQ(f.payload(0, 1).async_submission_context, 0u);
+}
+
+TEST(HbgAsyncRuntime, CorruptDefaultGuardRegionFailsBeforeBinding) {
+    for (uint32_t fault = 0; fault < 5; ++fault) {
+        RuntimeFixture f(1, 2, 2, 4, false, 2);
+        auto *layout = reinterpret_cast<SchedulerAsyncLayout *>(f.views[0].base);
+        auto *header = f.at<AsyncSdmaGuardContext>(layout->sdma_guard_context_offset);
+        if (fault == 0) ++header->run_epoch;
+        if (fault == 1) --header->bytes;
+        if (fault == 2) layout->sdma_guard_context_offset = layout->group_writer_offset;
+        if (fault == 3) layout->sdma_guard_context_offset = layout->total_bytes;
+        if (fault == 4) layout->sdma_guard_count = ASYNC_SDMA_CHANNELS + 1;
+        SchedulerAsyncRuntimeView view{};
+        EXPECT_FALSE(scheduler_async_runtime_mount(f.graph, f.base(), &f.locals[1], f.run, &view));
+        EXPECT_FALSE(view.enabled());
+    }
 }
 
 TEST(HbgAsyncRuntime, PayloadUsesLogicalSubtaskAndIndependentWriterAndTokenRegions) {

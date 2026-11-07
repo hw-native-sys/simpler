@@ -58,7 +58,7 @@ struct Publisher {
 struct Fixture {
     Fixture(
         uint32_t mask = 2, uint32_t blocks = 1, bool sync_start = false, uint32_t deferred_mask = 7, bool skip = false,
-        bool native_child = false
+        bool native_child = false, bool default_guards = false, uint32_t dynamic_mask = 0
     ) :
         execution_ref(native_child ? 1 : 0),
         storage(
@@ -106,12 +106,19 @@ struct Fixture {
         std::vector<SchedulerSubmissionExecutionUse> uses;
         for (uint32_t block = 0; block < blocks; ++block)
             for (uint32_t lane = 1; lane < 3; ++lane)
-                if (mask & (1u << lane)) uses.push_back({execution_ref, block, lane, 0, 0});
+                if ((mask & (1u << lane)) && !(dynamic_mask & (1u << lane)))
+                    uses.push_back({execution_ref, block, lane, 0, 0});
         for (size_t task = 0; task < metadata.size(); ++task)
             for (uint32_t block = 0; block < metadata[task].logical_block_num; ++block)
                 for (uint32_t lane = 0; lane < 3; ++lane)
-                    if (metadata[task].active_mask.has(static_cast<SubtaskSlot>(lane)))
-                        use_sets.push_back({static_cast<int64_t>(task), block, lane, 0, 1});
+                    if (metadata[task].active_mask.has(static_cast<SubtaskSlot>(lane))) {
+                        const bool dynamic =
+                            static_cast<int64_t>(task) == execution_ref && (dynamic_mask & (1u << lane)) != 0;
+                        use_sets.push_back(
+                            {static_cast<int64_t>(task), block, lane, dynamic ? SCHEDULER_ASYNC_INDEX_NONE : 0,
+                             dynamic ? 0u : 1u}
+                        );
+                    }
         backend.record_address = reinterpret_cast<uint64_t>(workspace_storage.data());
         const SchedulerSubmissionWorkspaceInput workspace{
             reinterpret_cast<uint64_t>(workspace_storage.data()), workspace_storage.size(), kEpoch, 1, 48,
@@ -125,6 +132,7 @@ struct Fixture {
         SchedulerAsyncAuxiliaryBytes auxiliary{};
         auxiliary.uses = sizeof(AsyncConditionContract);
         auxiliary.scratch = plan.image.size();
+        auxiliary.sdma_guard_count = default_guards ? ASYNC_SDMA_CHANNELS : 0;
         if (!scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, auxiliary, &async_plan, &error))
             throw std::runtime_error(error);
         image.reset(std::aligned_alloc(128, async_plan.image.size()));
@@ -137,8 +145,9 @@ struct Fixture {
             auto *group = scheduler_async_runtime_detail::at<SchedulerAsyncGroupIdentity>(
                 async, async.layout.group_identity_offset, i
             );
-            group->binding_uses_offset = async.layout.uses_offset;
-            group->binding_use_count = 1;
+            const bool dynamic = group->task_ref == execution_ref && (dynamic_mask & (1u << group->subtask_slot)) != 0;
+            group->binding_uses_offset = dynamic ? SCHEDULER_ASYNC_USES_DYNAMIC : async.layout.uses_offset;
+            group->binding_use_count = dynamic ? 0 : 1;
         }
         graph_view = graph.graph();
         if (native_child) initialize_native_identity();
@@ -628,6 +637,21 @@ TEST(HbgSubmissionExecution, DynamicExecutionCanShareARunWithQualifiedSubmission
         EXPECT_EQ(f.locals[0]->local_completed_generations[0], 7u);
         EXPECT_EQ(f.busy(), 0u);
     }
+}
+
+TEST(HbgSubmissionExecution, DynamicAivGuardCarrierSurvivesAdmissionAlongsideAQualifiedSibling) {
+    Fixture f(6, 1, false, 7, false, false, true, 2);
+    f.assign(1, 0, 1);
+    f.require_enter(1);
+    const auto address = reinterpret_cast<uint64_t>(f.async.base) + f.async.layout.sdma_guard_context_offset;
+    ASSERT_EQ(f.payload(1)->async_submission_context, address);
+    EXPECT_EQ(get_async_submission_context(reinterpret_cast<int64_t *>(f.payload(1)->args)), nullptr);
+    ASSERT_TRUE(f.returned(1));
+    f.assign(2, 0, 2);
+    f.require_enter(2);
+    EXPECT_NE(f.payload(2)->async_submission_context, address);
+    EXPECT_NE(get_async_submission_context(reinterpret_cast<int64_t *>(f.payload(2)->args)), nullptr);
+    EXPECT_TRUE(f.returned(2));
 }
 
 TEST(HbgSubmissionExecution, NativeChildFrameKeepsItsSubTaskIdentityThroughSealAndRelease) {

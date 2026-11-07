@@ -80,6 +80,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <type_traits>
 
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/task_id.h"
@@ -117,12 +118,25 @@ struct GlobalContext {
     int32_t sub_block_id;
 };
 
+// Shared dispatch prefix. Kernel-local submission metadata is not part of the wire layout.
+struct AsyncCtxStorage {
+    volatile __gm__ uint32_t *completion_count;
+    volatile __gm__ int32_t *completion_error_code;
+    volatile __gm__ DeferredCompletionEntry *completion_entries;
+    uint32_t completion_capacity;
+    TaskId task_token;
+};
+
+// A kernel-local view, populated by get_async_ctx. Its wire prefix remains
+// AsyncCtxStorage so existing LocalContext/GlobalContext offsets do not move.
 struct AsyncCtx {
     volatile __gm__ uint32_t *completion_count;
     volatile __gm__ int32_t *completion_error_code;
     volatile __gm__ DeferredCompletionEntry *completion_entries;
     uint32_t completion_capacity;
     TaskId task_token;
+
+    uint64_t sdma_guard_context{0};
 
     static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
         AsyncCtx ctx{};
@@ -150,8 +164,11 @@ struct LocalContext {
     int32_t block_num;  // Original logical block count, including multi-wave execution.
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
-    AsyncCtx async_ctx;
+    AsyncCtxStorage async_ctx;
 };
+
+static_assert(sizeof(AsyncCtxStorage) == 40 && sizeof(LocalContext) == 48);
+static_assert(std::is_standard_layout_v<AsyncCtxStorage> && std::is_trivially_copyable_v<AsyncCtxStorage>);
 
 /**
  * Return the AIV lane index within the cluster.

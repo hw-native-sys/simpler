@@ -16,9 +16,10 @@
 #include "scheduler_async_lease.h"
 #include "scheduler_resolve.h"
 #include "aicore_completion_mailbox_types.h"
+#include "async_sdma_guard.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 2;
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 3;
 // A group without static resource declarations uses the kernel registration
 // contract. Zero remains an empty declared-use set, never dynamic permission.
 inline constexpr uint64_t SCHEDULER_ASYNC_USES_DYNAMIC = UINT64_MAX;
@@ -169,6 +170,8 @@ struct SchedulerAsyncLayout {
     uint64_t uses_bytes{0};
     uint64_t scratch_offset{0};
     uint64_t scratch_bytes{0};
+    uint64_t sdma_guard_context_offset{0};
+    uint64_t sdma_guard_count{0};
 };
 
 static_assert(sizeof(SchedulerAsyncTaskMap) == 32);
@@ -182,7 +185,7 @@ static_assert(offsetof(SchedulerAsyncGroupProgress, terminal_at) == 88);
 static_assert(offsetof(SchedulerAsyncGroupProgress, active_cycles) == 120);
 static_assert(offsetof(SchedulerAsyncFinishProgress, drained_at) == 216);
 static_assert(offsetof(SchedulerAsyncFinishProgress, failure_code) == 240);
-static_assert(sizeof(SchedulerAsyncLayout) == 240);
+static_assert(sizeof(SchedulerAsyncLayout) == 256);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(std::is_standard_layout_v<SchedulerAsyncTaskMap> && std::is_trivially_copyable_v<SchedulerAsyncTaskMap>);
 static_assert(

@@ -1709,6 +1709,7 @@ bool create_scheduler_state(
             return false;
         }
         async_bindings.auxiliary.scratch = submission_plan.image.size();
+        if (async_bindings.needs_default_sdma_guards) async_bindings.auxiliary.sdma_guard_count = ASYNC_SDMA_CHANNELS;
         if (!scheduler_plan_async_layout(
                 task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, async_bindings.auxiliary,
                 &async_layout, &async_error

@@ -28,6 +28,7 @@ struct SchedulerAsyncAuxiliaryBytes {
     uint64_t uses{0};
     // Backend submission storage shares the retained async allocation.
     uint64_t scratch{0};
+    uint64_t sdma_guard_count{0};
 };
 
 struct SchedulerAsyncHostPlan {

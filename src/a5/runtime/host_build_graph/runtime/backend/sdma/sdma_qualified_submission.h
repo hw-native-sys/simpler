@@ -12,6 +12,7 @@
 #pragma once
 
 #include "sdma_metadata_handoff.h"
+#include "sdma_submission_guard.h"
 #include "async_completion_writer.h"
 #include "backend/async_resource_binding.h"
 #include "scheduler/scheduler_submission_provenance.h"
@@ -213,7 +214,11 @@ inline __aicore__ bool sdma_qualified_frame(__gm__ int64_t *args, SdmaQualifiedF
     out->context = context;
     AsyncCtx writer{};
     if (!sdma_qualified_writer(args, &writer) ||
-        !sdma_qualified_writer_matches(base, out->layout, out->execution, out->header, writer))
+        !sdma_qualified_writer_matches(base, out->layout, out->execution, out->header, writer) ||
+        !async_sdma_guard_region(
+            h.region_address, h.region_bytes, h.run_epoch, out->layout.sdma_guard_context_offset,
+            out->layout.sdma_guard_count, &writer.sdma_guard_context
+        ))
         return false;
     out->writer = writer;
     return true;
@@ -338,7 +343,13 @@ inline __aicore__ bool sdma_qualified_submit(
             writer.completion_error_code != nullptr ? *writer.completion_error_code :
                                                       SIMPLER_ERROR_ASYNC_COMPLETION_INVALID
         );
-    if (!async_submission_begin(context)) return sdma_qualified_error(context, writer, cache);
+    SdmaSubmissionScope submission;
+    if (!submission.acquire(
+            writer, static_cast<uint32_t>(access.grant.group_index * access.workspace.queue_num),
+            access.workspace.queue_num
+        ) ||
+        !async_submission_begin(context))
+        return sdma_qualified_error(context, writer, cache);
     if (!backend.build_session(access.workspace.queue_num, static_cast<uint32_t>(access.grant.group_index)))
         return sdma_qualified_error(context, writer, cache);
     const auto session = backend.metadata_session();
@@ -383,7 +394,12 @@ inline __aicore__ bool sdma_qualified_submit(
             cache.flush_range(&provenance, sizeof(provenance));
         }
         async_completion_flush(writer, cache);
-    } else if (!backend.wait()) {
+    }
+    // Default and qualified callers share queue ownership when both appear in
+    // one run. Publish the SDK state and unlock before a synchronous caller waits.
+    if (!publisher.publish_backend_metadata() || !submission.release(true, nullptr, SdmaMetadataAlreadyPublished{}))
+        return sdma_qualified_error(context, writer, cache);
+    if (!deferred && !backend.wait()) {
         return sdma_qualified_error(context, writer, cache);
     }
     if (!async_submission_commit(context, publisher)) return sdma_qualified_error(context, writer, cache);

@@ -991,7 +991,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    // Prefill the per-dispatch AsyncCtx constant fields once. Of AsyncCtx's five
+    // Prefill the per-dispatch AsyncCtxStorage fields once. Of its five
     // fields, four are constant for a given (core, buf_idx): the three pointers
     // target the fixed deferred_slab_per_core_[core][buf] members, and capacity is
     // MAX_COMPLETIONS_PER_TASK. Only task_token varies per dispatch, so build_payload
@@ -1005,7 +1005,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     for (int32_t core_id = 0; core_id < RUNTIME_MAX_WORKER; core_id++) {
         for (int32_t buf = 0; buf < 2; buf++) {
             DispatchPayload &dp = payload_per_core_[core_id][buf];
-            AsyncCtx &ac = dp.local_context.async_ctx;
+            auto &ac = dp.local_context.async_ctx;
             volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
             ac.completion_count = &slab->count;
             ac.completion_error_code = &slab->error_code;
