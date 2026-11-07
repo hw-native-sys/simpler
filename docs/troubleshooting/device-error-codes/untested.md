@@ -22,9 +22,10 @@ they cannot be provoked. Recording why, so the next person does not re-derive it
   end; hbg is whole-graph-resident and reclaims nothing, so overrunning the ring latches
   **2 HEAP_RING_DEADLOCK** or the ring's own exhaustion code instead. Reserved in hbg's
   table, raised only by `tensormap_and_ringbuffer`.
-- **11 TENSORMAP_OVERFLOW** needs the 65536-entry pool (`CHIP_TENSORMAP_POOL_SIZE`,
-  compile-time, not tunable via `runtime_env`) flooded *and* a stalled producer
-  holding entries.
+- **11 TENSORMAP_OVERFLOW** reports failure to grow the Host hazard map.
+  The initial entry chunk grows on demand while preserving producer addresses;
+  device completion does not reclaim entries. Reproducing this error requires
+  Host allocation failure or an unrepresentable entry demand.
 - **S4 / S5 / unknown**: not expressible through the public API. `set_dependencies()`
   can only name already-submitted tasks, so a dependency cycle cannot be written; a
   stuck producer is RUNNING (→ S1), never pure WAIT (S4). `total_tasks_` counts
@@ -36,8 +37,9 @@ The name tables are held complete for these anyway
 (`tests/ut/cpp/common/runtime_status/test_error_code_names.cpp`) — an unreachable code is exactly
 the one that would otherwise print as a bare number on the day it finally fires.
 
-If you do hit 10, 11, 103, S4, S5 or unknown, it is a runtime bug. Keep the device
-log and report it.
+For code 11, first follow the Host-memory remedies in [capacity.md](capacity.md):
+a failed allocation does not necessarily indicate a runtime bug.
+If you hit 10, 103, S4, S5 or unknown, keep the device log and report a runtime bug.
 
 Code 1 is the one entry above that is unreachable in only *one* runtime. Latched by
 `tensormap_and_ringbuffer` it is an ordinary capacity error carrying its own remedy

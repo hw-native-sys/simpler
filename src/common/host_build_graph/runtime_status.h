@@ -37,7 +37,7 @@
 #define SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT 8  // Not raised here; the number stays reserved across runtimes
 #define SIMPLER_ERROR_EXPLICIT_ORCH_FATAL 9
 #define SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW 10  // Not raised here; the number stays reserved across runtimes
-#define SIMPLER_ERROR_TENSORMAP_OVERFLOW 11    // graph registers more outputs than the tensormap entry pool holds
+#define SIMPLER_ERROR_TENSORMAP_OVERFLOW 11    // unable to reserve host TensorMap entries
 // A submission needs more of a fixed capacity than the run has: task slots, heap bytes,
 // the compact argument pools, or the Definition cache.
 #define SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED 12

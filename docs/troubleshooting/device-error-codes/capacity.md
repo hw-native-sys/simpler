@@ -15,12 +15,13 @@ the actual resource and determines how strong that diagnosis is:
 - `No reclaim progress for ~500 ms` or `cannot reclaim space after ~500 ms` is
   the backstop. It proves that reclaim remained stalled, but not whether the root
   cause is undersizing, a stuck consumer, or a stalled scheduler.
-- `Graph Too Large` / `Fanin Capacity Exhausted` / `TensorMap Entry Pool
-  Exhausted` is HBG, and it is unambiguous: that runtime builds a
-  whole-graph-resident image on the host, so the graph simply does not fit. These
-  checks return immediately; there is no concurrent scheduler progress that could
-  free capacity while the host is building. `Graph Heap Exhausted` shares the
-  wording but not the meaning — HBG's heap allocator is handed the whole virtual
+- `Graph Too Large` / `Fanin Capacity Exhausted` means HBG cannot fit the
+  graph within its task or fanin limit. `Unable to grow HBG TensorMap` instead
+  means its Host hazard-map allocation failed; entry chunks grow on demand,
+  so this is not a fixed entry-count limit. Reduce live hazard entries or make
+  more Host memory available. These checks return immediately; device completion
+  cannot release Host hazard entries while the image is being built.
+  `Graph Heap Exhausted` shares the wording but not the meaning — HBG's heap allocator is handed the whole virtual
   window during a real bind, so it does not report exhaustion there; the graph
   heap's size shows up instead as a failed device-region commit after
   orchestration.
@@ -44,7 +45,7 @@ that trips the code.
 | ------- | ------------------- | ---- | --- |
 | HBG | task count | 3 | raise `runtime_env.ring_task_window` (any positive count), or shrink the graph |
 | HBG | inline fanin | 4 | reduce distinct producers to `CHIP_MAX_FANIN` (currently 128) or less; HBG has no dependency spill pool |
-| HBG | TensorMap entries | 11 | increase `CHIP_TENSORMAP_POOL_SIZE`, or reduce registered outputs |
+| HBG | TensorMap allocation | 11 | reduce live hazard entries or provide more Host memory; entry chunks grow on demand |
 | HBG | submit-time capacity | 12 | see the four sources below |
 | TRB | open-scope task window | 1 or 3 | raise `runtime_env.ring_task_window` (a power of two, >= 4), split the scope, or diagnose stalled reclaim |
 | TRB | heap | 2 | raise `runtime_env.ring_heap`, shrink allocations, or diagnose stalled reclaim |
