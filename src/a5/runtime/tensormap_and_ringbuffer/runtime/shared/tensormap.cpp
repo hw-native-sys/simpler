@@ -53,6 +53,7 @@ ChipTensorMapLayout ChipTensorMap::reserve_layout(
     const int32_t new_task_window_sizes[CHIP_MAX_RING_DEPTH]
 ) {
     // num_buckets must be a power of two for the hash truncation to work.
+    always_assert(new_num_buckets > 0 && new_num_buckets <= INT32_MAX / 2);
     always_assert((new_num_buckets & (new_num_buckets - 1)) == 0);
 
     ChipTensorMapLayout layout{};
@@ -63,10 +64,10 @@ ChipTensorMapLayout ChipTensorMap::reserve_layout(
     }
 
     layout.off_buckets = arena.reserve(
-        static_cast<size_t>(new_num_buckets) * sizeof(ChipTensorMapEntry *), alignof(ChipTensorMapEntry *)
+        static_cast<size_t>(new_num_buckets) * 2 * sizeof(ChipTensorMapEntry *), alignof(ChipTensorMapEntry *)
     );
     layout.off_bucket_epochs =
-        arena.reserve(static_cast<size_t>(new_num_buckets) * sizeof(uint32_t), alignof(uint32_t));
+        arena.reserve(static_cast<size_t>(new_num_buckets) * 2 * sizeof(uint32_t), alignof(uint32_t));
     layout.off_entry_pool =
         arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(ChipTensorMapEntry), alignof(ChipTensorMapEntry));
     layout.off_free_entry_list =
@@ -98,7 +99,7 @@ bool ChipTensorMap::init_data_from_layout(const ChipTensorMapLayout &layout, Dev
     auto *free_list_arena = static_cast<ChipTensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
 
     // buckets[]: empty == nullptr.
-    for (int32_t i = 0; i < num_buckets; i++) {
+    for (int32_t i = 0; i < 2 * num_buckets; i++) {
         buckets_arena[i] = nullptr;
         bucket_epochs_arena[i] = 0;
     }
@@ -113,7 +114,7 @@ bool ChipTensorMap::init_data_from_layout(const ChipTensorMapLayout &layout, Dev
         entry_pool_arena[i].prev_in_bucket = nullptr;
         entry_pool_arena[i].next_in_task = nullptr;
         entry_pool_arena[i].prev_in_task = nullptr;
-        entry_pool_arena[i].producer_task_id = TaskId{};
+        entry_pool_arena[i].access_task_id = TaskId{};
     }
 
     // free_entry_list: zeroed (was calloc'd before); contents become meaningful
@@ -146,7 +147,7 @@ void ChipTensorMap::reset_for_reuse(const ChipTensorMapLayout &layout) {
     current_epoch++;
     if (current_epoch == 0) {
         current_epoch = 1;
-        memset(bucket_epochs, 0, static_cast<size_t>(layout.num_buckets) * sizeof(uint32_t));
+        memset(bucket_epochs, 0, static_cast<size_t>(layout.num_buckets) * 2 * sizeof(uint32_t));
         for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
             memset(task_entry_head_epochs[r], 0, static_cast<size_t>(layout.task_window_sizes[r]) * sizeof(uint32_t));
         }
@@ -208,7 +209,7 @@ void ChipTensorMap::print_stats() {
     }
 
     // Count bucket stats
-    for (int32_t b = 0; b < num_buckets; b++) {
+    for (int32_t b = 0; b < 2 * num_buckets; b++) {
         int32_t chain_len = 0;
         auto cur_entry = buckets[b];
 
@@ -232,7 +233,7 @@ void ChipTensorMap::print_stats() {
     LOG_DEBUG("Pool size:           %d", pool_size);
     LOG_DEBUG("Pool next entry idx: %d", next_entry_idx);
     LOG_DEBUG("Pool free_num:       %d", free_num);
-    LOG_DEBUG("Num buckets:         %d", num_buckets);
+    LOG_DEBUG("Num buckets:         %d", 2 * num_buckets);
     LOG_DEBUG("Valid entries:       %d", valid);
     LOG_DEBUG("Stale entries:       %d", stale);
     LOG_DEBUG("Empty buckets:       %d", empty_buckets);

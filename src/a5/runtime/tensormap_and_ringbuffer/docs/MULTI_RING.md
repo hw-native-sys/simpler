@@ -44,7 +44,7 @@ Type changes:
 | Field | Before | After |
 | ----- | ------ | ----- |
 | `TaskDescriptor.task_id` | `int32_t` | `TaskId` |
-| `ChipTensorMapEntry.producer_task_id` | `int32_t` | `TaskId` |
+| `ChipTensorMapEntry.access_task_id` | `int32_t` | `TaskId` |
 | `ChipTaskSlotState.ring_id` | N/A | `uint8_t` (new, denormalized for fast access) |
 
 ## 4. Data Structures
@@ -161,8 +161,8 @@ Entry validity checks and `cleanup_retired` operate per-ring:
 
 ```cpp
 bool entry_valid(const ChipTensorMapEntry& e) {
-    int32_t ring = e.producer_task_id.ring();
-    int32_t local = e.producer_task_id.local_id();
+    int32_t ring = e.access_task_id.ring();
+    int32_t local = e.access_task_id.local_id();
     return local >= last_task_alives[ring];
 }
 ```

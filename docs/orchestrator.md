@@ -603,16 +603,10 @@ private:
   first — `erase_task_outputs` therefore drops a key only while it still maps
   to the consumed slot, leaving the later writer's entry for new consumers to
   find.
-- **WAR (write-after-read)** is not tracked directly. Read tasks don't
-  register in TensorMap; write tasks only look up current producer. If a
-  consumer reads `X` (recording fanin on producer P1) and then a later task
-  writes `X` (new producer P2 in TensorMap), there's no P1 → P2 edge. This is
-  correct: the reader only needs P1 to have completed, the new writer only
-  needs its own prior producer. Simultaneous read and write races are a user
-  bug, not a scheduler concern. When a workload genuinely needs the reader
-  ordered ahead of the overwrite, express it explicitly — see
-  [WAR anti-dependencies](war-anti-dependency.md) (issue #1306) for the
-  `add_dep` vs `INOUT` trade-off.
+- **WAR (write-after-read)** is not inferred between host orchestrator tasks.
+  A later overwrite must explicitly depend on each earlier reader, for example
+  with `add_dep_wait`. This host-level map is separate from L2 TMR/HBG automatic
+  reader tracking; see [WAR anti-dependencies](war-anti-dependency.md).
 
 ### Thread safety
 

@@ -87,6 +87,9 @@ macro(tmr_case)
     simpler_ut_runtime_case(tmr ${ARGV})
 endmacro()
 
+tmr_case(test_scalar_war.cpp
+    SOURCES ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/runtime_core.cpp)
+
 tmr_case(test_dep_gen_replay.cpp
     SOURCES  ${TMR_SHARED_HOST_DIR}/dep_gen_replay.cpp
     INCLUDES ${TMR_SHARED_HOST_DIR})

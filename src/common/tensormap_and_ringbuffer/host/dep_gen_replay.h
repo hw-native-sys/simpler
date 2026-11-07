@@ -15,7 +15,7 @@
  *
  * Takes the records the host collector drained from the device ring buffer
  * (``DepGenCollector::window_records()``) and runs them back through a host-resident
- * ChipTensorMap using the same ``compute_task_fanin`` / ``register_task_outputs``
+ * ChipTensorMap using the same ``compute_task_fanin`` / ``register_task_accesses``
  * primitives the device orchestrator uses, emitting the full
  * predecessor → successor edge list to deps.json.
  *

@@ -16,11 +16,11 @@
  * Two header-only template entry points:
  *
  *   compute_task_fanin     — STEP 3 in submit_task: per-tensor creator retention (Step A)
- *                            + tensormap.lookup for INPUT/INOUT (Step B). Calls back into
+ *                            + tensormap.lookup for conflicting accesses (Step B). Calls back into
  *                            user-supplied `emit` for each producer it identifies.
  *
- *   register_task_outputs  — STEP 4 in submit_task: tensormap.insert for INOUT and
- *                            OUTPUT_EXISTING tensors. No callbacks.
+ *   register_task_accesses  — STEP 4 in submit_task: reader/writer access registration for INPUT,
+ *                            INOUT and OUTPUT_EXISTING tensors. No callbacks.
  *
  * STEP 1 (explicit_deps) is intentionally left at the runtime call site because its
  * unchecked slot lookup is subtly different from the
@@ -59,7 +59,7 @@
 #include "host_build_graph/tensor.h"
 
 /**
- * View struct for inputs to compute_task_fanin / register_task_outputs.
+ * View struct for inputs to compute_task_fanin / register_task_accesses.
  *
  * Both runtime and replay assemble one of these from their own data sources
  * (runtime: from Arg accessors; replay: from SubmitTraceEntry fields). All
@@ -84,12 +84,13 @@ struct NoDepAnnotate {
 
 /**
  * Compute fanin for a task being submitted (STEP 3: Step A creator retention +
- * Step B tensormap modifier lookup).
+ * Step B conflicting-access lookup).
  *
  * For each non-OUTPUT tensor:
  *   - If owner_task_id is valid, emit(owner)
- *   - For INPUT/INOUT (and not manual_dep), tensor_map.lookup(*tensor) and emit
- *     each matching producer. INOUT+COVERED triggers tensor_map.remove_entry(entry).
+ *   - INPUT/INOUT wait for overlapping writers. INOUT/OUTPUT_EXISTING also
+ *     wait for overlapping readers. Fully covered accesses are removed only
+ *     after their dependency has been emitted successfully.
  *
  * @return true on success (or producer-skipped-silently); false if emit signaled
  *         fatal — caller should propagate (after any fatal bookkeeping done by emit).
@@ -121,73 +122,79 @@ template <typename Emit, typename Annotate = NoDepAnnotate>
             annotate.creator(i, *tensor, owner);
         }
 
-        // Step B: only INPUT/INOUT need modifier dependency lookup.
-        if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
-            continue;
-        }
-        if (tensor->manual_dep) {
-            continue;
-        }
+        if (tensor->manual_dep) continue;
 
-        bool fatal = false;
-        tensor_map.lookup(*tensor, [&](ChipTensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
-            if (!emit(entry.producer_task_id)) {
-                fatal = true;
-                return false;  // stop iteration
-            }
-            annotate.tensormap(i, *tensor, entry, overlap_status);
-            if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
-                tensor_map.remove_entry(entry);
-            }
-            return true;
-        });
-        if (fatal) {
+        const bool writes = ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING;
+        auto visit = [&](TensorAccessKind kind) {
+            bool ok = true;
+            tensor_map.lookup(
+                *tensor,
+                [&](ChipTensorMapEntry &entry, OverlapStatus overlap_status) {
+                    if (!emit(entry.access_task_id)) {
+                        ok = false;
+                        return false;
+                    }
+                    annotate.tensormap(i, *tensor, entry, overlap_status);
+                    if (writes && overlap_status == OverlapStatus::COVERED) {
+                        tensor_map.remove_entry(entry);
+                    }
+                    return true;
+                },
+                kind
+            );
+            return ok;
+        };
+        if ((ptype == TensorArgType::INPUT || ptype == TensorArgType::INOUT) && !visit(TensorAccessKind::WRITER))
             return false;
-        }
+        if (writes && !visit(TensorAccessKind::READER)) return false;
     }
     return true;
 }
 
 /**
- * Register a task's outputs in the tensormap (STEP 4 in submit_task).
+ * Register a task's outstanding accesses in the tensormap (STEP 4 in submit_task).
  *
- * For INOUT and OUTPUT_EXISTING tensors (excluding manual_dep), inserts the
- * tensor into tensor_map keyed by its buffer.addr with `task_id` as producer.
+ * INPUT publishes a reader; INOUT and OUTPUT_EXISTING publish writers.
+ * manual_dep tensors do not publish accesses. Readers share the task cleanup
+ * chain with writers, but have a separate hash index.
  *
  * No-op when in_manual_scope.
  */
 inline void
-register_task_outputs(const DepInputs &inputs, TaskId task_id, ChipTensorMap &tensor_map, bool in_manual_scope) {
+register_task_accesses(const DepInputs &inputs, TaskId task_id, ChipTensorMap &tensor_map, bool in_manual_scope) {
     if (in_manual_scope) {
         return;
     }
     for (int32_t i = 0; i < inputs.tensor_count; i++) {
         TensorArgType ptype = inputs.arg_types[i];
-        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
+        if (ptype == TensorArgType::INPUT || ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
             const simpler::hbg::Tensor *tensor = &inputs.tensors[i].ref();
             if (!tensor->manual_dep) {
-                tensor_map.insert(*tensor, task_id);
+                tensor_map.insert(
+                    *tensor, task_id,
+                    ptype == TensorArgType::INPUT ? TensorAccessKind::READER : TensorAccessKind::WRITER
+                );
             }
         }
     }
 }
 
 /**
- * Count the tensormap entries register_task_outputs() will insert for this task.
+ * Count the tensormap entries register_task_accesses() will insert for this task.
  *
- * Mirrors register_task_outputs()'s selection exactly (INOUT / OUTPUT_EXISTING,
+ * Mirrors register_task_accesses()'s selection exactly (INPUT / INOUT / OUTPUT_EXISTING,
  * excluding manual_dep), so the returned value is the precise number of
  * new_entry() calls that step makes. The orchestrator uses it to reserve pool
  * capacity before inserting. Returns 0 in a manual scope (no registration).
  */
-inline int32_t count_registrable_outputs(const DepInputs &inputs, bool in_manual_scope) {
+inline int32_t count_registrable_accesses(const DepInputs &inputs, bool in_manual_scope) {
     if (in_manual_scope) {
         return 0;
     }
     int32_t needed = 0;
     for (int32_t i = 0; i < inputs.tensor_count; i++) {
         TensorArgType ptype = inputs.arg_types[i];
-        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
+        if (ptype == TensorArgType::INPUT || ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
             if (!inputs.tensors[i].ref().manual_dep) {
                 needed++;
             }

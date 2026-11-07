@@ -81,6 +81,38 @@ add_runtime_output_arg(CoreTaskArgs &args, std::vector<TensorCreateInfo> &create
     args.add_output(create_infos.back());
 }
 
+TEST_F(OrchestratorFaninTest, AutomaticWarDeduplicatesReadersAndUsesExistingSpillPool) {
+    orch.begin_scope();
+    uint32_t shape[] = {16};
+    auto tensor = simpler::tmr::make_tensor_external(reinterpret_cast<void *>(0x1000), shape, 1);
+    constexpr int reader_count = CHIP_FANIN_INLINE_CAP + 1;
+    for (int i = 0; i < reader_count; ++i) {
+        CoreTaskArgs args;
+        args.add_input(tensor);
+        args.add_input(tensor);
+        auto reader = orch.submit_dummy_task(args);
+        ASSERT_TRUE(reader.task_id().is_valid());
+        auto &slot =
+            sm_handle->header->rings[reader.task_id().ring()].get_slot_state_by_task_id(reader.task_id().local_id());
+        ASSERT_NE(slot.payload, nullptr);
+        EXPECT_EQ(slot.payload->fanin_actual_count, 0);
+    }
+    CoreTaskArgs args;
+    args.add_inout(tensor);
+    auto writer = orch.submit_dummy_task(args);
+    ASSERT_TRUE(writer.task_id().is_valid());
+    auto &slot =
+        sm_handle->header->rings[writer.task_id().ring()].get_slot_state_by_task_id(writer.task_id().local_id());
+    ASSERT_NE(slot.payload, nullptr);
+    EXPECT_EQ(slot.payload->fanin_actual_count, reader_count);
+    ASSERT_NE(slot.payload->fanin_spill_pool, nullptr);
+    for (int i = 0; i < CHIP_FANIN_INLINE_CAP; ++i) {
+        EXPECT_EQ(slot.payload->fanin_inline_edges[i].flags(), DEP_WAIT);
+    }
+    auto &pool = *slot.payload->fanin_spill_pool;
+    EXPECT_EQ(pool.base[slot.payload->fanin_spill_start % pool.capacity].flags(), DEP_WAIT);
+}
+
 TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     orch.begin_scope();
 

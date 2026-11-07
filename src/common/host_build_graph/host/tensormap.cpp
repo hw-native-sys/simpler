@@ -64,6 +64,7 @@ uint64_t g_insert_count = 0;
 bool ChipTensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t new_max_tasks) {
     // num_buckets must be a power of two for the hash truncation to work. The
     // task-chain count needs no such property: a task id indexes its chain directly.
+    always_assert(new_num_buckets <= INT32_MAX / 2);
     always_assert(new_num_buckets > 0 && (new_num_buckets & (new_num_buckets - 1)) == 0);
     always_assert(new_max_tasks > 0);
     always_assert(new_pool_size > 0);
@@ -82,7 +83,7 @@ bool ChipTensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
     std::unique_ptr<ChipTensorMapEntry *[]> new_free_list;
     std::unique_ptr<ChipTensorMapEntry *[]> new_heads;
     if (replace_buckets) {
-        new_buckets.reset(new (std::nothrow) ChipTensorMapEntry *[new_num_buckets]);
+        new_buckets.reset(new (std::nothrow) ChipTensorMapEntry *[2 * new_num_buckets]);
         if (!new_buckets) return fail();
     }
     if (replace_pool) {
@@ -117,7 +118,7 @@ bool ChipTensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
 void ChipTensorMap::reset() {
     always_assert(buckets != nullptr && entry_pool != nullptr && task_entry_heads != nullptr);
 
-    for (int32_t i = 0; i < num_buckets; i++) {
+    for (int32_t i = 0; i < 2 * num_buckets; i++) {
         buckets[i] = nullptr;
     }
     // Every retained head, not just the active domain: the head array outlives a
@@ -158,7 +159,7 @@ void ChipTensorMap::print_stats() {
     }
 
     // Count bucket stats
-    for (int32_t b = 0; b < num_buckets; b++) {
+    for (int32_t b = 0; b < 2 * num_buckets; b++) {
         int32_t chain_len = 0;
         auto cur_entry = buckets[b];
 
@@ -182,7 +183,7 @@ void ChipTensorMap::print_stats() {
     LOG_DEBUG("Pool size:           %d", pool_size);
     LOG_DEBUG("Pool next entry idx: %d", next_entry_idx);
     LOG_DEBUG("Pool free_num:       %d", free_num);
-    LOG_DEBUG("Num buckets:         %d", num_buckets);
+    LOG_DEBUG("Num buckets:         %d", 2 * num_buckets);
     LOG_DEBUG("Valid entries:       %d", valid);
     LOG_DEBUG("Empty buckets:       %d", empty_buckets);
     LOG_DEBUG("Max chain len:       %d", max_chain);
