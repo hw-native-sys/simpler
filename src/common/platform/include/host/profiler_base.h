@@ -224,6 +224,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -560,12 +561,15 @@ struct ProfilerAlgorithms {
         // race described above. If the entry's `buffer_ptr` is still 0 the
         // producer hasn't finished publishing — treat the queue as empty
         // for this tick.
-        if (mgr.read_range_from_device(&header->queues[q][head], sizeof(header->queues[q][head])) != 0) {
+        // The host mapping need not preserve ReadyEntry's device alignment.
+        auto *entry = reinterpret_cast<unsigned char *>(header) + offsetof(DataHeader, queues) +
+                      q * sizeof(header->queues[0]) + head * sizeof(ReadyEntry);
+        if (mgr.read_range_from_device(entry, sizeof(out)) != 0) {
             LOG_ERROR("%s: failed to refresh ready_queue entry for thread %d", Module::kSubsystemName, q);
             return false;
         }
         rmb();
-        out = header->queues[q][head];
+        std::memcpy(&out, entry, sizeof(out));
         return out.buffer_ptr != 0;
     }
 

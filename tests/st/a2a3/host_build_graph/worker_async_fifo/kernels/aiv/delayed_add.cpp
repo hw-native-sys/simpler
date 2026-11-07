@@ -12,22 +12,41 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
+#ifdef PTO_CPUSTUB_HPP
+#include <chrono>
+#endif
+
+#include "common/platform_config.h"
 #include "tensor.h"
 
 #include "pipe_sync.h"
+
+static __aicore__ uint64_t delay_ticks() {
+#ifdef PTO_CPUSTUB_HPP
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count() /
+        (1000000000 / PLATFORM_PROF_SYS_CNT_FREQ)
+    );
+#else
+    return get_sys_cnt();
+#endif
+}
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *src0_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *src1_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
 
-    // Match the repository's bounded slow-producer test shape. The caller uses
-    // a loop count calibrated to keep this task on-core long enough to observe
-    // successor preparation while remaining below the scheduler timeout,
-    // without an unbounded device-side handshake that teardown could not release.
+    // Keep the synthetic observation window below the CI scheduler's two-second
+    // no-progress budget even when a scalar loop runs slowly. The iteration
+    // argument remains an upper work bound; no result depends on completing it.
     const int32_t spin_iters = static_cast<int32_t>(args[3]);
+    const uint64_t started = delay_ticks();
+    constexpr uint64_t kDelayBudgetTicks = PLATFORM_PROF_SYS_CNT_FREQ;
     volatile int32_t spin_accumulator = 0;
     for (int32_t i = 0; i < spin_iters; ++i) {
+        if ((i & 1023) == 0 && delay_ticks() - started >= kDelayBudgetTicks) break;
         ++spin_accumulator;
     }
     (void)spin_accumulator;
