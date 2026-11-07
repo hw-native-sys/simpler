@@ -351,6 +351,27 @@ class TestL2TouchedIdentityTracking:
         assert run_id not in w._chip_runs
         assert run_id not in w._chip_run_touched_identities
 
+    @pytest.mark.parametrize("recovery_required", [False, True])
+    def test_failed_run_keeps_touched_identity_until_cleanup_proof(self, recovery_required):
+        w, buf = _l2_with_registered_buffer()
+        handle = w._submit_l2_locked(3, _buffer_args(buf), CallConfig())
+        run_id = handle._run_id
+        assert run_id is not None
+        native = w._chip_runs[run_id]
+        native._owner_recovery_required = recovery_required
+        native.lane_poisoned = False
+        w._finalize_run_handle(handle, run_id, RuntimeError("device execution failed"))
+        assert run_id not in w._chip_runs
+        if recovery_required:
+            assert w._chip_run_touched_identities[run_id] == {buf.identity}
+            with pytest.raises(RuntimeError, match="in-flight L2 run"):
+                w.release_buffer(buf)
+            assert not buf.closed
+        else:
+            assert run_id not in w._chip_run_touched_identities
+            w.release_buffer(buf)
+            assert buf.closed
+
     def test_publishes_touched_identities_before_dispatch_not_after(self):
         # _submit_l2_locked must publish _chip_run_touched_identities BEFORE calling
         # _submit_chip_run_direct, not after -- otherwise a release_buffer() landing in the

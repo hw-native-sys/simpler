@@ -20,6 +20,7 @@ import gc
 import importlib.util
 import json
 import os
+import sys
 import threading
 import time
 import weakref
@@ -131,6 +132,23 @@ def _prepare_frames(torch, worker, handle, stream, raw_stream, calls):
             }
         )
     return frames, weak_tensors
+
+
+def _close_with_tickets(worker, tickets) -> None:
+    """Attempt every ticket's cancellation, then close the Worker.
+
+    A consumed ticket refuses cancellation, and close retires it. A cancellation
+    error is raised after close unless another exception is already propagating.
+    """
+    error = None
+    for ticket in tickets:
+        try:
+            ticket.cancel()
+        except BaseException as exc:  # noqa: BLE001
+            error = error or exc
+    worker.close()
+    if error is not None and sys.exc_info()[1] is None:
+        raise error
 
 
 def run(runtime: str, device: int, bridge_path: Path, calls: int = 3, *, platform="a2a3"):

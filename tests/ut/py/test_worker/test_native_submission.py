@@ -198,9 +198,10 @@ def test_submit_then_cancel_does_not_revoke_native_run(prepared):
     assert handle not in worker_module._native_submission_roots
 
 
+@pytest.mark.parametrize("entry", ["prepare_submission", "submit"])
 @pytest.mark.parametrize("replace_callable", [False, True])
 def test_unregister_during_preparation_refuses_original_handle_without_source_leak(
-    prepared, monkeypatch, replace_callable
+    prepared, monkeypatch, replace_callable, entry
 ):
     from simpler.buffer import Buffer  # noqa: PLC0415
     from simpler.task_interface import ChipCallable  # noqa: PLC0415
@@ -224,7 +225,10 @@ def test_unregister_during_preparation_refuses_original_handle_without_source_le
 
     def prepare():
         try:
-            handles.append(worker.prepare_submission(chip.callable, arguments(backing), caller_stream=123))
+            if entry == "submit":
+                handles.append(worker.submit(chip.callable, arguments(backing)))
+            else:
+                handles.append(worker.prepare_submission(chip.callable, arguments(backing), caller_stream=123))
         except BaseException as error:
             errors.append(error)
 
@@ -253,7 +257,10 @@ def test_unregister_during_preparation_refuses_original_handle_without_source_le
         resume.set()
         thread.join(5)
         for handle in handles:
-            handle.cancel()
+            if isinstance(handle, worker_module.PreparedSubmission):
+                handle.cancel()
+            else:
+                handle.wait()
         # The transport is fake; clean up a failed regression run's leaked use.
         if not backing.closed:
             source = worker._device_buffer_source
@@ -327,6 +334,33 @@ def test_ordinary_submit_unregister_is_retryable_after_wait(chip_fixture):
         chip.worker.unregister(chip.callable)
     handle.wait()
     chip.worker.unregister(chip.callable)
+
+
+@pytest.mark.parametrize("recovery_required", [False, True])
+def test_ordinary_failure_retires_callable_use_only_with_cleanup_proof(chip_fixture, recovery_required):
+    chip = chip_fixture
+    error = RuntimeError("device execution failed")
+    chip.state.error = error
+    handle = chip.worker.submit(chip.callable)
+    run_id = handle._run_id
+    chip.runs[0]._owner_recovery_required = recovery_required
+    chip.runs[0].lane_poisoned = False
+    with pytest.raises(RuntimeError) as raised:
+        handle.wait()
+    assert raised.value is error
+    if recovery_required:
+        assert chip.worker._source_context_failed
+        assert run_id in chip.worker._chip_run_callable_ids
+        assert run_id in chip.worker._chip_run_touched_identities
+        with pytest.raises(RuntimeError, match="unretired L2 use"):
+            chip.worker.unregister(chip.callable)
+    else:
+        assert not chip.worker._source_context_failed
+        assert not chip.worker._chip_run_callable_ids
+        assert not chip.worker._chip_run_touched_identities
+        chip.worker.unregister(chip.callable)
+    chip.state.error = None
+    chip.live.clear()
 
 
 def test_failed_enqueue_after_submit_keeps_ticket(prepared):
@@ -406,6 +440,34 @@ def test_cancel_retains_owners_when_retirement_fails(prepared, monkeypatch):
     chip.worker.close()
     assert ticket.safe_to_release
     assert pending[0].retired
+
+
+@pytest.mark.parametrize("stage", ["before_publication", "after_chip_run_publication"])
+def test_publication_failure_cancels_unpublished_token(prepared, monkeypatch, stage):
+    chip, pending = prepared
+
+    if stage == "before_publication":
+
+        def fail(*args):
+            raise RuntimeError("injected publication failure")
+
+        monkeypatch.setattr(chip.worker, "_accept_l2_run", fail)
+    else:
+        # _accept_l2_run publishes the native run, then fails adding the handle.
+        class FailingAdd(set):
+            def add(self, item):
+                raise RuntimeError("injected publication failure")
+
+        monkeypatch.setattr(chip.worker, "_accepted_run_handles", FailingAdd(chip.worker._accepted_run_handles))
+    with pytest.raises(RuntimeError, match="injected publication failure"):
+        chip.worker.prepare_submission(chip.callable, caller_stream=123)
+    assert len(pending) == 1 and isinstance(pending[0].error, RunPreparationRefused)
+    assert pending[0].retired
+    assert not chip.worker._chip_runs and not chip.worker._chip_run_callable_ids
+    assert not chip.worker._accepted_run_handles
+    assert not chip.worker._chip_run_touched_identities and not chip.worker._source_context_failed
+    assert not any(handle._worker is chip.worker for handle in worker_module._native_submission_roots)
+    chip.worker.unregister(chip.callable)
 
 
 @pytest.mark.parametrize("failure_stage", ["materialize", "native_prepare"])

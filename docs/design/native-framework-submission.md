@@ -1,6 +1,6 @@
 # Native framework submission
 
-Status: the core design is implemented; full qualification and independent implementation review remain pending. This document covers direct L2 eager delivery for issue #2774 and PR #2776. The test matrix below specifies acceptance targets, not a claim that every case has been implemented or passed. Validation must identify the tested source and native build; results from an earlier revision do not automatically qualify a later one.
+This document covers direct L2 eager native submission ([issue #2774](https://github.com/hw-native-sys/simpler/issues/2774)).
 
 ## Background and goals
 
@@ -19,8 +19,6 @@ Design inputs:
 - [Consumer requirements](https://github.com/hw-native-sys/simpler/issues/2774#issuecomment-6653614631): ticket management and safe retirement after failure.
 - [Architecture requirements](https://github.com/hw-native-sys/simpler/pull/2776#issuecomment-6654551103) and [clarification](https://github.com/hw-native-sys/simpler/pull/2776#issuecomment-6655744756): one native execution path, a same-build interface and a real framework consumer.
 - [Run completion contract](run-completion-fence.md): execution, result observation, lifetime and cleanup responsibilities.
-
-The earlier consumer discussion accepted a versioned-handle proposal. Architecture review subsequently required a same-build interface without an independent version protocol. That change remains part of the consumer handoff; agreement on the overall direction does not approve every implementation detail.
 
 | Key | Goal | Observable acceptance |
 | --- | ---- | --------------------- |
@@ -72,9 +70,9 @@ Python-safe boundary
 
 `Worker.prepare_submission(callable, args, config, caller_stream=..., keepalive=...)` prepares a queue submission, not necessarily device preparation. The queued native action may perform existing device preparation.
 
-Preparation validates Worker state, process/context, original callable identity and call values. Value snapshots and source-use reservations share existing synchronization boundaries. Original-handle validation prevents unregister/slot reuse from redirecting a prepared invocation to a replacement callable.
+Preparation validates Worker state, process/context, original callable identity and call values. Value snapshots and source-use reservations share existing synchronization boundaries. Original-handle validation under the reservation lock prevents unregister/slot reuse from redirecting an ordinary or prepared invocation to a replacement callable.
 
-Ordinary submission and native handoff use distinct entry paths over shared argument snapshotting, source-use reservation and materialization. Both register accepted runs through the same bookkeeping helper. Preparation failure releases reservations before any native execution; an ordinary native execution failure still requires an explicit safe-release verdict. Native retirement removes Python roots only after native retirement succeeds.
+Ordinary submission and native handoff use distinct entry paths over shared argument snapshotting, source-use reservation and materialization. Both register accepted runs through the same bookkeeping helper. Preparation failure releases reservations before any native execution. A failed run, ordinary or prepared, releases its callable use, touched buffer identities and source uses only with the lane's recovery proof (native context destroyed and caller last use proven); without it they remain until successful owner close, so `release_buffer()` and `free()` keep refusing the run's buffers. Native retirement removes Python roots only after native retirement succeeds.
 
 Snapshots copy descriptors, scalars, configuration and readonly HOST/NONE control contents before handoff returns. The shared `_prepare_l2_args` boundary invokes native `CallArgumentSnapshot` before either ordinary submission or delayed handoff. Shared argument preparation uses the callable signature to select these inputs, preserves view geometry and retains native snapshot storage through safe retirement. Unknown native entry failures retain snapshot storage through the existing safe-use retirement/owner-close boundary, even if no run handle is returned. HOST OUT/INOUT retains its existing external writeback destination and access validation; it is not redirected into an input snapshot. DEVICE contents remain borrowed and governed by queue/stream ordering. Borrowed storage must remain valid and must not be mutated before its ordered use ends.
 
@@ -113,7 +111,7 @@ Global roots, when used, retain Python owners only. They must have verified remo
 
 ### Error observation and safe retirement
 
-The native callback reports success/failure and a message through the adapter. Python retains the original error and exposes a programmatic retirement predicate; error-string parsing is not a release protocol.
+The native callback reports success/failure and a message through the adapter. The reference adapter maps a failed submission to the framework's operator-failure channel: with the torch_npu host queue enabled, the callback returns non-zero, torch_npu discards later queued operations and raises at its next synchronization, so no successor consumes an unwritten output. Tickets of discarded callbacks remain pending until cancelled. Python retains the original error and exposes a programmatic retirement predicate; error-string parsing is not a release protocol.
 
 `safe_to_release` projects existing cleanup results. It starts false and becomes true only when this invocation's external-owner uses are discharged. It is not a new completion event, does not mean success, and does not release another invocation's uses of the same object.
 
@@ -132,15 +130,11 @@ The adapter periodically considers completed tickets for bounded observation and
 
 ### Unregister and integration
 
-Both prepared and ordinary L2 invocations protect the original callable while it is in use. Unregister refuses the last registration while an unretired use remains; refusal leaves the registration valid for retry. Other references follow existing registration counts. Physical completion alone does not retire the Python use.
+Both prepared and ordinary L2 invocations protect the original callable while it is in use. Unregister refuses the last registration while an unretired use remains; refusal leaves the registration valid for retry. A failed run whose cleanup is proven retires its use like a successful one; an unproven failure keeps it until owner close. Other references follow existing registration counts. Physical completion alone does not retire the Python use.
 
-Preserve main's context checks, completion/observation separation (#2829), finalize boundaries (#2844), framework setup and CI scheduling when integrating. Shared-file conflicts require semantic reconciliation. Public CI timeout changes are outside this feature. A5 follows the current `/run-a5` policy.
-
-## Test design and delivery criteria
+## Test design
 
 CPU tests exercise states, references and error contracts. Real NPU tests qualify framework queue/stream behavior. Neither substitutes for the other. Hardware qualification targets A3/A5 x HBG/TMR x `TASK_QUEUE_ENABLE=0/1`; pending-callback GIL drains apply to the enabled queue.
-
-Record head, base, CI merge/source, native build identity, Python/Torch/torch_npu/CANN versions, platform, queue mode and device-task outcome. Verify test plan and JUnit agree. Skipped/xfail required cases do not count as passes; unexecuted combinations remain explicit gaps.
 
 | Key | Layer | Scenario | Required observation |
 | --- | ----- | -------- | -------------------- |
@@ -169,7 +163,3 @@ Record head, base, CI merge/source, native build identity, Python/Torch/torch_np
 | T23 | Packaging/CI | Installed same-build package and adapter | No accidental source-tree dependency; required cases selected/executed and plan/JUnit checked |
 
 Fault injection distinguishes safely cleaned failure from unknown completion. Deterministic defect regressions demonstrate failure before the repair and success afterwards. GIL negative controls run in isolated processes with bounded termination and verified device-lock release.
-
-Delivery requires evidence for R1-R7, the same-build common native entry, a real reference consumer, required current-revision CI, declared hardware qualification, and documented success/error cleanup. Design agreement, implementation review and validation are separate records. Downstream PyPTO migration remains separate from this PR's merge criteria.
-
-Implementation review must confirm retirement projection semantics, entry/type placement, ordinary-unregister compatibility and consumer handoff. Pending qualification includes A5 and complete current-build GIL controls. Coverage gaps in the matrix must be resolved or explicitly reconciled with the agreed scope; a green CI status alone does not close them.

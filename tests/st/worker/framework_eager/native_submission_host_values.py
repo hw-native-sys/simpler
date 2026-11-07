@@ -37,10 +37,10 @@ def main():
     torch.npu.set_device(args.device)
     stream = torch.npu.Stream(device=args.device)
     worker = Worker(level=2, device_id=args.device, platform=args.platform, runtime="host_build_graph")
-    callable = worker.register(helpers._compile("host_build_graph", args.platform, host_control=True))
-    worker.init(borrowed_context_generation=1)
-    ticket = None
+    tickets = []
     try:
+        callable = worker.register(helpers._compile("host_build_graph", args.platform, host_control=True))
+        worker.init(borrowed_context_generation=1)
         with torch.npu.stream(stream):
             source = torch.full(helpers.SHAPE, 2.0, device="npu")
             output = torch.empty_like(source)
@@ -60,6 +60,7 @@ def main():
                 caller_stream=stream.npu_stream,
                 keepalive=(source, output, stream, *buffers),
             )
+            tickets.append(ticket)
             config.aicpu_thread_num = 9999
             control[1] = 19
             scalar_wrappers[0].value = 5.0
@@ -76,9 +77,7 @@ def main():
         worker.close()
         print("NATIVE_HOST_VALUES_PASS", flush=True)
     finally:
-        if ticket is not None:
-            ticket.cancel()
-        worker.close()
+        helpers._reference()._close_with_tickets(worker, tickets)
 
 
 if __name__ == "__main__":
