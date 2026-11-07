@@ -24,6 +24,8 @@
  * real implementations, a5 has stubs.
  */
 
+#include "host/host_graph_capture_scope.h"
+#include <optional>
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -72,6 +74,10 @@ extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
 // in the host_build_graph runtime .so, and its header pulls in that runtime's own
 // types. Each platform .so carries weak `false` / `-1` fallbacks for the runtimes
 // that capture on the device instead — see each arch's device_runner.cpp.
+// Runtimes without host graph capture own no capture session.
+extern "C" __attribute__((weak, visibility("hidden"))) void *dep_gen_host_graph_create_capture() { return nullptr; }
+extern "C" __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_destroy_capture(void *) noexcept {}
+
 extern "C" bool dep_gen_host_graph_active();
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
 
@@ -1800,11 +1806,15 @@ int simpler_prepare_run(
     // preparation whose release result has not been consumed by a raw caller.
     if (magic == kNativeRunPrepareReleasedMagic) std::memset(runtime, 0, kNativeRunPrepareReleaseBytes);
 
+    std::optional<DeviceRunnerBase::WorkspacePlanScope> workspace_transaction;
+    std::optional<HostGraphCaptureScope> capture_scope;
     OnboardNativeRunContext *state = nullptr;
     const uint64_t trace_hid = runner->callable_hash(callable_id);
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
+        workspace_transaction.emplace();
+        capture_scope.emplace(config->enable_dep_gen != 0);
         // The bank is resolved from this runtime's own declaration before the
         // context is built, so every consumer of it — the reservation, the
         // HostApi the bind receives, `setup_static_arena` — reads one value with
@@ -1845,9 +1855,7 @@ int simpler_prepare_run(
         // Names the run every workspace request inside this prepare belongs to:
         // the arena commits below and the retained-temp grow record their
         // references against this identity.
-        DeviceRunnerBase::WorkspacePlanScope workspace_plan(
-            state->descriptor.pipeline_slot, state->descriptor.run_epoch
-        );
+        DeviceRunnerBase::begin_workspace_plan(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
         const bool overlaps_active_run = allow_prepared_successor && runner->native_run_active();
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;

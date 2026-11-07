@@ -37,6 +37,7 @@ public:
 private:
     void *required_symbol(const char *name) const;
     void *optional_symbol(const char *name) const noexcept;
+    void (*release_host_services_)() noexcept {nullptr};
     void *handle_{nullptr};
     bool unload_allowed_{true};
 };

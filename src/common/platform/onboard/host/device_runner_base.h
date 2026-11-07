@@ -827,15 +827,26 @@ public:
     void *arena_region_backing(uint32_t bank_id, std::size_t region_index) const;
     static WorkspaceManager::RegionKey workspace_plan_region() noexcept;
 
-    /** Scopes one thread's workspace plan identity to a prepare. */
+    struct WorkspacePlanIdentity {
+        std::uint64_t epoch{0};
+        uint32_t pipeline_slot{0};
+        WorkspaceManager::RegionKey region{};
+        void *region_backing{nullptr};
+        WorkspaceManager::AcquireRefusal last_refusal{WorkspaceManager::AcquireRefusal::None};
+    };
+
+    // Owns identity and claims until all prepare cleanup, including catch, returns.
     class WorkspacePlanScope {
     public:
-        WorkspacePlanScope(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept {
-            begin_workspace_plan(pipeline_slot, run_epoch);
-        }
-        ~WorkspacePlanScope() { end_workspace_plan(); }
+        explicit WorkspacePlanScope(uint32_t pipeline_slot = 0, std::uint64_t run_epoch = 0);
+        ~WorkspacePlanScope();
         WorkspacePlanScope(const WorkspacePlanScope &) = delete;
         WorkspacePlanScope &operator=(const WorkspacePlanScope &) = delete;
+
+    private:
+        WorkspacePlanIdentity identity_;
+        WorkspacePlanIdentity *previous_;
+        AutoAdmissionState::ClaimScope claims_;
     };
 
     /** Runs still holding workspace whose completion a caller can still prove. */

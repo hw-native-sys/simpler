@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <set>
+#include <thread>
 #include <vector>
 
 #include "host/auto_admission.h"
@@ -389,7 +390,7 @@ TEST(AutoAdmissionPlan, AStagingStageParkOwnsNeitherStampNorStaging) {
 // Claims are this thread's in-flight transaction, so a successor prepared on
 // another thread cannot have its staged block rolled back by this one.
 TEST(AutoAdmissionClaims, ClaimsAreThreadLocalAndClearedOnCommit) {
-    AutoAdmissionState::claims().clear();
+    AutoAdmissionState::ClaimScope prepare_claims;
     int marker = 0;
     AutoAdmissionState::Claim claim;
     claim.base = &marker;
@@ -404,7 +405,7 @@ TEST(AutoAdmissionClaims, ClaimsAreThreadLocalAndClearedOnCommit) {
 }
 
 TEST(AutoAdmissionClaims, ARegionsOwnBackingIsMarkedSoARollbackLeavesItPublished) {
-    AutoAdmissionState::claims().clear();
+    AutoAdmissionState::ClaimScope prepare_claims;
     int first = 0;
     int second = 0;
     AutoAdmissionState::Claim fresh;
@@ -455,4 +456,42 @@ TEST(AutoAdmissionPlan, AReservedRetryOwnsItsPlanBeforeAnyFalliblePreparation) {
 
     state->adopt_plan_attempt(1, 102);
     EXPECT_EQ(state->plan(1).phase, Phase::None) << "reservation alone creates no plan for a fresh run";
+}
+
+TEST(AutoAdmissionClaims, ScopeRetainsClaimsThroughExceptionCleanup) {
+    EXPECT_FALSE(AutoAdmissionState::has_claim_scope());
+    {
+        AutoAdmissionState::ClaimScope transaction;
+        try {
+            AutoAdmissionState::Claim claim;
+            claim.epoch = 73;
+            AutoAdmissionState::record_claim(claim);
+            throw 1;
+        } catch (int) {
+            ASSERT_EQ(AutoAdmissionState::claims().size(), 1u);
+            EXPECT_EQ(AutoAdmissionState::claims()[0].epoch, 73u);
+            AutoAdmissionState::commit_claims();
+        }
+    }
+    EXPECT_FALSE(AutoAdmissionState::has_claim_scope());
+}
+
+TEST(AutoAdmissionClaims, ConcurrentScopesOwnIndependentLedgers) {
+    AutoAdmissionState::ClaimScope transaction;
+    AutoAdmissionState::Claim claim;
+    claim.epoch = 81;
+    AutoAdmissionState::record_claim(claim);
+    std::thread other([] {
+        EXPECT_FALSE(AutoAdmissionState::has_claim_scope());
+        AutoAdmissionState::ClaimScope transaction;
+        EXPECT_TRUE(AutoAdmissionState::claims().empty());
+        AutoAdmissionState::Claim claim;
+        claim.epoch = 82;
+        AutoAdmissionState::record_claim(claim);
+        AutoAdmissionState::commit_claims();
+    });
+    other.join();
+    ASSERT_EQ(AutoAdmissionState::claims().size(), 1u);
+    EXPECT_EQ(AutoAdmissionState::claims()[0].epoch, 81u);
+    AutoAdmissionState::commit_claims();
 }

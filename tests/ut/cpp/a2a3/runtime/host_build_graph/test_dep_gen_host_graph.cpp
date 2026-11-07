@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "host/host_graph_capture_scope.h"
+#include <stdexcept>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -43,6 +45,7 @@ std::string read_file(const std::filesystem::path &path) {
 }  // namespace
 
 TEST(DepGenHostGraphTest, EmitWritesTheGraphCapturedOnTheSameThread) {
+    HostGraphCaptureScope capture;
     const std::filesystem::path path = output_path("same_thread");
     std::filesystem::remove(path);
     dep_gen_host_graph_set_enabled(true);
@@ -59,6 +62,7 @@ TEST(DepGenHostGraphTest, EmitWritesTheGraphCapturedOnTheSameThread) {
 }
 
 TEST(DepGenHostGraphTest, EmitOnAnotherThreadWritesNothingAndReports) {
+    HostGraphCaptureScope capture;
     const std::filesystem::path path = output_path("cross_thread");
     std::filesystem::remove(path);
     dep_gen_host_graph_set_enabled(true);
@@ -78,6 +82,7 @@ TEST(DepGenHostGraphTest, EmitOnAnotherThreadWritesNothingAndReports) {
 }
 
 TEST(DepGenHostGraphTest, BeginCaptureClearsThePreviousRunsGraph) {
+    HostGraphCaptureScope capture;
     const std::filesystem::path path = output_path("reset");
     std::filesystem::remove(path);
     dep_gen_host_graph_set_enabled(true);
@@ -93,4 +98,66 @@ TEST(DepGenHostGraphTest, BeginCaptureClearsThePreviousRunsGraph) {
     EXPECT_EQ(json.find("\"task_id\":\"101\""), std::string::npos);
     EXPECT_NE(json.find("\"task_id\":\"202\""), std::string::npos);
     std::filesystem::remove(path);
+}
+
+TEST(DepGenHostGraphTest, EmptyAndIncompleteCapturesRemainDistinctFromNoSession) {
+    using simpler::dfx::host_graph::HostGraphExport;
+    using simpler::dfx::host_graph::TakeOutcome;
+    HostGraphExport graph;
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+    {
+        HostGraphCaptureScope capture;
+        dep_gen_host_graph_set_enabled(true);
+        dep_gen_host_graph_begin_capture();
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::Complete));
+        EXPECT_TRUE(graph.tasks.empty());
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+        dep_gen_host_graph_begin_capture();
+        dep_gen_host_graph_begin_task(TaskId::make_global(301), false, false, nullptr, 1, 0, nullptr, nullptr);
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::Incomplete));
+    }
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+}
+
+TEST(DepGenHostGraphTest, NestedCaptureIsRejectedAndExceptionDiscardsOwnedState) {
+    using simpler::dfx::host_graph::HostGraphExport;
+    using simpler::dfx::host_graph::TakeOutcome;
+    HostGraphExport graph;
+    try {
+        HostGraphCaptureScope capture;
+        dep_gen_host_graph_set_enabled(true);
+        dep_gen_host_graph_begin_capture();
+        capture_task(TaskId::make_global(401));
+        EXPECT_THROW(HostGraphCaptureScope nested, std::logic_error);
+        throw 1;
+    } catch (int) {}
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+    HostGraphCaptureScope next;
+    dep_gen_host_graph_begin_capture();
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::Complete));
+    EXPECT_TRUE(graph.tasks.empty());
+}
+
+TEST(DepGenHostGraphTest, ParkedCaptureCanMoveToANewSessionOnAnotherThread) {
+    using simpler::dfx::host_graph::HostGraphExport;
+    using simpler::dfx::host_graph::TakeOutcome;
+    HostGraphExport saved;
+    int outcome;
+    {
+        HostGraphCaptureScope capture;
+        dep_gen_host_graph_set_enabled(true);
+        dep_gen_host_graph_begin_capture();
+        capture_task(TaskId::make_global(501));
+        outcome = dep_gen_host_graph_take(&saved);
+    }
+    HostGraphExport restored;
+    std::thread other([&] {
+        HostGraphCaptureScope capture;
+        dep_gen_host_graph_restore_for_export(&saved, outcome);
+        EXPECT_EQ(dep_gen_host_graph_take(&restored), static_cast<int>(TakeOutcome::Complete));
+    });
+    other.join();
+    ASSERT_EQ(restored.tasks.size(), 1u);
+    EXPECT_EQ(restored.tasks[0].task_id, 501u);
+    EXPECT_TRUE(saved.tasks.empty());
 }

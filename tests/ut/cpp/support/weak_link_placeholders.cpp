@@ -24,7 +24,8 @@
 // (host/graph_recorder_pool.h). The real one is in orchestrator.cpp, which the
 // pool's own threading test does not link -- and does not need, since nothing
 // it records reaches the storage.
-__attribute__((weak)) bool graph_recorder_stand_up_storage() { return true; }
+struct GraphRecording;
+__attribute__((weak)) bool graph_recorder_stand_up_storage(GraphRecording &) { return true; }
 
 // DeviceRunnerBase::bind_callable_to_runtime (the merged bind facade) calls the
 // runtime's bind_callable_to_runtime_impl, which is defined in runtime_maker.cpp

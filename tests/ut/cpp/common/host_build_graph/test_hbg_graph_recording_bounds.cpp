@@ -29,6 +29,7 @@
 
 #include "graph_execution.h"
 #include "graph_host_state.h"
+#include "graph_submit.h"
 #include "scheduler/scheduler.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
@@ -376,3 +377,57 @@ TEST_P(HbgGraphExplicitDependencyRejectionTest, RejectsSelfAndFuturePredecessors
 }
 
 INSTANTIATE_TEST_SUITE_P(ColdInflightCached, HbgGraphExplicitDependencyRejectionTest, ::testing::Range(0, 6));
+TEST_F(HbgGraphRecordingBoundsTest, FallbackScratchIsReusedAndDuplicateAbortIsHarmless) {
+    GraphTaskArgs args;
+    orch.begin_scope();
+    const auto first = orch.graph_begin(0xFA110001, args);
+    ASSERT_TRUE(first.recording);
+    ASSERT_TRUE(orch.graph_prepare(first.recording_handle, args));
+    auto *scratch = static_cast<GraphInflightRecording *>(first.recording_handle)->fallback_storage.get();
+    ASSERT_NE(scratch, nullptr);
+    const auto *tensors = scratch->task_tensor_pool.get();
+    orch.graph_abort(first.recording_handle);
+    EXPECT_EQ(scratch->boundary, nullptr);
+    orch.graph_abort(first.recording_handle);
+    EXPECT_EQ(active_graph_recording(&orch), nullptr);
+    const auto second = orch.graph_begin(0xFA110002, args);
+    ASSERT_TRUE(second.recording);
+    ASSERT_TRUE(orch.graph_prepare(second.recording_handle, args));
+    EXPECT_EQ(static_cast<GraphInflightRecording *>(second.recording_handle)->fallback_storage.get(), scratch);
+    EXPECT_EQ(scratch->task_tensor_pool.get(), tensors);
+    // Retiring an old handle must not clear the new recording's identity.
+    orch.graph_abort(first.recording_handle);
+    EXPECT_EQ(active_graph_recording(&orch), scratch);
+    orch.graph_abort(second.recording_handle);
+    orch.end_scope();
+}
+
+#if defined(__linux__)
+#include <cerrno>
+#include <pthread.h>
+namespace {
+int fail_recording_bind_at = 0;
+}
+extern "C" int __real_pthread_setspecific(pthread_key_t, const void *);
+extern "C" int __wrap_pthread_setspecific(pthread_key_t key, const void *value) {
+    if (fail_recording_bind_at != 0 && --fail_recording_bind_at == 0) return ENOMEM;
+    return __real_pthread_setspecific(key, value);
+}
+TEST_F(HbgGraphRecordingBoundsTest, FailedIdentityBindingClearsBorrowedBoundary) {
+    GraphRecording scratch;
+    GraphRecorderStorageScope storage(scratch);
+    GraphTaskArgs args;
+    orch.begin_scope();
+    for (int word : {1, 2, 3}) {
+        const auto graph = orch.graph_begin(0xFA120000 + word, args);
+        ASSERT_TRUE(graph.recording);
+        fail_recording_bind_at = word;
+        EXPECT_FALSE(orch.graph_prepare(graph.recording_handle, args));
+        EXPECT_EQ(fail_recording_bind_at, 0);
+        EXPECT_EQ(scratch.boundary, nullptr);
+        EXPECT_EQ(active_graph_recording(&orch), nullptr);
+        orch.graph_abort(graph.recording_handle);
+    }
+    orch.end_scope();
+}
+#endif

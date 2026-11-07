@@ -827,3 +827,39 @@ TEST(HbgGraphAsyncSubmit, ASubmissionOntoAnAlreadyFatalRuntimeFailsRatherThanNoO
 
     framework_bind_orch_context(nullptr);
 }
+
+TEST(HbgGraphAsyncSubmit, ConcurrentShutdownClosesAdmissionAndJoinsWorkers) {
+    GraphAsyncRecordingState pool;
+    ASSERT_TRUE(pool.prewarm());
+    GraphTaskArgs args;
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    ASSERT_TRUE(pool.start(args, [&](const GraphTaskArgs &) {
+        EXPECT_NE(recorder_recording(), nullptr);
+        entered.set_value();
+        released.wait();
+        pool.wait();
+    }));
+    entered.get_future().wait();
+    auto first = std::async(std::launch::async, [&] {
+        pool.shutdown();
+    });
+    const auto deadline = std::chrono::steady_clock::now() + kHandshakeTimeout;
+    bool closed = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!pool.prewarm()) {
+            closed = true;
+            break;
+        }
+    }
+    auto second = std::async(std::launch::async, [&] {
+        pool.shutdown();
+    });
+    EXPECT_TRUE(closed);
+    EXPECT_FALSE(pool.start(args, [](const GraphTaskArgs &) {}));
+    release.set_value();
+    first.get();
+    second.get();
+    EXPECT_FALSE(pool.prewarm());
+    EXPECT_EQ(recorder_recording(), nullptr);
+}

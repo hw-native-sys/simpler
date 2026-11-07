@@ -20,6 +20,7 @@
  */
 
 #include "common/native_invocation_evidence.h"
+#include "common/module_thread_value.h"
 #include "device_runner_base.h"
 
 #include "run_resource_arena.h"
@@ -703,37 +704,36 @@ const char *workspace_refusal_text(WorkspaceManager::AcquireRefusal why) {
 
 // The run identity this thread's workspace requests belong to. Thread-scoped so
 // a prepared successor built on another thread cannot be charged to this one.
-struct WorkspacePlanIdentity {
-    std::uint64_t epoch{0};
-    uint32_t pipeline_slot{0};
-    WorkspaceManager::RegionKey region{};
-    // What the named region is published at right now, so a block the allocator
-    // hands back because it already covers the request is distinguishable from
-    // a new generation. Only the first is the region's own ownership, which a
-    // rollback must leave in place.
-    void *region_backing{nullptr};
-    // Why the last request for this region was refused. Carried here because
-    // the allocation callback the arena transaction drives has no return path
-    // of its own for a reason.
-    WorkspaceManager::AcquireRefusal last_refusal{WorkspaceManager::AcquireRefusal::None};
-};
-thread_local WorkspacePlanIdentity g_workspace_plan;
+using WorkspacePlanIdentity = DeviceRunnerBase::WorkspacePlanIdentity;
+simpler::ModuleThreadValue<WorkspacePlanIdentity *> workspace_selector;
+WorkspacePlanIdentity *active_workspace_plan() { return workspace_selector.get(); }
+const WorkspacePlanIdentity &workspace_plan_identity() {
+    static const WorkspacePlanIdentity empty;
+    return active_workspace_plan() != nullptr ? *active_workspace_plan() : empty;
+}
 }  // namespace
 
+DeviceRunnerBase::WorkspacePlanScope::WorkspacePlanScope(uint32_t pipeline_slot, std::uint64_t run_epoch) :
+    previous_(active_workspace_plan()) {
+    workspace_selector.set(&identity_);
+    begin_workspace_plan(pipeline_slot, run_epoch);
+}
+DeviceRunnerBase::WorkspacePlanScope::~WorkspacePlanScope() { workspace_selector.restore(previous_); }
+
 void DeviceRunnerBase::begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept {
-    g_workspace_plan.epoch = run_epoch;
-    g_workspace_plan.pipeline_slot = pipeline_slot;
-    g_workspace_plan.region = WorkspaceManager::staging_region(pipeline_slot);
+    if (!active_workspace_plan()) return;
+    active_workspace_plan()->epoch = run_epoch;
+    active_workspace_plan()->pipeline_slot = pipeline_slot;
+    active_workspace_plan()->region = WorkspaceManager::staging_region(pipeline_slot);
 }
-
-void DeviceRunnerBase::end_workspace_plan() noexcept { g_workspace_plan = WorkspacePlanIdentity{}; }
-
+void DeviceRunnerBase::end_workspace_plan() noexcept {
+    if (active_workspace_plan()) *active_workspace_plan() = WorkspacePlanIdentity{};
+}
 void DeviceRunnerBase::set_workspace_plan_region(const WorkspaceManager::RegionKey &region) noexcept {
-    g_workspace_plan.region = region;
+    if (active_workspace_plan()) active_workspace_plan()->region = region;
 }
-
 void DeviceRunnerBase::set_workspace_plan_region_backing(void *backing) noexcept {
-    g_workspace_plan.region_backing = backing;
+    if (active_workspace_plan()) active_workspace_plan()->region_backing = backing;
 }
 
 void *DeviceRunnerBase::arena_region_backing(uint32_t bank_id, std::size_t region_index) const {
@@ -751,15 +751,17 @@ void *DeviceRunnerBase::arena_region_backing(uint32_t bank_id, std::size_t regio
     }
 }
 
-WorkspaceManager::RegionKey DeviceRunnerBase::workspace_plan_region() noexcept { return g_workspace_plan.region; }
+WorkspaceManager::RegionKey DeviceRunnerBase::workspace_plan_region() noexcept {
+    return workspace_plan_identity().region;
+}
 
 void DeviceRunnerBase::record_workspace_claim(void *base, bool was_region_backing) {
-    if (base == nullptr || !auto_admission_.enabled()) return;
+    if (base == nullptr || !auto_admission_.enabled() || active_workspace_plan() == nullptr) return;
     AutoAdmissionState::Claim claim;
     claim.base = base;
-    claim.region_domain = static_cast<uint32_t>(g_workspace_plan.region.domain);
-    claim.region_index = g_workspace_plan.region.index;
-    claim.epoch = g_workspace_plan.epoch;
+    claim.region_domain = static_cast<uint32_t>(workspace_plan_identity().region.domain);
+    claim.region_index = workspace_plan_identity().region.index;
+    claim.epoch = workspace_plan_identity().epoch;
     claim.was_region_backing = was_region_backing;
     AutoAdmissionState::record_claim(claim);
 }
@@ -971,7 +973,7 @@ int DeviceRunnerBase::reference_bank_arenas(
         // inside it and is not the same value when the platform returns an
         // under-aligned pointer.
         void *const owned = arena->raw_backing();
-        if (workspace_.reference(owned, g_workspace_plan.epoch)) {
+        if (workspace_.reference(owned, workspace_plan_identity().epoch)) {
             // The transaction published every region before this ran, so this
             // address is what the region is using now: any earlier generation
             // of it becomes obsolete and its bytes become reclaimable once its
@@ -1007,14 +1009,14 @@ void *DeviceRunnerBase::acquire_arena_backing(std::size_t size) {
     // region of every bank would share one pool, and a growing GM heap could be
     // handed the block a still-attached shared-memory region is published at.
     WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
-    void *base = workspace_.acquire(g_workspace_plan.region, g_workspace_plan.epoch, size, &why);
+    void *base = workspace_.acquire(workspace_plan_identity().region, workspace_plan_identity().epoch, size, &why);
     if (base == nullptr) {
         LOG_ERROR(
             "setup_static_arena: workspace refused %zu bytes for region %u/%u: %s", size,
-            static_cast<unsigned>(g_workspace_plan.region.domain), g_workspace_plan.region.index,
+            static_cast<unsigned>(workspace_plan_identity().region.domain), workspace_plan_identity().region.index,
             workspace_refusal_text(why)
         );
-        g_workspace_plan.last_refusal = why;
+        if (active_workspace_plan()) active_workspace_plan()->last_refusal = why;
         return base;
     }
     // Recorded before the transaction can abandon it. A staged block the
@@ -1023,7 +1025,7 @@ void *DeviceRunnerBase::acquire_arena_backing(std::size_t size) {
     // block the ledger owns — so without the record the only thing that could
     // recover it is the whole run retiring, which a plan that resumes never
     // does.
-    record_workspace_claim(base, base == g_workspace_plan.region_backing);
+    record_workspace_claim(base, base == workspace_plan_identity().region_backing);
     return base;
 }
 
@@ -1156,7 +1158,7 @@ int DeviceRunnerBase::acquire_retained_temp(
         // anyway — otherwise a later growth would find no reference and treat
         // those bytes as free to overwrite.
         if (bytes != 0 && workspace_.enabled() && *addr_out != nullptr) {
-            if (!workspace_.reference(*addr_out, g_workspace_plan.epoch)) {
+            if (!workspace_.reference(*addr_out, workspace_plan_identity().epoch)) {
                 LOG_ERROR(
                     "acquire_retained_temp: slot %u could not register this run as a consumer of %p", pipeline_slot,
                     *addr_out
@@ -1195,7 +1197,7 @@ int DeviceRunnerBase::acquire_retained_temp(
     // plan that grows its inputs and then its regions is one grower, and
     // without this gate the earliest allocation of all would bypass it.
     const int permission =
-        claim_growth_permission(pipeline_slot, g_workspace_plan.epoch, AutoAdmissionState::Phase::Staging);
+        claim_growth_permission(pipeline_slot, workspace_plan_identity().epoch, AutoAdmissionState::Phase::Staging);
     if (permission != 0) return permission;
     // The retry sequence is the growth coordinator's; what belongs here is the
     // attempt itself and how to read its refusal. A degraded ledger publishes
@@ -1212,7 +1214,7 @@ int DeviceRunnerBase::acquire_retained_temp(
         pipeline_slot, /*rollback_before_retry=*/false,
         [](void *ctx) {
             auto *a = static_cast<StagingAttempt *>(ctx);
-            a->grown = a->runner->workspace_.acquire(a->region, g_workspace_plan.epoch, a->bytes, &a->why);
+            a->grown = a->runner->workspace_.acquire(a->region, workspace_plan_identity().epoch, a->bytes, &a->why);
             if (a->grown != nullptr) return GrowthAttempt::Served;
             return classify_growth_refusal(a->why);
         },
@@ -1601,11 +1603,12 @@ int DeviceRunnerBase::setup_static_arena(
     }
     if (needs_growth && auto_admission_.enabled()) {
         const int permission = claim_growth_permission(
-            g_workspace_plan.pipeline_slot, g_workspace_plan.epoch, AutoAdmissionState::Phase::Committing
+            workspace_plan_identity().pipeline_slot, workspace_plan_identity().epoch,
+            AutoAdmissionState::Phase::Committing
         );
         if (permission != 0) return permission;
     }
-    g_workspace_plan.last_refusal = WorkspaceManager::AcquireRefusal::None;
+    if (active_workspace_plan()) active_workspace_plan()->last_refusal = WorkspaceManager::AcquireRefusal::None;
     // One region at a time, each named to the ledger, because the allocation
     // callbacks carry no region of their own and a capacity hit calls none at
     // all. The transaction itself is unchanged: it still stages every region
@@ -1622,16 +1625,17 @@ int DeviceRunnerBase::setup_static_arena(
     } attempt{this, requests, kRegionCount, arena_bank};
     const auto stage_bank = [](void *ctx) {
         auto *a = static_cast<ArenaAttempt *>(ctx);
-        g_workspace_plan.last_refusal = WorkspaceManager::AcquireRefusal::None;
+        if (active_workspace_plan()) active_workspace_plan()->last_refusal = WorkspaceManager::AcquireRefusal::None;
         a->outcome = run_bank_arena_setup(
             a->requests, a->count, /*owns_prebuilt_cache=*/a->bank == 0, &a->runner->prebuilt_runtime_arena_cache_,
             DeviceArena::kDefaultBaseAlign
         );
         if (a->outcome.rc == 0) return GrowthAttempt::Served;
-        return classify_growth_refusal(g_workspace_plan.last_refusal);
+        return classify_growth_refusal(workspace_plan_identity().last_refusal);
     };
-    GrowthAttempt growth =
-        grow_with_one_retry(g_workspace_plan.pipeline_slot, /*rollback_before_retry=*/true, stage_bank, &attempt);
+    GrowthAttempt growth = grow_with_one_retry(
+        workspace_plan_identity().pipeline_slot, /*rollback_before_retry=*/true, stage_bank, &attempt
+    );
     BankArenaSetupOutcome outcome = attempt.outcome;
     bank_committed = outcome.rc == 0;
     if (outcome.rc == 0 && workspace_.enabled()) {
@@ -1656,7 +1660,7 @@ int DeviceRunnerBase::setup_static_arena(
             name, requested, arena_bank
         );
         const int refusal = report_growth_refusal(
-            g_workspace_plan.pipeline_slot, AutoAdmissionState::Phase::Committing, requested, growth
+            workspace_plan_identity().pipeline_slot, AutoAdmissionState::Phase::Committing, requested, growth
         );
         if (refusal != 0) return refusal;
     }
