@@ -750,6 +750,14 @@ static simpler::dfx::scope_stats_runs::Capacities scope_stats_capacities(const R
     return caps;
 }
 
+// The cache owns a host template, not proof that an earlier graph executed.
+// Every run snapshots its image before the backing can be reused or invalidated.
+static int stage_runtime_image(const HostApi *api, void *target, const void *source, size_t bytes) {
+    const HostMetadataRegion region{target, source, bytes};
+    const int rc = api->stage_launch_metadata(&region, 1);
+    return rc > 0 ? PTO_RUNTIME_ERR_INTERNAL : rc;
+}
+
 static int bind_cached_runtime_image(
     Runtime *runtime, const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe,
     const ChipStorageTaskArgs &device_args
@@ -780,6 +788,12 @@ static int bind_cached_runtime_image(
         &layout, static_cast<const char *>(cached_image) + runtime_off + offsetof(RuntimeContext, prebuilt_layout),
         sizeof(layout)
     );
+    if (layout.offsets.arena_size != cached_image_size) {
+        LOG_ERROR("Cached runtime image size differs from its layout");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const int stage_rc = stage_runtime_image(api, runtime_arena_dev, cached_image, cached_image_size);
+    if (stage_rc != 0) return stage_rc;
     runtime->scope_stats_capacity_.values = scope_stats_capacities(layout);
     runtime->set_orch_args(device_args);
     runtime->set_gm_sm_ptr(sm_ptr);
@@ -797,17 +811,12 @@ static void store_prebuilt_runtime_image(
     );
 }
 
-// Reserve the pooled arenas, build the host image, rtMemcpy it to the pooled
-// runtime-arena region, and record it in the DeviceRunnerBase prebuilt-arena
-// cache for `sizing`. Needs no Runtime and no per-run args — the image is
-// arg-independent. The cache store is best-effort (a no-op on backends without
-// cache callbacks); `out_ptrs`/`out_layout` return the freshly built arena so
-// the run path can wire the runtime directly instead of depending on a cache
-// round-trip. Shared by the lazy first-run miss path and the eager
-// prewarm_config_impl entry, so both build the arena identically.
+// The image is arg-independent. A run snapshots it for ordered launch; explicit
+// prewarm publishes immediately. Cache callbacks are best-effort, so the current
+// bind receives fresh addresses and layout without requiring a cache round-trip.
 static int build_and_cache_prebuilt_arena(
     const HostApi *api, const ArenaSizingConfig &sizing, StaticArenaPtrs *out_ptrs = nullptr,
-    RuntimeArenaLayout *out_layout = nullptr
+    RuntimeArenaLayout *out_layout = nullptr, bool for_launch = false
 ) {
     ArenaStaticSizes sizes;
     if (!derive_arena_static_sizes(sizing, &sizes)) {
@@ -825,10 +834,12 @@ static int build_and_cache_prebuilt_arena(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    int rc_upload = api->copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
+    const int rc_upload =
+        for_launch ? stage_runtime_image(api, ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size) :
+                     api->copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
     if (rc_upload != 0) {
-        LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
-        return PTO_RUNTIME_ERR_INTERNAL;
+        LOG_ERROR("Prebuilt runtime arena publication failed (rc=%d)", rc_upload);
+        return for_launch ? rc_upload : PTO_RUNTIME_ERR_INTERNAL;
     }
 
     PrebuiltRuntimeArenaCacheProbe probe = make_prebuilt_runtime_arena_cache_probe(sizing);
@@ -937,18 +948,14 @@ extern "C" int bind_callable_to_runtime_impl(
         PrebuiltRuntimeArenaCacheProbe cache_probe = make_prebuilt_runtime_arena_cache_probe(sizing);
         int cache_rc = bind_cached_runtime_image(runtime, api, cache_probe, device_args);
         if (cache_rc < 0) {
-            return PTO_RUNTIME_ERR_INTERNAL;
+            return cache_rc;
         }
         if (cache_rc != 0) {
-            // Miss: build + upload the arena image, then wire the runtime
-            // directly from the freshly built arena (same three fields the
-            // cache-hit path sets). The store inside build_and_cache is
-            // best-effort for the NEXT bind — this bind must not depend on the
-            // cache round-trip, so a backend with no-op cache callbacks still
-            // binds successfully.
+            // Both cache paths snapshot their own image for launch. A later
+            // cache hit does not depend on this run ever being launched.
             StaticArenaPtrs ptrs;
             RuntimeArenaLayout layout;
-            if (const int rc = build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout); rc != 0) {
+            if (const int rc = build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout, true); rc != 0) {
                 return rc;
             }
             runtime->set_orch_args(device_args);
@@ -998,9 +1005,9 @@ extern "C" int prewarm_config_impl(
 /**
  * Publish the device write a run's bind prepared. Nothing to do for this runtime.
  *
- * This runtime's bind writes its own prebuilt arena image where it builds it, so
- * it records no pending publication. The entry exists on both runtimes so the
- * platform's prepare path has one shape, the way copy_in_run_inputs_impl does.
+ * Bind snapshots the complete arena image through stage_launch_metadata while
+ * its local or cached host source is valid. The platform owns that snapshot and
+ * publishes it on the ordered launch stream before the descriptor and entry.
  */
 extern "C" int publish_run_image_impl(Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
 
