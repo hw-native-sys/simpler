@@ -383,6 +383,10 @@ class RuntimeCompiler:
                 dest = od / binary_name
                 place_binary(binary_path, dest)
                 if target_platform == "host" and self.platform == "a5":
+                    trigger = Path(actual_build_dir) / "ccu_trigger.o"
+                    if not trigger.is_file():
+                        raise FileNotFoundError(f"Required CCU trigger binary was not built: {trigger}")
+                    place_binary(trigger, od / trigger.name)
                     topo_fallback = Path(cmake_source_dir) / "aicpu_cpu_topo_fallback.json"
                     place_binary(topo_fallback, od / topo_fallback.name)
                 return dest
