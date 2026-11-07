@@ -1,13 +1,14 @@
 ---
 name: review-pr
-description: Review a GitHub PR by analyzing the correct diff (merge-base to HEAD), reconciling stated vs. real goal, and applying type-specific scrutiny. Optionally folds in independent reviews from local `codex` / `gemini` CLIs when the invocation explicitly opts in (`codex`, `gemini`, or `all` in the arguments). Use when the user asks to review a PR, analyze PR changes, or give feedback on a pull request.
+description: Review a GitHub PR or a fixed commit range by analyzing the correct diff, reconciling stated vs. real goal, checking repository standards, and applying type-specific scrutiny. Optionally folds in independent reviews from local `codex` / `claude` CLIs or read-only sub-agents when the invocation explicitly opts in. Use when the user asks to review a PR, a fixed range, or changes.
 ---
 
 # Review PR Workflow
 
-Analyze and review PR changes using the correct merge-base diff.
-Optionally cross-check against independent local CLI reviewers when
-the user explicitly opts in — see [Input](#input).
+Analyze and review PR changes using the correct diff: a user-supplied
+fixed range, a PR's merge-base, or the current branch against its base.
+Optionally cross-check against independent local CLI reviewers or
+read-only sub-agents when the user explicitly opts in — see [Input](#input).
 
 ## Role and review freshness
 
@@ -24,19 +25,117 @@ covering the old head. CI green is not a substitute for review; an agent's favor
 verdict is not approval by a required GitHub reviewer. Preserve unresolved disputes
 and distinguish verified defects from hypotheses or optional improvements.
 
+State the evidence level for each finding: code inspection, diff-only, or not
+run. Never present an untested behavior as verified; a missing test, build, or
+hardware run is a limit, not a pass.
+
+The main agent always performs the review in Steps 1–6. Step 7 only adds
+independent second opinions. The `claude` token launches a separate
+`claude -p` process; it never makes the main agent's own review the Claude
+external reviewer. If that CLI is unavailable, record the skip in Appendix C;
+do not substitute self-review.
+
 ## Input
 
-Accept PR number (`123`, `#123`), or no input (review current branch
-against its base).
+### Review target
 
-**User-stated expected goal (optional but high-priority).** When the
-user invokes `/review-pr` they may describe in natural language what
-they think this PR is *supposed* to achieve — possibly more ambitious
-or differently-framed than the PR body itself claims. Treat that
-description as a first-class source of the stated goal (see Step 4),
-ranked **above** the PR body. The most common reason this matters:
-the PR author downgraded the original goal in their own description,
-and the user — who is reviewing — knows the original target.
+Accept one of:
+
+- **PR number** (`123`, `#123`): review that PR against its base branch.
+- **Fixed range**: `<base-ref>...<head-ref>` (three-dot) or
+  `<base-ref>..<head-ref>` (two-dot). Use the range exactly as supplied;
+  never substitute a merge-base or a remote PR diff for it. This is the right
+  mode for a local, unpublished correction.
+- **No target**: review the current branch against its base.
+
+A standalone number is the PR number; an `#N` inside the user-stated goal is a
+reference, not the review target.
+
+`$ARGUMENTS` is the caller's argument string. Copy it once into `$REVIEW_ARGS`
+and parse the target and opt-in flags from that copy, so later steps do not
+depend on the harness variable name.
+
+**Review-only is the default.** The skill reads the diff and repository files,
+performs read-only `gh` lookups when a PR target requires them, and never
+checks out, edits, builds, tests, runs hardware, posts to GitHub, or invokes
+external CLIs or sub-agents. Optional cross-checks are opt-in tokens.
+
+```bash
+REVIEW_ARGS="${ARGUMENTS:-}"
+
+# Fixed range, if present. A 7-40 hex SHA pair; do not confuse it with a PR number.
+FIXED_RANGE=""
+if printf '%s\n' "$REVIEW_ARGS" | grep -qE '[0-9a-fA-F]{7,40}\.\.\.?[0-9a-fA-F]{7,40}'; then
+  FIXED_RANGE=$(printf '%s\n' "$REVIEW_ARGS" | grep -oE '[0-9a-fA-F]{7,40}\.\.\.?[0-9a-fA-F]{7,40}' | head -1)
+fi
+
+# Opt-in cross-checks and narrowing. Everything else is the default.
+WANT_CODEX=0; WANT_CLAUDE=0; WANT_SUBAGENTS=0
+SCOPE=""
+case " $REVIEW_ARGS " in *" all "*) WANT_CODEX=1; WANT_CLAUDE=1 ;; esac
+case " $REVIEW_ARGS " in *" codex "*) WANT_CODEX=1 ;; esac
+case " $REVIEW_ARGS " in *" claude "*) WANT_CLAUDE=1 ;; esac
+case " $REVIEW_ARGS " in *" subagents "*|*" parallel "*) WANT_SUBAGENTS=1 ;; esac
+for tok in $REVIEW_ARGS; do
+  case "$tok" in scope:*) SCOPE=${tok#scope:} ;; esac
+done
+```
+
+Optional tokens:
+
+- `codex` — opt in to the Step 7 codex cross-check when this session is not
+  Codex. If this session is Codex, ignore the token: the main review already
+  is Codex.
+- `claude` — opt in to the Step 7 Claude CLI cross-check when this session is
+  not Claude Code. If this session is Claude Code, ignore the token: the main
+  review already is Claude.
+- `all` — codex + claude, minus the token matching the current harness.
+- `subagents` or `parallel` — opt in to the Step 7.5 read-only sub-agent
+  cross-check. Without the token, stay single-agent.
+- `scope:<path>` — narrow the review to that path plus its direct callers.
+
+You know your harness from the system context; no shell detection is needed.
+If this session is Claude Code, treat `claude` as absent; if this session is
+Codex, treat `codex` as absent. `all` runs only the non-current harness.
+Record ignored tokens in Appendix C.
+
+Do not require `no-*` tokens. Review-only is the default: no checkout, edits,
+builds, tests, hardware, GitHub writes, external CLIs, or sub-agents. If the
+user asks for builds, tests, or hardware as part of the review, route to
+`testing`, `fix-pr`, or `develop-task`; do not add an opt-in token here.
+
+Echo the interpreted target and opt-in extras in the final Review limits.
+
+**Validate before analysis.** For a fixed range, verify both endpoints and the
+non-empty diff before reading any code:
+
+```bash
+case "$FIXED_RANGE" in
+  *"..."*) SEP="..." ;;
+  *".."*)  SEP=".." ;;
+  *)       SEP="" ;;
+esac
+if [ -n "$FIXED_RANGE" ] && [ -n "$SEP" ]; then
+  BASE_REF=${FIXED_RANGE%%$SEP*}
+  HEAD_REF=${FIXED_RANGE#*$SEP}
+  git rev-parse --verify "$BASE_REF^{commit}" >/dev/null || { echo "bad base: $BASE_REF"; exit 1; }
+  git rev-parse --verify "$HEAD_REF^{commit}" >/dev/null || { echo "bad head: $HEAD_REF"; exit 1; }
+  [ -n "$(git diff "$FIXED_RANGE" --name-only)" ] || { echo "empty diff: $FIXED_RANGE"; exit 1; }
+fi
+```
+
+If validation fails, stop and report the bad ref or empty range. Do not
+silently fall back to merge-base.
+
+### User-stated expected goal (optional but high-priority)
+
+When the user invokes `/review-pr` they may describe in natural language what
+they think this PR is *supposed* to achieve — possibly more ambitious or
+differently-framed than the PR body itself claims. Treat that description as a
+first-class source of the stated goal (see Step 4), ranked **above** the PR
+body. The most common reason this matters: the PR author downgraded the
+original goal in their own description, and the user — who is reviewing —
+knows the original target.
 
 Examples of user-stated goals to watch for:
 
@@ -45,46 +144,72 @@ Examples of user-stated goals to watch for:
 - "The team agreed to Z" — Z is now part of stated goal.
 - "Per issue #N this should do W" — go read issue #N before Step 4.
 
-**Optional external reviewer opt-in.** The arguments may also contain
-the literal tokens `codex`, `gemini`, or `all` — these turn on the
-Step 7 cross-check with the named CLIs. Without an explicit opt-in,
-**Step 7 is skipped** even if the binaries are installed; cross-check
-is slow (3–5 minutes per CLI) and noisy, so don't run it by default.
+### Optional cross-checks
+
+The arguments may also contain:
+
+- `codex`, `claude`, or `all` — Step 7 external CLI cross-check. Without an
+  explicit opt-in, **Step 7 is skipped** even if the binaries are installed;
+  the cross-check is slow (3–5 minutes per CLI) and noisy. The token matching
+  the current harness is ignored: `claude` under Claude Code, `codex` under
+  Codex; `all` runs only the non-current harness.
+- `subagents` or `parallel` — optional Step 7.5 read-only sub-agent
+  cross-check. Without the token, stay single-agent.
 
 Examples:
 
 - `/review-pr 773` — your own review only.
 - `/review-pr 773 codex` — also run `codex review`.
-- `/review-pr 773 codex gemini` or `/review-pr 773 all` — both.
+- `/review-pr 3f4b5541af...bea407de05` — fixed local range, no PR.
+- `/review-pr 3f4b5541af...bea407de05 scope:src/a5 subagents`
 - `/review-pr with codex` — review current branch, also run codex.
 - `/review-pr 773 — this PR is supposed to add symmetric IPC between
   X and Y` — user-stated goal wins over PR body for Step 4.
 
 ## Step 1: Setup
 
+If the target is a fixed range and no PR number was supplied, skip Setup: the
+review is local and needs no GitHub context. If a PR number is present, run
+Setup to resolve its base and metadata.
+
 1. [Setup](../../lib/github/setup.md) — authenticate and detect context
    (role, remotes, state)
 
-## Step 2: Determine Diff Base
+Setup performs read-only lookups only. This skill never posts, edits, labels,
+or merges; publishing belongs to `process-pr` or an explicit user instruction.
 
-**This is the critical step.** Never diff against a stale local branch.
+## Step 2: Determine Diff Base or Fixed Range
+
+**This is the critical step.** Never diff against a stale local branch, and
+never substitute a different diff for the user's fixed range.
 
 ```bash
-# Default base when reviewing the current branch (no PR number).
-# This must be set unconditionally so later steps (Step 7's codex/gemini
-# snippets) can reference $BASE_BRANCH safely.
-BASE_BRANCH="$DEFAULT_BRANCH"
+if [ -n "$FIXED_RANGE" ]; then
+  # Input already validated both endpoints and the non-empty diff.
+  DIFF_SPEC="$FIXED_RANGE"
+  LOG_RANGE="$BASE_REF..$HEAD_REF"
+  echo "Using fixed range: $DIFF_SPEC"
+else
+  # Default base when reviewing the current branch (no PR number).
+  # Set only in merge-base mode; the fixed-range path does not need it.
+  BASE_BRANCH="$DEFAULT_BRANCH"
 
-# Ensure upstream is fresh
-git fetch upstream "$BASE_BRANCH" --quiet
+  # Ensure upstream is fresh
+  git fetch upstream "$BASE_BRANCH" --quiet
 
-# Find the true fork point (merge-base)
-MERGE_BASE=$(git merge-base "upstream/$BASE_BRANCH" HEAD)
-echo "Merge base: $MERGE_BASE"
+  # Find the true fork point (merge-base)
+  MERGE_BASE=$(git merge-base "upstream/$BASE_BRANCH" HEAD)
+  echo "Merge base: $MERGE_BASE"
+
+  DIFF_SPEC="$MERGE_BASE...HEAD"
+  LOG_RANGE="$MERGE_BASE..HEAD"
+  BASE_REF="$MERGE_BASE"
+  HEAD_REF="HEAD"
+fi
 ```
 
-If reviewing a PR by number (not the current branch), override
-`$BASE_BRANCH` from PR metadata:
+If reviewing a PR by number (not the current branch), override `$BASE_BRANCH`
+from PR metadata and recompute the merge-base, then set the same variables:
 
 ```bash
 # Fetch PR metadata
@@ -95,29 +220,41 @@ BASE_BRANCH=$(echo "$PR_DATA" | jq -r '.baseRefName')
 # Fetch and compute merge-base against the PR's actual base branch
 git fetch upstream "$BASE_BRANCH" --quiet
 MERGE_BASE=$(git merge-base "upstream/$BASE_BRANCH" HEAD)
+DIFF_SPEC="$MERGE_BASE...HEAD"
+LOG_RANGE="$MERGE_BASE..HEAD"
+BASE_REF="$MERGE_BASE"
+HEAD_REF="HEAD"
 ```
 
-**Validation:** Verify the merge-base is NOT a commit on the PR branch
-itself:
+**Validation (merge-base mode only).** Verify the merge-base is NOT a commit on
+the PR branch itself:
 
 ```bash
-PR_COMMITS=$(git log --oneline "$MERGE_BASE"..HEAD)
-echo "$PR_COMMITS"
+if [ -z "$FIXED_RANGE" ]; then
+  PR_COMMITS=$(git log --oneline "$LOG_RANGE")
+  echo "$PR_COMMITS"
 
-if git log --oneline "$MERGE_BASE"..HEAD | grep -q "$(git rev-parse --short $MERGE_BASE)"; then
-  echo "ERROR: merge-base is on the PR branch — check upstream fetch"
+  if git log --oneline "$LOG_RANGE" | grep -q "$(git rev-parse --short $MERGE_BASE)"; then
+    echo "ERROR: merge-base is on the PR branch — check upstream fetch"
+  fi
 fi
 ```
 
+A fixed range is the user's contract. If it is invalid or empty, stop; do not
+recompute a merge-base and continue.
+
 ## Step 3: Gather Diff
 
-All diffs use the three-dot syntax against the merge-base:
+Use `$DIFF_SPEC` from Step 2 for every diff:
 
 ```bash
-git diff "$MERGE_BASE"...HEAD --stat
-git diff "$MERGE_BASE"...HEAD --name-only
-git diff "$MERGE_BASE"...HEAD
+git diff "$DIFF_SPEC" --stat
+git diff "$DIFF_SPEC" --name-only
+git diff "$DIFF_SPEC"
 ```
+
+If `$SCOPE` is non-empty, start with `git diff "$DIFF_SPEC" -- "$SCOPE"` and
+read only the surrounding callers needed to judge those files.
 
 For large PRs, read diffs per-category (by directory or file type) to
 avoid overwhelming context.
@@ -157,7 +294,7 @@ Docs, and a `.py` outside the Core dirs is Uncategorized, not Core.
   of being silently absorbed into Core or Docs.
 
 ```bash
-git diff "$MERGE_BASE"...HEAD --numstat | awk -F'\t' '
+git diff "$DIFF_SPEC" --numstat | awk -F'\t' '
   $1=="-" { next }                               # skip binary
   {
     a=$1; d=$2; path=$3; tot=a+d;
@@ -206,6 +343,19 @@ git diff "$MERGE_BASE"...HEAD --numstat | awk -F'\t' '
   pass. Recommend split and require the Mechanism Brief (Step 5.5,
   rendered in §2) plus a reviewer-friendly commit review order.
 
+### Review depth
+
+Set `REVIEW_DEPTH` from the churn and risk:
+
+- `quick` — single file, under ~50 changed lines, and no concurrency, ABI,
+  ownership, or security surface. The trivial-PR exception in Step 8 may apply.
+- `standard` — the default.
+- `deep` — over ~500 changed lines or 3+ files, or any concurrency, ABI,
+  ownership, or security surface. Require the Mechanism Brief (Step 5.5), the
+  traceability table (Step 5.7), and the Standards check (Step 6.0).
+
+Depth decides which later steps are mandatory; it does not decide the verdict.
+
 ## Step 4: Extract the Stated Goal(s)
 
 The stated goal can come from **multiple sources**. Gather all of them
@@ -239,7 +389,7 @@ disagreement itself is a finding.
 if [ -n "$PR_NUMBER" ]; then
   gh pr view "$PR_NUMBER" --repo "$PR_REPO_OWNER/$PR_REPO_NAME"
 fi
-git log --format='%s%n%n%b%n---' "$MERGE_BASE"..HEAD
+git log --format='%s%n%n%b%n---' "$LOG_RANGE"
 ```
 
 ### Producing the Stated Goal
@@ -267,6 +417,11 @@ extra Step 4 work catches it before approval.
 
 If reviewing the current branch with no open PR, commit messages and
 any user-stated description are your only sources.
+
+If no user description, linked issue/design doc, PR body, or commit message
+yields a coherent goal, state "no spec available" in Review coverage and
+review against the user's explicit contract. Do not invent a spec or silently
+promote an implementation detail into a goal.
 
 ## Step 5: Derive the Real Goal from the Code
 
@@ -349,6 +504,34 @@ This table also makes asymmetries obvious: if a PR has 8 stated goals
 and only 3 traceable design choices, the other 5 goals are either
 hand-waving or done implicitly via mechanisms the reader has to guess.
 
+## Step 6.0: Standards Check (cross-cutting)
+
+The Standards axis asks whether the diff follows the repository's documented
+rules, independently of whether it implements the stated goal. Run it for every
+non-trivial PR; for `quick` depth, keep it to the changed files.
+
+**Sources:** `.claude/rules/codestyle.md`, `comments.md`, `doc-consistency.md`,
+`project-layout.md`, `ascend.md`, `env-macro-gating.md`, `discipline.md`,
+`running-onboard.md`, `ci-change-detection.md`, plus any other rule relevant to
+the changed paths; `CLAUDE.md`, `docs/developer-guide.md`, and
+`docs/testing.md`.
+
+Rules:
+
+- Repository rules override generic smell heuristics (duplicated code, feature
+  envy, data clumps, primitive obsession, speculative generality, and similar).
+  Smells are judgement calls, not violations.
+- Skip anything tooling already enforces (clang-format, markdownlint, lint
+  hooks); a clean hook is not a review finding.
+- Hard-constraint violations (for example `ascend.md` MMIO/AICore limits, or an
+  unauthorized environment/macro gate) are **Must-fix**. Style, documentation,
+  and missing-test gaps are Should/Consider.
+- Report each violation with `file:line` and the rule it violates. If the diff
+  is clean, say so in Review coverage.
+
+The codestyle and doc-consistency items that used to live under Step 6 "Other"
+belong here; do not duplicate them there.
+
 ## Step 6: Type-Specific Analysis
 
 Classify the PR as one of the following and apply the matching checklist.
@@ -418,11 +601,8 @@ CI was green before this PR, which means the existing test suite does
 
 1. **Behavior preservation** (refactor): does any line change semantics?
    If yes, it is not a pure refactor — re-classify.
-2. **Doc/comment consistency** (any type, but especially docs): apply
-   `.claude/rules/doc-consistency.md` — are referenced identifiers,
-   flags, and paths still valid?
-3. **Codestyle** (any type): apply `.claude/rules/codestyle.md` and any
-   arch-specific rules (`.claude/rules/ascend.md`, etc.).
+2. **Standards**: apply Step 6.0 (codestyle, comments, doc consistency,
+   layout, and architecture rules). Do not repeat the checks here.
 
 ## Step 6.5: pto-isa Pin Check (repo-specific)
 
@@ -437,8 +617,8 @@ values (use latest HEAD): `""`, `head`, `latest`, `none` — see
 `simpler_setup/pto_isa.py` `_UNPINNED_COMMIT_VALUES`.
 
 ```bash
-# 1. Is the pin active? (read the PR's resulting HEAD)
-PIN_VALUE=$(git show "HEAD:pto_isa.pin" 2>/dev/null | tr -d '[:space:]')
+# 1. Is the pin active? (read the review head's pto_isa.pin)
+PIN_VALUE=$(git show "$HEAD_REF:pto_isa.pin" 2>/dev/null | tr -d '[:space:]')
 PIN_ACTIVE=0
 case "$(printf '%s' "$PIN_VALUE" | tr 'A-F' 'a-f')" in
   ""|head|latest|none) PIN_ACTIVE=0 ;;
@@ -451,7 +631,7 @@ echo "pto_isa.pin=$PIN_VALUE  active=$PIN_ACTIVE"
 #      CHANGED  = same basename, different path   (pto-isa header reorg)
 #      ADDED    = a pto-isa header newly referenced
 #      REMOVED  = a pto-isa header no longer referenced
-INC_REPORT=$(git diff "$MERGE_BASE"...HEAD -- '*.h' '*.hpp' '*.c' '*.cpp' '*.cc' '*.cxx' '*.cu' '*.cuh' | awk '
+INC_REPORT=$(git diff "$DIFF_SPEC" -- '*.h' '*.hpp' '*.c' '*.cpp' '*.cc' '*.cxx' '*.cu' '*.cuh' | awk '
   /^---/ { next }  /^\+\+\+/ { next }
   /^[+-][[:space:]]*#[[:space:]]*include[[:space:]]*[<"][^>"]*pto/ {
     sign = substr($0,1,1); line = substr($0,2)
@@ -470,7 +650,7 @@ INC_REPORT=$(git diff "$MERGE_BASE"...HEAD -- '*.h' '*.hpp' '*.c' '*.cpp' '*.cc'
   }')
 
 # (a) the pin file itself touched?
-git diff "$MERGE_BASE"...HEAD --name-only | grep -qx 'pto_isa.pin' \
+git diff "$DIFF_SPEC" --name-only | grep -qx 'pto_isa.pin' \
   && PIN_TOUCHED=1 || PIN_TOUCHED=0
 
 # (b) referenced pto-isa header PATH changed (the rename/reorg case)
@@ -500,35 +680,25 @@ Note: this detects *include-path* changes, **not** edits to files that merely ha
 ## Step 7: Optional Cross-Check with External CLI Reviewers
 
 **Opt-in only.** Skip this entire step unless the user's `/review-pr`
-arguments explicitly include `codex`, `gemini`, or `all`. The
+arguments explicitly include `codex`, `claude`, or `all`. The
 cross-check is slow (3–5 minutes per CLI), noisy, and unnecessary for
 small or routine PRs — your own analysis from Steps 5–6 is the review
 by default.
 
-Parse the request into flags. The slash-command harness exposes the
-caller's argument string as `$ARGUMENTS`; the line below copies it
-into `$REVIEW_ARGS` so the rest of the snippet is independent of the
-harness's variable name:
+The main agent's Steps 1–6 review still runs; Step 7 adds independent second
+opinions. Ignore the external token that names the current harness: `claude`
+under Claude Code, `codex` under Codex. `all` therefore runs only the
+non-current harness(es). The model knows its harness from the system context;
+no shell detection is needed. Record ignored tokens in Appendix C. Do not feed
+the main agent's analysis into an external reviewer's prompt.
 
-```bash
-REVIEW_ARGS="${ARGUMENTS:-}"
+The target and flags were parsed once in Input. Use the resulting
+`$WANT_CODEX` and `$WANT_CLAUDE`; do not re-parse `$ARGUMENTS` here.
 
-WANT_CODEX=0
-WANT_GEMINI=0
-case " $REVIEW_ARGS " in
-  *" all "*)              WANT_CODEX=1; WANT_GEMINI=1 ;;
-esac
-case " $REVIEW_ARGS " in *" codex "*)  WANT_CODEX=1  ;; esac
-case " $REVIEW_ARGS " in *" gemini "*) WANT_GEMINI=1 ;; esac
-
-# Only check availability for the ones the user asked for.
-[ "$WANT_CODEX"  = 1 ] && command -v codex  >/dev/null && HAS_CODEX=1
-[ "$WANT_GEMINI" = 1 ] && command -v gemini >/dev/null && HAS_GEMINI=1
-```
-
-If the user opted in but the requested binary isn't on PATH, note it
-in Appendix C (Independent Reviewer Notes) and proceed without it. If neither
-flag is set, skip the rest of Step 7 entirely.
+Each section checks its own binary. If the user opted in but the requested
+binary isn't on PATH, note it in Appendix C (Independent Reviewer Notes) and
+proceed without it. If no external reviewer remains after ignoring the current
+harness, skip the rest of Step 7 entirely.
 
 The CLIs run as **independent** second opinions — each runs in its
 own process and does not see your analysis. Run them in parallel
@@ -538,7 +708,7 @@ as if the user hadn't asked for it.
 
 ### Common setup: output capture
 
-Both CLIs take minutes on real PRs (codex 3–5 min, gemini comparable).
+Both CLIs take minutes on real PRs (codex 3–5 min, claude comparable).
 Write each one's output to a fixed scratch path under `.docs/review/`
 — that directory is already in the repo's `.gitignore` (`# Mid-work
 documentation`), so the files persist across the review session for
@@ -548,7 +718,7 @@ line buffering hides progress until the process exits.
 ```bash
 mkdir -p .docs/review
 CODEX_OUT=.docs/review/codex.out
-GEMINI_OUT=.docs/review/gemini.out
+CLAUDE_OUT=.docs/review/claude.out
 ```
 
 These paths overwrite on each run. If you want to keep prior output
@@ -556,23 +726,37 @@ for comparison, rename before re-running.
 
 No wall-clock timeout is applied. The caller (you, while running this
 skill) is expected to monitor progress with `wc -c "$CODEX_OUT"` /
-`tail "$CODEX_OUT"` and `kill` the process if it hangs (e.g. gemini's
+`tail "$CODEX_OUT"` and `kill` the process if it hangs (e.g. a CLI's
 backoff loop on a 503 from the model proxy). Hardcoded timeouts in
 the past killed legitimate runs that simply needed more time.
 
 ### Codex
+
+Run this section only when this session is not Codex and `$WANT_CODEX=1`.
+If this session is Codex, skip it and record "codex ignored: current session
+is Codex" in Appendix C.
 
 `codex review` takes either `--base <branch>` (auto-diff mode) **or** a
 custom `[PROMPT]` — never both; the CLI rejects the combination at
 parse time. Use auto-diff mode for PR review:
 
 ```bash
-if [ -n "$HAS_CODEX" ]; then
-  codex review \
-    --base "upstream/$BASE_BRANCH" \
-    --title "PR #${PR_NUMBER:-current}: $(printf '%s' "${PR_DATA:-}" | jq -e -r .title 2>/dev/null || git log -1 --format=%s "$MERGE_BASE"..HEAD)" \
-    >"$CODEX_OUT" 2>&1 \
-    || echo "[codex skipped: exit $?]" >>"$CODEX_OUT"
+if [ "$WANT_CODEX" = 1 ]; then
+  if command -v codex >/dev/null 2>&1; then
+    if [ -n "$FIXED_RANGE" ]; then
+      codex exec "You are an independent PR reviewer. The working directory is the checkout. Run \`git diff $DIFF_SPEC\` (and inspect surrounding files as needed). Report correctness bugs, scope mismatches, and missing tests only; do not modify files." \
+        >"$CODEX_OUT" 2>&1 \
+        || echo "[codex skipped: exit $?]" >>"$CODEX_OUT"
+    else
+      codex review \
+        --base "upstream/$BASE_BRANCH" \
+        --title "PR #${PR_NUMBER:-current}: $(printf '%s' "${PR_DATA:-}" | jq -e -r .title 2>/dev/null || git log -1 --format=%s "$LOG_RANGE")" \
+        >"$CODEX_OUT" 2>&1 \
+        || echo "[codex skipped: exit $?]" >>"$CODEX_OUT"
+    fi
+  else
+    echo "[codex skipped: not on PATH]" >>"$CODEX_OUT"
+  fi
 fi
 ```
 
@@ -580,26 +764,30 @@ If you need to pass a custom prompt instead of `--base` auto-mode, use
 `codex exec "<prompt>"` — `codex exec` accepts a free-form prompt and
 runs non-interactively.
 
-### Gemini
+### Claude
 
-`gemini` is an agent CLI with shell and file access — same model as
-`codex review --base`. Do **not** inline `$(git diff …)` into the
-prompt; that hits `ARG_MAX` on large PRs and is the wrong primitive
-anyway. Pass the merge-base SHA and let gemini run `git diff` itself
-in the current worktree:
+Run this section only when this session is not Claude Code and `$WANT_CLAUDE=1`.
+If this session is Claude Code, skip it and record "claude ignored: current
+session is Claude Code" in Appendix C.
+
+`claude` is an agent CLI with shell and file access. Do **not** inline
+`$(git diff …)` into the prompt; that hits `ARG_MAX` on large PRs and is
+the wrong primitive anyway. Pass `$DIFF_SPEC` and let claude run
+`git diff` itself in the current worktree:
 
 ```bash
-if [ -n "$HAS_GEMINI" ]; then
-  gemini --yolo -p "$(cat <<EOF
+if [ "$WANT_CLAUDE" = 1 ]; then
+  if command -v claude >/dev/null 2>&1; then
+    claude -p "$(cat <<EOF
 You are an independent PR reviewer. The working directory is a git
-worktree of the PR branch. Run \`git diff $MERGE_BASE...HEAD\` (and
-inspect surrounding files as needed) to read the changes.
+worktree. Run \`git diff $DIFF_SPEC\` (and inspect surrounding files as
+needed) to read the changes. Do not modify any files.
 
 Stated goal of the PR (from its body, may be empty for current-branch
 review):
-$(printf '%s' "${PR_DATA:-}" | jq -e -r .body 2>/dev/null || git log --format='%s%n%n%b%n---' "$MERGE_BASE"..HEAD)
+$(printf '%s' "${PR_DATA:-}" | jq -e -r .body 2>/dev/null || git log --format='%s%n%n%b%n---' "$LOG_RANGE")
 
-Stated title: $(printf '%s' "${PR_DATA:-}" | jq -e -r .title 2>/dev/null || git log -1 --format=%s "$MERGE_BASE"..HEAD)
+Stated title: $(printf '%s' "${PR_DATA:-}" | jq -e -r .title 2>/dev/null || git log -1 --format=%s "$LOG_RANGE")
 
 Report — terse bullets only:
 - correctness bugs you can verify by reading the diff and the files
@@ -607,17 +795,24 @@ Report — terse bullets only:
 - missing tests for any bugfix in the diff
 Skip style nits and skip anything you cannot verify against the code.
 EOF
-)" >"$GEMINI_OUT" 2>&1 \
-    || echo "[gemini skipped: exit $?]" >>"$GEMINI_OUT"
+)" >"$CLAUDE_OUT" 2>&1 \
+      || echo "[claude skipped: exit $?]" >>"$CLAUDE_OUT"
+  else
+    echo "[claude skipped: not on PATH]" >>"$CLAUDE_OUT"
+  fi
 fi
 ```
 
-`--yolo` auto-approves gemini's shell/file reads so it can run `git
-diff` without prompting; the worktree is read-only from gemini's
-perspective for this use case (it has no instruction to modify
-anything). Drop `--yolo` if you want to inspect each tool call.
+`claude -p` runs non-interactively. Do not add permission-bypass flags;
+the prompt restricts the reviewer to reading. The worktree is read-only
+from the reviewer's perspective because it has no instruction to modify
+anything.
 
-Read the captured output with `cat "$CODEX_OUT"` and `cat "$GEMINI_OUT"`
+This is a separate process with its own context, not the current session.
+Keep the prompt limited to the diff/range and the stated goal; do not pass
+the main agent's findings.
+
+Read the captured output with `cat "$CODEX_OUT"` and `cat "$CLAUDE_OUT"`
 — do **not** pipe these through `tail` while the process is still
 running; you will block on buffer flush and see no progress.
 
@@ -626,12 +821,17 @@ running; you will block on buffer flush and see no progress.
 - **Treat each CLI's output as one independent reviewer's notes**, not
   ground truth. Verify each claim against the actual code before
   including it.
-- **Agreement across reviewers** (your read + codex + gemini) raises
-  confidence — surface those findings prominently.
+- **Agreement across reviewers** (your read plus any external reviewer that
+  actually ran) raises confidence — surface those findings prominently.
 - **Disagreement** is worth investigating: if codex says a line is
   buggy and you don't see it, re-read that line before dismissing.
 - **Reviewer hallucinations** (claims about code that isn't in the
   diff) get dropped silently — do not pass them to the user.
+- **Same-model caveat:** the harness-matching token is ignored, but a
+  different harness can still use the same model family (for example, an
+  opencode session backed by Claude with the `claude` token). Treat
+  same-family agreement as weaker evidence than a genuinely different model;
+  verify every claim against the diff and state the limitation in Appendix C.
 - If a CLI is unavailable or errors out, note it once in the final
   review and continue.
 
@@ -644,7 +844,7 @@ check:
 
 1. **Locate the claimed code in the PR diff.** If the reviewer cites a
    function, file, or line number, open it and confirm the cited lines
-   are in `git diff "$MERGE_BASE"...HEAD -- <path>`. If they're not in
+   are in `git diff "$DIFF_SPEC" -- <path>`. If they're not in
    the diff, drop the finding — the reviewer is reading current file
    state, not your PR's contribution.
 
@@ -656,7 +856,7 @@ check:
    git log -S "distinctive substring" --oneline -- "path/to/file"
    ```
 
-   If the introducing commit is outside `"$MERGE_BASE"..HEAD`, the
+   If the introducing commit is outside `"$LOG_RANGE"`, the
    "bugfix" was merged earlier — the reviewer is hallucinating PR
    authorship. Drop it.
 
@@ -675,6 +875,44 @@ Step 8's Appendix C (Independent Reviewer Notes) then records, per
 reviewer, both the findings you surfaced and the ones you dropped (one
 line each) so the human can audit your filtering.
 
+## Step 7.5: Optional Internal Sub-agent Cross-check
+
+**Opt-in only.** Run this step only when the arguments include `subagents` or
+`parallel` (Input parsed `$WANT_SUBAGENTS`). Without it, stay single-agent and
+record "subagents not requested" in Review limits.
+
+This is the host's native subagent path, separate from the external `claude`
+CLI process in Step 7. A `claude` token does not enable this step, and a
+`subagents` token does not launch the external CLI.
+
+If the host cannot spawn read-only sub-agents, note "subagents unavailable" in
+Appendix C and continue with your own review.
+
+When enabled, spawn two independent, read-only reviewers in parallel:
+
+- **Standards reviewer** — read `.claude/rules/*.md`, `CLAUDE.md`, and the
+  developer/testing guides; inspect the changed files and report rule
+  violations with `file:line`. Treat tool-enforced checks as already handled.
+- **Spec reviewer** — read the stated goal, linked issue/design doc, and PR
+  body; inspect the diff and report missing, partial, scope-creep, or
+  incorrectly implemented goal items with `file:line`.
+
+Bounded brief for each:
+
+- Read-only: do not edit, checkout, build, test, run hardware, post to GitHub,
+  or invoke external CLIs.
+- Inspect only `$DIFF_SPEC` and the files named in the user's scope; read
+  surrounding callers when needed to verify a claim.
+- Return findings with severity (Must/Should/Consider), `file:line`, a concrete
+  failure example for each Must, and the evidence state (code inspection,
+  diff-only, or not run). State "no findings" explicitly.
+- Cap the report at 10 findings; rank correctness and contract issues first.
+
+Merge with the Step 7 "Synthesis rules" and "Verification before surfacing":
+verify every claim against the diff, drop hallucinations, and record surfaced
+and dropped findings in Appendix C. Count findings per axis in Review coverage;
+merge them into §4 by severity without letting one axis mask the other.
+
 ## Step 8: Write the Review
 
 Order the review by **reader logic** — background/problem → solution →
@@ -682,9 +920,9 @@ coverage → residual → verdict — not by the order the analysis steps
 ran. Sections 0–5 are a fixed frame: fill each one, in order, and put
 each piece of analysis output in the section named below — the frame
 exists precisely so the review cannot drift into free-form commentary.
-The mechanical outputs (change breakdown, pin check, external-reviewer
+The mechanical outputs (change breakdown, pin check, independent-reviewer
 notes) go in the appendices so they support the narrative without
-interrupting it. Everything Steps 3.5–7 produced still lands somewhere
+interrupting it. Everything Steps 3.5–7.5 produced still lands somewhere
 below — nothing is dropped, only reordered.
 
 **Trivial-PR exception**: a trivial PR (single-file, < ~50 changed
@@ -698,6 +936,16 @@ regardless of size.
 One or two lines: *this PR solves problem P by method M; remaining
 R; verdict: approve / request changes / needs discussion.* After
 this line the reader knows whether they need to read further.
+
+**Review coverage** — three short lines, not a second report:
+
+- **Spec:** which sources were checked (user contract, issue/design doc, PR
+  body, commits) and which goal items remain uncovered. If no spec exists, say
+  "no spec available".
+- **Standards:** which `.claude/rules/` areas were checked and whether any
+  violation was found; say "clean" when none.
+- **Evidence limits:** what was not inspected, not run (tests/build/hardware),
+  or skipped (external CLIs/sub-agents), plus the reviewed base/head SHAs.
 
 ### 1. Background and Problem Statement
 
@@ -794,7 +1042,10 @@ Then the severity-ranked issue list:
   unresolved goal-vs-code mismatches, ❌ / ➕ traceability rows.
   **Every Must-fix carries a failure example** — concrete input/state
   → wrong result. "There is a race here" without a named interleaving
-  is not a Must-fix.
+  is not a Must-fix. Every Must/Should finding also carries `file:line`
+  and an evidence state: code inspection, diff-only, or not run. A
+  hypothesis without evidence is a Consider item or explicitly "needs
+  verification", never a confirmed defect.
 - **Should fix**: style violations per `.claude/rules/`, missing
   tests for bugfixes, doc/comment drift, ⚠️ traceability rows with
   user-visible impact, string-matching error translations across
@@ -826,6 +1077,14 @@ verdict's justification. The oversized-PR warnings from Appendix A
 feed in here: Core churn > 1000 lines biases the verdict toward
 "request changes / needs discussion" unless the author justifies the
 size.
+
+### Review limits
+
+State what this review did not cover: files or directories outside the
+requested scope, tests/builds/hardware not run, external CLIs or sub-agents
+skipped, a missing or partial spec, and whether the reviewed head changed
+during the review. The default is review-only; name which opt-in extras were
+requested and which were not. Do not present a limit as a pass.
 
 ### Appendix A: Change Breakdown
 
@@ -870,7 +1129,8 @@ When the pin is not active, emit the one-line skip note and move on.
 
 ### Appendix C: Independent Reviewer Notes
 
-A short subsection per external reviewer (codex, gemini) listing:
+A short subsection per independent reviewer (codex, claude, or an internal
+Standards/Spec sub-agent) listing:
 
 - which of their findings you verified and surfaced above
 - which you dropped, with a one-line reason each (using the
@@ -880,21 +1140,27 @@ The dropped-list is part of the review's audit trail — do not omit it
 when there were dropped findings. A reader needs to see what filtering
 you did.
 
+Record any external token ignored because it names the current harness:
+`claude` under Claude Code, `codex` under Codex. `all` therefore runs only the
+non-current harness(es). When an external reviewer does run, note whether it
+shares the main reviewer's model family; if so, agreement is weaker
+independent evidence.
+
 ## Common Pitfalls
 
 1. **Stale local main** — Always `git fetch upstream` before computing
    merge-base. Never use local `main` directly.
 2. **Squash-merged upstream commits** — If upstream squash-merges, the
    merge-base may include commits that look like they are on the PR
-   branch. Verify with `git log --oneline MERGE_BASE..HEAD`.
+   branch. Verify with `git log --oneline "$LOG_RANGE"`.
 3. **Cross-fork PRs** — The PR head may be on a different remote. Use
    `/checkout-pr` first if not already on the PR branch.
 4. **Large PRs** — Read diffs in chunks by directory. Do not try to
    read the entire diff in one tool call if it exceeds ~2000 lines.
-   For `codex` and `gemini` in Step 7, pass only the merge-base SHA
-   and let each CLI run `git diff` itself in the worktree — never
-   inline `$(git diff …)` into the prompt argv (hits `ARG_MAX`, ~128
-   KiB on Linux).
+   For `codex` and `claude` in Step 7, pass only `$DIFF_SPEC` (and the
+   base branch for codex's `--base` mode) and let each CLI run
+   `git diff` itself in the worktree — never inline `$(git diff …)` into
+   the prompt argv (hits `ARG_MAX`, ~128 KiB on Linux).
 5. **Silent goal rewriting** — Never paper over a stated-vs-real goal
    mismatch by rephrasing the stated goal. The mismatch is the finding.
    Equally: never silently *accept* the PR body's framing of the goal
@@ -904,12 +1170,12 @@ you did.
    own goal description, and a review that adopts the downgraded version
    approves a PR that doesn't do what was intended. When in doubt, ask
    the user "is X the goal, or is Y?" before judging.
-6. **Trusting external reviewers** — `codex` and `gemini` hallucinate.
+6. **Trusting external reviewers** — `codex` and `claude` hallucinate.
    Verify every claim against the diff before surfacing it.
 7. **Misconfigured CLI ≠ unavailable** — a CLI binary can be on PATH
    but fail every call (no model route, expired token, upstream 5xx
    retry loop). The `command -v` gate alone won't catch this. Monitor
-   `wc -c "$CODEX_OUT"` / `wc -c "$GEMINI_OUT"` while the call runs;
+   `wc -c "$CODEX_OUT"` / `wc -c "$CLAUDE_OUT"` while the call runs;
    if a process produces nothing for several minutes, `kill` it and
    treat the empty file as "skip with note" — same as a missing
    binary. Avoid hardcoded timeouts: codex review legitimately takes
@@ -918,3 +1184,15 @@ you did.
    only flushes at EOF. A stuck process with active stderr looks like
    silence and breaks the empty-output heuristic. Always capture to
    a file with `>"$CAPTURE" 2>&1` and read post-hoc.
+9. **Substituting a different diff for a fixed range** — When the user
+   supplies `A...B`, use it verbatim. Do not recompute a merge-base, and do
+   not use a remote PR diff in its place. If the range is invalid or empty,
+   stop and report; do not silently fall back.
+10. **Treating a sub-agent's report as verified** — Internal reviewers
+    hallucinate like external CLIs. Run every finding through the Step 7
+    verification checks before surfacing it; record dropped findings in
+    Appendix C.
+11. **Letting one axis mask the other** — Report Standards and Spec coverage
+    separately in Review coverage. A clean Standards pass does not excuse a
+    missing spec item, and a correct spec implementation does not excuse a
+    hard-rule violation.
