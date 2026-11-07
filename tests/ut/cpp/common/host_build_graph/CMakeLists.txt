@@ -135,8 +135,7 @@ hbg_case(test_hbg_bind_ledger.cpp
 
 if(TARGET test_a5_hbg_bind_ledger)
     target_sources(test_a5_hbg_bind_ledger PRIVATE
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_binding_plan.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/submission_bundle_plan.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_backend_plan.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
 endif()

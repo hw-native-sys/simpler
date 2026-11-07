@@ -16,7 +16,6 @@
 #include "device_runner.h"
 #undef private
 #include "async_plan.h"
-#include "backend/async_resource_binding.h"
 #include "host_build_graph/async_retirement.h"
 #include "common/device_run_result.h"
 #include "scheduler/scheduler_types.h"
@@ -65,9 +64,9 @@ enum class Image {
     TRUNCATED,
     LEGACY,
     CORE_ONLY,
-    NO_RESOURCES,
-    BAD_RESOURCE_VERSION,
-    BAD_RESOURCE_EPOCH,
+    NO_DECLARATIONS,
+    BAD_CORE_VERSION,
+    OLD_CORE_EPOCH,
     BAD_CONTRACT
 };
 
@@ -124,23 +123,10 @@ public:
                               CoreAsyncCapability{1, CoreAsyncMode::DEFERRED, 1, CORE_ASYNC_CONDITION_COUNTER};
         SchedulerAsyncHostPlan plan;
         SchedulerAsyncAuxiliaryBytes auxiliary{};
-        if (image_ != Image::SYNC && image_ != Image::NO_RESOURCES) {
-            auxiliary.resources = sizeof(AsyncResourceHeader);
-        }
+        if (image_ == Image::CORE_ONLY || image_ == Image::BAD_CORE_VERSION || image_ == Image::OLD_CORE_EPOCH)
+            auxiliary.execution_contract = HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY;
         if (!scheduler_plan_async_state({task}, {capabilities}, identity.run_epoch, 1 << 20, auxiliary, &plan, nullptr))
             return PTO_RUNTIME_ERR_INTERNAL;
-        if (auxiliary.resources != 0) {
-            AsyncResourceHeader resource{};
-            resource.run_epoch = identity.run_epoch;
-            resource.execution_contract = image_ == Image::CORE_ONLY || image_ == Image::BAD_RESOURCE_VERSION ||
-                                                  image_ == Image::BAD_RESOURCE_EPOCH ?
-                                              ASYNC_EXECUTION_CORE_PIPELINES_ONLY :
-                                              ASYNC_EXECUTION_UNQUALIFIED;
-            if (image_ == Image::BAD_RESOURCE_VERSION) --resource.version;
-            if (image_ == Image::BAD_RESOURCE_EPOCH) --resource.run_epoch;
-            if (image_ == Image::BAD_CONTRACT) resource.execution_contract = 2;
-            std::memcpy(plan.image.data() + plan.layout.resources_offset, &resource, sizeof(resource));
-        }
         const uint64_t summary_offset = sizeof(SchedulerRunControl);
         const uint64_t async_offset = summary_offset + sizeof(SchedulerGraphSummary);
         const uint64_t bytes = async_offset + plan.image.size();
@@ -157,9 +143,10 @@ public:
         if (!plan.image.empty()) {
             std::memcpy(static_cast<std::byte *>(host) + async_offset, plan.image.data(), plan.image.size());
             auto *layout = reinterpret_cast<SchedulerAsyncLayout *>(static_cast<std::byte *>(host) + async_offset);
-            if (image_ == Image::BAD_VERSION) ++layout->version;
-            if (image_ == Image::OLD_EPOCH) --layout->run_epoch;
+            if (image_ == Image::BAD_VERSION || image_ == Image::BAD_CORE_VERSION) ++layout->version;
+            if (image_ == Image::OLD_EPOCH || image_ == Image::OLD_CORE_EPOCH) --layout->run_epoch;
             if (image_ == Image::TRUNCATED) layout->total_bytes = UINT64_MAX;
+            if (image_ == Image::BAD_CONTRACT) layout->execution_contract = 2;
         }
         submission_storage_[slot]->retain_replay_evidence = true;
         const int rc = ensure_device_run_result_region(slot, identity.run_epoch, prepared->kernel_args);
@@ -360,7 +347,7 @@ TEST_F(NativeAdmissionTest, CoreOnlyFailureRequiresAnExactSameEpochRetirementPay
 
 TEST_F(NativeAdmissionTest, RetirementPayloadAloneCannotQualifyAnUnqualifiedOrDamagedContract) {
     for (Image image :
-         {Image::DEFERRED, Image::NO_RESOURCES, Image::BAD_RESOURCE_VERSION, Image::BAD_RESOURCE_EPOCH,
+         {Image::DEFERRED, Image::NO_DECLARATIONS, Image::BAD_CORE_VERSION, Image::OLD_CORE_EPOCH,
           Image::BAD_CONTRACT}) {
         EXPECT_EXIT(
             {

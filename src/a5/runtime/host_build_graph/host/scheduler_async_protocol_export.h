@@ -16,8 +16,8 @@
 #include <string>
 #include <vector>
 
-#include "backend/async_resource_binding.h"
 #include "scheduler/scheduler_async_layout.h"
+#include "scheduler/scheduler_async_check.h"
 
 // This is retained Host provenance, not a device image or public kernel argument.
 struct SchedulerProtocolAsyncPlan {
@@ -101,10 +101,8 @@ public:
         region(layout.check_directory_offset, layout.check_directory_words, sizeof(SchedulerAsyncDirectoryWord), end);
         region(layout.finish_directory_offset, layout.finish_directory_words, sizeof(SchedulerAsyncDirectoryWord), end);
         region(layout.entries_offset, layout.entries_bytes, 1, end);
-        region(layout.condition_bindings_offset, layout.condition_bindings_bytes, 1, end);
-        region(layout.resources_offset, layout.resources_bytes, 1, end);
-        region(layout.uses_offset, layout.uses_bytes, 1, end);
-        region(layout.scratch_offset, layout.scratch_bytes, 1, end);
+        region(layout.backend_offset, layout.backend_bytes, 1, end);
+        require(layout.execution_contract <= HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY, "invalid execution contract");
         require(layout.sdma_guard_count <= ASYNC_SDMA_CHANNELS, "invalid SDMA guard count");
         if (layout.sdma_guard_count != 0)
             region(layout.sdma_guard_context_offset, layout.sdma_guard_count + 1, 128, end);
@@ -120,7 +118,7 @@ public:
     template <typename Tasks>
     void validate_tasks(const Tasks &tasks) const {
         uint64_t groups = 0, finishes = 0, capacity = 0;
-        uint64_t entries = layout.entries_offset, bindings = layout.condition_bindings_offset;
+        uint64_t entries = layout.entries_offset;
         for (uint64_t task = 0; task < layout.task_count; ++task) {
             const auto &map = at<SchedulerAsyncTaskMap>(layout.task_map_offset, task);
             if (map.finish_index == SCHEDULER_ASYNC_INDEX_NONE) {
@@ -171,32 +169,16 @@ public:
                         "group identity disagrees with its task map"
                     );
                     require(
-                        identity.entries_offset == entries && identity.condition_bindings_offset == bindings &&
+                        identity.entries_offset == entries &&
                             within(
                                 entries, identity.capacity, sizeof(DeferredCompletionEntry), layout.entries_offset,
                                 layout.entries_bytes
-                            ) &&
-                            within(
-                                bindings, identity.capacity, sizeof(SchedulerAsyncConditionBinding),
-                                layout.condition_bindings_offset, layout.condition_bindings_bytes
                             ),
                         "group conditions leave their planned sections or overlap another group"
                     );
                     entries += aligned_bytes(identity.capacity, sizeof(DeferredCompletionEntry));
-                    bindings += aligned_bytes(identity.capacity, sizeof(SchedulerAsyncConditionBinding));
                     require(capacity <= UINT64_MAX - identity.capacity, "condition capacity overflows");
                     capacity += identity.capacity;
-                    require(
-                        identity.binding_use_count == 0 ?
-                            (identity.binding_uses_offset == 0 ||
-                             identity.binding_uses_offset == SCHEDULER_ASYNC_USES_DYNAMIC) :
-                            identity.binding_uses_offset % alignof(AsyncConditionContract) == 0 &&
-                                within(
-                                    identity.binding_uses_offset, identity.binding_use_count,
-                                    sizeof(AsyncConditionContract), layout.uses_offset, layout.uses_bytes
-                                ),
-                        "group allowed-use table leaves its planned section"
-                    );
                 }
             }
             groups += map.group_count;
@@ -204,8 +186,7 @@ public:
         }
         require(
             groups == layout.group_count && finishes == layout.finish_count && capacity == layout.condition_capacity &&
-                entries - layout.entries_offset == layout.entries_bytes &&
-                bindings - layout.condition_bindings_offset == layout.condition_bindings_bytes,
+                entries - layout.entries_offset == layout.entries_bytes,
             "task maps do not cover the immutable async allocation"
         );
     }
@@ -238,12 +219,12 @@ private:
 
 inline const char *
 group_state(const SchedulerAsyncGroupWriter &writer, const SchedulerAsyncGroupProgress &progress, uint64_t lease_word) {
-    require(writer.sealed <= 1 && writer.reserved_count == 0, "invalid group seal flags");
+    require(writer.reservation.sealed <= 1 && writer.reservation.reserved == 0, "invalid group seal flags");
     require(progress.phase <= static_cast<uint64_t>(SchedulerAsyncCheckPhase::FAILED), "invalid CHECK progress phase");
     if (writer.error_code != 0 || progress.phase == static_cast<uint64_t>(SchedulerAsyncCheckPhase::FAILED) ||
         scheduler_async_lease_phase(lease_word) == SchedulerAsyncPhase::FAILED)
         return "FAILED";
-    if (writer.sealed == 0) return "UNSEALED";
+    if (writer.reservation.sealed == 0) return "UNSEALED";
     if (writer.count == 0 && lease_word == scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT)) return "EMPTY";
     if (writer.count != 0 && progress.phase == static_cast<uint64_t>(SchedulerAsyncCheckPhase::DRAINED) &&
         scheduler_async_lease_phase(lease_word) == SchedulerAsyncPhase::TERMINAL)
@@ -253,12 +234,13 @@ group_state(const SchedulerAsyncGroupWriter &writer, const SchedulerAsyncGroupPr
 
 inline const char *finish_state(const SchedulerAsyncFinishProgress &progress, uint64_t lease_word) {
     require(
-        progress.phase <= static_cast<uint64_t>(SchedulerAsyncFinishPhase::FAILED), "invalid FINISH progress phase"
+        progress.completion.phase <= static_cast<uint64_t>(SchedulerCompletionPhase::FAILED),
+        "invalid FINISH progress phase"
     );
-    if (progress.phase == static_cast<uint64_t>(SchedulerAsyncFinishPhase::FAILED) ||
+    if (progress.completion.phase == static_cast<uint64_t>(SchedulerCompletionPhase::FAILED) ||
         scheduler_async_lease_phase(lease_word) == SchedulerAsyncPhase::FAILED)
         return "FAILED";
-    return progress.phase == static_cast<uint64_t>(SchedulerAsyncFinishPhase::CONTRIBUTED) ? "DRAINED" : "PENDING";
+    return progress.contributed ? "DRAINED" : "PENDING";
 }
 
 template <typename Metadata>
@@ -325,14 +307,11 @@ inline void groups(
         for (uint32_t condition = 0; condition < writer.count; ++condition) {
             if (condition != 0) out << ',';
             const auto &entry = view.template at<DeferredCompletionEntry>(identity.entries_offset, condition);
-            const auto &binding =
-                view.template at<SchedulerAsyncConditionBinding>(identity.condition_bindings_offset, condition);
             Object item(out);
             item.number("index", condition);
             item.number("type", entry.completion_type);
-            item.number("binding_index", binding.binding_index);
-            if (binding.owner_generation == 0) item.field("owner_generation") << "null";
-            else item.number("owner_generation", binding.owner_generation);
+            item.field("binding_index") << "null";
+            item.field("owner_generation") << "null";
         }
         out << ']';
         row.string("state", group_state(writer, progress, lease));
@@ -384,8 +363,9 @@ inline void finishes(Object &root, const View<Image> &view) {
             view.template at<SchedulerAsyncFinishProgress>(view.layout.finish_progress_offset, index);
         const uint64_t lease = view.template at<SchedulerAsyncLease>(view.layout.finish_lease_offset, index).word;
         require(
-            progress.pending_count <= 8, "finishes[" + std::to_string(index) +
-                                             "].pending_count out of range: " + std::to_string(progress.pending_count)
+            progress.completion.pending_count <= 8,
+            "finishes[" + std::to_string(index) +
+                "].pending_count out of range: " + std::to_string(progress.completion.pending_count)
         );
         Object row(out);
         row.number("index", index);
@@ -400,8 +380,8 @@ inline void finishes(Object &root, const View<Image> &view) {
         }
         out << ']';
         point(row, "drained", progress.drained_at, identity.run_epoch, progress.drained_worker_index);
-        row.number("waiter_count", progress.visited_count);
-        row.number("pending_count", progress.pending_count);
+        row.number("waiter_count", progress.completion.visited_count);
+        row.number("pending_count", progress.completion.pending_count);
         row.number("slice_count", progress.slice_count);
         row.number("active_cycles", progress.active_slice_cycles);
         row.number("failure_code", progress.failure_code);

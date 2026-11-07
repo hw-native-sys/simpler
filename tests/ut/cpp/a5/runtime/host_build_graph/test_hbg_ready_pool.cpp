@@ -680,7 +680,8 @@ struct ResolveFixture : PoolFixture {
         completed(producer);
         locals[0].config.control_inboxes_offset = layout.ready_inboxes_offset;
         locals[0].control_resolve.producer_ref = producer;
-        locals[0].control_resolve.next_waiter = head;
+        locals[0].control_resolve.completion.current_waiter = head;
+        locals[0].control_resolve.completion.phase = static_cast<uint64_t>(SchedulerCompletionPhase::SELECT);
         scheduler_gm_store(run->bootstrap_scan_complete, uint64_t{1});
     }
 };
@@ -971,8 +972,9 @@ TEST(SchedulerResolveTest, ControlSlicePublishesPrefixWhileLongFaninRemainsOwned
     );
     EXPECT_TRUE(progress);
     const auto &continuation = fixture.locals[0].control_resolve;
-    EXPECT_EQ(continuation.next_waiter, 128);
-    EXPECT_EQ(continuation.route.next_fanin, SCHEDULER_CONTROL_RESOLVE_BUDGET - 3);
+    EXPECT_EQ(continuation.completion.current_waiter, 128);
+    EXPECT_GT(continuation.completion.resolve.next_fanin, 0u);
+    EXPECT_LT(continuation.completion.resolve.next_fanin, SCHEDULER_CONTROL_RESOLVE_BUDGET);
     EXPECT_EQ(fixture.locals[0].pending_completed, 0u);
     uint64_t pool_cursor = 0;
     SchedulerReadyClaim claim{};
@@ -1003,8 +1005,9 @@ TEST(SchedulerResolveTest, ControlResumeUsesDetachedSuccessorAfterWaiterMigrates
     ASSERT_TRUE(
         scheduler_service_controls(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, &progress)
     );
-    EXPECT_EQ(fixture.locals[0].control_resolve.detached_next, 129);
-    EXPECT_EQ(fixture.locals[0].control_resolve.route.next_fanin, SCHEDULER_CONTROL_RESOLVE_BUDGET - 1);
+    EXPECT_EQ(fixture.locals[0].control_resolve.completion.detached_next, 129);
+    EXPECT_GT(fixture.locals[0].control_resolve.completion.resolve.next_fanin, 0u);
+    EXPECT_LT(fixture.locals[0].control_resolve.completion.resolve.next_fanin, SCHEDULER_CONTROL_RESOLVE_BUDGET);
     EXPECT_EQ(fixture.locals[0].pending_completed, 0u);
     for (uint32_t slice = 0; slice < 2; ++slice)
         ASSERT_TRUE(

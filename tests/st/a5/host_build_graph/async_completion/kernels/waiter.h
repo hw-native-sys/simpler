@@ -32,6 +32,7 @@ inline __aicore__ void wait_task(__gm__ int64_t *args, int64_t lane) {
     }
     // Test-owned acknowledgement: this is registration progress, not TaskDone.
     add(cell(control, Control::ARRIVED, args[8]), 1);
+    publish_signal(condition(signals, execution, kConditionLimit), static_cast<int32_t>(args[10]));
     if (get_block_idx(args) + 1 == get_block_num(args)) delay(args[9]);
     stamp(record, Observation::BODY_DONE);
 }

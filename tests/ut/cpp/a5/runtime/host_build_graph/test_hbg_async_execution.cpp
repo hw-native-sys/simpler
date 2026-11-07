@@ -28,39 +28,21 @@ namespace {
 constexpr uint64_t kEpoch = 47;
 
 struct ExecutionBackend {
-    bool allow_binding{true};
+    bool allow_registration{true};
     bool ready{false};
     uint32_t observations{0};
-    bool bind_condition(
-        const SchedulerAsyncGroupIdentity &identity, uint32_t index, const DeferredCompletionEntry &entry,
-        SchedulerAsyncConditionBinding *binding
+    bool validate_registration(
+        const SchedulerAsyncGroupIdentity &identity, uint32_t index, const DeferredCompletionEntry &entry
     ) {
-        if (!allow_binding || identity.run_epoch != kEpoch || index != 0 || entry.addr != 0x8000 ||
+        if (!allow_registration || identity.run_epoch != kEpoch || index != 0 || entry.addr != 0x8000 ||
             entry.backend_cookie != 0)
             return false;
-        *binding = {0, 0};
         return true;
     }
-    bool validate(
-        const SchedulerAsyncGroupIdentity &identity, uint32_t index, const DeferredCompletionEntry &entry,
-        const SchedulerAsyncConditionBinding &binding
-    ) {
-        SchedulerAsyncConditionBinding expected{};
-        return bind_condition(identity, index, entry, &expected) && binding.binding_index == 0 &&
-               binding.owner_generation == 0;
-    }
-    SchedulerAsyncConditionOutcome observe_once(
-        const SchedulerAsyncGroupIdentity &, uint32_t, const DeferredCompletionEntry &,
-        const SchedulerAsyncConditionBinding &
-    ) {
+    SchedulerAsyncConditionOutcome
+    observe_once(const SchedulerAsyncGroupIdentity &, uint32_t, const DeferredCompletionEntry &) {
         ++observations;
         return {ready ? SchedulerAsyncConditionState::READY : SchedulerAsyncConditionState::PENDING, 0};
-    }
-    SchedulerAsyncConditionOutcome acquire_completed(
-        const SchedulerAsyncGroupIdentity &, uint32_t, const DeferredCompletionEntry &,
-        const SchedulerAsyncConditionBinding &, uint64_t &, uint64_t &
-    ) {
-        return {SchedulerAsyncConditionState::READY, 0};
     }
 };
 
@@ -390,7 +372,7 @@ TEST(HbgAsyncExecution, PredicateSkipSealsAnEmptyGroupBeforeRelease) {
         ),
         &writer_storage.get()
     );
-    EXPECT_EQ(writer.sealed, 1u);
+    EXPECT_EQ(writer.reservation.sealed, 1u);
     EXPECT_EQ(writer.count, 0u);
     EXPECT_EQ(fixture.backend.observations, 0u);
     ASSERT_TRUE(fixture.retire(0));
@@ -401,7 +383,7 @@ TEST(HbgAsyncExecution, PredicateSkipSealsAnEmptyGroupBeforeRelease) {
 TEST(HbgAsyncExecution, SealFailureDoesNotPublishExecutionReleaseOrSuccess) {
     ExecutionFixture fixture(1, LaneMask::aic());
     ASSERT_TRUE(fixture.fill(0));
-    fixture.backend.allow_binding = false;
+    fixture.backend.allow_registration = false;
     uint32_t slot = 0;
     EXPECT_FALSE(fixture.begin(0, &slot, true));
     EXPECT_NE(scheduler_read_error(fixture.run()), 0);

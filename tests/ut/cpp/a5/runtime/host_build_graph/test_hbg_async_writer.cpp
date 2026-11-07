@@ -24,8 +24,9 @@ struct Writer {
     uint32_t count{0};
     int32_t error{0};
     std::array<DeferredCompletionEntry, 64> entries{};
+    AsyncCompletionReservationState reservation{};
     AsyncCtx context(uint32_t capacity = 64) {
-        return {&count, &error, entries.data(), capacity, TaskId::make_global(3)};
+        return {&count, &error, entries.data(), capacity, TaskId::make_global(3), 0, &reservation};
     }
 };
 
@@ -35,7 +36,7 @@ CompletionToken token(uint64_t post = (UINT64_C(1) << 44) + 7) {
 
 TEST(HbgAsyncWriter, ExistingContextAndPayloadWireLayoutsArePreserved) {
     EXPECT_EQ(sizeof(AsyncCtxStorage), 40u);
-    EXPECT_EQ(sizeof(AsyncCtx), 48u);
+    EXPECT_EQ(sizeof(AsyncCtx), 56u);
     EXPECT_EQ(sizeof(LocalContext), 48u);
     EXPECT_EQ(sizeof(DispatchPayload), 512u);
     EXPECT_EQ(offsetof(DispatchPayload, args), 64u);
@@ -44,12 +45,13 @@ TEST(HbgAsyncWriter, ExistingContextAndPayloadWireLayoutsArePreserved) {
 TEST(HbgAsyncWriter, ReserveBeforeSubmitBoundsEveryPossibleCompletionRecord) {
     Writer writer;
     auto ctx = writer.context(4);
-    AsyncCompletionAllowance grant;
+    AsyncCompletionReservation grant;
     ASSERT_TRUE(async_completion_reserve(ctx, 4, &grant));
     EXPECT_EQ(writer.count, 0u);
     ASSERT_TRUE(async_completion_accept_count(ctx, grant, 2));
-    ASSERT_TRUE(async_completion_append(ctx, token()));
-    ASSERT_TRUE(async_completion_append(ctx, token(9)));
+    ASSERT_TRUE(async_completion_commit(ctx, grant, token()));
+    ASSERT_TRUE(async_completion_commit(ctx, grant, token(9)));
+    ASSERT_TRUE(async_completion_finish(ctx, grant, 2));
     EXPECT_EQ(writer.count, 2u);
     EXPECT_EQ(writer.entries[0].backend_cookie, (UINT64_C(1) << 44) + 7);
     EXPECT_EQ(writer.entries[1].backend_cookie, 9u);
@@ -65,7 +67,7 @@ TEST(HbgAsyncWriter, ExhaustionRefusesBeforeCallerCanSubmitAndPreservesOldEntrie
     auto ctx = writer.context();
     for (uint32_t index = 0; index < 64; ++index)
         ASSERT_TRUE(async_completion_append(ctx, token(index + 1)));
-    AsyncCompletionAllowance grant;
+    AsyncCompletionReservation grant;
     uint32_t submits = 0;
     if (async_completion_reserve(ctx, 1, &grant)) ++submits;
     EXPECT_EQ(submits, 0u);
@@ -83,9 +85,9 @@ TEST(HbgAsyncWriter, ActualCountAndUnexpectedWriterMutationFailWithoutRollback) 
     for (bool mutate_count : {false, true}) {
         Writer writer;
         auto ctx = writer.context();
-        AsyncCompletionAllowance grant;
+        AsyncCompletionReservation grant;
         ASSERT_TRUE(async_completion_reserve(ctx, 2, &grant));
-        if (mutate_count) ASSERT_TRUE(async_completion_append(ctx, token()));
+        if (mutate_count) ++writer.count;
         EXPECT_FALSE(async_completion_accept_count(ctx, grant, mutate_count ? 1 : 3));
         EXPECT_EQ(writer.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         EXPECT_EQ(writer.count, mutate_count ? 1u : 0u);
@@ -96,9 +98,10 @@ TEST(HbgAsyncWriter, ActualCountAndUnexpectedWriterMutationFailWithoutRollback) 
 TEST(HbgAsyncWriter, EmptyActualEventConsumesNoConditionAndStickyErrorStopsNewReservation) {
     Writer writer;
     auto ctx = writer.context();
-    AsyncCompletionAllowance grant;
+    AsyncCompletionReservation grant;
     ASSERT_TRUE(async_completion_reserve(ctx, 48, &grant));
     EXPECT_TRUE(async_completion_accept_count(ctx, grant, 0));
+    EXPECT_TRUE(async_completion_finish(ctx, grant, 0));
     EXPECT_EQ(writer.count, 0u);
     async_completion_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_FALSE(async_completion_reserve(ctx, 1, &grant));
@@ -110,7 +113,7 @@ TEST(HbgAsyncWriter, InvalidCapacitiesAndCorruptCountsCannotAppendOrGrant) {
     for (uint32_t capacity : {0u, 65u, UINT32_MAX}) {
         Writer writer;
         auto ctx = writer.context(capacity);
-        AsyncCompletionAllowance grant;
+        AsyncCompletionReservation grant;
         EXPECT_FALSE(async_completion_reserve(ctx, 1, &grant));
         EXPECT_EQ(writer.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         EXPECT_EQ(writer.count, 0u);
@@ -118,7 +121,7 @@ TEST(HbgAsyncWriter, InvalidCapacitiesAndCorruptCountsCannotAppendOrGrant) {
     Writer writer;
     writer.count = UINT32_MAX;
     auto ctx = writer.context();
-    AsyncCompletionAllowance grant;
+    AsyncCompletionReservation grant;
     EXPECT_FALSE(async_completion_reserve(ctx, 1, &grant));
     EXPECT_EQ(writer.error, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
     EXPECT_EQ(writer.count, UINT32_MAX);
@@ -143,12 +146,12 @@ TEST(HbgAsyncWriter, MissingCountStillPublishesTheAvailableErrorField) {
     Writer writer;
     auto ctx = writer.context();
     ctx.completion_count = nullptr;
-    AsyncCompletionAllowance grant;
+    AsyncCompletionReservation grant;
     EXPECT_FALSE(async_completion_reserve(ctx, 1, &grant));
     ASSERT_EQ(writer.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     RecordingCache cache;
     async_completion_flush(ctx, cache);
-    ASSERT_EQ(cache.ranges.size(), 1u);
+    ASSERT_EQ(cache.ranges.size(), 2u);
     EXPECT_EQ(cache.ranges.front().first, reinterpret_cast<uintptr_t>(&writer.error));
     EXPECT_EQ(cache.ranges.front().second, sizeof(writer.error));
     EXPECT_EQ(cache.fences, 1u);
@@ -195,6 +198,68 @@ TEST(HbgAsyncWriter, LegacyContiguousSlabAndEmptyFlushPublishOnlyTheirOwnFields)
     RecordingCache corrupt;
     async_completion_flush(ctx, corrupt);
     EXPECT_EQ(corrupt.ranges.back().second, 64 * sizeof(DeferredCompletionEntry));
+}
+
+TEST(HbgAsyncWriter, CopiesShareTheOutstandingReservation) {
+    Writer writer;
+    auto first = writer.context();
+    auto copy = first;
+    AsyncCompletionReservation original{}, nested{};
+    ASSERT_TRUE(async_completion_reserve(first, 2, &original));
+    EXPECT_FALSE(async_completion_reserve(copy, 1, &nested));
+    EXPECT_EQ(writer.count, 0u);
+    EXPECT_EQ(writer.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(writer.reservation.limit, 2u);
+}
+
+TEST(HbgAsyncWriter, ExpiredReservationCannotWriteIntoTheNextReservation) {
+    Writer writer;
+    auto ctx = writer.context();
+    AsyncCompletionReservation old{}, current{};
+    ASSERT_TRUE(async_completion_reserve(ctx, 2, &old));
+    ASSERT_TRUE(async_completion_commit(ctx, old, token(7)));
+    ASSERT_TRUE(async_completion_finish(ctx, old, 1));
+    ASSERT_TRUE(async_completion_reserve(ctx, 2, &current));
+    EXPECT_NE(old.serial, current.serial);
+    EXPECT_FALSE(async_completion_commit(ctx, old, token(9)));
+    EXPECT_EQ(writer.count, 1u);
+    EXPECT_EQ(writer.entries[0].backend_cookie, 7u);
+}
+
+TEST(HbgAsyncWriter, ReservationCannotMoveToAnotherWriterWithTheSameSerial) {
+    Writer first, second;
+    auto a = first.context(), b = second.context();
+    AsyncCompletionReservation x{}, y{};
+    ASSERT_TRUE(async_completion_reserve(a, 1, &x));
+    ASSERT_TRUE(async_completion_reserve(b, 1, &y));
+    ASSERT_EQ(x.serial, y.serial);
+    EXPECT_FALSE(async_completion_commit(b, x, token()));
+    EXPECT_EQ(first.error, 0);
+    EXPECT_EQ(second.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(second.count, 0u);
+}
+
+TEST(HbgAsyncWriter, SealRejectsUnfinishedReservationAndCannotBeRepeated) {
+    Writer writer;
+    auto ctx = writer.context();
+    AsyncCompletionReservation reservation{};
+    ASSERT_TRUE(async_completion_reserve(ctx, 1, &reservation));
+    EXPECT_FALSE(async_completion_seal(ctx));
+    EXPECT_EQ(writer.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(writer.reservation.sealed, 1u);
+    EXPECT_FALSE(async_completion_seal(ctx));
+    EXPECT_FALSE(async_completion_append(ctx, token()));
+    EXPECT_EQ(writer.count, 0u);
+}
+
+TEST(HbgAsyncWriter, EmptySealAndPostSealCopiesLeavePublishedStateUnchanged) {
+    Writer writer;
+    auto ctx = writer.context(), copy = ctx;
+    ASSERT_TRUE(async_completion_seal(ctx));
+    EXPECT_FALSE(async_completion_append(copy, token()));
+    EXPECT_EQ(writer.error, 0);
+    EXPECT_EQ(writer.count, 0u);
+    EXPECT_EQ(writer.reservation.serial, 0u);
 }
 
 struct TensorShape {

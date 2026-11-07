@@ -26,9 +26,8 @@ inline __aicore__ bool scheduler_service_controls(
     if (local->config.control_inboxes_offset == 0) return true;
     if (scheduler_read_error(run) != 0) return false;
     if (scheduler_gm_query(run->bootstrap_scan_complete) == 0) return true;
-    uint32_t started = 0, completed = 0;
+    uint32_t started = 0;
     uint32_t budget = SCHEDULER_CONTROL_RESOLVE_BUDGET;
-    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     auto &continuation = local->control_resolve;
     while (budget != 0) {
         if (continuation.producer_ref < 0) {
@@ -70,78 +69,19 @@ inline __aicore__ bool scheduler_service_controls(
                 return false;
             }
             scheduler_protocol_task_done(base, local, ref, false);
-            const int64_t head = scheduler_gm_exchange(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
-            if (head < SCHEDULER_WAKE_LIST_OPEN) {
-                scheduler_record_error(
-                    run, ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
-                    SchedulerErrorSite::COMPLETION_WAKE_ALREADY_CLOSED
-                );
-                return false;
-            }
             continuation.producer_ref = ref;
-            continuation.next_waiter = head;
             ++started;
             *progress = true;
         }
-        while (continuation.next_waiter >= 0 && budget != 0) {
-            const int64_t waiter = continuation.next_waiter;
-            if (continuation.route.task_ref == SCHEDULER_TASK_REF_INVALID) {
-                if (!scheduler_task_ref_valid(graph, waiter)) {
-                    scheduler_record_error(
-                        run, continuation.producer_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, local
-                    );
-                    return false;
-                }
-                auto *control = scheduler_task_control_at(base, local, waiter);
-                continuation.detached_next = scheduler_observe_next_waiter(control);
-                if (continuation.detached_next < SCHEDULER_WAKE_LIST_OPEN) {
-                    scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
-                    return false;
-                }
-                continuation.route = scheduler_resolve_begin(waiter);
-            }
-            const auto route = scheduler_resolve_step(graph, base, local, run, &continuation.route, &budget);
-            if (route == SchedulerRouteResult::ERROR) return false;
-            *progress = true;
-            if (route == SchedulerRouteResult::YIELD) break;
-            if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-                SchedulerNodeKind kind{};
-                if (scheduler_node_kind(graph, waiter, &kind) != SchedulerGraphResult::OK) {
-                    scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
-                    return false;
-                }
-                if (scheduler_node_is_control(kind)) {
-                    if (!scheduler_control_enqueue(graph, base, local, run, waiter)) return false;
-                } else {
-                    auto *metadata = scheduler_task_metadata_at(base, local, waiter);
-                    const auto lanes = scheduler_task_lanes(*metadata);
-                    const uint32_t queue = scheduler_task_ready_queue(metadata->flags, lanes);
-                    if (!scheduler_task_is_executable(metadata->flags) || queue >= SCHEDULER_READY_QUEUE_COUNT ||
-                        !scheduler_ready_batch_append(base, local, waiter, &batches[queue], nullptr, profiling_level)) {
-                        scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
-                        return false;
-                    }
-                }
-            }
-            // A successful link may already have been detached by its new
-            // producer. Advance using our saved link, never the waiter's fields.
-            continuation.next_waiter = continuation.detached_next;
-            continuation.route = {};
-        }
-        if (continuation.next_waiter >= 0) break;
-        ++completed;
+        const uint32_t initial_budget = budget;
+        const auto result = scheduler_resolve_completion_step(
+            graph, base, local, run, continuation.producer_ref, &continuation.completion, &budget
+        );
+        if (result == SchedulerCompletionResult::ERROR) return false;
+        *progress = *progress || budget != initial_budget;
+        if (result == SchedulerCompletionResult::PENDING) break;
+        ++local->pending_completed;
         continuation = {};
     }
-    // Successors become visible before their producer contributes to the exit
-    // count. A peer may already have resolved EXIT while this tail was owned here.
-    if (scheduler_read_error(run) != 0) return false;
-    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue)
-        if (!scheduler_ready_batch_push(base, local, queue, &batches[queue], nullptr)) {
-            scheduler_record_error(
-                run, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local
-            );
-            return false;
-        }
-    local->pending_completed += completed;
-    return true;
+    return scheduler_read_error(run) == 0;
 }

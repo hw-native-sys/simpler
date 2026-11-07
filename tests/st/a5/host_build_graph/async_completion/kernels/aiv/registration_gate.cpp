@@ -19,5 +19,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         async_case::stamp(records + args[2] * async_case::kObservationWords, async_case::Observation::MISSING_CONTEXT);
         return;
     }
-    save_expected_notification_counter(ctx, async_case::data<int32_t>(args[0]), 1);
+    save_expected_notification_counter(ctx, async_case::data<int32_t>(args[0]), static_cast<uint32_t>(args[3]));
 }

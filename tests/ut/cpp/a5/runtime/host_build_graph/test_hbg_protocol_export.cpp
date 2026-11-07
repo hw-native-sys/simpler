@@ -329,7 +329,7 @@ struct AsyncProtocolExportFixture : ProtocolExportFixture {
         const auto &identity = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset, index);
         auto &writer = async_at<SchedulerAsyncGroupWriter>(frozen.layout.group_writer_offset, index);
         writer.count = count;
-        writer.sealed = 1;
+        writer.reservation.sealed = 1;
         writer.sealed_at = {0, 2};
         const uint64_t trace = identity.block_idx * 3 + identity.subtask_slot;
         auto &execution = at<SchedulerProtocolExecutionTrace>(layout.protocol.executions_offset)[trace];
@@ -378,25 +378,18 @@ TEST_F(AsyncProtocolExportFixture, EmptySealUsesActualExecutionIdentityAndLitera
 
 TEST_F(AsyncProtocolExportFixture, DynamicRegistrationKeepsProtocolEvidenceWithoutAnAllowedUseTable) {
     auto &identity = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset);
-    identity.binding_uses_offset = SCHEDULER_ASYNC_USES_DYNAMIC;
-    identity.binding_use_count = 0;
     seal(0, 1);
-    auto &binding = async_at<SchedulerAsyncConditionBinding>(identity.condition_bindings_offset);
-    binding.binding_index = SCHEDULER_ASYNC_BINDING_DYNAMIC;
     const auto json = dump_async();
-    EXPECT_NE(json.find("\"binding_index\":18446744073709551614,\"owner_generation\":null"), std::string::npos);
-    identity.binding_use_count = 1;
+    EXPECT_NE(json.find("\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
+    identity.capacity = 0;
     EXPECT_THROW(dump_async(), std::invalid_argument);
 }
 
-TEST_F(AsyncProtocolExportFixture, ConditionsPreserveBindingScopeAndNullableAllocationGeneration) {
+TEST_F(AsyncProtocolExportFixture, ConditionsKeepTypesWithoutInventingResourceBindingEvidence) {
     seal(0, 2);
     const auto &id = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset);
     for (uint32_t condition = 0; condition < 2; ++condition) {
         async_at<DeferredCompletionEntry>(id.entries_offset, condition).completion_type = condition;
-        auto &binding = async_at<SchedulerAsyncConditionBinding>(id.condition_bindings_offset, condition);
-        binding.binding_index = 12;
-        binding.owner_generation = condition == 0 ? 0 : 27;
     }
     auto &progress = async_at<SchedulerAsyncGroupProgress>(frozen.layout.group_progress_offset);
     progress.phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::DRAINED);
@@ -409,8 +402,8 @@ TEST_F(AsyncProtocolExportFixture, ConditionsPreserveBindingScopeAndNullableAllo
     async_at<SchedulerAsyncLease>(frozen.layout.group_lease_offset).word =
         scheduler_async_lease_word(7, SchedulerAsyncPhase::TERMINAL);
     const auto json = dump_async();
-    EXPECT_NE(json.find("\"index\":0,\"type\":0,\"binding_index\":12,\"owner_generation\":null"), std::string::npos);
-    EXPECT_NE(json.find("\"index\":1,\"type\":1,\"binding_index\":12,\"owner_generation\":27"), std::string::npos);
+    EXPECT_NE(json.find("\"index\":0,\"type\":0,\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
+    EXPECT_NE(json.find("\"index\":1,\"type\":1,\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
     EXPECT_NE(json.find("\"state\":\"READY\""), std::string::npos);
     EXPECT_NE(json.find("\"terminal\":{\"run_epoch\":17,\"worker_index\":1,\"at\":[8,4]}"), std::string::npos);
     EXPECT_NE(
@@ -442,15 +435,15 @@ TEST_F(AsyncProtocolExportFixture, DoesNotDiscardAnOrphanOrNonownerReleaseEvent)
 
 TEST_F(AsyncProtocolExportFixture, FinishDrainRequiresContributionAndKeepsMissingEvidenceNull) {
     auto &progress = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
-    progress.phase = static_cast<uint64_t>(SchedulerAsyncFinishPhase::DRAINED);
-    progress.visited_count = 5;
+    progress.completion.phase = static_cast<uint64_t>(SchedulerCompletionPhase::DRAINED);
+    progress.completion.visited_count = 5;
     progress.slice_count = 2;
     progress.active_slice_cycles = 31;
     async_at<SchedulerAsyncLease>(frozen.layout.finish_lease_offset).word =
         scheduler_async_lease_word(3, SchedulerAsyncPhase::TERMINAL);
     auto json = dump_async();
     EXPECT_NE(json.find("\"state\":\"PENDING\",\"group_indices\":[0,1,2,3],\"drained\":null"), std::string::npos);
-    progress.phase = static_cast<uint64_t>(SchedulerAsyncFinishPhase::CONTRIBUTED);
+    progress.contributed = true;
     json = dump_async();
     EXPECT_NE(json.find("\"state\":\"DRAINED\",\"group_indices\":[0,1,2,3],\"drained\":null"), std::string::npos);
     progress.drained_at = {100, 7};
@@ -470,14 +463,14 @@ TEST_F(AsyncProtocolExportFixture, ErrorEvidenceAndUnboundConditionsRemainReadab
     progress.phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::FAILED);
     progress.failure_code = -2;
     auto &finish = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
-    finish.phase = static_cast<uint64_t>(SchedulerAsyncFinishPhase::FAILED);
+    finish.completion.phase = static_cast<uint64_t>(SchedulerCompletionPhase::FAILED);
     finish.failure_code = -19;
     at<SchedulerRunControl>(layout.run_control_offset)->scheduler_error = 7;
     const auto json = dump_async();
     EXPECT_EQ(count_text(json, "\"state\":\"FAILED\""), 2u);
     EXPECT_NE(json.find("\"failure_code\":-7"), std::string::npos);
     EXPECT_NE(json.find("\"failure_code\":-19"), std::string::npos);
-    EXPECT_NE(json.find("\"binding_index\":18446744073709551615,\"owner_generation\":null"), std::string::npos);
+    EXPECT_NE(json.find("\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
     EXPECT_EQ(count_text(json, "\"state\":\"UNSEALED\""), 3u);
 }
 
@@ -523,9 +516,9 @@ TEST_F(AsyncProtocolExportFixture, RejectsWrongMapOwnershipAndRecordedSealWithou
 
 TEST_F(AsyncProtocolExportFixture, RejectsOversizedFinishBatchWithoutClamping) {
     auto &finish = async_at<SchedulerAsyncFinishProgress>(frozen.layout.finish_progress_offset);
-    finish.pending_count = 8;
+    finish.completion.pending_count = 8;
     EXPECT_NO_THROW(dump_async());
-    finish.pending_count = 9;
+    finish.completion.pending_count = 9;
     try {
         (void)dump_async();
         FAIL() << "oversized batch accepted";

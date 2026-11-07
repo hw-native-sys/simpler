@@ -69,7 +69,7 @@
 #include "native_graph_plan.h"
 #include "ready_pool_plan.h"
 #include "async_plan.h"
-#include "async_binding_plan.h"
+#include "async_backend_plan.h"
 #include "host_build_graph/async_retirement.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
@@ -210,15 +210,8 @@ runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes
     if (layout.version != SCHEDULER_ASYNC_LAYOUT_VERSION || layout.run_epoch != epoch || layout.group_count == 0 ||
         layout.total_bytes < sizeof(layout) || !fits(summary.async_layout_offset, layout.total_bytes))
         return PTO_RUNTIME_ERR_INVALID_STATE;
-    // The versioned resource header, run epoch and complete section extents
-    // must agree before its execution contract can qualify retirement.
-    AsyncResourceTables bindings{};
-    if (!AsyncResourceTables::mount(
-            static_cast<const uint8_t *>(host) + summary.async_layout_offset, layout, &bindings
-        ))
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    static_assert(ASYNC_EXECUTION_CORE_PIPELINES_ONLY == HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY);
-    return bindings.header.execution_contract == ASYNC_EXECUTION_CORE_PIPELINES_ONLY ?
+    if (layout.execution_contract > HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY) return PTO_RUNTIME_ERR_INVALID_STATE;
+    return layout.execution_contract == HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY ?
                HBG_ASYNC_LAST_USE_CORE_PIPELINES_ONLY :
                HBG_ASYNC_LAST_USE_EXTERNAL_OR_UNKNOWN;
 }
@@ -1270,7 +1263,7 @@ void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
-    const AsyncHostDeclarations *async_declarations, const AsyncBindingTaskImage &binding_image
+    const AsyncHostDeclarations *async_declarations, const AsyncBackendTaskImage &binding_image
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1665,13 +1658,12 @@ bool create_scheduler_state(
         std::min<uint64_t>(std::numeric_limits<uint64_t>::max(), std::numeric_limits<size_t>::max()) -
         (SCHEDULER_STATE_ALIGNMENT - 1);
     SchedulerAsyncLayout async_layout{};
-    AsyncBindingHostPlan async_bindings;
-    SchedulerSubmissionHostPlan submission_plan;
+    AsyncBackendHostPlan async_backend;
     std::vector<SchedulerAsyncCapabilities> async_capabilities;
     std::string async_error;
     bool sdma_uses = false;
     if (async_declarations != nullptr &&
-        !scheduler_has_sdma_uses(task_metadata, native_plan, *async_declarations, &sdma_uses, &async_error)) {
+        !async_backend_has_sdma_uses(task_metadata, native_plan, *async_declarations, &sdma_uses, &async_error)) {
         LOG_ERROR("A5 HBG: submission declaration lookup failed: %s", async_error.c_str());
         return false;
     }
@@ -1697,22 +1689,20 @@ bool create_scheduler_state(
                 runtime->get_function_async_capability(task.kernel_ids[lane], &async_capabilities[task_ref][lane]);
             }
         }
-        if (!scheduler_plan_async_bindings(
+        if (!scheduler_plan_async_backend(
                 task_metadata, async_capabilities, binding_image, native_plan, declarations, *api, max_state_bytes,
-                &async_bindings, &async_error
-            ) ||
-            !scheduler_plan_submission_bundles(
-                task_metadata, async_capabilities, async_bindings.submission_workspaces, async_bindings.submission_uses,
-                async_bindings.execution_use_sets, api->run_epoch(), max_state_bytes, &submission_plan, &async_error
+                &async_backend, &async_error
             )) {
-            LOG_ERROR("A5 HBG: async resource/submission planning failed: %s", async_error.c_str());
+            LOG_ERROR("A5 HBG: async backend planning failed: %s", async_error.c_str());
             return false;
         }
-        async_bindings.auxiliary.scratch = submission_plan.image.size();
-        if (async_bindings.needs_default_sdma_guards) async_bindings.auxiliary.sdma_guard_count = ASYNC_SDMA_CHANNELS;
+        const SchedulerAsyncAuxiliaryBytes auxiliary{
+            async_backend.image.size(), async_backend.needs_sdma_guards ? ASYNC_SDMA_CHANNELS : 0,
+            async_backend.execution_contract
+        };
         if (!scheduler_plan_async_layout(
-                task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, async_bindings.auxiliary,
-                &async_layout, &async_error
+                task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, auxiliary, &async_layout,
+                &async_error
             )) {
             LOG_ERROR("A5 HBG: async state planning failed: %s", async_error.c_str());
             return false;
@@ -1767,24 +1757,15 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: async state initialization failed: %s", async_error.c_str());
         return false;
     }
-    if (async_offset != 0 && !scheduler_initialize_async_bindings(
-                                 async_bindings, async_layout, static_cast<std::byte *>(host_base) + async_offset,
-                                 layout.total_size - async_offset, &async_error
-                             )) {
-        LOG_ERROR("A5 HBG: async binding materialization failed: %s", async_error.c_str());
-        return false;
-    }
-    if (!submission_plan.image.empty()) {
+    if (!async_backend.image.empty()) {
         auto *async_base = static_cast<uint8_t *>(host_base) + async_offset;
-        if (async_offset == 0 || async_layout.scratch_bytes != submission_plan.image.size() ||
-            async_layout.scratch_offset > async_layout.total_bytes ||
-            async_layout.scratch_bytes > async_layout.total_bytes - async_layout.scratch_offset) {
-            LOG_ERROR("A5 HBG: submission image does not fit retained async auxiliary storage");
+        if (async_offset == 0 || async_layout.backend_bytes != async_backend.image.size() ||
+            async_layout.backend_offset > async_layout.total_bytes ||
+            async_layout.backend_bytes > async_layout.total_bytes - async_layout.backend_offset) {
+            LOG_ERROR("A5 HBG: backend declarations do not fit retained async storage");
             return false;
         }
-        std::memcpy(
-            async_base + async_layout.scratch_offset, submission_plan.image.data(), submission_plan.image.size()
-        );
+        std::memcpy(async_base + async_layout.backend_offset, async_backend.image.data(), async_backend.image.size());
     }
 
     if (native_graph) {
@@ -2056,7 +2037,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     if (!create_scheduler_state(
             runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph,
             plan.async_declarations.get(),
-            AsyncBindingTaskImage{
+            AsyncBackendTaskImage{
                 upload_base + copied_bytes, image_bytes, reinterpret_cast<uint64_t>(device_sm), device_segments.storage,
                 static_cast<uint32_t>(total_tasks)
             }

@@ -43,12 +43,14 @@ bool plan_async_layout(
 ) {
     if (out == nullptr || run_epoch == 0 || metadata.size() != capabilities.size() || metadata.size() > INT32_MAX)
         return fail(error, "async plan requires a live run epoch and matching capability rows");
-    if (auxiliary.sdma_guard_count > ASYNC_SDMA_CHANNELS)
-        return fail(error, "default SDMA guard count exceeds physical queue capacity");
+    if (auxiliary.sdma_guard_count > ASYNC_SDMA_CHANNELS ||
+        auxiliary.execution_contract > HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY)
+        return fail(error, "async auxiliary configuration is invalid");
     SchedulerAsyncLayout layout{};
     layout.run_epoch = run_epoch;
     layout.task_count = metadata.size();
-    uint64_t token_bytes = 0, binding_bytes = 0;
+    layout.execution_contract = auxiliary.execution_contract;
+    uint64_t token_bytes = 0;
     for (size_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
         if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
@@ -77,11 +79,6 @@ bool plan_async_layout(
                 !scheduler_layout_checked_mul(aligned, meta.logical_block_num, &bytes) ||
                 !scheduler_layout_checked_add(token_bytes, bytes, &token_bytes))
                 return fail(error, "async completion-entry storage overflows");
-            if (!scheduler_layout_checked_mul(cap.max_conditions, sizeof(SchedulerAsyncConditionBinding), &bytes) ||
-                !scheduler_layout_checked_align(bytes, 128, &aligned) ||
-                !scheduler_layout_checked_mul(aligned, meta.logical_block_num, &bytes) ||
-                !scheduler_layout_checked_add(binding_bytes, bytes, &binding_bytes))
-                return fail(error, "async condition-binding storage overflows");
             if (!scheduler_layout_checked_mul(cap.max_conditions, meta.logical_block_num, &bytes) ||
                 !scheduler_layout_checked_add(layout.condition_capacity, bytes, &layout.condition_capacity))
                 return fail(error, "async condition capacity overflows");
@@ -94,8 +91,7 @@ bool plan_async_layout(
             return fail(error, "async group count overflows");
     }
     if (layout.group_count == 0) {
-        if (auxiliary.resources != 0 || auxiliary.uses != 0 || auxiliary.scratch != 0 ||
-            auxiliary.sdma_guard_count != 0)
+        if (auxiliary.backend != 0 || auxiliary.sdma_guard_count != 0)
             return fail(error, "synchronous plan cannot carry unowned async auxiliary storage");
         *out = layout;
         return true;
@@ -103,10 +99,7 @@ bool plan_async_layout(
     layout.check_directory_words = (layout.group_count + 63) / 64;
     layout.finish_directory_words = (layout.finish_count + 63) / 64;
     layout.entries_bytes = token_bytes;
-    layout.condition_bindings_bytes = binding_bytes;
-    layout.resources_bytes = auxiliary.resources;
-    layout.uses_bytes = auxiliary.uses;
-    layout.scratch_bytes = auxiliary.scratch;
+    layout.backend_bytes = auxiliary.backend;
     layout.sdma_guard_count = auxiliary.sdma_guard_count;
     uint64_t cursor = sizeof(SchedulerAsyncLayout);
     if (!reserve(layout.task_count, sizeof(SchedulerAsyncTaskMap), cursor, layout.task_map_offset) ||
@@ -125,10 +118,7 @@ bool plan_async_layout(
             layout.finish_directory_words, sizeof(SchedulerAsyncDirectoryWord), cursor, layout.finish_directory_offset
         ) ||
         !reserve(token_bytes, 1, cursor, layout.entries_offset) ||
-        !reserve(binding_bytes, 1, cursor, layout.condition_bindings_offset) ||
-        !reserve(auxiliary.resources, 1, cursor, layout.resources_offset) ||
-        !reserve(auxiliary.uses, 1, cursor, layout.uses_offset) ||
-        !reserve(layout.scratch_bytes, 1, cursor, layout.scratch_offset) ||
+        !reserve(layout.backend_bytes, 1, cursor, layout.backend_offset) ||
         (layout.sdma_guard_count != 0 &&
          !reserve(layout.sdma_guard_count + 1, 128, cursor, layout.sdma_guard_context_offset)) ||
         !scheduler_layout_checked_align(cursor, 128, &layout.total_bytes) || layout.total_bytes > byte_budget ||
@@ -152,7 +142,7 @@ bool materialize_async_state(
         write(image, layout.sdma_guard_context_offset, context);
     }
     uint64_t group_base = 0, finish_index = 0;
-    uint64_t entry_cursor = layout.entries_offset, binding_cursor = layout.condition_bindings_offset;
+    uint64_t entry_cursor = layout.entries_offset;
     for (size_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
         SchedulerAsyncTaskMap map;
@@ -210,7 +200,6 @@ bool materialize_async_state(
                 identity.task_ref = static_cast<int64_t>(task);
                 identity.finish_index = map.finish_index;
                 identity.entries_offset = entry_cursor;
-                identity.condition_bindings_offset = binding_cursor;
                 identity.block_idx = block;
                 identity.subtask_slot = lane;
                 identity.capacity = cap.max_conditions;
@@ -226,24 +215,14 @@ bool materialize_async_state(
                     image, layout.group_progress_offset + index * sizeof(SchedulerAsyncGroupProgress),
                     SchedulerAsyncGroupProgress{}
                 );
-                for (uint32_t condition = 0; condition < cap.max_conditions; ++condition)
-                    write(
-                        image, binding_cursor + condition * sizeof(SchedulerAsyncConditionBinding),
-                        SchedulerAsyncConditionBinding{}
-                    );
                 uint64_t stride = 0;
                 scheduler_layout_checked_align(cap.max_conditions * sizeof(DeferredCompletionEntry), 128, &stride);
                 entry_cursor += stride;
-                scheduler_layout_checked_align(
-                    cap.max_conditions * sizeof(SchedulerAsyncConditionBinding), 128, &stride
-                );
-                binding_cursor += stride;
             }
         }
     }
-    if (entry_cursor != layout.entries_offset + layout.entries_bytes ||
-        binding_cursor != layout.condition_bindings_offset + layout.condition_bindings_bytes ||
-        group_base != layout.group_count || finish_index != layout.finish_count)
+    if (entry_cursor != layout.entries_offset + layout.entries_bytes || group_base != layout.group_count ||
+        finish_index != layout.finish_count)
         return fail(error, "async image materialization does not match its size plan");
     return true;
 }
@@ -281,7 +260,7 @@ bool scheduler_initialize_async_state(
 ) {
     SchedulerAsyncLayout expected{};
     const SchedulerAsyncAuxiliaryBytes auxiliary{
-        layout.resources_bytes, layout.uses_bytes, layout.scratch_bytes, layout.sdma_guard_count
+        layout.backend_bytes, layout.sdma_guard_count, layout.execution_contract
     };
     if (!plan_async_layout(metadata, capabilities, layout.run_epoch, layout.total_bytes, auxiliary, &expected, error))
         return false;

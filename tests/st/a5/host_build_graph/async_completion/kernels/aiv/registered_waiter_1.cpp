@@ -12,9 +12,4 @@
 #include "../waiter.h"
 
 // AIV0 reuses graph_waiter.cpp; this wrapper covers the other physical lane.
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    async_case::wait_task(args, 2);
-    const int64_t execution = args[5] + get_block_idx(args) * 3 + 2;
-    auto *signals = async_case::data<int32_t>(args[0]);
-    async_case::publish_signal(async_case::condition(signals, execution, async_case::kConditionLimit), 1);
-}
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { async_case::wait_task(args, 2); }

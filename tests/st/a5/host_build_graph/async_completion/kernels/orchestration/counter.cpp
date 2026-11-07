@@ -89,7 +89,7 @@ TaskId action(
 }
 
 template <typename Args>
-TaskId registration_gate(const Args &args, int64_t execution, bool declare_resources) {
+TaskId registration_gate(const Args &args, int64_t execution, bool declare_resources, int64_t epoch) {
     const uint32_t signal_shape[2]{1, 1};
     const uint32_t signal_offset[2]{
         static_cast<uint32_t>(execution * async_case::kConditionsPerExecution + async_case::kConditionLimit), 0
@@ -98,7 +98,7 @@ TaskId registration_gate(const Args &args, int64_t execution, bool declare_resou
     CoreTaskArgs gate;
     gate.add_no_dep(registration_signal);
     gate.add_no_dep(args.tensor(2).ref());
-    gate.add_scalar(execution);
+    gate.add_scalar(execution, epoch);
     const TaskId registered = rt_submit_aiv_task(10, gate).task_id();
     if (declare_resources &&
         (!rt_declare_async_counter(registered, 0, async_case::kSignalStride * sizeof(int32_t), kCleanLines) ||
@@ -149,7 +149,10 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
         const int64_t execution = base + waiter * p.blocks * 3;
         CoreTaskArgs task;
         tensors(task, args);
-        task.add_scalar(execution, p.conditions, p.expected, instance, scenario == Scenario::FANIN ? 0 : p.tail_ms);
+        task.add_scalar(
+            execution, p.conditions, p.expected, instance, scenario == Scenario::FANIN ? 0 : p.tail_ms,
+            p.registration_epoch
+        );
         task.launch_spec.set_block_num(static_cast<int32_t>(p.blocks));
         task.launch_spec.set_require_sync_start(p.sync_start != 0);
         if (!warm.empty()) task.set_dependencies(warm.data(), static_cast<uint32_t>(warm.size()));
@@ -167,14 +170,15 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
         const TaskId waited = scenario == Scenario::PROGRESS ? rt_submit_aiv_task(9, task).task_id() :
                                                                rt_submit_task(kernels, task).task_id();
         declare_waiter(waited, p.declare_resources);
-        if (scenario == Scenario::PROGRESS)
-            publisher_deps.push_back(registration_gate(args, execution + 1, p.declare_resources));
-        if (scenario == Scenario::FULL_SYNC_START)
+        // Registration gates release their slots while waiting. A publisher
+        // cannot strand an unstarted waiter in its other prefetched slot.
+        if (scenario != Scenario::NEVER && !p.skip)
             for (int64_t block = 0; block < p.blocks; ++block)
                 for (int64_t lane = 0; lane < 3; ++lane)
-                    publisher_deps.push_back(
-                        registration_gate(args, execution + block * 3 + lane, p.declare_resources)
-                    );
+                    if ((p.mask & (int64_t{1} << lane)) != 0)
+                        publisher_deps.push_back(registration_gate(
+                            args, execution + block * 3 + lane, p.declare_resources, p.registration_epoch
+                        ));
         std::vector<TaskId> deps{waited};
         if (prerequisite.is_valid()) deps.push_back(prerequisite);
         action(
@@ -195,7 +199,7 @@ void graph_body(const GraphTaskArgs &args, const BodyConfig &config) {
     tensors(waiter, args);
     // Forward parameter handles: reading an instance's values while recording would
     // freeze them into the shared Graph definition and invalidate this isolation test.
-    waiter.add_scalar(args.scalar(1), p.conditions, p.expected, args.scalar(0), p.tail_ms);
+    waiter.add_scalar(args.scalar(1), p.conditions, p.expected, args.scalar(0), p.tail_ms, args.scalar(3));
     const TaskId waited = rt_submit_aiv_task(9, waiter).task_id();
     declare_waiter(waited, p.declare_resources);
     action(args, p, Action::CONSUME, args.scalar(0), args.scalar(1), 1, args.scalar(2), 0, {waited});
@@ -204,14 +208,16 @@ void graph_body(const GraphTaskArgs &args, const BodyConfig &config) {
 
 extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 19};
+    return OrchestrationConfig{.expected_arg_count = 20};
 }
 
 static void run_counter(const ChipTaskArgs &args, bool declare_resources) {
-    const Plan p{args.scalar<int64_t>(0),  args.scalar<int64_t>(1),  args.scalar<int64_t>(2),  args.scalar<int64_t>(3),
-                 args.scalar<int64_t>(4),  args.scalar<int64_t>(5),  args.scalar<int64_t>(6),  args.scalar<int64_t>(7),
-                 args.scalar<int64_t>(8),  args.scalar<int64_t>(9),  args.scalar<int64_t>(10), args.scalar<int64_t>(11),
-                 args.scalar<int64_t>(12), args.scalar<int64_t>(13), declare_resources};
+    const Plan p{args.scalar<int64_t>(0),  args.scalar<int64_t>(1),  args.scalar<int64_t>(2),
+                 args.scalar<int64_t>(3),  args.scalar<int64_t>(4),  args.scalar<int64_t>(5),
+                 args.scalar<int64_t>(6),  args.scalar<int64_t>(7),  args.scalar<int64_t>(8),
+                 args.scalar<int64_t>(9),  args.scalar<int64_t>(10), args.scalar<int64_t>(11),
+                 args.scalar<int64_t>(12), args.scalar<int64_t>(13), declare_resources,
+                 args.scalar<int64_t>(14)};
     for (int64_t instance = 0; instance < p.instances; ++instance) {
         if (static_cast<Scenario>(p.scenario) == Scenario::GRAPH) {
             if (p.conditions > async_case::kConditionLimit)
@@ -222,7 +228,7 @@ static void run_counter(const ChipTaskArgs &args, bool declare_resources) {
             const int64_t max_waiters = p.slots / (p.instances * p.blocks * 3);
             const int64_t base = instance * max_waiters * p.blocks * 3;
             const int64_t execution = base + 1;
-            graph.add_scalar(instance, base, p.slots + instance * max_waiters);
+            graph.add_scalar(instance, base, p.slots + instance * max_waiters, p.registration_epoch);
             const auto invocation = rt_submit_graph(&graph_body, graph, BodyConfig{p});
             // A second consumer outside EXIT validates transitive completion and separate invocation bindings.
             action(
@@ -233,7 +239,7 @@ static void run_counter(const ChipTaskArgs &args, bool declare_resources) {
             // completion could hold EXIT even if the async child retired early.
             // Registration gates release their compute slot while the Graph
             // waiter is pending; they do not wait for the waiter's TaskDone.
-            const TaskId registered = registration_gate(args, execution, p.declare_resources);
+            const TaskId registered = registration_gate(args, execution, p.declare_resources, p.registration_epoch);
             action(
                 args, p, Action::PUBLISH, instance, base, 1, p.slots + max_waiters * p.instances + instance,
                 rt_available_aiv_count(), {registered}, p.delay_ms

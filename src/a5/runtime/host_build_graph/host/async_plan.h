@@ -21,14 +21,11 @@
 
 using SchedulerAsyncCapabilities = std::array<CoreAsyncCapability, 3>;
 
-// The resource owner supplies these sections after validating concrete bindings.
-// Reserving their byte ranges does not prove that the bindings are admissible.
+// Optional backend declarations share the run's retained scheduler allocation.
 struct SchedulerAsyncAuxiliaryBytes {
-    uint64_t resources{0};
-    uint64_t uses{0};
-    // Backend submission storage shares the retained async allocation.
-    uint64_t scratch{0};
+    uint64_t backend{0};
     uint64_t sdma_guard_count{0};
+    uint64_t execution_contract{HBG_ASYNC_CONTRACT_UNQUALIFIED};
 };
 
 struct SchedulerAsyncHostPlan {

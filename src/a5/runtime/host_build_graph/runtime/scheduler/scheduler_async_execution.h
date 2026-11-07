@@ -100,13 +100,10 @@ inline __aicore__ bool scheduler_async_execution_permitted(
     return true;
 }
 
-template <
-    typename Backend, typename BindingPolicy,
-    typename Publication = scheduler_async_runtime_detail::NoAdditionalSealPublication>
+template <typename Backend, typename RegistrationPolicy>
 inline __aicore__ bool scheduler_async_execution_returned(
     SchedulerAsyncExecutionState<Backend> *state, const SchedulerGraphAccess &graph, __gm__ void *base,
-    SchedulerLocalState *local, __gm__ SchedulerRunControl *run, uint32_t slot_index, BindingPolicy &backend,
-    Publication publication = {}
+    SchedulerLocalState *local, __gm__ SchedulerRunControl *run, uint32_t slot_index, RegistrationPolicy &backend
 ) {
     if (!state->view.enabled()) return true;
     if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT || state->permitted_slot != slot_index)
@@ -119,7 +116,7 @@ inline __aicore__ bool scheduler_async_execution_returned(
     bool registered = false;
     if (!scheduler_async_runtime_seal(
             state->view, graph, base, local, run, slot.task_ref, slot.block_idx, slot.subtask_slot, payload, backend,
-            &registered, publication
+            &registered
         ))
         return false;
     state->gate.kernel_returned();

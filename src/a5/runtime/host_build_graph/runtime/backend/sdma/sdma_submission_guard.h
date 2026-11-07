@@ -62,10 +62,6 @@ struct SdmaSubmissionMetadata {
     }
 };
 
-struct SdmaMetadataAlreadyPublished {
-    inline __aicore__ void publish(__gm__ uint8_t *) const {}
-};
-
 // The lock covers session creation, submission and publication of SDK metadata,
 // not the lifetime of the asynchronous transfer. CHECK observes completion after
 // this scope has released the submitting core's channel group.
@@ -76,15 +72,15 @@ public:
     SdmaSubmissionScope &operator=(const SdmaSubmissionScope &) = delete;
 
     template <typename Clock = SdmaSubmissionClock>
-    inline __aicore__ bool acquire(AsyncCtx &ctx, uint32_t first_queue, uint32_t queue_count = 1) {
-        if (ctx.sdma_guard_context == 0) return true;  // Existing legacy/AICPU ownership contract.
-        const auto *context = reinterpret_cast<__gm__ const AsyncSdmaGuardContext *>(ctx.sdma_guard_context);
+    inline __aicore__ bool
+    acquire(AsyncCtx &ctx, uint64_t guard_address, uint32_t first_queue, uint32_t queue_count = 1) {
+        if (guard_address == 0) return true;  // Existing legacy/AICPU ownership contract.
+        const auto *context = reinterpret_cast<__gm__ const AsyncSdmaGuardContext *>(guard_address);
         if ((ctx.task_token.is_valid() && !async_completion_writer_valid(ctx)) ||
             !async_sdma_guard_context_valid(context) || queue_count == 0 || first_queue >= context->guard_count ||
             queue_count > context->guard_count - first_queue)
             return reject(ctx);
-        guard_ = reinterpret_cast<__gm__ AsyncSdmaSubmissionGuard *>(ctx.sdma_guard_context + sizeof(*context)) +
-                 first_queue;
+        guard_ = reinterpret_cast<__gm__ AsyncSdmaSubmissionGuard *>(guard_address + sizeof(*context)) + first_queue;
         const uint64_t started = Clock::now();
         constexpr uint64_t timeout = UINT64_C(5) * PLATFORM_PROF_SYS_CNT_FREQ;
         // All callers acquire physical queues in ascending order. A partial

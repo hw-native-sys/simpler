@@ -768,7 +768,7 @@ TEST(HbgNativeGraphPlan, SlicedFanoutCountsProducerOnlyAfterAllWaitersArePublish
     ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress));
     EXPECT_TRUE(progress);
     EXPECT_EQ(view.locals[0].control_resolve.producer_ref, 0);
-    EXPECT_GE(view.locals[0].control_resolve.next_waiter, 0);
+    EXPECT_GE(view.locals[0].control_resolve.completion.current_waiter, 0);
     EXPECT_EQ(view.completed(), 0);
     // Another worker can consume the published prefix while its producer's
     // continuation still owns the remaining wake chain.

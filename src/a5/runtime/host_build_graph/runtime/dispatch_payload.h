@@ -126,10 +126,9 @@ struct alignas(64) DispatchPayload {
      *  the legacy scheduler seeds the equivalent per-core value at startup.
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
-    // Qualified per-execution context or tagged default SDMA guard context in
-    // the retained async image. Zero means neither. Argument offsets stay fixed.
-    uint64_t async_submission_context;
-    // No explicit tail padding: alignas(64) rounds sizeof up to 512 (8 cache lines).
+    // Resident executions point to the embedded context; legacy keeps zero.
+    uint64_t async_context_address;
+    AsyncExecutionContext async_context;
 
     static_assert(sizeof(args[0]) == 8);
     static_assert(
@@ -141,5 +140,6 @@ struct alignas(64) DispatchPayload {
 static_assert(sizeof(DispatchPayload) == 512, "DispatchPayload hardware ABI size drift");
 static_assert(offsetof(DispatchPayload, args) == 64, "args[] must start at cache line 1 (control block = CL0)");
 static_assert(offsetof(DispatchPayload, global_context) == 464, "global context offset changed");
-static_assert(offsetof(DispatchPayload, async_submission_context) == 472, "submission context offset changed");
+static_assert(offsetof(DispatchPayload, async_context_address) == 472, "context extension offset changed");
+static_assert(offsetof(DispatchPayload, async_context) == 480, "execution context offset changed");
 static_assert(offsetof(DispatchPayload, src_payload) < 64, "src_payload (gate) must live on the CL0 control block");

@@ -142,11 +142,11 @@ inline void async_checkpoints(const View &backing, const SchedulerGraphSummary &
             "A5 HBG live sample CHECK[%" PRIu64 "] epoch=%" PRIu64 " task=%" PRId64 " block=%u lane=%u"
             " finish=%" PRIu64 " lease=0x%" PRIx64 " directory[%" PRIu64 "]=0x%" PRIx64 " bit=%u"
             " sealed=%u count=%u writer_error=%d phase=%" PRIu64 " remaining=0x%" PRIx64 " next=%" PRIu64
-            " acquire=%" PRIu64 " observations=%" PRIu64 " slices=%" PRIu64 " failure=%" PRId64,
+            " observations=%" PRIu64 " slices=%" PRIu64 " failure=%" PRId64,
             index, identity.run_epoch, identity.task_ref, identity.block_idx, identity.subtask_slot,
             identity.finish_index, lease.word, index / 64, directory.bits,
-            static_cast<unsigned>((directory.bits >> (index % 64)) & 1), writer.sealed, writer.count, writer.error_code,
-            progress.phase, progress.remaining_mask, progress.next_condition, progress.acquire_condition,
+            static_cast<unsigned>((directory.bits >> (index % 64)) & 1), writer.reservation.sealed, writer.count,
+            writer.error_code, progress.phase, progress.remaining_mask, progress.next_condition,
             progress.observation_count, progress.slice_count, progress.failure_code
         );
     }
@@ -167,13 +167,15 @@ inline void async_checkpoints(const View &backing, const SchedulerGraphSummary &
             " join=0x%" PRIx64 " directory[%" PRIu64 "]=0x%" PRIx64 " bit=%u phase=%" PRIu64 " waiter=%" PRId64
             " detached=%" PRId64 " visited=%" PRIu64 " pending=%" PRIu64 " kind=%" PRIu64 " queue=%" PRIu64
             " target=%" PRIu64 " resume=%" PRIu64 " resolve_task=%" PRId64 " resolve_producer=%" PRId64
-            " resolve_fanin=%u/%u resolve_phase=%u slices=%" PRIu64,
+            " resolve_fanin=%u/%u resolve_phase=%u slices=%" PRIu64 " contributed=%u",
             index, identity.run_epoch, identity.task_ref, lease.word, join.word, index / 64, directory.bits,
-            static_cast<unsigned>((directory.bits >> (index % 64)) & 1), progress.phase, progress.current_waiter,
-            progress.detached_next, progress.visited_count, progress.pending_count, progress.pending_kind,
-            progress.pending_queue, progress.pending_target, progress.resume_phase, progress.resolve.task_ref,
-            progress.resolve.producer_ref, progress.resolve.next_fanin, progress.resolve.fanin_count,
-            static_cast<unsigned>(progress.resolve.phase), progress.slice_count
+            static_cast<unsigned>((directory.bits >> (index % 64)) & 1), progress.completion.phase,
+            progress.completion.current_waiter, progress.completion.detached_next, progress.completion.visited_count,
+            progress.completion.pending_count, progress.completion.pending_kind, progress.completion.pending_queue,
+            progress.completion.pending_target, progress.completion.resume_phase, progress.completion.resolve.task_ref,
+            progress.completion.resolve.producer_ref, progress.completion.resolve.next_fanin,
+            progress.completion.resolve.fanin_count, static_cast<unsigned>(progress.completion.resolve.phase),
+            progress.slice_count, static_cast<unsigned>(progress.contributed)
         );
     }
 }

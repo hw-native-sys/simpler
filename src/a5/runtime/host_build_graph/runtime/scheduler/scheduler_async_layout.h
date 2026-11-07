@@ -14,32 +14,17 @@
 #include "scheduler_async_directory.h"
 #include "scheduler_async_join.h"
 #include "scheduler_async_lease.h"
-#include "scheduler_resolve.h"
+#include "scheduler_completion_state.h"
+#include "intrinsic.h"
 #include "aicore_completion_mailbox_types.h"
 #include "async_sdma_guard.h"
+#include "host_build_graph/async_retirement.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 3;
-// A group without static resource declarations uses the kernel registration
-// contract. Zero remains an empty declared-use set, never dynamic permission.
-inline constexpr uint64_t SCHEDULER_ASYNC_USES_DYNAMIC = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_BINDING_DYNAMIC = UINT64_MAX - 1;
-
-enum class SchedulerAsyncFinishPhase : uint64_t {
-    INITIALIZE,
-    SELECT,
-    RESOLVE,
-    ENQUEUE,
-    PREPARE,
-    PUBLISH,
-    PUBLISH_DIRECTORY,
-    DRAINED,
-    CONTRIBUTED,
-    FAILED
-};
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 5;
 
 // All offsets are relative to the async region; only external resources may
-// carry absolute device addresses in their separately validated binding table.
+// carry absolute device addresses in backend declarations.
 struct SchedulerAsyncTaskMap {
     uint64_t group_base{SCHEDULER_ASYNC_INDEX_NONE};
     uint64_t finish_index{SCHEDULER_ASYNC_INDEX_NONE};
@@ -54,14 +39,11 @@ struct alignas(128) SchedulerAsyncGroupIdentity {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint64_t finish_index{SCHEDULER_ASYNC_INDEX_NONE};
     uint64_t entries_offset{0};
-    uint64_t condition_bindings_offset{0};
-    uint64_t binding_uses_offset{0};
-    uint64_t binding_use_count{0};
     uint32_t block_idx{0};
     uint32_t subtask_slot{0};
     uint32_t capacity{0};
     uint32_t condition_types{0};
-    uint8_t reserved[56]{};
+    uint8_t reserved[80]{};
 };
 
 struct SchedulerAsyncProtocolRelease {
@@ -77,27 +59,17 @@ static_assert(sizeof(SchedulerAsyncProtocolRelease) == 64);
 struct alignas(128) SchedulerAsyncGroupWriter {
     volatile uint32_t count{0};
     volatile int32_t error_code{0};
-    uint32_t reserved_count{0};
-    uint32_t sealed{0};
+    AsyncCompletionReservationState reservation{};
     SchedulerProtocolStamp sealed_at{};
-    uint8_t reserved_first[32]{};
+    uint8_t reserved_first[16]{};
     SchedulerAsyncProtocolRelease release{};
-};
-
-struct SchedulerAsyncConditionBinding {
-    uint64_t binding_index{SCHEDULER_ASYNC_INDEX_NONE};
-    uint64_t owner_generation{0};
 };
 
 struct alignas(128) SchedulerAsyncGroupProgress {
     uint64_t remaining_mask{0};
     uint64_t next_condition{0};
-    uint64_t acquire_stage{0};
-    uint64_t acquire_byte_offset{0};
     uint64_t observation_count{0};
     uint64_t phase{0};
-    uint64_t acquire_condition{SCHEDULER_ASYNC_INDEX_NONE};
-    uint64_t acquire_count{0};
     uint64_t work_units{0};
     uint64_t slice_count{0};
     int64_t failure_code{0};
@@ -105,6 +77,7 @@ struct alignas(128) SchedulerAsyncGroupProgress {
     uint64_t terminal_worker_index{0};
     uint64_t pending_slice_count{0};
     uint64_t active_cycles{0};
+    uint8_t reserved[32]{};
 };
 
 struct alignas(128) SchedulerAsyncFinishIdentity {
@@ -116,27 +89,15 @@ struct alignas(128) SchedulerAsyncFinishIdentity {
 };
 
 struct alignas(128) SchedulerAsyncFinishProgress {
-    SchedulerResolveCursor resolve{};
-    int64_t current_waiter{SCHEDULER_TASK_REF_INVALID};
-    int64_t detached_next{SCHEDULER_TASK_REF_INVALID};
-    uint64_t phase{0};
-    uint64_t pending_count{0};
-    uint64_t pending_queue{0};
-    uint64_t pending_target{0};
-    uint64_t pending_kind{0};
-    uint64_t resume_phase{0};
-    int64_t pending_first{SCHEDULER_TASK_REF_INVALID};
-    int64_t pending_last{SCHEDULER_TASK_REF_INVALID};
-    uint64_t pending_link_count{0};
-    uint64_t visited_count{0};
-    int64_t pending_tasks[8]{};
+    SchedulerCompletionCursor completion{};
     uint64_t active_slice_cycles{0};
     uint64_t slice_count{0};
     uint64_t work_units{0};
     SchedulerProtocolStamp drained_at{};
     uint64_t drained_worker_index{0};
     int64_t failure_code{0};
-    uint8_t reserved[8]{};
+    bool contributed{false};
+    uint8_t reserved[7]{};
 };
 
 struct SchedulerAsyncLayout {
@@ -162,14 +123,9 @@ struct SchedulerAsyncLayout {
     uint64_t finish_directory_words{0};
     uint64_t entries_offset{0};
     uint64_t entries_bytes{0};
-    uint64_t condition_bindings_offset{0};
-    uint64_t condition_bindings_bytes{0};
-    uint64_t resources_offset{0};
-    uint64_t resources_bytes{0};
-    uint64_t uses_offset{0};
-    uint64_t uses_bytes{0};
-    uint64_t scratch_offset{0};
-    uint64_t scratch_bytes{0};
+    uint64_t backend_offset{0};
+    uint64_t backend_bytes{0};
+    uint64_t execution_contract{HBG_ASYNC_CONTRACT_UNQUALIFIED};
     uint64_t sdma_guard_context_offset{0};
     uint64_t sdma_guard_count{0};
 };
@@ -178,14 +134,13 @@ static_assert(sizeof(SchedulerAsyncTaskMap) == 32);
 static_assert(sizeof(SchedulerAsyncGroupIdentity) == 128 && sizeof(SchedulerAsyncGroupWriter) == 128);
 static_assert(sizeof(SchedulerAsyncGroupProgress) == 128 && sizeof(SchedulerAsyncFinishIdentity) == 128);
 static_assert(sizeof(SchedulerAsyncFinishProgress) == 256);
-static_assert(sizeof(SchedulerAsyncConditionBinding) == 16);
-static_assert(offsetof(SchedulerAsyncGroupWriter, sealed_at) == 16);
+static_assert(offsetof(SchedulerAsyncGroupWriter, sealed_at) == 32);
 static_assert(offsetof(SchedulerAsyncGroupWriter, release) == 64);
-static_assert(offsetof(SchedulerAsyncGroupProgress, terminal_at) == 88);
-static_assert(offsetof(SchedulerAsyncGroupProgress, active_cycles) == 120);
+static_assert(offsetof(SchedulerAsyncGroupProgress, terminal_at) == 56);
+static_assert(offsetof(SchedulerAsyncGroupProgress, active_cycles) == 88);
 static_assert(offsetof(SchedulerAsyncFinishProgress, drained_at) == 216);
 static_assert(offsetof(SchedulerAsyncFinishProgress, failure_code) == 240);
-static_assert(sizeof(SchedulerAsyncLayout) == 256);
+static_assert(sizeof(SchedulerAsyncLayout) == 216);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(std::is_standard_layout_v<SchedulerAsyncTaskMap> && std::is_trivially_copyable_v<SchedulerAsyncTaskMap>);
 static_assert(
@@ -193,10 +148,6 @@ static_assert(
 );
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncGroupWriter> && std::is_trivially_copyable_v<SchedulerAsyncGroupWriter>
-);
-static_assert(
-    std::is_standard_layout_v<SchedulerAsyncConditionBinding> &&
-    std::is_trivially_copyable_v<SchedulerAsyncConditionBinding>
 );
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncGroupProgress> && std::is_trivially_copyable_v<SchedulerAsyncGroupProgress>

@@ -34,14 +34,10 @@ struct SchedulerAsyncConditionOutcome {
     int64_t error_code{0};
 };
 
-// Core-local views of the group's sealed tables. The binding rows are side
-// references into the existing run/domain binding table, not qualifications
-// inferred from a raw address or the group's dependency edges.
+// Sealing validates registration once. CHECK observes only immutable tokens.
 struct SchedulerAsyncCheckView {
     __gm__ const DeferredCompletionEntry *entries{nullptr};
-    __gm__ const SchedulerAsyncConditionBinding *bindings{nullptr};
     uint64_t entry_capacity{0};
-    uint64_t binding_capacity{0};
 };
 
 namespace scheduler_async_check_detail {
@@ -71,7 +67,7 @@ group_valid(const SchedulerAsyncGroupIdentity &identity, const SchedulerAsyncGro
     return identity.run_epoch != 0 && identity.task_ref >= 0 && identity.finish_index != SCHEDULER_ASYNC_INDEX_NONE &&
            identity.subtask_slot < 3 && identity.capacity >= 1 && identity.capacity <= CORE_ASYNC_MAX_CONDITIONS &&
            identity.condition_types != 0 && (identity.condition_types & ~CORE_ASYNC_CONDITION_TYPES) == 0 &&
-           writer.sealed == 1 && writer.reserved_count == 0 && writer.count <= identity.capacity;
+           writer.reservation.sealed == 1 && writer.reservation.limit == 0 && writer.count <= identity.capacity;
 }
 
 inline __aicore__ uint64_t count_mask(uint32_t count) { return count == 64 ? UINT64_MAX : (UINT64_C(1) << count) - 1; }
@@ -101,14 +97,6 @@ inline __aicore__ DeferredCompletionEntry entry(const SchedulerAsyncCheckView &v
     };
 }
 
-inline __aicore__ SchedulerAsyncConditionBinding binding(const SchedulerAsyncCheckView &view, uint32_t index) {
-    const auto &source = view.bindings[index];
-    return {
-        scheduler_gm_query(const_cast<__gm__ uint64_t &>(source.binding_index)),
-        scheduler_gm_query(const_cast<__gm__ uint64_t &>(source.owner_generation))
-    };
-}
-
 inline __aicore__ bool entry_valid(const SchedulerAsyncGroupIdentity &identity, const DeferredCompletionEntry &entry) {
     uint32_t type = 0;
     if (entry.completion_type == COMPLETION_TYPE_COUNTER) type = CORE_ASYNC_CONDITION_COUNTER;
@@ -134,8 +122,7 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_initialize(
     using namespace scheduler_async_check_detail;
     if (progress == nullptr) return SchedulerAsyncCheckResult::ERROR;
     if (phase(*progress) != SchedulerAsyncCheckPhase::UNINITIALIZED || progress->remaining_mask != 0 ||
-        progress->next_condition != 0 || progress->acquire_condition != SCHEDULER_ASYNC_INDEX_NONE ||
-        progress->acquire_stage != 0 || progress->acquire_byte_offset != 0 || progress->failure_code != 0)
+        progress->next_condition != 0 || progress->failure_code != 0)
         return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
     if (writer.error_code != 0) return fail(*progress, writer.error_code);
     if (!group_valid(identity, writer)) return fail(*progress, SchedulerAsyncCheckError::INVALID_GROUP);
@@ -145,29 +132,10 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_initialize(
     return writer.count == 0 ? SchedulerAsyncCheckResult::DONE : SchedulerAsyncCheckResult::PENDING;
 }
 
-// Backend is mandatory; there is deliberately no permissive/default backend.
-// It must provide bounded operations with these signatures:
-//   bool validate(identity, index, entry, binding);
-//   SchedulerAsyncConditionOutcome observe_once(identity, index, entry, binding);
-//   SchedulerAsyncConditionOutcome acquire_completed(identity, index, entry,
-//                                                    binding, stage&, offset&);
-// validate resolves the reference through the existing run/domain binding and
-// proves its lifetime, this execution's permitted use, condition-record range,
-// alignment/type/engine and observer-core qualification. A generation is checked
-// when that binding has one; a run-scoped retained binding need not invent an
-// allocation generation. A run epoch must never stand in for one.
-// It must not read the condition or walk an unbounded resource list. One validate
-// plus one observe/acquire is a bounded unit. observe_once never waits; acquire
-// READY means this execution's required observation-side acquisition is complete.
-// PENDING acquire stores all continuation in stage/offset, without retaining an
-// old core's UB, stack or cache state. The policy must validate that continuation.
-// No operation may use network queries or atomics on DMA-written condition words.
-// This scheduler only reads sealed entry/side-reference metadata and never
-// dereferences entry.addr. All 64 backend_cookie bits reach the policy unchanged.
-//
-// The caller owns the CHECK lease, acquires its sealed fields/progress, stages
-// progress locally, and publishes it before handoff. DONE only means all bits
-// drained; the outer fixed tail still owns terminal/clear/join contribution.
+// One operation observes one condition, including the backend's observation
+// ordering. READY is monotonic for the run and is never polled again. The backend
+// returns immediately; it cannot retain a continuation, a core, or a payload.
+// The caller publishes this cursor before releasing the CHECK lease.
 template <typename Backend>
 inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
     const SchedulerAsyncGroupIdentity &identity, const SchedulerAsyncGroupWriter &writer,
@@ -176,89 +144,45 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
     using namespace scheduler_async_check_detail;
     if (progress == nullptr || budget == nullptr) return SchedulerAsyncCheckResult::ERROR;
     if (phase(*progress) == SchedulerAsyncCheckPhase::FAILED) return SchedulerAsyncCheckResult::ERROR;
-    if (phase(*progress) == SchedulerAsyncCheckPhase::DRAINED) {
-        if (writer.error_code != 0) return fail(*progress, writer.error_code);
-        if (!group_valid(identity, writer)) return fail(*progress, SchedulerAsyncCheckError::INVALID_GROUP);
-        if (progress->remaining_mask != 0 || progress->acquire_condition != SCHEDULER_ASYNC_INDEX_NONE ||
-            progress->acquire_stage != 0 || progress->acquire_byte_offset != 0 || progress->failure_code != 0 ||
-            (writer.count == 0 ? progress->next_condition != 0 : progress->next_condition >= writer.count))
-            return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
-        return SchedulerAsyncCheckResult::DONE;
-    }
-    if (phase(*progress) != SchedulerAsyncCheckPhase::ACTIVE || progress->failure_code != 0)
-        return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
     if (writer.error_code != 0) return fail(*progress, writer.error_code);
     if (!group_valid(identity, writer)) return fail(*progress, SchedulerAsyncCheckError::INVALID_GROUP);
     const uint32_t count = writer.count;
-    const uint64_t valid_mask = count_mask(count);
-    if (count == 0 || progress->remaining_mask == 0 || (progress->remaining_mask & ~valid_mask) != 0 ||
+    if (phase(*progress) == SchedulerAsyncCheckPhase::DRAINED) {
+        if (progress->remaining_mask != 0 || progress->failure_code != 0 ||
+            (count == 0 ? progress->next_condition != 0 : progress->next_condition >= count))
+            return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
+        return SchedulerAsyncCheckResult::DONE;
+    }
+    if (phase(*progress) != SchedulerAsyncCheckPhase::ACTIVE || progress->failure_code != 0 || count == 0 ||
+        progress->remaining_mask == 0 || (progress->remaining_mask & ~count_mask(count)) != 0 ||
         progress->next_condition >= count)
         return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
-    const bool acquiring = progress->acquire_condition != SCHEDULER_ASYNC_INDEX_NONE;
-    if (acquiring ? (progress->acquire_condition >= count ||
-                     (progress->remaining_mask & (UINT64_C(1) << progress->acquire_condition)) == 0) :
-                    (progress->acquire_stage != 0 || progress->acquire_byte_offset != 0))
-        return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
-    if (view.entries == nullptr || view.bindings == nullptr || view.entry_capacity < identity.capacity ||
-        view.binding_capacity < identity.capacity)
-        return fail(*progress, SchedulerAsyncCheckError::INVALID_BINDING);
+    if (view.entries == nullptr || view.entry_capacity < identity.capacity)
+        return fail(*progress, SchedulerAsyncCheckError::INVALID_ENTRY);
     increment(progress->slice_count);
-    uint32_t remaining_units = *budget < SCHEDULER_ASYNC_CHECK_WORK_LIMIT ? *budget : SCHEDULER_ASYNC_CHECK_WORK_LIMIT;
-    uint64_t observed_this_slice = 0;
-    while (remaining_units != 0) {
-        const bool resume_acquire = progress->acquire_condition != SCHEDULER_ASYNC_INDEX_NONE;
-        uint32_t index = 0;
-        if (resume_acquire) {
-            index = static_cast<uint32_t>(progress->acquire_condition);
-        } else {
-            const uint64_t eligible = progress->remaining_mask & ~observed_this_slice;
-            if (eligible == 0) break;
-            const uint64_t suffix = eligible & (UINT64_MAX << progress->next_condition);
-            index = static_cast<uint32_t>(__builtin_ctzll(suffix != 0 ? suffix : eligible));
-        }
-        --remaining_units;
+    uint32_t units = *budget < SCHEDULER_ASYNC_CHECK_WORK_LIMIT ? *budget : SCHEDULER_ASYNC_CHECK_WORK_LIMIT;
+    uint64_t observed = 0;
+    while (units != 0) {
+        const uint64_t eligible = progress->remaining_mask & ~observed;
+        if (eligible == 0) break;
+        const uint64_t suffix = eligible & (UINT64_MAX << progress->next_condition);
+        const uint32_t index = static_cast<uint32_t>(__builtin_ctzll(suffix != 0 ? suffix : eligible));
+        --units;
         --*budget;
         increment(progress->work_units);
         const auto condition = entry(view, index);
-        const auto side = binding(view, index);
         if (!entry_valid(identity, condition)) return fail(*progress, SchedulerAsyncCheckError::INVALID_ENTRY);
-        if (side.binding_index == SCHEDULER_ASYNC_INDEX_NONE)
-            return fail(*progress, SchedulerAsyncCheckError::INVALID_BINDING);
-        if (!backend.validate(identity, index, condition, side))
-            return fail(*progress, SchedulerAsyncCheckError::BACKEND_REJECTED);
-        SchedulerAsyncConditionOutcome outcome{};
-        if (resume_acquire) {
-            const uint64_t stage = progress->acquire_stage;
-            const uint64_t offset = progress->acquire_byte_offset;
-            increment(progress->acquire_count);
-            outcome = backend.acquire_completed(
-                identity, index, condition, side, progress->acquire_stage, progress->acquire_byte_offset
-            );
-            if (!outcome_valid(outcome)) return fail(*progress, SchedulerAsyncCheckError::INVALID_BACKEND_RESULT);
-            if (outcome.state == SchedulerAsyncConditionState::FAILED) return fail(*progress, outcome.error_code);
-            if (outcome.state == SchedulerAsyncConditionState::READY) {
-                progress->remaining_mask &= ~(UINT64_C(1) << index);
-                progress->acquire_condition = SCHEDULER_ASYNC_INDEX_NONE;
-                progress->acquire_stage = progress->acquire_byte_offset = 0;
-                if (progress->remaining_mask == 0) {
-                    progress->phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::DRAINED);
-                    return SchedulerAsyncCheckResult::DONE;
-                }
-            } else if (progress->acquire_stage == stage && progress->acquire_byte_offset == offset) {
-                // A pending acquisition that made no progress needs another
-                // service opportunity, not repeated work on this same slice.
-                return SchedulerAsyncCheckResult::PENDING;
-            }
-        } else {
-            observed_this_slice |= UINT64_C(1) << index;
-            progress->next_condition = index + 1 == count ? 0 : index + 1;
-            increment(progress->observation_count);
-            outcome = backend.observe_once(identity, index, condition, side);
-            if (!outcome_valid(outcome)) return fail(*progress, SchedulerAsyncCheckError::INVALID_BACKEND_RESULT);
-            if (outcome.state == SchedulerAsyncConditionState::FAILED) return fail(*progress, outcome.error_code);
-            if (outcome.state == SchedulerAsyncConditionState::READY) {
-                progress->acquire_condition = index;
-                progress->acquire_stage = progress->acquire_byte_offset = 0;
+        observed |= UINT64_C(1) << index;
+        progress->next_condition = index + 1 == count ? 0 : index + 1;
+        increment(progress->observation_count);
+        const auto outcome = backend.observe_once(identity, index, condition);
+        if (!outcome_valid(outcome)) return fail(*progress, SchedulerAsyncCheckError::INVALID_BACKEND_RESULT);
+        if (outcome.state == SchedulerAsyncConditionState::FAILED) return fail(*progress, outcome.error_code);
+        if (outcome.state == SchedulerAsyncConditionState::READY) {
+            progress->remaining_mask &= ~(UINT64_C(1) << index);
+            if (progress->remaining_mask == 0) {
+                progress->phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::DRAINED);
+                return SchedulerAsyncCheckResult::DONE;
             }
         }
     }

@@ -26,6 +26,12 @@
 
 namespace {
 
+SchedulerGraphView published_graph(SchedulerGraphView graph, const scheduler_test::FixtureStorage &storage) {
+    graph.scheduler_state_address = reinterpret_cast<uint64_t>(storage.scheduler_state->base());
+    graph.scheduler_state_bytes = storage.layout.total_size;
+    return graph;
+}
+
 thread_local volatile uint8_t *startup_reg_base = nullptr;
 thread_local std::function<void()> startup_register_observer;
 thread_local bool startup_observing_register = false;
@@ -414,9 +420,15 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     SchedulerWorkerStats stats{};
     if (with_profiling) {
-        ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, level)));
+        ASSERT_TRUE((run_ready_dispatch_loop<false, true>(
+            published_graph(graph.graph(), storage), base, local, run, &stats, level
+        ))) << "scheduler_error="
+            << run->scheduler_error << " site=" << run->error_site << " task=" << run->error_task_ref;
     } else {
-        ASSERT_TRUE((run_ready_dispatch_loop<false, false>(graph.graph(), base, local, run, &stats, level)));
+        ASSERT_TRUE((run_ready_dispatch_loop<false, false>(
+            published_graph(graph.graph(), storage), base, local, run, &stats, level
+        ))) << "scheduler_error="
+            << run->scheduler_error << " site=" << run->error_site << " task=" << run->error_task_ref;
     }
     ASSERT_EQ(startup_kernel_calls, 1u);
     ASSERT_EQ(identity_test_payload->local_context.block_idx, 77);
@@ -561,9 +573,12 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
         if (observations == 128) write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     });
     SchedulerWorkerStats stats{};
-    const bool result = level == 0 ?
-                            run_ready_dispatch_loop<false, false>(graph.graph(), base, local, run, &stats, level) :
-                            run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, level);
+    const bool result = level == 0 ? run_ready_dispatch_loop<false, false>(
+                                         published_graph(graph.graph(), storage), base, local, run, &stats, level
+                                     ) :
+                                     run_ready_dispatch_loop<false, true>(
+                                         published_graph(graph.graph(), storage), base, local, run, &stats, level
+                                     );
     EXPECT_EQ(result, arrival != IdleDispatchArrival::ERROR);
     EXPECT_LT(observations, 128u);
     EXPECT_GE(observations, 5u);
@@ -620,7 +635,10 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     startup_kernel_calls = 0;
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     SchedulerWorkerStats stats{};
-    ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, 4)));
+    ASSERT_TRUE(
+        (run_ready_dispatch_loop<false, true>(published_graph(graph.graph(), storage), base, local, run, &stats, 4))
+    ) << "scheduler_error="
+      << run->scheduler_error << " site=" << run->error_site << " task=" << run->error_task_ref;
     ASSERT_EQ(startup_kernel_calls, 2u);
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), base, local, run, nullptr, nullptr, nullptr, 4, nullptr, nullptr

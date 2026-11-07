@@ -9,7 +9,7 @@
 
 """Async wire evidence, diagnostic summaries and publication/join causality.
 
-Group pending_count counts PENDING service slices, including budget/acquire yields.
+Group pending_count counts PENDING service slices, including budget yields.
 FINISH pending_count is the current unpublished batch length. Active cycles sum
 work within individual slices; seal/terminal timestamps are not a busy interval.
 """
@@ -62,7 +62,9 @@ def read_async_protocol(section):
         for condition in row["conditions"]:
             name = f"{path}.conditions[{condition['index']}]"
             _object(condition, {"index", "type", "binding_index", "owner_generation"}, name)
-            _scalars(condition, ("index", "type", "binding_index"), name)
+            _scalars(condition, ("index", "type"), name)
+            if condition["binding_index"] is not None:
+                _number(condition["binding_index"], f"{name}.binding_index")
             generation = condition["owner_generation"]
             if generation is not None:
                 _number(generation, f"{name}.owner_generation")
@@ -253,7 +255,8 @@ def _audit_group(audit, group, execution):
     _require(group["pending_count"] <= group["slice_count"], "pending slices exceed service slices")
     for condition in group["conditions"]:
         _require(condition["type"] in (0, 1), "unsupported condition type")
-        _require(condition["binding_index"] < (1 << 64) - 1, "unbound condition")
+        if condition["binding_index"] is not None:
+            _require(condition["binding_index"] < (1 << 64) - 1, "unbound condition")
     if group["state"] == "EMPTY":
         _lease(group, 0)
         _require(

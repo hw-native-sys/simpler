@@ -15,19 +15,18 @@ macro(a5_hbg_case src)
 endmacro()
 
 a5_hbg_case(test_hbg_async_records.cpp NO_OBJS TIMEOUT 30)
-a5_hbg_case(test_hbg_async_binding_plan.cpp
+a5_hbg_case(test_hbg_async_backend_plan.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
     SOURCES
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_binding_plan.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/submission_bundle_plan.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_backend_plan.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)
 a5_hbg_case(test_hbg_async_join.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_check.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_observer.cpp NO_OBJS TIMEOUT 30)
-a5_hbg_case(test_hbg_async_resource_binding.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_backend.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_writer.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_sdma_submission_guard.cpp NO_OBJS TIMEOUT 30)
-a5_hbg_case(test_hbg_async_submission_context.cpp NO_OBJS TIMEOUT 30)
+a5_hbg_case(test_hbg_async_execution_context.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_runtime.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
     SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)
@@ -37,35 +36,7 @@ a5_hbg_case(test_hbg_async_execution.cpp
         ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM
     SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)
-a5_hbg_case(test_hbg_submission_bundle.cpp
-    INCLUDES
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
-        ${SIMPLER_SRC}/a5/platform/sim/aicore
-    DEFINES __CPU_SIM
-    SOURCES
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/submission_bundle_plan.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)
-a5_hbg_case(test_hbg_submission_execution.cpp
-    INCLUDES
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
-        ${SIMPLER_SRC}/a5/platform/sim/aicore
-    DEFINES __CPU_SIM
-    SOURCES
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/submission_bundle_plan.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp)
-a5_hbg_case(test_hbg_sdma_metadata_handoff.cpp NO_OBJS TIMEOUT 30
-    INCLUDES
-        ${SIMPLER_SRC}/a5/platform/sim/aicore
-        ${SIMPLER_REPO_ROOT}/build/pto-isa/include
-    DEFINES __CPU_SIM)
-a5_hbg_case(test_hbg_sdma_qualified_submission.cpp NO_OBJS TIMEOUT 30
-    INCLUDES
-        ${SIMPLER_SRC}/a5/platform/sim/aicore
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
-    DEFINES __CPU_SIM
-    SOURCES
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/submission_bundle_plan.cpp)
+a5_hbg_case(test_hbg_sdma_submission.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_discovery.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_local_storage.cpp NO_OBJS TIMEOUT 30)
 a5_hbg_case(test_hbg_async_finish.cpp

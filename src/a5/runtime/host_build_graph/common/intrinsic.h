@@ -119,6 +119,29 @@ struct GlobalContext {
 };
 
 // Shared dispatch prefix. Kernel-local submission metadata is not part of the wire layout.
+// One resident execution owns this state. Copies of its kernel view share it.
+struct AsyncCompletionReservationState {
+    uint32_t serial{0};
+    uint32_t begin{0};
+    uint32_t limit{0};
+    uint32_t written{0};
+    uint32_t sealed{0};
+    uint32_t reserved{0};
+};
+static_assert(sizeof(AsyncCompletionReservationState) == 24);
+
+inline constexpr uint32_t ASYNC_EXECUTION_CONTEXT_MAGIC = 0x41535935;
+
+struct AsyncExecutionContext {
+    uint64_t region_address{0};
+    uint64_t writer_state{0};
+    uint32_t task_ref{0};
+    uint32_t subtask_slot{0};
+    int32_t error_code{0};
+    uint32_t magic{ASYNC_EXECUTION_CONTEXT_MAGIC};
+};
+static_assert(sizeof(AsyncExecutionContext) == 32);
+
 struct AsyncCtxStorage {
     volatile __gm__ uint32_t *completion_count;
     volatile __gm__ int32_t *completion_error_code;
@@ -136,7 +159,18 @@ struct AsyncCtx {
     uint32_t completion_capacity;
     TaskId task_token;
 
-    uint64_t sdma_guard_context{0};
+    __gm__ AsyncExecutionContext *execution_context{nullptr};
+    volatile __gm__ AsyncCompletionReservationState *completion_reservation{nullptr};
+
+    static inline __aicore__ AsyncCtx from_storage(__gm__ const AsyncCtxStorage &storage) {
+        AsyncCtx ctx{};
+        ctx.completion_count = storage.completion_count;
+        ctx.completion_error_code = storage.completion_error_code;
+        ctx.completion_entries = storage.completion_entries;
+        ctx.completion_capacity = storage.completion_capacity;
+        TaskId::assign(ctx.task_token, storage.task_token);
+        return ctx;
+    }
 
     static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
         AsyncCtx ctx{};

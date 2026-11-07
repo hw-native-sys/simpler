@@ -150,6 +150,19 @@ def test_async_join_handles_empty_mix_spmd_and_either_ready_release_order(mask, 
     assert raw == before
 
 
+def test_async_without_binding_side_table_keeps_completion_causality():
+    raw, identities = async_capture()
+    for group in raw["async"]["groups"]:
+        for condition in group["conditions"]:
+            condition["binding_index"] = None
+            condition["owner_generation"] = None
+    read_native_protocol(raw)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    raw["async"]["groups"][0]["terminal"] = None
+    with pytest.raises(ValueError):
+        audit_native_protocol(raw, identities)
+
+
 def test_async_graph_uses_existing_public_ids_and_consumer_can_start_before_drain():
     raw, identities = native_capture()
     add_async(raw, identities, refs=(2,))

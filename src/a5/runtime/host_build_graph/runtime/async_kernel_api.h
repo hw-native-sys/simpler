@@ -18,10 +18,8 @@
 
 #include "intrinsic.h"
 #include "async_completion_writer.h"
-#include "async_sdma_guard.h"
-#include "async_submission_context.h"
 #include "scheduler/scheduler_async_layout.h"
-#include "dispatch_payload.h"
+#include "async_execution_context.h"
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/completion_token.h"
 #include "host_build_graph/runtime_status.h"
@@ -92,41 +90,28 @@ inline __aicore__ void defer_flush(AsyncCtx &ctx) {
 }  // namespace pto2::detail
 
 inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
-    __gm__ LocalContext *lc =
-        reinterpret_cast<__gm__ LocalContext *>(static_cast<uintptr_t>(args[PAYLOAD_LOCAL_CONTEXT_INDEX]));
-    AsyncCtx ctx{};
-    ctx.completion_count = lc->async_ctx.completion_count;
-    ctx.completion_error_code = lc->async_ctx.completion_error_code;
-    ctx.completion_entries = lc->async_ctx.completion_entries;
-    ctx.completion_capacity = lc->async_ctx.completion_capacity;
-    TaskId::assign(ctx.task_token, lc->async_ctx.task_token);
-    pto2::detail::defer_load_slab(ctx);
+    auto *lc = reinterpret_cast<__gm__ LocalContext *>(static_cast<uintptr_t>(args[PAYLOAD_LOCAL_CONTEXT_INDEX]));
+    AsyncCtx ctx = AsyncCtx::from_storage(lc->async_ctx);
     const uint64_t argument_address = reinterpret_cast<uint64_t>(args);
-    if (argument_address < offsetof(DispatchPayload, args)) return ctx;
-    const uint64_t payload_address = argument_address - offsetof(DispatchPayload, args);
-    if (payload_address % alignof(DispatchPayload) != 0) return ctx;
-    const auto *payload = reinterpret_cast<__gm__ const DispatchPayload *>(payload_address);
-    if (payload->args[SPMD_LOCAL_CONTEXT_INDEX] == reinterpret_cast<uint64_t>(&payload->local_context) &&
-        payload->args[SPMD_GLOBAL_CONTEXT_INDEX] == reinterpret_cast<uint64_t>(&payload->global_context)) {
-        const uint64_t address = payload->async_submission_context;
-        if (address != 0 && address % 128 == 0 &&
-            reinterpret_cast<__gm__ const AsyncSdmaGuardContext *>(address)->magic == ASYNC_SDMA_GUARD_MAGIC)
-            ctx.sdma_guard_context = address;
-        else if (auto *qualified = get_async_submission_context(args)) {
-            const auto &header = qualified->header;
-            if (header.region_bytes < sizeof(SchedulerAsyncLayout)) {
-                pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-                return ctx;
-            }
-            const auto *layout = reinterpret_cast<__gm__ const SchedulerAsyncLayout *>(header.region_address);
-            if (layout->version != SCHEDULER_ASYNC_LAYOUT_VERSION ||
-                !async_sdma_guard_region(
-                    header.region_address, header.region_bytes, header.run_epoch, layout->sdma_guard_context_offset,
-                    layout->sdma_guard_count, &ctx.sdma_guard_context
-                ))
-                pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        }
+    if (argument_address < offsetof(DispatchPayload, args)) {
+        pto2::detail::defer_load_slab(ctx);
+        return ctx;
     }
+    const uint64_t payload_address = argument_address - offsetof(DispatchPayload, args);
+    if (payload_address % alignof(DispatchPayload) != 0) {
+        pto2::detail::defer_load_slab(ctx);
+        return ctx;
+    }
+    auto *payload = reinterpret_cast<__gm__ DispatchPayload *>(payload_address);
+    if (payload->args[SPMD_LOCAL_CONTEXT_INDEX] != reinterpret_cast<uint64_t>(&payload->local_context) ||
+        payload->args[SPMD_GLOBAL_CONTEXT_INDEX] != reinterpret_cast<uint64_t>(&payload->global_context) ||
+        payload->async_context_address == 0) {
+        pto2::detail::defer_load_slab(ctx);
+        return ctx;
+    }
+    // The resident entry establishes the cache view. Re-fetching this context
+    // must preserve the current kernel's still-dirty single-writer registration.
+    (void)async_execution_context_load(*payload, &ctx);
     return ctx;
 }
 

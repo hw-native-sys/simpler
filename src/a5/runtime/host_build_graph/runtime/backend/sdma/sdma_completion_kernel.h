@@ -14,8 +14,7 @@
 #include <stdint.h>
 
 #include "async_kernel_api.h"
-#include "sdma_submission_contract.h"
-#include "sdma_submission_guard.h"
+#include "sdma_submission.h"
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/runtime_status.h"
 
@@ -68,119 +67,100 @@ inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> Sdma
 }
 
 namespace pto2::detail {
-
-inline __aicore__ bool
-register_sdma_post_done_record(AsyncCtx &ctx, volatile __gm__ void *record_addr, uint64_t post_id) {
-    CompletionToken token{
-        reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD, post_id
-    };
-    return register_completion_condition(ctx, token);
-}
-
-template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ bool register_pto_async_event(
-    AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, const AsyncCompletionAllowance &allowance
-) {
-    const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (event.postFailed || engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
-        defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        return false;
+template <typename Descriptor>
+class SdmaPtoBackend {
+public:
+    inline __aicore__ explicit SdmaPtoBackend(Descriptor &descriptor) :
+        descriptor_(descriptor) {}
+    inline __aicore__ bool preflight() const {
+        using Scratch = std::remove_reference_t<decltype(descriptor_.scratch)>;
+        static_assert(Scratch::Loc == pto::TileType::Vec);
+        static_assert(pto::comm::sdma::kSdmaMaxChannel == ASYNC_SDMA_CHANNELS);
+        static_assert(sizeof(pto::comm::sdma::BatchWriteFlagInfo) == 64);
+        static_assert(sizeof(pto::comm::sdma::BatchWriteChannelInfo) == 64);
+        constexpr uint64_t bytes = static_cast<uint64_t>(Scratch::Numel) * sizeof(typename Scratch::DType);
+        return sdma_scratch_valid(
+            reinterpret_cast<uint64_t>(descriptor_.scratch.data()), bytes, pto::comm::sdma::UB_ALIGN_SIZE,
+            descriptor_.sync_id
+        );
     }
-    if (!ctx.task_token.is_valid()) return event.Wait(session);
-    if (event.handle == 0) return async_completion_accept_count(ctx, allowance, 0);
-
-    const uint32_t record_count = event.CompletionRecordCount(session);
-    if (record_count == 0 || record_count == ::pto::comm::kCompletionRecordCountError ||
-        !async_completion_accept_count(ctx, allowance, record_count)) {
-        defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        return false;
+    inline __aicore__ bool build_session(uint32_t queues, uint32_t group) {
+        const pto::comm::sdma::SdmaBaseConfig config{pto::comm::sdma::kDefaultSdmaBlockBytes, 0, queues};
+        return pto::comm::BuildAsyncSession(
+            descriptor_.scratch, descriptor_.workspace, session_, descriptor_.sync_id, config, group
+        );
     }
-    for (uint32_t index = 0; index < record_count; ++index) {
-        const auto record = event.CompletionRecordAt(session, index);
-        if (record.kind != ::pto::comm::CompletionKind::SDMA_POST_DONE || record.addr == nullptr ||
-            (reinterpret_cast<uint64_t>(record.addr) & 7u) != 0 || record.expected == 0) {
-            defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    inline __aicore__ bool session_valid(uint32_t queues, uint32_t group) const {
+        return session_.valid && session_.engine == pto::comm::DmaEngine::SDMA &&
+               session_.contextGm == descriptor_.workspace && session_.cfg.sdma.queueNum == queues &&
+               session_.cfg.sdma.channelGroupIdx == group;
+    }
+    inline __aicore__ bool submit() {
+        if (descriptor_.op == SdmaOp::TGET) event_ = pto::comm::TGET_ASYNC(descriptor_.dst, descriptor_.src, session_);
+        else event_ = pto::comm::TPUT_ASYNC(descriptor_.dst, descriptor_.src, session_);
+        return true;
+    }
+    inline __aicore__ bool event_valid(uint64_t bytes) const {
+        return async_sdma_event_valid(
+            descriptor_.op, bytes, event_.handle, event_.postFailed, static_cast<uint32_t>(event_.engine),
+            static_cast<uint32_t>(pto::comm::DmaEngine::SDMA)
+        );
+    }
+    inline __aicore__ bool has_records() const { return event_.handle != 0; }
+    inline __aicore__ uint32_t record_count() const { return event_.CompletionRecordCount(session_); }
+    inline __aicore__ bool record(uint32_t index, SdmaCompletionReceiptRecord *out) const {
+        const auto record = event_.CompletionRecordAt(session_, index);
+        if (out == nullptr || record.kind != pto::comm::CompletionKind::SDMA_POST_DONE || record.addr == nullptr)
             return false;
-        }
-        if (!register_sdma_post_done_record(ctx, record.addr, record.expected)) return false;
+        *out = {reinterpret_cast<uint64_t>(record.addr), record.expected};
+        return true;
     }
-    return true;
-}
+    inline __aicore__ bool wait() const { return event_.Wait(session_); }
 
+private:
+    Descriptor &descriptor_;
+    pto::comm::AsyncSession session_{};
+    pto::comm::AsyncEvent event_{};
+};
+
+template <typename Descriptor, typename Sink>
+inline __aicore__ bool sdma_kernel_submit(AsyncCtx &ctx, Descriptor &descriptor, Sink &sink) {
+    CompletionCache cache;
+#if defined(__DAV_CUBE__) && !defined(__DAV_VEC__)
+    return sdma_submit_error(ctx, cache);
+#else
+    uint64_t bytes = 0;
+    const bool valid_shape = async_sdma_transfer_bytes(descriptor.dst, descriptor.src, &bytes);
+    SdmaPtoBackend<Descriptor> backend(descriptor);
+    return sdma_submit(
+        ctx, descriptor.op, valid_shape, reinterpret_cast<uint64_t>(descriptor.workspace),
+        reinterpret_cast<uint64_t>(descriptor.src.data()), reinterpret_cast<uint64_t>(descriptor.dst.data()), bytes,
+        static_cast<uint32_t>(get_block_idx()), backend, cache, sink
+    );
+#endif
+}
 }  // namespace pto2::detail
 
-// SDMA overload of the runtime's send_request_entry. Submits the descriptor
-// to PTO-ISA, then registers the resulting AsyncEvent's GM post-done records into the
-// AsyncCtx deferred-wait slab and flushes. Returns false on submit/session
-// failure (also records the error in ctx.completion_error_code).
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 inline __aicore__ bool
-send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
-    if (ctx.task_token.is_valid() && !async_completion_writer_valid(ctx)) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    if (ctx.task_token.is_valid() && *ctx.completion_error_code != 0) {
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    if (desc.op != SdmaOp::TGET && desc.op != SdmaOp::TPUT) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    uint64_t transfer_bytes = 0;
-    if (!async_sdma_transfer_bytes(desc.dst, desc.src, &transfer_bytes)) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    if (transfer_bytes == 0) return true;
-    pto2::detail::SdmaSubmissionScope submission;
-    if (!submission.acquire(ctx, static_cast<uint32_t>(get_block_idx()))) {
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    pto::comm::AsyncSession session;
-    if (!pto::comm::BuildAsyncSession(desc.scratch, desc.workspace, session, desc.sync_id)) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-
-    // A post may produce a completion record for every queue in this session.
-    // The context is single-writer; hold that entire suffix until the submit
-    // returns, then accept only an actual record count within this allowance.
-    AsyncCompletionAllowance allowance;
-    if (ctx.task_token.is_valid() && !async_completion_reserve(ctx, session.cfg.sdma.queueNum, &allowance)) {
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    pto::comm::AsyncEvent event;
-    if (desc.op == SdmaOp::TGET) {
-        event = pto::comm::TGET_ASYNC(desc.dst, desc.src, session);
-    } else {
-        event = pto::comm::TPUT_ASYNC(desc.dst, desc.src, session);
-    }
-    if (!async_sdma_event_valid(
-            desc.op, transfer_bytes, event.handle, event.postFailed, static_cast<uint32_t>(event.engine),
-            static_cast<uint32_t>(pto::comm::DmaEngine::SDMA)
-        )) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    if (!ctx.task_token.is_valid()) return submission.release(true, desc.workspace) && event.Wait(session);
-    const bool registered = pto2::detail::register_pto_async_event(ctx, event, session, allowance);
-    if (!submission.release(registered, desc.workspace)) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        pto2::detail::defer_flush(ctx);
-        return false;
-    }
-    pto2::detail::defer_flush(ctx);
-    return registered;
+send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> descriptor) {
+    SdmaIgnoreCompletionRecords sink;
+    return pto2::detail::sdma_kernel_submit(ctx, descriptor, sink);
 }
 
-// The args-aware path retains its scheduler-granted channel and resource checks.
-#include "sdma_qualified_kernel.h"
+// Receipts are emitted after SDK metadata publication and queue-guard release.
+// This adapter uses the same canonical context as the AsyncCtx overload.
+template <typename DstTensor, typename SrcTensor, typename ScratchTileT, typename Sink>
+inline __aicore__ bool send_request_entry(
+    __gm__ int64_t *args, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> descriptor, Sink sink
+) {
+    AsyncCtx ctx{};
+    if (!async_execution_context_load(args, &ctx)) return false;
+    return pto2::detail::sdma_kernel_submit(ctx, descriptor, sink);
+}
+
+template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
+inline __aicore__ bool
+send_request_entry(__gm__ int64_t *args, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> descriptor) {
+    return send_request_entry(args, descriptor, SdmaIgnoreCompletionRecords{});
+}

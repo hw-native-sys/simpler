@@ -11,10 +11,5 @@
 
 #include "../waiter.h"
 
-// The local marker acknowledges the finite registration body, never TaskDone.
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    async_case::wait_task(args, 0);
-    const int64_t execution = args[5] + get_block_idx(args) * 3;
-    auto *signals = async_case::data<int32_t>(args[0]);
-    async_case::publish_signal(async_case::condition(signals, execution, async_case::kConditionLimit), 1);
-}
+// The marker acknowledges registration before the optional kernel-return delay.
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { async_case::wait_task(args, 0); }

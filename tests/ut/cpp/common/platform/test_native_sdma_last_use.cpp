@@ -13,10 +13,11 @@
 #define private public
 #include "device_runner.h"
 #undef private
-#include "async_binding_plan.h"
+#include "async_backend_plan.h"
+#include "async_execution_context.h"
 #include "aicore_scheduler_error.h"
-#include "backend/sdma/sdma_qualified_submission.h"
-#include "scheduler/scheduler_submission_execution.h"
+#include "backend/sdma/sdma_submission.h"
+#include "scheduler/scheduler_async_execution.h"
 #include "a5/runtime/host_build_graph/hbg_scheduler_test_support.h"
 
 #include <array>
@@ -25,12 +26,11 @@
 namespace native_admission_test {
 namespace {
 using namespace pto2::detail;
-using ExecutionBackend = AsyncResourceBindings<>;
+using ExecutionBackend = AsyncCompletionBackend<>;
 constexpr uint64_t kEpoch = 20;
 constexpr uint32_t kSlot = 1;
 constexpr uint64_t kBytes = 4096;
 constexpr uint64_t kBudget = 1 << 20;
-constexpr SdmaMetadataLayout kMetadata{64, 64, 4};
 constexpr auto kClean = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
 enum class SdmaFault { PREFLIGHT, RECORD_EXPORT };
 
@@ -73,10 +73,11 @@ struct SdmaIoFault {
     }
     bool build_session(uint32_t count, uint32_t index) {
         ++built;
-        require(count == queues && index == group, "backend geometry differs from real grant");
+        require(count == queues && index == group, "backend geometry differs from selected workspace");
         return true;
     }
-    SdmaMetadataSession metadata_session() const { return {workspace, group, queues, true}; }
+    bool session_valid(uint32_t count, uint32_t index) const { return count == queues && index == group; }
+    bool has_records() const { return true; }
     bool submit() {
         ++posted;
         return true;
@@ -205,11 +206,11 @@ public:
     SdmaAllocationFacts facts;
     void *native_storage{nullptr};
     int32_t first_sdk_error{0}, terminal_rc{0};
-    uint64_t attempted{UINT64_MAX}, committed{UINT64_MAX};
+    uint32_t outstanding_reservation{0};
     uint32_t receipt_count{0}, posted{0}, built{0}, exported{0}, preflights{0};
-    AsyncSubmissionContext *canonical{nullptr};
+    AsyncExecutionContext *canonical{nullptr};
     SchedulerAsyncGroupWriter *writer{nullptr};
-    AsyncBindingHostPlan bindings;
+    AsyncBackendHostPlan bindings;
 
 private:
     void plan_image(const HostApi &api, uint32_t slot, uint64_t epoch) {
@@ -250,34 +251,33 @@ private:
             declarations.add(false, 0, 0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1}),
             "SDMA declaration"
         );
-        const AsyncBindingTaskImage image{
+        const AsyncBackendTaskImage image{
             &task_image_, sizeof(task_image_), reinterpret_cast<uint64_t>(&task_image_), offsetof(TaskImage, tasks), 2
         };
         NativeGraphHostPlan native;
         std::string error;
         require(
-            scheduler_plan_async_bindings(
+            scheduler_plan_async_backend(
                 metadata_, capabilities_, image, native, declarations, api, kBudget, &bindings, &error
             ),
             error.c_str()
         );
+        AsyncBackendView declarations_view;
         require(
-            bindings.execution_contract == ASYNC_EXECUTION_UNQUALIFIED && bindings.submission_workspaces.size() == 1 &&
-                bindings.conditions.size() == 1 &&
-                bindings.conditions[0].completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD,
-            "genuine SDMA binding contract"
+            declarations_view.mount(reinterpret_cast<const uint8_t *>(bindings.image.data()), bindings.image.size()),
+            "backend declarations"
         );
         require(
-            scheduler_plan_submission_bundles(
-                metadata_, capabilities_, bindings.submission_workspaces, bindings.submission_uses,
-                bindings.execution_use_sets, epoch, kBudget, &submissions_plan_, &error
-            ),
-            error.c_str()
+            bindings.execution_contract == HBG_ASYNC_CONTRACT_UNQUALIFIED &&
+                declarations_view.layout.transfer_count == 1,
+            "genuine SDMA backend contract"
         );
-        bindings.auxiliary.scratch = submissions_plan_.image.size();
+        const SchedulerAsyncAuxiliaryBytes auxiliary{
+            bindings.image.size(), ASYNC_SDMA_CHANNELS, bindings.execution_contract
+        };
         SchedulerAsyncHostPlan plan;
         require(
-            scheduler_plan_async_state(metadata_, capabilities_, epoch, kBudget, bindings.auxiliary, &plan, &error),
+            scheduler_plan_async_state(metadata_, capabilities_, epoch, kBudget, auxiliary, &plan, &error),
             error.c_str()
         );
         const uint64_t summary_offset = sizeof(SchedulerRunControl);
@@ -298,15 +298,10 @@ private:
         summary->async_layout_offset = async_offset_;
         auto *base = static_cast<uint8_t *>(scheduler_host_) + async_offset_;
         std::memcpy(base, plan.image.data(), plan.image.size());
-        require(
-            scheduler_initialize_async_bindings(bindings, plan.layout, base, plan.image.size(), &error), error.c_str()
-        );
+        std::memcpy(base + plan.layout.backend_offset, bindings.image.data(), bindings.image.size());
         async_ = {base, plan.layout};
-        require(plan.layout.scratch_bytes == submissions_plan_.image.size(), "exact submission storage");
-        std::memcpy(base + plan.layout.scratch_offset, submissions_plan_.image.data(), submissions_plan_.image.size());
-        require(scheduler_submission_provenance_mount(base, plan.layout, &proof_), "submission provenance");
-        require(AsyncResourceTables::mount(base, plan.layout, &tables_), "resource tables");
-        require(tables_.header.execution_contract == ASYNC_EXECUTION_UNQUALIFIED, "no core-only promotion");
+        require(declarations_.mount(base, plan.layout), "backend declarations");
+        require(plan.layout.execution_contract == HBG_ASYNC_CONTRACT_UNQUALIFIED, "no core-only promotion");
     }
     void run_sdk_fault() {
         auto view = graph_.graph();
@@ -339,86 +334,56 @@ private:
         payload->args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload->global_context);
         SchedulerAsyncExecutionState<ExecutionBackend> state;
         state.view = async_;
-        SchedulerSubmissionExecutionView submissions;
-        require(scheduler_submission_execution_mount(state, &submissions), "execution mount");
-        ExecutionBackend resources(tables_, ASYNC_CORE_AIV, &proof_);
+        ExecutionBackend resources(declarations_, async_.layout.execution_contract);
         require(
-            scheduler_async_execution_bind(&state, view, base, local, storage_.run_control, 0),
-            "execution context binding"
+            scheduler_async_execution_bind(&state, view, base, local, storage_.run_control, 0), "execution binding"
         );
-        bool permit = false;
-        for (uint32_t i = 0; i < 16 && !permit; ++i)
-            require(
-                scheduler_submission_execution_admit(
-                    submissions, &state, view, base, local, storage_.run_control, 0, &permit
-                ),
-                "real grant admission"
-            );
-        require(
-            permit && scheduler_async_execution_permitted(&state, view, local, storage_.run_control, 0),
-            "kernel permission"
-        );
-        canonical = reinterpret_cast<AsyncSubmissionContext *>(payload->async_submission_context);
+        require(scheduler_async_execution_permitted(&state, view, local, storage_.run_control, 0), "kernel permission");
+        canonical = &payload->async_context;
         writer = reinterpret_cast<SchedulerAsyncGroupWriter *>(async_.base + async_.layout.group_writer_offset);
-        require(canonical == scheduler_submission_canonical_context(proof_, 0), "canonical context identity");
-        SdmaQualifiedAccess access;
         AsyncCtx verified_writer;
-        AsyncSubmissionContext *verified_context = nullptr;
-        auto *args = reinterpret_cast<int64_t *>(payload->args);
+        require(async_execution_context_load(*payload, &verified_writer), "canonical execution context");
         require(
-            sdma_qualified_access(
-                args, address(2), address(1), address(0) + 128, 32, &verified_context, &verified_writer, &access
-            ),
-            "real qualified frame"
-        );
-        require(
-            verified_context == canonical && verified_writer.completion_error_code == &writer->error_code,
+            verified_writer.execution_context == canonical &&
+                verified_writer.completion_error_code == &writer->error_code,
             "canonical writer identity"
         );
+        const auto transfer = declarations_.transfer(0);
         SdmaIoFault io{fault_};
-        io.workspace = access.workspace.address;
-        io.group = access.grant.group_index;
-        io.queues = access.workspace.queue_num;
+        io.workspace = transfer.workspace;
+        io.group = 0;
+        io.queues = transfer.queue_count;
         CpuCache cache;
         auto sink = [&](uint32_t, uint32_t, const SdmaCompletionReceiptRecord &) {
             ++receipt_count;
         };
-        require(
-            !sdma_qualified_entry(args, true, address(2), address(1), address(0) + 128, 32, kMetadata, io, cache, sink),
-            "fault must fail SDK entry"
-        );
+        auto submit = [&] {
+            return sdma_submit(
+                verified_writer, SdmaOp::TGET, true, address(2), address(1), address(0) + 128, 32, 0, io, cache, sink
+            );
+        };
+        require(!submit(), "fault must fail SDK entry");
         first_sdk_error = writer->error_code;
-        require(first_sdk_error != 0 && canonical->evidence.error_code == first_sdk_error, "same original error");
+        require(first_sdk_error != 0, "original SDK error");
         const auto before_retry_posts = io.posted;
+        require(!submit(), "sticky SDK error");
         require(
-            !sdma_qualified_entry(args, true, address(2), address(1), address(0) + 128, 32, kMetadata, io, cache, sink),
-            "sticky SDK error"
-        );
-        require(
-            io.posted == before_retry_posts && writer->error_code == first_sdk_error &&
-                canonical->evidence.error_code == first_sdk_error,
+            io.posted == before_retry_posts && writer->error_code == first_sdk_error,
             "retry cannot replace error or post"
         );
         require(
-            canonical->evidence.run_epoch == kEpoch && canonical->evidence.task_ref == 0 &&
-                canonical->evidence.dispatch_generation == 1 &&
-                canonical->evidence.flags == (fault_ == SdmaFault::PREFLIGHT ? ASYNC_SUBMISSION_METADATA_PUBLISHED : 0),
-            "canonical identity and uncommitted evidence flags"
+            canonical->task_ref == 0 && canonical->subtask_slot == 1 &&
+                canonical->region_address == reinterpret_cast<uint64_t>(async_.base),
+            "canonical execution identity"
         );
-        attempted = canonical->evidence.attempted;
-        committed = canonical->evidence.committed;
+        outstanding_reservation = writer->reservation.limit;
         posted = io.posted;
         built = io.built;
         exported = io.exported;
         preflights = io.preflights;
+        require(receipt_count == 0 && writer->count == 0 && io.waited == 0, "no successful completion publication");
         require(
-            receipt_count == 0 && writer->count == 0 && committed == 0 && io.waited == 0,
-            "no successful completion publication"
-        );
-        require(
-            !scheduler_submission_execution_returned(
-                submissions, &state, view, base, local, storage_.run_control, 0, resources
-            ),
+            !scheduler_async_execution_returned(&state, view, base, local, storage_.run_control, 0, resources),
             "runtime return must propagate fault"
         );
         require(
@@ -426,10 +391,13 @@ private:
                 storage_.run_control->error_task_ref == 0,
             "actual scheduler first-error authority"
         );
-        auto *pool = scheduler_submission_detail::at<SchedulerSubmissionPool>(
-            submissions.view, submissions.view.header.pools_offset
+        auto *guards = reinterpret_cast<AsyncSdmaSubmissionGuard *>(
+            async_.base + async_.layout.sdma_guard_context_offset + sizeof(AsyncSdmaGuardContext)
         );
-        require(scheduler_gm_query(pool->busy_groups) != 0, "failed writer must retain submission grant");
+        require(
+            scheduler_gm_query(guards[0].word) == (fault_ == SdmaFault::PREFLIGHT ? 0u : 2u),
+            "post failure poisons the queue while preflight failure holds no queue"
+        );
         require(
             scheduler_task_control_at(base, local, 0)->state != static_cast<int64_t>(SchedulerTaskState::DONE) &&
                 scheduler_task_control_at(base, local, 1)->state != static_cast<int64_t>(SchedulerTaskState::DONE),
@@ -447,10 +415,8 @@ private:
     scheduler_test::BasicGraphBuffer<2> graph_;
     std::vector<SchedulerTaskMetadata> metadata_;
     std::vector<SchedulerAsyncCapabilities> capabilities_;
-    SchedulerSubmissionHostPlan submissions_plan_;
-    SchedulerSubmissionProvenanceView proof_{};
     SchedulerAsyncRuntimeView async_{};
-    AsyncResourceTables tables_{};
+    AsyncBackendView declarations_{};
     void *scheduler_host_{nullptr};
     uint64_t scheduler_bytes_{0}, async_offset_{0};
 };
@@ -493,7 +459,7 @@ private:
             "semantic error bridge"
         );
         require(
-            runner.attempted == (fault == SdmaFault::PREFLIGHT ? 0u : 1u) && runner.committed == 0 &&
+            runner.outstanding_reservation == (fault == SdmaFault::PREFLIGHT ? 0u : 1u) &&
                 runner.posted == (fault == SdmaFault::PREFLIGHT ? 0u : 1u) && runner.built == runner.posted &&
                 runner.exported == runner.posted && runner.preflights == 1 && runner.receipt_count == 0,
             "fault stage evidence"
@@ -520,7 +486,7 @@ private:
             native->domain_snapshots.size() == 1 && native->domain_snapshots[0].use.id == runner.facts.domain.use.id &&
                 native->domain_sdma_owners[0].workspace_addr == runner.address(2) &&
                 native->domain_sdma_owners[0].access == CommSdmaAccess::SDK_ONLY &&
-                runner.bindings.execution_contract == ASYNC_EXECUTION_UNQUALIFIED,
+                runner.bindings.execution_contract == HBG_ASYNC_CONTRACT_UNQUALIFIED,
             "selected owner contract retained"
         );
         for (void *buffer : runner.facts.allocations)
@@ -539,9 +505,8 @@ private:
         require(next.prepare() != 0, "next admission must refuse");
         require(finalize_device(&runner) != 0 && !control().retired, "raw reset must refuse");
         require(
-            runner.canonical->evidence.error_code == runner.first_sdk_error &&
-                runner.writer->error_code == runner.first_sdk_error &&
-                runner.canonical->evidence.attempted == runner.attempted && runner.canonical->evidence.committed == 0,
+            runner.writer->error_code == runner.first_sdk_error &&
+                runner.writer->reservation.limit == runner.outstanding_reservation && runner.writer->count == 0,
             "fault evidence survives Host refusal"
         );
         // Deliberately retained failing carriers cannot be destructed as healthy

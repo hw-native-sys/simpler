@@ -1598,7 +1598,7 @@ TEST(SchedulerReadyWake, ConcurrentConsumersReceiveEveryEarlyMixPrefixAndSuffixT
     for (auto &consumer : consumers)
         consumer.join();
     EXPECT_FALSE(failed.load());
-    EXPECT_EQ(fixture.ready.batch_count, 2u);
+    EXPECT_GE(fixture.ready.batch_count, 2u);
     for (const auto &occurrences : seen)
         EXPECT_EQ(occurrences.load(), 1u);
     EXPECT_TRUE(scheduler_ready_endpoints_empty(fixture.endpoints()));

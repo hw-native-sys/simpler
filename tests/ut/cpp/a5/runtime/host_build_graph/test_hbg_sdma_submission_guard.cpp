@@ -29,9 +29,7 @@ struct GuardImage {
         context.guard_count = 2;
         context.bytes = 3 * 128;
     }
-    AsyncCtx ctx() {
-        return {&count, &error, entries, 64, TaskId::make_global(1), reinterpret_cast<uint64_t>(&context)};
-    }
+    AsyncCtx ctx() { return {&count, &error, entries, 64, TaskId::make_global(1)}; }
 };
 struct FastClock {
     inline static uint64_t ticks{0};
@@ -51,7 +49,7 @@ TEST(HbgSdmaSubmissionGuard, PublicationPrecedesUnlockAndAnotherOwnerCanEnter) {
     auto ctx = image.ctx();
     bool published = false;
     SdmaSubmissionScope owner;
-    ASSERT_TRUE(owner.acquire(ctx, 0));
+    ASSERT_TRUE(owner.acquire(ctx, reinterpret_cast<uint64_t>(&image.context), 0));
     EXPECT_EQ(sdma_guard_try_acquire(image.guards[0]), SdmaGuardResult::BUSY);
     ASSERT_TRUE(owner.release(true, nullptr, Publisher{&image.guards[0], &published}));
     EXPECT_TRUE(published);
@@ -65,7 +63,7 @@ TEST(HbgSdmaSubmissionGuard, FailedOrAbandonedSubmissionPoisonsOnlyItsChannelGro
         auto ctx = image.ctx();
         {
             SdmaSubmissionScope owner;
-            ASSERT_TRUE(owner.acquire(ctx, 0));
+            ASSERT_TRUE(owner.acquire(ctx, reinterpret_cast<uint64_t>(&image.context), 0));
             if (explicit_failure) EXPECT_TRUE(owner.release(false, nullptr));
         }
         EXPECT_EQ(sdma_guard_try_acquire(image.guards[0]), SdmaGuardResult::FAILED);
@@ -81,7 +79,7 @@ TEST(HbgSdmaSubmissionGuard, ContentionTimeoutDoesNotUnlockTheOtherOwner) {
     FastClock::ticks = 0;
     {
         SdmaSubmissionScope contender;
-        EXPECT_FALSE(contender.acquire<FastClock>(ctx, 0));
+        EXPECT_FALSE(contender.acquire<FastClock>(ctx, reinterpret_cast<uint64_t>(&image.context), 0));
     }
     EXPECT_EQ(image.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(image.guards[0].word, 1u);
@@ -94,7 +92,7 @@ TEST(HbgSdmaSubmissionGuard, PartialQueueSetTimeoutReleasesOnlyUnsubmittedOwners
     ASSERT_EQ(sdma_guard_try_acquire(image.guards[1]), SdmaGuardResult::ACQUIRED);
     FastClock::ticks = 0;
     SdmaSubmissionScope contender;
-    EXPECT_FALSE(contender.acquire<FastClock>(ctx, 0, 2));
+    EXPECT_FALSE(contender.acquire<FastClock>(ctx, reinterpret_cast<uint64_t>(&image.context), 0, 2));
     EXPECT_EQ(image.guards[0].word, 0u);
     EXPECT_EQ(image.guards[1].word, 1u);
     EXPECT_TRUE(sdma_guard_release(image.guards[1], true));
@@ -104,7 +102,7 @@ TEST(HbgSdmaSubmissionGuard, MultiQueueSubmissionOwnsAndPoisonsTheEntireOverlap)
     GuardImage image;
     auto ctx = image.ctx();
     SdmaSubmissionScope owner;
-    ASSERT_TRUE(owner.acquire(ctx, 0, 2));
+    ASSERT_TRUE(owner.acquire(ctx, reinterpret_cast<uint64_t>(&image.context), 0, 2));
     EXPECT_EQ(sdma_guard_try_acquire(image.guards[0]), SdmaGuardResult::BUSY);
     EXPECT_EQ(sdma_guard_try_acquire(image.guards[1]), SdmaGuardResult::BUSY);
     ASSERT_TRUE(owner.release(false, nullptr));
@@ -124,7 +122,7 @@ TEST(HbgSdmaSubmissionGuard, InvalidMetadataAndOutOfRangeGroupFailBeforeAcquirin
         if (fault == 4) group = 2;
         if (fault == 5) image.context.guard_count = ASYNC_SDMA_CHANNELS + 1;
         SdmaSubmissionScope owner;
-        EXPECT_FALSE(owner.acquire(ctx, group));
+        EXPECT_FALSE(owner.acquire(ctx, reinterpret_cast<uint64_t>(&image.context), group));
         EXPECT_EQ(image.error, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         EXPECT_EQ(image.guards[0].word, 0u);
     }

@@ -69,53 +69,53 @@ public:
 };
 
 void fill_finish(SchedulerAsyncFinishProgress &value) {
-    value.resolve.task_ref = 11;
-    value.resolve.producer_ref = 13;
-    value.resolve.next_fanin = 17;
-    value.resolve.fanin_count = 19;
-    value.resolve.phase = SchedulerResolvePhase::LINK;
-    value.resolve.validate_current_state = false;
-    value.current_waiter = 23;
-    value.detached_next = 29;
-    value.pending_count = 8;
-    value.pending_queue = 31;
-    value.pending_target = 37;
-    value.pending_kind = 41;
-    value.resume_phase = 43;
-    value.pending_first = 47;
-    value.pending_last = 53;
-    value.pending_link_count = 59;
-    value.visited_count = 61;
+    value.completion.resolve.task_ref = 11;
+    value.completion.resolve.producer_ref = 13;
+    value.completion.resolve.next_fanin = 17;
+    value.completion.resolve.fanin_count = 19;
+    value.completion.resolve.phase = SchedulerResolvePhase::LINK;
+    value.completion.resolve.validate_current_state = false;
+    value.completion.current_waiter = 23;
+    value.completion.detached_next = 29;
+    value.completion.pending_count = 8;
+    value.completion.pending_queue = 31;
+    value.completion.pending_target = 37;
+    value.completion.pending_kind = 41;
+    value.completion.resume_phase = 43;
+    value.completion.pending_first = 47;
+    value.completion.pending_last = 53;
+    value.completion.pending_link_count = 59;
+    value.completion.visited_count = 61;
     for (size_t i = 0; i < 8; ++i)
-        value.pending_tasks[i] = 100 + i;
+        value.completion.pending_tasks[i] = 100 + i;
     value.active_slice_cycles = 67;
     value.slice_count = 71;
     value.work_units = 73;
     // Writing the outer FINISH phase must preserve the nested resolver cursor
     // and both cache lines of the pending publication.
-    value.phase = 7;
+    value.completion.phase = 7;
 }
 
 void expect_finish_defaults(const SchedulerAsyncFinishProgress &value) {
-    EXPECT_EQ(value.resolve.task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.resolve.producer_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.resolve.phase, SchedulerResolvePhase::INITIALIZE);
-    EXPECT_TRUE(value.resolve.validate_current_state);
-    EXPECT_EQ(value.resolve.next_fanin, 0u);
-    EXPECT_EQ(value.resolve.fanin_count, 0u);
-    EXPECT_EQ(value.current_waiter, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.detached_next, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.pending_first, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.pending_last, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(value.phase, 0u);
-    EXPECT_EQ(value.pending_count, 0u);
-    EXPECT_EQ(value.pending_queue, 0u);
-    EXPECT_EQ(value.pending_target, 0u);
-    EXPECT_EQ(value.pending_kind, 0u);
-    EXPECT_EQ(value.resume_phase, 0u);
-    EXPECT_EQ(value.pending_link_count, 0u);
-    EXPECT_EQ(value.visited_count, 0u);
-    for (const auto task : value.pending_tasks)
+    EXPECT_EQ(value.completion.resolve.task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.resolve.producer_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.resolve.phase, SchedulerResolvePhase::INITIALIZE);
+    EXPECT_TRUE(value.completion.resolve.validate_current_state);
+    EXPECT_EQ(value.completion.resolve.next_fanin, 0u);
+    EXPECT_EQ(value.completion.resolve.fanin_count, 0u);
+    EXPECT_EQ(value.completion.current_waiter, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.detached_next, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.pending_first, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.pending_last, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(value.completion.phase, 0u);
+    EXPECT_EQ(value.completion.pending_count, 0u);
+    EXPECT_EQ(value.completion.pending_queue, 0u);
+    EXPECT_EQ(value.completion.pending_target, 0u);
+    EXPECT_EQ(value.completion.pending_kind, 0u);
+    EXPECT_EQ(value.completion.resume_phase, 0u);
+    EXPECT_EQ(value.completion.pending_link_count, 0u);
+    EXPECT_EQ(value.completion.visited_count, 0u);
+    for (const auto task : value.completion.pending_tasks)
         EXPECT_EQ(task, 0);
     EXPECT_EQ(value.active_slice_cycles, 0u);
     EXPECT_EQ(value.slice_count, 0u);
@@ -155,26 +155,26 @@ TEST(HbgLocalStorage, EveryScalarAlignedBasePreservesFinishFieldsAndGuards) {
         const auto &observed = std::as_const(carrier).get();
         EXPECT_EQ(std::as_const(carrier).operator->(), &observed);
         EXPECT_EQ(carrier.operator->(), &value);
-        EXPECT_EQ(observed.resolve.task_ref, 11);
-        EXPECT_EQ(observed.resolve.producer_ref, 13);
-        EXPECT_EQ(observed.resolve.next_fanin, 17u);
-        EXPECT_EQ(observed.resolve.fanin_count, 19u);
-        EXPECT_EQ(observed.resolve.phase, SchedulerResolvePhase::LINK);
-        EXPECT_FALSE(observed.resolve.validate_current_state);
-        EXPECT_EQ(observed.current_waiter, 23);
-        EXPECT_EQ(observed.detached_next, 29);
-        EXPECT_EQ(observed.phase, 7u);
-        EXPECT_EQ(observed.pending_count, 8u);
-        EXPECT_EQ(observed.pending_queue, 31u);
-        EXPECT_EQ(observed.pending_target, 37u);
-        EXPECT_EQ(observed.pending_kind, 41u);
-        EXPECT_EQ(observed.resume_phase, 43u);
-        EXPECT_EQ(observed.pending_first, 47);
-        EXPECT_EQ(observed.pending_last, 53);
-        EXPECT_EQ(observed.pending_link_count, 59u);
-        EXPECT_EQ(observed.visited_count, 61u);
+        EXPECT_EQ(observed.completion.resolve.task_ref, 11);
+        EXPECT_EQ(observed.completion.resolve.producer_ref, 13);
+        EXPECT_EQ(observed.completion.resolve.next_fanin, 17u);
+        EXPECT_EQ(observed.completion.resolve.fanin_count, 19u);
+        EXPECT_EQ(observed.completion.resolve.phase, SchedulerResolvePhase::LINK);
+        EXPECT_FALSE(observed.completion.resolve.validate_current_state);
+        EXPECT_EQ(observed.completion.current_waiter, 23);
+        EXPECT_EQ(observed.completion.detached_next, 29);
+        EXPECT_EQ(observed.completion.phase, 7u);
+        EXPECT_EQ(observed.completion.pending_count, 8u);
+        EXPECT_EQ(observed.completion.pending_queue, 31u);
+        EXPECT_EQ(observed.completion.pending_target, 37u);
+        EXPECT_EQ(observed.completion.pending_kind, 41u);
+        EXPECT_EQ(observed.completion.resume_phase, 43u);
+        EXPECT_EQ(observed.completion.pending_first, 47);
+        EXPECT_EQ(observed.completion.pending_last, 53);
+        EXPECT_EQ(observed.completion.pending_link_count, 59u);
+        EXPECT_EQ(observed.completion.visited_count, 61u);
         for (size_t i = 0; i < 8; ++i)
-            EXPECT_EQ(observed.pending_tasks[i], 100 + i);
+            EXPECT_EQ(observed.completion.pending_tasks[i], 100 + i);
         EXPECT_EQ(observed.active_slice_cycles, 67u);
         EXPECT_EQ(observed.slice_count, 71u);
         EXPECT_EQ(observed.work_units, 73u);

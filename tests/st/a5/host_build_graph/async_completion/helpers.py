@@ -187,7 +187,7 @@ def _counter_callable_spec():
         "orchestration": {
             "source": str(HERE / "kernels/orchestration/counter.cpp"),
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.INOUT] * 5 + [D.SCALAR] * 14,
+            "signature": [D.INOUT] * 5 + [D.SCALAR] * 15,
         },
         "incores": [
             {
@@ -298,6 +298,7 @@ class CounterRunner:
             case.skip,
             case.capacity_delta,
             self.slots,
+            self.iteration,
         ):
             args.add_scalar(int(value))
         return args
@@ -309,13 +310,9 @@ class CounterRunner:
         self.output.fill_(POISON)
         self.initial_signals.fill_(POISON)
         self.initial_signals[:, 0] = case.initial_signal
-        if case.scenario in (Scenario.PROGRESS, Scenario.FULL_SYNC_START):
-            # The runtime chooses the actual width; every potential marker starts pending.
-            self.initial_signals[CONDITION_LIMIT::CONDITIONS_PER_EXECUTION, 0] = 0
-        elif case.scenario == Scenario.GRAPH:
-            # Registration starts pending even when business conditions are already satisfied.
-            for _, _, execution in _active_executions(case, self.capacity_waiters, case.waiters):
-                self.initial_signals[execution * CONDITIONS_PER_EXECUTION + CONDITION_LIMIT, 0] = 0
+        # Registration uses an invocation sequence, independent of repeated
+        # business epochs. Only an explicit window reset initializes its slots.
+        self.initial_signals[CONDITION_LIMIT::CONDITIONS_PER_EXECUTION, 0] = 0
         self.initial_payload.fill_(POISON)
         if case.conditions == 0 or case.initial_signal >= case.expected or case.skip:
             for _, _, execution in _active_executions(case, self.capacity_waiters, case.waiters):

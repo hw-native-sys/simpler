@@ -17,7 +17,7 @@
 #include "scheduler_error.h"
 #include "scheduler_ssbuf.h"
 #include "scheduler_ready_pool.h"
-#include "scheduler_resolve.h"
+#include "scheduler_completion_state.h"
 
 enum class SchedulerPredicateResult : uint8_t {
     PASS = 0,
@@ -293,9 +293,7 @@ static_assert(std::is_trivially_copyable_v<SchedulerMixTracker> && std::is_stand
 
 struct SchedulerControlResolveContinuation {
     int64_t producer_ref{SCHEDULER_TASK_REF_INVALID};
-    int64_t next_waiter{SCHEDULER_TASK_REF_INVALID};
-    int64_t detached_next{SCHEDULER_TASK_REF_INVALID};
-    SchedulerResolveCursor route{};
+    SchedulerCompletionCursor completion{};
 };
 
 struct SchedulerLocalState {
@@ -392,7 +390,7 @@ static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 144, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 672, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 816, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248, "64-bit local profiling size changed"
 );
@@ -2048,7 +2046,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     };
     __gm__ DispatchPayload *payload =
         scheduler_state_at<DispatchPayload>(scheduler_state_base, dispatch_payload_offset);
-    payload->async_submission_context = 0;
+    payload->async_context_address = 0;
     SchedulerGraphResult status = SchedulerGraphResult::OK;
     if (inline_task) {
         payload->function_bin_addr = 0;
@@ -2237,6 +2235,8 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     return true;
 }
 
+#include "scheduler_completion_resolver.h"
+
 inline __aicore__ bool scheduler_resolve_completion(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerWakeStats *wake_stats,
@@ -2244,155 +2244,28 @@ inline __aicore__ bool scheduler_resolve_completion(
     bool validate_done_state, SchedulerReadyClaim *direct_ready, uint32_t direct_core_type,
     SchedulerReadyClaim *direct_mix_ready = nullptr
 ) {
-    if (context == nullptr) return false;
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
-    if (validate_done_state && scheduler_gm_query(control->state) != static_cast<int64_t>(SchedulerTaskState::DONE)) {
-        scheduler_record_error(
-            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-            SchedulerErrorSite::COMPLETION_TASK_NOT_DONE
-        );
-        return false;
-    }
-    const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
-    uint64_t resolve_start = phase_timing_enabled ? scheduler_cycles() : 0;
-    if (phase_timing_enabled) {
+    if (context == nullptr || run_control == nullptr || !scheduler_task_ref_valid(graph, task_ref)) return false;
+    const bool timed = scheduler_phase_timing_enabled(profiling_level);
+    auto *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
+    if (timed) {
+        if (context->profiling == nullptr) return false;
         scheduler_observe_cache_line(&control->next_fanin_index);
-        control->completion_resolve_start_cycles = resolve_start;
+        control->completion_resolve_start_cycles = scheduler_cycles();
         control->scheduler_worker_id = context->worker_id();
         control->completion_resolve_loop_iter = context->profiling->loop_iter;
     }
-    int64_t waiter = scheduler_gm_exchange(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
-    if (waiter == SCHEDULER_WAKE_LIST_CLOSED) {
-        scheduler_record_error(
-            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-            SchedulerErrorSite::COMPLETION_WAKE_ALREADY_CLOSED
+    SchedulerCompletionCursor cursor{};
+    SchedulerCompletionDirect direct{direct_ready, direct_mix_ready, direct_core_type};
+    for (;;) {
+        uint32_t budget = UINT32_MAX;
+        const auto result = scheduler_resolve_completion_step(
+            graph, scheduler_state_base, context, run_control, task_ref, &cursor, &budget, wake_stats, ready_stats,
+            &direct, validate_done_state
         );
-        return false;
+        if (result == SchedulerCompletionResult::ERROR) return false;
+        if (result == SchedulerCompletionResult::DONE) break;
     }
-    if (wake_stats != nullptr) ++wake_stats->wake_close_count;
-    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
-    bool mix_prefix_published = false;
-    while (waiter >= 0) {
-        if (!scheduler_task_ref_valid(graph, waiter)) {
-            scheduler_record_error(
-                run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, context,
-                SchedulerErrorSite::COMPLETION_INVALID_WAITER
-            );
-            return false;
-        }
-        __gm__ SchedulerTaskControl *waiter_control = scheduler_task_control_at(scheduler_state_base, context, waiter);
-        int64_t next = scheduler_observe_next_waiter(waiter_control);
-        if (wake_stats != nullptr) ++wake_stats->wake_migrate_count;
-        uint32_t fanin_count = 0;
-        const auto fanin_status = scheduler_node_fanin_count(graph, waiter, &fanin_count);
-        if (fanin_status != SchedulerGraphResult::OK) {
-            scheduler_record_error(run_control, waiter, fanin_status, &graph, context);
-            return false;
-        }
-        const SchedulerRouteResult route =
-            fanin_count == 1 ?
-                SchedulerRouteResult::READY_TO_ENQUEUE :
-                scheduler_route_task(graph, scheduler_state_base, context, run_control, waiter, wake_stats);
-        // A fatal scheduler error makes any ready publication in this local batch terminal;
-        // an unpublished partial batch is never reused as successful scheduler state.
-        if (route == SchedulerRouteResult::ERROR) return false;
-        if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-            if (graph.native_header_offset != 0) {
-                SchedulerNodeKind kind{};
-                if (scheduler_node_kind(graph, waiter, &kind) != SchedulerGraphResult::OK) return false;
-                if (scheduler_node_is_control(kind)) {
-                    if (!scheduler_control_enqueue(graph, scheduler_state_base, context, run_control, waiter))
-                        return false;
-                    waiter = next;
-                    continue;
-                }
-            }
-            __gm__ SchedulerTaskMetadata *metadata = scheduler_task_metadata_at(scheduler_state_base, context, waiter);
-            if (!scheduler_task_is_executable(metadata->flags)) {
-                scheduler_record_error(
-                    run_control, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                    SchedulerErrorSite::COMPLETION_WAITER_NOT_EXECUTABLE
-                );
-                return false;
-            }
-            const LaneMask lanes = scheduler_task_lanes(*metadata);
-            const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(lanes);
-            if (subtask_slot == UINT8_MAX && !scheduler_task_is_mix(metadata->flags)) {
-                scheduler_record_error(
-                    run_control, waiter, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, context,
-                    SchedulerErrorSite::COMPLETION_INVALID_SHAPE
-                );
-                return false;
-            }
-            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, lanes);
-            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr &&
-                !scheduler_task_ref_is_null(direct_mix_ready->task_ref)) {
-                if (!scheduler_ready_batch_append(
-                        scheduler_state_base, context, direct_mix_ready->task_ref, &batches[core_type], ready_stats,
-                        profiling_level
-                    ))
-                    return false;
-                *direct_mix_ready = {};
-            }
-            bool direct_mix_available = false;
-            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr && !mix_prefix_published &&
-                batches[core_type].head == SCHEDULER_INBOX_EMPTY) {
-                __gm__ SchedulerReadyInbox *inbox =
-                    scheduler_ready_inbox_at(scheduler_state_base, context, core_type, context->self_type_rank());
-                direct_mix_available = scheduler_ready_endpoints_empty(scheduler_gm_query(inbox->endpoints)) &&
-                                       !scheduler_ready_directory_nonempty(
-                                           scheduler_state_base, context, context->config.scheduler_count, core_type
-                                       );
-            }
-            SchedulerReadyClaim *direct_claim = direct_mix_available ? direct_mix_ready :
-                                                direct_ready != nullptr &&
-                                                        scheduler_task_ref_is_null(direct_ready->task_ref) &&
-                                                        core_type == direct_core_type ?
-                                                                       direct_ready :
-                                                                       nullptr;
-            if (direct_claim != nullptr) {
-                direct_claim->task_ref = waiter;
-                direct_claim->source = SchedulerReadySource::DIRECT_RESOLVE;
-                direct_claim->publication_mode = SchedulerPublicationMode::REFILL;
-
-            } else if (!scheduler_ready_batch_append(
-                           scheduler_state_base, context, waiter, &batches[core_type], ready_stats, profiling_level
-                       )) {
-                scheduler_record_error(
-                    run_control, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                    SchedulerErrorSite::COMPLETION_READY_APPEND_FAILED
-                );
-                return false;
-            }
-            // A MIX prefix becomes visible through the shared publication
-            // policy while the remaining wake chain is still being routed.
-            if (next >= 0 && core_type == SCHEDULER_MIX_QUEUE && !mix_prefix_published &&
-                batches[core_type].count >= 2) {
-                if (scheduler_read_error(run_control) != 0) return false;
-                if (!scheduler_ready_batch_push(
-                        scheduler_state_base, context, core_type, &batches[core_type], ready_stats
-                    )) {
-                    scheduler_record_error(
-                        run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                        SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED
-                    );
-                    return false;
-                }
-                mix_prefix_published = true;
-            }
-        }
-        waiter = next;
-    }
-    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
-        if (!scheduler_ready_batch_push(scheduler_state_base, context, type, &batches[type], ready_stats)) {
-            scheduler_record_error(
-                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED
-            );
-            return false;
-        }
-    }
-    if (phase_timing_enabled) {
+    if (timed) {
         control->completion_resolve_end_cycles = scheduler_cycles();
         scheduler_publish_cache_line(&control->next_fanin_index);
     }
