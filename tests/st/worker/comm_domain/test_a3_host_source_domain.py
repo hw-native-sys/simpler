@@ -8,7 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """A3 retained Host windows with local MTE and cross-rank SDMA."""
 
+import re
 import struct
+import sys
+from collections import deque
 from functools import partial
 from pathlib import Path
 
@@ -20,6 +23,25 @@ from examples.workers.l4.global_tload_mixed_l3.main import COUNT, _build_tload_c
 from simpler_setup.scene_test import compile_chip_callable_spec
 
 _RUNTIME = "tensormap_and_ringbuffer"
+_SDMA_DIAGNOSTIC = re.compile(
+    r"TIMEOUT_EXIT|\[ASYNC_WAIT|ProcessStarsSdmaErrorInfo|SMMU|\bCQE\b|(?:sched|orch)_error_code=", re.IGNORECASE
+)
+
+
+def _print_sdma_diagnostics(log_dir):
+    found = False
+    for path in sorted(log_dir.rglob("*.log")):
+        try:
+            with path.open(errors="replace") as stream:
+                records = deque((line.rstrip() for line in stream if _SDMA_DIAGNOSTIC.search(line)), maxlen=64)
+        except OSError as exc:
+            print(f"Cannot read SDMA diagnostic log {path.name}: {exc}", file=sys.stderr)
+            continue
+        if records:
+            found = True
+            print(f"{path.name}:\n" + "\n".join(records), file=sys.stderr)
+    if not found:
+        print("No SDMA timeout or device fault records captured", file=sys.stderr)
 
 
 @pytest.mark.platforms(["a2a3"])
@@ -96,7 +118,11 @@ def _build_sdma_callable(platform):
         pytest.param(True, 2, id="sdma-staged", marks=pytest.mark.sdma),
     ],
 )
-def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth):
+def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth, tmp_path, monkeypatch):
+    if sdma:
+        log_dir = tmp_path / "ascend"
+        log_dir.mkdir()
+        monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(log_dir))
     count = 128 * 128 if sdma else COUNT
     nbytes = count * 4
     prefix = 64
@@ -211,5 +237,16 @@ def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth):
             worker.copy_from(scratch, device.member(1).buffers["out"])
             assert struct.unpack_from(f"<{count}f", scratch.shm.buf) == (5.0,) * count
         device.release()
-    finally:
+    except BaseException:
+        try:
+            worker.close()
+        except BaseException as exc:
+            print(f"Worker.close after run failure: {exc}", file=sys.stderr)
+        if sdma:
+            try:
+                _print_sdma_diagnostics(log_dir)
+            except Exception as exc:
+                print(f"Cannot collect SDMA diagnostics: {exc}", file=sys.stderr)
+        raise
+    else:
         worker.close()
