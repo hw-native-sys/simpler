@@ -2072,7 +2072,8 @@ NB_MODULE(_task_interface, m) {
         .value("UINT32", DataType::UINT32)
         .value("FP8E4M3FN", DataType::FP8E4M3FN)  // A5 only
         .value("FP8E8M0", DataType::FP8E8M0)      // A5 only
-        .value("FP4E2M1", DataType::FP4E2M1);     // A5 only
+        .value("FP4E2M1", DataType::FP4E2M1)      // A5 only
+        .value("FP8E5M2", DataType::FP8E5M2);     // A5 only
 
     // --- Free functions ---
     m.def(
