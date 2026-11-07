@@ -16,15 +16,33 @@ and automatic table partitioning are outside this interface's current support.
 Use the existing domain API inside the L3 orchestration callback. Select the
 physical window source with `memory_source`; its default is `AddressSpace.DEVICE`.
 The Worker supplies the platform, so domain creation does not take a second
-platform argument.
+platform argument. An optional `initializer(domain)` fills the Host windows
+once during creation. The same orchestration then submits the model on both
+its first and subsequent invocations; no separate preparation run is required.
+For example, load raw rank-local float32 shard files directly into their windows:
 
 ```python
 from simpler.task_interface import AddressSpace, CommBufferSpec, DataType
 
 state = {}
 
-def prepare(orch, args, config):
-    state["table"] = orch.get_or_allocate_domain(
+def initialize_table(domain):
+    offset, nbytes = domain.buffer_range("table")
+    for rank in range(2):
+        buf = domain.member(rank).buffers["table"]
+        with buf.shm.buf[offset : offset + nbytes] as window:
+            with open(shard_paths[rank], "rb", buffering=0) as shard:
+                position = 0
+                while position < nbytes:
+                    end = min(position + 8 * 1024 * 1024, nbytes)
+                    with window[position:end] as chunk:
+                        count = shard.readinto(chunk)
+                    if not count:
+                        raise ValueError("Engram shard is shorter than its table")
+                    position += count
+
+def infer(orch, args, config):
+    domain = orch.get_or_allocate_domain(
         name="engram",
         members=[0, 1],
         memory_source=AddressSpace.HOST,
@@ -36,16 +54,41 @@ def prepare(orch, args, config):
                            rows_per_rank * row_bytes),
         ],
         retain_after_run=True,
+        initializer=initialize_table,
     )
+    state["table"] = domain
+    submit_model(orch, domain, args, config)
 
-worker.run(prepare)
+for args in batches:
+    worker.run(infer, args, config)
 domain = state["table"]
-offset, nbytes = domain.buffer_range("table")
-for rank in range(2):
-    buf = domain.member(rank).buffers["table"]
-    with buf.shm.buf[offset : offset + nbytes] as memory:
-        memory[:] = table_shards[rank].tobytes()
 ```
+
+`submit_model` is the application's task-submission code. The initializer runs
+synchronously on the L3 CPU after all rank windows are mapped and registered,
+before the allocation API returns. It receives the whole domain and must finish
+all rank writes before returning. Chunked `readinto` avoids a second whole-table
+allocation. Release temporary memoryviews and NumPy arrays on both success and
+failure; do not store them in application state.
+
+Both `allocate_domain` and `get_or_allocate_domain` accept `initializer`. It is
+supported only for L3 Host-source A5 TMR domains and may only initialize CPU
+storage: it must not submit tasks, issue Worker/control operations, recursively
+create or look up domains, or release the domain. Allocation and initialization
+must precede the run's first task submission.
+
+On an exact configuration reuse hit, `get_or_allocate_domain` skips the callback,
+including when the caller supplies a different callback or the existing domain
+was created without one. Callback identity is not part of the configuration;
+the domain does not retain the callback or its checkpoint closure. Releasing and
+recreating the domain invokes the initializer again. To change an existing table,
+wait for all users and update its CPU bytes explicitly, or release and recreate it.
+
+An initializer exception fails creation; a partially initialized domain cannot
+be reused or submitted. Cleanup retains the existing CPU-export and device-fence
+guards. If a leaked CPU view prevents release, the Worker keeps cleanup ownership;
+drop that view before retrying cleanup. Initialization is once per newly created
+domain instance, not once per process or model name.
 
 As with Device-source domains, sizes must satisfy the domain's alignment
 requirements. `CommBufferSpec` slices share the rank's physical allocation.
@@ -103,9 +146,8 @@ Host workspace slot. No Host registration is performed during Worker init.
 Host-source and Device-source domains have the same lifetime:
 
 ```text
-preparation run: create domain -> complete mappings and registration -> retain
-CPU: fill rank windows
-inference runs: get retained domain -> submit reads -> wait for completion
+first inference run: create domain -> map/register -> initialize -> submit reads -> wait
+later inference runs: get retained domain -> submit reads -> wait for completion
 CPU: update table only after all readers complete
 shutdown: release domain -> retire communication and Device mappings -> release backing
 ```
@@ -160,7 +202,9 @@ domain.release()
 
 [`host_comm_domain`](../examples/a5/tensormap_and_ringbuffer/host_comm_domain/README.md)
 initializes distinct rank tables from L3 and gathers boundary and repeated rows
-using local MTE and non-self URMA. Local MTE writes into a Host output slice,
+using local MTE and non-self URMA. The same L3 orchestration creates and initializes
+the Host domain on its first invocation and reuses it on later invocations, with
+an assertion that the initializer ran exactly once. Local MTE writes into a Host output slice,
 which L3 reads directly after completion. A dependent consumer checks the URMA
 deferred-completion contract. It reuses the table across runs, updates the Host bytes
 between completed runs, and keeps a Device-source URMA domain active after the

@@ -37,7 +37,7 @@ from __future__ import annotations
 import contextlib
 import operator
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, cast
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
@@ -183,12 +183,14 @@ _CALLBACK_RUN = threading.local()
 
 
 class _CallbackFrame:
-    __slots__ = ("has_submitted_task", "run_id", "worker")
+    __slots__ = ("has_submitted_task", "run_id", "worker", "initializing_domain", "domain_initialization_error")
 
     def __init__(self, worker: Any, run_id: int) -> None:
         self.worker = worker
         self.run_id = int(run_id)
         self.has_submitted_task = False
+        self.initializing_domain = False
+        self.domain_initialization_error: BaseException | None = None
 
 
 def _callback_frames() -> list[_CallbackFrame]:
@@ -218,6 +220,17 @@ def _callback_run(run_id: int, worker: Any = None):
         frames.pop()
 
 
+def _check_domain_initializer_context(worker: Any, api: str) -> None:
+    frame = _callback_frame_for(worker)
+    if frame is not None:
+        if frame.initializing_domain:
+            raise RuntimeError(f"{api}: cannot be called from a domain initializer; only CPU writes are allowed")
+        if frame.domain_initialization_error is not None:
+            raise RuntimeError(
+                f"{api}: domain initialization failed in this run"
+            ) from frame.domain_initialization_error
+
+
 def _admit_task_submission(worker: Any = None) -> None:
     """Gate one native task-submission attempt and record possible work in flight.
 
@@ -231,6 +244,7 @@ def _admit_task_submission(worker: Any = None) -> None:
     an open callback that caught a failed rollback would otherwise keep
     submitting on top of device state this worker can no longer reclaim.
     """
+    _check_domain_initializer_context(worker, "submit")
     if worker is not None:
         worker._require_no_ordered_cleanup_failure("submit")
     frame = _callback_frame_for(worker)
@@ -253,6 +267,7 @@ def direct_control(worker: Any, native_orch: Any, api: str):
     being alone: it takes the same serializer submission uses, so no run can be
     admitted between the check and the command.
     """
+    _check_domain_initializer_context(worker, api)
     frame = _callback_frame_for(worker)
     if frame is not None:
         if frame.has_submitted_task:
@@ -318,6 +333,7 @@ class Orchestrator:
         Returns an opaque ``TaskHandle`` accepted by ``TaskArgs.add_dep`` or
         ``TaskArgs.add_dep_wait`` during the same orchestration run.
         """
+        _check_domain_initializer_context(self._worker, "Orchestrator.submit_next_level")
         cfg = config if config is not None else CallConfig()
         cpp_worker_id = _require_next_level_worker_id(worker, argument="worker")
         expected_namespace = (
@@ -383,6 +399,7 @@ class Orchestrator:
         directed and is never silently widened to the whole group.
         Returns one opaque ``TaskHandle`` for the group DAG node.
         """
+        _check_domain_initializer_context(self._worker, "Orchestrator.submit_next_level_group")
         cfg = config if config is not None else CallConfig()
         worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]
         if len(worker_ids) != len(args_list):
@@ -486,6 +503,7 @@ class Orchestrator:
 
         ``args`` may be omitted for a tag-less task (no dependencies, no outputs).
         """
+        _check_domain_initializer_context(self._worker, "Orchestrator.submit_sub")
         if args is None:
             args = TaskArgs()
         digest, kind, target_namespace, _eligible_worker_ids = _require_handle(
@@ -503,6 +521,7 @@ class Orchestrator:
 
     def submit_sub_group(self, callable_handle: Any, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
+        _check_domain_initializer_context(self._worker, "Orchestrator.submit_sub_group")
         digest, kind, target_namespace, _eligible_worker_ids = _require_handle(
             callable_handle,
             kind="orch.submit_sub_group",
@@ -537,6 +556,7 @@ class Orchestrator:
         workers: Sequence[int] | None = None,
         workspace_engines: Sequence[str] = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
+        initializer: Callable[[CommDomainHandle], None] | None = None,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -553,6 +573,11 @@ class Orchestrator:
         ``memory_source=AddressSpace.HOST`` creates independent Host windows on
         L3 A5 TMR ranks, with local device access and optional URMA peer access.
         Their named Buffers expose CPU bytes through ``buffer.buffer`` on L3.
+        ``initializer(domain)`` optionally fills all Host rank windows synchronously
+        on the L3 CPU after mapping/registration and before this call returns.
+        Only L3 Host-source domains support it. It must return None and may not
+        submit tasks, issue Worker/control operations, or release the domain.
+        Failure rolls back creation; live CPU exports can defer physical cleanup.
         """
         if (members is None) == (workers is None):
             raise TypeError("provide exactly one of members or legacy workers")
@@ -566,6 +591,7 @@ class Orchestrator:
             retain_after_run,
             workspace_engines=workspace_engines,
             memory_source=memory_source,
+            initializer=initializer,
             reuse=False,
         )
 
@@ -579,11 +605,15 @@ class Orchestrator:
         retain_after_run: bool = False,
         workspace_engines: Sequence[str] = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
+        initializer: Callable[[CommDomainHandle], None] | None = None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
-        A hit neither allocates nor initializes the existing window.
+        A hit neither allocates nor initializes the existing window, even if a
+        different ``initializer`` is supplied. The callback is not retained or
+        compared as configuration. Recreating a released domain initializes again.
+        See ``allocate_domain`` for the synchronous Host initializer contract.
         """
         return self._domain(
             name,
@@ -593,6 +623,7 @@ class Orchestrator:
             retain_after_run,
             workspace_engines=workspace_engines,
             memory_source=memory_source,
+            initializer=initializer,
             reuse=True,
         )
 
@@ -606,6 +637,7 @@ class Orchestrator:
         *,
         workspace_engines=(),
         memory_source=AddressSpace.DEVICE,
+        initializer=None,
         reuse,
     ):
         if self._worker is None:
@@ -619,6 +651,7 @@ class Orchestrator:
             reuse=reuse,
             workspace_engines=workspace_engines,
             memory_source=memory_source,
+            initializer=initializer,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
@@ -810,10 +843,12 @@ class Orchestrator:
         Prefer the ``scope()`` context manager, which pairs the end for you. Every
         ``scope_begin()`` must be matched by a ``scope_end()``.
         """
+        _check_domain_initializer_context(self._worker, "Orchestrator.scope_begin")
         self._o.scope_begin()
 
     def scope_end(self) -> None:
         """Close the scope opened by the matching ``scope_begin()``."""
+        _check_domain_initializer_context(self._worker, "Orchestrator.scope_end")
         self._o.scope_end()
 
     @contextlib.contextmanager
@@ -824,6 +859,7 @@ class Orchestrator:
         reclaim independently of the outer scope (see Strict-1 in
         ``.claude/plans/HIERARCHICAL_RUNTIME_REFACTOR.md``).
         """
+        _check_domain_initializer_context(self._worker, "Orchestrator.scope")
         self._o.scope_begin()
         try:
             yield self
@@ -920,6 +956,7 @@ class Orchestrator:
         ``worker.alloc_shared_tensor``, additionally registered as an L3-L2 orch-comm host buffer so it
         may back an L3-L2 message-queue payload.
         """
+        _check_domain_initializer_context(self._worker, "Orchestrator.alloc")
         assert self._worker is not None, "orch.alloc requires an L3+ orchestration context"
         shape_t = tuple(int(s) for s in shape)
         nbytes = get_element_size(dtype)

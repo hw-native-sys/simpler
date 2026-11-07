@@ -64,6 +64,7 @@ import ctypes
 import enum
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import math
@@ -275,7 +276,13 @@ from .global_comm_domain import (
     validate_descriptor_table,
 )
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
-from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
+from .orchestrator import (
+    Orchestrator,
+    _callback_frame_for,
+    _callback_run,
+    _check_domain_initializer_context,
+    direct_control,
+)
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 from .task_interface import (
     MAILBOX_ARGS_CAPACITY,
@@ -7668,6 +7675,7 @@ class Worker:
         lease pins the native tree. Only pure source-descriptor queries opt out;
         refusal releases the temporary lease before the operation body starts.
         """
+        _check_domain_initializer_context(self, api)
         tid = threading.get_ident()
         with self._hierarchical_start_cv:
             self._consume_worker_host_mapped_cleanup_error_locked(api)
@@ -10525,6 +10533,29 @@ class Worker:
                     raise ValueError("URMA requires ranks in dense prefix order")
         return config
 
+    def _initialize_domain(self, handle, initializer) -> None:
+        if initializer is None:
+            return
+        frame = _callback_frame_for(self)
+        assert frame is not None
+        handle._initializing = True
+        frame.initializing_domain = True
+        try:
+            result = initializer(handle)
+            if result is not None:
+                if inspect.iscoroutine(result) or inspect.isgenerator(result):
+                    result.close()
+                del result
+                raise TypeError("domain initializer must be synchronous and return None")
+        except BaseException as error:
+            handle._initialization_failed = True
+            handle.retain_after_run = False
+            frame.domain_initialization_error = error
+            raise
+        finally:
+            handle._initializing = False
+            frame.initializing_domain = False
+
     def _comm_domain(
         self,
         *,
@@ -10536,7 +10567,21 @@ class Worker:
         reuse,
         workspace_engines=(),
         memory_source=AddressSpace.DEVICE,
+        initializer=None,
     ):
+        _check_domain_initializer_context(self, "allocate_domain")
+        if initializer is not None:
+            if not callable(initializer):
+                raise TypeError("domain initializer must be callable")
+            callback = getattr(initializer, "__call__", initializer)
+            if any(
+                check(fn)
+                for check in (inspect.iscoroutinefunction, inspect.isgeneratorfunction, inspect.isasyncgenfunction)
+                for fn in (initializer, callback)
+            ):
+                raise TypeError("domain initializer must be synchronous and return None")
+            if self.level != 3 or memory_source != AddressSpace.HOST:
+                raise ValueError("domain initializer requires an L3 Host-source domain")
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
@@ -10595,6 +10640,7 @@ class Worker:
                     )
                 handle._use_fn = self._use_domain
                 self._use_domain(handle)
+                self._initialize_domain(handle, initializer)
                 handle._config = config
                 return handle
             except BaseException as creation_error:
@@ -10602,15 +10648,17 @@ class Worker:
                 # failed transaction without publishing it, keeping its existing fence debt.
                 failed = table.get(name)
                 if failed is not None:
-                    failed._released = True
                     release = self._release_domain_handle if self.level == 3 else self._release_global_domain_handle
                     try:
+                        seal_host_mappings(failed._host_mappings)
+                        failed._released = True
                         release(failed, resources)
                     except BaseException as cleanup_error:
                         raise creation_error from cleanup_error
                 raise
 
     def _use_domain(self, handle) -> None:
+        handle._require_ready()
         resources = self._building_run_resources if _callback_frame_for(self) is not None else None
         if resources is None:
             return
@@ -10644,7 +10692,7 @@ class Worker:
     @contextlib.contextmanager
     def _domain_release_scope(self, handle: CommDomainHandle):
         with self._operation_lease("release_domain", allow_continuation=True), self._domain_serialization():
-            if not handle.released:
+            if not handle.released and not handle._initialization_failed:
                 self._use_domain(handle)
             yield
 
@@ -13245,6 +13293,7 @@ class Worker:
         dependency-wires to this producer slot. Chip-A→chip-B intermediates: name it as an OUTPUT of the
         producing task and an INPUT of the consumer.
         """
+        _check_domain_initializer_context(self, "Worker.alloc_shared_tensor")
         assert self._orch is not None, "alloc_shared_tensor requires an L3+ orchestration context"
         nbytes = get_element_size(dtype)
         for s in shapes:
@@ -13417,6 +13466,7 @@ class Worker:
         The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
         collide with a registry key, and evicting the live entry it names would strand that
         backing."""
+        _check_domain_initializer_context(self, "Worker.release_buffer")
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the

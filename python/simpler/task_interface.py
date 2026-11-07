@@ -1158,6 +1158,8 @@ class CommDomainHandle:
         "allocation_id",
         "_domain_size",
         "_allocation_pending",
+        "_initializing",
+        "_initialization_failed",
         "_domain_ranks",
         "_release_fn",
         "_release_scope",
@@ -1208,6 +1210,8 @@ class CommDomainHandle:
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
         self._allocation_pending = False
+        self._initializing = False
+        self._initialization_failed = False
         self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
@@ -1239,6 +1243,7 @@ class CommDomainHandle:
         handle. Engine selection is immutable for its lifetime. This method also
         records scalar-only context use in the current orchestration run.
         """
+        self._require_ready()
         context = self[worker]
         required = normalize_workspace_engines(workspace_engines)
         initialized = self._config.workspace_engines if self._config is not None else ()
@@ -1254,7 +1259,14 @@ class CommDomainHandle:
             self._use_fn(self)
         return context.device_ctx
 
+    def _require_ready(self) -> None:
+        self._require_live()
+        if self._initializing:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is initializing")
+
     def _require_live(self) -> None:
+        if self._initialization_failed:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) initialization failed")
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
@@ -1334,6 +1346,8 @@ class CommDomainHandle:
         a no-op, and the orch function must not pass it to further
         ``submit_*`` calls.
         """
+        if self._initializing:
+            raise RuntimeError("cannot release a domain from its initializer")
         if self.borrowed:
             raise RuntimeError("borrowed domain handles cannot release their owner")
         if self._released:
