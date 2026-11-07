@@ -30,7 +30,7 @@ def smoke(monkeypatch, tmp_path):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    state = SimpleNamespace(primary=None, cleanup=None, bad_shape=False, backend=None)
+    state = SimpleNamespace(primary=None, terminal=None, cleanup=None, bad_shape=False, backend=None)
     stream = SimpleNamespace(npu_stream=123, synchronize=lambda: None)
 
     def cpu(function):
@@ -51,6 +51,7 @@ def smoke(monkeypatch, tmp_path):
     class Backend:
         def __init__(self, **kwargs):
             self.steps, self.closed, self.failed = 0, False, False
+            self.cleanup_error = None
             self.values = {"out": torch.ones((1, 152064))}
             state.backend = self
 
@@ -63,7 +64,8 @@ def smoke(monkeypatch, tmp_path):
 
         def close(self):
             if state.cleanup:
-                raise state.cleanup
+                self.cleanup_error = state.cleanup
+                raise state.terminal if state.terminal is not None else state.cleanup
             self.closed = True
 
     monkeypatch.setattr(module, "TorchDecode", Backend)
@@ -97,11 +99,15 @@ def smoke(monkeypatch, tmp_path):
     return SimpleNamespace(module=module, state=state, output=output)
 
 
-@pytest.mark.parametrize("execution_fails,close_fails", [(False, False), (True, False), (False, True), (True, True)])
-def test_smoke_always_writes_receipt_and_preserves_primary(smoke, execution_fails, close_fails):
+@pytest.mark.parametrize(
+    "execution_fails,close_fails,replay_terminal",
+    [(False, False, False), (True, False, False), (False, True, False), (True, True, False), (True, True, True)],
+)
+def test_smoke_always_writes_receipt_and_preserves_primary(smoke, execution_fails, close_fails, replay_terminal):
     primary, cleanup = RuntimeError("execution failed"), RuntimeError("cleanup failed")
     smoke.state.primary = primary if execution_fails else None
     smoke.state.cleanup = cleanup if close_fails else None
+    smoke.state.terminal = primary if replay_terminal else None
     if execution_fails or close_fails:
         with pytest.raises(RuntimeError) as caught:
             smoke.module.main()
@@ -128,6 +134,23 @@ def test_model_failure_is_recorded_before_device_work(smoke, monkeypatch):
         smoke.module.main()
     assert smoke.state.backend is None
     assert json.loads(smoke.output.read_text())["error"] == "ValueError: model checksum mismatch"
+
+
+def test_close_preserves_terminal_error_and_records_cleanup_error(smoke, monkeypatch):
+    primary = RuntimeError("terminal execution failed")
+    smoke.state.cleanup = OSError("worker cleanup failed")
+
+    def finish_steps(*args):
+        smoke.state.terminal = primary
+
+    monkeypatch.setattr(smoke.module, "_run_steps", finish_steps)
+    with pytest.raises(RuntimeError) as caught:
+        smoke.module.main()
+    assert caught.value is primary
+    receipt = json.loads(smoke.output.read_text())
+    assert receipt["error"] == "RuntimeError: terminal execution failed"
+    assert receipt["cleanup_error"] == "OSError: worker cleanup failed"
+    assert receipt["status"] == "failed" and not receipt["closed"]
 
 
 def test_smoke_gate_has_shape_and_position_context(smoke):
