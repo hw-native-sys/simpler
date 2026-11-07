@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr uint64_t kDelayedAdd = 0;
+constexpr uint64_t kVectorAdd = 0;
 
 }  // namespace
 
@@ -32,7 +32,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     add_args.add_input(args.tensor(1).ref());
     add_args.add_output(args.tensor(2).ref());
     add_args.add_scalar(args.scalar(0));
-    rt_submit_aiv_task(kDelayedAdd, add_args);
+    rt_submit_aiv_task(kVectorAdd, add_args);
 }
 
 }  // extern "C"

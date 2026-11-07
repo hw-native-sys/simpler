@@ -809,11 +809,14 @@ implementation detail of the device firmware, which is not open and which a
 CANN upgrade may change with no signal here. That is why
 `TestPmuCountingWindow`
 ([test_pmu_counting_window.py](../../tests/st/a2a3/host_build_graph/dfx/pmu/test_pmu_counting_window.py))
-asserts per row rather than in aggregate, and asserts a floor on the spinning
-task as well: a window disabled partway through leaves a row that is non-zero
-but short, which was observed at 1.1% of the expected count with every row
-non-zero. An aggregate check, or a check for zeros alone, reads that run as a
-pass.
+uses the arithmetic event group in automatic A2/A3 onboard DFX CI. The first
+task completes the first half of a fixed FP32 vector add and acknowledges a
+device gate. The host runs a utilization query against that chip and then
+releases the gate so the task can finish the other half. The test reads the
+CSV for that run, checks all 513 task identities, and expects 256 FP32 repeats
+per task. A 128 × 128 float32 tile contains 256 repeats of 256 bytes each.
+This detects both zero counts and partial loss, without a cycle threshold or
+an assumed overlap between the query and device execution.
 
 ### 7.1 a2a3
 
