@@ -1,14 +1,19 @@
 # A5 Host-source communication domain
 
 Each L2 owns a separate Host table. L3 initializes its named `table` slice through
-`Buffer.shm.buf` with the offset from `domain.buffer_range(name)`; kernels read local rows with MTE and peer rows with URMA. A
+`Buffer.shm.buf` with the offset from `domain.buffer_range(name)` inside the
+domain's `initializer` callback; kernels read local rows with MTE and peer rows with URMA. A
 consumer adds one only after the asynchronous producer completes. Local MTE
 writes its gathered rows into a separate Host `local_echo` slice; L3 checks those
 bytes directly after the run, demonstrating Device writes to Host DDR. The table
 starts after a 256-byte slice, so peer addressing includes the window offset.
 
 The example keeps both a Host-source and a Device-source URMA domain alive. It
-reuses their windows across completed runs, updates the Host table from L3,
+uses the same L3 orchestration on the first and every subsequent invocation:
+`get_or_allocate_domain` creates and initializes the Host table on the first
+invocation, then reuses its data without calling the initializer again. There is
+no separate domain-preparation run. The example checks the initializer count,
+reuses both domains' windows across completed runs, updates the Host table from L3,
 releases the Host domain, and verifies that the Device domain still transfers.
 Each rank submits one gather task per domain per run. With `--aiv-blocks 4`,
 four AIV blocks start as one resident cohort. Each block handles two distinct
