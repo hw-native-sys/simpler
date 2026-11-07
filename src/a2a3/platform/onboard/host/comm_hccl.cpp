@@ -215,8 +215,9 @@ static bool file_barrier(
             if (f.good()) break;
             if (std::chrono::steady_clock::now() >= deadline) {
                 LOG_ERROR(
-                    "[comm rank %d] file_barrier('%s') timed out after %ds waiting for rank %d", rank, tag.c_str(),
-                    timeout_sec, r
+                    "[comm rank %d] file_barrier('%s') timed out after %ds waiting for rank %d; "
+                    "path=%s token=%s nranks=%d",
+                    rank, tag.c_str(), timeout_sec, r, rootinfo_path.c_str(), run_token_hex(run_token).c_str(), nranks
                 );
                 return false;
             }
@@ -442,6 +443,8 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     // in one place (DeviceRunner) and matches HCCL's API shape, which already
     // takes a caller-supplied stream.
 
+    LOG_INFO("[comm rank %d] bootstrap begin: path=%s nranks=%d", rank, h->rootinfo_path.c_str(), nranks);
+
     // RootInfo exchange
     HcclRootInfo rootInfo{};
     if (rank == 0) {
@@ -467,22 +470,36 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
         }
     } else {
         if (!wait_for_rootinfo(h->rootinfo_path, &rootInfo, &h->run_token)) {
-            LOG_ERROR("[comm rank %d] Timeout waiting for rootinfo", rank);
+            LOG_ERROR(
+                "[comm rank %d] Timeout waiting for rootinfo; path=%s nranks=%d", rank, h->rootinfo_path.c_str(), nranks
+            );
             delete h;
             return nullptr;
         }
     }
 
+    LOG_INFO(
+        "[comm rank %d] rootinfo ready: path=%s token=%s nranks=%d", rank, h->rootinfo_path.c_str(),
+        run_token_hex(h->run_token).c_str(), nranks
+    );
     if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "rootinfo_ready", h->run_token)) {
         delete h;
         return nullptr;
     }
 
+    LOG_INFO(
+        "[comm rank %d] rootinfo barrier passed: path=%s token=%s nranks=%d", rank, h->rootinfo_path.c_str(),
+        run_token_hex(h->run_token).c_str(), nranks
+    );
+
     // Init communicator
     HcclResult hret =
         hccl_comm_init_root_info(static_cast<uint32_t>(nranks), &rootInfo, static_cast<uint32_t>(rank), &h->hccl_comm);
     if (hret != HCCL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] HcclCommInitRootInfo failed: %d", rank, (int)hret);
+        LOG_ERROR(
+            "[comm rank %d] HcclCommInitRootInfo failed: %d; path=%s token=%s nranks=%d", rank, (int)hret,
+            h->rootinfo_path.c_str(), run_token_hex(h->run_token).c_str(), nranks
+        );
         delete h;
         return nullptr;
     }
