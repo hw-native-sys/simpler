@@ -64,3 +64,43 @@ TEST(EntryCacheDeinit, FailedSnapshotFallsBackToFullThroughExecutor) {
     set_platform_entry_args(0, {});
     platform_aicpu_affinity_set_thread_idx(-1);
 }
+
+class SchedulerContextTestPeer {
+public:
+    static void dirty(SchedulerContext &context, ChipTaskSlotState &running, ChipTaskSlotState &pending) {
+        for (auto &state : context.core_exec_states_) {
+            state.reg_addr = 0x1234;
+            state.running_slot_state = &running;
+            state.pending_slot_state = &pending;
+            state.running_reg_task_id = 17;
+            state.pending_reg_task_id = 19;
+        }
+    }
+    static void expect_entry_reset(const SchedulerContext &context) {
+        for (const auto &state : context.core_exec_states_) {
+            EXPECT_EQ(state.reg_addr, 0u);
+            EXPECT_EQ(state.running_slot_state, nullptr);
+            EXPECT_EQ(state.pending_slot_state, nullptr);
+            EXPECT_EQ(state.running_reg_task_id, 0);
+            EXPECT_EQ(state.pending_reg_task_id, 0);
+        }
+    }
+};
+
+TEST(EntryCacheDeinit, SchedulerEntryResetsPreviousRunStateBeforeValidation) {
+    SchedulerContext context;
+    ChipTaskSlotState running{};
+    ChipTaskSlotState pending{};
+    Runtime runtime;
+    runtime.dev.gm_sm_ptr_ = nullptr;
+    runtime.dev.callable_table_addr_ = 0;
+    runtime.dev.callable_table_len_ = 0;
+    for (int workers : {3, 0, RUNTIME_MAX_WORKER, 4, 3}) {
+        SCOPED_TRACE(workers);
+        SchedulerContextTestPeer::dirty(context, running, pending);
+        context.deinit();
+        runtime.dev.worker_count = workers;
+        EXPECT_EQ(context.pre_handshake_init(&runtime, 2, 1, 0), workers > 0 && workers % 3 == 0 ? 0 : -1);
+        SchedulerContextTestPeer::expect_entry_reset(context);
+    }
+}
