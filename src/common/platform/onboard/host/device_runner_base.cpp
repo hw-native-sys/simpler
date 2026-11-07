@@ -361,6 +361,13 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
                     scope_stats_collector_.abandon_run(reference->identity.run_epoch);
                     reference->scope_stats_window = false;
                 }
+                if (reference->args_dump_window) {
+                    if (!dump_collector_.abandon_run(reference->identity.run_epoch)) {
+                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+                        return outcome;
+                    }
+                    reference->args_dump_window = false;
+                }
                 if (reference->pmu_window) {
                     if (!pmu_collector_.abandon_run(reference->identity.run_epoch)) {
                         outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
@@ -3881,8 +3888,8 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller, bool *recording)
 bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &prepared) const {
     const auto &dfx = prepared.dfx;
     if (!dfx.diagnostics_any()) return true;
-    if (dfx.chip_swimlane_enabled() || dfx.dump_args_enabled() || dfx.dep_gen_enabled || dfx.output_prefix.empty())
-        return false;
+    if (dfx.chip_swimlane_enabled() || dfx.dep_gen_enabled || dfx.output_prefix.empty()) return false;
+    if (dfx.dump_args_enabled()) return supports_args_dump_capture() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
     if (dfx.pmu_enabled) return supports_pmu_capture() && !dfx.scope_stats_enabled;
     return supports_scope_stats_capture() && prepared.scope_stats_capacity.required &&
            prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled;
@@ -4044,21 +4051,36 @@ int DeviceRunnerBase::retain_external_run_resources(
     // The native claim remains excluded throughout pool construction/window admission.
     if (prepared.dfx.diagnostics_any()) {
         if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
-            pmu_collector_.recorded_window_open(prepared.identity.run_epoch))
+            pmu_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+            dump_collector_.recorded_window_open(prepared.identity.run_epoch))
             return PTO_RUNTIME_ERR_INVALID_STATE;
         rc = prepare_collector_storage(*prepared.runtime, prepared);
         if (rc != 0) return rc;
     }
+    bool dump_armed = false;
     bool pmu_armed = false;
     bool published = false;
     RAIIScopeGuard rollback_window([&] {
         if (published) return;
         if (prepared.dfx.scope_stats_enabled) scope_stats_collector_.abandon_run(prepared.identity.run_epoch);
+        if (dump_armed) dump_collector_.abandon_run(prepared.identity.run_epoch);
         if (pmu_armed) {
             pmu_collector_.abandon_run(prepared.identity.run_epoch);
             pmu_lease_.release(prepared.identity.run_epoch);
         }
     });
+    if (prepared.dfx.dump_args_enabled()) {
+        dump_armed = true;
+        dump_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        if (!dump_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.dfx.dump_args_level
+            ))
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        reference->args_dump_window = true;
+        prepared.kernel_args.args.args_dump_run_terminal_bank = 0;
+    }
     if (prepared.dfx.pmu_enabled) {
         pmu_collector_.start([this](std::function<void()> function) {
             return create_thread(std::move(function));
@@ -4141,7 +4163,7 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
             if (rc == 0) rc = storage.fence->retire(reference->identity);
             if (rc != 0) return rc;
         }
-        if (reference->scope_stats_window || reference->pmu_window) {
+        if (reference->scope_stats_window || reference->pmu_window || reference->args_dump_window) {
             // Raw replay is caller-ordered. Its drained stream plus the external
             // end promise stops producers; the lock excludes a new native run
             // while the collector establishes its reader-quiescence boundary.
@@ -4154,6 +4176,11 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
                 rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
                 if (rc != 0) return rc;
                 reference->scope_stats_window = false;
+            }
+            if (reference->args_dump_window) {
+                rc = dump_collector_.close_recorded_window(reference->identity.run_epoch);
+                if (rc != 0) return rc;
+                reference->args_dump_window = false;
             }
             if (reference->pmu_window) {
                 rc = pmu_collector_.close_recorded_window(reference->identity.run_epoch);
@@ -5411,7 +5438,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
             pmu_lease_.release(run_epoch);
         } catch (...) {}
     }
-    if (dfx.dump_args_enabled() && dump_collector_.retains_runs()) {
+    if (dfx.dump_args_enabled() && dump_collector_.retains_runs() && !dump_collector_.recorded_window_open(run_epoch)) {
         try {
             restored = dump_collector_.abandon_run(run_epoch) && restored;
         } catch (...) {
@@ -5569,6 +5596,7 @@ void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &outp
 int DeviceRunnerBase::close_args_dump_run_boundary(
     const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
+    if (dump_collector_.recorded_window_open(run_epoch)) return 0;
     if (!dump_collector_.retains_runs()) {
         return dump_collector_.close_ordinary_run(device_execution_complete || device_producers_stopped);
     }

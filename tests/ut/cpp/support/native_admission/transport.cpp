@@ -193,7 +193,8 @@ int aclrtStreamGetId(aclrtStream, int32_t *out) {
     return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
-    *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    *status = native_admission_transport::control().recording_active ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE :
+                                                                       ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     *model = nullptr;
     return 0;
 }

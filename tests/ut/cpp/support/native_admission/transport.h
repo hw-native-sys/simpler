@@ -51,6 +51,7 @@ struct Control {
     std::function<void()> stream_sync_hook;
     std::vector<void *> observed_streams;
     bool events_complete{true};
+    bool recording_active{false};
     int event_wait_rc{0};
     std::vector<std::pair<void *, const void *>> uploads;
 };

@@ -18,6 +18,10 @@
 #include "host/profiling_copy.h"
 #include "support/test_task_id.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -29,11 +33,33 @@
 #include <unistd.h>
 #include "profiler_test_allocator.h"
 
+namespace profiling_common {
+struct ProfilerBaseTestPeer {
+    static bool capture_pending(const ArgsDumpCollector &collector) {
+        for (const auto &slot : collector.cut_slots_) {
+            if (slot.state.load(std::memory_order_acquire) ==
+                    static_cast<int>(ProfilerBase<ArgsDumpCollector, DumpModule>::CutState::Published) &&
+                slot.qstate[0].load(std::memory_order_acquire) == 0)
+                return true;
+        }
+        return false;
+    }
+};
+}  // namespace profiling_common
+
 namespace {
 const volatile void *refused_source = nullptr;
 void *last_buffer_shadow = nullptr;
 const volatile void *tracked_buffer_source = nullptr;
 int refused_copies = 0;
+std::atomic<const volatile void *> refused_cursor{nullptr};
+ArgsDumpCollector *cursor_collector = nullptr;
+std::atomic<int> cursor_failures{0};
+std::atomic<const volatile void *> held_cursor{nullptr};
+std::mutex cursor_gate_mutex;
+std::condition_variable cursor_gate_cv;
+bool cursor_entered = false;
+bool cursor_released = false;
 void *allocate(size_t bytes) { return profiler_test_calloc(bytes); }
 int release(void *ptr) {
     std::free(ptr);
@@ -46,6 +72,20 @@ int profiling_copy_to_device(volatile void *dst, const void *src, size_t bytes) 
     return 0;
 }
 int profiling_copy_from_device(volatile void *dst, const volatile void *src, size_t bytes) {
+    if (refused_cursor.load(std::memory_order_acquire) == src &&
+        profiling_common::ProfilerBaseTestPeer::capture_pending(*cursor_collector)) {
+        cursor_failures.fetch_add(1);
+        return -1;
+    }
+    auto *expected = src;
+    if (held_cursor.compare_exchange_strong(expected, nullptr)) {
+        std::unique_lock lock(cursor_gate_mutex);
+        cursor_entered = true;
+        cursor_gate_cv.notify_all();
+        cursor_gate_cv.wait(lock, [] {
+            return cursor_released;
+        });
+    }
     if (src == refused_source) {
         ++refused_copies;
         return -1;
@@ -65,6 +105,22 @@ class TestArgsDumpCollector : public ArgsDumpCollector {
 public:
     void *host_ptr() const { return shm_host_; }
     void retire_unreadable_buffer() { note_handoff_retired({}); }
+    uint64_t capture_generation() const { return transport_failure_snapshot(-1).capture_request; }
+    int failed_cuts() const {
+        int count = 0;
+        for (size_t slot = 0; slot < kMaxCutSlots; ++slot) {
+            int failed = 0;
+            if (cut_failed_queues(static_cast<int>(slot), capture_generation(), &failed)) count += failed;
+        }
+        return count;
+    }
+    int retiring_cuts() const {
+        int count = 0;
+        for (size_t slot = 0; slot < kMaxCutSlots; ++slot)
+            if (transport_failure_snapshot(static_cast<int>(slot)).cut_state == static_cast<int>(CutState::Retiring))
+                ++count;
+        return count;
+    }
 };
 
 class ArgsDumpReadFailure : public ::testing::TestWithParam<bool> {
@@ -87,6 +143,13 @@ protected:
         std::filesystem::remove_all(root);
     }
     void TearDown() override {
+        refused_cursor.store(nullptr);
+        held_cursor.store(nullptr);
+        {
+            std::lock_guard lock(cursor_gate_mutex);
+            cursor_released = true;
+        }
+        cursor_gate_cv.notify_all();
         refused_source = nullptr;
         tracked_buffer_source = nullptr;
         set_dump_args_enabled(false);
@@ -459,3 +522,92 @@ INSTANTIATE_TEST_SUITE_P(
         return info.param ? "Lane1" : "Lane0";
     }
 );
+
+TEST_P(ArgsDumpReadFailure, RecordedCloseReplacesAFailedCursorSnapshotAfterReaderRetirement) {
+    collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    collector.start([](std::function<void()> fn) {
+        return std::thread(std::move(fn));
+    });
+    ASSERT_TRUE(collector.begin_recorded_window(9951, root.string(), DumpArgsLevel::FULL));
+    set_platform_run_result(0, 9951);
+    dump_args_init(dump_thread_count(), DumpArgsLevel::FULL);
+    ASSERT_EQ(record(41), 0);
+    dump_args_flush(0);
+    collector.quiesce();
+    const int failures = cursor_failures.load();
+    cursor_collector = &collector;
+    refused_cursor.store(&get_dump_header(device)->queue_heads[0]);
+    ASSERT_NE(collector.close_recorded_window(9951), 0);
+    refused_cursor.store(nullptr);
+    EXPECT_GE(cursor_failures.load(), failures + 1);
+    ASSERT_EQ(collector.failed_cuts(), 1);
+    ASSERT_TRUE(collector.recorded_window_open(9951));
+    const auto failed_generation = collector.capture_generation();
+    EXPECT_EQ(collector.close_recorded_window(9951), 0);
+    EXPECT_GT(collector.capture_generation(), failed_generation);
+    std::string error;
+    EXPECT_TRUE(collector.flush_retained_runs(5000, &error)) << error;
+    EXPECT_EQ(collector.retiring_cuts(), 0);
+    EXPECT_FALSE(collector.recorded_window_open(9951));
+    std::ifstream manifest(root / "args_dump/args_dump.json");
+    const std::string text{std::istreambuf_iterator<char>(manifest), std::istreambuf_iterator<char>()};
+    EXPECT_NE(text.find("\"total_args\": 1"), std::string::npos) << text;
+    EXPECT_NE(text.find("aggregate_counts_unknown"), std::string::npos) << text;
+}
+
+TEST_P(ArgsDumpReadFailure, FailedCutRetirementNeverReusesStorageUnderAnUnacknowledgedObserver) {
+    collector.configure_retained_runs(false, simpler::dfx::runs::kDefaultBudgetBytes);
+    collector.start([](std::function<void()> fn) {
+        return std::thread(std::move(fn));
+    });
+    ASSERT_TRUE(collector.begin_recorded_window(9961, root.string(), DumpArgsLevel::FULL));
+    set_platform_run_result(0, 9961);
+    dump_args_init(dump_thread_count(), DumpArgsLevel::FULL);
+    collector.quiesce();
+    cursor_collector = &collector;
+    refused_cursor.store(&get_dump_header(device)->queue_heads[0]);
+    ASSERT_NE(collector.close_recorded_window(9961), 0);
+    refused_cursor.store(nullptr);
+    ASSERT_EQ(collector.failed_cuts(), 1);
+    {
+        std::lock_guard lock(cursor_gate_mutex);
+        cursor_entered = false;
+        cursor_released = false;
+    }
+    struct ReleaseObserver {
+        ~ReleaseObserver() {
+            held_cursor.store(nullptr);
+            {
+                std::lock_guard lock(cursor_gate_mutex);
+                cursor_released = true;
+            }
+            cursor_gate_cv.notify_all();
+        }
+    } release_observer;
+    held_cursor.store(&get_dump_header(device)->queue_tails[0]);
+    {
+        std::unique_lock lock(cursor_gate_mutex);
+        ASSERT_TRUE(cursor_gate_cv.wait_for(lock, std::chrono::seconds(5), [] {
+            return cursor_entered;
+        }));
+    }
+    const auto failed_generation = collector.capture_generation();
+    // Device production is stopped. Call the close core directly so this gate
+    // tests retirement ACK, rather than the preceding quiescence handshake.
+    EXPECT_NE(collector.run_close(9961, true), 0);
+    const auto retiring_generation = collector.capture_generation();
+    EXPECT_GT(retiring_generation, failed_generation);
+    EXPECT_EQ(collector.retiring_cuts(), 1);
+    EXPECT_TRUE(collector.recorded_window_open(9961));
+    {
+        std::lock_guard lock(cursor_gate_mutex);
+        cursor_released = true;
+    }
+    cursor_gate_cv.notify_all();
+    collector.quiesce();
+    EXPECT_NE(collector.close_recorded_window(9961), 0);
+    EXPECT_EQ(collector.capture_generation(), retiring_generation);
+    EXPECT_EQ(collector.retiring_cuts(), 1);
+    EXPECT_TRUE(collector.recorded_window_open(9961));
+    EXPECT_FALSE(std::filesystem::exists(root / "args_dump/args_dump.json"));
+}

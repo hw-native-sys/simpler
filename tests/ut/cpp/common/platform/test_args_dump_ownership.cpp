@@ -39,18 +39,40 @@
 #include <future>
 #include <iterator>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include "aicpu/args_dump_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/args_dump.h"
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
+#include "host/raii_scope_guard.h"
 #include "support/test_task_id.h"
 #include "profiler_test_allocator.h"
+
+namespace args_dump_ownership_test {
+std::atomic<size_t> fail_allocation_bytes{0};
+std::atomic<size_t> allocation_failures{0};
+}  // namespace args_dump_ownership_test
+
+// This target fails one exact payload allocation on the real collector thread.
+// All other unaligned allocations keep their malloc-compatible delete pairing.
+void *operator new(std::size_t bytes) {
+    size_t expected = bytes;
+    if (bytes != 0 && args_dump_ownership_test::fail_allocation_bytes.compare_exchange_strong(expected, 0)) {
+        args_dump_ownership_test::allocation_failures.fetch_add(1);
+        throw std::bad_alloc();
+    }
+    if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
+    throw std::bad_alloc();
+}
 
 namespace fs = std::filesystem;
 
@@ -73,12 +95,75 @@ struct ArgsDumpCollectorTestPeer {
         });
     }
 
+    static std::unique_lock<std::mutex> hold_ordinary_completion(ArgsDumpCollector &collector) {
+        std::unique_lock<std::mutex> lock(collector.write_mutex_);
+        collector.ordinary_queued_payloads_.store(1, std::memory_order_relaxed);
+        return lock;
+    }
+
+    static void complete_ordinary_payload(ArgsDumpCollector &collector) { collector.complete_ordinary_payload(); }
+
+    static auto completion_native_handle(ArgsDumpCollector &collector) {
+        return collector.write_mutex_.native_handle();
+    }
+    static size_t charged(const ArgsDumpCollector &collector) { return collector.retained_budget_.charged(); }
+    static size_t fixed(const ArgsDumpCollector &collector) { return collector.retained_budget_.fixed(); }
+    static size_t first_window_allocation(const ArgsDumpCollector &collector) {
+        return (static_cast<size_t>(collector.manager_.shard_count()) + 1) * sizeof(std::vector<DumpedArg>);
+    }
+    static uint64_t ordinary_pending(const ArgsDumpCollector &collector) {
+        return collector.ordinary_queued_payloads_.load(std::memory_order_acquire);
+    }
+    static std::unique_lock<std::mutex> hold_configuration(ArgsDumpCollector &collector) {
+        return std::unique_lock<std::mutex>(collector.writer_start_mutex_);
+    }
+    static auto configuration_native_handle(ArgsDumpCollector &collector) {
+        return collector.writer_start_mutex_.native_handle();
+    }
+    static uint64_t ordinary_epoch(const ArgsDumpCollector &collector) { return collector.run_epoch_; }
+    static void request_progress_report(ArgsDumpCollector &collector) {
+        collector.last_progress_ms_.store(0, std::memory_order_relaxed);
+    }
+    static int64_t progress_stamp(const ArgsDumpCollector &collector) {
+        return collector.last_progress_ms_.load(std::memory_order_acquire);
+    }
+
     static void cross_wait_boundary(ArgsDumpCollector &collector) {
         // Once entered is ready, acquiring this mutex proves the waiter has
         // atomically released it into its CV wait. No sleep schedules the test.
         std::scoped_lock lock(collector.write_mutex_);
     }
 };
+
+#if defined(__linux__)
+namespace {
+struct ArgsDumpLockGate {
+    pthread_mutex_t *target;
+    std::promise<void> reached;
+    std::shared_future<void> proceed;
+};
+thread_local ArgsDumpLockGate *args_dump_lock_gate = nullptr;
+std::atomic<ArgsDumpLockGate *> callback_configuration_gate{nullptr};
+}  // namespace
+
+extern "C" int __real_pthread_mutex_lock(pthread_mutex_t *mutex);
+extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
+    auto *gate = args_dump_lock_gate;
+    if (gate != nullptr && gate->target == mutex) {
+        args_dump_lock_gate = nullptr;
+    } else {
+        gate = callback_configuration_gate.load(std::memory_order_acquire);
+        if (gate == nullptr || gate->target != mutex ||
+            !callback_configuration_gate.compare_exchange_strong(gate, nullptr, std::memory_order_acq_rel))
+            gate = nullptr;
+    }
+    if (gate != nullptr) {
+        gate->reached.set_value();
+        gate->proceed.wait();
+    }
+    return __real_pthread_mutex_lock(mutex);
+}
+#endif
 
 namespace {
 
@@ -187,12 +272,12 @@ struct OwnershipFixture {
     DumpDataHeader *header = nullptr;
     std::vector<int32_t> tensor;
 
-    explicit OwnershipFixture(const char *name) :
+    explicit OwnershipFixture(const char *name, bool retaining = true) :
         root(name),
         tensor(kTensorElements) {
         for (size_t i = 0; i < tensor.size(); i++)
             tensor[i] = static_cast<int32_t>(i + 1);
-        collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+        collector.configure_retained_runs(retaining, simpler::dfx::runs::kDefaultBudgetBytes);
         EXPECT_EQ(
             collector.initialize(
                 /*num_dump_threads=*/1, /*device_id=*/0, DumpArgsLevel::FULL, ownership_alloc, nullptr, ownership_free
@@ -814,4 +899,219 @@ TEST(ArgsDumpOwnership, ReferenceFailureKeepsQuarantinedEpoch) {
     EXPECT_FALSE(fs::exists(fx.root.manifest("run-a")));
     EXPECT_FALSE(fx.begin(7105, fx.root.prefix("run-b")));
     EXPECT_EQ(fx.stats().quarantined_epochs, 1u);
+}
+
+TEST(ArgsDumpOwnership, OrdinaryCompletionSharesTheCloseWaitMutex) {
+    OwnershipFixture fx("ordinary-completion-mutex", false);
+#if defined(__linux__)
+    auto close_mutex = ArgsDumpCollectorTestPeer::hold_ordinary_completion(fx.collector);
+    std::promise<void> proceed;
+    ArgsDumpLockGate gate{
+        ArgsDumpCollectorTestPeer::completion_native_handle(fx.collector), {}, proceed.get_future().share()
+    };
+    auto reached = gate.reached.get_future();
+    auto completion = std::async(std::launch::async, [&] {
+        args_dump_lock_gate = &gate;
+        auto clear_gate = RAIIScopeGuard([] {
+            args_dump_lock_gate = nullptr;
+        });
+        ArgsDumpCollectorTestPeer::complete_ordinary_payload(fx.collector);
+    });
+    auto release = RAIIScopeGuard([&] {
+        close_mutex.unlock();
+        proceed.set_value();
+    });
+    ASSERT_EQ(reached.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    // This writer reached the actual close-wait mutex before changing the predicate.
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_pending(fx.collector), 1u);
+    close_mutex.unlock();
+    proceed.set_value();
+    release.dismiss();
+    ASSERT_EQ(completion.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    completion.get();
+#else
+    {
+        auto close_mutex = ArgsDumpCollectorTestPeer::hold_ordinary_completion(fx.collector);
+    }
+    ArgsDumpCollectorTestPeer::complete_ordinary_payload(fx.collector);
+#endif
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_pending(fx.collector), 0u);
+
+    // Exercise the real producer, writer and ordinary close after contention.
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7201);
+    fx.produce(7201, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    const auto manifest = read_file(fx.root.manifest("ordinary"));
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 1u);
+    EXPECT_EQ(fs::file_size(fx.root.run_dir("ordinary") / "args.bin"), kTensorBytes);
+}
+
+TEST(ArgsDumpOwnership, OrdinaryAdmissionAndRecordedCallbackShareConfiguration) {
+    OwnershipFixture fx("recorded-callback-config", false);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(7301, fx.root.prefix("recorded").string(), DumpArgsLevel::FULL));
+#if defined(__linux__)
+    auto configuration = ArgsDumpCollectorTestPeer::hold_configuration(fx.collector);
+    std::promise<void> callback_proceed, admission_proceed;
+    ArgsDumpLockGate callback{
+        ArgsDumpCollectorTestPeer::configuration_native_handle(fx.collector), {}, callback_proceed.get_future().share()
+    };
+    ArgsDumpLockGate admission{
+        ArgsDumpCollectorTestPeer::configuration_native_handle(fx.collector), {}, admission_proceed.get_future().share()
+    };
+    auto callback_reached = callback.reached.get_future();
+    auto admission_reached = admission.reached.get_future();
+    std::future<void> begin;
+    bool callback_released = false, admission_released = false;
+    auto release = RAIIScopeGuard([&] {
+        callback_configuration_gate.store(nullptr, std::memory_order_release);
+        if (configuration.owns_lock()) configuration.unlock();
+        if (!admission_released) admission_proceed.set_value();
+        if (!callback_released) callback_proceed.set_value();
+        if (begin.valid()) begin.wait();
+        fx.collector.quiesce();
+    });
+    callback_configuration_gate.store(&callback, std::memory_order_release);
+    fx.produce(7301, 1);
+    ASSERT_EQ(callback_reached.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    begin = std::async(std::launch::async, [&] {
+        args_dump_lock_gate = &admission;
+        auto clear_gate = RAIIScopeGuard([] {
+            args_dump_lock_gate = nullptr;
+        });
+        fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7302);
+    });
+    ASSERT_EQ(admission_reached.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_epoch(fx.collector), 0u);
+    admission_proceed.set_value();
+    admission_released = true;
+    configuration.unlock();
+    ASSERT_EQ(begin.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    begin.get();
+    ArgsDumpCollectorTestPeer::request_progress_report(fx.collector);
+    callback_proceed.set_value();
+    callback_released = true;
+    fx.collector.quiesce();
+    EXPECT_GT(ArgsDumpCollectorTestPeer::progress_stamp(fx.collector), 0);
+    release.dismiss();
+#else
+    fx.produce(7301, 1);
+    fx.collector.quiesce();
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7302);
+#endif
+    fx.produce(7302, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    ASSERT_EQ(fx.collector.close_recorded_window(7301), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    for (const auto *leaf : {"recorded", "ordinary"}) {
+        const auto manifest = read_file(fx.root.manifest(leaf));
+        EXPECT_EQ(manifest_number(manifest, "total_args"), 1u);
+        const auto bytes = read_file(fx.root.run_dir(leaf) / manifest_string(manifest, "bin_file"));
+        ASSERT_EQ(bytes.size(), kTensorBytes);
+        EXPECT_EQ(std::memcmp(bytes.data(), fx.tensor.data(), kTensorBytes), 0);
+    }
+}
+
+TEST(ArgsDumpOwnership, OrdinaryPayloadAllocationLossSettlesButFailsQuality) {
+    OwnershipFixture fx("ordinary-allocation-loss", false);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7202);
+    set_platform_run_result(0, 7202);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    std::vector<int32_t> payload(257, 123);
+    ArgsDumpInfo info{};
+    info.task_id = simpler::ut::test_task_id(0xA22);
+    info.role = ArgsDumpRole::INPUT;
+    info.stage = ArgsDumpStage::BEFORE_DISPATCH;
+    info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+    info.dtype = static_cast<uint8_t>(DataType::INT32);
+    info.capture_payload = 1;
+    info.buffer_addr = reinterpret_cast<uint64_t>(payload.data());
+    info.ndims = 1;
+    info.shapes[0] = payload.size();
+    info.strides[0] = 1;
+    ASSERT_EQ(dump_arg_record(kLane, info), 0);
+    const size_t failures_before = args_dump_ownership_test::allocation_failures.load();
+    args_dump_ownership_test::fail_allocation_bytes.store(payload.size() * sizeof(int32_t));
+    dump_args_flush(kLane);
+    const int rc = fx.collector.close_ordinary_run(true);
+    const size_t unconsumed_fault = args_dump_ownership_test::fail_allocation_bytes.exchange(0);
+    EXPECT_EQ(unconsumed_fault, 0u) << "the real payload allocation did not reach the fault";
+    EXPECT_EQ(args_dump_ownership_test::allocation_failures.load(), failures_before + 1);
+    EXPECT_NE(rc, 0) << "known host loss cannot be a complete ordinary artifact";
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->published_payload_count, 1u);
+    EXPECT_EQ(fx.state()->completed_payload_count, 1u) << "discarded payloads no longer hold device storage";
+    const auto manifest = read_file(fx.root.manifest("ordinary"));
+    EXPECT_NE(manifest.find("\"host_discarded\": true"), std::string::npos);
+    EXPECT_NE(manifest.find("\"dropped_records_complete\": false"), std::string::npos);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error)) << "resource settlement must not erase sticky diagnostic loss";
+
+    // A fresh zero-record invocation has no failed payload of its own. It
+    // succeeds even while the collector-wide quality report remains sticky.
+    fx.collector.begin_run(fx.root.prefix("ordinary-empty").string(), DumpArgsLevel::FULL, 7203);
+    set_platform_run_result(0, 7203);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    EXPECT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_FALSE(fx.flush(&error));
+}
+
+TEST(ArgsDumpOwnership, OrdinaryMetadataAllocationFailurePreservesQueuedPayloadOwnership) {
+    OwnershipFixture fx("ordinary-metadata-allocation", false);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 9931);
+    fx.collector.stop(false);
+    fx.produce(9931, 1);
+    fx.collector.hold_retained_writer_for_test(true);
+    const size_t failures = args_dump_ownership_test::allocation_failures.load();
+    args_dump_ownership_test::fail_allocation_bytes.store(sizeof(DumpedArg));
+    fx.collector.start(ownership_thread_factory);
+    fx.collector.quiesce();
+    const size_t remaining = args_dump_ownership_test::fail_allocation_bytes.exchange(0);
+    EXPECT_EQ(remaining, 0u) << "the real ordinary metadata allocation was not reached";
+    EXPECT_EQ(args_dump_ownership_test::allocation_failures.load(), failures + 1);
+    EXPECT_EQ(fx.collector.retained_lane_transport_credit_for_test(0), 1u);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_pending(fx.collector), 1u);
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->completed_payload_count, 1u);
+    fx.collector.hold_retained_writer_for_test(false);
+    EXPECT_NE(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::charged(fx.collector), ArgsDumpCollectorTestPeer::fixed(fx.collector));
+    const auto manifest = read_file(fx.root.manifest("ordinary"));
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 0);
+    EXPECT_EQ(manifest_number(manifest, "metadata_discarded_records"), 1);
+    EXPECT_EQ(fs::file_size(fx.root.run_dir("ordinary") / "args.bin"), kTensorBytes);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+}
+
+TEST(ArgsDumpOwnership, RecordedInitializationFailureDoesNotResetOrdinaryPayloadCharges) {
+    OwnershipFixture fx("ordinary-budget-during-init", false);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 9941);
+    fx.collector.hold_retained_writer_for_test(true);
+    fx.produce(9941, 1);
+    fx.collector.quiesce();
+    const size_t charge = ArgsDumpCollectorTestPeer::charged(fx.collector);
+    EXPECT_GT(charge, ArgsDumpCollectorTestPeer::fixed(fx.collector));
+    const size_t failures = args_dump_ownership_test::allocation_failures.load();
+    args_dump_ownership_test::fail_allocation_bytes.store(
+        ArgsDumpCollectorTestPeer::first_window_allocation(fx.collector)
+    );
+    bool admitted = false;
+    EXPECT_NO_THROW(
+        admitted = fx.collector.begin_recorded_window(9942, fx.root.prefix("model").string(), DumpArgsLevel::FULL)
+    );
+    args_dump_ownership_test::fail_allocation_bytes.store(0);
+    EXPECT_FALSE(admitted);
+    EXPECT_EQ(args_dump_ownership_test::allocation_failures.load(), failures + 1);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::charged(fx.collector), charge);
+    EXPECT_EQ(fx.collector.retained_lane_transport_credit_for_test(0), 1u);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(9942, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::charged(fx.collector), charge);
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->completed_payload_count, 1u);
+    fx.collector.hold_retained_writer_for_test(false);
+    EXPECT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_EQ(fx.collector.close_recorded_window(9942), 0);
+    std::string error;
+    EXPECT_TRUE(fx.flush(&error)) << error;
 }

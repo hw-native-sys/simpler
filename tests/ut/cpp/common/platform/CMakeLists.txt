@@ -570,6 +570,14 @@ platform_case(test_args_dump_ownership.cpp PER_ARCH PER_RUNTIME
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        foreach(runtime tmr hbg)
+            target_link_options(test_${arch}_${runtime}_args_dump_ownership PRIVATE "-Wl,--wrap=pthread_mutex_lock")
+        endforeach()
+    endforeach()
+endif()
+
 platform_case(test_args_dump_retained_runs.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp

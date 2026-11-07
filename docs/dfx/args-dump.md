@@ -306,8 +306,10 @@ The dump artifacts land under the per-task output prefix
     └── [args.bin]      # eager for partial/full; present for hybrid only with selected tensor payload
 ```
 
-Filenames are fixed (no per-file timestamp) — the directory is the
-per-task uniqueness boundary. Once at least one record reaches the collector,
+Ordinary non-retained filenames are fixed (no per-file timestamp). Recorded
+windows and ordinary calls with `collect_across_runs=True` use distinct named
+payload files; always follow `bin_file` in the published manifest. With ordinary
+retention disabled, once at least one record reaches the collector,
 `partial` and `full` create `args.bin`, which may be empty when no tensor
 payload was selected or recorded. `hybrid` with records but no selected tensor
 payload emits only `args_dump.json`; otherwise it also emits `args.bin`.
@@ -317,7 +319,8 @@ payload emits only `args_dump.json`; otherwise it also emits `args.bin`.
 `args_dump.json` is the manifest; its `bin_file` field points at
 the sibling binary payload. A `hybrid` capture with no marked tensors has
 `bin_file: null`, no `.bin`, and `bin_size: 0` for every entry. A `hybrid`
-capture with marked tensors has `bin_file: "args.bin"`; only the
+capture with marked tensors names its payload in `bin_file` (`"args.bin"` for
+ordinary calls with retention disabled); only the
 `CoreTaskArgs::dump(...)`-marked tensor records have a non-zero `bin_size`.
 
 Example manifest, from a `full` capture (one input tensor captured before
@@ -393,7 +396,7 @@ Key fields:
   `is_contiguous` — logical view geometry. Tensor `bin_size` is
   `numel × elem_size` of the *logical* view, gathered if
   non-contiguous; scalar entries have `bin_size = 0`.
-- `bin_offset` — byte offset into `args.bin` where the
+- `bin_offset` — byte offset into the file named by `bin_file` where the
   payload starts.
 - `truncated` — set when the tensor exceeded arena size; see §7.
 - Top-level `dropped_records` surfaces aggregate metadata-buffer loss — useful
@@ -424,6 +427,15 @@ Exported `.txt` files include metadata headers, a row-major overview
 with aligned columns, and a detail listing with multi-dim indices —
 diff-friendly against golden tensors and pasteable into a
 spreadsheet.
+
+For a recorded window, the viewer first reports unknown aggregate accounting
+and observed host/metadata losses. Printed indices refer to the original
+manifest, even after filtering. `--index N` selects that same entry. Recorded
+exports include `entry_NNNNNN` in each filename: equal task, stage and argument
+IDs from different executions remain separate files. Ordinary export filenames
+are unchanged. A host-discarded payload is explicitly labelled; selected
+payload ranges must fit the binary named by the manifest. An empty recorded
+window is valid and contains no samples to export.
 
 ### 3.4 Add dump support to a new test
 
@@ -462,6 +474,54 @@ Full template:
 The a5 mirror at `tests/st/a5/host_build_graph/dump_args` demonstrates the same
 two registration APIs and asserts its computation, but collects nothing: that
 runtime has no capture (§3.1.1).
+
+### 3.5 Native A3 capture/replay collection
+
+ArgsDump alone can accompany native Kernel capture on A3 TMR and HBG. It uses
+the [common capture and resource lifetime](../design/native-capture-common-contract.md)
+path: prepare and retain before `CaptureBegin`, record the normal launch, then
+retire the original Host carrier. No eager computation is required. The retained
+reference keeps the dump pool and output window alive for model replay. Caller
+IO remains caller-owned and stream-ordered. Program remains eager-only.
+
+Diagnostic producers sharing a context's collector pool execute serially in one
+caller-ordered domain. Before releasing any retained model reference, finish
+all producers sharing that pool and start none until release returns. Multiple
+model windows may remain retained; closing one does not close the others.
+
+The task hooks sample inputs before dispatch and outputs after completion,
+including INOUT at both points. Replaying a model repeats these hooks without
+Host orchestration or a new Host-side run. Captured task IDs and diagnostic
+`run_epoch` may repeat: the epoch routes the window and is not a replay number.
+Manifest order is export order, not a cross-lane execution timeline.
+
+The settled artifact is the existing `args_dump.json` plus its named `bin_file`.
+Do not assume the payload is named `args.bin`. A healthy recorded manifest has:
+
+```json
+{
+  "recorded_window": true,
+  "counts_unknown": true,
+  "dropped_records": null,
+  "dropped_records_complete": false,
+  "collection_verdict": "aggregate_counts_unknown"
+}
+```
+
+Observed entry, role, stage, truncation and host-loss counts remain meaningful.
+The final replay's device counters cannot certify an aggregate replay total.
+Healthy recorded publication can therefore settle with
+`flush_diagnostics() == 0` while aggregate completeness remains unknown. Known
+collection loss or file publication failure still fails the diagnostic flush;
+it does not decide whether ordinary task computation executes. A zero-replay
+model publishes zero entries and `bin_file: null`. Truncated or discarded data
+never certifies a complete tensor.
+
+Repeated entries are raw samples, not paired replay invocations. Inspect them
+with `dump_viewer --index N` or export them all. `core_swimlane` refuses to
+reconstruct a task from a recorded aggregate before grouping task IDs, because
+that grouping could combine arguments from different executions. Ordinary
+single-run reconstruction remains available.
 
 ## 4. Capabilities
 
@@ -1100,7 +1160,7 @@ Per-thread arena =
 
 **No `args_dump/` directory or `args_dump.json` in the output.** Check that
 `--dump-args` was passed; without it the host does not allocate dump storage.
-The collector exports files only after receiving at least one record, so the
+An ordinary collector exports files only after receiving at least one record, so the
 same result is expected when the kernel dispatches no arguments or when
 `partial` has no `CoreTaskArgs::dump(...)` markers. Add markers (§3.2), or pass
 `--dump-args full`.

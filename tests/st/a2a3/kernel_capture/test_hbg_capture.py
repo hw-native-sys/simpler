@@ -11,8 +11,11 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
+import struct
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -28,18 +31,22 @@ _NATIVE = Path(__file__).with_name("native")
 pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.runtime("host_build_graph")]
 
 
-def build_probe(build: Path, *, retained_models: bool = False):
+def build_probe(
+    build: Path, *, retained_models: bool = False, args_dump: bool = False, runtime_name: str = "host_build_graph"
+):
     build.mkdir(parents=True, exist_ok=True)
     compiler = KernelCompiler("a2a3")
     kernel = compiler.compile_incore(
         str(_NATIVE / ("hbg_inout_step.cpp" if retained_models else "hbg_step.cpp")),
         core_type="aiv",
         pto_isa_root=ensure_pto_isa_root(),
-        extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
+        extra_include_dirs=compiler.get_orchestration_include_dirs(runtime_name),
         build_dir=str(build),
     )
     orch = compiler.compile_orchestration(
-        "host_build_graph", str(_NATIVE / "hbg_orchestration.cpp"), build_dir=str(build)
+        runtime_name,
+        str(_NATIVE / ("args_dump_orchestration.cpp" if args_dump else "hbg_orchestration.cpp")),
+        build_dir=str(build),
     )
     child = CoreCallable.build(
         signature=[D.INOUT, D.SCALAR] if retained_models else [D.IN, D.OUT, D.SCALAR],
@@ -47,14 +54,20 @@ def build_probe(build: Path, *, retained_models: bool = False):
     )
     chip = ChipCallable.build(
         signature=[D.INOUT, D.SCALAR] if retained_models else [D.IN, D.OUT, D.IN, D.SCALAR],
-        func_name="hbg_inout_orchestration" if retained_models else "hbg_capture_orchestration",
+        func_name=(
+            "args_dump_capture_orchestration"
+            if args_dump
+            else "hbg_inout_orchestration"
+            if retained_models
+            else "hbg_capture_orchestration"
+        ),
         binary=orch,
         children=[(0, child)],
     )
 
     (build / "callable.bin").write_bytes(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
-    runtime = _ROOT / "build/lib/a2a3/onboard/host_build_graph"
+    runtime = _ROOT / "build/lib/a2a3/onboard" / runtime_name
     command = [
         "c++",
         "-std=c++17",
@@ -64,7 +77,7 @@ def build_probe(build: Path, *, retained_models: bool = False):
         f"-I{_ROOT / 'src/common/worker'}",
         f"-I{_ROOT / 'src/common/task_interface'}",
         f"-I{_ROOT / 'src/common'}",
-        *[f"-I{path}" for path in compiler.get_orchestration_include_dirs("host_build_graph")],
+        *[f"-I{path}" for path in compiler.get_orchestration_include_dirs(runtime_name)],
         f"-I{cann / 'include'}",
         f"-I{cann / 'pkg_inc'}",
         f"-I{cann / 'pkg_inc/runtime'}",
@@ -255,3 +268,110 @@ def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
         assert all(int(row["pmu_total_cycles"]) > 0 for row in captured["records"])
         if replay:
             assert max(Counter(row["task_id"] for row in captured["records"]).values()) >= rounds
+
+
+def check_args_dump_output(output: Path, replays: int):
+    from simpler_setup.tools import dump_viewer  # noqa: PLC0415
+
+    for leaf, initial, increment, rounds, recorded in (
+        ("a", 10, -3, replays, True),
+        ("b", 1000, 5, replays, True),
+        ("eager", -24680, 17, 1, False),
+    ):
+        directory = output / leaf / "args_dump"
+        manifest = json.loads((directory / "args_dump.json").read_text())
+        entries = manifest["args"]
+        assert bool(manifest.get("recorded_window")) is recorded, manifest
+        if recorded:
+            assert manifest["counts_unknown"] is True, manifest
+            assert manifest["dropped_records"] is None, manifest
+            assert manifest["dropped_records_complete"] is False, manifest
+            assert manifest["collection_verdict"] == "aggregate_counts_unknown", manifest
+        else:
+            assert manifest["dropped_records"] == 0, manifest
+        assert manifest.get("host_discarded_args", 0) == 0, manifest
+        assert manifest.get("metadata_discarded_records", 0) == 0, manifest
+        assert manifest["dump_args_level"] == (3 if recorded else 1), manifest
+        assert manifest["total_args"] == len(entries), manifest
+        if not rounds:
+            assert not entries and manifest["bin_file"] is None, manifest
+            continue
+
+        assert entries, manifest
+        assert len({entry["run_epoch"] for entry in entries}) == 1, entries
+        binary = directory / manifest["bin_file"]
+        scalar_by_task = {}
+        scalar_occurrences = Counter()
+        for entry in entries:
+            if entry["kind"] == "scalar":
+                assert entry["arg_index"] == 1 and entry["dtype"] == "INT32", entry
+                assert entry["stage"] == "before_dispatch", entry
+                value = entry["value"]
+                # Signed INT32 JSON values preserve the complete inline scalar bit pattern.
+                assert struct.pack("<i", value) in (struct.pack("<i", increment), struct.pack("<i", 7)), entry
+                identity = (entry["task_id"], tuple(entry["func_id"]))
+                assert scalar_by_task.setdefault(identity, value) == value, entry
+                scalar_occurrences[identity] += 1
+        assert len(scalar_by_task) == 2 and set(scalar_by_task.values()) == {increment, 7}, scalar_by_task
+        assert scalar_occurrences == Counter({identity: rounds for identity in scalar_by_task}), scalar_occurrences
+        expected = Counter()
+        for round_index in range(rounds):
+            seed = initial + 100 * round_index
+            for scalar, before, after in (
+                (increment, seed, seed + increment),
+                (7, seed + increment, seed + increment + 7),
+            ):
+                for stage, base in (("before_dispatch", before), ("after_completion", after)):
+                    expected[(stage, scalar, tuple(base + 7 * i for i in range(16)))] += 1
+        observed = Counter()
+        ranges = set()
+        for index, entry in enumerate(entries):
+            exported = dump_viewer.export_arg(entry, binary, directory, entry_index=index if recorded else None)
+            assert exported.exists()
+            if entry["kind"] == "scalar":
+                assert f"# value: {entry['value']}" in exported.read_text()
+                continue
+            assert entry["role"] == "inout" and entry["arg_index"] == 0, entry
+            assert entry["dtype"] == "INT32" and entry["shape"] == [16], entry
+            assert not entry["truncated"] and not entry.get("host_discarded"), entry
+            payload = dump_viewer.read_arg_data(binary, entry["bin_offset"], entry["bin_size"])
+            values = struct.unpack("<16i", payload)
+            scalar = scalar_by_task[(entry["task_id"], tuple(entry["func_id"]))]
+            observed[(entry["stage"], scalar, values)] += 1
+            assert f"[0] {values[0]}\n" in exported.read_text()
+            assert f"[15] {values[-1]}\n" in exported.read_text()
+            ranges.add((entry["bin_offset"], entry["bin_size"]))
+        assert observed == expected, (leaf, observed, expected)
+        tensors = [entry for entry in entries if entry["kind"] != "scalar"]
+        assert len(ranges) == len(tensors), "separate samples alias exported payload offsets"
+        if recorded:
+            assert len(list((directory / "txt").glob("*.txt"))) == len(entries)
+
+
+def run_args_dump_probe(binaries, device, output: Path, replays: int):
+    logs = output.parent / "ascend-argsdump"
+    logs.mkdir()
+    result = subprocess.run(
+        [binaries[0], str(device), *binaries[1:], str(output), str(replays), "argsdump"],
+        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    (output.parent / "argsdump-native.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "stage=argsdump-flush rc=0" in result.stdout
+    assert f"argsdump_retained_models PASS models=2 replays={2 * replays}" in result.stdout
+    check_args_dump_output(output, replays)
+
+
+@pytest.fixture(scope="module")
+def hbg_args_dump_probe(tmp_path_factory):
+    return build_probe(tmp_path_factory.mktemp("hbg-argsdump-capture"), retained_models=True, args_dump=True)
+
+
+@pytest.mark.parametrize("replays", [0, 3])
+def test_hbg_args_dump_capture_exports_task_time_values(hbg_args_dump_probe, tmp_path, request, replays):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    run_args_dump_probe(hbg_args_dump_probe, device, tmp_path / "dump", replays)
