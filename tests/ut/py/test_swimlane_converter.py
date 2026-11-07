@@ -334,6 +334,23 @@ def _write_dispatch_identity(capture_dir, *, run_id, task_slot, group_index, gro
     (capture_dir / "dispatch_identity.json").write_text(json.dumps(payload))
 
 
+def test_recorded_window_refuses_multi_rank_host_placement_without_source_changes(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    paths = [_write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7) for rank in (0, 1)]
+    for path in paths:
+        records = path / "chip_swimlane_records.json"
+        raw = json.loads(records.read_text())
+        raw["metadata"]["collection"] = {"recorded_window": True, "counts_unknown": True}
+        records.write_text(json.dumps(raw))
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    output = tmp_path / "rejected.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+    with pytest.raises(ValueError, match="recorded windows cannot be merged"):
+        sc._generate_l3_trace(args, root)
+    assert not output.exists()
+    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+
+
 def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path):
     root = tmp_path / "dfx_outputs"
     _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)

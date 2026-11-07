@@ -44,6 +44,7 @@
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_runs.h"
+#include "host/host_phase_records.h"
 #include "host/collected_record.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -1249,6 +1250,9 @@ public:
          * stated no identity, which is the only state a reader may not match on.
          */
         NativeRunArtifactIdentity artifact_identity{};
+        bool recorded_window{false};
+        bool legacy_destination{false};
+        HandoffReport handoff{};
     };
 
     /**
@@ -1288,6 +1292,7 @@ public:
     }
 
 private:
+    friend struct ChipSwimlaneCollectorTestPeer;
     static constexpr size_t kProducerClasses = 4;  // indexed by ProfBufferType
 
     /**
@@ -1607,6 +1612,7 @@ private:
         // records are not kept, and the artifact says so.
         std::atomic<bool> retain{true};
         bool target_installed{false};
+        bool recorded_window{false};
         int cut_slot{-1};
         // The capture request this run's cut published. Every question about
         // that cut is asked against it, because an acknowledgement of a later
@@ -1776,6 +1782,10 @@ public:
     /** Whether this collector is configured to hold a run past its boundary. */
     bool retains_runs() const { return retain_across_runs_; }
 
+    /** Explicit model windows share this table without changing ordinary policy. */
+    bool has_retained_run_table() const { return retained_ready_.load(std::memory_order_acquire); }
+    bool recorded_window_open(uint64_t run_epoch) const;
+
     /**
      * Whether this collector has ever completed retention setup.
      *
@@ -1799,8 +1809,8 @@ public:
     /**
      * Whether this collector holds no unpublished retained run.
      *
-     * True with retention off, and true once every admitted run's writer has
-     * published. What it answers is whether a writer may still be reading
+     * True without an admitted ordinary or explicit model window, and once
+     * every admitted run's writer has published. A writer may still be reading
      * this collector's pools — which outlives a run's native retirement.
      */
     bool retained_runs_idle() const;
@@ -1864,6 +1874,25 @@ public:
     void run_close(uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped = false);
 
     /**
+     * Hold one recorded node's receipts and one prepared metadata snapshot.
+     * This does not change the ordinary retention policy. Device record arrays
+     * in `metadata` must be empty; the collector receives those from its pools.
+     */
+    bool begin_recorded_window(
+        uint64_t run_epoch, const RunExport &metadata, const CoreType *core_types = nullptr, int core_type_count = 0,
+        const simpler::dfx::HostPhaseRecordStore *host_records = nullptr,
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    );
+
+    /**
+     * Close after the caller proves every use of the recorded node quiescent.
+     * Waits for reader references and the transport cut to retire, independently
+     * of file publication. A pending processing cut can retry with the same
+     * owner; failed reader/cut retirement retains storage until reader join.
+     */
+    bool close_recorded_window(uint64_t run_epoch, int timeout_ms);
+
+    /**
      * Withdraw a run that was admitted and never launched.
      *
      * `run_begin` claims a slot before anything is submitted, so a launch that
@@ -1910,9 +1939,12 @@ public:
      * Wait until every run up to the current close watermark is published.
      *
      * Returns false and fills `error` when any of them ended without a file, or
-     * when the wait ran out. A published partial is a verdict, not a failure.
+     * when the wait ran out. Ordinary published partials keep their existing
+     * verdict-only policy; a recorded window with known loss fails quality.
+     * A nonzero epoch follows that admitted run's run_close and waits only for
+     * its publication. The owning execution claim prevents identity reuse.
      */
-    bool flush_retained_runs(int timeout_ms, std::string *error);
+    bool flush_retained_runs(int timeout_ms, std::string *error, uint64_t run_epoch = 0);
 
     /** Collector-shard hook called by ProfilerBase's poll loop. */
     void refresh_retained_run_view(int collector_shard);
@@ -1981,6 +2013,13 @@ private:
      * be mistaken for a prepared one.
      */
     bool ensure_retained_runs_ready(const std::string &output_root);
+    bool begin_run_window(
+        uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
+        int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity,
+        simpler::dfx::runs::AdmissionRefusal *why, const RunExport *recorded_metadata,
+        const simpler::dfx::HostPhaseRecordStore *host_records = nullptr
+    );
+    void install_run_cut(size_t slot);
 
     /**
      * Spawn the writer. A no-op before a run can be retained, and idempotent.
@@ -2008,7 +2047,9 @@ private:
     void writer_main();
     void service_retained_runs();
     void finish_retained_run(size_t slot, simpler::dfx::runs::Verdict verdict, const char *detail);
-    bool seal_and_publish_run(size_t slot, simpler::dfx::runs::Verdict verdict);
+    bool seal_run_for_export(size_t slot, simpler::dfx::runs::Verdict verdict);
+    bool publish_sealed_run(size_t slot);
+    std::mutex seal_mutex_;
     int publish_run_file(RunExport &data, const std::string &path);
     /**
      * Publish the collector's fatal state and wake every waiter, allocating

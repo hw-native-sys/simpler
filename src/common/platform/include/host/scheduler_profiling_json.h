@@ -26,7 +26,7 @@
 // capture has no streams at all.
 inline void chip_swimlane_write_scheduler_records(
     std::ostream &out, const std::vector<std::vector<CollectedRecord<ChipSwimlaneAicpuSchedPhaseRecord>>> &streams,
-    const std::vector<uint32_t> &dropped_records
+    const std::vector<uint32_t> &dropped_records, bool counts_unknown = false
 ) {
     out << "{\n    \"streams\": [";
     bool first_stream = true;
@@ -38,8 +38,10 @@ inline void chip_swimlane_write_scheduler_records(
         out << "\n      {\"platform\": \"" << CHIP_SWIMLANE_ARCHITECTURE_NAME
             << "\", \"producer\": \"aicpu\", \"scheduler_id\": " << stream_index << ", \"worker_id\": " << stream_index
             << ", \"core_type\": \"aicpu\", \"physical_core_id\": null, \"capture\": {\"committed\": " << records.size()
-            << ", \"dropped\": " << dropped << ", \"truncated\": " << (dropped == 0 ? "false" : "true")
-            << "}, \"records\": [";
+            << ", \"dropped\": ";
+        if (counts_unknown) out << "null, \"truncated\": null";
+        else out << dropped << ", \"truncated\": " << (dropped == 0 ? "false" : "true");
+        out << "}, \"records\": [";
         for (size_t record_index = 0; record_index < records.size(); ++record_index) {
             const ChipSwimlaneAicpuSchedPhaseRecord &record = records[record_index].record;
             if (record_index != 0) out << ",";

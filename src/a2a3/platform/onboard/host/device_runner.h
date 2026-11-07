@@ -80,6 +80,7 @@ class DeviceRunner : public DeviceRunnerBase {
 public:
     bool supports_scope_stats_capture() const override { return SIMPLER_DFX != 0; }
     bool supports_pmu_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_swimlane_capture() const override { return SIMPLER_DFX != 0; }
     bool supports_args_dump_capture() const override { return SIMPLER_DFX != 0; }
 
 private:

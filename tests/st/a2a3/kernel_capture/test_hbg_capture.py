@@ -270,6 +270,78 @@ def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
             assert max(Counter(row["task_id"] for row in captured["records"]).values()) >= rounds
 
 
+@pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
+def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, replay):
+    import sys  # noqa: PLC0415
+    from collections import Counter  # noqa: PLC0415
+
+    binaries = build_probe(tmp_path, retained_models=True)
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    logs = tmp_path / "ascend-swimlane"
+    logs.mkdir()
+    output = tmp_path / "swimlane"
+    result = subprocess.run(
+        [binaries[0], device, *binaries[1:], str(output), str(replay), "swimlane"],
+        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    (tmp_path / "swimlane-native.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "stage=swimlane-flush rc=0" in result.stdout
+    if replay:
+        assert result.stdout.index("state=eager verified=48") < result.stdout.index(
+            "state=b-after-a-release verified=48"
+        )
+    ordinary = json.loads((output / "eager/chip_swimlane_records.json").read_text())
+    assert ordinary["aicore_tasks"] and not ordinary["metadata"].get("collection", {}).get("recorded_window")
+    assert not (output / "unused").exists()
+    for leaf, rounds in (("a", 2), ("b", 4)):
+        [path] = (output / leaf).glob("swimlane-*/records_e*.json")
+        before = path.read_bytes()
+        raw = json.loads(before)
+        collection = raw["metadata"]["collection"]
+        assert raw["chip_swimlane_level"] == 4
+        assert collection["recorded_window"] is True and collection["counts_unknown"] is True
+        assert collection["processing_complete"] and collection["metadata_complete"], collection
+        assert all(collection[key] is None for key in ("device_total", "device_dropped", "fatal", "reconciliation"))
+        # This fixed one-kernel graph has one task per replay; this is not an exported replay denominator.
+        assert len(raw["aicore_tasks"]) == replay * rounds * len(ordinary["aicore_tasks"])
+        if replay:
+            assert max(Counter(row[1] for row in raw["aicore_tasks"]).values()) >= rounds
+        trace_path = path.with_name("observations.json")
+        converted = subprocess.run(
+            [sys.executable, "-m", "simpler_setup.tools.swimlane_converter", str(path), "-o", str(trace_path)],
+            cwd=_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        (path.parent / "converter.log").write_text(converted.stdout + converted.stderr)
+        assert converted.returncode == 0, converted.stdout + converted.stderr
+        assert path.read_bytes() == before
+        trace = json.loads(trace_path.read_text())
+        assert trace["metadata"]["clock_domain"] == "device_syscnt_cycles"
+        assert trace["metadata"]["clock_alignment"]["status"] == "unavailable"
+        assert trace["metadata"]["collection"] == collection
+        events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+        assert all(event["ph"] in ("M", "X") for event in trace["traceEvents"])
+        observed = [event for event in events if event["args"]["population"] == "aicore_tasks"]
+        assert len(observed) == len(raw["aicore_tasks"])
+        assert [event["args"]["record_index"] for event in observed] == list(range(len(raw["aicore_tasks"])))
+        host = json.loads((path.parent / trace["metadata"]["host_preparation_file"]).read_text())
+        assert host["metadata"]["clock_domain"] == "host_monotonic_ns" and host["metadata"]["preparation_only"] is True
+        # Frozen preparation exists once even for zero replay; no Host rows are multiplied by rounds.
+        preparation_count = sum(len(stream) for stream in raw.get("host_orchestrator_phases", [])) + len(
+            raw.get("host_device_uploads", [])
+        )
+        assert preparation_count > 0
+        assert len([event for event in host["traceEvents"] if event["ph"] == "X"]) == preparation_count
+
+
 def check_args_dump_output(output: Path, replays: int):
     from simpler_setup.tools import dump_viewer  # noqa: PLC0415
 

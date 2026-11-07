@@ -1164,7 +1164,7 @@ int simpler_validate_execution_context(DeviceContextHandle ctx);
  * model/external uses and resource-reference release. Prepare runs outside
  * capture. An active capture requires a resource reference retained before
  * CaptureBegin and no predecessor. Supported diagnostics are ScopeStats alone
- * on A3 TMR or PMU alone on A3 TMR/HBG. The same task sequence is
+ * on A3 TMR, or one of PMU, ArgsDump and Swimlane on A3 TMR/HBG. The same task sequence is
  * recorded once; an invalidated capture is refused before publication.
  * `predecessor`, when non-null outside capture, has the joined-launch contract.
  *
@@ -1292,7 +1292,8 @@ int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle ru
  * Onboard Program and Kernel retain their actual internal backing, including
  * Program input staging; Program execution remains eager-only. Kernel A3 TMR
  * additionally retains ScopeStats-only diagnostic windows; A3 TMR/HBG retain
- * PMU-only or ArgsDump-only windows. All producers sharing a diagnostic pool must be caller-ordered
+ * PMU-only, ArgsDump-only or Swimlane-only windows. All producers sharing a
+ * diagnostic pool must be caller-ordered
  * and stopped during resource-reference release. Other diagnostic combinations
  * are refused; sim returns
  * UNSUPPORTED. Borrowed context, caller stream and device tensor addresses
