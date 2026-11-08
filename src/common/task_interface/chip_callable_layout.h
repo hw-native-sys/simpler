@@ -40,11 +40,14 @@ struct ChipCallableLayout {
 /**
  * Compute byte-size and content hash for a ChipCallable buffer.
  *
- * `storage_used` is max(binary_size, child_offset[i] + CoreCallable header +
- * child binary_size) over all children — same arithmetic make_callable<>()
- * uses when emitting the host buffer.
+ * Storage includes orchestration, aligned CoreCallable children and the optional
+ * CCU definition table. The content hash covers every embedded module and entry.
  */
 inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *callable) {
+    if (callable->wire_version_ != CHIP_CALLABLE_WIRE_VERSION)
+        throw std::invalid_argument("unsupported ChipCallable wire version; rebuild the artifact");
+    if (callable->child_count_ < 0 || callable->child_count_ > ChipCallable::MAX_CHILDREN)
+        throw std::invalid_argument("invalid ChipCallable child count");
     constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
     size_t storage_used = static_cast<size_t>(callable->binary_size());
     const int32_t child_count = callable->child_count();
@@ -63,7 +66,12 @@ inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *calla
         size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
         if (end > storage_used) storage_used = end;
     }
+    if (callable->ccu_size_ != 0) {
+        const size_t end = static_cast<size_t>(callable->ccu_offset_) + callable->ccu_size_;
+        if (end > storage_used) storage_used = end;
+    }
     const size_t total_size = kHeaderSize + storage_used;
+    validate_chip_callable_buffer(callable, total_size);
     const uint64_t hash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(callable), total_size);
     return ChipCallableLayout{kHeaderSize, total_size, hash, aicore_image_hash};
 }

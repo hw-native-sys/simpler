@@ -291,7 +291,8 @@ class RuntimeCompiler:
             source_dirs: List of source directory paths
             build_dir: The directory path for compiling. When None, use a temporal path.
             output_dir: Directory to copy the final binary into. When set, returns Path.
-                        When None, returns bytes (backward-compatible).
+                        Required for A5 host builds, which also export the CCU trigger.
+                        When None, other targets return bytes (backward-compatible).
             dispatcher_dest: Directory to stage libsimpler_aicpu_dispatcher.so into.
                         Only consumed when target_platform == 'aicpu' (the aicpu
                         CMakeLists builds the dispatcher target as a side product).
@@ -310,10 +311,12 @@ class RuntimeCompiler:
             If output_dir is None: Compiled binary data as bytes.
 
         Raises:
-            ValueError: If target platform is invalid
+            ValueError: If target platform is invalid, or an A5 host build has no output_dir
             RuntimeError: If CMake or Make fails
             FileNotFoundError: If output binary not found
         """
+        if target_platform == "host" and self.platform == "a5" and output_dir is None:
+            raise ValueError("A5 host compilation requires output_dir to export the required CCU companion artifacts")
         if target_platform == "aicore":
             target = self.aicore_target
         elif target_platform == "aicpu":
@@ -383,6 +386,10 @@ class RuntimeCompiler:
                 dest = od / binary_name
                 place_binary(binary_path, dest)
                 if target_platform == "host" and self.platform == "a5":
+                    trigger = Path(actual_build_dir) / "ccu_trigger.o"
+                    if not trigger.is_file():
+                        raise FileNotFoundError(f"Required CCU trigger binary was not built: {trigger}")
+                    place_binary(trigger, od / trigger.name)
                     topo_fallback = Path(cmake_source_dir) / "aicpu_cpu_topo_fallback.json"
                     place_binary(topo_fallback, od / topo_fallback.name)
                 return dest

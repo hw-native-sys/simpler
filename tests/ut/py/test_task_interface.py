@@ -1567,7 +1567,7 @@ class TestChipCallable:
 
     def test_child_count_overflow(self):
         child = self._make_child([], b"\x01")
-        with pytest.raises(ValueError, match="child_count exceeds MaxChildren"):
+        with pytest.raises(ValueError, match="child_count outside supported range"):
             ChipCallable.build(
                 signature=[],
                 func_name="overflow",
@@ -1723,12 +1723,19 @@ class TestChipCallable:
             binary=b"\x00",
             children=[],
         )
-        raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
         # The wire signature contains 256 int32 ArgDirection entries before sig_count.
-        struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
-        clone = ChipCallable.from_bytes(bytes(raw))
+        count = ctypes.c_int32.from_address(int(chip.buffer_ptr()) + 256 * ctypes.sizeof(ctypes.c_int32))
+        count.value = signature_count
         with pytest.raises(ValueError, match=rf"signature count {signature_count}.*256"):
-            _ = clone.scalar_count
+            _ = chip.scalar_count
+
+    @pytest.mark.parametrize("signature_count", [-1, 257])
+    def test_from_bytes_rejects_corrupt_signature_count(self, signature_count):
+        chip = ChipCallable.build(signature=[ArgDirection.SCALAR], func_name="test", binary=b"\x00", children=[])
+        raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
+        struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
+        with pytest.raises(ValueError, match="invalid ChipCallable header fields"):
+            ChipCallable.from_bytes(bytes(raw))
 
 
 # ============================================================================

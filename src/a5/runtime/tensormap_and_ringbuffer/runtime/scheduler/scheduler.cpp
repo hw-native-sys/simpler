@@ -17,6 +17,7 @@
  */
 
 #include "scheduler.h"
+#include <algorithm>
 #include <inttypes.h>
 #include <cstdio>
 #include <stdlib.h>
@@ -312,4 +313,120 @@ void SchedulerState::print_queues() {
     LOG_DEBUG("  DUMMY: count=%" PRIu64, sched->dummy_ready_queue.size());
 
     LOG_DEBUG("====================");
+}
+
+void SchedulerState::capture_ccu_failure_successors() {
+    using Diagnostic = CcuDependencyFailureDiagnostic;
+    if (sm_header == nullptr || sm_header->sched_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_CCU_FAILED)
+        return;
+    auto &diagnostic = sm_header->ccu_dependency_failure;
+    if (diagnostic.flags != (Diagnostic::VERSION | Diagnostic::RECORDED)) return;
+    // Every return after this point is explicitly incomplete until the entire
+    // live fanout chain has been validated. No invalid pointer means "empty".
+    diagnostic.flags |= Diagnostic::SCAN_INVALID;
+    auto in_shared_memory = [&](const void *pointer, uint64_t bytes) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(sm_header);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+        return address >= base && address - base <= sm_header->total_size &&
+               bytes <= sm_header->total_size - (address - base);
+    };
+    auto valid_ring = [&](uint32_t index) {
+        if (index >= CHIP_MAX_RING_DEPTH) return false;
+        const auto &ring = sm_header->rings[index];
+        const uint64_t window = ring.task_window_size;
+        return ring_sched_states[index].ring == &ring && window != 0 && window <= INT32_MAX &&
+               (window & (window - 1)) == 0 && ring.task_window_mask == static_cast<int32_t>(window - 1) &&
+               reinterpret_cast<uintptr_t>(ring.slot_states) % alignof(ChipTaskSlotState) == 0 &&
+               reinterpret_cast<uintptr_t>(ring.task_descriptors) % alignof(TaskDescriptor) == 0 &&
+               reinterpret_cast<uintptr_t>(ring.task_payloads) % alignof(TaskPayload) == 0 &&
+               in_shared_memory(ring.slot_states, window * sizeof(ChipTaskSlotState)) &&
+               in_shared_memory(ring.task_descriptors, window * sizeof(TaskDescriptor)) &&
+               in_shared_memory(ring.task_payloads, window * sizeof(TaskPayload));
+    };
+    auto live_slot = [&](ChipTaskSlotState *slot) -> bool {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(slot);
+        for (uint32_t r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+            if (!valid_ring(r)) continue;
+            const auto &ring = sm_header->rings[r];
+            const uintptr_t base = reinterpret_cast<uintptr_t>(ring.slot_states);
+            if (address < base || address - base >= ring.task_window_size * sizeof(ChipTaskSlotState) ||
+                (address - base) % sizeof(ChipTaskSlotState) != 0)
+                continue;
+            const uint64_t index = (address - base) / sizeof(ChipTaskSlotState);
+            const int32_t alive = ring_sched_states[r].last_task_alive;
+            const int32_t published = ring.fc.current_task_index.load(std::memory_order_acquire);
+            if (alive < 0 || published <= alive ||
+                static_cast<int64_t>(published) - alive > static_cast<int64_t>(ring.task_window_size))
+                return false;
+            const uint64_t slot_distance =
+                (index + ring.task_window_size - (alive & ring.task_window_mask)) % ring.task_window_size;
+            if (slot_distance >= static_cast<uint32_t>(published - alive)) return false;
+            if (slot->task != &ring.task_descriptors[index] || slot->payload != &ring.task_payloads[index] ||
+                slot->ring_id != r)
+                return false;
+            const TaskId token = slot->task->task_id;
+            const int32_t local = token.local_id();
+            return token.is_valid() && (TaskId::to_uint64(token) >> 32) == r && local >= alive && local < published &&
+                   static_cast<uint64_t>(local & ring.task_window_mask) == index;
+        }
+        return false;
+    };
+    const uint64_t producer_ring = diagnostic.failed_token >> 32;
+    const uint32_t producer_local = static_cast<uint32_t>(diagnostic.failed_token);
+    if (producer_ring >= CHIP_MAX_RING_DEPTH || producer_local > INT32_MAX || !valid_ring(producer_ring)) return;
+    auto &ring = sm_header->rings[producer_ring];
+    auto *producer = &ring.slot_states[producer_local & ring.task_window_mask];
+    if (!live_slot(producer) || TaskId::to_uint64(producer->task->task_id) != diagnostic.failed_token) return;
+    if (producer->task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING || producer->is_completion_flag_set())
+        return;
+    diagnostic.flags |= Diagnostic::PRODUCER_VALID;
+
+    auto live_edge = [&](const DepListEntry *edge) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(edge);
+        for (const auto &state : ring_sched_states) {
+            const auto &pool = state.dep_pool;
+            if (pool.base == nullptr || pool.capacity <= 0 || pool.tail < 1 || pool.top < pool.tail ||
+                pool.top - pool.tail > pool.capacity)
+                continue;
+            const uintptr_t base = reinterpret_cast<uintptr_t>(pool.base);
+            if (address < base || (address - base) / sizeof(DepListEntry) >= static_cast<uint32_t>(pool.capacity) ||
+                (address - base) % sizeof(DepListEntry) != 0)
+                continue;
+            const uint64_t index = (address - base) / sizeof(DepListEntry);
+            const uint64_t distance = (index + pool.capacity - pool.tail % pool.capacity) % pool.capacity;
+            return distance < static_cast<uint32_t>(pool.top - pool.tail);
+        }
+        return false;
+    };
+    constexpr uint32_t MAX_DIAGNOSTIC_EDGES = 4096;
+    for (const DepListEntry *edge = producer->fanout_head; edge != nullptr; edge = edge->next) {
+        // The visit cap also rejects cycles without an unbounded temporary set.
+        if (diagnostic.successor_count == MAX_DIAGNOSTIC_EDGES || !live_edge(edge) || !live_slot(edge->slot_state))
+            return;
+        const auto &child = *edge->slot_state;
+        // A live slot and its reverse edge must agree; a reused slot is not a
+        // valid successor observation. Spill-only matches remain unconfirmed.
+        bool reverse_edge = false;
+        if (child.payload->fanin_actual_count < 0) return;
+        const int32_t inline_count = std::min(child.payload->fanin_actual_count, CHIP_FANIN_INLINE_CAP);
+        for (int32_t i = 0; i < inline_count; ++i) {
+            const auto &fanin = child.payload->fanin_inline_edges[i];
+            if (fanin.slot_state() == producer && (fanin.flags() & DEP_WAIT) != 0) reverse_edge = true;
+        }
+        if (!reverse_edge) return;
+        const auto state = child.task_state.load(std::memory_order_acquire);
+        const int32_t dispatched = child.next_block_idx.load(std::memory_order_acquire);
+        if (dispatched < 0 ||
+            (state != CHIP_TASK_PENDING && state != CHIP_TASK_COMPLETED && state != CHIP_TASK_CONSUMED))
+            return;
+        if (diagnostic.successor_count++ == 0) {
+            diagnostic.first_successor_token = TaskId::to_uint64(child.task->task_id);
+            diagnostic.first_successor_state = static_cast<uint32_t>(state);
+        }
+        diagnostic.dispatched_blocks += static_cast<uint32_t>(dispatched);
+        if (state != CHIP_TASK_PENDING || child.is_completion_flag_set() || child.completed_subtasks.load() != 0)
+            diagnostic.flags |= Diagnostic::SUCCESSOR_COMPLETED;
+    }
+    diagnostic.flags &= ~Diagnostic::SCAN_INVALID;
+    diagnostic.flags |= Diagnostic::SCAN_COMPLETE;
 }

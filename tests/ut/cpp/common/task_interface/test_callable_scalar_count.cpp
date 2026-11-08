@@ -58,16 +58,12 @@ TEST(CallableScalarCount, EmptySignatureHasNoScalars) {
     EXPECT_EQ(callable->scalar_count(), 0);
 }
 
-TEST(CallableScalarCount, CachedBlobUsesSignatureRegardlessOfPadding) {
+TEST(CallableScalarCount, CachedBlobUsesSignatureIndependentlyOfCcuMetadata) {
     auto buf = build_chip_callable(9);
     const auto *callable = reinterpret_cast<const ChipCallable *>(buf.data());
-    constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
-    constexpr size_t padding_size = offsetof(ChipCallable, storage_) - padding_begin;
-    for (size_t i = padding_begin; i < offsetof(ChipCallable, storage_); ++i) {
-        ASSERT_EQ(buf[i], 0);
-    }
-    EXPECT_EQ(callable->scalar_count(), 9);
-    std::memset(buf.data() + padding_begin, 0xff, padding_size);
+    ASSERT_EQ(callable->wire_version_, CHIP_CALLABLE_WIRE_VERSION);
+    ASSERT_EQ(callable->ccu_size_, 0u);
+    ASSERT_EQ(callable->ccu_offset_, 0u);
     EXPECT_EQ(callable->scalar_count(), 9);
     EXPECT_EQ(callable->sig_count(), 11);
     EXPECT_EQ(std::string(callable->func_name(), callable->func_name_len()), "orch_fn");

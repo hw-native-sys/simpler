@@ -254,10 +254,12 @@ At that snapshot, A5's SDMA and URMA overlays were mutually exclusive by CMake
 **Current A5 workspace selection.** SDMA and URMA are always compiled; optional
 RDMA defaults OFF and can be enabled alongside both providers.
 `CommContext.workspaces` stores independent descriptors indexed by
-`CommWorkspaceKind::{SDMA, URMA, RDMA}`. Domains create synchronous mapped
+`CommWorkspaceKind::{SDMA, URMA, RDMA, CCU}`. The CCU slot is part of the shared
+layout; allocation still requires a backend that supplies CCU resources and
+otherwise fails before domain publication. Domains create synchronous mapped
 windows by default and initialize async providers only when explicitly requested
 through `workspace_engines`. SDMA and URMA can share a domain; RDMA currently
-requires its own domain and cannot be combined with either in one domain.
+requires its own domain and cannot be combined with other engines in one domain.
 The [URMA example](../examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo/README.md)
 covers ordered mixed DAGs and same-kernel SDMA/URMA requests. The A5 onboard CI
 job runs these cases alongside SDMA using the default providers. RDMA remains

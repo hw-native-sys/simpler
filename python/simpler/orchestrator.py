@@ -357,6 +357,8 @@ class Orchestrator:
                 worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
                 remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
+            if worker is not None and target_namespace == "LOCAL_CHIP":
+                worker._prepare_ccu_submission(digest, c_args, cpp_worker_id)
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
@@ -471,6 +473,9 @@ class Orchestrator:
                 if remote_sidecars is not None:
                     remote_sidecars[index] = prepared
                     worker_id_sets[index] = _remote_data_eligible_worker_ids(prepared, eligible_worker_ids)
+            if worker is not None and target_namespace == "LOCAL_CHIP":
+                for c_args, worker_id in zip(c_args_list, worker_ids):
+                    worker._prepare_ccu_submission(digest, c_args, worker_id)
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
@@ -537,6 +542,7 @@ class Orchestrator:
         workers: Sequence[int] | None = None,
         workspace_engines: Sequence[str] = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
+        ccu_callables: Sequence[CallableHandle] = (),
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -553,6 +559,8 @@ class Orchestrator:
         ``memory_source=AddressSpace.HOST`` creates independent Host windows on
         L3 A5 TMR ranks, with local device access and optional URMA peer access.
         Their named Buffers expose CPU bytes through ``buffer.buffer`` on L3.
+        ``ccu_callables`` selects registered CCU callables to prepare collectively
+        before submission. Unlisted callables are not prepared.
         """
         if (members is None) == (workers is None):
             raise TypeError("provide exactly one of members or legacy workers")
@@ -566,6 +574,7 @@ class Orchestrator:
             retain_after_run,
             workspace_engines=workspace_engines,
             memory_source=memory_source,
+            ccu_callables=ccu_callables,
             reuse=False,
         )
 
@@ -579,11 +588,14 @@ class Orchestrator:
         retain_after_run: bool = False,
         workspace_engines: Sequence[str] = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
+        ccu_callables: Sequence[CallableHandle] = (),
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
         A hit neither allocates nor initializes the existing window.
+        New ``ccu_callables`` are prepared before the run's first submission;
+        already prepared callable/domain instances are reused.
         """
         return self._domain(
             name,
@@ -593,6 +605,7 @@ class Orchestrator:
             retain_after_run,
             workspace_engines=workspace_engines,
             memory_source=memory_source,
+            ccu_callables=ccu_callables,
             reuse=True,
         )
 
@@ -606,6 +619,7 @@ class Orchestrator:
         *,
         workspace_engines=(),
         memory_source=AddressSpace.DEVICE,
+        ccu_callables=(),
         reuse,
     ):
         if self._worker is None:
@@ -619,6 +633,7 @@ class Orchestrator:
             reuse=reuse,
             workspace_engines=workspace_engines,
             memory_source=memory_source,
+            ccu_callables=ccu_callables,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:

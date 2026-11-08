@@ -94,6 +94,7 @@ struct DomainPeerWindow {
     bool mapped = false;
 };
 
+struct CcuDomainState;
 struct DomainAllocation {
     int rank = 0;                            // this rank's index within the subset (domain_rank)
     int nranks = 0;                          // subset size
@@ -119,6 +120,9 @@ struct DomainAllocation {
 #endif
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
     size_t mapping_size = 0;
+    size_t requested_bytes = 0;
+    bool ccu_requested = false;
+    std::shared_ptr<CcuDomainState> ccu;
 };
 
 struct CommHandle_ {
@@ -135,7 +139,7 @@ struct CommHandle_ {
     CommContext *device_ctx = nullptr;
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
-    std::map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
+    std::map<uint64_t, std::shared_ptr<DomainAllocation>> domain_allocations;
     std::unordered_set<uint64_t> used_domain_ids;
     bool cleanup_failed = false;
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
@@ -145,6 +149,8 @@ struct CommHandle_ {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+#include "ccu_domain_provider.inc"
 
 namespace {
 
@@ -833,6 +839,7 @@ extern "C" void dma_workspace_release(void *handle) { (void)handle; }
 static uint32_t compiled_comm_workspaces() {
     uint32_t mask = comm_workspace_bit(CommWorkspaceKind::SDMA);
     mask |= comm_workspace_bit(CommWorkspaceKind::URMA);
+    mask |= comm_workspace_bit(CommWorkspaceKind::CCU);
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     mask |= comm_workspace_bit(CommWorkspaceKind::RDMA);
 #endif
@@ -931,13 +938,14 @@ static bool urma_domain_drained(const DomainAllocation &alloc) {
 static bool domain_drained(const DomainAllocation &alloc) {
     if (alloc.cleanup_failed) return false;
     if (!alloc.initialized) return true;  // Failed initialization never publishes device users.
-    return urma_domain_drained(alloc);
+    return ccu_domain_drained(alloc) && urma_domain_drained(alloc);
 }
 
 // Callers establish local/peer quiescence before closing a published domain.
 // Unpublished Init rollback has no device users and needs no release collective.
 static bool close_domain_resources(DomainAllocation &alloc) {
     if (alloc.cleanup_failed) return false;
+    if (!close_ccu_domain(alloc)) return false;
     alloc.cleanup_failed = true;
     if (alloc.urma_comm != nullptr) {
         if (hccl_comm_destroy(alloc.urma_comm) != HCCL_SUCCESS) return false;
@@ -1476,6 +1484,9 @@ static int domain_alloc_via_ipc(
     out->rank = my_dr;
     out->nranks = subset_n;
     out->mapping_size = win_size;
+    out->requested_bytes = win_size;
+    out->ccu_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::CCU)) != 0;
+    if (out->ccu_requested && rank_count != 2) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     uint64_t shareableHandle = 0;
     aclrtMemAccessDesc accessDesc{};
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
@@ -2022,7 +2033,7 @@ static int allocate_domain_windows(
 
     if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
     h->used_domain_ids.insert(allocation_id);
-    auto entry = h->domain_allocations.emplace(allocation_id, std::make_unique<DomainAllocation>()).first;
+    auto entry = h->domain_allocations.emplace(allocation_id, std::make_shared<DomainAllocation>()).first;
     auto &alloc = entry->second;
     alloc->rank = static_cast<int>(domain_rank);
     alloc->nranks = static_cast<int>(rank_count);
@@ -2221,6 +2232,7 @@ extern "C" int comm_destroy(CommHandle h) try {
         }
     }
 
+    ccu_forget_parent_comm(h);
     delete h;
     return rc;
 } catch (const std::exception &e) {

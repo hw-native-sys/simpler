@@ -24,8 +24,9 @@ add_subdirectory(worker)
 add_subdirectory(runtime_status)
 add_subdirectory(task_interface)
 add_subdirectory(hierarchical)
+add_subdirectory(platform_comm/ccu)
 
-# platform_comm's only case needs a device to run and CANN to build.
+# platform_comm's direct cases need a device to run and CANN to build.
 if(SIMPLER_ENABLE_HARDWARE_TESTS)
     add_subdirectory(platform_comm)
 else()

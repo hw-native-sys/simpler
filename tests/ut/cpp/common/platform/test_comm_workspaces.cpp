@@ -21,12 +21,15 @@ TEST(CommWorkspaces, BackendPublicationCannotOverwriteAnotherEngine) {
     set_comm_workspace(ctx, CommWorkspaceKind::SDMA, 0x1000, 16384);
     set_comm_workspace(ctx, CommWorkspaceKind::URMA, 0x2000, 32768);
     set_comm_workspace(ctx, CommWorkspaceKind::RDMA, 0x3000, 65536);
+    set_comm_workspace(ctx, CommWorkspaceKind::CCU, 0x4000, 8192);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::SDMA>(ctx).addr, 0x1000u);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::SDMA>(ctx).size, 16384u);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::URMA>(ctx).addr, 0x2000u);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::URMA>(ctx).size, 32768u);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::RDMA>(ctx).addr, 0x3000u);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::RDMA>(ctx).size, 65536u);
+    EXPECT_EQ(comm_workspace<CommWorkspaceKind::CCU>(ctx).addr, 0x4000u);
+    EXPECT_EQ(comm_workspace<CommWorkspaceKind::CCU>(ctx).size, 8192u);
 }
 
 TEST(CommWorkspaces, MissingBackendHasNoFallbackToAnotherWorkspace) {
@@ -34,6 +37,7 @@ TEST(CommWorkspaces, MissingBackendHasNoFallbackToAnotherWorkspace) {
     set_comm_workspace(ctx, CommWorkspaceKind::URMA, 0x2000, 32768);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::SDMA>(ctx).addr, 0u);
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::RDMA>(ctx).addr, 0u);
+    EXPECT_EQ(comm_workspace<CommWorkspaceKind::CCU>(ctx).addr, 0u);
 }
 
 TEST(CommWorkspaces, ContextCopyKeepsDomainWorkspaceReferencesIndependent) {
@@ -67,10 +71,14 @@ TEST(CommWorkspaces, EnumIndicesMatchSerializedDescriptorOrder) {
     set_comm_workspace(ctx, CommWorkspaceKind::SDMA, 0x1000, 16384);
     set_comm_workspace(ctx, CommWorkspaceKind::URMA, 0x2000, 32768);
     set_comm_workspace(ctx, CommWorkspaceKind::RDMA, 0x12345678, 65536);
+    set_comm_workspace(ctx, CommWorkspaceKind::CCU, 0x87654321, 128);
     const CommContext &view = ctx;
     EXPECT_EQ(comm_workspace<CommWorkspaceKind::RDMA>(view).addr, 0x12345678u);
-    EXPECT_EQ(COMM_WORKSPACE_COUNT, 3u);
-    ASSERT_EQ(sizeof(ctx), 1088u);
+    EXPECT_EQ(comm_workspace<CommWorkspaceKind::CCU>(view).addr, 0x87654321u);
+    EXPECT_EQ(COMM_WORKSPACE_COUNT, 4u);
+    EXPECT_EQ(comm_workspace_bit(CommWorkspaceKind::CCU), 8u);
+    EXPECT_EQ(static_cast<uint32_t>(CommWorkspaceKind::CCU), 3U);
+    ASSERT_EQ(sizeof(ctx), 1104u);
     unsigned char image[sizeof(ctx)];
     std::memcpy(image, &ctx, sizeof(ctx));
     uint32_t rank = 0;
@@ -85,4 +93,6 @@ TEST(CommWorkspaces, EnumIndicesMatchSerializedDescriptorOrder) {
     EXPECT_EQ(address, 0x2000u);
     std::memcpy(&address, image + 1040 + 2 * sizeof(CommWorkspace), sizeof(address));
     EXPECT_EQ(address, 0x12345678u);
+    std::memcpy(&address, image + offsetof(CommContext, workspaces) + 3 * sizeof(CommWorkspace), sizeof(address));
+    EXPECT_EQ(address, 0x87654321u);
 }

@@ -125,12 +125,14 @@ public:
 
     bool snapshot_is_ok() const { return selection_.verdict == DeviceRunVerdict::Ok; }
 
-    bool handoff() {
+    bool handoff(bool ccu_failure_retired = false) {
         const auto selection = selection_;
         const auto bytes = payload_bytes_;
         selection_ = {};
         payload_bytes_ = 0;
-        return aicpu_accept_runtime_terminal(selection, bytes != 0 ? payload_ : nullptr, bytes);
+        const void *payload = bytes != 0 ? payload_ : nullptr;
+        return ccu_failure_retired ? aicpu_accept_retired_ccu_failure(selection, payload, bytes) :
+                                     aicpu_accept_runtime_terminal(selection, payload, bytes);
     }
 
     bool publish(uint64_t region_base, uint64_t run_epoch) {

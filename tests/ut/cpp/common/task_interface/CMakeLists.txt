@@ -27,4 +27,7 @@ task_interface_case(test_chip_callable_upload_immutable.cpp
 task_interface_case(test_callable_function_tables.cpp
     INCLUDES ${SIMPLER_SRC}/common)
 
+task_interface_case(test_ccu_callable.cpp
+    INCLUDES ${SIMPLER_SRC}/common)
+
 simpler_ut_glob_cases(task_interface_case)

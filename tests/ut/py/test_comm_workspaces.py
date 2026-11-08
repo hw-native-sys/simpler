@@ -21,7 +21,17 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 @pytest.mark.parametrize(
-    "engines,mask", [((), 0), ([], 0), (["sdma"], 1), (["urma"], 2), (["urma", "sdma"], 3), (["rdma"], 4)]
+    "engines,mask",
+    [
+        ((), 0),
+        ([], 0),
+        (["sdma"], 1),
+        (["urma"], 2),
+        (["urma", "sdma"], 3),
+        (["rdma"], 4),
+        (["ccu"], 8),
+        (["ccu", "sdma", "urma"], 11),
+    ],
 )
 def test_domain_workspace_selection_is_part_of_configuration(engines, mask):
     config = DomainConfig.capture([0, 1], 4096, [], True, (), engines)
@@ -37,7 +47,9 @@ def test_domain_workspace_selection_is_part_of_configuration(engines, mask):
         assert not config.difference(synchronous)
 
 
-@pytest.mark.parametrize("engines", [["unknown"], ["sdma", "sdma"], ["rdma", "sdma"], ["rdma", "urma"]])
+@pytest.mark.parametrize(
+    "engines", [["unknown"], ["sdma", "sdma"], ["ccu", "ccu"], ["rdma", "sdma"], ["rdma", "urma"], ["rdma", "ccu"]]
+)
 def test_invalid_workspace_requests_are_rejected_before_allocation(engines):
     with pytest.raises(ValueError):
         DomainConfig.capture([0], 4096, [], False, (), engines)

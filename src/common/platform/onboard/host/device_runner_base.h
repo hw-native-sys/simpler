@@ -38,6 +38,7 @@
 
 #pragma once
 #include "host/aligned_image_storage.h"
+#include "platform_comm/ccu/ccu_run_lease.h"
 
 #include <runtime/rt.h>
 
@@ -1603,6 +1604,7 @@ public:
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
             prepared_resources(std::move(other.prepared_resources)),
+            ccu_readers(std::move(other.ccu_readers)),
             streams(std::exchange(other.streams, RunStreams{})),
             stream_lifetime(std::move(other.stream_lifetime)),
             artifact_identity(other.artifact_identity),
@@ -1638,6 +1640,7 @@ public:
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
         std::shared_ptr<const PreparedRunResources> prepared_resources;
+        mutable simpler::ccu::RunReaders ccu_readers;
         // Bound before publication under the execution claim, unchanged through
         // retirement. The runner retains its Core stream and the caller owns
         // an aliased CPU stream. Neither preparation nor moving this state

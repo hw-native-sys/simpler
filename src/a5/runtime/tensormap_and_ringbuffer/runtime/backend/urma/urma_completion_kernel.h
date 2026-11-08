@@ -16,7 +16,7 @@
 #include <type_traits>
 
 #if defined(__CPU_SIM)
-#include <type_traits>
+#include "async_completion_api.h"
 #else
 #include "async_kernel_api.h"
 
@@ -353,58 +353,7 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
 
 }  // namespace pto2::urma_backend
 
-#if defined(__CPU_SIM)
-inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
-    __gm__ LocalContext *lc =
-        reinterpret_cast<__gm__ LocalContext *>(static_cast<uintptr_t>(args[PAYLOAD_LOCAL_CONTEXT_INDEX]));
-    AsyncCtx ctx{};
-    ctx.completion_count = lc->async_ctx.completion_count;
-    ctx.completion_error_code = lc->async_ctx.completion_error_code;
-    ctx.completion_entries = lc->async_ctx.completion_entries;
-    ctx.completion_capacity = lc->async_ctx.completion_capacity;
-    ctx.urma_sender_id = lc->async_ctx.urma_sender_id;
-    TaskId::assign(ctx.task_token, lc->async_ctx.task_token);
-    return ctx;
-}
-
-inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const CompletionToken &token) {
-    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        return false;
-    }
-
-    uint32_t idx = *ctx.completion_count;
-    if (idx >= ctx.completion_capacity) {
-        if (ctx.completion_error_code != nullptr) {
-            *ctx.completion_error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
-        }
-        return false;
-    }
-
-    volatile __gm__ DeferredCompletionEntry *slot = &ctx.completion_entries[idx];
-    slot->addr = token.addr;
-    slot->backend_cookie = token.backend_cookie;
-    slot->expected_value = token.expected_value;
-    slot->engine = token.engine;
-    slot->completion_type = token.completion_type;
-    slot->_pad = 0;
-    *ctx.completion_count = idx + 1;
-    return true;
-}
-#endif
-
 namespace pto2::detail {
-
-#if defined(__CPU_SIM)
-inline __aicore__ void defer_load_slab(AsyncCtx & /*ctx*/) { __asm__ __volatile__("" ::: "memory"); }
-
-inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code) {
-    if (ctx.task_token.is_valid() && ctx.completion_error_code != nullptr) {
-        *ctx.completion_error_code = error_code;
-    }
-}
-
-inline __aicore__ void defer_flush(AsyncCtx & /*ctx*/) { __asm__ __volatile__("" ::: "memory"); }
-#endif
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_urma_async_event(

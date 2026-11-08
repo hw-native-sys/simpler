@@ -162,6 +162,13 @@ nav:
   - Multi-chip and comm:
       - Communication Domains: comm-domain.md
       - A5 Host-source Domains: a5-host-comm-domain.md
+      - CCU execution:
+          - Interface contract: zh-cn/design/ccu-pr1-interface-conformance.md
+          - Build and validation: zh-cn/design/ccu-pr1-build-validation.md
+          - Runtime requirements: zh-cn/design/ccu-pr2-requirements.md
+          - Runtime implementation: zh-cn/design/ccu-pr2-implementation.md
+          - Worker integration requirements: design/ccu-pr3-requirements.md
+          - Worker integration requirements (Chinese): zh-cn/design/ccu-pr3-requirements.md
       - L3-L2 Orchestrator Comm: l3-l2-orch-comm.md
       - L3-L2 Message Queue: l3-l2-message-queue.md
       - Directed NEXT_LEVEL Scheduling: directed-next-level-scheduling.md

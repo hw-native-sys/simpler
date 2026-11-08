@@ -24,6 +24,7 @@
 #include "host/acl_error_log.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
+#include "platform_comm/ccu/ccu_provider.h"
 #include "runtime_c_api.h"
 
 #include <dlfcn.h>
@@ -51,6 +52,10 @@
 namespace {
 constexpr const char *kAicpuTopologyQueryName = "simpler_aicpu_query_topology";
 }
+
+// Runtimes without a communication provider own no persistent CCU service.
+__attribute__((weak, visibility("hidden"))) bool platform_ccu_has_device_owners(void *) { return false; }
+__attribute__((weak, visibility("hidden"))) bool platform_ccu_close_runner(void *) { return true; }
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:
@@ -947,6 +952,12 @@ void DeviceRunner::emit_device_dep_gen_graph(
 
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {
     if (!prepared.resources_owned) return;
+    // A stream error, scheduler failure or missing FIN can leave a CCU reader
+    // alive. Keep the complete carrier until the provider proves it stopped.
+    if (launched && !prepared.ccu_readers.stopped()) {
+        mark_device_unusable(PTO_RUNTIME_ERR_INTERNAL);
+        return;
+    }
 
     // Before anything is released, and before the poison is read: a queued
     // stream wait naming one of this run's boundaries must not outlive the
@@ -1052,6 +1063,13 @@ void DeviceRunner::mark_device_unusable(int runtime_rc) {
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
     mark_device_unusable(aicore_rc);
+    if (platform_ccu_has_device_owners(this)) {
+        // A service waiting for its next request cannot satisfy a device-wide
+        // fence. Keep its owners until finalize proves its readers stopped.
+        LOG_ERROR("Execution error %d: persistent CCU services retained; device-wide drain deferred", aicore_rc);
+        clear_aicpu_topology_cache();
+        return;
+    }
     // A borrowed context cannot drain or reset the caller's entire device.
     // Poison stops this runner's admission; recovery belongs to the caller.
     if (execution_mode_latch_.is_kernel()) {
@@ -1161,6 +1179,14 @@ private:
 }  // namespace
 
 int DeviceRunner::force_reset_device() {
+    if (platform_ccu_has_device_owners(this) && !execution_mode_latch().is_kernel()) {
+        const int bind_rc = bind_current_thread(device_id_);
+        if (bind_rc != 0) return bind_rc;
+    }
+    if (!platform_ccu_close_runner(this)) {
+        LOG_ERROR("Device reset refused: CCU domain reclamation is unconfirmed; retaining device owners");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     clear_aicpu_topology_cache();
     if (device_id_ < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1262,13 +1288,24 @@ int DeviceRunner::force_reset_device() {
 // `DeviceRunnerBase`.
 
 int DeviceRunner::finalize_impl() {
+    if (device_unusable_.load(std::memory_order_acquire)) {
+        // Host readers stop even when device backing must remain quarantined.
+        begin_fatal_close();
+        stop_shared_collectors_for_device_failure();
+        dep_gen_collector_.stop_for_device_failure();
+    }
+    if (platform_ccu_has_device_owners(this) && !execution_mode_latch().is_kernel()) {
+        const int bind_rc = bind_current_thread(device_id_);
+        if (bind_rc != 0) return bind_rc;
+    }
+    if (!platform_ccu_close_runner(this)) {
+        LOG_ERROR("Device finalize refused: CCU domain reclamation is unconfirmed; retaining device owners");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     // Fatal cleanup must not walk poisoned streams, mappings, or allocations.
     // Stop collector threads locally, drain and force-reset the card, then
     // forget the old generation's handles.
     if (device_unusable_.load(std::memory_order_acquire)) {
-        begin_fatal_close();
-        stop_shared_collectors_for_device_failure();
-        dep_gen_collector_.stop_for_device_failure();
         if (prepared_resources_block_fatal_reset()) {
             LOG_ERROR("Fatal teardown: prepared resources remain referenced; device reset deferred");
             return PTO_RUNTIME_ERR_INVALID_STATE;

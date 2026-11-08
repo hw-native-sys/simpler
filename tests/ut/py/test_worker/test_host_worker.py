@@ -999,6 +999,10 @@ class _FakeChipRun:
         return self._lane._lane_poisoned
 
     @property
+    def _owner_recovery_required(self) -> bool:
+        return self._lane._lane_poisoned
+
+    @property
     def _execution_ended(self) -> bool:
         # This collaborator completes observation atomically in _progress;
         # real ENDED/result-pending behavior is covered by native fork tests.
@@ -2275,6 +2279,85 @@ def test_two_frame_launch_cleanup_failure_terminalizes_staged_successor():
         assert not harness.cw.prepared[1].is_set()
         assert not harness.cw.launched[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("owner_recovery_required", [False, True])
+@pytest.mark.parametrize("early_observation", [False, True])
+def test_two_frame_failed_run_keeps_cleanup_control_only_with_last_use_proof(
+    monkeypatch, owner_recovery_required, early_observation
+):
+    monkeypatch.setattr(_FakeChipRun, "_owner_recovery_required", property(lambda self: owner_recovery_required))
+    wait_entered = threading.Event()
+    original_wait = _FakeChipRun.wait
+
+    def observe_wait(run, timeout=-1.0):
+        wait_entered.set()
+        return original_wait(run, timeout)
+
+    monkeypatch.setattr(_FakeChipRun, "wait", observe_wait)
+    harness = _TwoFrameLoopHarness()
+    try:
+        harness.publish(0, 1)
+        harness.start()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.finalize_errors[(0, 11)] = RuntimeError("observed semantic failure")
+        if early_observation:
+            _mailbox_store_i32(
+                harness.mailbox_addr + harness._entry_offset(0) + worker_mod._OFF_ENTRY_OBSERVATION_REQUESTED, 1
+            )
+            assert wait_entered.wait(5.0)
+        harness.cw.completed[0].set()
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        assert harness.cw._lane_poisoned
+        error_offset = harness._entry_offset(0) + worker_mod._OFF_ENTRY_ERROR_TEXT
+        error_text = bytes(harness.buf[error_offset : error_offset + worker_mod.MAILBOX_ERROR_MSG_SIZE])
+        assert b"observed semantic failure" in error_text
+        if owner_recovery_required:
+            harness.thread.join(5.0)
+            assert not harness.thread.is_alive()
+            assert harness.cw.unregister_calls == []
+        else:
+            harness.publish_unregister()
+            harness.wait_control_state(worker_mod._CONTROL_DONE)
+            assert harness.cw.unregister_calls == [7]
+            assert harness.thread.is_alive()
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_two_frame_uncached_wait_failure_requires_terminal_before_cleanup_control(monkeypatch, terminal):
+    monkeypatch.setattr(_FakeChipRun, "_owner_recovery_required", property(lambda self: False))
+
+    def failed_wait(run, timeout=-1.0):
+        if terminal:
+            run._lane._finish(run)
+        raise RuntimeError("uncached observation failure")
+
+    monkeypatch.setattr(_FakeChipRun, "wait", failed_wait)
+    harness = _TwoFrameLoopHarness()
+    try:
+        harness.publish(0, 1)
+        harness.start()
+        assert harness.cw.launched[0].wait(5.0)
+        _mailbox_store_i32(
+            harness.mailbox_addr + harness._entry_offset(0) + worker_mod._OFF_ENTRY_OBSERVATION_REQUESTED, 1
+        )
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        error_offset = harness._entry_offset(0) + worker_mod._OFF_ENTRY_ERROR_TEXT
+        error_text = bytes(harness.buf[error_offset : error_offset + worker_mod.MAILBOX_ERROR_MSG_SIZE])
+        assert b"uncached observation failure" in error_text
+        if terminal:
+            harness.publish_unregister()
+            harness.wait_control_state(worker_mod._CONTROL_DONE)
+            assert harness.cw.unregister_calls == [7]
+            assert harness.thread.is_alive()
+        else:
+            harness.thread.join(5.0)
+            assert not harness.thread.is_alive()
+            assert harness.cw.unregister_calls == []
     finally:
         harness.close()
 

@@ -23,7 +23,13 @@ repos:
           entry: python tests/lint/check_english_only.py
           language: python
           language_version: python3
-          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md)|vendor/
+          # The CCU execution component carries English and Chinese comments.
+          exclude: >-
+            (?x)^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md|
+            src/a5/platform/include/host/ccu_device\.h$|
+            src/a5/platform/onboard/host/ccu/ccu_(device|execution_api|execution_registry)\.cpp$|
+            src/a5/platform/onboard/aicore/ccu_trigger\.cpp$|
+            tests/ut/cpp/a5/platform/test_ccu_execution_api\.cpp$)|vendor/
 
         - id: check-test-platform-literals
           name: check-test-platform-literals

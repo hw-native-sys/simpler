@@ -22,6 +22,60 @@ macro(a5_platform_case src)
         LABEL no_hardware ${ARGN})
 endmacro()
 
+a5_platform_case(test_ccu_execution_abi.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/include)
+
+if(SIMPLER_ENABLE_HARDWARE_TESTS)
+    find_package(OpenSSL QUIET COMPONENTS Crypto)
+else()
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+endif()
+if(TARGET OpenSSL::Crypto)
+    a5_platform_case(test_ccu_session.cpp
+        SOURCES ${A5_ONBOARD_HOST_DIR}/ccu/ccu_session.cpp
+        INCLUDES ${A5_ONBOARD_HOST_DIR}/ccu ${SIMPLER_SRC}/a5/platform/include
+        LINK OpenSSL::Crypto ${CMAKE_DL_LIBS})
+    include("${CMAKE_CURRENT_SOURCE_DIR}/support/ccu_session_tests.cmake")
+    get_filename_component(_ccu_test_root "${SIMPLER_SRC}/.." ABSOLUTE)
+    ccu_session_test_modules(test_a5_ccu_session "${_ccu_test_root}")
+else()
+    message(STATUS "CCU session test omitted from hardware UTs: OpenSSL Crypto unavailable; CPU UTs require it")
+    simpler_ut_exclude_case(test_ccu_session.cpp)
+endif()
+set(_ccu_sdk "$ENV{ASCEND_HOME_PATH}")
+if(SIMPLER_ENABLE_HARDWARE_TESTS AND EXISTS "${_ccu_sdk}/include/hcomm/ccu/ccu_primitives.hpp")
+    a5_platform_case(test_ccu_service_program.cpp
+        SOURCES ${A5_ONBOARD_HOST_DIR}/ccu/ccu_service_program.cpp
+        INCLUDES ${A5_ONBOARD_HOST_DIR}/ccu ${_ccu_sdk}/include ${_ccu_sdk}/include/hccl
+            ${_ccu_sdk}/include/hcomm/ccu ${_ccu_sdk}/pkg_inc/hcomm/ccu)
+    set(ASCEND_HOME_PATH "${_ccu_sdk}")
+    include("${A5_ONBOARD_HOST_DIR}/ccu/ccu_build_config.cmake")
+    a5_platform_case(test_ccu_session_sdk.cpp
+        SOURCES ${A5_ONBOARD_HOST_DIR}/ccu/ccu_session_sdk.cpp
+        INCLUDES ${A5_ONBOARD_HOST_DIR}/ccu ${CCU_GENERATED_INCLUDE_DIR} ${_ccu_sdk}/include ${_ccu_sdk}/include/hccl
+            ${_ccu_sdk}/include/hcomm/ccu ${_ccu_sdk}/pkg_inc/hcomm/ccu
+        LINK ${CMAKE_DL_LIBS})
+else()
+    simpler_ut_exclude_case(test_ccu_service_program.cpp)
+    simpler_ut_exclude_case(test_ccu_session_sdk.cpp)
+endif()
+
+a5_platform_case(test_ccu_request_state.cpp
+    SOURCES ${SIMPLER_SRC}/a5/platform/onboard/host/ccu/ccu_request_state.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/include)
+
+a5_platform_case(test_ccu_request_validation.cpp
+    SOURCES ${SIMPLER_SRC}/a5/platform/onboard/host/ccu/ccu_request_validation.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/include)
+
+a5_platform_case(test_ccu_execution_api.cpp
+    SOURCES
+        ${SIMPLER_SRC}/a5/platform/onboard/host/ccu/ccu_execution_api.cpp
+        ${SIMPLER_SRC}/a5/platform/onboard/host/ccu/ccu_execution_registry.cpp
+        ${SIMPLER_SRC}/a5/platform/onboard/host/ccu/ccu_request_state.cpp
+        ${SIMPLER_SRC}/a5/platform/onboard/host/ccu/ccu_request_validation.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/include)
+
 # Host logger silent/off behavior — no runtime deps, just compile the same
 # self-contained host logger sources used by production consumers. It carries no
 # arch token: the logger is arch-agnostic and this is where the case happens to

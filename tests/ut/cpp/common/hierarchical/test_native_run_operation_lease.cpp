@@ -80,6 +80,7 @@ bool g_finalize_during_prepare = false;
 bool g_wait_entered = false;
 bool g_wait_released = true;
 int g_wait_rc = 0;
+int g_wait_completion_rc = 0;
 bool g_wait_throws = false;
 int g_finalize_rc = 0;
 bool g_finalize_throws = false;
@@ -200,8 +201,8 @@ int wait_run_completion(void *, void *) {
     g_cv.wait(lk, [] {
         return g_wait_released;
     });
-    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-    return 0;
+    if (g_wait_completion_rc == 0) g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    return g_wait_completion_rc;
 }
 
 int finalize_run(void *, void *runtime, int) {
@@ -279,6 +280,7 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
         g_query_released = true;
     }
     g_wait_rc = 0;
+    g_wait_completion_rc = 0;
     g_wait_throws = false;
     g_finalize_rc = 0;
     g_finalize_throws = false;
@@ -1088,7 +1090,7 @@ TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProv
     EXPECT_TRUE(worker.native_runs_.empty());
 }
 
-// A destroyed carrier permits device teardown, but a poisoned lane cannot authorize comm free.
+// A destroyed carrier permits device teardown, but does not prove physical last use.
 TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeardownRetry) {
     for (bool failed : {false, true}) {
         SCOPED_TRACE(failed);
@@ -1108,12 +1110,15 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
         ChipStorageTaskArgs args{};
         ChipRun run = worker.run_lane_->submit(1, args, CallConfig{});
         g_wait_rc = failed ? -5 : 0;
+        g_wait_completion_rc = failed ? -5 : 0;
         if (failed) {
             EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
         } else {
             EXPECT_TRUE(run.wait_until(ChipRun::Deadline::max()));
         }
         EXPECT_EQ(worker.run_lane_->poisoned(), failed);
+        ASSERT_EQ(worker.run_lane_->reclamation_unconfirmed(), failed);
+        ASSERT_EQ(run.owner_recovery_required(), failed);
         EXPECT_EQ(g_finalize_calls, 1);
         EXPECT_EQ(worker.unproven_native_run_count(), 0u);
         uint64_t tag = kNativeRunContextMagic;
@@ -1153,6 +1158,50 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
         EXPECT_NO_THROW(worker.finalize());
         EXPECT_EQ(g_device_finalize_calls, 2);
         EXPECT_EQ(g_comm_free_calls, 0);
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, ProvenCompletionAllowsCommReclamationAfterBusinessFailure) {
+    for (int business_error : {-5, -105}) {
+        SCOPED_TRACE(business_error);
+        ChipWorker worker;
+        prime(worker);
+        worker.finalize_device_fn_ = stub_finalize_device;
+        worker.comm_release_domain_windows_fn_ = stub_release_domain;
+        worker.comm_global_domain_release_fn_ = stub_release_global_domain;
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        int comm_placeholder = 0;
+        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+        ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+        worker.base_comm_handle_ = comm;
+        worker.global_domain_ids_.insert(7);
+        const auto module = worker.runtime_module_;
+        worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+        ChipStorageTaskArgs args{};
+        ChipRun run = worker.run_lane_->submit(1, args, CallConfig{});
+        g_wait_rc = business_error;
+
+        EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+        ASSERT_TRUE(worker.run_lane_->poisoned());
+        ASSERT_FALSE(worker.run_lane_->reclamation_unconfirmed());
+        ASSERT_FALSE(run.owner_recovery_required());
+        EXPECT_EQ(g_poll_rc, SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+        EXPECT_EQ(g_finalize_calls, 1);
+        EXPECT_EQ(worker.unproven_native_run_count(), 0u);
+        EXPECT_THROW(worker.run_lane_->submit(1, args, CallConfig{}), std::runtime_error);
+        EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+
+        EXPECT_NO_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0));
+        EXPECT_NO_THROW(worker.comm_global_domain_release(7));
+        EXPECT_NO_THROW(worker.comm_destroy(comm));
+        EXPECT_NO_THROW(worker.comm_destroy_all());
+        EXPECT_EQ(g_comm_free_calls, 3);
+        EXPECT_TRUE(worker.comm_sessions_.empty());
+        EXPECT_TRUE(worker.global_domain_ids_.empty());
+        EXPECT_NO_THROW(worker.finalize());
+        EXPECT_EQ(g_device_finalize_calls, 1);
+        EXPECT_EQ(g_destroy_context_calls, 1);
+        EXPECT_TRUE(module->unload_allowed_);
     }
 }
 

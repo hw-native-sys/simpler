@@ -76,7 +76,8 @@ missing. `allocate_global_domain` and `release_global_domain` are compatibility
 wrappers; `workers=` remains the legacy L3 allocation spelling.
 
 Domain creation and configuration reuse occur in an orchestration callback.
-L3 creation and staging precede its first submission; a reuse hit performs no device control and remains valid afterwards.
+L3 creation and staging precede its first submission; a reuse hit requiring no
+new CCU preparation performs no device control and remains valid afterwards.
 A successful run preserves domains created with `retain_after_run=True`.
 Later runs can submit cached Buffers/Tensors directly. Submission and ordinary copies enroll
 the current run; release waits for it and its descendants, while a failed run closes its used domains.
@@ -137,6 +138,16 @@ continues; child exit alone does not prove device reclamation.
 Kernels read peer windows through `device_ctx` (which holds every rank's
 window base, local + imported peer); `buffers[name]` is the local slice —
 name it in a task arg with `buffers[name].tensor(shapes, dtype)`.
+
+### Selecting CCU callables
+
+For a Device domain with `workspace_engines=("ccu",)`, pass
+`ccu_callables=(registered_handle, ...)` to creation or reuse to select its
+embedded builders. Only selected callable/domain pairs are prepared, once per
+domain generation. Declare every needed pair before the run's first task
+submission; tasks reject unprepared pairs. Reuse may add callables before that
+boundary without changing the domain identity. Unused registered builders are
+not invoked. Host-source domains do not support CCU.
 
 ### A5 Host-source windows
 
@@ -470,11 +481,13 @@ is supported on L3 A5; A2/A3 keeps its Worker-owned SDMA path. Simulation and L4
 domains support synchronous mappings, with no domain-owned asynchronous engines.
 
 Each `CommContext` stores a POD array `workspaces`, indexed by
-`CommWorkspaceKind::{SDMA, URMA, RDMA}`. Kernels use
+`CommWorkspaceKind::{SDMA, URMA, RDMA, CCU}`. Kernels use
 `comm_workspace<CommWorkspaceKind::URMA>(*ctx)` (or the corresponding engine),
 whose template argument is checked at compile time. Host publication rejects
 out-of-range enum values before indexing. An absent backend has zero address
-and size.
+and size. The CCU slot has its own bit and descriptor; a backend without CCU
+support rejects a CCU allocation request before publishing a domain. Its presence
+in the shared layout does not imply that the native provider is available.
 
 Before submitting a URMA task, obtain its context through the checked host API:
 
@@ -530,10 +543,13 @@ The legacy `device_ctx` field remains a raw address for synchronous consumers;
 it does not declare or validate an asynchronous engine requirement. No compiled
 capability query or `enable_urma` initialization switch is needed.
 
-The context is simpler's own 1088-byte host/device ABI. Rank metadata starts
+The context is simpler's own 1104-byte host/device ABI. Rank metadata starts
 at offset zero; there is no legacy workspace pair or PTO-compatible prefix.
 PTO session builders receive the chosen workspace address explicitly and do
-not parse this context.
+not parse this context. The CCU descriptor occupies slot 3; the slot itself does
+not enable CCU allocation, which belongs to its provider. Python obtains the
+workspace count and context size from the native binding and checks its ctypes
+mirror against them.
 
 All runtime libraries, bindings, communication-context producers and compiled
 kernels must come from the same simpler build and be updated together. This

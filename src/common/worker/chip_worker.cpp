@@ -458,6 +458,7 @@ void ChipWorker::init(
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
         comm_alloc_host_domain_windows_fn_ =
             module->optional<CommAllocHostDomainWindowsFn>("comm_alloc_host_domain_windows");
+        comm_prepare_ccu_fn_ = module->optional<CommPrepareCcuFn>("comm_prepare_ccu");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
@@ -775,7 +776,7 @@ void ChipWorker::finalize() {
         } catch (...) {
             lane_error = std::current_exception();
         }
-        comm_reclamation_unconfirmed_ |= run_lane_->poisoned();
+        comm_reclamation_unconfirmed_ |= run_lane_->reclamation_unconfirmed();
     }
     {
         std::unique_lock<std::mutex> lock(native_run_mu_);
@@ -932,6 +933,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_alloc_host_domain_windows_fn_ = nullptr;
+    comm_prepare_ccu_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_abort_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
@@ -2410,7 +2412,7 @@ void ChipWorker::require_comm_cleanup_confirmed() const {
 
 void ChipWorker::require_comm_reclamation_safe() const {
     require_comm_cleanup_confirmed();
-    if (comm_reclamation_unconfirmed_ || (run_lane_ != nullptr && run_lane_->poisoned()) ||
+    if (comm_reclamation_unconfirmed_ || (run_lane_ != nullptr && run_lane_->reclamation_unconfirmed()) ||
         unproven_native_run_count() != 0) {
         throw std::runtime_error("communication resource reclamation is unconfirmed");
     }
@@ -2646,6 +2648,17 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
     }
     return {device_ctx, local_window_base, actual_window_size};
+}
+
+void ChipWorker::comm_prepare_ccu(
+    uint64_t comm_handle, int32_t callable_id, uint64_t allocation_id, uint64_t owner, uint64_t generation,
+    const std::vector<uint8_t> &digest
+) {
+    if (!comm_prepare_ccu_fn_ || digest.size() != 32) throw std::runtime_error("CCU platform provider unavailable");
+    const int rc = comm_prepare_ccu_fn_(
+        device_ctx_, reinterpret_cast<void *>(comm_handle), callable_id, allocation_id, owner, generation, digest.data()
+    );
+    if (rc != 0) throw std::runtime_error("CCU callable/domain preparation failed: " + std::to_string(rc));
 }
 
 void ChipWorker::comm_release_domain_windows(

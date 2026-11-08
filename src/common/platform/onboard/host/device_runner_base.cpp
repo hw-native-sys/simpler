@@ -4539,17 +4539,24 @@ int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
         poll_and_retain_run_boundaries(run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity);
     switch (completion) {
     case RunCompletionFence::Completion::Complete:
-        // Own boundaries prove physical last use; explicit observation reads
-        // the stream verdict independently.
-        return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        break;
     case RunCompletionFence::Completion::Pending:
         return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
-    case RunCompletionFence::Completion::Unfenced:
-        return query_stream_pair_nonblocking(streams.aicpu, streams.aicore);
-    case RunCompletionFence::Completion::Error:
+    case RunCompletionFence::Completion::Unfenced: {
+        const int rc = query_stream_pair_nonblocking(streams.aicpu, streams.aicore);
+        if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return rc;
         break;
     }
-    return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    case RunCompletionFence::Completion::Error:
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    }
+    const auto readers = prepared.ccu_readers.poll();
+    if (readers.state == simpler::ccu::ReaderState::PENDING) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    if (readers.state == simpler::ccu::ReaderState::UNCONFIRMED)
+        mark_device_unusable(readers.error_code != 0 ? readers.error_code : PTO_RUNTIME_ERR_INTERNAL);
+    if (readers.state != simpler::ccu::ReaderState::STOPPED || readers.error_code != 0)
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
 }
 
 int DeviceRunnerBase::wait_execution_completion(ActiveExecution &active) {
@@ -4562,7 +4569,13 @@ int DeviceRunnerBase::wait_execution_completion(ActiveExecution &active) {
         );
         if (observed.rc != 0) return observed.rc;
         if (observed.completion != RunCompletionFence::Completion::Complete) return PTO_RUNTIME_ERR_INTERNAL;
-        prepared.physical_complete = true;
+        const auto readers = prepared.ccu_readers.drain();
+        prepared.physical_complete = prepared.ccu_readers.stopped();
+        if (!prepared.physical_complete) {
+            mark_device_unusable(PTO_RUNTIME_ERR_INTERNAL);
+            return readers.error_code != 0 ? readers.error_code : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (readers.error_code != 0) return readers.error_code;
     }
     const int caller_rc = submission_storage_[prepared.pipeline_slot]->caller_order->discharge(
         prepared.identity, timeout_config_.stream_sync_timeout_ms, true, false
@@ -4581,8 +4594,17 @@ int DeviceRunnerBase::wait_run_fence(PreparedExecution &prepared) {
     trace_observation_start(prepared.identity, prepared.streams.aicpu, prepared.streams.aicore);
     // These are the actual handles selected for this call, not today's runner
     // pair. A late explicit observer deliberately has stream-wide scope.
-    const int rc = sync_stream_pair(prepared.streams.aicpu, prepared.streams.aicore);
-    if (rc == 0) prepared.physical_complete = true;
+    int rc = sync_stream_pair(prepared.streams.aicpu, prepared.streams.aicore);
+    if (rc == 0) {
+        const auto readers = prepared.ccu_readers.drain();
+        prepared.physical_complete = prepared.ccu_readers.stopped();
+        if (!prepared.physical_complete) {
+            mark_device_unusable(PTO_RUNTIME_ERR_INTERNAL);
+            rc = readers.error_code != 0 ? readers.error_code : PTO_RUNTIME_ERR_INTERNAL;
+        } else if (readers.error_code != 0) {
+            rc = readers.error_code;
+        }
+    }
     // A nonzero stream result is not last-use proof. Preserve an independent
     // event proof already acquired by automatic progress, or query it now.
     bool polled = false;
