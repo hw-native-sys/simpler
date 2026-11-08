@@ -2359,14 +2359,14 @@ protected:
     int ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
 
     /**
-     * Point this run's KernelArgs at its slot's result region and stamp the run
-     * epoch the device must publish. Allocated lazily per slot and, unlike the
-     * timing buffer, never gated on diagnostics. Its first publication stages
-     * an unpublished marker into the slot's launch metadata; warm reuse needs
-     * no clear. Preparation does not write the device block. Returns non-zero
-     * when allocation or staging fails; no kernel may launch without a region.
+     * Preserve this run's identity and bind private result backing when requested.
+     * Kernel diagnostics-off calls have no record. Program and requested Kernel
+     * calls initialize lazily before publication. Warm backing preserves any
+     * existing replay-evidence obligation.
      */
-    int ensure_device_run_result_region(uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args);
+    int ensure_device_run_result_region(
+        const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
+    );
 
     /**
      * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and

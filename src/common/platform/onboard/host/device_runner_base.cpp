@@ -3602,11 +3602,12 @@ DeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, 
 }
 
 int DeviceRunnerBase::ensure_device_run_result_region(
-    uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args
+    const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
 ) {
-    std::lock_guard<std::mutex> lock(run_result_mu_);
+    const uint32_t pipeline_slot = identity.pipeline_slot;
+    const uint64_t run_epoch = identity.run_epoch;
     kernel_args.args.run_result_data_base = 0;
-    kernel_args.args.run_result_epoch = 0;
+    kernel_args.args.run_result_epoch = run_epoch;
     if (pipeline_slot >= submission_storage_.size()) {
         LOG_ERROR("run-result region: pipeline slot %u is out of range", pipeline_slot);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -3617,6 +3618,8 @@ int DeviceRunnerBase::ensure_device_run_result_region(
         LOG_ERROR("run-result region: run epoch 0 cannot be published");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (execution_mode_latch().is_kernel() && !dfx.diagnostics_any()) return 0;
+    std::lock_guard<std::mutex> lock(run_result_mu_);
     auto [it, inserted] = run_result_storage_.try_emplace(run_epoch);
     RunResultStorage &storage = it->second;
     if (inserted) storage.pipeline_slot = pipeline_slot;
@@ -3909,7 +3912,8 @@ int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
             return PTO_RUNTIME_ERR_INVALID_STATE;
         reference->recording = true;
         prepared.recording = true;
-        submission_storage_[prepared.pipeline_slot]->retain_replay_evidence = true;
+        if (prepared.kernel_args.args.run_result_data_base != 0)
+            submission_storage_[prepared.pipeline_slot]->retain_replay_evidence = true;
         // A retained block must publish even if eager left an identical prefix.
         submission_storage_[prepared.pipeline_slot]->args.published_prefix_bytes = 0;
         return 0;

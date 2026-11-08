@@ -122,7 +122,15 @@ result. An invalid requested binding is an internal producer-contract error;
 a known functional error keeps precedence. Optional diagnostic payload may be
 absent without replacing the original signed code and provenance.
 
-Retained fault evidence does not decide whether a later independent invocation
+Program execution preserves its structured error record. For Kernel eager and
+capture alike, enabling any diagnostic in the call's `CallConfig` requests the
+private native result and retained replay history; with all diagnostics off,
+execution has no private record. The existing run epoch still identifies the
+packet and Core reports, independently of the optional result address. Required
+terminal handoff and actual signed RTS errors remain mandatory. No missing
+private record establishes functional success or physical completion.
+
+Requested retained fault evidence does not decide whether a later independent invocation
 executes or skips. Device health, real dependencies and unresolved ownership
 still constrain execution; independent replay is not permission to reuse unsafe
 storage or operate on a quarantined device. RTS errors remain observable through

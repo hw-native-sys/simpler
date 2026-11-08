@@ -44,7 +44,7 @@ extern "C" int32_t aicpu_begin_native_invocation(int32_t callbacks, uint64_t reg
     if (callbacks <= 0 || callbacks > MAX_GATE_THREADS) return NativeInvocationCompletion::kInternalError;
     g_native_storage = nullptr;
     set_platform_run_result(region_base, run_epoch);
-    if ((region_base == 0) != (run_epoch == 0)) {
+    if (region_base != 0 && run_epoch == 0) {
         g_native_completion.begin(callbacks);
         return NativeInvocationCompletion::kInternalError;
     }
@@ -67,7 +67,7 @@ extern "C" int32_t aicpu_finish_native_invocation(int32_t callback_index, int32_
         [](RunTerminalSelection result, const void *payload, size_t bytes) {
             const uint64_t base = get_platform_run_result_base();
             const uint64_t epoch = get_platform_run_result_epoch();
-            if (base == 0 && epoch == 0) return NativeTerminalPublication::NotRequested;
+            if (base == 0) return NativeTerminalPublication::NotRequested;
             // This publisher performs synchronous stores/cache maintenance,
             // not a fallible RTS transfer. False means invalid producer inputs.
             return aicpu_publish_run_terminal(base, epoch, result.verdict, result.code, result.source, payload, bytes) ?

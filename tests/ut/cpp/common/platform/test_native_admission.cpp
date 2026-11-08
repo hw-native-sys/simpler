@@ -213,7 +213,7 @@ public:
         int rc = Runner::prepare_execution(runtime, config, slot, identity, out);
         if (rc != 0) return rc;
         (*out)->resources_owned = true;
-        rc = ensure_device_run_result_region(slot, identity.run_epoch, (*out)->kernel_args);
+        rc = ensure_device_run_result_region(identity, (*out)->kernel_args, (*out)->dfx);
         if (rc != 0) return rc;
         return (*out)->kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot_persistent_args(slot));
     }
@@ -243,9 +243,10 @@ public:
             published.code_source =
                 static_cast<uint32_t>(published_error == 0 ? DeviceRunCodeSource::None : DeviceRunCodeSource::Header);
         }
-        std::memcpy(
-            reinterpret_cast<void *>(prepared.kernel_args.args.run_result_data_base), &published, sizeof(published)
-        );
+        if (prepared.kernel_args.args.run_result_data_base != 0)
+            std::memcpy(
+                reinterpret_cast<void *>(prepared.kernel_args.args.run_result_data_base), &published, sizeof(published)
+            );
         return result;
     }
     int poll_execution(const ActiveExecution &active) override { return poll_run_fence(*active.prepared); }
@@ -623,6 +624,105 @@ TEST_F(NativeAdmissionTest, KnownLaneFailureDoesNotPublishUnobservedProgramOutpu
         }
         worker.device_ctx_ = nullptr;
     }
+}
+
+TEST_F(NativeAdmissionTest, OptionalResultKernelHelperKeepsIdentityWithoutPrivateSideEffects) {
+    class ResultRunner : public FencedCompletionRunner {
+    public:
+        int prepare_result(const NativeRunIdentity &identity, KernelArgsHelper &args) {
+            return ensure_device_run_result_region(identity, args, {});
+        }
+        size_t result_epochs() const {
+            std::lock_guard<std::mutex> lock(run_result_mu_);
+            return run_result_storage_.size();
+        }
+    } runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    KernelArgsHelper args;
+    const size_t allocations = control().allocations;
+    const size_t uploads = control().uploads.size();
+    ASSERT_EQ(runner.prepare_result(NativeRunIdentity{94001, 1, 1, 0}, args), 0);
+    EXPECT_EQ(args.args.run_result_data_base, 0u);
+    EXPECT_EQ(args.args.run_result_epoch, 94001u);
+    EXPECT_EQ(runner.result_epochs(), 0u);
+    EXPECT_EQ(control().allocations, allocations);
+    EXPECT_EQ(control().uploads.size(), uploads);
+    EXPECT_NE(runner.prepare_result(NativeRunIdentity{0, 1, 1, 0}, args), 0);
+    EXPECT_NE(runner.prepare_result(NativeRunIdentity{94002, 1, 1, 99}, args), 0);
+}
+
+TEST_F(NativeAdmissionTest, OptionalResultNativeKernelPreparationsDoNotBindAPrivateRecord) {
+    for (const auto purpose : {SIMPLER_PREPARE_EAGER, SIMPLER_PREPARE_CAPTURE}) {
+        SCOPED_TRACE(purpose);
+        FencedCompletionRunner runner;
+        ASSERT_EQ(initialize_capture_runner(runner), 0);
+        Attempt attempt(runner, 0, 94003 + static_cast<uint64_t>(purpose));
+        use_capture_preparation(attempt);
+        attempt.descriptor.prepare_purpose = purpose;
+        ASSERT_EQ(attempt.prepare(), 0);
+        const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+        EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_data_base, 0u);
+        EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_epoch, attempt.descriptor.run_epoch);
+        EXPECT_FALSE(runner.result_storage().retain_replay_evidence);
+        const size_t downloads = control().d2h_calls;
+        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+        EXPECT_EQ(control().d2h_calls, downloads);
+    }
+}
+
+TEST_F(NativeAdmissionTest, OptionalResultProgramAllocationFailureKeepsItsOriginalErrorAndCleanup) {
+    class FailedResultRunner : public FencedCompletionRunner {
+    public:
+        int prepare_execution(
+            Runtime &runtime, const CallConfig &config, uint32_t slot, const NativeRunIdentity &identity,
+            std::unique_ptr<PreparedExecution> *out
+        ) override {
+            control().fail_allocation = control().allocations + 1;
+            return FencedCompletionRunner::prepare_execution(runtime, config, slot, identity, out);
+        }
+    } runner;
+    Attempt attempt(runner, 0, 94007);
+    EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_EQ(runner.native_run_claim_count(), 0u);
+    EXPECT_EQ(control().d2h_calls, 0u);
+}
+
+TEST_F(NativeAdmissionTest, OptionalResultKernelObserverErrorRemainsTheOriginalSignedCode) {
+    EXPECT_EXIT(
+        {
+            class CallerRunner : public FencedCompletionRunner {
+            public:
+                LaunchTransactionResult
+                launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+                    auto result = FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+                    if (result.rc == 0) result.rc = queue_caller_exit(prepared);
+                    return result;
+                }
+            } runner;
+            if (initialize_capture_runner(runner) != 0) std::_Exit(1);
+            Attempt attempt(runner, 0, 94008);
+            use_capture_preparation(attempt);
+            attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_EAGER;
+            if (attempt.prepare() != 0) std::_Exit(2);
+            auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+            if (state->prepared_execution->kernel_args.args.run_result_data_base != 0 ||
+                state->prepared_execution->kernel_args.args.run_result_epoch != attempt.descriptor.run_epoch)
+                std::_Exit(3);
+            int caller;
+            if (simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr) != 0) std::_Exit(4);
+            if (simpler_poll_run(&runner, attempt.storage) != SIMPLER_NATIVE_RUN_POLL_COMPLETE) std::_Exit(5);
+            control().stream_sync_rc = -946;
+            if (simpler_wait_run(&runner, attempt.storage) != -946) std::_Exit(6);
+            control().stream_sync_rc = 0;
+            if (simpler_wait_run(&runner, attempt.storage) != -946) std::_Exit(7);
+            if (simpler_finalize_run(&runner, attempt.storage) != -946) std::_Exit(8);
+            if (control().d2h_calls != 0) std::_Exit(9);
+            std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
 }
 
 TEST_F(NativeAdmissionTest, SuccessfulExplicitObservationDoesNotReadThePrivateResult) {
@@ -2380,7 +2480,7 @@ TEST_F(NativeAdmissionTest, EntryCacheQualificationRequiresObservedSuccessAndCur
             prepared.streams = {&streams[0], &streams[1]};
             prepared.resources_owned = resources_owned;
             auto &slot = slot_persistent_args(slot_index);
-            EXPECT_EQ(ensure_device_run_result_region(slot_index, epoch, prepared.kernel_args), 0);
+            EXPECT_EQ(ensure_device_run_result_region(identity, prepared.kernel_args, prepared.dfx), 0);
             EXPECT_EQ(prepared.kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot), 0);
             LaunchProgressSink sink;
             EXPECT_EQ(prepared.kernel_args.publish_runtime_args(true, &streams[0], sink), 0);
@@ -3006,6 +3106,72 @@ public:
     int arm_calls{0};
 };
 }  // namespace
+
+TEST_F(NativeAdmissionTest, OptionalResultNativeRecordingKeepsFiveModelsWithoutPrivateHistory) {
+    class CaptureRunner : public PmuCaptureRunner {
+    public:
+        LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+            if (!prepared.recording) return FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+            prepared.streams = borrowed_run_streams();
+            prepared.streams.aicpu = prepared.caller_stream;
+            const int rc = arm_run_fence(prepared);
+            if (rc != 0) return {rc, LaunchProgress::NotStarted, {}};
+            return exact_launch_transaction(
+                prepared.identity, std::move(permit),
+                [&](LaunchProgressSink &sink) {
+                    const int entry_rc = queue_run_entry(prepared, sink);
+                    if (entry_rc != 0) return entry_rc;
+                    sink.mark_submitted();
+                    return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore);
+                },
+                [&](LaunchProgressSink &sink) {
+                    sink.mark_submitted();
+                    const int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
+                    return boundary_rc != 0 ? boundary_rc : queue_caller_exit(prepared);
+                }
+            );
+        }
+    } runner;
+    ASSERT_TRUE(runner.set_run_resource_grant(2));
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    std::vector<RuntimeHandle> references;
+    int caller;
+    const size_t downloads = control().d2h_calls;
+    auto cleanup = RAIIScopeGuard([&] {
+        control().recording_active = false;
+        control().stream_sync_rc = 0;
+        for (auto reference : references)
+            (void)simpler_release_run_resources(&runner, reference);
+    });
+    for (uint32_t index = 0; index < 5; ++index) {
+        Attempt attempt(runner, index % 2, 94100 + index);
+        use_capture_preparation(attempt);
+        ASSERT_FALSE(control().recording_active);
+        ASSERT_EQ(attempt.prepare(), 0) << index;
+        const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+        EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_data_base, 0u);
+        EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_epoch, attempt.descriptor.run_epoch);
+        RuntimeHandle reference = nullptr;
+        ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+        ASSERT_NE(reference, nullptr);
+        references.push_back(reference);
+        control().recording_active = true;
+        ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+        EXPECT_FALSE(runner.result_storage(index % 2).retain_replay_evidence);
+        EXPECT_EQ(runner.result_storage(index % 2).device_result, nullptr);
+        control().recording_active = false;
+        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    }
+    control().stream_sync_rc = -947;
+    EXPECT_EQ(simpler_release_run_resources(&runner, references.front()), -947);
+    control().stream_sync_rc = 0;
+    for (auto reference : references)
+        ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    references.clear();
+    EXPECT_EQ(control().d2h_calls, downloads);
+    ASSERT_EQ(runner.finalize(), 0);
+    cleanup.dismiss();
+}
 
 TEST_F(NativeAdmissionTest, CapturePmuWindowLivesThroughSourceRetirementAndFailedRelease) {
     PmuCaptureRunner runner;

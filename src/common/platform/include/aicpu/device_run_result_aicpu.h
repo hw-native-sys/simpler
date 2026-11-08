@@ -48,8 +48,8 @@
 // evidence has been retained outside this region. Replayed bindings can carry
 // the same epoch: invalidate before any new producer can publish under it.
 inline bool aicpu_invalidate_run_terminal(uint64_t region_base, uint64_t run_epoch) {
-    if (region_base == 0 && run_epoch == 0) return true;
-    if (region_base == 0 || run_epoch == 0) return false;
+    if (region_base == 0) return true;
+    if (run_epoch == 0) return false;
     auto *region = reinterpret_cast<DeviceRunResultRegion *>(region_base);
     region->published = 0;
     cache_flush_range(&region->published, sizeof(region->published));

@@ -66,13 +66,18 @@ runtime terminal selection. It does not authorize reuse of execution storage.
 `NativeInvocationResultStorage` keeps the existing result prefix and a separate
 `NativeInvocationEvidence` tail.
 
-Cold preparation initializes that storage outside capture. Device entry
-invalidates the current result publication before new production. Recorded
-initialization must not erase the retained evidence tail on each replay.
-Missing required terminal contributions, invalid handoff state and execution
-errors are distinct from missing optional diagnostic detail.
+Program execution keeps its structured result record. Kernel calls request a
+private record when any diagnostic in their own `CallConfig` is enabled;
+DFX-off Kernel eager and capture use the same no-record completion path. The
+existing run epoch remains the actual invocation/report identity even when the
+private result address is zero. There is no separate public error-history knob.
+Missing required terminal contributions, invalid handoff state and signed
+execution errors remain functional errors without optional diagnostic detail.
 
-Retained fault evidence survives healthy replays and per-invocation state reset.
+Device entry invalidates a requested result publication before new production;
+recorded initialization never erases its evidence tail on each replay.
+
+Requested retained fault evidence survives healthy replays and per-invocation state reset.
 Reading or retaining a copy is not acknowledgement. Only explicit owner
 acknowledgement or final destruction of its backing ends retention, after
 physical exit; this introduces no public acknowledgement API. It is not an
@@ -82,7 +87,7 @@ still constrain subsequent use.
 
 Ordinary eager progress and successful result observation require no private
 result D2H. A failed run may request optional structured detail after the required
-observation. Retained recording backing reads replay evidence during external
+observation. Requested retained recording backing reads replay evidence during external
 resource cleanup; a failed read keeps the owner for retry. None of these reads
 establishes physical completion or replaces the RTS execution error.
 

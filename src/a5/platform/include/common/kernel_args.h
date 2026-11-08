@@ -114,16 +114,11 @@ struct KernelArgs {
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
 
-    // Device pointer to this run's result region (DeviceRunResultRegion), and
-    // the run epoch its device side publishes into that region. Same reason the
-    // wall base travels here rather than inline: AICPU gets KernelArgs as a
-    // CANN-private copy, so an inline field would be write-only from AICPU.
-    //
-    // Unlike the wall buffer this is NOT gated on diagnostics — a run's error
-    // result has to survive whether or not timing capture is on. The host does
-    // not clear the region per run; the epoch is what makes a previous run's
-    // payload recognisable as stale, so arming costs no H2D.
-    // Both zero when no region was allocated.
+    // Optional private result address and the actual invocation/report epoch.
+    // Kernel diagnostics-off calls keep the nonzero epoch for packet and Core
+    // identity while publishing no private record (base 0). Program retains its
+    // structured error record. A nonzero base names fully initialized storage
+    // and requires a nonzero epoch; raw legacy no-record calls may use 0/0.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
 

@@ -447,11 +447,11 @@ TEST(RunTerminalReplay, ReplayedClearCannotEraseExternalEvidence) {
     EXPECT_EQ(saved.payload_bytes, sizeof(payload));
 }
 
-TEST(RunTerminalReplay, MissingRegionIsCompatibleButHalfBindingIsRejected) {
+TEST(RunTerminalReplay, MissingRegionAcceptsInvocationEpochButBoundRegionRequiresOne) {
     DeviceRunResultRegion region{};
     region.published = kEpoch;
     EXPECT_TRUE(aicpu_invalidate_run_terminal(0, 0));
-    EXPECT_FALSE(aicpu_invalidate_run_terminal(0, kEpoch));
+    EXPECT_TRUE(aicpu_invalidate_run_terminal(0, kEpoch));
     EXPECT_FALSE(aicpu_invalidate_run_terminal(reinterpret_cast<uint64_t>(&region), 0));
     EXPECT_EQ(region.published, kEpoch);
 }
