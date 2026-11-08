@@ -380,7 +380,7 @@ public:
         std::unique_ptr<PreparedExecution> *out
     ) override {
         int rc = Runner::prepare_execution(runtime, config, slot, identity, out);
-        if (rc == 0) rc = ensure_device_run_result_region(slot, identity.run_epoch, (*out)->kernel_args);
+        if (rc == 0) rc = ensure_device_run_result_region(identity, (*out)->kernel_args, (*out)->dfx);
         return rc == 0 ? (*out)->kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot_persistent_args(slot)) : rc;
     }
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
