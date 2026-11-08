@@ -910,7 +910,8 @@ static void check(int fault, bool capturing) {
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
 }
-static void check_joined_callers(void *first_caller, void *second_caller, bool fail_proof = false) {
+static void
+check_joined_callers(void *first_caller, void *second_caller, bool fail_proof = false, bool image_publication = false) {
     fail_at = 0;
     capture = false;
     next_stream = next_event = submits = syncs = copies = 0;
@@ -923,6 +924,12 @@ static void check_joined_callers(void *first_caller, void *second_caller, bool f
     first_runtime.dev = second_runtime.dev = {};
     MemoryAllocator allocator;
     SlotPersistentArgs first_slot, second_slot;
+    uint64_t image_target = 0, image_source = 37;
+    if (image_publication) {
+        const HostMetadataRegion image{&image_target, &image_source, sizeof(image_source)};
+        assert(second_slot.staged_launch_metadata.prepare(&image, 1) == 0);
+        image_source = 99;
+    }
     const NativeRunIdentity first_id{1, 1, 1, 0}, second_id{2, 1, 2, 1};
     auto first = std::make_unique<DeviceRunnerBase::PreparedExecution>(first_id, first_runtime, CallConfig{}, 0);
     first->caller_stream = first_caller;
@@ -937,22 +944,38 @@ static void check_joined_callers(void *first_caller, void *second_caller, bool f
     second->joinable_boundary = true;
     second->join = NativeRunJoin{preceding.active->prepared.get(), first_id};
     assert(second->kernel_args.prepare_runtime_args(second_runtime, allocator, second_slot) == 0);
+    assert(image_target == 0);
     submits = 0;
     trace.clear();
     stream_trace.clear();
     event_trace.clear();
-    fail_at = fail_proof ? 2 : 0;
+    fail_at = fail_proof ? (image_publication ? 3 : 2) : 0;
     auto following = runner.launch_execution(std::move(second), NativeRunExecutionTestPeer::mint(second_id));
     assert(syncs == 0);
     assert(following.active != nullptr);
     const auto streams = following.active->prepared->streams;
     if (second_caller != nullptr) assert(streams.aicpu == second_caller);
+    if (image_publication) {
+        assert(trace[0] == "wait" && "run image must follow the predecessor whole-operator boundary");
+    }
     assert(trace[0] == "wait" && trace[1] == "record");
     assert(stream_trace[0] == streams.aicpu && stream_trace[1] == streams.aicpu);
     assert(event_trace[0] == whole_done);
     if (fail_proof) {
         assert(following.rc == -777 && following.progress == LaunchProgress::Partial);
-        assert(trace.size() == 2);
+        assert(trace.size() == (image_publication ? 3u : 2u));
+        if (image_publication) {
+            assert(trace[2] == "publish" && stream_trace[2] == streams.aicpu);
+            assert(image_target == 0);
+            assert(second_slot.runtime_upload_source != nullptr);
+            assert(runner.discharge_boundary_waits(*preceding.active->prepared, true) == 0);
+            assert(runner.retire_boundary(first_id) == 0);
+            void *const pinned_source = second_slot.runtime_upload_source;
+            preceding.active->prepared->kernel_args.release_run_view();
+            following.active->prepared->kernel_args.release_run_view();
+            assert(second_slot.runtime_upload_source == pinned_source);
+            return;
+        }
         const size_t pending = runner.queued_boundary_wait_count();
         assert(pending == 2);
         for (int retry = 0; retry != 2; ++retry) {
@@ -964,9 +987,14 @@ static void check_joined_callers(void *first_caller, void *second_caller, bool f
     } else {
         assert(following.rc == 0 && following.progress == LaunchProgress::Complete);
         assert(trace[2] == "publish" && stream_trace[2] == streams.aicpu);
-        assert(trace[3] == "record" && stream_trace[3] == streams.aicpu);
-        assert(trace[4] == "wait" && stream_trace[4] == streams.aicore);
-        assert(event_trace[3] == event_trace[4]);
+        const size_t fork_index = image_publication ? 4 : 3;
+        if (image_publication) {
+            assert(trace[3] == "publish" && stream_trace[3] == streams.aicpu);
+            assert(image_target == 37);
+        }
+        assert(trace[fork_index] == "record" && stream_trace[fork_index] == streams.aicpu);
+        assert(trace[fork_index + 1] == "wait" && stream_trace[fork_index + 1] == streams.aicore);
+        assert(event_trace[fork_index] == event_trace[fork_index + 1]);
         assert(runner.retire_boundary(first_id) == PTO_RUNTIME_ERR_INTERNAL);
         assert(runner.discharge_boundary_waits(*preceding.active->prepared, true) == 0);
         assert(runner.retire_boundary(first_id) == 0);
@@ -2810,6 +2838,9 @@ int main(int argc, char **argv) {
     check_external_resource_api(false);
     check_external_resource_api(false, true);
     check_submission_resource_binding();
+    check_joined_callers(nullptr, nullptr, false, true);
+    check_joined_callers(caller, &tokens[62], false, true);
+    check_joined_callers(caller, &tokens[62], true, true);
     check_joined_callers(nullptr, nullptr);
     check_joined_callers(nullptr, caller);
     check_joined_callers(caller, nullptr);

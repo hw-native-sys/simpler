@@ -183,7 +183,7 @@ tmr_case(test_trb_runtime_temp_buffer.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
         ${SIMPLER_SRC}/common/platform/shared/host/platform_compile_info.cpp
-    INCLUDES ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host)
+    INCLUDES ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host ${SIMPLER_SRC}/common/worker)
 
 # Everything else here is a case of this runtime with nothing beyond the
 # directory's own contract, built for both arches.
