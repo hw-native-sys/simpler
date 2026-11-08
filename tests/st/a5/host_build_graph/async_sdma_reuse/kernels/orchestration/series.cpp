@@ -20,7 +20,6 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     const int64_t posts = args.scalar<int64_t>(2);
     if (posts < 1 || posts > kMaxPosts) throw std::runtime_error("SDMA series post count exceeds its fixture bound");
-    constexpr auto clean = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
     for (int64_t index = 0; index < posts; ++index) {
         const uint32_t shape[1]{static_cast<uint32_t>(elements(index))};
         const uint32_t start[1]{static_cast<uint32_t>(offset(index))};
@@ -34,8 +33,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         task.add_no_dep(args.tensor(3).ref());
         task.add_scalar(args.scalar<int64_t>(0), args.scalar<int64_t>(1), index, elements(index), posts);
         const TaskId transfer = rt_submit_aiv_task(0, task).task_id();
-        if (!rt_declare_async_sdma_get(transfer, 0, 1, 0, 1, clean))
-            throw std::runtime_error("SDMA series transfer declaration failed");
         task.set_dependencies(&transfer, 1);
         rt_submit_aiv_task(1, task);
     }

@@ -99,7 +99,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_store_i32,
     _mailbox_store_u64,
     _MpiDirectTransportHub,
-    _read_comm_domain_uses_from_blob,
     _read_control_copy_request,
     _region_vmm_granularity,
     _set_host_span_level_prefix,
@@ -399,7 +398,7 @@ _DISPOSITION_NONE = 0
 _VALIDATED_ONLY = 1
 _NATIVE_PREPARED = 2
 _TASK_ACCEPTED = 1
-_TASK_PROTOCOL_VERSION = 8
+_TASK_PROTOCOL_VERSION = 9
 
 # A request frame's own header: which run-state entry this payload belongs to,
 # that entry's generation, and this frame's generation — which the child echoes
@@ -3958,7 +3957,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 # only thing that still needs it.
                 args_address = frame_addrs[frame_index] + _OFF_TASK_ARGS_BLOB
                 args = read_args_from_blob(args_address, _MAILBOX_ARGS_CAPACITY)
-                domain_uses = _read_comm_domain_uses_from_blob(args_address, _MAILBOX_ARGS_CAPACITY)
                 staged = _StagedRun(
                     index=entry_index,
                     entry_buf=entry_buf,
@@ -3972,7 +3970,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     digest=digest,
                 )
                 staged.pending_args = args  # type: ignore[attr-defined]
-                staged.pending_domain_uses = domain_uses  # type: ignore[attr-defined]
             except Exception as e:  # noqa: BLE001
                 message = _format_exc(f"chip_process dev={device_id} frame={frame_index}", e)
                 # Reached only with the entry's identity already established, so this run is this
@@ -4010,7 +4007,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 _TASK_ACCEPTED,
                 False,
                 **staged.provenance._asdict(),
-                domain_uses=staged.pending_domain_uses,  # type: ignore[attr-defined]
             )
             staged.pending_args = None  # type: ignore[attr-defined]
             raw_disposition = staged.chip_run.preparation_disposition
@@ -4994,8 +4990,6 @@ class _RunResources:
     remote_slot_refs: list[_RemoteSlotRefClaim | RemoteBufferHandle] = field(default_factory=list)
     live_domains: dict[str, CommDomainHandle] = field(default_factory=dict)
     pending_release_domains: list[CommDomainHandle] = field(default_factory=list)
-    # Read-only imported owner references; their existing node owner performs release.
-    borrowed_domain_uses: dict[int, Any] = field(default_factory=dict)
     live_global_domains: dict[str, GlobalCommDomainHandle] = field(default_factory=dict)
     pending_release_global_domains: list[GlobalCommDomainHandle] = field(default_factory=list)
     worker_chip_orch_comm_host_buffers: dict[int, int] = field(default_factory=dict)
@@ -10706,73 +10700,11 @@ class Worker:
         release = self._release_domain_handle if local else self._release_global_domain_handle
         handle._release_fn = lambda released, owner=resources: release(released, owner)
 
-    def _use_borrowed_domain(self, handle) -> None:
-        resources = self._building_run_resources if _callback_frame_for(self) is not None else None
-        if resources is None:
-            return
-        state = self._global_node_domains.get(handle.domain_id)
-        if (
-            state is None
-            or state.phase is not GlobalDomainPhase.COMMIT
-            or state.command.generation != handle.generation
-            or state.borrowed_handle is not handle
-            or handle.released
-        ):
-            raise RuntimeError("borrowed communication domain has no live node owner")
-        with resources.domain_lock:
-            resources.borrowed_domain_uses[handle.domain_id] = handle
-
-    def _domain_uses_for_dispatch(
-        self, args: Any, worker_id: int, *, provenance_locked: bool = False
-    ) -> list[tuple[int, int, int]]:
-        """Select actual run owners before canonical tensors become ChipTensors."""
-        resources = self._building_run_resources if _callback_frame_for(self) is not None else None
-        if self.level != 3 or resources is None:
-            return []
-        touched = self._identities_in_args(args)
-        with contextlib.nullcontext() if provenance_locked else self._child_prov_lock:
-            selected = {
-                allocation_id
-                for allocation_id, identities in self._domain_members.items()
-                if not identities.isdisjoint(touched)
-            }
-        for handle in self._live_domains.values():
-            if handle.allocation_id in selected:
-                self._use_domain(handle)
-        # Imported global domains already belong to their committed node owner;
-        # preserve that owner reference without acquiring a second release duty.
-        for allocation_id in selected:
-            if allocation_id >= 0:
-                continue
-            state = self._global_node_domains.get(-allocation_id)
-            if state is None or state.phase is not GlobalDomainPhase.COMMIT or state.view is None:
-                raise RuntimeError("domain tensor has no committed imported owner")
-            with resources.domain_lock:
-                resources.borrowed_domain_uses[-allocation_id] = state.view
-        with resources.domain_lock:
-            local = tuple(resources.live_domains.values())
-            borrowed = tuple(resources.borrowed_domain_uses.items())
-        uses: dict[tuple[int, int], tuple[int, int, int]] = {}
-        for handle in local:
-            context = handle.contexts.get(worker_id)
-            if context is not None and not handle.released:
-                uses[(1, handle.allocation_id)] = (1, handle.allocation_id, int(context.device_ctx))
-        for domain_id, reference in borrowed:
-            state = self._global_node_domains.get(domain_id)
-            if state is None or state.phase is not GlobalDomainPhase.COMMIT or state.view is None:
-                raise RuntimeError("selected imported domain was released before dispatch")
-            if reference is not state.view and reference is not state.borrowed_handle:
-                raise RuntimeError("selected imported domain owner was replaced")
-            context = state.contexts.get(worker_id)
-            if context is not None:
-                uses[(2, domain_id)] = (2, domain_id, int(context.device_ctx))
-        return list(uses.values())
-
     def _domain_serialization(self):
         return contextlib.nullcontext() if _callback_frame_for(self) is not None else self._submit_mu.exclusive()
 
-    def _enroll_domain_uses(self, resources: _RunResources) -> None:
-        with self._child_prov_lock:
+    def _enroll_domain_uses(self, resources: _RunResources, *, provenance_locked: bool = False) -> None:
+        with contextlib.nullcontext() if provenance_locked else self._child_prov_lock:
             used = {
                 allocation_id
                 for allocation_id, identities in self._domain_members.items()
@@ -10830,8 +10762,6 @@ class Worker:
                             ref=name,
                             _release_fn=None,
                         )
-                    state.borrowed_handle._use_fn = self._use_borrowed_domain
-                    self._use_borrowed_domain(state.borrowed_handle)
                     return state.borrowed_handle
             self._use_domain(handle)
             return handle
@@ -12749,7 +12679,7 @@ class Worker:
         """Every tensor arg's identity in ``args``."""
         return set(args.identities())
 
-    def _record_touched_identities(self, args: Any) -> None:
+    def _record_touched_identities(self, args: Any, *, provenance_locked: bool = False) -> None:
         """Add every tensor arg's identity in ``args`` to the current run's touched set.
 
         A no-op when no run is being built (``_building_run_resources is None``) — tracking is
@@ -12771,6 +12701,8 @@ class Worker:
         if resources is None:
             return
         resources.touched_identities.update(self._identities_in_args(args))
+        if self.level == 3 and _callback_frame_for(self) is not None:
+            self._enroll_domain_uses(resources, provenance_locked=provenance_locked)
 
     def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.

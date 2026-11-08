@@ -13,7 +13,7 @@
 #define private public
 #include "device_runner.h"
 #undef private
-#include "async_backend_plan.h"
+#include "async_plan.h"
 #include "async_execution_context.h"
 #include "aicore_scheduler_error.h"
 #include "backend/sdma/sdma_submission.h"
@@ -31,36 +31,15 @@ constexpr uint64_t kEpoch = 20;
 constexpr uint32_t kSlot = 1;
 constexpr uint64_t kBytes = 4096;
 constexpr uint64_t kBudget = 1 << 20;
-constexpr auto kClean = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
 enum class SdmaFault { PREFLIGHT, RECORD_EXPORT };
 
 void require(bool value, const char *message) {
     if (!value) throw std::runtime_error(message);
 }
 
-// The native caller owns these allocations. The real native argument borrow,
-// not this provider's lifetime, must prevent their release after UNKNOWN.
+// Real caller-buffer borrows keep these addresses alive on failed runs.
 struct SdmaAllocationFacts {
     std::array<void *, 3> allocations{}, buffers{};
-    CommDomainSnapshot domain{};
-    CommSdmaOwnerInfoV1 workspace{};
-    NativeRunDomainProviderV2 provider() {
-        return {
-            {2, 0, this,
-             [](void *raw, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *execution) {
-                 if (epoch != kEpoch || slot != kSlot || index != 0) return -1;
-                 *out = static_cast<SdmaAllocationFacts *>(raw)->domain;
-                 *execution = static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN);
-                 return 0;
-             },
-             1},
-            [](void *raw, uint64_t epoch, uint32_t slot, size_t index, CommSdmaOwnerInfoV1 *out, size_t bytes) {
-                if (epoch != kEpoch || slot != kSlot || index != 0 || bytes != sizeof(*out)) return -1;
-                *out = static_cast<SdmaAllocationFacts *>(raw)->workspace;
-                return 0;
-            }
-        };
-    }
 };
 
 struct SdmaIoFault {
@@ -124,15 +103,6 @@ public:
             facts.buffers[i] = reinterpret_cast<void *>(aligned);
             std::memset(facts.buffers[i], 0x5a, kBytes);
         }
-        facts.workspace = {address(2), kBytes, CommSdmaAccess::SDK_ONLY, 1};
-        facts.domain.use = {CommDomainKind::LOCAL, 0, 71, reinterpret_cast<uint64_t>(&facts.domain.context)};
-        auto &comm = facts.domain.context;
-        comm.rankId = 0;
-        comm.rankNum = 2;
-        comm.winSize = kBytes;
-        comm.windowsIn[0] = comm.windowsOut[0] = address(0);
-        comm.windowsIn[1] = comm.windowsOut[1] = address(1);
-        set_comm_workspace(comm, CommWorkspaceKind::SDMA, address(2), kBytes);
     }
     int prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) override {
         static int streams[2];
@@ -149,7 +119,7 @@ public:
         prepared->resources_owned = true;
         auto *native = static_cast<NativeRunContext<DeviceRunnerBase> *>(native_storage);
         require(native != nullptr && native->identity().run_epoch == identity.run_epoch, "native identity");
-        plan_image(native->host_api, slot, identity.run_epoch);
+        plan_image(slot, identity.run_epoch);
         submission_storage_[slot]->retain_replay_evidence = true;
         const int rc = ensure_device_run_result_region(slot, identity.run_epoch, prepared->kernel_args);
         if (rc != 0) return rc;
@@ -210,10 +180,9 @@ public:
     uint32_t receipt_count{0}, posted{0}, built{0}, exported{0}, preflights{0};
     AsyncExecutionContext *canonical{nullptr};
     SchedulerAsyncGroupWriter *writer{nullptr};
-    AsyncBackendHostPlan bindings;
 
 private:
-    void plan_image(const HostApi &api, uint32_t slot, uint64_t epoch) {
+    void plan_image(uint32_t slot, uint64_t epoch) {
         metadata_.resize(2);
         capabilities_.resize(2);
         for (uint32_t task = 0; task < 2; ++task) {
@@ -227,54 +196,12 @@ private:
             graph_.executable(task, 1, task == 0 ? std::vector<int32_t>{} : std::vector<int32_t>{0});
             for (auto &cap : capabilities_[task])
                 cap = {CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::SYNCHRONOUS, 0, 0};
-            task_image_.tasks[task].payload.bind_regions(task_image_.tensors[task], task_image_.scalars[task], nullptr);
         }
         capabilities_[0][1] = {
             CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::DEFERRED, 1, CORE_ASYNC_CONDITION_SDMA_POST_DONE
         };
-        auto make_tensor = [&](uint32_t task, uint32_t arg, uint32_t offset) {
-            const uint32_t shape[]{8};
-            auto &tensor = task_image_.tensors[task][arg];
-            tensor.init_external(facts.buffers[0], kBytes, shape, 1, DataType::INT32, 0);
-            tensor.start_offset = offset;
-        };
-        make_tensor(0, 0, 0);
-        make_tensor(0, 1, 32);
-        make_tensor(1, 0, 32);
-        task_image_.tasks[0].payload.tensor_count = 2;
-        task_image_.tasks[0].payload.scalar_count = 2;
-        task_image_.scalars[0][0] = facts.domain.use.device_context;
-        task_image_.scalars[0][1] = 1;
-        task_image_.tasks[1].payload.tensor_count = 1;
-        AsyncHostDeclarations declarations;
-        require(
-            declarations.add(false, 0, 0, {AsyncUseDeclarationKind::SDMA_TRANSFER, UINT32_MAX, 1, 0, 0, 0, kClean, 1}),
-            "SDMA declaration"
-        );
-        const AsyncBackendTaskImage image{
-            &task_image_, sizeof(task_image_), reinterpret_cast<uint64_t>(&task_image_), offsetof(TaskImage, tasks), 2
-        };
-        NativeGraphHostPlan native;
+        const SchedulerAsyncAuxiliaryBytes auxiliary{ASYNC_SDMA_CHANNELS};
         std::string error;
-        require(
-            scheduler_plan_async_backend(
-                metadata_, capabilities_, image, native, declarations, api, kBudget, &bindings, &error
-            ),
-            error.c_str()
-        );
-        AsyncBackendView declarations_view;
-        require(
-            declarations_view.mount(reinterpret_cast<const uint8_t *>(bindings.image.data()), bindings.image.size()),
-            "backend declarations"
-        );
-        require(
-            bindings.execution_contract == HBG_ASYNC_CONTRACT_UNQUALIFIED &&
-                declarations_view.layout.transfer_count == 1,
-            "genuine SDMA backend contract"
-        );
-        const SchedulerAsyncAuxiliaryBytes auxiliary{
-            bindings.image.size(), ASYNC_SDMA_CHANNELS, bindings.execution_contract
-        };
         SchedulerAsyncHostPlan plan;
         require(
             scheduler_plan_async_state(metadata_, capabilities_, epoch, kBudget, auxiliary, &plan, &error),
@@ -298,15 +225,7 @@ private:
         summary->async_layout_offset = async_offset_;
         auto *base = static_cast<uint8_t *>(scheduler_host_) + async_offset_;
         std::memcpy(base, plan.image.data(), plan.image.size());
-        std::memcpy(base + plan.layout.backend_offset, bindings.image.data(), bindings.image.size());
         async_ = {base};
-        require(
-            declarations_.mount(
-                plan.layout.backend_bytes == 0 ? nullptr : base + plan.layout.backend_offset, plan.layout.backend_bytes
-            ),
-            "backend declarations"
-        );
-        require(plan.layout.execution_contract == HBG_ASYNC_CONTRACT_UNQUALIFIED, "no core-only promotion");
     }
     void run_sdk_fault() {
         auto view = graph_.graph();
@@ -339,7 +258,6 @@ private:
         payload->args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload->global_context);
         SchedulerAsyncExecutionState<ExecutionBackend> state;
         state.view = async_;
-        ExecutionBackend resources(declarations_, async_.layout().execution_contract);
         require(
             scheduler_async_execution_bind(&state, view, base, local, storage_.run_control, 0), "execution binding"
         );
@@ -353,11 +271,10 @@ private:
                 verified_writer.completion_error_code == &writer->error_code,
             "canonical writer identity"
         );
-        const auto transfer = declarations_.transfer(0);
         SdmaIoFault io{fault_};
-        io.workspace = transfer.workspace;
+        io.workspace = address(2);
         io.group = 0;
-        io.queues = transfer.queue_count;
+        io.queues = 1;
         CpuCache cache;
         auto sink = [&](uint32_t, uint32_t, const SdmaCompletionReceiptRecord &) {
             ++receipt_count;
@@ -388,7 +305,7 @@ private:
         preflights = io.preflights;
         require(receipt_count == 0 && writer->count == 0 && io.waited == 0, "no successful completion publication");
         require(
-            !scheduler_async_execution_returned(&state, view, base, local, storage_.run_control, 0, resources),
+            !scheduler_async_execution_returned(&state, view, base, local, storage_.run_control, 0),
             "runtime return must propagate fault"
         );
         require(
@@ -410,18 +327,12 @@ private:
         );
         terminal_rc = -aicore_scheduler_runtime_error_code(scheduler_read_error(storage_.run_control));
     }
-    struct alignas(64) TaskImage {
-        ChipTaskStorage tasks[2]{};
-        simpler::hbg::Tensor tensors[2][2]{};
-        uint64_t scalars[2][2]{};
-    } task_image_;
     SdmaFault fault_;
     scheduler_test::FixtureStorage storage_;
     scheduler_test::BasicGraphBuffer<2> graph_;
     std::vector<SchedulerTaskMetadata> metadata_;
     std::vector<SchedulerAsyncCapabilities> capabilities_;
     SchedulerAsyncRuntimeView async_{};
-    AsyncBackendView declarations_{};
     void *scheduler_host_{nullptr};
     uint64_t scheduler_bytes_{0}, async_offset_{0};
 };
@@ -444,14 +355,7 @@ private:
         // permission for the caller to release it after finalize.
         require(runner.borrow_caller_buffers(kSlot + 1, spans.data(), spans.size()), "caller borrow setup");
         runner.native_storage = attempt.storage;
-        auto provider = runner.facts.provider();
-        require(
-            simpler_prepare_run_with_domains_v2(
-                &runner, attempt.storage, 1, &attempt.args, &attempt.config, &attempt.descriptor,
-                sizeof(attempt.descriptor), &provider, sizeof(provider)
-            ) == 0,
-            "native prepare"
-        );
+        require(attempt.prepare() == 0, "native prepare");
         auto *native = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
         const auto prepared_owner = native->prepared_execution->prepared_resources;
         require(
@@ -476,23 +380,14 @@ private:
                 runner.retained_image_is_same(*native->active_execution->prepared),
             "unproved execution retained"
         );
-        uint32_t proof = 99;
         require(
-            simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof) == runner.terminal_rc &&
-                proof == SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN && !attempt.empty(),
+            simpler_finalize_run_with_delivery(&runner, attempt.storage, 0) == runner.terminal_rc && !attempt.empty(),
             "unknown final last-use"
         );
         require(
             runner.retained() && native->active_execution->prepared->prepared_resources == prepared_owner &&
                 runner.holds_epoch() && runner.reset_blocked() && !runner.can_accept_run(),
             "native backing and admission retention"
-        );
-        require(
-            native->domain_snapshots.size() == 1 && native->domain_snapshots[0].use.id == runner.facts.domain.use.id &&
-                native->domain_sdma_owners[0].workspace_addr == runner.address(2) &&
-                native->domain_sdma_owners[0].access == CommSdmaAccess::SDK_ONLY &&
-                runner.bindings.execution_contract == HBG_ASYNC_CONTRACT_UNQUALIFIED,
-            "selected owner contract retained"
         );
         for (void *buffer : runner.facts.allocations)
             require(

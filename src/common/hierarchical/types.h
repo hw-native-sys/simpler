@@ -46,7 +46,6 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args_wire.h"
 #include "../worker/runtime_c_api.h"
-#include "../platform_comm/comm_domain_use.h"
 
 // =============================================================================
 // TensorKey — compound key for TensorMap dependency tracking
@@ -433,8 +432,6 @@ struct TaskSlotState {
     bool is_group_{false};
     RemoteTaskArgsSidecar remote_sidecar;
     std::vector<RemoteTaskArgsSidecar> remote_sidecars;
-    // Existing Python run owners authorize these per-member Host-only identities.
-    std::vector<std::vector<CommDomainUse>> domain_uses;
 
     // Runtime-owned OUTPUT slabs live in the Worker's HeapRing and are
     // reclaimed implicitly by Ring::release(slot) — no per-slot
@@ -466,12 +463,6 @@ struct TaskSlotState {
             return remote_sidecars[static_cast<size_t>(i)];
         }
         return remote_sidecar;
-    }
-
-    const std::vector<CommDomainUse> &domain_uses_for(int32_t i) const {
-        static const std::vector<CommDomainUse> empty;
-        if (i < 0 || static_cast<size_t>(i) >= domain_uses.size()) return empty;
-        return domain_uses[static_cast<size_t>(i)];
     }
 
     // The i-th worker's Tensor args (the L3→L2 wire element).

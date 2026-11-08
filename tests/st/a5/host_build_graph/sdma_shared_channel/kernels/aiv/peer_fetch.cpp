@@ -70,7 +70,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         Data source(remote + iteration_offset, Shape(1, 1, 1, 1, count), Stride(count, count, count, count, 1));
         Data target(destination + iteration_offset, Shape(1, 1, 1, 1, count), Stride(count, count, count, count, 1));
         const uint32_t before = *ctx.completion_count;
-        if (!send_request_entry(ctx, SdmaTget(target, source, scratch, workspace))) return;
+        if (!send_request_entry(ctx, SdmaTget(target, source, scratch, workspace, 0, static_cast<uint32_t>(args[6]))))
+            return;
         const uint32_t registered = *ctx.completion_count;
         if (registered <= before || registered - before > 2 || registered > ctx.completion_capacity) {
             pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);

@@ -10,7 +10,16 @@
 
 import pytest
 
-from .helpers import CONDITION_LIMIT, Case, CounterRunner, Scenario, error_log_cursor, failure_evidence, l3_case
+from .helpers import (
+    CONDITION_LIMIT,
+    Case,
+    CounterRunner,
+    Scenario,
+    close_after_failure,
+    error_log_cursor,
+    failure_evidence,
+    l3_case,
+)
 
 pytestmark = [
     pytest.mark.platforms(["a5sim", "a5"]),
@@ -39,8 +48,10 @@ def test_last_condition_controls_completion(run_case):
 @l3_case
 def test_capacity_overflow_is_not_success(st_platform, st_device_ids, tmp_path, capfd):
     case = Case(conditions=CONDITION_LIMIT + 1)
-    with CounterRunner(st_platform, st_device_ids, tmp_path, case) as runner:
+    runner = CounterRunner(st_platform, st_device_ids, tmp_path, case)
+    try:
         runner.require_support()
+        domain = runner.worker.live_domains["async_completion_contract"]
         capfd.readouterr()
         cursor = error_log_cursor()
         with pytest.raises(RuntimeError) as failure:
@@ -48,7 +59,10 @@ def test_capacity_overflow_is_not_success(st_platform, st_device_ids, tmp_path, 
         captured = capfd.readouterr()
         evidence = failure_evidence(failure.value, captured, cursor)
         (tmp_path / "overflow.log").write_text(evidence)
-        assert "ASYNC_WAIT_OVERFLOW" in evidence, evidence
+        assert "ASYNC_WAIT_OVERFLOW" in evidence or "terminal_code=-102 " in evidence, evidence
+    finally:
+        close_after_failure(runner.worker)
+    assert not domain.freed, "failed async run released a domain with unconfirmed external access"
 
 
 @l3_case

@@ -131,8 +131,7 @@ public:
     // `worker_id`: exact stable NEXT_LEVEL worker id that runs this task.
     SubmitResult submit_next_level(
         const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id,
-        const std::vector<int32_t> &eligible_worker_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {},
-        const std::vector<CommDomainUse> &domain_uses = {}
+        const std::vector<int32_t> &eligible_worker_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
     );
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N worker selections, 1 DAG node.
@@ -140,8 +139,7 @@ public:
     SubmitResult submit_next_level_group(
         const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
         const std::vector<int32_t> &worker_ids, const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
-        const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {},
-        const std::vector<std::vector<CommDomainUse>> &domain_uses = {}
+        const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {}
     );
 
     // Submit a SUB task by registered callable identity.
@@ -500,8 +498,7 @@ private:
         WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config,
         std::vector<TaskArgs> args_list, std::vector<int32_t> target_worker_ids = {},
         std::vector<std::vector<int32_t>> eligible_worker_ids = {},
-        std::vector<RemoteTaskArgsSidecar> remote_sidecars = {},
-        std::vector<std::vector<CommDomainUse>> domain_uses = {}
+        std::vector<RemoteTaskArgsSidecar> remote_sidecars = {}
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.

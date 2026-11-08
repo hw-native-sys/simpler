@@ -43,7 +43,8 @@ inline __aicore__ bool sdma_submit_error(AsyncCtx &writer, Cache &cache) {
 template <typename Backend, typename Cache, typename Sink, typename Metadata = SdmaSubmissionMetadata>
 inline __aicore__ bool sdma_submit(
     AsyncCtx &writer, SdmaOp operation, bool valid_shape, uint64_t workspace, uint64_t source, uint64_t destination,
-    uint64_t bytes, uint32_t physical_cluster, Backend &backend, Cache &cache, Sink &sink, Metadata metadata = {}
+    uint64_t bytes, uint32_t physical_cluster, Backend &backend, Cache &cache, Sink &sink, Metadata metadata = {},
+    uint32_t queues = 1
 ) {
     const bool deferred = writer.task_token.is_valid();
     // Nonempty deferred submissions validate writer state when reserving capacity.
@@ -51,26 +52,13 @@ inline __aicore__ bool sdma_submit(
     if ((deferred && bytes == 0 && !async_completion_open(writer)) ||
         (writer.completion_error_code != nullptr && *writer.completion_error_code != 0))
         return sdma_submit_error(writer, cache);
-    AsyncBackendView declarations{};
-    uint64_t guard_address = 0, contract = 0;
+    uint64_t guard_address = 0;
     if (!valid_shape || (operation != SdmaOp::TGET && operation != SdmaOp::TPUT) || workspace == 0 ||
         workspace % 64 != 0 || source == 0 || destination == 0 || bytes > UINT64_MAX - source ||
-        bytes > UINT64_MAX - destination || !async_backend_context(writer, &declarations, &guard_address, &contract) ||
-        contract != HBG_ASYNC_CONTRACT_UNQUALIFIED ||
+        bytes > UINT64_MAX - destination || !async_sdma_guard_address(writer, &guard_address) ||
         (writer.execution_context != nullptr && writer.execution_context->subtask_slot == 0))
         return sdma_submit_error(writer, cache);
-    AsyncSdmaTransfer transfer{};
-    bool declared = false;
-    if (writer.execution_context != nullptr &&
-        !declarations.select_transfer(
-            writer.execution_context->task_ref, workspace, source, destination, bytes, &transfer, &declared
-        ))
-        return sdma_submit_error(writer, cache);
-    const uint32_t queues = declared ? static_cast<uint32_t>(transfer.queue_count) : 1;
-    if (queues == 0 || queues > ASYNC_SDMA_CHANNELS ||
-        (declared && (operation != SdmaOp::TGET || transfer.workspace_bytes < (ASYNC_SDMA_CHANNELS + 1) * 64)) ||
-        !backend.preflight())
-        return sdma_submit_error(writer, cache);
+    if (queues == 0 || queues > ASYNC_SDMA_CHANNELS || !backend.preflight()) return sdma_submit_error(writer, cache);
     if (bytes == 0) return true;
     const uint32_t group = physical_cluster % (ASYNC_SDMA_CHANNELS / queues);
     AsyncCompletionReservation reservation{};
@@ -90,10 +78,7 @@ inline __aicore__ bool sdma_submit(
     for (uint32_t i = 0; i < count; ++i) {
         auto &record = records[i];
         if (!backend.record(i, &record) || record.address == 0 || record.address % alignof(uint64_t) != 0 ||
-            record.expected == 0 ||
-            (declared && !async_backend_detail::contains(
-                             transfer.workspace, transfer.workspace_bytes, record.address & ~UINT64_C(63), 64
-                         )))
+            record.expected == 0)
             return sdma_submit_error(writer, cache);
         for (uint32_t j = 0; j < i; ++j)
             if (records[j].address == record.address) return sdma_submit_error(writer, cache);

@@ -13,7 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 12))
+SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 14))
 
 ROOT_NUMBERS = frozenset(
     """
@@ -96,11 +96,11 @@ def uses_resource_scoped_mix(section):
 def has_native_graph(section):
     """Native Graph v6 is distinguished from claim-seal v6 by its source tables."""
     version = protocol_version(section)
-    return version in (9, 11) or (version == 6 and ("node_map" in section or "graph_source" in section))
+    return version in (9, 11, 13) or (version == 6 and ("node_map" in section or "graph_source" in section))
 
 
 def has_async_protocol(section):
-    return protocol_version(section) in (10, 11)
+    return protocol_version(section) in (10, 11, 12, 13)
 
 
 def has_claim_seal(section):
@@ -221,7 +221,7 @@ def _read_extensions(section):
     if has_async_protocol(section):
         from .native_async import read_async_protocol  # noqa: PLC0415
 
-        read_async_protocol(section["async"])
+        read_async_protocol(section["async"], legacy=protocol_version(section) < 12)
     if has_native_graph(section):
         from .native_graph import read_graph_source  # noqa: PLC0415
 

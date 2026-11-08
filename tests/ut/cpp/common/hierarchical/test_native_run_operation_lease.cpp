@@ -82,7 +82,6 @@ bool g_wait_released = true;
 int g_wait_rc = 0;
 bool g_wait_throws = false;
 int g_finalize_rc = 0;
-uint32_t g_last_use_proof = 0;
 bool g_finalize_throws = false;
 bool g_finalize_destroys = true;
 bool g_finalize_corrupts = false;
@@ -218,13 +217,6 @@ int finalize_run(void *, void *runtime, int) {
     return g_finalize_rc;
 }
 
-int finalize_run_with_last_use(void *context, void *runtime, int delivery, uint32_t *out_proof) {
-    *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
-    const int rc = finalize_run(context, runtime, delivery);
-    *out_proof = g_last_use_proof;
-    return rc;
-}
-
 int supports_successor(void *) { return 1; }
 
 int launch_run_joined(void *, void *, void *predecessor_runtime) {
@@ -289,7 +281,6 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     g_wait_rc = 0;
     g_wait_throws = false;
     g_finalize_rc = 0;
-    g_last_use_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
     g_finalize_throws = false;
     g_finalize_destroys = true;
     g_finalize_corrupts = false;
@@ -349,170 +340,24 @@ void prime_joined(ChipWorker &worker) {
     worker.retained_epoch_limit_granted_ = 3;
 }
 
-NativeRunDomainProvider g_domain_provider{};
-CommDomainSnapshot g_domain_answer{};
-uint32_t g_domain_qualification = 0;
-int g_domain_backend_queries = 0;
-
-int domain_snapshot_backend(CommHandle handle, uint64_t id, CommDomainSnapshot *out) {
-    ++g_domain_backend_queries;
-    *out = {};
-    if (handle == nullptr || id != 31) return -1;
-    out->use = {CommDomainKind::LOCAL, 0, 31, 0x1000};
-    out->context.rankNum = 1;
-    out->context.winSize = 4096;
-    out->context.windowsIn[0] = 0x2000;
-    return 0;
-}
-
-int prepare_domain_run(
-    void *device, void *runtime, int32_t callable, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
-    size_t provider_bytes
-) {
-    EXPECT_EQ(descriptor_bytes, sizeof(NativeRunDescriptor));
-    EXPECT_EQ(provider_bytes, sizeof(NativeRunDomainProvider));
-    EXPECT_EQ(provider->version, 1u);
-    EXPECT_EQ(provider->count, 1u);
-    g_domain_provider = *provider;
-    const int rc = provider->query(
-        provider->owner, descriptor->run_epoch, descriptor->pipeline_slot, 0, &g_domain_answer, &g_domain_qualification
-    );
-    if (rc != 0) {
-        publish_released_preparation(runtime, descriptor->run_epoch);
-        return rc;
-    }
-    return prepare_run(device, runtime, callable, args, config, descriptor);
-}
-
-TEST(NativeRunOperationLeaseTest, ActualLaneDomainProviderUsesTheCurrentOwnerAndBlocksRelease) {
+TEST(NativeRunOperationLeaseTest, LiveRunRetainsTheExistingCommunicationOwner) {
     ChipWorker worker;
     prime(worker);
-    worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, false};
     worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
-    worker.prepare_run_with_domains_fn_ = prepare_domain_run;
-    worker.comm_query_domain_snapshot_fn_ = domain_snapshot_backend;
     worker.comm_release_domain_windows_fn_ = stub_release_domain;
     worker.comm_destroy_fn_ = stub_destroy_comm;
     static int comm = 0;
     ASSERT_NE(worker.create_comm_session(&comm, nullptr, true), nullptr);
     worker.base_comm_handle_ = reinterpret_cast<uint64_t>(&comm);
-    g_domain_backend_queries = 0;
-    g_domain_provider = {};
-    g_domain_answer = {};
-    g_domain_qualification = 0;
     ChipStorageTaskArgs args;
-    const auto run = worker.submit_chip_run(
-        1, args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 8, 9, nullptr, 0, true, {},
-        {{CommDomainKind::LOCAL, 0, 31, 0x1000}}
-    );
-    EXPECT_EQ(g_domain_backend_queries, 1);
-    EXPECT_EQ(g_domain_answer.use.id, 31u);
-    EXPECT_EQ(g_domain_qualification, static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN));
+    auto run = worker.submit_chip_run(1, args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 8, 9, nullptr, 0, true, {});
     EXPECT_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0), std::runtime_error);
     EXPECT_EQ(g_comm_free_calls, 0);
-    CommDomainSnapshot stale;
-    uint32_t qualification = 99;
-    ASSERT_NE(g_domain_provider.query, nullptr);
-    EXPECT_NE(g_domain_provider.query(&worker, g_prepare_epoch, 0, 0, &stale, &qualification), 0);
-    EXPECT_EQ(qualification, 0u);  // The owner exists, but preparation has ended.
     g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-    auto completed = run;
-    EXPECT_TRUE(completed.wait_until(ChipRun::Clock::now() + std::chrono::seconds(1)));
-    EXPECT_NE(g_domain_provider.query(&worker, g_prepare_epoch, 0, 0, &stale, &qualification), 0);
-    EXPECT_EQ(stale.use.device_context, 0u);
+    EXPECT_TRUE(run.wait_until(ChipRun::Clock::now() + std::chrono::seconds(1)));
     EXPECT_NO_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0));
     EXPECT_EQ(g_comm_free_calls, 1);
     EXPECT_NO_THROW(worker.comm_destroy_all());
-}
-
-NativeRunDomainProviderV2 g_sdma_provider{};
-CommSdmaOwnerInfoV1 g_sdma_answer{};
-
-int sdma_domain_snapshot_backend(CommHandle owner, uint64_t id, CommDomainSnapshot *out) {
-    const int rc = domain_snapshot_backend(owner, id, out);
-    if (rc == 0) set_comm_workspace(out->context, CommWorkspaceKind::SDMA, 0x8000, 4096);
-    return rc;
-}
-int sdma_owner_backend(CommHandle owner, uint64_t id, CommSdmaOwnerInfoV1 *out, size_t bytes) {
-    if (owner == nullptr || id != 31 || bytes != sizeof(*out)) return -1;
-    *out = {0x8000, 4096, CommSdmaAccess::SDK_ONLY, 3};
-    return 0;
-}
-int prepare_sdma_domain_run(
-    void *device, void *runtime, int32_t callable, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProviderV2 *provider,
-    size_t provider_bytes
-) {
-    EXPECT_EQ(descriptor_bytes, sizeof(NativeRunDescriptor));
-    EXPECT_EQ(provider_bytes, sizeof(NativeRunDomainProviderV2));
-    EXPECT_EQ(provider->base.version, 2u);
-    g_sdma_provider = *provider;
-    const auto &base = provider->base;
-    CommDomainSnapshot snapshot;
-    uint32_t execution = 0;
-    int rc = base.query(base.owner, descriptor->run_epoch, descriptor->pipeline_slot, 0, &snapshot, &execution);
-    if (rc == 0)
-        rc = provider->query_sdma_owner(
-            base.owner, descriptor->run_epoch, descriptor->pipeline_slot, 0, &g_sdma_answer, sizeof(g_sdma_answer)
-        );
-    CommSdmaOwnerInfoV1 wrong{1, 1, CommSdmaAccess::SDK_ONLY, 1};
-    EXPECT_NE(
-        provider->query_sdma_owner(
-            base.owner, descriptor->run_epoch, descriptor->pipeline_slot + 1, 0, &wrong, sizeof(wrong)
-        ),
-        0
-    );
-    EXPECT_EQ(wrong.workspace_addr, 0u);
-    EXPECT_NE(
-        provider->query_sdma_owner(
-            base.owner, descriptor->run_epoch, descriptor->pipeline_slot, 1, &wrong, sizeof(wrong)
-        ),
-        0
-    );
-    if (rc != 0) {
-        publish_released_preparation(runtime, descriptor->run_epoch);
-        return rc;
-    }
-    return prepare_run(device, runtime, callable, args, config, descriptor);
-}
-
-TEST(NativeRunOperationLeaseTest, ActualLaneV2QueriesOnlyItsSelectedLiveOwnerDuringPrepare) {
-    for (bool supported : {false, true}) {
-        ChipWorker worker;
-        prime(worker);
-        worker.execution_environment_ =
-            ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, false};
-        worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
-        worker.prepare_run_with_domains_fn_ = prepare_domain_run;
-        worker.prepare_run_with_domains_v2_fn_ = prepare_sdma_domain_run;
-        worker.comm_query_domain_snapshot_fn_ = sdma_domain_snapshot_backend;
-        worker.comm_query_domain_sdma_owner_fn_ = supported ? sdma_owner_backend : nullptr;
-        worker.comm_release_domain_windows_fn_ = stub_release_domain;
-        worker.comm_destroy_fn_ = stub_destroy_comm;
-        static int comm = 0;
-        ASSERT_NE(worker.create_comm_session(&comm, nullptr, true), nullptr);
-        worker.base_comm_handle_ = reinterpret_cast<uint64_t>(&comm);
-        g_sdma_answer = {};
-        g_sdma_provider = {};
-        ChipStorageTaskArgs args;
-        auto run = worker.submit_chip_run(
-            1, args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 8, 9, nullptr, 0, true, {},
-            {{CommDomainKind::LOCAL, 0, 31, 0x1000}}
-        );
-        ASSERT_NE(g_sdma_provider.query_sdma_owner, nullptr);
-        EXPECT_EQ(g_sdma_answer.access, supported ? CommSdmaAccess::SDK_ONLY : CommSdmaAccess::UNKNOWN);
-        EXPECT_EQ(g_sdma_answer.queue_num, supported ? 3u : 0u);
-        CommSdmaOwnerInfoV1 stale{1, 1, CommSdmaAccess::SDK_ONLY, 1};
-        EXPECT_NE(g_sdma_provider.query_sdma_owner(&worker, g_prepare_epoch, 0, 0, &stale, sizeof(stale)), 0);
-        EXPECT_EQ(stale.workspace_addr, 0u);
-        EXPECT_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0), std::runtime_error);
-        g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        EXPECT_TRUE(run.wait_until(ChipRun::Clock::now() + std::chrono::seconds(1)));
-        EXPECT_NE(g_sdma_provider.query_sdma_owner(&worker, g_prepare_epoch, 0, 0, &stale, sizeof(stale)), 0);
-        EXPECT_NO_THROW(worker.comm_release_domain_windows(worker.base_comm_handle_, 31, 1, 0));
-        EXPECT_NO_THROW(worker.comm_destroy_all());
-    }
 }
 
 TEST(NativeRunOperationLeaseTest, ManagedAllocationNeverFallsBackToTheLegacySymbol) {
@@ -521,21 +366,6 @@ TEST(NativeRunOperationLeaseTest, ManagedAllocationNeverFallsBackToTheLegacySymb
     worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
     EXPECT_THROW(worker.comm_alloc_domain_windows_sdma_sdk_v1(1, 1, {0, 1}, 0, 4096, 3), std::runtime_error);
     EXPECT_EQ(g_comm_alloc_calls, 0);
-}
-
-TEST(NativeRunOperationLeaseTest, SelectedDomainsCannotFallBackToAnOldPrepareEntry) {
-    ChipWorker worker;
-    prime(worker);
-    ChipStorageTaskArgs args;
-    EXPECT_THROW(
-        worker.prepare_native_run_for_lane(
-            1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1}, 1, 1, nullptr, 0, true, {},
-            {{CommDomainKind::LOCAL, 0, 31, 0x1000}}
-        ),
-        RunPreparationRefused
-    );
-    EXPECT_FALSE(g_prepare_entered);
-    EXPECT_EQ(worker.unproven_native_run_count(), 0u);
 }
 
 ChipWorkerNativeRun prepare(ChipWorker &worker, uint32_t slot, uint64_t generation) {
@@ -1398,83 +1228,61 @@ TEST(NativeRunOperationLeaseTest, UnprovedDestroyedRunRetainsCommOwnersAcrossDev
     }
 }
 
-TEST(NativeRunOperationLeaseTest, CompletedSemanticFailureReleasesCommOwnersWithoutClearingItsError) {
-    for (bool explicit_release : {false, true}) {
-        SCOPED_TRACE(explicit_release);
-        ChipWorker worker;
-        prime(worker);
-        worker.finalize_run_with_last_use_fn_ = finalize_run_with_last_use;
-        g_last_use_proof = SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
-        worker.finalize_device_fn_ = stub_finalize_device;
-        worker.comm_release_domain_windows_fn_ = stub_release_domain;
-        worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
-        worker.comm_global_domain_release_fn_ = stub_release_global_domain;
-        worker.comm_destroy_fn_ = stub_destroy_comm;
-        int base_placeholder = 0;
-        int child_placeholder = 0;
-        const uint64_t base = reinterpret_cast<uint64_t>(&base_placeholder);
-        const uint64_t child = reinterpret_cast<uint64_t>(&child_placeholder);
-        ASSERT_NE(worker.create_comm_session(&base_placeholder, nullptr, true), nullptr);
-        ASSERT_NE(worker.create_comm_session(&child_placeholder, nullptr, false), nullptr);
-        worker.base_comm_handle_ = base;
-        worker.global_domain_ids_.insert(7);
-        const auto module = worker.runtime_module_;
-        worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
-        ChipStorageTaskArgs args{};
-        ChipRun run = worker.run_lane_->submit(1, args, CallConfig{});
-        g_wait_rc = -5;
-        const auto expect_original_error = [&] {
-            try {
-                (void)run.wait_until(ChipRun::Deadline::max());
-                FAIL() << "the semantic error was discarded";
-            } catch (const std::runtime_error &error) {
-                EXPECT_NE(std::string(error.what()).find("-5"), std::string::npos);
-            }
-        };
-        // The blocking completion entry proves END before the semantic observer fails.
-        expect_original_error();
-        EXPECT_EQ(g_poll_rc, SIMPLER_NATIVE_RUN_POLL_COMPLETE);
-        EXPECT_TRUE(run.lane_poisoned());
-        EXPECT_FALSE(run.owner_recovery_required());
-        EXPECT_TRUE(worker.native_runs_.empty());
-        EXPECT_FALSE(worker.comm_reclamation_unconfirmed_);
-        EXPECT_EQ(g_wait_calls, 1);
-        EXPECT_EQ(g_finalize_calls, 1);
-
-        if (explicit_release) {
-            EXPECT_NO_THROW(worker.comm_release_domain_windows(base, 1, 2, 0));
-            EXPECT_NO_THROW(worker.comm_abort_domain_windows(base, 2, 2, 0));
-            EXPECT_NO_THROW(worker.comm_global_domain_release(7));
-            EXPECT_NO_THROW(worker.comm_destroy(child));
-            EXPECT_NO_THROW(worker.comm_destroy_all());
-            EXPECT_EQ(g_comm_free_calls, 4);
-            EXPECT_EQ(g_comm_abort_calls, 1);
+TEST(NativeRunOperationLeaseTest, SemanticFailureRetainsCommunicationOwnersAndItsOriginalError) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_release_domain_windows_fn_ = stub_release_domain;
+    worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
+    worker.comm_global_domain_release_fn_ = stub_release_global_domain;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    int base_placeholder = 0, child_placeholder = 0;
+    const uint64_t base = reinterpret_cast<uint64_t>(&base_placeholder);
+    const uint64_t child = reinterpret_cast<uint64_t>(&child_placeholder);
+    ASSERT_NE(worker.create_comm_session(&base_placeholder, nullptr, true), nullptr);
+    ASSERT_NE(worker.create_comm_session(&child_placeholder, nullptr, false), nullptr);
+    worker.base_comm_handle_ = base;
+    worker.global_domain_ids_.insert(7);
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    ChipStorageTaskArgs args{};
+    ChipRun run = worker.run_lane_->submit(1, args, CallConfig{});
+    g_wait_rc = -5;
+    const auto expect_original_error = [&] {
+        try {
+            (void)run.wait_until(ChipRun::Deadline::max());
+            FAIL() << "the semantic error was discarded";
+        } catch (const std::runtime_error &error) {
+            EXPECT_NE(std::string(error.what()).find("-5"), std::string::npos);
         }
-        EXPECT_TRUE(run.lane_poisoned());
-        EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_comm_free_calls, explicit_release ? 4 : 3);
-        EXPECT_TRUE(worker.comm_sessions_.empty());
-        EXPECT_TRUE(worker.global_domain_ids_.empty());
-        EXPECT_EQ(g_device_finalize_calls, 1);
-        EXPECT_EQ(g_destroy_context_calls, 1);
-        EXPECT_TRUE(module->unload_allowed_);
-        EXPECT_TRUE(run.lane_poisoned());
-        expect_original_error();
-        EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_wait_calls, 1);
-        EXPECT_EQ(g_finalize_calls, 1);
-        EXPECT_EQ(g_device_finalize_calls, 1);
-        EXPECT_EQ(g_comm_free_calls, explicit_release ? 4 : 3);
-    }
+    };
+    expect_original_error();
+    EXPECT_EQ(g_poll_rc, SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    EXPECT_TRUE(run.lane_poisoned());
+    EXPECT_TRUE(run.owner_recovery_required());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_TRUE(worker.comm_reclamation_unconfirmed_);
+    EXPECT_THROW(worker.comm_release_domain_windows(base, 1, 2, 0), std::runtime_error);
+    EXPECT_THROW(worker.comm_abort_domain_windows(base, 2, 2, 0), std::runtime_error);
+    EXPECT_THROW(worker.comm_global_domain_release(7), std::runtime_error);
+    EXPECT_THROW(worker.comm_destroy(child), std::runtime_error);
+    EXPECT_THROW(worker.comm_destroy_all(), std::runtime_error);
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_comm_free_calls, 0);
+    EXPECT_EQ(g_comm_abort_calls, 0);
+    EXPECT_EQ(worker.comm_sessions_.size(), 2u);
+    EXPECT_EQ(worker.global_domain_ids_.count(7), 1u);
+    expect_original_error();
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_EQ(g_finalize_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 1);
 }
 
-TEST(NativeRunOperationLeaseTest, FinalizerOwnWaitPublishesLatestRetirementProofDespiteSemanticFailure) {
+TEST(NativeRunOperationLeaseTest, FinalizerOwnWaitDoesNotReleaseCommOnSemanticFailure) {
     for (bool poll_proves_retirement : {false, true}) {
         SCOPED_TRACE(poll_proves_retirement);
         ChipWorker worker;
         prime(worker);
-        worker.finalize_run_with_last_use_fn_ = finalize_run_with_last_use;
-        g_last_use_proof = SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
         worker.finalize_device_fn_ = stub_finalize_device;
         worker.comm_release_domain_windows_fn_ = stub_release_domain;
         worker.comm_destroy_fn_ = stub_destroy_comm;
@@ -1496,20 +1304,20 @@ TEST(NativeRunOperationLeaseTest, FinalizerOwnWaitPublishesLatestRetirementProof
         g_poll_rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
         g_wait_rc = -5;
         // The failed initial poll enters finalization while the entry is still LAUNCHED.
-        // Proof first arrives either from its own follow-up poll or the v1 finalizer.
+        // Local completion cannot establish that external accesses ended.
         EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
         EXPECT_EQ(g_wait_calls, 1);
         EXPECT_EQ(g_finalize_calls, 1);
         EXPECT_TRUE(worker.native_runs_.empty());
         EXPECT_TRUE(run.lane_poisoned());
-        EXPECT_FALSE(run.owner_recovery_required());
-        EXPECT_FALSE(worker.comm_reclamation_unconfirmed_);
-        EXPECT_NO_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0));
-        EXPECT_EQ(g_comm_free_calls, 1);
+        EXPECT_TRUE(run.owner_recovery_required());
+        EXPECT_TRUE(worker.comm_reclamation_unconfirmed_);
+        EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
+        EXPECT_EQ(g_comm_free_calls, 0);
         EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_comm_free_calls, 2);
+        EXPECT_EQ(g_comm_free_calls, 0);
         EXPECT_EQ(g_device_finalize_calls, 1);
-        EXPECT_FALSE(run.owner_recovery_required());
+        EXPECT_TRUE(run.owner_recovery_required());
     }
 }
 
@@ -1541,37 +1349,30 @@ TEST(NativeRunOperationLeaseTest, DetachedLaneKeepsCommunicationDebtWithoutChang
     }
 }
 
-TEST(NativeRunOperationLeaseTest, LocalRetirementCannotReplaceMissingUnknownOrInvalidBackendProof) {
-    for (int provider : {-1, static_cast<int>(SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN), 2}) {
-        SCOPED_TRACE(provider);
-        ChipWorker worker;
-        prime(worker);
-        worker.finalize_device_fn_ = stub_finalize_device;
-        worker.comm_release_domain_windows_fn_ = stub_release_domain;
-        worker.comm_destroy_fn_ = stub_destroy_comm;
-        if (provider >= 0) {
-            worker.finalize_run_with_last_use_fn_ = finalize_run_with_last_use;
-            g_last_use_proof = static_cast<uint32_t>(provider);
-        }
-        int comm_placeholder = 0;
-        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
-        ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
-        worker.base_comm_handle_ = comm;
-        const auto run = prepare(worker, 0, 1);
-        worker.launch_native_run(run);
-        g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        g_wait_rc = -5;
-        EXPECT_NO_THROW(worker.wait_native_run(run));
-        EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::REAPED);
-        EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
-        EXPECT_TRUE(worker.native_runs_.empty());
-        EXPECT_TRUE(worker.comm_reclamation_unconfirmed());
-        EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
-        EXPECT_THROW(worker.comm_destroy_all(), std::runtime_error);
-        EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_comm_free_calls, 0);
-        EXPECT_EQ(worker.comm_sessions_.size(), 1u);
-    }
+TEST(NativeRunOperationLeaseTest, LocalRetirementCannotProveExternalAccessEnded) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_release_domain_windows_fn_ = stub_release_domain;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+    worker.base_comm_handle_ = comm;
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    g_wait_rc = -5;
+    EXPECT_NO_THROW(worker.wait_native_run(run));
+    EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::REAPED);
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_TRUE(worker.comm_reclamation_unconfirmed());
+    EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
+    EXPECT_THROW(worker.comm_destroy_all(), std::runtime_error);
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_comm_free_calls, 0);
+    EXPECT_EQ(worker.comm_sessions_.size(), 1u);
 }
 
 TEST(NativeRunOperationLeaseTest, UnknownPrepareRollbackWithoutNativeCarrierStillProtectsCommOwners) {

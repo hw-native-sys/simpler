@@ -29,4 +29,4 @@ def test_real_peer_sdma_completion(st_platform, st_device_ids, tmp_path, element
 @pytest.mark.parametrize("elements", [8, 1024 * 1024], ids=["minimum_tile", "pending_after_return"])
 @l3_case
 def test_unknown_kernel_sdma_without_declarations(st_platform, st_device_ids, tmp_path, elements):
-    run_sdma(st_platform, st_device_ids, tmp_path, elements, declared=False)
+    run_sdma(st_platform, st_device_ids, tmp_path, elements, explicit_capability=False)

@@ -302,9 +302,8 @@ struct AsyncProtocolExportFixture : ProtocolExportFixture {
             };
         SchedulerAsyncHostPlan plan;
         std::string error;
-        ASSERT_TRUE(scheduler_plan_async_state(
-            metadata, capabilities, kEpoch, 1 << 20, {0, 0, HBG_ASYNC_CONTRACT_UNQUALIFIED, true}, &plan, &error
-        )) << error;
+        ASSERT_TRUE(scheduler_plan_async_state(metadata, capabilities, kEpoch, 1 << 20, {0, true}, &plan, &error))
+            << error;
         std::vector<uint8_t> prefix(layout.total_size);
         std::memcpy(prefix.data(), storage->base(), prefix.size());
         uint64_t total = 0;
@@ -357,7 +356,7 @@ size_t count_text(const std::string &text, const std::string &needle) {
 
 TEST_F(AsyncProtocolExportFixture, DenseNeverRunGroupsAndFinishesKeepLayoutCounts) {
     const auto json = dump_async();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v10\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v12\""), std::string::npos);
     EXPECT_NE(json.find("\"async\":{\"group_count\":4,\"finish_count\":1"), std::string::npos);
     EXPECT_EQ(count_text(json, "\"state\":\"UNSEALED\""), 4u);
     EXPECT_EQ(count_text(json, "\"publication\":null"), 2u);
@@ -382,7 +381,8 @@ TEST_F(AsyncProtocolExportFixture, DynamicRegistrationKeepsProtocolEvidenceWitho
     auto &identity = async_at<SchedulerAsyncGroupIdentity>(frozen.layout.group_identity_offset);
     seal(0, 1);
     const auto json = dump_async();
-    EXPECT_NE(json.find("\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
+    EXPECT_EQ(json.find("binding_index"), std::string::npos);
+    EXPECT_EQ(json.find("owner_generation"), std::string::npos);
     identity.capacity = 0;
     EXPECT_THROW(dump_async(), std::invalid_argument);
 }
@@ -404,8 +404,8 @@ TEST_F(AsyncProtocolExportFixture, ConditionsKeepTypesWithoutInventingResourceBi
     async_at<SchedulerAsyncLease>(frozen.layout.group_lease_offset).word =
         scheduler_async_lease_word(7, SchedulerAsyncPhase::TERMINAL);
     const auto json = dump_async();
-    EXPECT_NE(json.find("\"index\":0,\"type\":0,\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
-    EXPECT_NE(json.find("\"index\":1,\"type\":1,\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
+    EXPECT_NE(json.find("\"index\":0,\"type\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"index\":1,\"type\":1"), std::string::npos);
     EXPECT_NE(json.find("\"state\":\"READY\""), std::string::npos);
     EXPECT_NE(json.find("\"terminal\":{\"run_epoch\":17,\"worker_index\":1,\"at\":[8,4]}"), std::string::npos);
     EXPECT_NE(
@@ -472,7 +472,8 @@ TEST_F(AsyncProtocolExportFixture, ErrorEvidenceAndUnboundConditionsRemainReadab
     EXPECT_EQ(count_text(json, "\"state\":\"FAILED\""), 2u);
     EXPECT_NE(json.find("\"failure_code\":-7"), std::string::npos);
     EXPECT_NE(json.find("\"failure_code\":-19"), std::string::npos);
-    EXPECT_NE(json.find("\"binding_index\":null,\"owner_generation\":null"), std::string::npos);
+    EXPECT_EQ(json.find("binding_index"), std::string::npos);
+    EXPECT_EQ(json.find("owner_generation"), std::string::npos);
     EXPECT_EQ(count_text(json, "\"state\":\"UNSEALED\""), 3u);
 }
 
@@ -482,7 +483,7 @@ TEST_F(AsyncProtocolExportFixture, GraphAsyncSchemaKeepsExistingNodeMapAndSource
     tasks[0].local_child_id = 3;
     tasks[0].public_task_id = TaskId::to_uint64(TaskId::make_sub_task(7, 3));
     const auto json = dump_async("{\"tasks\":[],\"definitions\":[]}");
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v11\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v13\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }

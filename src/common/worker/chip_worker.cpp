@@ -349,8 +349,6 @@ void ChipWorker::init(
         register_callable_v2_fn_ = module->optional<SimplerRegisterCallableV2Fn>("simpler_register_callable_v2");
         run_fn_ = module->required<SimplerRunFn>("simpler_run");
         prepare_run_fn_ = module->required<SimplerPrepareRunFn>("simpler_prepare_run");
-        prepare_run_with_domains_fn_ =
-            module->optional<decltype(&simpler_prepare_run_with_domains_v1)>("simpler_prepare_run_with_domains_v1");
         launch_run_fn_ = module->required<SimplerNativeRunFn>("simpler_launch_run");
         validate_execution_context_fn_ =
             module->optional<ValidateExecutionContextFn>("simpler_validate_execution_context");
@@ -362,8 +360,6 @@ void ChipWorker::init(
         wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
         wait_run_completion_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run_completion");
         finalize_run_fn_ = module->required<SimplerFinalizeRunFn>("simpler_finalize_run_with_delivery");
-        finalize_run_with_last_use_fn_ =
-            module->optional<decltype(finalize_run_with_last_use_fn_)>("simpler_finalize_run_with_last_use_v1");
         // Absent on every simulated and stand-in module by construction, so a
         // null here is a fact about the backend rather than a stale build. The
         // caller reports it.
@@ -462,19 +458,11 @@ void ChipWorker::init(
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
         comm_alloc_domain_windows_sdma_sdk_fn_ =
             module->optional<CommAllocDomainWindowsFn>("comm_alloc_domain_windows_sdma_sdk_v1");
-        comm_query_domain_sdma_owner_fn_ =
-            module->optional<decltype(&comm_query_domain_sdma_owner_v1)>("comm_query_domain_sdma_owner_v1");
-        prepare_run_with_domains_v2_fn_ =
-            module->optional<decltype(&simpler_prepare_run_with_domains_v2)>("simpler_prepare_run_with_domains_v2");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
-        comm_query_domain_snapshot_fn_ =
-            module->optional<decltype(&comm_query_domain_snapshot)>("comm_query_domain_snapshot");
-        comm_query_global_domain_snapshot_fn_ =
-            module->optional<decltype(&comm_query_global_domain_snapshot)>("comm_query_global_domain_snapshot");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
         kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
@@ -898,8 +886,6 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     register_callable_v2_fn_ = nullptr;
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
-    prepare_run_with_domains_fn_ = nullptr;
-    prepare_run_with_domains_v2_fn_ = nullptr;
     launch_run_fn_ = nullptr;
     validate_execution_context_fn_ = nullptr;
     validate_caller_stream_fn_ = nullptr;
@@ -909,7 +895,6 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     wait_run_fn_ = nullptr;
     wait_run_completion_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
-    finalize_run_with_last_use_fn_ = nullptr;
     probe_run_retention_fn_ = nullptr;
     get_teardown_report_fn_ = nullptr;
     // Reached only past the throw a failed teardown takes, which keeps the
@@ -952,14 +937,11 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_alloc_domain_windows_sdma_sdk_fn_ = nullptr;
-    comm_query_domain_sdma_owner_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_abort_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
-    comm_query_domain_snapshot_fn_ = nullptr;
-    comm_query_global_domain_snapshot_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     set_retain_runs_fn_ = nullptr;
@@ -1108,11 +1090,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run(
 ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    bool pipeline_leased, NativeRunProvenance provenance, const std::vector<CommDomainUse> &domain_uses
+    bool pipeline_leased, NativeRunProvenance provenance
 ) {
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        pipeline_leased, provenance, domain_uses, true
+        pipeline_leased, provenance
     );
 }
 
@@ -1212,91 +1194,10 @@ void ChipWorker::configure_launch_depth(unsigned depth) {
     launch_depth_ = depth;
 }
 
-int ChipWorker::query_native_domain_snapshot(
-    void *owner, uint64_t epoch, uint32_t slot, size_t index, CommDomainSnapshot *out, uint32_t *qualification
-) try {
-    if (out != nullptr) *out = {};
-    if (qualification != nullptr) *qualification = 0;
-    if (owner == nullptr || out == nullptr || qualification == nullptr) return -1;
-    auto &worker = *static_cast<ChipWorker *>(owner);
-    std::lock_guard<std::mutex> lock(worker.native_run_mu_);
-    const auto found = worker.native_runs_.find(epoch);
-    if (found == worker.native_runs_.end() || found->second->phase != NativeRunPhase::PREPARING ||
-        found->second->slot_id != slot || index >= found->second->domain_uses.size() ||
-        worker.comm_cleanup_unconfirmed_ || worker.comm_reclamation_unconfirmed_)
-        return -1;
-    const auto &entry = *found->second;
-    const auto &use = entry.domain_uses[index];
-    int result = -1;
-    if (use.kind == CommDomainKind::LOCAL && worker.comm_query_domain_snapshot_fn_ != nullptr &&
-        worker.base_comm_handle_ != 0 && worker.find_comm_session(worker.base_comm_handle_) != nullptr) {
-        result =
-            worker.comm_query_domain_snapshot_fn_(reinterpret_cast<CommHandle>(worker.base_comm_handle_), use.id, out);
-    } else if (use.kind == CommDomainKind::GLOBAL && worker.comm_query_global_domain_snapshot_fn_ != nullptr &&
-               worker.global_domain_ids_.count(use.id) != 0) {
-        result = worker.comm_query_global_domain_snapshot_fn_(use.id, out);
-    }
-    if (result != 0 || out->use.kind != use.kind || out->use.id != use.id ||
-        out->use.device_context != use.device_context || out->use.reserved != 0) {
-        *out = {};
-        return -1;
-    }
-    // Only the actual owned chip lane supplies this provenance. Its existing
-    // live-communication gate forbids joined launches; raw prepare has none.
-    if (entry.domains_from_lane && worker.execution_environment_.has_value() &&
-        !worker.execution_environment_->borrowed)
-        *qualification = static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN);
-    return 0;
-} catch (...) {
-    if (out != nullptr) *out = {};
-    if (qualification != nullptr) *qualification = 0;
-    return -1;
-}
-
-int ChipWorker::query_native_sdma_owner(
-    void *owner, uint64_t epoch, uint32_t slot, size_t index, CommSdmaOwnerInfoV1 *out, size_t out_bytes
-) try {
-    if (out != nullptr && out_bytes >= sizeof(*out)) *out = {};
-    if (owner == nullptr || out == nullptr || out_bytes != sizeof(*out)) return -1;
-    CommDomainSnapshot snapshot{};
-    uint32_t qualification = 0;
-    if (query_native_domain_snapshot(owner, epoch, slot, index, &snapshot, &qualification) != 0) return -1;
-    auto &worker = *static_cast<ChipWorker *>(owner);
-    std::lock_guard<std::mutex> lock(worker.native_run_mu_);
-    const auto found = worker.native_runs_.find(epoch);
-    if (found == worker.native_runs_.end() || found->second->phase != NativeRunPhase::PREPARING ||
-        found->second->slot_id != slot || index >= found->second->domain_uses.size() ||
-        worker.comm_cleanup_unconfirmed_ || worker.comm_reclamation_unconfirmed_)
-        return -1;
-    const auto &use = found->second->domain_uses[index];
-    if (use.kind != snapshot.use.kind || use.id != snapshot.use.id || use.device_context != snapshot.use.device_context)
-        return -1;
-    if (use.kind != CommDomainKind::LOCAL || worker.comm_query_domain_sdma_owner_fn_ == nullptr) return 0;
-    if (worker.base_comm_handle_ == 0 || worker.find_comm_session(worker.base_comm_handle_) == nullptr) return -1;
-    if (worker.comm_query_domain_sdma_owner_fn_(
-            reinterpret_cast<CommHandle>(worker.base_comm_handle_), use.id, out, sizeof(*out)
-        ) != 0 ||
-        !comm_sdma_owner_info_valid(*out)) {
-        *out = {};
-        return -1;
-    }
-    const auto &workspace = comm_workspace<CommWorkspaceKind::SDMA>(snapshot.context);
-    if (out->access != CommSdmaAccess::UNKNOWN &&
-        (out->workspace_addr != workspace.addr || out->workspace_bytes != workspace.size)) {
-        *out = {};
-        return -1;
-    }
-    return 0;
-} catch (...) {
-    if (out != nullptr && out_bytes >= sizeof(*out)) *out = {};
-    return -1;
-}
-
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance,
-    const std::vector<CommDomainUse> &domain_uses, bool domains_from_lane
+    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
 ) {
     validate_execution_process();
     require_comm_cleanup_confirmed();
@@ -1341,8 +1242,6 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             entry->lease_generation = generation;
             entry->run_epoch = run_epoch;
             entry->phase = NativeRunPhase::PREPARING;
-            entry->domain_uses = domain_uses;
-            entry->domains_from_lane = domains_from_lane;
             entry->permits_prepared_successor = allow_prepared_successor;
             native_runs_.emplace(run_epoch, std::move(entry));
         } catch (const std::bad_alloc &) {
@@ -1405,30 +1304,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             slot_id,        arena_bank_for_slot(slot_id), run_id,    generation, dispatch_id, run_epoch, accepted_state,
             accepted_value, launch_depth_ > 1 ? 1u : 0u,  provenance
         };
-        if (domain_uses.empty()) {
-            rc = prepare_run_fn_(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
-        } else {
-            if (prepare_run_with_domains_v2_fn_ != nullptr) {
-                const NativeRunDomainProviderV2 provider{
-                    {2, 0, this, &ChipWorker::query_native_domain_snapshot, domain_uses.size()},
-                    &ChipWorker::query_native_sdma_owner
-                };
-                rc = prepare_run_with_domains_v2_fn_(
-                    device_ctx_, run_storage, callable_id, args, &config, &descriptor, sizeof(descriptor), &provider,
-                    sizeof(provider)
-                );
-            } else {
-                if (prepare_run_with_domains_fn_ == nullptr)
-                    throw RunPreparationRefused("runtime has no versioned native communication-domain owner entry");
-                const NativeRunDomainProvider provider{
-                    1, 0, this, &ChipWorker::query_native_domain_snapshot, domain_uses.size()
-                };
-                rc = prepare_run_with_domains_fn_(
-                    device_ctx_, run_storage, callable_id, args, &config, &descriptor, sizeof(descriptor), &provider,
-                    sizeof(provider)
-                );
-            }
-        }
+        rc = prepare_run_fn_(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
     } catch (...) {
         drop_preparing_native_run(run_epoch);
         throw;
@@ -1480,21 +1356,20 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated,
-    NativeRunProvenance provenance, const std::vector<CommDomainUse> &domain_uses
+    NativeRunProvenance provenance
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
     return run_lane_->submit(
-        callable_id, args, config, lease, run_id, dispatch_id, accepted_state, accepted_value, activated, provenance,
-        domain_uses
+        callable_id, args, config, lease, run_id, dispatch_id, accepted_state, accepted_value, activated, provenance
     );
 }
 
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value, void *caller_stream, const std::vector<CommDomainUse> &domain_uses
+    int32_t accepted_value, void *caller_stream
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
-    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream, domain_uses);
+    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream);
 }
 
 void ChipWorker::stop_chip_run_lane_admission() noexcept {
@@ -1937,18 +1812,16 @@ void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) { finalize_
 
 void ChipWorker::finalize_native_run_impl(
     const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs, bool *context_destroyed,
-    bool *retirement_finalized, bool *backend_last_use_proved
+    bool *retirement_finalized
 ) {
     if (no_submission_released != nullptr) *no_submission_released = false;
     if (context_destroyed != nullptr) *context_destroyed = false;
     if (retirement_finalized != nullptr) *retirement_finalized = false;
-    if (backend_last_use_proved != nullptr) *backend_last_use_proved = false;
     validate_execution_process();
     const NativeRunFinalizeOutcome outcome =
         finalize_native_run_epoch(run.run_epoch, &run, FinalizeMode::Caller, deliver_outputs);
     if (context_destroyed != nullptr) *context_destroyed = outcome.context_destroyed;
     if (retirement_finalized != nullptr) *retirement_finalized = outcome.retirement_finalized;
-    if (backend_last_use_proved != nullptr) *backend_last_use_proved = outcome.backend_last_use_proved;
     if (no_submission_released != nullptr && outcome.captured == nullptr &&
         (outcome.fault == FinalizeFault::None || outcome.fault == FinalizeFault::Failed)) {
         *no_submission_released = outcome.no_submission_released;
@@ -2087,7 +1960,6 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
 
     bool entered_finalize = false;
     int finalize_rc = 0;
-    uint32_t last_use_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
 
     // This call's own wait records its outcome where every other operation records one, and before
     // the teardown below can run. A later call on a retained handle then reads completion and this
@@ -2115,9 +1987,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         entered_finalize = true;
         try {
             const int delivery = deliver_outputs && (!persisted || persisted_rc == 0) ? 1 : 0;
-            finalize_rc = finalize_run_with_last_use_fn_ != nullptr ?
-                              finalize_run_with_last_use_fn_(device_ctx_, storage, delivery, &last_use_proof) :
-                              finalize_run_fn_(device_ctx_, storage, delivery);
+            finalize_rc = finalize_run_fn_(device_ctx_, storage, delivery);
         } catch (...) {
             outcome.captured = std::current_exception();
         }
@@ -2139,10 +2009,9 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
             if (tag == RunStorageTag::Destroyed && !threw) {
                 // This call's wait may have established retirement after the
                 // initial phase snapshot. Carrier destruction alone is not proof.
-                outcome.backend_last_use_proved = last_use_proof == SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
-                outcome.retirement_finalized = entry.phase == NativeRunPhase::REAPED || outcome.backend_last_use_proved;
+                outcome.retirement_finalized = entry.phase == NativeRunPhase::REAPED;
                 if (holds_live_comm_resources() && (finalize_rc != 0 || (persisted && persisted_rc != 0)) &&
-                    !outcome.no_submission_released && !outcome.backend_last_use_proved)
+                    !outcome.no_submission_released)
                     comm_reclamation_unconfirmed_ = true;
                 auto &cache = runtime_bufs_[entry.slot_id];
                 if (cache.data() == nullptr) cache = std::move(entry.storage);
@@ -2748,8 +2617,7 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows_imp
 ) {
     require_comm_cleanup_confirmed();
     const auto allocate = sdk_only ? comm_alloc_domain_windows_sdma_sdk_fn_ : comm_alloc_domain_windows_fn_;
-    if (allocate == nullptr ||
-        (sdk_only && (comm_query_domain_sdma_owner_fn_ == nullptr || prepare_run_with_domains_v2_fn_ == nullptr))) {
+    if (allocate == nullptr) {
         throw std::runtime_error(
             sdk_only ? "managed SDK-only SDMA domains are unsupported by this runtime" :
                        "comm_alloc_domain_windows is not supported by this runtime"

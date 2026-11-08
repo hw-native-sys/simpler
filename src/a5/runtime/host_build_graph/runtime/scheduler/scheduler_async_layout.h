@@ -18,13 +18,11 @@
 #include "intrinsic.h"
 #include "aicore_completion_mailbox_types.h"
 #include "async_sdma_guard.h"
-#include "host_build_graph/async_retirement.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 6;
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 7;
 
-// All offsets are relative to the async region; only external resources may
-// carry absolute device addresses in backend declarations.
+// All offsets are relative to the retained async region.
 struct SchedulerAsyncTaskMap {
     uint64_t group_base{SCHEDULER_ASYNC_INDEX_NONE};
     uint64_t finish_index{SCHEDULER_ASYNC_INDEX_NONE};
@@ -138,9 +136,6 @@ struct SchedulerAsyncLayout {
     uint64_t finish_directory_words{0};
     uint64_t entries_offset{0};
     uint64_t entries_bytes{0};
-    uint64_t backend_offset{0};
-    uint64_t backend_bytes{0};
-    uint64_t execution_contract{HBG_ASYNC_CONTRACT_UNQUALIFIED};
     uint64_t sdma_guard_context_offset{0};
     uint64_t sdma_guard_count{0};
     uint64_t group_trace_offset{0};
@@ -154,7 +149,7 @@ static_assert(sizeof(SchedulerAsyncFinishProgress) == 168);
 static_assert(sizeof(SchedulerAsyncCheckStats) == 40 && sizeof(SchedulerAsyncFinishStats) == 24);
 static_assert(sizeof(SchedulerAsyncGroupTrace) == 192 && sizeof(SchedulerAsyncFinishTrace) == 48);
 static_assert(offsetof(SchedulerAsyncGroupTrace, release) == 128);
-static_assert(sizeof(SchedulerAsyncLayout) == 232);
+static_assert(sizeof(SchedulerAsyncLayout) == 208);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(std::is_standard_layout_v<SchedulerAsyncTaskMap> && std::is_trivially_copyable_v<SchedulerAsyncTaskMap>);
 static_assert(

@@ -384,7 +384,7 @@ inline std::string scheduler_export_protocol(
     {
         JsonObject root(out);
         root.string(
-            "schema", asynchronous ? (graph_source.empty() ? "hbg-native-protocol-v10" : "hbg-native-protocol-v11") :
+            "schema", asynchronous ? (graph_source.empty() ? "hbg-native-protocol-v12" : "hbg-native-protocol-v13") :
                                      (graph_source.empty() ? "hbg-native-protocol-v8" : "hbg-native-protocol-v9")
         );
         root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));

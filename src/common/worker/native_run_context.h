@@ -15,8 +15,6 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <stdexcept>
-#include <vector>
 
 #include "call_config.h"
 #include "common/host_api.h"
@@ -25,7 +23,6 @@
 #include "native_run_storage_tag.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
-#include "../platform_comm/comm_domain_use_wire.h"
 
 /**
  * The single placement-owned carrier for one progressable native lifecycle.
@@ -39,60 +36,16 @@ struct NativeRunContext {
 
     NativeRunContext(
         Runner *runner_in, const CallConfig &config_in, uint64_t trace_hid_in, const NativeRunDescriptor &descriptor_in,
-        const HostApiOps *host_api_ops, const NativeRunDomainProvider *domain_provider = nullptr,
-        const NativeRunDomainProviderV2 *domain_provider_v2 = nullptr
+        const HostApiOps *host_api_ops
     ) :
         runner(runner_in),
         config(config_in),
         descriptor(descriptor_in),
         host_api(
             runner_in, descriptor_in.pipeline_slot, descriptor_in.arena_bank, descriptor_in.run_epoch, host_api_ops,
-            HostApi::DiagnosticConfig{static_cast<uint32_t>(config_in.enable_chip_swimlane), config_in.enable_pmu > 0},
-            this
+            HostApi::DiagnosticConfig{static_cast<uint32_t>(config_in.enable_chip_swimlane), config_in.enable_pmu > 0}
         ),
         trace_hid(trace_hid_in) {
-        const NativeRunDomainProvider empty_provider{1, 0, nullptr, nullptr, 0};
-        const auto &provider = domain_provider != nullptr ? *domain_provider : empty_provider;
-        if (provider.reserved != 0 ||
-            (domain_provider_v2 == nullptr ? provider.version != 1 :
-                                             (domain_provider != &domain_provider_v2->base || provider.version != 2)))
-            throw std::invalid_argument("unsupported native communication-domain provider version");
-        if (provider.count != 0) {
-            if (provider.owner == nullptr || provider.query == nullptr)
-                throw std::invalid_argument("native communication-domain provider is missing");
-            domain_snapshots.resize(provider.count);
-            domain_execution.resize(provider.count);
-            domain_sdma_owners.resize(provider.count);
-            std::vector<CommDomainUse> uses;
-            uses.reserve(provider.count);
-            for (size_t i = 0; i < provider.count; ++i) {
-                uint32_t qualification = 0;
-                if (provider.query(
-                        provider.owner, descriptor.run_epoch, descriptor.pipeline_slot, i, &domain_snapshots[i],
-                        &qualification
-                    ) != 0 ||
-                    qualification > static_cast<uint32_t>(CommDomainExecution::EXCLUSIVE_RUN) ||
-                    !comm_domain_snapshot_valid(domain_snapshots[i]))
-                    throw std::invalid_argument("native communication-domain owner query failed");
-                if (domain_provider_v2 != nullptr && domain_provider_v2->query_sdma_owner != nullptr) {
-                    auto &info = domain_sdma_owners[i];
-                    if (domain_provider_v2->query_sdma_owner(
-                            provider.owner, descriptor.run_epoch, descriptor.pipeline_slot, i, &info, sizeof(info)
-                        ) != 0 ||
-                        !comm_sdma_owner_info_valid(info))
-                        throw std::invalid_argument("native SDMA workspace owner query failed");
-                    const auto &workspace = comm_workspace<CommWorkspaceKind::SDMA>(domain_snapshots[i].context);
-                    if (info.access != CommSdmaAccess::UNKNOWN &&
-                        (info.workspace_addr != workspace.addr || info.workspace_bytes != workspace.size))
-                        throw std::invalid_argument("native SDMA workspace owner does not match selected domain");
-                }
-                domain_execution[i] = static_cast<CommDomainExecution>(qualification);
-                uses.push_back(domain_snapshots[i].use);
-            }
-            validate_comm_domain_uses(uses);
-        }
-        // The borrowed provider is consumed here and never stored. Later
-        // phases retain values, never the submitting Host object's address.
         // Publish the storage tag only after every potentially-throwing member
         // has been constructed. A failed placement construction must leave the
         // caller-owned slot reusable rather than looking like a prepared run.
@@ -118,9 +71,6 @@ struct NativeRunContext {
     CallConfig config{};
     NativeRunDescriptor descriptor{};
     HostApi host_api;
-    std::vector<CommDomainSnapshot> domain_snapshots;
-    std::vector<CommDomainExecution> domain_execution;
-    std::vector<CommSdmaOwnerInfoV1> domain_sdma_owners;
     std::unique_ptr<Runtime> runtime{std::make_unique<Runtime>()};
     uint64_t trace_hid{0};
     uint64_t trace_inv{0};

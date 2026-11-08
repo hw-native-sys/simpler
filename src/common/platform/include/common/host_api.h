@@ -17,8 +17,6 @@
 #include <utility>
 
 #include "common/chip_swimlane_extension.h"
-#include "platform_comm/comm_domain_use.h"
-#include "platform_comm/comm_sdma_owner.h"
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -26,25 +24,6 @@ struct HostMetadataRegion {
     void *device_target;
     const void *host_source;
     size_t bytes;
-};
-
-enum class HostAsyncRetainedOwner : uint32_t {
-    UNKNOWN = 0,
-    CALLER_BORROW = 1,
-    TEMPORARY = 2,
-    GM_HEAP = 3,
-    DOMAIN_WINDOW = 4,
-    DOMAIN_CONTEXT = 5,
-    DOMAIN_WORKSPACE = 6
-};
-
-// A read-only ownership answer, not permission for cache maintenance, DMA or
-// access to a communication domain. The existing run owner retains the bytes.
-struct HostAsyncRetainedSpan {
-    uint64_t base{0};
-    uint64_t bytes{0};
-    HostAsyncRetainedOwner owner_kind{HostAsyncRetainedOwner::UNKNOWN};
-    uint32_t reserved{0};
 };
 
 /**
@@ -313,18 +292,6 @@ struct HostApiOps {
     int (*stage_launch_metadata)(
         void *runner_ctx, uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count
     );
-    bool (*query_async_retained_span)(
-        void *runner_ctx, const void *run_owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch,
-        uint64_t address, uint64_t bytes, HostAsyncRetainedSpan *out
-    );
-    bool (*query_async_domain_context)(
-        void *runner_ctx, const void *run_owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch,
-        uint64_t device_context, CommDomainSnapshot *out, CommDomainExecution *execution
-    );
-    bool (*query_async_sdma_owner)(
-        void *runner_ctx, const void *run_owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch,
-        uint64_t device_context, CommSdmaOwnerInfoV1 *out
-    );
 };
 
 /**
@@ -356,58 +323,19 @@ public:
     // prewarm callers without a run retain the runner-query fallback.
     HostApi(
         void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops,
-        std::optional<DiagnosticConfig> diagnostics = std::nullopt, const void *run_owner = nullptr
+        std::optional<DiagnosticConfig> diagnostics = std::nullopt
     ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
         arena_bank_(arena_bank),
         run_epoch_(run_epoch),
         ops_(ops),
-        diagnostics_(diagnostics),
-        run_owner_(run_owner) {}
+        diagnostics_(diagnostics) {}
 
     // The epoch this run was given. Runtimes that build their own swimlane
     // record streams stamp it into each row: per-task tokens restart every run,
     // so a row without it cannot be attributed once one file holds several runs.
     uint64_t run_epoch() const { return run_epoch_; }
-
-    // Borrowed API: call synchronously during native preparation, under the
-    // caller's phase-serialization/storage-lifetime contract. A copy does not
-    // pin the owner and must not race finalize/destroy. Sequential stale-owner
-    // and registration/prewarm queries refuse and clear the answer.
-    bool query_async_retained_span(uint64_t address, uint64_t bytes, HostAsyncRetainedSpan *out) const {
-        if (out != nullptr) *out = {};
-        return out != nullptr && run_owner_ != nullptr && ops_ != nullptr &&
-               ops_->query_async_retained_span != nullptr &&
-               ops_->query_async_retained_span(
-                   runner_ctx_, run_owner_, pipeline_slot_, arena_bank_, run_epoch_, address, bytes, out
-               );
-    }
-
-    // The same borrowed preparation lifetime as query_async_retained_span.
-    // Execution qualification comes from the native owner, independently of
-    // retention, cache visibility and legal SDMA completion-record geometry.
-    bool query_async_domain_context(
-        uint64_t device_context, CommDomainSnapshot *out, CommDomainExecution *execution = nullptr
-    ) const {
-        if (out != nullptr) *out = {};
-        if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
-        return out != nullptr && run_owner_ != nullptr && ops_ != nullptr &&
-               ops_->query_async_domain_context != nullptr &&
-               ops_->query_async_domain_context(
-                   runner_ctx_, run_owner_, pipeline_slot_, arena_bank_, run_epoch_, device_context, out, execution
-               );
-    }
-
-    // Existing selected owner's immutable allocation-time SDK access/q contract.
-    // No retained reference, cache proof or public completion-record span is added.
-    bool query_async_sdma_owner(uint64_t device_context, CommSdmaOwnerInfoV1 *out) const {
-        if (out != nullptr) *out = {};
-        return out != nullptr && run_owner_ != nullptr && ops_ != nullptr && ops_->query_async_sdma_owner != nullptr &&
-               ops_->query_async_sdma_owner(
-                   runner_ctx_, run_owner_, pipeline_slot_, arena_bank_, run_epoch_, device_context, out
-               );
-    }
 
     void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
     void device_free(void *dev_ptr) const { ops_->device_free(runner_ctx_, dev_ptr); }
@@ -657,5 +585,4 @@ private:
     uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
     std::optional<DiagnosticConfig> diagnostics_;
-    const void *run_owner_{nullptr};
 };

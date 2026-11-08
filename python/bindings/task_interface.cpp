@@ -3765,23 +3765,21 @@ NB_MODULE(_task_interface, m) {
                uint32_t slot_id, uint64_t generation, uint64_t run_id, uint64_t dispatch_id,
                uint64_t accepted_state_addr, int32_t accepted_value, bool activated, nb::bytes owner_instance_id,
                uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot, uint32_t group_index,
-               uint32_t group_size, nb::object domain_uses) {
+               uint32_t group_size) {
                 const NativeRunProvenance provenance = make_run_provenance(
                     owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
                 );
-                const auto selected_domains = parse_comm_domain_uses(domain_uses);
                 nb::gil_scoped_release release;
                 return self.submit_chip_run(
                     callable_id, args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
-                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated, provenance,
-                    selected_domains
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated, provenance
                 );
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
             nb::arg("run_id"), nb::arg("dispatch_id"), nb::arg("accepted_state_addr"), nb::arg("accepted_value"),
             nb::arg("activated"), nb::arg("owner_instance_id") = nb::bytes(""), nb::arg("chip_rank") = 0,
             nb::arg("capture_index") = 0, nb::arg("task_slot") = 0, nb::arg("group_index") = 0,
-            nb::arg("group_size") = 0, nb::arg("domain_uses") = nb::none(),
+            nb::arg("group_size") = 0,
             "Submit materialized task args to the chip native-run lane. The provenance arguments name the "
             "submission a diagnostic artifact belongs to; an empty owner_instance_id states none. The nonce is "
             "copied into the POD under the GIL, which the submission itself then releases."
@@ -3800,15 +3798,13 @@ NB_MODULE(_task_interface, m) {
         .def(
             "_submit_chip_run_direct",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-               uintptr_t caller_stream, nb::object domain_uses) {
-                const auto selected_domains = parse_comm_domain_uses(domain_uses);
+               uintptr_t caller_stream) {
                 nb::gil_scoped_release release;
                 return self.submit_chip_run(
-                    callable_id, args, config, nullptr, 0, reinterpret_cast<void *>(caller_stream), selected_domains
+                    callable_id, args, config, nullptr, 0, reinterpret_cast<void *>(caller_stream)
                 );
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream") = 0,
-            nb::arg("domain_uses") = nb::none(),
             "Submit materialized task args to the chip native-run lane without a pipeline lease and return the live "
             "run. The lane follows the runtime PipelineContract: compatible runs admit one active plus one prepared "
             "successor; otherwise this call drains its predecessor before admitting. With caller_stream, "

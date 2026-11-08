@@ -87,7 +87,6 @@ struct DomainAllocation {
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
-    CommContext published_context{};    // Host copy of the exact successful device publication.
 };
 
 static_assert(sizeof(CommGlobalDomainDescriptor) == 288, "global domain descriptor ABI changed");
@@ -1065,7 +1064,6 @@ static int domain_alloc_via_ipc(
         LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(status));
         return -1;
     }
-    out->published_context = ctx;
     return 0;
 }
 
@@ -1271,7 +1269,6 @@ static FabricAttempt domain_alloc_via_fabric(
         LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
         return FabricAttempt::kError;
     }
-    out->published_context = ctx;
     return FabricAttempt::kSuccess;
 }
 
@@ -1689,7 +1686,6 @@ extern "C" int comm_global_domain_import(
     }
     allocation->peer_windows = std::move(peer_windows);
     allocation->device_ctx = static_cast<CommContext *>(device_ctx);
-    allocation->published_context = ctx;
     *device_ctx_out = reinterpret_cast<uint64_t>(device_ctx);
     return 0;
 } catch (const std::exception &e) {
@@ -1697,38 +1693,6 @@ extern "C" int comm_global_domain_import(
     return -1;
 } catch (...) {
     LOG_ERROR("[global domain] import unknown exception");
-    return -1;
-}
-
-extern "C" int comm_query_domain_snapshot(CommHandle h, uint64_t allocation_id, CommDomainSnapshot *out) {
-    if (out != nullptr) *out = {};
-    if (h == nullptr || out == nullptr) return -1;
-    const auto found = h->domain_allocations.find(allocation_id);
-    if (found == h->domain_allocations.end()) return -1;
-    const auto &allocation = *found->second;
-    if (!allocation.initialized || allocation.release_failed || allocation.device_ctx == nullptr ||
-        !allocation.local_window.mapped || allocation.local_window.base == nullptr)
-        return -1;
-    out->use = {CommDomainKind::LOCAL, 0, allocation_id, reinterpret_cast<uint64_t>(allocation.device_ctx)};
-    out->context = allocation.published_context;
-    return 0;
-}
-
-extern "C" int comm_query_global_domain_snapshot(uint64_t domain_id, CommDomainSnapshot *out) try {
-    if (out != nullptr) *out = {};
-    if (out == nullptr || domain_id == 0) return -1;
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
-    const auto found = global_domain_allocations.find(domain_id);
-    if (found == global_domain_allocations.end()) return -1;
-    const auto &allocation = *found->second;
-    if (allocation.release_failed || allocation.device_ctx == nullptr || !allocation.local_window.mapped ||
-        allocation.local_window.base == nullptr)
-        return -1;
-    out->use = {CommDomainKind::GLOBAL, 0, domain_id, reinterpret_cast<uint64_t>(allocation.device_ctx)};
-    out->context = allocation.published_context;
-    return 0;
-} catch (...) {
-    if (out != nullptr) *out = {};
     return -1;
 }
 

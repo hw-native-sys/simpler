@@ -77,9 +77,6 @@
 #include "runtime.h"
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
-struct HostAsyncRetainedSpan;
-struct CommDomainSnapshot;
-enum class CommDomainExecution : uint32_t;
 
 // Width sim resolves the CallConfig "auto" sentinel to, deliberately below
 // PLATFORM_MAX_BLOCKDIM (24 on a2a3, 36 on a5). The simulator runs one OS
@@ -369,14 +366,6 @@ public:
     int free_caller_buffer(void *dev_ptr);
 
     bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count);
-    bool query_async_retained_span(
-        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, uint64_t address,
-        uint64_t bytes, HostAsyncRetainedSpan *out
-    ) const;
-    bool query_async_domain_context(
-        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, uint64_t device_context,
-        CommDomainSnapshot *out, CommDomainExecution *execution, CommSdmaOwnerInfoV1 *sdma_owner = nullptr
-    ) const;
     void release_caller_buffers(uint64_t identity, bool keep);
     /**
      * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
@@ -544,14 +533,6 @@ public:
      * Record whether this Worker asked for an async-DMA workspace.
      */
     void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
-    // A full CPU-thread join is a whole-run stop proof only when no separate
-    // engine was requested or provisioned on this simulated device context.
-    bool independent_dma_configured() const {
-        if (sdma_requested_ || dma_workspace_handle_ != nullptr) return true;
-        for (uint64_t address : dma_workspace_addr_)
-            if (address != 0) return true;
-        return false;
-    }
     int ensure_dma_workspace_provisioned();
     int device_id() const { return device_id_; }
 

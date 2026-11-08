@@ -28,17 +28,8 @@ namespace {
 constexpr uint64_t kEpoch = 47;
 
 struct ExecutionBackend {
-    bool allow_registration{true};
     bool ready{false};
     uint32_t observations{0};
-    bool validate_registration(
-        const SchedulerAsyncGroupIdentity &identity, uint32_t index, const DeferredCompletionEntry &entry
-    ) {
-        if (!allow_registration || identity.run_epoch != kEpoch || index != 0 || entry.addr != 0x8000 ||
-            entry.backend_cookie != 0)
-            return false;
-        return true;
-    }
     SchedulerAsyncConditionOutcome
     observe_once(const SchedulerAsyncGroupIdentity &, uint32_t, const DeferredCompletionEntry &) {
         ++observations;
@@ -154,16 +145,14 @@ struct ExecutionFixture {
             EXPECT_NE(payload->local_context.async_ctx.completion_count, nullptr);
             auto &ctx = payload->local_context.async_ctx;
             auto &entry = *ctx.completion_entries;
-            entry.addr = 0x8000;
+            entry.addr = condition_address;
             entry.expected_value = 1;
             entry.engine = COMPLETION_ENGINE_SDMA;
             entry.completion_type = COMPLETION_TYPE_COUNTER;
             entry.backend_cookie = 0;
             *ctx.completion_count = 1;
         }
-        if (!scheduler_async_execution_returned(
-                &execution_states[worker], graph.graph(), base(), local, run(), slot, backend
-            ))
+        if (!scheduler_async_execution_returned(&execution_states[worker], graph.graph(), base(), local, run(), slot))
             return false;
         local->local_completed_generations[slot] = state.generation;
         *slot_out = slot;
@@ -199,6 +188,7 @@ struct ExecutionFixture {
     std::array<SchedulerAsyncDiscoveryState, 6> discovery{};
     std::array<SchedulerAsyncExecutionState<ExecutionBackend>, 6> execution_states{};
     ExecutionBackend backend;
+    uint64_t condition_address{0x8000};
     uint64_t predicate{0};
 };
 
@@ -337,9 +327,9 @@ TEST(HbgAsyncExecution, GrantedPermitSuppressesServiceAndOneIterationHasOnlyOneS
     ASSERT_TRUE(service());
     EXPECT_EQ(fixture.backend.observations, 0u);
     EXPECT_FALSE(state.gate.spent);
-    ASSERT_TRUE(scheduler_async_execution_returned(
-        &state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, fixture.backend
-    ));
+    ASSERT_TRUE(
+        scheduler_async_execution_returned(&state, fixture.graph.graph(), fixture.base(), local, fixture.run(), slot)
+    );
     local->local_completed_generations[slot] = local->slots[slot].generation;
     ASSERT_TRUE(fixture.retire(3));
     ASSERT_TRUE(service());
@@ -382,7 +372,7 @@ TEST(HbgAsyncExecution, PredicateSkipSealsAnEmptyGroupBeforeRelease) {
 TEST(HbgAsyncExecution, SealFailureDoesNotPublishExecutionReleaseOrSuccess) {
     ExecutionFixture fixture(1, LaneMask::aic());
     ASSERT_TRUE(fixture.fill(0));
-    fixture.backend.allow_registration = false;
+    fixture.condition_address = 0;
     uint32_t slot = 0;
     EXPECT_FALSE(fixture.begin(0, &slot, true));
     EXPECT_NE(scheduler_read_error(fixture.run()), 0);

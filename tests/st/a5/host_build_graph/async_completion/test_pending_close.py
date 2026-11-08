@@ -10,7 +10,7 @@
 
 import pytest
 
-from .helpers import Case, CounterRunner, Scenario, error_log_cursor, failure_evidence, l3_case
+from .helpers import Case, CounterRunner, Scenario, close_after_failure, error_log_cursor, failure_evidence, l3_case
 
 pytestmark = [
     pytest.mark.platforms(["a5sim", "a5"]),
@@ -38,8 +38,10 @@ def test_never_satisfied_condition_cannot_report_success(st_platform, st_device_
     monkeypatch.setenv("SIMPLER_OP_EXECUTE_TIMEOUT_US", "3000000")
     monkeypatch.setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "5000")
     case = Case(scenario=Scenario.NEVER)
-    with CounterRunner(st_platform, st_device_ids, tmp_path, case) as runner:
+    runner = CounterRunner(st_platform, st_device_ids, tmp_path, case)
+    try:
         runner.require_support()
+        domain = runner.worker.live_domains["async_completion_contract"]
         capfd.readouterr()
         cursor = error_log_cursor()
         with pytest.raises(RuntimeError) as failure:
@@ -50,3 +52,6 @@ def test_never_satisfied_condition_cannot_report_success(st_platform, st_device_
         assert "SCHEDULER_TIMEOUT" in evidence, evidence
         consumer = runner.slots
         assert int(runner.records[consumer, 0]) == 0, "consumer executed despite an unsatisfied condition"
+    finally:
+        close_after_failure(runner.worker)
+    assert not domain.freed, "failed async run released a domain with unconfirmed external access"

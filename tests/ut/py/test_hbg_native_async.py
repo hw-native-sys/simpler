@@ -43,7 +43,7 @@ def add_async(raw, identities, refs=(0,), *, empty=False, ready_first=True):
         if claim is not None and claim["published_before"][1]:
             claim["published_before"][0] += 1
             claim["published_after"][0] += 2
-    raw["schema"] = "hbg-native-protocol-v11" if "node_map" in raw else "hbg-native-protocol-v10"
+    raw["schema"] = "hbg-native-protocol-v13" if "node_map" in raw else "hbg-native-protocol-v12"
     asynchronous: dict[str, Any] = dict(group_count=0, finish_count=0, groups=[], releases=[], finishes=[])
     raw["async"] = asynchronous
 
@@ -76,7 +76,7 @@ def add_async(raw, identities, refs=(0,), *, empty=False, ready_first=True):
                     lease_word=8 if empty else (7 << 3) | 3,
                     capacity=4,
                     registered_count=0 if empty else 1,
-                    conditions=[] if empty else [dict(index=0, type=0, binding_index=0, owner_generation=None)],
+                    conditions=[] if empty else [dict(index=0, type=0)],
                     state="EMPTY" if empty else "READY",
                     sealed=stamp(execution["worker_index"], execution[previous][0] + 1),
                     terminal=None if empty else stamp(done["worker_index"], end + (2 if ready_first else 8)),
@@ -152,10 +152,6 @@ def test_async_join_handles_empty_mix_spmd_and_either_ready_release_order(mask, 
 
 def test_async_without_binding_side_table_keeps_completion_causality():
     raw, identities = async_capture()
-    for group in raw["async"]["groups"]:
-        for condition in group["conditions"]:
-            condition["binding_index"] = None
-            condition["owner_generation"] = None
     read_native_protocol(raw)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     raw["async"]["groups"][0]["terminal"] = None
@@ -259,7 +255,6 @@ def test_dense_immutable_tables_reject_truncation(table, count):
         "empty_with_conditions",
         "pending_exceeds_slices",
         "unknown_type",
-        "unbound",
         "missing_release_point",
         "drained_before_done",
         "ready_after_done",
@@ -291,7 +286,6 @@ def test_complete_sequences_do_not_hide_async_protocol_corruption(mutation):
         "empty_with_conditions": (group, "state", "EMPTY"),
         "pending_exceeds_slices": (group, "pending_count", 4),
         "unknown_type": (group["conditions"][0], "type", 9),
-        "unbound": (group["conditions"][0], "binding_index", (1 << 64) - 1),
         "missing_release_point": (release, "publication", None),
         "drained_before_done": (finish["drained"]["at"], 0, done["before"][0] - 1),
         "ready_after_done": (group["terminal"]["at"], 0, done["after"][0] + 1),
@@ -319,12 +313,21 @@ def test_complete_sequences_do_not_hide_async_protocol_corruption(mutation):
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("value", (0, True, -1, 1 << 64, "1"))
-def test_allocation_generation_is_positive_or_explicitly_unavailable(value):
+@pytest.mark.parametrize("field", ("binding_index", "owner_generation"))
+def test_current_schema_has_no_resource_binding_fields(field):
     raw, _ = async_capture()
-    raw["async"]["groups"][0]["conditions"][0]["owner_generation"] = value
-    with pytest.raises(ValueError, match="owner_generation"):
+    raw["async"]["groups"][0]["conditions"][0][field] = None
+    with pytest.raises(ValueError, match="missing or unknown fields"):
         read_native_protocol(raw)
+
+
+def test_historical_async_capture_is_read_without_resource_validation():
+    raw, identities = async_capture()
+    raw["schema"] = "hbg-native-protocol-v10"
+    for group in raw["async"]["groups"]:
+        for condition in group["conditions"]:
+            condition.update(binding_index=None, owner_generation=None)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
 
 
 @pytest.mark.parametrize("path", ("root", "async", "group", "condition", "point", "finish", "release", "interval"))
@@ -359,7 +362,7 @@ def test_ordinary_task_worker_assumption_is_preserved_without_async_coverage():
     raw, identities = ProtocolBuilder([(2, 1, ())]).run()
     _add_claim_seal_certificates(raw, identities)
     _isolated_close_seals(raw)
-    raw.update(schema="hbg-native-protocol-v10")
+    raw.update(schema="hbg-native-protocol-v12")
     raw["async"] = dict(group_count=0, finish_count=0, groups=[], releases=[], finishes=[])
     raw["task_events"][0]["completion"]["worker_index"] = 2
     resequence(raw)
@@ -445,19 +448,18 @@ def test_async_points_never_fabricate_unavailable_or_foreign_evidence(mutation):
         audit_protocol_sequences(raw)
 
 
-def test_different_conditions_may_share_a_binding_within_execution_scope():
+def test_different_condition_types_share_one_execution_scope():
     raw, identities = async_capture()
     group = raw["async"]["groups"][0]
-    group["conditions"].append(dict(index=1, type=1, binding_index=0, owner_generation=None))
+    group["conditions"].append(dict(index=1, type=1))
     group.update(registered_count=2, observations=2)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
 
 
-def test_lease_generation_is_independent_of_dispatch_and_positive_resource_generation():
+def test_lease_generation_is_independent_of_dispatch_generation():
     raw, identities = async_capture()
     group = raw["async"]["groups"][0]
     assert group["lease_word"] >> 3 != group["dispatch_generation"]
-    group["conditions"][0]["owner_generation"] = 27
     assert audit_native_protocol(raw, identities)["protocol_verified"]
 
 

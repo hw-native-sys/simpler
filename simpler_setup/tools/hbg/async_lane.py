@@ -19,8 +19,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .native_async import summarize_async_protocol
-from .native_protocol import has_async_protocol, read_native_protocol
+from . import native_protocol
+from .native_async import async_summary_counts
 
 _CLOCK_NOTE = "Each endpoint uses its recorded worker clock; link lengths are not elapsed or busy time."
 _GROUP_PENDING_NOTE = "PENDING service slices, including acquire and budget yields; not a count of unmet counter reads."
@@ -34,9 +34,11 @@ def project_async_protocol(protocol, to_us, *, protocol_verified=False) -> dict[
     ``to_us(worker_index, cycles)`` is the capture's actual clock-placement
     callback. This function never subtracts endpoints, invents missing stamps,
     or turns the aggregate pending count into per-observation events.
+    ``protocol_verified=True`` requires a successful audit of this unchanged input.
     """
-    read_native_protocol(protocol)
-    if not has_async_protocol(protocol):
+    if not protocol_verified:
+        native_protocol.read_native_protocol(protocol)
+    if not native_protocol.has_async_protocol(protocol):
         return None
     raw = protocol["async"]
     epoch = protocol["run_epoch"]
@@ -160,9 +162,7 @@ def project_async_protocol(protocol, to_us, *, protocol_verified=False) -> dict[
             if release_ref == ref:
                 link("release_lower_bound_to_logical_done_upper_bound", f"release-join:{ref}:{block}", first, after)
 
-    captured_summary = summarize_async_protocol(protocol)
-    assert captured_summary is not None
-    summary: dict[str, Any] = dict(captured_summary)
+    summary: dict[str, Any] = async_summary_counts(raw)
     summary.update(
         protocol_verified=bool(protocol_verified),
         clock_note=_CLOCK_NOTE,

@@ -21,11 +21,9 @@
 
 using SchedulerAsyncCapabilities = std::array<CoreAsyncCapability, 3>;
 
-// Optional backend declarations share the run's retained scheduler allocation.
+// Queue guards and diagnostic records share the retained scheduler allocation.
 struct SchedulerAsyncAuxiliaryBytes {
-    uint64_t backend{0};
     uint64_t sdma_guard_count{0};
-    uint64_t execution_contract{HBG_ASYNC_CONTRACT_UNQUALIFIED};
     bool diagnostics{false};
 };
 

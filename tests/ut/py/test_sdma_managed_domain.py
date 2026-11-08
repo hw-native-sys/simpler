@@ -9,6 +9,7 @@
 
 import ctypes
 import struct
+from contextlib import nullcontext
 from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
 from typing import Any, cast
@@ -16,6 +17,7 @@ from typing import Any, cast
 import pytest
 import simpler.worker as worker_mod
 from simpler.comm_domain import DomainConfig
+from simpler.orchestrator import Orchestrator, _callback_run
 from simpler.worker import Worker
 
 
@@ -48,6 +50,32 @@ def test_managed_contract_refuses_non_a5_before_allocation():
     worker = cast(Worker, SimpleNamespace(level=3, _config={"device_ids": (0, 1), "platform": "a2a3sim"}))
     with pytest.raises(ValueError, match="requires A5"):
         Worker._domain_config(worker, (0, 1), 128, (), True, ("sdma",), 1)
+
+
+@pytest.mark.parametrize("method", ["allocate_domain", "get_or_allocate_domain"])
+@pytest.mark.parametrize("queues", [None, 2], ids=["legacy", "multi-queue"])
+def test_public_orchestration_preserves_sdk_queue_configuration(monkeypatch, method, queues):
+    worker = Worker(level=3, platform="a5", runtime="host_build_graph", device_ids=[0, 1])
+    monkeypatch.setattr(worker, "_building_run_resources", object())
+    monkeypatch.setattr(worker, "_control_admission", lambda _api: nullcontext())
+    allocated = []
+
+    class AllocationReached(Exception):
+        pass
+
+    def allocate(**request):
+        allocated.append(request)
+        raise AllocationReached
+
+    # Exercise the public API and real configuration validation without touching hardware.
+    monkeypatch.setattr(worker, "_allocate_domain", allocate)
+    orch = Orchestrator(cast(Any, None), worker)
+    with _callback_run(1, worker), pytest.raises(AllocationReached):
+        getattr(orch, method)(
+            name="queues", members=[0, 1], window_size=128, workspace_engines=("sdma",), sdma_sdk_queue_num=queues
+        )
+    assert allocated[0]["sdma_sdk_queue_num"] == queues
+    assert allocated[0]["workspace_mask"] == 1
 
 
 def request_bytes(**changes):

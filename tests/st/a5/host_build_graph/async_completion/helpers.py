@@ -201,7 +201,7 @@ def _counter_callable_spec():
                 "core_type": core,
                 "signature": [D.INOUT] * (2 if index == 10 else 5),
                 # Zero-condition invocations retain this source-level bound;
-                # the 65-condition case must still exceed the declared 64 slots.
+                # the 65-condition case must still exceed the explicit_capability 64 slots.
                 "async_capability": {
                     "mode": "DEFERRED",
                     "max_conditions": 1 if index == 10 else CONDITION_LIMIT,
@@ -397,7 +397,7 @@ class CounterRunner:
 
 
 @cache
-def compile_sdma(platform: str, *, declared: bool = True):
+def compile_sdma(platform: str, *, explicit_capability: bool = True):
     spec = {
         "orchestration": {
             "source": str(HERE / "kernels/orchestration/sdma.cpp"),
@@ -422,21 +422,21 @@ def compile_sdma(platform: str, *, declared: bool = True):
             for index, source in enumerate(("sdma_submit.cpp", "sdma_consumer.cpp", "sdma_probe.cpp"))
         ],
     }
-    if not declared:
-        spec["orchestration"].update(
-            function_name="unannotated_orchestration_entry", config_name="aicpu_orchestration_config"
-        )
+    if not explicit_capability:
         spec["incores"][0]["source"] = str(HERE / "kernels/aiv/sdma_submit_unannotated.cpp")
         for kernel in spec["incores"]:
             kernel.pop("async_capability")
     return compile_chip_callable_spec(
-        spec, platform, "host_build_graph", (str(HERE), platform, "sdma", declared, _pto_isa_compile_cache_token())
+        spec,
+        platform,
+        "host_build_graph",
+        (str(HERE), platform, "sdma", explicit_capability, _pto_isa_compile_cache_token()),
     )
 
 
-def run_sdma(platform: str, devices: list[int], directory: Path, elements: int, *, declared: bool = True):
+def run_sdma(platform: str, devices: list[int], directory: Path, elements: int, *, explicit_capability: bool = True):
     assert len(devices) >= 2, "real peer SDMA requires two assigned devices"
-    compiled = compile_sdma(platform, declared=declared)
+    compiled = compile_sdma(platform, explicit_capability=explicit_capability)
     # CommDomain buffers are 64-byte aligned; leave at least 32 guard elements.
     allocated = ((elements + 32 + 15) // 16) * 16
     sources = [

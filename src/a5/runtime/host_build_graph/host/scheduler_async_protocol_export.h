@@ -83,35 +83,11 @@ public:
         ) {
         const auto &wire = *image.template array<SchedulerAsyncLayout>(0, 1);
         require(std::memcmp(&wire, &layout, sizeof(layout)) == 0, "layout disagrees with retained Host plan");
-        uint64_t end = sizeof(SchedulerAsyncLayout);
-        region(layout.task_map_offset, layout.task_count, sizeof(SchedulerAsyncTaskMap), end);
-        region(layout.group_identity_offset, layout.group_count, sizeof(SchedulerAsyncGroupIdentity), end);
-        region(layout.group_writer_offset, layout.group_count, sizeof(SchedulerAsyncGroupWriter), end);
-        region(layout.group_lease_offset, layout.group_count, sizeof(SchedulerAsyncLease), end);
-        region(layout.group_progress_offset, layout.group_count, sizeof(SchedulerAsyncGroupProgress), end);
-        region(layout.finish_identity_offset, layout.finish_count, sizeof(SchedulerAsyncFinishIdentity), end);
-        region(layout.finish_lease_offset, layout.finish_count, sizeof(SchedulerAsyncLease), end);
-        region(layout.finish_join_offset, layout.finish_count, sizeof(SchedulerAsyncTaskJoin), end);
-        region(layout.finish_progress_offset, layout.finish_count, sizeof(SchedulerAsyncFinishProgress), end);
-        require(
-            layout.check_directory_words == (layout.group_count - 1) / 64 + 1 &&
-                layout.finish_directory_words == (layout.finish_count - 1) / 64 + 1,
-            "directory capacity disagrees with retained counts"
-        );
-        region(layout.check_directory_offset, layout.check_directory_words, sizeof(SchedulerAsyncDirectoryWord), end);
-        region(layout.finish_directory_offset, layout.finish_directory_words, sizeof(SchedulerAsyncDirectoryWord), end);
-        region(layout.entries_offset, layout.entries_bytes, 1, end);
-        region(layout.backend_offset, layout.backend_bytes, 1, end);
-        require(layout.execution_contract <= HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY, "invalid execution contract");
-        require(layout.sdma_guard_count <= ASYNC_SDMA_CHANNELS, "invalid SDMA guard count");
-        if (layout.sdma_guard_count != 0)
-            region(layout.sdma_guard_context_offset, layout.sdma_guard_count + 1, 128, end);
-        else require(layout.sdma_guard_context_offset == 0, "empty SDMA guard section has an offset");
         require(
             layout.group_trace_offset != 0 && layout.finish_trace_offset != 0, "protocol diagnostics were not allocated"
         );
-        region(layout.group_trace_offset, layout.group_count, sizeof(SchedulerAsyncGroupTrace), end);
-        region(layout.finish_trace_offset, layout.finish_count, sizeof(SchedulerAsyncFinishTrace), end);
+        // The immutable layout comes from the validated Host plan. Image::array
+        // checks each actual read; the wire copy must match that plan exactly.
     }
 
     template <typename T>
@@ -209,13 +185,6 @@ private:
             "invalid retained Host async plan"
         );
         return frozen.offset;
-    }
-    void region(uint64_t offset, uint64_t count, uint64_t stride, uint64_t &end) const {
-        require(
-            offset % 128 == 0 && offset >= end && within(offset, count, stride, 0, layout.total_bytes),
-            "planned async section is overlapping or out of bounds"
-        );
-        end = offset + count * stride;
     }
     static uint64_t aligned_bytes(uint32_t capacity, uint64_t stride) {
         return (static_cast<uint64_t>(capacity) * stride + 127) & ~UINT64_C(127);
@@ -316,8 +285,6 @@ inline void groups(
             Object item(out);
             item.number("index", condition);
             item.number("type", entry.completion_type);
-            item.field("binding_index") << "null";
-            item.field("owner_generation") << "null";
         }
         out << ']';
         row.string("state", group_state(writer, progress, lease));

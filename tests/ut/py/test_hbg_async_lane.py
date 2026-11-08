@@ -21,6 +21,7 @@ from test_hbg_native_graph import native_capture
 from test_swimlane_converter import _write_hbg_l3_rank
 
 from simpler_setup.tools import swimlane_converter as sc
+from simpler_setup.tools.hbg import native_protocol
 from simpler_setup.tools.hbg.native_protocol import STAMPS, _event_records
 
 
@@ -69,6 +70,30 @@ def points(trace):
     return [event for event in trace["traceEvents"] if event.get("cat") == "hbg_async"]
 
 
+def test_converter_validates_each_capture_once(monkeypatch):
+    original = native_protocol.read_native_protocol
+    calls = []
+
+    def read(section):
+        calls.append(section)
+        return original(section)
+
+    monkeypatch.setattr(native_protocol, "read_native_protocol", read)
+    raw = wire_capture()
+    trace, _ = trace_for(raw)
+    assert points(trace)
+    assert calls == [raw["aicore_protocol"]]
+
+
+def test_standalone_projection_still_validates_structure():
+    from simpler_setup.tools.hbg.async_lane import project_async_protocol  # noqa: PLC0415
+
+    raw, _ = async_capture()
+    raw["async"]["groups"].clear()
+    with pytest.raises(ValueError, match="table length"):
+        project_async_protocol(raw, lambda _worker, cycles: cycles)
+
+
 def test_success_draws_all_recorded_boundaries_and_keeps_business_rows():
     raw = wire_capture()
     trace, decoded = trace_for(raw)
@@ -87,7 +112,7 @@ def test_success_draws_all_recorded_boundaries_and_keeps_business_rows():
     assert terminal["args"]["capture_pending_count"] == 2
     assert terminal["args"]["capture_observations"] == 1
     assert terminal["args"]["capture_active_cycles"] == 17
-    assert terminal["args"]["conditions"][0]["owner_generation"] is None
+    assert "owner_generation" not in terminal["args"]["conditions"][0]
     assert terminal["args"]["condition_types"] == ["COUNTER"]
     assert "acquire" in terminal["args"]["pending_count_meaning"]
     assert terminal["args"]["capture_lease_generation"] == 7
@@ -138,15 +163,13 @@ def test_empty_group_has_a_real_seal_but_no_invented_check_terminal():
     assert not any(event.get("name") == "logical_wait_endpoints" for event in trace["traceEvents"])
 
 
-def test_graph_public_ids_and_resource_generation_remain_distinct():
+def test_graph_public_ids_remain_distinct_from_internal_task_refs():
     raw, identities = native_capture()
     add_async(raw, identities, refs=(2,))
-    raw["async"]["groups"][0]["conditions"][0]["owner_generation"] = 37
     trace, _ = trace_for(wire_capture(raw, identities))
     sealed = next(event for event in points(trace) if event["name"] == "registration_sealed")
     assert sealed["args"]["task_ref"] == 2
     assert sealed["args"]["task_id"] == (1 << 62) | (1 << 32)
-    assert sealed["args"]["conditions"][0]["owner_generation"] == 37
 
 
 def test_standard_converter_still_rejects_partial_and_failed_native_protocol():
@@ -186,7 +209,7 @@ def test_explicit_projection_preserves_partial_zero_and_null_evidence():
     assert "registration_sealed" in names and "execution_release.before" in names
     assert "execution_release.after" not in names and "resolve_drained" not in names
     assert "condition_failed" not in names  # A failure code alone is not a timestamp.
-    assert view["summary"]["groups"][0]["conditions"][0]["owner_generation"] is None
+    assert "owner_generation" not in view["summary"]["groups"][0]["conditions"][0]
     assert not view["links"]
 
 

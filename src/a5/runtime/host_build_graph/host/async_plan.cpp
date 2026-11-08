@@ -43,13 +43,11 @@ bool plan_async_layout(
 ) {
     if (out == nullptr || run_epoch == 0 || metadata.size() != capabilities.size() || metadata.size() > INT32_MAX)
         return fail(error, "async plan requires a live run epoch and matching capability rows");
-    if (auxiliary.sdma_guard_count > ASYNC_SDMA_CHANNELS ||
-        auxiliary.execution_contract > HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY)
+    if (auxiliary.sdma_guard_count > ASYNC_SDMA_CHANNELS)
         return fail(error, "async auxiliary configuration is invalid");
     SchedulerAsyncLayout layout{};
     layout.run_epoch = run_epoch;
     layout.task_count = metadata.size();
-    layout.execution_contract = auxiliary.execution_contract;
     uint64_t token_bytes = 0;
     for (size_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
@@ -91,7 +89,7 @@ bool plan_async_layout(
             return fail(error, "async group count overflows");
     }
     if (layout.group_count == 0) {
-        if (auxiliary.backend != 0 || auxiliary.sdma_guard_count != 0)
+        if (auxiliary.sdma_guard_count != 0)
             return fail(error, "synchronous plan cannot carry unowned async auxiliary storage");
         *out = layout;
         return true;
@@ -99,7 +97,6 @@ bool plan_async_layout(
     layout.check_directory_words = (layout.group_count + 63) / 64;
     layout.finish_directory_words = (layout.finish_count + 63) / 64;
     layout.entries_bytes = token_bytes;
-    layout.backend_bytes = auxiliary.backend;
     layout.sdma_guard_count = auxiliary.sdma_guard_count;
     uint64_t cursor = sizeof(SchedulerAsyncLayout);
     if (!reserve(layout.task_count, sizeof(SchedulerAsyncTaskMap), cursor, layout.task_map_offset) ||
@@ -118,7 +115,6 @@ bool plan_async_layout(
             layout.finish_directory_words, sizeof(SchedulerAsyncDirectoryWord), cursor, layout.finish_directory_offset
         ) ||
         !reserve(token_bytes, 1, cursor, layout.entries_offset) ||
-        !reserve(layout.backend_bytes, 1, cursor, layout.backend_offset) ||
         (layout.sdma_guard_count != 0 &&
          !reserve(layout.sdma_guard_count + 1, 128, cursor, layout.sdma_guard_context_offset)) ||
         (auxiliary.diagnostics &&
@@ -262,9 +258,7 @@ bool scheduler_initialize_async_state(
     const SchedulerAsyncLayout &layout, void *region, uint64_t region_bytes, std::string *error
 ) {
     SchedulerAsyncLayout expected{};
-    const SchedulerAsyncAuxiliaryBytes auxiliary{
-        layout.backend_bytes, layout.sdma_guard_count, layout.execution_contract, layout.group_trace_offset != 0
-    };
+    const SchedulerAsyncAuxiliaryBytes auxiliary{layout.sdma_guard_count, layout.group_trace_offset != 0};
     if (!plan_async_layout(metadata, capabilities, layout.run_epoch, layout.total_bytes, auxiliary, &expected, error))
         return false;
     if (std::memcmp(&expected, &layout, sizeof(layout)) != 0 || region_bytes < layout.total_bytes)

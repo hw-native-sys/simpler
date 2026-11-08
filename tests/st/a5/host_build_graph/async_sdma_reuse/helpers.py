@@ -178,7 +178,7 @@ def audit_capture(directory, posts, rows):
     raw = json.loads(files[0].read_text())
     decoded = read_perf_data(files[0])
     protocol = raw["aicore_protocol"]
-    assert protocol["schema"] == "hbg-native-protocol-v10"
+    assert protocol["schema"] == "hbg-native-protocol-v12"
     assert decoded["protocol_audit"]["protocol_verified"]
     assert protocol["scheduler_error"] == protocol["error_claimed"] == 0
     assert len(protocol["tasks"]) == len(protocol["executions"]) == len(decoded["tasks"]) == 2 * posts

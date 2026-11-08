@@ -46,24 +46,25 @@ struct SdmaRequestDescriptor {
     ScratchTileT scratch;
     __gm__ uint8_t *workspace;
     uint32_t sync_id;
+    uint32_t queue_num{1};
 };
 
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTget(
     const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
-    uint32_t sync_id = 0
+    uint32_t sync_id = 0, uint32_t queue_num = 1
 ) {
-    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TGET, dst,       src,
-                                                                     scratch,      workspace, sync_id};
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TGET, dst,     src,      scratch,
+                                                                     workspace,    sync_id, queue_num};
 }
 
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTput(
     const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
-    uint32_t sync_id = 0
+    uint32_t sync_id = 0, uint32_t queue_num = 1
 ) {
-    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TPUT, dst,       src,
-                                                                     scratch,      workspace, sync_id};
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TPUT, dst,     src,      scratch,
+                                                                     workspace,    sync_id, queue_num};
 }
 
 namespace pto2::detail {
@@ -135,7 +136,7 @@ inline __aicore__ bool sdma_kernel_submit(AsyncCtx &ctx, Descriptor &descriptor,
     return sdma_submit(
         ctx, descriptor.op, valid_shape, reinterpret_cast<uint64_t>(descriptor.workspace),
         reinterpret_cast<uint64_t>(descriptor.src.data()), reinterpret_cast<uint64_t>(descriptor.dst.data()), bytes,
-        static_cast<uint32_t>(get_block_idx()), backend, cache, sink
+        static_cast<uint32_t>(get_block_idx()), backend, cache, sink, SdmaSubmissionMetadata{}, descriptor.queue_num
     );
 #endif
 }

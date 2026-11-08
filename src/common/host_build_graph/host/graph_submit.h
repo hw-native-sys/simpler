@@ -16,7 +16,6 @@
 #include "host_build_graph/host/graph_recording.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/runtime_types.h"
-#include "host_build_graph/async_use_declaration.h"
 
 // What the Graph submit path offers the ordinary one. The traffic in this direction is
 // only the two questions the ordinary path has to ask on every submission -- "is this
@@ -31,11 +30,6 @@
 // The owner is part of the answer: a thread holding a recording for another orchestrator
 // is not recording for this one.
 GraphRecording *active_graph_recording(OrchestratorState *orch);
-
-// Validate an existing task's argument positions and retain its async-specific
-// declaration in this run's Host side map. A recording resolves SUB_TASK only
-// within its active Graph key; ordinary submissions resolve GLOBAL only.
-bool declare_async_use(OrchestratorState *orch, TaskId task, const AsyncUseDeclaration &use);
 
 // Record one sub-task while recording, without consuming a task-table
 // slot. Builds the task's metadata and materialized outputs exactly as

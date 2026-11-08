@@ -111,53 +111,6 @@ GraphRecording *active_graph_recording(OrchestratorState *orch) {
     return g_active_graph_recording;
 }
 
-bool declare_async_use(OrchestratorState *orch, TaskId task, const AsyncUseDeclaration &use) {
-    GraphHostState *state = graph_state_from(orch);
-    if (orch == nullptr || orch->is_fatal()) return false;
-    const auto refuse = [&]() {
-        orch->report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "async use declaration requires an already-submitted kernel and valid invocation argument positions"
-        );
-        return false;
-    };
-    if (state == nullptr || !task.is_valid() || task.local_id() < 0) return refuse();
-    GraphRecording *recording = active_graph_recording(orch);
-    uint32_t tensor_count = 0, scalar_count = 0;
-    const simpler::hbg::Tensor *tensors = nullptr;
-    uint64_t graph_key = 0;
-    if (recording != nullptr) {
-        if (task.space() != TaskId::Space::SUB_TASK || task.parent_id() != GRAPH_RECORD_NO_OWNING_GRAPH ||
-            task.local_id() >= recording->task_count)
-            return refuse();
-        const auto &record = recording->tasks[task.local_id()];
-        if (record.active_mask.is_empty()) return refuse();
-        tensor_count = static_cast<uint32_t>(record.tensor_count);
-        scalar_count = static_cast<uint32_t>(record.scalar_count);
-        tensors = recording->task_tensors(record);
-        graph_key = recording->graph_key;
-    } else {
-        if (!task.is_global() || task.local_id() >= orch->task_allocator.active_count()) return refuse();
-        const auto &slot = orch->sm_header->tasks.get_slot_state_by_task_id(task.local_id());
-        if (slot.task_kind != TaskKind::KERNEL || slot.active_mask.is_empty()) return refuse();
-        const auto &payload = slot.to_payload();
-        tensor_count = static_cast<uint32_t>(payload.tensor_count);
-        scalar_count = static_cast<uint32_t>(payload.scalar_count);
-        tensors = payload.tensor_data();
-    }
-    if (!async_use_declaration_valid(use, tensor_count, scalar_count) || tensors == nullptr ||
-        (async_use_is_counter(use.kind) && tensors[use.condition_arg].dtype != DataType::INT32))
-        return refuse();
-    std::scoped_lock lock(state->recording_mutex);
-    if (recording != nullptr &&
-        (g_active_graph_entry == nullptr || g_active_graph_entry->status() != GraphRecordingStatus::RECORDING ||
-         g_active_graph_entry->graph_key != graph_key))
-        return refuse();
-    if (!state->async_declarations) state->async_declarations = std::make_unique<AsyncHostDeclarations>();
-    if (!state->async_declarations->add(recording != nullptr, graph_key, task.local_id(), use)) return refuse();
-    return true;
-}
-
 namespace {
 
 // Which side an expectation came from. It reaches the log line only, so the two cases are
@@ -1032,7 +985,6 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
     GraphInflightRecording *entry_ptr = entry.get();
     // A fresh capture has no declarations until its own body submits them.
     // A cached/in-flight replay returned above and keeps its existing schema.
-    if (state->async_declarations) state->async_declarations->erase_graph(graph_key);
     state->inflight.emplace(graph_key, std::move(entry));
     state->inflight_count.store(state->inflight.size(), std::memory_order_release);
 
@@ -1101,7 +1053,6 @@ void OrchestratorState::graph_abort(void *recording_handle) {
     {
         std::scoped_lock lock(state->recording_mutex);
         entry->set_status(GraphRecordingStatus::FAILED);
-        if (state->async_declarations) state->async_declarations->erase_graph(entry->graph_key);
     }
     // The storage outlives the entry it was bound to, and graph_commit destroys the
     // entries, so leaving the pointer behind parks a stale one in thread_local state for

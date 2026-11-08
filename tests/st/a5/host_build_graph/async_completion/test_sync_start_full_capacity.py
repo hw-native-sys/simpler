@@ -49,7 +49,7 @@ def _assert_topology(protocol, capacity):
 
 def _qualify_full_cohort(directory, capacity):
     path, protocol, audit = _native_capture(directory)
-    assert protocol["schema"] == "hbg-native-protocol-v10"
+    assert protocol["schema"] == "hbg-native-protocol-v12"
     all_workers = _assert_topology(protocol, capacity)
     tasks = protocol["tasks"]
     main_tasks = [task for task in tasks if task["kernel_ids"] == [11, 9, 12]]

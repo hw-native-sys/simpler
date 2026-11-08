@@ -76,11 +76,6 @@
 // include call_config.h in their .cpp before calling / defining simpler_run.
 #ifdef __cplusplus
 struct CallConfig;
-struct CommDomainSnapshot;
-struct CommSdmaOwnerInfoV1;
-#else
-typedef struct CommDomainSnapshot CommDomainSnapshot;
-typedef struct CommSdmaOwnerInfoV1 CommSdmaOwnerInfoV1;
 #endif
 
 #ifdef __cplusplus
@@ -305,34 +300,6 @@ typedef enum NativeRunPreparePurpose { SIMPLER_PREPARE_EAGER = 0, SIMPLER_PREPAR
  * id remain diagnostic after admission. A non-null acceptance sink is written
  * only at the real kernel-launch marker.
  */
-/** Trusted Host-only provider borrowed from the submitting native run owner.
- * It is queried synchronously during preparation only. The provider resolves
- * selected domains against retained backend allocations and certifies its
- * execution qualification; the runtime checks returned structure and mode.
- * The production provider derives these facts from the actual chip lane and
- * backend owner. A custom provider must uphold the same contract. */
-typedef struct NativeRunDomainProvider {
-    uint32_t version;
-    uint32_t reserved;
-    void *owner;
-    int (*query)(
-        void *owner, uint64_t run_epoch, uint32_t pipeline_slot, size_t index, CommDomainSnapshot *out,
-        uint32_t *execution_qualification
-    );
-    size_t count;
-} NativeRunDomainProvider;
-
-/** Sized read-only extension. base.version is 2; all other base rules are
- * unchanged. The optional query copies existing workspace-owner configuration,
- * never binds or changes it. A missing callback supplies UNKNOWN, not q=1. */
-typedef struct NativeRunDomainProviderV2 {
-    NativeRunDomainProvider base;
-    int (*query_sdma_owner)(
-        void *owner, uint64_t run_epoch, uint32_t pipeline_slot, size_t index, CommSdmaOwnerInfoV1 *out,
-        size_t out_bytes
-    );
-} NativeRunDomainProviderV2;
-
 typedef struct NativeRunDescriptor {
     uint32_t pipeline_slot;
     uint32_t arena_bank;
@@ -1161,23 +1128,6 @@ int simpler_prepare_run(
     const NativeRunDescriptor *descriptor
 );
 
-/** Sized v1 Host-domain extension. The original NativeRunDescriptor layout and
- * simpler_prepare_run symbol stay unchanged. Both extents and provider version
- * are checked before reading either image. Missing support must be refused by
- * callers that selected domains, never silently retried without their owner. */
-int simpler_prepare_run_with_domains_v1(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
-    size_t provider_bytes
-);
-
-/** Read-only owner configuration extension; v1/Descriptor remain unchanged. */
-int simpler_prepare_run_with_domains_v2(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProviderV2 *provider,
-    size_t provider_bytes
-);
-
 /**
  * Return nonzero when non-diagnostic preparation may overlap the execution
  * claim held by a run in another pipeline slot.
@@ -1330,27 +1280,6 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * caller. This operation is required before a worker accepts any run.
  */
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs);
-
-enum {
-    SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN = 0,
-    SIMPLER_NATIVE_RUN_LAST_USE_PROVED = 1,
-};
-
-/** Optional v1 finalization result for this run's own accesses. The return code
- * preserves the original execution/cleanup result. PROVED independently states
- * that this run can submit no further work and its core/backend accesses ended,
- * and that its native cleanup and carrier destruction completed. It does not
- * prove another peer's accesses ended or replace the domain owner's release
- * protocol. Physical completion alone is insufficient on an unaudited backend.
- *
- * A non-null output is set to UNKNOWN before validation; a null output is
- * rejected without mutating the run. Missing support must be treated as UNKNOWN.
- * The backend captures proof while the carrier is live and publishes it only
- * after destruction, including when a semantic execution error is returned.
- */
-int simpler_finalize_run_with_last_use_v1(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs, uint32_t *out_proof
-);
 
 /**
  * Retain preparation backing independently of the original run. Call before

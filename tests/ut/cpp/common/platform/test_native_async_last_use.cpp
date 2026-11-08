@@ -56,19 +56,7 @@ enum class Result {
     ERROR_SHORT_PAYLOAD,
     ERROR_LONG_PAYLOAD
 };
-enum class Image {
-    SYNC,
-    DEFERRED,
-    BAD_VERSION,
-    OLD_EPOCH,
-    TRUNCATED,
-    LEGACY,
-    CORE_ONLY,
-    NO_DECLARATIONS,
-    BAD_CORE_VERSION,
-    OLD_CORE_EPOCH,
-    BAD_CONTRACT
-};
+enum class Image { SYNC, DEFERRED, BAD_VERSION, OLD_EPOCH, TRUNCATED, LEGACY };
 
 // Only submission and the device-produced bytes are faked. Retirement, drain,
 // native poll/wait/finalize, resource facts and the raw fatal-close gate below
@@ -111,8 +99,7 @@ public:
         prepared->scheduler_runtime_mode =
             image_ == Image::LEGACY ? SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH : SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING;
         prepared->resources_owned = true;
-        // Model a published async run even while public admission still refuses
-        // unqualified backends. Its image comes from the real Host planner.
+        // Model a published async run using the real Host planner.
         SchedulerTaskMetadata task{};
         task.flags = SCHEDULER_TASK_EXECUTABLE;
         task.active_mask = LaneMask::aiv0();
@@ -123,8 +110,6 @@ public:
                               CoreAsyncCapability{1, CoreAsyncMode::DEFERRED, 1, CORE_ASYNC_CONDITION_COUNTER};
         SchedulerAsyncHostPlan plan;
         SchedulerAsyncAuxiliaryBytes auxiliary{};
-        if (image_ == Image::CORE_ONLY || image_ == Image::BAD_CORE_VERSION || image_ == Image::OLD_CORE_EPOCH)
-            auxiliary.execution_contract = HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY;
         if (!scheduler_plan_async_state({task}, {capabilities}, identity.run_epoch, 1 << 20, auxiliary, &plan, nullptr))
             return PTO_RUNTIME_ERR_INTERNAL;
         const uint64_t summary_offset = sizeof(SchedulerRunControl);
@@ -143,10 +128,9 @@ public:
         if (!plan.image.empty()) {
             std::memcpy(static_cast<std::byte *>(host) + async_offset, plan.image.data(), plan.image.size());
             auto *layout = reinterpret_cast<SchedulerAsyncLayout *>(static_cast<std::byte *>(host) + async_offset);
-            if (image_ == Image::BAD_VERSION || image_ == Image::BAD_CORE_VERSION) ++layout->version;
-            if (image_ == Image::OLD_EPOCH || image_ == Image::OLD_CORE_EPOCH) --layout->run_epoch;
+            if (image_ == Image::BAD_VERSION) ++layout->version;
+            if (image_ == Image::OLD_EPOCH) --layout->run_epoch;
             if (image_ == Image::TRUNCATED) layout->total_bytes = UINT64_MAX;
-            if (image_ == Image::BAD_CONTRACT) layout->execution_contract = 2;
         }
         submission_storage_[slot]->retain_replay_evidence = true;
         const int rc = ensure_device_run_result_region(slot, identity.run_epoch, prepared->kernel_args);
@@ -244,20 +228,20 @@ TEST_F(NativeAdmissionTest, AsyncSuccessUsesActualA5PollRetirementAndReleasesNat
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
     );
     EXPECT_EQ(simpler_wait_run(&runner, attempt.storage), 0);
-    uint32_t proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
-    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 1, &proof), 0);
-    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
+
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, attempt.storage, 1), 0);
+
     EXPECT_FALSE(runner.holds_epoch(20));
 }
 
-TEST_F(NativeAdmissionTest, AsyncLastUseProofIsCapturedWhenFinalizePerformsTheFirstDrain) {
+TEST_F(NativeAdmissionTest, AsyncFinalizePerformsTheFirstDrain) {
     AsyncRunner runner;
     Attempt attempt(runner, 1, 20);
     ASSERT_EQ(attempt.prepare(), 0);
     ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
-    uint32_t proof = 99;
-    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof), 0);
-    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
+
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, attempt.storage, 0), 0);
+
     EXPECT_TRUE(attempt.empty());
 }
 
@@ -272,48 +256,33 @@ TEST_F(NativeAdmissionTest, AsyncSuccessUsesActualA5BlockingDrainAndReleasesNati
     EXPECT_FALSE(runner.holds_epoch(20));
 }
 
-TEST_F(NativeAdmissionTest, CoreOnlyFailureRetiresResourcesButPreservesTheOriginalError) {
-    for (bool poll_first : {false, true}) {
-        AsyncRunner runner(Image::CORE_ONLY, Result::ERROR_RETIRED);
-        Attempt attempt(runner, 1, 20);
-        ASSERT_EQ(attempt.prepare(), 0);
-        ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
-        if (poll_first) EXPECT_EQ(simpler_poll_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
-        EXPECT_EQ(simpler_wait_run(&runner, attempt.storage), -17);
-        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
-        EXPECT_TRUE(state->physical_complete);
-        EXPECT_FALSE(state->active_execution->prepared->resources_owned);
-        uint32_t proof = 99;
-        EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof), -17);
-        EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
-        EXPECT_TRUE(attempt.empty());
-        EXPECT_FALSE(runner.holds_epoch(20));
-    }
-}
-
-TEST_F(NativeAdmissionTest, CoreOnlyFailureCanFirstProveRetirementInsideFinalize) {
-    AsyncRunner runner(Image::CORE_ONLY, Result::ERROR_RETIRED);
-    Attempt attempt(runner, 1, 20);
-    ASSERT_EQ(attempt.prepare(), 0);
-    ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
-    uint32_t proof = 99;
-    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof), -17);
-    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
-    EXPECT_TRUE(attempt.empty());
-}
-
-TEST_F(NativeAdmissionTest, CoreOnlyRetirementDoesNotReplaceAnObservedStreamError) {
+TEST_F(NativeAdmissionTest, FailedFinalizeRetainsOwnersDespiteRetiredCores) {
     EXPECT_EXIT(
         {
-            AsyncRunner runner(Image::CORE_ONLY, Result::ERROR_RETIRED);
+            AsyncRunner runner(Image::DEFERRED, Result::ERROR_RETIRED);
             Attempt attempt(runner, 1, 20);
             if (attempt.prepare() != 0 || simpler_launch_run(&runner, attempt.storage) != 0) _exit(2);
-            if (simpler_poll_run(&runner, attempt.storage) != SIMPLER_NATIVE_RUN_POLL_COMPLETE) _exit(3);
+            if (simpler_finalize_run_with_delivery(&runner, attempt.storage, 0) != -17 || attempt.empty() ||
+                !runner.holds_epoch(20))
+                _exit(3);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
+TEST_F(NativeAdmissionTest, RetiredCoresDoNotReplaceAnObservedStreamErrorOrReleaseOwners) {
+    EXPECT_EXIT(
+        {
+            AsyncRunner runner(Image::DEFERRED, Result::ERROR_RETIRED);
+            Attempt attempt(runner, 1, 20);
+            if (attempt.prepare() != 0 || simpler_launch_run(&runner, attempt.storage) != 0) _exit(2);
+            if (simpler_poll_run(&runner, attempt.storage) != SIMPLER_NATIVE_RUN_POLL_ERROR) _exit(3);
             control().stream_sync_rc = -47;
             if (simpler_wait_run(&runner, attempt.storage) != -47) _exit(4);
-            uint32_t proof = 99;
-            if (simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof) != -47 ||
-                proof != SIMPLER_NATIVE_RUN_LAST_USE_PROVED || !attempt.empty() || runner.holds_epoch(20))
+
+            if (simpler_finalize_run_with_delivery(&runner, attempt.storage, 0) != -47 || attempt.empty() ||
+                !runner.holds_epoch(20))
                 _exit(5);
             _exit(0);
         },
@@ -321,22 +290,22 @@ TEST_F(NativeAdmissionTest, CoreOnlyRetirementDoesNotReplaceAnObservedStreamErro
     );
 }
 
-TEST_F(NativeAdmissionTest, CoreOnlyFailureRequiresAnExactSameEpochRetirementPayload) {
+TEST_F(NativeAdmissionTest, FailedAsyncRunRetainsOwnersForEveryRetirementPayloadShape) {
     for (Result result :
          {Result::ERROR, Result::ERROR_NOT_RETIRED, Result::ERROR_BAD_PAYLOAD_VERSION, Result::ERROR_OLD_PAYLOAD_EPOCH,
           Result::ERROR_BAD_PAYLOAD_FLAGS, Result::ERROR_BAD_PAYLOAD_MAGIC, Result::ERROR_SHORT_PAYLOAD,
           Result::ERROR_LONG_PAYLOAD}) {
         EXPECT_EXIT(
             {
-                AsyncRunner runner(Image::CORE_ONLY, result);
+                AsyncRunner runner(Image::DEFERRED, result);
                 Attempt attempt(runner, 1, 20);
                 if (attempt.prepare() != 0 || simpler_launch_run(&runner, attempt.storage) != 0) _exit(2);
                 if (simpler_wait_run(&runner, attempt.storage) == 0) _exit(3);
                 auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
                 if (state->physical_complete || !state->active_execution->prepared->resources_owned) _exit(4);
-                uint32_t proof = 99;
-                if (simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 0, &proof) == 0 ||
-                    proof != SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN || attempt.empty() || !runner.holds_epoch(20))
+
+                if (simpler_finalize_run_with_delivery(&runner, attempt.storage, 0) == 0 || attempt.empty() ||
+                    !runner.holds_epoch(20))
                     _exit(5);
                 _exit(0);
             },
@@ -345,10 +314,8 @@ TEST_F(NativeAdmissionTest, CoreOnlyFailureRequiresAnExactSameEpochRetirementPay
     }
 }
 
-TEST_F(NativeAdmissionTest, RetirementPayloadAloneCannotQualifyAnUnqualifiedOrDamagedContract) {
-    for (Image image :
-         {Image::DEFERRED, Image::NO_DECLARATIONS, Image::BAD_CORE_VERSION, Image::OLD_CORE_EPOCH,
-          Image::BAD_CONTRACT}) {
+TEST_F(NativeAdmissionTest, RetirementPayloadCannotProveExternalAccessEnded) {
+    for (Image image : {Image::DEFERRED, Image::BAD_VERSION, Image::OLD_EPOCH}) {
         EXPECT_EXIT(
             {
                 AsyncRunner runner(image, Result::ERROR_RETIRED);
@@ -381,9 +348,9 @@ TEST_F(NativeAdmissionTest, StreamSuccessWithoutThisEpochsSuccessfulAsyncTermina
                     if (state->physical_complete || state->execution_retired ||
                         !state->active_execution->prepared->resources_owned)
                         _exit(5);
-                    uint32_t proof = 99;
-                    if (simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 1, &proof) == 0 ||
-                        proof != SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN || attempt.empty() || !runner.holds_epoch(20))
+
+                    if (simpler_finalize_run_with_delivery(&runner, attempt.storage, 1) == 0 || attempt.empty() ||
+                        !runner.holds_epoch(20))
                         _exit(6);
                     if (!runner.fatal_reset_blocked() || finalize_device(&runner) == 0 || control().retired) _exit(7);
                     const auto retained = runner.retained(20);
@@ -397,7 +364,7 @@ TEST_F(NativeAdmissionTest, StreamSuccessWithoutThisEpochsSuccessfulAsyncTermina
     }
 }
 
-TEST_F(NativeAdmissionTest, DamagedAsyncDeclarationCannotAllowNativeRetirementOrRawReset) {
+TEST_F(NativeAdmissionTest, DamagedAsyncLayoutCannotAllowNativeRetirementOrRawReset) {
     for (Image image : {Image::BAD_VERSION, Image::OLD_EPOCH, Image::TRUNCATED}) {
         EXPECT_EXIT(
             {
@@ -421,9 +388,8 @@ TEST_F(NativeAdmissionTest, SynchronousAndLegacyRunsDoNotRequireAnAsyncTerminal)
         ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
         EXPECT_EQ(simpler_wait_run(&runner, attempt.storage), 0);
         EXPECT_FALSE(runner.fatal_reset_blocked());
-        uint32_t proof = 99;
-        EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, attempt.storage, 1, &proof), 0);
-        EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
+
+        EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, attempt.storage, 1), 0);
     }
 }
 

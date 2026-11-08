@@ -243,8 +243,7 @@ inline __aicore__ bool scheduler_async_runtime_mount(
         l.finish_count > l.task_count || l.finish_count > l.group_count || l.condition_capacity < l.group_count ||
         l.condition_capacity > l.entries_bytes / sizeof(DeferredCompletionEntry) ||
         l.check_directory_words != scheduler_async_directory_word_count(l.group_count) ||
-        l.finish_directory_words != scheduler_async_directory_word_count(l.finish_count) ||
-        l.execution_contract > HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY)
+        l.finish_directory_words != scheduler_async_directory_word_count(l.finish_count))
         return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     end = sizeof(SchedulerAsyncLayout);
 #define SCHEDULER_ASYNC_CHECK_REGION(field, count, type) region(l.total_bytes, l.field, count, sizeof(type), 128, &end)
@@ -260,8 +259,7 @@ inline __aicore__ bool scheduler_async_runtime_mount(
         SCHEDULER_ASYNC_CHECK_REGION(finish_progress_offset, l.finish_count, SchedulerAsyncFinishProgress) &&
         SCHEDULER_ASYNC_CHECK_REGION(check_directory_offset, l.check_directory_words, SchedulerAsyncDirectoryWord) &&
         SCHEDULER_ASYNC_CHECK_REGION(finish_directory_offset, l.finish_directory_words, SchedulerAsyncDirectoryWord) &&
-        SCHEDULER_ASYNC_CHECK_REGION(entries_offset, l.entries_bytes, uint8_t) &&
-        SCHEDULER_ASYNC_CHECK_REGION(backend_offset, l.backend_bytes, uint8_t);
+        SCHEDULER_ASYNC_CHECK_REGION(entries_offset, l.entries_bytes, uint8_t);
 #undef SCHEDULER_ASYNC_CHECK_REGION
     if (!valid || l.sdma_guard_count > ASYNC_SDMA_CHANNELS ||
         (l.sdma_guard_count == 0 ?
@@ -351,11 +349,10 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
 // execution-release contribution. The backend validates optional declarations;
 // CHECK sees only the sealed immutable entries.
 // Ordinary graph projections carry no scheduler backing address; it is passed separately.
-template <typename RegistrationPolicy>
 inline __aicore__ bool scheduler_async_runtime_seal(
     const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, __gm__ void *scheduler_base,
     SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task, uint32_t block, uint32_t subtask,
-    __gm__ DispatchPayload *payload, RegistrationPolicy &policy, bool *registered
+    __gm__ DispatchPayload *payload, bool *registered
 ) {
     using namespace scheduler_async_runtime_detail;
     if (registered == nullptr || payload == nullptr) return false;
@@ -406,8 +403,7 @@ inline __aicore__ bool scheduler_async_runtime_seal(
         SchedulerAsyncCheckView entries{at<DeferredCompletionEntry>(view, identity.entries_offset), identity.capacity};
         for (uint32_t condition = 0; condition < count; ++condition) {
             const auto entry = scheduler_async_check_detail::entry(entries, condition);
-            if (!scheduler_async_check_detail::entry_valid(identity, entry) ||
-                !policy.validate_registration(identity, condition, entry)) {
+            if (!async_completion_format_valid(entry) || !scheduler_async_check_detail::entry_valid(identity, entry)) {
                 valid = false;
                 break;
             }

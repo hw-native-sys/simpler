@@ -15,14 +15,6 @@
 #include <cstring>
 #include <type_traits>
 
-inline constexpr int HBG_ASYNC_LAST_USE_NONE = 0;
-inline constexpr int HBG_ASYNC_LAST_USE_EXTERNAL_OR_UNKNOWN = 1;
-inline constexpr int HBG_ASYNC_LAST_USE_CORE_PIPELINES_ONLY = 2;
-
-// Immutable Host author/compiler contract, independent of the observed result.
-inline constexpr uint64_t HBG_ASYNC_CONTRACT_UNQUALIFIED = 0;
-inline constexpr uint64_t HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY = 1;
-
 inline constexpr uint64_t HBG_ASYNC_RETIREMENT_MAGIC = UINT64_C(0x4842475245544952);
 inline constexpr uint32_t HBG_ASYNC_RETIREMENT_VERSION = 1;
 inline constexpr uint32_t HBG_ASYNC_CORES_RETIRED = 1;

@@ -99,7 +99,7 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 8;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 9;
 
 // Error message region. 256 B of headroom is enough for
 // `<ExceptionType>: <short message>` produced by the child-side Python loops;

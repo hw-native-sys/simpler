@@ -59,7 +59,6 @@ public:
         return DrainOutcome::device_error(semantic_rc, true);
     }
     int finalize() override { return 0; }
-    void provision_unqualified_address() { dma_workspace_addr_[0] = 64; }
     std::thread producer;
     int semantic_rc{-100};
     int drains{0};
@@ -120,9 +119,9 @@ TEST(SimNativeLastUse, SemanticErrorKeepsItsCodeAfterARealJoinAndCarrierDestruct
         JoiningRunner runner;
         runner.semantic_rc = semantic_rc;
         Invocation invocation(runner);
-        uint32_t proof = 99;
-        EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, invocation.storage, 0, &proof), semantic_rc);
-        EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
+
+        EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, invocation.storage, 0), semantic_rc);
+
         EXPECT_TRUE(invocation.produced.load(std::memory_order_acquire));
         EXPECT_TRUE(runner.run_producers_stopped(17));
         EXPECT_TRUE(invocation.destroyed());
@@ -132,65 +131,36 @@ TEST(SimNativeLastUse, SemanticErrorKeepsItsCodeAfterARealJoinAndCarrierDestruct
     }
 }
 
-TEST(SimNativeLastUse, NullAndInvalidOutputContractsDoNotStartFinalization) {
+TEST(SimNativeLastUse, InvalidDeliveryDoesNotStartFinalization) {
     JoiningRunner runner;
     Invocation invocation(runner);
-    EXPECT_EQ(
-        simpler_finalize_run_with_last_use_v1(&runner, invocation.storage, 0, nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    uint32_t proof = 99;
-    EXPECT_EQ(
-        simpler_finalize_run_with_last_use_v1(&runner, invocation.storage, 2, &proof), PTO_RUNTIME_ERR_INVALID_ARGUMENT
-    );
-    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
+
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, invocation.storage, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+
     EXPECT_EQ(runner.drains, 0);
     EXPECT_FALSE(invocation.destroyed());
-}
-
-TEST(SimNativeLastUse, IndependentEngineConfigurationOrDomainWorkspaceWithholdsProof) {
-    for (uint32_t kind = 0; kind < 3; ++kind) {
-        JoiningRunner runner;
-        Invocation invocation(runner);
-        if (kind == 0) runner.set_dma_workspace_request(true);
-        if (kind == 1) runner.provision_unqualified_address();
-        if (kind == 2) {
-            invocation.state->domain_snapshots.resize(1);
-            invocation.state->domain_snapshots[0].context.workspaces[0] = {64, 64};
-        }
-        uint32_t proof = 99;
-        EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, invocation.storage, 0, &proof), runner.semantic_rc);
-        EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
-        EXPECT_TRUE(invocation.destroyed());
-    }
 }
 
 TEST(SimNativeLastUse, UnprovedStopRetainsTheCarrierAndAProvedRetryCanFinalize) {
     JoiningRunner runner;
     runner.refuse_stop = true;
     Invocation invocation(runner);
-    uint32_t proof = 99;
-    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, invocation.storage, 0, &proof), runner.semantic_rc);
-    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
+
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, invocation.storage, 0), runner.semantic_rc);
+
     EXPECT_FALSE(invocation.destroyed());
     runner.refuse_stop = false;
-    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, invocation.storage, 0, &proof), runner.semantic_rc);
-    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_PROVED);
+    EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, invocation.storage, 0), runner.semantic_rc);
+
     EXPECT_TRUE(invocation.destroyed());
 }
 
-TEST(SimNativeLastUse, FailedBindingCleanupDoesNotPublishAProvedResult) {
+TEST(SimNativeLastUse, FailedBindingCleanupPreservesTheExecutionError) {
     JoiningRunner runner;
     Invocation invocation(runner);
     release_bindings_rc = -61;
-    uint32_t proof = 99;
-    EXPECT_EQ(simpler_finalize_run_with_last_use_v1(&runner, invocation.storage, 0, &proof), runner.semantic_rc);
-    EXPECT_EQ(proof, SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN);
-    EXPECT_TRUE(invocation.destroyed());
-}
 
-TEST(SimNativeLastUse, OriginalFinalizeEntryPreservesItsSemanticError) {
-    JoiningRunner runner;
-    Invocation invocation(runner);
     EXPECT_EQ(simpler_finalize_run_with_delivery(&runner, invocation.storage, 0), runner.semantic_rc);
+
     EXPECT_TRUE(invocation.destroyed());
 }

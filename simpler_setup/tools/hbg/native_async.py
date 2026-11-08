@@ -14,7 +14,10 @@ FINISH pending_count is the current unpublished batch length. Active cycles sum
 work within individual slices; seal/terminal timestamps are not a busy interval.
 """
 
+from __future__ import annotations
+
 from collections import Counter, defaultdict
+from typing import Any
 
 from .native_protocol import _array, _error, _indices, _number, _object, has_async_protocol
 
@@ -46,7 +49,7 @@ def _evidence(value, path, *, interval=False):
             _error(f"{path}.{field} requires recorded evidence; use null when unavailable")
 
 
-def read_async_protocol(section):
+def read_async_protocol(section, *, legacy=False):
     """Validate exact shapes while retaining failed and incomplete diagnostic state."""
     _object(section, {"group_count", "finish_count", "groups", "releases", "finishes"}, "async")
     _scalars(section, ("group_count", "finish_count"), "async")
@@ -61,15 +64,10 @@ def read_async_protocol(section):
         _indices(row["conditions"], row["registered_count"], f"{path}.conditions", dense=True)
         for condition in row["conditions"]:
             name = f"{path}.conditions[{condition['index']}]"
-            _object(condition, {"index", "type", "binding_index", "owner_generation"}, name)
+            # Older captures carry unused resource fields; current exports omit them.
+            fields = {"index", "type"} | ({"binding_index", "owner_generation"} if legacy else set())
+            _object(condition, fields, name)
             _scalars(condition, ("index", "type"), name)
-            if condition["binding_index"] is not None:
-                _number(condition["binding_index"], f"{name}.binding_index")
-            generation = condition["owner_generation"]
-            if generation is not None:
-                _number(generation, f"{name}.owner_generation")
-                if generation == 0:
-                    _error(f"{name}.owner_generation must be positive or null")
         _evidence(row["sealed"], f"{path}.sealed")
         _evidence(row["terminal"], f"{path}.terminal")
     if not isinstance(section["releases"], list):
@@ -117,7 +115,24 @@ def async_event_records(section):
             yield row["drained"], "async_point", f"async.finishes[{row['index']}].drained"
 
 
-def summarize_async_protocol(section):
+def async_summary_counts(raw):
+    """Aggregate observed counters from a validated async section."""
+    return dict(
+        group_count=raw["group_count"],
+        finish_count=raw["finish_count"],
+        group_states=dict(Counter(row["state"] for row in raw["groups"])),
+        finish_states=dict(Counter(row["state"] for row in raw["finishes"])),
+        execution_releases_recorded=sum(
+            row["publication"] is not None and row["publication"]["after"] is not None for row in raw["releases"]
+        ),
+        execution_release_intervals_incomplete=sum(
+            row["publication"] is not None and row["publication"]["after"] is None for row in raw["releases"]
+        ),
+        resolve_drained_recorded=sum(row["drained"] is not None for row in raw["finishes"]),
+    )
+
+
+def summarize_async_protocol(section) -> dict[str, Any] | None:
     """Return observed counters and evidence availability, without elapsed-time inference."""
     from .native_protocol import read_native_protocol  # noqa: PLC0415
 
@@ -158,21 +173,7 @@ def summarize_async_protocol(section):
         )
         for row in raw["finishes"]
     ]
-    return dict(
-        group_count=raw["group_count"],
-        finish_count=raw["finish_count"],
-        group_states=dict(Counter(row["state"] for row in raw["groups"])),
-        finish_states=dict(Counter(row["state"] for row in raw["finishes"])),
-        execution_releases_recorded=sum(
-            row["publication"] is not None and row["publication"]["after"] is not None for row in raw["releases"]
-        ),
-        execution_release_intervals_incomplete=sum(
-            row["publication"] is not None and row["publication"]["after"] is None for row in raw["releases"]
-        ),
-        resolve_drained_recorded=sum(row["drained"] is not None for row in raw["finishes"]),
-        groups=groups,
-        finishes=finishes,
-    )
+    return dict(async_summary_counts(raw), groups=groups, finishes=finishes)
 
 
 def _require(condition, message):
@@ -255,8 +256,6 @@ def _audit_group(audit, group, execution):
     _require(group["pending_count"] <= group["slice_count"], "pending slices exceed service slices")
     for condition in group["conditions"]:
         _require(condition["type"] in (0, 1), "unsupported condition type")
-        if condition["binding_index"] is not None:
-            _require(condition["binding_index"] < (1 << 64) - 1, "unbound condition")
     if group["state"] == "EMPTY":
         _lease(group, 0)
         _require(

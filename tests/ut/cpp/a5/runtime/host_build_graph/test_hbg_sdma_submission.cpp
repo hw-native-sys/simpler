@@ -17,14 +17,8 @@
 namespace {
 using namespace pto2::detail;
 struct SubmissionData {
-    struct BackendImage {
-        AsyncBackendLayout layout{};
-        AsyncBackendTask task{};
-        AsyncSdmaTransfer transfer{};
-    };
     struct alignas(128) Region {
         SchedulerAsyncLayout layout{};
-        alignas(128) BackendImage backend{};
         AsyncSdmaGuardContext header{};
         AsyncSdmaSubmissionGuard guards[ASYNC_SDMA_CHANNELS]{};
     } region;
@@ -39,7 +33,7 @@ struct SubmissionData {
     uint32_t fault{0};
     bool records{true};
     bool deferred{true};
-    bool declared{false};
+    uint32_t queue_count{1};
     SubmissionData() {
         region.layout.total_bytes = sizeof(region);
         region.layout.run_epoch = 11;
@@ -54,19 +48,6 @@ struct SubmissionData {
         execution.subtask_slot = 1;
     }
     uint64_t workspace_address() { return reinterpret_cast<uint64_t>(workspace); }
-    void declare(uint32_t count = 2) {
-        declared = true;
-        region.layout.backend_offset = offsetof(Region, backend);
-        region.layout.backend_bytes = sizeof(BackendImage);
-        auto &b = region.backend;
-        b.layout.total_bytes = sizeof(b);
-        b.layout.task_count = 1;
-        b.layout.transfer_count = 1;
-        b.layout.tasks_offset = offsetof(BackendImage, task);
-        b.layout.transfers_offset = offsetof(BackendImage, transfer);
-        b.task = {0, 0, 0, 0, 1};
-        b.transfer = {workspace_address(), sizeof(workspace), 0x20000, 128, 0x30000, 256, count};
-    }
     AsyncCtx ctx() {
         AsyncCtx value{};
         value.task_token = deferred ? TaskId::make_global(0) : TaskId::invalid();
@@ -101,7 +82,7 @@ struct SubmissionData {
         if (fault == 6) return false;
         out->address = workspace_address() + (fault == 7 ? 0 : index * 64);
         if (fault == 8) ++out->address;
-        if (fault == 9) out->address += sizeof(workspace);
+        if (fault == 9) out->address = 0;
         out->expected = fault == 10 ? 0 : UINT64_C(0x100000001);
         return true;
     }
@@ -140,17 +121,16 @@ struct Sink {
 bool submit(SubmissionData &data, AsyncCtx &ctx, Sink &sink, uint64_t bytes = 64, SdmaOp operation = SdmaOp::TGET) {
     Cache cache;
     return sdma_submit(
-        ctx, operation, true, data.workspace_address(), 0x20000, 0x30000, bytes, 47, data, cache, sink, Metadata{&data}
+        ctx, operation, true, data.workspace_address(), 0x20000, 0x30000, bytes, 47, data, cache, sink, Metadata{&data},
+        data.queue_count
     );
 }
 
-TEST(HbgSdmaSubmission, DefaultAndDeclaredTransfersUseOneRegistrationAndPublicationProtocol) {
-    for (bool declared : {false, true}) {
+TEST(HbgSdmaSubmission, SingleAndMultipleQueuesUseOneRegistrationAndPublicationProtocol) {
+    for (uint32_t queues : {1u, 2u}) {
         SubmissionData data;
-        if (declared) {
-            data.declare();
-            data.actual_count = 2;
-        }
+        data.queue_count = queues;
+        data.actual_count = queues;
         auto ctx = data.ctx();
         const CompletionToken prefix{0x8000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
         ASSERT_TRUE(async_completion_append(ctx, prefix));
@@ -164,18 +144,19 @@ TEST(HbgSdmaSubmission, DefaultAndDeclaredTransfersUseOneRegistrationAndPublicat
         ASSERT_EQ(sink.values.size(), data.actual_count);
         EXPECT_EQ(data.order.front(), 1u);
         EXPECT_EQ(data.order.back(), 3u);
-        EXPECT_EQ(data.group * data.queues, declared ? 46u : 47u);
+        EXPECT_EQ(data.group * data.queues, queues == 2 ? 46u : 47u);
     }
 }
 
 TEST(HbgSdmaSubmission, CapacityAndPreflightFailuresPreventSdkSideEffects) {
-    for (uint32_t fault = 0; fault < 4; ++fault) {
+    for (uint32_t fault = 0; fault < 5; ++fault) {
         SubmissionData data;
-        data.declare();
+        data.queue_count = 2;
         auto ctx = data.ctx();
         if (fault == 0) ctx.completion_capacity = 1;
         if (fault == 1) data.fault = 1;
-        if (fault == 2) data.region.backend.transfer.source = 0x40000;
+        if (fault == 2) data.queue_count = 0;
+        if (fault == 4) data.queue_count = ASYNC_SDMA_CHANNELS + 1;
         if (fault == 3) data.execution.subtask_slot = 0;
         Sink sink{&data, {}};
         EXPECT_FALSE(submit(data, ctx, sink));
@@ -209,7 +190,7 @@ TEST(HbgSdmaSubmission, InvalidWriterCannotReachSdkForEmptyOrNonemptyTransfers) 
 TEST(HbgSdmaSubmission, SdkOrRecordFailuresPoisonHeldQueuesAndKeepTheFirstError) {
     for (uint32_t fault = 2; fault <= 10; ++fault) {
         SubmissionData data;
-        data.declare();
+        data.queue_count = 2;
         data.actual_count = 2;
         data.fault = fault;
         auto ctx = data.ctx();
@@ -229,7 +210,7 @@ TEST(HbgSdmaSubmission, SdkOrRecordFailuresPoisonHeldQueuesAndKeepTheFirstError)
 TEST(HbgSdmaSubmission, InvalidRecordCountsNeverCompleteTheReservation) {
     for (uint32_t count : {0u, 3u, UINT32_MAX}) {
         SubmissionData data;
-        data.declare();
+        data.queue_count = 2;
         data.actual_count = count;
         auto ctx = data.ctx();
         Sink sink{&data, {}};
@@ -256,7 +237,7 @@ TEST(HbgSdmaSubmission, EmptyTransferHasNoAttemptAndSynchronousFallbackHasNoCond
 
 TEST(HbgSdmaSubmission, SynchronousEntryPublishesAndUnlocksBeforeWaitAndReceipt) {
     SubmissionData data;
-    data.declare();
+    data.queue_count = 2;
     data.deferred = false;
     auto ctx = data.ctx();
     Sink sink{&data, {}};

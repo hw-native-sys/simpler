@@ -18,7 +18,6 @@
 using namespace peer_counter;
 
 namespace {
-constexpr auto clean = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
 
 // Host-only owning storage: CoreTaskArgs stores Tensor pointers, so each view
 // must remain at a stable address until the corresponding submit has returned.
@@ -45,16 +44,6 @@ void add_diagnostic(TaskViews &task, const ChipTaskArgs &args, uint32_t row) {
     add_view(task, args, 5, kDiagnosticWords, row * kDiagnosticWords);
 }
 
-void declare_core_only(TaskId task) {
-    if (!rt_declare_async_core_only(task)) throw std::runtime_error("peer COUNTER core-only declaration failed");
-}
-
-void declare_waiter(TaskId task) {
-    if (!rt_declare_async_counter_payload(task, 0, 1, kSignalWords * sizeof(int32_t), clean))
-        throw std::runtime_error("peer COUNTER payload binding failed");
-    declare_core_only(task);
-}
-
 void submit_source(const ChipTaskArgs &args, int64_t context, int64_t epoch, int64_t tag, int64_t pressure) {
     TaskViews waiter;
     add_view(waiter, args, 4, kSignalWords);
@@ -64,7 +53,6 @@ void submit_source(const ChipTaskArgs &args, int64_t context, int64_t epoch, int
     waiter.args.add_scalar(epoch);
     waiter.args.add_scalar(tag);
     const TaskId ready_waiter = rt_submit_aiv_task(0, waiter.args).task_id();
-    declare_waiter(ready_waiter);
 
     TaskViews publisher;
     add_view(publisher, args, 0, kMaxRows * kRowWords);
@@ -78,8 +66,7 @@ void submit_source(const ChipTaskArgs &args, int64_t context, int64_t epoch, int
     publisher.args.add_scalar(static_cast<int64_t>(kMaxRows));
     publisher.args.add_scalar(pressure);
     publisher.args.set_dependencies(&ready_waiter, 1);
-    const TaskId publication = rt_submit_aiv_task(3, publisher.args).task_id();
-    declare_core_only(publication);
+    rt_submit_aiv_task(3, publisher.args);
 }
 
 void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, int64_t tag, int64_t pressure) {
@@ -96,7 +83,6 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
         waiter.args.add_scalar(epoch);
         waiter.args.add_scalar(tag);
         const TaskId main_waiter = rt_submit_aiv_task(0, waiter.args).task_id();
-        declare_waiter(main_waiter);
 
         TaskViews consumer;
         add_view(consumer, args, 1, kDataWords, row * kRowWords);
@@ -108,8 +94,7 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
         consumer.args.add_scalar(static_cast<int64_t>(row));
         consumer.args.add_scalar(INT64_C(0));
         consumer.args.set_dependencies(&main_waiter, 1);
-        const TaskId consumption = rt_submit_aiv_task(4, consumer.args).task_id();
-        declare_core_only(consumption);
+        rt_submit_aiv_task(4, consumer.args);
     }
 
     // No waiter TaskDone dependency: the separate AIC checks only the test's
@@ -122,7 +107,6 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
     gate.args.add_scalar(epoch);
     gate.args.add_scalar(tag);
     const TaskId registration_gate = rt_submit_aic_task(1, gate.args).task_id();
-    declare_core_only(registration_gate);
 
     TaskViews sender;
     add_view(sender, args, 3, kReadyWords);
@@ -134,8 +118,7 @@ void submit_receiver(const ChipTaskArgs &args, int64_t context, int64_t epoch, i
     sender.args.add_scalar(tag);
     sender.args.add_scalar(static_cast<int64_t>(kMaxRows));
     sender.args.set_dependencies(&registration_gate, 1);
-    const TaskId ready_sender = rt_submit_aiv_task(2, sender.args).task_id();
-    declare_core_only(ready_sender);
+    rt_submit_aiv_task(2, sender.args);
 }
 }  // namespace
 

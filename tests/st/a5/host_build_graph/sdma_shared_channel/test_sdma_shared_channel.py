@@ -67,7 +67,7 @@ class _PeerFetchBase(SceneTestCase):
                         "func_id": 0,
                         "source": "kernels/aiv/peer_fetch.cpp",
                         "core_type": "aiv",
-                        "signature": [D.IN, D.OUT, D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR],
+                        "signature": [D.IN, D.OUT, D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR, D.SCALAR],
                     },
                     {
                         "func_id": 1,

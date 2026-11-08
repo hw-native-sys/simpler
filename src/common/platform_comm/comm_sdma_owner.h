@@ -16,23 +16,9 @@
 // explicit native/compiler access contract; it is not inferred from run mode.
 enum class CommSdmaAccess : uint32_t { UNKNOWN = 0, LEGACY = 1, SDK_ONLY = 2 };
 
-struct CommSdmaOwnerInfoV1 {
-    uint64_t workspace_addr{0};
-    uint64_t workspace_bytes{0};
-    CommSdmaAccess access{CommSdmaAccess::UNKNOWN};
-    uint32_t queue_num{0};
-};
-
 inline bool comm_sdma_request_valid(CommSdmaAccess access, uint32_t queue_num) {
     return (access == CommSdmaAccess::LEGACY && queue_num == 0) ||
            (access == CommSdmaAccess::SDK_ONLY && queue_num >= 1 && queue_num <= 48);
-}
-
-inline bool comm_sdma_owner_info_valid(const CommSdmaOwnerInfoV1 &info) {
-    if (info.access == CommSdmaAccess::UNKNOWN)
-        return info.workspace_addr == 0 && info.workspace_bytes == 0 && info.queue_num == 0;
-    return comm_sdma_request_valid(info.access, info.queue_num) && info.workspace_addr != 0 &&
-           info.workspace_bytes != 0 && info.workspace_bytes <= UINT64_MAX - info.workspace_addr;
 }
 
 // Lives on CommHandle_, not on domains or runs. Releasing a domain must not
@@ -71,6 +57,5 @@ inline bool comm_sdma_admissions_agree(const CommSdmaAdmissionV1 &a, const CommS
            a.access == b.access && a.queue_num == b.queue_num;
 }
 
-static_assert(sizeof(CommSdmaOwnerInfoV1) == 24);
 static_assert(sizeof(CommSdmaOwnerConfiguration) == 8);
 static_assert(sizeof(CommSdmaAdmissionV1) == 24);

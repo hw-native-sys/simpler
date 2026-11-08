@@ -59,7 +59,6 @@ macro(hbg_cases)
 endmacro()
 
 hbg_case(test_hbg_scope_mode.cpp)
-hbg_case(test_hbg_async_declarations.cpp ORCH)
 
 # Fault injection uses the ELF linker's pthread wrappers.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -135,7 +134,6 @@ hbg_case(test_hbg_bind_ledger.cpp
 
 if(TARGET test_a5_hbg_bind_ledger)
     target_sources(test_a5_hbg_bind_ledger PRIVATE
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_backend_plan.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_plan.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
 endif()

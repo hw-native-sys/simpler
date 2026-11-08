@@ -521,56 +521,6 @@ static int caller_device_span_written_by_other_run(void *runner_ctx, uint64_t ru
     }
 }
 
-static bool query_async_retained_span(
-    void *runner_ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t address, uint64_t bytes,
-    HostAsyncRetainedSpan *out
-) {
-    if (out != nullptr) *out = {};
-    if (runner_ctx == nullptr) return false;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
-            ->query_async_retained_span(owner, slot, bank, epoch, address, bytes, out);
-    } catch (...) {
-        if (out != nullptr) *out = {};
-        return false;
-    }
-}
-
-static bool query_async_domain_context(
-    void *runner_ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context,
-    CommDomainSnapshot *out, CommDomainExecution *execution
-) {
-    if (out != nullptr) *out = {};
-    if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
-    if (runner_ctx == nullptr) return false;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
-            ->query_async_domain_context(owner, slot, bank, epoch, device_context, out, execution);
-    } catch (...) {
-        if (out != nullptr) *out = {};
-        if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
-        return false;
-    }
-}
-
-static bool query_async_sdma_owner(
-    void *ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context,
-    CommSdmaOwnerInfoV1 *out
-) {
-    if (out != nullptr) *out = {};
-    if (ctx == nullptr || out == nullptr) return false;
-    try {
-        CommDomainSnapshot snapshot{};
-        return static_cast<SimDeviceRunnerBase *>(ctx)->query_async_domain_context(
-                   owner, slot, bank, epoch, device_context, &snapshot, nullptr, out
-               ) &&
-               out->access != CommSdmaAccess::UNKNOWN;
-    } catch (...) {
-        *out = {};
-        return false;
-    }
-}
-
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -612,9 +562,6 @@ static const HostApiOps g_host_api_ops = {
     .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
     .get_orchestration_scratch = get_orchestration_scratch,
     .set_orchestration_scratch = set_orchestration_scratch,
-    .query_async_retained_span = query_async_retained_span,
-    .query_async_domain_context = query_async_domain_context,
-    .query_async_sdma_owner = query_async_sdma_owner,
 };
 
 /* ===========================================================================
@@ -1091,8 +1038,7 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) 
 
 static int prepare_run_impl(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, const NativeRunDomainProvider *domain_provider,
-    const NativeRunDomainProviderV2 *domain_provider_v2 = nullptr
+    const NativeRunDescriptor *descriptor
 ) {
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1143,9 +1089,7 @@ static int prepare_run_impl(
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
-        state = new (runtime) SimNativeRunContext(
-            runner, *config, trace_hid, *descriptor, &g_host_api_ops, domain_provider, domain_provider_v2
-        );
+        state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
         if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
             LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
             destroy_native_run_context(state);
@@ -1239,36 +1183,7 @@ int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, nullptr);
-}
-
-int simpler_prepare_run_with_domains_v1(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
-    size_t provider_bytes
-) {
-    if (descriptor == nullptr || descriptor_bytes != sizeof(NativeRunDescriptor) || provider == nullptr ||
-        provider_bytes != sizeof(NativeRunDomainProvider))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    if (provider->version != 1 || provider->reserved != 0 ||
-        (provider->count != 0 && (provider->owner == nullptr || provider->query == nullptr)))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, provider);
-}
-
-int simpler_prepare_run_with_domains_v2(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProviderV2 *provider,
-    size_t provider_bytes
-) {
-    if (descriptor == nullptr || descriptor_bytes != sizeof(NativeRunDescriptor) || provider == nullptr ||
-        provider_bytes != sizeof(NativeRunDomainProviderV2))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    const auto &base = provider->base;
-    if (base.version != 2 || base.reserved != 0 ||
-        (base.count != 0 && (base.owner == nullptr || base.query == nullptr)))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, &base, provider);
+    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor);
 }
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
@@ -1467,22 +1382,7 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return state->completion_rc;
 }
 
-static bool sim_run_origin_accesses_ended(const SimNativeRunContext &state) {
-    if (!state.physical_complete || state.recording || state.active_execution == nullptr ||
-        state.active_execution->prepared == nullptr ||
-        !(state.active_execution->prepared->identity == state.identity()) || state.runner->independent_dma_configured())
-        return false;
-    for (const auto &snapshot : state.domain_snapshots)
-        for (const auto &workspace : snapshot.context.workspaces)
-            if (workspace.addr != 0 || workspace.size != 0) return false;
-    // Sim drain's physical fact is the completed join of all executing CPU
-    // threads. No separately configured engine can outlive that join here.
-    return true;
-}
-
-static int finalize_native_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs, uint32_t *out_proof = nullptr
-) try {
+static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
     SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
@@ -1541,7 +1441,6 @@ static int finalize_native_run(
     emit_native_run_runner_wall(state);
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
-    bool bindings_ended = false;
     try {
         if (attach_rc == 0) {
             {
@@ -1563,7 +1462,6 @@ static int finalize_native_run(
                 // after output delivery or its refusal has ended that reader.
                 const int release_rc =
                     state->runtime != nullptr ? release_run_bindings_impl(state->runtime.get(), &state->host_api) : 0;
-                bindings_ended = release_rc == 0;
                 if (validation_rc == 0) validation_rc = release_rc;
             }
             if (launched && execution_rc == 0 && !state->execution_retired) emit_device_phase_markers(state->runner);
@@ -1587,10 +1485,8 @@ static int finalize_native_run(
         state->runner_claimed = false;
     }
     if (state->retired_host_staging != nullptr) state->runner->free_tensor(state->retired_host_staging);
-    const bool last_use_proved = out_proof != nullptr && bindings_ended && sim_run_origin_accesses_ended(*state);
     state->runner->release_run_result(state->descriptor.run_epoch);
     destroy_native_run_context(state);
-    if (last_use_proved) *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1605,15 +1501,6 @@ static int finalize_native_run(
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {
     if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return finalize_native_run(ctx, runtime, deliver_outputs != 0);
-}
-
-int simpler_finalize_run_with_last_use_v1(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs, uint32_t *out_proof
-) {
-    if (out_proof == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
-    if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return finalize_native_run(ctx, runtime, deliver_outputs != 0, out_proof);
 }
 
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {

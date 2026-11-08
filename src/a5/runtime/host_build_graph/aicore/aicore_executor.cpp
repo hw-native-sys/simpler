@@ -349,18 +349,7 @@ __aicore__ bool run_ready_dispatch_loop(
     auto &async_state = async_state_storage.get();
     if (!scheduler_async_execution_mount(published_graph, scheduler_state_base, context, run_control, &async_state))
         return false;
-    AsyncBackendView declarations{};
-    uint64_t execution_contract = HBG_ASYNC_CONTRACT_UNQUALIFIED;
-    if (async_state.view.enabled()) {
-        const auto &layout = async_state.view.layout();
-        if (!declarations.mount(
-                layout.backend_bytes == 0 ? nullptr : async_state.view.base + layout.backend_offset,
-                layout.backend_bytes
-            ))
-            return scheduler_async_runtime_detail::fail(graph, context, run_control, SCHEDULER_TASK_REF_INVALID);
-        execution_contract = layout.execution_contract;
-    }
-    SchedulerLocalStorage<AsyncBackend> async_backend_storage(declarations, execution_contract);
+    SchedulerLocalStorage<AsyncBackend> async_backend_storage;
     auto &async_backend = async_backend_storage.get();
     const SchedulerAsyncRuntimeView *async_view = async_state.view.enabled() ? &async_state.view : nullptr;
     const uint32_t cluster_lane = context->config.self_lane;
@@ -584,7 +573,7 @@ __aicore__ bool run_ready_dispatch_loop(
             if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
             uint64_t completion_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (!scheduler_async_execution_returned(
-                    &async_state, graph, scheduler_state_base, context, run_control, slot_index, async_backend
+                    &async_state, graph, scheduler_state_base, context, run_control, slot_index
                 ))
                 return false;
             // Own-slot retirement publishes a Mix lane's release after trace completion.

@@ -65,10 +65,6 @@ static void graph_abort_impl(OrchContext *ctx, void *recording_handle) {
 
 static bool graph_end_impl(OrchContext *ctx) { return ctx != nullptr && ctx->orchestrator->graph_end(); }
 
-static bool declare_async_use_impl(OrchContext *ctx, TaskId task, const AsyncUseDeclaration &use) {
-    return ctx != nullptr && declare_async_use(ctx->orchestrator, task, use);
-}
-
 // The orchestration .so's phases arrive already bracketed, so this only forwards them
 // to the same pool the runtime's own records go to. Defined only at SIMPLER_DFX=1: the
 // slot stays in the struct either way, but a definition the table does not reference is
@@ -217,7 +213,6 @@ static const OrchOps s_orch_ops = {
 #endif
     .graph_record_start = graph_record_start_impl,
     .graph_record_wait = graph_record_wait_impl,
-    .declare_async_use = declare_async_use_impl,
 };
 
 // =============================================================================

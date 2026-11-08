@@ -31,28 +31,15 @@
 namespace {
 constexpr uint64_t kEpoch = 37;
 constexpr uint64_t kRecords = UINT64_C(0x100000000);
-constexpr uint64_t kCookie = UINT64_C(0xfedcba9800000000);
 
 struct RuntimeBackend {
     std::array<bool, 64> ready{};
     std::array<bool, 64> failed{};
     std::array<uint32_t, 64> observations{};
-    uint32_t validations{0};
     uint32_t acquisitions{0};
-    bool allow_registration{true};
 
     static uint64_t key(const SchedulerAsyncGroupIdentity &identity, uint32_t condition) {
         return (identity.block_idx * 3 + identity.subtask_slot) * 4 + condition;
-    }
-    bool validate_registration(
-        const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &entry
-    ) {
-        ++validations;
-        const auto index = key(identity, condition);
-        if (!allow_registration || identity.run_epoch != kEpoch || index >= ready.size() ||
-            entry.addr != kRecords + index * 128 || entry.backend_cookie != kCookie + index)
-            return false;
-        return true;
     }
     SchedulerAsyncConditionOutcome
     observe_once(const SchedulerAsyncGroupIdentity &identity, uint32_t condition, const DeferredCompletionEntry &) {
@@ -216,7 +203,7 @@ struct RuntimeFixture {
         auto &ctx = payload(block, lane).local_context.async_ctx;
         auto &entry = ctx.completion_entries[index];
         entry.addr = kRecords + key * 128;
-        entry.backend_cookie = kCookie + key;
+        entry.backend_cookie = 0;
         entry.expected_value = 1;
         entry.engine = COMPLETION_ENGINE_SDMA;
         entry.completion_type = COMPLETION_TYPE_COUNTER;
@@ -226,8 +213,7 @@ struct RuntimeFixture {
     bool seal(uint32_t worker, uint32_t block = 0, uint32_t lane = 0, bool *registered_out = nullptr) {
         bool registered = false;
         const bool ok = scheduler_async_runtime_seal(
-            views[worker], graph, base(), &locals[worker], run, 0, block, lane, &payload(block, lane), backend,
-            &registered
+            views[worker], graph, base(), &locals[worker], run, 0, block, lane, &payload(block, lane), &registered
         );
         if (registered_out != nullptr) *registered_out = registered;
         return ok;
@@ -363,7 +349,6 @@ TEST(HbgAsyncRuntime, ZeroLocatorDisablesPollingAndClearsStalePayloadContextWith
     for (auto value : fixture.payloads[0].args)
         EXPECT_EQ(value, UINT64_C(0xdeadbeef));
     EXPECT_EQ(fixture.service(0), SchedulerAsyncRuntimeServiceResult::IDLE);
-    EXPECT_EQ(fixture.backend.validations, 0u);
 }
 
 TEST(HbgAsyncRuntime, AllResidentLanesUseTheSameRunContextAndGuardPool) {
@@ -375,9 +360,8 @@ TEST(HbgAsyncRuntime, AllResidentLanesUseTheSameRunContextAndGuardPool) {
         EXPECT_EQ(payload.async_context.subtask_slot, lane);
         auto ctx = AsyncCtx::from_storage(payload.local_context.async_ctx);
         ctx.execution_context = const_cast<AsyncExecutionContext *>(&payload.async_context);
-        AsyncBackendView backend;
-        uint64_t guards = 0, contract = 0;
-        ASSERT_TRUE(async_backend_context(ctx, &backend, &guards, &contract));
+        uint64_t guards = 0;
+        ASSERT_TRUE(async_sdma_guard_address(ctx, &guards));
         EXPECT_EQ(guards, reinterpret_cast<uint64_t>(f.views[0].base) + f.async.sdma_guard_context_offset);
     }
 }
@@ -545,7 +529,6 @@ TEST(HbgAsyncRuntime, ZeroConditionGroupDoesNotActivateCheckAndLastBlockActivate
     ASSERT_TRUE(fixture.release(0, 0, &activated));
     EXPECT_TRUE(activated);
     fixture.drain();
-    EXPECT_EQ(fixture.backend.validations, 0u);
 }
 
 TEST(HbgAsyncRuntime, LaterBlocksMayRegisterGroupsAfterEarlierChecksDrain) {
@@ -574,7 +557,6 @@ TEST(HbgAsyncRuntime, LaterBlocksMayRegisterGroupsAfterEarlierChecksDrain) {
     ASSERT_TRUE(fixture.release(3, 1));
     fixture.backend.ready[20] = true;
     fixture.drain();
-    EXPECT_EQ(fixture.backend.validations, 3u);
     EXPECT_EQ(fixture.backend.acquisitions, 3u);
 }
 
@@ -602,7 +584,7 @@ TEST(HbgAsyncRuntime, ReleaseBeforeSealAndRepeatedGrantFailWithoutSuccessfulTask
     }
 }
 
-TEST(HbgAsyncRuntime, StickyWriterOverflowInvalidBindingAndDuplicateSealPreserveFailureEvidence) {
+TEST(HbgAsyncRuntime, StickyWriterOverflowInvalidConditionAndDuplicateSealPreserveFailureEvidence) {
     for (uint32_t scenario = 0; scenario < 4; ++scenario) {
         RuntimeFixture fixture(1, 1, 1, 1);
         fixture.bind(0);
@@ -610,7 +592,7 @@ TEST(HbgAsyncRuntime, StickyWriterOverflowInvalidBindingAndDuplicateSealPreserve
         auto &ctx = fixture.payload(0, 0).local_context.async_ctx;
         if (scenario == 0) *ctx.completion_error_code = -811;
         if (scenario == 1) *ctx.completion_count = 2;
-        if (scenario == 2) fixture.backend.allow_registration = false;
+        if (scenario == 2) fixture.payload(0, 0).local_context.async_ctx.completion_entries[0].addr = 0;
         if (scenario == 3) ASSERT_TRUE(fixture.seal(0));
         EXPECT_FALSE(fixture.seal(0));
         if (scenario == 0) EXPECT_EQ(*ctx.completion_error_code, -811);
@@ -641,7 +623,6 @@ TEST(HbgAsyncRuntime, SixtyFifthWriterAppendPublishesOverflowAsTheFirstScheduler
     scheduler_record_error(fixture.run, 1, SchedulerGraphResult::INVALID_ARGUMENTS);
     EXPECT_EQ(scheduler_read_error(fixture.run), static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW));
     EXPECT_EQ(*ctx.completion_error_code, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
-    EXPECT_EQ(fixture.backend.validations, 0u);
     EXPECT_EQ(fixture.completed(), 0u);
     EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
 }
@@ -704,7 +685,7 @@ TEST(HbgAsyncRuntime, EarliestCheckClaimObservesSealedWriterAndConditions) {
     std::atomic<bool> observing{false};
     bool claimed = false;
     uint32_t sealed = 0, count = 0;
-    uint64_t cookie = 0;
+    uint64_t address = 0;
     auto &lease = *f.at<SchedulerAsyncLease>(f.async.group_lease_offset);
     auto &directory = *f.at<SchedulerAsyncDirectoryWord>(f.async.check_directory_offset);
     std::thread peer([&] {
@@ -717,7 +698,7 @@ TEST(HbgAsyncRuntime, EarliestCheckClaimObservesSealedWriterAndConditions) {
         const auto *writer = f.at<SchedulerAsyncGroupWriter>(f.async.group_writer_offset);
         sealed = writer->reservation.sealed;
         count = writer->count;
-        cookie = f.at<DeferredCompletionEntry>(f.async.entries_offset)->backend_cookie;
+        address = f.at<DeferredCompletionEntry>(f.async.entries_offset)->addr;
         EXPECT_EQ(
             scheduler_async_lease_handoff(lease, claim.word, SchedulerAsyncPhase::RUNNABLE).result,
             SchedulerAsyncLeaseResult::SUCCESS
@@ -729,14 +710,14 @@ TEST(HbgAsyncRuntime, EarliestCheckClaimObservesSealedWriterAndConditions) {
     EXPECT_TRUE(claimed);
     EXPECT_EQ(sealed, 1u);
     EXPECT_EQ(count, 1u);
-    EXPECT_EQ(cookie, kCookie);
+    EXPECT_EQ(address, kRecords);
 }
 
 TEST(HbgAsyncRuntime, RejectedRegistrationNeverPublishesCheckOrSuccessfulJoin) {
     RuntimeFixture f;
     f.bind(0);
     f.condition();
-    f.backend.allow_registration = false;
+    f.payload(0, 0).local_context.async_ctx.completion_entries[0].addr = 0;
     EXPECT_FALSE(f.seal(0));
     EXPECT_EQ(scheduler_async_directory_load(*f.at<SchedulerAsyncDirectoryWord>(f.async.check_directory_offset)), 0u);
     EXPECT_EQ(
@@ -1002,7 +983,7 @@ TEST(HbgAsyncProtocol, FailedSealRetainsActualSealAndNoRelease) {
     fixture.bind(0);
     fixture.condition();
     fixture.record_execution(0);
-    fixture.backend.allow_registration = false;
+    fixture.payload(0, 0).local_context.async_ctx.completion_entries[0].addr = 0;
     EXPECT_FALSE(fixture.seal(0));
     const auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
     EXPECT_NE(fixture.group_trace()->sealed_at.sequence, 0u);
@@ -1220,9 +1201,7 @@ void ordinary_projection_returned_path() {
     ASSERT_EQ(fixture.graph.scheduler_state_address, 0u);
     ASSERT_EQ(fixture.graph.scheduler_state_bytes, 0u);
     ASSERT_TRUE(scheduler_protocol_enabled(&local));
-    ASSERT_TRUE(scheduler_async_execution_returned(
-        &state, fixture.graph, fixture.base(), &local, fixture.run, 0, fixture.backend
-    ));
+    ASSERT_TRUE(scheduler_async_execution_returned(&state, fixture.graph, fixture.base(), &local, fixture.run, 0));
     const auto *writer = fixture.at<SchedulerAsyncGroupWriter>(fixture.async.group_writer_offset);
     EXPECT_GT(fixture.group_trace()->sealed_at.sequence, execution->visible.sequence);
     ASSERT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::IDLE);

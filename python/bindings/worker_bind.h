@@ -45,33 +45,8 @@
 #include "types.h"
 #include "worker.h"
 #include "worker_manager.h"
-#include "../platform_comm/comm_domain_use_wire.h"
 
 namespace nb = nanobind;
-
-inline std::vector<CommDomainUse> parse_comm_domain_uses(nb::handle value) {
-    std::vector<CommDomainUse> result;
-    if (value.is_none()) return result;
-    for (nb::handle row : nb::cast<nb::iterable>(value)) {
-        const auto fields = nb::cast<nb::sequence>(row);
-        if (nb::len(fields) != 3) throw std::invalid_argument("domain use must contain kind, id and device context");
-        result.push_back(
-            {static_cast<CommDomainKind>(nb::cast<uint32_t>(fields[0])), 0, nb::cast<uint64_t>(fields[1]),
-             nb::cast<uint64_t>(fields[2])}
-        );
-    }
-    validate_comm_domain_uses(result);
-    return result;
-}
-
-inline std::vector<std::vector<CommDomainUse>> parse_comm_domain_use_groups(nb::handle value) {
-    std::vector<std::vector<CommDomainUse>> result;
-    if (!value.is_none()) {
-        for (nb::handle group : nb::cast<nb::iterable>(value))
-            result.push_back(parse_comm_domain_uses(group));
-    }
-    return result;
-}
 
 class PyBufferView {
 public:
@@ -394,17 +369,15 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const TaskArgs &args, const CallConfig &config, int32_t worker_id,
-               const std::vector<int32_t> &eligible_worker_ids, nb::object remote_sidecar,
-               nb::object domain_uses) -> TaskHandle {
+               const std::vector<int32_t> &eligible_worker_ids, nb::object remote_sidecar) -> TaskHandle {
                 return self.submit_next_level(
                     make_callable_identity(digest, kind, target_namespace), args, config, worker_id,
-                    eligible_worker_ids, parse_remote_task_args_sidecar(remote_sidecar),
-                    parse_comm_domain_uses(domain_uses)
+                    eligible_worker_ids, parse_remote_task_args_sidecar(remote_sidecar)
                 );
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"), nb::arg("config"),
             nb::arg("worker"), nb::arg("eligible_worker_ids") = std::vector<int32_t>{},
-            nb::arg("remote_sidecar") = nb::none(), nb::arg("domain_uses") = nb::none(),
+            nb::arg("remote_sidecar") = nb::none(),
             "Submit a NEXT_LEVEL task by registered callable digest. "
             "worker= selects the exact stable NEXT_LEVEL worker id."
         )
@@ -412,17 +385,15 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level_group",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const std::vector<TaskArgs> &args_list, const CallConfig &config, const std::vector<int32_t> &worker_ids,
-               const std::vector<std::vector<int32_t>> &eligible_worker_ids, nb::object remote_sidecars,
-               nb::object domain_uses) -> TaskHandle {
+               const std::vector<std::vector<int32_t>> &eligible_worker_ids, nb::object remote_sidecars) -> TaskHandle {
                 return self.submit_next_level_group(
                     make_callable_identity(digest, kind, target_namespace), args_list, config, worker_ids,
-                    eligible_worker_ids, parse_remote_task_args_sidecars(remote_sidecars),
-                    parse_comm_domain_use_groups(domain_uses)
+                    eligible_worker_ids, parse_remote_task_args_sidecars(remote_sidecars)
                 );
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"), nb::arg("config"),
             nb::arg("workers"), nb::arg("eligible_worker_ids") = std::vector<std::vector<int32_t>>{},
-            nb::arg("remote_sidecars") = nb::none(), nb::arg("domain_uses") = nb::none(),
+            nb::arg("remote_sidecars") = nb::none(),
             "Submit a group of NEXT_LEVEL tasks by registered callable digest. "
             "workers= selects one exact stable NEXT_LEVEL worker id per member."
         )
@@ -1151,21 +1122,6 @@ inline void bind_worker(nb::module_ &m) {
     m.attr("TEARDOWN_REPORT_SCHEMA") = static_cast<int>(TEARDOWN_REPORT_SCHEMA);
     m.attr("MAILBOX_ARGS_CAPACITY") = static_cast<int>(MAILBOX_ARGS_CAPACITY);
     m.attr("MAILBOX_TASK_PROTOCOL_VERSION") = static_cast<uint32_t>(MAILBOX_TASK_PROTOCOL_VERSION);
-    m.def(
-        "_read_comm_domain_uses_from_blob",
-        [](uintptr_t blob_address, size_t capacity) {
-            const auto *blob = reinterpret_cast<const uint8_t *>(blob_address);
-            const TaskArgsView view = read_blob(blob, capacity);
-            const size_t offset = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor) +
-                                  static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
-            const auto uses = read_comm_domain_uses(blob + offset, capacity - offset);
-            nb::list result;
-            for (const auto &use : uses)
-                result.append(nb::make_tuple(static_cast<uint32_t>(use.kind), use.id, use.device_context));
-            return result;
-        },
-        nb::arg("blob_address"), nb::arg("capacity")
-    );
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
 

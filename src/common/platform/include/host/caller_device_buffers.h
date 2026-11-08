@@ -130,25 +130,6 @@ public:
         return resolve_locked(addr, bytes, out);
     }
 
-    // A recorded allocation is not proof that this run holds it. Resolve and
-    // check the existing borrow under the same leaf mutex; acquire no new ref.
-    bool resolve_borrowed(uint64_t identity, uint64_t addr, uint64_t bytes, Allocation *out) const {
-        if (out != nullptr) *out = {};
-        if (out == nullptr || identity == 0 || addr == 0 || bytes == 0 || bytes > UINT64_MAX - addr) return false;
-        std::scoped_lock lk(mu_);
-        const auto borrowed = borrows_.find(identity);
-        if (borrowed == borrows_.end()) return false;
-        Allocation allocation;
-        if (!resolve_locked(addr, bytes, &allocation) || allocation.bytes > UINT64_MAX - allocation.base) return false;
-        for (const uint64_t base : borrowed->second) {
-            if (base == allocation.base) {
-                *out = allocation;
-                return true;
-            }
-        }
-        return false;
-    }
-
     /**
      * Take `identity`'s borrow over every span's containing allocation.
      *

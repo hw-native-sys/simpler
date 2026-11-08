@@ -65,7 +65,6 @@ struct Plan {
     int64_t skip;
     int64_t capacity_delta;
     int64_t slots;
-    bool declare_resources{true};
     int64_t registration_epoch{1};
 };
 

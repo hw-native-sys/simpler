@@ -38,9 +38,6 @@ pytestmark = [
 @cache
 def compile_unknown(platform):
     spec = _counter_callable_spec()
-    spec["orchestration"].update(
-        function_name="unannotated_orchestration_entry", config_name="aicpu_orchestration_config"
-    )
     for kernel in spec["incores"]:
         kernel.pop("async_capability")
     return compile_chip_callable_spec(

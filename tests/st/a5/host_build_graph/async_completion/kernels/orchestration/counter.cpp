@@ -28,15 +28,13 @@ struct BodyConfig : simpler::hbg::ConfigBase {
     uint64_t hash() const {
         return simpler::hbg::config_hash(
             plan.scenario, plan.conditions, plan.waiters, plan.blocks, plan.mask, plan.expected, plan.epoch,
-            plan.delay_ms, plan.tail_ms, plan.sync_start, plan.instances, plan.skip, plan.capacity_delta, plan.slots,
-            plan.declare_resources
+            plan.delay_ms, plan.tail_ms, plan.sync_start, plan.instances, plan.skip, plan.capacity_delta, plan.slots
         );
     }
     auto fields() const {
         return std::tie(
             plan.scenario, plan.conditions, plan.waiters, plan.blocks, plan.mask, plan.expected, plan.epoch,
-            plan.delay_ms, plan.tail_ms, plan.sync_start, plan.instances, plan.skip, plan.capacity_delta, plan.slots,
-            plan.declare_resources
+            plan.delay_ms, plan.tail_ms, plan.sync_start, plan.instances, plan.skip, plan.capacity_delta, plan.slots
         );
     }
     bool operator==(const BodyConfig &other) const { return fields() == other.fields(); }
@@ -46,20 +44,6 @@ template <typename Args>
 void tensors(CoreTaskArgs &task, const Args &args) {
     for (int32_t i = 0; i < 5; ++i)
         task.add_no_dep(args.tensor(i).ref());
-}
-
-constexpr auto kCleanLines = AsyncUseCacheContract::PUBLISHED_CLEAN_LINES;
-
-void declare_core_only(TaskId task, bool enabled) {
-    if (!enabled) return;
-    if (!rt_declare_async_core_only(task)) throw std::runtime_error("async case core-only declaration failed");
-}
-
-void declare_waiter(TaskId task, bool enabled) {
-    if (!enabled) return;
-    if (!rt_declare_async_counter_payload(task, 0, 1, async_case::kSignalStride * sizeof(int32_t), kCleanLines))
-        throw std::runtime_error("async fixture counter declaration failed");
-    declare_core_only(task, enabled);
 }
 
 template <typename Args, typename Instance, typename Base, typename Record>
@@ -84,12 +68,11 @@ TaskId action(
             submitted = rt_submit_aic_task(8, task).task_id();
         else submitted = rt_submit_aiv_task(5, task).task_id();
     } else submitted = rt_submit_aiv_task(op == Action::PREREQUISITE ? 6 : 3, task).task_id();
-    declare_core_only(submitted, p.declare_resources);
     return submitted;
 }
 
 template <typename Args>
-TaskId registration_gate(const Args &args, int64_t execution, bool declare_resources, int64_t epoch) {
+TaskId registration_gate(const Args &args, int64_t execution, int64_t epoch) {
     const uint32_t signal_shape[2]{1, 1};
     const uint32_t signal_offset[2]{
         static_cast<uint32_t>(execution * async_case::kConditionsPerExecution + async_case::kConditionLimit), 0
@@ -100,10 +83,6 @@ TaskId registration_gate(const Args &args, int64_t execution, bool declare_resou
     gate.add_no_dep(args.tensor(2).ref());
     gate.add_scalar(execution, epoch);
     const TaskId registered = rt_submit_aiv_task(10, gate).task_id();
-    if (declare_resources &&
-        (!rt_declare_async_counter(registered, 0, async_case::kSignalStride * sizeof(int32_t), kCleanLines) ||
-         !rt_declare_async_core_only(registered)))
-        throw std::runtime_error("async fixture registration gate declaration failed");
     return registered;
 }
 
@@ -169,16 +148,16 @@ void body_tasks(const Args &args, const Plan &p, int64_t instance) {
         }
         const TaskId waited = scenario == Scenario::PROGRESS ? rt_submit_aiv_task(9, task).task_id() :
                                                                rt_submit_task(kernels, task).task_id();
-        declare_waiter(waited, p.declare_resources);
+
         // Registration gates release their slots while waiting. A publisher
         // cannot strand an unstarted waiter in its other prefetched slot.
         if (scenario != Scenario::NEVER && !p.skip)
             for (int64_t block = 0; block < p.blocks; ++block)
                 for (int64_t lane = 0; lane < 3; ++lane)
                     if ((p.mask & (int64_t{1} << lane)) != 0)
-                        publisher_deps.push_back(registration_gate(
-                            args, execution + block * 3 + lane, p.declare_resources, p.registration_epoch
-                        ));
+                        publisher_deps.push_back(
+                            registration_gate(args, execution + block * 3 + lane, p.registration_epoch)
+                        );
         std::vector<TaskId> deps{waited};
         if (prerequisite.is_valid()) deps.push_back(prerequisite);
         action(
@@ -211,7 +190,7 @@ void graph_body(const GraphTaskArgs &args, const BodyConfig &config) {
     // freeze them into the shared Graph definition and invalidate this isolation test.
     waiter.add_scalar(args.scalar(1), p.conditions, p.expected, args.scalar(0), p.tail_ms, args.scalar(3));
     const TaskId waited = rt_submit_aiv_task(9, waiter).task_id();
-    declare_waiter(waited, p.declare_resources);
+
     action(args, p, Action::CONSUME, args.scalar(0), args.scalar(1), 1, args.scalar(2), 0, {waited});
 }
 }  // namespace
@@ -221,13 +200,11 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
     return OrchestrationConfig{.expected_arg_count = 20};
 }
 
-static void run_counter(const ChipTaskArgs &args, bool declare_resources) {
-    const Plan p{args.scalar<int64_t>(0),  args.scalar<int64_t>(1),  args.scalar<int64_t>(2),
-                 args.scalar<int64_t>(3),  args.scalar<int64_t>(4),  args.scalar<int64_t>(5),
-                 args.scalar<int64_t>(6),  args.scalar<int64_t>(7),  args.scalar<int64_t>(8),
-                 args.scalar<int64_t>(9),  args.scalar<int64_t>(10), args.scalar<int64_t>(11),
-                 args.scalar<int64_t>(12), args.scalar<int64_t>(13), declare_resources,
-                 args.scalar<int64_t>(14)};
+static void run_counter(const ChipTaskArgs &args) {
+    const Plan p{args.scalar<int64_t>(0),  args.scalar<int64_t>(1),  args.scalar<int64_t>(2),  args.scalar<int64_t>(3),
+                 args.scalar<int64_t>(4),  args.scalar<int64_t>(5),  args.scalar<int64_t>(6),  args.scalar<int64_t>(7),
+                 args.scalar<int64_t>(8),  args.scalar<int64_t>(9),  args.scalar<int64_t>(10), args.scalar<int64_t>(11),
+                 args.scalar<int64_t>(12), args.scalar<int64_t>(13), args.scalar<int64_t>(14)};
     for (int64_t instance = 0; instance < p.instances; ++instance) {
         if (static_cast<Scenario>(p.scenario) == Scenario::GRAPH) {
             if (p.conditions > async_case::kConditionLimit)
@@ -249,7 +226,7 @@ static void run_counter(const ChipTaskArgs &args, bool declare_resources) {
             // completion could hold EXIT even if the async child retired early.
             // Registration gates release their compute slot while the Graph
             // waiter is pending; they do not wait for the waiter's TaskDone.
-            const TaskId registered = registration_gate(args, execution, p.declare_resources, p.registration_epoch);
+            const TaskId registered = registration_gate(args, execution, p.registration_epoch);
             action(
                 args, p, Action::PUBLISH, instance, base, 1, p.slots + max_waiters * p.instances + instance,
                 rt_available_aiv_count(), {registered}, p.delay_ms
@@ -259,11 +236,5 @@ static void run_counter(const ChipTaskArgs &args, bool declare_resources) {
         }
     }
 }
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
-    run_counter(args, true);
-}
-
-__attribute__((visibility("default"))) void unannotated_orchestration_entry(const ChipTaskArgs &args) {
-    run_counter(args, false);
-}
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) { run_counter(args); }
 }  // extern "C"

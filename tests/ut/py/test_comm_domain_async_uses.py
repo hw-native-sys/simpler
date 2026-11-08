@@ -6,29 +6,24 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Selected-domain metadata from real sim owners; no chip callable executes.
+"""Existing communication owners remain retained without native domain metadata.
 
-Allocation, import, provenance registration, callback scopes and cleanup are
-production paths. Only the final submission sink is intercepted when checking
-group metadata, so ownership is never supplied by a fabricated registry row.
+Allocation, imports and run ownership use production paths. Group submission
+intercepts only the final sink; no communication kernel executes here.
 """
 
 from __future__ import annotations
 
-import ctypes
-import struct
 from dataclasses import replace
 
 import pytest
 import simpler.orchestrator as orch_module
-from _task_interface import _read_comm_domain_uses_from_blob
 from simpler.comm_domain import CommDomainRef
 from simpler.global_comm_domain import (
     GlobalDomainBuffer,
     GlobalDomainCommand,
     GlobalDomainMember,
     GlobalDomainPhase,
-    GlobalDomainReleaseCommand,
 )
 from simpler.orchestrator import Orchestrator
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs
@@ -109,7 +104,7 @@ def test_canonical_tensor_enrolls_its_existing_domain_in_the_current_run(owner):
     def inspect(_orch):
         resources = owner._building_run_resources
         assert resources.live_domains == {}
-        assert owner._domain_uses_for_dispatch(args, 0) == [(1, domain.allocation_id, domain[0].device_ctx)]
+        owner._record_touched_identities(args)
         assert resources.live_domains[domain.name] is domain
         assert resources.requires_ordered_cleanup
 
@@ -123,14 +118,14 @@ def test_scalar_only_device_context_records_the_same_live_owner(owner):
         args = TaskArgs()
         args.add_scalar(domain.device_context(0))
         assert args.tensor_count() == 0
-        assert owner._domain_uses_for_dispatch(args, 0) == [(1, domain.allocation_id, domain[0].device_ctx)]
+        owner._record_touched_identities(args)
         assert owner._building_run_resources.live_domains[domain.name] is domain
 
     _run(owner, inspect)
 
 
 @pytest.mark.parametrize("source", ["tensor", "scalar"])
-def test_default_worker_first_local_domain_zero_reaches_the_native_decoder(source):
+def test_first_local_domain_zero_is_retained_without_native_metadata(source):
     worker = Worker(
         level=3,
         platform="a2a3sim",
@@ -151,20 +146,10 @@ def test_default_worker_first_local_domain_zero_reaches_the_native_decoder(sourc
             else:
                 args = TaskArgs()
                 args.add_scalar(domain.device_context(0))
-            selected = worker._domain_uses_for_dispatch(args, 0)
-            assert selected == [(1, 0, domain[0].device_ctx)]
+            worker._record_touched_identities(args)
             resources = worker._building_run_resources
             assert resources is not None
             assert resources.live_domains[domain.name] is domain
-            kind, identity, context = selected[0]
-            # The C++ consumer reads the domain trailer after an empty TaskArgs blob.
-            payload = (
-                struct.pack("<ii", 0, 0)
-                + struct.pack("<IIII", 0x53554443, 1, 1, 24)
-                + struct.pack("<IIQQ", kind, 0, identity, context)
-            )
-            blob = ctypes.create_string_buffer(payload)
-            assert _read_comm_domain_uses_from_blob(ctypes.addressof(blob), len(payload)) == selected
 
         _run(worker, inspect)
     finally:
@@ -177,9 +162,8 @@ def test_wrong_worker_and_an_unselected_live_domain_do_not_gain_authority(owner)
     args = _tensor_args(selected[0])
 
     def inspect(_orch):
-        assert owner._domain_uses_for_dispatch(TaskArgs(), 1) == []
-        assert owner._domain_uses_for_dispatch(args, 0) == [(1, selected.allocation_id, selected[0].device_ctx)]
-        assert owner._domain_uses_for_dispatch(args, 1) == []
+        owner._record_touched_identities(args)
+        assert owner._building_run_resources.live_domains[selected.name] is selected
         assert unselected.name not in owner._building_run_resources.live_domains
         with owner._child_prov_lock, pytest.raises(ValueError, match="wrong worker, or stale"):
             owner._child_prov_check_dispatch_locked(args, 1, api="async-domain-test")
@@ -189,11 +173,12 @@ def test_wrong_worker_and_an_unselected_live_domain_do_not_gain_authority(owner)
 
 def test_a_live_domain_outside_a_building_run_is_not_a_selected_run_owner(owner):
     domain = _allocate(owner, "outside")
-    assert owner._domain_uses_for_dispatch(_tensor_args(domain[0]), 0) == []
+    owner._record_touched_identities(_tensor_args(domain[0]))
+    assert owner._building_run_resources is None
     assert not domain.released
 
 
-def test_group_submission_preserves_each_members_actual_domain_context(owner, monkeypatch):
+def test_group_submission_retains_the_existing_owner_without_a_domain_sidecar(owner, monkeypatch):
     domain = _allocate(owner, "group", (0, 1))
     unselected = _allocate(owner, "group-not-used", (0,))
     calls = []
@@ -203,8 +188,8 @@ def test_group_submission_preserves_each_members_actual_domain_context(owner, mo
             calls.append(arguments)
             return "captured"
 
-    # Callable lookup and final task execution are outside this metadata test.
-    # Real provenance checks and _domain_uses_for_dispatch remain in the path.
+    # Only callable lookup and final task execution are intercepted.
+    # Production provenance checks and owner enrollment remain in the path.
     monkeypatch.setattr(
         orch_module, "_require_handle", lambda *_args, **_kw: (bytes(32), "CHIP_CALLABLE", "LOCAL_CHIP", (0, 1))
     )
@@ -217,10 +202,8 @@ def test_group_submission_preserves_each_members_actual_domain_context(owner, mo
             )
             == "captured"
         )
-        assert calls[0][-1] == [
-            [(1, domain.allocation_id, domain[1].device_ctx)],
-            [(1, domain.allocation_id, domain[0].device_ctx)],
-        ]
+        assert len(calls[0]) == 8
+        assert owner._building_run_resources.live_domains[domain.name] is domain
         assert unselected.name not in owner._building_run_resources.live_domains
 
     _run(owner, inspect)
@@ -235,34 +218,19 @@ def test_imported_global_domain_uses_its_committed_owner_without_a_release_duty(
         if source == "scalar":
             borrowed = orch.get_domain(reference)
             assert borrowed.borrowed
+            with pytest.raises(RuntimeError, match="borrowed domain handles cannot release"):
+                borrowed.release()
             args = TaskArgs()
             args.add_scalar(borrowed.device_context(0))
         else:
             args = _tensor_args(state.view[0])
-        assert owner._domain_uses_for_dispatch(args, 0) == [(2, reference.domain_id, state.contexts[0].device_ctx)]
+        owner._record_touched_identities(args)
         resources = owner._building_run_resources
-        assert reference.domain_id in resources.borrowed_domain_uses
+        assert owner._global_node_domains[reference.domain_id] is state
+        assert state.phase is GlobalDomainPhase.COMMIT
         assert not resources.live_domains
         assert not resources.pending_release_domains
 
     _run(owner, inspect)
     assert owner._global_node_domains[reference.domain_id] is state
     assert state.phase is GlobalDomainPhase.COMMIT
-
-
-@pytest.mark.parametrize("replacement", [False, True], ids=["released", "replaced"])
-def test_a_selected_borrowed_owner_cannot_be_reused_after_release_or_replacement(owner, replacement):
-    reference = _import_global(owner)
-
-    def inspect(orch):
-        borrowed = orch.get_domain(reference)
-        assert owner._domain_uses_for_dispatch(TaskArgs(), 0)
-        owner._release_global_domain_node(GlobalDomainReleaseCommand(reference.domain_id, reference.generation))
-        assert borrowed.released
-        if replacement:
-            _import_global(owner, reference.domain_id, reference.generation + 1)
-        message = "owner was replaced" if replacement else "released before dispatch"
-        with pytest.raises(RuntimeError, match=message):
-            owner._domain_uses_for_dispatch(TaskArgs(), 0)
-
-    _run(owner, inspect)

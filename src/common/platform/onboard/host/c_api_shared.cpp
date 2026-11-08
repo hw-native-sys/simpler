@@ -626,56 +626,6 @@ stage_launch_metadata(void *runner_ctx, uint32_t pipeline_slot, const HostMetada
     }
 }
 
-static bool query_async_retained_span(
-    void *runner_ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t address, uint64_t bytes,
-    HostAsyncRetainedSpan *out
-) {
-    if (out != nullptr) *out = {};
-    if (runner_ctx == nullptr) return false;
-    try {
-        return static_cast<DeviceRunnerBase *>(runner_ctx)
-            ->query_async_retained_span(owner, slot, bank, epoch, address, bytes, out);
-    } catch (...) {
-        if (out != nullptr) *out = {};
-        return false;
-    }
-}
-
-static bool query_async_domain_context(
-    void *runner_ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context,
-    CommDomainSnapshot *out, CommDomainExecution *execution
-) {
-    if (out != nullptr) *out = {};
-    if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
-    if (runner_ctx == nullptr) return false;
-    try {
-        return static_cast<DeviceRunnerBase *>(runner_ctx)
-            ->query_async_domain_context(owner, slot, bank, epoch, device_context, out, execution);
-    } catch (...) {
-        if (out != nullptr) *out = {};
-        if (execution != nullptr) *execution = CommDomainExecution::UNKNOWN;
-        return false;
-    }
-}
-
-static bool query_async_sdma_owner(
-    void *ctx, const void *owner, uint32_t slot, uint32_t bank, uint64_t epoch, uint64_t device_context,
-    CommSdmaOwnerInfoV1 *out
-) {
-    if (out != nullptr) *out = {};
-    if (ctx == nullptr || out == nullptr) return false;
-    try {
-        CommDomainSnapshot snapshot{};
-        return static_cast<DeviceRunnerBase *>(ctx)->query_async_domain_context(
-                   owner, slot, bank, epoch, device_context, &snapshot, nullptr, out
-               ) &&
-               out->access != CommSdmaAccess::UNKNOWN;
-    } catch (...) {
-        *out = {};
-        return false;
-    }
-}
-
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -715,9 +665,6 @@ static const HostApiOps g_host_api_ops = {
     .get_prepare_plan = get_prepare_plan,
     .set_prepare_plan = set_prepare_plan,
     .stage_launch_metadata = stage_launch_metadata,
-    .query_async_retained_span = query_async_retained_span,
-    .query_async_domain_context = query_async_domain_context,
-    .query_async_sdma_owner = query_async_sdma_owner,
 };
 
 /* ===========================================================================
@@ -1772,8 +1719,7 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
 
 static int prepare_run_impl(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, const NativeRunDomainProvider *domain_provider,
-    const NativeRunDomainProviderV2 *domain_provider_v2 = nullptr
+    const NativeRunDescriptor *descriptor
 ) {
     // One prepare owns this module's thread-local workspace and diagnostic
     // transaction until its cleanup returns, including across host callbacks.
@@ -1872,9 +1818,7 @@ static int prepare_run_impl(
                 resolved.pipeline_slot, descriptor->arena_bank, resolved.arena_bank
             );
         }
-        state = new (runtime) OnboardNativeRunContext(
-            runner, *config, trace_hid, resolved, &g_host_api_ops, domain_provider, domain_provider_v2
-        );
+        state = new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops);
         std::snprintf(
             state->trace_attrs, sizeof(state->trace_attrs),
             "run_id=%llu dispatch_id=%llu slot_id=%u generation=%llu run_epoch=%llu",
@@ -2109,36 +2053,7 @@ int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, nullptr);
-}
-
-int simpler_prepare_run_with_domains_v1(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProvider *provider,
-    size_t provider_bytes
-) {
-    if (descriptor == nullptr || descriptor_bytes != sizeof(NativeRunDescriptor) || provider == nullptr ||
-        provider_bytes != sizeof(NativeRunDomainProvider))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    if (provider->version != 1 || provider->reserved != 0 ||
-        (provider->count != 0 && (provider->owner == nullptr || provider->query == nullptr)))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, provider);
-}
-
-int simpler_prepare_run_with_domains_v2(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor, size_t descriptor_bytes, const NativeRunDomainProviderV2 *provider,
-    size_t provider_bytes
-) {
-    if (descriptor == nullptr || descriptor_bytes != sizeof(NativeRunDescriptor) || provider == nullptr ||
-        provider_bytes != sizeof(NativeRunDomainProviderV2))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    const auto &base = provider->base;
-    if (base.version != 2 || base.reserved != 0 ||
-        (base.count != 0 && (base.owner == nullptr || base.query == nullptr)))
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor, &base, provider);
+    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor);
 }
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
@@ -2715,9 +2630,7 @@ int simpler_release_run_resources(DeviceContextHandle ctx, RuntimeHandle referen
     }
 }
 
-static int finalize_native_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs, uint32_t *out_proof = nullptr
-) try {
+static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     // A refused environment leaves the run owned for a retry on its context.
@@ -2925,19 +2838,6 @@ static int finalize_native_run(
     }
 
     // Capture while the run's retained image and result owner are still live.
-    // A returned semantic error does not revoke separately qualified last use.
-    bool last_use_proved = false;
-    if (out_proof != nullptr && launched && state->physical_complete && state->copyback_returned &&
-        state->bindings_released && reclaim_rc == 0 && state->active_execution->prepared != nullptr &&
-        state->active_execution->prepared->identity == state->identity()) {
-        try {
-            last_use_proved = state->runner->run_origin_accesses_ended(*state->active_execution->prepared);
-        } catch (...) {
-            // An optional proof query cannot interrupt the established cleanup
-            // path or replace the original result. Unknown remains conservative.
-        }
-    }
-
     // The epoch selects this call's retained workspace facts when execution
     // retirement has already released the slot to a successor. Destruction
     // ends this call's IO ownership without changing that successor's record.
@@ -2963,7 +2863,6 @@ static int finalize_native_run(
     }
     state->runner->release_native_run_observation(state);
     destroy_native_run_context(state);
-    if (last_use_proved) *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_PROVED;
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -2983,15 +2882,6 @@ static int finalize_native_run(
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {
     if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return finalize_native_run(ctx, runtime, deliver_outputs != 0);
-}
-
-int simpler_finalize_run_with_last_use_v1(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs, uint32_t *out_proof
-) {
-    if (out_proof == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    *out_proof = SIMPLER_NATIVE_RUN_LAST_USE_UNKNOWN;
-    if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return finalize_native_run(ctx, runtime, deliver_outputs != 0, out_proof);
 }
 
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {

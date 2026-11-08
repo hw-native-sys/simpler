@@ -100,7 +100,6 @@ public:
     int poll_execution(const ActiveExecution &active) override;
     int retire_completed_execution(ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
-    bool run_origin_accesses_ended(const PreparedExecution &prepared) const override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
 
     /**
@@ -277,13 +276,10 @@ private:
     // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
-    // Resource retirement is independent of execution success. A failed run
-    // needs explicit core-only admission plus this epoch's core retirement fact;
-    // independent/unknown backends still require the audited successful path.
+    // Failed async runs retain resources unless external accesses have ended.
+    // Only the audited successful path supplies that fact here.
     int qualify_async_last_use(PreparedExecution &prepared);
     int async_last_use_requirement(const PreparedExecution &prepared) const;
-    bool async_terminal_proves_last_use(const PreparedExecution &prepared, int requirement) const;
-    int qualified_async_execution_error(const PreparedExecution &prepared) const;
     bool retained_run_blocks_fatal_reset(
         const NativeRunIdentity &identity, const PreparedRunResources &resources
     ) const override;

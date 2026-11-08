@@ -110,7 +110,6 @@ struct DomainAllocation {
     void *rdma_workspace_addr = nullptr;
 #endif
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
-    CommContext published_context{};    // Same bytes published by this allocation; Host-only query metadata.
     size_t mapping_size = 0;
 };
 
@@ -1782,7 +1781,6 @@ static int domain_alloc_via_ipc(
     // partition, even if workspace storage was initialized along the way.
     if (sdma != nullptr && !h->sdma_owner.bind(sdma->access, sdma->queue_num)) return -1;
     out->mapping_size = aligned_size;
-    out->published_context = ctx;
     return 0;
 }
 
@@ -2087,42 +2085,6 @@ static int release_domain_windows(
     LOG_ERROR("[comm] release_domain: unknown exception");
     if (h) h->cleanup_failed = true;
     return COMM_RECLAMATION_UNCONFIRMED;
-}
-
-extern "C" int comm_query_domain_snapshot(CommHandle h, uint64_t allocation_id, CommDomainSnapshot *out) {
-    if (out != nullptr) *out = {};
-    if (h == nullptr || out == nullptr || h->cleanup_failed) return -1;
-    const auto found = h->domain_allocations.find(allocation_id);
-    if (found == h->domain_allocations.end()) return -1;
-    const auto &allocation = *found->second;
-    if (!allocation.initialized || allocation.cleanup_failed || allocation.device_ctx == nullptr ||
-        !allocation.local_mapped || allocation.local_buf == nullptr)
-        return -1;
-    out->use = {CommDomainKind::LOCAL, 0, allocation_id, reinterpret_cast<uint64_t>(allocation.device_ctx)};
-    out->context = allocation.published_context;
-    return 0;
-}
-
-extern "C" int
-comm_query_domain_sdma_owner_v1(CommHandle h, uint64_t allocation_id, CommSdmaOwnerInfoV1 *out, size_t out_bytes) {
-    if (out != nullptr && out_bytes >= sizeof(*out)) *out = {};
-    if (out == nullptr || out_bytes != sizeof(*out)) return -1;
-    CommDomainSnapshot snapshot{};
-    if (comm_query_domain_snapshot(h, allocation_id, &snapshot) != 0) return -1;
-    const auto &workspace = comm_workspace<CommWorkspaceKind::SDMA>(snapshot.context);
-    if (workspace.addr == 0 && workspace.size == 0) return 0;
-    if (h->sdma_workspace == nullptr || workspace.addr != reinterpret_cast<uint64_t>(h->sdma_workspace_addr) ||
-        workspace.size != comm_workspace<CommWorkspaceKind::SDMA>(h->host_ctx).size)
-        return -1;
-    const CommSdmaOwnerInfoV1 info{workspace.addr, workspace.size, h->sdma_owner.access, h->sdma_owner.queue_num};
-    if (!comm_sdma_owner_info_valid(info) || info.access == CommSdmaAccess::UNKNOWN) return -1;
-    *out = info;
-    return 0;
-}
-
-extern "C" int comm_query_global_domain_snapshot(uint64_t, CommDomainSnapshot *out) {
-    if (out != nullptr) *out = {};
-    return -1;  // This backend has no global-domain allocation implementation.
 }
 
 extern "C" int

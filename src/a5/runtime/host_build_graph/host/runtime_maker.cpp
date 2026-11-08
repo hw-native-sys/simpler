@@ -69,8 +69,6 @@
 #include "native_graph_plan.h"
 #include "ready_pool_plan.h"
 #include "async_plan.h"
-#include "async_backend_plan.h"
-#include "host_build_graph/async_retirement.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler_protocol_export.h"
@@ -183,11 +181,11 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
 
 // This parser receives the immutable Host mirror held by PreparedRunResources,
 // not Runtime's current binding or the reusable slot cache. No device read and
-// no second async marker is needed to recover the run's existing declaration.
+// no second async marker is needed to identify the run's async storage.
 extern "C" int
 runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes, uint64_t epoch) noexcept {
     if (mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE)
-        return HBG_ASYNC_LAST_USE_NONE;  // UNKNOWN retains the legacy path's existing lifetime contract.
+        return 0;  // UNKNOWN retains the legacy path's existing lifetime contract.
     if ((mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING && mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) ||
         host == nullptr || epoch == 0 || bytes < sizeof(SchedulerRunControl))
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -202,7 +200,7 @@ runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes
     SchedulerGraphSummary summary{};
     std::memcpy(&summary, static_cast<const std::byte *>(host) + run.graph_summary_offset, sizeof(summary));
     if (summary.run_epoch != epoch) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (summary.async_layout_offset == 0) return HBG_ASYNC_LAST_USE_NONE;
+    if (summary.async_layout_offset == 0) return 0;
     if (summary.async_layout_offset % 128 != 0 || !fits(summary.async_layout_offset, sizeof(SchedulerAsyncLayout)))
         return PTO_RUNTIME_ERR_INVALID_STATE;
     SchedulerAsyncLayout layout{};
@@ -210,10 +208,7 @@ runtime_async_last_use_requirement(uint32_t mode, const void *host, size_t bytes
     if (layout.version != SCHEDULER_ASYNC_LAYOUT_VERSION || layout.run_epoch != epoch || layout.group_count == 0 ||
         layout.total_bytes < sizeof(layout) || !fits(summary.async_layout_offset, layout.total_bytes))
         return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (layout.execution_contract > HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY) return PTO_RUNTIME_ERR_INVALID_STATE;
-    return layout.execution_contract == HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY ?
-               HBG_ASYNC_LAST_USE_CORE_PIPELINES_ONLY :
-               HBG_ASYNC_LAST_USE_EXTERNAL_OR_UNKNOWN;
+    return 1;
 }
 
 extern "C" int joined_native_launch_supported_impl(void) {
@@ -1262,8 +1257,7 @@ void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode
 
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
-    const AsyncHostDeclarations *async_declarations, const AsyncBackendTaskImage &binding_image
+    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1658,26 +1652,10 @@ bool create_scheduler_state(
         std::min<uint64_t>(std::numeric_limits<uint64_t>::max(), std::numeric_limits<size_t>::max()) -
         (SCHEDULER_STATE_ALIGNMENT - 1);
     SchedulerAsyncLayout async_layout{};
-    AsyncBackendHostPlan async_backend;
     std::vector<SchedulerAsyncCapabilities> async_capabilities;
     std::string async_error;
-    bool sdma_uses = false;
-    if (async_declarations != nullptr &&
-        !async_backend_has_sdma_uses(task_metadata, native_plan, *async_declarations, &sdma_uses, &async_error)) {
-        LOG_ERROR("A5 HBG: submission declaration lookup failed: %s", async_error.c_str());
-        return false;
-    }
-    if (sdma_uses && !has_deferred_callable) {
-        LOG_ERROR(
-            "A5 HBG: qualified SDMA submission requires an async-enabled run; synchronous-only image unsupported"
-        );
-        return false;
-    }
     if (has_deferred_callable) {
-        const AsyncHostDeclarations empty_declarations;
-        const auto &declarations = async_declarations != nullptr ? *async_declarations : empty_declarations;
-        // Registration-owned descriptors are projected onto the final expanded
-        // nodes. A synchronous run needs neither these rows nor an async region.
+        bool needs_sdma_guards = false;
         async_capabilities.resize(task_metadata.size());
         for (size_t task_ref = 0; task_ref < task_metadata.size(); ++task_ref) {
             const auto &task = task_metadata[task_ref];
@@ -1687,18 +1665,14 @@ bool create_scheduler_state(
                 // Older registration tables omit capabilities. Their callable
                 // was validated above and uses the same default as UNKNOWN.
                 runtime->get_function_async_capability(task.kernel_ids[lane], &async_capabilities[task_ref][lane]);
+                const auto cap = core_async_effective_capability(async_capabilities[task_ref][lane]);
+                needs_sdma_guards |= lane != 0 && (cap.mode == CoreAsyncMode::SYNCHRONOUS ||
+                                                   (cap.condition_types & CORE_ASYNC_CONDITION_SDMA_POST_DONE) != 0);
             }
         }
-        if (!scheduler_plan_async_backend(
-                task_metadata, async_capabilities, binding_image, native_plan, declarations, *api, max_state_bytes,
-                &async_backend, &async_error
-            )) {
-            LOG_ERROR("A5 HBG: async backend planning failed: %s", async_error.c_str());
-            return false;
-        }
         const SchedulerAsyncAuxiliaryBytes auxiliary{
-            async_backend.image.size(), async_backend.needs_sdma_guards ? ASYNC_SDMA_CHANNELS : 0,
-            async_backend.execution_contract, scheduler_phase_timing_enabled(runtime->dev.chip_swimlane_level)
+            needs_sdma_guards ? ASYNC_SDMA_CHANNELS : 0,
+            scheduler_phase_timing_enabled(runtime->dev.chip_swimlane_level)
         };
         if (!scheduler_plan_async_layout(
                 task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, auxiliary, &async_layout,
@@ -1757,17 +1731,6 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: async state initialization failed: %s", async_error.c_str());
         return false;
     }
-    if (!async_backend.image.empty()) {
-        auto *async_base = static_cast<uint8_t *>(host_base) + async_offset;
-        if (async_offset == 0 || async_layout.backend_bytes != async_backend.image.size() ||
-            async_layout.backend_offset > async_layout.total_bytes ||
-            async_layout.backend_bytes > async_layout.total_bytes - async_layout.backend_offset) {
-            LOG_ERROR("A5 HBG: backend declarations do not fit retained async storage");
-            return false;
-        }
-        std::memcpy(async_base + async_layout.backend_offset, async_backend.image.data(), async_backend.image.size());
-    }
-
     if (native_graph) {
         std::memcpy(
             static_cast<std::byte *>(host_base) + sizeof(SchedulerRunControl),
@@ -1914,7 +1877,6 @@ bool create_scheduler_state(
 
 struct HostPreparePlan : RetainedHostPreparePlan<RuntimeArenaLayout> {
     NativeGraphHostPlan native_graph;
-    std::unique_ptr<AsyncHostDeclarations> async_declarations;
 };
 
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
@@ -2035,12 +1997,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         instance.args_base = instance.heap_base + definition.required_heap;
     }
     if (!create_scheduler_state(
-            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph,
-            plan.async_declarations.get(),
-            AsyncBackendTaskImage{
-                upload_base + copied_bytes, image_bytes, reinterpret_cast<uint64_t>(device_sm), device_segments.storage,
-                static_cast<uint32_t>(total_tasks)
-            }
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2276,7 +2233,6 @@ int32_t run_host_orchestration(
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    plan.async_declarations = std::move(graph_state->async_declarations);
 
     ReadyQueueCapacities ready_queue_capacities{};
     const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);

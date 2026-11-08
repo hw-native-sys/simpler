@@ -243,10 +243,7 @@ TEST(HbgAsyncPlan, ImageBeginsDormantEmptyAndUnbound) {
 
 TEST(HbgAsyncPlan, AllRegionsAndPerGroupEntriesHaveDisjointCacheLines) {
     SchedulerAsyncHostPlan plan;
-    ASSERT_TRUE(scheduler_plan_async_state(
-        {task(7, 4)}, {capabilities(7, 5)}, kEpoch, kBudget, {257, 1, HBG_ASYNC_CONTRACT_CORE_PIPELINES_ONLY}, &plan,
-        nullptr
-    ));
+    ASSERT_TRUE(scheduler_plan_async_state({task(7, 4)}, {capabilities(7, 5)}, kEpoch, kBudget, {1}, &plan, nullptr));
     const auto &l = plan.layout;
     uint64_t end = sizeof(SchedulerAsyncLayout);
     const std::pair<uint64_t, uint64_t> regions[] = {
@@ -262,7 +259,6 @@ TEST(HbgAsyncPlan, AllRegionsAndPerGroupEntriesHaveDisjointCacheLines) {
         {l.check_directory_offset, l.check_directory_words * sizeof(SchedulerAsyncDirectoryWord)},
         {l.finish_directory_offset, l.finish_directory_words * sizeof(SchedulerAsyncDirectoryWord)},
         {l.entries_offset, l.entries_bytes},
-        {l.backend_offset, l.backend_bytes},
         {l.sdma_guard_context_offset, (l.sdma_guard_count + 1) * 128}
     };
     for (const auto &[offset, size] : regions) {
@@ -315,7 +311,7 @@ TEST(HbgAsyncPlan, DirectoryWordBoundaryAndUnusedRecordBytesAreDeterministic) {
 
 TEST(HbgAsyncPlan, DiagnosticsUseOptionalRunStorageWithoutChangingDefaultCapacity) {
     SchedulerAsyncHostPlan plain, measured, synchronous;
-    const SchedulerAsyncAuxiliaryBytes diagnostics{0, 0, HBG_ASYNC_CONTRACT_UNQUALIFIED, true};
+    const SchedulerAsyncAuxiliaryBytes diagnostics{0, true};
     ASSERT_TRUE(scheduler_plan_async_state({task(2, 8)}, {capabilities(2, 64)}, kEpoch, kBudget, {}, &plain, nullptr));
     ASSERT_TRUE(scheduler_plan_async_state(
         {task(2, 8)}, {capabilities(2, 64)}, kEpoch, kBudget, diagnostics, &measured, nullptr
@@ -349,8 +345,7 @@ TEST(HbgAsyncPlan, ExactBudgetSucceedsAndRefusalPreservesPreviousImage) {
     EXPECT_EQ(plan.image, saved);
     EXPECT_EQ(plan.layout.run_epoch, kEpoch);
     for (const auto aux :
-         {SchedulerAsyncAuxiliaryBytes{UINT64_MAX, 0, 0}, SchedulerAsyncAuxiliaryBytes{0, UINT64_MAX, 0},
-          SchedulerAsyncAuxiliaryBytes{0, 0, UINT64_MAX}}) {
+         {SchedulerAsyncAuxiliaryBytes{UINT64_MAX}, SchedulerAsyncAuxiliaryBytes{ASYNC_SDMA_CHANNELS + 1}}) {
         EXPECT_FALSE(scheduler_plan_async_state({task(1)}, {capabilities(1)}, 18, UINT64_MAX, aux, &plan, &error));
         EXPECT_EQ(plan.image, saved);
     }
@@ -418,7 +413,7 @@ TEST(HbgAsyncPlan, ValidatesInputsBeforePublishingThePlan) {
     EXPECT_FALSE(scheduler_plan_async_state({}, {}, 0, kBudget, {}, &plan, nullptr));
     EXPECT_FALSE(scheduler_plan_async_state({task(1)}, {}, kEpoch, kBudget, {}, &plan, nullptr));
     EXPECT_FALSE(scheduler_plan_async_state({}, {}, kEpoch, kBudget, {}, nullptr, nullptr));
-    EXPECT_FALSE(scheduler_plan_async_state({task(1)}, {capabilities()}, kEpoch, kBudget, {1, 0, 0}, &plan, nullptr));
+    EXPECT_FALSE(scheduler_plan_async_state({task(1)}, {capabilities()}, kEpoch, kBudget, {1}, &plan, nullptr));
     EXPECT_TRUE(scheduler_plan_async_state({}, {}, kEpoch, 0, {}, &plan, nullptr));
     EXPECT_TRUE(plan.image.empty());
 }
@@ -513,34 +508,7 @@ TEST(HbgAsyncPlan, MixedAndSyncStartTasksNeedNoConsumerScratch) {
     ASSERT_TRUE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, {}, &plan, nullptr));
     EXPECT_EQ(plan.layout.group_count, 1u);
     EXPECT_EQ(plan.layout.finish_count, 1u);
-    EXPECT_EQ(plan.layout.backend_bytes, 0u);
     EXPECT_EQ(plan.layout.total_bytes, plan.layout.entries_offset + plan.layout.entries_bytes);
-}
-
-TEST(HbgAsyncPlan, BackendDeclarationsHaveNoConsumerPrefix) {
-    const std::vector<SchedulerTaskMetadata> metadata{task(7, 2, true)};
-    const std::vector<SchedulerAsyncCapabilities> caps{capabilities(2)};
-    SchedulerAsyncHostPlan plan;
-    ASSERT_TRUE(scheduler_plan_async_state(metadata, caps, kEpoch, kBudget, {129, 0, 0}, &plan, nullptr));
-    EXPECT_EQ(plan.layout.backend_bytes, 129u);
-    EXPECT_EQ(plan.layout.backend_offset % 128, 0u);
-    for (uint64_t i = 0; i < plan.layout.backend_bytes; ++i)
-        EXPECT_EQ(plan.image[plan.layout.backend_offset + i], std::byte{0});
-    SchedulerAsyncLayout exact{};
-    ASSERT_TRUE(
-        scheduler_plan_async_layout(metadata, caps, kEpoch, plan.layout.total_bytes, {129, 0, 0}, &exact, nullptr)
-    );
-    EXPECT_FALSE(
-        scheduler_plan_async_layout(metadata, caps, kEpoch, plan.layout.total_bytes - 1, {129, 0, 0}, &exact, nullptr)
-    );
-    std::vector<std::byte> rebuilt(plan.image.size(), std::byte{0xA5});
-    ASSERT_TRUE(scheduler_initialize_async_state(metadata, caps, plan.layout, rebuilt.data(), rebuilt.size(), nullptr));
-    EXPECT_EQ(rebuilt, plan.image);
-    auto bad = plan.layout;
-    --bad.backend_offset;
-    const auto saved = rebuilt;
-    EXPECT_FALSE(scheduler_initialize_async_state(metadata, caps, bad, rebuilt.data(), rebuilt.size(), nullptr));
-    EXPECT_EQ(rebuilt, saved);
 }
 
 }  // namespace

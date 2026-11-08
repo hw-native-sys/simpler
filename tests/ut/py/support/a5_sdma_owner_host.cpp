@@ -41,11 +41,13 @@ static void actor(int rank, int ready, int release, const std::string &folder, c
     assert(std::filesystem::exists(marker) == (success || upload_failure));
     assert((peer_import_calls > 0) == (success || upload_failure));
     if (success) {
-        CommSdmaOwnerInfoV1 info;
-        assert(comm_query_domain_sdma_owner_v1(h, 1, &info, sizeof(info)) == 0);
-        assert(info.access == (legacy ? CommSdmaAccess::LEGACY : CommSdmaAccess::SDK_ONLY));
-        assert(info.queue_num == (legacy ? 0u : 3u));
-        assert(info.workspace_addr == comm_workspace<CommWorkspaceKind::SDMA>(h->host_ctx).addr);
+        assert(h->domain_allocations.count(1) == 1);
+        assert(h->sdma_owner.access == (legacy ? CommSdmaAccess::LEGACY : CommSdmaAccess::SDK_ONLY));
+        assert(h->sdma_owner.queue_num == (legacy ? 0u : 3u));
+        assert(
+            reinterpret_cast<uint64_t>(h->sdma_workspace_addr) ==
+            comm_workspace<CommWorkspaceKind::SDMA>(h->host_ctx).addr
+        );
     } else {
         assert(context == 0 && window == 0);
         assert(h->domain_allocations.count(1) == 1);  // still retained until both Init calls return
@@ -68,8 +70,7 @@ static void actor(int rank, int ready, int release, const std::string &folder, c
         // Domain release must not erase the shared owner's partition/history.
         assert(h->sdma_owner.access == (legacy ? CommSdmaAccess::LEGACY : CommSdmaAccess::SDK_ONLY));
         assert(h->sdma_owner.queue_num == (legacy ? 0u : 3u));
-        CommSdmaOwnerInfoV1 info{1, 1, CommSdmaAccess::SDK_ONLY, 1};
-        assert(comm_query_domain_sdma_owner_v1(h, 1, &info, sizeof(info)) != 0 && info.workspace_addr == 0);
+        assert(h->domain_allocations.count(1) == 0);
         assert(
             comm_alloc_domain_windows_sdma_sdk_v1(h, 2, ranks, 2, rank, 4096, 2, &context, &window, &bytes) ==
             COMM_INITIALIZATION_ABORT_REQUIRED

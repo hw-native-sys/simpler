@@ -32,27 +32,11 @@
 #include "common/dma_workspace.h"
 
 #ifdef __cplusplus
-#include "comm_domain_use.h"
 #include "comm_sdma_owner.h"
 extern "C" {
-#else
-typedef struct CommDomainSnapshot CommDomainSnapshot;
-typedef struct CommSdmaOwnerInfoV1 CommSdmaOwnerInfoV1;
 #endif
 
 typedef struct CommHandle_ *CommHandle;
-
-/**
- * Copy metadata from a live, successfully published domain allocation. No new
- * reference is acquired; the caller retains the existing domain and serializes
- * this query with allocation/release. On failure, a non-null output is cleared.
- * No device readback is performed and no completion-record qualification is
- * implied by a workspace extent. A global domain uses its existing domain id.
- */
-int comm_query_domain_snapshot(CommHandle h, uint64_t allocation_id, CommDomainSnapshot *out);
-int comm_query_global_domain_snapshot(uint64_t domain_id, CommDomainSnapshot *out);
-// Sized read-only owner configuration; no lifetime/cache/record rights added.
-int comm_query_domain_sdma_owner_v1(CommHandle h, uint64_t allocation_id, CommSdmaOwnerInfoV1 *out, size_t out_bytes);
 
 // Domain allocation failures that callers can distinguish from generic ACL errors.
 typedef enum CommDomainStatus {

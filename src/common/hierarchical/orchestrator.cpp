@@ -10,7 +10,6 @@
  */
 
 #include "orchestrator.h"
-#include "../platform_comm/comm_domain_use_wire.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1109,8 +1108,7 @@ uint64_t Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype,
 
 SubmitResult Orchestrator::submit_next_level(
     const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id,
-    const std::vector<int32_t> &eligible_worker_ids, const RemoteTaskArgsSidecar &remote_sidecar,
-    const std::vector<CommDomainUse> &domain_uses
+    const std::vector<int32_t> &eligible_worker_ids, const RemoteTaskArgsSidecar &remote_sidecar
 ) {
     std::vector<int32_t> target_worker_ids{worker_id};
     std::vector<std::vector<int32_t>> worker_id_sets;
@@ -1119,19 +1117,17 @@ SubmitResult Orchestrator::submit_next_level(
     if (!remote_sidecar.tensors.empty() || !remote_sidecar.inline_payload.empty()) sidecars = {remote_sidecar};
     return submit_impl(
         WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(target_worker_ids), std::move(worker_id_sets),
-        std::move(sidecars), {domain_uses}
+        std::move(sidecars)
     );
 }
 
 SubmitResult Orchestrator::submit_next_level_group(
     const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
     const std::vector<int32_t> &worker_ids, const std::vector<std::vector<int32_t>> &eligible_worker_ids,
-    const std::vector<RemoteTaskArgsSidecar> &remote_sidecars,
-    const std::vector<std::vector<CommDomainUse>> &domain_uses
+    const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
 ) {
     return submit_impl(
-        WorkerType::NEXT_LEVEL, callable, config, args_list, worker_ids, eligible_worker_ids, remote_sidecars,
-        domain_uses
+        WorkerType::NEXT_LEVEL, callable, config, args_list, worker_ids, eligible_worker_ids, remote_sidecars
     );
 }
 
@@ -1150,21 +1146,13 @@ SubmitResult Orchestrator::submit_sub_group(const CallableIdentity &callable, co
 SubmitResult Orchestrator::submit_impl(
     WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config, std::vector<TaskArgs> args_list,
     std::vector<int32_t> target_worker_ids, std::vector<std::vector<int32_t>> eligible_worker_ids,
-    std::vector<RemoteTaskArgsSidecar> remote_sidecars, std::vector<std::vector<CommDomainUse>> domain_uses
+    std::vector<RemoteTaskArgsSidecar> remote_sidecars
 ) {
     auto run = current_building_run();
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
     config.validate();
     validate_worker_eligibility(worker_type, args_list.size(), target_worker_ids, eligible_worker_ids);
     validate_remote_sidecars(args_list, remote_sidecars, eligible_worker_ids);
-    if (!domain_uses.empty() && domain_uses.size() != args_list.size())
-        throw std::invalid_argument("communication-domain sidecar group size mismatch");
-    for (const auto &uses : domain_uses) {
-        validate_comm_domain_uses(uses);
-        if (!uses.empty() &&
-            (worker_type != WorkerType::NEXT_LEVEL || callable.target_namespace != TargetNamespace::LOCAL_CHIP))
-            throw std::invalid_argument("communication-domain sidecars require a local chip dispatch");
-    }
     validate_explicit_deps(run->id, args_list);
     validate_submit_args(args_list);
 
@@ -1275,7 +1263,6 @@ SubmitResult Orchestrator::submit_impl(
         s.group_member_outcomes.swap(group_member_outcomes);
     }
     s.target_worker_ids = std::move(target_worker_ids);
-    s.domain_uses = std::move(domain_uses);
 
     // --- Step 5: Finalize fanin — lock each producer's fanout_mu, attach ---
     //

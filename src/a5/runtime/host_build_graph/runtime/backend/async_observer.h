@@ -23,8 +23,8 @@
 #define __gm__
 #endif
 
-// Reads only the external condition word. Declared uses validate retained
-// ranges; otherwise the registering kernel owns the live-address contract.
+// Reads only the external condition word. The registering kernel owns the
+// live-address contract; the runtime does not infer ownership from an address.
 // The entire condition cache line must be read-only/clean on this observer:
 // invalidation cannot repair an old dirty line owned by some other use.
 //
