@@ -46,6 +46,8 @@
 #define SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW 102
 #define SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED 103
 #define SIMPLER_ERROR_READY_QUEUE_OVERFLOW 104
+#define SIMPLER_ERROR_CCU_FAILED 105
+#define SIMPLER_ERROR_CCU_UNCONFIRMED 106
 
 // Sub-classification of a SIMPLER_ERROR_SCHEDULER_TIMEOUT (code 100). The top-level
 // sched_error_code stays 100 for backward compatibility; this detail value tells

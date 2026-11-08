@@ -61,6 +61,10 @@ extern "C" bool aicpu_accept_runtime_terminal(RunTerminalSelection selection, co
     return g_native_completion.accept_runtime_terminal(selection, payload, bytes);
 }
 
+extern "C" bool aicpu_accept_retired_ccu_failure(RunTerminalSelection selection, const void *payload, size_t bytes) {
+    return g_native_completion.accept_runtime_terminal(selection, payload, bytes, true);
+}
+
 extern "C" int32_t aicpu_finish_native_invocation(int32_t callback_index, int32_t status) {
     return g_native_completion.finish(
         callback_index, status,

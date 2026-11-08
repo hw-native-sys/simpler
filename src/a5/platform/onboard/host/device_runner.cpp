@@ -947,6 +947,12 @@ void DeviceRunner::emit_device_dep_gen_graph(
 
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {
     if (!prepared.resources_owned) return;
+    // A stream error, scheduler failure or missing FIN can leave a CCU reader
+    // alive. Keep the complete carrier until the provider proves it stopped.
+    if (launched && !prepared.ccu_readers.stopped()) {
+        mark_device_unusable(PTO_RUNTIME_ERR_INTERNAL);
+        return;
+    }
 
     // Before anything is released, and before the poison is read: a queued
     // stream wait naming one of this run's boundaries must not outlive the

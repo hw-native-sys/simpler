@@ -170,6 +170,8 @@ void SharedMemoryHandle::init_header_per_ring(
     header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
     header->sched_stall_task_id.store(TaskId::invalid(), std::memory_order_relaxed);
     header->sched_stall_core.store(-1, std::memory_order_relaxed);
+    // Both error-specific diagnostic interpretations share these 32 bytes.
+    header->ccu_accept_diagnostic = {};
 
     // No per-slot loop: prepare_task resets each slot when it allocates it, and
     // the scheduler only scans submitted task_ids [last_task_alive,

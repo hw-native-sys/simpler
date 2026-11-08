@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "async_completion_api.h"
 #include "callable.h"
 #include "scheduler/scheduler_context.h"
 
@@ -28,6 +29,14 @@ constexpr LaneMask kAicAiv1{true, false, true};
 
 class SchedulerDispatchTestPeer {
 public:
+    static AsyncCtx payload_context(SchedulerContext &context, ChipTaskSlotState &slot, int32_t callable_id) {
+        context.active_callable_id_ = callable_id;
+        DispatchPayload payload{};
+        context.build_payload(payload, slot, SubtaskSlot::AIV0, 0, false);
+        payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.local_context);
+        payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.global_context);
+        return get_async_ctx(reinterpret_cast<int64_t *>(payload.args));
+    }
     static void bind(SchedulerContext &context, SchedulerState &scheduler, uint64_t *callables) {
         context.sched_ = &scheduler;
         context.active_sched_threads_ = 1;
@@ -212,6 +221,13 @@ protected:
         if (later_lanes.is_full()) EXPECT_EQ(SchedulerDispatchTestPeer::running(*context, 1), &later_mix);
     }
 };
+
+TEST_F(MixSpareLane, DispatchCarriesTheCurrentCallableIdentity) {
+    auto &slot = task(0, LaneMask::aiv0());
+    EXPECT_EQ(SchedulerDispatchTestPeer::payload_context(*context, slot, 7).callable_id, 7);
+    EXPECT_EQ(SchedulerDispatchTestPeer::payload_context(*context, slot, 8).callable_id, 8);
+    EXPECT_EQ(SchedulerDispatchTestPeer::payload_context(*context, slot, -1).callable_id, -1);
+}
 
 TEST_F(MixSpareLane, LaterOppositeMixWaitsForExistingVectorAndThenProgresses) { check_later_mix(kAicAiv1); }
 

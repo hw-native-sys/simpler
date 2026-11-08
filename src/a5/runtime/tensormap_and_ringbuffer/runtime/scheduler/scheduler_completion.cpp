@@ -103,9 +103,11 @@ void SchedulerContext::complete_slot_task(
         int32_t slab_err = deferred_slab->error_code;
         if (slab_err != SIMPLER_ERROR_NONE) {
             int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
+            const bool won = sched_->sm_header->sched_error_code.compare_exchange_strong(
                 expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
             );
+            if (won && slab_err == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID)
+                sched_->sm_header->ccu_accept_diagnostic.capture(*deferred_slab);
             completed_.store(true, std::memory_order_release);
             return;
         }

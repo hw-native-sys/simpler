@@ -17,14 +17,14 @@
  * array, and embedded SPMD context (LocalContext + GlobalContext).  AICPU
  * maintains a static array of these (one per core).
  *
- * GlobalContext (sub_block_id plus async-DMA workspace addresses) is
+ * GlobalContext topology and async-DMA workspace addresses are
  * initialized during scheduler cold start from core topology and the resident
- * per-device config, then remains stable for that scheduler instance.
+ * per-device config, then remain stable for that scheduler instance.
  *
  * The scheduler prefills the AsyncCtx slab pointers and capacity, along with
  * both context pointers in the args[] suffix, during cold initialization.
  * build_payload() updates only the task-varying LocalContext fields and
- * args[0..num_args) before each dispatch.
+ * args[0..num_args) and the GlobalContext callable identity before each dispatch.
  *
  * AICore caches a pointer to its per-core slot at startup and reads from
  * it on each dispatch.  The struct is cache-line aligned to avoid false
@@ -84,7 +84,7 @@ constexpr uint32_t TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(simpler::tmr::Ten
  * concurrently dispatched cores.
  */
 struct alignas(64) DispatchPayload {
-    // === Cache line 0 (64B): control block, the only line written per dispatch ===
+    // === Cache line 0 (64B): dispatch control block ===
     // function_bin_addr, local_context.{block_idx,block_num,async_ctx.task_token}
     // and src_payload are the per-dispatch writes; async_ctx's slab pointers +
     // capacity/sender identity are cold (prefilled once at init) but ride this hot line for free.
@@ -114,8 +114,9 @@ struct alignas(64) DispatchPayload {
     uint64_t args[DISPATCH_MAX_ARGS];
 
     /** Per-core global context: sub_block_id (AIV lane identity) plus optional
-     *  async-DMA workspace addresses. Cold: written during scheduler init, never
-     *  per dispatch, so it lives in the tail (not the CL0 control block).
+     *  async-DMA workspace addresses. Those fields are cold; callable_id is
+     *  refreshed per dispatch. The publication barrier and AICore whole-cache
+     *  invalidation cover this tail as well as the CL0 control block.
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
     // No explicit tail padding: alignas(64) rounds sizeof up to 512 (8 cache lines).

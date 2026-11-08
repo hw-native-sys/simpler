@@ -1609,6 +1609,8 @@ static int park_prepare(OnboardNativeRunContext *state, int wait_rc) {
     state->runner->release_plan_epoch_refs(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
     if (state->prepared_execution != nullptr) {
         try {
+            if (state->prepared_execution->ccu_readers.cancel_unlaunched().state != simpler::ccu::ReaderState::STOPPED)
+                wait_rc = PTO_RUNTIME_ERR_INTERNAL;
             state->runner->abandon_prepared_execution(*state->prepared_execution);
         } catch (...) {
             // The wait is still the outcome: this run has reached no device
@@ -1665,6 +1667,8 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     int resources_rc = 0;
     if (state->prepared_execution != nullptr) {
         try {
+            if (state->prepared_execution->ccu_readers.cancel_unlaunched().state != simpler::ccu::ReaderState::STOPPED)
+                resources_rc = PTO_RUNTIME_ERR_INTERNAL;
             state->runner->abandon_prepared_execution(*state->prepared_execution);
         } catch (...) {
             resources_rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -2685,6 +2689,9 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
         // Keep the carrier, IO, actual streams and all unresolved cleanup debt.
         return execution_rc != 0 ? execution_rc : PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (!launched && !recorded && state->prepared_execution &&
+        state->prepared_execution->ccu_readers.cancel_unlaunched().state != simpler::ccu::ReaderState::STOPPED)
+        return PTO_RUNTIME_ERR_INTERNAL;
     // Cleanup has begun, including for an unlaunched preparation. A failed
     // cleanup may be retried, but must never make the carrier launchable again.
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
@@ -2693,13 +2700,29 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         if (attach_rc == 0) {
-            // Error detail comes from the original call-owned record. A
-            // successful qualified observer performs no private-result copy.
-            if (launched && execution_rc != 0) {
-                (void)state->runner->read_device_run_result(
-                    state->descriptor.pipeline_slot, state->descriptor.run_epoch
-                );
-                report_terminal_disagreement(state, execution_rc);
+            // CCU can finish its physical shutdown while reporting a failed
+            // operation. Its call-owned terminal decides output delivery only
+            // after the streams and CCU readers have independently stopped.
+            const bool ccu_run = launched && state->active_execution->prepared &&
+                                 state->active_execution->prepared->ccu_readers.lease != nullptr;
+            if (launched && (execution_rc != 0 || ccu_run)) {
+                const int read_rc =
+                    state->runner->read_device_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+                if (ccu_run && execution_rc == 0) {
+                    const RunExecutionOutcome outcome = decide_run_execution(collect_run_evidence(state));
+                    if (outcome.state == RunExecutionState::Failed) {
+                        execution_rc = outcome.code != 0 ? outcome.code : PTO_RUNTIME_ERR_INTERNAL;
+                    } else if (outcome.state != RunExecutionState::Succeeded) {
+                        execution_rc = read_rc != 0 ? read_rc : PTO_RUNTIME_ERR_INTERNAL;
+                        LOG_ERROR(
+                            "CCU run terminal unavailable after physical completion: %s (%s)",
+                            outcome.reason != nullptr ? outcome.reason : "no terminal decision", state->trace_attrs
+                        );
+                    }
+                    state->completion_rc = execution_rc;
+                } else {
+                    report_terminal_disagreement(state, execution_rc);
+                }
             }
             if (launched) {
                 // A separate axis from this run's outcome: a notification names a
