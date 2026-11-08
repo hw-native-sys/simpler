@@ -945,6 +945,45 @@ standalone HBG P-thread `resolve` bars. It excludes only `resolve` records whose
 timestamps are contained by a TMR `complete` or `dummy` parent, preventing the
 nested TMR work from being counted twice.
 
+#### Recorded Kernel model windows
+
+On A3, a native Kernel model can retain Swimlane records across cold capture and
+replay. Capture prepares the model without executing its kernels. Destroying the
+model and releasing its resources closes its collection window; flushing
+diagnostics finishes writing `swimlane-*/records_e<epoch>.json`. Program execution
+remains eager-only.
+
+Convert that file with the same command:
+
+```bash
+python -m simpler_setup.tools.swimlane_converter path/to/records_e1.json -o observations.json
+```
+
+`metadata.collection.recorded_window` selects the recorded-window reader. Every
+received interval is preserved, including repeated task IDs and identical
+timestamps. Trace event arguments retain the population, original stream and
+record indices, fixed window epoch, and raw timestamps. The epoch identifies the
+recorded node; it is not a replay number. Scheduler and AICore observations are
+separate tracks, without inferred task joins, dependency arrows or invocation
+overhead statistics.
+
+The device trace uses relative device SysCnt time. When Host preparation records
+exist, the trace's `host_preparation_file` names a unique companion containing
+that **one-time preparation** on its separate Host monotonic clock. Replacing a
+device trace publishes its companion first; a failed replacement preserves the
+previous trace and its companion. It is not repeated Host activity for each
+replay. There are no replay-local Host anchors, so saved/sibling Host logs cannot
+align these windows; explicit Host placement, dependency/overhead analysis and
+multi-rank merging are refused. Conversion preserves the original records file;
+output paths that alias it are refused.
+
+`counts_unknown: true` and null cumulative device totals/drop/fatal fields mean
+the collector cannot infer those totals across replays. Numeric Host receipts and
+known transport, budget or writer loss remain evidence of actual observations and
+quality. An empty recorded artifact is valid for a model destroyed without replay;
+it does not establish a replay count or zero cumulative loss. A5 recorded-window
+capture is not supported by this route.
+
 ### 3.4 Adding human-readable names
 
 Lane labels degrade in two steps:

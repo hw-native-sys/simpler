@@ -69,8 +69,8 @@ The exact native entry names are `simpler_prepare_run`,
 
 Active recording requires Kernel mode, capture-purpose preparation, a matching
 retained reference and caller stream, and no predecessor argument. Diagnostics
-allow ScopeStats alone on native A3 TMR, or PMU alone or ArgsDump alone on native
-A3 TMR/HBG.
+allow ScopeStats alone on native A3 TMR, or one of PMU, ArgsDump and Swimlane
+on native A3 TMR/HBG.
 Each supported family reserves and arms its collection window during retention,
 before capture; other diagnostic families and combinations remain refused. Duplicate recording,
 invalidated capture and unsupported combinations are refused. A capture query or
@@ -100,8 +100,9 @@ the caller establishes that ordering. This contract adds neither a second owner
 nor a whole-context stream synchronization operation. Aggregate sample and
 publication semantics are specified in the
 [ScopeStats capture contract](../dfx/scope-stats.md#native-tmr-capturereplay-collection),
-the [PMU capture contract](../dfx/pmu-profiling.md#native-a3-capturereplay) and
-[ArgsDump capture contract](../dfx/args-dump.md#35-native-a3-capturereplay-collection).
+the [PMU capture contract](../dfx/pmu-profiling.md#native-a3-capturereplay),
+the [ArgsDump capture contract](../dfx/args-dump.md#35-native-a3-capturereplay-collection)
+and the [Swimlane capture contract](../dfx/chip-swimlane-profiling.md#recorded-kernel-model-windows).
 
 ## Completion and errors
 
@@ -161,6 +162,9 @@ rows nor fixed task IDs identify individual replays. ArgsDump alone samples
 actual task input/output boundaries on A3 TMR/HBG, retaining each occurrence
 and its payload independently. Its recorded manifest explicitly leaves
 aggregate device totals unknown; task IDs do not define replay boundaries.
+Swimlane alone preserves repeated raw device intervals on A3 TMR/HBG.
+Its Host preparation context uses a separate clock and does not describe replay
+Host activity. Fixed IDs do not define replay boundaries or dependency joins.
 Other capture diagnostic families and combinations remain unsupported.
 
 A3 qualification does not qualify A5 or framework graph integration. Native CPU

@@ -1846,6 +1846,7 @@ public:
     bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
     virtual bool supports_scope_stats_capture() const { return false; }
     virtual bool supports_pmu_capture() const { return false; }
+    virtual bool supports_swimlane_capture() const { return false; }
     virtual bool supports_args_dump_capture() const { return false; }
     bool prepared_storage_in_use() const;
     bool prepared_resources_block_fatal_reset() const;
@@ -2718,8 +2719,8 @@ protected:
      * observed this run's completion fence.
      */
     /**
-     * Returns non-zero when a collector's close reported an ownership failure
-     * the caller must surface — today only retained ArgsDump. A caller folds it
+     * Returns non-zero when a collector's close reports an ownership failure
+     * or required ordinary publication fails. A caller folds it
      * into its own rc behind any device error, which stays the more useful
      * diagnosis.
      */
@@ -3160,6 +3161,7 @@ protected:
         bool recording{false};
         bool scope_stats_window{false};
         bool pmu_window{false};
+        bool swimlane_window{false};
         bool args_dump_window{false};
         bool release_requested{false};
         bool closing{false};

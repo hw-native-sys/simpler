@@ -11,6 +11,7 @@
 
 #include <acl/acl.h>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -42,12 +43,14 @@ std::vector<uint8_t> read(const char *path) {
 
 int main(int argc, char **argv) {
     require(
-        argc == 6 || argc == 8 || argc == 9, "usage: device callable cpu core dispatcher [output replay [argsdump]]"
+        argc == 6 || argc == 8 ||
+            (argc == 9 && (std::strcmp(argv[8], "swimlane") == 0 || std::strcmp(argv[8], "argsdump") == 0)),
+        "usage: device callable cpu core dispatcher [diagnostic-output replay [swimlane|argsdump]]"
     );
     const bool pmu = argc == 8;
-    const bool args_dump = argc == 9;
-    require(!args_dump || std::strcmp(argv[8], "argsdump") == 0, "diagnostic-mode");
-    const bool execute_models = !(pmu || args_dump) || std::atoi(argv[7]) != 0;
+    const bool swimlane = argc == 9 && std::strcmp(argv[8], "swimlane") == 0;
+    const bool args_dump = argc == 9 && std::strcmp(argv[8], "argsdump") == 0;
+    const bool execute_models = argc == 6 || std::atoi(argv[7]) != 0;
     require(!args_dump || std::atoi(argv[7]) == 0 || std::atoi(argv[7]) == 3, "argsdump-replays");
     const int device = std::atoi(argv[1]);
     const auto callable = read(argv[2]), cpu = read(argv[3]), core = read(argv[4]), dispatcher = read(argv[5]);
@@ -108,8 +111,9 @@ int main(int argc, char **argv) {
     const auto original_run = run;
     uint64_t identity = 0;
     auto prepare = [&](int callable_id, size_t tensor, int32_t increment, bool capture) {
-        if (pmu || args_dump) {
+        if (pmu || swimlane || args_dump) {
             if (pmu) config.enable_pmu = capture ? (callable_id == 0 ? 2 : 4) : 7;
+            if (swimlane) config.enable_chip_swimlane = 4;
             if (args_dump) config.enable_dump_args = capture ? 3 : 1;
             const char *leaf = capture ? (callable_id == 0 ? "a" : "b") : "eager";
             std::snprintf(config.output_prefix, sizeof(config.output_prefix), "%s/%s", argv[6], leaf);
@@ -167,6 +171,10 @@ int main(int argc, char **argv) {
     const auto model_b = record(reference_b);
     require(model_a != model_b && reference_a != reference_b, "independent-models-and-references");
     verify("b-recorded");
+    if (swimlane) {
+        config.enable_chip_swimlane = 1;
+        std::snprintf(config.output_prefix, sizeof(config.output_prefix), "%s/unused", argv[6]);
+    }
     if (args_dump && execute_models) {
         for (int round = 0; round < 3; ++round) {
             replay_dump(model_a, 0, -3, round, "argsdump-a");
@@ -184,32 +192,57 @@ int main(int argc, char **argv) {
     check(simpler_unregister_callable(ctx, 0), "unregister-a");
     require(simpler_unregister_callable(ctx, 1) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-callable");
     require(finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-context");
-    if (!args_dump) {
-        if (execute_models) replay(model_b, 1, 5, "b-after-a-release");
-        check(aclmdlRIDestroy(model_b), "destroy-b");
-        check(simpler_release_run_resources(ctx, reference_b), "release-b");
-        check(simpler_unregister_callable(ctx, 1), "unregister-b");
-    }
-    check(simpler_kernel_mode_prepare_callable(ctx, 0, callable.data(), callable.size()), "register-eager");
-    prepare(0, 2, 17, false);
-    check(simpler_launch_run_on_stream(ctx, run, caller, nullptr), "eager-launch");
-    check(aclrtSynchronizeStreamWithTimeout(caller, 10000), "eager-sync");
-    check(simpler_finalize_run(ctx, run), "eager-finalize");
-    for (auto &value : expected[2])
-        value += args_dump ? 24 : 17;
-    verify("eager");
+    auto run_eager = [&] {
+        check(simpler_kernel_mode_prepare_callable(ctx, 0, callable.data(), callable.size()), "register-eager");
+        prepare(0, 2, 17, false);
+        if (swimlane) {
+            // A's detached publication may still hold the second output credit.
+            // Only the clean capacity refusal preserves this same prepared run.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (true) {
+                const auto seen = simpler_diagnostic_credit_generation_ctx(ctx);
+                const int launch_rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
+                std::printf("stage=eager-launch-attempt rc=%d\n", launch_rc);
+                std::fflush(stdout);
+                if (launch_rc != SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL) {
+                    check(launch_rc, "eager-launch");
+                    break;
+                }
+                verify("eager-capacity-refused");
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
+                        .count();
+                require(remaining > 0, "eager-credit-deadline");
+                const int wait_rc = simpler_wait_diagnostic_credit_ctx(ctx, seen, static_cast<int32_t>(remaining));
+                std::printf("stage=eager-credit-wait rc=%d\n", wait_rc);
+                std::fflush(stdout);
+                require(wait_rc == 1, "eager-credit-progress");
+            }
+        } else {
+            check(simpler_launch_run_on_stream(ctx, run, caller, nullptr), "eager-launch");
+        }
+        check(aclrtSynchronizeStreamWithTimeout(caller, 10000), "eager-sync");
+        check(simpler_finalize_run(ctx, run), "eager-finalize");
+        for (auto &value : expected[2])
+            value += args_dump ? 24 : 17;
+        verify("eager");
+    };
+    if (swimlane || args_dump) run_eager();
     if (args_dump) {
         // B's final replay follows an eager call with a different frozen dump level.
         if (execute_models) replay_dump(model_b, 1, 5, 2, "argsdump-b-after-eager");
-        check(aclmdlRIDestroy(model_b), "destroy-b");
-        check(simpler_release_run_resources(ctx, reference_b), "release-b");
-        check(simpler_unregister_callable(ctx, 1), "unregister-b");
+    } else if (execute_models) {
+        replay(model_b, 1, 5, "b-after-a-release");
     }
-    if (pmu || args_dump) {
+    check(aclmdlRIDestroy(model_b), "destroy-b");
+    check(simpler_release_run_resources(ctx, reference_b), "release-b");
+    check(simpler_unregister_callable(ctx, 1), "unregister-b");
+    if (!swimlane && !args_dump) run_eager();
+    if (pmu || swimlane || args_dump) {
         std::array<char, 4096> error{};
         const int flush_rc = simpler_flush_diagnostics_ctx(ctx, 60000, error.data(), error.size());
-        if (flush_rc != 0) std::fprintf(stderr, "%s flush: %s\n", pmu ? "PMU" : "ArgsDump", error.data());
-        check(flush_rc, pmu ? "pmu-flush" : "argsdump-flush");
+        if (flush_rc != 0) std::fprintf(stderr, "diagnostic flush: %s\n", error.data());
+        check(flush_rc, swimlane ? "swimlane-flush" : args_dump ? "argsdump-flush" : "pmu-flush");
     }
     check(simpler_unregister_callable(ctx, 0), "unregister-eager");
     check(finalize_device(ctx), "finalize-context");
@@ -222,5 +255,8 @@ int main(int argc, char **argv) {
     check(aclFinalize(), "acl-finalize");
     if (args_dump)
         std::printf("argsdump_retained_models PASS models=2 replays=%d eager=1 elements=16\n", execute_models ? 6 : 0);
-    else std::printf("hbg_retained_models PASS models=2 references=2 replays=6 eager=1 elements=16\n");
+    else
+        std::printf(
+            "hbg_retained_models PASS models=2 references=2 replays=%d eager=1 elements=16\n", execute_models ? 6 : 0
+        );
 }

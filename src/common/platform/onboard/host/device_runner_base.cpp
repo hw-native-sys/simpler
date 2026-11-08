@@ -361,6 +361,13 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
                     scope_stats_collector_.abandon_run(reference->identity.run_epoch);
                     reference->scope_stats_window = false;
                 }
+                if (reference->swimlane_window) {
+                    if (!chip_swimlane_collector_.abandon_run(reference->identity.run_epoch)) {
+                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+                        return outcome;
+                    }
+                    reference->swimlane_window = false;
+                }
                 if (reference->args_dump_window) {
                     if (!dump_collector_.abandon_run(reference->identity.run_epoch)) {
                         outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
@@ -3891,7 +3898,9 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller, bool *recording)
 bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &prepared) const {
     const auto &dfx = prepared.dfx;
     if (!dfx.diagnostics_any()) return true;
-    if (dfx.chip_swimlane_enabled() || dfx.dep_gen_enabled || dfx.output_prefix.empty()) return false;
+    if (dfx.dep_gen_enabled || dfx.output_prefix.empty()) return false;
+    if (dfx.chip_swimlane_enabled())
+        return supports_swimlane_capture() && !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
     if (dfx.dump_args_enabled()) return supports_args_dump_capture() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
     if (dfx.pmu_enabled) return supports_pmu_capture() && !dfx.scope_stats_enabled;
     return supports_scope_stats_capture() && prepared.scope_stats_capacity.required &&
@@ -4056,6 +4065,7 @@ int DeviceRunnerBase::retain_external_run_resources(
     if (prepared.dfx.diagnostics_any()) {
         if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
             pmu_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+            chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch) ||
             dump_collector_.recorded_window_open(prepared.identity.run_epoch))
             return PTO_RUNTIME_ERR_INVALID_STATE;
         rc = prepare_collector_storage(*prepared.runtime, prepared);
@@ -4063,9 +4073,11 @@ int DeviceRunnerBase::retain_external_run_resources(
     }
     bool dump_armed = false;
     bool pmu_armed = false;
+    bool swimlane_armed = false;
     bool published = false;
     RAIIScopeGuard rollback_window([&] {
         if (published) return;
+        if (swimlane_armed) chip_swimlane_collector_.abandon_run(prepared.identity.run_epoch);
         if (prepared.dfx.scope_stats_enabled) scope_stats_collector_.abandon_run(prepared.identity.run_epoch);
         if (dump_armed) dump_collector_.abandon_run(prepared.identity.run_epoch);
         if (pmu_armed) {
@@ -4073,6 +4085,41 @@ int DeviceRunnerBase::retain_external_run_resources(
             pmu_lease_.release(prepared.identity.run_epoch);
         }
     });
+    if (prepared.dfx.chip_swimlane_enabled()) {
+        ChipSwimlaneCollector::RunExport metadata;
+        metadata.output_prefix = prepared.dfx.output_prefix;
+        metadata.level = prepared.dfx.chip_swimlane_level;
+        metadata.artifact_identity = prepared.artifact_identity;
+        metadata.num_aicore = prepared.num_aicore;
+        if (prepared.num_aicore < 0 || prepared.num_aicore > PLATFORM_MAX_CORES) return PTO_RUNTIME_ERR_INVALID_STATE;
+        std::vector<CoreType> core_types(static_cast<size_t>(prepared.num_aicore));
+        for (int core = 0; core < prepared.num_aicore; ++core)
+            core_types[static_cast<size_t>(core)] = prepared.runtime->core_type_rule(core);
+        const auto &host = host_phase_runs_[prepared.pipeline_slot];
+        metadata.host_orchestrated = host.host_orchestrated;
+        if (host.records.finished()) {
+            metadata.host_phase_records_present = true;
+            metadata.host_phase_submitted_tasks = host.records.submitted_tasks();
+            metadata.host_phase_total_records = host.records.total_records();
+            metadata.host_phase_dropped_records = host.records.dropped_records();
+        }
+        if (metadata.level == ChipSwimlaneLevel::ORCH_PHASES && !metadata.host_orchestrated)
+            metadata.num_orch_phase_threads = 1;  // A3 device orchestration publishes one phase pool.
+        chip_swimlane_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        swimlane_armed = true;
+        auto refusal = simpler::dfx::runs::AdmissionRefusal::None;
+        if (!chip_swimlane_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, metadata, core_types.data(), prepared.num_aicore,
+                host.records.finished() ? &host.records : nullptr, &refusal
+            ))
+            return refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                       SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                       PTO_RUNTIME_ERR_INTERNAL;
+        reference->swimlane_window = true;
+        prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+    }
     if (prepared.dfx.dump_args_enabled()) {
         dump_armed = true;
         dump_collector_.start([this](std::function<void()> function) {
@@ -4167,7 +4214,8 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
             if (rc == 0) rc = storage.fence->retire(reference->identity);
             if (rc != 0) return rc;
         }
-        if (reference->scope_stats_window || reference->pmu_window || reference->args_dump_window) {
+        if (reference->scope_stats_window || reference->pmu_window || reference->swimlane_window ||
+            reference->args_dump_window) {
             // Raw replay is caller-ordered. Its drained stream plus the external
             // end promise stops producers; the lock excludes a new native run
             // while the collector establishes its reader-quiescence boundary.
@@ -4175,6 +4223,13 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
             for (size_t index = 0; index < active_native_run_count_; ++index) {
                 if (!reference->recording || active_native_runs_[index].identity != reference->identity)
                     return PTO_RUNTIME_ERR_INVALID_STATE;
+            }
+            if (reference->swimlane_window) {
+                if (!chip_swimlane_collector_.close_recorded_window(
+                        reference->identity.run_epoch, timeout_config_.stream_sync_timeout_ms
+                    ))
+                    return PTO_RUNTIME_ERR_INTERNAL;
+                reference->swimlane_window = false;
             }
             if (reference->scope_stats_window) {
                 rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
@@ -5273,14 +5328,14 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
-    if (dfx.chip_swimlane_enabled()) {
+    if (dfx.chip_swimlane_enabled() && !chip_swimlane_collector_.recorded_window_open(run_epoch)) {
         // Which of the two paths a run takes is decided by configuration, not
         // by what the collector answers: `run_begin` refusing means this run
         // cannot be retained, and falling back to `begin_run` would then reset
         // a store a predecessor is still publishing into. So a refusal fails
         // the run, here, before any kernel is submitted and before any
         // predecessor's records or slots are touched.
-        if (chip_swimlane_collector_.retains_runs()) {
+        if (chip_swimlane_collector_.retains_runs() || chip_swimlane_collector_.has_retained_run_table()) {
             // Reader shards before admission: admitting a run waits for every
             // shard to acknowledge the new run table, and a shard that has not
             // been spawned cannot acknowledge anything. From the second run on
@@ -5467,7 +5522,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     if (dfx.dep_gen_enabled && dep_gen_retains_runs()) {
         withdraw_dep_gen_run(run_epoch);
     }
-    if (!dfx.chip_swimlane_enabled()) return restored;
+    if (!dfx.chip_swimlane_enabled() || chip_swimlane_collector_.recorded_window_open(run_epoch)) return restored;
     // Nothing may escape a rollback path: the caller owes the layer above its
     // own transaction's rc and the ownership of this run's `prepared`. The
     // withdrawal publishes its outcome — a released slot, or a quarantine with
@@ -5475,7 +5530,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     // this boundary cannot be what hides unreachable capacity; it exists so a
     // failure past that point cannot displace the launch failure either.
     try {
-        if (chip_swimlane_collector_.retains_runs()) {
+        if (chip_swimlane_collector_.retains_runs() || chip_swimlane_collector_.has_retained_run_table()) {
             restored = chip_swimlane_collector_.abandon_run(run_epoch) && restored;
         } else {
             // A terminal bank is taken per run whether or not this collector
@@ -5690,13 +5745,12 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
     //
-    // Only ArgsDump's close reports anything here: a retained run whose
-    // published buffers it could not prove processed inside the execution claim
-    // is an ownership failure the caller has to see, because releasing the
-    // claim past one would let the successor reuse an arena whose bytes nobody
-    // copied. Every other collector's close is void, as it was.
-    int args_dump_rc = 0;
-    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
+    // Collector publication and ownership failures follow any device error in
+    // the caller's result. Retained ordinary publication remains asynchronous.
+    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.recorded_window_open(run_epoch)) return 0;
+    int diagnostic_rc = 0;
+    if (dfx.chip_swimlane_enabled() &&
+        (chip_swimlane_collector_.retains_runs() || chip_swimlane_collector_.has_retained_run_table())) {
         // A retained run keeps the run boundary's device-side reads — terminal
         // and live counters — and hands the rest to the writer. No quiesce: the
         // pipeline is shared with the successor and draining it here is what
@@ -5721,15 +5775,25 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
                 publish_host_phase_records_to_swimlane(pipeline_slot);
             }
         );
+        if (!chip_swimlane_collector_.retains_runs()) {
+            std::string error;
+            if (!chip_swimlane_collector_.flush_retained_runs(
+                    simpler::dfx::runs::kCutAckBudgetMs * 8, &error, run_epoch
+                )) {
+                LOG_ERROR("ChipSwimlane ordinary publication failed: %s", error.c_str());
+                diagnostic_rc = PTO_RUNTIME_ERR_INTERNAL;
+            }
+        }
         write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
         // Every owner is settled on the same terms as the swimlane above: a
         // real device's producers do not become observable from a host
         // teardown, so no stop is proved here and a failed run's bank is
         // withdrawn rather than returned.
         if (dfx.dump_args_enabled()) {
-            args_dump_rc = close_args_dump_run_boundary(
+            const int rc = close_args_dump_run_boundary(
                 dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false
             );
+            if (diagnostic_rc == 0) diagnostic_rc = rc;
         }
         if (dfx.pmu_enabled) {
             close_pmu_run_boundary(dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false);
@@ -5739,7 +5803,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
                 dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false
             );
         }
-        return args_dump_rc;
+        return diagnostic_rc;
     }
     if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
@@ -5772,7 +5836,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
     write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
 
     if (dfx.dump_args_enabled()) {
-        args_dump_rc =
+        diagnostic_rc =
             close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false);
     }
 
@@ -5783,7 +5847,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
     if (dfx.scope_stats_enabled) {
         close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false);
     }
-    return args_dump_rc;
+    return diagnostic_rc;
 }
 
 bool DeviceRunnerBase::try_acquire_native_run(

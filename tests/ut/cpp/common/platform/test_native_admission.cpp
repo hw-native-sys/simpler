@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include "aicpu/scope_stats_collector_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "callable.h"
 #include "fixture.h"
@@ -52,6 +53,44 @@ void *operator new(std::size_t bytes) {
     if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
     throw std::bad_alloc();
 }
+
+#if defined(__linux__)
+namespace {
+struct SwimlaneRecordGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered{false};
+    bool released{false};
+    void arrive() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        changed.notify_all();
+        changed.wait(lock, [this] {
+            return released;
+        });
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+        changed.notify_all();
+    }
+    bool wait_entered() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(5), [this] {
+            return entered;
+        });
+    }
+};
+std::atomic<SwimlaneRecordGate *> swimlane_record_gate{nullptr};
+}  // namespace
+extern "C" void *__real__ZnwmSt11align_val_t(size_t bytes, std::align_val_t alignment);
+extern "C" void *__wrap__ZnwmSt11align_val_t(size_t bytes, std::align_val_t alignment) {
+    if (bytes == sizeof(CollectedRecord<ChipSwimlaneAicoreTaskRecord>)) {
+        if (auto *gate = swimlane_record_gate.exchange(nullptr)) gate->arrive();
+    }
+    return __real__ZnwmSt11align_val_t(bytes, alignment);
+}
+#endif
 
 class NativeRunExecutionTestPeer {
 public:
@@ -3492,4 +3531,353 @@ TEST_F(NativeAdmissionTest, DuplicatePmuRetainAfterUnexecutedReleasePreservesPub
     EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
 }
 
+}  // namespace native_admission_test
+
+namespace native_admission_test {
+namespace {
+class SwimlaneCaptureRunner : public FencedCompletionRunner {
+public:
+    SwimlaneCaptureRunner() {
+        static int binary;
+        aicore_bin_handle_ = &binary;
+    }
+    ~SwimlaneCaptureRunner() override {
+        chip_swimlane_collector_.finish_retained_runs();
+        chip_swimlane_collector_.finalize(nullptr, [this](void *pointer) {
+            return mem_alloc_.free(pointer);
+        });
+    }
+    bool supports_swimlane_capture() const override { return supported; }
+    bool supported{true};
+    int prepare_collector_storage(const Runtime &, PreparedExecution &prepared) override {
+        ++arm_calls;
+        const int rc = chip_swimlane_collector_.initialize(
+            1, 1, 0, prepared.dfx.chip_swimlane_level,
+            [this](size_t bytes) {
+                return mem_alloc_.alloc(bytes);
+            },
+            nullptr,
+            [this](void *pointer) {
+                return mem_alloc_.free(pointer);
+            }
+        );
+        prepared.kernel_args.args.chip_swimlane_data_base =
+            reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_chip_swimlane_setup_device_ptr());
+        return rc;
+    }
+    void seed_host_preparation() {
+        auto &host = host_phase_runs_[0];
+        host.host_orchestrated = true;
+        auto *pool = host.records.arm(true);
+        host_phase_pool_append(pool, HostPhaseKind::OrchSubmitTask, 300, 350, 8802, 1);
+        host_phase_pool_append(pool, HostPhaseKind::BindArenaH2d, 200, 250, 128, 0);
+        host_phase_pool_append(pool, HostPhaseKind::OrchSubmitTask, 100, 150, 8801, 0);
+        host.records.finish(2, 9800);
+    }
+    bool flush(std::string *error) { return chip_swimlane_collector_.flush_retained_runs(5000, error); }
+    bool window(uint64_t epoch) const { return chip_swimlane_collector_.recorded_window_open(epoch); }
+    bool ordinary_retention() const { return chip_swimlane_collector_.retains_runs(); }
+    void close_timeout(int milliseconds) { timeout_config_.stream_sync_timeout_ms = milliseconds; }
+    void produce_one(uint64_t epoch) {
+        void *shm = chip_swimlane_collector_.get_chip_swimlane_setup_device_ptr();
+        set_platform_run_result(0, epoch);
+        ::set_chip_swimlane_enabled(true);
+        set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
+        set_platform_chip_swimlane_aicore_rotation_table(0);
+        set_platform_chip_swimlane_run_terminal_bank(0);
+        chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::TASK_TIMING);
+        chip_swimlane_aicpu_on_aicore_dispatch(0, 0, 1);
+        auto *pool = get_aicore_buffer_state(shm, 0);
+        auto *buffer = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(pool->head.current_buf_ptr);
+        buffer->records[0].start_time = 100;
+        buffer->records[0].end_time = 200;
+        const int cores[] = {0};
+        chip_swimlane_aicpu_flush(0, cores, 1);
+    }
+    int arm_calls{0};
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, CaptureSwimlaneWindowUsesTheCommonExternalReference) {
+    SwimlaneCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9800);
+    use_capture_preparation(attempt);
+    diagnostic_path = "native-swimlane-capture-lifetime";
+    attempt.config.enable_chip_swimlane = 4;
+    std::strncpy(attempt.config.output_prefix, diagnostic_path.c_str(), sizeof(attempt.config.output_prefix) - 1);
+    ASSERT_EQ(attempt.prepare(), 0);
+    runner.seed_host_preparation();
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    auto release = RAIIScopeGuard([&] {
+        (void)simpler_finalize_run(&runner, attempt.storage);
+        (void)simpler_release_run_resources(&runner, reference);
+    });
+    EXPECT_EQ(runner.arm_calls, 1);
+    EXPECT_FALSE(runner.ordinary_retention());
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    EXPECT_EQ(state->prepared_execution->kernel_args.args.chip_swimlane_run_terminal_bank, 0u);
+    RuntimeHandle duplicate = reinterpret_cast<void *>(1);
+    EXPECT_NE(simpler_retain_run_resources(&runner, attempt.storage, &caller, &duplicate), 0);
+    EXPECT_EQ(duplicate, nullptr);
+    EXPECT_TRUE(runner.window(9800));
+    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
+    state->recording = true;
+    state->completion_rc = 0;
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_TRUE(runner.window(9800));
+    control().stream_sync_rc = -996;
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), -996);
+    EXPECT_TRUE(runner.window(9800));
+    control().stream_sync_rc = 0;
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    release.dismiss();
+    std::string error;
+    EXPECT_TRUE(runner.flush(&error)) << error;
+    const auto path = std::filesystem::path(diagnostic_path) / "swimlane-0/records_e9800.json";
+    std::ifstream artifact(path);
+    ASSERT_TRUE(artifact.is_open());
+    const std::string text{std::istreambuf_iterator<char>(artifact), std::istreambuf_iterator<char>()};
+    EXPECT_NE(text.find("\"host_device_uploads\""), std::string::npos);
+    EXPECT_NE(text.find("\"metadata_complete\": true"), std::string::npos);
+    const auto first = text.find("\"task_id\": 8801");
+    const auto second = text.find("\"task_id\": 8802");
+    ASSERT_NE(first, std::string::npos);
+    ASSERT_NE(second, std::string::npos);
+    EXPECT_LT(first, second) << "the finished pool is copied directly in timestamp order";
+}
+}  // namespace native_admission_test
+
+namespace native_admission_test {
+#if defined(__linux__)
+TEST_F(NativeAdmissionTest, SwimlaneReleaseRetriesPendingCutAfterEventRetirement) {
+    SwimlaneCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9808);
+    use_capture_preparation(attempt);
+    diagnostic_path = "native-swimlane-cut-retry";
+    attempt.config.enable_chip_swimlane = 1;
+    std::strcpy(attempt.config.output_prefix, diagnostic_path.c_str());
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
+    state->recording = true;
+    state->completion_rc = 0;
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    SwimlaneRecordGate gate;
+    swimlane_record_gate.store(&gate);
+    auto cleanup = RAIIScopeGuard([&] {
+        swimlane_record_gate.store(nullptr);
+        gate.release();
+        runner.close_timeout(5000);
+        (void)simpler_release_run_resources(&runner, reference);
+    });
+    runner.produce_one(9808);
+    ASSERT_TRUE(gate.wait_entered()) << "the real producer record must reach collector allocation";
+    runner.close_timeout(0);
+    const int first_close = simpler_release_run_resources(&runner, reference);
+    if (first_close == 0) reference = nullptr;
+    ASSERT_EQ(first_close, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(runner.window(9808));
+    swimlane_record_gate.store(nullptr);
+    gate.release();
+    runner.close_timeout(5000);
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    cleanup.dismiss();
+    std::string error;
+    ASSERT_TRUE(runner.flush(&error)) << error;
+    EXPECT_FALSE(runner.window(9808));
+}
+
+#endif
+
+TEST_F(NativeAdmissionTest, SwimlanePermanentPathRefusalDoesNotAdvertiseCapacity) {
+    SwimlaneCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 9809);
+    use_capture_preparation(attempt);
+    diagnostic_path = "native-swimlane-permanent-path";
+    std::ofstream(diagnostic_path) << "not a directory";
+    attempt.config.enable_chip_swimlane = 1;
+    std::strcpy(attempt.config.output_prefix, diagnostic_path.c_str());
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    RuntimeHandle reference = nullptr;
+    EXPECT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(reference, nullptr);
+}
+
+TEST_F(NativeAdmissionTest, UnsupportedSwimlaneCaptureRefusesBeforePoolMutation) {
+    for (bool mixed : {false, true}) {
+        SwimlaneCaptureRunner runner;
+        ASSERT_EQ(initialize_capture_runner(runner), 0);
+        Attempt attempt(runner, 0, 9801);
+        use_capture_preparation(attempt);
+        attempt.config.enable_chip_swimlane = 1;
+        attempt.config.enable_pmu = mixed ? 2 : 0;
+        std::strcpy(attempt.config.output_prefix, "unused-swimlane-refusal");
+        runner.supported = mixed;
+        ASSERT_EQ(attempt.prepare(), 0);
+        const auto allocations = control().allocations;
+        int caller;
+        RuntimeHandle reference = reinterpret_cast<void *>(1);
+        EXPECT_EQ(
+            simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_UNSUPPORTED
+        );
+        EXPECT_EQ(reference, nullptr);
+        EXPECT_EQ(runner.arm_calls, 0);
+        EXPECT_EQ(control().allocations, allocations);
+    }
+}
+}  // namespace native_admission_test
+
+namespace native_admission_test {
+namespace {
+class CaptureDiagnosticGateRunner : public FencedCompletionRunner {
+public:
+    CaptureDiagnosticGateRunner() {
+        static int binary;
+        aicore_bin_handle_ = &binary;
+    }
+    bool supports_scope_stats_capture() const override { return true; }
+    bool supports_pmu_capture() const override { return true; }
+    bool supports_args_dump_capture() const override { return true; }
+    bool supports_swimlane_capture() const override { return true; }
+    int prepare_collector_storage(const Runtime &, PreparedExecution &) override {
+        ++arm_calls;
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    int arm_calls{0};
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, MixedCaptureDiagnosticsRefuseBeforeAnySharedPoolMutation) {
+    const bool args_dump_supported = args_dump_capture_supported_impl() != 0;
+    unsigned checked = 0;
+    for (unsigned selection = 1; selection < 16; ++selection) {
+        if ((selection & (selection - 1)) == 0) continue;
+        if (!args_dump_supported && (selection & 4) != 0) continue;
+        ++checked;
+        SCOPED_TRACE(selection);
+        CaptureDiagnosticGateRunner runner;
+        ASSERT_EQ(initialize_capture_runner(runner), 0);
+        Attempt attempt(runner, 0, 9900 + selection);
+        use_capture_preparation(attempt);
+        attempt.config.enable_scope_stats = (selection & 1) != 0;
+        attempt.config.enable_pmu = (selection & 2) != 0 ? 2 : 0;
+        attempt.config.enable_dump_args = (selection & 4) != 0 ? static_cast<int>(DumpArgsLevel::FULL) : 0;
+        attempt.config.enable_chip_swimlane = (selection & 8) != 0 ? 4 : 0;
+        std::strcpy(attempt.config.output_prefix, "unused-mixed-diagnostic-refusal");
+        ASSERT_EQ(attempt.prepare(), 0);
+        const auto allocations = control().allocations;
+        const auto pmu_starts = control().pmu_start_calls;
+        int caller;
+        RuntimeHandle reference = reinterpret_cast<void *>(1);
+        EXPECT_EQ(
+            simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_UNSUPPORTED
+        );
+        EXPECT_EQ(reference, nullptr);
+        EXPECT_EQ(runner.arm_calls, 0);
+        EXPECT_EQ(control().allocations, allocations);
+        EXPECT_EQ(control().pmu_start_calls, pmu_starts);
+    }
+    RecordProperty("mixed_selections_checked", checked);
+    EXPECT_EQ(checked, args_dump_supported ? 11u : 4u);
+}
+}  // namespace native_admission_test
+
+namespace native_admission_test {
+namespace {
+class ArgsAndSwimlaneCaptureRunner : public SwimlaneCaptureRunner {
+public:
+    ~ArgsAndSwimlaneCaptureRunner() override {
+        dump_collector_.finalize(nullptr, [this](void *pointer) {
+            return mem_alloc_.free(pointer);
+        });
+    }
+    bool supports_args_dump_capture() const override { return true; }
+    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared) override {
+        if (!prepared.dfx.dump_args_enabled())
+            return SwimlaneCaptureRunner::prepare_collector_storage(runtime, prepared);
+        const int rc = dump_collector_.initialize(
+            1, 0, prepared.dfx.dump_args_level,
+            [this](size_t bytes) {
+                return mem_alloc_.alloc(bytes);
+            },
+            nullptr,
+            [this](void *pointer) {
+                return mem_alloc_.free(pointer);
+            }
+        );
+        prepared.kernel_args.args.dump_data_base =
+            reinterpret_cast<uint64_t>(dump_collector_.get_dump_shm_device_ptr());
+        return rc;
+    }
+    bool args_window(uint64_t epoch) const { return dump_collector_.recorded_window_open(epoch); }
+    bool flush_args(std::string *error) { return dump_collector_.flush_retained_runs(5000, error); }
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, SeparateDiagnosticModelsKeepIndependentCommonReferenceObligations) {
+    if (args_dump_capture_supported_impl() == 0) GTEST_SKIP() << "runtime has no task-time argument producer";
+    ArgsAndSwimlaneCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    diagnostic_path = "native-separate-diagnostic-models";
+    Attempt swimlane(runner, 0, 9950), args(runner, 1, 9951);
+    use_capture_preparation(swimlane);
+    use_capture_preparation(args);
+    swimlane.config.enable_chip_swimlane = 4;
+    args.config.enable_dump_args = static_cast<int>(DumpArgsLevel::FULL);
+    const auto swimlane_prefix = diagnostic_path + "/swimlane";
+    const auto args_prefix = diagnostic_path + "/args";
+    std::strncpy(swimlane.config.output_prefix, swimlane_prefix.c_str(), sizeof(swimlane.config.output_prefix) - 1);
+    std::strncpy(args.config.output_prefix, args_prefix.c_str(), sizeof(args.config.output_prefix) - 1);
+    int caller;
+    RuntimeHandle swimlane_ref = nullptr, args_ref = nullptr;
+    auto cleanup = RAIIScopeGuard([&] {
+        control().stream_sync_rc = 0;
+        (void)simpler_finalize_run(&runner, swimlane.storage);
+        (void)simpler_finalize_run(&runner, args.storage);
+        if (swimlane_ref != nullptr) (void)simpler_release_run_resources(&runner, swimlane_ref);
+        if (args_ref != nullptr) (void)simpler_release_run_resources(&runner, args_ref);
+    });
+    auto capture = [&](Attempt &attempt, RuntimeHandle *reference) {
+        ASSERT_EQ(attempt.prepare(), 0);
+        ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, reference), 0);
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+        ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
+        state->recording = true;
+        state->completion_rc = 0;
+        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    };
+    capture(swimlane, &swimlane_ref);
+    capture(args, &args_ref);
+    ASSERT_NE(swimlane_ref, nullptr);
+    ASSERT_NE(args_ref, nullptr);
+    ASSERT_TRUE(runner.window(9950));
+    ASSERT_TRUE(runner.args_window(9951));
+    control().stream_sync_rc = -996;
+    EXPECT_EQ(simpler_release_run_resources(&runner, swimlane_ref), -996);
+    EXPECT_TRUE(runner.window(9950));
+    EXPECT_TRUE(runner.args_window(9951));
+    control().stream_sync_rc = 0;
+    ASSERT_EQ(simpler_release_run_resources(&runner, swimlane_ref), 0);
+    swimlane_ref = nullptr;
+    EXPECT_TRUE(runner.args_window(9951));
+    std::string error;
+    EXPECT_TRUE(runner.flush(&error)) << error;
+    EXPECT_FALSE(runner.window(9950));
+    ASSERT_EQ(simpler_release_run_resources(&runner, args_ref), 0);
+    args_ref = nullptr;
+    EXPECT_TRUE(runner.flush_args(&error)) << error;
+    EXPECT_FALSE(runner.args_window(9951));
+    EXPECT_TRUE(std::filesystem::exists(std::filesystem::path(swimlane_prefix) / "swimlane-0/records_e9950.json"));
+    EXPECT_TRUE(std::filesystem::exists(std::filesystem::path(args_prefix) / "args_dump/args_dump.json"));
+    cleanup.dismiss();
+}
 }  // namespace native_admission_test

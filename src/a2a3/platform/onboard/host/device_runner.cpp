@@ -1628,7 +1628,8 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     if (rc != 0) return rc;
     // A per-run bank is acquired only after all enabled storage is ready.
     // Collector admission and thread startup remain in the launch transaction.
-    if (prepared.dfx.chip_swimlane_enabled()) {
+    if (prepared.dfx.chip_swimlane_enabled() && !prepared.recording &&
+        !chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch)) {
         prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
             arm_chip_swimlane_run_terminal_bank(prepared.identity.run_epoch);
     }
