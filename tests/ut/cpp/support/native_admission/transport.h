@@ -17,6 +17,11 @@
 #include <utility>
 #include <vector>
 namespace native_admission_transport {
+struct AsyncCopy {
+    void *destination;
+    const void *source;
+    size_t bytes;
+};
 struct Control {
     size_t ceiling{std::numeric_limits<size_t>::max()};
     size_t bytes{0};
@@ -38,6 +43,10 @@ struct Control {
     uint64_t requested_op_timeout_us{0};
     size_t op_timeout_calls{0};
     int copy_rc{0};
+    bool defer_async_copies{false};
+    void *failed_async_destination{nullptr};
+    int async_copy_rc{0};
+    std::vector<AsyncCopy> deferred_copies;
     int free_rc{0};
     void *selected_free{nullptr};
     int selected_free_rc{0};

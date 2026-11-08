@@ -944,6 +944,15 @@ hbg_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(_arch IN ITEMS a2a3 a5)
+        target_sources(test_${_arch}_hbg_native_admission PRIVATE
+            ${CMAKE_SOURCE_DIR}/../py/support/prepare_release_faults.cpp)
+        target_compile_definitions(test_${_arch}_hbg_native_admission PRIVATE SIMPLER_TEST_LINKER_WRAP=1)
+        target_link_options(test_${_arch}_hbg_native_admission PRIVATE
+            "-Wl,--wrap=publish_run_image_impl" "-Wl,--wrap=release_run_bindings_impl")
+    endforeach()
+endif()
 if(TARGET test_a5_hbg_native_admission)
     target_sources(test_a5_hbg_native_admission PRIVATE
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)

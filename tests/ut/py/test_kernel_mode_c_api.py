@@ -135,6 +135,37 @@ def prepare_release_faults(tmp_path_factory):
     return output
 
 
+@pytest.mark.parametrize("actual_rc", [0, -4320])
+def test_prepare_fault_shim_calls_the_original_before_injecting(prepare_release_faults, actual_rc):
+    faults = ctypes.CDLL(str(prepare_release_faults))
+    callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    calls = []
+
+    @callback_type
+    def original(runtime, api):
+        calls.append((runtime, api))
+        return actual_rc
+
+    for operation, setter, counter, result in (
+        ("publish_run_image_impl", "set_publication_result", "publication_call_count", "actual_publication_rc"),
+        (
+            "release_run_bindings_impl",
+            "set_binding_release_result",
+            "binding_release_call_count",
+            "actual_binding_release_rc",
+        ),
+    ):
+        configure = getattr(faults, setter)
+        configure.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        configure(ctypes.cast(original, ctypes.c_void_p), -4324)
+        invoke = getattr(faults, operation)
+        invoke.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        assert invoke(0x1234, 0x5678) == (actual_rc or -4324)
+        assert getattr(faults, counter)() == 1
+        assert getattr(faults, result)() == actual_rc
+    assert calls == [(0x1234, 0x5678), (0x1234, 0x5678)]
+
+
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 @pytest.mark.parametrize(
     "scenario",
@@ -1445,6 +1476,9 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
         faults.set_binding_release_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
         release_function = ctypes.cast(lib.release_run_bindings_impl, ctypes.c_void_p)
         faults.set_binding_release_result(release_function, 0)
+        faults.set_publication_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        publication_function = ctypes.cast(lib.publish_run_image_impl, ctypes.c_void_p)
+        faults.set_publication_result(publication_function, 0)
     faults.bind_test_log.argtypes = [ctypes.c_void_p]
     assert faults.bind_test_log(lib._handle) == 0
     faults.force_current_device.argtypes = [ctypes.c_int]
@@ -1585,10 +1619,16 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
         if release_failure:
             faults.set_binding_release_result(release_function, -4324)
             if runtime == "host_build_graph":
-                faults.arm_copy_failure()
+                faults.set_publication_result(publication_function, -4321)
             descriptor.run_epoch += 1
             release_unproven = True
-            assert prepare(device_args if runtime == "host_build_graph" else host_args) == -4324
+            prepare_rc = prepare(device_args if runtime == "host_build_graph" else host_args)
+            assert prepare_rc == -4324, prepare_rc
+            assert faults.binding_release_call_count() == 1
+            assert faults.actual_binding_release_rc() == 0
+            if runtime == "host_build_graph":
+                assert faults.publication_call_count() == 1
+                assert faults.actual_publication_rc() == 0
             # Destruction alone is not a successful input-release verdict.
             assert ctypes.string_at(run, 8) == bytes(8)
     finally:

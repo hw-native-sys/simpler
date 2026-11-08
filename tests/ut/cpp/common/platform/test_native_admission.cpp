@@ -294,6 +294,8 @@ private:
 };
 }  // namespace
 
+std::unique_ptr<Runner> make_fenced_completion_runner() { return std::make_unique<FencedCompletionRunner>(); }
+
 extern "C" int simpler_execution_environment_releasable_ctx(DeviceContextHandle);
 
 namespace {
