@@ -420,10 +420,9 @@ int DeviceRunner::prepare_execution(
     rc = ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
     if (rc != 0) return rc;
 
-    // A run without somewhere to publish its result must not launch: it would
-    // leave the host with no way to recover the run's own error scene, and a
-    // region still holding a predecessor's payload.
-    rc = ensure_device_run_result_region(pipeline_slot, identity.run_epoch, execution->kernel_args);
+    // Kernel execution keeps its invocation identity without requesting private
+    // detail when diagnostics are off. Program retains its structured errors.
+    rc = ensure_device_run_result_region(identity, execution->kernel_args, execution->dfx);
     if (rc != 0) return rc;
 
     if (block_dim < 1) {

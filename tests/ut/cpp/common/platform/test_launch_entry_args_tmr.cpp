@@ -50,6 +50,8 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     EXPECT_EQ(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime));
     KernelArgs header{};
     std::memcpy(&header, helper.launch_payload(), sizeof(header));
+    EXPECT_EQ(header.run_result_data_base, 0u);
+    EXPECT_EQ(header.run_result_epoch, 19u);
     EXPECT_EQ(header.entry_args_source, static_cast<uint32_t>(EntryArgsSource::KernelInvocation));
     PlatformEntryArgs view{
         helper.launch_payload(), header.entry_args_offset, header.entry_tensor_count, header.entry_scalar_count,
@@ -57,13 +59,22 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     };
     const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
     simpler::tmr::EntryArgsStorage decoded{};
-    ASSERT_TRUE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 19, &decoded));
+    ASSERT_TRUE(
+        simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, header.run_result_epoch, &decoded)
+    );
     EXPECT_EQ(decoded.scalar(0), 0x1111U);
     auto next_occupant = registered;
     ++next_occupant.generation;
     EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, next_occupant, 19, &decoded));
     EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 20, &decoded));
+    EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 0, &decoded));
     EXPECT_EQ(decoded.scalar(0), 0x1111U);
+    Handshake report{};
+    report.aicore_done = 1;
+    report.report_epoch = header.run_result_epoch - 1;
+    EXPECT_FALSE(aicore_report_accepted(&report, header.run_result_epoch));
+    report.report_epoch = header.run_result_epoch;
+    EXPECT_TRUE(aicore_report_accepted(&report, header.run_result_epoch));
 }
 
 TEST_F(LaunchEntryArgs, KernelPacketRejectsUndeclaredScalarBeforePublication) {

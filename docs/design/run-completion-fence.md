@@ -12,15 +12,24 @@ read the successor's result address. Sequential finalized calls can reuse the
 idle backing, while overlapping observations or model references require a
 new submission allocation before preparation writes it.
 
-Cold preparation initializes `NativeInvocationResultStorage` once, including
-its unchanged result prefix and private replay-evidence tail. Device entry
-invalidates the current result publication before every execution. This does
-not add a host reset task to the captured sequence or erase evidence on replay.
-A failed cold copy leaves the allocation uninitialized and retryable.
+Program execution retains its structured result record. Kernel execution
+requests that record when any diagnostic in its own `CallConfig` is enabled;
+DFX-off eager and captured Kernel calls have no private record. Their existing
+nonzero run epoch still identifies the invocation and Core reports. A zero
+result address means no private publication, independently of that identity.
+Required terminal handoff, signed callback errors and explicit RTS observation
+remain part of execution without a private record.
+
+For a requested record, cold preparation initializes
+`NativeInvocationResultStorage` once, including its result prefix and private
+replay-evidence tail. Device entry invalidates the current publication before
+every execution. This does not add a host reset task to the captured sequence
+or erase evidence on replay. A failed cold copy retains the original allocation
+for checked cleanup.
 
 Execution progress and normal successful observation perform no private-result
 D2H. An SDK error can request the original call's optional structured detail;
-that detail cannot override the SDK verdict. Only backing admitted for recording
+that detail cannot override the SDK verdict. Only requested result backing admitted for recording
 requires the separate replay-evidence read at external-use cleanup. That read
 never becomes an eager progress or ordinary result-observation prerequisite.
 
