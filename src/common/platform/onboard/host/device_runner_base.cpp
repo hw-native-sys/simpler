@@ -5960,7 +5960,7 @@ bool DeviceRunnerBase::try_reserve_native_run(
 
     for (NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) {
-            native_run_observations_.insert(owner);
+            native_run_observations_.insert(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}});
             reservation =
                 NativeRunReservation{owner, pipeline_slot, arena_bank, allow_prepared_successor, capture_preparation};
             return true;
@@ -6034,12 +6034,13 @@ bool DeviceRunnerBase::retire_run_workspace(
 
 void DeviceRunnerBase::release_native_run_observation(const void *owner) {
     std::lock_guard<std::mutex> lk(native_run_mu_);
-    native_run_observations_.erase(owner);
+    native_run_observations_.erase(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}});
 }
 
 bool DeviceRunnerBase::owns_native_run_observation(const void *owner) const {
     std::lock_guard<std::mutex> lock(native_run_mu_);
-    return native_run_observations_.find(owner) != native_run_observations_.end();
+    return native_run_observations_.find(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}}) !=
+           native_run_observations_.end();
 }
 
 bool DeviceRunnerBase::native_runs_outstanding() const {
@@ -6049,6 +6050,89 @@ bool DeviceRunnerBase::native_runs_outstanding() const {
         if (reservation.owner != nullptr) return true;
     }
     return false;
+}
+
+bool DeviceRunnerBase::fresh_callable_addition_allowed() const {
+    const auto control = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
+    bool bindings = false;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        for (const auto &row : native_run_observations_) {
+            if (row.kind == NativeRunObservation::Kind::RunOwner) return false;
+            bindings = true;
+            // Registration may wait its own control task, never an old caller pair.
+            if (row.streams.aicpu == control || row.streams.aicore == control) return false;
+        }
+        for (const auto &reservation : native_run_reservations_)
+            if (reservation.owner != nullptr) return false;
+        if (bindings && active_native_run_count_ != 0) return false;
+    }
+    if (!bindings) return true;
+    return execution_mode_latch_.is_kernel() && kernel_exec_state_.accepts_dispatch() && accepts_new_run() &&
+           !prepared_storage_in_use();
+}
+
+bool DeviceRunnerBase::has_external_run_reference(const NativeRunIdentity &identity) const {
+    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
+    return std::any_of(external_run_references_.begin(), external_run_references_.end(), [&](const auto &row) {
+        return row.second->identity == identity;
+    });
+}
+
+void DeviceRunnerBase::retain_framework_observation(const RunStreams &streams) {
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    native_run_observations_.insert(
+        NativeRunObservation{NativeRunObservation::Kind::FrameworkBinding, nullptr, streams}
+    );
+}
+
+int DeviceRunnerBase::observe_framework_submissions(int *all_observed) {
+    if (all_observed == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *all_observed = 0;
+    if (!execution_mode_latch_.is_kernel()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    const int context_rc = validate_current_context();
+    if (context_rc != 0) {
+        kernel_exec_state_.poison(context_rc);
+        return kernel_exec_state_.last_runtime_error();
+    }
+    try {
+        std::vector<RunStreams> bindings;
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            for (const auto &row : native_run_observations_)
+                if (row.kind == NativeRunObservation::Kind::FrameworkBinding) bindings.push_back(row.streams);
+        }
+        // The caller serializes this pass with launch/transfer. A nonzero raw
+        // return is not a terminal-error classifier or permission to clear debt.
+        for (const auto &streams : bindings) {
+            int rc = PTO_RUNTIME_ERR_INTERNAL;
+            try {
+                rc = sync_stream_pair(streams.aicpu, streams.aicore);
+            } catch (...) {}
+            if (rc != 0) {
+                kernel_exec_state_.poison(rc);
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            native_run_observations_.erase(
+                NativeRunObservation{NativeRunObservation::Kind::FrameworkBinding, nullptr, streams}
+            );
+        }
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            *all_observed = std::none_of(
+                                native_run_observations_.begin(), native_run_observations_.end(),
+                                [](const auto &row) {
+                                    return row.kind == NativeRunObservation::Kind::FrameworkBinding;
+                                }
+                            ) ?
+                                1 :
+                                0;
+        }
+    } catch (...) {
+        kernel_exec_state_.poison(PTO_RUNTIME_ERR_INTERNAL);
+    }
+    return kernel_exec_state_.last_runtime_error();
 }
 
 void DeviceRunnerBase::install_credit_release_notifiers() {

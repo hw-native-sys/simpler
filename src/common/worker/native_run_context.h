@@ -81,6 +81,9 @@ struct NativeRunContext {
     bool result_observed{false};
     bool physical_complete{false};
     bool execution_retired{false};
+    // Captured while the actual arguments exist, before physical retirement
+    // releases their Runtime. HOST views never acquire this entitlement.
+    bool framework_transfer_eligible{false};
     // This call's finished host-phase export requirement, retained across slot reuse.
     bool clock_alignment_log_required{false};
     // Detached unmanaged HOST staging, owned until output delivery/release.

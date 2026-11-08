@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
@@ -3689,7 +3690,7 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
                 self.register_callable(callable_id, callable.buffer_.data());
             },
-            nb::arg("callable_id"), nb::arg("callable"),
+            nb::arg("callable_id"), nb::arg("callable"), nb::call_guard<nb::gil_scoped_release>(),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
             "via run. Variants without per-callable_id support raise."
         )
@@ -3698,7 +3699,7 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
                 self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
             },
-            nb::arg("callable_id"), nb::arg("blob_ptr"),
+            nb::arg("callable_id"), nb::arg("blob_ptr"), nb::call_guard<nb::gil_scoped_release>(),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
             "bytes via shared memory; see docs/callable-identity-registration.md). "
@@ -3761,7 +3762,12 @@ NB_MODULE(_task_interface, m) {
             "copied into the POD under the GIL, which the submission itself then releases."
         )
         .def(
-            "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::call_guard<nb::gil_scoped_release>(),
+            "_observe_framework_submissions", &ChipWorker::observe_framework_submissions,
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
+            "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::arg("report_run_error") = true,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
         .def(

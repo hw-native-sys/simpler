@@ -56,6 +56,11 @@ struct Control {
     size_t d2h_calls{0};
     size_t d2h_bytes{0};
     std::vector<const void *> downloads;
+    // Opt-in registration leaf; the real maker/registry/control-stream wait remain above it.
+    bool allow_registration{false};
+    int registration_launch_rc{0};
+    std::vector<int> registered_ids;
+    std::vector<void *> registration_streams;
     int stream_sync_rc{0};
     std::function<void()> stream_sync_hook;
     std::vector<void *> observed_streams;

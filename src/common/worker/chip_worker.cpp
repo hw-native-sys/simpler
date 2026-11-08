@@ -360,6 +360,11 @@ void ChipWorker::init(
         wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
         wait_run_completion_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run_completion");
         finalize_run_fn_ = module->required<SimplerFinalizeRunFn>("simpler_finalize_run_with_delivery");
+        // A backend without stream observation cannot accept this private owner
+        // transfer. It never falls back to ordinary strong finalization.
+        transfer_completed_run_fn_ = module->optional<SimplerNativeRunFn>("simpler_transfer_completed_kernel_run");
+        observe_framework_submissions_fn_ =
+            module->optional<ObserveFrameworkSubmissionsFn>("simpler_observe_framework_submissions");
         // Absent on every simulated and stand-in module by construction, so a
         // null here is a fact about the backend rather than a stale build. The
         // caller reports it.
@@ -890,6 +895,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     wait_run_fn_ = nullptr;
     wait_run_completion_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
+    transfer_completed_run_fn_ = nullptr;
+    observe_framework_submissions_fn_ = nullptr;
     probe_run_retention_fn_ = nullptr;
     get_teardown_report_fn_ = nullptr;
     // Reached only past the throw a failed teardown takes, which keeps the
@@ -968,10 +975,13 @@ int32_t ChipWorker::register_callable(const void *callable, size_t callable_size
     validate_execution_context();
     if (register_callable_v2_fn_ == nullptr)
         throw std::runtime_error("runtime does not support versioned callable registration");
-    int32_t id = -1;
-    const int rc = register_callable_v2_fn_(device_ctx_, callable, callable_size, &id);
-    if (rc != 0) throw std::runtime_error("callable registration failed with code " + std::to_string(rc));
-    return id;
+    auto registration = [&] {
+        int32_t id = -1;
+        const int rc = register_callable_v2_fn_(device_ctx_, callable, callable_size, &id);
+        if (rc != 0) throw std::runtime_error("callable registration failed with code " + std::to_string(rc));
+        return id;
+    };
+    return run_lane_ ? run_lane_->with_callable_addition(registration) : registration();
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
@@ -982,10 +992,13 @@ void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
         throw std::runtime_error("register_callable: callable must not be null");
     }
     validate_execution_context();
-    int rc = register_callable_fn_(device_ctx_, callable_id, callable);
-    if (rc != 0) {
-        throw std::runtime_error("register_callable failed with code " + std::to_string(rc));
-    }
+    auto registration = [&] {
+        const int rc = register_callable_fn_(device_ctx_, callable_id, callable);
+        if (rc != 0) throw std::runtime_error("register_callable failed with code " + std::to_string(rc));
+        return int32_t{0};
+    };
+    if (run_lane_) (void)run_lane_->with_callable_addition(registration);
+    else (void)registration();
 }
 
 void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
@@ -1351,10 +1364,10 @@ ChipRun ChipWorker::submit_chip_run(
 
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value, void *caller_stream
+    int32_t accepted_value, void *caller_stream, bool framework_owned
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
-    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream);
+    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream, framework_owned);
 }
 
 std::shared_ptr<QueuedSubmission<ChipRun>> ChipWorker::prepare_chip_submission(
@@ -1363,24 +1376,62 @@ std::shared_ptr<QueuedSubmission<ChipRun>> ChipWorker::prepare_chip_submission(
     validate_execution_context();
     validate_caller_stream(caller_stream);
     config.validate();
-    return std::make_shared<QueuedSubmission<ChipRun>>([this, callable_id, args, config, caller_stream] {
-        // Preflight refusal precedes lane admission and cannot enqueue device work.
-        try {
-            validate_execution_context();
-            validate_caller_stream(caller_stream);
-        } catch (const std::exception &error) {
-            throw RunPreparationRefused(error.what());
-        }
-        return submit_chip_run(callable_id, args, config, nullptr, 0, caller_stream);
-    });
+    bool framework_eligible = execution_environment_ && execution_environment_->borrowed && !config.diagnostics_any() &&
+                              transfer_completed_run_fn_ != nullptr && observe_framework_submissions_fn_ != nullptr;
+    for (int i = 0; framework_eligible && i < args.tensor_count(); ++i)
+        framework_eligible =
+            args.tensor(i).address_space == AddressSpace::DEVICE && args.tensor(i).transfer == TensorTransfer::NONE;
+    return std::make_shared<QueuedSubmission<ChipRun>>(
+        [this, callable_id, args, config, caller_stream](bool framework) {
+            // Preflight refusal precedes lane admission and cannot enqueue device work.
+            try {
+                validate_execution_context();
+                validate_caller_stream(caller_stream);
+            } catch (const std::exception &error) {
+                throw RunPreparationRefused(error.what());
+            }
+            if (framework) {
+                if (!execution_environment_ || !execution_environment_->borrowed || config.diagnostics_any() ||
+                    transfer_completed_run_fn_ == nullptr || observe_framework_submissions_fn_ == nullptr)
+                    throw RunPreparationRefused("framework observation transfer requires matched eager Kernel runtime");
+                for (int i = 0; i < args.tensor_count(); ++i) {
+                    if (args.tensor(i).address_space != AddressSpace::DEVICE ||
+                        args.tensor(i).transfer != TensorTransfer::NONE)
+                        throw RunPreparationRefused("framework observation transfer requires DEVICE/NONE arguments");
+                }
+            }
+            return submit_chip_run(callable_id, args, config, nullptr, 0, caller_stream, framework);
+        },
+        framework_eligible
+    );
 }
 
 void ChipWorker::stop_chip_run_lane_admission() noexcept {
     if (run_lane_ != nullptr) run_lane_->stop_admission();
 }
 
-void ChipWorker::close_chip_run_lane() {
-    if (run_lane_ != nullptr) run_lane_->close();
+std::pair<int, bool> ChipWorker::observe_framework_submissions() {
+    if (!run_lane_ || observe_framework_submissions_fn_ == nullptr)
+        throw UnsupportedRuntimeOperation("runtime has no framework observation owner");
+    return run_lane_->observe_framework_submissions();
+}
+
+bool ChipWorker::transfer_native_run(const ChipWorkerNativeRun &run, bool *context_destroyed) {
+    if (context_destroyed != nullptr) *context_destroyed = false;
+    validate_execution_process();
+    if (transfer_completed_run_fn_ == nullptr)
+        throw UnsupportedRuntimeOperation("runtime has no framework transfer operation");
+    const auto outcome = finalize_native_run_epoch(run.run_epoch, &run, FinalizeMode::FrameworkTransfer, false);
+    if (context_destroyed != nullptr) *context_destroyed = outcome.context_destroyed;
+    if (outcome.fault == FinalizeFault::Reserved) return false;
+    if (outcome.captured) std::rethrow_exception(outcome.captured);
+    if (outcome.fault != FinalizeFault::None)
+        throw std::runtime_error("framework native transfer failed with code " + std::to_string(outcome.rc));
+    return true;
+}
+
+void ChipWorker::close_chip_run_lane(bool report_run_error) {
+    if (run_lane_ != nullptr) run_lane_->close(report_run_error);
 }
 
 void ChipWorker::validate_execution_process() const {
@@ -1880,6 +1931,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     uint64_t run_epoch, const ChipWorkerNativeRun *token, FinalizeMode mode, bool deliver_outputs
 ) noexcept {
     const bool teardown = mode == FinalizeMode::Teardown;
+    const bool transfer = mode == FinalizeMode::FrameworkTransfer;
     NativeRunFinalizeOutcome outcome;
     void *storage = nullptr;
     size_t storage_bytes = 0;
@@ -1900,6 +1952,10 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         // that already ran and discard its error.
         if (found->second->finalize_reserved) {
             if (!teardown) outcome.fault = FinalizeFault::Reserved;
+            return outcome;
+        }
+        if (transfer && found->second->ops_in_flight != 0) {
+            outcome.fault = FinalizeFault::Reserved;
             return outcome;
         }
         found->second->finalize_reserved = true;
@@ -1954,7 +2010,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         clear_finalize_reservation_noexcept(run_epoch);
         return outcome;
     }
-    const bool needs_wait = !result_observed &&
+    const bool needs_wait = !transfer && !result_observed &&
                             (phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED) &&
                             wait_run_fn_ != nullptr;
 
@@ -1986,8 +2042,11 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     if (outcome.captured == nullptr) {
         entered_finalize = true;
         try {
-            finalize_rc =
-                finalize_run_fn_(device_ctx_, storage, deliver_outputs && (!persisted || persisted_rc == 0) ? 1 : 0);
+            finalize_rc = transfer ?
+                              transfer_completed_run_fn_(device_ctx_, storage) :
+                              finalize_run_fn_(
+                                  device_ctx_, storage, deliver_outputs && (!persisted || persisted_rc == 0) ? 1 : 0
+                              );
         } catch (...) {
             outcome.captured = std::current_exception();
         }

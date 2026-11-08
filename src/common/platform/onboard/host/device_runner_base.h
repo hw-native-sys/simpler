@@ -286,6 +286,12 @@ public:
     bool
     retire_run_workspace(uint32_t slot, uint64_t run_epoch, bool retain_host_outputs, void **retired_unmanaged_staging);
     bool native_runs_outstanding() const;
+    struct RunStreams;
+    // Only fresh callable additions may ignore already-retired observer debt.
+    bool fresh_callable_addition_allowed() const;
+    void retain_framework_observation(const RunStreams &streams);
+    int observe_framework_submissions(int *all_observed);
+    bool has_external_run_reference(const NativeRunIdentity &identity) const;
 
     /**
      * Whether a live reservation other than `owner`'s holds `arena_bank`.
@@ -2949,7 +2955,25 @@ protected:
     };
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
-    std::unordered_set<const void *> native_run_observations_;
+    struct NativeRunObservation {
+        enum class Kind { RunOwner, FrameworkBinding };
+        Kind kind{Kind::RunOwner};
+        const void *owner{nullptr};
+        RunStreams streams{};
+        bool operator==(const NativeRunObservation &other) const {
+            return kind == other.kind && owner == other.owner && streams.aicpu == other.streams.aicpu &&
+                   streams.aicore == other.streams.aicore;
+        }
+    };
+    struct NativeRunObservationHash {
+        size_t operator()(const NativeRunObservation &value) const {
+            const auto first = std::hash<const void *>{}(value.owner);
+            const auto cpu = std::hash<const void *>{}(value.streams.aicpu);
+            const auto core = std::hash<const void *>{}(value.streams.aicore);
+            return first ^ (cpu << 1) ^ (core << 2) ^ static_cast<size_t>(value.kind);
+        }
+    };
+    std::unordered_set<NativeRunObservation, NativeRunObservationHash> native_run_observations_;
     std::optional<uint64_t> terminal_close_generation_;
     struct NativeRunClaim {
         const void *owner{nullptr};

@@ -82,7 +82,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
@@ -4757,6 +4757,7 @@ class _CloseOutcome:
 
     error: BaseException | None
     incomplete: bool
+    cleanup_complete: bool = False
 
 
 class CleanupJournal:
@@ -4818,20 +4819,25 @@ class _CloseAttempt:
     close() publishes CLOSED atomically and installs a fresh attempt; concurrent
     close()s pin to the attempt they observed (via ``_close_completion``) and
     wait on its ``done``, so every joiner of the same attempt sees the same
-    outcome. ``incomplete=True`` means the tree was not fully reclaimed.
+    outcome. ``incomplete`` retains the public error/debt status; the
+    outcome's independent ``cleanup_complete`` requires positive reclamation
+    proof and can be true while the original semantic error is still reported.
 
     CLOSED is terminal for public admission, but teardown debt is retryable. A
     later close() re-drives entries left in ``CleanupJournal``; a drain timeout
     likewise leaves the native tree intact for a later attempt.
     """
 
-    __slots__ = ("_outcome", "draining_chip_runs")
+    __slots__ = ("_outcome", "draining_chip_runs", "framework_run_error", "transferred_run_error")
 
     def __init__(self) -> None:
         self._outcome: _CloseOutcome | None = None
         # Error-delivery fact retained across retries once close takes these
         # runs. Their completion still requires each actual fence.
         self.draining_chip_runs = False
+        self.framework_run_error: BaseException | None = None
+        # A transferred ticket's cleanup proof is independent of the first error.
+        self.transferred_run_error = False
 
     @property
     def done(self) -> bool:
@@ -4847,17 +4853,20 @@ class _CloseAttempt:
         outcome = self._outcome
         return False if outcome is None else outcome.incomplete
 
-    def publish(self, error: BaseException | None, incomplete: bool) -> _CloseOutcome:
+    def publish(
+        self, error: BaseException | None, incomplete: bool, *, cleanup_complete: bool = False
+    ) -> _CloseOutcome:
         """Install the attempt's only outcome despite pre-commit interruptions."""
         effective_error = error
         effective_incomplete = incomplete
+        effective_cleanup_complete = cleanup_complete
         try:
             while True:
                 try:
                     committed = self._outcome
                     if committed is not None:
                         return committed
-                    candidate = _CloseOutcome(effective_error, effective_incomplete)
+                    candidate = _CloseOutcome(effective_error, effective_incomplete, effective_cleanup_complete)
                     self._outcome = candidate
                     return candidate
                 except BaseException as exc:  # noqa: BLE001, PERF203
@@ -4869,6 +4878,7 @@ class _CloseAttempt:
                     if effective_error is None:
                         effective_error = exc
                     effective_incomplete = True
+                    effective_cleanup_complete = False
         except BaseException as exc:  # noqa: BLE001
             if self._outcome is not None:
                 raise
@@ -5051,7 +5061,7 @@ class RunHandle:
         self._keepalive: tuple[Any, ...] | None = keepalive
         self._resources = resources if resources is not None else _RunResources()
         self._cv = threading.Condition()
-        self._wait_in_progress = False
+        self._wait_in_progress: object = False
         self._accept_wait_in_progress = False
         self._launch_accepted = False
         self._terminal = False
@@ -5118,10 +5128,10 @@ class RunHandle:
             self._execution_done = self._worker._run_handle_done(run_id)
             return self._execution_done
 
-    def _clear_wait_owner(self) -> None:
+    def _clear_wait_owner(self, election: object = True) -> None:
         """Make an interrupted pre-finalization fence wait re-electable."""
         try:
-            while self._wait_in_progress:
+            while self._wait_in_progress is election:
                 try:
                     self._wait_in_progress = False
                 except BaseException:  # noqa: BLE001, PERF203
@@ -5133,7 +5143,7 @@ class RunHandle:
                 # Parked waiters use bounded re-checks and observe the plain flag.
                 pass
         except BaseException:  # noqa: BLE001
-            self._clear_wait_owner()
+            self._clear_wait_owner(election)
 
     def _clear_acceptance_owner(self) -> None:
         """Make an interrupted acceptance wait re-electable."""
@@ -5405,6 +5415,129 @@ class PreparedSubmission(RunHandle):
     External tensor and stream owners belong in prepare_submission(keepalive=...).
     """
 
+    _framework_claimed = False
+    _framework_cancelled = False
+    _framework_source_release_unknown = False
+
+    @property
+    def done(self) -> bool:
+        if self._framework_claimed:
+            raise RuntimeError("framework-owned submission cannot be publicly observed")
+        return super().done
+
+    def wait(self, timeout: float | None = None) -> None:
+        if self._framework_claimed:
+            raise RuntimeError("framework-owned submission cannot be publicly observed")
+        super().wait(timeout)
+
+    def _claim_framework_observation(
+        self, stream_owner: object, binding_identity: tuple[int, int, int, int], resolve_stream: Callable[[], int]
+    ) -> None:
+        """Privately move this unexported token's observation to its existing Worker."""
+        self._worker._claim_framework_observation(self, stream_owner, binding_identity, resolve_stream)
+
+    def _retire_framework(self, *, wait_for_own_completion: bool = False) -> bool:
+        return self._framework_progress(wait_for_own_completion=wait_for_own_completion)
+
+    def _wait_framework(self, timeout: float | None = None) -> None:
+        self._framework_progress(explicit_wait=True, timeout=timeout)
+
+    def _framework_progress(
+        self, *, wait_for_own_completion: bool = False, explicit_wait: bool = False, timeout: float | None = None
+    ) -> bool:
+        if not self._framework_claimed:
+            raise RuntimeError("submission has no framework observation owner")
+        if self._framework_source_release_unknown:
+            assert self._error is not None
+            raise self._error
+        deadline = self._deadline(timeout)
+        election = object()
+        try:
+            with self._cv:
+                while self._wait_in_progress:
+                    if not explicit_wait and not wait_for_own_completion:
+                        return False
+                    remaining = _RUN_HANDLE_WAIT_RECHECK_S if deadline is None else deadline - _monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("framework submission wait timed out")
+                    self._cv.wait(min(remaining, _RUN_HANDLE_WAIT_RECHECK_S))
+                if self._terminal:
+                    if self._error is not None:
+                        raise self._error
+                    return True
+                self._wait_in_progress = election
+
+            return self._settle_framework_progress(wait_for_own_completion, explicit_wait, deadline)
+        finally:
+            if self._wait_in_progress is election:
+                self._clear_wait_owner(election)
+
+    def _settle_framework_progress(
+        self, wait_for_own_completion: bool, explicit_wait: bool, deadline: float | None
+    ) -> bool:
+        error = None
+        try:
+            safe = self._progress_framework_native(wait_for_own_completion, explicit_wait, deadline)
+        except ExecutionContextRefused:
+            # Context validation precedes observation and preserves the carrier.
+            raise
+        except BaseException as exc:  # noqa: BLE001
+            error = exc
+            # A known no-publication refusal or an actual native destruction
+            # fact permits per-call cleanup even when error delivery failed.
+            safe = (
+                self._framework_cancelled
+                or isinstance(exc, RunPreparationRefused)
+                or self._native_submission._framework_transferred
+                or (explicit_wait and not self._native_submission._owner_recovery_required)
+            )
+        if error is not None and not isinstance(error, TimeoutError) and self._error is None:
+            self._error = error
+        if safe:
+            try:
+                self._worker._finish_framework_submission(self)
+            except BaseException as exc:  # noqa: BLE001
+                if self._error is None:
+                    self._error = exc
+                raise self._error
+        if self._error is not None:
+            raise self._error
+        if error is not None:
+            raise error
+        return safe
+
+    def _drain_framework_for_close(self, deadline: float) -> None:
+        """Try checked retirement again within the same close budget after a run error."""
+        try:
+            self._framework_progress(wait_for_own_completion=True, timeout=max(0.0, deadline - _monotonic()))
+        except RuntimeError as primary:
+            remaining = deadline - _monotonic()
+            if (
+                self._error is primary
+                and not self.safe_to_release
+                and not self._framework_source_release_unknown
+                and remaining > 0
+            ):
+                try:
+                    self._framework_progress(wait_for_own_completion=True, timeout=remaining)
+                except Exception as retry_error:
+                    if retry_error is not primary:
+                        raise primary from retry_error
+            raise
+
+    def _progress_framework_native(
+        self, wait_for_own_completion: bool, explicit_wait: bool, deadline: float | None
+    ) -> bool:
+        remaining = -1.0 if deadline is None else max(0.0, deadline - _monotonic())
+        if explicit_wait:
+            if not self._native_submission._wait_framework(remaining):
+                raise TimeoutError("framework submission wait timed out")
+            return not self._native_submission._owner_recovery_required
+        safe = self._native_submission._retire_framework(wait_for_own_completion, remaining)
+        if not safe and wait_for_own_completion and deadline is not None:
+            raise TimeoutError("framework own-completion wait timed out")
+        return safe
+
     @property
     def safe_to_release(self) -> bool:
         """Whether existing cleanup has discharged this call's external owner uses.
@@ -5430,8 +5563,13 @@ class PreparedSubmission(RunHandle):
         """
         if not self._native_submission.cancel():
             return False
+        if self._framework_claimed:
+            self._framework_cancelled = True
         try:
-            self.wait()
+            if self._framework_claimed:
+                self._wait_framework()
+            else:
+                self.wait()
         except RunPreparationRefused:
             pass
         return True
@@ -5823,6 +5961,10 @@ class Worker:
         # is the admission authority and holds its own FIFO; this only maps a
         # handle back to its run so waiting and finalization can find it.
         self._chip_runs: dict[int, Any] = {}
+        # Original stream owners survive per-call retirement until an explicit
+        # successful observation acknowledges every binding in the native ledger.
+        self._framework_observation_roots: dict[tuple[int, int, int, int], tuple[object, Callable[[], int]]] = {}
+        self._framework_observation_error: BaseException | None = None
         self._chip_run_callable_ids: dict[int, int] = {}
         self._chip_run_seq: int = 0
         # Mirrors _chip_runs' own lifecycle so release_buffer() sees the actual
@@ -8725,6 +8867,14 @@ class Worker:
                 raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable handle already pending unregister")
             if self.level == 2 and state.ref_count == 1 and cid in self._chip_run_callable_ids.values():
                 raise RuntimeError("Worker.unregister: callable is referenced by an unretired L2 use")
+            if self.level == 2 and state.ref_count == 1:
+                assert self._chip_worker is not None
+                self._chip_worker.unregister_callable(cid)
+                self._live_handles.pop(handle_id, None)
+                state.ref_count -= 1
+                self._callable_registry.pop(cid, None)
+                self._identity_registry.pop(digest, None)
+                return
             self._live_handles.pop(handle_id, None)
             state.ref_count -= 1
             should_broadcast_decrement = self.level >= 3
@@ -8736,12 +8886,6 @@ class Worker:
                 self._pending_unregister_cids.add(cid)
                 if state.ref_count > 0:
                     remove_target = False
-            elif self.level == 2:
-                assert self._chip_worker is not None
-                self._chip_worker.unregister_callable(cid)
-                self._callable_registry.pop(cid, None)
-                self._identity_registry.pop(digest, None)
-                return
 
         try:
             if isinstance(target, ChipCallable):
@@ -13698,6 +13842,7 @@ class Worker:
                 owners = (state.slot_id, args, cfg, chip_args, values, *owners)
                 handle = PreparedSubmission(self, run_id, owners)
                 handle._native_submission = native
+                handle._framework_caller_stream = stream
                 _native_submission_roots[handle] = (self, owners)
                 self._accept_l2_run(run_id, native, handle)
             except BaseException:
@@ -14186,6 +14331,124 @@ class Worker:
         """Release Python roots only after native retirement succeeds."""
         handle._native_submission._retire()
         _native_submission_roots.pop(handle, None)
+
+    def _claim_framework_observation(
+        self,
+        handle: PreparedSubmission,
+        stream_owner: object,
+        binding_identity: tuple[int, int, int, int],
+        resolve_stream: Callable[[], int],
+    ) -> None:
+        if not callable(resolve_stream) or stream_owner is None:
+            raise ValueError("framework observation requires its original stream owner and resolver")
+        identity = tuple(operator.index(value) for value in binding_identity)
+        if len(identity) != 4 or any(value < 0 for value in identity):
+            raise ValueError("framework stream identity must contain four nonnegative integers")
+        environment = self._chip_worker._execution_environment if self._chip_worker is not None else None
+        if (
+            environment is None
+            or not environment[4]
+            or identity[:2] != (environment[2], environment[3])
+            or identity[3] != handle._framework_caller_stream
+            or operator.index(resolve_stream()) != identity[3]
+        ):
+            raise ExecutionContextRefused("framework stream identity no longer matches its borrowed context")
+        with self._registry_lock:
+            previous = self._framework_observation_roots.get(identity)
+            if previous is not None and previous[0] is not stream_owner:
+                raise ExecutionContextRefused("framework stream identity belongs to another stream owner")
+            try:
+                self._framework_observation_roots[identity] = (stream_owner, resolve_stream)
+                handle._framework_binding_identity = identity
+                handle._framework_claimed = True
+                handle._native_submission._claim_framework()
+            except BaseException:
+                handle._framework_claimed = handle._native_submission._framework_claimed
+                if not handle._framework_claimed:
+                    if previous is None:
+                        self._framework_observation_roots.pop(identity, None)
+                    else:
+                        self._framework_observation_roots[identity] = previous
+                raise
+
+    def _finish_framework_submission(self, handle: PreparedSubmission) -> None:
+        """Commit source cleanup before discarding the per-call ownership record."""
+        if handle._framework_source_release_unknown:
+            assert handle._error is not None
+            raise handle._error
+        run_id = handle._run_id
+        assert run_id is not None
+        with self._registry_lock:
+            identities = self._chip_source_uses.get(run_id, ())
+        if identities:
+            assert self._device_buffer_source is not None
+            try:
+                self._device_buffer_source.release(identities)
+                with self._registry_lock:
+                    self._chip_source_uses.pop(run_id, None)
+            except BaseException as exc:  # noqa: BLE001
+                # This source returns no per-identity receipt: even an ordinary
+                # exception may follow an earlier decrement in the same loop.
+                # Preserve all roots and never replay an ambiguous decrement.
+                if handle._error is None:
+                    handle._error = exc
+                handle._framework_source_release_unknown = True
+                raise handle._error
+        handle._native_submission._retire()
+        # No fallible source release remains after removing these records.
+        with self._registry_lock:
+            self._chip_source_uses.pop(run_id, None)
+            self._chip_call_values.pop(run_id, None)
+            self._chip_runs.pop(run_id, None)
+            self._chip_run_touched_identities.pop(run_id, None)
+            self._chip_run_callable_ids.pop(run_id, None)
+        with self._hierarchical_start_cv:
+            handle._cleanup_published = True
+            self._accepted_run_handles.discard(handle)
+            self._hierarchical_start_cv.notify_all()
+        handle._publish_terminal(handle._error)
+        _native_submission_roots.pop(handle, None)
+
+    def _observe_framework_submissions(self) -> None:
+        """Observe original bindings, retaining active or unproven roots and the first error."""
+        with self._registry_lock:
+            roots = tuple(self._framework_observation_roots.items())
+            if not roots:
+                if self._framework_observation_error is not None:
+                    raise self._framework_observation_error
+                return
+            active_before = {
+                item._framework_binding_identity
+                for item in tuple(_native_submission_roots)
+                if item._worker is self and item._framework_claimed and not item._terminal
+            }
+        try:
+            environment = self._chip_worker._execution_environment if self._chip_worker is not None else None
+            for identity, (_, resolve_stream) in roots:
+                if (
+                    environment is None
+                    or identity[:2] != (environment[2], environment[3])
+                    or operator.index(resolve_stream()) != identity[3]
+                ):
+                    raise ExecutionContextRefused("framework original stream mapping changed before observation")
+            assert self._chip_worker is not None
+            rc, all_observed = self._chip_worker._observe_framework_submissions()
+            if all_observed:
+                # This is binding-debt proof only, never proof for active tokens.
+                with self._registry_lock:
+                    for identity, root in roots:
+                        # An earlier active ticket may transfer after the native
+                        # observation, and a new claim installs a fresh root tuple.
+                        if identity not in active_before and self._framework_observation_roots.get(identity) is root:
+                            self._framework_observation_roots.pop(identity, None)
+            if rc != 0:
+                raise RuntimeError(f"framework original stream observation failed: {rc}")
+        except BaseException as exc:  # noqa: BLE001
+            if self._framework_observation_error is None:
+                self._framework_observation_error = exc
+            raise self._framework_observation_error
+        if self._framework_observation_error is not None:
+            raise self._framework_observation_error
 
     def _submit_l2_locked(
         self,
@@ -14684,7 +14947,7 @@ class Worker:
             parts.append(f"{len(self._cleanup_journal)} cleanup journal item(s)")
         return ", ".join(parts) if parts else "(none)"
 
-    def close(self) -> None:  # noqa: PLR0912, PLR0915 -- lifecycle linearization: reentrancy / init-guard / join / owner / claim / drain / teardown
+    def close(self) -> None:
         """Release this worker's resources. Publicly terminal and retryable.
 
         A permanent commitment, not a reversible attempt: CLOSED is published
@@ -14711,6 +14974,20 @@ class Worker:
           pid/mailbox pair until ``waitpid`` proves the child is gone.
         - Native teardown runs on the ``init()``-owner thread, being device-bound.
         """
+        outcome = self._close_impl()
+        if outcome.error is not None:
+            raise outcome.error
+
+    def _close_framework(self) -> BaseException | None:
+        """Return the original error only after this exact close outcome proves cleanup."""
+        outcome = self._close_impl()
+        if not outcome.cleanup_complete:
+            if outcome.error is not None:
+                raise outcome.error
+            raise RuntimeError("Worker framework cleanup remains unconfirmed")
+        return outcome.error
+
+    def _close_impl(self) -> _CloseOutcome:  # noqa: PLR0912, PLR0915 -- one owner linearizes close, drain, teardown and immutable publication
         # close() is a permanent commitment against a resource, not a reversible
         # attempt: it publishes CLOSED atomically (the sole public admission
         # fence — the leased live-tree APIs are rejected once CLOSED) and NEVER
@@ -14739,11 +15016,13 @@ class Worker:
         deferred_native_cleanup_error: RuntimeError | None = None
         attempt: _CloseAttempt | None = None
         result: BaseException | None = None
+        published: _CloseOutcome | None = None
         teardown_tree = False
         teardown_completed = False
         drain_complete = False
         drain_deadline: float | None = None
         drain_deadline_expired = False
+        prior_framework_error: BaseException | None = None
         handles_to_drain: tuple[RunHandle, ...] = ()
         try:
             with self._hierarchical_start_cv:
@@ -14781,9 +15060,9 @@ class Worker:
                     # joiner forever — it re-observes `done` within the interval.
                     while not joined.done:
                         self._hierarchical_start_cv.wait(timeout=_CLOSE_JOIN_RECHECK_S)
-                    if joined.error is not None:
-                        raise joined.error
-                    return
+                    outcome = joined._outcome
+                    assert outcome is not None
+                    return outcome
                 # Fresh entry: the last attempt (if any) is already resolved. A
                 # terminal result (teardown ran, or nothing to tear down)
                 # replays; only a drain-timeout — teardown un-attempted, tree
@@ -14796,11 +15075,11 @@ class Worker:
                     and (self._teardown_attempted or prior.error is None)
                 ):
                     deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
-                    if prior.error is not None:
-                        raise prior.error
                     if deferred_native_cleanup_error is not None:
-                        raise deferred_native_cleanup_error
-                    return
+                        raise prior.error if prior.error is not None else deferred_native_cleanup_error
+                    outcome = prior._outcome
+                    assert outcome is not None
+                    return outcome
                 # A device-bound native object must be finalized on the init-owner
                 # thread — always, even after that thread has exited (affinity
                 # does not transfer). NEW/FAILED/reclaimed-CLOSED have none.
@@ -14822,6 +15101,10 @@ class Worker:
                 # Teardown may fail before the native journal action captures
                 # this fact, so replacement attempts inherit that reporting debt.
                 attempt.draining_chip_runs = prior is not None and prior.draining_chip_runs
+                if prior is not None:
+                    attempt.transferred_run_error = prior.transferred_run_error
+                    if prior.error is prior.framework_run_error:
+                        prior_framework_error = attempt.framework_run_error = prior.framework_run_error
                 self._close_completion = attempt
                 self._hierarchical_start_cv.notify_all()
                 # One absolute budget covers both kinds of admitted work. A
@@ -14862,10 +15145,26 @@ class Worker:
                         drain_deadline_expired = True
                         break
                     try:
-                        handle.wait(remaining)
+                        if isinstance(handle, PreparedSubmission) and handle._framework_claimed:
+                            # One close operation observes stream debt only at
+                            # the final Worker-owned observer, never once per
+                            # claimed ticket before that pass.
+                            handle._drain_framework_for_close(drain_deadline)
+                        else:
+                            handle.wait(remaining)
                     except BaseException as exc:  # noqa: BLE001
                         if result is None:
                             result = exc
+                        if (
+                            isinstance(handle, PreparedSubmission)
+                            and handle._framework_claimed
+                            and not handle._framework_source_release_unknown
+                            and handle._error is exc
+                        ):
+                            if result is exc and attempt.framework_run_error is None:
+                                attempt.framework_run_error = exc
+                            if handle.safe_to_release and handle._native_submission._framework_transferred:
+                                attempt.transferred_run_error = True
                         if isinstance(exc, TimeoutError) and _monotonic() >= drain_deadline:
                             drain_deadline_expired = True
                             break
@@ -14909,11 +15208,24 @@ class Worker:
         finally:
             if attempt is not None:
                 had_live = True  # conservative default if a read below is interrupted
+                cleanup_complete = False
                 detached_registry: tuple[dict, dict, dict] | None = None
                 try:
                     deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error("close")
                     if result is None and deferred_native_cleanup_error is not None:
                         result = deferred_native_cleanup_error
+                    # A retained journal action can outlive the attempt whose
+                    # local error list it captured. The original stream verdict
+                    # therefore belongs to this owner, independently of whether
+                    # a later attempt actually discharged its cleanup debt.
+                    if prior_framework_error is not None:
+                        result = prior_framework_error
+                    elif result is None and attempt.framework_run_error is not None:
+                        result = attempt.framework_run_error
+                    elif self._framework_observation_error is not None and (
+                        result is None or not attempt.transferred_run_error
+                    ):
+                        result = self._framework_observation_error
                     # A successful tree teardown is the reclamation boundary
                     # for abandoned run ownership. Drain it before the residual
                     # inventory: that diagnostic probe is interruptible and an
@@ -14946,6 +15258,9 @@ class Worker:
                             self._callable_registry = {}
                             self._identity_registry = {}
                             self._live_handles = {}
+                    cleanup_complete = (
+                        drain_complete and (not teardown_tree or teardown_completed) and self._close_cleanup_complete()
+                    )
                 except BaseException as exc:  # noqa: BLE001
                     if result is None:
                         result = exc
@@ -14959,17 +15274,18 @@ class Worker:
                     # result. A reader can therefore never observe completion
                     # without its error/incomplete payload. Publication precedes
                     # notification; bounded re-checks cover a skipped wakeup.
-                    published: _CloseOutcome | None = None
+                    published = None
                     incomplete = result is not None or had_live
                     while published is None:
                         try:
-                            published = attempt.publish(result, incomplete)
+                            published = attempt.publish(result, incomplete, cleanup_complete=cleanup_complete)
                         except BaseException as exc:  # noqa: BLE001, PERF203
                             if attempt.done:
                                 raise
                             if result is None:
                                 result = exc
                             incomplete = True
+                            cleanup_complete = False
                     result = published.error
                     with self._hierarchical_start_cv:
                         self._hierarchical_start_cv.notify_all()
@@ -14978,8 +15294,52 @@ class Worker:
                 # already done, so the reentrant close() resolves against it
                 # instead of self-deadlocking.
                 del detached_registry
-        if result is not None:
-            raise result
+        if attempt is None:
+            # A pre-claim failure is local to this call, not a committed outcome.
+            if result is not None:
+                raise result
+            raise RuntimeError("close did not publish an outcome")
+        assert published is not None
+        return published
+
+    def _close_cleanup_complete(self) -> bool:
+        """Read positive owner-cleanup facts after the original teardown driver finishes."""
+        with self._hierarchical_start_cv:
+            if (
+                self._lifecycle is not _Lifecycle.CLOSED
+                or self._active_ops
+                or self._accepted_run_handles
+                or self._abandoned_run_handles
+            ):
+                return False
+        with self._registry_lock:
+            if any(
+                (
+                    self._buffers,
+                    self._chip_runs,
+                    self._chip_source_uses,
+                    self._chip_call_values,
+                    self._chip_run_touched_identities,
+                    self._chip_run_callable_ids,
+                    self._callable_registry,
+                    self._identity_registry,
+                    self._live_handles,
+                )
+            ):
+                return False
+        if self._has_live_resources() or any(
+            (
+                self._framework_observation_roots,
+                self._active_remote_slot_refs,
+                self._pending_remote_import_release_states,
+                self._fork_tensor_handles,
+                self._reexport_by_source,
+                self._chip_import_registry is not None,
+                self._worker_host_mapped_cleanup_error is not None,
+            )
+        ):
+            return False
+        return not any(handle._worker is self for handle in _native_submission_roots)
 
     @staticmethod
     def _broadcast_child_shutdown(shms: list[SharedMemory]) -> None:
@@ -15234,12 +15594,21 @@ class Worker:
                     undelivered = close_drained_chip_runs or bool(self._chip_runs)
                     lane_error = None
                     try:
-                        self._chip_worker._close_chip_run_lane()
+                        close_attempt = self._close_completion
+                        if close_attempt is not None and close_attempt.transferred_run_error:
+                            self._chip_worker._close_chip_run_lane(report_run_error=False)
+                        else:
+                            self._chip_worker._close_chip_run_lane()
                     except Exception as exc:  # noqa: BLE001
                         if undelivered:
                             if not recovering_abandoned_runs:
                                 raise
                             lane_error = exc
+                    try:
+                        self._observe_framework_submissions()
+                    except BaseException as exc:  # noqa: BLE001
+                        if self._framework_observation_roots or exc is not self._framework_observation_error:
+                            raise
                     # Zero from exceptional owner close proves terminal teardown;
                     # a run error does not supply that proof or block its attempt.
                     self._chip_worker.finalize()
@@ -15255,6 +15624,9 @@ class Worker:
                     self._chip_worker = None
                     if lane_error is not None:
                         errors.append(lane_error)
+                    # Observation errors remain in the original owner's sticky
+                    # result. They do not skip the journal's retirement tail
+                    # after every native cleanup above actually succeeds.
 
             # Abandoned run owners keep backing alive until native close. The
             # native owner classifies fatal Program recovery; a borrowed or

@@ -1256,13 +1256,13 @@ class TestLevel2Lifecycle:
                 super().__init__()
                 object.__setattr__(self, "_armed", True)
 
-            def publish(self, error, incomplete):
+            def publish(self, error, incomplete, *, cleanup_complete=False):
                 if self._armed:
                     object.__setattr__(self, "_armed", False)
                     entered.set()
                     assert release.wait(10.0)
                     raise interrupt
-                return super().publish(error, incomplete)
+                return super().publish(error, incomplete, cleanup_complete=cleanup_complete)
 
             @property
             def done(self):

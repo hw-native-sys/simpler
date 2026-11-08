@@ -51,7 +51,10 @@ int rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     ++c.allocations;
     *out = nullptr;
     if (c.allocations == c.fail_allocation || c.bytes > c.ceiling || bytes > c.ceiling - c.bytes) return -12;
-    *out = std::calloc(1, bytes);
+    // Match the device allocator's address alignment, including real callable
+    // images; calloc's max_align_t alignment is insufficient for that contract.
+    if (posix_memalign(out, 64, bytes == 0 ? 1 : bytes) != 0) *out = nullptr;
+    if (*out != nullptr) std::memset(*out, 0, bytes);
     if (!*out) return -12;
     ++c.successful_allocations;
     allocations[*out] = bytes;
@@ -216,7 +219,14 @@ int LoadAicpuOp::Finalize(rtStream_t) {
 void LoadAicpuOp::ForgetWithoutUnload() {}
 int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) { return -1; }
 int LoadAicpuOp::Init(const std::vector<std::string> &) { return -1; }
-int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &) { return -1; }
+int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &name) {
+    auto &c = native_admission_transport::control();
+    if (!c.allow_registration || name != KernelNames::RegisterCallableName || bytes != sizeof(RegisterCallableArgs))
+        return -1;
+    c.registered_ids.push_back(static_cast<RegisterCallableArgs *>(args)->active_callable_id);
+    c.registration_streams.push_back(stream);
+    return c.registration_launch_rc;
+}
 }  // namespace host
 
 KernelContextOps make_onboard_kernel_context_ops() {
