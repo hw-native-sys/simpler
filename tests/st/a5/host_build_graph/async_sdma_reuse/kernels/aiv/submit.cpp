@@ -42,7 +42,7 @@ inline __aicore__ bool post(__gm__ int64_t *args, __gm__ uint64_t *meta) {
     TASSIGN(scratch, SDMA_SCRATCH_ALIGNMENT);
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::SDMA>(*comm).addr);
     return send_request_entry(
-        args, SdmaTget(Global(data<float>(args[1])), Global(remote), scratch, workspace), Receipt{meta}
+        args, SdmaTget(Global(data<float>(args[1])), Global(remote), scratch, workspace, 0, kQueueNum), Receipt{meta}
     );
 }
 }  // namespace

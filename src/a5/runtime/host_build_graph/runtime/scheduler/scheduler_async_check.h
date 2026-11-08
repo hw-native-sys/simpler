@@ -11,7 +11,6 @@
 
 #pragma once
 
-#include "async_capability.h"
 #include "scheduler_async_layout.h"
 
 inline constexpr uint32_t SCHEDULER_ASYNC_CHECK_WORK_LIMIT = 8;
@@ -45,10 +44,6 @@ inline __aicore__ SchedulerAsyncCheckPhase phase(const SchedulerAsyncGroupProgre
     return static_cast<SchedulerAsyncCheckPhase>(progress.phase);
 }
 
-inline __aicore__ void increment(uint64_t &counter) {
-    if (counter != UINT64_MAX) ++counter;
-}
-
 inline __aicore__ SchedulerAsyncCheckResult fail(SchedulerAsyncGroupProgress &progress, int64_t error) {
     if (phase(progress) != SchedulerAsyncCheckPhase::FAILED) {
         progress.failure_code = error != 0 ? error : static_cast<int64_t>(SchedulerAsyncCheckError::BACKEND_FAILED);
@@ -65,8 +60,7 @@ fail(SchedulerAsyncGroupProgress &progress, SchedulerAsyncCheckError error) {
 template <typename Writer>
 inline __aicore__ bool group_valid(const SchedulerAsyncGroupIdentity &identity, const Writer &writer) {
     return identity.run_epoch != 0 && identity.task_ref >= 0 && identity.finish_index != SCHEDULER_ASYNC_INDEX_NONE &&
-           identity.subtask_slot < 3 && identity.capacity >= 1 && identity.capacity <= CORE_ASYNC_MAX_CONDITIONS &&
-           identity.condition_types != 0 && (identity.condition_types & ~CORE_ASYNC_CONDITION_TYPES) == 0 &&
+           identity.subtask_slot < 3 && identity.capacity >= 1 && identity.capacity <= MAX_COMPLETIONS_PER_TASK &&
            writer.reservation.sealed == 1 && writer.reservation.limit == 0 && writer.count <= identity.capacity;
 }
 
@@ -97,11 +91,10 @@ inline __aicore__ DeferredCompletionEntry entry(const SchedulerAsyncCheckView &v
     };
 }
 
-inline __aicore__ bool entry_valid(const SchedulerAsyncGroupIdentity &identity, const DeferredCompletionEntry &entry) {
-    uint32_t type = 0;
-    if (entry.completion_type == COMPLETION_TYPE_COUNTER) type = CORE_ASYNC_CONDITION_COUNTER;
-    else if (entry.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) type = CORE_ASYNC_CONDITION_SDMA_POST_DONE;
-    return type != 0 && (identity.condition_types & type) != 0 && entry._pad == 0;
+inline __aicore__ bool entry_valid(const DeferredCompletionEntry &entry) {
+    return (entry.completion_type == COMPLETION_TYPE_COUNTER ||
+            entry.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) &&
+           entry._pad == 0;
 }
 
 inline __aicore__ bool outcome_valid(const SchedulerAsyncConditionOutcome &outcome) {
@@ -139,7 +132,7 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_initialize(
 template <typename Backend, typename Writer>
 inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
     const SchedulerAsyncGroupIdentity &identity, const Writer &writer, const SchedulerAsyncCheckView &view,
-    Backend &backend, SchedulerAsyncGroupProgress *progress, uint32_t *budget, SchedulerAsyncCheckStats *stats = nullptr
+    Backend &backend, SchedulerAsyncGroupProgress *progress, uint32_t *budget
 ) {
     using namespace scheduler_async_check_detail;
     if (progress == nullptr || budget == nullptr) return SchedulerAsyncCheckResult::ERROR;
@@ -159,7 +152,6 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
         return fail(*progress, SchedulerAsyncCheckError::INVALID_STATE);
     if (view.entries == nullptr || view.entry_capacity < identity.capacity)
         return fail(*progress, SchedulerAsyncCheckError::INVALID_ENTRY);
-    if (stats != nullptr) increment(stats->slice_count);
     uint32_t units = *budget < SCHEDULER_ASYNC_CHECK_WORK_LIMIT ? *budget : SCHEDULER_ASYNC_CHECK_WORK_LIMIT;
     uint64_t observed = 0;
     while (units != 0) {
@@ -169,12 +161,10 @@ inline __aicore__ SchedulerAsyncCheckResult scheduler_async_check_step(
         const uint32_t index = static_cast<uint32_t>(__builtin_ctzll(suffix != 0 ? suffix : eligible));
         --units;
         --*budget;
-        if (stats != nullptr) increment(stats->work_units);
         const auto condition = entry(view, index);
-        if (!entry_valid(identity, condition)) return fail(*progress, SchedulerAsyncCheckError::INVALID_ENTRY);
+        if (!entry_valid(condition)) return fail(*progress, SchedulerAsyncCheckError::INVALID_ENTRY);
         observed |= UINT64_C(1) << index;
         progress->next_condition = index + 1 == count ? 0 : index + 1;
-        if (stats != nullptr) increment(stats->observation_count);
         const auto outcome = backend.observe_once(identity, index, condition);
         if (!outcome_valid(outcome)) return fail(*progress, SchedulerAsyncCheckError::INVALID_BACKEND_RESULT);
         if (outcome.state == SchedulerAsyncConditionState::FAILED) return fail(*progress, outcome.error_code);

@@ -11,21 +11,11 @@
 
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <string>
 #include <vector>
 
-#include "async_capability.h"
 #include "scheduler/scheduler_async_layout.h"
-
-using SchedulerAsyncCapabilities = std::array<CoreAsyncCapability, 3>;
-
-// Queue guards and diagnostic records share the retained scheduler allocation.
-struct SchedulerAsyncAuxiliaryBytes {
-    uint64_t sdma_guard_count{0};
-    bool diagnostics{false};
-};
 
 struct SchedulerAsyncHostPlan {
     SchedulerAsyncLayout layout{};
@@ -35,9 +25,8 @@ struct SchedulerAsyncHostPlan {
 // Count and validate without allocating an image. Offsets in the result are
 // relative to the async region, independent of its final scheduler placement.
 bool scheduler_plan_async_layout(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    uint64_t run_epoch, uint64_t byte_budget, const SchedulerAsyncAuxiliaryBytes &auxiliary, SchedulerAsyncLayout *out,
-    std::string *error
+    const std::vector<SchedulerTaskMetadata> &metadata, uint64_t run_epoch, uint64_t byte_budget,
+    SchedulerAsyncLayout *out, std::string *error
 );
 
 // Append to the same retained scheduler backing. Zero bytes produce locator 0.
@@ -52,15 +41,13 @@ bool scheduler_append_async_layout(
 // revalidated before any write; only its own extent is initialized. No device
 // address or pointer fix-up is needed, and no second full image is allocated.
 bool scheduler_initialize_async_state(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    const SchedulerAsyncLayout &layout, void *region, uint64_t region_bytes, std::string *error
+    const std::vector<SchedulerTaskMetadata> &metadata, const SchedulerAsyncLayout &layout, void *region,
+    uint64_t region_bytes, std::string *error
 );
 
-// Metadata is the final expanded native-Graph/TOP node sequence. Capabilities
-// belong to actual registered lane callables, never profiling/trace identities.
-// Failure leaves out unchanged. A fully synchronous run has an empty image.
+// Metadata is the final expanded native-Graph/TOP node sequence.
+// Failure leaves out unchanged. Only runs with no executable task need no image.
 bool scheduler_plan_async_state(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    uint64_t run_epoch, uint64_t byte_budget, const SchedulerAsyncAuxiliaryBytes &auxiliary,
+    const std::vector<SchedulerTaskMetadata> &metadata, uint64_t run_epoch, uint64_t byte_budget,
     SchedulerAsyncHostPlan *out, std::string *error
 );

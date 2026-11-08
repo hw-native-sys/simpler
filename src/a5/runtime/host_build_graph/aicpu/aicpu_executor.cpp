@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include "scheduler/scheduler_async_layout.h"
 #include <atomic>
 #include <cinttypes>
 #include <cstdint>
@@ -19,7 +20,6 @@
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
-#include "scheduler_timeout_diagnostics.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
@@ -253,8 +253,6 @@ static void log_unfinished_tasks(Runtime *runtime) {
 }
 
 static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
-    if (error_site == SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT)
-        log_aicore_scheduler_timeout_checkpoints(runtime, get_platform_run_result_epoch());
     log_unfinished_tasks(runtime);
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context != nullptr) {

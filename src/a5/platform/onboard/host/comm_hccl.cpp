@@ -132,7 +132,6 @@ struct CommHandle_ {
     bool cleanup_failed = false;
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
     void *sdma_workspace_addr = nullptr;
-    CommSdmaOwnerConfiguration sdma_owner{};
 };
 
 // ============================================================================
@@ -709,7 +708,7 @@ domain_announce_path(const std::string &rootinfo, uint64_t allocation_id, uint32
 static bool domain_write_announce(
     const std::string &rootinfo, uint64_t allocation_id, uint32_t domain_rank, uint64_t run_token, int32_t pid,
     int32_t device_id, uint64_t shareable_handle, uint64_t symmetric_addr = 0, uint32_t phy_id = 0,
-    uint16_t roce_base_port = 0, const char *roce_ip = nullptr, const CommSdmaAdmissionV1 *sdma = nullptr
+    uint16_t roce_base_port = 0, const char *roce_ip = nullptr
 ) {
     IpcAnnounceFile a{};
     a.magic = kIpcAnnounceMagic;
@@ -728,7 +727,6 @@ static bool domain_write_announce(
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         f.write(reinterpret_cast<const char *>(&a), sizeof(a));
-        if (sdma != nullptr) f.write(reinterpret_cast<const char *>(sdma), sizeof(*sdma));
         if (!f.good()) {
             std::remove(tmp.c_str());
             return false;
@@ -743,7 +741,7 @@ static bool domain_write_announce(
 
 static bool domain_read_announce(
     const std::string &rootinfo, uint64_t allocation_id, uint32_t peer_domain_rank, uint64_t run_token,
-    IpcAnnounceFile *out, CommSdmaAdmissionV1 *sdma = nullptr, int timeout_sec = 60
+    IpcAnnounceFile *out, int timeout_sec = 60
 ) {
     std::string p = domain_announce_path(rootinfo, allocation_id, peer_domain_rank, run_token);
     for (int i = 0; i < timeout_sec * 10; ++i) {
@@ -751,11 +749,8 @@ static bool domain_read_announce(
         if (f.good()) {
             IpcAnnounceFile a{};
             f.read(reinterpret_cast<char *>(&a), sizeof(a));
-            CommSdmaAdmissionV1 admission{};
-            if (sdma != nullptr) f.read(reinterpret_cast<char *>(&admission), sizeof(admission));
             if (f.good() && a.magic == kIpcAnnounceMagic && a.rank == peer_domain_rank) {
                 *out = a;
-                if (sdma != nullptr) *sdma = admission;
                 return true;
             }
         }
@@ -1430,7 +1425,7 @@ static bool init_rdma_workspace(
 // Every acquisition is recorded on out; the caller owns commit and rollback.
 static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    uint64_t win_size, uint32_t workspace_mask, DomainAllocation *out, const CommSdmaAdmissionV1 *sdma
+    uint64_t win_size, uint32_t workspace_mask, DomainAllocation *out
 ) {
     const bool rdma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::RDMA)) != 0;
     out->peer_windows.reserve(rank_count - 1);
@@ -1439,22 +1434,6 @@ static int domain_alloc_via_ipc(
     const int subset_n = static_cast<int>(rank_count);
     const int my_dr = static_cast<int>(domain_rank);
     aclError aret = ACL_SUCCESS;  // shared by both allocation branches and the ctx upload below
-
-    if (sdma != nullptr && sdma->status != 0) {
-        // Publish rejection through the existing allocation announce exchange.
-        // Peers must see it before entering p2p_ready; no physical window is
-        // required for a rejected participant, but its domain owner is retained
-        // until the parent joins every request and aborts all participants.
-        if (!domain_write_announce(rootinfo, allocation_id, domain_rank, run_token, 0, 0, 0, 0, 0, 0, nullptr, sdma))
-            return -1;
-        for (uint32_t peer = 0; peer < rank_count; ++peer) {
-            if (peer == domain_rank) continue;
-            IpcAnnounceFile ignored{};
-            CommSdmaAdmissionV1 admission{};
-            if (!domain_read_announce(rootinfo, allocation_id, peer, run_token, &ignored, &admission)) return -1;
-        }
-        return -1;
-    }
 
     int32_t myDevice = -1;
     if (aclrtGetDevice(&myDevice) != ACL_SUCCESS) {
@@ -1566,16 +1545,12 @@ static int domain_alloc_via_ipc(
     } else
 #endif
     {
-        if (!domain_write_announce(
-                rootinfo, allocation_id, domain_rank, run_token, myPid, myDevice, shareableHandle, 0, 0, 0, nullptr,
-                sdma
-            )) {
+        if (!domain_write_announce(rootinfo, allocation_id, domain_rank, run_token, myPid, myDevice, shareableHandle)) {
             LOG_ERROR("[comm rank %d] alloc_domain: write_announce failed", h->rank);
             return -1;
         }
     }
     std::vector<IpcAnnounceFile> peers(subset_n);
-    bool sdma_agreed = true;
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) {
             peers[p].magic = kIpcAnnounceMagic;
@@ -1593,21 +1568,10 @@ static int domain_alloc_via_ipc(
 #endif
             continue;
         }
-        CommSdmaAdmissionV1 peer_admission{};
-        if (!domain_read_announce(
-                rootinfo, allocation_id, static_cast<uint32_t>(p), run_token, &peers[p],
-                sdma != nullptr ? &peer_admission : nullptr
-            )) {
+        if (!domain_read_announce(rootinfo, allocation_id, static_cast<uint32_t>(p), run_token, &peers[p])) {
             LOG_ERROR("[comm rank %d] alloc_domain: read_announce(peer_dr=%d) timed out", h->rank, p);
             return -1;
         }
-        if (sdma != nullptr && !comm_sdma_admissions_agree(*sdma, peer_admission)) sdma_agreed = false;
-    }
-    if (!sdma_agreed) {
-        LOG_ERROR(
-            "[comm rank %d] alloc_domain: SDMA owner access or queue count disagrees across participants", h->rank
-        );
-        return -1;
     }
 
     // Enable cross-card P2P for every domain peer, then a best-effort
@@ -1775,11 +1739,6 @@ static int domain_alloc_via_ipc(
         LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
         return -1;
     }
-    // No device context escaped this allocation before the successful copy.
-    // Commit the owner's first possible SDK/legacy exposure here: an earlier
-    // failed allocation without a published context has not chosen a session
-    // partition, even if workspace storage was initialized along the way.
-    if (sdma != nullptr && !h->sdma_owner.bind(sdma->access, sdma->queue_num)) return -1;
     out->mapping_size = aligned_size;
     return 0;
 }
@@ -1921,10 +1880,10 @@ extern "C" int comm_barrier(CommHandle h) {
     return 0;
 }
 
-static int alloc_domain_windows(
+extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out, CommSdmaAccess sdma_access, uint32_t sdma_queue_num
+    size_t *actual_window_size_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
@@ -1969,18 +1928,6 @@ static int alloc_domain_windows(
     }
 
     if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
-    CommSdmaAdmissionV1 admission{};
-    const bool has_sdma = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::SDMA)) != 0;
-    admission.access = sdma_access;
-    admission.queue_num = sdma_queue_num;
-    if (has_sdma && !h->sdma_owner.accepts(sdma_access, sdma_queue_num)) {
-        admission.status = -1;
-        LOG_ERROR(
-            "[comm rank %d] alloc_domain: incompatible SDMA owner access/q (%u/%u requested %u/%u)", h->rank,
-            static_cast<unsigned>(h->sdma_owner.access), h->sdma_owner.queue_num, static_cast<unsigned>(sdma_access),
-            sdma_queue_num
-        );
-    }
     h->used_domain_ids.insert(allocation_id);
     auto entry = h->domain_allocations.emplace(allocation_id, std::make_unique<DomainAllocation>()).first;
     auto &alloc = entry->second;
@@ -1989,8 +1936,7 @@ static int alloc_domain_windows(
     int rc = -1;
     try {
         rc = domain_alloc_via_ipc(
-            h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, alloc.get(),
-            has_sdma ? &admission : nullptr
+            h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, alloc.get()
         );
     } catch (const std::exception &e) {
         LOG_ERROR("[comm] alloc_domain: exception: %s", e.what());
@@ -2017,28 +1963,6 @@ static int alloc_domain_windows(
     LOG_ERROR("[comm] alloc_domain: unknown exception");
     if (h) h->cleanup_failed = true;
     return COMM_RECLAMATION_UNCONFIRMED;
-}
-
-extern "C" int comm_alloc_domain_windows(
-    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out
-) {
-    return alloc_domain_windows(
-        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, device_ctx_out,
-        local_window_base_out, actual_window_size_out, CommSdmaAccess::LEGACY, 0
-    );
-}
-
-extern "C" int comm_alloc_domain_windows_sdma_sdk_v1(
-    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint32_t queue_num, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out
-) {
-    return alloc_domain_windows(
-        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, comm_workspace_bit(CommWorkspaceKind::SDMA),
-        device_ctx_out, local_window_base_out, actual_window_size_out, CommSdmaAccess::SDK_ONLY, queue_num
-    );
 }
 
 static int release_domain_windows(

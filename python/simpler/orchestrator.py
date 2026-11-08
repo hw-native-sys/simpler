@@ -359,7 +359,7 @@ class Orchestrator:
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
-                worker._record_touched_identities(c_args, provenance_locked=needs_prov)
+                worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
             return self._o.submit_next_level(
                 digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
@@ -475,7 +475,7 @@ class Orchestrator:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
                 for c_args in c_args_list:
-                    worker._record_touched_identities(c_args, provenance_locked=bool(member_checks))
+                    worker._record_touched_identities(c_args)
             _admit_task_submission(self._worker)
             return self._o.submit_next_level_group(
                 digest, kind, target_namespace, c_args_list, cfg, worker_ids, worker_id_sets, remote_sidecars
@@ -536,7 +536,6 @@ class Orchestrator:
         retain_after_run: bool = False,
         workers: Sequence[int] | None = None,
         workspace_engines: Sequence[str] = (),
-        sdma_sdk_queue_num: int | None = None,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -550,10 +549,6 @@ class Orchestrator:
         On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
         its own low-address window. Explicit selection is limited to L3 A5.
-        Explicit sdma_sdk_queue_num (1..48) additionally promises that every
-        access to this shared workspace uses the qualified SDK. It binds the
-        partition for the communicator lifetime and requires SDMA-only selection.
-        None preserves legacy access; an exposed legacy owner cannot be upgraded.
         """
         if (members is None) == (workers is None):
             raise TypeError("provide exactly one of members or legacy workers")
@@ -566,7 +561,6 @@ class Orchestrator:
             buffers,
             retain_after_run,
             workspace_engines=workspace_engines,
-            sdma_sdk_queue_num=sdma_sdk_queue_num,
             reuse=False,
         )
 
@@ -579,7 +573,6 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         workspace_engines: Sequence[str] = (),
-        sdma_sdk_queue_num: int | None = None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
@@ -587,28 +580,10 @@ class Orchestrator:
         A hit neither allocates nor initializes the existing window.
         """
         return self._domain(
-            name,
-            members,
-            window_size,
-            buffers,
-            retain_after_run,
-            workspace_engines=workspace_engines,
-            sdma_sdk_queue_num=sdma_sdk_queue_num,
-            reuse=True,
+            name, members, window_size, buffers, retain_after_run, workspace_engines=workspace_engines, reuse=True
         )
 
-    def _domain(
-        self,
-        name,
-        members,
-        window_size,
-        buffers,
-        retain_after_run,
-        *,
-        workspace_engines=(),
-        sdma_sdk_queue_num=None,
-        reuse,
-    ):
+    def _domain(self, name, members, window_size, buffers, retain_after_run, *, workspace_engines=(), reuse):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -619,7 +594,6 @@ class Orchestrator:
             retain_after_run=retain_after_run,
             reuse=reuse,
             workspace_engines=workspace_engines,
-            sdma_sdk_queue_num=sdma_sdk_queue_num,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:

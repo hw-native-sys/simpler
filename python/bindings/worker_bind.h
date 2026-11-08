@@ -1000,11 +1000,6 @@ inline void bind_worker(nb::module_ &m) {
             "participating chips in parallel (one Python thread per chip)."
         )
         .def(
-            "control_alloc_domain_sdma_sdk_v1", &Worker::control_alloc_domain_sdma_sdk_v1, nb::arg("worker_id"),
-            nb::arg("request_shm_name"), nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
-            "Allocate a qualified-SDK-only SDMA domain through the versioned local control request."
-        )
-        .def(
             "control_release_domain", &Worker::control_release_domain, nb::arg("worker_id"),
             nb::arg("request_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
             "Drive one NEXT_LEVEL chip child through CTRL_RELEASE_DOMAIN.  Same serialisation "

@@ -37,18 +37,16 @@ bool reserve(uint64_t count, uint64_t stride, uint64_t &cursor, uint64_t &offset
 }
 
 bool plan_async_layout(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    uint64_t run_epoch, uint64_t byte_budget, const SchedulerAsyncAuxiliaryBytes &auxiliary, SchedulerAsyncLayout *out,
-    std::string *error
+    const std::vector<SchedulerTaskMetadata> &metadata, uint64_t run_epoch, uint64_t byte_budget,
+    SchedulerAsyncLayout *out, std::string *error
 ) {
-    if (out == nullptr || run_epoch == 0 || metadata.size() != capabilities.size() || metadata.size() > INT32_MAX)
-        return fail(error, "async plan requires a live run epoch and matching capability rows");
-    if (auxiliary.sdma_guard_count > ASYNC_SDMA_CHANNELS)
-        return fail(error, "async auxiliary configuration is invalid");
+    if (out == nullptr || run_epoch == 0 || metadata.size() > INT32_MAX)
+        return fail(error, "async plan requires a live run epoch and valid task metadata");
     SchedulerAsyncLayout layout{};
     layout.run_epoch = run_epoch;
     layout.task_count = metadata.size();
     uint64_t token_bytes = 0;
+    bool needs_sdma = false;
     for (size_t task = 0; task < metadata.size(); ++task) {
         const auto &meta = metadata[task];
         if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
@@ -61,23 +59,20 @@ bool plan_async_layout(
             (scheduler_task_requires_sync_start(meta.flags) && meta.logical_block_num == 1) ||
             (scheduler_task_has_predicate(meta.flags) && (meta.logical_block_num != 1 || lanes != 1)))
             return fail(error, "async plan task exceeds the physical execution contract");
+        needs_sdma |= meta.active_mask.has(SubtaskSlot::AIV0) || meta.active_mask.has(SubtaskSlot::AIV1);
         SchedulerAsyncTaskMap map;
         map.block_count = meta.logical_block_num;
         for (uint32_t lane = 0; lane < 3; ++lane) {
             if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-            const auto cap = core_async_effective_capability(capabilities[task][lane]);
-            if (!core_async_capability_valid(cap))
-                return fail(error, "async plan requires a valid callable capability");
-            if (cap.mode != CoreAsyncMode::DEFERRED) continue;
             map.async_lane_mask |= 1u << lane;
             ++map.groups_per_block;
             uint64_t bytes = 0, aligned = 0;
-            if (!scheduler_layout_checked_mul(cap.max_conditions, sizeof(DeferredCompletionEntry), &bytes) ||
+            if (!scheduler_layout_checked_mul(MAX_COMPLETIONS_PER_TASK, sizeof(DeferredCompletionEntry), &bytes) ||
                 !scheduler_layout_checked_align(bytes, 128, &aligned) ||
                 !scheduler_layout_checked_mul(aligned, meta.logical_block_num, &bytes) ||
                 !scheduler_layout_checked_add(token_bytes, bytes, &token_bytes))
                 return fail(error, "async completion-entry storage overflows");
-            if (!scheduler_layout_checked_mul(cap.max_conditions, meta.logical_block_num, &bytes) ||
+            if (!scheduler_layout_checked_mul(MAX_COMPLETIONS_PER_TASK, meta.logical_block_num, &bytes) ||
                 !scheduler_layout_checked_add(layout.condition_capacity, bytes, &layout.condition_capacity))
                 return fail(error, "async condition capacity overflows");
         }
@@ -89,15 +84,13 @@ bool plan_async_layout(
             return fail(error, "async group count overflows");
     }
     if (layout.group_count == 0) {
-        if (auxiliary.sdma_guard_count != 0)
-            return fail(error, "synchronous plan cannot carry unowned async auxiliary storage");
         *out = layout;
         return true;
     }
     layout.check_directory_words = (layout.group_count + 63) / 64;
     layout.finish_directory_words = (layout.finish_count + 63) / 64;
     layout.entries_bytes = token_bytes;
-    layout.sdma_guard_count = auxiliary.sdma_guard_count;
+    layout.sdma_guard_count = needs_sdma ? ASYNC_SDMA_CHANNELS : 0;
     uint64_t cursor = sizeof(SchedulerAsyncLayout);
     if (!reserve(layout.task_count, sizeof(SchedulerAsyncTaskMap), cursor, layout.task_map_offset) ||
         !reserve(layout.group_count, sizeof(SchedulerAsyncGroupIdentity), cursor, layout.group_identity_offset) ||
@@ -117,9 +110,6 @@ bool plan_async_layout(
         !reserve(token_bytes, 1, cursor, layout.entries_offset) ||
         (layout.sdma_guard_count != 0 &&
          !reserve(layout.sdma_guard_count + 1, 128, cursor, layout.sdma_guard_context_offset)) ||
-        (auxiliary.diagnostics &&
-         (!reserve(layout.group_count, sizeof(SchedulerAsyncGroupTrace), cursor, layout.group_trace_offset) ||
-          !reserve(layout.finish_count, sizeof(SchedulerAsyncFinishTrace), cursor, layout.finish_trace_offset))) ||
         !scheduler_layout_checked_align(cursor, 128, &layout.total_bytes) || layout.total_bytes > byte_budget ||
         layout.total_bytes > std::numeric_limits<size_t>::max())
         return fail(error, "async state exceeds the byte budget or addressable storage");
@@ -128,8 +118,8 @@ bool plan_async_layout(
 }
 
 bool materialize_async_state(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    const SchedulerAsyncLayout &layout, std::byte *image, std::string *error
+    const std::vector<SchedulerTaskMetadata> &metadata, const SchedulerAsyncLayout &layout, std::byte *image,
+    std::string *error
 ) {
     std::memset(image, 0, static_cast<size_t>(layout.total_bytes));
     write(image, 0, layout);
@@ -147,8 +137,7 @@ bool materialize_async_state(
         SchedulerAsyncTaskMap map;
         if (scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags)) {
             for (uint32_t lane = 0; lane < 3; ++lane) {
-                if (meta.active_mask.has(static_cast<SubtaskSlot>(lane)) &&
-                    core_async_effective_capability(capabilities[task][lane]).mode == CoreAsyncMode::DEFERRED) {
+                if (meta.active_mask.has(static_cast<SubtaskSlot>(lane))) {
                     map.async_lane_mask |= 1u << lane;
                     ++map.groups_per_block;
                 }
@@ -193,7 +182,6 @@ bool materialize_async_state(
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 const uint64_t index = scheduler_async_group_index(map, block, lane);
                 if (index == SCHEDULER_ASYNC_INDEX_NONE) continue;
-                const auto cap = core_async_effective_capability(capabilities[task][lane]);
                 SchedulerAsyncGroupIdentity identity;
                 identity.run_epoch = layout.run_epoch;
                 identity.task_ref = static_cast<int64_t>(task);
@@ -201,8 +189,7 @@ bool materialize_async_state(
                 identity.entries_offset = entry_cursor;
                 identity.block_idx = block;
                 identity.subtask_slot = lane;
-                identity.capacity = cap.max_conditions;
-                identity.condition_types = cap.condition_types;
+                identity.capacity = MAX_COMPLETIONS_PER_TASK;
                 write(image, layout.group_identity_offset + index * sizeof(identity), identity);
                 write(
                     image,
@@ -215,7 +202,9 @@ bool materialize_async_state(
                     SchedulerAsyncGroupProgress{}
                 );
                 uint64_t stride = 0;
-                scheduler_layout_checked_align(cap.max_conditions * sizeof(DeferredCompletionEntry), 128, &stride);
+                scheduler_layout_checked_align(
+                    MAX_COMPLETIONS_PER_TASK * sizeof(DeferredCompletionEntry), 128, &stride
+                );
                 entry_cursor += stride;
             }
         }
@@ -228,11 +217,10 @@ bool materialize_async_state(
 }  // namespace
 
 bool scheduler_plan_async_layout(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    uint64_t run_epoch, uint64_t byte_budget, const SchedulerAsyncAuxiliaryBytes &auxiliary, SchedulerAsyncLayout *out,
-    std::string *error
+    const std::vector<SchedulerTaskMetadata> &metadata, uint64_t run_epoch, uint64_t byte_budget,
+    SchedulerAsyncLayout *out, std::string *error
 ) {
-    return plan_async_layout(metadata, capabilities, run_epoch, byte_budget, auxiliary, out, error);
+    return plan_async_layout(metadata, run_epoch, byte_budget, out, error);
 }
 
 bool scheduler_append_async_layout(
@@ -254,35 +242,29 @@ bool scheduler_append_async_layout(
 }
 
 bool scheduler_initialize_async_state(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    const SchedulerAsyncLayout &layout, void *region, uint64_t region_bytes, std::string *error
+    const std::vector<SchedulerTaskMetadata> &metadata, const SchedulerAsyncLayout &layout, void *region,
+    uint64_t region_bytes, std::string *error
 ) {
     SchedulerAsyncLayout expected{};
-    const SchedulerAsyncAuxiliaryBytes auxiliary{layout.sdma_guard_count, layout.group_trace_offset != 0};
-    if (!plan_async_layout(metadata, capabilities, layout.run_epoch, layout.total_bytes, auxiliary, &expected, error))
-        return false;
+    if (!plan_async_layout(metadata, layout.run_epoch, layout.total_bytes, &expected, error)) return false;
     if (std::memcmp(&expected, &layout, sizeof(layout)) != 0 || region_bytes < layout.total_bytes)
         return fail(error, "async initialization does not match its validated layout");
     if (layout.total_bytes == 0) return true;
     if (region == nullptr || layout.total_bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(region))
         return fail(error, "async initialization destination is invalid");
-    return materialize_async_state(metadata, capabilities, layout, static_cast<std::byte *>(region), error);
+    return materialize_async_state(metadata, layout, static_cast<std::byte *>(region), error);
 }
 
 bool scheduler_plan_async_state(
-    const std::vector<SchedulerTaskMetadata> &metadata, const std::vector<SchedulerAsyncCapabilities> &capabilities,
-    uint64_t run_epoch, uint64_t byte_budget, const SchedulerAsyncAuxiliaryBytes &auxiliary,
+    const std::vector<SchedulerTaskMetadata> &metadata, uint64_t run_epoch, uint64_t byte_budget,
     SchedulerAsyncHostPlan *out, std::string *error
 ) {
     if (out == nullptr) return fail(error, "async plan requires an output");
     try {
         SchedulerAsyncHostPlan next;
-        if (!plan_async_layout(metadata, capabilities, run_epoch, byte_budget, auxiliary, &next.layout, error))
-            return false;
+        if (!plan_async_layout(metadata, run_epoch, byte_budget, &next.layout, error)) return false;
         next.image.resize(static_cast<size_t>(next.layout.total_bytes));
-        if (!scheduler_initialize_async_state(
-                metadata, capabilities, next.layout, next.image.data(), next.image.size(), error
-            ))
+        if (!scheduler_initialize_async_state(metadata, next.layout, next.image.data(), next.image.size(), error))
             return false;
         *out = std::move(next);
         return true;

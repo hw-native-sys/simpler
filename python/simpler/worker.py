@@ -398,7 +398,7 @@ _DISPOSITION_NONE = 0
 _VALIDATED_ONLY = 1
 _NATIVE_PREPARED = 2
 _TASK_ACCEPTED = 1
-_TASK_PROTOCOL_VERSION = 9
+_TASK_PROTOCOL_VERSION = 7
 
 # A request frame's own header: which run-state entry this payload belongs to,
 # that entry's generation, and this frame's generation — which the child echoes
@@ -858,7 +858,6 @@ _CTRL_UNREGISTER = 6
 # OFF_ARGS+32.  Both shms have a fixed header (see _DOMAIN_REQ_HEADER /
 # _DOMAIN_REPLY_HEADER) followed by variable buffer/rank data.
 _CTRL_ALLOC_DOMAIN = 7
-_CTRL_ALLOC_DOMAIN_SDMA_SDK_V1 = 28
 _CTRL_RELEASE_DOMAIN = 8
 # Lazy base-comm init driven from Orchestrator.allocate_domain on first use.
 # Request shm carries `<II` header (rank, nranks) + NUL-terminated
@@ -880,7 +879,6 @@ _CTRL_IMPORT_RELEASE = 13
 # fails, so the parent's re-raised text names the operation and not just a
 # numeric sub-command. Absent entries fall back to the raw number.
 _CTRL_OP_NAMES = {
-    _CTRL_ALLOC_DOMAIN_SDMA_SDK_V1: "alloc_domain_sdma_sdk_v1",
     _CTRL_REGISTER: "register",
     _CTRL_UNREGISTER: "unregister",
     _CTRL_PY_REGISTER: "py_register",
@@ -937,65 +935,6 @@ _DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
 #         window_size (u64), buffer_count (u32), workspace_mask (u32)
 assert _DOMAIN_REQ_HEADER.size == 32
 _DOMAIN_WORKSPACE_MASK_OFFSET = struct.calcsize("<QIIQI")
-# Separate versioned request: no reinterpretation of the legacy header's padding.
-_DOMAIN_SDMA_REQ_HEADER = struct.Struct("<IIQIIQIIII")
-assert _DOMAIN_SDMA_REQ_HEADER.size == 48
-_DOMAIN_SDMA_SDK_ONLY = 2
-
-
-def _pack_domain_request_header(
-    req_buf, allocation_id, rank_count, domain_rank, window_size, buffer_count, workspace_mask, sdma_sdk_queue_num
-):
-    if sdma_sdk_queue_num is None:
-        _DOMAIN_REQ_HEADER.pack_into(req_buf, 0, allocation_id, rank_count, domain_rank, window_size, buffer_count)
-        struct.pack_into("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET, workspace_mask)
-    else:
-        _DOMAIN_SDMA_REQ_HEADER.pack_into(
-            req_buf,
-            0,
-            1,
-            _DOMAIN_SDMA_REQ_HEADER.size,
-            allocation_id,
-            rank_count,
-            domain_rank,
-            window_size,
-            buffer_count,
-            workspace_mask,
-            _DOMAIN_SDMA_SDK_ONLY,
-            sdma_sdk_queue_num,
-        )
-
-
-def _decode_sdma_domain_request(req_buf):
-    if len(req_buf) < _DOMAIN_SDMA_REQ_HEADER.size:
-        raise ValueError("managed SDMA domain request is truncated")
-    (
-        version,
-        header_bytes,
-        allocation_id,
-        rank_count,
-        domain_rank,
-        window_size,
-        buffer_count,
-        workspace_mask,
-        access_contract,
-        queue_num,
-    ) = _DOMAIN_SDMA_REQ_HEADER.unpack_from(req_buf)
-    if (
-        version != 1
-        or header_bytes != _DOMAIN_SDMA_REQ_HEADER.size
-        or workspace_mask != 1
-        or access_contract != _DOMAIN_SDMA_SDK_ONLY
-        or not 1 <= queue_num <= 48
-        or not 1 <= rank_count <= 64
-        or domain_rank >= rank_count
-        or window_size == 0
-    ):
-        raise ValueError("invalid managed SDMA domain request")
-    if len(req_buf) != header_bytes + buffer_count * 8 + rank_count * 4:
-        raise ValueError("managed SDMA domain request extent does not match its arrays")
-    return allocation_id, rank_count, domain_rank, window_size, buffer_count, workspace_mask, queue_num
-
 
 # Domain-allocation reply shm layout: 40-byte header + buffer_ptrs (u64).
 _DOMAIN_REPLY_HEADER = struct.Struct("<QQQQI4x")
@@ -2927,9 +2866,7 @@ def _read_shm_name(buf, offset: int) -> str:
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
 
 
-def _handle_ctrl_alloc_domain(
-    cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int, sdma_sdk: bool = False
-) -> None:
+def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
     Reads the request shm (header + buffer_nbytes + rank_ids), calls
@@ -2946,19 +2883,10 @@ def _handle_ctrl_alloc_domain(
     req_buf = req_shm.buf
     assert req_buf is not None
     try:
-        if sdma_sdk:
-            (allocation_id, rank_count, domain_rank, window_size, buffer_count, workspace_mask, queue_num) = (
-                _decode_sdma_domain_request(req_buf)
-            )
-            nbytes_offset = _DOMAIN_SDMA_REQ_HEADER.size
-        else:
-            (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(
-                req_buf, 0
-            )
-            workspace_mask = struct.unpack_from("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET)[0]
-            queue_num = 0
-            nbytes_offset = _DOMAIN_REQ_HEADER.size
+        (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        workspace_mask = struct.unpack_from("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET)[0]
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
+        nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
         buffer_nbytes = nbytes_struct.unpack_from(req_buf, nbytes_offset) if buffer_count else ()
         rank_ids_offset = nbytes_offset + nbytes_struct.size
@@ -2977,22 +2905,15 @@ def _handle_ctrl_alloc_domain(
     assert reply_buf is not None
     try:
         handle = _require_base_communicator(base_comm_handle)
-        allocation_args = (
+        device_ctx, local_window_base, actual_window_size = cw.comm_alloc_domain_windows(
             int(handle),
             int(allocation_id),
             rank_ids,
             int(domain_rank),
             int(window_size),
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
+            workspace_mask=workspace_mask,
         )
-        if sdma_sdk:
-            device_ctx, local_window_base, actual_window_size = cw.comm_alloc_domain_windows_sdma_sdk_v1(
-                *allocation_args, queue_num=queue_num
-            )
-        else:
-            device_ctx, local_window_base, actual_window_size = cw.comm_alloc_domain_windows(
-                *allocation_args, workspace_mask=workspace_mask
-            )
 
         # Carve buffer pointers sequentially inside the local window.
         buffer_ptrs: list[int] = []
@@ -3691,7 +3612,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         exported = ctypes.c_char.from_buffer(shm_buf)
                         try:
                             addr = ctypes.addressof(exported)
-                            cw.register_callable_from_blob(int(cid), addr, payload_size)
+                            cw.register_callable_from_blob(int(cid), addr)
                         finally:
                             del exported
                         prepared.add(int(cid))
@@ -3719,8 +3640,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         prepared.discard(int(cid))
             elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                 _handle_ctrl_alloc_domain(cw, buf, base_comm_handle=base_comm_handle)
-            elif sub_cmd == _CTRL_ALLOC_DOMAIN_SDMA_SDK_V1:
-                _handle_ctrl_alloc_domain(cw, buf, base_comm_handle=base_comm_handle, sdma_sdk=True)
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
                 _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
             elif sub_cmd == _CTRL_COMM_INIT:
@@ -3924,13 +3843,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 )
                 if protocol != _TASK_PROTOCOL_VERSION:
                     raise RuntimeError(f"unsupported task protocol {protocol}")
-                if (
-                    run_id == 0
-                    or generation == 0
-                    or dispatch_id == 0
-                    or _group_size == 0
-                    or _group_index >= _group_size
-                ):
+                if run_id == 0 or generation == 0 or dispatch_id == 0:
                     raise RuntimeError(f"invalid run identity {identity}")
                 if slot_id != pipeline_slot:
                     raise RuntimeError(
@@ -3955,8 +3868,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 staged_config, staged_provenance = read_task_config(frame_buf, identity, digest)
                 # The args blob is the last thing read out of the frame, and the
                 # only thing that still needs it.
-                args_address = frame_addrs[frame_index] + _OFF_TASK_ARGS_BLOB
-                args = read_args_from_blob(args_address, _MAILBOX_ARGS_CAPACITY)
+                args = read_args_from_blob(frame_addrs[frame_index] + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY)
                 staged = _StagedRun(
                     index=entry_index,
                     entry_buf=entry_buf,
@@ -4187,7 +4099,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                             # done() also includes cached terminal failures. Deliver
                             # those directly; a failed rollback is not physical END.
                             code, msg = publish_completed_run(staged)
-                            if code != 0 and staged.chip_run.lane_poisoned and staged.chip_run._owner_recovery_required:
+                            if code != 0 and staged.chip_run.lane_poisoned:
                                 shutdown_message = msg
                                 stop_progress = True
                                 break
@@ -4243,13 +4155,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         if not staged.ended_published:
                             # An explicit wait must reach the native bounded wait even
                             # when a hung launch never reports physical END on its own.
-                            try:
-                                staged.chip_run.wait()
-                            except Exception:  # noqa: BLE001
-                                if not staged.chip_run.done() or staged.chip_run._owner_recovery_required:
-                                    raise
+                            staged.chip_run.wait()
                         code, msg = publish_completed_run(staged)
-                        if code != 0 and staged.chip_run.lane_poisoned and staged.chip_run._owner_recovery_required:
+                        if code != 0 and staged.chip_run.lane_poisoned:
                             shutdown_message = msg
                             stop_progress = True
                             break
@@ -10556,9 +10464,7 @@ class Worker:
             after_success=lambda: setattr(self, "_comm_base_ready", True),
         )
 
-    def _domain_config(
-        self, members, window_size, buffers, retain_after_run, workspace_engines=(), sdma_sdk_queue_num=None
-    ) -> DomainConfig:
+    def _domain_config(self, members, window_size, buffers, retain_after_run, workspace_engines=()) -> DomainConfig:
         if self.level == 3:
             ids = tuple(self._config.get("device_ids", ()))
             members = tuple(operator.index(member) for member in members)
@@ -10588,9 +10494,7 @@ class Worker:
             topology = (self._global_cluster_id, tuple(targets))
         else:
             raise RuntimeError("communication domains require an L3+ Worker")
-        config = DomainConfig.capture(
-            members, window_size, buffers, retain_after_run, topology, workspace_engines, sdma_sdk_queue_num
-        )
+        config = DomainConfig.capture(members, window_size, buffers, retain_after_run, topology, workspace_engines)
         if config.workspace_engines:
             if self.level != 3:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
@@ -10603,18 +10507,7 @@ class Worker:
                     raise ValueError("URMA requires ranks in dense prefix order")
         return config
 
-    def _comm_domain(
-        self,
-        *,
-        name,
-        members,
-        window_size,
-        buffers,
-        retain_after_run,
-        reuse,
-        workspace_engines=(),
-        sdma_sdk_queue_num=None,
-    ):
+    def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse, workspace_engines=()):
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
@@ -10626,9 +10519,7 @@ class Worker:
         with control:
             if not name:
                 raise ValueError("domain name must be non-empty")
-            config = self._domain_config(
-                members, window_size, buffers, retain_after_run, workspace_engines, sdma_sdk_queue_num
-            )
+            config = self._domain_config(members, window_size, buffers, retain_after_run, workspace_engines)
             table = self._live_domains if self.level == 3 else self._live_global_domains
             handle = table.get(name)
             if handle is not None:
@@ -10649,7 +10540,6 @@ class Worker:
                         window_size=config.window_size,
                         buffers=config.specs(),
                         workspace_mask=config.workspace_mask(),
-                        sdma_sdk_queue_num=config.sdma_sdk_queue_num,
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -10703,8 +10593,8 @@ class Worker:
     def _domain_serialization(self):
         return contextlib.nullcontext() if _callback_frame_for(self) is not None else self._submit_mu.exclusive()
 
-    def _enroll_domain_uses(self, resources: _RunResources, *, provenance_locked: bool = False) -> None:
-        with contextlib.nullcontext() if provenance_locked else self._child_prov_lock:
+    def _enroll_domain_uses(self, resources: _RunResources) -> None:
+        with self._child_prov_lock:
             used = {
                 allocation_id
                 for allocation_id, identities in self._domain_members.items()
@@ -10774,7 +10664,6 @@ class Worker:
         window_size: int,
         buffers: list[CommBufferSpec],
         workspace_mask: int = 0,
-        sdma_sdk_queue_num: int | None = None,
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -10795,8 +10684,7 @@ class Worker:
         # Stage per-chip request shms (domain_rank differs per chip) and a
         # per-chip reply shm.  We let the chip child write back its own slot.
         buffer_count = len(buffers)
-        request_header = _DOMAIN_REQ_HEADER if sdma_sdk_queue_num is None else _DOMAIN_SDMA_REQ_HEADER
-        req_size = request_header.size + buffer_count * 8 + len(workers) * 4
+        req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
         # Precompute worker → dense rank for O(1) lookup in the staging /
         # context loops below (and again in _release_domain_handle).  Without
@@ -10818,17 +10706,22 @@ class Worker:
                     request_shms[chip_idx] = req
                     req_buf = req.buf
                     assert req_buf is not None
-                    _pack_domain_request_header(
+                    _DOMAIN_REQ_HEADER.pack_into(
                         req_buf,
+                        0,
                         int(allocation_id),
                         int(len(workers)),
-                        int(worker_to_rank[chip_idx]),
+                        int(worker_to_rank[chip_idx]),  # domain_rank
                         int(window_size),
                         int(buffer_count),
-                        workspace_mask,
-                        sdma_sdk_queue_num,
                     )
-                    nbytes_off = request_header.size
+                    struct.pack_into(
+                        "<I",
+                        req_buf,
+                        _DOMAIN_WORKSPACE_MASK_OFFSET,
+                        workspace_mask,
+                    )
+                    nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:
                         struct.pack_into(f"<{buffer_count}Q", req_buf, nbytes_off, *[int(b.nbytes) for b in buffers])
                     rank_ids_off = nbytes_off + buffer_count * 8
@@ -10867,7 +10760,7 @@ class Worker:
                         workers=workers,
                         request_shms=request_shms,
                         reply_shms=reply_shms,
-                        op="alloc" if sdma_sdk_queue_num is None else "alloc_sdma_sdk",
+                        op="alloc",
                         allocation_id=allocation_id,
                     )
 
@@ -11252,12 +11145,9 @@ class Worker:
         def dispatch(chip_idx: int) -> None:
             try:
                 req_name = request_shms[chip_idx].name
-                if op in ("alloc", "alloc_sdma_sdk"):
+                if op == "alloc":
                     assert reply_shms is not None
-                    allocate = (
-                        dw.control_alloc_domain_sdma_sdk_v1 if op == "alloc_sdma_sdk" else dw.control_alloc_domain
-                    )
-                    allocate(chip_idx, req_name, reply_shms[chip_idx].name)
+                    dw.control_alloc_domain(chip_idx, req_name, reply_shms[chip_idx].name)
                 else:
                     dw.control_release_domain(chip_idx, req_name)
             except BaseException as e:  # noqa: BLE001
@@ -12679,7 +12569,7 @@ class Worker:
         """Every tensor arg's identity in ``args``."""
         return set(args.identities())
 
-    def _record_touched_identities(self, args: Any, *, provenance_locked: bool = False) -> None:
+    def _record_touched_identities(self, args: Any) -> None:
         """Add every tensor arg's identity in ``args`` to the current run's touched set.
 
         A no-op when no run is being built (``_building_run_resources is None``) — tracking is
@@ -12701,8 +12591,6 @@ class Worker:
         if resources is None:
             return
         resources.touched_identities.update(self._identities_in_args(args))
-        if self.level == 3 and _callback_frame_for(self) is not None:
-            self._enroll_domain_uses(resources, provenance_locked=provenance_locked)
 
     def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.

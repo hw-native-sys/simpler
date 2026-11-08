@@ -34,17 +34,19 @@ struct ChipCallableLayout {
     size_t header_size;          // offsetof(ChipCallable, storage_)
     size_t total_size;           // header_size + storage_used (matches make_callable())
     uint64_t content_hash;       // FNV-1a 64 over [callable, total_size)
-    uint64_t aicore_image_hash;  // FNV-1a 64 over func ids, capabilities and child binaries
+    uint64_t aicore_image_hash;  // FNV-1a 64 over func ids and child binaries
 };
 
 /**
  * Compute byte-size and content hash for a ChipCallable buffer.
  *
- * The caller must own a factory-constructed or size-validated image. Untrusted
- * byte ingress must call chip_callable_image_valid with its actual extent first.
+ * `storage_used` is max(binary_size, child_offset[i] + CoreCallable header +
+ * child binary_size) over all children — same arithmetic make_callable<>()
+ * uses when emitting the host buffer.
  */
 inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *callable) {
     constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
+    size_t storage_used = static_cast<size_t>(callable->binary_size());
     const int32_t child_count = callable->child_count();
     uint64_t aicore_image_hash = simpler::common::utils::fnv1a_64(&child_count, sizeof(child_count));
     for (int32_t i = 0; i < callable->child_count(); ++i) {
@@ -52,16 +54,16 @@ inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *calla
         const int32_t func_id = callable->child_func_id(i);
         const uint32_t binary_size = c.binary_size();
         aicore_image_hash = simpler::common::utils::fnv1a_64_append(aicore_image_hash, &func_id, sizeof(func_id));
-        aicore_image_hash = simpler::common::utils::fnv1a_64_append(
-            aicore_image_hash, &c.async_capability(), sizeof(CoreAsyncCapability)
-        );
         aicore_image_hash =
             simpler::common::utils::fnv1a_64_append(aicore_image_hash, &binary_size, sizeof(binary_size));
         aicore_image_hash = simpler::common::utils::fnv1a_64_append(
             aicore_image_hash, c.binary_data(), static_cast<size_t>(binary_size)
         );
+        size_t child_total = CoreCallable::binary_data_offset() + static_cast<size_t>(c.binary_size());
+        size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
+        if (end > storage_used) storage_used = end;
     }
-    const size_t total_size = callable->image_size();
+    const size_t total_size = kHeaderSize + storage_used;
     const uint64_t hash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(callable), total_size);
     return ChipCallableLayout{kHeaderSize, total_size, hash, aicore_image_hash};
 }
@@ -104,19 +106,17 @@ chip_callable_table_length(const ChipCallable *callable, uint32_t max_func_id, u
  * pointer in sim; one formula therefore serves both platforms. Entries no child
  * claims stay 0, which is what an unmapped func_id must read.
  *
- * All supplied spans hold `length` entries, as chip_callable_table_length() computed
+ * Both spans hold `length` entries, as chip_callable_table_length() computed
  * for this same callable. `entry` may be null on a runtime whose consumers
- * resolve the entry out of the object themselves. The optional capabilities
- * stay in host memory; holes carry UNKNOWN and never imply synchronous code.
+ * resolve the entry out of the object themselves.
  */
 inline void chip_callable_fill_tables(
     const ChipCallable *callable, const ChipCallableLayout &layout, const uint8_t *scratch, uint64_t object_base,
-    uint32_t length, uint64_t *object, uint64_t *entry, CoreAsyncCapability *capabilities = nullptr
+    uint32_t length, uint64_t *object, uint64_t *entry
 ) {
     for (uint32_t i = 0; i < length; ++i) {
         object[i] = 0;
         if (entry != nullptr) entry[i] = 0;
-        if (capabilities != nullptr) capabilities[i] = CoreAsyncCapability{};
     }
     for (int32_t i = 0; i < callable->child_count(); ++i) {
         const uint32_t off = callable->child_offset(i);
@@ -124,7 +124,6 @@ inline void chip_callable_fill_tables(
         const uint32_t func_id = static_cast<uint32_t>(callable->child_func_id(i));
         object[func_id] = object_base + layout.header_size + off;
         if (entry != nullptr) entry[func_id] = child->resolved_addr();
-        if (capabilities != nullptr) capabilities[func_id] = child->async_capability();
     }
 }
 

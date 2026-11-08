@@ -1772,28 +1772,6 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
             raise AssertionError(f"Golden mismatch on '{name}': {_describe_mismatch(actual, expected, rtol, atol)}")
 
 
-def _incore_async_capability(kernel):
-    """Preserve unknown completion behavior unless the source declares a contract."""
-    from simpler.task_interface import CoreAsyncCapability, CoreAsyncMode  # noqa: PLC0415
-
-    if "async_capability" not in kernel:
-        return CoreAsyncCapability()
-    declaration = kernel["async_capability"]
-    if isinstance(declaration, CoreAsyncCapability):
-        return declaration
-    if not isinstance(declaration, dict):
-        raise TypeError("incore async_capability must be a descriptor or a field mapping")
-    fields = dict(declaration)
-    mode = fields.get("mode", CoreAsyncMode.UNKNOWN)
-    if isinstance(mode, str):
-        try:
-            mode = getattr(CoreAsyncMode, mode.upper())
-        except AttributeError as exc:
-            raise ValueError(f"unknown incore async mode: {mode}") from exc
-    fields["mode"] = mode
-    return CoreAsyncCapability(**fields)
-
-
 def compile_chip_callable_spec(spec, platform, runtime, cache_key):
     """Compile a chip entry spec into a memory- and disk-cached ``ChipCallable``.
 
@@ -1803,13 +1781,8 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
     ``l3_compile_cache_key`` so every path shares one cache entry per
     orchestration.
     """
-    capabilities = [_incore_async_capability(kernel) for kernel in spec["incores"]]
-    capability_keys = tuple(
-        (cap.version, cap.mode.name, cap.max_conditions, cap.condition_types) for cap in capabilities
-    )
-    memory_key = (cache_key, capability_keys)
-    if memory_key in _compile_cache:
-        return _compile_cache[memory_key]
+    if cache_key in _compile_cache:
+        return _compile_cache[cache_key]
 
     from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
 
@@ -1874,11 +1847,8 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
                     "core_type": k["core_type"],
                     "signature": k.get("signature", []),
                     "artifact_key": incore_artifact_key,
-                    "async_capability": capability_key,
                 }
-                for k, incore_artifact_key, capability_key in zip(
-                    incores, incore_artifact_keys, capability_keys, strict=True
-                )
+                for k, incore_artifact_key in zip(incores, incore_artifact_keys, strict=True)
             ],
         },
         orchestration_units,
@@ -1923,11 +1893,11 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
         if len(incores_binary) != len(incores):
             raise AssertionError("compiled incore binaries must match the incore specification")
         kernel_binaries = []
-        for k, incore, capability in zip(incores, incores_binary, capabilities, strict=True):
+        for k, incore in zip(incores, incores_binary):
             kernel_binaries.append(
                 (
                     k["func_id"],
-                    CoreCallable.build(signature=k.get("signature", []), binary=incore, async_capability=capability),
+                    CoreCallable.build(signature=k.get("signature", []), binary=incore),
                 )
             )
 
@@ -1940,7 +1910,7 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
         )
 
     chip_callable = get_or_compile(artifact_key, compile_callable)
-    _compile_cache[memory_key] = chip_callable
+    _compile_cache[cache_key] = chip_callable
     return chip_callable
 
 

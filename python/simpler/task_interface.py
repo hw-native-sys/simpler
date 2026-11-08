@@ -52,8 +52,6 @@ if TYPE_CHECKING:
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    CORE_ASYNC_CONDITION_COUNTER,
-    CORE_ASYNC_CONDITION_SDMA_POST_DONE,
     MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
@@ -79,8 +77,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ChipCallable,
     ChipStorageTaskArgs,
     ChipTensor,
-    CoreAsyncCapability,
-    CoreAsyncMode,
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
@@ -253,10 +249,6 @@ __all__ = [
     "RemoteTensorRef",
     "ArgDirection",
     "CoreCallable",
-    "CoreAsyncCapability",
-    "CoreAsyncMode",
-    "CORE_ASYNC_CONDITION_COUNTER",
-    "CORE_ASYNC_CONDITION_SDMA_POST_DONE",
     "ChipCallable",
     "CallConfig",
     "RuntimeEnv",

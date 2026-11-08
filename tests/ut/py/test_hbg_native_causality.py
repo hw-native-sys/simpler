@@ -889,3 +889,24 @@ def test_counts_and_complete_sequences_cannot_hide_protocol_corruption(mutation)
     assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
     with pytest.raises(ValueError, match="protocol"):
         audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("blocks", (1, 2))
+def test_deferred_finish_can_move_to_another_worker_after_execution_release(mask, blocks):
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], deferred_tasks=(0,)).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    raw["task_events"][0]["completion"]["flags"] &= ~(1 << 31)
+    with pytest.raises(ValueError, match="TaskDone"):
+        audit_native_protocol(raw, identities)
+
+
+def test_deferred_finish_flag_cannot_relabel_admission_or_inline_control():
+    raw, identities = ProtocolBuilder([(7, 2, ())]).run()
+    raw["task_events"][0]["admission"]["flags"] |= 1 << 31
+    with pytest.raises(ValueError, match="identity"):
+        audit_native_protocol(raw, identities)
+    raw, identities = ProtocolBuilder([(0, 1, ())]).run()
+    raw["task_events"][0]["completion"]["flags"] |= 1 << 31
+    with pytest.raises(ValueError, match="deferred"):
+        audit_native_protocol(raw, identities)

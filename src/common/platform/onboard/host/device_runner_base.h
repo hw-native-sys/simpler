@@ -2888,8 +2888,6 @@ protected:
         // never CHIP_MAX_FUNC_ID: the content hash covers the child func_ids
         // and offsets, so every cid sharing this entry has exactly this table.
         std::vector<uint64_t> object_table;
-        // Retained host metadata; this table is never copied to device memory.
-        std::vector<CoreAsyncCapability> capability_table;
         uint64_t object_table_dev{0};
         // The same domain resolved to kernel-entry addresses, present only on a
         // runtime whose device scheduler dispatches from them.

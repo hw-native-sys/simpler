@@ -1717,7 +1717,7 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     return execution_rc;
 }
 
-static int prepare_run_impl(
+int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
@@ -2048,13 +2048,6 @@ static int prepare_run_impl(
 }
 
 static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJoin *join);
-
-int simpler_prepare_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor
-) {
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor);
-}
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run");
@@ -2837,7 +2830,6 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
         reclaim_rc = state->runner->reclaim_workspace_obsolete();
     }
 
-    // Capture while the run's retained image and result owner are still live.
     // The epoch selects this call's retained workspace facts when execution
     // retirement has already released the slot to a successor. Destruction
     // ends this call's IO ownership without changing that successor's record.

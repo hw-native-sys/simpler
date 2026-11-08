@@ -15,15 +15,14 @@ from functools import cache
 from pathlib import Path
 
 import torch
+from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import (
-    CORE_ASYNC_CONDITION_COUNTER,
     CallConfig,
     CommBufferSpec,
     DataType,
     TaskArgs,
     TensorArgType,
 )
-from simpler.task_interface import ArgDirection as D
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
@@ -121,13 +120,6 @@ def compile_peer_counter(platform):
                 "source": str(HERE / "kernels" / source),
                 "core_type": core,
                 "signature": [D.INOUT] * tensors,
-                "async_capability": {
-                    "mode": "DEFERRED",
-                    "max_conditions": 1,
-                    "condition_types": CORE_ASYNC_CONDITION_COUNTER,
-                }
-                if index == 0
-                else {"mode": "SYNCHRONOUS"},
             }
             for index, source, core, tensors in specifications
         ],
@@ -260,8 +252,8 @@ class PeerCounterRunner:
         raw = json.loads(paths[0].read_text())
         protocol = raw.get("aicore_protocol", {})
         assert protocol.get("producer") == "aicore", paths[0]
-        assert protocol.get("schema") in ("hbg-native-protocol-v12", "hbg-native-protocol-v13"), (
-            "resident diagnostic qualification requires actual native schema12/13 evidence",
+        assert protocol.get("schema") in ("hbg-native-protocol-v14", "hbg-native-protocol-v15"), (
+            "resident diagnostic qualification requires actual native schema14/15 evidence",
             paths[0],
         )
         identities = raw["aicore_execution_identities"]["records"]
@@ -347,21 +339,9 @@ class PeerCounterRunner:
         assert sum(worker["core_type"] == 1 for worker in receiver["workers"]) == capacity, (
             "native worker topology differs from the public AIV capacity"
         )
-        for rank, protocol, expected in ((0, source, 1), (1, receiver, count)):
-            groups = protocol["async"]["groups"]
-            assert len(groups) == expected, (rank, len(groups), expected)
-            assert all(group["state"] == "READY" and group["registered_count"] == 1 for group in groups)
-            assert all(group["conditions"][0]["type"] == 0 for group in groups)
-        # A one-condition READY group observes again only after an unmet COUNTER
-        # read. Acquire-only and budget yields can raise pending_count without it.
-        assert any(group["observations"] > group["registered_count"] for group in receiver["async"]["groups"]), (
-            "coverage missing: no repeated resident COUNTER observation; "
-            "this invocation does not qualify an unmet-counter window"
-        )
-        if self.pressure:
-            assert any(group["pending_count"] > 0 for group in receiver["async"]["groups"]), (
-                "coverage missing: no recorded PENDING service slice"
-            )
+        # Payload, epoch and registration gates are checked by the business
+        # oracle. The native audit verifies execution and dependency completion.
+        assert count > 0
         (capture / "peer-counter-audit.json").write_text(
             json.dumps(
                 {"capacity_aiv": capacity, "main_waiters": count, "source": source_audit, "receiver": receiver_audit},

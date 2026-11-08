@@ -983,8 +983,6 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
     }
     boundary.params.set_predicate(args.predicate());
     GraphInflightRecording *entry_ptr = entry.get();
-    // A fresh capture has no declarations until its own body submits them.
-    // A cached/in-flight replay returned above and keeps its existing schema.
     state->inflight.emplace(graph_key, std::move(entry));
     state->inflight_count.store(state->inflight.size(), std::memory_order_release);
 

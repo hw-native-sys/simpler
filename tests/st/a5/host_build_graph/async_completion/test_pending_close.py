@@ -8,6 +8,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import re
+
 import pytest
 
 from .helpers import Case, CounterRunner, Scenario, close_after_failure, error_log_cursor, failure_evidence, l3_case
@@ -49,7 +51,9 @@ def test_never_satisfied_condition_cannot_report_success(st_platform, st_device_
         captured = capfd.readouterr()
         evidence = failure_evidence(failure.value, captured, cursor)
         (tmp_path / "never_ready.log").write_text(evidence)
-        assert "SCHEDULER_TIMEOUT" in evidence, evidence
+        # Retained-owner failures report the native terminal code before poisoning the lane.
+        # runtime_status.h defines SCHEDULER_TIMEOUT as 100; failed terminals store its negative.
+        assert "SCHEDULER_TIMEOUT" in evidence or re.search(r"\bterminal_code=-100\b", evidence), evidence
         consumer = runner.slots
         assert int(runner.records[consumer, 0]) == 0, "consumer executed despite an unsatisfied condition"
     finally:

@@ -1165,141 +1165,6 @@ class TestWorkerNativeChip:
         assert events == ["abandon-b", "terminal-b", "observe-a"]
         assert not staged_runs
 
-    @pytest.mark.parametrize("phase", ["progress", "observation", "observation_before_end"])
-    @pytest.mark.parametrize("recovery_required", [False, True], ids=["retired", "unproved"])
-    def test_staged_semantic_failure_stops_loop_only_for_owner_recovery(self, phase, recovery_required):
-        import ast  # noqa: PLC0415
-        import inspect  # noqa: PLC0415
-
-        from simpler import worker as worker_module  # noqa: PLC0415
-
-        tree = ast.parse(inspect.getsource(worker_module._run_chip_main_loop))
-        frame_loop = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "run_staged_frame_loop"
-        )
-        publish = next(
-            node
-            for node in frame_loop.body
-            if isinstance(node, ast.FunctionDef) and node.name == "publish_completed_run"
-        )
-        main_try = next(
-            node
-            for node in frame_loop.body
-            if isinstance(node, ast.Try) and node.body and isinstance(node.body[0], ast.While)
-        )
-        main_loop = main_try.body[0]
-        marker = "run_complete" if phase == "progress" else "requested"
-        loop_index, loop = next(
-            (index, node)
-            for index, node in enumerate(main_loop.body)
-            if isinstance(node, ast.For)
-            and any(isinstance(child, ast.Name) and child.id == marker for child in ast.walk(node))
-        )
-        stop_check = main_loop.body[loop_index + 1]
-        assert isinstance(stop_check, ast.If) and isinstance(stop_check.body[0], ast.Break)
-
-        events = []
-
-        def raise_semantic_failure():
-            raise RuntimeError("semantic failure -5")
-
-        # Native ownership classification is an input here. This test checks
-        # publication and control flow, not how the backend proves retirement.
-        chip_run = SimpleNamespace(
-            launched=True,
-            lane_poisoned=True,
-            _owner_recovery_required=recovery_required,
-            _execution_ended=False,
-            done=lambda: True,
-            wait=raise_semantic_failure,
-            _raise_if_failed=raise_semantic_failure,
-        )
-        staged = SimpleNamespace(
-            index=0,
-            identity=(0, 0, 0, 0, 1),
-            entry_addr=100,
-            entry_buf=b"entry",
-            activated=True,
-            launched_published=True,
-            ended_published=phase != "observation_before_end",
-            chip_run=chip_run,
-            config=None,
-        )
-        staged_runs = {staged.index: staged}
-        wrapper = ast.FunctionDef(
-            name="exercise",
-            args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-            body=[
-                *ast.parse('shutdown_message = "still running"\nstop_progress = False').body,
-                publish,
-                ast.While(
-                    test=ast.Constant(value=True),
-                    body=[
-                        loop,
-                        stop_check,
-                        *ast.parse('events.append(("continued",))\nbreak').body,
-                    ],
-                    orelse=[],
-                ),
-                ast.Return(value=ast.Name(id="shutdown_message", ctx=ast.Load())),
-            ],
-            decorator_list=[],
-        )
-        context = {
-            "staged_runs": staged_runs,
-            "device_id": 0,
-            "events": events,
-            "_StagedRun": SimpleNamespace,
-            "live_execution": False,
-            "pending_activation": False,
-            "pressure": False,
-            "activate_pending_runs": lambda: True,
-            "republish_native_preparation": lambda _staged: None,
-            "_mailbox_load_i32": lambda _address: 1,
-            "_read_run_entry_identity": lambda _buf: staged.identity,
-            "_format_exc": lambda prefix, error: f"{prefix}: {error}",
-            "on_task_done_success": None,
-            "finish_task_logging": lambda _config, code, message: (code, message),
-            "_write_entry_error": lambda _buf, code, message: events.append(("error", code, message)),
-            "_write_entry_admissible_sets": lambda _address, _sets: None,
-            "reports_admissible_sets": False,
-            "_mailbox_store_i32": lambda _address, state: events.append(("state", state)),
-            **{
-                name: getattr(worker_module, name)
-                for name in (
-                    "_OFF_ENTRY_STATE",
-                    "_OFF_ENTRY_OBSERVATION_REQUESTED",
-                    "_TASK_LAUNCHED",
-                    "_TASK_ENDED",
-                    "_TASK_DONE",
-                    "_TASK_FAILED",
-                )
-            },
-        }
-        code = compile(
-            ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
-            str(Path(worker_module.__file__)),
-            "exec",
-        )
-        exec(code, context)  # noqa: S102 -- actual staged-loop control and publication, no native ownership claims
-        shutdown_message = context["exercise"]()
-        if phase == "observation_before_end" and recovery_required:
-            # The enclosing production finally publishes unresolved runs;
-            # this extracted observation segment only requests shutdown.
-            assert events == []
-            assert shutdown_message == "chip_process dev=0: result observation: semantic failure -5"
-            assert staged_runs == {staged.index: staged}
-            return
-        message = "chip_process dev=0: chip run: semantic failure -5"
-        expected = [("error", 1, message), ("state", worker_module._TASK_FAILED)]
-        if not recovery_required:
-            expected.append(("continued",))
-        assert events == expected
-        assert shutdown_message == (message if recovery_required else "still running")
-        assert not staged_runs
-
     def test_l3_failed_child_does_not_freshly_publish_unobserved_successor_success(self, l3_progress_owner):
         worker, control, handle = l3_progress_owner
         control.test_progress_set(12, 1)  # One native observer reports an error; the later observer returns zero.
@@ -2620,7 +2485,7 @@ class TestChipWorkerBorrowedInit:
             elif operation == "register_blob":
 
                 def action():
-                    native.register_callable_from_blob(0, target.buffer_ptr(), target.buffer_size())
+                    native.register_callable_from_blob(0, target.buffer_ptr())
 
                 calls = observer.test_registrations
             else:
@@ -3029,7 +2894,7 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
         with pytest.raises(RuntimeError, match="not initialized"):
-            worker.register_callable_from_blob(0, callable_obj.buffer_ptr(), callable_obj.buffer_size())
+            worker.register_callable_from_blob(0, callable_obj.buffer_ptr())
 
     def test_run_before_init_raises(self):
         from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415

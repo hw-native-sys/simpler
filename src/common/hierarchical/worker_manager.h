@@ -99,7 +99,7 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 9;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 7;
 
 // Error message region. 256 B of headroom is enough for
 // `<ExceptionType>: <short message>` produced by the child-side Python loops;
@@ -364,7 +364,6 @@ static constexpr uint64_t CTRL_UNREGISTER = 6;
 // (child → parent: device_ctx + local_window_base + buffer_ptrs).  RELEASE
 // uses only the request shm; no payload comes back beyond status.
 static constexpr uint64_t CTRL_ALLOC_DOMAIN = 7;
-static constexpr uint64_t CTRL_ALLOC_DOMAIN_SDMA_SDK_V1 = 28;
 static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 // Establish the base HCCL/sim communicator on this chip.  Driven lazily by
 // the orch facade on the first ``allocate_domain`` call.  Payload is a single
@@ -635,7 +634,6 @@ public:
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     );
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
-    virtual void control_alloc_domain_sdma_sdk_v1(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
 
@@ -713,7 +711,6 @@ public:
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     ) override;
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
-    void control_alloc_domain_sdma_sdk_v1(const char *request_shm_name, const char *reply_shm_name) override;
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
 
@@ -992,7 +989,6 @@ public:
     // CTRL_SHM_NAME_BYTES-1. Holds mailbox_mu_ so control commands serialize;
     // task dispatch uses distinct frame state.
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
-    void control_alloc_domain_sdma_sdk_v1(const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(const char *request_shm_name);
 
     // Lazy comm_init driver — payload shm carries (rank, nranks, rootinfo_path).
@@ -1177,7 +1173,6 @@ public:
     // allocation across a subset of chips — caller dispatches to each
     // participating chip and joins on completion.
     void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
-    void control_alloc_domain_sdma_sdk_v1(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
     ControlResult

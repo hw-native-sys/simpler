@@ -364,7 +364,6 @@ TEST(NativeRunOperationLeaseTest, ManagedAllocationNeverFallsBackToTheLegacySymb
     ChipWorker worker;
     prime(worker);
     worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
-    EXPECT_THROW(worker.comm_alloc_domain_windows_sdma_sdk_v1(1, 1, {0, 1}, 0, 4096, 3), std::runtime_error);
     EXPECT_EQ(g_comm_alloc_calls, 0);
 }
 

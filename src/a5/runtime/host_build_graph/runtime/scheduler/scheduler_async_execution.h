@@ -132,14 +132,13 @@ template <typename Backend>
 inline __aicore__ bool scheduler_async_execution_service(
     SchedulerAsyncExecutionState<Backend> *state, const SchedulerGraphAccess &graph, __gm__ void *base,
     SchedulerLocalState *local, __gm__ SchedulerRunControl *run, Backend &backend, SchedulerAsyncAdmission admission,
-    bool runnable_business, bool *progress, uint64_t profiling_level = 0
+    bool runnable_business, bool *progress
 ) {
     if (state->permitted_slot != UINT32_MAX || !state->gate.take(state->view.enabled(), admission, runnable_business))
         return true;
     SchedulerAsyncSliceBudget budget{};
-    const auto result = scheduler_async_runtime_service(
-        state->view, graph, base, local, run, &state->discovery, &budget, backend, profiling_level
-    );
+    const auto result =
+        scheduler_async_runtime_service(state->view, graph, base, local, run, &state->discovery, &budget, backend);
     if (result == SchedulerAsyncRuntimeServiceResult::ERROR) return false;
     *progress = *progress || result == SchedulerAsyncRuntimeServiceResult::PROGRESS;
     return true;

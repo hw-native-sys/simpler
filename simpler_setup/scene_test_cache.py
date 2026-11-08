@@ -51,18 +51,11 @@ _ENTRY_RETENTION_S = 14 * 24 * 3600
 @cache
 def _chip_callable_abi_token() -> str:
     """Return a fingerprint of the binding's serialized callable layout."""
-    from simpler.task_interface import (  # noqa: PLC0415
-        ArgDirection,
-        ChipCallable,
-        CoreAsyncCapability,
-        CoreAsyncMode,
-        CoreCallable,
-    )
+    from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable  # noqa: PLC0415
 
     child = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT],
         binary=b"scene-test-cache-core-abi",
-        async_capability=CoreAsyncCapability(mode=CoreAsyncMode.SYNCHRONOUS),
     )
     callable_obj = ChipCallable.build(
         signature=[ArgDirection.INOUT],

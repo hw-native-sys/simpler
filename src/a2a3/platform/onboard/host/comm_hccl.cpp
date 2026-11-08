@@ -1064,6 +1064,7 @@ static int domain_alloc_via_ipc(
         LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(status));
         return -1;
     }
+
     return 0;
 }
 

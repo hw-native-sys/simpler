@@ -3042,29 +3042,6 @@ NB_MODULE(_task_interface, m) {
         nb::arg("direction"), "Return the string name of an ArgDirection."
     );
 
-    nb::enum_<CoreAsyncMode>(m, "CoreAsyncMode")
-        .value("UNKNOWN", CoreAsyncMode::UNKNOWN)
-        .value("SYNCHRONOUS", CoreAsyncMode::SYNCHRONOUS)
-        .value("DEFERRED", CoreAsyncMode::DEFERRED);
-    nb::class_<CoreAsyncCapability>(m, "CoreAsyncCapability")
-        .def(
-            "__init__",
-            [](CoreAsyncCapability *self, uint32_t version, CoreAsyncMode mode, uint32_t max_conditions,
-               uint32_t condition_types) {
-                CoreAsyncCapability capability{version, mode, max_conditions, condition_types};
-                if (!core_async_capability_valid(capability)) throw nb::value_error("Invalid core async capability");
-                new (self) CoreAsyncCapability(capability);
-            },
-            nb::arg("version") = CORE_ASYNC_CAPABILITY_VERSION, nb::arg("mode") = CoreAsyncMode::UNKNOWN,
-            nb::arg("max_conditions") = 0, nb::arg("condition_types") = 0
-        )
-        .def_ro("version", &CoreAsyncCapability::version)
-        .def_ro("mode", &CoreAsyncCapability::mode)
-        .def_ro("max_conditions", &CoreAsyncCapability::max_conditions)
-        .def_ro("condition_types", &CoreAsyncCapability::condition_types);
-    m.attr("CORE_ASYNC_CONDITION_COUNTER") = CORE_ASYNC_CONDITION_COUNTER;
-    m.attr("CORE_ASYNC_CONDITION_SDMA_POST_DONE") = CORE_ASYNC_CONDITION_SDMA_POST_DONE;
-
     // --- PyCoreCallable wrapper ---
     struct PyCoreCallable {
         std::vector<uint8_t> buffer_;
@@ -3074,28 +3051,17 @@ NB_MODULE(_task_interface, m) {
     nb::class_<PyCoreCallable>(m, "CoreCallable")
         .def_static(
             "build",
-            [](std::vector<ArgDirection> signature, nb::bytes binary,
-               const CoreAsyncCapability &capability) -> PyCoreCallable {
-                if (binary.size() > std::numeric_limits<uint32_t>::max())
-                    throw nb::value_error("Core binary too large");
+            [](std::vector<ArgDirection> signature, nb::bytes binary) -> PyCoreCallable {
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto buf = make_callable<CORE_MAX_TENSOR_ARGS>(
-                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size, capability
+                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size
                 );
                 return PyCoreCallable{std::move(buf)};
             },
-            nb::arg("signature"), nb::arg("binary"), nb::arg("async_capability") = CoreAsyncCapability{},
+            nb::arg("signature"), nb::arg("binary"),
             "Build a CoreCallable from a signature list and binary bytes. The dump "
-            "maps signature entry i to payload slot i positionally. An omitted capability "
-            "is UNKNOWN, not a synchronous-completion declaration."
-        )
-
-        .def_prop_ro(
-            "async_capability",
-            [](const PyCoreCallable &self) {
-                return self.get().async_capability();
-            }
+            "maps signature entry i to payload slot i positionally."
         )
 
         .def(
@@ -3163,8 +3129,6 @@ NB_MODULE(_task_interface, m) {
             "build",
             [](std::vector<ArgDirection> signature, std::string func_name, nb::bytes binary,
                std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name) -> PyChipCallable {
-                if (binary.size() > std::numeric_limits<uint32_t>::max())
-                    throw nb::value_error("Chip binary too large");
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto child_count = static_cast<int32_t>(children.size());
@@ -3201,9 +3165,6 @@ NB_MODULE(_task_interface, m) {
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
                 );
-                if (!chip_callable_image_valid(buf.data(), buf.size())) {
-                    throw nb::value_error("Incompatible or invalid ChipCallable image; rebuild the callable");
-                }
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("raw"),
@@ -3287,8 +3248,14 @@ NB_MODULE(_task_interface, m) {
                 // Reconstruct a PyCoreCallable by copying the child's raw bytes
                 auto offset = parent.child_offset(i);
                 const uint8_t *child_start = reinterpret_cast<const uint8_t *>(parent.storage_ + offset);
-                // Inter-child alignment belongs to the parent, not the child image.
-                size_t child_size = c.image_size();
+                // Determine child size: from offset to next child or end of buffer
+                size_t child_size;
+                if (i + 1 < parent.child_count()) {
+                    child_size = parent.child_offset(i + 1) - offset;
+                } else {
+                    size_t header_size = offsetof(ChipCallable, storage_);
+                    child_size = self.buffer_.size() - header_size - offset;
+                }
                 std::vector<uint8_t> child_buf(child_start, child_start + child_size);
                 return PyCoreCallable{std::move(child_buf)};
             },
@@ -3711,7 +3678,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
-                self.register_callable(callable_id, callable.buffer_.data(), callable.buffer_.size());
+                self.register_callable(callable_id, callable.buffer_.data());
             },
             nb::arg("callable_id"), nb::arg("callable"),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
@@ -3719,10 +3686,10 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "register_callable_from_blob",
-            [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr, size_t blob_size) {
-                self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr), blob_size);
+            [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
+                self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
             },
-            nb::arg("callable_id"), nb::arg("blob_ptr"), nb::arg("blob_size"),
+            nb::arg("callable_id"), nb::arg("blob_ptr"),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
             "bytes via shared memory; see docs/callable-identity-registration.md). "
@@ -3799,12 +3766,12 @@ NB_MODULE(_task_interface, m) {
             "_submit_chip_run_direct",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uintptr_t caller_stream) {
-                nb::gil_scoped_release release;
                 return self.submit_chip_run(
                     callable_id, args, config, nullptr, 0, reinterpret_cast<void *>(caller_stream)
                 );
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream") = 0,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Submit materialized task args to the chip native-run lane without a pipeline lease and return the live "
             "run. The lane follows the runtime PipelineContract: compatible runs admit one active plus one prepared "
             "successor; otherwise this call drains its predecessor before admitting. With caller_stream, "
@@ -4180,27 +4147,6 @@ NB_MODULE(_task_interface, m) {
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
             nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("workspace_mask") = 0,
-            "Collectively allocate a fresh per-rank pool for a subset; returns "
-            "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
-            "responsibility before result conversion or an allocation error; it does not imply a usable context."
-        )
-        .def(
-            "comm_alloc_domain_windows_sdma_sdk_v1",
-            [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
-               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t queue_num) {
-                if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
-                    throw std::invalid_argument(
-                        "comm_alloc_domain_windows_sdma_sdk_v1: commit flag address is invalid"
-                    );
-                }
-                auto [device_ctx, local_window_base, actual_window_size] = self.comm_alloc_domain_windows_sdma_sdk_v1(
-                    comm_handle, allocation_id, rank_ids, domain_rank, window_size, queue_num,
-                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address))
-                );
-                return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
-            },
-            nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
-            nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("queue_num"),
             "Collectively allocate a fresh per-rank pool for a subset; returns "
             "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
             "responsibility before result conversion or an allocation error; it does not imply a usable context."

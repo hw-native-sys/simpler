@@ -56,8 +56,6 @@
 #include "host/sim_thread_start_gate.h"
 #include "runtime.h"
 #include "profiler_test_allocator.h"
-#include "native_run_context.h"
-#include "platform_comm/comm.h"
 
 #if defined(__linux__)
 static std::atomic<bool> reject_device_bind{false};
@@ -176,11 +174,9 @@ public:
         int refcount{0};
         size_t object_table_size{0};
         size_t entry_table_size{0};
-        size_t capability_table_size{0};
         size_t dlopen_handles{0};
         const uint64_t *object_table{nullptr};
         const uint64_t *entry_table{nullptr};
-        const CoreAsyncCapability *capability_table{nullptr};
     };
 
     PoolView view(uint64_t hash) const {
@@ -194,11 +190,9 @@ public:
         out.refcount = it->second.refcount;
         out.object_table_size = it->second.object_table.size();
         out.entry_table_size = it->second.entry_table.size();
-        out.capability_table_size = it->second.capability_table.size();
         out.dlopen_handles = it->second.dlopen_handles.size();
         out.object_table = it->second.object_table.data();
         out.entry_table = it->second.entry_table.data();
-        out.capability_table = it->second.capability_table.data();
         return out;
     }
 };
@@ -218,23 +212,19 @@ std::vector<uint8_t> loadable_kernel_bytes() {
     return bytes;
 }
 
-std::vector<uint8_t> make_child(const std::vector<uint8_t> &binary, CoreAsyncCapability capability = {}) {
-    return make_callable<CORE_MAX_TENSOR_ARGS>(
-        nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()), capability
-    );
+std::vector<uint8_t> make_child(const std::vector<uint8_t> &binary) {
+    return make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()));
 }
 
 // A ChipCallable whose children claim `func_ids`, each carrying `binary`.
 // `orch_tag` makes two otherwise-identical callables differ in content, which
 // is what decides whether they dedup onto one pool entry.
-std::vector<uint8_t> make_chip(
-    const std::vector<int32_t> &func_ids, const std::vector<uint8_t> &binary, uint8_t orch_tag,
-    CoreAsyncCapability capability = {}
-) {
+std::vector<uint8_t>
+make_chip(const std::vector<int32_t> &func_ids, const std::vector<uint8_t> &binary, uint8_t orch_tag) {
     std::vector<std::vector<uint8_t>> children;
     children.reserve(func_ids.size());
     for (size_t i = 0; i < func_ids.size(); ++i)
-        children.push_back(make_child(binary, capability));
+        children.push_back(make_child(binary));
     const uint8_t orch[64] = {orch_tag};
     return make_chip_callable(
         nullptr, 0, "orch_entry", orch, sizeof(orch), func_ids.data(), children.data(),
@@ -370,7 +360,6 @@ TEST_F(SimCallablePoolTest, APublishedEntryCarriesCompleteTables) {
     EXPECT_EQ(v.table_len, 4u) << "one past the largest func_id";
     EXPECT_EQ(v.object_table_size, 4u);
     EXPECT_EQ(v.entry_table_size, 4u);
-    EXPECT_EQ(v.capability_table_size, 4u);
     EXPECT_EQ(v.dlopen_handles, 2u) << "the entry owns every handle the registration opened";
     EXPECT_EQ(v.object_table_dev, reinterpret_cast<uint64_t>(v.object_table));
     EXPECT_EQ(v.entry_table_dev, reinterpret_cast<uint64_t>(v.entry_table));
@@ -388,44 +377,6 @@ TEST_F(SimCallablePoolTest, APublishedEntryCarriesCompleteTables) {
     }
     EXPECT_EQ(v.object_table[1], 0u) << "a func_id no child claims stays unmapped";
     EXPECT_EQ(v.entry_table[1], 0u);
-    EXPECT_EQ(v.capability_table[1].mode, CoreAsyncMode::UNKNOWN);
-}
-
-TEST_F(SimCallablePoolTest, IdenticalCodeWithDifferentCapabilitiesKeepsDistinctRegisteredTables) {
-    const CoreAsyncCapability synchronous{1, CoreAsyncMode::SYNCHRONOUS, 0, 0};
-    const CoreAsyncCapability deferred{1, CoreAsyncMode::DEFERRED, 64, CORE_ASYNC_CONDITION_COUNTER};
-    const auto first = make_chip({3}, kernel_, 0x44, synchronous);
-    const auto second = make_chip({3}, kernel_, 0x44, deferred);
-    ASSERT_EQ(register_host_orch(1, first, nullptr), 0);
-    ASSERT_EQ(register_host_orch(2, second, nullptr), 0);
-    ASSERT_EQ(register_host_orch(3, second, nullptr), 0);
-    ASSERT_EQ(runner_.pool_size(), 2u);
-    const auto synchronous_view = runner_.view(hash_of(first));
-    const auto deferred_view = runner_.view(hash_of(second));
-    ASSERT_NE(synchronous_view.capability_table, deferred_view.capability_table);
-    EXPECT_EQ(deferred_view.refcount, 2);
-    EXPECT_EQ(deferred_view.capability_table_size, 4u);
-    EXPECT_EQ(deferred_view.capability_table[0].mode, CoreAsyncMode::UNKNOWN);
-
-    Runtime runtime;
-    CoreAsyncCapability out;
-    for (int id : {1, 2, 3, 1}) {
-        ASSERT_EQ(runner_.bind_callable_to_runtime(runtime, id, nullptr, nullptr, nullptr, nullptr, nullptr), 0);
-        ASSERT_TRUE(runtime.get_function_async_capability(3, &out));
-        EXPECT_EQ(out.mode, id == 1 ? CoreAsyncMode::SYNCHRONOUS : CoreAsyncMode::DEFERRED);
-        EXPECT_EQ(out.max_conditions, id == 1 ? 0u : 64u);
-        EXPECT_FALSE(runtime.get_function_async_capability(0, &out));
-        EXPECT_EQ(out.mode, CoreAsyncMode::UNKNOWN);
-    }
-    EXPECT_EQ(runner_.view(hash_of(first)).capability_table, synchronous_view.capability_table);
-    EXPECT_EQ(runner_.view(hash_of(second)).capability_table, deferred_view.capability_table);
-
-    const auto empty = make_chip({}, kernel_, 0x55);
-    ASSERT_EQ(register_host_orch(4, empty, nullptr), 0);
-    EXPECT_EQ(runner_.view(hash_of(empty)).capability_table_size, 0u);
-    ASSERT_EQ(runner_.bind_callable_to_runtime(runtime, 4, nullptr, nullptr, nullptr, nullptr, nullptr), 0);
-    EXPECT_FALSE(runtime.get_function_async_capability(3, &out));
-    EXPECT_EQ(out.mode, CoreAsyncMode::UNKNOWN);
 }
 
 // A runtime whose device consumers resolve the entry from the object asks for
@@ -527,15 +478,12 @@ TEST_F(SimCallablePoolTest, RebindingInstallsEachCallablesOwnReference) {
 // An unregistered id has no block, so a bind against it installs nothing and
 // leaves no reference to whatever the Runtime last carried.
 TEST_F(SimCallablePoolTest, ABindAgainstAnUnregisteredIdLeavesNoReference) {
-    const std::vector<uint8_t> chip = make_chip({0}, kernel_, 0xc3, {1, CoreAsyncMode::DEFERRED, 1, 1});
+    const std::vector<uint8_t> chip = make_chip({0}, kernel_, 0xc3);
     ASSERT_EQ(register_host_orch(4, chip, nullptr), 0);
 
     Runtime runtime;
     ASSERT_EQ(runner_.bind_callable_to_runtime(runtime, 4, nullptr, nullptr, nullptr, nullptr, nullptr), 0);
     ASSERT_NE(runtime.dev.callable_table_addr_, 0u);
-    CoreAsyncCapability out;
-    ASSERT_TRUE(runtime.get_function_async_capability(0, &out));
-    EXPECT_EQ(out.mode, CoreAsyncMode::DEFERRED);
 
     ASSERT_EQ(runner_.unregister_callable(4), 0);
     EXPECT_EQ(runner_.pool_size(), 0u);
@@ -545,14 +493,13 @@ TEST_F(SimCallablePoolTest, ABindAgainstAnUnregisteredIdLeavesNoReference) {
     EXPECT_EQ(runtime.dev.callable_table_len_, 0u);
     EXPECT_EQ(runtime.callable_entry_table_addr(), 0u);
     EXPECT_EQ(runtime.get_function_bin_addr(0), 0u);
-    EXPECT_FALSE(runtime.get_function_async_capability(0, &out));
-    EXPECT_EQ(out.mode, CoreAsyncMode::UNKNOWN);
 }
 
-// The delegate sees the current registration; after its failure no table or
-// capability pointer may survive the registration's subsequent unregister.
-TEST_F(SimCallablePoolTest, ADelegateFailureClearsTheInstalledReference) {
-    const std::vector<uint8_t> chip = make_chip({5}, kernel_, 0xd4, {1, CoreAsyncMode::DEFERRED, 1, 1});
+// A delegate failure is reported, and the reference it was handed is the bound
+// callable's — a bind that fails inside the runtime's own half has already
+// replaced any predecessor's reference rather than leaving one standing.
+TEST_F(SimCallablePoolTest, ADelegateFailureIsReportedAfterTheReferenceIsInstalled) {
+    const std::vector<uint8_t> chip = make_chip({5}, kernel_, 0xd4);
     ASSERT_EQ(register_host_orch(6, chip, nullptr), 0);
     const auto v = runner_.view(hash_of(chip));
 
@@ -560,14 +507,7 @@ TEST_F(SimCallablePoolTest, ADelegateFailureClearsTheInstalledReference) {
     g_bind_impl_rc = -7;
     EXPECT_EQ(runner_.bind_callable_to_runtime(runtime, 6, nullptr, nullptr, nullptr, nullptr, nullptr), -7);
     EXPECT_EQ(g_bind_impl_seen_object_addr, v.object_table_dev);
-    EXPECT_EQ(runtime.dev.callable_table_addr_, 0u);
-    EXPECT_EQ(runtime.callable_table_len(), 0u);
-    EXPECT_EQ(runtime.callable_entry_table_addr(), 0u);
-    CoreAsyncCapability out;
-    EXPECT_FALSE(runtime.get_function_async_capability(5, &out));
-    ASSERT_EQ(runner_.unregister_callable(6), 0);
-    EXPECT_FALSE(runtime.get_function_async_capability(5, &out));
-    EXPECT_EQ(runtime.get_function_bin_addr(5), 0u);
+    EXPECT_EQ(runtime.dev.callable_table_addr_, v.object_table_dev);
 }
 
 // Re-registering the same bytes after the last id went away rebuilds the block

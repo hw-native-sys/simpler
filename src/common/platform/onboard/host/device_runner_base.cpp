@@ -2307,7 +2307,6 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     // scratch fill, the patch, the table fill and the copy — allocates nothing.
     std::vector<uint8_t> scratch(alloc_size);
     std::vector<uint64_t> object_table(table_len, 0);
-    std::vector<CoreAsyncCapability> capability_table(table_len);
     std::vector<uint64_t> entry_table;
     if (want_entry_table) entry_table.assign(table_len, 0);
 
@@ -2345,7 +2344,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     // name.
     chip_callable_fill_tables(
         callable, layout, scratch.data(), chip_dev, table_len, object_table.data(),
-        want_entry_table ? entry_table.data() : nullptr, capability_table.data()
+        want_entry_table ? entry_table.data() : nullptr
     );
     if (table_len != 0) {
         std::memcpy(scratch.data() + object_table_off, object_table.data(), table_bytes);
@@ -2391,7 +2390,6 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     }
     auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
     inserted.first->second.object_table = std::move(object_table);
-    inserted.first->second.capability_table = std::move(capability_table);
     published = true;
     LOG_DEBUG(
         "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, table_len=%u, hash=0x%lx", chip_dev,
@@ -2959,8 +2957,7 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     const ChipCallableBuffer &tables = block->second;
     runtime.set_callable_tables(
         tables.object_table.empty() ? nullptr : tables.object_table.data(), tables.object_table_dev,
-        tables.entry_table_dev, tables.table_len,
-        tables.capability_table.empty() ? nullptr : tables.capability_table.data()
+        tables.entry_table_dev, tables.table_len
     );
     // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
     // descriptor itself was delivered at register time via RegisterCallableArgs.
@@ -2972,16 +2969,11 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     // decisions in runtime_maker (trb consumes it for copy direction; hbg consumes it too, for
     // copy direction and for the caller device buffers a run declares it produces). Both stay
     // internal to the runner now — they are no longer returned to the c_api.
-    auto table_guard = RAIIScopeGuard([&]() {
-        runtime.clear_callable_tables();
-    });
-    const int rc = bind_callable_to_runtime_impl(
+    return bind_callable_to_runtime_impl(
         &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,
         state.signature.empty() ? nullptr : state.signature.data(), static_cast<int>(state.signature.size()),
         ring_task_window, ring_heap, ring_dep_pool
     );
-    if (rc == 0) table_guard.dismiss();
-    return rc;
 }
 
 // Eager prebuilt-arena warm-up. A runtime that has a prebuilt runtime arena

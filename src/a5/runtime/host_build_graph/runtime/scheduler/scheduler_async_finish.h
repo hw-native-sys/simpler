@@ -18,7 +18,7 @@ struct SchedulerAsyncFinishProtocol {
     inline __aicore__ static void task_done(
         __gm__ void *base, const SchedulerLocalState *local, int64_t task, uint64_t order, uint32_t flags, bool before
     ) {
-        scheduler_protocol_task_actor(base, local, task, order, flags, true, before);
+        scheduler_protocol_task_actor(base, local, task, order, flags | (UINT32_C(1) << 31), true, before);
     }
 };
 
@@ -50,7 +50,7 @@ inline __aicore__ bool protocol_order(
 template <
     typename QueueOps = SchedulerCompletionQueueOps, typename Link = SchedulerResolveLink,
     typename Protocol = SchedulerAsyncFinishProtocol>
-inline __aicore__ SchedulerCompletionResult scheduler_async_finish_step_impl(
+inline __aicore__ SchedulerCompletionResult scheduler_async_finish_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAsyncFinishIdentity &identity, __gm__ SchedulerAsyncTaskJoin *join,
     SchedulerAsyncFinishProgress *progress, uint32_t *budget, SchedulerWakeStats *wake_stats = nullptr,
@@ -98,41 +98,6 @@ inline __aicore__ SchedulerCompletionResult scheduler_async_finish_step_impl(
     const auto result = scheduler_resolve_completion_step<QueueOps, Link>(
         graph, base, local, run, identity.task_ref, &cursor, budget, wake_stats, ready_stats
     );
-    return result;
-}
-
-struct SchedulerAsyncFinishClock {
-    inline __aicore__ static uint64_t now() { return scheduler_cycles(); }
-};
-
-inline __aicore__ void scheduler_async_finish_accumulate(uint64_t &total, uint64_t added) {
-    total = added > UINT64_MAX - total ? UINT64_MAX : total + added;
-}
-
-// Every measured interval starts and ends on the same core. The old synchronous
-// completion_resolve span would attribute all handoffs and gaps to its first
-// worker, so async FINISH never emits that pair. Host export can consume these
-// owned counters independently; no common clock origin across cores is assumed.
-template <
-    typename QueueOps = SchedulerCompletionQueueOps, typename Link = SchedulerResolveLink,
-    typename Clock = SchedulerAsyncFinishClock, typename Protocol = SchedulerAsyncFinishProtocol>
-inline __aicore__ SchedulerCompletionResult scheduler_async_finish_step(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const SchedulerAsyncFinishIdentity &identity, __gm__ SchedulerAsyncTaskJoin *join,
-    SchedulerAsyncFinishProgress *progress, uint32_t *budget, SchedulerWakeStats *wake_stats = nullptr,
-    SchedulerReadyStats *ready_stats = nullptr, uint64_t profiling_level = 0, SchedulerAsyncFinishStats *stats = nullptr
-) {
-    const bool measured = scheduler_phase_timing_enabled(profiling_level) && progress != nullptr && stats != nullptr;
-    const uint64_t start = measured ? Clock::now() : 0;
-    const uint32_t initial_budget = budget == nullptr ? 0 : *budget;
-    const auto result = scheduler_async_finish_step_impl<QueueOps, Link, Protocol>(
-        graph, base, local, run, identity, join, progress, budget, wake_stats, ready_stats
-    );
-    if (measured) {
-        scheduler_async_finish_accumulate(stats->active_slice_cycles, Clock::now() - start);
-        scheduler_async_finish_accumulate(stats->slice_count, 1);
-        scheduler_async_finish_accumulate(stats->work_units, budget == nullptr ? 0 : initial_budget - *budget);
-    }
     return result;
 }
 

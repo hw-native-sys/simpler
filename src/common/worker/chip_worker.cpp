@@ -10,7 +10,6 @@
  */
 
 #include "chip_worker.h"
-#include "../task_interface/callable.h"
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
@@ -456,8 +455,6 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
-        comm_alloc_domain_windows_sdma_sdk_fn_ =
-            module->optional<CommAllocDomainWindowsFn>("comm_alloc_domain_windows_sdma_sdk_v1");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
@@ -936,7 +933,6 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
-    comm_alloc_domain_windows_sdma_sdk_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_abort_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
@@ -969,9 +965,6 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
 }
 
 int32_t ChipWorker::register_callable(const void *callable, size_t callable_size) {
-    if (!chip_callable_image_valid(callable, callable_size)) {
-        throw std::invalid_argument("register_callable: incompatible or invalid image; rebuild the callable");
-    }
     if (!initialized_) throw std::runtime_error("ChipWorker not initialized; call init() first");
     validate_execution_context();
     if (register_callable_v2_fn_ == nullptr)
@@ -980,13 +973,6 @@ int32_t ChipWorker::register_callable(const void *callable, size_t callable_size
     const int rc = register_callable_v2_fn_(device_ctx_, callable, callable_size, &id);
     if (rc != 0) throw std::runtime_error("callable registration failed with code " + std::to_string(rc));
     return id;
-}
-
-void ChipWorker::register_callable(int32_t callable_id, const void *callable, size_t callable_size) {
-    if (!chip_callable_image_valid(callable, callable_size)) {
-        throw std::invalid_argument("register_callable: incompatible or invalid image; rebuild the callable");
-    }
-    register_callable(callable_id, callable);
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
@@ -1300,7 +1286,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             }
             native_runs_.at(run_epoch)->permits_prepared_successor = allow_prepared_successor;
         }
-        NativeRunDescriptor descriptor{
+        const NativeRunDescriptor descriptor{
             slot_id,        arena_bank_for_slot(slot_id), run_id,    generation, dispatch_id, run_epoch, accepted_state,
             accepted_value, launch_depth_ > 1 ? 1u : 0u,  provenance
         };
@@ -2597,31 +2583,9 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag
 ) {
-    return comm_alloc_domain_windows_impl(
-        comm_handle, allocation_id, rank_ids, domain_rank, window_size, workspace_mask, ownership_flag, false
-    );
-}
-
-std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows_sdma_sdk_v1(
-    uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size, uint32_t queue_num, uint64_t *ownership_flag
-) {
-    return comm_alloc_domain_windows_impl(
-        comm_handle, allocation_id, rank_ids, domain_rank, window_size, queue_num, ownership_flag, true
-    );
-}
-
-std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows_impl(
-    uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_or_queue_num, uint64_t *ownership_flag, bool sdk_only
-) {
     require_comm_cleanup_confirmed();
-    const auto allocate = sdk_only ? comm_alloc_domain_windows_sdma_sdk_fn_ : comm_alloc_domain_windows_fn_;
-    if (allocate == nullptr) {
-        throw std::runtime_error(
-            sdk_only ? "managed SDK-only SDMA domains are unsupported by this runtime" :
-                       "comm_alloc_domain_windows is not supported by this runtime"
-        );
+    if (comm_alloc_domain_windows_fn_ == nullptr) {
+        throw std::runtime_error("comm_alloc_domain_windows is not supported by this runtime");
     }
     if (rank_ids.empty()) {
         throw std::runtime_error("comm_alloc_domain_windows: rank_ids must not be empty");
@@ -2635,9 +2599,9 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows_imp
     uint64_t device_ctx = 0;
     uint64_t local_window_base = 0;
     size_t actual_window_size = 0;
-    int rc = allocate(
+    int rc = comm_alloc_domain_windows_fn_(
         reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-        window_size, workspace_or_queue_num, &device_ctx, &local_window_base, &actual_window_size
+        window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
     );
     if (ownership_flag != nullptr &&
         (rc == 0 || rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED)) {

@@ -31,7 +31,6 @@
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/task_id.h"
-#include "host_build_graph/host/graph_submit.h"
 
 // =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)

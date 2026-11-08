@@ -51,7 +51,7 @@ def _require_completed_empty_capture(runner):
     assert len(captures) == 1, captures
     raw = json.loads(captures[0].read_text())
     protocol = raw["aicore_protocol"]
-    assert protocol["schema"] == "hbg-native-protocol-v12"
+    assert protocol["schema"] == "hbg-native-protocol-v14"
     decoded = read_perf_data(captures[0])
     assert decoded["protocol_audit"]["protocol_verified"]
     assert protocol["scheduler_error"] == protocol["error_claimed"] == 0
@@ -63,15 +63,6 @@ def _require_completed_empty_capture(runner):
     assert consumer["task_ref"] == 1 and consumer["kernel_ids"] == [65535, 5, 65535]
     assert waiter["dependencies"] == [] and consumer["dependencies"] == [0]
     assert {task["task_id"] for task in decoded["tasks"]} == {0, 1}
-    groups, finishes = protocol["async"]["groups"], protocol["async"]["finishes"]
-    assert len(groups) == len(finishes) == 1
-    group, finish = groups[0], finishes[0]
-    assert group["task_ref"] == 0 and group["state"] == "EMPTY"
-    assert group["capacity"] == 64 and group["registered_count"] == 0 and group["conditions"] == []
-    assert group["observations"] == group["pending_count"] == group["failure_code"] == 0
-    assert group["sealed"] is not None and group["terminal"] is None
-    assert finish["task_ref"] == 0 and finish["state"] == "DRAINED"
-    assert finish["group_indices"] == [group["index"]] and finish["failure_code"] == 0
     (runner.capture / "omitted-registration-audit.json").write_text(
         json.dumps(decoded["protocol_audit"], indent=2) + "\n"
     )

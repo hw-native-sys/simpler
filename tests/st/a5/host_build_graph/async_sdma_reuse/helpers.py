@@ -18,15 +18,14 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import (
-    CORE_ASYNC_CONDITION_SDMA_POST_DONE,
     CallConfig,
     CommBufferSpec,
     DataType,
     TaskArgs,
     TensorArgType,
 )
-from simpler.task_interface import ArgDirection as D
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
@@ -99,13 +98,6 @@ def compile_series(platform):
                 "source": str(HERE / "kernels/aiv" / source),
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.INOUT, D.INOUT],
-                "async_capability": {
-                    "mode": "DEFERRED",
-                    "max_conditions": 64,
-                    "condition_types": CORE_ASYNC_CONDITION_SDMA_POST_DONE,
-                }
-                if index == 0
-                else {"mode": "SYNCHRONOUS"},
             }
             for index, source in enumerate(("submit.cpp", "consume.cpp"))
         ],
@@ -178,12 +170,10 @@ def audit_capture(directory, posts, rows):
     raw = json.loads(files[0].read_text())
     decoded = read_perf_data(files[0])
     protocol = raw["aicore_protocol"]
-    assert protocol["schema"] == "hbg-native-protocol-v12"
+    assert protocol["schema"] == "hbg-native-protocol-v14"
     assert decoded["protocol_audit"]["protocol_verified"]
     assert protocol["scheduler_error"] == protocol["error_claimed"] == 0
     assert len(protocol["tasks"]) == len(protocol["executions"]) == len(decoded["tasks"]) == 2 * posts
-    groups = {group["task_ref"]: group for group in protocol["async"]["groups"]}
-    assert len(groups) == len(protocol["async"]["finishes"]) == posts
     executions = {execution["task_ref"]: execution for execution in protocol["executions"]}
     tasks = {task["task_ref"]: task for task in protocol["tasks"]}
     for row in rows:
@@ -191,12 +181,10 @@ def audit_capture(directory, posts, rows):
         assert tasks[task]["dependencies"] == [] and tasks[task + 1]["dependencies"] == [task]
         assert tasks[task]["kernel_ids"] == [65535, 0, 65535]
         assert tasks[task + 1]["kernel_ids"] == [65535, 1, 65535]
-        group = groups[task]
-        assert group["state"] == "READY" and group["registered_count"] == len(row["records"])
-        assert all(condition["type"] == 1 for condition in group["conditions"])
         row["worker_index"] = executions[task]["worker_index"]
-        row["terminal_worker_index"] = group["terminal"]["worker_index"]
-    assert all(finish["state"] == "DRAINED" for finish in protocol["async"]["finishes"])
+        completion = next(event["completion"] for event in protocol["task_events"] if event["index"] == task)
+        assert completion["flags"] & (1 << 31)
+        row["finish_worker_index"] = completion["worker_index"]
     return {"capture": str(files[0]), "run_epoch": protocol["run_epoch"], "audit": decoded["protocol_audit"]}
 
 
@@ -269,7 +257,6 @@ class SdmaReuseRunner:
                 buffers=buffers,
                 retain_after_run=True,
                 workspace_engines=("sdma",),
-                sdma_sdk_queue_num=QUEUE_NUM,
             )
             identity = (domain.domain_id, domain.generation, tuple(domain.device_context(rank) for rank in range(2)))
             if self.domain_identity is None:

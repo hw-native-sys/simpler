@@ -24,7 +24,6 @@ def peer_fetch_orchestration(orch, callables, task_args, config):
     queues = int(task_args.queues)
     with orch.allocate_domain(
         workspace_engines=("sdma",),
-        sdma_sdk_queue_num=queues if queues > 1 else None,
         name="peer_fetch",
         workers=list(range(ranks)),
         window_size=max(nbytes, 4096),
@@ -164,8 +163,8 @@ class TestSdmaSharedChannelTwoRanks(_PeerFetchBase):
 @pytest.mark.sdma(worker_workspace=False)
 @scene_test(level=3, runtime="host_build_graph")
 class TestSdmaSharedChannelMultiQueue(_PeerFetchBase):
-    # A communicator's SDMA owner keeps its access mode and queue count for its
-    # lifetime. SDK-only multi-queue cases need a Worker separate from legacy.
+    # Each SDK workspace uses one consistent queue partition. Keep one-queue
+    # and multi-queue cases in separate Workers.
     CASES = [
         {
             "name": "peer_fetch_per_submit_payload_queues2",

@@ -15,7 +15,6 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
-#include <vector>
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"

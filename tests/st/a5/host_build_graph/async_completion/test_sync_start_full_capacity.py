@@ -49,7 +49,7 @@ def _assert_topology(protocol, capacity):
 
 def _qualify_full_cohort(directory, capacity):
     path, protocol, audit = _native_capture(directory)
-    assert protocol["schema"] == "hbg-native-protocol-v12"
+    assert protocol["schema"] == "hbg-native-protocol-v14"
     all_workers = _assert_topology(protocol, capacity)
     tasks = protocol["tasks"]
     main_tasks = [task for task in tasks if task["kernel_ids"] == [11, 9, 12]]
@@ -82,18 +82,8 @@ def _qualify_full_cohort(directory, capacity):
     assert {row["owner"]["block_idx"] for row in blocks} == set(range(capacity))
     assert all(len(row["lanes"]) == 3 for row in blocks)
 
-    groups = [row for row in protocol["async"]["groups"] if row["task_ref"] == main_ref]
-    assert len(groups) == 3 * capacity
-    assert all(row["state"] == "READY" and row["registered_count"] == 1 for row in groups)
-    assert all(row["conditions"][0]["type"] == 0 for row in groups)
-    assert any(row["observations"] > row["registered_count"] for row in groups), (
-        "diagnostic coverage missing: no main-cohort COUNTER was observed unmet"
-    )
-    releases = [row for row in protocol["async"]["releases"] if row["task_ref"] == main_ref]
-    assert len(releases) == capacity and {row["block_idx"] for row in releases} == set(range(capacity))
-    finishes = [row for row in protocol["async"]["finishes"] if row["task_ref"] == main_ref]
-    assert len(finishes) == 1 and finishes[0]["state"] == "DRAINED"
-    assert set(finishes[0]["group_indices"]) == {row["index"] for row in groups}
+    completion = next(event["completion"] for event in protocol["task_events"] if event["index"] == main_ref)
+    assert completion["flags"] & (1 << 31)
     return {"capture": str(path), "capacity_clusters": capacity, "main_task_ref": main_ref, "audit": audit}
 
 

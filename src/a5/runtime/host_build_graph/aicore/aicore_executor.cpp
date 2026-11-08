@@ -451,8 +451,7 @@ __aicore__ bool run_ready_dispatch_loop(
         if (!scheduler_async_execution_service(
                 &async_state, graph, scheduler_state_base, context, run_control, async_backend,
                 SchedulerAsyncAdmission::BEFORE_ADMISSION,
-                context->local_ready_mask != 0 && !scheduler_ready_pool_has_pending(context), &scheduler_progress,
-                profiling_level
+                context->local_ready_mask != 0 && !scheduler_ready_pool_has_pending(context), &scheduler_progress
             ))
             return false;
         if (phase_timing_enabled && scheduler_progress && idle_active) {
@@ -505,7 +504,7 @@ __aicore__ bool run_ready_dispatch_loop(
         }
         if (ready_slot < 0 && !scheduler_async_execution_service(
                                   &async_state, graph, scheduler_state_base, context, run_control, async_backend,
-                                  SchedulerAsyncAdmission::ADMISSION_DENIED, false, &scheduler_progress, profiling_level
+                                  SchedulerAsyncAdmission::ADMISSION_DENIED, false, &scheduler_progress
                               ))
             return false;
         if (ready_slot >= 0) {

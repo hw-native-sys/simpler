@@ -20,7 +20,7 @@
 #include "async_sdma_guard.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 7;
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 8;
 
 // All offsets are relative to the retained async region.
 struct SchedulerAsyncTaskMap {
@@ -40,7 +40,6 @@ struct SchedulerAsyncGroupIdentity {
     uint16_t block_idx{0};
     uint8_t subtask_slot{0};
     uint8_t capacity{0};
-    uint32_t condition_types{0};
 };
 
 struct alignas(64) SchedulerAsyncGroupWriter {
@@ -50,7 +49,7 @@ struct alignas(64) SchedulerAsyncGroupWriter {
 };
 
 // A local registration view excludes cache-line padding.
-struct SchedulerAsyncWriterSnapshot {
+struct alignas(8) SchedulerAsyncWriterSnapshot {
     uint32_t count{0};
     int32_t error_code{0};
     AsyncCompletionReservationState reservation{};
@@ -80,39 +79,6 @@ struct SchedulerAsyncFinishProgress {
     uint8_t reserved[7]{};
 };
 
-struct SchedulerAsyncCheckStats {
-    uint64_t observation_count{0};
-    uint64_t work_units{0};
-    uint64_t slice_count{0};
-    uint64_t pending_slice_count{0};
-    uint64_t active_cycles{0};
-};
-struct SchedulerAsyncFinishStats {
-    uint64_t active_slice_cycles{0};
-    uint64_t slice_count{0};
-    uint64_t work_units{0};
-};
-struct alignas(64) SchedulerAsyncProtocolRelease {
-    SchedulerProtocolStamp before{};
-    SchedulerProtocolStamp after{};
-    uint64_t worker_index{0};
-};
-
-// Existing DFX levels allocate these records. CHECK writes only check/terminal;
-// the execution-release owner has a separate line and no CHECK reads it.
-struct alignas(64) SchedulerAsyncGroupTrace {
-    SchedulerAsyncCheckStats check{};
-    SchedulerProtocolStamp sealed_at{};
-    SchedulerProtocolStamp terminal_at{};
-    uint64_t terminal_worker_index{0};
-    SchedulerAsyncProtocolRelease release{};
-};
-struct SchedulerAsyncFinishTrace {
-    SchedulerAsyncFinishStats finish{};
-    SchedulerProtocolStamp drained_at{};
-    uint64_t drained_worker_index{0};
-};
-
 struct SchedulerAsyncLayout {
     uint64_t version{SCHEDULER_ASYNC_LAYOUT_VERSION};
     uint64_t total_bytes{0};
@@ -138,18 +104,13 @@ struct SchedulerAsyncLayout {
     uint64_t entries_bytes{0};
     uint64_t sdma_guard_context_offset{0};
     uint64_t sdma_guard_count{0};
-    uint64_t group_trace_offset{0};
-    uint64_t finish_trace_offset{0};
 };
 
 static_assert(sizeof(SchedulerAsyncTaskMap) == 24);
 static_assert(sizeof(SchedulerAsyncGroupIdentity) == 40 && sizeof(SchedulerAsyncGroupWriter) == 64);
 static_assert(sizeof(SchedulerAsyncGroupProgress) == 32 && sizeof(SchedulerAsyncFinishIdentity) == 32);
 static_assert(sizeof(SchedulerAsyncFinishProgress) == 168);
-static_assert(sizeof(SchedulerAsyncCheckStats) == 40 && sizeof(SchedulerAsyncFinishStats) == 24);
-static_assert(sizeof(SchedulerAsyncGroupTrace) == 192 && sizeof(SchedulerAsyncFinishTrace) == 48);
-static_assert(offsetof(SchedulerAsyncGroupTrace, release) == 128);
-static_assert(sizeof(SchedulerAsyncLayout) == 208);
+static_assert(sizeof(SchedulerAsyncLayout) == 192);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(std::is_standard_layout_v<SchedulerAsyncTaskMap> && std::is_trivially_copyable_v<SchedulerAsyncTaskMap>);
 static_assert(

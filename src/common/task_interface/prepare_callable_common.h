@@ -65,7 +65,7 @@ struct CallableArtifacts {
     void *host_dlopen_handle{nullptr};  // hbg only
     void *host_orch_func_ptr{nullptr};  // hbg only
     uint64_t chip_buffer_hash{0};       // FNV-1a hash for the whole ChipCallable buffer
-    uint64_t aicore_image_hash{0};      // FNV-1a hash for func ids, capabilities and AICore child binaries
+    uint64_t aicore_image_hash{0};      // FNV-1a hash for func ids and AICore child binaries
     uint64_t chip_buffer_dev{0};        // device address of the ChipCallable header
     const void *orch_so_data{nullptr};  // trb only; host view used for validation/hash only
     size_t orch_so_size{0};             // trb only

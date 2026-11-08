@@ -19,7 +19,6 @@ SchedulerAsyncGroupIdentity identity(int64_t task = 1) {
     result.run_epoch = 19;
     result.task_ref = task;
     result.capacity = 64;
-    result.condition_types = CORE_ASYNC_CONDITION_TYPES;
     return result;
 }
 DeferredCompletionEntry counter(uint64_t address, uint32_t expected = 1) {

@@ -268,39 +268,6 @@ def test_compile_cache_survives_session_cache_clear(monkeypatch, tmp_path):
     assert second.child_count == first.child_count
 
 
-def test_capability_change_invalidates_memory_and_callable_disk_cache(monkeypatch, tmp_path):
-    from simpler.task_interface import CoreAsyncMode
-
-    _configure_fake_compilation(monkeypatch, tmp_path)
-    spec, _header = _cacheable_spec(tmp_path)
-    cache_key = ("TestScene", "a2a3sim", "host_build_graph", "pin")
-    unknown = compile_chip_callable_spec(spec, "a2a3sim", "host_build_graph", cache_key)
-    assert unknown.child(0).async_capability.mode == CoreAsyncMode.UNKNOWN
-
-    spec["incores"][0]["async_capability"] = {"mode": "SYNCHRONOUS"}
-    synchronous = compile_chip_callable_spec(spec, "a2a3sim", "host_build_graph", cache_key)
-    assert synchronous is not unknown
-    assert synchronous.child(0).async_capability.mode == CoreAsyncMode.SYNCHRONOUS
-
-    spec["incores"][0]["async_capability"] = {
-        "version": 1,
-        "mode": "deferred",
-        "max_conditions": 2,
-        "condition_types": 1,
-    }
-    deferred = compile_chip_callable_spec(spec, "a2a3sim", "host_build_graph", cache_key)
-    assert deferred is not unknown
-    assert deferred.child(0).async_capability.mode == CoreAsyncMode.DEFERRED
-    assert deferred.child(0).async_capability.max_conditions == 2
-    assert _FakeKernelCompiler.incore_compiles == 1  # Code bytes may be shared; the registration may not.
-
-    clear_compile_cache()
-    restored = compile_chip_callable_spec(spec, "a2a3sim", "host_build_graph", cache_key)
-    assert restored.child(0).async_capability.mode == CoreAsyncMode.DEFERRED
-    assert restored.child(0).async_capability.max_conditions == 2
-    assert _FakeKernelCompiler.incore_compiles == 1
-
-
 def test_compile_cache_invalidates_transitive_include(monkeypatch, tmp_path):
     _configure_fake_compilation(monkeypatch, tmp_path)
     spec, header = _cacheable_spec(tmp_path)

@@ -49,7 +49,6 @@ struct CheckFixture {
     SchedulerAsyncGroupIdentity identity{};
     SchedulerAsyncGroupWriter writer{};
     SchedulerAsyncGroupProgress saved{};
-    SchedulerAsyncCheckStats stats{};
     std::array<DeferredCompletionEntry, 64> entries{};
     BackendState backend;
     uint32_t remaining_budget{0};
@@ -58,7 +57,6 @@ struct CheckFixture {
         identity.task_ref = 0;
         identity.finish_index = 0;
         identity.capacity = 64;
-        identity.condition_types = CORE_ASYNC_CONDITION_TYPES;
         writer.count = count;
         writer.reservation.sealed = 1;
         for (uint32_t index = 0; index < 64; ++index) {
@@ -84,7 +82,7 @@ struct CheckFixture {
         auto progress = saved;
         remaining_budget = budget;
         const auto result =
-            scheduler_async_check_step(identity, writer, view(), observer, &progress, &remaining_budget, &stats);
+            scheduler_async_check_step(identity, writer, view(), observer, &progress, &remaining_budget);
         saved = progress;
         return result;
     }
@@ -96,14 +94,11 @@ TEST(HbgAsyncCheck, SixtyFourPendingConditionsCompleteOneRotationInEightSlices) 
         ASSERT_EQ(fixture.slice(slice % 3), SchedulerAsyncCheckResult::PENDING);
         EXPECT_EQ(fixture.remaining_budget, 0u);
         EXPECT_EQ(fixture.saved.next_condition, (slice + 1) * 8 % 64);
-        EXPECT_EQ(fixture.stats.observation_count, (slice + 1) * 8);
-        EXPECT_EQ(fixture.stats.work_units, (slice + 1) * 8);
         EXPECT_EQ(fixture.saved.remaining_mask, UINT64_MAX);
     }
     std::vector<uint32_t> expected(64);
     std::iota(expected.begin(), expected.end(), 0);
     EXPECT_EQ(fixture.backend.observe_order, expected);
-    EXPECT_EQ(fixture.stats.slice_count, 8u);
     for (uint32_t count : fixture.backend.observed)
         EXPECT_EQ(count, 1u);
 }
@@ -116,7 +111,6 @@ TEST(HbgAsyncCheck, PendingConditionIsObservedOnlyOnceEvenWithOversizedCallerBud
     CheckFixture many(64);
     EXPECT_EQ(many.slice(0, 100), SchedulerAsyncCheckResult::PENDING);
     EXPECT_EQ(many.remaining_budget, 92u);
-    EXPECT_EQ(many.stats.observation_count, 8u);
 }
 
 TEST(HbgAsyncCheck, RoundRobinPositionPersistsAcrossDifferentCoreOwners) {
@@ -129,7 +123,7 @@ TEST(HbgAsyncCheck, RoundRobinPositionPersistsAcrossDifferentCoreOwners) {
 }
 
 TEST(HbgAsyncCheck, SealedWriterAndCapacityAreValidatedBeforeInitialization) {
-    for (uint32_t scenario = 0; scenario < 10; ++scenario) {
+    for (uint32_t scenario = 0; scenario < 8; ++scenario) {
         CheckFixture fixture(1, false);
         switch (scenario) {
         case 0:
@@ -151,15 +145,9 @@ TEST(HbgAsyncCheck, SealedWriterAndCapacityAreValidatedBeforeInitialization) {
             fixture.writer.error_code = -900;
             break;
         case 6:
-            fixture.identity.condition_types = 0;
-            break;
-        case 7:
-            fixture.identity.condition_types = 4;
-            break;
-        case 8:
             fixture.identity.run_epoch = 0;
             break;
-        case 9:
+        case 7:
             fixture.identity.finish_index = SCHEDULER_ASYNC_INDEX_NONE;
             break;
         }
@@ -169,17 +157,15 @@ TEST(HbgAsyncCheck, SealedWriterAndCapacityAreValidatedBeforeInitialization) {
         );
         EXPECT_EQ(fixture.saved.phase, static_cast<uint64_t>(SchedulerAsyncCheckPhase::FAILED));
         if (scenario == 5) EXPECT_EQ(fixture.saved.failure_code, -900);
-        EXPECT_EQ(fixture.stats.observation_count, 0u);
     }
 }
 
-TEST(HbgAsyncCheck, UnknownUndeclaredAndMalformedEntryTypesFailBeforeObservation) {
-    for (uint32_t scenario = 0; scenario < 4; ++scenario) {
+TEST(HbgAsyncCheck, UnknownAndMalformedEntryTypesFailBeforeObservation) {
+    for (uint32_t scenario = 0; scenario < 3; ++scenario) {
         CheckFixture fixture(1);
         if (scenario == 0) fixture.entries[0].completion_type = -1;
         if (scenario == 1) fixture.entries[0].completion_type = 2;
-        if (scenario == 2) fixture.identity.condition_types = CORE_ASYNC_CONDITION_SDMA_POST_DONE;
-        if (scenario == 3) fixture.entries[0]._pad = 1;
+        if (scenario == 2) fixture.entries[0]._pad = 1;
         EXPECT_EQ(fixture.slice(0), SchedulerAsyncCheckResult::ERROR);
         EXPECT_EQ(fixture.saved.failure_code, static_cast<int64_t>(SchedulerAsyncCheckError::INVALID_ENTRY));
         EXPECT_TRUE(fixture.backend.observe_order.empty());
@@ -208,17 +194,6 @@ TEST(HbgAsyncCheck, EmptyAndDrainedGroupsNeedNoEntryAccessAndCannotBeReinitializ
     EXPECT_EQ(fixture.saved.remaining_mask, 0u);
 }
 
-TEST(HbgAsyncCheck, DiagnosticCountersSaturateWithoutChangingProgress) {
-    CheckFixture fixture(1);
-    fixture.stats.slice_count = fixture.stats.work_units = fixture.stats.observation_count = UINT64_MAX;
-    EXPECT_EQ(fixture.slice(0, 1), SchedulerAsyncCheckResult::PENDING);
-    EXPECT_EQ(fixture.stats.slice_count, UINT64_MAX);
-    EXPECT_EQ(fixture.stats.work_units, UINT64_MAX);
-    EXPECT_EQ(fixture.stats.observation_count, UINT64_MAX);
-    EXPECT_EQ(fixture.backend.observed[0], 1u);
-    EXPECT_EQ(fixture.saved.remaining_mask, 1u);
-}
-
 TEST(HbgAsyncCheck, SealedMetadataReadsPreserveBothThirtyTwoBitPairsAndFullCookie) {
     CheckFixture fixture(1);
     fixture.entries[0] = {kBase, UINT64_MAX, UINT32_MAX, UINT32_C(0x87654321), -11, UINT32_C(0xfedcba98)};
@@ -236,7 +211,6 @@ TEST(HbgAsyncCheck, ReadyBitsAreClearedAndNeverReadAgainAcrossOwners) {
     f.backend.observations[0] = f.backend.observations[2] = SchedulerAsyncConditionState::READY;
     ASSERT_EQ(f.slice(0), SchedulerAsyncCheckResult::PENDING);
     EXPECT_EQ(f.saved.remaining_mask, UINT64_C(0xa));
-    EXPECT_EQ(f.stats.work_units, 4u);
     f.entries[0].completion_type = f.entries[2].completion_type = -55;
     ASSERT_EQ(f.slice(2), SchedulerAsyncCheckResult::PENDING);
     EXPECT_EQ(f.backend.observe_order, (std::vector<uint32_t>{0, 1, 2, 3, 1, 3}));
@@ -251,7 +225,6 @@ TEST(HbgAsyncCheck, CompletionOrderingIsPartOfOneObservationUnit) {
     f.backend.observations[0] = SchedulerAsyncConditionState::READY;
     EXPECT_EQ(f.slice(0, 1), SchedulerAsyncCheckResult::DONE);
     EXPECT_EQ(f.remaining_budget, 0u);
-    EXPECT_EQ(f.stats.work_units, 1u);
     f.backend.observations[0] = SchedulerAsyncConditionState::PENDING;
     EXPECT_EQ(f.slice(2, 1), SchedulerAsyncCheckResult::DONE);
     EXPECT_EQ(f.backend.observed[0], 1u);
@@ -264,8 +237,6 @@ TEST(HbgAsyncCheck, AllSixtyFourReadyBitsDrainWithinEightBoundedSlices) {
         EXPECT_EQ(
             f.slice(slice % 3), slice == 7 ? SchedulerAsyncCheckResult::DONE : SchedulerAsyncCheckResult::PENDING
         );
-    EXPECT_EQ(f.stats.observation_count, 64u);
-    EXPECT_EQ(f.stats.work_units, 64u);
     for (auto count : f.backend.observed)
         EXPECT_EQ(count, 1u);
 }
@@ -281,7 +252,6 @@ TEST(HbgAsyncCheck, InvalidProgressFailsBeforeBackendWork) {
         if (scenario == 5) f.saved.phase = static_cast<uint64_t>(SchedulerAsyncCheckPhase::DRAINED);
         EXPECT_EQ(f.slice(0), SchedulerAsyncCheckResult::ERROR);
         EXPECT_TRUE(f.backend.observe_order.empty());
-        EXPECT_EQ(f.stats.work_units, 0u);
     }
 }
 

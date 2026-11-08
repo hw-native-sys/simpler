@@ -21,16 +21,14 @@ from functools import cache
 from pathlib import Path
 
 import torch
+from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import (
-    CORE_ASYNC_CONDITION_COUNTER,
-    CORE_ASYNC_CONDITION_SDMA_POST_DONE,
     CallConfig,
     CommBufferSpec,
     DataType,
     TaskArgs,
     TensorArgType,
 )
-from simpler.task_interface import ArgDirection as D
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import _bound_host_logs, _pto_isa_compile_cache_token, compile_chip_callable_spec
@@ -200,15 +198,6 @@ def _counter_callable_spec():
                 "source": str(HERE / "kernels" / source),
                 "core_type": core,
                 "signature": [D.INOUT] * (2 if index == 10 else 5),
-                # Zero-condition invocations retain this source-level bound;
-                # the 65-condition case must still exceed the explicit_capability 64 slots.
-                "async_capability": {
-                    "mode": "DEFERRED",
-                    "max_conditions": 1 if index == 10 else CONDITION_LIMIT,
-                    "condition_types": CORE_ASYNC_CONDITION_COUNTER,
-                }
-                if index < 3 or index in (9, 10, 11, 12)
-                else {"mode": "SYNCHRONOUS"},
             }
             for index, source, core in (
                 (0, "aic/waiter.cpp", "aic"),
@@ -397,7 +386,7 @@ class CounterRunner:
 
 
 @cache
-def compile_sdma(platform: str, *, explicit_capability: bool = True):
+def compile_sdma(platform: str, *, plain_kernel: bool = False):
     spec = {
         "orchestration": {
             "source": str(HERE / "kernels/orchestration/sdma.cpp"),
@@ -411,32 +400,23 @@ def compile_sdma(platform: str, *, explicit_capability: bool = True):
                 "source": str(HERE / "kernels/aiv" / source),
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.OUT, D.INOUT] if index != 2 else [D.INOUT],
-                "async_capability": {
-                    "mode": "DEFERRED",
-                    "max_conditions": CONDITION_LIMIT,
-                    "condition_types": CORE_ASYNC_CONDITION_SDMA_POST_DONE,
-                }
-                if index == 0
-                else {"mode": "SYNCHRONOUS"},
             }
             for index, source in enumerate(("sdma_submit.cpp", "sdma_consumer.cpp", "sdma_probe.cpp"))
         ],
     }
-    if not explicit_capability:
+    if plain_kernel:
         spec["incores"][0]["source"] = str(HERE / "kernels/aiv/sdma_submit_unannotated.cpp")
-        for kernel in spec["incores"]:
-            kernel.pop("async_capability")
     return compile_chip_callable_spec(
         spec,
         platform,
         "host_build_graph",
-        (str(HERE), platform, "sdma", explicit_capability, _pto_isa_compile_cache_token()),
+        (str(HERE), platform, "sdma", plain_kernel, _pto_isa_compile_cache_token()),
     )
 
 
-def run_sdma(platform: str, devices: list[int], directory: Path, elements: int, *, explicit_capability: bool = True):
+def run_sdma(platform: str, devices: list[int], directory: Path, elements: int, *, plain_kernel: bool = False):
     assert len(devices) >= 2, "real peer SDMA requires two assigned devices"
-    compiled = compile_sdma(platform, explicit_capability=explicit_capability)
+    compiled = compile_sdma(platform, plain_kernel=plain_kernel)
     # CommDomain buffers are 64-byte aligned; leave at least 32 guard elements.
     allocated = ((elements + 32 + 15) // 16) * 16
     sources = [
@@ -474,7 +454,6 @@ def run_sdma(platform: str, devices: list[int], directory: Path, elements: int, 
             buffers=buffers,
             retain_after_run=True,
             workspace_engines=("sdma",),
-            sdma_sdk_queue_num=1,
         )
         for rank in range(2):
             stage_host_tensor(source_staging[rank], sources[rank])

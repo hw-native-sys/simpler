@@ -39,7 +39,6 @@ struct FinishFixture {
     SchedulerAsyncLease lease{};
     SchedulerAsyncDirectoryWord directory{};
     SchedulerAsyncFinishProgress saved{};
-    SchedulerAsyncFinishStats stats{};
     SchedulerWakeStats wake{};
     SchedulerReadyStats ready{};
     SchedulerCompletionStats completion{};
@@ -183,15 +182,14 @@ struct FinishFixture {
             count += local.pending_completed;
         return count;
     }
-    template <typename Ops = SchedulerCompletionQueueOps, typename Clock = SchedulerAsyncFinishClock>
-    SchedulerCompletionResult slice(uint32_t worker, uint32_t budget, uint64_t profiling_level = 0) {
+    template <typename Ops = SchedulerCompletionQueueOps>
+    SchedulerCompletionResult slice(uint32_t worker, uint32_t budget) {
         const auto claim = scheduler_async_lease_try_claim(lease, scheduler_async_lease_load(lease));
         EXPECT_EQ(claim.result, SchedulerAsyncLeaseResult::SUCCESS);
         owned = claim.word;
         auto progress = saved;
-        const auto result = scheduler_async_finish_step<Ops, SchedulerResolveLink, Clock>(
-            graph, base(), &locals[worker], run, identity, &join, &progress, &budget, &wake, &ready, profiling_level,
-            &stats
+        const auto result = scheduler_async_finish_step<Ops, SchedulerResolveLink>(
+            graph, base(), &locals[worker], run, identity, &join, &progress, &budget, &wake, &ready
         );
         saved = progress;
         for (const auto &local : locals)
@@ -622,6 +620,7 @@ TEST(HbgAsyncFinish, CooperativeTaskDoneUsesPersistentOrderOnAnUnrelatedObserver
     );
     auto *protocol = scheduler_protocol_layout_at(base, local);
     const auto *trace = scheduler_state_at<SchedulerProtocolTaskTrace>(base, protocol->tasks_offset);
+    EXPECT_EQ(trace->completion.flags, metadata.flags | (UINT32_C(1) << 31));
     EXPECT_EQ(trace->completion.order_key, 0u);
     EXPECT_EQ(trace->completion.worker_index, worker);
     EXPECT_GT(trace->completion.before.sequence, 0u);
@@ -685,52 +684,6 @@ TEST(HbgAsyncFinish, DirectoryContentionYieldsAfterPublicationWithoutTouchingTra
     EXPECT_EQ(fixture.ready.batch_count, 1u);
     fixture.terminal(4);
     ContendedDirectory::directory_word = nullptr;
-}
-
-struct OffsetSliceClock {
-    inline static uint64_t stamp{0};
-    static uint64_t now() {
-        stamp += 7;
-        return stamp;
-    }
-};
-
-TEST(HbgAsyncFinish, PhaseTimingAccumulatesActualSlicesWithoutCrossCoreBusySpan) {
-    FinishFixture fixture(4);
-    fixture.fanout(1, 4);
-    const auto original_worker = fixture.control(0)->scheduler_worker_id;
-    const auto original_loop = fixture.control(0)->completion_resolve_loop_iter;
-    SchedulerCompletionResult result = SchedulerCompletionResult::PENDING;
-    uint32_t worker = 0;
-    uint32_t calls = 0;
-    for (; calls < 100 && result == SchedulerCompletionResult::PENDING; ++calls) {
-        worker = calls % 6;
-        // Clock origins differ and wall time includes gaps. Only each call's
-        // own seven-cycle interval belongs to FINISH's active work.
-        OffsetSliceClock::stamp = UINT64_C(10000000) * worker + UINT64_C(1000) * calls;
-        result = fixture.slice<SchedulerCompletionQueueOps, OffsetSliceClock>(
-            worker, calls == 0 ? 0 : 1, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
-        );
-        EXPECT_EQ(fixture.stats.active_slice_cycles, 7 * (calls + 1));
-        EXPECT_EQ(fixture.stats.slice_count, calls + 1);
-        EXPECT_EQ(fixture.stats.work_units, calls);
-    }
-    ASSERT_EQ(result, SchedulerCompletionResult::DONE);
-    EXPECT_GT(calls, 6u);
-    EXPECT_EQ(fixture.control(0)->completion_resolve_start_cycles, 0u);
-    EXPECT_EQ(fixture.control(0)->completion_resolve_end_cycles, 0u);
-    EXPECT_EQ(fixture.control(0)->scheduler_worker_id, original_worker);
-    EXPECT_EQ(fixture.control(0)->completion_resolve_loop_iter, original_loop);
-    fixture.terminal(worker);
-
-    FinishFixture unprofiled(1);
-    ASSERT_EQ(unprofiled.slice(0, 8), SchedulerCompletionResult::DONE);
-    EXPECT_EQ(unprofiled.stats.active_slice_cycles, 0u);
-    EXPECT_EQ(unprofiled.stats.slice_count, 0u);
-    EXPECT_EQ(unprofiled.stats.work_units, 0u);
-    uint64_t saturated = UINT64_MAX - 3;
-    scheduler_async_finish_accumulate(saturated, 7);
-    EXPECT_EQ(saturated, UINT64_MAX);
 }
 
 struct ClearedDirectory : SchedulerCompletionQueueOps {
@@ -803,10 +756,10 @@ TEST(HbgAsyncFinish, ForeignAbortAfterRealTaskDoneBeforeDoesNotInventLocalFailur
     SchedulerAsyncFinishProgress progress{};
     uint32_t budget = 8;
     ForeignAbortAfterTaskDoneBefore::run = storage.run_control;
-    const auto result = scheduler_async_finish_step<
-        SchedulerCompletionQueueOps, SchedulerResolveLink, SchedulerAsyncFinishClock, ForeignAbortAfterTaskDoneBefore>(
-        graph.graph(), base, local, storage.run_control, identity, &join, &progress, &budget
-    );
+    const auto result =
+        scheduler_async_finish_step<SchedulerCompletionQueueOps, SchedulerResolveLink, ForeignAbortAfterTaskDoneBefore>(
+            graph.graph(), base, local, storage.run_control, identity, &join, &progress, &budget
+        );
     ForeignAbortAfterTaskDoneBefore::run = nullptr;
     EXPECT_EQ(result, SchedulerCompletionResult::ERROR);
     EXPECT_EQ(progress.completion.publication.phase, static_cast<uint64_t>(SchedulerCompletionPhase::FAILED));

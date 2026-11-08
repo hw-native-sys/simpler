@@ -309,10 +309,7 @@ public:
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64). An ID that is already
     // registered is rejected; unregister it before reuse.
-    // Pointer-only overload is for previously validated/constructed owned
-    // images. External bytes must use the overload with an actual extent.
     void register_callable(int32_t callable_id, const void *callable);
-    void register_callable(int32_t callable_id, const void *callable, size_t callable_size);
     /// Register with a runtime-assigned ID in either initialization mode.
     int32_t register_callable(const void *callable, size_t callable_size);
     void unregister_callable(int32_t callable_id);
@@ -432,10 +429,6 @@ public:
     std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr
-    );
-    std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows_sdma_sdk_v1(
-        uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-        size_t window_size, uint32_t queue_num, uint64_t *ownership_flag = nullptr
     );
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
@@ -775,7 +768,6 @@ private:
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
-    CommAllocDomainWindowsFn comm_alloc_domain_windows_sdma_sdk_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
@@ -889,10 +881,6 @@ private:
     };
     /** Why a lease was refused, or that the run had already completed. */
     enum class NativeRunLease : uint8_t { Acquired, AlreadyComplete, Absent, Stale, Reserved, Busy };
-    std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows_impl(
-        uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-        size_t window_size, uint32_t workspace_or_queue_num, uint64_t *ownership_flag, bool sdk_only
-    );
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
         uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,

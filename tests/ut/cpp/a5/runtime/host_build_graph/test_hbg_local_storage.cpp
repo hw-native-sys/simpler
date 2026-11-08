@@ -173,19 +173,6 @@ TEST(HbgLocalStorage, EveryScalarAlignedBasePreservesFinishFieldsAndGuards) {
     }
 }
 
-TEST(HbgLocalStorage, OptionalFinishDiagnosticsPreserveOwnedCounters) {
-    SchedulerLocalStorage<SchedulerAsyncFinishTrace> trace;
-    trace->finish = {67, 71, 73};
-    SchedulerAsyncFinishTrace stored{};
-    scheduler_async_runtime_detail::publish(&stored, trace.get());
-    trace.reset();
-    EXPECT_EQ(trace->finish.slice_count, 0u);
-    scheduler_async_runtime_detail::load_into(&stored, &trace.get());
-    EXPECT_EQ(trace->finish.active_slice_cycles, 67u);
-    EXPECT_EQ(trace->finish.slice_count, 71u);
-    EXPECT_EQ(trace->finish.work_units, 73u);
-}
-
 TEST(HbgLocalStorage, ResetRestoresNonzeroSentinelsAtEveryScalarAlignedBase) {
     for (size_t displacement = 0; displacement < 128; displacement += 8) {
         SCOPED_TRACE(displacement);

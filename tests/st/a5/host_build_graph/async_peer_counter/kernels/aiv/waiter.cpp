@@ -28,7 +28,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     auto context = get_async_ctx(args);
     if (!async_ctx_is_deferred(context) || context.completion_count == nullptr ||
         context.completion_error_code == nullptr || context.completion_entries == nullptr ||
-        context.completion_capacity != 1) {
+        context.completion_capacity != MAX_COMPLETIONS_PER_TASK) {
         error(diagnostic, Error::MISSING_CONTEXT);
     } else if (*context.completion_count != 0 || *context.completion_error_code != 0) {
         error(diagnostic, Error::REGISTRATION_FAILED);

@@ -1036,7 +1036,7 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) 
     return execution_rc;
 }
 
-static int prepare_run_impl(
+int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
@@ -1177,13 +1177,6 @@ static int prepare_run_impl(
         publish_released_preparation(runtime, descriptor->run_epoch);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-}
-
-int simpler_prepare_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    const NativeRunDescriptor *descriptor
-) {
-    return prepare_run_impl(ctx, runtime, callable_id, args, config, descriptor);
 }
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {

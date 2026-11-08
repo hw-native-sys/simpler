@@ -38,9 +38,7 @@ struct ExecutionBackend {
 };
 
 struct ExecutionFixture {
-    ExecutionFixture(
-        uint32_t blocks, LaneMask lanes, bool sync_start = false, uint32_t async_mask = 7, bool skip = false
-    ) :
+    ExecutionFixture(uint32_t blocks, LaneMask lanes, bool sync_start = false, bool skip = false) :
         storage(1, 6, blocks * 3, {6, 2, lanes.is_mix() || blocks > 1 ? 1u : 0u, lanes.is_mix() ? 1u : 0u}),
         graph(1),
         image(nullptr, &std::free) {
@@ -57,21 +55,13 @@ struct ExecutionFixture {
         metadata.timing_slot = -1;
         for (uint32_t lane = 0; lane < 3; ++lane)
             metadata.kernel_ids[lane] = lanes.has(static_cast<SubtaskSlot>(lane)) ? 1 : INVALID_KERNEL_ID;
-        std::vector<SchedulerAsyncCapabilities> caps(1);
-        for (uint32_t lane = 0; lane < 3; ++lane) {
-            const bool deferred = lanes.has(static_cast<SubtaskSlot>(lane)) && (async_mask & (1u << lane));
-            caps[0][lane] = {
-                CORE_ASYNC_CAPABILITY_VERSION, deferred ? CoreAsyncMode::DEFERRED : CoreAsyncMode::SYNCHRONOUS,
-                deferred ? 1u : 0u, deferred ? CORE_ASYNC_CONDITION_COUNTER : 0u
-            };
-        }
         std::vector<SchedulerTaskMetadata> tasks{metadata};
         SchedulerAsyncLayout layout{};
-        EXPECT_TRUE(scheduler_plan_async_layout(tasks, caps, kEpoch, 1 << 20, {}, &layout, nullptr));
+        EXPECT_TRUE(scheduler_plan_async_layout(tasks, kEpoch, 1 << 20, &layout, nullptr));
         image.reset(std::aligned_alloc(128, layout.total_bytes));
         EXPECT_NE(image, nullptr);
         async.base = static_cast<uint8_t *>(image.get());
-        EXPECT_TRUE(scheduler_initialize_async_state(tasks, caps, layout, async.base, layout.total_bytes, nullptr));
+        EXPECT_TRUE(scheduler_initialize_async_state(tasks, layout, async.base, layout.total_bytes, nullptr));
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, kEpoch));
         run()->active_worker_count = 6;
         run()->aic_active_worker_count = 2;
@@ -346,7 +336,7 @@ TEST(HbgAsyncExecution, GrantedPermitSuppressesServiceAndOneIterationHasOnlyOneS
 }
 
 TEST(HbgAsyncExecution, PredicateSkipSealsAnEmptyGroupBeforeRelease) {
-    ExecutionFixture fixture(1, LaneMask::aic(), false, 7, true);
+    ExecutionFixture fixture(1, LaneMask::aic(), false, true);
     ASSERT_TRUE(fixture.fill(0));
     uint32_t slot = 0;
     ASSERT_TRUE(fixture.begin(0, &slot));
@@ -426,7 +416,7 @@ class HbgAsyncExecutionShapes : public ::testing::TestWithParam<AsyncShape> {};
 
 TEST_P(HbgAsyncExecutionShapes, RealDispatchRetiresAllLanesAndBlocksExactlyOnce) {
     const auto shape = GetParam();
-    ExecutionFixture fixture(shape.blocks, shape.lanes, shape.sync, shape.deferred);
+    ExecutionFixture fixture(shape.blocks, shape.lanes, shape.sync);
     std::set<std::pair<uint32_t, uint32_t>> executions;
     for (uint32_t iteration = 0; iteration < 64 && fixture.blocks_left() != 0; ++iteration) {
         for (uint32_t worker = 0; worker < 6; ++worker) {

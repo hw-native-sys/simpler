@@ -535,7 +535,6 @@ struct SchedulerStateOwner {
     const HostApi *api;
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
     std::string protocol_source;
-    SchedulerProtocolAsyncPlan async_protocol;
 };
 
 std::mutex scheduler_state_owners_mutex;
@@ -588,7 +587,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         try {
             const auto payload = scheduler_export_protocol(
                 host_base, static_cast<size_t>(owner.layout.total_size), owner.layout, api->run_epoch(),
-                owner.protocol_tasks, owner.protocol_source, owner.async_protocol
+                owner.protocol_tasks, owner.protocol_source
             );
             if (!api->publish_chip_swimlane_extension(
                     ChipSwimlaneExtensionSection::AicoreProtocol, payload.c_str(), payload.size()
@@ -1273,8 +1272,6 @@ bool create_scheduler_state(
     const bool native_graph = !native_plan.instances.empty();
     const uint64_t node_count = native_graph ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
     bool legacy_graph_required = false;
-    bool has_deferred_callable = false;
-    bool has_explicit_deferred_callable = false;
     for (const auto &definition : native_plan.definitions) {
         legacy_graph_required = legacy_graph_required || !definition.resident_supported;
         for (const auto &child : definition.children) {
@@ -1284,16 +1281,6 @@ bool create_scheduler_state(
                     LOG_ERROR("A5 HBG: Graph child has an unregistered callable");
                     return false;
                 }
-                if (!child.metadata.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-                CoreAsyncCapability capability{};
-                const int kernel_id = child.metadata.kernel_ids[lane];
-                runtime->get_function_async_capability(kernel_id, &capability);
-                if (!core_async_capability_valid(capability)) {
-                    LOG_ERROR("A5 HBG: Graph child kernel=%d lane=%u has invalid async capability", kernel_id, lane);
-                    return false;
-                }
-                has_explicit_deferred_callable |= capability.mode == CoreAsyncMode::DEFERRED;
-                has_deferred_callable |= capability.mode != CoreAsyncMode::SYNCHRONOUS;
             }
         }
     }
@@ -1410,17 +1397,6 @@ bool create_scheduler_state(
                 );
                 return false;
             }
-            CoreAsyncCapability capability{};
-            runtime->get_function_async_capability(kernel_id, &capability);
-            if (!core_async_capability_valid(capability)) {
-                LOG_ERROR(
-                    "A5 HBG: task ref=%" PRId64 " kernel=%d lane=%u has invalid async capability", task_ref, kernel_id,
-                    subtask_slot
-                );
-                return false;
-            }
-            has_explicit_deferred_callable |= capability.mode == CoreAsyncMode::DEFERRED;
-            has_deferred_callable |= capability.mode != CoreAsyncMode::SYNCHRONOUS;
         }
         const auto *predicate = scheduler_node_predicate(host_graph, task_ref);
         if (predicate == nullptr ||
@@ -1504,10 +1480,6 @@ bool create_scheduler_state(
         return false;
     }
     if (legacy_graph_required) {
-        if (has_explicit_deferred_callable) {
-            LOG_ERROR("A5 HBG: deferred completion is not qualified for legacy Graph scheduling");
-            return false;
-        }
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
         return true;
     }
@@ -1582,10 +1554,6 @@ bool create_scheduler_state(
         }
     }
     if (legacy_shape_task_ref >= 0) {
-        if (has_explicit_deferred_callable) {
-            LOG_ERROR("A5 HBG: deferred completion is not qualified for legacy task-shape scheduling");
-            return false;
-        }
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
             "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with unsupported task shape",
@@ -1652,35 +1620,10 @@ bool create_scheduler_state(
         std::min<uint64_t>(std::numeric_limits<uint64_t>::max(), std::numeric_limits<size_t>::max()) -
         (SCHEDULER_STATE_ALIGNMENT - 1);
     SchedulerAsyncLayout async_layout{};
-    std::vector<SchedulerAsyncCapabilities> async_capabilities;
     std::string async_error;
-    if (has_deferred_callable) {
-        bool needs_sdma_guards = false;
-        async_capabilities.resize(task_metadata.size());
-        for (size_t task_ref = 0; task_ref < task_metadata.size(); ++task_ref) {
-            const auto &task = task_metadata[task_ref];
-            if (!scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags)) continue;
-            for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
-                if (!task.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-                // Older registration tables omit capabilities. Their callable
-                // was validated above and uses the same default as UNKNOWN.
-                runtime->get_function_async_capability(task.kernel_ids[lane], &async_capabilities[task_ref][lane]);
-                const auto cap = core_async_effective_capability(async_capabilities[task_ref][lane]);
-                needs_sdma_guards |= lane != 0 && (cap.mode == CoreAsyncMode::SYNCHRONOUS ||
-                                                   (cap.condition_types & CORE_ASYNC_CONDITION_SDMA_POST_DONE) != 0);
-            }
-        }
-        const SchedulerAsyncAuxiliaryBytes auxiliary{
-            needs_sdma_guards ? ASYNC_SDMA_CHANNELS : 0,
-            scheduler_phase_timing_enabled(runtime->dev.chip_swimlane_level)
-        };
-        if (!scheduler_plan_async_layout(
-                task_metadata, async_capabilities, api->run_epoch(), max_state_bytes, auxiliary, &async_layout,
-                &async_error
-            )) {
-            LOG_ERROR("A5 HBG: async state planning failed: %s", async_error.c_str());
-            return false;
-        }
+    if (!scheduler_plan_async_layout(task_metadata, api->run_epoch(), max_state_bytes, &async_layout, &async_error)) {
+        LOG_ERROR("A5 HBG: async state planning failed: %s", async_error.c_str());
+        return false;
     }
     uint64_t async_offset = 0;
     if (!scheduler_append_async_layout(
@@ -1723,11 +1666,10 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
         return false;
     }
-    if (async_offset != 0 &&
-        !scheduler_initialize_async_state(
-            task_metadata, async_capabilities, async_layout, static_cast<std::byte *>(host_base) + async_offset,
-            layout.total_size - async_offset, &async_error
-        )) {
+    if (async_offset != 0 && !scheduler_initialize_async_state(
+                                 task_metadata, async_layout, static_cast<std::byte *>(host_base) + async_offset,
+                                 layout.total_size - async_offset, &async_error
+                             )) {
         LOG_ERROR("A5 HBG: async state initialization failed: %s", async_error.c_str());
         return false;
     }
@@ -1858,12 +1800,8 @@ bool create_scheduler_state(
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
             runtime, SchedulerStateOwner{
-                         reinterpret_cast<void *>(aligned_address),
-                         layout,
-                         api,
-                         std::move(protocol_tasks),
-                         std::move(protocol_source),
-                         {async_offset, async_layout}
+                         reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks),
+                         std::move(protocol_source)
                      }
         );
     }

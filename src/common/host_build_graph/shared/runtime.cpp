@@ -53,7 +53,6 @@ Runtime::Runtime() {
     host_.active_callable_id_ = -1;
     host_.pending_publication_ = {};
     host_.callable_table_host_ = nullptr;
-    host_.callable_capabilities_host_ = nullptr;
     host_.callable_entry_table_addr_ = 0;
 }
 
@@ -99,24 +98,14 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
     return host_.callable_table_host_[func_id];
 }
 
-bool Runtime::get_function_async_capability(int func_id, CoreAsyncCapability *out) const {
-    if (out == nullptr) return false;
-    *out = CoreAsyncCapability{};
-    if (host_.callable_capabilities_host_ == nullptr || get_function_bin_addr(func_id) == 0) return false;
-    *out = host_.callable_capabilities_host_[func_id];
-    return true;
-}
-
 void Runtime::set_callable_tables(
-    const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len,
-    const CoreAsyncCapability *capabilities
+    const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len
 ) {
-    if (host_view == nullptr || object_table_addr == 0 || len == 0 || len > CHIP_MAX_FUNC_ID) {
+    if (host_view == nullptr || object_table_addr == 0 || len == 0) {
         clear_callable_tables();
         return;
     }
     host_.callable_table_host_ = host_view;
-    host_.callable_capabilities_host_ = capabilities;
     host_.callable_entry_table_addr_ = entry_table_addr;
     dev.callable_table_addr_ = object_table_addr;
     dev.callable_table_len_ = len;
@@ -124,7 +113,6 @@ void Runtime::set_callable_tables(
 
 void Runtime::clear_callable_tables() {
     host_.callable_table_host_ = nullptr;
-    host_.callable_capabilities_host_ = nullptr;
     host_.callable_entry_table_addr_ = 0;
     dev.callable_table_addr_ = 0;
     dev.callable_table_len_ = 0;

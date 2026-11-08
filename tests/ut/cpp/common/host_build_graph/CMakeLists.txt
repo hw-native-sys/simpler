@@ -191,9 +191,6 @@ hbg_case(test_native_run_acceptance.cpp
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES ${SIMPLER_SRC}/common/worker)
 
-hbg_case(test_hbg_callable_capability.cpp
-    SOURCES ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
-
 # Explicit host views never acquire device mappings or invoke device copies.
 hbg_case(test_hbg_tensor_access.cpp
     SOURCES ${HBG_HOST_DIR}/host_tensor_access.cpp)

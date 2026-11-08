@@ -56,7 +56,7 @@ enum class Result {
     ERROR_SHORT_PAYLOAD,
     ERROR_LONG_PAYLOAD
 };
-enum class Image { SYNC, DEFERRED, BAD_VERSION, OLD_EPOCH, TRUNCATED, LEGACY };
+enum class Image { EMPTY, DEFERRED, BAD_VERSION, OLD_EPOCH, TRUNCATED, LEGACY };
 
 // Only submission and the device-produced bytes are faked. Retirement, drain,
 // native poll/wait/finalize, resource facts and the raw fatal-close gate below
@@ -104,13 +104,9 @@ public:
         task.flags = SCHEDULER_TASK_EXECUTABLE;
         task.active_mask = LaneMask::aiv0();
         task.logical_block_num = 1;
-        SchedulerAsyncCapabilities capabilities{};
-        capabilities[1] = image_ == Image::SYNC ?
-                              CoreAsyncCapability{1, CoreAsyncMode::SYNCHRONOUS, 0, 0} :
-                              CoreAsyncCapability{1, CoreAsyncMode::DEFERRED, 1, CORE_ASYNC_CONDITION_COUNTER};
+        if (image_ == Image::EMPTY) task.flags = 0;
         SchedulerAsyncHostPlan plan;
-        SchedulerAsyncAuxiliaryBytes auxiliary{};
-        if (!scheduler_plan_async_state({task}, {capabilities}, identity.run_epoch, 1 << 20, auxiliary, &plan, nullptr))
+        if (!scheduler_plan_async_state({task}, identity.run_epoch, 1 << 20, &plan, nullptr))
             return PTO_RUNTIME_ERR_INTERNAL;
         const uint64_t summary_offset = sizeof(SchedulerRunControl);
         const uint64_t async_offset = summary_offset + sizeof(SchedulerGraphSummary);
@@ -380,8 +376,8 @@ TEST_F(NativeAdmissionTest, DamagedAsyncLayoutCannotAllowNativeRetirementOrRawRe
     }
 }
 
-TEST_F(NativeAdmissionTest, SynchronousAndLegacyRunsDoNotRequireAnAsyncTerminal) {
-    for (Image image : {Image::SYNC, Image::LEGACY}) {
+TEST_F(NativeAdmissionTest, EmptyAndLegacyRunsDoNotRequireAnAsyncTerminal) {
+    for (Image image : {Image::EMPTY, Image::LEGACY}) {
         AsyncRunner runner(image, Result::ABSENT);
         Attempt attempt(runner, 1, 20);
         ASSERT_EQ(attempt.prepare(), 0);

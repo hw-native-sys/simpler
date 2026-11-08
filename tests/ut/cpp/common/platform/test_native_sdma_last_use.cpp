@@ -184,7 +184,6 @@ public:
 private:
     void plan_image(uint32_t slot, uint64_t epoch) {
         metadata_.resize(2);
-        capabilities_.resize(2);
         for (uint32_t task = 0; task < 2; ++task) {
             auto &meta = metadata_[task];
             meta.flags = SCHEDULER_TASK_EXECUTABLE;
@@ -194,19 +193,10 @@ private:
             meta.timing_slot = -1;
             storage_.metadata[task] = meta;
             graph_.executable(task, 1, task == 0 ? std::vector<int32_t>{} : std::vector<int32_t>{0});
-            for (auto &cap : capabilities_[task])
-                cap = {CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::SYNCHRONOUS, 0, 0};
         }
-        capabilities_[0][1] = {
-            CORE_ASYNC_CAPABILITY_VERSION, CoreAsyncMode::DEFERRED, 1, CORE_ASYNC_CONDITION_SDMA_POST_DONE
-        };
-        const SchedulerAsyncAuxiliaryBytes auxiliary{ASYNC_SDMA_CHANNELS};
         std::string error;
         SchedulerAsyncHostPlan plan;
-        require(
-            scheduler_plan_async_state(metadata_, capabilities_, epoch, kBudget, auxiliary, &plan, &error),
-            error.c_str()
-        );
+        require(scheduler_plan_async_state(metadata_, epoch, kBudget, &plan, &error), error.c_str());
         const uint64_t summary_offset = sizeof(SchedulerRunControl);
         async_offset_ = summary_offset + sizeof(SchedulerGraphSummary);
         scheduler_bytes_ = async_offset_ + plan.image.size();
@@ -331,7 +321,6 @@ private:
     scheduler_test::FixtureStorage storage_;
     scheduler_test::BasicGraphBuffer<2> graph_;
     std::vector<SchedulerTaskMetadata> metadata_;
-    std::vector<SchedulerAsyncCapabilities> capabilities_;
     SchedulerAsyncRuntimeView async_{};
     void *scheduler_host_{nullptr};
     uint64_t scheduler_bytes_{0}, async_offset_{0};
