@@ -93,6 +93,15 @@ Runtime binaries (host `.so`, aicpu `.so`, aicore `.o`) are pre-built during `pi
 
 Persistent cmake build directories under `build/cache/` enable incremental compilation — only changed files are recompiled.
 
+Runtime cache validity follows source contents and the pinned PTO-ISA version,
+not Git history. Documentation-only commits and unchanged exported snapshots
+preserve the cache. Normal source edits retain CMake incrementality; depfiles
+select the objects to rebuild. Backdated or removed inputs, replacements of the
+compiler/linker executables, pin changes, and missing or malformed input
+provenance trigger a conservative clean rebuild. Source-file content checks
+also detect edits that preserve modification times. This does not provide
+cross-worktree object reuse.
+
 **Architecture note:** binaries are built separately for each architecture and
 backend. The onboard AICore targets are `dav-c220-cube/vec` for a2a3 and
 `dav-c310-cube/vec` for a5, so their artifacts are not interchangeable.

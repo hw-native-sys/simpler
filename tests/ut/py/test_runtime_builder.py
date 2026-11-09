@@ -765,7 +765,7 @@ class TestAbbrevStamp:
 
 
 class TestBuildCacheStamp:
-    """Test cmake cache stamp composition (runtime HEAD + pto-isa commit)."""
+    """Test cmake cache stamp composition (runtime source content + pto-isa commit)."""
 
     def _make_builder(self, platform):
         from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
@@ -781,7 +781,7 @@ class TestBuildCacheStamp:
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a2a3")
@@ -793,7 +793,7 @@ class TestBuildCacheStamp:
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a5")
@@ -804,7 +804,7 @@ class TestBuildCacheStamp:
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
 
         builder = self._make_builder("a2a3sim")
@@ -815,7 +815,7 @@ class TestBuildCacheStamp:
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
 
         builder = self._make_builder("a2a3")
