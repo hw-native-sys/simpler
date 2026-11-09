@@ -747,7 +747,10 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
         const uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         if (reg_addr == 0) continue;
         claimed_ids[count] = core_id;
-        targets[count] = {reg_addr, &runtime->get_teardown_gates()[core_id]};
+        targets[count] = {
+            reg_addr, &runtime->get_teardown_gates()[core_id], &runtime->dev.workers[core_id].retired_epoch,
+            get_platform_run_result_epoch()
+        };
         ++count;
     }
     if (count == 0) return 0;

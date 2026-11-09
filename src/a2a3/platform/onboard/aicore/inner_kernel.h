@@ -193,3 +193,17 @@ __aicore__ inline void acknowledge_aicore_cond_nonce_and_wait(__gm__ AicoreTeard
     }
     wait_for_post_close_release(&control->post_close_release);
 }
+
+// The current startup report commits a cleared ACK. After EXIT, publish the
+// exact epoch once, then wait on the CPU-owned post-CLOSE release line.
+__aicore__ inline void
+publish_aicore_epoch_and_wait(__gm__ volatile uint64_t *ack, __gm__ AicoreTeardownControl *control, uint64_t epoch) {
+    dsb(DSB_DDR);
+    *ack = epoch;
+    dcci((__gm__ void *)ack, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(DSB_DDR);
+    while (ld_dev(&control->release_epoch, 0) != epoch) {
+        SPIN_WAIT_HINT();
+    }
+    dsb(DSB_DDR);
+}

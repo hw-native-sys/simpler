@@ -80,7 +80,9 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     }
     if (count > PLATFORM_MAX_CORES || (count != 0 && targets == nullptr)) return -1;
     for (size_t i = 0; i < count; ++i) {
-        if (targets[i].reg_addr == 0 || targets[i].teardown == nullptr) return -1;
+        if (targets[i].reg_addr == 0 || targets[i].teardown == nullptr ||
+            (targets[i].expected_epoch != 0 && targets[i].retired_epoch == nullptr))
+            return -1;
     }
 
     // COND can retain a prior launch's EXITED or nonce. Only this physical
@@ -89,6 +91,7 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     // retained value, so only a response to this request can acknowledge exit.
     uint32_t exit_requests[PLATFORM_MAX_CORES];
     for (size_t i = 0; i < count; ++i) {
+        if (targets[i].expected_epoch != 0) continue;
         const uint32_t old_cond = static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND));
         const uint32_t request = old_cond == AICORE_EXIT_NONCE_0 ? AICORE_EXIT_NONCE_1 : AICORE_EXIT_NONCE_0;
         exit_requests[i] = request;
@@ -120,8 +123,11 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     while (remaining != 0) {
         for (size_t i = 0; i < count; ++i) {
             if (acknowledged[i]) continue;
-            const uint32_t cond = static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND));
-            if (cond == exit_requests[i]) {
+            const bool matches =
+                targets[i].expected_epoch != 0 ?
+                    __atomic_load_n(targets[i].retired_epoch, __ATOMIC_ACQUIRE) == targets[i].expected_epoch :
+                    static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND)) == exit_requests[i];
+            if (matches) {
                 acknowledged[i] = true;
                 --remaining;
             }
@@ -129,9 +135,9 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         if (remaining == 0 || get_sys_cnt_aicpu() > deadline) break;
     }
 
-    // No window closes until every ACK above is in, so a core is never quiesced
-    // while a peer is still being waited on. COND is not re-read here: the
-    // passes above already established it.
+    // The shared-deadline sweep finishes before any acknowledged window closes.
+    // The accepted ACKs remain valid; each Core waits for its release and does
+    // not write its SPRs or report again.
     int32_t rc = 0;
     for (size_t i = 0; i < count; ++i) {
         if (acknowledged[i]) {
@@ -159,7 +165,11 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     // the caller can name them; the host recovery path owns them from here.
     for (size_t i = 0; i < count; ++i) {
         if (acknowledged[i]) {
-            __atomic_store_n(&targets[i].teardown->post_close_release, AICORE_POST_CLOSE_RELEASE, __ATOMIC_RELAXED);
+            if (targets[i].expected_epoch != 0) {
+                __atomic_store_n(&targets[i].teardown->release_epoch, targets[i].expected_epoch, __ATOMIC_RELAXED);
+            } else {
+                __atomic_store_n(&targets[i].teardown->post_close_release, AICORE_POST_CLOSE_RELEASE, __ATOMIC_RELAXED);
+            }
         }
         if (released != nullptr) released[i] = acknowledged[i];
     }
