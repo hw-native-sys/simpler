@@ -42,6 +42,84 @@ def test_cache_layout_and_capacity(adapter, monkeypatch):
         adapter.allocate_layer_caches(pages=55, device="cpu")
 
 
+@pytest.mark.parametrize("invalid", [None, "last-layer", "duplicate-page", "capacity", "dtype"])
+def test_prefill_import_validates_all_layers_before_writing(adapter, monkeypatch, invalid):
+    for name, value in {"LAYERS": 2, "PAGE": 2, "HEADS": 2, "HEAD_DIM": 4}.items():
+        monkeypatch.setattr(adapter, name, value)
+    caches = tuple(torch.full((2, 4, 2, 2, 4), sentinel, dtype=torch.bfloat16) for sentinel in (-9, -10))
+    layers = tuple(
+        tuple(torch.arange(24, dtype=torch.bfloat16).reshape(1, 2, 3, 4) + layer * 100 + kind * 50 for kind in range(2))
+        for layer in range(2)
+    )
+    blocks = torch.tensor([[2, 0]])
+    if invalid == "last-layer":
+        layers[1][1][0, 0, 0, 0] = float("nan")
+    elif invalid == "duplicate-page":
+        blocks[0, 1] = 2
+    elif invalid == "capacity":
+        blocks[0, 1] = 4
+    elif invalid == "dtype":
+        blocks = blocks.float()
+    before = tuple(cache.clone() for cache in caches)
+    if invalid:
+        with pytest.raises(ValueError):
+            adapter.load_prefill_kv(caches, layers, blocks)
+        assert all(torch.equal(actual, original) for actual, original in zip(caches, before))
+    else:
+        adapter.load_prefill_kv(caches, layers, blocks)
+        for layer, pair in enumerate(layers):
+            for cache, expected, original in zip(caches, pair, before):
+                logical = cache[layer, [2, 0]].flatten(0, 1).permute(1, 0, 2).unsqueeze(0)
+                assert torch.equal(logical[:, :, :3], expected)
+                assert not logical[:, :, 3:].count_nonzero()
+                assert torch.equal(cache[layer, [1, 3]], original[layer, [1, 3]])
+
+
+@pytest.mark.parametrize("offset", [0, 1, -1, 128, 129])
+def test_prefill_import_checks_target_ranges_before_writing(adapter, monkeypatch, offset):
+    for name, value in {"LAYERS": 2, "PAGE": 2, "HEADS": 2, "HEAD_DIM": 4}.items():
+        monkeypatch.setattr(adapter, name, value)
+    shape, count = (2, 4, 2, 2, 4), 128
+    storage = torch.arange(count + abs(offset), dtype=torch.bfloat16)
+    key = storage[:count].view(shape)
+    value = key if offset == 0 else storage[abs(offset) : abs(offset) + count].view(shape)
+    caches = (value, key) if offset < 0 else (key, value)
+    layers = [
+        tuple(torch.full((1, 2, 3, 4), layer * 100 + kind * 50, dtype=torch.bfloat16) for kind in range(2))
+        for layer in range(2)
+    ]
+    blocks = torch.tensor([[2, 0]])
+    before = storage.clone()
+    if abs(offset) < count:
+        with pytest.raises(ValueError, match="overlap"):
+            adapter.load_prefill_kv(caches, layers, blocks)
+        assert torch.equal(storage, before)
+    else:
+        adapter.load_prefill_kv(caches, layers, blocks)
+        for layer, pair in enumerate(layers):
+            for cache, expected in zip(caches, pair):
+                logical = cache[layer, [2, 0]].flatten(0, 1).permute(1, 0, 2).unsqueeze(0)
+                assert torch.equal(logical[:, :, :3], expected)
+
+
+@pytest.mark.parametrize("cache_index,source_layer", [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_prefill_import_rejects_source_storage_aliases(adapter, monkeypatch, cache_index, source_layer):
+    for name, value in {"LAYERS": 2, "PAGE": 4, "HEADS": 2, "HEAD_DIM": 4}.items():
+        monkeypatch.setattr(adapter, name, value)
+    caches = tuple(torch.full((2, 4, 4, 2, 4), -9 - index, dtype=torch.bfloat16) for index in range(2))
+    source = caches[cache_index][0, 0, :3].permute(1, 0, 2).unsqueeze(0)
+    layers = [
+        tuple(torch.full((1, 2, 3, 4), layer * 100 + kind * 50, dtype=torch.bfloat16) for kind in range(2))
+        for layer in range(2)
+    ]
+    layers[source_layer] = (layers[source_layer][0], source)
+    blocks = torch.tensor([[2, 0]])
+    before = tuple(cache.clone() for cache in caches)
+    with pytest.raises(ValueError, match="source.*target"):
+        adapter.load_prefill_kv(caches, layers, blocks)
+    assert all(torch.equal(actual, original) for actual, original in zip(caches, before))
+
+
 @pytest.mark.parametrize("names,signature", [((), [object()]), (("input",), [])])
 def test_argument_count_mismatch_refused_before_compile(adapter, names, signature):
     obj = adapter.TorchDecode.__new__(adapter.TorchDecode)
