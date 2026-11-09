@@ -297,3 +297,156 @@ TEST(NativeInvocationCompletion, UnrequestedPrivateRecordDoesNotGateSuccessOrLos
     EXPECT_EQ(evidence.read_after_exit().terminal.code, -73);
     EXPECT_FALSE(evidence.read_after_exit().publication_succeeded);
 }
+
+TEST(NativeInvocationCompletion, RetiredCcuFailureCompletesStreamsAndPreservesBusinessEvidence) {
+    NativeInvocationCompletion completion;
+    NativeInvocationEvidence evidence;
+    Publication publish;
+    ASSERT_TRUE(completion.begin(3, &evidence));
+    uint8_t bytes[] = {7, 19};
+    ASSERT_TRUE(completion.accept_runtime_terminal(
+        {DeviceRunVerdict::Error, -105, DeviceRunCodeSource::Header}, bytes, sizeof(bytes), true
+    ));
+    bytes[0] = 99;
+    EXPECT_EQ(completion.finish(0, -105, publish), 0);
+    EXPECT_EQ(completion.finish(1, 0, publish), 0);
+    EXPECT_EQ(publish.count, 0);
+    EXPECT_EQ(completion.finish(2, -105, publish), 0);
+    EXPECT_EQ(publish.count, 1);
+    EXPECT_EQ(publish.result.verdict, DeviceRunVerdict::Error);
+    EXPECT_EQ(publish.result.code, -105);
+    EXPECT_EQ(publish.payload, (std::vector<uint8_t>{7, 19}));
+    const auto saved = evidence.read_after_exit();
+    EXPECT_EQ(saved.kind, NativeInvocationEvidence::Kind::Error);
+    EXPECT_EQ(saved.terminal.code, -105);
+    EXPECT_TRUE(saved.publication_succeeded);
+    EXPECT_EQ(saved.payload_bytes, 2);
+    EXPECT_EQ(saved.payload[0], 7);
+}
+
+TEST(NativeInvocationCompletion, CcuFailureRequiresExplicitRetirementProof) {
+    NativeInvocationCompletion completion;
+    Publication publish;
+    ASSERT_TRUE(completion.begin(2));
+    ASSERT_TRUE(
+        completion.accept_runtime_terminal({DeviceRunVerdict::Error, -105, DeviceRunCodeSource::Header}, nullptr, 0)
+    );
+    EXPECT_EQ(completion.finish(0, -105, publish), 0);
+    EXPECT_EQ(completion.finish(1, 0, publish), -105);
+}
+
+TEST(NativeInvocationCompletion, OtherCallbackErrorsVetoRetiredCcuFailureInEitherOrder) {
+    for (int other_error : {-1, -106, -507018}) {
+        for (bool other_first : {false, true}) {
+            NativeInvocationCompletion completion;
+            Publication publish;
+            ASSERT_TRUE(completion.begin(3));
+            ASSERT_TRUE(completion.accept_runtime_terminal(
+                {DeviceRunVerdict::Error, -105, DeviceRunCodeSource::Header}, nullptr, 0, true
+            ));
+            EXPECT_EQ(completion.finish(0, other_first ? other_error : -105, publish), 0);
+            EXPECT_EQ(completion.finish(1, other_first ? -105 : other_error, publish), 0);
+            EXPECT_NE(completion.finish(2, 0, publish), 0);
+            EXPECT_EQ(publish.result.code, -105);
+        }
+    }
+}
+
+TEST(NativeInvocationCompletion, RetiredCcuFailureCannotNormalizeUnpublishedRecord) {
+    for (auto publication : {NativeTerminalPublication::NotRequested, NativeTerminalPublication::InvalidState}) {
+        NativeInvocationCompletion completion;
+        NativeInvocationEvidence evidence;
+        ASSERT_TRUE(completion.begin(1, &evidence));
+        ASSERT_TRUE(completion.accept_runtime_terminal(
+            {DeviceRunVerdict::Error, -105, DeviceRunCodeSource::Header}, nullptr, 0, true
+        ));
+        EXPECT_EQ(
+            completion.finish(
+                0, -105,
+                [publication](RunTerminalSelection, const void *, size_t) {
+                    return publication;
+                }
+            ),
+            -105
+        );
+        const auto saved = evidence.read_after_exit();
+        EXPECT_EQ(saved.terminal.code, -105);
+        EXPECT_FALSE(saved.publication_succeeded);
+    }
+}
+
+TEST(NativeInvocationCompletion, RetirementProofRejectsOtherTerminalKindsAndInvalidHandoff) {
+    for (const auto terminal :
+         {success, RunTerminalSelection{DeviceRunVerdict::Error, -106, DeviceRunCodeSource::Header},
+          RunTerminalSelection{DeviceRunVerdict::Error, -105, DeviceRunCodeSource::None}}) {
+        NativeInvocationCompletion completion;
+        Publication publish;
+        ASSERT_TRUE(completion.begin(1));
+        EXPECT_FALSE(completion.accept_runtime_terminal(terminal, nullptr, 0, true));
+        EXPECT_EQ(completion.finish(0, -105, publish), NativeInvocationCompletion::kInternalError);
+        EXPECT_EQ(publish.count, 0);
+    }
+    NativeInvocationCompletion completion;
+    Publication publish;
+    const RunTerminalSelection failed{DeviceRunVerdict::Error, -105, DeviceRunCodeSource::Header};
+    ASSERT_TRUE(completion.begin(1));
+    EXPECT_FALSE(completion.accept_runtime_terminal(failed, nullptr, 1, true));
+    EXPECT_EQ(completion.finish(0, -105, publish), NativeInvocationCompletion::kInternalError);
+    ASSERT_TRUE(completion.begin(1));
+    ASSERT_TRUE(completion.accept_runtime_terminal(failed, nullptr, 0, true));
+    EXPECT_FALSE(completion.accept_runtime_terminal(failed, nullptr, 0, true));
+    EXPECT_EQ(completion.finish(0, -105, publish), NativeInvocationCompletion::kInternalError);
+    EXPECT_EQ(publish.count, 0);
+}
+
+TEST(NativeInvocationCompletion, BeginClearsRetirementProofAndOtherErrorVeto) {
+    NativeInvocationCompletion completion;
+    const RunTerminalSelection failed{DeviceRunVerdict::Error, -105, DeviceRunCodeSource::Header};
+    Publication publish;
+    ASSERT_TRUE(completion.begin(1));
+    ASSERT_TRUE(completion.accept_runtime_terminal(failed, nullptr, 0, true));
+    EXPECT_EQ(completion.finish(0, -106, publish), -105);
+    ASSERT_TRUE(completion.begin(1));
+    ASSERT_TRUE(completion.accept_runtime_terminal(failed, nullptr, 0, true));
+    EXPECT_EQ(completion.finish(0, -105, publish), 0);
+    ASSERT_TRUE(completion.begin(1));
+    ASSERT_TRUE(completion.accept_runtime_terminal(failed, nullptr, 0));
+    EXPECT_EQ(completion.finish(0, -105, publish), -105);
+    ASSERT_TRUE(completion.begin(1));
+    ASSERT_TRUE(completion.accept_runtime_terminal(success, nullptr, 0));
+    EXPECT_EQ(completion.finish(0, 0, publish), 0);
+}
+
+TEST(NativeInvocationCompletion, ConcurrentCallbacksCannotHideOtherErrorBehindCcuFailure) {
+    NativeInvocationCompletion completion;
+    ASSERT_TRUE(completion.begin(6));
+    std::atomic<bool> start{false};
+    std::atomic<int> published{0};
+    std::array<int, 6> returns{};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 6; ++i) {
+        workers.emplace_back([&, i] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            if (i == 0) {
+                EXPECT_TRUE(completion.accept_runtime_terminal(
+                    {DeviceRunVerdict::Error, -105, DeviceRunCodeSource::Header}, nullptr, 0, true
+                ));
+            }
+            returns[i] =
+                completion.finish(i, i == 4 ? -106 : -105, [&](RunTerminalSelection result, const void *, size_t) {
+                    EXPECT_EQ(result.code, -105);
+                    published.fetch_add(1);
+                    return NativeTerminalPublication::Published;
+                });
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &worker : workers)
+        worker.join();
+    EXPECT_EQ(published.load(), 1);
+    int failures = 0;
+    for (int rc : returns)
+        failures += rc != 0;
+    EXPECT_EQ(failures, 1);
+}

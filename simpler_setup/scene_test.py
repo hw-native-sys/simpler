@@ -1781,10 +1781,22 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
     ``l3_compile_cache_key`` so every path shares one cache entry per
     orchestration.
     """
+    import hashlib  # noqa: PLC0415
+
+    from simpler.task_interface import CcuFunction, ChipCallable, CoreCallable  # noqa: PLC0415
+
+    ccu_functions = [
+        function if isinstance(function, CcuFunction) else CcuFunction.build(**function)
+        for function in spec.get("ccu_functions", ())
+    ]
+    ccu_cache = tuple(
+        (hashlib.sha256(function.binary).hexdigest(), function.entry, function.abi_version)
+        for function in ccu_functions
+    )
+    if ccu_cache:
+        cache_key = (cache_key, "ccu", ccu_cache)
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
-
-    from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
 
     from .elf_parser import extract_text_section  # noqa: PLC0415
     from .kernel_compiler import KernelCompiler  # noqa: PLC0415
@@ -1836,6 +1848,7 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
             "host_machine": host_platform.machine(),
             "sanitizers": KernelCompiler._sanitizers,
             "compiler": compiler_token,
+            "ccu_functions": ccu_cache,
             "orchestration": {
                 "function_name": orch["function_name"],
                 "config_name": orch.get("config_name", ""),
@@ -1907,6 +1920,7 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
             binary=orch_binary,
             children=kernel_binaries,
             config_name=orch.get("config_name", ""),
+            ccu_functions=ccu_functions,
         )
 
     chip_callable = get_or_compile(artifact_key, compile_callable)

@@ -118,6 +118,7 @@ struct ChipRunState {
 static uint64_t borrow_identity(const ChipRunState &run) { return static_cast<uint64_t>(run.lease.slot_id) + 1; }
 
 struct ChipRunLaneState {
+    bool reclamation_unconfirmed{false};
     explicit ChipRunLaneState(ChipWorker &worker) :
         worker(&worker),
         generations(worker.pipeline_depth(), 0) {
@@ -395,6 +396,7 @@ struct ChipRunLaneState {
      */
     void release_device_spans(const std::shared_ptr<ChipRunState> &run, bool proven_done) noexcept {
         if (proven_done) run->caller_last_use_proven = true;
+        if (!run->caller_last_use_proven) reclamation_unconfirmed = true;
         if (!run->caller_references_live) return;
         worker->release_caller_device_borrow(borrow_identity(*run), !proven_done);
         try {
@@ -451,10 +453,10 @@ struct ChipRunLaneState {
                 &run->native_context_destroyed
             );
         } catch (...) {
-            finalized = no_submission_released;
+            finalized = no_submission_released || (run->native_context_destroyed && run->caller_last_use_proven);
             const std::exception_ptr finalize_error = std::current_exception();
             if (run->error == nullptr) run->error = finalize_error;
-            if (!finalized) poison_with(run, joined_failure != nullptr ? joined_failure : finalize_error);
+            if (!no_submission_released) poison_with(run, joined_failure != nullptr ? joined_failure : finalize_error);
         }
         if (joined_failure != nullptr && !no_submission_released) poison_with(run, joined_failure);
         if (prior_poison != nullptr && run->error == nullptr) run->error = prior_poison;
@@ -1554,4 +1556,10 @@ bool ChipRunLane::poisoned() const {
     state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
     return state_->poison != nullptr;
+}
+
+bool ChipRunLane::reclamation_unconfirmed() const {
+    state_->validate_process();
+    std::lock_guard<std::mutex> lk(state_->mu);
+    return state_->reclamation_unconfirmed;
 }

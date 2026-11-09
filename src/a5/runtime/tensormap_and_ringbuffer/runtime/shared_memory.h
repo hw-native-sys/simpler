@@ -38,6 +38,7 @@
 
 #pragma once
 
+#include "aicore_completion_mailbox_types.h"
 #include <stddef.h>
 
 #include "utils/device_arena.h"
@@ -125,6 +126,76 @@ static_assert(
  *
  * Contains per-ring flow control and global layout information.
  */
+struct CcuAcceptDiagnostic {
+    uint64_t packed;
+    uint64_t identity;
+    uint32_t checks;
+    uint32_t count;
+    uint32_t magic;
+    uint32_t state;  // Bit 0: slab captured; bit 1: CCU marker/engine/type match.
+
+    void capture(const volatile DeferredCompletionSlab &slab) {
+        *this = {};
+        count = slab.count;
+        state = 1;
+        if (count >= MAX_COMPLETIONS_PER_TASK) return;
+        const auto &entry = slab.entries[count];
+        magic = entry._pad;
+        if (magic != CCU_ACCEPT_DIAGNOSTIC_MAGIC || entry.engine != COMPLETION_ENGINE_CCU ||
+            entry.completion_type != COMPLETION_TYPE_CCU_REQUEST)
+            return;
+        packed = entry.addr;
+        identity = entry.backend_cookie;
+        checks = entry.expected_value;
+        state |= 2;
+    }
+
+    bool valid() const { return state == 3 && magic == CCU_ACCEPT_DIAGNOSTIC_MAGIC; }
+    uint32_t stage() const { return static_cast<uint32_t>((packed >> 32) & 0xff); }
+    uint32_t status() const { return static_cast<uint32_t>(packed); }
+    uint32_t flags() const { return static_cast<uint32_t>((packed >> 40) & 0xff); }
+    uint32_t ranks() const { return static_cast<uint32_t>(packed >> 48); }
+    uint32_t rank() const { return static_cast<uint32_t>(identity >> 32); }
+    int32_t callable() const { return static_cast<int32_t>(identity); }
+};
+static_assert(sizeof(CcuAcceptDiagnostic) == 32, "CCU accept diagnostic layout drift");
+static_assert(offsetof(CcuAcceptDiagnostic, state) == 28, "CCU accept diagnostic state layout drift");
+
+// Error 105 only. This is a post-rendezvous scheduling observation, never a
+// hardware-stop or resource-reclamation certificate.
+struct CcuDependencyFailureDiagnostic {
+    static constexpr uint32_t VERSION = 0x01000000;
+    static constexpr uint32_t RECORDED = 1;
+    static constexpr uint32_t PRODUCER_VALID = 2;
+    static constexpr uint32_t SCAN_COMPLETE = 4;
+    static constexpr uint32_t SUCCESSOR_COMPLETED = 8;
+    static constexpr uint32_t SCAN_INVALID = 16;
+    uint64_t failed_token;
+    uint64_t first_successor_token;
+    uint32_t successor_count;
+    uint32_t first_successor_state;
+    uint32_t dispatched_blocks;
+    uint32_t flags;
+
+    static CcuDependencyFailureDiagnostic recorded(TaskId token) {
+        CcuDependencyFailureDiagnostic result{};
+        result.failed_token = TaskId::to_uint64(token);
+        result.first_successor_token = UINT64_MAX;
+        result.first_successor_state = UINT32_MAX;
+        result.flags = VERSION | RECORDED;
+        return result;
+    }
+    bool scan_complete() const {
+        return flags == (VERSION | RECORDED | PRODUCER_VALID | SCAN_COMPLETE) ||
+               flags == (VERSION | RECORDED | PRODUCER_VALID | SCAN_COMPLETE | SUCCESSOR_COMPLETED);
+    }
+    bool successors_unstarted() const {
+        return scan_complete() && successor_count != 0 && dispatched_blocks == 0 && (flags & SUCCESSOR_COMPLETED) == 0;
+    }
+};
+static_assert(sizeof(CcuDependencyFailureDiagnostic) == 32, "CCU failure diagnostic layout drift");
+static_assert(offsetof(CcuDependencyFailureDiagnostic, flags) == 28, "CCU failure flags layout drift");
+
 struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     // === PER-RING FLOW CONTROL + LAYOUT INFO (set once at init) ===
     SharedMemoryRingHeader rings[CHIP_MAX_RING_DEPTH];
@@ -161,9 +232,19 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
     std::atomic<TaskId> sched_stall_task_id;       // S1: stuck task_id (invalid() if N/A)
     std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
+
+    // Only the winning error-CAS thread writes this record. The terminal snapshot
+    // reads it after all participants rendezvous; Host reads the per-run copy.
+    union {
+        CcuAcceptDiagnostic ccu_accept_diagnostic;
+        CcuDependencyFailureDiagnostic ccu_dependency_failure;
+    };
 };
 
 static_assert(sizeof(SharedMemoryHeader) == 896, "SharedMemoryHeader layout drift");
+static_assert(offsetof(SharedMemoryHeader, ccu_accept_diagnostic) == 848, "CCU diagnostic offset drift");
+static_assert(offsetof(SharedMemoryHeader, ccu_dependency_failure) == 848, "CCU failure diagnostic offset drift");
+static_assert(offsetof(SharedMemoryHeader, sched_stall_core) == 840, "SharedMemoryHeader stall core layout drift");
 static_assert(offsetof(SharedMemoryHeader, total_size) == 776, "SharedMemoryHeader total_size layout drift");
 static_assert(offsetof(SharedMemoryHeader, orch_error_code) == 784, "SharedMemoryHeader orch_error_code layout drift");
 static_assert(

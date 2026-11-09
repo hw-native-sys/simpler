@@ -701,6 +701,46 @@ TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneTest, SemanticFailureKeepsAdmissionClosedButAllowsProvenCommunicationReclamation) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    auto &lane = *worker.run_lane_;
+    ChipRun run = submit(lane, 101, 0);
+    EXPECT_THROW(worker.require_comm_reclamation_safe(), std::runtime_error);
+    g_complete[0] = true;
+    EXPECT_TRUE(run.done());
+    g_wait_rc[0] = -123;
+    EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_FALSE(run.owner_recovery_required());
+    EXPECT_FALSE(lane.reclamation_unconfirmed());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_NO_THROW(worker.require_comm_reclamation_safe());
+    EXPECT_THROW(submit(lane, 102, 1), std::runtime_error);
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_FALSE(worker.comm_reclamation_unconfirmed_);
+}
+
+TEST(ChipRunLaneTest, DestroyedCarrierWithoutLastUseProofStillBlocksCommunicationReclamation) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    auto &lane = *worker.run_lane_;
+    ChipRun run = submit(lane, 101, 0);
+    g_poll_rc[0] = SIMPLER_NATIVE_RUN_POLL_ERROR;
+    g_wait_rc[0] = -123;
+    EXPECT_TRUE(run.done());
+    EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_TRUE(run.owner_recovery_required());
+    EXPECT_TRUE(lane.reclamation_unconfirmed());
+    EXPECT_THROW(worker.require_comm_reclamation_safe(), std::runtime_error);
+    EXPECT_NO_THROW(worker.finalize());
+}
+
 TEST(ChipRunLaneTest, LaunchFailureWhoseFinalizeFailsReportsThePoisonedLane) {
     ChipWorker worker;
     prime_worker(worker);

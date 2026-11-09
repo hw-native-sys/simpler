@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -20,6 +21,9 @@
 
 #include "comm_workspace_managers.h"
 #include "comm_hccl.cpp"
+
+// This fixture owns no CCU sessions; entering their cleanup path is a test failure.
+CcuStatus CcuSession::close(CcuCloseMode) { std::abort(); }
 
 namespace {
 std::unordered_map<void *, size_t> mappings;

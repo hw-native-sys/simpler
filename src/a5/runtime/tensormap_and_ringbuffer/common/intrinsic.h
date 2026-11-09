@@ -15,7 +15,7 @@
  *
  * Runtime context exposed to user kernels has two distinct lifetimes:
  *
- *   1. Global context (per-core, fixed for one scheduler instance):
+ *   1. Global context (per-core):
  *      - sub_block_id : identifies the AIV lane within a cluster
  *        (0 = AIV0/left, 1 = AIV1/right).  Initialized once at runtime
  *        startup based on each core's cluster position; never changes.
@@ -23,6 +23,7 @@
  *      - dma_workspace : optional per-engine device addresses copied from the
  *        resident runtime config when the scheduler starts. A declaring
  *        callable is provisioned before that scheduler run begins.
+ *      - callable_id : native registration identity copied on every dispatch.
  *
  *   2. Local per-dispatch context (changes each dispatch):
  *      - block_idx : which logical block the current worker is executing
@@ -82,6 +83,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "aicore_completion_mailbox_types.h"
@@ -112,14 +114,15 @@ static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDE
 /**
  * Per-core global context, stored in DispatchPayload.
  * Initialized during scheduler cold start from each core's cluster position
- * and the resident per-device async-DMA config. Stable for that scheduler
- * instance; unavailable workspace slots remain zero.
+ * and the resident per-device async-DMA config. Callable identity is refreshed
+ * on dispatch; unavailable workspace slots remain zero.
  */
 struct GlobalContext {
     // AIV lane within cluster: 0=AIV0(left), 1=AIV1(right).
     // Used by AIV to select the correct intra-cluster hw instruction.
     // Not meaningful for AIC kernels or single-AIV tasks.
     int32_t sub_block_id;
+    int32_t callable_id{-1};  // Native callable identity for this dispatch.
     // Per-engine async-DMA workspace device addresses (0 when unavailable),
     // indexed by DmaWorkspaceKind. The scheduler copies them from the resident
     // config into every core's context during cold start.
@@ -127,7 +130,7 @@ struct GlobalContext {
     uint64_t dma_workspace[DMA_WORKSPACE_KIND_COUNT];
 };
 
-struct AsyncCtx {
+struct AsyncCtxStorage {
     volatile __gm__ uint32_t *completion_count;
     volatile __gm__ int32_t *completion_error_code;
     volatile __gm__ DeferredCompletionEntry *completion_entries;
@@ -135,6 +138,10 @@ struct AsyncCtx {
     // Stable resident AIV index; AIC and manually constructed contexts have no sender.
     uint32_t urma_sender_id{UINT32_MAX};
     TaskId task_token;
+};
+
+struct AsyncCtx : AsyncCtxStorage {
+    int32_t callable_id{-1};
 
     static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
         AsyncCtx ctx{};
@@ -161,8 +168,15 @@ struct LocalContext {
     int32_t block_num;  // How many logical blocks this task requires.
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
-    AsyncCtx async_ctx;
+    AsyncCtxStorage async_ctx;
 };
+
+static_assert(sizeof(AsyncCtxStorage) == 40);
+static_assert(offsetof(AsyncCtxStorage, urma_sender_id) == 28);
+static_assert(offsetof(AsyncCtxStorage, task_token) == 32);
+static_assert(sizeof(LocalContext) == 48);
+static_assert(offsetof(GlobalContext, callable_id) == 4);
+static_assert(offsetof(GlobalContext, dma_workspace) == 8);
 
 /**
  * Return the AIV lane index within the cluster.

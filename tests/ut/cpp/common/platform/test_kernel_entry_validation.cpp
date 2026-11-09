@@ -195,6 +195,59 @@ TEST(KernelEntryValidation, CallableImageRejectsOutOfRangeChildMetadata) {
     EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
 }
 
+std::vector<uint8_t> make_ccu_callable_image() {
+    std::vector<uint8_t> module(64, 0);
+    std::memcpy(module.data(), "\177ELF", 4);
+    module[4] = 2;
+    module[5] = 1;
+    module[6] = 1;
+    module[16] = 3;
+    module[20] = 1;
+    const ArgDirection signature[] = {ArgDirection::IN, ArgDirection::SCALAR};
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(signature, 2, kBinary, sizeof(kBinary));
+    const int32_t child_id = 0;
+    return make_chip_callable(
+        signature, 2, "orch", kBinary, sizeof(kBinary), &child_id, &child, 1, "",
+        {{module, "build_copy"}, {module, "build_reduce"}}
+    );
+}
+
+TEST(KernelEntryValidation, CallableImageAcceptsEmbeddedCcuDefinitions) {
+    const auto image = make_ccu_callable_image();
+    EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, image.data(), image.size()), 0);
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsCorruptCcuDefinitions) {
+    auto image = make_ccu_callable_image();
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size() - 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    CcuDefinitionsHeader header{};
+    auto *definitions = callable->storage_ + callable->ccu_offset_;
+    std::memcpy(&header, definitions, sizeof(header));
+    header.version = CCU_DEFINITIONS_VERSION + 1;
+    std::memcpy(definitions, &header, sizeof(header));
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsLegacyWireVersion) {
+    auto image = make_chip_callable(nullptr, 0, "orch", kBinary, sizeof(kBinary), nullptr, nullptr, 0, "");
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    callable->wire_version_ = 0;
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsInvalidSignatureDirections) {
+    auto image = make_ccu_callable_image();
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    callable->signature_[0] = static_cast<ArgDirection>(4);
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    callable->signature_[0] = ArgDirection::IN;
+    auto *child = reinterpret_cast<CoreCallable *>(callable->storage_ + callable->child_offsets_[0]);
+    child->signature_[0] = static_cast<ArgDirection>(-1);
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
 TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
     EXPECT_EQ(validate_kernel_launch_args(kCtx, 0, kCallableImage, kStream), 0);
     EXPECT_EQ(validate_kernel_launch_args(nullptr, 0, kCallableImage, kStream), PTO_RUNTIME_ERR_INVALID_ARGUMENT);

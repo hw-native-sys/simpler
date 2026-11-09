@@ -163,6 +163,8 @@ struct AicpuExecutor {
     RunTerminalAccumulator terminal_;
     std::atomic<int32_t> normal_path_claims_{0};
     RunTerminalPublisher terminal_publisher_;
+    // Written by the last participant and consumed by the cleanup owner.
+    bool ccu_failure_retired_{false};
 
     // Per-Worker arena attaching to the pooled prebuilt runtime image. Host
     // populates the layout + data on its own arena, rtMemcpys into a pooled
@@ -1077,7 +1079,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     if (normal_path) {
         normal_path_claims_.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (shutdown_rc != 0 && run_rc == 0) {
+    if (shutdown_rc != 0) {
         run_rc = shutdown_rc;
     }
 
@@ -1121,12 +1123,17 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     const int32_t header_status = read_runtime_status(runtime);
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
     const RunTerminalSelection selection = run_terminal_select(normal_path, header_status, terminal_);
+    ccu_failure_retired_ = selection.verdict == DeviceRunVerdict::Error &&
+                           selection.code == -SIMPLER_ERROR_CCU_FAILED && sched_ctx_.all_cores_released();
 
     const uint8_t *payload = nullptr;
     size_t payload_bytes = 0;
     if (selection.verdict == DeviceRunVerdict::Error && runtime != nullptr) {
         void *sm = runtime->get_gm_sm_ptr();
         if (sm != nullptr) {
+            if (rt != nullptr && rt->scheduler.sm_header == sm) {
+                rt->scheduler.capture_ccu_failure_successors();
+            }
             // The header is reset by whichever run occupies the arena next, so
             // the scene is copied out of it here rather than read in place.
             payload = reinterpret_cast<const uint8_t *>(sm) + SHARED_MEMORY_ERROR_TAIL_OFFSET;
@@ -1137,7 +1144,9 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
 }
 
 void AicpuExecutor::handoff_run_terminal() {
-    if (!terminal_publisher_.handoff()) {
+    // deinit preserves this finalizer-owned proof until the handoff. The native
+    // completion layer still requires every callback and actual publication.
+    if (!terminal_publisher_.handoff(ccu_failure_retired_)) {
         // Nothing to publish is the normal shape for a run that never reached
         // its rendezvous; a refused record is a producer defect. Either way the
         // host reads the run as undecided, so say which one happened.
@@ -1283,6 +1292,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         g_aicpu_executor.handoff_run_terminal();
     }
 
+    // A shared CCU business error must not mask an independent thread/teardown
+    // failure when the native completion layer considers a normal kernel exit.
+    if (rc != 0 && rc != -SIMPLER_ERROR_CCU_FAILED) return rc;
     if (runtime_rc != 0) {
         LOG_ERROR("aicpu_execute: simpler runtime failed with rc=%d", runtime_rc);
         return runtime_rc;

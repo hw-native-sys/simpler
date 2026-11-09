@@ -386,6 +386,8 @@ static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
 // diagnostic run this chip child has closed, and report what it published. The
 // child writes one DfxFlushReport at CTRL_OFF_RESULT.
 static constexpr uint64_t CTRL_DFX_FLUSH = 27;
+// Prepare registered CCU callable instances on the selected domain's chip members.
+static constexpr uint64_t CTRL_CCU_PREPARE = 28;
 // 26 is reserved by the Python delegated-region control. It carries the DRCT
 // envelope on control_payload at every hop of the recursive single-owner
 // region protocol, so no C++ endpoint method claims it.

@@ -268,6 +268,31 @@ def test_compile_cache_survives_session_cache_clear(monkeypatch, tmp_path):
     assert second.child_count == first.child_count
 
 
+def test_ccu_definitions_invalidate_memory_and_disk_cache(monkeypatch, tmp_path):
+    from simpler.task_interface import CcuFunction
+
+    _configure_fake_compilation(monkeypatch, tmp_path)
+    spec, _header = _cacheable_spec(tmp_path)
+    binary = bytearray(64)
+    binary[:7] = b"\x7fELF\x02\x01\x01"
+    binary[16] = 3
+    binary[20] = 1
+    copy = CcuFunction.build(bytes(binary), "copy")
+    reduce = CcuFunction.build(bytes(binary), "reduce")
+    cache_key = ("CcuScene", "a5sim", "tensormap_and_ringbuffer", "pin")
+    spec["ccu_functions"] = [copy, reduce]
+    first = compile_chip_callable_spec(spec, "a5sim", "tensormap_and_ringbuffer", cache_key)
+    spec["ccu_functions"] = [reduce, copy]
+    second = compile_chip_callable_spec(spec, "a5sim", "tensormap_and_ringbuffer", cache_key)
+    assert first.ccu_functions[0].entry == "copy"
+    assert second.ccu_functions[0].entry == "reduce"
+    assert _FakeKernelCompiler.orchestration_compiles == 2
+    clear_compile_cache()
+    restored = compile_chip_callable_spec(spec, "a5sim", "tensormap_and_ringbuffer", cache_key)
+    assert restored.ccu_functions[0].entry == "reduce"
+    assert _FakeKernelCompiler.orchestration_compiles == 2
+
+
 def test_compile_cache_invalidates_transitive_include(monkeypatch, tmp_path):
     _configure_fake_compilation(monkeypatch, tmp_path)
     spec, header = _cacheable_spec(tmp_path)

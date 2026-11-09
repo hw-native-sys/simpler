@@ -113,6 +113,8 @@ public:
 
     void close();
     bool poisoned() const;
+    // Semantic failure stops admission independently of device last-use proof.
+    bool reclamation_unconfirmed() const;
 
 private:
     friend class ChipWorker;

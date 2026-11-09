@@ -146,6 +146,17 @@ public:
     int32_t aic_count() const { return aic_count_; }
     int32_t aiv_count() const { return aiv_count_; }
     int32_t cores_total_num() const { return cores_total_num_; }
+    // Only the platform's completed ACK/window-close protocol publishes this
+    // gate. A retirement request or a repeated shutdown's zero return cannot.
+    bool all_cores_released() const {
+        if (teardown_gates_ == nullptr || cores_total_num_ <= 0 || cores_total_num_ > PLATFORM_MAX_CORES) return false;
+        for (int32_t core = 0; core < cores_total_num_; ++core) {
+            if (__atomic_load_n(&teardown_gates_[core].post_close_release, __ATOMIC_ACQUIRE) !=
+                AICORE_POST_CLOSE_RELEASE)
+                return false;
+        }
+        return true;
+    }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
@@ -158,6 +169,7 @@ private:
     // --- Scheduler binding & per-core runtime state ---
     alignas(64) SchedulerState *sched_{nullptr};
     RuntimeContext *rt_{nullptr};
+    int32_t active_callable_id_{-1};
 
     // Per-core execution state, indexed by core_id (= worker_id)
     CoreExecState core_exec_states_[RUNTIME_MAX_WORKER];

@@ -49,6 +49,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from simpler.task_interface import _CommContextStruct as _CommContext
 
 # ---------------------------------------------------------------------------
 # CommContext layout — must stay byte-compatible with
@@ -56,25 +57,7 @@ import pytest
 # simpler owns this layout; its producers, kernels and Python mirrors are
 # rebuilt together when the shared ABI changes.
 # ---------------------------------------------------------------------------
-_COMM_MAX_RANK_NUM = 64
-
-
-class _CommWorkspace(ctypes.Structure):
-    _fields_ = [("addr", ctypes.c_uint64), ("size", ctypes.c_uint64)]
-
-
-class _CommContext(ctypes.Structure):
-    _fields_ = [
-        ("rankId", ctypes.c_uint32),
-        ("rankNum", ctypes.c_uint32),
-        ("winSize", ctypes.c_uint64),
-        ("windowsIn", ctypes.c_uint64 * _COMM_MAX_RANK_NUM),
-        ("windowsOut", ctypes.c_uint64 * _COMM_MAX_RANK_NUM),
-        ("workspaces", _CommWorkspace * 3),
-    ]
-
-
-assert ctypes.sizeof(_CommContext) == 1088, "CommContext python mirror drifted from C++ header"
+assert ctypes.sizeof(_CommContext) == 1104, "CommContext python mirror drifted from C++ header"
 
 
 @contextmanager

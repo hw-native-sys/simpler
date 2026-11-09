@@ -33,6 +33,7 @@
 #include "chip_worker.h"
 #undef private
 #include "chip_run_lane.h"
+#include "platform_comm/ccu/ccu_provider.h"
 
 extern "C" int args_dump_capture_supported_impl();
 
@@ -203,6 +204,8 @@ public:
 class FencedCompletionRunner : public Runner {
 public:
     using Runner::Runner;
+    std::shared_ptr<simpler::ccu::RunLease> ccu_lease;
+    size_t ccu_acquisitions{0};
     bool publish_success{true};
     int published_error{0};
     bool refuse_retirement_owner{false};
@@ -785,6 +788,146 @@ TEST_F(NativeAdmissionTest, SuccessfulExplicitObservationDoesNotReadThePrivateRe
     EXPECT_EQ(control().observed_streams.size(), 2u);
     EXPECT_EQ(control().d2h_calls, 0u);
     EXPECT_TRUE(active.empty());
+}
+
+TEST_F(NativeAdmissionTest, CcuReadersKeepNativeCarrierUntilPlatformStops) {
+    class Lease final : public simpler::ccu::RunLease {
+    public:
+        simpler::ccu::ReaderResult next{simpler::ccu::ReaderState::PENDING, 0};
+        simpler::ccu::ReaderResult poll() noexcept override { return next; }
+        simpler::ccu::ReaderResult drain() noexcept override { return next; }
+    };
+    FencedCompletionRunner runner;
+    auto lease = std::make_shared<Lease>();
+    runner.ccu_lease = lease;
+    Attempt active(runner, 0, 10);
+    ASSERT_EQ(active.prepare(), 0);
+    ASSERT_EQ(runner.ccu_acquisitions, 1u);
+    ASSERT_EQ(simpler_launch_run(&runner, active.storage), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(active.storage);
+    const auto retained_bytes = control().bytes;
+    EXPECT_EQ(simpler_poll_run(&runner, active.storage), SIMPLER_NATIVE_RUN_POLL_NOT_READY);
+    EXPECT_EQ(control().bytes, retained_bytes);
+    EXPECT_FALSE(state->physical_complete);
+    EXPECT_FALSE(state->execution_retired);
+    EXPECT_TRUE(state->active_execution->prepared->resources_owned);
+    lease->next = {simpler::ccu::ReaderState::STOPPED, 0};
+    EXPECT_EQ(simpler_poll_run(&runner, active.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    EXPECT_TRUE(state->physical_complete);
+    EXPECT_EQ(simpler_finalize_run(&runner, active.storage), 0);
+    EXPECT_TRUE(active.empty());
+}
+
+TEST_F(NativeAdmissionTest, CcuUnconfirmedDrainCannotTurnStreamSuccessIntoPhysicalCompletion) {
+    class Lease final : public simpler::ccu::RunLease {
+    public:
+        simpler::ccu::ReaderResult poll() noexcept override { return {simpler::ccu::ReaderState::UNCONFIRMED, -106}; }
+        simpler::ccu::ReaderResult drain() noexcept override { return poll(); }
+    };
+    class CcuRunner : public Runner {
+    public:
+        void check() {
+            Runtime runtime;
+            CallConfig config;
+            NativeRunIdentity identity{301, 3, 301, 0};
+            PreparedExecution prepared(identity, runtime, config, 0);
+            static int streams[2];
+            prepared.streams = {&streams[0], &streams[1]};
+            prepared.resources_owned = false;
+            prepared.ccu_readers.lease = std::make_shared<Lease>();
+            EXPECT_EQ(wait_run_fence(prepared), -106);
+            EXPECT_FALSE(prepared.physical_complete);
+            EXPECT_TRUE(admission_poisoned);
+            EXPECT_FALSE(prepared.ccu_readers.stopped());
+        }
+    } runner;
+    runner.check();
+}
+
+TEST_F(NativeAdmissionTest, CcuFinalizationReadsBusinessTerminalAfterPhysicalCompletion) {
+    class Lease final : public simpler::ccu::RunLease {
+    public:
+        simpler::ccu::ReaderResult poll() noexcept override { return {simpler::ccu::ReaderState::STOPPED, 0}; }
+        simpler::ccu::ReaderResult drain() noexcept override { return poll(); }
+    };
+    enum class Terminal { Success, Failure, Missing, WrongEpoch, InvalidVerdict, ReadError };
+    for (const auto terminal :
+         {Terminal::Success, Terminal::Failure, Terminal::Missing, Terminal::WrongEpoch, Terminal::InvalidVerdict,
+          Terminal::ReadError}) {
+        SCOPED_TRACE(static_cast<int>(terminal));
+        FencedCompletionRunner runner;
+        runner.use_inout_argument();
+        runner.ccu_lease = std::make_shared<Lease>();
+        runner.published_error = terminal == Terminal::Failure ? -105 : 0;
+        runner.publish_success = terminal != Terminal::Missing;
+        Attempt active(runner, 0, 10);
+        const size_t uploads_before = control().uploads.size();
+        ASSERT_EQ(active.prepare(), 0);
+        ASSERT_EQ(runner.ccu_acquisitions, 1u);
+        ASSERT_EQ(simpler_launch_run(&runner, active.storage), 0);
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(active.storage);
+        auto *record = reinterpret_cast<DeviceRunResultRegion *>(
+            state->active_execution->prepared->kernel_args.args.run_result_data_base
+        );
+        if (terminal == Terminal::WrongEpoch) record->published = active.descriptor.run_epoch + 1;
+        if (terminal == Terminal::InvalidVerdict) record->verdict = UINT32_MAX;
+        const auto upload =
+            std::find_if(control().uploads.begin() + uploads_before, control().uploads.end(), [&](const auto &item) {
+                return item.second == active.bytes.data();
+            });
+        ASSERT_NE(upload, control().uploads.end());
+        std::memset(upload->first, 0x42, active.bytes.size());
+        const size_t downloads_before = control().downloads.size();
+        ASSERT_EQ(simpler_wait_run(&runner, active.storage), 0);
+        EXPECT_TRUE(state->physical_complete);
+        EXPECT_TRUE(state->active_execution->prepared->ccu_readers.stopped());
+        EXPECT_EQ(state->active_execution->prepared->ccu_readers.lease, runner.ccu_lease);
+        EXPECT_EQ(control().downloads.size(), downloads_before);
+        control().copy_rc = terminal == Terminal::ReadError ? -91 : 0;
+        const int expected = terminal == Terminal::Success   ? 0 :
+                             terminal == Terminal::Failure   ? -105 :
+                             terminal == Terminal::ReadError ? -91 :
+                                                               PTO_RUNTIME_ERR_INTERNAL;
+        testing::internal::CaptureStderr();
+        const int rc = simpler_finalize_run(&runner, active.storage);
+        const std::string log = testing::internal::GetCapturedStderr();
+        control().copy_rc = 0;
+        EXPECT_EQ(rc, expected);
+        EXPECT_TRUE(active.empty());
+        EXPECT_FALSE(runner.admission_poisoned);
+        EXPECT_EQ(runner.recovery_calls, 0);
+        ASSERT_EQ(control().downloads.size(), downloads_before + (expected == 0 ? 2 : 1));
+        EXPECT_EQ(control().downloads[downloads_before], record);
+        EXPECT_EQ(active.bytes, std::vector<uint8_t>(active.bytes.size(), expected == 0 ? 0x42 : 0x71));
+        if (expected != 0) {
+            EXPECT_NE(log.find("Skipping tensor copy-back because execution failed"), std::string::npos);
+        }
+    }
+}
+
+TEST_F(NativeAdmissionTest, CcuFailureSurvivesPhysicalRetirementWithoutHostOutputs) {
+    class Lease final : public simpler::ccu::RunLease {
+    public:
+        simpler::ccu::ReaderResult poll() noexcept override { return {simpler::ccu::ReaderState::STOPPED, 0}; }
+        simpler::ccu::ReaderResult drain() noexcept override { return poll(); }
+    };
+    FencedCompletionRunner runner;
+    runner.ccu_lease = std::make_shared<Lease>();
+    runner.published_error = -105;
+    Attempt active(runner, 0, 10);
+    ASSERT_EQ(active.prepare(), 0);
+    ASSERT_EQ(runner.ccu_acquisitions, 1u);
+    ASSERT_EQ(simpler_launch_run(&runner, active.storage), 0);
+    ASSERT_EQ(simpler_poll_run(&runner, active.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(active.storage);
+    EXPECT_TRUE(state->execution_retired);
+    EXPECT_EQ(state->runtime, nullptr);
+    EXPECT_EQ(state->active_execution->prepared->ccu_readers.lease, runner.ccu_lease);
+    EXPECT_EQ(control().d2h_calls, 0u);
+    EXPECT_EQ(simpler_finalize_run(&runner, active.storage), -105);
+    EXPECT_EQ(control().d2h_calls, 1u);
+    EXPECT_TRUE(active.empty());
+    EXPECT_FALSE(runner.admission_poisoned);
 }
 
 TEST_F(NativeAdmissionTest, BlockingPhysicalProgressDoesNotPerformTheStrongObserver) {
@@ -2504,6 +2647,17 @@ TEST_F(NativeAdmissionTest, FinalizePrefixAllocationFailureKeepsLaunchedOwnerRet
 }
 
 }  // namespace native_admission_test
+
+// Replace only the provider boundary. The C API must acquire and retain the
+// lease itself, just as it does for a real registered CCU callable.
+std::shared_ptr<simpler::ccu::RunLease>
+platform_ccu_acquire_run(void *runner, int32_t callable_id, const ChipStorageTaskArgs &) {
+    auto *completion_runner =
+        dynamic_cast<native_admission_test::FencedCompletionRunner *>(static_cast<DeviceRunnerBase *>(runner));
+    if (completion_runner == nullptr || callable_id != 1) return {};
+    ++completion_runner->ccu_acquisitions;
+    return completion_runner->ccu_lease;
+}
 
 namespace native_admission_test {
 TEST_F(NativeAdmissionTest, EntryCacheQualificationRequiresObservedSuccessAndCurrentPublication) {

@@ -59,6 +59,7 @@
 #include "arg_direction.h"
 #include "call_argument_snapshot.h"
 #include "callable.h"
+#include "platform_comm/comm_context.h"
 #include "callable_protocol.h"
 #include "chip_run_lane.h"
 #include "chip_worker.h"
@@ -2090,6 +2091,8 @@ NB_MODULE(_task_interface, m) {
 
     // --- Constants ---
     m.attr("MAX_TENSOR_DIMS") = MAX_TENSOR_DIMS;
+    m.attr("COMM_WORKSPACE_COUNT") = COMM_WORKSPACE_COUNT;
+    m.attr("COMM_CONTEXT_SIZE") = sizeof(CommContext);
     m.attr("MAX_REGISTERED_CALLABLE_IDS") = MAX_REGISTERED_CALLABLE_IDS;
     m.attr("RUNTIME_ENV_RING_COUNT") = RUNTIME_ENV_RING_COUNT;
 #if SIMPLER_HOST_STRACE
@@ -3118,6 +3121,33 @@ NB_MODULE(_task_interface, m) {
             return os.str();
         });
 
+    nb::class_<CcuFunction>(m, "CcuFunction")
+        .def_static(
+            "build",
+            [](nb::bytes binary, std::string entry) {
+                const auto *data = reinterpret_cast<const uint8_t *>(binary.c_str());
+                CcuFunction function{{data, data + binary.size()}, std::move(entry)};
+                function.validate();
+                return function;
+            },
+            nb::arg("binary"), nb::arg("entry")
+        )
+        .def_prop_ro(
+            "binary",
+            [](const CcuFunction &self) {
+                return nb::bytes(reinterpret_cast<const char *>(self.binary.data()), self.binary.size());
+            }
+        )
+        .def_prop_ro(
+            "entry",
+            [](const CcuFunction &self) {
+                return self.entry;
+            }
+        )
+        .def_prop_ro("abi_version", [](const CcuFunction &) {
+            return CCU_BUILDER_ABI_VERSION;
+        });
+
     // --- PyChipCallable wrapper ---
     struct PyChipCallable {
         std::vector<uint8_t> buffer_;
@@ -3135,7 +3165,10 @@ NB_MODULE(_task_interface, m) {
         .def_static(
             "build",
             [](std::vector<ArgDirection> signature, std::string func_name, nb::bytes binary,
-               std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name) -> PyChipCallable {
+               std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name,
+               std::vector<CcuFunction> ccu_functions) -> PyChipCallable {
+                if (binary.size() > std::numeric_limits<uint32_t>::max())
+                    throw std::invalid_argument("ChipCallable binary exceeds wire size limit");
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto child_count = static_cast<int32_t>(children.size());
@@ -3149,12 +3182,13 @@ NB_MODULE(_task_interface, m) {
 
                 auto buf = make_chip_callable(
                     signature.data(), static_cast<int32_t>(signature.size()), func_name.c_str(), bin_ptr, bin_size,
-                    func_ids.data(), child_bufs.data(), child_count, config_name.c_str()
+                    func_ids.data(), child_bufs.data(), child_count, config_name.c_str(), ccu_functions
                 );
+                validate_chip_callable_buffer(buf.data(), buf.size());
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("signature"), nb::arg("func_name"), nb::arg("binary"), nb::arg("children"),
-            nb::arg("config_name") = "",
+            nb::arg("config_name") = "", nb::arg("ccu_functions") = std::vector<CcuFunction>{},
             "Build a ChipCallable from signature, func_name, binary, and list of (func_id, CoreCallable) children."
         )
 
@@ -3172,6 +3206,7 @@ NB_MODULE(_task_interface, m) {
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
                 );
+                validate_chip_callable_buffer(buf.data(), buf.size());
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("raw"),
@@ -3181,6 +3216,18 @@ NB_MODULE(_task_interface, m) {
             "cascade IPC channel."
         )
 
+        .def_prop_ro(
+            "ccu_functions",
+            [](const PyChipCallable &self) {
+                return self.get().ccu_functions();
+            }
+        )
+        .def_prop_ro(
+            "ccu_function_count",
+            [](const PyChipCallable &self) {
+                return self.get().ccu_functions().size();
+            }
+        )
         .def(
             "sig",
             [](const PyChipCallable &self, int32_t i) -> ArgDirection {
@@ -3255,14 +3302,7 @@ NB_MODULE(_task_interface, m) {
                 // Reconstruct a PyCoreCallable by copying the child's raw bytes
                 auto offset = parent.child_offset(i);
                 const uint8_t *child_start = reinterpret_cast<const uint8_t *>(parent.storage_ + offset);
-                // Determine child size: from offset to next child or end of buffer
-                size_t child_size;
-                if (i + 1 < parent.child_count()) {
-                    child_size = parent.child_offset(i + 1) - offset;
-                } else {
-                    size_t header_size = offsetof(ChipCallable, storage_);
-                    child_size = self.buffer_.size() - header_size - offset;
-                }
+                const size_t child_size = CoreCallable::binary_data_offset() + c.binary_size();
                 std::vector<uint8_t> child_buf(child_start, child_start + child_size);
                 return PyCoreCallable{std::move(child_buf)};
             },
@@ -4169,6 +4209,11 @@ NB_MODULE(_task_interface, m) {
             "Collectively allocate a fresh per-rank pool for a subset; returns "
             "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
             "responsibility before result conversion or an allocation error; it does not imply a usable context."
+        )
+        .def(
+            "comm_prepare_ccu", &ChipWorker::comm_prepare_ccu, nb::arg("comm_handle"), nb::arg("callable_id"),
+            nb::arg("allocation_id"), nb::arg("owner"), nb::arg("generation"), nb::arg("digest"),
+            nb::call_guard<nb::gil_scoped_release>()
         )
         .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),

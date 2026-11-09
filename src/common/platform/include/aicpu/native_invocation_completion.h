@@ -31,6 +31,7 @@ enum class NativeTerminalPublication { Published, NotRequested, InvalidState };
 class NativeInvocationCompletion {
 public:
     static constexpr int32_t kInternalError = -1;
+    static constexpr int32_t kRetiredCcuFailure = -105;
 
     bool begin(int32_t callbacks, NativeInvocationEvidence *evidence = nullptr) {
         if (callbacks <= 0 || callbacks > MAX_GATE_THREADS) return false;
@@ -40,16 +41,20 @@ public:
         claimed_.store(0, std::memory_order_relaxed);
         finished_.store(0, std::memory_order_relaxed);
         entry_errors_.reset();
+        other_callback_error_.store(false, std::memory_order_relaxed);
         runtime_terminal_ = {};
         payload_bytes_ = 0;
         handed_off_ = false;
         invalid_handoff_ = false;
+        ccu_failure_retired_ = false;
         return true;
     }
 
     // Copy while the runtime snapshot is alive; cleanup must not leave borrowed
     // payload pointers for the last callback to dereference.
-    bool accept_runtime_terminal(RunTerminalSelection terminal, const void *payload, size_t bytes) {
+    bool accept_runtime_terminal(
+        RunTerminalSelection terminal, const void *payload, size_t bytes, bool ccu_failure_retired = false
+    ) {
         if (handed_off_) {
             invalid_handoff_ = true;
             return false;
@@ -59,11 +64,15 @@ public:
                              terminal.source == DeviceRunCodeSource::None && bytes == 0;
         const bool failure = terminal.verdict == DeviceRunVerdict::Error && terminal.code != 0 &&
                              device_run_code_source_is_failure(terminal.source);
-        if ((!success && !failure) || bytes > sizeof(payload_) || (bytes != 0 && payload == nullptr)) {
+        if ((!success && !failure) || bytes > sizeof(payload_) || (bytes != 0 && payload == nullptr) ||
+            (ccu_failure_retired && (!failure || terminal.code != kRetiredCcuFailure))) {
             invalid_handoff_ = true;
             return false;
         }
         runtime_terminal_ = terminal;
+        // The runtime owner supplies this only after every AICore has acknowledged
+        // retirement. The terminal record itself is never a retirement proof.
+        ccu_failure_retired_ = ccu_failure_retired;
         payload_bytes_ = bytes;
         if (bytes != 0) std::memcpy(payload_, payload, bytes);
         return true;
@@ -83,6 +92,8 @@ public:
         const uint32_t bit = uint32_t{1} << callback_index;
         if ((claimed_.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) return kInternalError;
         entry_errors_.record(rc, DeviceRunCodeSource::ThreadRc);
+        // Keep an independent veto: the first recorded error may already be -105.
+        if (rc != 0 && rc != kRetiredCcuFailure) other_callback_error_.store(true, std::memory_order_relaxed);
         // The claim precedes the contribution; only this separate release RMW
         // certifies its completion. The final acquire observes all contributors.
         if (finished_.fetch_add(1, std::memory_order_acq_rel) + 1 != expected_) return 0;
@@ -110,6 +121,14 @@ public:
                 publication != NativeTerminalPublication::NotRequested
             );
         complete();
+        // Preserve the business failure and its payload for Host observation,
+        // while allowing normal stream completion only for the explicitly
+        // retired CCU failure whose own record was successfully published.
+        if (ccu_failure_retired_ && result.verdict == DeviceRunVerdict::Error && result.code == kRetiredCcuFailure &&
+            !other_callback_error_.load(std::memory_order_relaxed) &&
+            publication == NativeTerminalPublication::Published) {
+            return 0;
+        }
         // Preserve a real execution error even if its private record is invalid.
         return publication != NativeTerminalPublication::InvalidState || result.code != 0 ? result.code :
                                                                                             kInternalError;
@@ -122,9 +141,11 @@ private:
     std::atomic<uint32_t> claimed_{0};
     std::atomic<int32_t> finished_{0};
     RunTerminalAccumulator entry_errors_;
+    std::atomic<bool> other_callback_error_{false};
     RunTerminalSelection runtime_terminal_{};
     size_t payload_bytes_{0};
     uint8_t payload_[DEVICE_RUN_RESULT_PAYLOAD_BYTES]{};
     bool handed_off_{false};
     bool invalid_handoff_{false};
+    bool ccu_failure_retired_{false};
 };

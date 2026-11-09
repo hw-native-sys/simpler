@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_COMPLETION_TOKEN_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_COMPLETION_TOKEN_H_
+#pragma once
 
 #include <stdint.h>
 
@@ -35,11 +34,10 @@ enum class CompletionPollState : uint8_t {
     PENDING = 0,
     READY = 1,
     FAILED = 2,
+    UNCONFIRMED = 3,  // A failed observation is not proof that hardware stopped.
 };
 
 struct CompletionPollResult {
     CompletionPollState state{CompletionPollState::PENDING};
     int32_t error_code{SIMPLER_ERROR_NONE};
 };
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_COMPLETION_TOKEN_H_

@@ -52,6 +52,8 @@ if TYPE_CHECKING:
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    COMM_CONTEXT_SIZE,
+    COMM_WORKSPACE_COUNT,
     MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
@@ -74,6 +76,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     TEARDOWN_REPORT_SCHEMA,
     ArgDirection,
     CallConfig,
+    CcuFunction,
     ChipCallable,
     ChipStorageTaskArgs,
     ChipTensor,
@@ -127,7 +130,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef, normalize_workspace_engines, seal_host_mappings
+from .comm_domain import COMM_WORKSPACE_ENGINES, CommDomainRef, normalize_workspace_engines, seal_host_mappings
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -250,6 +253,7 @@ __all__ = [
     "ArgDirection",
     "CoreCallable",
     "ChipCallable",
+    "CcuFunction",
     "CallConfig",
     "RuntimeEnv",
     "ChipWorker",
@@ -1028,11 +1032,12 @@ class _CommContextStruct(ctypes.Structure):
         ("winSize", ctypes.c_uint64),
         ("windowsIn", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
         ("windowsOut", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
-        ("workspaces", _CommWorkspaceStruct * 3),
+        ("workspaces", _CommWorkspaceStruct * COMM_WORKSPACE_COUNT),
     ]
 
 
-assert ctypes.sizeof(_CommContextStruct) == 1088
+assert len(COMM_WORKSPACE_ENGINES) == COMM_WORKSPACE_COUNT
+assert ctypes.sizeof(_CommContextStruct) == COMM_CONTEXT_SIZE
 
 
 def scalar_to_uint64(value) -> int:

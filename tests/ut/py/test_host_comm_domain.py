@@ -48,6 +48,7 @@ def test_memory_source_is_part_of_reuse_identity():
 )
 def test_host_domain_capability_before_backend(platform, runtime, engines, accepted):
     owner = SimpleNamespace(level=3, _config={"device_ids": [0, 1], "platform": platform, "runtime": runtime})
+    owner._validate_domain_workspaces = lambda config: Worker._validate_domain_workspaces(cast(Any, owner), config)
 
     def call():
         return Worker._domain_config(cast(Any, owner), [0, 1], 4096, [], True, engines, AddressSpace.HOST)

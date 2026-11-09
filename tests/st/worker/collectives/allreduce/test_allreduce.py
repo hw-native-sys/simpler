@@ -539,15 +539,63 @@ def _assert_rejected_domain_error(error, platform, rank_logs):
         ), f"missing controlled INVALID_ARGS classification in {record['path']}"
 
 
+def _assert_rejected_domain_retirement(rank_logs, reclaimed, platform):
+    stopped = []
+    for record in rank_logs.values():
+        text = record["text"]
+        assert text is not None, f"missing owned rank log: {record['source']}"
+        releases = re.findall(r"[^\n]*\bname=chip\.run\.borrow_release\s[^\n]*", text)
+        assert len(releases) == 1, f"missing or ambiguous caller last-use evidence in {record['path']}"
+        fields = dict(re.findall(r"\b(\w+)=([^\s]+)", releases[0]))
+        assert fields["pid"] == str(record["pid"]), releases[0]
+        assert int(fields["ep"]) > 0 and int(fields["run"]) > 0, releases[0]
+        assert (fields["proof"], fields["keep"]) in (("1", "0"), ("0", "1")), releases[0]
+        proven = fields["proof"] == "1"
+        if proven:
+            roots = re.findall(r"[^\n]*\bname=chip\.run\s[^\n]*", text)
+            if platform.endswith("sim"):
+                # Sim emits its post-destruction root without native descriptor attributes.
+                # This owned PID slice contains exactly one rejected run and one borrow release.
+                assert len(roots) == 1, f"missing or ambiguous destroyed native carrier in {record['path']}"
+                root = dict(re.findall(r"\b(\w+)=([^\s]+)", roots[0]))
+                assert root["pid"] == fields["pid"] and int(root["inv"]) > 0, roots[0]
+                assert root["depth"] == "0" and int(root["dur"]) > 0, roots[0]
+                runners = re.findall(r"[^\n]*\bname=chip\.run\.runner_run\s[^\n]*", text)
+                assert len(runners) == 1, f"missing or ambiguous simulator execution in {record['path']}"
+                runner = dict(re.findall(r"\b(\w+)=([^\s]+)", runners[0]))
+                assert all(runner[key] == root[key] for key in ("pid", "inv", "hid")), runners[0]
+                assert int(root["ts"]) <= int(runner["ts"]), roots[0]
+                assert 0 <= int(runner["dur"]), runners[0]
+                assert int(runner["ts"]) + int(runner["dur"]) <= int(root["ts"]) + int(root["dur"]), roots[0]
+            else:
+                identity = {
+                    "pid": fields["pid"],
+                    "run_id": fields["run"],
+                    "run_epoch": fields["ep"],
+                    "slot_id": fields["slot"],
+                    "generation": fields["gen"],
+                    "dispatch_id": fields["disp"],
+                }
+                matching_roots = [
+                    line for line in roots if identity.items() <= dict(re.findall(r"\b(\w+)=([^\s]+)", line)).items()
+                ]
+                assert len(matching_roots) == 1, f"missing destroyed native carrier in {record['path']}"
+        stopped.append(proven)
+    assert len(stopped) == 2
+    assert reclaimed == all(stopped), f"domain reclamation disagrees with rank last-use proofs: {stopped}"
+
+
 def _run_rejected_domain_case(case, platform, device_ids, request, monkeypatch):
     from _task_interface import _host_log_directory  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
 
     request.getfixturevalue("drain_host_log")
+    request.getfixturevalue("caplog").set_level(25, logger="simpler")
     directory = _host_log_directory()
     assert directory
     log_directory = Path(directory)
     output = request.getfixturevalue("tmp_path") / "collective-rejection"
     rank_logs, captured_logs, primary_error = {}, {}, None
+    reclaimed = False
     worker = Worker(
         level=3,
         platform=platform,
@@ -587,16 +635,26 @@ def _run_rejected_domain_case(case, platform, device_ids, request, monkeypatch):
         primary_error = str(failure.value)
         assert len(domains) == 1
         domain = domains[0]
-        assert domain.released and not domain.freed
-        assert not worker._cleanup_journal.empty
+        assert domain.released
+        reclaimed = domain.freed
+        if reclaimed:
+            assert worker._domain_free_results[domain.allocation_id] is None
+            assert worker._cleanup_journal.empty
+        else:
+            assert not worker._cleanup_journal.empty
         for _ in range(2):
-            with pytest.raises(RuntimeError, match="window reclamation is unconfirmed"):
+            if reclaimed:
                 worker.close()
-            assert not domain.freed and not worker._cleanup_journal.empty
-            assert worker._domain_free_results[domain.allocation_id] is not None
-            assert [(kind, identity) for kind, identity, _ in worker._cleanup_journal._entries] == [
-                ("domain-retirement", f"True:{domain.allocation_id}")
-            ]
+                assert domain.freed and worker._cleanup_journal.empty
+                assert worker._domain_free_results[domain.allocation_id] is None
+            else:
+                with pytest.raises(RuntimeError, match="window reclamation is unconfirmed"):
+                    worker.close()
+                assert not domain.freed and not worker._cleanup_journal.empty
+                assert worker._domain_free_results[domain.allocation_id] is not None
+                assert [(kind, identity) for kind, identity, _ in worker._cleanup_journal._entries] == [
+                    ("domain-retirement", f"True:{domain.allocation_id}")
+                ]
             assert worker._worker is None
             assert not worker._chip_pids and not worker._sub_pids and not worker._next_level_pids
             for pid in pids:
@@ -618,6 +676,7 @@ def _run_rejected_domain_case(case, platform, device_ids, request, monkeypatch):
             (output / "primary-error.txt").write_text(primary_error or "no RuntimeError captured")
     assert primary_error is not None
     _assert_rejected_domain_error(primary_error, platform, captured_logs)
+    _assert_rejected_domain_retirement(captured_logs, reclaimed, platform)
 
 
 @pytest.mark.device_count(2)
@@ -642,7 +701,7 @@ class TestAllreduceBidirectionalRingRejectNonSum(SceneTestCase):
         pass
 
     def test_run(self, st_platform, st_device_ids, request, monkeypatch):
-        """The device error leaves explicit retirement debt without stranding the worker tree."""
+        """A rejected operation releases only proven-stopped readers and retains every unproven debt."""
         _run_rejected_domain_case(self, st_platform, st_device_ids, request, monkeypatch)
 
 
@@ -669,7 +728,7 @@ class TestAllreduceIbingRejectNonSum(SceneTestCase):
         pass
 
     def test_run(self, st_platform, st_device_ids, request, monkeypatch):
-        """The device error leaves explicit retirement debt without stranding the worker tree."""
+        """A rejected operation releases only proven-stopped readers and retains every unproven debt."""
         _run_rejected_domain_case(self, st_platform, st_device_ids, request, monkeypatch)
 
 

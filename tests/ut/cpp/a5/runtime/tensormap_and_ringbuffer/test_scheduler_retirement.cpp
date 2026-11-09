@@ -61,6 +61,10 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
 
 class SchedulerRetirementTestPeer {
 public:
+    static void bind_release_gates(SchedulerContext &context, AicoreTeardownControl *gates, int count) {
+        context.teardown_gates_ = gates;
+        context.cores_total_num_ = count;
+    }
     static void publish_orchestration(SchedulerContext &context, int total, int completed, bool done) {
         context.total_tasks_ = total;
         context.completed_tasks_.store(completed, std::memory_order_relaxed);
@@ -111,6 +115,28 @@ public:
         context.log_stall_diagnostics(0, 42, StallDumpReport::Shutdown);
     }
 };
+
+TEST(SchedulerRetirementProof, RequiresEveryCurrentCoreReleaseGate) {
+    auto context = std::make_unique<SchedulerContext>();
+    std::array<AicoreTeardownControl, kCores> gates{};
+    EXPECT_FALSE(context->all_cores_released());
+    SchedulerRetirementTestPeer::bind_release_gates(*context, gates.data(), kCores);
+    for (int core = 0; core < kCores; ++core) {
+        EXPECT_FALSE(context->all_cores_released());
+        __atomic_store_n(&gates[core].post_close_release, AICORE_POST_CLOSE_RELEASE, __ATOMIC_RELEASE);
+    }
+    EXPECT_TRUE(context->all_cores_released());
+    // A reset for the next invocation invalidates the preceding proof, even
+    // when retirement requests/return values would otherwise be unchanged.
+    __atomic_store_n(&gates[0].post_close_release, 0, __ATOMIC_RELEASE);
+    EXPECT_FALSE(context->all_cores_released());
+    SchedulerRetirementTestPeer::bind_release_gates(*context, nullptr, kCores);
+    EXPECT_FALSE(context->all_cores_released());
+    SchedulerRetirementTestPeer::bind_release_gates(*context, gates.data(), 0);
+    EXPECT_FALSE(context->all_cores_released());
+    SchedulerRetirementTestPeer::bind_release_gates(*context, gates.data(), PLATFORM_MAX_CORES + 1);
+    EXPECT_FALSE(context->all_cores_released());
+}
 
 class SchedulerRetirement : public testing::Test {
 protected:

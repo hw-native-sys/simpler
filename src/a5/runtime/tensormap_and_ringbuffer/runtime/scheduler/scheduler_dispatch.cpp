@@ -137,6 +137,7 @@ void SchedulerContext::build_payload(
     dispatch_payload.local_context.block_idx = block_idx;
     dispatch_payload.local_context.block_num = slot_state.logical_block_num;
     dispatch_payload.local_context.async_ctx.task_token = slot_state.task->task_id;
+    dispatch_payload.global_context.callable_id = active_callable_id_;
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
@@ -1093,9 +1094,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             );
             if (poll_result.error_code != SIMPLER_ERROR_NONE) {
                 int32_t expected = SIMPLER_ERROR_NONE;
-                header->sched_error_code.compare_exchange_strong(
+                const bool won_error = header->sched_error_code.compare_exchange_strong(
                     expected, poll_result.error_code, std::memory_order_acq_rel, std::memory_order_acquire
                 );
+                if (won_error && poll_result.error_code == SIMPLER_ERROR_CCU_FAILED) {
+                    header->ccu_dependency_failure =
+                        CcuDependencyFailureDiagnostic::recorded(poll_result.failed_task_token);
+                }
                 completed_.store(true, std::memory_order_release);
                 break;
             }

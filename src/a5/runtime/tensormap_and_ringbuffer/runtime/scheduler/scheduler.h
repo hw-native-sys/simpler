@@ -1434,6 +1434,9 @@ struct SchedulerState {
     // device sides.
     void wire_arena_pointers(const SchedulerLayout &layout, DeviceArena &arena);
 
+    // Only after all orchestration/scheduler participants have rendezvoused.
+    void capture_ccu_failure_successors();
+
     // Forget per-region pointers; arena owns the backing memory.
     void destroy();
     void print_stats();
@@ -1526,15 +1529,25 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
             CompletionPollResult poll = cond.test();
-            if (poll.state == CompletionPollState::FAILED) {
+            if (poll.state == CompletionPollState::FAILED || poll.state == CompletionPollState::UNCONFIRMED) {
                 result.error_code = poll.error_code;
+                if (cond.completion_type == COMPLETION_TYPE_CCU_REQUEST && poll.state == CompletionPollState::FAILED &&
+                    !cond.retire())
+                    result.error_code = SIMPLER_ERROR_CCU_UNCONFIRMED;
                 result.failed_slot_state = entry.slot_state;
+                result.failed_task_token = entry.task_token;
                 unlock();
                 return result;
             }
             if (poll.state == CompletionPollState::READY) {
+                if (!cond.retire()) {
+                    result.error_code = SIMPLER_ERROR_CCU_UNCONFIRMED;
+                    result.failed_slot_state = entry.slot_state;
+                    result.failed_task_token = entry.task_token;
+                    unlock();
+                    return result;
+                }
                 cond.satisfied = true;
-                cond.retire();
                 entry.waiting_completion_count--;
             }
         }

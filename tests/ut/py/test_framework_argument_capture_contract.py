@@ -303,8 +303,16 @@ def transport(consumer, monkeypatch, tmp_path):
         _submit_chip_run_direct=submit,
     )
     worker._lifecycle = _Lifecycle.READY
-    monkeypatch.setattr(worker, "_resolve_handle", lambda *args, **kwargs: SimpleNamespace(slot_id=3))
-    monkeypatch.setattr(worker, "_resolve_handle_locked", lambda *args, **kwargs: SimpleNamespace(slot_id=3))
+    monkeypatch.setattr(
+        worker,
+        "_resolve_handle",
+        lambda *args, **kwargs: SimpleNamespace(slot_id=3, target=SimpleNamespace(ccu_function_count=0)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_resolve_handle_locked",
+        lambda *args, **kwargs: SimpleNamespace(slot_id=3, target=SimpleNamespace(ccu_function_count=0)),
+    )
     monkeypatch.setattr(worker, "register", lambda image: object())
     monkeypatch.setattr(worker, "init", lambda **kwargs: None)
 
