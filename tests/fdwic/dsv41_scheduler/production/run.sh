@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if (($# != 6)); then
+    echo 'usage: production/run.sh BUNDLE RUNTIME_LIB OUTPUT LEVEL WARMUP ROUNDS' >&2
+    exit 2
+fi
+: "${ASCEND_HOME_PATH:?source the CANN set_env.sh first}"
+# Outside the repository's reservation service, an explicit pair selects
+# devices already assigned by the user's environment. Never choose implicitly.
+if [[ -z "${TASK_DEVICE:-}" && -n "${DSV41_DEVICES:-}" ]]; then
+    bash "$root/../../../.claude/skills/onboard-arch-precheck/check.sh" a5
+    export TASK_DEVICE="$DSV41_DEVICES"
+fi
+if [[ -z "${TASK_DEVICE:-}" ]]; then
+    bash "$root/../../../.claude/skills/onboard-arch-precheck/check.sh" a5
+    printf -v command 'TASK_DEVICE="$TASK_DEVICE" bash %q' "$root/production/run.sh"
+    for argument in "$@"; do printf -v command '%s %q' "$command" "$argument"; done
+    command -v task-submit >/dev/null || {
+        echo 'Set DSV41_DEVICES to two available A5 device IDs, or use task-submit.' >&2
+        exit 2
+    }
+    exec task-submit --device auto --device-num 2 --max-time "${DSV41_MAX_TIME:-300}" --run "$command"
+fi
+IFS=',' read -r -a devices <<< "$TASK_DEVICE"
+[[ ${#devices[@]} == 2 ]] || { echo 'Original EP2 workload requires two reserved devices' >&2; exit 2; }
+bundle=$(realpath "$1")
+runtime=$(realpath "$2")
+mkdir -p "$3"
+output=$(realpath "$3")
+[[ ! -e "$output/rank0" && ! -e "$output/rank1" ]] || { echo 'Refusing to overwrite a run' >&2; exit 2; }
+runner=${DSV41_RUNNER:-"${DSV41_BUILD_DIR:-$root/build/portable}/host/native-runner"}
+[[ -x "$runner" && -f "$bundle/callable.bin" ]] || { echo 'Build the native runner and bundle first' >&2; exit 2; }
+pids=()
+for rank in 0 1; do
+    mkdir -p "$output/rank$rank/ascend"
+    ASCEND_PROCESS_LOG_PATH="$output/rank$rank/ascend" DSV41_RECORD_PATH="$output/rank$rank/submissions.bin" DSV41_ORIGINAL_ORCH="$bundle/orchestration.so" \
+    "$runner" "$bundle" "$runtime" "${devices[$rank]}" "$rank" "$output/rootinfo" \
+        "$output/rank$rank" "$4" "$5" "$6" > "$output/rank$rank/console.log" 2>&1 &
+    pids+=("$!")
+done
+status=0
+for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+for rank in 0 1; do tail -n 12 "$output/rank$rank/console.log"; done
+exit "$status"

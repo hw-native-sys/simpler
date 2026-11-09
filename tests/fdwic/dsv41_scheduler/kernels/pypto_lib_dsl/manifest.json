@@ -1,0 +1,2068 @@
+{
+  "schema": 1,
+  "origin": "pypto_lib_dsl generated DSV4.1 forward snapshot, 2026-11-07",
+  "platform": "a5",
+  "entry_signature": [
+    1,
+    1,
+    1,
+    1,
+    3,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    3,
+    3,
+    3,
+    1,
+    1,
+    3,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    1,
+    2,
+    1
+  ],
+  "host_tensor_indices": [
+    67,
+    68
+  ],
+  "kernels": [
+    {
+      "func_id": 0,
+      "name": "v41_rope_rows",
+      "core_type": "aiv",
+      "source": "vendor/aiv/v41_rope_rows.cpp",
+      "signature": [
+        2,
+        2,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 1,
+      "name": "v41_rope_rows_1",
+      "core_type": "aiv",
+      "source": "vendor/aiv/v41_rope_rows_1.cpp",
+      "signature": [
+        2,
+        2,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 2,
+      "name": "prepare_compressed_lens",
+      "core_type": "aiv",
+      "source": "vendor/aiv/prepare_compressed_lens.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 3,
+      "name": "engram_quant",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_quant.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 4,
+      "name": "engram_projection_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/engram_projection_aic.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 5,
+      "name": "engram_projection_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_projection_aiv.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 6,
+      "name": "engram_widen",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_widen.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 7,
+      "name": "engram_gate",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_gate.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 8,
+      "name": "collapse_norm_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/008_collapse_norm_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/008_collapse_norm_grid"
+      ]
+    },
+    {
+      "func_id": 9,
+      "name": "zero_bf16_rows",
+      "core_type": "aiv",
+      "source": "vendor/external/009_zero_bf16_rows/entry.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/009_zero_bf16_rows"
+      ]
+    },
+    {
+      "func_id": 10,
+      "name": "quantize_bf16_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/010_quantize_bf16_grid/entry.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/010_quantize_bf16_grid"
+      ]
+    },
+    {
+      "func_id": 11,
+      "name": "project_q_a",
+      "core_type": "aic",
+      "source": "vendor/external/011_project_q_a/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/011_project_q_a"
+      ]
+    },
+    {
+      "func_id": 12,
+      "name": "normalize_quant_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/012_normalize_quant_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/012_normalize_quant_grid"
+      ]
+    },
+    {
+      "func_id": 13,
+      "name": "project_q_b",
+      "core_type": "aic",
+      "source": "vendor/external/013_project_q_b/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/013_project_q_b"
+      ]
+    },
+    {
+      "func_id": 14,
+      "name": "query_rope_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/014_query_rope_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/014_query_rope_grid"
+      ]
+    },
+    {
+      "func_id": 15,
+      "name": "project_kv",
+      "core_type": "aic",
+      "source": "vendor/external/015_project_kv/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/015_project_kv"
+      ]
+    },
+    {
+      "func_id": 16,
+      "name": "window_kv_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/016_window_kv_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/016_window_kv_grid"
+      ]
+    },
+    {
+      "func_id": 17,
+      "name": "swa_queries_aic",
+      "core_type": "aic",
+      "source": "vendor/external/017_swa_queries_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/017_swa_queries_aic"
+      ]
+    },
+    {
+      "func_id": 18,
+      "name": "swa_queries_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/017_swa_queries_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/017_swa_queries_aic"
+      ]
+    },
+    {
+      "func_id": 19,
+      "name": "inverse_rms_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/019_inverse_rms_grid/entry.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/019_inverse_rms_grid"
+      ]
+    },
+    {
+      "func_id": 20,
+      "name": "project_hf32_grid",
+      "core_type": "aic",
+      "source": "vendor/external/020_project_hf32_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/020_project_hf32_grid"
+      ]
+    },
+    {
+      "func_id": 21,
+      "name": "coefficients_grid__2",
+      "core_type": "aiv",
+      "source": "vendor/external/021_coefficients_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/021_coefficients_grid__2"
+      ]
+    },
+    {
+      "func_id": 22,
+      "name": "rope_quant_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/022_rope_quant_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/022_rope_quant_grid"
+      ]
+    },
+    {
+      "func_id": 23,
+      "name": "project_o_a",
+      "core_type": "aic",
+      "source": "vendor/external/023_project_o_a/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/023_project_o_a"
+      ]
+    },
+    {
+      "func_id": 24,
+      "name": "quantize_bf16_grid__2",
+      "core_type": "aiv",
+      "source": "vendor/external/024_quantize_bf16_grid__2/entry.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/024_quantize_bf16_grid__2"
+      ]
+    },
+    {
+      "func_id": 25,
+      "name": "project_o_b",
+      "core_type": "aic",
+      "source": "vendor/external/025_project_o_b/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/025_project_o_b"
+      ]
+    },
+    {
+      "func_id": 26,
+      "name": "expand_grid__2",
+      "core_type": "aiv",
+      "source": "vendor/external/026_expand_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/026_expand_grid__2"
+      ]
+    },
+    {
+      "func_id": 27,
+      "name": "project_kv__2",
+      "core_type": "aic",
+      "source": "vendor/external/015_project_kv/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/015_project_kv"
+      ]
+    },
+    {
+      "func_id": 28,
+      "name": "window_kv_grid__2",
+      "core_type": "aiv",
+      "source": "vendor/external/016_window_kv_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/016_window_kv_grid"
+      ]
+    },
+    {
+      "func_id": 29,
+      "name": "project_c2a_grid",
+      "core_type": "aic",
+      "source": "vendor/external/029_project_c2a_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/029_project_c2a_grid"
+      ]
+    },
+    {
+      "func_id": 30,
+      "name": "clear_latent",
+      "core_type": "aiv",
+      "source": "vendor/external/030_clear_latent/entry.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/030_clear_latent"
+      ]
+    },
+    {
+      "func_id": 31,
+      "name": "pool_state_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/031_pool_state_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        1,
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/external/031_pool_state_grid"
+      ]
+    },
+    {
+      "func_id": 32,
+      "name": "publish_compressed_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/032_publish_compressed_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/032_publish_compressed_grid"
+      ]
+    },
+    {
+      "func_id": 33,
+      "name": "project_index_key_grid",
+      "core_type": "aic",
+      "source": "vendor/external/033_project_index_key_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/033_project_index_key_grid"
+      ]
+    },
+    {
+      "func_id": 34,
+      "name": "publish_index_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/034_publish_index_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/034_publish_index_grid"
+      ]
+    },
+    {
+      "func_id": 35,
+      "name": "project_query_grid_aic",
+      "core_type": "aic",
+      "source": "vendor/external/035_project_query_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/035_project_query_grid_aic"
+      ]
+    },
+    {
+      "func_id": 36,
+      "name": "project_query_grid_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/035_project_query_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/035_project_query_grid_aic"
+      ]
+    },
+    {
+      "func_id": 37,
+      "name": "project_index_weight_grid",
+      "core_type": "aic",
+      "source": "vendor/external/037_project_index_weight_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/037_project_index_weight_grid"
+      ]
+    },
+    {
+      "func_id": 38,
+      "name": "reduce_index_weight_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/038_reduce_index_weight_grid/entry.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/038_reduce_index_weight_grid"
+      ]
+    },
+    {
+      "func_id": 39,
+      "name": "plan_runs",
+      "core_type": "aiv",
+      "source": "vendor/external/039_plan_runs/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/039_plan_runs"
+      ]
+    },
+    {
+      "func_id": 40,
+      "name": "score_topk_mix_aic",
+      "core_type": "aic",
+      "source": "vendor/external/040_score_topk_mix_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/040_score_topk_mix_aic"
+      ]
+    },
+    {
+      "func_id": 41,
+      "name": "score_topk_mix_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/040_score_topk_mix_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/040_score_topk_mix_aic"
+      ]
+    },
+    {
+      "func_id": 42,
+      "name": "sparse_attention_mix_aic",
+      "core_type": "aic",
+      "source": "vendor/external/042_sparse_attention_mix_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/042_sparse_attention_mix_aic"
+      ]
+    },
+    {
+      "func_id": 43,
+      "name": "sparse_attention_mix_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/042_sparse_attention_mix_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/042_sparse_attention_mix_aic"
+      ]
+    },
+    {
+      "func_id": 44,
+      "name": "coefficients_grid__3",
+      "core_type": "aiv",
+      "source": "vendor/external/021_coefficients_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/021_coefficients_grid__2"
+      ]
+    },
+    {
+      "func_id": 45,
+      "name": "rope_quant_grid__2",
+      "core_type": "aiv",
+      "source": "vendor/external/022_rope_quant_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/022_rope_quant_grid"
+      ]
+    },
+    {
+      "func_id": 46,
+      "name": "project_kv__3",
+      "core_type": "aic",
+      "source": "vendor/external/015_project_kv/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/015_project_kv"
+      ]
+    },
+    {
+      "func_id": 47,
+      "name": "coefficients_grid__4",
+      "core_type": "aiv",
+      "source": "vendor/external/021_coefficients_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/021_coefficients_grid__2"
+      ]
+    },
+    {
+      "func_id": 48,
+      "name": "coefficients_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/021_coefficients_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/021_coefficients_grid__2"
+      ]
+    },
+    {
+      "func_id": 49,
+      "name": "collapse_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/049_collapse_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/049_collapse_grid"
+      ]
+    },
+    {
+      "func_id": 50,
+      "name": "collapse_tail",
+      "core_type": "aiv",
+      "source": "vendor/external/050_collapse_tail/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/050_collapse_tail"
+      ]
+    },
+    {
+      "func_id": 51,
+      "name": "normalize_gate_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/051_normalize_gate_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/051_normalize_gate_grid"
+      ]
+    },
+    {
+      "func_id": 52,
+      "name": "quantize_gate_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/052_quantize_gate_grid/entry.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/052_quantize_gate_grid"
+      ]
+    },
+    {
+      "func_id": 53,
+      "name": "initialize_routes",
+      "core_type": "aiv",
+      "source": "vendor/external/053_initialize_routes/entry.cpp",
+      "signature": [
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/053_initialize_routes"
+      ]
+    },
+    {
+      "func_id": 54,
+      "name": "project_gate_grid_aic",
+      "core_type": "aic",
+      "source": "vendor/external/054_project_gate_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/054_project_gate_grid_aic"
+      ]
+    },
+    {
+      "func_id": 55,
+      "name": "project_gate_grid_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/054_project_gate_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/054_project_gate_grid_aic"
+      ]
+    },
+    {
+      "func_id": 56,
+      "name": "route_gate_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/056_route_gate_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/056_route_gate_grid"
+      ]
+    },
+    {
+      "func_id": 57,
+      "name": "project_shared_grid",
+      "core_type": "aic",
+      "source": "vendor/external/057_project_shared_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/057_project_shared_grid"
+      ]
+    },
+    {
+      "func_id": 58,
+      "name": "shared_swiglu_quant_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/058_shared_swiglu_quant_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/058_shared_swiglu_quant_grid"
+      ]
+    },
+    {
+      "func_id": 59,
+      "name": "project_shared_grid__2",
+      "core_type": "aic",
+      "source": "vendor/external/059_project_shared_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/059_project_shared_grid__2"
+      ]
+    },
+    {
+      "func_id": 60,
+      "name": "stage_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/060_stage_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/060_stage_grid"
+      ]
+    },
+    {
+      "func_id": 61,
+      "name": "dispatch_meta_publish",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_meta_publish.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 62,
+      "name": "dispatch_meta_wait",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_meta_wait.cpp",
+      "signature": [
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 63,
+      "name": "dispatch_meta_finalize",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_meta_finalize.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 64,
+      "name": "dispatch_push",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_push.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        1,
+        3,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 65,
+      "name": "combine_notify",
+      "core_type": "aiv",
+      "source": "vendor/aiv/combine_notify.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 66,
+      "name": "combine_wait",
+      "core_type": "aiv",
+      "source": "vendor/aiv/combine_wait.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 67,
+      "name": "gather_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/067_gather_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/067_gather_grid"
+      ]
+    },
+    {
+      "func_id": 68,
+      "name": "project_up_worker_aic",
+      "core_type": "aic",
+      "source": "vendor/external/068_project_up_worker_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/068_project_up_worker_aic"
+      ]
+    },
+    {
+      "func_id": 69,
+      "name": "project_up_worker_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/068_project_up_worker_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/068_project_up_worker_aic"
+      ]
+    },
+    {
+      "func_id": 70,
+      "name": "activate_worker",
+      "core_type": "aiv",
+      "source": "vendor/external/070_activate_worker/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/070_activate_worker"
+      ]
+    },
+    {
+      "func_id": 71,
+      "name": "project_down_worker_aic",
+      "core_type": "aic",
+      "source": "vendor/external/071_project_down_worker_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/071_project_down_worker_aic"
+      ]
+    },
+    {
+      "func_id": 72,
+      "name": "project_down_worker_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/071_project_down_worker_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/071_project_down_worker_aic"
+      ]
+    },
+    {
+      "func_id": 73,
+      "name": "ffn_reduce_scatter",
+      "core_type": "aiv",
+      "source": "vendor/aiv/ffn_reduce_scatter.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 74,
+      "name": "combine_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/074_combine_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/074_combine_grid"
+      ]
+    },
+    {
+      "func_id": 75,
+      "name": "expand_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/026_expand_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/026_expand_grid__2"
+      ]
+    },
+    {
+      "func_id": 76,
+      "name": "prepare_compressed_lens_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/prepare_compressed_lens_0.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 77,
+      "name": "coefficients_grid__5",
+      "core_type": "aiv",
+      "source": "vendor/external/021_coefficients_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/021_coefficients_grid__2"
+      ]
+    },
+    {
+      "func_id": 78,
+      "name": "project_kv__4",
+      "core_type": "aic",
+      "source": "vendor/external/015_project_kv/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/015_project_kv"
+      ]
+    },
+    {
+      "func_id": 79,
+      "name": "project_c1a_compressor",
+      "core_type": "aic",
+      "source": "vendor/external/079_project_c1a_compressor/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/079_project_c1a_compressor"
+      ]
+    },
+    {
+      "func_id": 80,
+      "name": "publish_c1a",
+      "core_type": "aiv",
+      "source": "vendor/external/080_publish_c1a/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/080_publish_c1a"
+      ]
+    },
+    {
+      "func_id": 81,
+      "name": "publish_index_grid__2",
+      "core_type": "aiv",
+      "source": "vendor/external/034_publish_index_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/034_publish_index_grid"
+      ]
+    },
+    {
+      "func_id": 82,
+      "name": "project_query_grid__2_aic",
+      "core_type": "aic",
+      "source": "vendor/external/035_project_query_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/035_project_query_grid_aic"
+      ]
+    },
+    {
+      "func_id": 83,
+      "name": "project_query_grid__2_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/035_project_query_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/035_project_query_grid_aic"
+      ]
+    },
+    {
+      "func_id": 84,
+      "name": "score_topk_mix__2_aic",
+      "core_type": "aic",
+      "source": "vendor/external/040_score_topk_mix_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/040_score_topk_mix_aic"
+      ]
+    },
+    {
+      "func_id": 85,
+      "name": "score_topk_mix__2_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/040_score_topk_mix_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/040_score_topk_mix_aic"
+      ]
+    },
+    {
+      "func_id": 86,
+      "name": "generate_pool",
+      "core_type": "aiv",
+      "source": "vendor/external/086_generate_pool/entry.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/086_generate_pool"
+      ]
+    },
+    {
+      "func_id": 87,
+      "name": "project_kv__5",
+      "core_type": "aic",
+      "source": "vendor/external/015_project_kv/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/015_project_kv"
+      ]
+    },
+    {
+      "func_id": 88,
+      "name": "project_query_grid__3_aic",
+      "core_type": "aic",
+      "source": "vendor/external/035_project_query_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/035_project_query_grid_aic"
+      ]
+    },
+    {
+      "func_id": 89,
+      "name": "project_query_grid__3_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/035_project_query_grid_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/035_project_query_grid_aic"
+      ]
+    },
+    {
+      "func_id": 90,
+      "name": "gather_pool",
+      "core_type": "aiv",
+      "source": "vendor/external/090_gather_pool/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/090_gather_pool"
+      ]
+    },
+    {
+      "func_id": 91,
+      "name": "plan_pool_rows",
+      "core_type": "aiv",
+      "source": "vendor/external/091_plan_pool_rows/entry.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/091_plan_pool_rows"
+      ]
+    },
+    {
+      "func_id": 92,
+      "name": "score_topk_mix__3_aic",
+      "core_type": "aic",
+      "source": "vendor/external/092_score_topk_mix__3_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/092_score_topk_mix__3_aic"
+      ]
+    },
+    {
+      "func_id": 93,
+      "name": "score_topk_mix__3_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/092_score_topk_mix__3_aic/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/092_score_topk_mix__3_aic"
+      ]
+    },
+    {
+      "func_id": 94,
+      "name": "coefficients_grid__6",
+      "core_type": "aiv",
+      "source": "vendor/external/021_coefficients_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/021_coefficients_grid__2"
+      ]
+    },
+    {
+      "func_id": 95,
+      "name": "project_kv__6",
+      "core_type": "aic",
+      "source": "vendor/external/015_project_kv/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/015_project_kv"
+      ]
+    },
+    {
+      "func_id": 96,
+      "name": "coefficients_grid__7",
+      "core_type": "aiv",
+      "source": "vendor/external/021_coefficients_grid__2/entry.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/021_coefficients_grid__2"
+      ]
+    },
+    {
+      "func_id": 97,
+      "name": "moe_signal_clear",
+      "core_type": "aiv",
+      "source": "vendor/aiv/moe_signal_clear.cpp",
+      "signature": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 98,
+      "name": "collapse_grid",
+      "core_type": "aiv",
+      "source": "vendor/external/049_collapse_grid/entry.cpp",
+      "signature": [
+        1,
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/external/049_collapse_grid"
+      ]
+    },
+    {
+      "func_id": 99,
+      "name": "collapse_tail",
+      "core_type": "aiv",
+      "source": "vendor/external/050_collapse_tail/entry.cpp",
+      "signature": [
+        1,
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/external/050_collapse_tail"
+      ]
+    },
+    {
+      "func_id": 100,
+      "name": "final_rms_norm",
+      "core_type": "aiv",
+      "source": "vendor/aiv/final_rms_norm.cpp",
+      "signature": [
+        1,
+        2,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 101,
+      "name": "lm_head_dispatch_push",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_dispatch_push.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 102,
+      "name": "lm_head_combine_wait",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_combine_wait.cpp",
+      "signature": [],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 103,
+      "name": "lm_head_dispatch_gather",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_dispatch_gather.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 104,
+      "name": "lm_head_matmul",
+      "core_type": "aic",
+      "source": "vendor/aic/lm_head_matmul.cpp",
+      "signature": [
+        2,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 105,
+      "name": "lm_head_combine_push",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_combine_push.cpp",
+      "signature": [
+        2,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 106,
+      "name": "lm_head_combine_gather",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_combine_gather.cpp",
+      "signature": [
+        2,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 107,
+      "name": "lm_head_signal_retire",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_signal_retire.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 108,
+      "name": "lm_head_greedy_sample",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_greedy_sample.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    }
+  ],
+  "imported_source_sha256": {
+    "vendor/aic/engram_projection_aic.cpp": "0e7615623413a0a2a5485671604cf1564e5b28e6214f62183fb808730a909111",
+    "vendor/aic/lm_head_matmul.cpp": "4d425e90271165869569e58a727189045a341c039011511e485a3130b054c7b2",
+    "vendor/aiv/combine_notify.cpp": "c4b71f5bfc709ae9367b2988befe8e2f1b0143e448e9d7b7851b1a50b3d75cfc",
+    "vendor/aiv/combine_wait.cpp": "1aa9b8509065b3619464567c06100041dd4d4d3cb72c47da724af4f3c0ec43bf",
+    "vendor/aiv/dispatch_meta_finalize.cpp": "e64a89d3f999cc85120e1ece8f2fc2637ae25147dad7cd92e67ab8bb4336688a",
+    "vendor/aiv/dispatch_meta_publish.cpp": "c9e301afd420f423623ab7fa28b5df92c9b33abdde0333d7dc7a29493c5959fb",
+    "vendor/aiv/dispatch_meta_wait.cpp": "769a9b52ad8a9b33f152e9f8218d17115110bbdce53d1e2884acfa4b54c49019",
+    "vendor/aiv/dispatch_push.cpp": "37b2c43cbbe97cab11b39636d2d6d412f28da38b3a64a360fc3d8a929c87885b",
+    "vendor/aiv/engram_gate.cpp": "fc1b6d98ee3a306caff1a6cdf24de4ae013bb07d5855a744c7154c5588bff452",
+    "vendor/aiv/engram_projection_aiv.cpp": "dcd956466317176ca3c4b7b3f3dd89f923f96cbd8b31bf1c38736e005c362be3",
+    "vendor/aiv/engram_quant.cpp": "cf0480bde3fe64a8bc5fb0eb9ea08a5152e802036f7ac15b956731c6ca3f3b39",
+    "vendor/aiv/engram_widen.cpp": "26265ef936794e0823104d950f026a7285ca346e8d4c46e2e6293092ba0e3d45",
+    "vendor/aiv/ffn_reduce_scatter.cpp": "bb7af8dd07f5b10bc79821e583a804aea760e02f7e75206f3ec7a281f2e913f0",
+    "vendor/aiv/final_rms_norm.cpp": "a6c03b36969e727412ebf1f44b5a687514604e46c2ff69ef2b89b6d9269ef126",
+    "vendor/aiv/lm_head_combine_gather.cpp": "1f94b87dd9397f993415d293718071ef5d61089b8c77a0d2e3d43eb4cb7e1bbd",
+    "vendor/aiv/lm_head_combine_push.cpp": "267670c562b3c4cb0fcc4cf3e22d4ca0c345d48d40b72cfa48abab6022ac32fc",
+    "vendor/aiv/lm_head_combine_wait.cpp": "65484e3ca08d3114c89b99fcdda0f486d00c70d050ac72086f14720c636201aa",
+    "vendor/aiv/lm_head_dispatch_gather.cpp": "0e26713b0dd64610b6e31a39edf29d73e91b92911d3c9710495f55bc8434af45",
+    "vendor/aiv/lm_head_dispatch_push.cpp": "c22c229c6c2abce73fce42b0105894357868ac2910339719062d5277a1f8172d",
+    "vendor/aiv/lm_head_greedy_sample.cpp": "e913dda282cd2d33d434991783c6b18e13b09dd7b5e55f62b9beb7ebdb35ee18",
+    "vendor/aiv/lm_head_signal_retire.cpp": "3e08cbc9aac0e98c91fbc640c3b809baad6dbc62716a87315ef154b62de49f26",
+    "vendor/aiv/moe_signal_clear.cpp": "d45b75a628f07287cc774c40ec7ebcd4326b5e0a9568f3e1043a71fda2342158",
+    "vendor/aiv/prepare_compressed_lens.cpp": "6bdede814ac9afb810766af46d659d7f2f83a6547ffe37264ace0d85f927f2eb",
+    "vendor/aiv/prepare_compressed_lens_0.cpp": "7ce5ea8801c22d01dd4e71f5b570844bcc0b845ad2bb02c53d9569fcd729f0a0",
+    "vendor/aiv/v41_rope_rows.cpp": "797c3c6742bbac4a419e6f219328df2399f2815371e7366654427a925c637393",
+    "vendor/aiv/v41_rope_rows_1.cpp": "ce64474f2b97ecd4bff387206a23dead96f015a0b9cd89cc6e18ac4dd6721461",
+    "vendor/external/008_collapse_norm_grid/device_source.hpp": "89f8c82586de0062c74c681e8ef80bb1ecc9a6d4cff5ea393475fdef111bed20",
+    "vendor/external/008_collapse_norm_grid/entry.cpp": "205b1944a7385515332e5a526ebaa61e6f7012b6f8abc1463ee249b2ffe9ed09",
+    "vendor/external/008_collapse_norm_grid/manifest.json": "c65023cdad95ebaefd8eb494fcab55df39a5b6e667c5e4203b6319d200eded04",
+    "vendor/external/009_zero_bf16_rows/device_source.hpp": "31d70dc1e44b04315be6e948897a6bc1c3cbd58d79a71c78ec354de8faef6e40",
+    "vendor/external/009_zero_bf16_rows/entry.cpp": "b844a94348a88de21144abc32d3f7f65326628949a8548126baecb1a72bcbc56",
+    "vendor/external/009_zero_bf16_rows/manifest.json": "fb8adbc429707b57354c7aa519bdb7da1513a952e19209984e1b606e7718c390",
+    "vendor/external/010_quantize_bf16_grid/device_source.hpp": "81d6cb71ffef212232015928e158b2e1401c62e8b584058b751cb9043555737e",
+    "vendor/external/010_quantize_bf16_grid/entry.cpp": "c09b04a8ee134e2aeb1ccbb68eba6ce103f53bb2922024b504ac58b2111a98ca",
+    "vendor/external/010_quantize_bf16_grid/manifest.json": "13d730f7095d20158bed24060a03031ea9386d28cf59f9a7837f9bd8438782f9",
+    "vendor/external/011_project_q_a/device_source.hpp": "9c38dc3a88634ed90f707570364d0995388f7829e23f4886c3f4a70dd4f900be",
+    "vendor/external/011_project_q_a/entry.cpp": "2684fe6a67fd646909f28399a9663492ccc27b5e4362083cb5b3e2de57ab4c28",
+    "vendor/external/011_project_q_a/manifest.json": "cba5d6ba81298f511f25bac214ea694c308f980db2a42e598d14735313cffc1a",
+    "vendor/external/012_normalize_quant_grid/device_source.hpp": "25c37adf5e2adae76f65352d3724792ad37d55a5924c415374b7b70817930d68",
+    "vendor/external/012_normalize_quant_grid/entry.cpp": "078069579c70188be79f22987dfb02785cc5a6b2db77854d8a8e85709e1ede84",
+    "vendor/external/012_normalize_quant_grid/manifest.json": "22aceb279ace2cfdb7bc58404bbe18a962165feed3b0899c9a2abe80fd7ce2ed",
+    "vendor/external/013_project_q_b/device_source.hpp": "9583132649843f9652eb31514e2e788efc4a981035a29ab2f854fffe6a210f3c",
+    "vendor/external/013_project_q_b/entry.cpp": "be628b1b72a32135b80a4a4538cc3850587e30f4f9475a122f56cb94d756b567",
+    "vendor/external/013_project_q_b/manifest.json": "4c0acb1edc9af054b41a98511d79e69144883ef05fc2af964d820958ebe811cc",
+    "vendor/external/014_query_rope_grid/device_source.hpp": "67ffdda00c9c4237d08d6c154701539a28e1045215a993e6c03408b2dd9bf1bb",
+    "vendor/external/014_query_rope_grid/entry.cpp": "c04ab2c20a279b93f42b8625f5884349fb3712b9f3f4bad79a054b2eea0366f4",
+    "vendor/external/014_query_rope_grid/manifest.json": "ffee4d6d32e06a847efdc2b21e533998e45f4702480f2a49eb3d4df53e0dc802",
+    "vendor/external/015_project_kv/device_source.hpp": "46801de96d928f10fd2ee4e427c5fe829c01bb8259b643ef0048f83c81c97a3c",
+    "vendor/external/015_project_kv/entry.cpp": "ef9f451e3ef85c8706840d7a55cc6903b83f42bbc441add597bc5a1bc49d4249",
+    "vendor/external/015_project_kv/manifest.json": "c0bba4875c69c00ca3744e50fbc9c53e07ddd8e1e1c418a9a4c2570c580fde2c",
+    "vendor/external/016_window_kv_grid/device_source.hpp": "9eaeeadf2193b1a5cdedf098505bc38a22a0a5369d3090ddcfc43c32bd284244",
+    "vendor/external/016_window_kv_grid/entry.cpp": "266d662469fbb82e177b4fc0eea3e64b0a3bae28a02aaccc3969b80dda7d71c1",
+    "vendor/external/016_window_kv_grid/manifest.json": "f2110ec959f3204ea64bdfbabafc6ff6959985d7d15e819ba9925c7d7e58382b",
+    "vendor/external/017_swa_queries_aic/device_source.hpp": "bd0690451c6782bb5e44322a9325d2083a7fc045937c78d47fcdcdf088af1c01",
+    "vendor/external/017_swa_queries_aic/entry.cpp": "f0f8da8225e656bc78052f11aaaa39de76bcc3acb04709b11de85b2fc20dc1de",
+    "vendor/external/017_swa_queries_aic/manifest.json": "b87223f9df21537b1a967450b4e0881f91dfe2843b444936e9861eb66c1f3cca",
+    "vendor/external/019_inverse_rms_grid/device_source.hpp": "8db4bbe87e4ea856592ac5d1be8efd86c1e658875e2b9bd2823b9f70b602146a",
+    "vendor/external/019_inverse_rms_grid/entry.cpp": "26852690f1869a908da9754c3a9ff34134a380c667f226b47e660748a6e5cb92",
+    "vendor/external/019_inverse_rms_grid/manifest.json": "56ec2b2ccc62530dd75335cb4dc65e5cdd489da3cf58e44ebfb85aba6318c8a7",
+    "vendor/external/020_project_hf32_grid/device_source.hpp": "a2473a407cf1f8c477db3ebb611241c0d93dbad962015863e7adbf9e98f583fd",
+    "vendor/external/020_project_hf32_grid/entry.cpp": "75d9e4d84915d7c90f78f13913756c9c89b12c8d7d90329c1b52eb72bd99019e",
+    "vendor/external/020_project_hf32_grid/manifest.json": "788d8febf9e8e64ac36a758f2ec6cec91f0f795a00b67516960f954ba04e1fc4",
+    "vendor/external/021_coefficients_grid__2/device_source.hpp": "b014a55ed4d7570e9e884db1fb9df5d272ca3bd5de16ad87b1cbca9b27e53eb3",
+    "vendor/external/021_coefficients_grid__2/entry.cpp": "9dadcc15da9ebe6d1a7ffe863186963ba762473114b55016caff93c48c58749f",
+    "vendor/external/021_coefficients_grid__2/manifest.json": "132b8e78477beb17f90e36698b2a08738cce98135cabe4fb85d71cec5c0f2bcc",
+    "vendor/external/022_rope_quant_grid/device_source.hpp": "e39d64a11e85c63e27e736d4fa16e315ba18b4e66ed8742b3bbd71fd459974b4",
+    "vendor/external/022_rope_quant_grid/entry.cpp": "793639f7eccfa83979d091e42f47666042fb85204d54d5df970d3bfc3a827bdd",
+    "vendor/external/022_rope_quant_grid/manifest.json": "7e090e324764392f3c69a0ebcd21d83c4cd3db9649230adde76ec69e57a86835",
+    "vendor/external/023_project_o_a/device_source.hpp": "282a8fad2ba3b109aa5d94d328bd8546ea3619fc082281091f0212a2cfeb26dc",
+    "vendor/external/023_project_o_a/entry.cpp": "581211b3780e30fcabc2941a1902faa1b5034c9d8bc2000c12fc042e95be7c11",
+    "vendor/external/023_project_o_a/manifest.json": "87f7162cffa40d926390b8e1ea4079dfa7af67c0bf602616ae70b50a4217e84d",
+    "vendor/external/024_quantize_bf16_grid__2/device_source.hpp": "cd6064cb2f4ca00530f60d5f2dec3fc20945adc81a54760a26b3009533a1c90e",
+    "vendor/external/024_quantize_bf16_grid__2/entry.cpp": "b734799d91c37309e196e4de65aefd21171acbe6a9e1c359107b6a0c0a3e3617",
+    "vendor/external/024_quantize_bf16_grid__2/manifest.json": "1c69d91e8d647d35c9ca17eb30003a189d311974bd224c4ae6b227de654a199e",
+    "vendor/external/025_project_o_b/device_source.hpp": "4d33afc495b3938c956c150ef2ce6ae33e73cf1a587c5e5892c5861f45cc9f8a",
+    "vendor/external/025_project_o_b/entry.cpp": "79d176520ef0e61a7c2cadf52acac172941315e8711c4f4ecba67ad8192bd406",
+    "vendor/external/025_project_o_b/manifest.json": "0b9186f6233d49dc4f7d64c37db906ed4e9afa9dc70157cdddf8ee62908861ee",
+    "vendor/external/026_expand_grid__2/device_source.hpp": "8d2efa99a3224ea82091a80c8eb598e6d103d3d232bb616649ee96992316474a",
+    "vendor/external/026_expand_grid__2/entry.cpp": "f98c809dd5375c1e7b5c02e8427e7b57dd8cfa8414b2e07de10937e6e2c759c1",
+    "vendor/external/026_expand_grid__2/manifest.json": "fb3e4ea4418ba5738ef1ce174d5b14d9150a8308a900e2f88ab5cf2e8731a320",
+    "vendor/external/029_project_c2a_grid/device_source.hpp": "c5841f2dc606a6a7c352c2b2db717a44686766908d124c61e08de4d3165ac295",
+    "vendor/external/029_project_c2a_grid/entry.cpp": "3d2fe634cc24d99694b6505c38057685f5f90fe7ca3438294a943b403822a624",
+    "vendor/external/029_project_c2a_grid/manifest.json": "e733a682705799934dba562bbc822a75207775a66786f0c991bfdb6e74f34eac",
+    "vendor/external/030_clear_latent/device_source.hpp": "5dfc64084c8a699ac0836daad59156b54f0f350bcefcaaeddc5ad7cf0595d7ae",
+    "vendor/external/030_clear_latent/entry.cpp": "eb92a3cb59d69687da2714ffd054badf1dd74d6ae46b329b34997c13128d9cfa",
+    "vendor/external/030_clear_latent/manifest.json": "b8a8b2bbcd43ae06dd032d23b371d708d8add916f2c4d1a9415ccc9cb7122647",
+    "vendor/external/031_pool_state_grid/device_source.hpp": "3d1eabfca017565a2880a626ed758885ac5db6557e84140cfac159b7ff90c6f7",
+    "vendor/external/031_pool_state_grid/entry.cpp": "fc109d7252002eee77a1220a2a4be6c9de17f148e1b51bbc5a84085fd11a7a7b",
+    "vendor/external/031_pool_state_grid/manifest.json": "39e06974c8ec7397a7f001a71d8391f6e6641e22abd289231953c5030b2f1689",
+    "vendor/external/032_publish_compressed_grid/device_source.hpp": "5d44ae91705e84bb25b2caf3f825157856ea034b7bc283130d9a8e4de5125ce0",
+    "vendor/external/032_publish_compressed_grid/entry.cpp": "abbfa945c2600418d5de6dc6df736f9d6806fe9967b113501605c515229bbb97",
+    "vendor/external/032_publish_compressed_grid/manifest.json": "3dfa3be9f821def1f434f9eaa6db56b75630588f2f46a676d287faf7529d6b95",
+    "vendor/external/033_project_index_key_grid/device_source.hpp": "be4f0af1f7c863d95aacc83ff6403102e19f11684caa2edcee93753271616bec",
+    "vendor/external/033_project_index_key_grid/entry.cpp": "c5941b3ef6ac6bd94c6d7afe55ec0a5dd0112abc30f03d74608ae0dcb06d11ee",
+    "vendor/external/033_project_index_key_grid/manifest.json": "ee8aea1ad59cb28ccc37377ce7c81d02b46946c84dd37a09f9f2e081734a99b2",
+    "vendor/external/034_publish_index_grid/device_source.hpp": "f6a1b07be87cb1bc2df3078840a9849e1b53b6b51c0a60d5f91c27e92553afc8",
+    "vendor/external/034_publish_index_grid/entry.cpp": "5352de993545b3209e1c1d967869c38805a1828620f64a6828c72cf2e9fd6d14",
+    "vendor/external/034_publish_index_grid/manifest.json": "bcb418905a997e20af5e8348e10404deaa6e0339854d822f415a31a70a648a58",
+    "vendor/external/035_project_query_grid_aic/device_source.hpp": "d99d819cbdf5470f44e214df920f1a74ca5318e1376983c868f11a55e6bc48bf",
+    "vendor/external/035_project_query_grid_aic/entry.cpp": "615b9b7d42e9f3f85efd8d6e1b08e1d9084092d857b1205129b989bbdea9cf13",
+    "vendor/external/035_project_query_grid_aic/manifest.json": "0967083547d19d5d9fd041bc68ad801fe2c08a8fa9e0d3ca5cabd3b05dfc46ca",
+    "vendor/external/037_project_index_weight_grid/device_source.hpp": "ff776c9b5949e4b8c575b23259a6dc8ed065828c90a6f8cf36e54958415698a4",
+    "vendor/external/037_project_index_weight_grid/entry.cpp": "f54b2045af882b324eca9f33acf2769d97e80079cc3dd00e8fe54464cc66493d",
+    "vendor/external/037_project_index_weight_grid/manifest.json": "665a77aba4673dd9790730a3dbb3ed02dd668d86636b7ee8fdde181569f91e28",
+    "vendor/external/038_reduce_index_weight_grid/device_source.hpp": "5040e789cbbfe45bfba5414ea57c85b361ee1853e759c0996c4e3bfd1af32b32",
+    "vendor/external/038_reduce_index_weight_grid/entry.cpp": "0b060de8e7fdd4e16461c22b963c38c0693a2da36267eb244917bad93c3e2c0f",
+    "vendor/external/038_reduce_index_weight_grid/manifest.json": "0fb3850936bc9be5fa8221b28909fcf7441080087b6549062f8d4521d266d553",
+    "vendor/external/039_plan_runs/device_source.hpp": "4b4075ded536126e83c8e1e760d5c1a040e4ecc3e8dbf94b3a1ee89f2f1de024",
+    "vendor/external/039_plan_runs/entry.cpp": "768578c0282224c5bd2daa23ed79eaede7d9c88c2e1498abe497b6c8c9380b23",
+    "vendor/external/039_plan_runs/manifest.json": "0e1c59ae9e7621da5f5c4fa87768c24db52642f44b345c2fe1355190234e3eb6",
+    "vendor/external/040_score_topk_mix_aic/device_source.hpp": "52fae63f3997216eda2f6e73ecec89986d470c1cb091a7e006ed90ec6050b430",
+    "vendor/external/040_score_topk_mix_aic/entry.cpp": "b1be7f58e9e358b6365fb9bd24528af2cfce774f6156326724e1e51acb12848c",
+    "vendor/external/040_score_topk_mix_aic/manifest.json": "f56b07ddb4b57365b20ece8884478ee2b4eb7173e0a3bd40624f5399f0b98321",
+    "vendor/external/042_sparse_attention_mix_aic/device_source.hpp": "696b7389431877c0707f93b7666e41a7b7e32091172019ecd3b6d4a1c2a53c68",
+    "vendor/external/042_sparse_attention_mix_aic/entry.cpp": "c40179da5b5f557e40428a84d81ca5d2ba183474e9ea93204bc0c8451641b745",
+    "vendor/external/042_sparse_attention_mix_aic/manifest.json": "70c2a090a3abd04194cbefeb5fef7f5e527e1e64fab95f14bbb64ba77ef6adb5",
+    "vendor/external/049_collapse_grid/device_source.hpp": "6be9a761489accc18420fae35e03d704b6c19e42e6b6e53d8b9d302c88beacf1",
+    "vendor/external/049_collapse_grid/entry.cpp": "873873d488df726cc18e6a26e5c48620d5d0004ab63c7c67908cb63302169bba",
+    "vendor/external/049_collapse_grid/manifest.json": "0725d5cd0733eca556dae10be4fb9ca81a68fb484f9fb9ea2f186052c98fdb60",
+    "vendor/external/050_collapse_tail/device_source.hpp": "3be2a2481e160e5859fbfa8a3f80e1619064a689982f3af4e038ab7db7e0163b",
+    "vendor/external/050_collapse_tail/entry.cpp": "7fc6b183a4745a17ecc24865b26391fe003ec52cc8551233be0b4d769367df90",
+    "vendor/external/050_collapse_tail/manifest.json": "56e11fae6d3dd518e01e02e98ebde99ae0479e3e35ff52c67ac9bda275391e21",
+    "vendor/external/051_normalize_gate_grid/device_source.hpp": "2773d66bfe06eec81d202eeebe3ef74efb86f016d8d94dd6b451fef662315df4",
+    "vendor/external/051_normalize_gate_grid/entry.cpp": "0d0fb83acab55b6a21d5226dd2571ad430daf1c58a74163e66869f14c4f3a299",
+    "vendor/external/051_normalize_gate_grid/manifest.json": "bbaf282b622a36060f40988717822c1f2885803cdb3fd1e8ceedfaafc036929f",
+    "vendor/external/052_quantize_gate_grid/device_source.hpp": "8cb4bcf029d3211749e4dec1d637ce331e6b00a2bfad2976a96feeac6983017f",
+    "vendor/external/052_quantize_gate_grid/entry.cpp": "c3151cb3560625739f775260ac06640e3a0a4193c50eca3e4b43ae2b1b2ee300",
+    "vendor/external/052_quantize_gate_grid/manifest.json": "27159a3098adabc7b132875163176d131b461399f6ce6d8220131df14cb18d21",
+    "vendor/external/053_initialize_routes/device_source.hpp": "24c7131d7622e789f09cc4ec1062be0995e1b1b50a582d59c25225124afd4eea",
+    "vendor/external/053_initialize_routes/entry.cpp": "678a189a088c81f78e73b2a1d564aa4d2746b70f1dbb15275757c461550d4c5e",
+    "vendor/external/053_initialize_routes/manifest.json": "e8280f0fe94eadbb49aeb0dc8d69f92dd8660fae22818b5a180485ebd278e365",
+    "vendor/external/054_project_gate_grid_aic/device_source.hpp": "b8d9c9779b5f8ca013057acd93f349351737a119de4ed909249fe2ca5bd33606",
+    "vendor/external/054_project_gate_grid_aic/entry.cpp": "69c6778ddb1fa04942ec611b1f4b0237003cceb31e63ab8e512be213e9f0bc05",
+    "vendor/external/054_project_gate_grid_aic/manifest.json": "7cb47f6a6ca67556957646c895772d70579d3c7566051bf8775825ef75ac9fd7",
+    "vendor/external/056_route_gate_grid/device_source.hpp": "1e0986e7fe8423ed4d549513dbfc86e7005ac3e938ff51423fd10abf4dc60e59",
+    "vendor/external/056_route_gate_grid/entry.cpp": "6eae097746af262f609deb0a4ef002006b3a73f6b103c79494a4a528d676633d",
+    "vendor/external/056_route_gate_grid/manifest.json": "a7e2a60db0d49f35a89cf3046671bbd45cdad8654b8dd020a98bcd4cedb6842c",
+    "vendor/external/057_project_shared_grid/device_source.hpp": "1890ff6da254c4c9918b8853fd554cdbf794a839b823b43af0cedc79844a1260",
+    "vendor/external/057_project_shared_grid/entry.cpp": "f4382ffc246500c672aa6e65551ee6cc26f2532f8a96e7fbff9fed0bdef63a42",
+    "vendor/external/057_project_shared_grid/manifest.json": "7f77b6a7206479c2c454ea60ef9e83ec99a6fe62e51b42d5635b182d03c1fd14",
+    "vendor/external/058_shared_swiglu_quant_grid/device_source.hpp": "6d5fc06b7cdf73ade1795784a13523035d63f5e50280da95c75b398dc692aacd",
+    "vendor/external/058_shared_swiglu_quant_grid/entry.cpp": "0a9a99f39f78789ee0aeed71011399b2e1264ace8b8929898b6ba5fc15bfd8f2",
+    "vendor/external/058_shared_swiglu_quant_grid/manifest.json": "37490f5cafe0f162498d0b4c69670ec6d1bf6a74e8897c92c743b46fe01d0833",
+    "vendor/external/059_project_shared_grid__2/device_source.hpp": "4affbede4e67233b79a611c4155774d631cc669d873e30e5f5a32ac63ffb7242",
+    "vendor/external/059_project_shared_grid__2/entry.cpp": "f4382ffc246500c672aa6e65551ee6cc26f2532f8a96e7fbff9fed0bdef63a42",
+    "vendor/external/059_project_shared_grid__2/manifest.json": "5bcdd896450d59292ce4eb7be2584443ebcee83b8b6f0ead9dd76db68dd20321",
+    "vendor/external/060_stage_grid/device_source.hpp": "70c964def683943ef28f47d1b388d7f573532b1dccee27f3861905b19591b009",
+    "vendor/external/060_stage_grid/entry.cpp": "bfa3287a66d90de228c3c8dea7ec688fdc72ac18d9efaca71f0ddcd45c8a6129",
+    "vendor/external/060_stage_grid/manifest.json": "8aa21f29c50b366f34bc999e1d11d7dcca613486694a5400604523c497643c87",
+    "vendor/external/067_gather_grid/device_source.hpp": "a16180ee7c7c721bb57eb3c48a5fb2131cb434c40f8a4b4e29f7feeca30567f0",
+    "vendor/external/067_gather_grid/entry.cpp": "cd5be316adc5f34b7843e3d3b93c5dded069790c4985afbe38b922fd62760e39",
+    "vendor/external/067_gather_grid/manifest.json": "78cb4ac0bab038d4fc378553ffa4cb88841033c35c329b591c3180dd64b33143",
+    "vendor/external/068_project_up_worker_aic/device_source.hpp": "ee7be49a5b206da793f2fc1a7b9f3b9483094455f1dd9b3331590e36e668866c",
+    "vendor/external/068_project_up_worker_aic/entry.cpp": "803f010ce0c49daecfbbde10470a8e8e77a47f10109f945f50df6d03c03f1492",
+    "vendor/external/068_project_up_worker_aic/manifest.json": "d7b1780cf80566e916a447b88160fe645dec7f05181a009f078a2c82dd7850f5",
+    "vendor/external/070_activate_worker/device_source.hpp": "0b0f059f9d2a8c0db6e6a1e23cb7ee209e52b08a3e45387bf0312220607236b9",
+    "vendor/external/070_activate_worker/entry.cpp": "5cc8c133b84c091af669a3861b649ba44ddc768179e223d7ea768a2574c1715e",
+    "vendor/external/070_activate_worker/manifest.json": "d17396e384364f8269f9e090f705120afa4cb1a32a293ab56672e9ad78ea8cfb",
+    "vendor/external/071_project_down_worker_aic/device_source.hpp": "76dab01e25e103861691e5b41ff15376410cbd1398a19d8b1278863989a82c7d",
+    "vendor/external/071_project_down_worker_aic/entry.cpp": "bfc031ccce3270f65758fb3d5ba917d136efc562d5c06a8a02176e0bb9b2b4ed",
+    "vendor/external/071_project_down_worker_aic/manifest.json": "9016a90a3233536082a713c12e710c99909462bed105984ff9d2271f166955b8",
+    "vendor/external/074_combine_grid/device_source.hpp": "0b4c26ced1101f07fc9cee2937b490f4e36ded881a07c2056ff2b6ddf31e3b35",
+    "vendor/external/074_combine_grid/entry.cpp": "e321ffba7293e6019099ee696acfcdbee56258d568269c97217fd0e7887ba78a",
+    "vendor/external/074_combine_grid/manifest.json": "9b8cc9f11b81cfc35705643e6b82cd2ad5850502fb8b2f4a037c856c5e080965",
+    "vendor/external/079_project_c1a_compressor/device_source.hpp": "ef1c9ed270780473b42254d4372131a02bdd678ecc73f2da85df6977051964d6",
+    "vendor/external/079_project_c1a_compressor/entry.cpp": "be8e08f75aa5aa2605171810345176ac27c821837835729b7436573fc6b2b05b",
+    "vendor/external/079_project_c1a_compressor/manifest.json": "9aa40d9549af05ff953ef9525e09ca81675e6f74faa2975cfad58a6c105139b1",
+    "vendor/external/080_publish_c1a/device_source.hpp": "c23a89b80a27f2a9ba21f1083ece3ca9045a8aebc4eea7354fcb229119d9f22c",
+    "vendor/external/080_publish_c1a/entry.cpp": "d9bc48f93e4bf61b6cb76df50a2ec3c1e0099a436c637b703cced253a6b9df55",
+    "vendor/external/080_publish_c1a/manifest.json": "dc7fa8ce9d3ccd1255196ec05b42cdb1bffff59fc13360389070538c416b820e",
+    "vendor/external/086_generate_pool/device_source.hpp": "494566acc3415a24f525dafe78135be80d1c80589f679405a5bff444677ae718",
+    "vendor/external/086_generate_pool/entry.cpp": "35e843dd55ec842be8f7d784fb977533cac237ac9455b9000f5c0de4f8682663",
+    "vendor/external/086_generate_pool/manifest.json": "bff5f56829af2d26180094de7f6312e1fcedba65e725231aec3d1a328dd28f7e",
+    "vendor/external/090_gather_pool/device_source.hpp": "3c27886dfd50b82a545eb1d08ca9326d928d680fa1568c9d23a84cfd3b408818",
+    "vendor/external/090_gather_pool/entry.cpp": "bea2e9bc4669c2a83af9ca9ac8ca297ac392ca402e8ad00c8ef389a2a671b239",
+    "vendor/external/090_gather_pool/manifest.json": "707c1ab9b9033649eedcbe0fa2020fbda54cc1d5cf9474fc5f9db4a759f2c315",
+    "vendor/external/091_plan_pool_rows/device_source.hpp": "8a6c7fe3afbee416ff87f6ec607a57825bac3136b368a468af70435613c466af",
+    "vendor/external/091_plan_pool_rows/entry.cpp": "d5b4035eca82922e37cc4ef1737c4c4e1cabf2ab77fbab9f53334dd4dd29e2b0",
+    "vendor/external/091_plan_pool_rows/manifest.json": "2ea9d8dfd3b48829624992d13ec1df21caa54c4f9c8c5014d6d4a440d7491a8e",
+    "vendor/external/092_score_topk_mix__3_aic/device_source.hpp": "d407d67a86a79113facd40a3d8d04b85a86eb941355dce878055447da860ddb3",
+    "vendor/external/092_score_topk_mix__3_aic/entry.cpp": "734d0294d3fd60b597e2030cc229cc5bdef26c12a642f15e039068451561073a",
+    "vendor/external/092_score_topk_mix__3_aic/manifest.json": "c510281c493238ad66a93ddfbbdf28d446bdfcacbc5950041bc7580148899ace"
+  }
+}
