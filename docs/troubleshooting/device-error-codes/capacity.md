@@ -69,7 +69,8 @@ capacities ran out:
 - **The owned heap request.** The bytes one Definition owns exceed `INT32_MAX`. Split
   the body.
 - **The Definition cache.** The per-worker `GRAPH_MAX_DEFINITIONS` limit was reached.
-  Submit fewer distinct Definitions, or raise the constant.
+  Published and unpublished recordings reserve distinct keys; a key present in both
+  tables reserves one entry. Submit fewer distinct Definitions, or raise the constant.
 
 The runtime's own `error hint:` line already names the knob for the code it
 latched; this table is for when you have `scope_stats` output and want to read the
