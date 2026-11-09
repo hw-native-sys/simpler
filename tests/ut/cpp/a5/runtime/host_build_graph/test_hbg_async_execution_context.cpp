@@ -32,7 +32,7 @@ struct ContextData {
             ctx.completion_count = &writer.count;
             ctx.completion_entries = entries;
             ctx.completion_capacity = 4;
-            payload.async_context.writer_state = reinterpret_cast<uint64_t>(&writer.reservation);
+            payload.async_context.writer_state = reinterpret_cast<uint64_t>(&writer.sealed);
         }
     }
 };
@@ -49,22 +49,18 @@ TEST(HbgAsyncExecutionContext, EmbeddedContextPreservesThePublicWireLayout) {
     EXPECT_EQ(sizeof(AsyncExecutionContext), 32u);
 }
 
-TEST(HbgAsyncExecutionContext, CopiesAndRepeatedGettersShareReservationAndPreserveDirtyRegistration) {
+TEST(HbgAsyncExecutionContext, CopiesAndRepeatedGettersShareCountAndPreserveDirtyRegistration) {
     ContextData data;
     AsyncCtx first{}, second{};
     ASSERT_TRUE(async_execution_context_load(data.payload, &first));
-    AsyncCompletionReservation reservation;
-    ASSERT_TRUE(async_completion_reserve(first, 2, &reservation));
     const CompletionToken token{0x8000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
-    ASSERT_TRUE(async_completion_commit(first, reservation, token));
+    ASSERT_TRUE(async_completion_append(first, token));
     ASSERT_TRUE(async_execution_context_load(data.payload, &second));
-    EXPECT_EQ(second.completion_reservation, first.completion_reservation);
+    EXPECT_EQ(second.completion_sealed, first.completion_sealed);
     EXPECT_EQ(*second.completion_count, 1u);
     EXPECT_EQ(TaskId::to_uint64(second.task_token), TaskId::to_uint64(TaskId::make_sub_task(2, 3)));
-    ASSERT_TRUE(async_completion_commit(second, reservation, token));
-    ASSERT_TRUE(async_completion_finish(second, reservation, 2));
+    ASSERT_TRUE(async_completion_append(second, token));
     EXPECT_EQ(data.writer.count, 2u);
-    EXPECT_EQ(data.writer.reservation.limit, 0u);
     ASSERT_TRUE(async_completion_seal(second));
     EXPECT_FALSE(async_completion_append(first, token));
     EXPECT_EQ(data.writer.count, 2u);
@@ -76,7 +72,7 @@ TEST(HbgAsyncExecutionContext, SynchronousExecutionsRetainIgnoredSubmissionError
     ASSERT_TRUE(async_execution_context_load(data.payload, &ctx));
     EXPECT_FALSE(ctx.task_token.is_valid());
     EXPECT_EQ(ctx.completion_count, nullptr);
-    EXPECT_EQ(ctx.completion_reservation, nullptr);
+    EXPECT_EQ(ctx.completion_sealed, nullptr);
     async_completion_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     async_completion_error(ctx, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
     EXPECT_EQ(data.payload.async_context.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);

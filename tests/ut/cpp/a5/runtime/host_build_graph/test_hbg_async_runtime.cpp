@@ -447,6 +447,7 @@ TEST(HbgAsyncRuntime, FinishRetryDoesNotReportProgressButTraversalAndPublication
 
 TEST(HbgAsyncRuntime, ZeroConditionGroupLeavesCheckAndFinishDormant) {
     RuntimeFixture fixture;
+    std::memset(fixture.at<DeferredCompletionEntry>(fixture.async.entries_offset), 0xa5, fixture.async.entries_bytes);
     fixture.bind(0);
     bool registered = true;
     ASSERT_TRUE(fixture.seal(0, 0, 0, &registered));
@@ -543,8 +544,7 @@ TEST(HbgAsyncRuntime, SixtyFifthWriterAppendPublishesOverflowAsTheFirstScheduler
     RuntimeFixture fixture(1, 1);
     fixture.bind(0);
     auto ctx = AsyncCtx::from_storage(fixture.payload(0, 0).local_context.async_ctx);
-    ctx.completion_reservation =
-        reinterpret_cast<AsyncCompletionReservationState *>(fixture.payload(0, 0).async_context.writer_state);
+    ctx.completion_sealed = reinterpret_cast<uint32_t *>(fixture.payload(0, 0).async_context.writer_state);
     const CompletionToken token{kRecords, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
     for (uint32_t condition = 0; condition < 64; ++condition)
         ASSERT_TRUE(async_completion_append(ctx, token));
@@ -565,8 +565,7 @@ TEST(HbgAsyncRuntime, SealPreservesRecognizedWriterReasonsAndAnEarlierSchedulerF
         RuntimeFixture fixture;
         fixture.bind(0);
         auto ctx = AsyncCtx::from_storage(fixture.payload(0, 0).local_context.async_ctx);
-        ctx.completion_reservation =
-            reinterpret_cast<AsyncCompletionReservationState *>(fixture.payload(0, 0).async_context.writer_state);
+        ctx.completion_sealed = reinterpret_cast<uint32_t *>(fixture.payload(0, 0).async_context.writer_state);
         async_completion_error(ctx, reason);
         EXPECT_FALSE(fixture.seal(0));
         const auto expected = reason == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ?
@@ -579,8 +578,7 @@ TEST(HbgAsyncRuntime, SealPreservesRecognizedWriterReasonsAndAnEarlierSchedulerF
     RuntimeFixture fixture;
     fixture.bind(0);
     auto ctx = AsyncCtx::from_storage(fixture.payload(0, 0).local_context.async_ctx);
-    ctx.completion_reservation =
-        reinterpret_cast<AsyncCompletionReservationState *>(fixture.payload(0, 0).async_context.writer_state);
+    ctx.completion_sealed = reinterpret_cast<uint32_t *>(fixture.payload(0, 0).async_context.writer_state);
     async_completion_error(ctx, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
     scheduler_record_error(fixture.run, 1, SchedulerGraphResult::TIMEOUT);
     EXPECT_FALSE(fixture.seal(0));
@@ -629,7 +627,7 @@ TEST(HbgAsyncRuntime, EarliestCheckClaimObservesSealedWriterAndConditions) {
         claimed = claim.result == SchedulerAsyncLeaseResult::SUCCESS;
         if (!claimed) return;
         const auto *writer = f.at<SchedulerAsyncGroupWriter>(f.async.group_writer_offset);
-        sealed = writer->reservation.sealed;
+        sealed = writer->sealed;
         count = writer->count;
         address = f.at<DeferredCompletionEntry>(f.async.entries_offset)->addr;
         EXPECT_EQ(

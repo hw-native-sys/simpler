@@ -44,7 +44,7 @@ struct SubmissionData {
         region.header.guard_count = ASYNC_SDMA_CHANNELS;
         region.header.bytes = (ASYNC_SDMA_CHANNELS + 1) * 128;
         execution.region_address = reinterpret_cast<uint64_t>(&region);
-        execution.writer_state = reinterpret_cast<uint64_t>(&writer.reservation);
+        execution.writer_state = reinterpret_cast<uint64_t>(&writer.sealed);
         execution.subtask_slot = 1;
     }
     uint64_t workspace_address() { return reinterpret_cast<uint64_t>(workspace); }
@@ -57,7 +57,7 @@ struct SubmissionData {
             value.completion_count = &writer.count;
             value.completion_capacity = 64;
             value.completion_entries = entries;
-            value.completion_reservation = &writer.reservation;
+            value.completion_sealed = &writer.sealed;
         }
         return value;
     }
@@ -139,7 +139,6 @@ TEST(HbgSdmaSubmission, SingleAndMultipleQueuesUseOneRegistrationAndPublicationP
         EXPECT_EQ(data.writer.count, data.actual_count + 1);
         EXPECT_EQ(data.entries[0].addr, 0x8000u);
         EXPECT_EQ(data.entries[1].backend_cookie, UINT64_C(0x100000001));
-        EXPECT_EQ(data.writer.reservation.limit, 0u);
         EXPECT_EQ(data.waits, 0u);
         ASSERT_EQ(sink.values.size(), data.actual_count);
         EXPECT_EQ(data.order.front(), 1u);
@@ -174,7 +173,7 @@ TEST(HbgSdmaSubmission, InvalidWriterCannotReachSdkForEmptyOrNonemptyTransfers) 
             auto ctx = data.ctx();
             if (fault == 0) ctx.completion_count = nullptr;
             if (fault == 1) ctx.completion_capacity = 0;
-            if (fault == 2) data.writer.reservation.sealed = 1;
+            if (fault == 2) data.writer.sealed = 1;
             if (fault == 3) data.writer.error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
             Sink sink{&data, {}};
             EXPECT_FALSE(submit(data, ctx, sink, bytes));
@@ -207,7 +206,7 @@ TEST(HbgSdmaSubmission, SdkOrRecordFailuresPoisonHeldQueuesAndKeepTheFirstError)
     }
 }
 
-TEST(HbgSdmaSubmission, InvalidRecordCountsNeverCompleteTheReservation) {
+TEST(HbgSdmaSubmission, InvalidRecordCountsNeverPublishConditions) {
     for (uint32_t count : {0u, 3u, UINT32_MAX}) {
         SubmissionData data;
         data.queue_count = 2;
@@ -216,7 +215,7 @@ TEST(HbgSdmaSubmission, InvalidRecordCountsNeverCompleteTheReservation) {
         Sink sink{&data, {}};
         EXPECT_FALSE(submit(data, ctx, sink));
         EXPECT_EQ(data.writer.count, 0u);
-        EXPECT_NE(data.writer.reservation.limit, 0u);
+        EXPECT_NE(data.writer.error_code, 0);
     }
 }
 
@@ -226,12 +225,10 @@ TEST(HbgSdmaSubmission, EmptyTransferHasNoAttemptAndSynchronousFallbackHasNoCond
     Sink sink{&data, {}};
     ASSERT_TRUE(submit(data, ctx, sink, 0));
     EXPECT_EQ(data.builds, 0u);
-    EXPECT_EQ(data.writer.reservation.serial, 0u);
     EXPECT_TRUE(sink.values.empty());
     data.records = false;
     ASSERT_TRUE(submit(data, ctx, sink, 64, SdmaOp::TPUT));
     EXPECT_EQ(data.writer.count, 0u);
-    EXPECT_EQ(data.writer.reservation.limit, 0u);
     EXPECT_TRUE(sink.values.empty());
 }
 

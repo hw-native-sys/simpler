@@ -1,5 +1,20 @@
 # Public SDMA post-id and retained workspace qualification
 
+`test_shared_queue_reuse.py` additionally covers the default queue partition with
+all AIV lanes entering through sync-start. Each lane posts 33 transfers, giving
+66 posts per shared physical queue; a retained second run adds one post per lane.
+The two- and four-rank cases run at diagnostic levels 0 and 4, checking physical
+queue ownership, contiguous post IDs, complete payloads, guards and retained
+context identity. The case is adapted from poursoul's `sdma_queue_reuse` at the
+comparison version recorded in the local refactor reference. It does not infer
+simultaneous outstanding work or SDK backpressure from the number of posts.
+The serial 48-queue case below remains separate coverage. The manual
+`test_registration_failure_after_real_sdma_retains_domain` case reuses this
+runner: after a successful round it accepts real SDMA work, then overflows the
+public COUNTER registration capacity. It checks the original overflow error and
+unconfirmed domain reclamation; it does not infer that DMA was still pending
+at the instant of failure.
+
 This A5-only supplement leaves the original three async_completion SDMA cases unchanged. Run66 independent ordinary AIV transfer tasks per rank, each with its own dependent +7 consumer, then2 tasks in a later fully retired run using the exact same retained SDMA-only domain and fixed public queue count48. Every transfer has a distinct aligned data slice and full guards. One transfer per run is4MiB; the rest are32B.
 
 Each task has capacity64 but issues only one SDK request. The public owner partition48 yields one submission group, so receipt addresses and complete uint64 post-id continuity can demonstrate session/flag-slot reuse past the pinned64-slot depth. The test checks every result, source, destination, guard, receipt and full native capture. It does not read or mutate private queue/flag addresses.

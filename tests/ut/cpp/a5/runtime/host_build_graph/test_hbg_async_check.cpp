@@ -58,7 +58,7 @@ struct CheckFixture {
         identity.finish_index = 0;
         identity.capacity = 64;
         writer.count = count;
-        writer.reservation.sealed = 1;
+        writer.sealed = 1;
         for (uint32_t index = 0; index < 64; ++index) {
             const bool counter = index % 2 == 0;
             entries[index] = {
@@ -136,10 +136,10 @@ TEST(HbgAsyncCheck, SealedWriterAndCapacityAreValidatedBeforeInitialization) {
             fixture.writer.count = 65;
             break;
         case 3:
-            fixture.writer.reservation.sealed = 0;
+            fixture.writer.sealed = 0;
             break;
         case 4:
-            fixture.writer.reservation.limit = 1;
+            fixture.writer.sealed = 2;
             break;
         case 5:
             fixture.writer.error_code = -900;

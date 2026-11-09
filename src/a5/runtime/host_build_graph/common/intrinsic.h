@@ -118,18 +118,6 @@ struct GlobalContext {
     int32_t sub_block_id;
 };
 
-// Shared dispatch prefix. Kernel-local submission metadata is not part of the wire layout.
-// One resident execution owns this state. Copies of its kernel view share it.
-struct AsyncCompletionReservationState {
-    uint32_t serial{0};
-    uint32_t begin{0};
-    uint32_t limit{0};
-    uint32_t written{0};
-    uint32_t sealed{0};
-    uint32_t reserved{0};
-};
-static_assert(sizeof(AsyncCompletionReservationState) == 24);
-
 inline constexpr uint32_t ASYNC_EXECUTION_CONTEXT_MAGIC = 0x41535935;
 
 struct AsyncExecutionContext {
@@ -160,7 +148,7 @@ struct AsyncCtx {
     TaskId task_token;
 
     __gm__ AsyncExecutionContext *execution_context{nullptr};
-    volatile __gm__ AsyncCompletionReservationState *completion_reservation{nullptr};
+    volatile __gm__ uint32_t *completion_sealed{nullptr};
 
     static inline __aicore__ AsyncCtx from_storage(__gm__ const AsyncCtxStorage &storage) {
         AsyncCtx ctx{};

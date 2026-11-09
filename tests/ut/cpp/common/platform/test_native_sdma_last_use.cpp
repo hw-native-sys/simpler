@@ -176,7 +176,6 @@ public:
     SdmaAllocationFacts facts;
     void *native_storage{nullptr};
     int32_t first_sdk_error{0}, terminal_rc{0};
-    uint32_t outstanding_reservation{0};
     uint32_t receipt_count{0}, posted{0}, built{0}, exported{0}, preflights{0};
     AsyncExecutionContext *canonical{nullptr};
     SchedulerAsyncGroupWriter *writer{nullptr};
@@ -287,7 +286,6 @@ private:
                 canonical->region_address == reinterpret_cast<uint64_t>(async_.base),
             "canonical execution identity"
         );
-        outstanding_reservation = writer->reservation.limit;
         posted = io.posted;
         built = io.built;
         exported = io.exported;
@@ -356,8 +354,7 @@ private:
             "semantic error bridge"
         );
         require(
-            runner.outstanding_reservation == (fault == SdmaFault::PREFLIGHT ? 0u : 1u) &&
-                runner.posted == (fault == SdmaFault::PREFLIGHT ? 0u : 1u) && runner.built == runner.posted &&
+            runner.posted == (fault == SdmaFault::PREFLIGHT ? 0u : 1u) && runner.built == runner.posted &&
                 runner.exported == runner.posted && runner.preflights == 1 && runner.receipt_count == 0,
             "fault stage evidence"
         );
@@ -393,8 +390,8 @@ private:
         require(next.prepare() != 0, "next admission must refuse");
         require(finalize_device(&runner) != 0 && !control().retired, "raw reset must refuse");
         require(
-            runner.writer->error_code == runner.first_sdk_error &&
-                runner.writer->reservation.limit == runner.outstanding_reservation && runner.writer->count == 0,
+            runner.writer->error_code == runner.first_sdk_error && runner.writer->sealed == 1 &&
+                runner.writer->count == 0,
             "fault evidence survives Host refusal"
         );
         // Deliberately retained failing carriers cannot be destructed as healthy

@@ -268,13 +268,13 @@ inline __aicore__ bool scheduler_async_runtime_mount(
         SCHEDULER_ASYNC_CHECK_REGION(finish_join_offset, l.finish_count, SchedulerAsyncTaskJoin) &&
         SCHEDULER_ASYNC_CHECK_REGION(finish_progress_offset, l.finish_count, SchedulerAsyncFinishProgress) &&
         SCHEDULER_ASYNC_CHECK_REGION(check_directory_offset, l.check_directory_words, SchedulerAsyncDirectoryWord) &&
-        SCHEDULER_ASYNC_CHECK_REGION(finish_directory_offset, l.finish_directory_words, SchedulerAsyncDirectoryWord) &&
-        SCHEDULER_ASYNC_CHECK_REGION(entries_offset, l.entries_bytes, uint8_t);
+        SCHEDULER_ASYNC_CHECK_REGION(finish_directory_offset, l.finish_directory_words, SchedulerAsyncDirectoryWord);
 #undef SCHEDULER_ASYNC_CHECK_REGION
     if (!valid || l.sdma_guard_count > ASYNC_SDMA_CHANNELS ||
         (l.sdma_guard_count == 0 ?
              l.sdma_guard_context_offset != 0 :
-             !region(l.total_bytes, l.sdma_guard_context_offset, l.sdma_guard_count + 1, 128, 128, &end)))
+             !region(l.total_bytes, l.sdma_guard_context_offset, l.sdma_guard_count + 1, 128, 128, &end)) ||
+        !region(l.total_bytes, l.entries_offset, l.entries_bytes, 1, 128, &end))
         return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     if (l.sdma_guard_count != 0) {
         const auto *context = at<AsyncSdmaGuardContext>(next, l.sdma_guard_context_offset);
@@ -333,7 +333,7 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
     // Host initializes one writer per physical execution. The admitted slot
     // generation binds it once; no CHECK can own it before this execution seals.
     auto *destination = at<SchedulerAsyncGroupWriter>(view, view.layout().group_writer_offset, index);
-    execution.writer_state = reinterpret_cast<uint64_t>(&destination->reservation);
+    execution.writer_state = reinterpret_cast<uint64_t>(&destination->sealed);
     ctx.completion_count = &destination->count;
     ctx.completion_error_code = &destination->error_code;
     ctx.completion_entries = at<DeferredCompletionEntry>(view, identity.entries_offset);
@@ -370,28 +370,18 @@ inline __aicore__ bool scheduler_async_runtime_seal(
     if (index >= view.layout().group_count) return fail(graph, local, run, task);
     auto *writer = at<SchedulerAsyncGroupWriter>(view, view.layout().group_writer_offset, index);
     const auto &ctx = payload->local_context.async_ctx;
-    if (writer->count == 0 && execution.writer_state == reinterpret_cast<uint64_t>(&writer->reservation) &&
-        ctx.completion_count == &writer->count && ctx.completion_error_code == &writer->error_code) {
-        // Binding already validates immutable identity and token storage. An
-        // empty return needs only the shared writer's seal/error/reservation
-        // decision; it never reads tokens or publishes a CHECK lease.
-        auto registration = AsyncCtx::from_storage(ctx);
-        registration.completion_reservation = &writer->reservation;
-        const bool valid = async_completion_seal(registration) && scheduler_read_error(run) == 0;
-        // No CHECK can read an empty writer. Native retirement/exit barriers
-        // drain this writeback before the run storage can be reused.
-        if (valid) {
-            scheduler_writeback_cache_line(writer);
-            return true;
-        }
-        scheduler_publish_cache_line(writer);
-        SchedulerAsyncTaskMap map{};
-        if (!task_map(view, task, &map)) return fail(graph, local, run, task);
-        auto &lease = *at<SchedulerAsyncLease>(view, view.layout().group_lease_offset, index);
-        (void)scheduler_async_lease_try_transition(
-            lease, scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT), SchedulerAsyncPhase::FAILED
-        );
-        return fail(graph, local, run, task, &view, map.finish_index, writer_error_result(writer->error_code));
+    if (execution.writer_state != reinterpret_cast<uint64_t>(&writer->sealed) ||
+        ctx.completion_count != &writer->count || ctx.completion_error_code != &writer->error_code)
+        return fail(graph, local, run, task);
+    const uint32_t count = writer->count;
+    auto registration = AsyncCtx::from_storage(ctx);
+    registration.completion_sealed = &writer->sealed;
+    bool valid = async_completion_seal(registration) && scheduler_read_error(run) == 0;
+    if (count == 0 && valid) {
+        // Binding validates identity and storage. Empty writers need no CHECK;
+        // native retirement drains this writeback before storage reuse.
+        scheduler_writeback_cache_line(writer);
+        return true;
     }
     SchedulerAsyncTaskMap map{};
     if (!task_map(view, task, &map) || scheduler_async_group_index(map, block, subtask) != index)
@@ -402,18 +392,11 @@ inline __aicore__ bool scheduler_async_runtime_seal(
     if (!group_identity_valid(view, index, task, map, identity) || !task_token(graph, task, &token))
         return fail(graph, local, run, task, &view, map.finish_index);
     auto &lease = *at<SchedulerAsyncLease>(view, view.layout().group_lease_offset, index);
-    if (scheduler_async_lease_load(lease) != scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT) ||
-        writer->reservation.sealed != 0)
+    if (scheduler_async_lease_load(lease) != scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT))
         return fail(graph, local, run, task, &view, map.finish_index);
-    if (execution.writer_state != reinterpret_cast<uint64_t>(&writer->reservation) ||
-        ctx.completion_count != &writer->count || ctx.completion_error_code != &writer->error_code ||
-        ctx.completion_entries != at<DeferredCompletionEntry>(view, identity.entries_offset) ||
+    if (ctx.completion_entries != at<DeferredCompletionEntry>(view, identity.entries_offset) ||
         ctx.completion_capacity != identity.capacity || TaskId::to_uint64(ctx.task_token) != TaskId::to_uint64(token))
         return fail(graph, local, run, task, &view, map.finish_index);
-    const uint32_t count = writer->count;
-    auto registration = AsyncCtx::from_storage(ctx);
-    registration.completion_reservation = &writer->reservation;
-    bool valid = async_completion_seal(registration) && scheduler_read_error(run) == 0;
     // Failed registrations also retain their actual prefix for diagnostics.
     // Clamp corrupt counts to this execution's independent token allocation.
     const uint32_t published_count = count < identity.capacity ? count : identity.capacity;

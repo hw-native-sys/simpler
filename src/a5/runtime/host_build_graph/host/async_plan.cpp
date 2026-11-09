@@ -108,9 +108,9 @@ bool plan_async_layout(
         !reserve(
             layout.finish_directory_words, sizeof(SchedulerAsyncDirectoryWord), cursor, layout.finish_directory_offset
         ) ||
-        !reserve(token_bytes, 1, cursor, layout.entries_offset) ||
         (layout.sdma_guard_count != 0 &&
          !reserve(layout.sdma_guard_count + 1, 128, cursor, layout.sdma_guard_context_offset)) ||
+        !reserve(token_bytes, 1, cursor, layout.entries_offset) ||
         !scheduler_layout_checked_align(cursor, 128, &layout.total_bytes) || layout.total_bytes > byte_budget ||
         layout.total_bytes > std::numeric_limits<size_t>::max())
         return fail(error, "async state exceeds the byte budget or addressable storage");
@@ -122,7 +122,9 @@ bool materialize_async_state(
     const std::vector<SchedulerTaskMetadata> &metadata, const SchedulerAsyncLayout &layout, std::byte *image,
     std::string *error
 ) {
-    std::memset(image, 0, static_cast<size_t>(layout.total_bytes));
+    // Conditions are written by the kernel before seal publishes their count.
+    // Only the control prefix must be initialized and uploaded for a new run.
+    std::memset(image, 0, static_cast<size_t>(layout.entries_offset));
     write(image, 0, layout);
     if (layout.sdma_guard_count != 0) {
         AsyncSdmaGuardContext context{};

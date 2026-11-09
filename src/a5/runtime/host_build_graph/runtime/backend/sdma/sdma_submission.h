@@ -47,8 +47,7 @@ inline __aicore__ bool sdma_submit(
     uint32_t queues = 1
 ) {
     const bool deferred = writer.task_token.is_valid();
-    // Nonempty deferred submissions validate writer state when reserving capacity.
-    // Zero-work calls have no reservation, but must still reject an invalid writer.
+    // Empty submissions still validate the writer, even though no record is appended.
     if ((deferred && bytes == 0 && !async_completion_open(writer)) ||
         (writer.completion_error_code != nullptr && *writer.completion_error_code != 0))
         return sdma_submit_error(writer, cache);
@@ -61,8 +60,8 @@ inline __aicore__ bool sdma_submit(
     if (queues == 0 || queues > ASYNC_SDMA_CHANNELS || !backend.preflight()) return sdma_submit_error(writer, cache);
     if (bytes == 0) return true;
     const uint32_t group = physical_cluster % (ASYNC_SDMA_CHANNELS / queues);
-    AsyncCompletionReservation reservation{};
-    if (deferred && !async_completion_reserve(writer, queues, &reservation)) return sdma_submit_error(writer, cache);
+    if (deferred && !async_completion_has_capacity(writer, queues)) return sdma_submit_error(writer, cache);
+    const uint32_t first = deferred ? *writer.completion_count : 0;
     SdmaSubmissionScope submission;
     if (!submission.acquire(writer, guard_address, group * queues, queues) || !backend.build_session(queues, group) ||
         !backend.session_valid(queues, group) || !backend.submit() || !backend.event_valid(bytes))
@@ -70,7 +69,7 @@ inline __aicore__ bool sdma_submit(
     const bool has_records = backend.has_records();
     const uint32_t count = has_records ? backend.record_count() : 0;
     if ((has_records && (count == 0 || count > queues)) ||
-        (deferred && !async_completion_accept_count(writer, reservation, count)))
+        (deferred && (*writer.completion_count != first || !async_completion_has_capacity(writer, count))))
         return sdma_submit_error(writer, cache);
     // Snapshot under the queue guards: another submit can advance SDK metadata
     // as soon as they are released, including before a synchronous Wait returns.
@@ -89,9 +88,8 @@ inline __aicore__ bool sdma_submit(
             const CompletionToken token{
                 record.address, 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD, record.expected
             };
-            if (!async_completion_commit(writer, reservation, token)) return sdma_submit_error(writer, cache);
+            if (!async_completion_append(writer, token)) return sdma_submit_error(writer, cache);
         }
-        if (!async_completion_finish(writer, reservation, count)) return sdma_submit_error(writer, cache);
         async_completion_flush(writer, cache);
     }
     if (!submission.release(true, reinterpret_cast<__gm__ uint8_t *>(workspace), metadata))

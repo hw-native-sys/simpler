@@ -115,6 +115,28 @@ TEST(HbgAsyncPlan, BudgetFailureLeavesOutputUnchangedAndInitializationUsesTheSam
     EXPECT_FALSE(scheduler_append_async_layout(UINT64_MAX, plan.layout, kBudget, &offset, &total, nullptr));
 }
 
+TEST(HbgAsyncPlan, ReusedStorageInitializesControlPrefixWithoutTouchingConditions) {
+    const std::vector<SchedulerTaskMetadata> metadata{task(6, 4)};
+    SchedulerAsyncHostPlan fresh;
+    ASSERT_TRUE(scheduler_plan_async_state(metadata, kEpoch, kBudget, &fresh, nullptr));
+    const auto &layout = fresh.layout;
+    ASSERT_LE(layout.sdma_guard_context_offset + (layout.sdma_guard_count + 1) * 128, layout.entries_offset);
+    ASSERT_EQ(layout.entries_offset + layout.entries_bytes, layout.total_bytes);
+    std::vector<std::byte> reused(layout.total_bytes, std::byte{0xa5});
+    ASSERT_TRUE(scheduler_initialize_async_state(metadata, layout, reused.data(), reused.size(), nullptr));
+    EXPECT_EQ(std::memcmp(reused.data(), fresh.image.data(), layout.entries_offset), 0);
+    for (size_t i = layout.entries_offset; i < reused.size(); ++i) {
+        ASSERT_EQ(reused[i], std::byte{0xa5}) << i;
+    }
+    SchedulerAsyncHostPlan next;
+    ASSERT_TRUE(scheduler_plan_async_state(metadata, kEpoch + 1, kBudget, &next, nullptr));
+    ASSERT_TRUE(scheduler_initialize_async_state(metadata, next.layout, reused.data(), reused.size(), nullptr));
+    EXPECT_EQ(std::memcmp(reused.data(), next.image.data(), next.layout.entries_offset), 0);
+    for (size_t i = next.layout.entries_offset; i < reused.size(); ++i) {
+        ASSERT_EQ(reused[i], std::byte{0xa5}) << i;
+    }
+}
+
 TEST(HbgAsyncPlan, InvalidExecutionShapeAndEpochAreRejected) {
     for (auto invalid : {task(0), task(2, 0), task(1, 1, true)}) {
         SchedulerAsyncHostPlan plan;

@@ -1,6 +1,6 @@
 # A5 resident peer COUNTER qualification
 
-This module contains two manual two-device L3 tests. It combines business
+`test_peer_counter.py` contains two manual two-device L3 tests. It combines business
 behavior checks with diagnostics for the current A5 resident implementation;
 the entire module is not an implementation-independent oracle. The existing
 `async_completion` tests keep their own DAGs and oracles.
@@ -53,11 +53,18 @@ assertion. The delay is fixture latency, not a performance threshold. The
 registration gate remains bounded at 2 seconds and the enclosing wait at
 30 seconds.
 
-Both channels explicitly declare COUNTER_PAYLOAD; consumers need no separate
-cache declaration. The
-publisher retires MTE3 and completes its release barriers before notify; actual
+Both channels publish their payload before the COUNTER notification, without
+resource or consumer declarations. The publisher retires MTE3 and completes its
+release barriers before notify; actual
 consumers rely on the common business-kernel entry for local DCache acquisition.
 Shared communication allocations stay alive until the joint two-rank
 invocation completes, and are not overwritten before the consumers finish.
-No COUNTER_ONLY inference, peer rescue from AIC, blocking comparison, extra
-communication workspace or additional test case is introduced.
+The two manual cases require no peer rescue from AIC, blocking comparison or
+extra communication workspace.
+
+`test_signal_payload.py` adds six A5 cases adapted from the peer implementation.
+They cover two/four ranks, four independently allocated payload fields, full-pool
+cache warmup, clean/dirty release, AIC/AIV scalar and AIV TLOAD consumers, and
+scope release or retained-domain reuse. Every active consumer validates the
+complete payload; inactive outputs retain their poison values. The existing
+pending-close test covers Worker.close draining accepted work separately.

@@ -38,7 +38,8 @@ bool scheduler_append_async_layout(
 );
 
 // Initialize directly in the retained Host mirror. The complete layout is
-// revalidated before any write; only its own extent is initialized. No device
+// revalidated before any write; only the control prefix before entries_offset
+// is initialized. The full extent remains reserved for kernel-written conditions. No device
 // address or pointer fix-up is needed, and no second full image is allocated.
 bool scheduler_initialize_async_state(
     const std::vector<SchedulerTaskMetadata> &metadata, const SchedulerAsyncLayout &layout, void *region,

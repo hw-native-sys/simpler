@@ -20,7 +20,7 @@
 #include "async_sdma_guard.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 10;
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 11;
 
 // All offsets are relative to the retained async region.
 struct SchedulerAsyncTaskMap {
@@ -45,17 +45,17 @@ struct SchedulerAsyncGroupIdentity {
 struct alignas(64) SchedulerAsyncGroupWriter {
     volatile uint32_t count{0};
     volatile int32_t error_code{0};
-    AsyncCompletionReservationState reservation{};
+    uint32_t sealed{0};
 };
 
 // A local registration view excludes cache-line padding.
 struct alignas(8) SchedulerAsyncWriterSnapshot {
     uint32_t count{0};
     int32_t error_code{0};
-    AsyncCompletionReservationState reservation{};
+    uint32_t sealed{0};
 };
-static_assert(sizeof(SchedulerAsyncWriterSnapshot) == 32);
-static_assert(offsetof(SchedulerAsyncGroupWriter, reservation) == offsetof(SchedulerAsyncWriterSnapshot, reservation));
+static_assert(sizeof(SchedulerAsyncWriterSnapshot) == 16);
+static_assert(offsetof(SchedulerAsyncGroupWriter, sealed) == offsetof(SchedulerAsyncWriterSnapshot, sealed));
 
 // CHECK owns these words under its lease. They use bypass loads/stores only.
 struct SchedulerAsyncGroupProgress {

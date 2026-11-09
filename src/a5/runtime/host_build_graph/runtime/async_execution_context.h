@@ -25,8 +25,8 @@ inline __aicore__ bool async_execution_context_load(__gm__ DispatchPayload &payl
     const bool writer_valid =
         deferred ?
             ctx.completion_count != nullptr &&
-                execution.writer_state == reinterpret_cast<uint64_t>(ctx.completion_count) +
-                                              offsetof(SchedulerAsyncGroupWriter, reservation) &&
+                execution.writer_state ==
+                    reinterpret_cast<uint64_t>(ctx.completion_count) + offsetof(SchedulerAsyncGroupWriter, sealed) &&
                 ctx.completion_error_code == reinterpret_cast<volatile __gm__ int32_t *>(
                                                  reinterpret_cast<uint64_t>(ctx.completion_count) +
                                                  offsetof(SchedulerAsyncGroupWriter, error_code)
@@ -45,8 +45,7 @@ inline __aicore__ bool async_execution_context_load(__gm__ DispatchPayload &payl
         return false;
     }
     ctx.execution_context = &execution;
-    ctx.completion_reservation =
-        reinterpret_cast<volatile __gm__ AsyncCompletionReservationState *>(execution.writer_state);
+    ctx.completion_sealed = reinterpret_cast<volatile __gm__ uint32_t *>(execution.writer_state);
     *out = ctx;
     return true;
 }

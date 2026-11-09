@@ -61,7 +61,7 @@ template <typename Writer>
 inline __aicore__ bool group_valid(const SchedulerAsyncGroupIdentity &identity, const Writer &writer) {
     return identity.run_epoch != 0 && identity.task_ref >= 0 && identity.finish_index != SCHEDULER_ASYNC_INDEX_NONE &&
            identity.subtask_slot < 3 && identity.capacity >= 1 && identity.capacity <= MAX_COMPLETIONS_PER_TASK &&
-           writer.reservation.sealed == 1 && writer.reservation.limit == 0 && writer.count <= identity.capacity;
+           writer.sealed == 1 && writer.count <= identity.capacity;
 }
 
 inline __aicore__ uint64_t count_mask(uint32_t count) { return count == 64 ? UINT64_MAX : (UINT64_C(1) << count) - 1; }

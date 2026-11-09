@@ -364,7 +364,7 @@ TEST(HbgAsyncExecution, PredicateSkipSealsAnEmptyGroupBeforeRelease) {
         ),
         &writer_storage.get()
     );
-    EXPECT_EQ(writer.reservation.sealed, 1u);
+    EXPECT_EQ(writer.sealed, 1u);
     EXPECT_EQ(writer.count, 0u);
     EXPECT_EQ(fixture.backend.observations, 0u);
     ASSERT_TRUE(fixture.retire(0));
