@@ -1494,6 +1494,10 @@ void SchedulerContext::deinit() {
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/ack state for the next reuse.
+    for (auto &held : retained_ready_) {
+        held.count = 0;
+        held.lanes = LaneMask::none();
+    }
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
     drain_state_.drain_attempt.store(0, std::memory_order_release);
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
