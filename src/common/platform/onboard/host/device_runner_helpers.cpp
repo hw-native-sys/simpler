@@ -118,23 +118,11 @@ int publish_for_launch(
     return rc;
 }
 
-int KernelArgsHelper::prepare_runtime_args(
-    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, bool replayable
+int reserve_slot_runtime_args(
+    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, uint64_t metadata_bytes,
+    RuntimeWorkerInit worker_init, int *capture_mode_restore_error
 ) {
-    if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
-    entry_cache_eligible_ = slot.entry_cache_qualification.consume();
-    // Ahead of the allocation and of the snapshot, so a descriptor carrying
-    // counts no consumer may believe fails the run here: nothing is allocated,
-    // nothing is copied, and the caller's prepare returns the error rather than
-    // publishing lengths the device would trust.
-    const LaunchEntryArgsPlan plan = runtime_launch_entry_args_plan(host_runtime);
-    if (!plan.counts_valid) {
-        LOG_ERROR("prepare_runtime_args: this run's entry-argument counts are outside capacity");
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    }
-    release_run_view();
-    allocator_ = &allocator;
-
+    if (capture_mode_restore_error != nullptr) *capture_mode_restore_error = 0;
     // Both runtime variants publish the descriptor at offset zero. Host-only
     // orchestration state and tensor leases remain outside this snapshot, and so
     // does any tail no host copy reaches: the block is sized to the whole
@@ -152,7 +140,7 @@ int KernelArgsHelper::prepare_runtime_args(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (slot.runtime_args == nullptr) {
-        void *runtime_dev = allocator_->alloc(runtime_extent);
+        void *runtime_dev = allocator.alloc(runtime_extent);
         if (runtime_dev == nullptr) {
             LOG_ERROR("Alloc for runtime_args failed");
             return PTO_RUNTIME_ERR_INTERNAL;
@@ -160,7 +148,6 @@ int KernelArgsHelper::prepare_runtime_args(
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
         slot.runtime_bytes = runtime_extent;
         slot.workers_initialized = false;
-        entry_cache_eligible_ = false;
         slot.entry_cache_qualification.clear();
         slot.entry_cmo_may_have_trimmed = false;
         // A fresh block inherits no claim about its contents. The two teardown
@@ -169,25 +156,9 @@ int KernelArgsHelper::prepare_runtime_args(
         // here rather than inherited.
         slot.published_prefix_bytes = 0;
     }
-    if (replayable && !slot.workers_initialized) {
-        // A captured DMA repeats on every replay. Device-owned handshake words
-        // are initialized only while this allocation is exclusively prepared,
-        // before capture can record a publication over them.
-        const size_t begin = runtime_device_copy_size(host_runtime);
-        const size_t end = runtime_device_initialized_prefix_size(host_runtime);
-        if (end < begin || end > runtime_extent) return PTO_RUNTIME_ERR_INTERNAL;
-        const size_t bytes = end - begin;
-        const int init_rc = rtMemcpy(
-            reinterpret_cast<std::byte *>(slot.runtime_args) + begin, bytes,
-            reinterpret_cast<const std::byte *>(&host_runtime) + begin, bytes, RT_MEMCPY_HOST_TO_DEVICE
-        );
-        if (init_rc != 0) return init_rc;
-        slot.workers_initialized = true;
-    }
-    const uint64_t metadata_bytes = slot.staged_launch_metadata.size();
     if (metadata_bytes > UINT64_MAX - runtime_extent) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const uint64_t upload_bytes = runtime_extent + metadata_bytes;
-    // Reservation excludes every previous DMA reader before this storage grows.
+    // Initialization owns unused backing; per-run reservation excludes prior DMA readers.
     // A failed free retains ownership; a failed allocation leaves a retryable slot.
     if (slot.runtime_upload_source != nullptr && slot.runtime_upload_bytes < upload_bytes) {
         const int free_rc = rtFreeHost(slot.runtime_upload_source);
@@ -203,6 +174,59 @@ int KernelArgsHelper::prepare_runtime_args(
         slot.runtime_upload_source = source;
         slot.runtime_upload_bytes = upload_bytes;
     }
+    if (worker_init != RuntimeWorkerInit::OnPublication && !slot.workers_initialized) {
+        constexpr size_t begin = offsetof(DeviceRuntimeLaunchDesc, workers);
+        constexpr size_t bytes = sizeof(DeviceRuntimeLaunchDesc::workers);
+        if (begin + bytes > runtime_extent) return PTO_RUNTIME_ERR_INTERNAL;
+        const bool recording = worker_init == RuntimeWorkerInit::DuringRecording;
+        aclmdlRICaptureMode previous_mode = ACL_MODEL_RI_CAPTURE_MODE_RELAXED;
+        if (recording) {
+            // The backing is private to this preparation. The synchronous copy
+            // initializes it once without adding an overwrite to the graph.
+            const int rc = aclmdlRICaptureThreadExchangeMode(&previous_mode);
+            if (rc != 0) return rc;
+        }
+        const int copy_rc = rtMemcpy(
+            reinterpret_cast<std::byte *>(slot.runtime_args) + begin, bytes,
+            reinterpret_cast<const std::byte *>(&host_runtime) + begin, bytes, RT_MEMCPY_HOST_TO_DEVICE
+        );
+        if (recording) {
+            const int restore_rc = aclmdlRICaptureThreadExchangeMode(&previous_mode);
+            if (restore_rc != 0) {
+                if (capture_mode_restore_error != nullptr) *capture_mode_restore_error = restore_rc;
+                LOG_ERROR("Restoring the caller's capture mode failed: %d", restore_rc);
+                return copy_rc != 0 ? copy_rc : restore_rc;
+            }
+        }
+        if (copy_rc != 0) return copy_rc;
+        slot.workers_initialized = true;
+    }
+    return 0;
+}
+
+int KernelArgsHelper::prepare_runtime_args(
+    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, bool replayable
+) {
+    if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
+    entry_cache_eligible_ = slot.entry_cache_qualification.consume();
+    // Ahead of the allocation and of the snapshot, so a descriptor carrying
+    // counts no consumer may believe fails the run here: nothing is allocated,
+    // nothing is copied, and the caller's prepare returns the error rather than
+    // publishing lengths the device would trust.
+    const LaunchEntryArgsPlan plan = runtime_launch_entry_args_plan(host_runtime);
+    if (!plan.counts_valid) {
+        LOG_ERROR("prepare_runtime_args: this run's entry-argument counts are outside capacity");
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    release_run_view();
+    allocator_ = &allocator;
+
+    if (slot.runtime_args == nullptr) entry_cache_eligible_ = false;
+    const int reserve_rc = reserve_slot_runtime_args(
+        host_runtime, allocator, slot, slot.staged_launch_metadata.size(),
+        replayable ? RuntimeWorkerInit::BeforeRecording : RuntimeWorkerInit::OnPublication
+    );
+    if (reserve_rc != 0) return reserve_rc;
     // A block whose handshake region has never been published still holds
     // whatever the allocator returned, so the first publication onto it carries
     // that region from the ctor-zeroed host copy. Every later publication stops

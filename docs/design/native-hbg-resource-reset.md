@@ -11,12 +11,13 @@ orchestration. Prepared information survives each execution; mutable scheduling
 state is initialized at the device boundary that excludes its previous writers.
 There is no separate Host-submitted reset task or new AICore launch ABI.
 
-Kernel-mode preparation initializes a new descriptor's handshake region once,
-before capture. The recorded descriptor DMA excludes that device-owned region:
-replaying a cold initialization can erase current AICore startup reports.
-The host-owned prefix remains part of the recorded publication. Initialization
-failure leaves the allocation uninitialized so a later preparation retries it;
-reusing an initialized allocation does not clear its reports.
+Kernel-mode preparation initializes a new descriptor's handshake region once.
+The initial slots are ready before recording. If a retained graph still owns a
+slot's old backing, preparation initializes only the new backing's worker
+reports and restores the caller's thread capture mode before graph submission.
+The recorded descriptor DMA carries the host-owned prefix and excludes worker
+reports so replay preserves the current AICore startup reports. Preparation
+requires successful initialization and restoration before it can publish.
 
 Recording a publication does not prove that its DMA has executed. Captured
 descriptor copies always remain in the graph and do not populate the eager
@@ -86,6 +87,11 @@ private result address is zero. There is no separate public error-history knob.
 Missing required terminal contributions, invalid handoff state and signed
 execution errors remain functional errors without optional diagnostic detail.
 
+Initial Kernel caches are warmed after mandatory execution reservations. Only
+an explicit allocation OOM with a null output may leave that optional cache
+missing; initialization-copy and other failures remain fatal. A requested
+capture preparation requires already initialized backing. It does not perform
+a synchronous cold-result upload during capture or silently omit the request.
 Device entry invalidates a requested result publication before new production;
 recorded initialization never erases its evidence tail on each replay.
 

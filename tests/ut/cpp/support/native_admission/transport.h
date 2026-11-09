@@ -15,6 +15,7 @@
 #include <functional>
 #include <limits>
 #include <utility>
+#include <string>
 #include <vector>
 namespace native_admission_transport {
 struct AsyncCopy {
@@ -28,6 +29,16 @@ struct Control {
     size_t allocations{0};
     size_t successful_allocations{0};
     size_t fail_allocation{0};
+    int allocation_failure_rc{-12};
+    size_t failed_allocation_bytes{0};
+    bool allocation_failure_with_storage{false};
+    std::vector<std::pair<void *, size_t>> allocated_device_blocks;
+    int host_alloc_rc{0};
+    size_t host_allocations{0};
+    size_t live_host_allocations{0};
+    void *selected_host_free{nullptr};
+    int selected_host_free_rc{0};
+    size_t selected_host_free_attempts{0};
     int loader_finalize_error{0};
     size_t loader_finalize_calls{0};
     int reset_error{0};
@@ -43,6 +54,7 @@ struct Control {
     uint64_t requested_op_timeout_us{0};
     size_t op_timeout_calls{0};
     int copy_rc{0};
+    uint64_t copy_error_bytes{0};
     bool defer_async_copies{false};
     void *failed_async_destination{nullptr};
     int async_copy_rc{0};
@@ -51,6 +63,25 @@ struct Control {
     void *selected_free{nullptr};
     int selected_free_rc{0};
     size_t selected_free_attempts{0};
+    int loader_start_rc{-1};
+    std::function<void()> ctrl_query_hook;
+    int ctrl_query_rc{0};
+    size_t ctrl_query_calls{0};
+    size_t topology_query_calls{0};
+    int topology_query_rc{0};
+    uint64_t topology_mask{0xf};
+    int c2c_rc{0};
+    uint64_t c2c_address{0x12340000};
+    size_t c2c_calls{0};
+    std::function<int(void *, void *, size_t, const std::string &)> aicpu_payload;
+    size_t binary_register_calls{0};
+    size_t event_create_calls{0};
+    size_t event_destroy_calls{0};
+    size_t live_events{0};
+    size_t fail_event_create{0};
+    int event_destroy_rc{0};
+    int capture_info_rc{0};
+    bool recording_invalidated{false};
     size_t stream_create_calls{0};
     size_t fail_stream_create{0};
     size_t d2h_calls{0};
@@ -66,6 +97,8 @@ struct Control {
     std::vector<void *> observed_streams;
     bool events_complete{true};
     bool recording_active{false};
+    size_t capture_mode_exchanges{0};
+    size_t fail_capture_mode_exchange{0};
     int event_wait_rc{0};
     std::vector<std::pair<void *, const void *>> uploads;
 };

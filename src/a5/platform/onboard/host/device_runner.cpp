@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "aicpu_topology_probe.h"
+#include "context_preparation.h"
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -47,10 +48,6 @@
 #include "host/raii_scope_guard.h"
 #include "host/run_boundary.h"
 #include "utils/fatal_shutdown_latch.h"
-
-namespace {
-constexpr const char *kAicpuTopologyQueryName = "simpler_aicpu_query_topology";
-}
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:
@@ -201,72 +198,59 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
-int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out) {
+int DeviceRunner::prepare_kernel_arch_context(rtStream_t control_stream) {
+    const int rc = ensure_aicore_reg_table();
+    if (rc != 0) return rc;
+    pto::a5::AicpuTopology topology;
+    return query_aicpu_topology(topology, control_stream);
+}
+
+int DeviceRunner::release_arch_context_resources(bool abandon_device_resources) {
+    if (abandon_device_resources) {
+        aicpu_topology_query_result_ = nullptr;
+        aicpu_topology_query_pending_ = false;
+        aicpu_topology_query_stream_ = nullptr;
+        return 0;
+    }
+    const int rc = pto::a5::release_aicpu_query_result(
+        mem_alloc_, aicpu_topology_query_stream_, aicpu_topology_query_result_, aicpu_topology_query_pending_
+    );
+    if (rc == 0) aicpu_topology_query_stream_ = nullptr;
+    return rc;
+}
+
+int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out, rtStream_t control_stream) {
     if (aicpu_device_occupancy_cached_) {
         out = aicpu_device_occupancy_;
         return 0;
     }
-
-    void *device_result = mem_alloc_.alloc(sizeof(AicpuTopologyQueryResult));
-    if (device_result == nullptr) {
-        LOG_ERROR("AICPU topology query result allocation failed");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    auto result_cleanup = RAIIScopeGuard([&]() {
-        mem_alloc_.free(device_result);
-    });
-    AicpuTopologyQueryResult zero{};
-    int rc = rtMemcpy(device_result, sizeof(zero), &zero, sizeof(zero), RT_MEMCPY_HOST_TO_DEVICE);
+    if (!aicpu_topology_query_pending_) aicpu_topology_query_stream_ = control_stream;
+    pto::a5::AicpuDeviceOccupancy occupancy;
+    const int rc = pto::a5::query_device_aicpu_occupancy(
+        mem_alloc_, load_aicpu_op_, control_stream, aicpu_topology_query_result_, aicpu_topology_query_pending_,
+        occupancy
+    );
     if (rc != 0) {
-        LOG_ERROR("AICPU topology query result initialization failed: %d", rc);
+        // Borrowed Kernel cleanup can prove this same control stream later;
+        // Program retains its existing owned-device recovery policy.
+        if (aicpu_topology_query_pending_ && !execution_mode_latch().is_kernel()) recover_device_or_mark_unusable(rc);
         return rc;
     }
-    AicpuTopologyQueryArgs args{};
-    args.result_addr = reinterpret_cast<uint64_t>(device_result);
-    rc = launch_aicpu_payload(stream_aicpu_, &args, sizeof(args), kAicpuTopologyQueryName, /*aicpu_num=*/1);
-    if (rc != 0) {
-        LOG_ERROR("AICPU device occupancy query launch failed: %d", rc);
-        recover_device_or_mark_unusable(rc);
-        return rc;
-    }
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
-    if (rc != 0) {
-        LOG_ERROR("AICPU device occupancy query sync failed: %d", rc);
-        recover_device_or_mark_unusable(rc);
-        return rc;
-    }
-    AicpuTopologyQueryResult result{};
-    rc = rtMemcpy(&result, sizeof(result), device_result, sizeof(result), RT_MEMCPY_DEVICE_TO_HOST);
-    if (rc != 0) {
-        LOG_ERROR("AICPU device occupancy query copy failed: %d", rc);
-        return rc;
-    }
-    if (result.occupy_rc != 0 || result.occupy == 0) {
-        LOG_ERROR(
-            "device-side AICPU OCCUPY query failed: rc=%d mask=0x%llx", result.occupy_rc,
-            static_cast<unsigned long long>(result.occupy)
-        );
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    aicpu_device_occupancy_.occupy = result.occupy;
-    aicpu_device_occupancy_.pf_occupy = result.pf_occupy;
-    aicpu_device_occupancy_.os_sched = result.os_sched;
-    aicpu_device_occupancy_.occupy_valid = result.occupy_rc == 0;
-    aicpu_device_occupancy_.pf_occupy_valid = result.pf_occupy_rc == 0;
-    aicpu_device_occupancy_.os_sched_valid = result.os_sched_rc == 0;
+    aicpu_device_occupancy_ = occupancy;
     aicpu_device_occupancy_cached_ = true;
+    aicpu_topology_query_stream_ = nullptr;
     out = aicpu_device_occupancy_;
     return 0;
 }
 
-int DeviceRunner::query_aicpu_topology(pto::a5::AicpuTopology &out) {
+int DeviceRunner::query_aicpu_topology(pto::a5::AicpuTopology &out, rtStream_t control_stream) {
     if (aicpu_topology_cached_) {
         out = aicpu_topology_;
         return 0;
     }
 
     pto::a5::AicpuDeviceOccupancy occupancy;
-    int rc = query_aicpu_device_occupancy(occupancy);
+    int rc = query_aicpu_device_occupancy(occupancy, control_stream);
     if (rc != 0) return rc;
 
     pto::a5::AicpuTopology topology;
@@ -447,7 +431,11 @@ int DeviceRunner::prepare_execution(
     {
         pto::a5::AicpuTopology topology;
         runtime.set_aicpu_allowed_cpu_count(0);
-        if (query_aicpu_topology(topology) != 0) {
+        const rtStream_t control_stream =
+            execution_mode_latch().is_kernel() ?
+                static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu)) :
+                stream_aicpu_;
+        if (query_aicpu_topology(topology, control_stream) != 0) {
             LOG_ERROR("AICPU topology probe failed; affinity gate will not launch");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
@@ -1457,18 +1445,9 @@ int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
 // halves the per-core halResMap loop and the live driver-side mappings a worker
 // holds.
 int DeviceRunner::ensure_aicore_reg_table() {
-    if (aicore_ctrl_reg_table_committed_) return 0;
-    // The handle may already hold an address a previous failed release retained;
-    // passing it back in is what lets the driver entry reuse that block instead
-    // of stranding it.
-    const int rc =
-        init_aicore_register_addresses(&aicore_ctrl_reg_table_dev_, static_cast<uint64_t>(device_id_), mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
-        return rc;
-    }
-    aicore_ctrl_reg_table_committed_ = true;
-    return 0;
+    return pto::a5::ensure_ctrl_table(
+        mem_alloc_, device_id_, aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_
+    );
 }
 
 int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {

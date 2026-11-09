@@ -120,6 +120,9 @@ struct PreparedSubmissionStorage {
     std::unique_ptr<RunCallerOrder> caller_order;
     void *device_wall{nullptr};
     void *device_result{nullptr};
+    // A failed allocation's nonnull output is owned, but cannot be initialized
+    // until checked release succeeds. Copy failures keep a valid allocation.
+    int result_allocation_rc{0};
     bool result_initialized{false};
     bool retain_replay_evidence{false};
     bool evidence_observed{false};
@@ -276,7 +279,7 @@ public:
      */
     bool try_reserve_native_run(
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
-        bool capture_preparation = false
+        bool capture_preparation = false, const NativeRunIdentity &identity = {}
     );
     /** Publish preparation only after its backing owner and resource plan are complete. */
     void mark_native_run_prepared(const void *owner);
@@ -526,6 +529,9 @@ public:
 
     /** Drop `identity`'s borrow, or keep it for good when its last consumer is unproven. */
     void release_caller_buffers(uint64_t identity, bool keep);
+
+    /** Detach only the exact currently reserved capture carrier from its retained references. */
+    bool retire_caller_buffer_carrier(const void *owner, const NativeRunIdentity &identity);
 
     /**
      * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
@@ -1844,9 +1850,11 @@ public:
         return prepared.streams.ready() ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
     }
     virtual int reclaim_execution_streams() { return 0; }
-    int prepare_run_storage(uint32_t pipeline_slot);
+    int prepare_run_storage(uint32_t pipeline_slot, bool capture_preparation = false);
     int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1);
-    int retain_external_run_resources(PreparedExecution &prepared, void *caller_stream, void **out_reference);
+    int retain_external_run_resources(
+        PreparedExecution &prepared, void *caller_stream, void **out_reference, NativeRunPreparePurpose purpose
+    );
     int release_external_run_resources(void *reference);
     int admit_recording(PreparedExecution &prepared);
     bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
@@ -2142,6 +2150,10 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
 protected:
+    // Context-fixed architecture resources use the real hidden control stream.
+    // Per-call thread selection and Program's lazy initialization stay separate.
+    virtual int prepare_kernel_arch_context(rtStream_t /*control_stream*/) { return 0; }
+    virtual int release_arch_context_resources(bool /*abandon_device_resources*/) { return 0; }
     virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
 
     /**
@@ -2368,8 +2380,8 @@ protected:
     /**
      * Preserve this run's identity and bind private result backing when requested.
      * Kernel diagnostics-off calls have no record. Program and requested Kernel
-     * calls initialize lazily before publication. Warm backing preserves any
-     * existing replay-evidence obligation.
+     * calls initialize lazily. Native diagnostic capture prepares its result
+     * backing before recording. Reuse preserves any existing replay evidence.
      */
     int ensure_device_run_result_region(
         const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
@@ -2952,6 +2964,7 @@ protected:
         bool permits_prepared_successor{false};
         bool capture_preparation{false};
         NativeRunPreparationState preparation_state{NativeRunPreparationState::Preparing};
+        NativeRunIdentity identity{};
     };
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
@@ -3454,4 +3467,8 @@ protected:
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
     bool pmu_enabled_{false};                                             // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                         // diagnostic artifact root directory
+private:
+    int prepare_submission_slot_resources(uint32_t pipeline_slot);
+    // Called under run_result_mu_; initialization creates no epoch observation.
+    int initialize_result_storage(PreparedSubmissionStorage &backing);
 };

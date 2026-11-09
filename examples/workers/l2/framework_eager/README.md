@@ -56,7 +56,69 @@ must still publish and finish its queued callbacks before closing the Worker.
 
 The C++ extension uses torch_npu's existing `OpCommand::RunOpApi`. It provides
 no separate executor or public Torch integration API. PyPTO's process adapter
-and capture/replay are outside this eager example.
+is outside these examples. The cold consumer below uses the existing Torch graph
+and the ACL model destroy callback.
+
+## Cold Kernel graph consumer
+
+`native_capture.py` uses the same public `Worker.prepare_submission` and
+`bridge.enqueue_native` inside the existing stock `torch.npu.graph` body. The
+consumer arms the original native ticket before exporting it to the host queue.
+The ACL model must support destroy callback registration. A capture that cannot
+register the callback fails before publication. The pytest entry
+`tests/st/worker/framework_eager/test_native_capture.py` runs this consumer in the
+existing `torch_npu` test environment and produces its normal JUnit receipt. On A2/A3 it checks three concurrently retained models
+with two initial grants and includes an injected destroy refusal followed by
+a real retry on the same model.
+Build the bridge against the same stock Torch and torch_npu installation that
+will run the case. Select the normal compiled artifact explicitly:
+
+```sh
+TASK_QUEUE_ENABLE=0 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python tests/st/worker/framework_eager/native_capture.py \
+  --runtime tensormap_and_ringbuffer --platform a2a3 --device "$TASK_DEVICE" \
+  --bridge /path/to/_simpler_framework_queue.so --output /path/to/new-case-output
+```
+
+Use an exclusive task allocation and matching device/platform as for the eager
+consumers. `host_build_graph` selects the other runtime. This command is an
+onboard validation payload, not evidence of an executed qualification. It retains
+raw stdout/stderr and private Ascend logs and bounds the child with a 180-second
+watchdog. A timeout or nonzero child return remains a failure.
+
+Callable registration and Worker initialization happen before Begin. There is no eager
+business computation or diagnostic warmup; ArgsDump, PMU, swimlane, scope stats
+and dependency generation are disabled. The body prepares one token after
+Begin, enqueues it through the original framework queue, then records a Torch
+successor. Both outputs must retain their poison values after End. Three
+replays change the input at the same address and check every result against
+`[10, 20, 44]`. The ticket and callable must remain unavailable for retirement
+while the graph owns the run, even though its Host carrier has finalized.
+The original ticket roots the actual tensors through checked native release.
+The adapter checks host queue dispatch in the capture body. After replay
+completes, reset requests destruction and the ACL notice permits checked
+retirement of the same ticket. A missing notice leaves the resources retained.
+
+With `TASK_QUEUE_ENABLE=0`, the consumer creates Torch's `_WeakTensorRef` before
+Begin, removes the external RHS Tensor roots after End, and requires the original
+TensorImpl to remain alive until checked native release. It must expire after
+ticket retirement. This probes the original Worker's tensor roots. Storage-only
+retention can preserve payload bytes without retaining the original TensorImpl.
+The PASS report records
+`tensor_impl_lifetime: "observed"` only after both checks succeed.
+
+`TASK_QUEUE_ENABLE=1` preserves the same recording, replay and checked-close
+checks, but reports `tensor_impl_lifetime: "not_observed"`. Its asynchronous
+ReleaseQueue can independently retain Tensor operands after execution; stream
+synchronization does not prove that queue released them. This mode cannot
+independently qualify the ticket's TensorImpl ownership.
+
+Cleanup requests destruction through the original graph's `reset()`. Ticket
+retirement requires the actual model notice and checked native release. The
+consumer preserves the primary error and retains unresolved native owners.
+Program capture is outside this contract.
+CPU consumer tests exercise the real Worker facade with CPU tensors and explicit
+framework/device leaves. SDK recording behavior and hardware numerics require
+the separate onboard case.
 
 ## Run
 
@@ -300,6 +362,15 @@ does not load diagnostic probes. The separate system-test driver
 reference on a background thread while Python holds GIL and exercises
 `stream.query()` and `torch.npu.empty_cache()` with two controlled calls.
 Every successful wait checks `safe_to_release` before owners may retire.
+
+`enqueue_native(token, tensors)` receives the actual Torch tensor owners for that
+invocation. Its native queue frame retains that list while the callback is
+pending. Eager device use can outlive the callback: the producer must also pass
+those owners and its stream through `prepare_submission(keepalive=...)` until
+native retirement. In capture, the Worker's accepted ticket retains the actual
+tensors through the ACL model destroy notice and checked native release.
+Readonly HOST control values are already native snapshots; that value copy does
+not establish ownership of unrelated DEVICE storage.
 
 The system test is `tests/st/worker/framework_eager/test_native_submission.py`.
 Run it in the declared `torch_npu` test environment with `--junitxml`, the matching

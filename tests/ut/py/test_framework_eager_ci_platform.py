@@ -70,8 +70,9 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
     ]
     _executable(
         binary / "python",
-        f"#!{sys.executable}\nimport json,os,sys\n"
+        f"#!{sys.executable}\nimport json,os,sys\nfrom pathlib import Path\n"
         "with open(os.environ['COMMAND_LOG'],'a') as out: out.write(json.dumps(sys.argv[1:])+'\\n')\n"
+        "if sys.argv[1] == '-c': print(Path.cwd() / 'framework-site')\n"
         "if sys.argv[1:4] == ['simpler_setup/test_environments.py', 'requirements', 'torch_npu']:\n"
         f"    selected = {requirements!r}\n"
         "    if len(sys.argv) == 5: selected = [item for item in selected if item.split('==')[0] == sys.argv[4]]\n"
@@ -94,6 +95,8 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
             "BUILD_TARGET": f"build_package_{platform_name}",
             "CANN_ENV": str(cann),
             "COMMAND_LOG": str(command_log),
+            "GITHUB_ENV": str(tmp_path / "github-env"),
+            "PYTEST_ADDOPTS": "-q",
         },
         text=True,
         capture_output=True,
@@ -134,6 +137,10 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
     sdk_install = next(args for args in commands if any(arg.startswith("--config-settings=") for arg in args))
     assert sdk_install[:3] == ["-m", "pip", "install"]
     assert f"--config-settings=build.targets=build_package_{platform_name}" in sdk_install
+    assert (tmp_path / "github-env").read_text().splitlines() == [
+        f"FRAMEWORK_WHEEL_SITE={tmp_path}/framework-site",
+        f"PYTEST_ADDOPTS=-q -o pythonpath={tmp_path}/framework-site",
+    ]
 
 
 def _identity_module():
@@ -147,9 +154,11 @@ def _identity_module():
 @pytest.mark.parametrize("platform_name", ["a2a3", "a5"])
 def test_identity_records_the_selected_platform_runtime_and_environment(tmp_path, monkeypatch, platform_name):
     identity = _identity_module()
+    site_packages = tmp_path / "framework-site"
+    assets = site_packages / "simpler_setup/_assets"
     for candidate in ("a2a3", "a5"):
         for runtime in ("host_build_graph", "tensormap_and_ringbuffer"):
-            directory = tmp_path / "build/lib" / candidate / "onboard" / runtime
+            directory = assets / "build/lib" / candidate / "onboard" / runtime
             directory.mkdir(parents=True)
             for name in ("libhost_runtime.so", "libaicpu_kernel.so", "aicore_kernel.o"):
                 (directory / name).write_text(f"{candidate}/{runtime}/{name}")
@@ -163,7 +172,8 @@ def test_identity_records_the_selected_platform_runtime_and_environment(tmp_path
         )
     monkeypatch.setattr(identity.subprocess, "check_output", lambda *args, **kwargs: "fixed-source\n")
     observed_environment = {"cann": {"version": "9.2.0-beta.2"}, "cpu_transport": True}
-    monkeypatch.setitem(sys.modules, "simpler_setup.environment", SimpleNamespace(PROJECT_ROOT=tmp_path))
+    monkeypatch.setitem(sys.modules, "simpler_setup.environment", SimpleNamespace(PROJECT_ROOT=assets))
+    monkeypatch.setattr(identity.sysconfig, "get_path", lambda name: str(site_packages))
     monkeypatch.setitem(
         sys.modules, "simpler_setup.test_environments", SimpleNamespace(preflight=lambda name: observed_environment)
     )
@@ -176,7 +186,10 @@ def test_identity_records_the_selected_platform_runtime_and_environment(tmp_path
     assert record["environment"] == observed_environment
     for runtime in record["runtimes"].values():
         for file in runtime.values():
-            assert Path(file["path"]).is_relative_to(tmp_path / "build/lib" / platform_name / "onboard")
+            assert Path(file["path"]).is_relative_to(assets / "build/lib" / platform_name / "onboard")
+    monkeypatch.setitem(sys.modules, "simpler_setup.environment", SimpleNamespace(PROJECT_ROOT=tmp_path))
+    with pytest.raises(RuntimeError, match="Framework runtime assets must come from"):
+        identity.main()
 
 
 def test_identity_refuses_bad_platform_before_optional_backend_import(tmp_path):
@@ -216,6 +229,7 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     _executable(
         tmp_path / ".venv-framework/bin/python",
         f"#!{sys.executable}\nimport json,os,sys\n"
+        "if sys.argv[1].endswith('identity.py'): assert os.environ['PYTHONPATH']=='/framework-site:/cann-site'\n"
         "with open(os.environ['COMMAND_LOG'], 'a') as out: out.write(json.dumps(sys.argv[1:])+'\\n')\n",
     )
     binary = tmp_path / "bin"
@@ -228,6 +242,8 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
         "assert args[args.index('--timeout')+1]=='2100'\n"
         "assert args[args.index('--max-time')+1]=='1200'\n"
         "assert ['--env','PLATFORM']==args[4:6]\n"
+        "assert ['--env','PYTEST_ADDOPTS']==args[6:8]\n"
+        "assert ['--env','FRAMEWORK_WHEEL_SITE']==args[8:10]\n"
         "subprocess.run(['bash','-e','-c',args[args.index('--run')+1]], "
         "env={**os.environ,'TASK_DEVICE':'0'},check=True)\n",
     )
@@ -237,7 +253,7 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
         tmp_path / ".claude/skills/onboard-arch-precheck/check.sh", '#!/bin/sh\n[ "$1" = "$ACTUAL_PLATFORM" ]\n'
     )
     cann = tmp_path / "set_env.sh"
-    cann.write_text(":\n")
+    cann.write_text("export PYTHONPATH=/cann-site\n")
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
         cwd=tmp_path,
@@ -249,6 +265,8 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
             "MANUAL_MODE": "exclude",
             "ACTUAL_PLATFORM": actual_platform,
             "COMMAND_LOG": str(log),
+            "PYTEST_ADDOPTS": "-o pythonpath=/framework-site",
+            "FRAMEWORK_WHEEL_SITE": "/framework-site",
         },
         text=True,
         capture_output=True,

@@ -10,18 +10,23 @@
  */
 // This module is a bounded reference consumer, not a Simpler submission API.
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <torch/csrc/utils/pybind.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <vector>
 
 #include "native_submission.h"
 
@@ -45,14 +50,16 @@ struct QueuedCall {
 };
 
 struct QueuedNativeCall {
-    explicit QueuedNativeCall(const SimplerNativeSubmission &api) :
-        submission(api) {}
+    QueuedNativeCall(const SimplerNativeSubmission &api, std::vector<at::Tensor> owners) :
+        submission(api),
+        tensors(std::move(owners)) {}
     NativeSubmissionRef submission;
+    std::vector<at::Tensor> tensors;
     std::atomic<bool> complete{false};
-    std::string error;
+    std::exception_ptr error;
     void check() const {
         if (!complete.load(std::memory_order_acquire)) throw std::runtime_error("native callback is not complete");
-        if (!error.empty()) throw std::runtime_error(error);
+        if (error) std::rethrow_exception(error);
     }
 };
 
@@ -89,36 +96,44 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     });
     py::class_<QueuedNativeCall, std::shared_ptr<QueuedNativeCall>>(module, "QueuedNativeCall")
         .def("check", &QueuedNativeCall::check);
-    module.def("enqueue_native", [](py::capsule capsule) {
+    module.def("enqueue_native", [](py::capsule capsule, std::vector<at::Tensor> tensors) {
+        // Only the native token's preflight qualifies capture. This public
+        // query selects whether the caller must check host queue dispatch.
+        const bool capturing =
+            py::module_::import("torch_npu.npu.graphs").attr("is_current_stream_capturing")().cast<bool>();
+        std::optional<c10_npu::NPUStream> capture_stream;
+        if (capturing) capture_stream.emplace(c10_npu::getCurrentNPUStream());
         auto *api = static_cast<SimplerNativeSubmission *>(
             PyCapsule_GetPointer(capsule.ptr(), SIMPLER_NATIVE_SUBMISSION_CAPSULE)
         );
         if (!api) throw py::error_already_set();
-        auto call = std::make_shared<QueuedNativeCall>(*api);
+        auto call = std::make_shared<QueuedNativeCall>(*api, std::move(tensors));
         // A non-zero return is the framework's operator-failure channel: with the
         // host queue enabled, torch_npu discards every later queued operation and
         // reports the error at its next synchronization, so no successor reads an
         // unwritten output. Discarded callbacks never submit; their tickets remain
         // pending until the producer cancels them.
-        auto invoke = [call]() -> int {
+        auto invoke = [call]() noexcept -> int {
             try {
                 call->submission.submit();
-            } catch (const std::exception &error) {
-                call->error = error.what();
             } catch (...) {
-                call->error = "unknown native submission exception";
+                call->error = std::current_exception();
             }
             call->complete.store(true, std::memory_order_release);
-            return call->error.empty() ? 0 : -1;
+            return call->error ? -1 : 0;
         };
         py::gil_scoped_release unlocked;
         try {
             at_npu::native::OpCommand::RunOpApi("SimplerNativeSubmit", invoke, false);
-        } catch (const std::exception &) {
-            // With the host queue disabled the callback ran inline and torch_npu
-            // raised a generic operator error; report the Simpler error instead.
-            if (call->complete.load(std::memory_order_acquire) && !call->error.empty())
-                throw std::runtime_error(call->error);
+            if (capture_stream) {
+                // Wait for host dispatch before returning into the graph body.
+                // The original runtime's launch recorded work on the device.
+                if (capture_stream->stream() == nullptr)
+                    throw std::runtime_error("could not drain the capture host queue");
+                call->check();
+            }
+        } catch (...) {
+            if (call->complete.load(std::memory_order_acquire) && call->error) std::rethrow_exception(call->error);
             throw;
         }
         return call;

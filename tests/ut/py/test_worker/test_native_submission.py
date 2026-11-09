@@ -75,9 +75,9 @@ def prepared(chip_fixture, monkeypatch):
         def capsule(self):
             return self
 
-    def prepare(cid, args, config, *, caller_stream):
+    def prepare(cid, values, config, *, caller_stream):
         assert caller_stream == 123
-        result = Pending(cid, args, config)
+        result = Pending(cid, values.args, config)
         pending.append(result)
         return result
 
@@ -615,3 +615,22 @@ def test_call_value_retention_follows_native_failure_proof(prepared, monkeypatch
     assert bool(chip.worker._chip_call_values) is not safe
     chip.worker.close()
     assert not chip.worker._chip_call_values
+
+
+def test_snapshot_preparation_defers_stream_admission_but_ordinary_submit_keeps_it(prepared, monkeypatch):
+    chip, pending = prepared
+    checked = []
+
+    def reject_stream(stream):
+        checked.append(stream)
+        raise RunPreparationRefused("stream is already capturing")
+
+    monkeypatch.setattr(chip.impl, "_validate_caller_stream", reject_stream, raising=False)
+    handle = chip.worker.prepare_submission(chip.callable, caller_stream=123)
+    assert not checked and not chip.runs
+    assert handle.native_handle is pending[0]
+    assert handle.cancel()
+    with pytest.raises(RunPreparationRefused, match="stream is already capturing"):
+        chip.worker.submit(chip.callable, caller_stream=123)
+    assert checked == [123]
+    assert not chip.runs

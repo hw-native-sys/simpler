@@ -11,6 +11,11 @@
 // Minimal RTS declarations for the CPU-only KernelArgsHelper tests.
 #pragma once
 
+enum aclmdlRICaptureMode {
+    ACL_MODEL_RI_CAPTURE_MODE_GLOBAL,
+    ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL,
+    ACL_MODEL_RI_CAPTURE_MODE_RELAXED,
+};
 extern "C" const char *aclGetRecentErrMsg();
 
 // The capture-status query the launch route's permit asks, and just enough of
@@ -29,3 +34,4 @@ typedef enum {
 } aclmdlRICaptureStatus;
 
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream stream, aclmdlRICaptureStatus *status, aclmdlRI *modelRI);
+extern "C" aclError aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *mode);

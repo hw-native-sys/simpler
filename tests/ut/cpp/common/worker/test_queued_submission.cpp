@@ -367,3 +367,103 @@ TEST(QueuedSubmissionTest, SubmitFailureWithoutRunHasNoCleanupProof) {
     EXPECT_THROW(submission.submit(), std::runtime_error);
     EXPECT_TRUE(submission.owner_recovery_required());
 }
+
+TEST(QueuedSubmissionTest, NativeOwnerSurvivesEmissionAndRetiresOutsideSubmissionLock) {
+    struct Owner {
+        std::function<void()> on_destroy;
+        ~Owner() {
+            if (on_destroy) on_destroy();
+        }
+    };
+    auto owner = std::make_shared<Owner>();
+    std::weak_ptr<Owner> observed = owner;
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    Submission submission(
+        [complete] {
+            return FakeRun{complete};
+        },
+        owner
+    );
+    bool destroyed = false;
+    owner->on_destroy = [&] {
+        EXPECT_TRUE(submission.done());
+        destroyed = true;
+    };
+    owner.reset();
+    submission.submit();
+    EXPECT_FALSE(observed.expired());
+    EXPECT_FALSE(destroyed);
+    submission.retire();
+    EXPECT_TRUE(observed.expired());
+    EXPECT_TRUE(destroyed);
+}
+
+TEST(QueuedSubmissionTest, EphemeralPreflightConsumesOneAttemptBeforeTheOriginalAction) {
+    int checks = 0, actions = 0;
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    Submission submission([&] {
+        ++actions;
+        return FakeRun{complete};
+    });
+    EXPECT_THROW(
+        submission.submit([&] {
+            ++checks;
+            throw std::runtime_error("preflight rejected");
+        }),
+        std::runtime_error
+    );
+    EXPECT_EQ(checks, 1);
+    EXPECT_EQ(actions, 0);
+    EXPECT_THROW(
+        submission.submit([&] {
+            ++checks;
+        }),
+        std::logic_error
+    );
+    EXPECT_EQ(checks, 1);
+    EXPECT_THROW(submission.wait_until(FakeRun::Deadline::max()), std::runtime_error);
+}
+
+TEST(QueuedSubmissionTest, CancelDuringEphemeralPreflightReportsSubmittingWithoutRunningAnotherAction) {
+    std::promise<void> entered, resume;
+    auto released = resume.get_future();
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    int actions = 0;
+    Submission submission([&] {
+        ++actions;
+        return FakeRun{complete};
+    });
+    auto queued = std::async(std::launch::async, [&] {
+        submission.submit([&] {
+            entered.set_value();
+            released.wait();
+        });
+    });
+    const bool observed = entered.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (observed) {
+        EXPECT_EQ(submission.disposition(), Submission::Disposition::Submitting);
+        EXPECT_FALSE(submission.cancel(std::make_exception_ptr(std::runtime_error("cancel"))));
+    }
+    resume.set_value();
+    EXPECT_NO_THROW(queued.get());
+    EXPECT_TRUE(observed);
+    EXPECT_EQ(actions, 1);
+    EXPECT_EQ(submission.disposition(), Submission::Disposition::Submitted);
+}
+
+TEST(QueuedSubmissionTest, CancellationHasADistinctDispositionAndNeverRunsPreflight) {
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    Submission submission([&] {
+        return FakeRun{complete};
+    });
+    EXPECT_TRUE(submission.cancel(std::make_exception_ptr(std::runtime_error("cancel"))));
+    EXPECT_EQ(submission.disposition(), Submission::Disposition::Cancelled);
+    int checks = 0;
+    EXPECT_THROW(
+        submission.submit([&] {
+            ++checks;
+        }),
+        std::logic_error
+    );
+    EXPECT_EQ(checks, 0);
+}

@@ -10,7 +10,9 @@
  */
 
 #include "chip_worker.h"
+#include "call_argument_snapshot.h"
 #include "queued_submission.h"
+#include "native_submission_state.h"
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
@@ -365,6 +367,10 @@ void ChipWorker::init(
         transfer_completed_run_fn_ = module->optional<SimplerNativeRunFn>("simpler_transfer_completed_kernel_run");
         observe_framework_submissions_fn_ =
             module->optional<ObserveFrameworkSubmissionsFn>("simpler_observe_framework_submissions");
+        acl_capture_info_fn_ = module->optional<AclCaptureInfoFn>("aclmdlRICaptureGetInfo");
+        acl_model_destroy_register_fn_ = module->optional<AclModelDestroyRegisterFn>("aclmdlRIDestroyRegisterCallback");
+        retain_run_resources_fn_ = module->optional<RetainRunResourcesFn>("simpler_retain_run_resources");
+        release_run_resources_fn_ = module->optional<ReleaseRunResourcesFn>("simpler_release_run_resources");
         // Absent on every simulated and stand-in module by construction, so a
         // null here is a fact about the backend rather than a stale build. The
         // caller reports it.
@@ -772,6 +778,11 @@ bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
 
 void ChipWorker::finalize() {
     validate_execution_context();
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        if (native_resource_references_ != 0)
+            throw std::runtime_error("ChipWorker::finalize: external run resources still require checked release");
+    }
     std::exception_ptr lane_error;
     if (run_lane_ != nullptr) {
         run_lane_->stop_admission();
@@ -792,6 +803,10 @@ void ChipWorker::finalize() {
                 return entry.phase != NativeRunPhase::PREPARING && entry.ops_in_flight == 0 && !entry.finalize_reserved;
             });
         });
+        // A retain may have already held its run operation when close began.
+        // The operation's output must not be invalidated by context teardown.
+        if (native_resource_references_ != 0)
+            throw std::runtime_error("ChipWorker::finalize: external run resources still require checked release");
     }
     cleanup_native_runs_noexcept();
     const size_t unproven = unproven_native_run_count();
@@ -889,6 +904,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     launch_run_fn_ = nullptr;
     validate_execution_context_fn_ = nullptr;
     validate_caller_stream_fn_ = nullptr;
+    acl_capture_info_fn_ = nullptr;
+    acl_model_destroy_register_fn_ = nullptr;
     launch_run_on_stream_fn_ = nullptr;
     launch_run_joined_fn_ = nullptr;
     poll_run_fn_ = nullptr;
@@ -897,6 +914,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     finalize_run_fn_ = nullptr;
     transfer_completed_run_fn_ = nullptr;
     observe_framework_submissions_fn_ = nullptr;
+    retain_run_resources_fn_ = nullptr;
+    release_run_resources_fn_ = nullptr;
     probe_run_retention_fn_ = nullptr;
     get_teardown_report_fn_ = nullptr;
     // Reached only past the throw a failed teardown takes, which keeps the
@@ -1074,25 +1093,25 @@ void ChipWorker::run_with_lease(
 ChipWorkerNativeRun ChipWorker::prepare_native_run(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    NativeRunProvenance provenance
+    NativeRunProvenance provenance, NativeRunPreparePurpose purpose
 ) {
     if (lease.reserved != 0 || lease.generation == 0 || lease.slot_id >= pipeline_contract_.pipeline_depth) {
         throw std::runtime_error("native-run pipeline lease is outside the runtime PipelineContract");
     }
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        true, provenance
+        true, provenance, purpose
     );
 }
 
 ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    bool pipeline_leased, NativeRunProvenance provenance
+    bool pipeline_leased, NativeRunProvenance provenance, NativeRunPreparePurpose purpose
 ) {
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        pipeline_leased, provenance
+        pipeline_leased, provenance, purpose
     );
 }
 
@@ -1195,9 +1214,14 @@ void ChipWorker::configure_launch_depth(unsigned depth) {
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
+    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance,
+    NativeRunPreparePurpose purpose
 ) {
     validate_execution_process();
+    if (purpose != SIMPLER_PREPARE_EAGER && purpose != SIMPLER_PREPARE_CAPTURE)
+        throw RunPreparationRefused("unknown native run preparation purpose");
+    if (purpose == SIMPLER_PREPARE_CAPTURE && (!execution_environment_ || !execution_environment_->borrowed))
+        throw RunPreparationRefused("capture preparation requires a borrowed Kernel execution environment");
     require_comm_cleanup_confirmed();
     try {
         config.validate();
@@ -1240,6 +1264,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             entry->lease_generation = generation;
             entry->run_epoch = run_epoch;
             entry->phase = NativeRunPhase::PREPARING;
+            entry->prepare_purpose = purpose;
             entry->permits_prepared_successor = allow_prepared_successor;
             native_runs_.emplace(run_epoch, std::move(entry));
         } catch (const std::bad_alloc &) {
@@ -1261,7 +1286,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int rc = -1;
     try {
         validate_execution_context();
-        allow_prepared_successor = supports_concurrent_native_prepare();
+        allow_prepared_successor = purpose == SIMPLER_PREPARE_CAPTURE || supports_concurrent_native_prepare();
         {
             std::lock_guard<std::mutex> lock(native_run_mu_);
             size_t occupied = 0;
@@ -1278,8 +1303,14 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                     );
                 }
                 ++occupied;
-                if (!allow_prepared_successor || !entry.permits_prepared_successor ||
-                    (entry.phase != NativeRunPhase::LAUNCHED && entry.phase != NativeRunPhase::REAPED)) {
+                const bool capture_peer = purpose == SIMPLER_PREPARE_CAPTURE &&
+                                          entry.prepare_purpose == SIMPLER_PREPARE_CAPTURE &&
+                                          entry.phase == NativeRunPhase::PREPARED;
+                const bool eager_peer =
+                    purpose == SIMPLER_PREPARE_EAGER && entry.prepare_purpose == SIMPLER_PREPARE_EAGER &&
+                    allow_prepared_successor && entry.permits_prepared_successor &&
+                    (entry.phase == NativeRunPhase::LAUNCHED || entry.phase == NativeRunPhase::REAPED);
+                if (!capture_peer && !eager_peer) {
                     throw RunPreparationRefused(
                         "prepare_native_run requires an active predecessor before staging a successor " +
                         format_native_run_identity(run_identity)
@@ -1299,8 +1330,17 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             native_runs_.at(run_epoch)->permits_prepared_successor = allow_prepared_successor;
         }
         const NativeRunDescriptor descriptor{
-            slot_id,        arena_bank_for_slot(slot_id), run_id,    generation, dispatch_id, run_epoch, accepted_state,
-            accepted_value, launch_depth_ > 1 ? 1u : 0u,  provenance
+            slot_id,
+            arena_bank_for_slot(slot_id),
+            run_id,
+            generation,
+            dispatch_id,
+            run_epoch,
+            accepted_state,
+            accepted_value,
+            purpose == SIMPLER_PREPARE_EAGER && launch_depth_ > 1 ? 1u : 0u,
+            provenance,
+            static_cast<uint32_t>(purpose)
         };
         rc = prepare_run_fn_(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
     } catch (...) {
@@ -1364,45 +1404,29 @@ ChipRun ChipWorker::submit_chip_run(
 
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value, void *caller_stream, bool framework_owned
+    int32_t accepted_value, void *caller_stream, NativeRunPreparePurpose purpose, ChipRun *prepared_out,
+    bool framework_owned
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
-    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream, framework_owned);
+    return run_lane_->submit(
+        callable_id, args, config, accepted_state, accepted_value, caller_stream, purpose, prepared_out, framework_owned
+    );
 }
 
-std::shared_ptr<QueuedSubmission<ChipRun>> ChipWorker::prepare_chip_submission(
-    int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, void *caller_stream
+std::shared_ptr<NativeSubmissionState> ChipWorker::prepare_chip_submission(
+    int32_t callable_id, const CallArgumentSnapshot &values, const CallConfig &config, void *caller_stream
 ) {
     validate_execution_context();
-    validate_caller_stream(caller_stream);
+    if (caller_stream == nullptr) throw RunPreparationRefused("native submission requires a caller stream");
     config.validate();
+    const auto &args = values.args();
     bool framework_eligible = execution_environment_ && execution_environment_->borrowed && !config.diagnostics_any() &&
                               transfer_completed_run_fn_ != nullptr && observe_framework_submissions_fn_ != nullptr;
     for (int i = 0; framework_eligible && i < args.tensor_count(); ++i)
         framework_eligible =
             args.tensor(i).address_space == AddressSpace::DEVICE && args.tensor(i).transfer == TensorTransfer::NONE;
-    return std::make_shared<QueuedSubmission<ChipRun>>(
-        [this, callable_id, args, config, caller_stream](bool framework) {
-            // Preflight refusal precedes lane admission and cannot enqueue device work.
-            try {
-                validate_execution_context();
-                validate_caller_stream(caller_stream);
-            } catch (const std::exception &error) {
-                throw RunPreparationRefused(error.what());
-            }
-            if (framework) {
-                if (!execution_environment_ || !execution_environment_->borrowed || config.diagnostics_any() ||
-                    transfer_completed_run_fn_ == nullptr || observe_framework_submissions_fn_ == nullptr)
-                    throw RunPreparationRefused("framework observation transfer requires matched eager Kernel runtime");
-                for (int i = 0; i < args.tensor_count(); ++i) {
-                    if (args.tensor(i).address_space != AddressSpace::DEVICE ||
-                        args.tensor(i).transfer != TensorTransfer::NONE)
-                        throw RunPreparationRefused("framework observation transfer requires DEVICE/NONE arguments");
-                }
-            }
-            return submit_chip_run(callable_id, args, config, nullptr, 0, caller_stream, framework);
-        },
-        framework_eligible
+    return std::make_shared<NativeSubmissionState>(
+        *this, weak_from_this().lock(), callable_id, values, config, caller_stream, framework_eligible
     );
 }
 
@@ -1515,6 +1539,7 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
         // Only a run still executing is something to be ordered behind. A reaped one is already
         // over, so the ordinary launch is both correct and cheaper.
         return phase == NativeRunPhase::LAUNCHED;
+    case NativeRunOp::RetainResources:
     case NativeRunOp::ProbeSuccessor:
         // The retention probe launches and drains this one itself, so it takes it unlaunched.
         return phase == NativeRunPhase::PREPARED;
@@ -1665,6 +1690,97 @@ void ChipWorker::note_native_run_wait(uint64_t run_epoch, void *storage, int rc)
     if (physical == SIMPLER_NATIVE_RUN_POLL_COMPLETE) note_native_run_completion(run_epoch, 0, false);
 }
 
+struct ChipRunResources::Backing {
+    explicit Backing(std::shared_ptr<ChipWorker> owner, const ChipRun *observation) :
+        owner(std::move(owner)) {
+        if (observation != nullptr) run.emplace(*observation);
+    }
+    std::shared_ptr<ChipWorker> owner;
+    std::optional<ChipRun> run;
+    void *reference{nullptr};
+};
+
+ChipRunResources::ChipRunResources(std::shared_ptr<ChipWorker> owner, const ChipRun *observation) :
+    backing_(std::make_unique<Backing>(std::move(owner), observation)) {}
+
+bool ChipRunResources::has_reference() const noexcept { return backing_->reference != nullptr; }
+
+ChipRunResources::~ChipRunResources() noexcept {
+    // Destruction supplies no model-destruction or external-last-use proof.
+    // Keep the exact allocation and native owner when release is unresolved;
+    // no callback, Python destructor or SDK operation runs from this path.
+    if (backing_->reference != nullptr) (void)backing_.release();
+}
+
+void ChipRunResources::release() {
+    if (backing_->reference == nullptr) return;
+    ChipWorker &owner = *backing_->owner;
+    if (backing_->run) backing_->run->require_carrier_retired();
+    owner.validate_execution_context();
+    const int rc = owner.release_run_resources_fn_(owner.device_ctx_, backing_->reference);
+    if (rc != 0) throw std::runtime_error("release_native_run_resources failed with code " + std::to_string(rc));
+    backing_->reference = nullptr;
+    if (backing_->run) backing_->run->external_resources_released();
+    std::lock_guard<std::mutex> lock(owner.native_run_mu_);
+    --owner.native_resource_references_;
+}
+
+std::unique_ptr<ChipRunResources>
+ChipWorker::retain_native_run_resources(const ChipWorkerNativeRun &run, void *caller_stream) {
+    std::unique_ptr<ChipRunResources> resources;
+    retain_native_run_resources_impl(run, caller_stream, nullptr, resources);
+    return resources;
+}
+
+void ChipWorker::retain_native_run_resources_impl(
+    const ChipWorkerNativeRun &run, void *caller_stream, const ChipRun *observation,
+    std::unique_ptr<ChipRunResources> &resources
+) {
+    NativeRunOpLease held;
+    bool acquired = false;
+    try {
+        validate_execution_process();
+        if (caller_stream == nullptr) throw RunPreparationRefused("native resource retention requires a caller stream");
+        // Both allocations and the genuine native owner pin precede acquisition.
+        // The output goes directly to that already-owned stable allocation.
+        resources = std::unique_ptr<ChipRunResources>(new ChipRunResources(shared_from_this(), observation));
+        void *storage = nullptr;
+        const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::RetainResources, &storage, nullptr, &held);
+        if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "retain_native_run_resources");
+        // Close cannot clear these entries while this run operation is held.
+        if (retain_run_resources_fn_ == nullptr || release_run_resources_fn_ == nullptr)
+            throw RunPreparationRefused("native resource retention requires runtime retention entries");
+        validate_execution_context();
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            ++native_resource_references_;
+        }
+        int rc = PTO_RUNTIME_ERR_INTERNAL;
+        std::exception_ptr failure;
+        try {
+            rc = retain_run_resources_fn_(device_ctx_, storage, caller_stream, &resources->backing_->reference);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        acquired = resources->backing_->reference != nullptr;
+        if (!acquired) {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            --native_resource_references_;
+        }
+        if (failure != nullptr) std::rethrow_exception(failure);
+        if (rc != 0 || resources->backing_->reference == nullptr)
+            throw std::runtime_error("retain_native_run_resources failed with code " + std::to_string(rc));
+    } catch (...) {
+        // No lane lock may wait on the native operation held by this call.
+        held = NativeRunOpLease{};
+        if (!acquired) {
+            if (observation != nullptr) observation->external_resource_acquire_failed();
+            resources.reset();
+        }
+        throw;
+    }
+}
+
 ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
     validate_execution_process();
     require_comm_cleanup_confirmed();
@@ -1672,8 +1788,16 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
     NativeRunOpLease held;
     const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::Launch, &storage, nullptr, &held);
     if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "launch_native_run");
+    bool capture_prepared;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        capture_prepared = native_runs_.at(run.run_epoch)->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
+    }
     validate_execution_context();
-    if (caller_stream != nullptr) validate_caller_stream(caller_stream);
+    // The ordinary validator rejects ACTIVE streams. Capture intent delegates
+    // actual stream/recording classification to the common launch entry; it
+    // does not itself prove that this call will be recorded.
+    if (caller_stream != nullptr && !capture_prepared) validate_caller_stream(caller_stream);
 
     int rc = 0;
     std::exception_ptr failure;
@@ -1696,14 +1820,21 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
         // A launch that failed may still have reached the device. The probe decides which, and
         // the answer is an execution fact: a completed one carries this launch's own error into
         // the record a later finalize reports, and an uncompleted one leaves the run preparable.
-        int poll_rc = 0;
-        try {
-            poll_rc = poll_run_fn_(device_ctx_, storage);
-        } catch (...) {
-            poll_rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
-        }
-        if (poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
-            note_native_run_completion(run.run_epoch, rc, false);
+        if (capture_prepared) {
+            // Capture intent may actually run eagerly outside recording. Keep
+            // the error without an eager probe; the common finalizer uses its
+            // actual recording/execution fact to prove safe retirement.
+            note_native_run_result(run.run_epoch, rc);
+        } else {
+            int poll_rc = 0;
+            try {
+                poll_rc = poll_run_fn_(device_ctx_, storage);
+            } catch (...) {
+                poll_rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
+            }
+            if (poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
+                note_native_run_completion(run.run_epoch, rc, false);
+            }
         }
         failure = std::make_exception_ptr(
             std::runtime_error(
@@ -1997,6 +2128,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     int persisted_rc = 0;
     bool persisted = false;
     bool result_observed = false;
+    bool capture_prepared = false;
     try {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         const auto it = native_runs_.find(run_epoch);
@@ -2005,12 +2137,13 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         persisted_rc = it->second->pending_rc;
         persisted = it->second->pending_rc_set;
         result_observed = it->second->result_observed;
+        capture_prepared = it->second->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
     } catch (...) {
         outcome.captured = std::current_exception();
         clear_finalize_reservation_noexcept(run_epoch);
         return outcome;
     }
-    const bool needs_wait = !transfer && !result_observed &&
+    const bool needs_wait = !transfer && !capture_prepared && !result_observed &&
                             (phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED) &&
                             wait_run_fn_ != nullptr;
 

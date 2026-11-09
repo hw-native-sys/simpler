@@ -1290,8 +1290,10 @@ int simpler_transfer_completed_kernel_run(DeviceContextHandle ctx, RuntimeHandle
 int simpler_observe_framework_submissions(DeviceContextHandle ctx, int *all_observed);
 
 /**
- * Retain preparation backing independently of the original run. Call before
- * CaptureBegin on a Prepared run; exactly one retention is allowed per run.
+ * Retain preparation backing independently of the original Prepared run;
+ * exactly one retention is allowed per run. Kernel capture-purpose preparations
+ * allow an already ACTIVE caller stream, verified by its actual capture status.
+ * Other preparations require a caller stream outside recording.
  * The output is a resource reference, not an executable RuntimeHandle. The
  * caller still finalizes the original run. Success submits no user task and
  * does not advertise capture/replay support on this backend.

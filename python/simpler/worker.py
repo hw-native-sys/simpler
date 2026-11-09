@@ -13816,8 +13816,10 @@ class Worker:
         Preparation snapshots arguments/configuration without device launch or
         waiting for lane capacity. caller_stream and external storage owners must
         remain alive until wait/close; pass their Python owners in keepalive.
-        The callback's successful native submit establishes the caller exit wait.
-        This API does not support capture or L3 Python orchestration.
+        Ordinary native submit establishes the caller exit wait. The stock graph
+        adapter registers this same token with the ACL model before submit. The
+        ticket keeps its owners until the model destroy notice and checked native
+        release. Capture supports Kernels on direct L2 Workers.
         """
         if self.level != 2:
             raise ValueError("prepare_submission requires a direct L2 Worker")
@@ -13829,11 +13831,11 @@ class Worker:
             if getattr(cfg, "output_prefix", ""):
                 _bind_host_log_session_directory()
             run_id, args, chip_args, values = self._prepare_l2_args(
-                state.slot_id, args, caller_stream=stream, original_handle=callable
+                state.slot_id, args, caller_stream=stream, original_handle=callable, snapshot_only=True
             )
             assert self._chip_worker is not None
             try:
-                native = self._chip_worker._prepare_chip_submission(state.slot_id, chip_args, cfg, caller_stream=stream)
+                native = self._chip_worker._prepare_chip_submission(state.slot_id, values, cfg, caller_stream=stream)
             except BaseException:
                 self._discard_l2_reservation(run_id, safe=True)
                 raise
@@ -14228,7 +14230,13 @@ class Worker:
         return None
 
     def _prepare_l2_args(
-        self, callable_id: int, args, *, caller_stream: int | None, original_handle: CallableHandle | None = None
+        self,
+        callable_id: int,
+        args,
+        *,
+        caller_stream: int | None,
+        original_handle: CallableHandle | None = None,
+        snapshot_only: bool = False,
     ):
         """Snapshot and reserve call values before native execution or queue handoff."""
         assert self._chip_worker is not None
@@ -14238,7 +14246,7 @@ class Worker:
         borrowed = environment is not None and environment[4]
         if borrowed and caller_stream is None:
             raise ValueError("borrowed submission requires caller_stream")
-        if caller_stream is not None:
+        if caller_stream is not None and not snapshot_only:
             self._chip_worker._validate_caller_stream(caller_stream)
         args = _snapshot_local_task_args(TaskArgs() if args is None else args)
         if borrowed and any(args.transfer(i) == TensorTransfer.H2D for i in range(args.tensor_count())):

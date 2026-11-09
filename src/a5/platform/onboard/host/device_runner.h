@@ -188,6 +188,8 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    int prepare_kernel_arch_context(rtStream_t control_stream) override;
+    int release_arch_context_resources(bool abandon_device_resources) override;
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
 
     int finalize_impl() override;
@@ -363,8 +365,11 @@ private:
     //
     // dep_gen enablement is a5-specific (a2a3 carries its own copy).
 
-    int query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out);
-    int query_aicpu_topology(pto::a5::AicpuTopology &out);
+    int query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out, rtStream_t control_stream);
+    int query_aicpu_topology(pto::a5::AicpuTopology &out, rtStream_t control_stream);
+    void *aicpu_topology_query_result_{nullptr};
+    bool aicpu_topology_query_pending_{false};
+    rtStream_t aicpu_topology_query_stream_{nullptr};
     void clear_aicpu_topology_cache();
     // Device-side occupancy and the merged Host topology are immutable during
     // one DeviceRunner attach/reset lifetime. Cache successful probes only;

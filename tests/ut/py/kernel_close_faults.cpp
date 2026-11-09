@@ -22,9 +22,9 @@ int failure_kind = 0;
 int attempts = 0;
 bool pending = false;
 int failures_to_skip = 0;
-void *failed_free_address = nullptr;
-int failed_free_attempts = 0;
-int failed_free_successes = 0;
+void *failed_destroy_handle = nullptr;
+int failed_destroy_attempts = 0;
+int failed_destroy_successes = 0;
 SimplerHostLogState test_log_state{};
 bool guard_acl = false;
 std::array<int, 8> forbidden_calls{};
@@ -32,6 +32,10 @@ int forced_current_device = -2;
 int (*real_get_device)(int *) = nullptr;
 int (*real_set_device)(int) = nullptr;
 int (*real_set_op_timeout)(uint64_t, uint64_t *) = nullptr;
+int (*real_capture_info)(void *, void *, void **) = nullptr;
+void *capture_fault_stream = nullptr;
+int capture_queries_until_fault = 0;
+int capture_query_faults = 0;
 int (*real_memcpy)(void *, uint64_t, const void *, uint64_t, int) = nullptr;
 int (*real_memcpy_async)(void *, uint64_t, const void *, uint64_t, int, void *) = nullptr;
 int (*real_malloc_host)(void **, uint64_t, uint16_t) = nullptr;
@@ -71,31 +75,30 @@ int forbidden(size_t index) {
 }
 
 int destroy(const char *symbol, void *handle, int kind) {
-    const bool retrying_free = kind == 4 && handle == failed_free_address && failed_free_address != nullptr;
-    if (retrying_free) ++failed_free_attempts;
+    const bool retrying_handle =
+        kind == failure_kind && failed_destroy_handle != nullptr && handle == failed_destroy_handle;
+    if (retrying_handle) ++failed_destroy_attempts;
     if (failure_kind == kind) {
         ++attempts;
         if (pending && attempts > failures_to_skip) {
             pending = false;
-            if (kind == 4) {
-                failed_free_address = handle;
-                failed_free_attempts = 1;
-                failed_free_successes = 0;
-            }
+            failed_destroy_handle = handle;
+            failed_destroy_attempts = 1;
+            failed_destroy_successes = 0;
             return -4321;
         }
     }
     auto real_destroy = reinterpret_cast<int (*)(void *)>(dlsym(RTLD_NEXT, symbol));
     const int rc = real_destroy(handle);
-    if (retrying_free && rc == 0) ++failed_free_successes;
+    if (retrying_handle && rc == 0) ++failed_destroy_successes;
     return rc;
 }
 }  // namespace
 
 extern "C" void arm_destroy_failure(int kind) {
     failure_kind = kind;
-    failed_free_address = nullptr;
-    failed_free_attempts = failed_free_successes = 0;
+    failed_destroy_handle = nullptr;
+    failed_destroy_attempts = failed_destroy_successes = 0;
     attempts = 0;
     pending = true;
     failures_to_skip = 0;
@@ -103,16 +106,16 @@ extern "C" void arm_destroy_failure(int kind) {
 
 extern "C" void arm_destroy_failure_after(int kind, int skip) {
     failure_kind = kind;
-    failed_free_address = nullptr;
-    failed_free_attempts = failed_free_successes = 0;
+    failed_destroy_handle = nullptr;
+    failed_destroy_attempts = failed_destroy_successes = 0;
     attempts = 0;
     pending = true;
     failures_to_skip = skip;
 }
 
 extern "C" int destroy_attempts() { return attempts; }
-extern "C" int failed_free_retry_attempts() { return failed_free_attempts; }
-extern "C" int failed_free_retry_successes() { return failed_free_successes; }
+extern "C" int failed_destroy_retry_attempts() { return failed_destroy_attempts; }
+extern "C" int failed_destroy_retry_successes() { return failed_destroy_successes; }
 
 extern "C" void arm_acl_guard() {
     forbidden_calls.fill(0);
@@ -150,6 +153,23 @@ extern "C" int aclrtGetDevice(int *device) {
     }
     return real_get_device != nullptr ? real_get_device(device) : -4323;
 }
+extern "C" void arm_capture_query_failure(void *stream, int query) {
+    capture_fault_stream = stream;
+    capture_queries_until_fault = query;
+    capture_query_faults = 0;
+}
+extern "C" int capture_query_failure_hits() { return capture_query_faults; }
+extern "C" int aclmdlRICaptureGetInfo(void *stream, void *status, void **model) {
+    if (stream == capture_fault_stream && capture_queries_until_fault > 0 && --capture_queries_until_fault == 0) {
+        ++capture_query_faults;
+        return -4321;
+    }
+    auto query = real_capture_info != nullptr ?
+                     real_capture_info :
+                     reinterpret_cast<decltype(real_capture_info)>(dlsym(RTLD_NEXT, "aclmdlRICaptureGetInfo"));
+    return query != nullptr ? query(stream, status, model) : -4323;
+}
+
 extern "C" void arm_copy_failure() { fail_next_copy = true; }
 extern "C" int copy_call_count() { return copies; }
 extern "C" int rtMemcpy(void *dst, uint64_t dst_bytes, const void *src, uint64_t src_bytes, int kind) {
@@ -258,6 +278,7 @@ extern "C" int bind_test_rts(void *runtime) {
     // ACL is a dependency of the RTLD_LOCAL component and need not be in the
     // preload shim's RTLD_NEXT lookup scope.
     real_get_device = reinterpret_cast<int (*)(int *)>(dlsym(runtime, "aclrtGetDevice"));
+    real_capture_info = reinterpret_cast<decltype(real_capture_info)>(dlsym(runtime, "aclmdlRICaptureGetInfo"));
     real_set_device = reinterpret_cast<int (*)(int)>(dlsym(runtime, "rtSetDevice"));
     real_set_op_timeout = reinterpret_cast<int (*)(uint64_t, uint64_t *)>(dlsym(runtime, "aclrtSetOpExecuteTimeOutV2"));
     real_memcpy = reinterpret_cast<int (*)(void *, uint64_t, const void *, uint64_t, int)>(dlsym(runtime, "rtMemcpy"));
