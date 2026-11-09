@@ -10747,8 +10747,8 @@ class Worker:
             if "urma" in config.workspace_engines:
                 if self._config.get("runtime") != "tensormap_and_ringbuffer":
                     raise ValueError("URMA domain workspaces require the A5 tensormap_and_ringbuffer runtime")
-                if config.members != tuple(range(len(config.members))):
-                    raise ValueError("URMA requires ranks in dense prefix order")
+                if config.memory_source == AddressSpace.HOST and config.members != tuple(range(len(config.members))):
+                    raise ValueError("Host-source URMA requires ranks in dense prefix order")
         return config
 
     def _initialize_domain(self, handle, initializer) -> None:

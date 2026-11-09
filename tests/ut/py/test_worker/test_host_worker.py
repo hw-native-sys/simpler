@@ -6486,7 +6486,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         return worker
 
     @pytest.mark.parametrize("failed_rank_owns", [False, True])
-    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch, failed_rank_owns):
+    @pytest.mark.parametrize("members", [(0, 1, 2), (1, 2), (2, 1)])
+    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch, failed_rank_owns, members):
         """Abort every reported owner after all allocation requests finish.
 
         A failed rank may retain an unpublished allocation for late import.
@@ -6497,10 +6498,17 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         resources = worker_mod._RunResources()
         worker._building_run_resources = resources
         monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
-        owners = (0, 1, 2) if failed_rank_owns else (0, 2)
+        owners = members if failed_rank_owns else members[:1] + members[2:]
 
-        def partial_failure(*, reply_shms, **_kwargs):
+        def partial_failure(*, workers, request_shms, reply_shms, **_kwargs):
+            assert workers == members
             assert reply_shms is not None
+            for rank, chip in enumerate(members):
+                req_buf = request_shms[chip].buf
+                assert req_buf is not None
+                header = worker_mod._DOMAIN_REQ_HEADER
+                assert header.unpack_from(req_buf, 0)[1:3] == (len(members), rank)
+                assert struct.unpack_from(f"<{len(members)}I", req_buf, header.size) == members
             for chip_idx in owners:
                 reply_buf = reply_shms[chip_idx].buf
                 assert reply_buf is not None
@@ -6509,7 +6517,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", partial_failure)
         with pytest.raises(RuntimeError, match="rank 1 failed"):
-            worker._allocate_domain(name="d", workers=(0, 1, 2), window_size=64, buffers=[])
+            worker._allocate_domain(name="d", workers=members, window_size=64, buffers=[], workspace_mask=2)
 
         handle = resources.live_domains["d"]
         assert handle.workers == owners
@@ -6534,9 +6542,11 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         monkeypatch.setattr(worker, "_dispatch_control_domain", capture_release)
         worker._release_domain_claimed(handle)
 
-        assert release_headers == {rank: (handle.allocation_id, 3, rank, 1) for rank in owners}
+        assert release_headers == {
+            chip: (handle.allocation_id, len(members), members.index(chip), 1) for chip in owners
+        }
 
-        assert abort_calls == [(1, handle.allocation_id, 3, rank) for rank in owners]
+        assert abort_calls == [(1, handle.allocation_id, len(members), members.index(chip)) for chip in owners]
 
     def test_a_chip_that_committed_before_its_reply_failed_is_still_reclaimed(self):
         """The window exists before the reply is written.

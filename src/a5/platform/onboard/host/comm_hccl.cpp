@@ -30,6 +30,7 @@
 #include "host/file_marker_handshake.h"
 #include "host/raii_scope_guard.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cctype>
@@ -842,10 +843,21 @@ static uint32_t compiled_comm_workspaces() {
     return mask;
 }
 
-static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_count) {
-    if (rank_ids == nullptr) return false;
+static bool validate_urma_ranks(CommHandle h, const uint32_t *rank_ids, size_t rank_count, bool host_source) {
     for (size_t i = 0; i < rank_count; ++i) {
-        if (rank_ids[i] != static_cast<uint32_t>(i)) return false;
+        const uint32_t rank = rank_ids[i];
+        const uint32_t *previous_end = rank_ids + i;
+        if (rank >= static_cast<uint32_t>(h->nranks) || std::find(rank_ids, previous_end, rank) != previous_end) {
+            LOG_ERROR(
+                "[comm rank %d] alloc_domain: URMA rank_ids[%zu]=%u is repeated or outside [0, %d)", h->rank, i, rank,
+                h->nranks
+            );
+            return false;
+        }
+        if (host_source && rank != i) {
+            LOG_ERROR("[comm rank %d] alloc_domain: Host-source URMA requires dense prefix ranks", h->rank);
+            return false;
+        }
     }
     return true;
 }
@@ -861,6 +873,7 @@ static int init_urma_workspace(
     // HCCL owns registrations and channels; its lifetime is private to this domain.
     HcclCommConfig config{};
     HcclCommConfigInit(&config);
+    // HCCL assigns child ranks by position in the base-rank list.
     std::vector<uint32_t> ranks(rank_ids, rank_ids + rank_count);
     if (HcclCreateSubCommConfig == nullptr) return COMM_DOMAIN_URMA_INIT_FAILED;
     const HcclResult result = HcclCreateSubCommConfig(
@@ -1972,13 +1985,11 @@ static int allocate_domain_windows(
         LOG_ERROR("[comm rank %d] alloc_domain: unsupported workspace combination 0x%x", h->rank, workspace_mask);
         return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     }
-    if ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0 &&
-        !rank_ids_are_dense_prefix(rank_ids, rank_count)) {
-        LOG_ERROR("[comm rank %d] alloc_domain: URMA requires dense prefix ranks", h->rank);
+    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
+    if (urma_requested && !validate_urma_ranks(h, rank_ids, rank_count, host_shm_name != nullptr)) {
         return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }
     const CommWorkspaceConfig config = workspace_config ? *workspace_config : CommWorkspaceConfig{1, 0};
-    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
     const uint32_t jetties = config.urma_jetties_per_aiv;
     const uint32_t depth = config.urma_sq_depth;
     if (jetties == 0 || jetties > pto::comm::urma::kUrmaMaxJettiesPerCore ||
@@ -2009,7 +2020,7 @@ static int allocate_domain_windows(
             "[comm rank %d] alloc_domain: rank_ids[%u]=%u does not match base rank", h->rank, domain_rank,
             rank_ids[domain_rank]
         );
-        return -1;
+        return urma_requested ? COMM_DOMAIN_URMA_CONFIG_INVALID : -1;
     }
     // The base communicator only needs comm_init to have run (rootinfo_path
     // + run_token are set, used to scope barrier filenames).  We do NOT

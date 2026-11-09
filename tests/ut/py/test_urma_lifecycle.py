@@ -121,6 +121,9 @@ def urma_lifecycle_binary(tmp_path_factory):
         "release_destroy_failure",
         "finalize_live",
         "finalize_undrained",
+        "overlap_subset",
+        "overlap_reordered",
+        "overlap_release_failure",
     ],
 )
 def test_urma_lifecycle(urma_lifecycle_binary, scenario):
