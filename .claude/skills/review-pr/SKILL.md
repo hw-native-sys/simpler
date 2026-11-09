@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Review a GitHub PR by analyzing the correct diff (merge-base to HEAD), reconciling stated vs. real goal, and applying type-specific scrutiny. Optionally folds in independent reviews from local `codex` / `gemini` CLIs when the invocation explicitly opts in (`codex`, `gemini`, or `all` in the arguments). Use when the user asks to review a PR, analyze PR changes, or give feedback on a pull request.
+description: Review a GitHub PR from its background, existing pain points, and expected benefits through correctness, architecture, decoupling, performance, and code quality. Uses the merge-base diff and checks claims against implementation and evidence. Optionally incorporates independent local CLI reviews when explicitly requested with `codex`, `gemini`, or `all`. Use when the user asks to review a PR, analyze PR changes, or give feedback on a pull request.
 ---
 
 # Review PR Workflow
@@ -8,6 +8,11 @@ description: Review a GitHub PR by analyzing the correct diff (merge-base to HEA
 Analyze and review PR changes using the correct merge-base diff.
 Optionally cross-check against independent local CLI reviewers when
 the user explicitly opts in — see [Input](#input).
+
+Understand the current system, its concrete pain points, and the intended
+benefit before judging the solution. Review both functional behavior and the
+quality of the resulting design. A passing test suite alone does not establish
+that the architecture, performance, or maintenance cost is acceptable.
 
 ## Role and review freshness
 
@@ -47,8 +52,8 @@ Examples of user-stated goals to watch for:
 
 **Optional external reviewer opt-in.** The arguments may also contain
 the literal tokens `codex`, `gemini`, or `all` — these turn on the
-Step 7 cross-check with the named CLIs. Without an explicit opt-in,
-**Step 7 is skipped** even if the binaries are installed; cross-check
+Step 8 cross-check with the named CLIs. Without an explicit opt-in,
+**Step 8 is skipped** even if the binaries are installed; cross-check
 is slow (3–5 minutes per CLI) and noisy, so don't run it by default.
 
 Examples:
@@ -71,7 +76,7 @@ Examples:
 
 ```bash
 # Default base when reviewing the current branch (no PR number).
-# This must be set unconditionally so later steps (Step 7's codex/gemini
+# This must be set unconditionally so later steps (Step 8's codex/gemini
 # snippets) can reference $BASE_BRANCH safely.
 BASE_BRANCH="$DEFAULT_BRANCH"
 
@@ -125,7 +130,7 @@ avoid overwhelming context.
 ## Step 3.5: Categorize and Size the Changes
 
 Break the diff into buckets and count changed lines (added + deleted,
-i.e. churn) per bucket. This feeds Step 8's Appendix A (Change
+i.e. churn) per bucket. This feeds Step 9's Appendix A (Change
 Breakdown) and drives the oversized-PR warnings.
 
 **Precedence:** classify by file type / purpose first (Test/Examples,
@@ -197,7 +202,7 @@ git diff "$MERGE_BASE"...HEAD --numstat | awk -F'\t' '
 '
 ```
 
-**Thresholds (carry into Step 8):**
+**Thresholds (carry into Step 9):**
 
 - **Total churn > 1000 lines** → ⚠️ oversized-PR warning (review burden + merge-conflict risk; suggest splitting by concern).
 - **Core churn > 1000 lines** → ❌ stronger oversized-PR warning. Core
@@ -250,7 +255,7 @@ others. Then explicitly note any *narrower* sources:
 
 - If the user said "should do X" and the PR body says "adds primitive
   for X-helper", **state X as the goal** and record "PR body downgrades
-  to X-helper" as a discrepancy to track through Steps 5.7 and 8.
+  to X-helper" as a discrepancy to track through Steps 5.7 and 9.
 - If a linked issue says "implement Y" and PR body says "first step
   toward Y", **state Y as the goal** and record "PR body scopes to
   first step" as a discrepancy.
@@ -267,6 +272,28 @@ extra Step 4 work catches it before approval.
 
 If reviewing the current branch with no open PR, commit messages and
 any user-stated description are your only sources.
+
+## Step 4.5: Establish the Background, Pain, and Expected Benefit
+
+Before judging the changed implementation, inspect the base version and the
+relevant callers, consumers, contracts, and existing alternatives. Establish:
+
+- **Current behavior and constraints:** how the affected mechanism works today
+  and why it has this shape. Read relevant design docs and investigations.
+- **Concrete pain:** an input, workflow, dependency, or maintenance operation
+  that exposes the limitation; identify who pays the cost and where.
+- **Expected benefit:** what becomes possible, faster, simpler, or easier to
+  maintain, including better architectural boundaries, less coupling, and
+  clearer code. These quality improvements are benefits in their own right.
+  State the success criterion when known; do not invent a numerical target
+  or turn the author's claim into an observed result.
+- **Evidence and uncertainty:** cite base-code locations, issue/design context,
+  reproductions, or measurements. Keep verified facts, author claims, and your
+  hypotheses distinct; say what is missing when the motivation is unclear.
+
+Carry the background and pain into report §1, then evaluate the benefit against
+the actual mechanism in §2. Keep this proportional to the change, but do not
+skip it because the PR is small or labeled refactor.
 
 ## Step 5: Derive the Real Goal from the Code
 
@@ -320,16 +347,20 @@ Cover, in order:
    IPC. What's the wire format? What's the version story?
 6. **How the existing system absorbed the change** — which extension
    points were used, what was generalized, what was duplicated.
+7. **Benefit and cost** — how the mechanism removes the identified pain,
+   which costs it adds or moves elsewhere, and what evidence supports the
+   expected improvement. Explain relevant alternatives and trade-offs.
 
 ## Step 5.7: Goal-Method Traceability
 
-Build a table mapping every stated goal to the specific design choice
-and code location that implements it:
+Start a table mapping every stated goal to its design choice and code location.
+In Step 6, extend the same assessment with quality dimensions and their benefits
+and costs relative to the baseline:
 
-| Stated goal | Design choice | Code location | Assessment |
-| :---------- | :------------ | :------------ | :--------- |
+| Goal / dimension | Design / code location | Before → after | Benefit / cost | Assessment / evidence |
+| :--------------- | :--------------------- | :------------- | :------------- | :-------------------- |
 
-For each row, mark one of:
+For goal coverage, use the following assessments:
 
 - ✅ **Solid** — choice clearly supports the goal
 - ⚠️ **Underspecified** — choice exists but rationale missing from PR
@@ -337,11 +368,14 @@ For each row, mark one of:
 - ⚠️ **Weak** — choice exists but doesn't fully support the goal
   (explain how it falls short)
 - ❌ **Missing** — goal stated but no corresponding choice in the diff
-- ➕ **Implicit** — code introduces a choice not covered by any stated
-  goal. This is itself a finding — either the author needs to state
-  the goal, or the code needs to go.
+- ➕ **Implicit** — code introduces behavior or obligations beyond the stated
+  scope. Discuss whether to include that scope or remove the extra behavior.
 
-❌ and ➕ rows are must-discuss before approval. ⚠️ rows feed Step 8's
+Distinguish author-stated goals from reviewer-observed quality effects. A quality
+improvement does not become scope creep merely because the author did not
+advertise it; explain its benefit and any associated cost.
+
+❌ and ➕ rows are must-discuss before approval. ⚠️ rows feed Step 9's
 §4 issue list (typically as Should-fix or Consider). ✅ rows need no
 further action but document that the goal landed.
 
@@ -349,7 +383,33 @@ This table also makes asymmetries obvious: if a PR has 8 stated goals
 and only 3 traceable design choices, the other 5 goals are either
 hand-waving or done implicitly via mechanisms the reader has to guess.
 
-## Step 6: Type-Specific Analysis
+## Step 6: Comprehensive Quality Review
+
+Read and apply [the quality review guide](references/quality-review.md).
+For every code-changing PR, assess architecture, coupling, performance,
+simplicity, reuse, naming, data structures, concurrency/ownership, failure
+handling, compatibility, test quality, and documentation/operability. These
+dimensions also apply to bugfixes and refactors, not only features.
+
+Evaluate each dimension as part of the change's benefit/cost analysis. Better
+architecture, weaker coupling, clearer code, and stronger performance are
+benefits; architectural degradation, tighter coupling, complexity, and resource
+regressions are costs. Trace **baseline pain → design change → quality effect →
+benefit/cost → evidence**, including effects beyond the author's stated claims.
+A dimension can improve in one respect and regress in another; record both.
+
+Inspect relevant surrounding and analogous code with `rg`; a diff alone cannot
+establish that a new abstraction fits or that no equivalent already exists.
+Scale the depth to the changed paths and risks. For docs/config-only work,
+explain which dimensions are inapplicable; do not manufacture code findings.
+
+Use these results to substantiate the benefits and costs explained in report §2
+and the combined assessment in §3. Route actionable issues to §4 and explain
+which trade-offs support the recommendation in §5. Never replace the assessment
+with a blanket "looks good" or present an unmeasured performance expectation as
+a verified improvement.
+
+## Step 7: Type-Specific Analysis
 
 Classify the PR as one of the following and apply the matching checklist.
 A PR with multiple types gets multiple checklists.
@@ -424,7 +484,7 @@ CI was green before this PR, which means the existing test suite does
 3. **Codestyle** (any type): apply `.claude/rules/codestyle.md` and any
    arch-specific rules (`.claude/rules/ascend.md`, etc.).
 
-## Step 6.5: pto-isa Pin Check (repo-specific)
+## Step 7.5: pto-isa Pin Check (repo-specific)
 
 This repo vendors the `pto-isa` headers from a **pinned** git commit. When the pin is active (a concrete SHA, not the "latest main/master" default), the review always carries a pto-isa pin note: a baseline **advisory** that the pinned commit exists and may need bumping, escalating to a **recommendation** when the PR adds or relocates a pto-isa header reference — the case where the pinned revision likely no longer matches what the PR references and a bump is probably required. The risk being mitigated: a PR can silently rely on pto-isa surface the pinned revision does not provide, whose only signal is a broken build or runtime on device.
 
@@ -486,7 +546,7 @@ echo "new pto includes:";        printf '%s\n' "$NEW_PTO_INC"
 **Decision — two severity levels:**
 
 - `PIN_ACTIVE=0` → pin check is **skipped** (repo runs on latest main/master). Record one line ("pto-isa unpinned — using latest; pin check skipped") and stop this step.
-- `PIN_ACTIVE=1` **and no** pto-isa header-reference change (`PTO_REFS` and `NEW_PTO_INC` both empty) → render the Step 8 Appendix B (pto-isa Pin Check) paragraph at the default level, an **advisory**: a light, always-on reminder that the pin exists and may need bumping. This level surfaces whenever the pin is active — even when the diff does not touch the pto-isa cone — so the human is nudged to confirm the pinned commit is still adequate. It does not by itself block the merge.
+- `PIN_ACTIVE=1` **and no** pto-isa header-reference change (`PTO_REFS` and `NEW_PTO_INC` both empty) → render the Step 9 Appendix B (pto-isa Pin Check) paragraph at the default level, an **advisory**: a light, always-on reminder that the pin exists and may need bumping. This level surfaces whenever the pin is active — even when the diff does not touch the pto-isa cone — so the human is nudged to confirm the pinned commit is still adequate. It does not by itself block the merge.
 - `PIN_ACTIVE=1` **and** a pto-isa header reference changed (`PTO_REFS` or `NEW_PTO_INC` non-empty) → escalate one level to a **recommendation**: the pinned commit likely no longer matches the headers the PR references, so a bump is probably required, not merely worth checking. Escalating signals:
   1. `PTO_REFS` — a referenced pto-isa header **path** changed (e.g. `pto/npu/comm/async/sdma/sdma_workspace_manager.hpp` → `pto/comm/async/sdma/sdma_workspace_manager.hpp`). The PR is adapting to a pto-isa header-tree reorg → the pinned commit almost certainly must bump to the revision with the new layout. This is the strongest pin-bump signal.
   2. `NEW_PTO_INC` — the PR newly references a pto-isa header not used before → may need a newer pin that provides it.
@@ -495,14 +555,14 @@ echo "new pto includes:";        printf '%s\n' "$NEW_PTO_INC"
 
 Note: this detects *include-path* changes, **not** edits to files that merely happen to `#include` pto-isa. A logic-only change inside an existing pto-isa consumer keeps the paragraph at the default advisory level — it does not by itself escalate.
 
-**What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_BUILD_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Appendix B blockquotes in Step 8.
+**What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_BUILD_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Appendix B blockquotes in Step 9.
 
-## Step 7: Optional Cross-Check with External CLI Reviewers
+## Step 8: Optional Cross-Check with External CLI Reviewers
 
 **Opt-in only.** Skip this entire step unless the user's `/review-pr`
 arguments explicitly include `codex`, `gemini`, or `all`. The
 cross-check is slow (3–5 minutes per CLI), noisy, and unnecessary for
-small or routine PRs — your own analysis from Steps 5–6 is the review
+small or routine PRs — your own analysis from Steps 5–7 is the review
 by default.
 
 Parse the request into flags. The slash-command harness exposes the
@@ -528,7 +588,7 @@ case " $REVIEW_ARGS " in *" gemini "*) WANT_GEMINI=1 ;; esac
 
 If the user opted in but the requested binary isn't on PATH, note it
 in Appendix C (Independent Reviewer Notes) and proceed without it. If neither
-flag is set, skip the rest of Step 7 entirely.
+flag is set, skip the rest of Step 8 entirely.
 
 The CLIs run as **independent** second opinions — each runs in its
 own process and does not see your analysis. Run them in parallel
@@ -605,6 +665,10 @@ Report — terse bullets only:
 - correctness bugs you can verify by reading the diff and the files
 - scope mismatches between the stated goal and the actual diff
 - missing tests for any bugfix in the diff
+- design and code-quality concerns supported by the changed code and the
+  relevant existing contracts or analogous implementations; consult
+  .claude/skills/review-pr/references/quality-review.md
+- performance risks, clearly distinguishing measurements from hypotheses
 Skip style nits and skip anything you cannot verify against the code.
 EOF
 )" >"$GEMINI_OUT" 2>&1 \
@@ -642,11 +706,11 @@ External reviewers routinely confuse "code in the file I'm reading" with
 including any external finding in your final review, run the matching
 check:
 
-1. **Locate the claimed code in the PR diff.** If the reviewer cites a
-   function, file, or line number, open it and confirm the cited lines
-   are in `git diff "$MERGE_BASE"...HEAD -- <path>`. If they're not in
-   the diff, drop the finding — the reviewer is reading current file
-   state, not your PR's contribution.
+1. **Tie the finding to the PR diff.** Identify the changed lines or behavior
+   in `git diff "$MERGE_BASE"...HEAD -- <path>` that introduce or worsen the
+   issue. Existing callers, contracts, or duplicate implementations outside
+   the diff can supply evidence, but an unchanged pre-existing defect is not
+   a finding against this PR.
 
 2. **For "missing test for bugfix" claims, verify the alleged bugfix is
    in your diff.** Take a distinctive substring from the change the
@@ -669,34 +733,40 @@ check:
    without a concrete "allocated here, never freed on path X" trace is
    speculative. Drop it.
 
+5. **For design or performance claims, verify the criterion and impact.**
+   Name the violated contract, dependency, duplicated implementation, or
+   measured workload. A personal preference is optional; an unmeasured speed
+   claim is a hypothesis, not a confirmed regression.
+
 Only findings that survive these checks may be surfaced in the review
 itself — they enter the §4 issue list like any of your own findings.
-Step 8's Appendix C (Independent Reviewer Notes) then records, per
+Step 9's Appendix C (Independent Reviewer Notes) then records, per
 reviewer, both the findings you surfaced and the ones you dropped (one
 line each) so the human can audit your filtering.
 
-## Step 8: Write the Review
+## Step 9: Write the Review
 
 Order the review by **reader logic** — background/problem → solution →
-coverage → residual → verdict — not by the order the analysis steps
-ran. Sections 0–5 are a fixed frame: fill each one, in order, and put
+benefit/cost evidence → residual → verdict — not by the order the analysis
+steps ran. Sections 0–5 are a fixed frame: fill each one, in order, and put
 each piece of analysis output in the section named below — the frame
 exists precisely so the review cannot drift into free-form commentary.
 The mechanical outputs (change breakdown, pin check, external-reviewer
 notes) go in the appendices so they support the narrative without
-interrupting it. Everything Steps 3.5–7 produced still lands somewhere
+interrupting it. Everything Steps 3.5–8 produced still lands somewhere
 below — nothing is dropped, only reordered.
 
 **Trivial-PR exception**: a trivial PR (single-file, < ~50 changed
 lines) may collapse the frame to §0, §4, and §5 — §0 then carries the
-problem and the solution in one sentence each. Anything larger fills
+problem, solution, and expected benefit concisely; §4 records any material
+quality concerns or missing evidence. Anything larger fills
 every section, in order. The appendices follow their own rules
 regardless of size.
 
 ### 0. Summary
 
-One or two lines: *this PR solves problem P by method M; remaining
-R; verdict: approve / request changes / needs discussion.* After
+One or two lines: *this PR addresses pain P by method M, with benefit B and cost C;
+remaining R; verdict: approve / request changes / needs discussion.* After
 this line the reader knows whether they need to read further.
 
 ### 1. Background and Problem Statement
@@ -725,7 +795,7 @@ codebase. Two layers, in this order:
 
 ### 2. Solution and Rationale
 
-Two questions, both answered here:
+Three questions, all answered here:
 
 - **What the method is** — the Mechanism Brief (Step 5.5): mechanism,
   central abstractions, key design choices. Depth scales with PR size
@@ -734,15 +804,23 @@ Two questions, both answered here:
   (single-file, < ~50 lines).
 - **Why this method solves the §1 problem** — the causal argument
   from mechanism to problem. This absorbs the type-specific
-  correctness reasoning from Step 6 (bugfix: how the changed lines
+  correctness reasoning from Step 7 (bugfix: how the changed lines
   restore correct behavior under the trigger; feature: how it fits
   the existing design and extension points). Also: why this shape
   rather than the plausible alternatives (Feature checklist #8).
-  The routing rule for all of Step 6's output: checklist items that
+  The routing rule for all of Step 7's output: checklist items that
   yield design reasoning (needed-ness, design fit, blast radius,
   boundary and error-path walkthroughs, the concurrency model) are
   woven into this section; items that yield findings go to the §4
   issue list.
+
+- **What improves and what it costs** — evaluate the expected benefit from
+  Step 4.5 using the quality analysis from Step 6. Improvements in architecture,
+  coupling, performance, and maintainability contribute directly to benefits;
+  degradation in those dimensions contributes directly to costs. Explain who
+  gains and who bears each cost, including work shifted to other phases or
+  maintainers. Separate observed results from expectations, cite measurements
+  for speed or resource claims, and state unverified gaps.
 
 **Reuse the §1 example as a before/after**: show the behavior or code
 path with and without the PR. One example threaded through §1 and §2
@@ -750,24 +828,22 @@ costs the reader one mental context, not two. This is the section
 that proves you understood the PR; omitting it on a large PR makes
 the rest of the review look like nitpicking.
 
-### 3. Implementation–Claim Consistency
+### 3. Implementation–Claim Consistency and Benefit/Cost Evidence
 
 A solution narrative can read as valid while the diff does not deliver
 it. This section checks the implementation against the PR body and
 commit messages, in **both** directions:
 
-- The Goal-Method Traceability table (Step 5.7), rendered as a
+- The combined goal, quality, and benefit/cost table (Steps 5.7 and 6), rendered as a
   **markdown table plus footnotes — never reformatted into a
   vertical list or card layout**, no matter how long the content
   is. Cells hold short phrases only; the detailed explanation of any
   ⚠️ / ❌ / ➕ row goes into a numbered footnote (`[1]`, `[2]`, ...)
-  directly below the table, referenced from the Assessment cell.
+  directly below the table, referenced from the Assessment / evidence cell.
   ❌ rows = claimed but not implemented (incomplete work); ➕ rows =
-  implemented but never claimed (scope creep). Both are must-discuss.
-  Sole exception to the table form: when the table is short (< 3
-  rows) and every row is ✅, it may be replaced by one prose sentence
-  stating that every stated goal traced to its implementation; any
-  ⚠️ / ❌ / ➕ row forces the table.
+  extra behavior or obligations outside the stated scope. Both are must-discuss.
+  Reviewer-observed quality benefits and costs are labeled as observations,
+  not attributed to the author as claims they never made.
 - The stated-vs-real mismatch classes from Step 5 (stated as bugfix
   but adds functionality, stated as refactor but changes behavior)
   are reported here — never silently papered over. When the stated
@@ -778,27 +854,43 @@ commit messages, in **both** directions:
   test exist that fails pre-fix and passes post-fix (Bugfix checklist
   #4)? A gap found here is recorded and carried into §4 as an issue.
 
+In that same table, cover every dimension from Step 6 relative to the baseline.
+State the benefit, cost, or lack of material change, including both gains and
+losses within a dimension when applicable. Mark missing evidence as **Not
+verified** and irrelevant dimensions as **Not applicable**, with the reason.
+Support conclusions with concrete code/contracts/tests/measurements. Related
+goals and dimensions may share a row when their relationship remains clear;
+reference shared evidence rather than counting one improvement twice. Keep
+cells short, put details below, and link actionable costs to §4. "Not verified"
+does not establish either a benefit or the absence of a cost.
+
 ### 4. Residual Issues and Risks
 
 Three sub-lists; give each entry a concrete example where possible:
 
 - **Uncovered cases** — ❌ traceability rows and stated-goal parts not
   done; name an input/scenario that still fails after merge.
-- **New risks/costs introduced** — ➕ rows, concurrency or ABI
-  hazards, maintenance weight from churn.
+- **New risks/costs introduced** — ➕ rows, architecture or coupling
+  regressions, concurrency or ABI hazards, performance/resource regressions,
+  maintenance weight from churn. Include deliberate trade-offs from §3.
 - **Follow-up work** — TODOs, deferred items, docs to sync.
 
 Then the severity-ranked issue list:
 
 - **Must fix**: bugs, correctness issues, security problems,
-  unresolved goal-vs-code mismatches, ❌ / ➕ traceability rows.
-  **Every Must-fix carries a failure example** — concrete input/state
-  → wrong result. "There is a race here" without a named interleaving
-  is not a Must-fix.
+  unresolved goal-vs-code mismatches, ❌ / ➕ traceability rows, or
+  demonstrated violations of required architecture/data contracts or agreed
+  performance budgets. **Every Must-fix carries concrete evidence:** a failing
+  input/interleaving, a reproducible budget violation, or the required design
+  rule plus the changed dependency/layout and its impact. "There is a race"
+  without an interleaving or "this is inelegant" without an objective criterion
+  is not a Must-fix. An unresolved design preference belongs in discussion.
 - **Should fix**: style violations per `.claude/rules/`, missing
   tests for bugfixes, doc/comment drift, ⚠️ traceability rows with
   user-visible impact, string-matching error translations across
-  boundaries, missing version stories on new ABIs.
+  boundaries, missing version stories on new ABIs, avoidable coupling or
+  redundancy with demonstrated maintenance cost, and missing evidence for
+  material performance claims.
 - **Consider**: suggestions, optional improvements, ⚠️ rows that
   only affect future maintainability.
 
@@ -807,13 +899,14 @@ Then the severity-ranked issue list:
 Not a bare word — an explicit chain over the sections above:
 
 > problem is real (§1) → method solves it (§2) → implementation
-> matches the claims (§3) → residual is acceptable (§4) →
+> and benefit/cost evidence hold (§3) → benefits justify the costs and
+> residual risks (§4), with required contracts intact →
 > **approve** (list follow-ups)
 
 Decision rule:
 
-- Real problem + working method + claims-matching implementation +
-  residual is only acceptable follow-up → **approve**.
+- Real problem + working method + claims-matching implementation + benefits
+  justify the costs + residual is only acceptable follow-up → **approve**.
 - Any Must-fix, an unexplained goal-vs-code mismatch, or an
   unresolved ❌ coverage row (§3) → **request changes**.
 - Method works but a design choice is contested, a goal downgrade
@@ -821,8 +914,17 @@ Decision rule:
   coverage row still awaits the author's rationale →
   **needs discussion**.
 
+Explain why each material cost is justified, must be reduced, or requires
+agreement. Functional gains do not automatically compensate for architectural
+degradation or tighter coupling, and no benefit cancels a required contract
+violation. Do not invent a numerical score that hides these trade-offs.
+
 If the chain breaks, say at which link and why — that link *is* the
-verdict's justification. The oversized-PR warnings from Appendix A
+verdict's justification. State whether each material unverified benefit or
+quality concern blocks the recommendation or can be an explicit follow-up.
+Do not treat functional tests as evidence for unmeasured performance or
+unexamined architecture; do not block solely on personal taste.
+The oversized-PR warnings from Appendix A
 feed in here: Core churn > 1000 lines biases the verdict toward
 "request changes / needs discussion" unless the author justifies the
 size.
@@ -854,7 +956,7 @@ should question before approval.
 
 ### Appendix B: pto-isa Pin Check
 
-From Step 6.5. **Always rendered when the pin is active** (`PIN_ACTIVE=1`), at one of two severity levels chosen by whether a pto-isa header reference changed — the level is the whole point of this section, so state it explicitly in the heading:
+From Step 7.5. **Always rendered when the pin is active** (`PIN_ACTIVE=1`), at one of two severity levels chosen by whether a pto-isa header reference changed — the level is the whole point of this section, so state it explicitly in the heading:
 
 - **No header-reference change** (`PTO_REFS` and `NEW_PTO_INC` empty) → **advisory**. A light, always-on nudge that the pin exists; does not by itself block the merge. Render as a single info line, e.g.:
 
@@ -874,7 +976,7 @@ A short subsection per external reviewer (codex, gemini) listing:
 
 - which of their findings you verified and surfaced above
 - which you dropped, with a one-line reason each (using the
-  "Verification before surfacing" checks from Step 7)
+  "Verification before surfacing" checks from Step 8)
 
 The dropped-list is part of the review's audit trail — do not omit it
 when there were dropped findings. A reader needs to see what filtering
@@ -891,7 +993,7 @@ you did.
    `/checkout-pr` first if not already on the PR branch.
 4. **Large PRs** — Read diffs in chunks by directory. Do not try to
    read the entire diff in one tool call if it exceeds ~2000 lines.
-   For `codex` and `gemini` in Step 7, pass only the merge-base SHA
+   For `codex` and `gemini` in Step 8, pass only the merge-base SHA
    and let each CLI run `git diff` itself in the worktree — never
    inline `$(git diff …)` into the prompt argv (hits `ARG_MAX`, ~128
    KiB on Linux).
