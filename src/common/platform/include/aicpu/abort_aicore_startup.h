@@ -18,6 +18,19 @@
 #include "common/unified_log.h"
 #include "runtime.h"
 
+// Stamped A2/A3 TMR cores acknowledge even an entry rejection through their
+// report. Runtimes without that ACK field use the COND nonce protocol.
+template <typename Target, typename Report>
+inline auto startup_abort_target(uint64_t reg, AicoreTeardownControl *gate, Report *report, uint64_t epoch)
+    -> decltype(Target{reg, gate, &report->retired_epoch, epoch}) {
+    return {reg, gate, &report->retired_epoch, epoch};
+}
+
+template <typename Target>
+inline Target startup_abort_target(uint64_t reg, AicoreTeardownControl *gate, const void *, uint64_t) {
+    return {reg, gate};
+}
+
 // Called once by callback 0 after the whole entry cohort rejected execution.
 // No executor has initialized, and affinity TLS may be unavailable. Discover
 // only this launch's reports and retire without publishing tasks or READY.
@@ -57,7 +70,7 @@ inline int32_t abort_aicore_startup(Runtime *runtime, uint64_t regs_base, uint64
             // core-side exit path acknowledges through teardown_gates[block_idx],
             // so this path relies on the launch block index and the worker report
             // index being the same, as the normal retirement path does.
-            targets[count] = {regs[physical], &gates[i]};
+            targets[count] = startup_abort_target<AicoreExitTarget>(regs[physical], &gates[i], report, epoch);
             ids[count++] = i;
         }
     } while (remaining != 0 && get_sys_cnt_aicpu() <= discovery_deadline);

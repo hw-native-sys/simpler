@@ -193,3 +193,42 @@ __aicore__ inline void acknowledge_aicore_cond_nonce_and_wait(__gm__ AicoreTeard
     }
     wait_for_post_close_release(&control->post_close_release);
 }
+
+__aicore__ inline void publish_startup_markers(
+    __gm__ volatile uint64_t *ack, __gm__ volatile uint32_t *done, __gm__ volatile uint64_t *stamp, uint32_t ready,
+    uint64_t report_epoch
+) {
+    if (report_epoch != 0) {
+        // A captured replay retains its prepared epoch. Reset the Core-owned
+        // ACK before publishing this execution's startup report.
+        *ack = 0;
+        // A repeated epoch makes aicore_done the fresh startup marker too.
+        OUT_OF_ORDER_STORE_BARRIER();
+        // Native program run: `aicore_done` is payload, and `report_epoch` is
+        // the marker that commits it. The barrier separates the two, so the
+        // AICPU cannot see this run's epoch without the report it stands for.
+        *done = ready;
+        OUT_OF_ORDER_STORE_BARRIER();
+        *stamp = report_epoch;
+    } else {
+        // Kernel/persistent launch: unchanged. `aicore_done` is itself the
+        // marker, its per-run reset is what makes it meaningful, and no stamp
+        // is written.
+        OUT_OF_ORDER_STORE_BARRIER();
+        *done = ready;
+    }
+}
+
+// The current startup report commits a cleared ACK. After EXIT, publish the
+// exact epoch once, then wait on the CPU-owned post-CLOSE release line.
+__aicore__ inline void
+publish_aicore_epoch_and_wait(__gm__ volatile uint64_t *ack, __gm__ AicoreTeardownControl *control, uint64_t epoch) {
+    dsb(DSB_DDR);
+    *ack = epoch;
+    dcci((__gm__ void *)ack, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb(DSB_DDR);
+    while (ld_dev(&control->release_epoch, 0) != epoch) {
+        SPIN_WAIT_HINT();
+    }
+    dsb(DSB_DDR);
+}

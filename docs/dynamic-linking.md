@@ -395,8 +395,10 @@ resident AICPU SO. Native entry initialization still runs on binding failure;
 each callback retains its index and receives a failed gate result so it can
 contribute to invocation completion without entering the executor. Onboard has
 already launched AICores at this point: callback 0 first discovers this launch's
-core reports and runs the EXIT/nonce/close/release protocol, without affinity
-TLS or executor initialization. Its completion contribution is held until this
+core reports and sends EXIT without affinity TLS or executor initialization.
+Stamped A2/A3 TMR observes retired_epoch; other paths observe the COND nonce.
+The owner closes the window, reads it back, drains the close, then publishes
+release_epoch for stamped TMR or post_close_release for the nonce path. Its completion contribution is held until this
 retirement attempt ends. Startup EXIT bypasses task and profiling initialization
 on the cores. Missing reports or ACKs are bounded failures and leave unreleased
 cores to host device recovery; a failed native result alone does not authorize

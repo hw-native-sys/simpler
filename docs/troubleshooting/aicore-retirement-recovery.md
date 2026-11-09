@@ -1,8 +1,10 @@
 # AICore retirement failure and device-owner recovery
 
 An AICore exit ACK is not a completion fence. The retirement owner must
-observe this request's nonce, close/read back the window, drain that close,
-and publish the post-close release before the Core may return.
+observe the matching retired_epoch for stamped A2/A3 TMR or the current COND
+nonce on the other paths. It then closes the window, reads it back, drains
+the close, and publishes release_epoch or post_close_release respectively.
+Only then may the Core return.
 
 ## ACK after the retirement deadline
 
