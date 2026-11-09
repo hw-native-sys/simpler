@@ -17,7 +17,7 @@
 
 constexpr uint32_t AICORE_POST_CLOSE_RELEASE = 1;
 
-// Only AICPU writes this line. It clears the full line before READY or EXIT
+// Only AICPU writes this line. It clears the gate fields before READY or EXIT
 // and releases only after the current exit ACK and window-close/readback/drain.
 // AICore bypass-loads the control and never caches or writes this line.
 struct alignas(64) AicoreTeardownControl {

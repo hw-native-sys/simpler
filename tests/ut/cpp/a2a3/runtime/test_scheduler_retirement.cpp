@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -40,6 +41,7 @@ bool pause_open = false;
 bool open_paused = false;
 bool resume_open = false;
 bool silent_first_core = false;
+thread_local std::function<void()> before_report_poll;
 
 template <typename Context>
 auto initialize(Context &context, Runtime *runtime, uint64_t regs, int)
@@ -89,7 +91,10 @@ bool assign_owned(Context &, Runtime *, int, long) {
 }
 }  // namespace
 
-uint32_t platform_get_physical_cores_count() { return kCores; }
+uint32_t platform_get_physical_cores_count() {
+    if (before_report_poll) before_report_poll();
+    return kCores;
+}
 static uint64_t test_report_epoch = 0;
 uint64_t test_exit_epoch() {
 #ifdef SIMPLER_TEST_EPOCH_RETIREMENT
@@ -110,7 +115,13 @@ volatile uint32_t *get_reg_ptr(uint64_t address, RegId) { return &conditions.at(
 void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *, const char *) {}
 #endif
 
+static AicoreTeardownControl *gates_at_window = nullptr;
 void platform_init_aicore_regs(uint64_t address) {
+    if (gates_at_window != nullptr) {
+        EXPECT_EQ(gates_at_window[address - 1].post_close_release, 0U);
+        EXPECT_EQ(gates_at_window[address - 1].exit_request, 0U);
+        EXPECT_EQ(gates_at_window[address - 1].release_epoch, 0U);
+    }
     ++opened.at(address - 1);
     std::unique_lock<std::mutex> lock(init_mutex);
     if (pause_open && address == kCores) {
@@ -210,6 +221,7 @@ protected:
         nonce_batches = 0;
         epoch_batches = 0;
         batches = 0;
+        gates_at_window = nullptr;
         deadlines = 0;
         pause_open = false;
         open_paused = false;
@@ -619,41 +631,76 @@ TEST_F(SchedulerRetirement, NewGenerationClearsPendingRequestsAndReturnGates) {
     expect_once();
 }
 
-TEST_F(SchedulerRetirement, InitializationClearsRequestAndReleaseForEveryCore) {
+TEST_F(SchedulerRetirement, DirtyGatesAreResetBeforeEachWindow) {
+    auto *gates = runtime->get_teardown_gates();
     for (int i = 0; i < kCores; ++i) {
-        auto &control = runtime->get_teardown_gates()[i];
-        control.post_close_release = AICORE_POST_CLOSE_RELEASE;
-        control.exit_request = 9;
-        control.release_epoch = UINT64_MAX;
+        gates[i].post_close_release = AICORE_POST_CLOSE_RELEASE;
+        gates[i].exit_request = AICORE_EXIT_NONCE_0;
+        gates[i].release_epoch = UINT64_MAX;
     }
     ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
+    gates_at_window = gates;
+    handshake();
+    gates_at_window = nullptr;
+    EXPECT_EQ(request_all(), 0);
+    expect_once();
+}
+
+TEST_F(SchedulerRetirement, EarlyRequestWaitsForItsOwnerToArmDirtyGates) {
+    auto *gates = runtime->get_teardown_gates();
     for (int i = 0; i < kCores; ++i) {
-        const auto &control = runtime->get_teardown_gates()[i];
-        EXPECT_EQ(control.post_close_release, 0u);
-        EXPECT_EQ(control.exit_request, 0u);
-        EXPECT_EQ(control.release_epoch, 0U);
+        gates[i].post_close_release = AICORE_POST_CLOSE_RELEASE;
+        gates[i].exit_request = AICORE_EXIT_NONCE_1;
+        gates[i].release_epoch = UINT64_MAX;
     }
+    ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
+    EXPECT_EQ(request_all(), 0);
+    EXPECT_EQ(batches.load(), 0);
+    gates_at_window = gates;
+    if (!handshake_owned_only(*context, runtime.get(), 0, 0)) {
+        GTEST_SKIP() << "This runtime uses the contiguous partition handshake";
+    }
+    EXPECT_EQ(batches.load(), 0);
+    ASSERT_TRUE(assign_owned(*context, runtime.get(), 0, 0));
+    for (int i : {1, 4, 5}) {
+        EXPECT_EQ(opened[i].load(), 0);
+        EXPECT_EQ(retired[i].load(), 0);
+    }
+    ASSERT_TRUE(handshake_owned(*context, runtime.get(), 1, 0));
+    gates_at_window = nullptr;
+    expect_once();
+    EXPECT_EQ(request_all(), 0);
+    EXPECT_EQ(batches.load(), 2);
 }
 
 TEST_F(SchedulerRetirement, NativeModeClaimsOnlyAfterCurrentReportAndUsesMatchingProtocol) {
-    test_report_epoch = 42;
-    ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
-    for (int i = 0; i < kCores; ++i) {
-        EXPECT_EQ(runtime->get_teardown_gates()[i].exit_request, 0U);
-        EXPECT_EQ(runtime->get_teardown_gates()[i].post_close_release, 0U);
-        runtime->get_workers()[i].report_epoch = 42;
+    test_report_epoch = 0x10000002aULL;
+    gates_at_window = runtime->get_teardown_gates();
+    for (int launch = 0; launch < 2; ++launch) {
+        SCOPED_TRACE(launch);
+        ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
+        for (int i = 0; i < kCores; ++i) {
+            opened[i] = 0;
+            retired[i] = 0;
+            auto &report = runtime->get_workers()[i];
+#ifdef SIMPLER_TEST_EPOCH_RETIREMENT
+            report.retired_epoch = 0;
+#endif
+            report.report_epoch = test_report_epoch;
+            report.aicore_done = 1;
+        }
+        // Captured replay reuses the epoch and the gates left by the previous retirement.
+        SchedulerContextTestPeer::assign(*context);
+        EXPECT_EQ(request_all(), 0);
+        EXPECT_EQ(batches.load(), launch);
+        handshake();
+        expect_once();
+        EXPECT_EQ(nonce_batches.load(), test_exit_epoch() == 0 ? launch + 1 : 0);
+        EXPECT_EQ(epoch_batches.load(), test_exit_epoch() == 0 ? 0 : launch + 1);
+        for (int i = 0; i < kCores; ++i)
+            EXPECT_EQ(runtime->get_workers()[i].aicore_done, 0U);
     }
-    SchedulerContextTestPeer::assign(*context);
-    EXPECT_EQ(request_all(), 0);
-    EXPECT_EQ(nonce_batches.load(), 0);
-    handshake();
-    expect_once();
-    EXPECT_EQ(nonce_batches.load(), test_exit_epoch() == 0 ? 1 : 0);
-    EXPECT_EQ(epoch_batches.load(), test_exit_epoch() == 0 ? 0 : 1);
-    for (int i = 0; i < kCores; ++i) {
-        EXPECT_EQ(runtime->get_teardown_gates()[i].release_epoch, test_exit_epoch());
-        EXPECT_EQ(runtime->get_workers()[i].aicore_done, 0U);
-    }
+    gates_at_window = nullptr;
     test_report_epoch = 0;
 }
 TEST_F(SchedulerRetirement, UnstampedModeUsesNonceAfterOwnershipPublication) {
@@ -687,21 +734,38 @@ TEST_F(SchedulerRetirement, ReportsAreInvalidatedOnlyAfterTheirOwnExitAcknowledg
 TEST_F(SchedulerRetirement, MissingReportDoesNotTurnAcceptedRetirementIntoExitProof) {
     EXPECT_EXIT(
         {
+            auto *gates = runtime->get_teardown_gates();
+            for (int i = 0; i < kCores; ++i) {
+                gates[i].post_close_release = AICORE_POST_CLOSE_RELEASE;
+                gates[i].exit_request = AICORE_EXIT_NONCE_1;
+                gates[i].release_epoch = UINT64_MAX;
+            }
+            if (initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0) != 0) std::_Exit(8);
             SchedulerContextTestPeer::clear_ownership(*context);
             runtime->get_workers()[kCores - 1].aicore_done = 0;
             context->handshake_partition(runtime.get(), 0, 2);
-            for (int i = 0; i < kCores / 2; ++i)
-                if (opened[i].load() != 1) std::_Exit(1);
+            for (int i = 0; i < kCores / 2; ++i) {
+                if (opened[i].load() != 1 || gates[i].post_close_release != 0 || gates[i].exit_request != 0 ||
+                    gates[i].release_epoch != 0)
+                    std::_Exit(1);
+            }
 
-            std::atomic<bool> entered{false};
+            std::atomic<bool> reached_poll{false};
             std::atomic<bool> returned{false};
             std::thread missing_report([&] {
-                entered.store(true, std::memory_order_release);
+                // Inspect the second slice on its writer thread, before it waits for the missing report.
+                before_report_poll = [&] {
+                    for (int i = kCores / 2; i < kCores; ++i)
+                        if (gates[i].post_close_release != 0 || gates[i].exit_request != 0 ||
+                            gates[i].release_epoch != 0)
+                            std::_Exit(9);
+                    reached_poll.store(true, std::memory_order_release);
+                };
                 context->handshake_partition(runtime.get(), 1, 2);
                 returned.store(true, std::memory_order_release);
             });
             const auto startup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            while (!entered.load(std::memory_order_acquire)) {
+            while (!reached_poll.load(std::memory_order_acquire)) {
                 if (std::chrono::steady_clock::now() >= startup_deadline) std::_Exit(2);
             }
             if (request_all() != 0) std::_Exit(3);
@@ -712,9 +776,8 @@ TEST_F(SchedulerRetirement, MissingReportDoesNotTurnAcceptedRetirementIntoExitPr
             // READY is published only after the handshake join. An accepted
             // request is still pending, even for the already-open first slice.
             if (batches.load() != 0 || deadlines.load() != 0) std::_Exit(5);
-            for (int i = 0; i < kCores; ++i) {
-                if (retired[i].load() != 0 || runtime->get_teardown_gates()[i].post_close_release != 0) std::_Exit(6);
-            }
+            for (int i = 0; i < kCores; ++i)
+                if (retired[i].load() != 0) std::_Exit(6);
             if (opened[kCores - 1].load() != 0) std::_Exit(7);
             // Only the fixture process ends here; no physical-exit fact is minted.
             std::_Exit(0);
