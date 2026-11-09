@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -130,7 +131,8 @@ inline constexpr uint64_t kFixtureCallableCount = 1024;
 struct FixtureStorage {
     explicit FixtureStorage(
         uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1,
-        const SchedulerSpmdRequirements &spmd = {}, bool protocol_profiling = false
+        const SchedulerSpmdRequirements &spmd = {}, bool protocol_profiling = false,
+        const std::function<void(AicoreSchedulerLayout &)> &extend_layout = {}
     ) :
         test_profiles(workers),
         test_contexts(workers),
@@ -144,6 +146,7 @@ struct FixtureStorage {
         EXPECT_TRUE(scheduler_plan_layout(
             task_count, task_count, 0, &layout, false, task_count * traces_per_task, spmd, protocol_profiling
         ));
+        if (extend_layout) extend_layout(layout);
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
         contexts = scheduler_state_at<SchedulerWorkerContext>(scheduler_state->base(), layout.worker_contexts_offset);

@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PTO_ASYNC_KERNEL_API_H
-#define PTO_ASYNC_KERNEL_API_H
+#pragma once
 
 #include <stdint.h>
 
@@ -18,6 +17,7 @@
 #include <pto/comm/pto_comm_inst.hpp>
 
 #include "intrinsic.h"
+#include "async_condition_writer.h"
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/completion_token.h"
 #include "host_build_graph/runtime_status.h"
@@ -29,14 +29,38 @@
 #define __gm__
 #endif
 
-// Public surface: get_async_ctx, async_ctx_is_deferred,
-// register_completion_condition, send_notification,
-// save_expected_notification_counter. Everything else lives in
-// pto2::detail and is reserved for backend adapters / internal use.
+// Kernel-local view. The legacy wire prefix lives in LocalContext; resident
+// state is addressed explicitly through the GlobalContext fields.
+struct AsyncCtx : LegacyAsyncCtx {
+    uint32_t resident_enabled{0};
+    pto2::resident::AsyncWriter resident{};
+
+    static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
+        AsyncCtx ctx{};
+        const auto legacy = LegacyAsyncCtx::make(task_token, buffer);
+        ctx.completion_count = legacy.completion_count;
+        ctx.completion_error_code = legacy.completion_error_code;
+        ctx.completion_entries = legacy.completion_entries;
+        ctx.completion_capacity = legacy.completion_capacity;
+        ctx.task_token = legacy.task_token;
+        return ctx;
+    }
+};
+
+// Cache and error adapters for the existing address-based registration API.
 namespace pto2::detail {
 
+inline __aicore__ bool resident_context_is_live(const AsyncCtx &ctx) {
+    if (ctx.resident_enabled != 1) return false;
+    const auto *data = pto2::resident::detail::group(ctx.resident);
+    if (data == nullptr) return false;
+    // A sticky registration error does not erase the context's identity.
+    return data->state == pto2::resident::AsyncPublicationState::OPEN &&
+           pto2::resident::detail::layout_valid(ctx.resident, *data);
+}
+
 inline __aicore__ void defer_load_slab(AsyncCtx &ctx) {
-    if (ctx.completion_count == nullptr) return;
+    if (ctx.resident_enabled != 0 || ctx.completion_count == nullptr) return;
 #if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
     uintptr_t line = reinterpret_cast<uintptr_t>(ctx.completion_count) & ~(uintptr_t(CHIP_ALIGN_SIZE) - 1u);
     dcci((__gm__ int32_t *)line, SINGLE_CACHE_LINE);
@@ -46,6 +70,10 @@ inline __aicore__ void defer_load_slab(AsyncCtx &ctx) {
 }
 
 inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code) {
+    if (ctx.resident_enabled != 0) {
+        pto2::resident::detail::fail(ctx.resident, error_code);
+        return;
+    }
     if (ctx.task_token.is_valid() && ctx.completion_error_code != nullptr) {
         *ctx.completion_error_code = error_code;
     }
@@ -67,7 +95,7 @@ inline __aicore__ void defer_flush_range(volatile __gm__ void *addr, uint32_t si
 }
 
 inline __aicore__ void defer_flush(AsyncCtx &ctx) {
-    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr) return;
+    if (ctx.resident_enabled != 0 || !ctx.task_token.is_valid() || ctx.completion_count == nullptr) return;
 #if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
     uint32_t count = *ctx.completion_count;
     if (count > ctx.completion_capacity) {
@@ -99,6 +127,33 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     __gm__ LocalContext *lc =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uintptr_t>(args[PAYLOAD_LOCAL_CONTEXT_INDEX]));
     AsyncCtx ctx{};
+    const auto *global =
+        reinterpret_cast<__gm__ const GlobalContext *>(static_cast<uintptr_t>(args[PAYLOAD_GLOBAL_CONTEXT_INDEX]));
+    ctx.resident_enabled = global->async_present;
+    if (ctx.resident_enabled != 0) {
+        ctx.task_token = TaskId::invalid();
+        ctx.resident.image = reinterpret_cast<__gm__ uint8_t *>(global->async_image_address);
+        ctx.resident.image_bytes = global->async_image_bytes;
+        ctx.resident.run_epoch = global->async_run_epoch;
+        ctx.resident.group_offset = global->async_group_offset;
+        ctx.resident.group_index = global->async_group_index;
+        if (ctx.resident_enabled != 1 || global->async_reserved != 0) {
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+            ctx.resident_enabled = UINT32_MAX;
+            return ctx;
+        }
+        if (!pto2::detail::resident_context_is_live(ctx)) {
+            (void)pto2::resident::detail::valid(ctx.resident);
+            return ctx;
+        }
+        auto *data = pto2::resident::detail::group(ctx.resident);
+        ctx.completion_count = &data->count;
+        ctx.completion_error_code = &data->error_code;
+        ctx.completion_entries =
+            reinterpret_cast<volatile __gm__ DeferredCompletionEntry *>(ctx.resident.image + data->entries_offset);
+        ctx.completion_capacity = data->capacity;
+        return ctx;
+    }
     ctx.completion_count = lc->async_ctx.completion_count;
     ctx.completion_error_code = lc->async_ctx.completion_error_code;
     ctx.completion_entries = lc->async_ctx.completion_entries;
@@ -108,7 +163,11 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     return ctx;
 }
 
-inline __aicore__ bool async_ctx_is_deferred(const AsyncCtx &ctx) { return ctx.task_token.is_valid(); }
+inline __aicore__ bool async_ctx_is_deferred(const AsyncCtx &ctx) {
+    return ctx.resident_enabled == 1 ? pto2::detail::resident_context_is_live(ctx) :
+           ctx.resident_enabled == 0 ? ctx.task_token.is_valid() :
+                                       false;
+}
 
 // Canonical writer: backend submit handlers build a CompletionToken and pass
 // it here. Writes one DeferredCompletionEntry to the AsyncCtx slab and
@@ -116,6 +175,7 @@ inline __aicore__ bool async_ctx_is_deferred(const AsyncCtx &ctx) { return ctx.t
 // SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW in ctx.completion_error_code) or when ctx is
 // not currently a deferred context.
 inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const CompletionToken &token) {
+    if (ctx.resident_enabled != 0) return pto2::resident::register_completion_condition(ctx.resident, token);
     if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
         return false;
     }
@@ -154,5 +214,3 @@ save_expected_notification_counter(AsyncCtx &ctx, volatile __gm__ void *counter_
     (void)register_completion_condition(ctx, token);
     pto2::detail::defer_flush(ctx);
 }
-
-#endif  // PTO_ASYNC_KERNEL_API_H

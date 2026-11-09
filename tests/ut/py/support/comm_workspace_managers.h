@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "pto/comm/async/urma/urma_types.hpp"
+#include "pto/comm/async_common/sdma_constants.hpp"
 
 namespace workspace_fixture {
 inline int started[3]{};
@@ -47,7 +48,9 @@ public:
         return fail_engine != engine_;
     }
     void *GetWorkspaceAddr() const { return invalid_addr_engine == engine_ ? nullptr : addr_; }
-    uint64_t GetWorkspaceSize() const { return invalid_size_engine == engine_ ? 0 : engine_ == 0 ? 16384 : 8192; }
+    uint64_t GetWorkspaceSize() const {
+        return invalid_size_engine == engine_ ? 0 : engine_ == 0 ? pto::comm::sdma::kSdmaWorkspaceBytes : 8192;
+    }
 
 private:
     int engine_;
@@ -66,7 +69,7 @@ public:
             *size = 0;
             return ACL_ERROR_INVALID_PARAM;
         }
-        *size = 16384;
+        *size = pto::comm::sdma::kSdmaWorkspaceBytes;
         return ACL_SUCCESS;
     }
     bool Init(void *addr, uint64_t size) { return create(addr, size); }

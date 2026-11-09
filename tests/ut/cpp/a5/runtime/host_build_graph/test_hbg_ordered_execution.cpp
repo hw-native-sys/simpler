@@ -1757,6 +1757,34 @@ TEST(HbgOrderedProtocol, ExhaustedCursorDoesNotInventAnotherClaim) {
     EXPECT_NE(blocks[1].owner.claim_after.sequence, 0u);
 }
 
+TEST(HbgOrderedProtocol, EachBlockPublishesItsTraceBeforeContributingCompletion) {
+    OrderedFixture fixture({{2, LaneMask::aic()}}, true);
+    ASSERT_TRUE(fixture.admit(0, 0));
+    for (const uint32_t worker : {0u, 3u}) {
+        ASSERT_TRUE(fixture.stage_one(worker, 0));
+        OrderedExecution execution;
+        ASSERT_TRUE(fixture.begin(worker, &execution));
+        auto *local = fixture.locals[worker];
+        ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), local->config.self_lane, execution.slot,
+            execution.generation, nullptr, nullptr, nullptr, 4, nullptr, nullptr, fixture.storage.ssbuf_region
+        ));
+        const auto *blocks = scheduler_state_at<SchedulerProtocolBlockTrace>(
+            fixture.base(), fixture.storage.layout.protocol.blocks_offset
+        );
+        const auto *executions = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+            fixture.base(), fixture.storage.layout.protocol.executions_offset
+        );
+        EXPECT_NE(executions[execution.block].trace_published.sequence, 0u);
+        EXPECT_LT(
+            executions[execution.block].trace_published.sequence,
+            blocks[execution.block].owner.completion_before.sequence
+        );
+        EXPECT_EQ(local->slots[execution.slot].state, SchedulerDispatchSlotState::FREE);
+    }
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 2u);
+}
+
 TEST(HbgOrderedProtocol, OutOfRangeTracePrefixDoesNotWriteOutsideThePlannedBlockRegion) {
     OrderedFixture fixture({{2, LaneMask::aic()}}, true);
     ASSERT_TRUE(fixture.admit(0, 0));

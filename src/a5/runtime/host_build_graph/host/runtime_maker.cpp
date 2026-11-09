@@ -67,6 +67,7 @@
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "native_graph_plan.h"
+#include "async_completion_plan.h"
 #include "ready_pool_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
@@ -1563,20 +1564,37 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
         return false;
     }
-    // Zero gives one queue per type; four and eight bound the preferred
-    // consumer group while retaining global visibility of all ready tasks.
-    constexpr uint32_t kReadyPoolGroupWidth = 8;
-    constexpr auto kReadyPoolKind = SchedulerReadyPoolKind::TICKET;
-    constexpr uint32_t kReadyChunkWindow = 0;
+    // Groups of eight bound preferred consumers while retaining global
+    // visibility of all ready tasks.
     SchedulerReadyPoolPlan ready_pool_plan;
     if (!scheduler_plan_ready_pool(
-            task_metadata, static_cast<uint32_t>(spmd.cluster_count), kReadyPoolGroupWidth, layout.total_size,
-            &ready_pool_plan, kReadyPoolKind, kReadyChunkWindow
+            task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &ready_pool_plan
         )) {
         LOG_ERROR("A5 HBG: ready pool layout overflow or invalid topology");
         return false;
     }
     layout.total_size = ready_pool_plan.total_size;
+    AsyncCompletionHostPlan async_plan;
+    std::vector<AsyncTaskPlanInput> async_inputs;
+    for (uint32_t ref = 0; ref < task_metadata.size(); ++ref) {
+        const auto &metadata = task_metadata[ref];
+        if ((metadata.flags & SCHEDULER_TASK_EXECUTABLE) == 0 || scheduler_task_is_inline(metadata.flags)) continue;
+        AsyncTaskPlanInput input;
+        input.task_ref = ref;
+        input.block_count = metadata.logical_block_num;
+        input.active_mask = metadata.active_mask;
+        async_inputs.push_back(input);
+    }
+    std::string async_error;
+    if (!plan_async_completion(
+            layout.total_size, api->run_epoch(), static_cast<uint32_t>(node_count), async_inputs, &async_plan,
+            &async_error, static_cast<uint32_t>(spmd.cluster_count)
+        )) {
+        LOG_ERROR("A5 HBG: async completion layout failed: %s", async_error.c_str());
+        return false;
+    }
+    layout.total_size = async_plan.total_bytes;
+    layout.async_layout_offset = async_plan.layout_offset;
     layout.executable_task_count = executable_task_count;
     layout.executable_subtask_count = executable_subtask_count;
     layout.aic_worker_demand = aic_worker_demand;
@@ -1585,8 +1603,8 @@ bool create_scheduler_state(
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
     // The slot's retained pair, each side aligned with at least total_size
     // behind it. Handed over uninitialized and never carrying anything between
-    // runs: the initialization below writes this run's whole length, and the
-    // publication ships it.
+    // runs: initialization publishes the current metadata prefix. Reserved
+    // async storage remains hidden until its first runtime publication.
     void *device_state = nullptr;
     void *host_base = nullptr;
     if (api->acquire_scheduler_state_storage(
@@ -1602,11 +1620,14 @@ bool create_scheduler_state(
     }
     const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
 
-    // The only pass over this run's total_size: it zeroes and fills the whole
-    // length, which is what makes a retained block's previous contents
-    // unreachable.
-    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address)) {
+    const uint64_t initialized_bytes = async_plan.layout_offset == 0 ? layout.total_size : async_plan.initialized_bytes;
+    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address, initialized_bytes)) {
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
+        return false;
+    }
+
+    if (layout.async_layout_offset != 0 && !initialize_async_completion(host_base, layout.total_size, async_plan)) {
+        LOG_ERROR("A5 HBG: failed to initialize async completion storage");
         return false;
     }
 
@@ -1742,7 +1763,7 @@ bool create_scheduler_state(
         );
     }
     runtime->add_pending_metadata(
-        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size),
+        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(initialized_bytes),
         HostPhaseKind::Count, {}
     );
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);
@@ -2826,7 +2847,10 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     }
     if (runtime_status != 0) {
         if (api->observed_run_status().has_value()) {
-            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read)", runtime_status);
+            const char *name = runtime_status < 0 && runtime_status >= -PTO_RUNTIME_LATCHED_CODE_MAX ?
+                                   error_name(-runtime_status) :
+                                   "unknown";
+            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read) error=%s", runtime_status, name);
         } else {
             int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
             LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);

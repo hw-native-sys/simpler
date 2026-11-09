@@ -55,20 +55,22 @@ MPMC pop 的成功 CAS 是唯一 owner 的获取点，不再增加 Graph 级 own
 即使所有 payload slot 占满或 admission candidate 被暂存，也必须运行控制切片。
 已有 kernel completion 的控制后继只入队；下一切片处理，避免 completion→control 的递归。
 
-建议初值为每轮最多新完成 8 个控制节点、路由 64 个 detached waiter，作为内部常量。
-每 worker 只有一个私有 `ControlResolveContinuation { producer_ref, next_waiter }`：
+每轮最多开始 8 个控制节点，并消耗 64 个控制工作单位，作为内部常量。
+每 worker 持有一个 184 bytes 的 `SchedulerResolveCursor`，保存 producer、剩余链、当前 waiter 的旧 next、fanin 游标及最多 8 项的发布状态：
 
 1. pop 一个 ready 控制节点，校验 kind、BLOCKED 和无 kernel 资源；以原子写发布 DONE。
 2. 原子 exchange 将其 wake-list 置为 CLOSED，取得完整旧链；重复 CLOSED 是协议错误。
-3. 先原子读取当前 waiter 的 next，再调用通用 fanin 访问器路由此 waiter。
+3. 先原子读取并保存当前 waiter 的旧 next，再按工作预算推进 fanin 扫描及 wake-list 登记。
 4. 路由结果只能是重新挂到某个 producer、进入某个 ready inbox，或错误；不能同时存在两个位置。
-5. 达到 waiter 预算就保存剩余链头；返回前发布本切片所有 ready batch。下轮先继续这条链。
+5. 预算耗尽时保存完整进度，包括已经准备但尚未公开的 batch；下轮继续。重新挂链成功后不再访问该 waiter，原链只按保存的旧 next 推进。
 6. 链耗尽且 batch 发布完成后才增加本 worker 的 `pending_completed`，清空 continuation。
 
 continuation 私有拥有整条剩余链；不把它重新入队，不再次关闭 producer，也不再次发布 DONE。
-每个 waiter 的一次路由不可中途悬停，其 fanin 扫描最多为该行长度，当前上限为 1024。
-因此 64 是 waiter 数预算，**不是 64 次 GM 访问或硬实时周期上限**。
-kernel completion 原有路径仍可能一次处理较长链；此处只约束新增控制工作，后续据测量决定是否统一切片。
+初始化、单个 fanin 观察、一次 wake-list 登记尝试、waiter 选择/暂存或一次 ready 发布步骤各消耗一个单位。
+ready 发布的准备及 ticket 发布最多处理 8 项；inbox tail 的成功 CAS 后必须立即完成旧 tail 挂链及屏障，之后才允许让出。
+可复用 ready directory 的置位独立续接，每步使用权威读取及至多一次 CAS。
+64 是上述工作单位预算，**不是 64 次 GM 访问或硬实时周期上限**；每种单位的固定访问和屏障成本仍需计量。
+普通同步 kernel completion 保持直接 refill 和 MIX prefix 发布策略；可移交的 FINISH 使用同一有界 fanin 原语及完整解析游标。
 本地状态避免新增过度对齐的大栈对象；GM wire 的对齐要求不直接搬到 CCEC 局部变量上。
 
 ## 参数绑定与资源准入
@@ -99,7 +101,7 @@ cooperative 的 claim owner 只准备 admission record；所有成员首次 adop
 
 `SchedulerLocalSlotState` 用三态 predicate（未求值、通过、不通过）保存一次求值的结果，
 park/restore 与 `args_observed` 一起迁移，不因重试而读取更新后的 predicate operand。
-slot 保持 24 bytes，`SchedulerLocalState` 为 632 bytes，均有 64-bit 构建的静态断言。
+slot 保持 24 bytes，`SchedulerLocalState` 为 808 bytes（含可选异步服务状态的 8-byte 引用），其中控制解析游标占 184 bytes，均有 64-bit 构建的静态断言。
 最初 I4 测试快照使用两个 predicate 布尔值，slot 为 32 bytes、总状态为 616 bytes；
 后续性能证据必须明确区分该快照与三态布局。
 这些局部状态也用于无 Graph 路径，P1 必须实测其开销，不能仅凭 native 分支未执行就断言零影响。

@@ -38,13 +38,14 @@ static inline __aicore__ void record_async_boundary(__gm__ int64_t *args, int32_
                                   (static_cast<int64_t>(ctx.completion_error_code != nullptr) << 2) |
                                   (static_cast<int64_t>(ctx.completion_entries != nullptr) << 3) |
                                   (static_cast<int64_t>(ctx.completion_capacity != 0) << 4);
-    // This allocated counter remains zero even if an incorrect legacy path registers it.
+    // An already-satisfied condition exercises registration without issuing DMA.
     CompletionToken token{
         reinterpret_cast<uint64_t>(&record->atomic_padding[1]), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
     };
     record->metadata_padding[1] = static_cast<int64_t>(register_completion_condition(ctx, token));
-    record->metadata_padding[2] = static_cast<int64_t>(register_completion_condition(ctx, token));
-    record->metadata_padding[3] = 0xC34;
+    AsyncCtx missing{};
+    record->metadata_padding[2] = static_cast<int64_t>(register_completion_condition(missing, token));
+    record->metadata_padding[3] = ctx.resident_enabled == 1 ? 0xC34 : 0;
     // Fanin observes valid identity only after both API calls and the sentinel write.
     record_execution(args, slot);
 }

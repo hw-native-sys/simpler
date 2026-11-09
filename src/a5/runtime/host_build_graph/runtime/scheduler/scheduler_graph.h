@@ -57,6 +57,9 @@ enum class SchedulerGraphResult : uint64_t {
     INVALID_FANIN_COUNT = 8,
     INVALID_FANIN_ID = 9,
     TIMEOUT = 10,
+    ASYNC_COMPLETION_INVALID = 11,
+    ASYNC_WAIT_OVERFLOW = 12,
+    ASYNC_REGISTRATION_FAILED = 13,
 };
 
 inline __aicore__ bool scheduler_node_is_control(SchedulerNodeKind kind) {

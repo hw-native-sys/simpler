@@ -515,6 +515,8 @@ int main(int argc, char **argv) {
         assert(allocate(3, second, second_ctx) == 0);
         const auto *a = reinterpret_cast<CommContext *>(first_ctx);
         const auto *b = reinterpret_cast<CommContext *>(second_ctx);
+        assert(comm_workspace<CommWorkspaceKind::SDMA>(*a).size == pto::comm::sdma::kSdmaWorkspaceBytes);
+        assert(comm_workspace<CommWorkspaceKind::SDMA>(*b).size == pto::comm::sdma::kSdmaWorkspaceBytes);
         assert(comm_workspace<CommWorkspaceKind::SDMA>(*a).addr == comm_workspace<CommWorkspaceKind::SDMA>(*b).addr);
         assert(comm_workspace<CommWorkspaceKind::URMA>(*a).addr != comm_workspace<CommWorkspaceKind::URMA>(*b).addr);
         assert(comm_workspace<CommWorkspaceKind::SDMA>(*a).addr != comm_workspace<CommWorkspaceKind::URMA>(*a).addr);

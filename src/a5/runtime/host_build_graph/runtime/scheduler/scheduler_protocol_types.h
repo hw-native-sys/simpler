@@ -16,6 +16,7 @@
 #include <type_traits>
 
 inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520001);
+inline constexpr uint32_t SCHEDULER_PROTOCOL_DEFERRED_FINISH = UINT32_C(1) << 31;
 
 enum SchedulerProtocolError : uint64_t {
     SCHEDULER_PROTOCOL_DUPLICATE = UINT64_C(1),

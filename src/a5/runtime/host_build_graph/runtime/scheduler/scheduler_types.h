@@ -1070,7 +1070,7 @@ struct alignas(128) SchedulerGraphSummary {
     uint64_t protocol_layout_offset;
     SchedulerTopologyLayout topology_layout;
     uint64_t ready_pool_offset;
-    uint8_t cache_line_padding[8];
+    uint64_t async_layout_offset;
 };
 
 struct alignas(64) SchedulerReadyDirectoryShard {
@@ -1153,6 +1153,11 @@ enum class SchedulerErrorSite : uint64_t {
     GRAPH_BIND_TENSOR = 133,
     GRAPH_BIND_SCALAR = 134,
     GRAPH_BIND_PREDICATE = 135,
+    ASYNC_CONTEXT_INVALID = 140,
+    ASYNC_SEAL_FAILED = 141,
+    ASYNC_CHECK_FAILED = 142,
+    ASYNC_FINISH_FAILED = 143,
+    ASYNC_BLOCK_RELEASE_FAILED = 144,
 };
 
 enum SchedulerErrorIdentityField : uint32_t {
@@ -1491,6 +1496,7 @@ static_assert(
 static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
 static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");
+static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 120);
 static_assert(alignof(SchedulerGraphSummary) == 128, "graph summary alignment changed");
 static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard must occupy one cache line");
 static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
@@ -1780,13 +1786,17 @@ inline bool scheduler_plan_layout(
     return true;
 }
 
-inline bool
-scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout, uint64_t device_base_address) {
+inline bool scheduler_init_data_from_layout(
+    void *base, const AicoreSchedulerLayout &layout, uint64_t device_base_address, uint64_t initialized_bytes = 0
+) {
+    if (initialized_bytes == 0) initialized_bytes = layout.total_size;
     if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
         device_base_address == 0 || (device_base_address & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-        layout.total_size > UINT64_MAX - device_base_address)
+        layout.total_size > UINT64_MAX - device_base_address || initialized_bytes > layout.total_size ||
+        (layout.async_layout_offset == 0 ? initialized_bytes != layout.total_size :
+                                           initialized_bytes < layout.async_layout_offset))
         return false;
-    __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
+    __builtin_memset(base, 0, static_cast<size_t>(initialized_bytes));
     if (layout.protocol_layout_offset != 0) {
         *scheduler_state_at<SchedulerProtocolLayout>(base, layout.protocol_layout_offset) = layout.protocol;
         auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, layout.protocol.workers_offset);
@@ -1851,6 +1861,7 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
     summary->group_mailboxes_offset = layout.group_mailboxes_offset;
     summary->mix_close_seals_offset = layout.mix_close_seals_offset;
     summary->protocol_layout_offset = layout.protocol_layout_offset;
+    summary->async_layout_offset = layout.async_layout_offset;
     if (layout.spmd.cooperative_task_count != 0) {
         for (uint64_t task = 0; task < layout.task_count; ++task) {
             const uint64_t offset = layout.admission_records_offset + task * layout.admission_record_stride;
