@@ -173,15 +173,16 @@ struct SlotPersistentArgs {
     Runtime *runtime_args{nullptr};  // device block holding the Runtime descriptor
     uint64_t runtime_bytes{0};       // committed length: the full device extent, not a published prefix
 
-    // Whether THIS block's handshake region has been published once.
+    // Whether THIS block's handshake initialization has been established.
     //
     // It states a fact about the allocation named above, not about the slot:
     // the field lives here so it is adopted, released and abandoned with the
     // pointer it describes, and the two teardown paths reset the whole struct
     // rather than named fields, so a later block cannot inherit a predecessor's
-    // verdict. Committed only after the copy carrying that region has
-    // been accepted into the stream; the entry fork orders both readers after
-    // that copy. A failed enqueue leaves it false. Slot reuse requires retirement
+    // verdict. Replayable preparation commits it after synchronous initialization.
+    // Program publication commits it after the initializing copy is accepted
+    // into the stream, with both readers ordered after it by the entry fork.
+    // A failed initializing copy leaves it false. Slot reuse requires retirement
     // of the previous run, never just an accepted publication.
     bool workers_initialized{false};
     EntryCacheQualification entry_cache_qualification;
@@ -205,7 +206,8 @@ struct SlotPersistentArgs {
     //
     // A publication whose bytes equal this skips its copy: the block already
     // holds them, and on this runtime nothing but a publication writes that
-    // range. Only the launch route records here, so the copy is never skipped
+    // range. Only eager launch-route publication records here; capture always
+    // includes its own copy and invalidates this cache. The copy is never skipped
     // on the strength of a range some other route wrote. Fixed and trivially
     // copyable because recording happens *after* the copy that earned it, where
     // an allocation or a throw would leave a published descriptor with no state
@@ -296,7 +298,11 @@ struct KernelArgsHelper {
     // descriptor. An unpublished snapshot rejects another prepare without
     // changing its source, destination, or allocator. After publication or
     // release, a fresh prepare withdraws the previous publication status.
-    int prepare_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot);
+    // Replayable allocations initialize their handshake region synchronously
+    // before capture; their recorded publications exclude device-owned words.
+    int prepare_runtime_args(
+        const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, bool replayable = false
+    );
 
     int prepare_kernel_invocation(const simpler::tmr::KernelCallableIdentity &identity);
 
@@ -323,7 +329,9 @@ struct KernelArgsHelper {
      * kernel may be submitted. A repeated publish is rejected without another
      * copy.
      */
-    int publish_runtime_args(bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink);
+    int publish_runtime_args(
+        bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink, bool retained_recording = false
+    );
 
     // A non-null destination alone may still contain a previous run's bytes.
     // This verdict covers the Runtime descriptor and staged launch metadata,
@@ -412,11 +420,10 @@ private:
     RuntimeLaunchMetadata launch_metadata_;
     RuntimeArgsState runtime_args_state_{RuntimeArgsState::Empty};
 
-    // The slot whose pending snapshot carries the handshake region, or null
-    // when the snapshot is an ordinary shorter one. `publish_runtime_args`
-    // records the block as initialized through this, and only after its copy
-    // returns success — so the fact is committed by the same call that earns
-    // it, and no caller can commit it early by forgetting the order.
+    // The slot awaiting asynchronous handshake initialization through Program
+    // publication. Successful publication commits workers_initialized through it.
+    // Null for an already initialized block, including one initialized
+    // synchronously by replayable preparation.
     SlotPersistentArgs *initializing_slot_{nullptr};
 
     // The slot this run prepared against, which owns both the destination and
