@@ -164,7 +164,7 @@ TEST_F(TensorMapTest, InsertThenLookupFindsProducer) {
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, tid);
+    EXPECT_EQ(result.entries[0].entry->access_task_id, tid);
 }
 
 TEST_F(TensorMapTest, LookupEmptyReturnsZero) {
@@ -198,12 +198,12 @@ TEST_F(TensorMapTest, InsertDifferentBuffersNoCollision) {
     TestLookupResult r1;
     run_lookup(tmap, t1, r1);
     EXPECT_EQ(r1.count, 1);
-    EXPECT_EQ(r1.entries[0].entry->producer_task_id, TaskId::make(0, 0));
+    EXPECT_EQ(r1.entries[0].entry->access_task_id, TaskId::make(0, 0));
 
     TestLookupResult r2;
     run_lookup(tmap, t2, r2);
     EXPECT_EQ(r2.count, 1);
-    EXPECT_EQ(r2.entries[0].entry->producer_task_id, TaskId::make(0, 1));
+    EXPECT_EQ(r2.entries[0].entry->access_task_id, TaskId::make(0, 1));
 }
 
 // =============================================================================
@@ -338,7 +338,7 @@ TEST_F(TensorMapTest, StaleEntriesSkippedDuringLookup) {
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make(0, 1));
+    EXPECT_EQ(result.entries[0].entry->access_task_id, TaskId::make(0, 1));
 }
 
 TEST_F(TensorMapTest, StaleEntriesNotTruncatedAcrossRings) {
@@ -354,7 +354,7 @@ TEST_F(TensorMapTest, StaleEntriesNotTruncatedAcrossRings) {
     run_lookup(tmap, t, result);
     // Ring 1 task 0 still valid, ring 0 task 0 invalidated
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make(1, 0));
+    EXPECT_EQ(result.entries[0].entry->access_task_id, TaskId::make(1, 0));
 }
 
 // =============================================================================
@@ -376,7 +376,7 @@ TEST_F(TensorMapTest, CleanupRetiredRemovesEntriesForRetiredTasks) {
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make(0, 2));
+    EXPECT_EQ(result.entries[0].entry->access_task_id, TaskId::make(0, 2));
 }
 
 TEST_F(TensorMapTest, CleanupRetiredPreservesOtherRings) {
@@ -391,7 +391,7 @@ TEST_F(TensorMapTest, CleanupRetiredPreservesOtherRings) {
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make(1, 0));
+    EXPECT_EQ(result.entries[0].entry->access_task_id, TaskId::make(1, 0));
 }
 
 TEST_F(TensorMapTest, CleanupRetiredFreesEntriesToPool) {
@@ -429,7 +429,7 @@ TEST_F(TensorMapTest, CleanupRetiredSparesLaterTaskReusingSlot) {
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make(0, WINDOW_SIZE));
+    EXPECT_EQ(result.entries[0].entry->access_task_id, TaskId::make(0, WINDOW_SIZE));
 }
 
 // =============================================================================
@@ -453,7 +453,7 @@ TEST_F(TensorMapTest, MultiRingIndependentLookup) {
     TestLookupResult result2;
     run_lookup(tmap, t, result2);
     EXPECT_EQ(result2.count, 1);
-    EXPECT_EQ(result2.entries[0].entry->producer_task_id, TaskId::make(1, 3));
+    EXPECT_EQ(result2.entries[0].entry->access_task_id, TaskId::make(1, 3));
 }
 
 // =============================================================================
@@ -549,7 +549,7 @@ TEST_F(TensorMapTest, RemoveMiddleEntryPreservesChain) {
 
     std::set<uint32_t> found_locals;
     for (int i = 0; i < result.count; i++) {
-        found_locals.insert(result.entries[i].entry->producer_task_id.local_id());
+        found_locals.insert(result.entries[i].entry->access_task_id.local_id());
     }
     EXPECT_TRUE(found_locals.count(0));
     EXPECT_TRUE(found_locals.count(2));

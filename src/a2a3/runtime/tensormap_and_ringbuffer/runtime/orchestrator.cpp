@@ -955,7 +955,7 @@ static bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed) {
                 return true;
             }
             // Progress is entries actually freed, NOT watermark movement: a ring can
-            // retire zero-output tasks (count_registrable_outputs == 0), advancing
+            // retire zero-output tasks (count_registrable_accesses == 0), advancing
             // last_task_alive without freeing any entry. Gating the backstop on
             // free_entries() keeps a wedged pool from dodging the timeout while some
             // unrelated ring keeps draining.
@@ -1133,11 +1133,11 @@ static TaskOutputTensors submit_task_common(
     // is shared across rings and reclaimed as last_task_alive advances; an
     // exhausted pool back-pressures here (and detects a wedged watermark) rather
     // than tripping new_entry()'s hard assert mid-registration.
-    int32_t tensormap_needed = count_registrable_outputs(dep_inputs, orch->in_manual_scope());
+    int32_t tensormap_needed = count_registrable_accesses(dep_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) {
         return result;
     }
-    register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
+    register_task_accesses(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
 
     CYCLE_COUNT_LAP(g_orch_insert_cycle);
 

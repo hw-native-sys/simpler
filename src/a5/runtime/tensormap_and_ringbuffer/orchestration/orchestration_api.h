@@ -278,41 +278,11 @@ static inline bool rt_is_fatal() {
  *   uint64_t raw = get_tensor_data(tensor, 1, idx);       // old usage unchanged
  *   float val = get_tensor_data<float>(tensor, 1, idx);   // typed read
  *
- * If the tensor has a producer in TensorMap, spin-waits until the producer
- * task completes before reading. External tensors (make_tensor_external)
- * are read immediately without waiting.
- */
-template <typename T = uint64_t>
-static inline T get_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return from_u64<T>(0);
-    }
-    return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
-}
-
-/**
- * Write a value to a tensor at the given multi-dimensional indices.
- *
- * Type is deduced from value argument; uint64_t by default:
- *
- *   set_tensor_data(tensor, 1, idx, raw_u64);     // old usage unchanged
- *   set_tensor_data(tensor, 1, idx, 42.0f);       // typed write (T = float)
- *
- * If the tensor has a producer in TensorMap, spin-waits until the producer
- * and all its consumers complete before writing (WAW + WAR safety).
- * External tensors (make_tensor_external) with no TensorMap entry are
- * written immediately without waiting.
- *
- * Limitation: TensorMap only tracks producers (OUTPUT/INOUT), not consumers
- * that used the tensor as INPUT. If a kernel reads this tensor as INPUT
- * (not INOUT) and the tensor has no TensorMap producer entry, set_tensor_data
- * cannot detect the reader and may cause a data race.
- *
- * To ensure WAR safety for all access patterns, use add_inout() instead of
- * add_input() for kernel parameters that may later be written via
- * set_tensor_data. INOUT creates a TensorMap entry that enables automatic
- * consumer tracking via fanout_refcount.
+ * Waits for overlapping registered readers and writers to complete before
+ * writing. Creator/writer consumer guards also remain in effect. A reader's
+ * downstream consumers are not waited on. Ordinary INPUT accesses in automatic
+ * scopes are registered; manual scopes and manual_dep require explicit ordering.
+ * External tensors with no matching access or owner are written immediately.
  *
  * The tensor must already have an allocated buffer (addr != 0).
  * For runtime-created outputs, call this only on the simpler::tmr::Tensor returned by

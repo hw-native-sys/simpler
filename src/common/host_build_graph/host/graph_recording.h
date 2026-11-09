@@ -194,7 +194,7 @@ struct GraphRecording {
     //
     // The ordinary submit path reads a task's producers out of orch->tensor_map
     // (compute_task_fanin, STEP 3) and publishes the task's writes back into it
-    // (register_task_outputs, STEP 4). The shadow-record path replaces
+    // (register_task_accesses, STEP 4). The shadow-record path replaces
     // submit_task_common wholesale, so without a map of its own the recorder
     // can only see the edges tensor-source classification yields — and that
     // classification answers "which recorded task's packed window holds these bytes",

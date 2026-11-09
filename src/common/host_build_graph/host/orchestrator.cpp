@@ -597,7 +597,6 @@ static TaskOutputTensors submit_task_common(
     TaskId task_id = prepared.task_id;
     TaskDescriptor &task = *prepared.task;
     TaskPayload &payload = *prepared.payload;
-    result.set_task_id(task_id);
 
     // dep_gen capture point: open this task's graph entry before its dependency
     // steps run, so the edges STEP 1 / STEP 3 discover attach to it. The graph
@@ -673,11 +672,11 @@ static TaskOutputTensors submit_task_common(
     // Reserve pool capacity for this task's inserts before registering, so an
     // exhausted pool reports here rather than tripping new_entry()'s hard assert
     // mid-registration.
-    int32_t tensormap_needed = count_registrable_outputs(dep_inputs, orch->in_manual_scope());
+    int32_t tensormap_needed = count_registrable_accesses(dep_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) {
         return result;
     }
-    register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
+    register_task_accesses(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
 
     ORCH_STEP_LAP(g_orch_insert_ns);
 
@@ -696,6 +695,7 @@ static TaskOutputTensors submit_task_common(
     // region and counted them in payload.fanin_count. payload.init writes
     // tensor_count/scalar_count only and must not touch either, or it would discard
     // that.
+    result.set_task_id(task_id);
     payload.init(args, result, prepared.alloc_result, layout);
 
     // Predicate validation runs before task allocation. Copy the resolved, bounded

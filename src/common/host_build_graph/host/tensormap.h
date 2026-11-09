@@ -12,8 +12,8 @@
 /**
  * host_build_graph TensorMap interface
  *
- * TensorMap provides producer lookup for dependency discovery:
- * - Maps simpler::hbg::Tensor -> producer task ID
+ * TensorMap provides conflicting-access lookup for dependency discovery:
+ * - Maps simpler::hbg::Tensor -> reader or writer task ID
  * - Used by rt_submit_task() to find dependencies
  *
  * host_build_graph runs its orchestrator on the host, so this map is host-only
@@ -57,6 +57,8 @@
 // Overlap geometry types. Relocated here from tensor.h: they are used only by
 // the runtime's overlap-detection / dependency machinery, not by the
 // wire/host-facing simpler::hbg::Tensor definition.
+enum class TensorAccessKind : uint8_t { WRITER, READER };
+
 enum class OverlapStatus {
     NO_OVERLAP,
     COVERED,
@@ -110,7 +112,7 @@ extern uint64_t g_insert_count;
  * the hash key, size in [8, 16) is unused by the entry — we repurpose it for
  * `next_in_bucket`).
  *
- *   buffer_addr / next_in_bucket / producer_task_id   — chain traversal + match
+ *   buffer_addr / next_in_bucket / access_task_id   — chain traversal + match
  *   start_offset                                       — overlap byte range begin
  *   version, ndims, dtype, manual_dep, is_contiguous   — overlap fast path
  *   shapes[5]                                          — overlap comparison (line 1)
@@ -130,14 +132,14 @@ struct alignas(64) ChipTensorMapEntry {
     // === Cache line 1 (64B) — lookup hot path; mirrors simpler::hbg::Tensor line 1 from byte 16 ===
     uint64_t buffer_addr;  // 8B [0, 8):   tensor base address (hash key, mirrors simpler::hbg::Tensor::buffer.addr)
     ChipTensorMapEntry
-        *next_in_bucket;  // 8B [8, 16):  next entry in hash bucket chain (overlays simpler::hbg::Tensor::buffer.size)
-    TaskId producer_task_id;           // 8B [16,24):  mirrors simpler::hbg::Tensor::owner_task_id slot
-    uint64_t start_offset;             // 8B [24,32):  mirrors simpler::hbg::Tensor::start_offset (element offset)
-    int32_t version;                   // 4B [32,36):  mirrors simpler::hbg::Tensor::version
-    uint8_t ndims;                     // 1B [36,37):  mirrors simpler::hbg::Tensor::ndims
-    DataType dtype;                    // 1B [37,38):  mirrors simpler::hbg::Tensor::dtype
-    bool manual_dep;                   // 1B [38,39):  mirrors simpler::hbg::Tensor::manual_dep
-    bool is_contiguous;                // 1B [39,40):  mirrors simpler::hbg::Tensor::is_contiguous
+        *next_in_bucket;    // 8B [8, 16):  next entry in hash bucket chain (overlays simpler::hbg::Tensor::buffer.size)
+    TaskId access_task_id;  // 8B [16,24):  mirrors simpler::hbg::Tensor::owner_task_id slot
+    uint64_t start_offset;  // 8B [24,32):  mirrors simpler::hbg::Tensor::start_offset (element offset)
+    int32_t version;        // 4B [32,36):  mirrors simpler::hbg::Tensor::version
+    uint8_t ndims;          // 1B [36,37):  mirrors simpler::hbg::Tensor::ndims
+    DataType dtype;         // 1B [37,38):  mirrors simpler::hbg::Tensor::dtype
+    bool manual_dep;        // 1B [38,39):  mirrors simpler::hbg::Tensor::manual_dep
+    bool is_contiguous;     // 1B [39,40):  mirrors simpler::hbg::Tensor::is_contiguous
     uint8_t __padding1__[4];           // 4B [40,44):  spans simpler::hbg::Tensor::address_space, which an
                                        //              entry never reads, and the padding after it
     uint32_t shapes[MAX_TENSOR_DIMS];  // 20B [44,64): mirrors simpler::hbg::Tensor::shapes
@@ -156,7 +158,7 @@ struct alignas(64) ChipTensorMapEntry {
      * Copy overlap-relevant fields from a simpler::hbg::Tensor into this entry.
      *
      * 64B memcpy of simpler::hbg::Tensor cache line 1 populates buffer_addr (byte [0,8)),
-     * producer_task_id, start_offset, version, ndims, dtype, manual_dep,
+     * access_task_id, start_offset, version, ndims, dtype, manual_dep,
      * is_contiguous and shapes[]. Byte [8,16) holds simpler::hbg::Tensor::buffer.size in
      * the source and gets written into next_in_bucket; that's harmless
      * because link_entry() overwrites next_in_bucket immediately after.
@@ -202,7 +204,7 @@ struct alignas(64) ChipTensorMapEntry {
     }
 
     /**
-     * Check overlap between input tensor and this entry (the producer output).
+     * Check overlap between input tensor and this registered access.
      *
      * Three-level cascade:
      *   L1 — O(1) byte-range intersection. Disjoint -> NO_OVERLAP.
@@ -324,7 +326,7 @@ struct alignas(64) ChipTensorMapEntry {
 
 static_assert(sizeof(ChipTensorMapEntry) == 128, "TensorMapEntry must be exactly 2 cache lines (128 bytes)");
 static_assert(offsetof(ChipTensorMapEntry, buffer_addr) == offsetof(simpler::hbg::Tensor, buffer.addr));
-static_assert(offsetof(ChipTensorMapEntry, producer_task_id) == offsetof(simpler::hbg::Tensor, owner_task_id));
+static_assert(offsetof(ChipTensorMapEntry, access_task_id) == offsetof(simpler::hbg::Tensor, owner_task_id));
 static_assert(offsetof(ChipTensorMapEntry, start_offset) == offsetof(simpler::hbg::Tensor, start_offset));
 static_assert(offsetof(ChipTensorMapEntry, version) == offsetof(simpler::hbg::Tensor, version));
 static_assert(offsetof(ChipTensorMapEntry, ndims) == offsetof(simpler::hbg::Tensor, ndims));
@@ -374,7 +376,7 @@ struct ChipTensorMap {
 
     // new_entry allocates a slot and initializes only its linkage (bucket_index
     // and the four link pointers) to the clean unlinked state; insert() assigns
-    // the tensor attributes and producer_task_id.
+    // the tensor attributes and access_task_id.
     ChipTensorMapEntry *new_entry() {
         if (free_num > 0) {
             ChipTensorMapEntry *res = free_entry_list[--free_num];
@@ -465,7 +467,7 @@ struct ChipTensorMap {
     bool init_default(int32_t new_max_tasks);
 
     /**
-     * Lookup producer for a tensor region
+     * Lookup accesses of one kind for a tensor region
      *
      * Searches the hash table for matching regions and invokes the callback
      * for each overlapping entry.
@@ -479,8 +481,8 @@ struct ChipTensorMap {
      * @param on_match  Callback invoked for each overlapping entry
      */
     template <typename Fn>
-    void lookup(const simpler::hbg::Tensor &tensor, Fn &&on_match) {
-        uint32_t bucket_index = hash(tensor.buffer.addr);
+    void lookup(const simpler::hbg::Tensor &tensor, Fn &&on_match, TensorAccessKind kind = TensorAccessKind::WRITER) {
+        uint32_t bucket_index = hash(tensor.buffer.addr) + (kind == TensorAccessKind::READER ? num_buckets : 0);
         ChipTensorMapEntry *cur_entry = buckets[bucket_index];
 
 #if SIMPLER_TENSORMAP_PROFILING
@@ -526,19 +528,21 @@ struct ChipTensorMap {
     }
 
     /**
-     * Insert a new entry (called when task produces output)
+     * Insert a reader or writer access
      *
      * Allocates from the fixed pool or its explicit-removal free list. A live
      * entry is never overwritten.
      * Inserts at head of hash bucket chain (maintains task_id ordering).
      *
-     * @param tensor            simpler::hbg::Tensor produced
-     * @param producer_task_id  Task ID of producer
+     * @param tensor            simpler::hbg::Tensor accessed
+     * @param access_task_id  Task ID of the accessing task
      */
-    void insert(const simpler::hbg::Tensor &tensor, TaskId producer_task_id) {
+    void insert(
+        const simpler::hbg::Tensor &tensor, TaskId access_task_id, TensorAccessKind kind = TensorAccessKind::WRITER
+    ) {
         ChipTensorMapEntry *entry = new_entry();
         entry->copy_from_tensor(tensor);
-        link_entry(entry, tensor.buffer.addr, producer_task_id);
+        link_entry(entry, tensor.buffer.addr, access_task_id, kind);
     }
 
     // =============================================================================
@@ -556,18 +560,21 @@ struct ChipTensorMap {
     /**
      * Link an initialized entry into bucket and task chains.
      */
-    void link_entry(ChipTensorMapEntry *entry, uint64_t addr, TaskId producer_task_id) {
+    void link_entry(
+        ChipTensorMapEntry *entry, uint64_t addr, TaskId access_task_id,
+        TensorAccessKind kind = TensorAccessKind::WRITER
+    ) {
 #if SIMPLER_TENSORMAP_PROFILING
         g_insert_count++;
 #endif
-        uint32_t bucket_index = hash(addr);
-        const int32_t task_slot = producer_task_id.local_id();
+        uint32_t bucket_index = hash(addr) + (kind == TensorAccessKind::READER ? num_buckets : 0);
+        const int32_t task_slot = access_task_id.local_id();
         // A producer's low id field is a task chain index directly, so the id space a
         // caller inserts under has to be the one this map was dimensioned for: a
         // whole-run map takes task capacity, a Graph recording's takes SUB_TASK_MAX_NUM.
         debug_assert(task_slot >= 0 && task_slot < max_tasks);
 
-        entry->producer_task_id = producer_task_id;
+        entry->access_task_id = access_task_id;
 
         // Insert at head of hash bucket
         entry->bucket_index = bucket_index;
@@ -602,7 +609,7 @@ struct ChipTensorMap {
         // Update predecessor's next pointer (O(1) via prev_in_task)
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
-            int32_t local_id = entry.producer_task_id.local_id();
+            int32_t local_id = entry.access_task_id.local_id();
             const int32_t task_slot = local_id;
             debug_assert(task_slot >= 0 && task_slot < max_tasks);
             task_entry_heads[task_slot] = entry.next_in_task;
