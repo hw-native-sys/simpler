@@ -560,7 +560,7 @@ TEST_F(SchedulerStateTest, SyncStartRoutesToDedicatedReadyQueue) {
     EXPECT_EQ(out[0].ptr(), &slot);
 }
 
-TEST(CoreTrackerTest, MixPartiallyRunningClusterAdmittedAsPerCorePlacement) {
+TEST(CoreTrackerTest, MixPartiallyRunningClusterWaitsForLocalStorage) {
     CoreTracker tracker;
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
@@ -573,15 +573,11 @@ TEST(CoreTrackerTest, MixPartiallyRunningClusterAdmittedAsPerCorePlacement) {
     EXPECT_FALSE(tracker.is_aiv0_core_idle(cluster_offset));
     EXPECT_TRUE(tracker.is_aiv1_core_idle(cluster_offset));
 
-    // A 1C2V MIX task is admitted on this partial cluster as a PENDING placement.
-    // Per-core dispatch then puts the idle AIC/AIV1 on their running slots (marked
-    // running so the completion poller tracks them) and the busy AIV0 on its pending
-    // slot, executing after the in-flight AIV-only task.
+    // The cube must not overwrite UB belonging to the unrelated AIV task.
     constexpr LaneMask used_mask = LaneMask::all();
-    EXPECT_EQ(tracker.classify_mix_cluster(cluster_offset, used_mask), CoreTracker::MixPlacement::PENDING);
+    EXPECT_EQ(tracker.classify_mix_cluster(cluster_offset, used_mask), CoreTracker::MixPlacement::REJECT);
 
-    // Not all used cores are idle, so the IDLE phase skips this cluster; it is
-    // consumed by the PENDING phase.
+    // Admission waits for every participating lane to finish its current task.
     auto idle = tracker.get_idle_core_offset_states(ResourceShape::MIX);
     EXPECT_FALSE(idle.has_value());
 }
@@ -645,7 +641,7 @@ TEST(CoreTrackerTest, MixClassifyIgnoresUnusedBusyCoreForRunningPlacement) {
     EXPECT_EQ(placement, CoreTracker::MixPlacement::RUNNING);
 }
 
-TEST(CoreTrackerTest, MixClassifyAllowsPendingForUsedRunningCoresOnly) {
+TEST(CoreTrackerTest, MixClassifyWaitsForUsedRunningCores) {
     CoreTracker tracker;
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
@@ -657,10 +653,10 @@ TEST(CoreTrackerTest, MixClassifyAllowsPendingForUsedRunningCoresOnly) {
 
     auto placement =
         tracker.classify_mix_cluster(cluster_offset, LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false));
-    EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
+    EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
 }
 
-TEST(CoreTrackerTest, MixClassifyAdmitsMixedUsedCoresAsPending) {
+TEST(CoreTrackerTest, MixClassifyRejectsStaggeredCubeVectorStart) {
     CoreTracker tracker;
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
@@ -668,11 +664,10 @@ TEST(CoreTrackerTest, MixClassifyAdmitsMixedUsedCoresAsPending) {
     constexpr int32_t cluster_offset = 0;
     tracker.change_core_state(cluster_offset + 1);  // AIV0 running while AIC is idle
 
-    // Mixed used-core state (AIC idle, AIV0 running) is admitted as PENDING; the
-    // idle AIC takes its running slot and the busy AIV0 takes its pending slot.
+    // A free pending slot does not transfer ownership of the busy vector's UB.
     auto placement =
         tracker.classify_mix_cluster(cluster_offset, LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false));
-    EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
+    EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
 }
 
 TEST(CoreTrackerTest, MixClassifyRejectsOccupiedPendingSlotInUsedMask) {

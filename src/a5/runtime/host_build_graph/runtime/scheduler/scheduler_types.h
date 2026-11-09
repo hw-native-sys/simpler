@@ -375,14 +375,9 @@ public:
     // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
     enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
 
-    // Placement for the cores named by active_mask, ignoring cores this task does
-    // not use. All used cores idle -> RUNNING placement (each to its running slot).
-    // Otherwise -> PENDING placement: at dispatch each used core is filled per its
-    // own state -- an idle core takes its running slot (and is marked running, so
-    // the completion poller, which scans only running cores, tracks its FIN), an
-    // already-running core takes its pending slot and executes after its in-flight
-    // task. REJECT only when a used core's pending slot is already occupied (no free
-    // slot) or the mask is empty.
+    // Cube/vector MIX requires all participating lanes idle: Fixpipe can write
+    // a paired AIV's UB before that AIV starts. Vector-only pairs may use pending
+    // slots. Gated sync_start uses the separate split-placement rendezvous.
     MixPlacement classify_mix_cluster(int32_t cluster_offset, LaneMask lanes) const {
         BitStates used;
         if (lanes.has_aic()) {
@@ -402,7 +397,7 @@ public:
         if (idle.count() == used.count()) {
             return MixPlacement::RUNNING;
         }
-        return MixPlacement::PENDING;
+        return lanes.has_aic() ? MixPlacement::REJECT : MixPlacement::PENDING;
     }
 
     BitStates get_mix_cluster_offset_states(LaneMask lanes, MixPlacement placement) const {

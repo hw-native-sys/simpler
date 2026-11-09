@@ -321,7 +321,7 @@ TEST_F(MixSpareLane, DualVectorResidualAllowsIndependentCube) {
     EXPECT_EQ(mixed.next_block_idx.load(), 0);
 }
 
-TEST_F(MixSpareLane, PartialMixPendingDrainsReservationAndAdmitsVectorSamePass) {
+TEST_F(MixSpareLane, PartialMixRetainsReservationWhileUsedLanesAreBusy) {
     auto &mixed = task(0, (kAicAiv0));
     auto &vector = task(1, LaneMask::aiv0());
     SchedulerDispatchTestPeer::clusters(*context, 2);
@@ -334,17 +334,15 @@ TEST_F(MixSpareLane, PartialMixPendingDrainsReservationAndAdmitsVectorSamePass) 
     queue(mixed);
     queue(vector);
     SchedulerDispatchTestPeer::dispatch(*context);
-    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 0), &mixed);
-    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 1), &mixed);
+    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 0), nullptr);
+    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 1), nullptr);
     EXPECT_EQ(SchedulerDispatchTestPeer::running(*context, 2), nullptr);
-    // Newly published work holds its pickup until AICore ACK. The second
-    // cluster has V capacity but cannot take MIX because its C pickup is full.
     EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 2), nullptr);
-    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 4), &vector);
-    EXPECT_EQ(scheduler->ready_queues[2].reserved_mix_lanes(), LaneMask::none());
+    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 4), nullptr);
+    EXPECT_EQ(scheduler->ready_queues[2].reserved_mix_lanes(), kAicAiv0);
 }
 
-TEST_F(MixSpareLane, FullMixPendingPreservesWholePassPriority) {
+TEST_F(MixSpareLane, FullMixRetainsReservationWhileUsedLanesAreBusy) {
     auto &mixed = task(0, LaneMask::all());
     auto &vector = task(1, LaneMask::aiv0());
     SchedulerDispatchTestPeer::clusters(*context, 2);
@@ -356,14 +354,14 @@ TEST_F(MixSpareLane, FullMixPendingPreservesWholePassPriority) {
     queue(mixed);
     queue(vector);
     SchedulerDispatchTestPeer::dispatch(*context);
-    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 0), &mixed);
-    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 1), &mixed);
-    EXPECT_EQ(SchedulerDispatchTestPeer::running(*context, 2), &mixed);
+    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 0), nullptr);
+    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 1), nullptr);
+    EXPECT_EQ(SchedulerDispatchTestPeer::running(*context, 2), nullptr);
     EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 4), nullptr);
     EXPECT_EQ(vector.next_block_idx.load(), 0);
-    EXPECT_EQ(scheduler->ready_queues[2].reserved_mix_lanes(), LaneMask::none());
+    EXPECT_EQ(scheduler->ready_queues[2].reserved_mix_lanes(), LaneMask::all());
     SchedulerDispatchTestPeer::dispatch(*context);
-    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 4), &vector);
+    EXPECT_EQ(SchedulerDispatchTestPeer::pending(*context, 4), nullptr);
 }
 
 TEST_F(MixSpareLane, TwoOwnersFillSpareLanesBeforeActualRetryAckTree) {

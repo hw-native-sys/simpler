@@ -753,10 +753,10 @@ edge (#1405).
 
 #### MIX per-core placement
 
-A MIX task spans a cluster (1 AIC + 2 AIV). `classify_mix_cluster` admits a cluster whenever
-every used core has a free slot; `prepare_block_for_dispatch` then places **per core**
-(`to_pending && !is_core_idle`): idle cores → running, busy cores → pending. Cross-core start
-skew within a block is tolerated by AICore incore synchronization.
+A MIX task uses selected lanes within a cluster (1 AIC + 2 AIV). Regular cube/vector MIX
+requires every participating core idle, so C2V cannot overwrite a preceding task's UB.
+Vector-only pairs retain per-core pending placement. Gated `sync_start` cohorts may use split
+placement because their rendezvous waits for all participating cores before execution.
 
 ---
 

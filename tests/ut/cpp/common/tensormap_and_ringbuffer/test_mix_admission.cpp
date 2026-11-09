@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -50,14 +51,14 @@ public:
         }
     }
 
-    static void normal(SchedulerContext &context, CoreTracker::DispatchPhase phase) {
+    static void normal(SchedulerContext &context, CoreTracker::DispatchPhase phase, bool admitted) {
         bool drain = false;
         bool progress = false;
         bool pushed = false;
         dispatch(context, phase, drain, progress, pushed, 0);
         EXPECT_FALSE(drain);
-        EXPECT_TRUE(progress);
-        EXPECT_TRUE(pushed);
+        EXPECT_EQ(progress, admitted);
+        EXPECT_EQ(pushed, admitted);
     }
 
     template <typename Context, typename = typename Context::MixPriority>
@@ -170,15 +171,20 @@ protected:
         return std::get<2>(GetParam()) ? CoreTracker::DispatchPhase::PENDING : CoreTracker::DispatchPhase::IDLE;
     }
 
-    void expect_all_blocks() {
+    bool admits_blocks() const {
         const auto [clusters, mask, pending] = GetParam();
-        ASSERT_EQ(slot.next_block_idx.load(), clusters);
+        return !pending || !(mask & 1) || std::string_view(SIMPLER_PLATFORM_NAME) != "a5sim";
+    }
+
+    void expect_admission() {
+        const auto [clusters, mask, pending] = GetParam();
+        ASSERT_EQ(slot.next_block_idx.load(), admits_blocks() ? clusters : 0);
         for (int cluster = 0; cluster < clusters; ++cluster) {
             for (int lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
                 SCOPED_TRACE(testing::Message() << "cluster=" << cluster << " lane=" << lane);
                 EXPECT_EQ(
                     MixAdmissionTestPeer::placed(*context, 3 * cluster + lane, pending),
-                    mask & (1u << lane) ? &slot : nullptr
+                    admits_blocks() && (mask & (1u << lane)) ? &slot : nullptr
                 );
             }
         }
@@ -189,8 +195,8 @@ TEST_P(MixAdmission, NormalSelectsEveryOwnedCluster) {
     ASSERT_TRUE(
         MixAdmissionTestPeer::push_normal(scheduler->ready_queues[static_cast<int>(ResourceShape::MIX)], &slot, 0)
     );
-    MixAdmissionTestPeer::normal(*context, phase());
-    expect_all_blocks();
+    MixAdmissionTestPeer::normal(*context, phase(), admits_blocks());
+    expect_admission();
 }
 
 TEST_P(MixAdmission, EarlySelectsEveryOwnedCluster) {
@@ -201,7 +207,7 @@ TEST_P(MixAdmission, EarlySelectsEveryOwnedCluster) {
         )
     );
     MixAdmissionTestPeer::early(*context, phase());
-    expect_all_blocks();
+    expect_admission();
 }
 
 INSTANTIATE_TEST_SUITE_P(
