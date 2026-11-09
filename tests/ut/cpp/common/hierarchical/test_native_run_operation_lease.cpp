@@ -1088,8 +1088,8 @@ TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProv
     EXPECT_TRUE(worker.native_runs_.empty());
 }
 
-// A destroyed carrier permits device teardown, but a poisoned lane cannot authorize comm free.
-TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeardownRetry) {
+// Carrier destruction leaves communication owners live when the lane has failed.
+TEST(NativeRunOperationLeaseTest, PoisonedLaneRefusesDeviceTeardownWithLiveCommunication) {
     for (bool failed : {false, true}) {
         SCOPED_TRACE(failed);
         ChipWorker worker;
@@ -1139,19 +1139,15 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
             EXPECT_EQ(worker.global_domain_ids_.count(7), 1u);
         };
         expect_refused();
-        g_device_finalize_rc = -9;
         EXPECT_THROW(worker.finalize(), std::runtime_error);
-        EXPECT_EQ(g_device_finalize_calls, 1);
+        EXPECT_EQ(g_device_finalize_calls, 0);
         EXPECT_EQ(g_destroy_context_calls, 0);
         EXPECT_FALSE(module->unload_allowed_);
+        EXPECT_NE(worker.device_ctx_, nullptr);
         expect_refused();
-        g_device_finalize_rc = 0;
-        EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_device_finalize_calls, 2);
-        EXPECT_EQ(g_destroy_context_calls, 1);
-        expect_refused();
-        EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_device_finalize_calls, 2);
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        EXPECT_EQ(g_device_finalize_calls, 0);
+        EXPECT_EQ(g_destroy_context_calls, 0);
         EXPECT_EQ(g_comm_free_calls, 0);
     }
 }
