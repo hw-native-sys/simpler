@@ -129,9 +129,9 @@ uint32_t Runtime::callable_table_len() const { return dev.callable_table_len_; }
 // A steady-state trb run uploads the `dev` descriptor before the handshake
 // region (the rest of Runtime is host-only). Neither that region nor the gate
 // tail carries a host value the device consumes: the AICore publishes its
-// report, the AICPU writes the task pointer it answers with, and the AICPU
-// zeroes the active gates and executes wmb() before publishing hs_setup_done_,
-// with no register window open before that.
+// report and the AICPU writes the task pointer it answers with. One AICPU
+// thread clears the active gates and executes wmb(). On success the leader
+// joins that reset before publishing hs_setup_done_ and any window can open.
 //
 // The length stops inside the entry args, after the tensor slots this run
 // filled, which is why it is the one length that depends on the run rather than

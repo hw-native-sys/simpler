@@ -193,13 +193,20 @@ earlier run's reader is still live on the line. For this one field, existing cod
 provides the **two intra-run ordering edges** below, under the lifetime preconditions
 that code already assumes — it does not establish those preconditions:
 
-- **Reset before window-open.** AICPU resets the request/release words in each
-  64-byte `AicoreTeardownControl` with a whole-control clear, then executes
-  `wmb()` in `pre_handshake_init`. AICPU is its only writer; AICore only
-  bypass-loads the request and release words. The barrier orders
-  the resets before `hs_setup_done_` and before any register window opens — a window is a
-  plain `Device-nGnRE` store carrying no release semantics of its own. No core can read
-  its gate before its window opens.
+- **Reset before window-open.** One AICPU thread clears all active 64-byte
+  `AicoreTeardownControl` entries and executes `wmb()`. The HBG leader does
+  this in `pre_handshake_init`. In TMR, scheduler 1 can claim the reset
+  while the leader prepares shared state when affinity is stable and at
+  least two schedulers run alongside a separate orchestrator. A scheduler
+  that owns the reset publishes `Complete` with release ordering after the
+  barrier, and the leader observes it with an acquire load. The TMR leader
+  clears the entries itself if the reset is unclaimed or cooperative reset
+  is disabled.
+  Peer handshakers acquire `hs_setup_done_` and check `init_failed_` before
+  opening their register windows. If waiting for the owner times out, the
+  leader publishes failure before releasing the waiters, so the windows stay
+  closed. A `Device-nGnRE` window store relies on this ordering. AICore
+  only bypass-loads its request and release words after the window opens.
 - **RELEASE after window-close.** The quiesce pass, then the CLOSE pass and its
   readbacks, then `rmb()`, then the relaxed `post_close_release` stores
   in `platform_retire_aicore_group`. The drain is what orders every store after

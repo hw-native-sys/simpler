@@ -19,6 +19,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -65,6 +66,7 @@ protected:
     }
 
     void TearDown() override {
+        set_scheduler_timeout_ms(0);
         // The fixture's registration has no loader-owned handle to close.
         executor->orch_so_table_[0].handle = nullptr;
         executor->orch_so_table_[0].func = nullptr;
@@ -201,4 +203,81 @@ TEST_F(EntryArgsPreparationTest, SerialAndUnstableRolesDoNotPrepareEarly) {
     EXPECT_EQ(executor->init(runtime.get(), preparation), -1);
     EXPECT_EQ(preparation, EntryArgsPreparation::NotPrepared);
     EXPECT_EQ(view_reads.load(), 0);
+}
+
+TEST_F(EntryArgsPreparationTest, GateOwnerClearsBeforeSharedReleaseAndOnlyOnce) {
+    runtime->dev.worker_count = 3;
+    auto *gates = runtime->get_teardown_gates();
+    gates[0].post_close_release = 1;
+    gates[0].exit_request = 23;
+    gates[3].post_close_release = 1;
+
+    auto worker = std::async(std::launch::async, [this] {
+        execution_index = 1;
+        auto args = EntryArgsPreparation::NotPrepared;
+        return executor->init(runtime.get(), args);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (executor->gate_reset_.load(std::memory_order_acquire) != GateReset::Complete &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool ready = executor->gate_reset_.load(std::memory_order_acquire) == GateReset::Complete;
+    EXPECT_TRUE(ready);
+    EXPECT_FALSE(executor->hs_setup_done_.load(std::memory_order_acquire));
+    if (ready) {
+        EXPECT_EQ(gates[0].post_close_release, 0u);
+        EXPECT_EQ(gates[0].exit_request, 0u);
+        EXPECT_EQ(gates[3].post_close_release, 1u);
+        gates[0].post_close_release = 1;
+        executor->finish_teardown_gate_reset(runtime.get(), 3);
+        EXPECT_EQ(gates[0].post_close_release, 1u);
+    }
+    executor->init_failed_.store(true, std::memory_order_release);
+    executor->hs_setup_done_.store(true, std::memory_order_release);
+    EXPECT_EQ(worker.get(), -1);
+}
+
+TEST_F(EntryArgsPreparationTest, LeaderClaimsUnstartedGateResetAndRearmsForNextRun) {
+    auto *gates = runtime->get_teardown_gates();
+    for (int32_t workers : {3, 6, 3}) {
+        SCOPED_TRACE(workers);
+        gates[workers - 1].post_close_release = 1;
+        gates[workers - 1].exit_request = 23;
+        executor->finish_teardown_gate_reset(runtime.get(), workers);
+        EXPECT_EQ(executor->gate_reset_.load(), GateReset::Complete);
+        EXPECT_EQ(gates[workers - 1].post_close_release, 0u);
+        EXPECT_EQ(gates[workers - 1].exit_request, 0u);
+        EXPECT_FALSE(executor->try_reset_teardown_gates(runtime.get(), workers));
+        executor->reset_entry_state();
+        EXPECT_EQ(executor->gate_reset_.load(), GateReset::Unclaimed);
+    }
+}
+
+TEST_F(EntryArgsPreparationTest, StalledGateOwnerCannotReleaseTheFailedInvocation) {
+    runtime->dev.worker_count = 3;
+    auto *gates = runtime->get_teardown_gates();
+    gates[0].post_close_release = 1;
+    gates[0].exit_request = 23;
+    executor->gate_reset_.store(GateReset::Claimed, std::memory_order_relaxed);
+    set_scheduler_timeout_ms(1);
+
+    execution_index = 0;
+    ASSERT_EQ(executor->init(runtime.get(), preparation), -1);
+    EXPECT_TRUE(executor->init_failed_.load(std::memory_order_acquire));
+    EXPECT_FALSE(executor->runtime_init_ready_.load(std::memory_order_acquire));
+    EXPECT_EQ(executor->gate_reset_.load(), GateReset::Claimed);
+    EXPECT_EQ(gates[0].post_close_release, 1u);
+    EXPECT_EQ(gates[0].exit_request, 23u);
+
+    SchedulerContext::reset_teardown_gates(runtime.get(), runtime->dev.worker_count);
+    executor->gate_reset_.store(GateReset::Complete, std::memory_order_release);
+    for (int idx : {1, 2, kOrchestrator}) {
+        execution_index = idx;
+        EXPECT_EQ(executor->init(runtime.get(), preparation), -1);
+    }
+    EXPECT_TRUE(executor->init_failed_.load(std::memory_order_acquire));
+    EXPECT_FALSE(executor->runtime_init_ready_.load(std::memory_order_acquire));
+    EXPECT_EQ(gates[0].post_close_release, 0u);
+    EXPECT_EQ(gates[0].exit_request, 0u);
 }
