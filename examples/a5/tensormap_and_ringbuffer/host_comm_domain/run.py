@@ -77,7 +77,7 @@ def _specs(*, outputs=False):
     return specs
 
 
-def _allocate(orch, source):
+def _allocate(orch, source, *, initializer=None):
     host = source == "host"
     return orch.get_or_allocate_domain(
         name=f"engram_{source}",
@@ -87,6 +87,7 @@ def _allocate(orch, source):
         memory_source=AddressSpace.HOST if host else AddressSpace.DEVICE,
         workspace_engines=("urma",),
         retain_after_run=True,
+        initializer=initializer,
     )
 
 
@@ -95,6 +96,13 @@ def _write_host(domain, generation):
     for rank in range(2):
         with domain.member(rank).buffers["table"].shm.buf[offset : offset + nbytes] as memory:
             memory[:] = _table(rank, generation).tobytes()
+
+
+def _clear_host_output(domain):
+    offset, nbytes = domain.buffer_range("local_echo")
+    for rank in range(2):
+        with domain.member(rank).buffers["local_echo"].shm.buf[offset : offset + nbytes] as memory:
+            memory[:] = bytes(OUTPUT_BYTES)
 
 
 def _read_device(worker, buffer, scratch):
@@ -121,28 +129,30 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
     )
     entry = worker.register(compiled)
     domains = {}
+    initialized = []
     try:
         worker.init()
         scratch = worker.create_buffer(OUTPUT_BYTES)
 
-        def prepare(orch, _args, _config):
-            domains["host"] = _allocate(orch, "host")
-            domains["device"] = _allocate(orch, "device")
-            for rank in range(2):
-                orch.copy_to_domain(domains["device"], rank, _table(rank, 1, device=True).tobytes(), buffer="table")
-
-        worker.run(prepare)
-        host, device = domains["host"], domains["device"]
-        original_host_id = host.domain_id
-        original_host_bases = tuple(host.local_context(rank).local_window_base for rank in range(2))
-        assert host.buffer_range("table") == (PREFIX_BYTES, TABLE_BYTES)
-        _write_host(host, 1)
+        def initialize_host(domain):
+            _write_host(domain, 1)
+            _clear_host_output(domain)
+            initialized.append(domain.domain_id)
 
         def submit(orch, _args, config, *, sources=("host", "device")):
-            target = orch.get_domain("engram_device")
             for source in sources:
-                domain = _allocate(orch, source)
-                assert domain is domains[source]
+                domain = _allocate(orch, source, initializer=initialize_host if source == "host" else None)
+                previous = domains.get(source)
+                if previous is None:
+                    if source == "device":
+                        for rank in range(2):
+                            orch.copy_to_domain(domain, rank, _table(rank, 1, device=True).tobytes(), buffer="table")
+                    domains[source] = domain
+                else:
+                    assert domain is previous
+            target = domains["device"]
+            for source in sources:
+                domain = domains[source]
                 for rank in range(2):
                     args = TaskArgs()
                     args.add_tensor(domain.member(rank).buffers["table"].tensor((ROWS, WIDTH), DataType.FLOAT32))
@@ -176,18 +186,24 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                         np.testing.assert_array_equal(actual, expected)
             print(f"PASS generation={generation} sources={sources} staged={staged} aiv_blocks={aiv_blocks}", flush=True)
 
+        original_host_id = None
+        original_host_bases = None
         for generation in (1, 1, 2):
             if generation == 2:
-                _write_host(host, generation)
-            offset, nbytes = host.buffer_range("local_echo")
-            for rank in range(2):
-                with host.member(rank).buffers["local_echo"].shm.buf[offset : offset + nbytes] as memory:
-                    memory[:] = bytes(OUTPUT_BYTES)
+                _write_host(domains["host"], generation)
+            if "host" in domains:
+                _clear_host_output(domains["host"])
             pending = worker.submit(submit)
             following = worker.submit(submit) if staged else None
             pending.wait()
             if following is not None:
                 following.wait()
+            host, device = domains["host"], domains["device"]
+            if original_host_id is None:
+                original_host_id = host.domain_id
+                original_host_bases = tuple(host.local_context(rank).local_window_base for rank in range(2))
+            assert host.buffer_range("table") == (PREFIX_BYTES, TABLE_BYTES)
+            assert initialized == [original_host_id]
             verify(generation)
             assert host.domain_id == original_host_id and not host.freed
             assert tuple(host.local_context(rank).local_window_base for rank in range(2)) == original_host_bases
