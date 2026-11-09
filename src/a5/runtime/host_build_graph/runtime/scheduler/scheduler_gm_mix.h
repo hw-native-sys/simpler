@@ -12,6 +12,7 @@
 #pragma once
 
 #include "scheduler_admission.h"
+#include "scheduler_async_control.h"
 
 enum class SchedulerGmMixResult : uint8_t { WAIT, PROGRESS, TASK_LAST, ERROR };
 

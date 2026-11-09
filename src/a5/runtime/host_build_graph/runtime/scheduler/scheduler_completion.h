@@ -54,6 +54,15 @@ static inline __aicore__ bool scheduler_complete_ordered_task(
 ) {
     if (scheduler == nullptr || scheduler->admission == nullptr || !scheduler_task_ref_valid(graph, task_ref))
         return false;
+    bool deferred = false;
+    if (!scheduler_async_close_computation(scheduler->async, task_ref, deferred)) {
+        scheduler_record_error(
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            SchedulerErrorSite::ASYNC_CONTEXT_INVALID
+        );
+        return false;
+    }
+    if (deferred) return true;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
     if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
@@ -215,8 +224,9 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         );
         return false;
     }
-    bool task_complete = !gm_mix;
-    if (local_slot->cooperative && !gm_mix) {
+    const bool ordered_block = local_slot->cooperative && !gm_mix;
+    bool task_complete = !gm_mix && !ordered_block;
+    if (ordered_block) {
         if (mix_slot || mix_tracker != nullptr || cluster_lane != scheduler->config.self_lane) {
             scheduler_record_error(
                 run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -224,17 +234,6 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
             );
             return false;
         }
-        const SchedulerBlockFinishResult result = scheduler_finish_ordered_block<RecordProtocol>(
-            graph, scheduler_state_base, scheduler, run_control, pending_slot
-        );
-        if (result == SchedulerBlockFinishResult::ERROR) {
-            scheduler_record_error(
-                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-                SchedulerErrorSite::BLOCK_COMPLETION_INVALID
-            );
-            return false;
-        }
-        task_complete = result == SchedulerBlockFinishResult::TASK_LAST;
     }
     scheduler_mark_completion_consumed(scheduler, cluster_lane, pending_slot, completed_generation, mix_slot);
     if constexpr (RecordProtocol)
@@ -248,11 +247,20 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         task_complete = mix_tracker->completed_mask == mix_tracker->active_mask;
         if (task_complete) mix_tracker->task_ref = SCHEDULER_TASK_REF_INVALID;
     }
-    scheduler_initialize_free_slot(local_slot);
+    if (!ordered_block) scheduler_initialize_free_slot(local_slot);
     scheduler->set_timing_slot(cluster_lane, pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     SchedulerReadyClaim resolved_ready{};
-    if (task_complete && scheduler->admission == nullptr) {
+    bool deferred = false;
+    if (task_complete && scheduler->admission == nullptr &&
+        !scheduler_async_has_registered_groups(scheduler->async, task_ref, deferred)) {
+        scheduler_record_error(
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            SchedulerErrorSite::ASYNC_CONTEXT_INVALID
+        );
+        return false;
+    }
+    if (task_complete && !deferred && scheduler->admission == nullptr) {
         __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
         if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
@@ -346,20 +354,40 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     } else if (completed_trace != nullptr) {
         scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
     }
+    if (ordered_block) {
+        // Every block publishes its final trace and frees its slot before the
+        // shared join can authorize another core to finish the logical task.
+        const auto result = scheduler_finish_ordered_block<RecordProtocol>(
+            graph, scheduler_state_base, scheduler, run_control, pending_slot
+        );
+        if (result == SchedulerBlockFinishResult::ERROR) return false;
+        task_complete = result == SchedulerBlockFinishResult::TASK_LAST;
+    }
     if (gm_mix) {
         if (!scheduler_gm_mix_release_lane<RecordProtocol>(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, pending_slot, completed_generation
             ))
             return false;
-    } else if (task_complete) {
-        if (scheduler->admission != nullptr) {
-            if (!scheduler_complete_ordered_task<RecordProtocol>(
-                    graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,
-                    ready_stats, completion_stats
-                ))
-                return false;
-        } else {
-            ++scheduler->pending_completed;
+    } else {
+        if (task_complete) {
+            if (scheduler->admission != nullptr) {
+                if (!scheduler_complete_ordered_task<RecordProtocol>(
+                        graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,
+                        ready_stats, completion_stats
+                    ))
+                    return false;
+            } else if (deferred) {
+                bool held = false;
+                if (!scheduler_async_close_computation(scheduler->async, task_ref, held) || !held) {
+                    scheduler_record_error(
+                        run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                        SchedulerErrorSite::ASYNC_BLOCK_RELEASE_FAILED
+                    );
+                    return false;
+                }
+            } else {
+                ++scheduler->pending_completed;
+            }
         }
     }
     if (direct_refilled != nullptr) *direct_refilled = refilled;

@@ -242,7 +242,7 @@ def run(args):
                     else [
                         "--rounds",
                         str(args.rounds + args.warmup),
-                        "--skip-golden",
+                        *([] if case.get("timing_requires_golden", False) else ["--skip-golden"]),
                     ]
                 )
             )

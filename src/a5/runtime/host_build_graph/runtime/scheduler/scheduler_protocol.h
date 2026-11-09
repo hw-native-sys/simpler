@@ -290,7 +290,8 @@ inline __aicore__ void scheduler_protocol_admission(
 }
 
 template <typename Local>
-inline __aicore__ void scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task, bool before) {
+inline __aicore__ void
+scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task, bool before, bool deferred = false) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
     if (task < 0 || static_cast<uint64_t>(task) >= layout->task_count) {
@@ -303,14 +304,29 @@ inline __aicore__ void scheduler_protocol_task_done(__gm__ void *base, const Loc
     metadata.logical_block_num = source->logical_block_num;
     uint64_t order = UINT64_MAX;
     if (scheduler_task_requires_admission(metadata)) {
-        const auto *admission = local->admission;
-        if (admission == nullptr || admission->current_task_ref != task || admission->epoch != layout->run_epoch) {
-            scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-            return;
+        if (deferred) {
+            // FINISH may run on a different core after the execution cohort
+            // closed. The admission publication retains the original order.
+            auto *admission =
+                &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task].admission;
+            scheduler_protocol_observe_record(admission);
+            if (admission->task_ref != task || admission->run_epoch != layout->run_epoch ||
+                admission->after.sequence == 0 || admission->order_key >= layout->cooperative_task_count) {
+                scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+                return;
+            }
+            order = admission->order_key;
+        } else {
+            const auto *admission = local->admission;
+            if (admission == nullptr || admission->current_task_ref != task || admission->epoch != layout->run_epoch) {
+                scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+                return;
+            }
+            order = admission->scan_cursor;
         }
-        order = admission->scan_cursor;
     }
-    scheduler_protocol_task_actor(base, local, task, order, metadata.flags, true, before);
+    const uint32_t flags = metadata.flags | (deferred ? SCHEDULER_PROTOCOL_DEFERRED_FINISH : 0);
+    scheduler_protocol_task_actor(base, local, task, order, flags, true, before);
 }
 
 template <typename Local, typename Admission>

@@ -265,6 +265,31 @@ def test_v6_rejects_invalid_claim_seal_proof(mask, fault):
         audit_native_protocol(raw, identities)
 
 
+@pytest.mark.parametrize("mask", (1, 2, 4))
+@pytest.mark.parametrize("partial_retirement", (False, True))
+def test_pure_completion_join_after_retirement_requires_the_final_trace(mask, partial_retirement):
+    raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
+    for block in raw["blocks"]:
+        owner = block["owner"]
+        execution = next(row for row in raw["executions"] if row["index"] == block["index"])
+        fields = [
+            (owner, "completion_before"),
+            (owner, "completion_after"),
+            (execution, "completion_consumed"),
+            (execution, "trace_published"),
+        ]
+        stamps = [row[name] for row, name in fields]
+        order = (2, 0, 1, 3) if partial_retirement else (2, 3, 0, 1)
+        for stamp, index in zip(stamps, order):
+            row, name = fields[index]
+            row[name] = stamp
+    if partial_retirement:
+        with pytest.raises(ValueError, match="completion join before trace retirement"):
+            audit_native_protocol(raw, identities)
+    else:
+        assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 3, 16))
 @pytest.mark.parametrize("tail", (False, True))
@@ -888,4 +913,30 @@ def test_counts_and_complete_sequences_cannot_hide_protocol_corruption(mutation)
         target[field] = value
     assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
     with pytest.raises(ValueError, match="protocol"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("blocks", (1, 2))
+@pytest.mark.parametrize("resource_scoped", (False, True))
+def test_deferred_finish_can_move_to_another_worker_after_execution_release(mask, blocks, resource_scoped):
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], deferred_tasks=(0,), resource_scoped=resource_scoped).run()
+    if resource_scoped:
+        _add_claim_seal_certificates(raw, identities)
+        _isolated_close_seals(raw)
+        raw["schema"] = "hbg-native-protocol-v8"
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    raw["task_events"][0]["completion"]["flags"] &= ~(1 << 31)
+    with pytest.raises(ValueError, match="TaskDone"):
+        audit_native_protocol(raw, identities)
+
+
+def test_deferred_finish_flag_cannot_relabel_admission_or_inline_control():
+    raw, identities = ProtocolBuilder([(7, 2, ())]).run()
+    raw["task_events"][0]["admission"]["flags"] |= 1 << 31
+    with pytest.raises(ValueError, match="identity"):
+        audit_native_protocol(raw, identities)
+    raw, identities = ProtocolBuilder([(0, 1, ())]).run()
+    raw["task_events"][0]["completion"]["flags"] |= 1 << 31
+    with pytest.raises(ValueError, match="deferred"):
         audit_native_protocol(raw, identities)

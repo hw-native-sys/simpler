@@ -7,10 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Resident deferred-registration refusal, without issuing asynchronous work.
+"""Resident registration and missing-context refusal, without issuing DMA.
 
-This checks the public kernel API's return values, not Host detection of async
-kernels, deferred completion support, or hardware SDMA fallback.
+This checks the existing public API with a valid resident execution context
+and an empty context. Delayed conditions are covered by the progress scenes.
 """
 
 import copy
@@ -36,7 +36,7 @@ class TestHbgAsyncBoundary(_spmd.TestHbgSpmdContract):
 
     CASES = [
         {
-            "name": f"async_refusal_mask{mask}_n{blocks}",
+            "name": f"async_context_mask{mask}_n{blocks}",
             "platforms": ["a5", "a5sim"],
             "params": {"mask": mask, "blocks": blocks, "tasks": 2, "tail_delay": 4096},
         }
@@ -50,6 +50,8 @@ class TestHbgAsyncBoundary(_spmd.TestHbgSpmdContract):
         for block in range(params["blocks"]):
             for slot in range(3):
                 if params["mask"] & (1 << slot):
+                    records[:, block * 3 + slot, 12] = 0b11111
+                    records[:, block * 3 + slot, 13] = 1
                     records[:, block * 3 + slot, 15] = _ASYNC_COMPLETE
 
     def _run_and_validate(self, worker, callable_obj, case, *args, **kwargs):

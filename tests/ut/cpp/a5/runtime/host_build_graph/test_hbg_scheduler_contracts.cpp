@@ -42,6 +42,25 @@ TEST(AicoreSchedulerError, MapsInternalFailureToExistingHostStatus) {
         SIMPLER_ERROR_SCHEDULER_TIMEOUT
     );
     EXPECT_EQ(aicore_scheduler_runtime_error_code(UINT64_MAX), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(
+        aicore_scheduler_runtime_error_code(static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW)),
+        SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW
+    );
+    EXPECT_EQ(
+        aicore_scheduler_runtime_error_code(static_cast<uint64_t>(SchedulerGraphResult::ASYNC_COMPLETION_INVALID)),
+        SIMPLER_ERROR_ASYNC_COMPLETION_INVALID
+    );
+    EXPECT_EQ(
+        aicore_scheduler_runtime_error_code(static_cast<uint64_t>(SchedulerGraphResult::ASYNC_REGISTRATION_FAILED)),
+        SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED
+    );
+    EXPECT_STREQ(
+        aicore_scheduler_error_name(static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW)),
+        "ASYNC_WAIT_OVERFLOW"
+    );
+    EXPECT_STREQ(
+        aicore_scheduler_error_name(static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)), "SCHEDULER_TIMEOUT"
+    );
 }
 
 TEST(AicoreSchedulerError, LatchesFirstHostVisibleFailure) {

@@ -809,7 +809,7 @@ protected:
     }
 
     FakeHostApi fake_;
-    HostApi api_{nullptr, 0, 0, 0, &fake_ops()};
+    HostApi api_{nullptr, 0, 0, 1, &fake_ops()};
     TestHostOrchEntryPoints eps_{empty_orch_entry, empty_orch_bind};
 };
 
@@ -980,7 +980,7 @@ TEST_F(HbgBindLedgerTest, StagedImageRecordsHostWorkWithoutAnUploadAnchor) {
         snapshot.assign(regions, regions + count);
         return 0;
     };
-    HostApi api(&staged, 0, 0, 0, &ops);
+    HostApi api(&staged, 0, 0, 1, &ops);
     ASSERT_EQ(publish_run_image_impl(&runtime, &api), 0);
     ASSERT_FALSE(staged.empty());
     EXPECT_EQ(fake_.copies.size(), copies_before);
@@ -1549,7 +1549,7 @@ TEST_F(HbgBindLedgerTest, OldReleaseDoesNotCloseSuccessorTrace) {
     ChipStorageTaskArgs args;
     ASSERT_EQ(bind(predecessor, args, nullptr, 0), 0);
     ASSERT_EQ(publish_run_image_impl(&predecessor, &api_), 0);
-    HostApi successor_api{nullptr, 1, 1, 0, &fake_ops()};
+    HostApi successor_api{nullptr, 1, 1, 2, &fake_ops()};
     uint64_t win[4] = {8, 0, 0, 0};
     ASSERT_EQ(
         bind_callable_to_runtime_impl(&successor, &successor_api, &args, &eps_, nullptr, 0, win, nullptr, nullptr), 0
@@ -2077,7 +2077,7 @@ TEST_F(HbgResidentSchedulerStorageTest, TwoPipelineSlotsHoldDistinctStorage) {
     eps_ = {ordinary_orch_entry, capture_orch_bind};
     ChipStorageTaskArgs args;
     uint64_t win[4] = {8, 0, 0, 0};
-    HostApi other_slot{nullptr, 1, 1, 0, &fake_ops()};
+    HostApi other_slot{nullptr, 1, 1, 2, &fake_ops()};
     auto cleanup_second = RAIIScopeGuard([&second, &other_slot]() {
         EXPECT_EQ(release_run_bindings_impl(&second, &other_slot), 0);
     });
@@ -2769,7 +2769,7 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         }
         return 0;
     };
-    api_ = HostApi(&staging, 0, 0, 0, &ops);
+    api_ = HostApi(&staging, 0, 0, 1, &ops);
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, ordinary_orch_entry}) {
         SCOPED_TRACE(entry == ordinary_orch_entry ? "resident" : "graph");

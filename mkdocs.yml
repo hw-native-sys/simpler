@@ -138,6 +138,15 @@ nav:
           - Execution and API: design/native-capture-common-contract.md
           - Resource lifetime: design/native-hbg-prepared-lifetime.md
           - HBG state restoration: design/native-hbg-resource-reset.md
+      - A5 HBG 异步完成设计:
+          - 设计总览: zh-cn/design/a5-hbg-async-completion.md
+          - 接口与数据布局: zh-cn/design/a5-hbg-async-completion/interfaces-and-layout.md
+          - 调度与完成协议: zh-cn/design/a5-hbg-async-completion/protocol.md
+          - 后端与资源生命周期: zh-cn/design/a5-hbg-async-completion/backends-and-lifetime.md
+          - 消费准备与准入: zh-cn/design/a5-hbg-async-completion/consumer-preparation.md
+          - 实现方案: zh-cn/design/a5-hbg-async-completion/implementation.md
+          - 验证与性能验收: zh-cn/design/a5-hbg-async-completion/validation.md
+          - 待验证选型: zh-cn/design/a5-hbg-async-completion/choices.md
       - Worker Manager: worker-manager.md
       - Hardware:
           - Overview: hardware/README.md

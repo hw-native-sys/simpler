@@ -19,6 +19,16 @@ a5_hbg_case(test_hbg_scheduler_contracts.cpp
 
 a5_hbg_case(test_hbg_graph_view.cpp)
 
+a5_hbg_case(test_hbg_async_directory.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_state.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_pending.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_writer.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_control.cpp TIMEOUT 20
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+a5_hbg_case(test_hbg_async_plan.cpp NO_OBJS TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+
 a5_hbg_case(test_hbg_ready_pool.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 

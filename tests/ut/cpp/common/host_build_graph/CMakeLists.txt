@@ -134,7 +134,8 @@ hbg_case(test_hbg_bind_ledger.cpp
 
 if(TARGET test_a5_hbg_bind_ledger)
     target_sources(test_a5_hbg_bind_ledger PRIVATE
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
 endif()
 
 # Which maker states the caller device buffers a run produces. a2a3's does; a5's makes no such

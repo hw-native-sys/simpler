@@ -94,7 +94,7 @@ def test_async_golden_records_every_active_slot_and_preserves_satisfied_counters
                 if mask & (1 << slot):
                     assert row[0].item() == 1
                     assert row[8:12].tolist() == [block + 1, blocks, slot + 1, task + 1]
-                    assert row[12:16].tolist() == [0, 0, 0, async_native._ASYNC_COMPLETE]
+                    assert row[12:16].tolist() == [0b11111, 1, 0, async_native._ASYNC_COMPLETE]
                 else:
                     assert torch.count_nonzero(row).item() == 0
 
@@ -134,12 +134,12 @@ def test_async_fixture_cannot_skip_records_or_provenance(monkeypatch, async_nati
 @pytest.mark.parametrize(
     "field,value",
     [
-        (12, 1),
-        (12, 2),
-        (12, 4),
-        (12, 8),
-        (12, 16),
-        (13, 1),
+        (12, 0b11110),
+        (12, 0b11101),
+        (12, 0b11011),
+        (12, 0b10111),
+        (12, 0b01111),
+        (13, 0),
         (14, 1),
         (15, 0),
         (15, -1),

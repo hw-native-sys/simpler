@@ -973,7 +973,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 if(TARGET test_a5_hbg_native_admission)
     target_sources(test_a5_hbg_native_admission PRIVATE
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
 endif()
 tmr_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}

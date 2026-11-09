@@ -177,10 +177,10 @@ void SchedulerContext::build_payload(
     }
     dispatch_payload.local_context.block_idx = block_idx;
     dispatch_payload.local_context.block_num = slot_state.logical_block_num;
-    // AsyncCtx's slab pointers + capacity are prefilled once per (core, buf_idx)
+    // LegacyAsyncCtx's slab pointers + capacity are prefilled once per (core, buf_idx)
     // in init(); only task_token varies per dispatch. deferred_slab is never null
     // on this path, so task_token is always the live task id (matches the old
-    // AsyncCtx::make(non-null) result). args[PAYLOAD_LOCAL_CONTEXT_INDEX] /
+    // LegacyAsyncCtx::make(non-null) result). args[PAYLOAD_LOCAL_CONTEXT_INDEX] /
     // [PAYLOAD_GLOBAL_CONTEXT_INDEX] are per-(core, buf_idx) constants, also
     // prefilled in init().
     dispatch_payload.local_context.async_ctx.task_token = slot_state.to_descriptor().task_id;

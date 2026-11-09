@@ -6,7 +6,9 @@
 G/H4/H8 首轮只比较了同一种 ticket 协议的拓扑，不能据此完成算法选型。
 以下区分原论文事实、针对 A5 的推断、原型验证与生产接入；CPU 吞吐不作为 A5 性能证据。
 
-当前代码已恢复 `queue-ordinary-credit-v1`，保持 task 粒度的六种队列选型和 T/H8 默认，Qwen 历史中位数 38.454 ms。
+当前代码只保留 task 粒度的 **T/H8**。T/G、T/H4、L/G、C/W1/W4 的实现与配置入口已删除，因为它们没有完成当前异步实现的验证；将来需要基于现有调度协议重新实现，不能直接恢复旧候选。
+下文的候选状态、结构尺寸、API 名称与性能均记录历史原型，不能视为当前源码提供的能力。当前池 header 为 version 4，固定组宽 8；不含 linked/chunk 字段或本核 pending 发布列表。重新开发与验收要求见[异步选型约定](../a5-hbg-async-completion/choices.md#ready-queue-implementation-scope)。
+历史 `queue-ordinary-credit-v1` 的 Qwen 中位数为 38.454 ms。
 独立 block 原型的 37.855 ms 结果伴随 3.08 倍冷构建成本，按用户要求撤回；
 其发布预算、MIX lease、同步 cohort 和审计改动不在当前代码中。
 完整思路与再次评估条件见[后续优化候选](block-ready-scheduling.md)，历史数据见[原型记录](qwen-block-work.md)。
@@ -23,10 +25,10 @@ G/H4/H8 首轮只比较了同一种 ticket 协议的拓扑，不能据此完成�
 | 拓扑和路由 | 每类型唯一队列、分组共享、producer 子队列、本地 deque 加 injector | 热点地址分布与发现成本 |
 | 同步聚合 | 同一 producer 合批、多个消费者合并请求、代理批量分配 | 同地址原子流量与代理等待 |
 
-当前实测配置包括 `T/G/claim1`、`T/H4/claim1`、`T/H8/claim1`、`L/G/claim1`、`C/W1/claim1` 与 `C/W4/claim1`。
+历史实测配置包括 `T/G/claim1`、`T/H4/claim1`、`T/H8/claim1`、`L/G/claim1`、`C/W1/claim1` 与 `C/W4/claim1`。
 其中 T 为 append-only ticket。H4/H8 是组宽，G 是每类型唯一物理队列。
 
-| 候选 | 实质变化 | 当前证据 |
+| 候选 | 实质变化 | 历史证据 |
 | ---- | -------- | -------- |
 | T/G、T/H4、T/H8 | 同一 ticket 算法，改变拓扑 | 已接生产调度，有功能和 Qwen 数据 |
 | T/claim2 | 仅改变领取粒度，一次 CAS 最多取两个 | 底层原语已有 CPU 测试，未接 dispatch |
@@ -83,16 +85,16 @@ NOT_READY 只表示本次没取到，不能用作 run 完成或全局无任务�
 仅操作同一 publisher 独占、尚未共享的链尾，转移 incoming 所有权并清空其本地描述符。
 每次 prepare 最多 8 项，多个私有批次可以合并为最多 N 项的待发布链；共享领取仍受 1/2 个 credit 限制。
 必须在 scheduler 的持久状态里保存未发布工作，下一服务轮继续，不能沿用旧 bool push 的“false 就 abort”。
-L/G 已接入 Host plan、bootstrap 和 dispatch；每个类型一个持久 pending 描述符，RETRY 返回成功接收但保留发布责任。
-它已通过仿真、Graph 真机协议与 Qwen 数值校验，但同卡性能慢于 T/G；常规硬件回归和故障矩阵仍在推进。
+历史 L/G 原型曾接入 Host plan、bootstrap 和 dispatch；每个类型一个持久 pending 描述符，RETRY 返回成功接收但保留发布责任。
+它已通过仿真、Graph 真机协议与 Qwen 数值校验，但同卡性能慢于 T/G；对应历史回归记录不证明当前异步资格。
 
 ### L 的待发布状态与 scheduler 接入契约
 
 第一条 L/G 候选按类型各保存一个本核 publisher 描述符；L/H 需要按目标组保存，不能把不同组的私有链合并。
 存储只包含 ref/count，任务本体仍在 run-resident GM，空间不能随未发布任务数增加本地数组。
-`SchedulerLinkedBatch` 是 24 bytes；L/G 三类型增加 72 bytes/core，`SchedulerLocalState` 从 560 增至 632 bytes。
+历史 `SchedulerLinkedBatch` 是 24 bytes；L/G 三类型 pending 描述符占 72 bytes/core。控制解析的独立续接游标占 184 bytes，`SchedulerLocalState` 共 808 bytes（含可选异步服务状态的 8-byte 引用）；控制解析和可移交 FINISH 的待发布 batch 由各自游标持有，不借用上述本核 pending 列表。
 ready pool header 保持 128 bytes，version 升至 2，新增 kind 与 links_offset；Host 初始化独立 links 和每队列 sentinel。
-首个接入候选只允许 LINKED + group_width=0，拒绝未实现的 L/H。旧 T/G/H4/H8 仍可用同一设备 binary 进行比较。
+首个接入候选只允许 LINKED + group_width=0，拒绝未实现的 L/H。当时的 T/G/H4/H8 可用同一设备 binary 进行比较；当前已不提供这些切换入口。
 L/H 若每核保存全部 Q 个组则为 `24 × Q bytes/core`，必须与 GM publisher descriptors 等替代方案比较。
 
 | 状态 | 唯一 owner | 允许操作 | 退出条件 |
@@ -143,7 +145,7 @@ Host 对 chunk 容量不能直接用 `ceil(N / 8)`：短链和稀疏唤醒可能
 
 ### C/G 的首个实现边界
 
-以下契约已落实到 `scheduler_chunk_queue.h`、ready pool、Host plan 和生产领取路径。
+以下契约曾落实到现已删除的 `scheduler_chunk_queue.h`、ready pool、Host plan 和领取路径。
 `C/W1` 与 `C/W4` 是同一种 chunk 算法的窗口配置，
 不能再计作两种底层算法。它与 L/G 的实质区别是：任务领取 CAS 转移到每块 cursor，
 全局 head 仅在跳过耗尽块时推进；块中未被 credit 领取的任务始终共享。
@@ -224,31 +226,26 @@ B 为实际发布批量，C 为实际领取数，不能用上限 8/2 代替测�
 | FAAArrayQueue 类 | FAA 加 slot 仲裁，偶尔扩链 | FAA 加 slot 仲裁，可能跳过作废槽 | 空轮询、取消槽和容量管理 |
 | 聚合代理类 | 每次合并有少量主地址原子 | 按请求合并返回 | 本地请求行、代理串行、等待和接管 |
 
-实施顺序如下。用户已授权自主分析、实现、验证和分阶段提交，不在每一步重新询问。
+后续重新实现候选时，采用以下顺序：
 
-1. 保留 `ready-pool-candidates.json` 中的 T/G/H 实测产物；补齐算法层设计及 L 原语并发验证。
-2. L 接入持久 pending publish，先解决正常、RETRY、abort、close 的所有权和服务顺序。
-   不切换生产默认直到仿真、真机功能和 native protocol 审计通过。
-3. 独立接入实际 credit 限制的 claim2，先用于能够立即持有的普通任务；MIX 沿用先 placement 后 claim。
-   T/L 使用同样领取额度比较，不能将算法收益与额外囤积任务混合；native ordered MIX 的领取沿用
-   candidate credit 与统一 admission，不能误套传统局部 placement，也不在首个 claim2 候选中批量领取 MIX。
-4. 比较 T/G、L/G，再将有价值候选与 T/H8 对照；C 补充块级分散，H2 补充所有权转移。
-   未测候选继续标为未测，不把 H8 胜过 T/G 写成分级一定胜过全局。
-5. 使用既有固定 callable、完整 golden、fresh resident/native 检查；只有候选接近或波动影响判断才针对性交叉。
-   不重采主线基线，不惯例重跑完整 A/B/A。无 Graph 最终仍覆盖原定 19 项。
+1. 从当前 T/H8 和异步完成协议建立基线，重新设计候选的发布、领取、续接与资源参与方式；历史证据仅供定位。
+2. 先证明正常、RETRY、abort、close 的所有权和服务顺序，不以私有待发布工作阻塞业务或 CHECK/FINISH。
+3. 全局与分组候选使用相同的领取额度和任务形状；MIX 保持先准入/placement 后转移所有权，不能以囤积任务伪装算法收益。
+4. 完成 CPU、SIM、单卡、多卡和 native protocol 验证后，再采集同机同卡、相同计算产物的完整模型与固定场景性能。旧基线和历史最优值不能拼成当前对照。
+5. 只有功能相同且差异有重复证据时才替换 T/H8；保留结论和证据路径，未验证的候选不保留为生产分支。
 
 先采队列行为分布和调度间隙，判断性能变化是否与假设一致；不得把 DFX 的全部 scheduling 时间归因于原子争用。
 评估至少覆盖单 producer 宽 fanout、多 producer 汇聚、短链、间歇 ready、MIX/普通混合以及完整 A5 Qwen。
 队列微测试只提供正确性和原子争用机制证据，模型性能决定最终选择。
 
-### 本轮原语证据与未完成部分
+### 历史原语证据
 
-`scheduler_linked_queue.h` 已有单项/批量领取和有界发布原语，AIC/AIV CCEC 编译探针通过。
+已删除的 `scheduler_linked_queue.h` 曾实现单项/批量领取和有界发布原语，AIC/AIV CCEC 编译探针通过。
 对应 CPU 用例验证未挂链 producer 暂停、已挂链 tail 落后、消费越过 tail、耗尽重试保留批次、
 空/非空转换、过期 head、非法输入、最后任务唯一领取和并发 payload 可见性。
 CPU 原语测试与并发重复结果见原语证据（本地 `linked-queue-primitives.json`）。
 L/G 接入后新增生产池布局、跨原 shard 领取、MIX placement 失败、滞后 tail 引发 RETRY 后合并新工作、
 full slots 下发布、abort 保留私有链和非法 link 防护测试；原有并发池测试扩展到 L/G。
 三候选同卡 Qwen 的 L/G、T/G、T/H8 分别为 51.179、49.532、40.960 ms，完整 out/K/V 均通过。
-保留 T/H8 为默认；L/G 作为独立算法对照，不作为性能胜者。常规硬件回归与故障矩阵状态见
+当时保留 T/H8 为默认；L/G 仅作为独立算法对照，不作为性能胜者。常规硬件回归与故障矩阵状态见
 生产接入证据（本地 `linked-ready-pool-candidates.json`），与原语证据分开记录。

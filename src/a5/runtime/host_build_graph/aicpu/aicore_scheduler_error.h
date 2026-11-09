@@ -30,7 +30,30 @@ inline int32_t aicore_scheduler_runtime_error_code(uint64_t scheduler_error) {
     if (scheduler_error == static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)) {
         return SIMPLER_ERROR_SCHEDULER_TIMEOUT;
     }
+    if (scheduler_error == static_cast<uint64_t>(SchedulerGraphResult::ASYNC_COMPLETION_INVALID))
+        return SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+    if (scheduler_error == static_cast<uint64_t>(SchedulerGraphResult::ASYNC_WAIT_OVERFLOW))
+        return SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+    if (scheduler_error == static_cast<uint64_t>(SchedulerGraphResult::ASYNC_REGISTRATION_FAILED))
+        return SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
     return SIMPLER_ERROR_INVALID_ARGS;
+}
+
+inline const char *aicore_scheduler_error_name(uint64_t scheduler_error) {
+    switch (aicore_scheduler_runtime_error_code(scheduler_error)) {
+    case SIMPLER_ERROR_NONE:
+        return "NONE";
+    case SIMPLER_ERROR_SCHEDULER_TIMEOUT:
+        return "SCHEDULER_TIMEOUT";
+    case SIMPLER_ERROR_ASYNC_COMPLETION_INVALID:
+        return "ASYNC_COMPLETION_INVALID";
+    case SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW:
+        return "ASYNC_WAIT_OVERFLOW";
+    case SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED:
+        return "ASYNC_REGISTRATION_FAILED";
+    default:
+        return "INVALID_ARGS";
+    }
 }
 
 inline bool latch_aicore_scheduler_runtime_error(std::atomic<int32_t> *sched_error_code, uint64_t scheduler_error) {
@@ -87,11 +110,12 @@ inline void log_aicore_scheduler_error_identity(SchedulerRunControl *run, const 
     cache_invalidate_range(error_line, 128);
     LOG_ERROR(
         "A5 HBG scheduler identity: phase=%s task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64 " type=%" PRIu64
-        " site=%" PRIu64 " epoch=%" PRIu64 " order=%" PRIu64 " block=%" PRIu64 " group_seq=%" PRIu64 " worker=%" PRIu64
-        " lane=%" PRIu32 " identity_fields=0x%" PRIx32,
-        phase, run->error_task_ref, status, run->error_core_id, run->error_core_type, run->error_site,
-        run->error_run_epoch, run->error_order_key, run->error_block_idx, run->error_group_seq, run->error_worker_index,
-        run->error_cluster_lane, run->error_identity_fields
+        " error=%s site=%" PRIu64 " epoch=%" PRIu64 " order=%" PRIu64 " block=%" PRIu64 " group_seq=%" PRIu64
+        " worker=%" PRIu64 " lane=%" PRIu32 " identity_fields=0x%" PRIx32,
+        phase, run->error_task_ref, status, run->error_core_id, run->error_core_type,
+        aicore_scheduler_error_name(status), run->error_site, run->error_run_epoch, run->error_order_key,
+        run->error_block_idx, run->error_group_seq, run->error_worker_index, run->error_cluster_lane,
+        run->error_identity_fields
     );
 }
 
