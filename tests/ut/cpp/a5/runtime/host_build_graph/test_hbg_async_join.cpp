@@ -45,7 +45,7 @@ TEST(HbgAsyncJoin, ZeroRegistrationAndSkippedExecutionNeedNoGroupSettlement) {
     EXPECT_EQ(scheduler_async_join_release_block(join).result, Result::PENDING);
     EXPECT_EQ(scheduler_async_join_release_block(join).result, Result::PENDING);
     EXPECT_EQ(scheduler_async_join_release_block(join).result, Result::FINISH_OWNER);
-    EXPECT_EQ(scheduler_async_join_load(join), 0u);
+    EXPECT_TRUE(scheduler_async_join_complete(scheduler_async_join_load(join)));
 }
 
 TEST(HbgAsyncJoin, LastConditionCanPrecedeOrFollowLastExecutionRelease) {
@@ -53,14 +53,17 @@ TEST(HbgAsyncJoin, LastConditionCanPrecedeOrFollowLastExecutionRelease) {
         SchedulerAsyncTaskJoin join;
         initialize(join, 1);
         ASSERT_EQ(scheduler_async_join_add_group(join).result, Result::PENDING);
+        EXPECT_EQ(scheduler_async_join_registered(scheduler_async_join_load(join)), 1u);
         if (condition_first) {
             EXPECT_EQ(scheduler_async_join_settle_group(join).result, Result::PENDING);
+            EXPECT_EQ(scheduler_async_join_groups(scheduler_async_join_load(join)), 0u);
+            EXPECT_EQ(scheduler_async_join_registered(scheduler_async_join_load(join)), 1u);
             EXPECT_EQ(scheduler_async_join_release_block(join).result, Result::FINISH_OWNER);
         } else {
             EXPECT_EQ(scheduler_async_join_release_block(join).result, Result::PENDING);
             EXPECT_EQ(scheduler_async_join_settle_group(join).result, Result::FINISH_OWNER);
         }
-        EXPECT_EQ(scheduler_async_join_load(join), 0u);
+        EXPECT_TRUE(scheduler_async_join_complete(scheduler_async_join_load(join)));
     }
 }
 
@@ -98,7 +101,7 @@ TEST(HbgAsyncJoin, FinalConditionAndBlockRaceGrantsExactlyOneFinishOwner) {
             (condition == Result::FINISH_OWNER && block == Result::PENDING) ||
             (block == Result::FINISH_OWNER && condition == Result::PENDING)
         );
-        EXPECT_EQ(scheduler_async_join_load(join), 0u);
+        EXPECT_TRUE(scheduler_async_join_complete(scheduler_async_join_load(join)));
     }
 }
 
@@ -129,7 +132,7 @@ TEST(HbgAsyncJoin, ConcurrentMixedPublicationAndSettlementDoNotLoseWakeup) {
         worker.join();
     EXPECT_EQ(errors.load(), 0);
     EXPECT_EQ(finish_owners.load(), 1);
-    EXPECT_EQ(scheduler_async_join_load(join), 0u);
+    EXPECT_TRUE(scheduler_async_join_complete(scheduler_async_join_load(join)));
 }
 
 TEST(HbgAsyncJoin, RegisteringAfterExecutionReleaseIsAProtocolError) {
@@ -173,12 +176,12 @@ TEST(HbgAsyncJoin, MaximumValidCountsSettleWithoutBorrowingBetweenFields) {
         const auto expected = i + 1 == SCHEDULER_ASYNC_JOIN_LIMIT ? Result::FINISH_OWNER : Result::PENDING;
         ASSERT_EQ(scheduler_async_join_release_block(join).result, expected);
     }
-    EXPECT_EQ(scheduler_async_join_load(join), 0u);
+    EXPECT_TRUE(scheduler_async_join_complete(scheduler_async_join_load(join)));
 }
 
 TEST(HbgAsyncJoin, UnknownHighBitsCannotGrantFinish) {
     SchedulerAsyncTaskJoin join;
-    join.word = (UINT64_C(1) << 32) | (UINT64_C(1) << 16);
+    join.word = (UINT64_C(1) << 48) | (UINT64_C(1) << 16);
     EXPECT_FALSE(scheduler_async_join_valid(join.word));
     EXPECT_EQ(scheduler_async_join_release_block(join).result, Result::INVALID_STATE);
 }

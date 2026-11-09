@@ -41,7 +41,9 @@ inline __aicore__ SchedulerCompletionResult scheduler_resolve_completion_step(
         return SchedulerCompletionResult::ERROR;
     }
     for (;;) {
-        if (scheduler_read_error(run) != 0) {
+        // Poll between successors, not between each local cursor phase. Slice
+        // entry and publication retries also pass through the error gate above.
+        if (phase(*progress) == SchedulerCompletionPhase::SELECT && scheduler_read_error(run) != 0) {
             phase(*progress, SchedulerCompletionPhase::FAILED);
             return SchedulerCompletionResult::ERROR;
         }

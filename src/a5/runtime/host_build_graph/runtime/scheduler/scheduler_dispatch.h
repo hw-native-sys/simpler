@@ -40,13 +40,15 @@ static inline __aicore__ bool scheduler_service_gm_mix(
     if (local->is_mix_coordinator()) {
         if (group.phase == SchedulerGmMixPhase::RELEASED) {
             const int64_t released_task = admission.current_task_ref;
-            const uint32_t released_block = group.block_idx;
-            bool deferred = false;
-            if (!scheduler_completion_async_task(async, graph, local, run, released_task, &deferred)) return false;
             const auto retired = scheduler_gm_mix_retire<RecordProtocol, true>(
                 graph, base, local, run, ack_prefilter_phase == SchedulerGmMixPhase::RELEASED
             );
             if (retired == SchedulerGmMixResult::ERROR) return false;
+            bool deferred = false;
+            if (!scheduler_completion_async_task(
+                    async, graph, local, run, released_task, retired == SchedulerGmMixResult::TASK_LAST, &deferred
+                ))
+                return false;
             if (!deferred && retired == SchedulerGmMixResult::TASK_LAST &&
                 !scheduler_complete_ordered_task<RecordProtocol>(
                     graph, base, local, run, admission.current_task_ref, profiling_level, wake_stats, ready_stats,
@@ -57,12 +59,9 @@ static inline __aicore__ bool scheduler_service_gm_mix(
                 *progress = true;
                 if (!scheduler_gm_mix_close<RecordProtocol, true>(graph, base, local, run, &closed)) return false;
                 if (deferred) {
-                    // Retirement owns this cohort generation after all actual
-                    // lane release acknowledgements and its local close tail.
-                    SchedulerAsyncExecutionRelease grant{released_task, released_block, false};
                     bool finish_published = false;
-                    if (!scheduler_async_runtime_release_execution_block(
-                            *async, graph, base, local, run, &grant, &finish_published
+                    if (!scheduler_async_runtime_release_task(
+                            *async, graph, base, local, run, released_task, &finish_published
                         ))
                         return false;
                 }

@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-11 — A5 deferred-completion performance experiments](2026-11-a5-defer-wait-performance.md) — runtime candidates with insufficient or inconsistent CSA/SWA benefit, with numerical and execution-identity validation.
 - [2026-11 — A5 HBG independent block scheduling](../zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md) — implementation restored to the task-level T/H8 ordinary-credit candidate; retained as a future candidate. Qwen reaches 37.855 ms versus historical 38.454 ms, but the AICore cold build grows from 744.257 s to 2295.011 s (3.08x). Full work-protocol acceptance remains incomplete.
 
 - [2026-11 — Outlining A5 HBG work protocol progress](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#work-protocol-outline) — reverted: MIX fails with an illegal GM address on hardware, so no Qwen performance result exists. AIC/AIV weak-symbol merging is confirmed, but localization and relinking alone still fail; the complete cause remains unresolved.

@@ -44,18 +44,27 @@ struct SchedulerRefillCandidates {
     SchedulerReadyClaim mix_ready{};
 };
 
-// The private async task map decides logical completion ownership. A missing
-// map in an enabled run is an error, never an implicit synchronous task.
+// Only the last native block/cohort completion can rule out future registrations.
+// Empty tasks keep ordinary TaskDone/resolver/refill; registered tasks retain
+// FINISH ownership even if an earlier CHECK has already settled every condition.
+// A never-registered task has no CHECK reader and leaves its unused join dormant.
 inline __aicore__ bool scheduler_completion_async_task(
     const SchedulerAsyncRuntimeView *async, const SchedulerGraphAccess &graph, SchedulerLocalState *local,
-    __gm__ SchedulerRunControl *run, int64_t task, bool *deferred
+    __gm__ SchedulerRunControl *run, int64_t task, bool task_complete, bool *deferred
 ) {
     *deferred = false;
-    if (async == nullptr || !async->enabled()) return true;
+    if (!task_complete || async == nullptr || !async->enabled()) return true;
     SchedulerAsyncTaskMap map{};
     if (!scheduler_async_runtime_detail::task_map(*async, task, &map))
         return scheduler_async_runtime_detail::fail(graph, local, run, task);
-    *deferred = map.finish_index != SCHEDULER_ASYNC_INDEX_NONE;
+    if (map.finish_index != SCHEDULER_ASYNC_INDEX_NONE) {
+        const uint64_t word = scheduler_async_join_load(*scheduler_async_runtime_detail::at<SchedulerAsyncTaskJoin>(
+            *async, async->layout().finish_join_offset, map.finish_index
+        ));
+        if (!scheduler_async_join_valid(word) || (word & SCHEDULER_ASYNC_JOIN_FAILED) != 0)
+            return scheduler_async_runtime_detail::fail(graph, local, run, task, async, map.finish_index);
+        *deferred = scheduler_async_join_registered(word) != 0;
+    }
     return true;
 }
 
@@ -131,8 +140,6 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, scheduler);
         return false;
     }
-    bool deferred = false;
-    if (!scheduler_completion_async_task(async, graph, scheduler, run_control, task_ref, &deferred)) return false;
     SchedulerMixTracker *mix_tracker = nullptr;
     bool valid_subtask = local_slot->subtask_slot < 3;
     if (local_slot->mix_tracker != UINT8_MAX) {
@@ -267,6 +274,9 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         task_complete = mix_tracker->completed_mask == mix_tracker->active_mask;
         if (task_complete) mix_tracker->task_ref = SCHEDULER_TASK_REF_INVALID;
     }
+    bool deferred = false;
+    if (!scheduler_completion_async_task(async, graph, scheduler, run_control, task_ref, task_complete, &deferred))
+        return false;
     scheduler_initialize_free_slot(local_slot);
     scheduler->set_timing_slot(cluster_lane, pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
@@ -371,17 +381,13 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
             ))
             return false;
     } else if (deferred) {
-        // The consumed slot generation owns one pure block. Legacy Mix owns
-        // its block only after every participating lane has retired.
-        if (mix_tracker == nullptr || task_complete) {
-            SchedulerAsyncExecutionRelease grant{task_ref, completed_block_idx, false};
-            bool finish_published = false;
-            if (!scheduler_async_runtime_release_execution_block(
-                    *async, graph, scheduler_state_base, scheduler, run_control, &grant, &finish_published
-                ))
-                return false;
-        }
-    } else if (task_complete) {
+        bool finish_published = false;
+        if (!scheduler_async_runtime_release_task(
+                *async, graph, scheduler_state_base, scheduler, run_control, task_ref, &finish_published
+            ))
+            return false;
+    }
+    if (task_complete && !deferred) {
         if (scheduler->admission != nullptr) {
             if (!scheduler_complete_ordered_task<RecordProtocol>(
                     graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,

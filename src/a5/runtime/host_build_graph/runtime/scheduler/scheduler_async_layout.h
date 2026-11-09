@@ -20,7 +20,7 @@
 #include "async_sdma_guard.h"
 
 inline constexpr uint64_t SCHEDULER_ASYNC_INDEX_NONE = UINT64_MAX;
-inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 8;
+inline constexpr uint64_t SCHEDULER_ASYNC_LAYOUT_VERSION = 10;
 
 // All offsets are relative to the retained async region.
 struct SchedulerAsyncTaskMap {
@@ -87,6 +87,7 @@ struct SchedulerAsyncLayout {
     uint64_t group_count{0};
     uint64_t finish_count{0};
     uint64_t condition_capacity{0};
+    uint64_t work_signal_offset{0};
     uint64_t task_map_offset{0};
     uint64_t group_identity_offset{0};
     uint64_t group_writer_offset{0};
@@ -110,7 +111,7 @@ static_assert(sizeof(SchedulerAsyncTaskMap) == 24);
 static_assert(sizeof(SchedulerAsyncGroupIdentity) == 40 && sizeof(SchedulerAsyncGroupWriter) == 64);
 static_assert(sizeof(SchedulerAsyncGroupProgress) == 32 && sizeof(SchedulerAsyncFinishIdentity) == 32);
 static_assert(sizeof(SchedulerAsyncFinishProgress) == 168);
-static_assert(sizeof(SchedulerAsyncLayout) == 192);
+static_assert(sizeof(SchedulerAsyncLayout) == 200);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLayout> && std::is_trivially_copyable_v<SchedulerAsyncLayout>);
 static_assert(std::is_standard_layout_v<SchedulerAsyncTaskMap> && std::is_trivially_copyable_v<SchedulerAsyncTaskMap>);
 static_assert(

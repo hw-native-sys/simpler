@@ -62,6 +62,7 @@ struct RuntimeFixture {
     std::array<SchedulerAsyncRuntimeView, 6> views{};
     std::array<SchedulerAsyncDiscoveryState, 6> discovery{};
     std::array<DispatchPayload, 24> payloads{};
+    std::array<uint64_t, 24> bound_indices{};
     std::vector<SchedulerTaskMetadata> metadata{2};
     SchedulerRunControl *run{nullptr};
     RuntimeBackend backend;
@@ -151,11 +152,12 @@ struct RuntimeFixture {
         auto &p = payload(block, lane);
         p.local_context.block_idx = block;
         p.local_context.block_num = metadata[0].logical_block_num;
-        bool bound = false;
+        auto &bound = bound_indices[block * 3 + lane];
+        bound = SCHEDULER_ASYNC_INDEX_NONE;
         ASSERT_TRUE(
             scheduler_async_runtime_bind_payload(views[worker], graph, &locals[worker], run, 0, block, lane, &p, &bound)
         );
-        ASSERT_TRUE(bound);
+        ASSERT_EQ(bound, group(block, lane));
     }
     void condition(uint32_t block = 0, uint32_t lane = 0, uint32_t index = 0) {
         const auto identity = *at<SchedulerAsyncGroupIdentity>(async.group_identity_offset, group(block, lane));
@@ -173,17 +175,16 @@ struct RuntimeFixture {
     bool seal(uint32_t worker, uint32_t block = 0, uint32_t lane = 0, bool *registered_out = nullptr) {
         bool registered = false;
         const bool ok = scheduler_async_runtime_seal(
-            views[worker], graph, base(), &locals[worker], run, 0, block, lane, &payload(block, lane), &registered
+            views[worker], graph, base(), &locals[worker], run, 0, block, lane, bound_indices[block * 3 + lane],
+            &payload(block, lane), &registered
         );
         if (registered_out != nullptr) *registered_out = registered;
         return ok;
     }
-    bool release(uint32_t worker, uint32_t block, bool *activated = nullptr) {
-        SchedulerAsyncExecutionRelease grant{0, block, false};
+    bool release(uint32_t worker, bool *activated = nullptr) {
         bool published = false;
-        const bool ok = scheduler_async_runtime_release_execution_block(
-            views[worker], graph, base(), &locals[worker], run, &grant, &published
-        );
+        const bool ok =
+            scheduler_async_runtime_release_task(views[worker], graph, base(), &locals[worker], run, 0, &published);
         if (activated != nullptr) *activated = published;
         return ok;
     }
@@ -269,11 +270,11 @@ TEST(HbgAsyncRuntime, ZeroLocatorDisablesPollingAndClearsStalePayloadContextWith
     TaskId::assign(fixture.payloads[0].local_context.async_ctx.task_token, TaskId::make_global(1));
     for (auto &value : fixture.payloads[0].args)
         value = UINT64_C(0xdeadbeef);
-    bool bound = true;
+    uint64_t bound = 0;
     ASSERT_TRUE(scheduler_async_runtime_bind_payload(
         fixture.views[0], fixture.graph, &fixture.locals[0], fixture.run, 0, 0, 0, &fixture.payloads[0], &bound
     ));
-    EXPECT_FALSE(bound);
+    EXPECT_EQ(bound, SCHEDULER_ASYNC_INDEX_NONE);
     EXPECT_EQ(fixture.payloads[0].local_context.async_ctx.completion_capacity, 0u);
     EXPECT_FALSE(fixture.payloads[0].local_context.async_ctx.task_token.is_valid());
     for (auto value : fixture.payloads[0].args)
@@ -338,7 +339,7 @@ TEST(HbgAsyncRuntime, PendingThenReadyAcrossCoresActivatesFinishForALaterSliceEx
     fixture.condition();
     ASSERT_TRUE(fixture.seal(0));
     bool activated = true;
-    ASSERT_TRUE(fixture.release(0, 0, &activated));
+    ASSERT_TRUE(fixture.release(0, &activated));
     EXPECT_FALSE(activated);
     ASSERT_EQ(fixture.service(3), SchedulerAsyncRuntimeServiceResult::IDLE);
     EXPECT_EQ(fixture.backend.observations[0], 1u);
@@ -372,7 +373,7 @@ TEST(HbgAsyncRuntime, PendingCursorRotationAndLeaseHandoffDoNotReportProgress) {
     for (uint32_t condition = 0; condition < 16; ++condition)
         fixture.condition(0, 0, condition);
     ASSERT_TRUE(fixture.seal(0));
-    ASSERT_TRUE(fixture.release(0, 0));
+    ASSERT_TRUE(fixture.release(0));
     for (uint32_t slice = 0; slice < 24; ++slice) {
         SchedulerAsyncSliceBudget budget{4, 2, 2, 8};
         EXPECT_EQ(fixture.service(slice % 6, &budget), SchedulerAsyncRuntimeServiceResult::IDLE);
@@ -421,8 +422,11 @@ struct RuntimeRetryReserve : SchedulerCompletionQueueOps {
 TEST(HbgAsyncRuntime, FinishRetryDoesNotReportProgressButTraversalAndPublicationDo) {
     RuntimeFixture fixture;
     fixture.bind(0);
+    fixture.condition();
     ASSERT_TRUE(fixture.seal(0));
-    ASSERT_TRUE(fixture.release(0, 0));
+    fixture.backend.ready[0] = true;
+    EXPECT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    ASSERT_TRUE(fixture.release(0));
     RuntimeRetryReserve::retry = true;
     auto service = [&](uint32_t worker) {
         SchedulerAsyncSliceBudget budget{};
@@ -441,7 +445,7 @@ TEST(HbgAsyncRuntime, FinishRetryDoesNotReportProgressButTraversalAndPublication
     EXPECT_EQ(fixture.completed(), 1u);
 }
 
-TEST(HbgAsyncRuntime, ZeroConditionGroupDoesNotActivateCheckAndLastBlockActivatesFinish) {
+TEST(HbgAsyncRuntime, ZeroConditionGroupLeavesCheckAndFinishDormant) {
     RuntimeFixture fixture;
     fixture.bind(0);
     bool registered = true;
@@ -458,9 +462,13 @@ TEST(HbgAsyncRuntime, ZeroConditionGroupDoesNotActivateCheckAndLastBlockActivate
         SchedulerAsyncPhase::DORMANT
     );
     bool activated = false;
-    ASSERT_TRUE(fixture.release(0, 0, &activated));
-    EXPECT_TRUE(activated);
-    fixture.drain();
+    ASSERT_TRUE(fixture.release(0, &activated));
+    EXPECT_FALSE(activated);
+    EXPECT_EQ(fixture.service(3), SchedulerAsyncRuntimeServiceResult::IDLE);
+    EXPECT_EQ(fixture.completed(), 0u);
+    EXPECT_TRUE(scheduler_async_join_complete(
+        scheduler_async_join_load(*fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset))
+    ));
 }
 
 TEST(HbgAsyncRuntime, LaterBlocksMayRegisterGroupsAfterEarlierChecksDrain) {
@@ -473,43 +481,36 @@ TEST(HbgAsyncRuntime, LaterBlocksMayRegisterGroupsAfterEarlierChecksDrain) {
             *fixture.at<SchedulerAsyncGroupIdentity>(fixture.async.group_identity_offset, fixture.group(0, lane)), 0
         )] = true;
     }
-    ASSERT_TRUE(fixture.release(0, 0));
     for (uint32_t iteration = 0; iteration < 16; ++iteration)
         ASSERT_NE(fixture.service(iteration % 6), SchedulerAsyncRuntimeServiceResult::ERROR);
     EXPECT_EQ(fixture.completed(), 0u);
     EXPECT_EQ(
-        scheduler_async_join_load(*fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset)), UINT64_C(1)
-                                                                                                              << 16
+        scheduler_async_join_load(*fixture.at<SchedulerAsyncTaskJoin>(fixture.async.finish_join_offset)),
+        (UINT64_C(2) << 32) | (UINT64_C(1) << 16)
     );
     for (uint32_t lane : {0u, 1u, 2u}) {
         fixture.bind(lane + 3, 1, lane);
         if (lane == 2) fixture.condition(1, lane);
         ASSERT_TRUE(fixture.seal(lane + 3, 1, lane));
     }
-    ASSERT_TRUE(fixture.release(3, 1));
+    ASSERT_TRUE(fixture.release(3));
     fixture.backend.ready[20] = true;
     fixture.drain();
     EXPECT_EQ(fixture.backend.acquisitions, 3u);
 }
 
-TEST(HbgAsyncRuntime, ReleaseBeforeSealAndRepeatedGrantFailWithoutSuccessfulTaskCompletion) {
+TEST(HbgAsyncRuntime, RepeatedNativeCompletionFailsWithoutSuccessfulTaskCompletion) {
     {
         RuntimeFixture fixture;
-        EXPECT_FALSE(fixture.release(0, 0));
-        EXPECT_EQ(fixture.completed(), 0u);
-        EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
-    }
-    {
-        RuntimeFixture fixture(2);
         fixture.bind(0);
+        fixture.condition();
         ASSERT_TRUE(fixture.seal(0));
-        SchedulerAsyncExecutionRelease grant{0, 0, false};
         bool published = false;
-        ASSERT_TRUE(scheduler_async_runtime_release_execution_block(
-            fixture.views[0], fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, &grant, &published
+        ASSERT_TRUE(scheduler_async_runtime_release_task(
+            fixture.views[0], fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, &published
         ));
-        EXPECT_FALSE(scheduler_async_runtime_release_execution_block(
-            fixture.views[3], fixture.graph, fixture.base(), &fixture.locals[3], fixture.run, &grant, &published
+        EXPECT_FALSE(scheduler_async_runtime_release_task(
+            fixture.views[3], fixture.graph, fixture.base(), &fixture.locals[3], fixture.run, 0, &published
         ));
         EXPECT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::ERROR);
         EXPECT_EQ(fixture.completed(), 0u);
@@ -669,7 +670,7 @@ TEST(HbgAsyncRuntime, BackendFailureKeepsFailedRecordAndNeverMakesTaskDone) {
     fixture.bind(0);
     fixture.condition();
     ASSERT_TRUE(fixture.seal(0));
-    ASSERT_TRUE(fixture.release(0, 0));
+    ASSERT_TRUE(fixture.release(0));
     fixture.backend.failed[0] = true;
     EXPECT_EQ(fixture.service(3), SchedulerAsyncRuntimeServiceResult::ERROR);
     SchedulerLocalStorage<SchedulerAsyncGroupProgress> progress_storage;
@@ -692,24 +693,18 @@ TEST(HbgAsyncRuntime, BackendFailureKeepsFailedRecordAndNeverMakesTaskDone) {
     EXPECT_EQ(fixture.completed(), 0u);
 }
 
-TEST(HbgAsyncRuntime, TwoAuthorizedBlockReleasesActivateOneFinishAndCompetingServicesCountOnce) {
+TEST(HbgAsyncRuntime, NativeCompletionPublishesOneFinishAndCompetingServicesCountOnce) {
     RuntimeFixture fixture(2);
     fixture.bind(0, 0);
     fixture.bind(3, 1);
+    fixture.condition();
     ASSERT_TRUE(fixture.seal(0, 0));
     ASSERT_TRUE(fixture.seal(3, 1));
-    bool published[2]{};
-    bool released[2]{};
-    std::thread first([&] {
-        released[0] = fixture.release(0, 0, &published[0]);
-    });
-    std::thread second([&] {
-        released[1] = fixture.release(3, 1, &published[1]);
-    });
-    first.join();
-    second.join();
-    ASSERT_TRUE(released[0] && released[1]);
-    EXPECT_NE(published[0], published[1]);
+    fixture.backend.ready[0] = true;
+    EXPECT_EQ(fixture.service(1), SchedulerAsyncRuntimeServiceResult::PROGRESS);
+    bool published = false;
+    ASSERT_TRUE(fixture.release(3, &published));
+    ASSERT_TRUE(published);
     std::thread service_a([&] {
         for (uint32_t i = 0; i < 32; ++i)
             fixture.service(0);
@@ -763,11 +758,11 @@ TEST(HbgAsyncRuntime, LazyRecordValidationRejectsBadMapsAndAtomicRegionAliasingB
         if (scenario == 1) identity->entries_offset = fixture.async.group_lease_offset;
         if (scenario == 2) identity->entries_offset = fixture.async.finish_join_offset;
         if (scenario == 3) identity->task_ref = 1;
-        bool bound = true;
+        uint64_t bound = 0;
         EXPECT_FALSE(scheduler_async_runtime_bind_payload(
             fixture.views[0], fixture.graph, &fixture.locals[0], fixture.run, 0, 0, 0, &fixture.payloads[0], &bound
         ));
-        EXPECT_FALSE(bound);
+        EXPECT_EQ(bound, SCHEDULER_ASYNC_INDEX_NONE);
         EXPECT_EQ(fixture.payloads[0].local_context.async_ctx.completion_count, nullptr);
         EXPECT_EQ(fixture.payloads[0].local_context.async_ctx.completion_entries, nullptr);
         EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));

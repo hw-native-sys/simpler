@@ -16,6 +16,7 @@
 inline constexpr uint32_t SCHEDULER_ASYNC_JOIN_LIMIT = INT16_MAX;
 inline constexpr uint64_t SCHEDULER_ASYNC_JOIN_FAILED = UINT64_C(1) << 63;
 inline constexpr uint64_t SCHEDULER_ASYNC_JOIN_COUNTS = UINT64_C(0xffffffff);
+inline constexpr uint64_t SCHEDULER_ASYNC_JOIN_REGISTERED = UINT64_C(0xffff) << 32;
 
 struct alignas(128) SchedulerAsyncTaskJoin {
     volatile uint64_t word{0};
@@ -41,11 +42,24 @@ constexpr inline __aicore__ uint32_t scheduler_async_join_blocks(uint64_t word) 
     return static_cast<uint32_t>((word >> 16) & UINT64_C(0xffff));
 }
 
+// Registration history survives CHECK settlement. A task cannot become
+// synchronous again just because its conditions completed before kernel return.
+constexpr inline __aicore__ uint32_t scheduler_async_join_registered(uint64_t word) {
+    return static_cast<uint32_t>((word >> 32) & UINT64_C(0xffff));
+}
+
 constexpr inline __aicore__ bool scheduler_async_join_valid(uint64_t word) {
-    return (word & ~(SCHEDULER_ASYNC_JOIN_FAILED | SCHEDULER_ASYNC_JOIN_COUNTS)) == 0 &&
+    return (word & ~(SCHEDULER_ASYNC_JOIN_FAILED | SCHEDULER_ASYNC_JOIN_COUNTS | SCHEDULER_ASYNC_JOIN_REGISTERED)) ==
+               0 &&
            ((word & SCHEDULER_ASYNC_JOIN_FAILED) != 0 ||
             (scheduler_async_join_groups(word) <= SCHEDULER_ASYNC_JOIN_LIMIT &&
-             scheduler_async_join_blocks(word) <= SCHEDULER_ASYNC_JOIN_LIMIT));
+             scheduler_async_join_blocks(word) <= SCHEDULER_ASYNC_JOIN_LIMIT &&
+             scheduler_async_join_registered(word) <= SCHEDULER_ASYNC_JOIN_LIMIT));
+}
+
+constexpr inline __aicore__ bool scheduler_async_join_complete(uint64_t word) {
+    return scheduler_async_join_valid(word) &&
+           (word & (SCHEDULER_ASYNC_JOIN_FAILED | SCHEDULER_ASYNC_JOIN_COUNTS)) == 0;
 }
 
 // Initialization is Host-only before publication, never a reset of a live join.
@@ -72,11 +86,11 @@ inline __aicore__ void scheduler_async_join_abort(__gm__ SchedulerAsyncTaskJoin 
 }
 
 inline __aicore__ SchedulerAsyncJoinOutcome scheduler_async_join_add_group(__gm__ SchedulerAsyncTaskJoin &join) {
-    const uint64_t previous = scheduler_gm_fetch_add(join.word, UINT64_C(1));
+    const uint64_t previous = scheduler_gm_fetch_add(join.word, (UINT64_C(1) << 32) | UINT64_C(1));
     if (!scheduler_async_join_valid(previous)) return {SchedulerAsyncJoinResult::INVALID_STATE, previous};
     if ((previous & SCHEDULER_ASYNC_JOIN_FAILED) != 0) return {SchedulerAsyncJoinResult::FAILED, previous};
     if (scheduler_async_join_blocks(previous) == 0) return {SchedulerAsyncJoinResult::INVALID_STATE, previous};
-    if (scheduler_async_join_groups(previous) == SCHEDULER_ASYNC_JOIN_LIMIT)
+    if (scheduler_async_join_registered(previous) == SCHEDULER_ASYNC_JOIN_LIMIT)
         return {SchedulerAsyncJoinResult::OVERFLOW, previous};
     return {SchedulerAsyncJoinResult::PENDING, previous};
 }
@@ -90,7 +104,11 @@ inline __aicore__ SchedulerAsyncJoinOutcome settle(__gm__ SchedulerAsyncTaskJoin
     if ((previous & SCHEDULER_ASYNC_JOIN_FAILED) != 0) return {SchedulerAsyncJoinResult::FAILED, previous};
     const uint32_t count = Group ? scheduler_async_join_groups(previous) : scheduler_async_join_blocks(previous);
     if (count == 0) return {SchedulerAsyncJoinResult::UNDERFLOW, previous};
-    return {previous == unit ? SchedulerAsyncJoinResult::FINISH_OWNER : SchedulerAsyncJoinResult::PENDING, previous};
+    return {
+        (previous & SCHEDULER_ASYNC_JOIN_COUNTS) == unit ? SchedulerAsyncJoinResult::FINISH_OWNER :
+                                                           SchedulerAsyncJoinResult::PENDING,
+        previous
+    };
 }
 }  // namespace scheduler_async_join_detail
 

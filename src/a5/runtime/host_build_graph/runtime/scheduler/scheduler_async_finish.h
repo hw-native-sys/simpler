@@ -71,7 +71,8 @@ inline __aicore__ SchedulerCompletionResult scheduler_async_finish_step(
             progress->failure_code = static_cast<int64_t>(SchedulerGraphResult::INVALID_ARGUMENTS);
         return fail(graph, local, run, identity.task_ref, cursor, site);
     };
-    if (scheduler_read_error(run) != 0 || scheduler_async_join_load(*join) != 0) return failed();
+    if (scheduler_read_error(run) != 0 || !scheduler_async_join_complete(scheduler_async_join_load(*join)))
+        return failed();
     if (phase(cursor) == SchedulerCompletionPhase::INITIALIZE && *budget != 0) {
         if (!scheduler_task_ref_valid(graph, identity.task_ref) || identity.run_epoch == 0 ||
             local->config.graph_summary_offset == 0 ||
@@ -114,7 +115,7 @@ inline __aicore__ bool scheduler_async_finish_contribute(
     if (local == nullptr || run == nullptr || progress == nullptr || bit >= 64) return false;
     if (progress->contributed) return true;
     if (phase(progress->completion) != SchedulerCompletionPhase::DRAINED || scheduler_read_error(run) != 0 ||
-        scheduler_async_join_load(join) != 0)
+        !scheduler_async_join_complete(scheduler_async_join_load(join)))
         return false;
     const auto word = scheduler_async_lease_load(lease);
     if (!scheduler_async_lease_valid(word) || scheduler_async_lease_phase(word) != SchedulerAsyncPhase::TERMINAL ||

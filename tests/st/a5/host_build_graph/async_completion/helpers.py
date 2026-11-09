@@ -180,8 +180,10 @@ def assert_resident_capture(path: Path) -> None:
     assert captures, f"missing invocation evidence under {path}"
     for capture in captures:
         raw = json.loads(capture.read_text())
-        protocol = raw.get("aicore_protocol", {})
-        assert protocol.get("producer") == "aicore", f"not an AICore resident invocation: {capture}"
+        identity = raw.get(
+            "aicore_execution_identities" if raw.get("chip_swimlane_level") == 1 else "aicore_protocol", {}
+        )
+        assert identity.get("producer") == "aicore", f"not an AICore resident invocation: {capture}"
         assert raw.get("aicore_tasks"), f"no kernel executions in {capture}"
 
 

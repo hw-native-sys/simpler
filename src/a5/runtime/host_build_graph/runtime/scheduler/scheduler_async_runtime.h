@@ -21,19 +21,9 @@
 // Local views only. No pointer or extra field enters the dispatch/wire ABI.
 struct SchedulerAsyncRuntimeView {
     __gm__ uint8_t *base{nullptr};
-    inline __aicore__ const __gm__ SchedulerAsyncLayout &layout() const {
-        return *reinterpret_cast<__gm__ const SchedulerAsyncLayout *>(base);
-    }
+    SchedulerAsyncLayout header{};
+    inline __aicore__ const SchedulerAsyncLayout &layout() const { return header; }
     inline __aicore__ bool enabled() const { return base != nullptr; }
-};
-
-// Construct only after the existing slot/cohort generation protocol grants the
-// unique ExecutionReleased contribution for this logical block. consumed catches
-// reuse of this local object, not arbitrary copies/replays of an authorization.
-struct SchedulerAsyncExecutionRelease {
-    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
-    uint32_t block_idx{0};
-    bool consumed{false};
 };
 
 enum class SchedulerAsyncRuntimeServiceResult : uint8_t { IDLE, PROGRESS, ERROR };
@@ -157,21 +147,27 @@ finish_identity(const SchedulerAsyncRuntimeView &view, uint64_t index, Scheduler
            map.finish_index == index && map.group_base == out->group_base && map.group_count == out->group_count;
 }
 
+inline __aicore__ bool group_identity_valid(
+    const SchedulerAsyncRuntimeView &view, uint64_t index, int64_t task, const SchedulerAsyncTaskMap &map,
+    const SchedulerAsyncGroupIdentity &identity
+) {
+    return identity.run_epoch == view.layout().run_epoch && identity.task_ref == task &&
+           map.finish_index == identity.finish_index &&
+           scheduler_async_group_index(map, identity.block_idx, identity.subtask_slot) == index &&
+           identity.capacity > 0 && identity.capacity <= MAX_COMPLETIONS_PER_TASK &&
+           identity.entries_offset % 128 == 0 &&
+           contained(
+               view.layout().entries_offset, view.layout().entries_bytes, identity.entries_offset, identity.capacity,
+               sizeof(DeferredCompletionEntry)
+           );
+}
+
 inline __aicore__ bool
 group_identity(const SchedulerAsyncRuntimeView &view, uint64_t index, SchedulerAsyncGroupIdentity *out) {
     if (index >= view.layout().group_count) return false;
     load_into(at<SchedulerAsyncGroupIdentity>(view, view.layout().group_identity_offset, index), out);
     SchedulerAsyncTaskMap map{};
-    if (out->run_epoch != view.layout().run_epoch || !task_map(view, out->task_ref, &map) ||
-        map.finish_index != out->finish_index ||
-        scheduler_async_group_index(map, out->block_idx, out->subtask_slot) != index || out->capacity == 0 ||
-        out->capacity > MAX_COMPLETIONS_PER_TASK || out->entries_offset % 128 != 0 ||
-        !contained(
-            view.layout().entries_offset, view.layout().entries_bytes, out->entries_offset, out->capacity,
-            sizeof(DeferredCompletionEntry)
-        ))
-        return false;
-    return true;
+    return task_map(view, out->task_ref, &map) && group_identity_valid(view, index, out->task_ref, map, *out);
 }
 
 inline __aicore__ bool task_token(const SchedulerGraphAccess &graph, int64_t task, TaskId *out) {
@@ -184,6 +180,14 @@ inline __aicore__ bool task_token(const SchedulerGraphAccess &graph, int64_t tas
     return TaskId::to_uint64(*out) == value;
 }
 
+inline __aicore__ void clear_async_storage(__gm__ AsyncCtxStorage &ctx, volatile __gm__ int32_t *error) {
+    ctx.completion_count = nullptr;
+    ctx.completion_error_code = error;
+    ctx.completion_entries = nullptr;
+    ctx.completion_capacity = 0;
+    TaskId::assign(ctx.task_token, TaskId::invalid());
+}
+
 inline __aicore__ bool activate_finish(
     const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, SchedulerLocalState *local,
     __gm__ SchedulerRunControl *run, uint64_t index
@@ -192,7 +196,8 @@ inline __aicore__ bool activate_finish(
     if (!finish_identity(view, index, &identity) || scheduler_read_error(run) != 0)
         return fail(graph, local, run, identity.task_ref, &view, index);
     auto &join = *at<SchedulerAsyncTaskJoin>(view, view.layout().finish_join_offset, index);
-    if (scheduler_async_join_load(join) != 0) return fail(graph, local, run, identity.task_ref, &view, index);
+    if (!scheduler_async_join_complete(scheduler_async_join_load(join)))
+        return fail(graph, local, run, identity.task_ref, &view, index);
     scheduler_cache_barrier();
     auto &lease = *at<SchedulerAsyncLease>(view, view.layout().finish_lease_offset, index);
     if (scheduler_async_lease_publish(lease).result != SchedulerAsyncLeaseResult::SUCCESS)
@@ -229,23 +234,22 @@ inline __aicore__ bool scheduler_async_runtime_mount(
     if (base_address % 128 != 0 || graph.scheduler_state_address != base_address || bytes > UINT64_MAX - base_address ||
         !region(bytes, local->config.graph_summary_offset, 1, sizeof(SchedulerGraphSummary), 128, &end))
         return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
-    SchedulerLocalStorage<SchedulerGraphSummary> summary_storage;
-    auto &summary = summary_storage.get();
-    load_into(scheduler_state_at<SchedulerGraphSummary>(scheduler_base, local->config.graph_summary_offset), &summary);
-    if (summary.async_layout_offset == 0) {
+    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(scheduler_base, local->config.graph_summary_offset);
+    const uint64_t async_offset = load(&summary->async_layout_offset);
+    if (async_offset == 0) {
         *out = {};
         return true;
     }
-    if (summary.run_epoch == 0 ||
-        !region(bytes, summary.async_layout_offset, 1, sizeof(SchedulerAsyncLayout), 128, &end))
+    const uint64_t run_epoch = load(&summary->run_epoch);
+    if (run_epoch == 0 || !region(bytes, async_offset, 1, sizeof(SchedulerAsyncLayout), 128, &end))
         return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     SchedulerAsyncRuntimeView next{};
-    next.base = reinterpret_cast<__gm__ uint8_t *>(scheduler_base) + summary.async_layout_offset;
+    next.base = reinterpret_cast<__gm__ uint8_t *>(scheduler_base) + async_offset;
     const auto l = load(reinterpret_cast<__gm__ const SchedulerAsyncLayout *>(next.base));
-    if (l.version != SCHEDULER_ASYNC_LAYOUT_VERSION || l.run_epoch != summary.run_epoch ||
-        l.total_bytes > bytes - summary.async_layout_offset || l.total_bytes % 128 != 0 ||
-        l.task_count != graph.task_count || l.task_count > INT32_MAX || l.group_count == 0 || l.finish_count == 0 ||
-        l.finish_count > l.task_count || l.finish_count > l.group_count || l.condition_capacity < l.group_count ||
+    if (l.version != SCHEDULER_ASYNC_LAYOUT_VERSION || l.run_epoch != run_epoch ||
+        l.total_bytes > bytes - async_offset || l.total_bytes % 128 != 0 || l.task_count != graph.task_count ||
+        l.task_count > INT32_MAX || l.group_count == 0 || l.finish_count == 0 || l.finish_count > l.task_count ||
+        l.finish_count > l.group_count || l.condition_capacity < l.group_count ||
         l.condition_capacity > l.entries_bytes / sizeof(DeferredCompletionEntry) ||
         l.check_directory_words != scheduler_async_directory_word_count(l.group_count) ||
         l.finish_directory_words != scheduler_async_directory_word_count(l.finish_count))
@@ -253,6 +257,7 @@ inline __aicore__ bool scheduler_async_runtime_mount(
     end = sizeof(SchedulerAsyncLayout);
 #define SCHEDULER_ASYNC_CHECK_REGION(field, count, type) region(l.total_bytes, l.field, count, sizeof(type), 128, &end)
     const bool valid =
+        SCHEDULER_ASYNC_CHECK_REGION(work_signal_offset, 1, uint64_t) &&
         SCHEDULER_ASYNC_CHECK_REGION(task_map_offset, l.task_count, SchedulerAsyncTaskMap) &&
         SCHEDULER_ASYNC_CHECK_REGION(group_identity_offset, l.group_count, SchedulerAsyncGroupIdentity) &&
         SCHEDULER_ASYNC_CHECK_REGION(group_writer_offset, l.group_count, SchedulerAsyncGroupWriter) &&
@@ -277,10 +282,9 @@ inline __aicore__ bool scheduler_async_runtime_mount(
             context->guard_count != l.sdma_guard_count)
             return fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     }
-    // This header is immutable until the run retires. Acquire its cache view once;
-    // later service slices read it without copying the layout or maintaining cache.
-    for (uint64_t offset = 0; offset < sizeof(SchedulerAsyncLayout); offset += 64)
-        scheduler_observe_cache_line(next.base + offset);
+    // Only immutable layout metadata belongs to this per-core snapshot. Writer,
+    // lease, directory and completion values remain in their shared GM records.
+    next.header = l;
     *out = next;
     return true;
 }
@@ -288,19 +292,17 @@ inline __aicore__ bool scheduler_async_runtime_mount(
 inline __aicore__ bool scheduler_async_runtime_bind_payload(
     const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, SchedulerLocalState *local,
     __gm__ SchedulerRunControl *run, int64_t task, uint32_t block, uint32_t subtask, __gm__ DispatchPayload *payload,
-    bool *bound
+    uint64_t *bound_index
 ) {
     using namespace scheduler_async_runtime_detail;
-    if (bound == nullptr || payload == nullptr) return false;
-    *bound = false;
-    payload->async_context_address = 0;
+    if (bound_index == nullptr || payload == nullptr) return false;
+    *bound_index = SCHEDULER_ASYNC_INDEX_NONE;
     auto &ctx = payload->local_context.async_ctx;
-    ctx.completion_count = nullptr;
-    ctx.completion_error_code = nullptr;
-    ctx.completion_entries = nullptr;
-    ctx.completion_capacity = 0;
-    TaskId::assign(ctx.task_token, TaskId::invalid());
-    if (!view.enabled()) return true;
+    if (!view.enabled()) {
+        payload->async_context_address = 0;
+        clear_async_storage(ctx, nullptr);
+        return true;
+    }
     if (task < 0 || static_cast<uint64_t>(task) >= view.layout().task_count || subtask >= 3)
         return fail(graph, local, run, task);
     auto &execution = payload->async_context;
@@ -311,26 +313,25 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
     execution.error_code = 0;
     execution.magic = ASYNC_EXECUTION_CONTEXT_MAGIC;
     payload->async_context_address = reinterpret_cast<uint64_t>(&execution);
-    ctx.completion_error_code = &execution.error_code;
     SchedulerAsyncTaskMap map{};
     if (!task_map(view, task, &map)) return fail(graph, local, run, task);
-    if (map.finish_index == SCHEDULER_ASYNC_INDEX_NONE) return true;
+    if (map.finish_index == SCHEDULER_ASYNC_INDEX_NONE) {
+        clear_async_storage(ctx, &execution.error_code);
+        return true;
+    }
     if (block >= map.block_count || subtask >= 3) return fail(graph, local, run, task, &view, map.finish_index);
     const uint64_t index = scheduler_async_group_index(map, block, subtask);
-    if (index == SCHEDULER_ASYNC_INDEX_NONE) return true;
+    if (index == SCHEDULER_ASYNC_INDEX_NONE) {
+        clear_async_storage(ctx, &execution.error_code);
+        return true;
+    }
     SchedulerAsyncGroupIdentity identity{};
     TaskId token = TaskId::invalid();
-    if (!group_identity(view, index, &identity) || !task_token(graph, task, &token))
+    load_into(at<SchedulerAsyncGroupIdentity>(view, view.layout().group_identity_offset, index), &identity);
+    if (!group_identity_valid(view, index, task, map, identity) || !task_token(graph, task, &token))
         return fail(graph, local, run, task, &view, map.finish_index);
-    SchedulerAsyncWriterSnapshot writer{};
-    scheduler_async_writer_snapshot(
-        at<SchedulerAsyncGroupWriter>(view, view.layout().group_writer_offset, index), &writer
-    );
-    const auto lease =
-        scheduler_async_lease_load(*at<SchedulerAsyncLease>(view, view.layout().group_lease_offset, index));
-    if (writer.reservation.sealed != 0 || writer.count != 0 || writer.error_code != 0 ||
-        writer.reservation.limit != 0 || lease != scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT))
-        return fail(graph, local, run, task, &view, map.finish_index);
+    // Host initializes one writer per physical execution. The admitted slot
+    // generation binds it once; no CHECK can own it before this execution seals.
     auto *destination = at<SchedulerAsyncGroupWriter>(view, view.layout().group_writer_offset, index);
     execution.writer_state = reinterpret_cast<uint64_t>(&destination->reservation);
     ctx.completion_count = &destination->count;
@@ -338,7 +339,7 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
     ctx.completion_entries = at<DeferredCompletionEntry>(view, identity.entries_offset);
     ctx.completion_capacity = identity.capacity;
     TaskId::assign(ctx.task_token, token);
-    *bound = true;
+    *bound_index = index;
     return true;
 }
 
@@ -349,7 +350,7 @@ inline __aicore__ bool scheduler_async_runtime_bind_payload(
 inline __aicore__ bool scheduler_async_runtime_seal(
     const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, __gm__ void *scheduler_base,
     SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task, uint32_t block, uint32_t subtask,
-    __gm__ DispatchPayload *payload, bool *registered
+    uint64_t index, __gm__ DispatchPayload *payload, bool *registered
 ) {
     using namespace scheduler_async_runtime_detail;
     if (registered == nullptr || payload == nullptr) return false;
@@ -365,22 +366,45 @@ inline __aicore__ bool scheduler_async_runtime_seal(
         return fail(
             graph, local, run, task, nullptr, SCHEDULER_ASYNC_INDEX_NONE, writer_error_result(execution.error_code)
         );
-    SchedulerAsyncTaskMap map{};
-    if (!task_map(view, task, &map)) return fail(graph, local, run, task);
-    if (map.finish_index == SCHEDULER_ASYNC_INDEX_NONE) return true;
-    if (block >= map.block_count || subtask >= 3) return fail(graph, local, run, task, &view, map.finish_index);
-    const uint64_t index = scheduler_async_group_index(map, block, subtask);
     if (index == SCHEDULER_ASYNC_INDEX_NONE) return true;
+    if (index >= view.layout().group_count) return fail(graph, local, run, task);
+    auto *writer = at<SchedulerAsyncGroupWriter>(view, view.layout().group_writer_offset, index);
+    const auto &ctx = payload->local_context.async_ctx;
+    if (writer->count == 0 && execution.writer_state == reinterpret_cast<uint64_t>(&writer->reservation) &&
+        ctx.completion_count == &writer->count && ctx.completion_error_code == &writer->error_code) {
+        // Binding already validates immutable identity and token storage. An
+        // empty return needs only the shared writer's seal/error/reservation
+        // decision; it never reads tokens or publishes a CHECK lease.
+        auto registration = AsyncCtx::from_storage(ctx);
+        registration.completion_reservation = &writer->reservation;
+        const bool valid = async_completion_seal(registration) && scheduler_read_error(run) == 0;
+        // No CHECK can read an empty writer. Native retirement/exit barriers
+        // drain this writeback before the run storage can be reused.
+        if (valid) {
+            scheduler_writeback_cache_line(writer);
+            return true;
+        }
+        scheduler_publish_cache_line(writer);
+        SchedulerAsyncTaskMap map{};
+        if (!task_map(view, task, &map)) return fail(graph, local, run, task);
+        auto &lease = *at<SchedulerAsyncLease>(view, view.layout().group_lease_offset, index);
+        (void)scheduler_async_lease_try_transition(
+            lease, scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT), SchedulerAsyncPhase::FAILED
+        );
+        return fail(graph, local, run, task, &view, map.finish_index, writer_error_result(writer->error_code));
+    }
+    SchedulerAsyncTaskMap map{};
+    if (!task_map(view, task, &map) || scheduler_async_group_index(map, block, subtask) != index)
+        return fail(graph, local, run, task);
     SchedulerAsyncGroupIdentity identity{};
     TaskId token = TaskId::invalid();
-    if (!group_identity(view, index, &identity) || !task_token(graph, task, &token))
+    load_into(at<SchedulerAsyncGroupIdentity>(view, view.layout().group_identity_offset, index), &identity);
+    if (!group_identity_valid(view, index, task, map, identity) || !task_token(graph, task, &token))
         return fail(graph, local, run, task, &view, map.finish_index);
-    auto *writer = at<SchedulerAsyncGroupWriter>(view, view.layout().group_writer_offset, index);
     auto &lease = *at<SchedulerAsyncLease>(view, view.layout().group_lease_offset, index);
     if (scheduler_async_lease_load(lease) != scheduler_async_lease_word(1, SchedulerAsyncPhase::DORMANT) ||
         writer->reservation.sealed != 0)
         return fail(graph, local, run, task, &view, map.finish_index);
-    const auto &ctx = payload->local_context.async_ctx;
     if (execution.writer_state != reinterpret_cast<uint64_t>(&writer->reservation) ||
         ctx.completion_count != &writer->count || ctx.completion_error_code != &writer->error_code ||
         ctx.completion_entries != at<DeferredCompletionEntry>(view, identity.entries_offset) ||
@@ -422,10 +446,13 @@ inline __aicore__ bool scheduler_async_runtime_seal(
         return fail(graph, local, run, task, &view, map.finish_index, writer_error_result(snapshot.error_code));
     }
 
-    if (count == 0) return true;
     auto &join = *at<SchedulerAsyncTaskJoin>(view, view.layout().finish_join_offset, map.finish_index);
     if (scheduler_async_join_add_group(join).result != SchedulerAsyncJoinResult::PENDING)
         return fail(graph, local, run, task, &view, map.finish_index);
+    // A monotonic search hint, never a completion proof. First publication
+    // enables discovery; later registrations need no additional shared write.
+    auto &work_signal = *at<uint64_t>(view, view.layout().work_signal_offset);
+    if (scheduler_gm_query(work_signal) == 0) scheduler_gm_store(work_signal, UINT64_C(1));
     scheduler_cache_barrier();
     if (scheduler_async_lease_publish(lease).result != SchedulerAsyncLeaseResult::SUCCESS)
         return fail(graph, local, run, task, &view, map.finish_index);
@@ -438,41 +465,33 @@ inline __aicore__ bool scheduler_async_runtime_seal(
     return true;
 }
 
-inline __aicore__ bool scheduler_async_runtime_release_execution_block(
+// Only native TASK_LAST calls this after the final slot/cohort retirement tail.
+// The existing native counters already account for every physical execution.
+inline __aicore__ bool scheduler_async_runtime_release_task(
     const SchedulerAsyncRuntimeView &view, const SchedulerGraphAccess &graph, __gm__ void *scheduler_base,
-    SchedulerLocalState *local, __gm__ SchedulerRunControl *run, SchedulerAsyncExecutionRelease *grant,
-    bool *finish_published
+    SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task, bool *finish_published
 ) {
     using namespace scheduler_async_runtime_detail;
-    if (grant == nullptr || finish_published == nullptr) return false;
+    if (finish_published == nullptr) return false;
     *finish_published = false;
     if (!view.enabled()) return true;
     SchedulerAsyncTaskMap map{};
-    if (!task_map(view, grant->task_ref, &map)) return fail(graph, local, run, grant->task_ref);
+    if (!task_map(view, task, &map)) return fail(graph, local, run, task);
     if (map.finish_index == SCHEDULER_ASYNC_INDEX_NONE) return true;
-    if (grant->consumed || grant->block_idx >= map.block_count || scheduler_read_error(run) != 0)
-        return fail(graph, local, run, grant->task_ref, &view, map.finish_index);
-    grant->consumed = true;
-    for (uint32_t lane = 0; lane < 3; ++lane) {
-        const auto index = scheduler_async_group_index(map, grant->block_idx, lane);
-        if (index == SCHEDULER_ASYNC_INDEX_NONE) continue;
-        SchedulerAsyncWriterSnapshot writer{};
-        scheduler_async_writer_snapshot(
-            at<SchedulerAsyncGroupWriter>(view, view.layout().group_writer_offset, index), &writer
-        );
-        if (writer.reservation.sealed != 1 || writer.error_code != 0 || writer.reservation.limit != 0)
-            return fail(graph, local, run, grant->task_ref, &view, map.finish_index);
-    }
+    if (scheduler_read_error(run) != 0) return fail(graph, local, run, task, &view, map.finish_index);
+    // Drain native retirement publications before contributing to the join.
     scheduler_cache_barrier();
     const auto result = scheduler_async_join_release_block(
         *at<SchedulerAsyncTaskJoin>(view, view.layout().finish_join_offset, map.finish_index)
     );
     if (result.result == SchedulerAsyncJoinResult::FINISH_OWNER) {
+        // The native last-block completion owns TaskDone for an empty task.
+        if (scheduler_async_join_registered(result.previous) == 0) return true;
         *finish_published = activate_finish(view, graph, local, run, map.finish_index);
         return *finish_published;
     }
     if (result.result != SchedulerAsyncJoinResult::PENDING)
-        return fail(graph, local, run, grant->task_ref, &view, map.finish_index);
+        return fail(graph, local, run, task, &view, map.finish_index);
     return true;
 }
 
@@ -487,9 +506,16 @@ inline __aicore__ SchedulerAsyncRuntimeServiceResult scheduler_async_runtime_ser
 ) {
     using namespace scheduler_async_runtime_detail;
     if (!view.enabled()) return SchedulerAsyncRuntimeServiceResult::IDLE;
-    if (discovery == nullptr || budget == nullptr || scheduler_read_error(run) != 0)
-        return SchedulerAsyncRuntimeServiceResult::ERROR;
+    if (discovery == nullptr || budget == nullptr) return SchedulerAsyncRuntimeServiceResult::ERROR;
     if (budget->work_units == 0) return SchedulerAsyncRuntimeServiceResult::IDLE;
+    // No directory can contain work before the first actual registration.
+    // A zero query can only postpone a racing publication; the producer drains
+    // the signal before publishing its CHECK lease and returning from seal.
+    if (scheduler_gm_query(*at<uint64_t>(view, view.layout().work_signal_offset)) == 0)
+        return SchedulerAsyncRuntimeServiceResult::IDLE;
+    // Empty service owns no work; the resident loop retains its error poll.
+    // Active service must observe failure before taking any CHECK/FINISH lease.
+    if (scheduler_read_error(run) != 0) return SchedulerAsyncRuntimeServiceResult::ERROR;
     SchedulerAsyncSliceBudget slice{
         budget->directory_words < 4 ? budget->directory_words : 4, budget->lease_probes < 2 ? budget->lease_probes : 2,
         budget->claim_attempts < 2 ? budget->claim_attempts : 2, budget->work_units < 8 ? budget->work_units : 8

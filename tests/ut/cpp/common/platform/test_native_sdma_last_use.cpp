@@ -215,7 +215,7 @@ private:
         summary->async_layout_offset = async_offset_;
         auto *base = static_cast<uint8_t *>(scheduler_host_) + async_offset_;
         std::memcpy(base, plan.image.data(), plan.image.size());
-        async_ = {base};
+        async_ = {base, plan.layout};
     }
     void run_sdk_fault() {
         auto view = graph_.graph();
@@ -251,7 +251,6 @@ private:
         require(
             scheduler_async_execution_bind(&state, view, base, local, storage_.run_control, 0), "execution binding"
         );
-        require(scheduler_async_execution_permitted(&state, view, local, storage_.run_control, 0), "kernel permission");
         canonical = &payload->async_context;
         writer = reinterpret_cast<SchedulerAsyncGroupWriter *>(async_.base + async_.layout().group_writer_offset);
         AsyncCtx verified_writer;

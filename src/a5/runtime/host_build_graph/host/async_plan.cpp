@@ -92,7 +92,8 @@ bool plan_async_layout(
     layout.entries_bytes = token_bytes;
     layout.sdma_guard_count = needs_sdma ? ASYNC_SDMA_CHANNELS : 0;
     uint64_t cursor = sizeof(SchedulerAsyncLayout);
-    if (!reserve(layout.task_count, sizeof(SchedulerAsyncTaskMap), cursor, layout.task_map_offset) ||
+    if (!reserve(1, sizeof(uint64_t), cursor, layout.work_signal_offset) ||
+        !reserve(layout.task_count, sizeof(SchedulerAsyncTaskMap), cursor, layout.task_map_offset) ||
         !reserve(layout.group_count, sizeof(SchedulerAsyncGroupIdentity), cursor, layout.group_identity_offset) ||
         !reserve(layout.group_count, sizeof(SchedulerAsyncGroupWriter), cursor, layout.group_writer_offset) ||
         !reserve(layout.group_count, sizeof(SchedulerAsyncLease), cursor, layout.group_lease_offset) ||
@@ -159,7 +160,9 @@ bool materialize_async_state(
         finish.group_count = map.group_count;
         write(image, layout.finish_identity_offset + map.finish_index * sizeof(finish), finish);
         uint64_t initial_word = 0;
-        if (!scheduler_async_join_initial_word(map.block_count, initial_word))
+        // Native block/cohort retirement already joins every physical return.
+        // The async join receives that one logical completion, plus its CHECKs.
+        if (!scheduler_async_join_initial_word(1, initial_word))
             return fail(error, "async block join cannot represent task shape");
         write(
             image,
