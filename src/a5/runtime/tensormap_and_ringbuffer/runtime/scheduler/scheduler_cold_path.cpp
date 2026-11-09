@@ -1120,7 +1120,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             int32_t core_id = tracker.get_core_id_by_offset(c * PLATFORM_CORES_PER_BLOCKDIM + sub);
             for (int32_t buf = 0; buf < 2; buf++) {
                 DispatchPayload &dp = payload_per_core_[core_id][buf];
-                AsyncCtx &ac = dp.local_context.async_ctx;
+                AsyncCtxStorage &ac = dp.local_context.async_ctx;
                 volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
                 ac.completion_count = &slab->count;
                 ac.completion_error_code = &slab->error_code;
@@ -1129,6 +1129,9 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 ac.urma_sender_id = core_id >= aic_n ? static_cast<uint32_t>(core_id - aic_n) : UINT32_MAX;
                 slab->count = 0;
                 slab->error_code = SIMPLER_ERROR_NONE;
+                // Diagnostic markers are valid only within this invocation.
+                for (uint32_t i = 0; i < MAX_COMPLETIONS_PER_TASK; ++i)
+                    slab->entries[i]._pad = 0;
                 for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                     dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
                 }
@@ -1339,6 +1342,7 @@ int32_t SchedulerContext::pre_handshake_init(
     completed_tasks_.store(0, std::memory_order_release);
     orchestrator_done_.store(false, std::memory_order_release);
     func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
+    active_callable_id_ = runtime->dev.active_callable_id_;
     func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
     // total_tasks_ must be read before hs_setup_done_ is published: on the
@@ -1457,7 +1461,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
                 UINT32_MAX;
         for (int32_t buf = 0; buf < 2; buf++) {
             DispatchPayload &dp = payload_per_core_[core_id][buf];
-            AsyncCtx &ac = dp.local_context.async_ctx;
+            AsyncCtxStorage &ac = dp.local_context.async_ctx;
             volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
             ac.completion_count = &slab->count;
             ac.completion_error_code = &slab->error_code;
@@ -1468,6 +1472,9 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             // count (and only when a deferred task dirtied it), never per dispatch.
             slab->count = 0;
             slab->error_code = SIMPLER_ERROR_NONE;
+            // Diagnostic markers are valid only within this invocation.
+            for (uint32_t i = 0; i < MAX_COMPLETIONS_PER_TASK; ++i)
+                slab->entries[i]._pad = 0;
             for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                 dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
             }
@@ -1477,6 +1484,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     }
 
     func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
+    active_callable_id_ = runtime->dev.active_callable_id_;
     func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
     for (int32_t t = 0; t < aicpu_thread_num_; ++t)
@@ -1537,6 +1545,7 @@ void SchedulerContext::deinit() {
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;
+    active_callable_id_ = -1;
     func_id_to_addr_count_ = 0;
 }
 

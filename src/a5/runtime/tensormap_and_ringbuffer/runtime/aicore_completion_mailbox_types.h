@@ -9,9 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_TYPES_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_TYPES_H_
-
+#pragma once
 #include <stdint.h>
 
 #include "constants.h"
@@ -37,6 +35,13 @@ inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
 #define COMPLETION_TYPE_SDMA_EVENT_RECORD 1
 #define COMPLETION_TYPE_URMA_EVENT_HANDLE 2
 #define COMPLETION_TYPE_RDMA_EVENT_HANDLE 3
+#define COMPLETION_TYPE_CCU_REQUEST 4
+
+// Error-only record at entries[count]; it never contributes to count.
+// addr: status[31:0], stage[39:32], flags[47:40], rank_count[63:48]
+// (rank_count saturates at UINT16_MAX). backend_cookie: callable[31:0], rank[63:32].
+// expected_value carries instance-check failures; _pad identifies the record.
+inline constexpr uint32_t CCU_ACCEPT_DIAGNOSTIC_MAGIC = 0x43435544;
 
 // DeferredCompletionEntry / DeferredCompletionSlab back the per-task scratch
 // area that AICore writes into to record "this completion has to be observed
@@ -66,5 +71,3 @@ static_assert(
     sizeof(DeferredCompletionSlab) % CHIP_ALIGN_SIZE == 0,
     "DeferredCompletionSlab size must preserve array element cache-line boundaries"
 );
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_TYPES_H_

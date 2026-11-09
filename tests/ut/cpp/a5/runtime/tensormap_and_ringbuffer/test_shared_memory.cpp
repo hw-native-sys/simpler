@@ -69,6 +69,93 @@ protected:
 // Normal path
 // =============================================================================
 
+TEST_F(SharedMemoryTest, CcuDiagnosticSurvivesErrorTailCopyAndClearsOnReuse) {
+    DeferredCompletionSlab slab{};
+    slab.count = 1;
+    slab.entries[1] = {
+        7U | (uint64_t{4} << 32) | (uint64_t{15} << 40) | (uint64_t{2} << 48),
+        17U | (uint64_t{1} << 32),
+        0x1234,
+        COMPLETION_ENGINE_CCU,
+        COMPLETION_TYPE_CCU_REQUEST,
+        CCU_ACCEPT_DIAGNOSTIC_MAGIC
+    };
+    auto &diagnostic = handle->header->ccu_accept_diagnostic;
+    diagnostic.capture(slab);
+    SharedMemoryHeader host{};
+    std::memcpy(
+        reinterpret_cast<uint8_t *>(&host) + SHARED_MEMORY_ERROR_TAIL_OFFSET,
+        reinterpret_cast<const uint8_t *>(handle->header) + SHARED_MEMORY_ERROR_TAIL_OFFSET,
+        SHARED_MEMORY_ERROR_TAIL_BYTES
+    );
+    ASSERT_TRUE(host.ccu_accept_diagnostic.valid());
+    EXPECT_EQ(host.ccu_accept_diagnostic.count, 1U);
+    EXPECT_EQ(host.ccu_accept_diagnostic.stage(), 4U);
+    EXPECT_EQ(host.ccu_accept_diagnostic.status(), 7U);
+    EXPECT_EQ(host.ccu_accept_diagnostic.callable(), 17);
+    EXPECT_EQ(host.ccu_accept_diagnostic.rank(), 1U);
+    EXPECT_EQ(host.ccu_accept_diagnostic.ranks(), 2U);
+    EXPECT_EQ(host.ccu_accept_diagnostic.flags(), 15U);
+    EXPECT_EQ(host.ccu_accept_diagnostic.checks, 0x1234U);
+    const auto window = handle->header->rings[0].task_window_size;
+    const auto heap = handle->header->rings[0].heap_size;
+    ASSERT_TRUE(handle->init(handle->sm_base, handle->sm_size, window, heap));
+    EXPECT_EQ(diagnostic.state, 0U);
+    EXPECT_EQ(diagnostic.magic, 0U);
+    EXPECT_EQ(diagnostic.packed, 0U);
+    EXPECT_FALSE(diagnostic.valid());
+}
+
+TEST_F(SharedMemoryTest, CcuFailureDiagnosticSurvivesErrorTailCopyAndClearsOnReuse) {
+    using Diagnostic = CcuDependencyFailureDiagnostic;
+    handle->header->ccu_dependency_failure = Diagnostic::recorded(TaskId::make(1, 23));
+    auto &diagnostic = handle->header->ccu_dependency_failure;
+    diagnostic.first_successor_token = TaskId::to_uint64(TaskId::make(2, 7));
+    diagnostic.successor_count = 1;
+    diagnostic.first_successor_state = CHIP_TASK_PENDING;
+    diagnostic.flags |= Diagnostic::PRODUCER_VALID | Diagnostic::SCAN_COMPLETE;
+    handle->header->sched_error_code.store(SIMPLER_ERROR_CCU_FAILED);
+    SharedMemoryHeader host{};
+    std::memcpy(
+        reinterpret_cast<uint8_t *>(&host) + SHARED_MEMORY_ERROR_TAIL_OFFSET,
+        reinterpret_cast<const uint8_t *>(handle->header) + SHARED_MEMORY_ERROR_TAIL_OFFSET,
+        SHARED_MEMORY_ERROR_TAIL_BYTES
+    );
+    ASSERT_TRUE(host.ccu_dependency_failure.successors_unstarted());
+    EXPECT_EQ(host.ccu_dependency_failure.failed_token, TaskId::to_uint64(TaskId::make(1, 23)));
+    EXPECT_EQ(host.ccu_dependency_failure.first_successor_token, TaskId::to_uint64(TaskId::make(2, 7)));
+    const auto window = handle->header->rings[0].task_window_size;
+    const auto heap = handle->header->rings[0].heap_size;
+    ASSERT_TRUE(handle->init(handle->sm_base, handle->sm_size, window, heap));
+    // Read the newly active accept member; its state occupies the failure flags.
+    EXPECT_EQ(handle->header->ccu_accept_diagnostic.state, 0U);
+    EXPECT_EQ(handle->header->sched_error_code.load(), SIMPLER_ERROR_NONE);
+    handle->header->ccu_dependency_failure = Diagnostic::recorded(TaskId::make(0, 0));
+    EXPECT_FALSE(diagnostic.scan_complete());
+    EXPECT_FALSE(diagnostic.successors_unstarted());
+}
+
+TEST(CcuAcceptDiagnosticTest, MissingMarkerAndOutOfRangeCountAreReadable) {
+    DeferredCompletionSlab slab{};
+    CcuAcceptDiagnostic diagnostic{};
+    slab.entries[0]._pad = CCU_ACCEPT_DIAGNOSTIC_MAGIC;
+    // A coincidental magic value on a non-CCU entry is not a valid diagnostic.
+    diagnostic.capture(slab);
+    EXPECT_EQ(diagnostic.state, 1U);
+    EXPECT_EQ(diagnostic.magic, CCU_ACCEPT_DIAGNOSTIC_MAGIC);
+    EXPECT_FALSE(diagnostic.valid());
+    slab.entries[0]._pad = 0;
+    diagnostic.capture(slab);
+    EXPECT_EQ(diagnostic.state, 1U);
+    EXPECT_EQ(diagnostic.magic, 0U);
+    EXPECT_FALSE(diagnostic.valid());
+    slab.count = UINT32_MAX;
+    diagnostic.capture(slab);
+    EXPECT_EQ(diagnostic.count, UINT32_MAX);
+    EXPECT_EQ(diagnostic.magic, 0U);
+    EXPECT_FALSE(diagnostic.valid());
+}
+
 TEST_F(SharedMemoryTest, CreateDefaultReturnsNonNull) {
     EXPECT_NE(handle->sm_base, nullptr);
     EXPECT_GT(handle->sm_size, 0u);
