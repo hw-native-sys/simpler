@@ -5086,7 +5086,7 @@ void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {
 int DeviceRunnerBase::init_runtime_args_with_metadata(
     Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot
 ) {
-    int rc = kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot);
+    int rc = kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot, execution_mode_latch_.is_kernel());
     if (rc != 0) {
         LOG_ERROR("prepare_runtime_args failed: %d", rc);
         return rc;
