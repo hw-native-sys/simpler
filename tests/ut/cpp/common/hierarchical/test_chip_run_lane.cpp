@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <csignal>
 #include <functional>
+#include <future>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -58,6 +59,7 @@ std::array<size_t, 2> g_prepare_count{};
 std::array<bool, 2> g_reject_first_prepare{};
 size_t g_poll_count{0};
 size_t g_completion_wait_count{0};
+int g_completion_wait_rc{0};
 // When nonzero, the poll stub completes the run after this many polls. Only
 // UnboundedWaitBlocksInsteadOfPolling sets it, so that a regression there fails
 // on the poll count instead of looping forever.
@@ -127,6 +129,7 @@ int wait_run_completion(void *, void *runtime) {
     g_wait_cv.wait(lk, [] {
         return g_release_wait;
     });
+    if (g_completion_wait_rc != 0) return g_completion_wait_rc;
     g_complete[slot_of(runtime)] = true;
     return 0;
 }
@@ -162,6 +165,7 @@ void prime_worker(ChipWorker &worker) {
     g_reject_first_prepare = {};
     g_poll_count = 0;
     g_completion_wait_count = 0;
+    g_completion_wait_rc = 0;
     g_poll_completes_after = 0;
     g_supports_successor = true;
     g_context_rc = 0;
@@ -195,6 +199,218 @@ ChipRun submit(ChipRunLane &lane, uint64_t run_id, uint32_t slot, bool activate 
 }
 
 }  // namespace
+
+namespace {
+int framework_transfer_rc = 0;
+bool framework_destroy = true;
+int transfer_completed_run(void *, void *runtime) {
+    g_events.push_back("transfer" + std::to_string(slot_of(runtime)));
+    if (framework_destroy) std::memset(runtime, 0, sizeof(uint64_t));
+    return framework_transfer_rc;
+}
+ChipRun submit_framework(ChipRunLane &lane) {
+    ChipStorageTaskArgs args{};
+    return lane.submit(1, args, CallConfig{}, nullptr, 0, nullptr, true);
+}
+void enable_framework_transfer(ChipWorker &worker) {
+    framework_transfer_rc = 0;
+    framework_destroy = true;
+    worker.transfer_completed_run_fn_ = transfer_completed_run;
+}
+}  // namespace
+
+TEST(ChipRunLaneTest, FrameworkOwnRetirementUsesTransferInsteadOfStrongWaitOrFinalize) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto run = submit_framework(lane);
+    EXPECT_FALSE(run.retire_framework(false));
+    g_complete[0] = true;
+    ASSERT_TRUE(run.retire_framework(false));
+    EXPECT_TRUE(run.framework_transferred());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "transfer0"}));
+    EXPECT_EQ(g_completion_wait_count, 0u);
+    EXPECT_TRUE(run.retire_framework(false));
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FrameworkRequiredOwnWaitNeverBecomesAWholeStreamObserver) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto run = submit_framework(lane);
+    ASSERT_TRUE(run.retire_framework(true));
+    EXPECT_EQ(g_completion_wait_count, 1u);
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "transfer0"}));
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FrameworkPhysicalCompletionDeadlineRetainsTheUnfinishedCarrier) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto run = submit_framework(lane);
+    {
+        std::lock_guard<std::mutex> lock(g_wait_mu);
+        g_release_wait = false;
+    }
+    const auto deadline = ChipRun::Clock::now() + std::chrono::milliseconds(20);
+    auto retirement = std::async(std::launch::async, [&] {
+        return run.retire_framework(true, deadline);
+    });
+    const auto status = retirement.wait_for(std::chrono::seconds(1));
+    // Release the blocking native leaf before any assertion or future destruction.
+    // A regression can enter it, but must not hang the test process.
+    {
+        std::lock_guard<std::mutex> lock(g_wait_mu);
+        g_release_wait = true;
+    }
+    g_wait_cv.notify_all();
+    const bool retired = retirement.get();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_FALSE(retired);
+    EXPECT_EQ(g_completion_wait_count, 0u);
+    EXPECT_FALSE(run.framework_transferred());
+    EXPECT_EQ(worker.native_runs_.size(), 1u);
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
+    g_complete[0] = true;
+    EXPECT_TRUE(run.retire_framework(false));
+    EXPECT_TRUE(worker.native_runs_.empty());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FrameworkDestroyedFactPrecedesReturnedCleanupError) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto run = submit_framework(lane);
+    g_complete[0] = true;
+    framework_transfer_rc = -907;
+    EXPECT_THROW(run.retire_framework(false), std::runtime_error);
+    EXPECT_TRUE(run.framework_transferred());
+    EXPECT_FALSE(run.owner_recovery_required());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    const auto events = g_events;
+    EXPECT_TRUE(run.retire_framework(false));  // cleanup fact; lane/facade retain the first error
+    EXPECT_EQ(g_events, events);               // no stale storage wait or finalization
+
+    int context = 0;
+    worker.device_ctx_ = &context;
+    worker.validate_execution_context_fn_ = validate_context;
+    g_context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_THROW(lane.close(false), ExecutionContextRefused);
+    g_context_rc = 0;
+    EXPECT_NO_THROW(lane.close(false));
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.device_ctx_ = nullptr;
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FrameworkKnownIntactCleanupRetryNeverRelaunchesOrStrongWaits) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto run = submit_framework(lane);
+    g_complete[0] = true;
+    // Native runtime's canonical live tag means no destruction occurred.
+    auto *storage = worker.native_runs_.at(g_epochs[0])->storage.data();
+    const uint64_t canonical = kNativeRunContextMagic;
+    std::memcpy(storage, &canonical, sizeof(canonical));
+    framework_transfer_rc = -909;
+    framework_destroy = false;
+    EXPECT_THROW(run.retire_framework(false), std::runtime_error);
+    EXPECT_FALSE(run.framework_transferred());
+    EXPECT_FALSE(worker.native_runs_.empty());
+    framework_transfer_rc = 0;
+    framework_destroy = true;
+    EXPECT_THROW(run.retire_framework(false), std::runtime_error);  // original -909 remains the verdict
+    EXPECT_TRUE(run.framework_transferred());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "transfer0", "transfer0"}));
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FrameworkPollFailureCannotImplicitlyStrongFinalize) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto run = submit_framework(lane);
+    g_poll_rc[0] = -908;
+    EXPECT_THROW(run.retire_framework(false), std::runtime_error);
+    EXPECT_FALSE(run.framework_transferred());
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
+    EXPECT_FALSE(worker.native_runs_.empty());
+    g_poll_rc[0] = 0;
+    EXPECT_THROW(lane.close(), std::runtime_error);  // explicit recovery alone may observe/finalize
+    EXPECT_TRUE(worker.native_runs_.empty());
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FrameworkPollFailureRecoversThroughBoundedPhysicalRetirement) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto run = submit_framework(lane);
+    g_poll_rc[0] = -908;
+    EXPECT_THROW(run.retire_framework(false), std::runtime_error);
+    ASSERT_TRUE(run.owner_recovery_required());
+    ASSERT_FALSE(run.framework_transferred());
+
+    g_poll_rc[0] = 0;
+    g_complete[0] = true;
+    const auto deadline = ChipRun::Clock::now() + std::chrono::seconds(1);
+    try {
+        (void)run.retire_framework(true, deadline);
+        ADD_FAILURE() << "retirement did not report the original completion error";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-908"), std::string::npos);
+    }
+    EXPECT_TRUE(run.framework_transferred());
+    EXPECT_FALSE(run.owner_recovery_required());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_EQ(g_completion_wait_count, 0u);
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "transfer0"}));
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, BlockingSuccessorCannotObserveFrameworkPredecessorAfterCompletionWaitFailure) {
+    ChipWorker worker;
+    prime_worker(worker);
+    enable_framework_transfer(worker);
+    ChipRunLane lane(worker);
+    auto framework = submit_framework(lane);
+    auto ordinary = submit(lane, 102, 1, false);
+    g_completion_wait_rc = -912;
+    try {
+        (void)ordinary.wait_until(ChipRun::Deadline::max());
+        ADD_FAILURE() << "successor wait did not report its predecessor's error";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-912"), std::string::npos);
+    }
+    EXPECT_EQ(g_completion_wait_count, 1u);
+    EXPECT_FALSE(framework.framework_transferred());
+    EXPECT_TRUE(framework.owner_recovery_required());
+    EXPECT_NE(worker.native_runs_.count(g_epochs[0]), 0u);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 0);
+
+    g_completion_wait_rc = 0;
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_TRUE(worker.native_runs_.empty());
+    worker.finalize();
+}
 
 TEST(ChipRunLaneTest, OwnsFifoPreparationAndLaunch) {
     ChipWorker worker;

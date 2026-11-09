@@ -99,6 +99,8 @@ struct ChipRunState {
     // destroys its carrier; physical END can precede carrier cleanup instead.
     bool caller_last_use_proven{false};
     bool native_context_destroyed{false};
+    bool framework_owned{false};
+    bool framework_transferred{false};
     std::exception_ptr error;
     std::exception_ptr poison_error;
 };
@@ -126,6 +128,15 @@ struct ChipRunLaneState {
         // a raw pointer, and a parked waiter is exactly the thing that can
         // outlive it.
         credit_gate.entries = worker.credit_entries();
+    }
+
+    std::pair<int, bool> observe_framework() {
+        worker->validate_execution_context();
+        if (worker->observe_framework_submissions_fn_ == nullptr)
+            throw UnsupportedRuntimeOperation("runtime has no framework observer");
+        int all_observed = 0;
+        const int rc = worker->observe_framework_submissions_fn_(worker->device_ctx_, &all_observed);
+        return {rc, all_observed != 0};
     }
 
     bool in_current_process() const noexcept { return process_id == getpid(); }
@@ -435,6 +446,36 @@ struct ChipRunLaneState {
         retire_execution(run);
     }
 
+    bool transfer_framework(const std::shared_ptr<ChipRunState> &run) {
+        if (!run->framework_owned) throw std::logic_error("run has no framework observation owner");
+        if (run->framework_transferred) return true;
+        if (run->phase != ChipRunState::Phase::ENDED) return false;
+        bool destroyed = false;
+        bool transferred = false;
+        std::exception_ptr failure;
+        try {
+            transferred = worker->transfer_native_run(run->native_run, &destroyed);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        // A returned error can follow actual destruction. Publish that fact
+        // before raising so later source cleanup cannot re-enter stale storage.
+        if (destroyed) {
+            run->native_context_destroyed = true;
+            run->framework_transferred = true;
+            release_device_spans(run, true);
+            const auto it = std::find(completed.begin(), completed.end(), run);
+            if (it != completed.end()) completed.erase(it);
+        }
+        if (failure) {
+            if (run->error == nullptr) run->error = failure;
+            poison_with(run, run->error);
+            std::rethrow_exception(run->error);
+        }
+        if (run->error != nullptr) std::rethrow_exception(run->error);
+        return transferred && destroyed;
+    }
+
     void finish(const std::shared_ptr<ChipRunState> &run, std::exception_ptr joined_failure = {}) noexcept {
         // A later successful cleanup cannot establish a healthy result after
         // this lane already observed failure. Withhold Program HOST delivery
@@ -507,12 +548,14 @@ struct ChipRunLaneState {
 
     void fail_launch(const std::shared_ptr<ChipRunState> &run) noexcept {
         run->error = std::current_exception();
-        finish(run);
+        if (run->framework_owned) poison_with(run, run->error);
+        else finish(run);
     }
 
     void launch_front() noexcept {
         if (admission_stopped || fifo.empty()) return;
         const auto run = fifo.front();
+        if (run->framework_owned && run->error != nullptr) return;
         if (poison != nullptr) {
             if (run->phase == ChipRunState::Phase::PREPARED) {
                 run->error = poison;
@@ -780,7 +823,8 @@ struct ChipRunLaneState {
                 );
             } catch (...) {
                 successor->error = std::current_exception();
-                finish(successor, successor->error);
+                if (successor->framework_owned) poison_with(successor, successor->error);
+                else finish(successor, successor->error);
                 return;
             }
             if (!joined) {
@@ -863,6 +907,7 @@ struct ChipRunLaneState {
     }
 
     bool progress(const std::shared_ptr<ChipRunState> &target) {
+        if (target->framework_owned && target->error != nullptr) std::rethrow_exception(target->error);
         if (target->phase == ChipRunState::Phase::TERMINAL || target->phase == ChipRunState::Phase::ENDED) return true;
         worker->validate_execution_context();
         if (fifo.empty()) throw std::runtime_error("chip run lane lost a nonterminal run");
@@ -897,6 +942,11 @@ struct ChipRunLaneState {
             if (!worker->poll_native_run(target->native_run)) return false;
         } catch (...) {
             const std::exception_ptr poll_error = std::current_exception();
+            if (target->framework_owned) {
+                if (target->error == nullptr) target->error = poll_error;
+                poison_with(target, target->error);
+                std::rethrow_exception(target->error);
+            }
             finish(target);
             if (target->error == nullptr) target->error = poll_error;
             poison_with(target, target->error);
@@ -920,9 +970,14 @@ struct ChipRunLaneState {
      */
     enum class DrainOutcome : int { Progressed, CreditBlocked };
 
-    DrainOutcome drain_front() noexcept {
+    DrainOutcome drain_front(bool observe = false) {
         if (fifo.empty()) return DrainOutcome::Progressed;
         const auto run = fifo.front();
+        if (run->framework_owned && run->error != nullptr) {
+            if (!observe) std::rethrow_exception(run->error);
+            finish(run);
+            return DrainOutcome::Progressed;
+        }
         if (poison != nullptr && run->phase == ChipRunState::Phase::QUEUED) {
             run->error = poison;
             run->poison_error = poison;
@@ -958,6 +1013,7 @@ struct ChipRunLaneState {
             } catch (...) {
                 run->error = std::current_exception();
                 poison_with(run, run->error);
+                if (run->framework_owned && !observe) std::rethrow_exception(run->error);
                 finish(run);
             }
             return DrainOutcome::Progressed;
@@ -965,7 +1021,10 @@ struct ChipRunLaneState {
         if (run->resource_wait && !completed.empty()) {
             // Actual workspace pressure may require delivery of an old call's
             // retained host outputs. Poll/progress never takes this path.
-            finish(completed.front());
+            const auto previous = completed.front();
+            if (previous->framework_owned && !observe) {
+                if (!transfer_framework(previous)) throw std::runtime_error("framework transfer is busy");
+            } else finish(previous);
             return DrainOutcome::Progressed;
         }
         // Activated, prepared, and still not launched: the launch above
@@ -1067,11 +1126,14 @@ struct ChipRunLaneState {
     // wakeup primitive rather than a busy loop. Reports whether it actually
     // blocked, so a caller that cannot be unblocked this way does not spin on
     // it.
-    bool block_on_front() noexcept {
+    bool block_on_front() {
         if (fifo.empty()) return false;
         const auto front = fifo.front();
         if (front->resource_wait && !completed.empty()) {
-            finish(completed.front());
+            const auto previous = completed.front();
+            if (previous->framework_owned) {
+                if (!transfer_framework(previous)) throw std::runtime_error("framework transfer is busy");
+            } else finish(previous);
             return true;
         }
         if (front->phase != ChipRunState::Phase::LAUNCHED) return false;
@@ -1081,6 +1143,7 @@ struct ChipRunLaneState {
             const std::exception_ptr wait_error = std::current_exception();
             if (front->error == nullptr) front->error = wait_error;
             poison_with(front, front->error);
+            if (front->framework_owned) std::rethrow_exception(front->error);
             finish(front);
         }
         launch_ready_prefix();
@@ -1115,6 +1178,61 @@ bool ChipRun::done() {
     return lane_->progress(run_);
 }
 
+bool ChipRun::retire_framework(bool wait_for_own_completion, Deadline deadline) {
+    if (!lane_ || !run_) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(lane_->mu);
+            if (!run_->framework_owned) throw std::logic_error("run has no framework observation owner");
+            if (run_->framework_transferred) return true;
+            lane_->worker->validate_execution_context();
+            // Physical retirement is established already. A later cleanup request may
+            // retry the same canonical carrier, without polling, launching or observing
+            // streams. ChipWorker itself isolates unknown destruction from any retry.
+            if (run_->phase == ChipRunState::Phase::ENDED) return lane_->transfer_framework(run_);
+            if (run_->error != nullptr) {
+                bool complete = false;
+                if (wait_for_own_completion && run_->phase == ChipRunState::Phase::LAUNCHED &&
+                    Clock::now() < deadline) {
+                    try {
+                        complete = lane_->worker->poll_native_run(run_->native_run);
+                    } catch (...) {
+                        // A later poll failure does not replace the original verdict.
+                    }
+                }
+                if (!complete) std::rethrow_exception(run_->error);
+                lane_->retire_execution(run_);
+                return lane_->transfer_framework(run_);
+            }
+            if (lane_->progress(run_)) return lane_->transfer_framework(run_);
+            if (!wait_for_own_completion) return false;
+            if (run_->phase != ChipRunState::Phase::LAUNCHED)
+                throw std::runtime_error("framework run has not published its launch");
+            // A finite caller budget must not enter the platform's blocking
+            // completion wait, whose timeout belongs to the runtime instead.
+            if (deadline == Deadline::max()) {
+                try {
+                    lane_->wait_for_execution(run_);
+                } catch (...) {
+                    run_->error = std::current_exception();
+                    lane_->poison_with(run_, run_->error);
+                    throw;
+                }
+                return lane_->transfer_framework(run_);
+            }
+        }
+        if (Clock::now() >= deadline) return false;
+    }
+}
+
+bool ChipRun::framework_transferred() const {
+    if (!lane_ || !run_) return false;
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lock(lane_->mu);
+    return run_->framework_transferred;
+}
+
 bool ChipRun::wait_until(Deadline deadline) {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
@@ -1123,6 +1241,15 @@ bool ChipRun::wait_until(Deadline deadline) {
         std::shared_ptr<ChipRunState> blocked_front;
         {
             std::unique_lock<std::mutex> lk(lane_->mu);
+            if (run_->framework_owned && run_->error != nullptr && !run_->native_context_destroyed) {
+                // Only an explicit observer may retry known-intact carrier
+                // cleanup after a private transfer/poll failure. Admission
+                // keeps refusing it; unknown native teardown stays isolated.
+                lane_->worker->validate_execution_context();
+                lane_->finish(run_);
+                lane_->rethrow_run_error(run_);
+                return true;
+            }
             if (lane_->progress(run_)) {
                 if (run_->phase == ChipRunState::Phase::ENDED) {
                     // Observation still uses the original execution context. A refusal
@@ -1350,7 +1477,7 @@ ChipRun ChipRunLane::submit(
 
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value, void *caller_stream
+    int32_t accepted_value, void *caller_stream, bool framework_owned
 ) {
     state_->validate_process();
     std::unique_lock<std::mutex> lk(state_->mu);
@@ -1407,6 +1534,7 @@ ChipRun ChipRunLane::submit(
     run->accepted_state = accepted_state;
     run->accepted_value = accepted_value;
     run->caller_stream = caller_stream;
+    run->framework_owned = framework_owned;
     run->pipeline_leased = false;
     run->activated = true;
     state_->fifo.push_back(run);
@@ -1447,13 +1575,28 @@ ChipRun ChipRunLane::submit(
     return ChipRun(state_, std::move(run));
 }
 
+int32_t ChipRunLane::with_callable_addition(const std::function<int32_t()> &operation) {
+    state_->validate_process();
+    std::lock_guard<std::mutex> lock(state_->mu);
+    if (state_->closed || state_->worker == nullptr) throw std::runtime_error("chip run lane is closed");
+    state_->worker->validate_execution_context();
+    return operation();
+}
+
+std::pair<int, bool> ChipRunLane::observe_framework_submissions() {
+    state_->validate_process();
+    std::lock_guard<std::mutex> lock(state_->mu);
+    if (state_->worker == nullptr) throw std::runtime_error("chip run lane has no observation owner");
+    return state_->observe_framework();
+}
+
 void ChipRunLane::drain() {
     state_->validate_process();
     std::unique_lock<std::mutex> lk(state_->mu);
     if (state_->worker != nullptr) state_->worker->validate_execution_context();
     while (!state_->fifo.empty()) {
         const auto front = state_->fifo.front();
-        if (state_->drain_front() == ChipRunLaneState::DrainOutcome::CreditBlocked) {
+        if (state_->drain_front(true) == ChipRunLaneState::DrainOutcome::CreditBlocked) {
             // The run's own admission deadline bounds this: when it passes,
             // the next drain fails that run and the queue advances, so a drain
             // terminates even if credit never comes back. A park that declines
@@ -1470,7 +1613,7 @@ void ChipRunLane::drain() {
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }
 
-void ChipRunLane::close() {
+void ChipRunLane::close(bool report_run_error) {
     state_->validate_process();
     // Refusal before mutation. A close on the wrong device context is not a
     // close: it changes nothing and throws, and the worker it was called on is
@@ -1500,12 +1643,12 @@ void ChipRunLane::close() {
 
     std::unique_lock<std::mutex> lk(state_->mu);
     if (state_->closed) {
-        if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
+        if (report_run_error && state_->poison != nullptr) std::rethrow_exception(state_->poison);
         return;
     }
     while (!state_->fifo.empty()) {
         const auto front = state_->fifo.front();
-        if (state_->drain_front() == ChipRunLaneState::DrainOutcome::CreditBlocked) {
+        if (state_->drain_front(true) == ChipRunLaneState::DrainOutcome::CreditBlocked) {
             // The gate was detached above, so no release can reach a waiter
             // any more and no amount of waiting will admit this run. Waiting
             // out its budget would be a spin against a signal nobody will
@@ -1518,7 +1661,7 @@ void ChipRunLane::close() {
     while (!state_->completed.empty())
         state_->finish(state_->completed.front());
     state_->closed = true;
-    if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
+    if (report_run_error && state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }
 
 void ChipRunLane::detach_after_failed_teardown(std::exception_ptr error) noexcept {

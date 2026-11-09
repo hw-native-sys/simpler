@@ -24,6 +24,16 @@
 
 using NativeSubmissionState = QueuedSubmission<ChipRun>;
 
+inline ChipRun::Deadline native_submission_wait_deadline(double timeout) {
+    if (std::isnan(timeout)) throw std::invalid_argument("submission wait timeout must not be NaN");
+    auto deadline = ChipRun::Deadline::max();
+    const auto available = deadline - ChipRun::Clock::now();
+    if (timeout >= 0 && timeout < std::chrono::duration<double>(available).count())
+        deadline = ChipRun::Clock::now() +
+                   std::chrono::duration_cast<ChipRun::Clock::duration>(std::chrono::duration<double>(timeout));
+    return deadline;
+}
+
 struct NativeSubmissionCapsule {
     explicit NativeSubmissionCapsule(std::shared_ptr<NativeSubmissionState> state) :
         state(std::move(state)) {
@@ -59,6 +69,41 @@ inline void bind_native_submission(nanobind::module_ &m) {
             nanobind::call_guard<nanobind::gil_scoped_release>()
         )
         .def("done", &NativeSubmissionState::done, nanobind::call_guard<nanobind::gil_scoped_release>())
+        .def(
+            "_claim_framework", &NativeSubmissionState::claim_framework,
+            nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
+        .def_prop_ro(
+            "_framework_claimed", &NativeSubmissionState::framework_claimed,
+            nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
+        .def_prop_ro(
+            "_framework_transferred", &NativeSubmissionState::framework_transferred,
+            nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
+        .def(
+            "_retire_framework",
+            [](NativeSubmissionState &self, bool wait_for_own_completion, double timeout) {
+                const auto deadline = native_submission_wait_deadline(timeout);
+                return self.with_framework_run(
+                    wait_for_own_completion,
+                    [&](ChipRun &run) {
+                        try {
+                            const bool retired = run.retire_framework(wait_for_own_completion, deadline);
+                            if (run.framework_transferred()) self.note_framework_transfer();
+                            return retired;
+                        } catch (...) {
+                            // Destruction and error delivery are independent facts.
+                            if (run.framework_transferred()) self.note_framework_transfer();
+                            throw;
+                        }
+                    },
+                    deadline
+                );
+            },
+            nanobind::arg("wait_for_own_completion") = false, nanobind::arg("timeout") = -1.0,
+            nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
         .def("_retire", &NativeSubmissionState::retire, nanobind::call_guard<nanobind::gil_scoped_release>())
         .def(
             "cancel",
@@ -72,14 +117,14 @@ inline void bind_native_submission(nanobind::module_ &m) {
         .def(
             "wait",
             [](NativeSubmissionState &self, double timeout) {
-                if (std::isnan(timeout)) throw std::invalid_argument("submission wait timeout must not be NaN");
-                auto deadline = ChipRun::Deadline::max();
-                const auto available = deadline - ChipRun::Clock::now();
-                if (timeout >= 0 && timeout < std::chrono::duration<double>(available).count())
-                    deadline =
-                        ChipRun::Clock::now() +
-                        std::chrono::duration_cast<ChipRun::Clock::duration>(std::chrono::duration<double>(timeout));
-                return self.wait_until(deadline);
+                return self.wait_until(native_submission_wait_deadline(timeout));
+            },
+            nanobind::arg("timeout") = -1.0, nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
+        .def(
+            "_wait_framework",
+            [](NativeSubmissionState &self, double timeout) {
+                return self.wait_framework_until(native_submission_wait_deadline(timeout));
             },
             nanobind::arg("timeout") = -1.0, nanobind::call_guard<nanobind::gil_scoped_release>()
         )
@@ -87,6 +132,7 @@ inline void bind_native_submission(nanobind::module_ &m) {
             // The control block comes from make_shared, never nanobind's
             // Python-owner shared_ptr caster (whose deleter acquires GIL).
             auto holder = std::make_unique<NativeSubmissionCapsule>(self.shared_from_this());
+            self.note_export();
             auto capsule =
                 nanobind::capsule(&holder->api, SIMPLER_NATIVE_SUBMISSION_CAPSULE, [](void *pointer) noexcept {
                     auto *api = static_cast<SimplerNativeSubmission *>(pointer);

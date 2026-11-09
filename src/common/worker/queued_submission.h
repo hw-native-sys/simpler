@@ -28,19 +28,84 @@ public:
     using Deadline = typename Run::Deadline;
 
     explicit QueuedSubmission(std::function<Run()> action) :
+        action_([action = std::move(action)](bool) {
+            return action();
+        }) {}
+
+    explicit QueuedSubmission(std::function<Run(bool)> action, bool framework_eligible = true) :
+        framework_eligible_(framework_eligible),
         action_(std::move(action)) {}
+
+    void claim_framework() {
+        validate_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (phase_ != Phase::Pending || exported_ || public_observation_ || framework_claimed_)
+            throw std::logic_error("framework ownership requires an unexported, unconsumed native token");
+        if (!framework_eligible_)
+            throw std::logic_error("native token does not support framework observation transfer");
+        framework_claimed_ = true;
+    }
+
+    void note_export() {
+        validate_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        exported_ = true;
+    }
+
+    bool framework_claimed() {
+        validate_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        return framework_claimed_;
+    }
+
+    bool framework_transferred() {
+        validate_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        return framework_transferred_;
+    }
+
+    void note_framework_transfer() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!framework_claimed_) throw std::logic_error("native submission has no framework owner");
+        framework_transferred_ = true;
+    }
+
+    template <typename Operation>
+    bool with_framework_run(bool wait_for_publication, Operation operation, Deadline deadline = Deadline::max()) {
+        validate_process();
+        std::optional<Run> run;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (!framework_claimed_) throw std::logic_error("native submission has no framework owner");
+            if (wait_for_publication) {
+                auto ready = [&] {
+                    return phase_ == Phase::Submitted || phase_ == Phase::Retired;
+                };
+                if (deadline == Deadline::max()) changed_.wait(lock, ready);
+                else if (!changed_.wait_until(lock, deadline, ready)) return false;
+            }
+            if (error_) std::rethrow_exception(error_);
+            if (framework_transferred_) return true;
+            if (phase_ != Phase::Submitted) return false;
+            if (!run_) throw std::logic_error("framework submission has no published native run");
+            run = run_;
+        }
+        return operation(*run);
+    }
 
     void submit() {
         validate_process();
+        bool framework = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (phase_ != Phase::Pending) throw std::logic_error("submission token is already consumed or cancelled");
+            framework = framework_claimed_;
             phase_ = Phase::Submitting;
         }
         std::optional<Run> result;
         std::exception_ptr error;
         try {
-            result.emplace(action_());
+            result.emplace(action_(framework));
         } catch (...) {
             error = std::current_exception();
         }
@@ -74,6 +139,8 @@ public:
         std::optional<Run> run;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (framework_claimed_) throw std::logic_error("framework-owned token cannot be publicly observed");
+            public_observation_ = true;
             if (phase_ == Phase::Retired || error_) return true;
             if (phase_ != Phase::Submitted) return false;
             run = run_;
@@ -81,11 +148,18 @@ public:
         return run->done();
     }
 
-    bool wait_until(Deadline deadline) {
+    bool wait_until(Deadline deadline) { return wait_until_impl(deadline, false); }
+    bool wait_framework_until(Deadline deadline) { return wait_until_impl(deadline, true); }
+
+private:
+    bool wait_until_impl(Deadline deadline, bool framework) {
         validate_process();
         std::optional<Run> run;
         {
             std::unique_lock<std::mutex> lock(mutex_);
+            if (framework != framework_claimed_)
+                throw std::logic_error("native submission observation belongs to a different owner");
+            if (!framework) public_observation_ = true;
             auto ready = [&] {
                 return phase_ == Phase::Submitted || phase_ == Phase::Retired;
             };
@@ -95,12 +169,13 @@ public:
                 return false;
             }
             if (error_) std::rethrow_exception(error_);
-            if (phase_ == Phase::Retired) return true;
+            if (phase_ == Phase::Retired || (framework && framework_transferred_)) return true;
             run = run_;
         }
         return run->wait_until(deadline);
     }
 
+public:
     bool owner_recovery_required() {
         validate_process();
         std::optional<Run> run;
@@ -133,7 +208,12 @@ private:
     std::mutex mutex_;
     std::condition_variable changed_;
     Phase phase_ = Phase::Pending;
-    std::function<Run()> action_;
+    bool exported_{false};
+    bool public_observation_{false};
+    bool framework_claimed_{false};
+    bool framework_transferred_{false};
+    const bool framework_eligible_{true};
+    std::function<Run(bool)> action_;
     std::optional<Run> run_;
     std::exception_ptr error_;
 };

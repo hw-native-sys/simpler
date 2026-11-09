@@ -30,6 +30,129 @@ struct FakeRun {
 };
 using Submission = QueuedSubmission<FakeRun>;
 
+TEST(QueuedSubmissionTest, IneligibleFrameworkClaimLeavesTheOriginalEagerActionPending) {
+    bool eager = false;
+    QueuedSubmission<FakeRun> submission(
+        std::function<FakeRun(bool)>([&](bool framework) {
+            eager = !framework;
+            return FakeRun{};
+        }),
+        false
+    );
+    EXPECT_THROW(submission.claim_framework(), std::logic_error);
+    EXPECT_FALSE(submission.framework_claimed());
+    EXPECT_NO_THROW(submission.submit());
+    EXPECT_TRUE(eager);
+}
+
+TEST(QueuedSubmissionTest, FrameworkClaimSelectsTheSameActionBeforeExportAndRejectsPublicObservation) {
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    bool owned = false;
+    Submission submission(std::function<FakeRun(bool)>([&](bool framework) {
+        owned = framework;
+        return FakeRun{complete};
+    }));
+    submission.claim_framework();
+    submission.note_export();
+    EXPECT_FALSE(submission.with_framework_run(false, [](FakeRun &) {
+        return true;
+    }));
+    EXPECT_FALSE(submission.with_framework_run(
+        true,
+        [](FakeRun &) {
+            return true;
+        },
+        std::chrono::steady_clock::now()
+    ));
+    submission.submit();
+    EXPECT_TRUE(owned);
+    EXPECT_THROW(submission.done(), std::logic_error);
+    EXPECT_THROW(submission.wait_until(FakeRun::Deadline::max()), std::logic_error);
+    EXPECT_TRUE(submission.with_framework_run(false, [](FakeRun &run) {
+        return run.done();
+    }));
+    submission.note_framework_transfer();
+    submission.retire();
+    EXPECT_TRUE(submission.framework_transferred());
+    EXPECT_TRUE(submission.wait_framework_until(FakeRun::Deadline::max()));
+}
+
+TEST(QueuedSubmissionTest, LateClaimCannotStealAnExportPublicObservationOrCancellation) {
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    auto action = [complete] {
+        return FakeRun{complete};
+    };
+    Submission exported(action), observed(action), cancelled(action), submitted(action);
+    exported.note_export();
+    EXPECT_THROW(exported.claim_framework(), std::logic_error);
+    EXPECT_FALSE(observed.done());
+    EXPECT_THROW(observed.claim_framework(), std::logic_error);
+    EXPECT_TRUE(cancelled.cancel(std::make_exception_ptr(std::runtime_error("cancelled"))));
+    EXPECT_THROW(cancelled.claim_framework(), std::logic_error);
+    submitted.submit();
+    EXPECT_THROW(submitted.claim_framework(), std::logic_error);
+    EXPECT_TRUE(submitted.done());
+}
+
+TEST(QueuedSubmissionTest, ClaimedPublicationIsIncompleteUntilTheOriginalActionReturns) {
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    std::promise<void> entered, release;
+    auto gate = release.get_future();
+    Submission submission(std::function<FakeRun(bool)>([&](bool framework) {
+        EXPECT_TRUE(framework);
+        entered.set_value();
+        gate.wait();
+        return FakeRun{complete};
+    }));
+    submission.claim_framework();
+    auto callback = std::async(std::launch::async, [&] {
+        submission.submit();
+    });
+    entered.get_future().wait();
+    // The action holds neither the token mutex nor a publication proof.
+    EXPECT_FALSE(submission.with_framework_run(false, [](FakeRun &) {
+        return true;
+    }));
+    EXPECT_FALSE(submission.cancel(std::make_exception_ptr(std::runtime_error("late"))));
+    EXPECT_THROW(submission.claim_framework(), std::logic_error);
+    release.set_value();
+    callback.get();
+    EXPECT_TRUE(submission.with_framework_run(true, [](FakeRun &run) {
+        return run.done();
+    }));
+}
+
+TEST(QueuedSubmissionTest, ConcurrentClaimAndSubmitHaveOneImmutableOwnershipChoice) {
+    auto complete = std::make_shared<std::atomic<bool>>(true);
+    std::promise<void> start;
+    auto gate = start.get_future().share();
+    std::atomic<bool> claimed{false}, action_owned{false};
+    Submission submission(std::function<FakeRun(bool)>([&](bool framework) {
+        action_owned = framework;
+        return FakeRun{complete};
+    }));
+    auto claim = std::async(std::launch::async, [&] {
+        gate.wait();
+        try {
+            submission.claim_framework();
+            claimed = true;
+        } catch (const std::logic_error &) {}
+    });
+    auto callback = std::async(std::launch::async, [&] {
+        gate.wait();
+        submission.submit();
+    });
+    start.set_value();
+    claim.get();
+    callback.get();
+    EXPECT_EQ(claimed.load(), action_owned.load());
+    if (claimed)
+        EXPECT_TRUE(submission.with_framework_run(false, [](FakeRun &run) {
+            return run.done();
+        }));
+    else EXPECT_TRUE(submission.done());
+}
+
 TEST(QueuedSubmissionTest, PreparationDoesNotExecuteAndSubmitIsOneShot) {
     int calls = 0;
     auto complete = std::make_shared<std::atomic<bool>>(false);

@@ -1282,6 +1282,13 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  */
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs);
 
+// Internal same-build framework owner operations. Transfer requires independently
+// retired eager DEVICE/NONE work without requested diagnostics/model references.
+// Observation acknowledges a stored original pair only on a returned zero.
+// A prior error remains the return verdict even after all_observed becomes one.
+int simpler_transfer_completed_kernel_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+int simpler_observe_framework_submissions(DeviceContextHandle ctx, int *all_observed);
+
 /**
  * Retain preparation backing independently of the original run. Call before
  * CaptureBegin on a Prepared run; exactly one retention is allowed per run.

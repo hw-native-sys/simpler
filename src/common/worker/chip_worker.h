@@ -300,7 +300,8 @@ public:
     // run() is the blocking composition without caller stream ordering.
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr,
+        bool framework_owned = false
     );
     // The owner retains this worker, callable, storage and stream through
     // consumption and safe retirement; preparation does not launch device work.
@@ -308,7 +309,10 @@ public:
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, void *caller_stream
     );
 
-    void close_chip_run_lane();
+    std::pair<int, bool> observe_framework_submissions();
+    bool transfer_native_run(const ChipWorkerNativeRun &run, bool *context_destroyed);
+
+    void close_chip_run_lane(bool report_run_error = true);
     /**
      * Stop the run lane admitting anything further, finishing every run that
      * has not launched without launching it. @see ChipRunLane::stop_admission.
@@ -608,6 +612,7 @@ private:
     using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
     using SimplerFinalizeRunFn = decltype(&simpler_finalize_run_with_delivery);
+    using ObserveFrameworkSubmissionsFn = decltype(&simpler_observe_framework_submissions);
     using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
     using ValidateExecutionContextFn = decltype(&simpler_validate_execution_context);
     using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
@@ -703,6 +708,8 @@ private:
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_completion_fn_ = nullptr;
     SimplerFinalizeRunFn finalize_run_fn_ = nullptr;
+    SimplerNativeRunFn transfer_completed_run_fn_ = nullptr;
+    ObserveFrameworkSubmissionsFn observe_framework_submissions_fn_ = nullptr;
     SimplerProbeRunRetentionFn probe_run_retention_fn_ = nullptr;
     GetTeardownReportFn get_teardown_report_fn_ = nullptr;
     // The first captured teardown observation, kept by value so it outlives
@@ -1033,7 +1040,7 @@ private:
     /** Remove an entry that never got past preparation. */
     void drop_preparing_native_run(uint64_t run_epoch) noexcept;
     /** Whether a finalization reports to a caller or is closing this worker down. */
-    enum class FinalizeMode : uint8_t { Caller, Teardown };
+    enum class FinalizeMode : uint8_t { Caller, Teardown, FrameworkTransfer };
     /** Why a finalization has something to report; the message belongs to whoever raises it. */
     enum class FinalizeFault : uint8_t {
         None,

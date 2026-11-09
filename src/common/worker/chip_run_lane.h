@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <functional>
+#include <utility>
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
@@ -37,6 +39,8 @@ public:
     ChipRun() = default;
 
     bool done();
+    bool retire_framework(bool wait_for_own_completion, Deadline deadline = Deadline::max());
+    bool framework_transferred() const;
     bool wait_until(Deadline deadline);
     void activate();
     void abandon();
@@ -89,7 +93,8 @@ public:
     // return. Stream work appended after that return is ordered after both kernels.
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr,
+        bool framework_owned = false
     );
 
     void drain();
@@ -111,11 +116,13 @@ public:
      */
     void stop_admission() noexcept;
 
-    void close();
+    void close(bool report_run_error = true);
     bool poisoned() const;
 
 private:
     friend class ChipWorker;
+    int32_t with_callable_addition(const std::function<int32_t()> &operation);
+    std::pair<int, bool> observe_framework_submissions();
     void detach_after_failed_teardown(std::exception_ptr error) noexcept;
     std::shared_ptr<ChipRunLaneState> state_;
 };

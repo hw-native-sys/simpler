@@ -21,6 +21,7 @@
 #include <iterator>
 #include <optional>
 #include <string>
+#include <string_view>
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
@@ -2506,6 +2507,191 @@ TEST_F(NativeAdmissionTest, FinalizePrefixAllocationFailureKeepsLaunchedOwnerRet
 }  // namespace native_admission_test
 
 namespace native_admission_test {
+class FrameworkCompletionRunner : public FencedCompletionRunner {
+public:
+    void add_host_control_signature() { callables_.at(1).signature.push_back(ArgDirection::IN); }
+    void qualify_registration_transport() {
+        aicpu_runtime_registered_ = true;
+        aicpu_initialized_ = true;
+        control().allow_registration = true;
+    }
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        auto result = FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+        if (result.rc == 0) result.rc = queue_caller_exit(prepared);
+        return result;
+    }
+};
+
+TEST_F(NativeAdmissionTest, FrameworkTransferEndsOnlyThePhysicalCarrierWithoutObservingItsStreams) {
+    FrameworkCompletionRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 10100);
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_poll_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    ASSERT_TRUE(state->execution_retired);
+    ASSERT_FALSE(state->result_observed);
+    control().observed_streams.clear();
+    control().stream_sync_rc = -901;
+    ASSERT_EQ(simpler_transfer_completed_kernel_run(&runner, attempt.storage), 0);
+    EXPECT_TRUE(attempt.empty());
+    EXPECT_TRUE(control().observed_streams.empty());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_TRUE(runner.native_runs_outstanding());
+    EXPECT_TRUE(runner.fresh_callable_addition_allowed());
+    EXPECT_NE(simpler_unregister_callable(&runner, 1), 0);
+    int all = 77;
+    EXPECT_EQ(simpler_observe_framework_submissions(&runner, &all), -901);
+    EXPECT_EQ(all, 0);
+    EXPECT_EQ(control().observed_streams.size(), 1u);  // original pair helper short-circuits
+    EXPECT_TRUE(runner.native_runs_outstanding());
+    EXPECT_FALSE(runner.fresh_callable_addition_allowed());  // original context is poisoned
+    control().stream_sync_rc = 0;
+    control().observed_streams.clear();
+    EXPECT_EQ(simpler_observe_framework_submissions(&runner, &all), -901);
+    EXPECT_EQ(all, 1);  // cleanup fact does not replace the first semantic error
+    EXPECT_EQ(control().observed_streams.size(), 2u);
+    EXPECT_FALSE(runner.native_runs_outstanding());
+}
+
+TEST_F(NativeAdmissionTest, FrameworkDebtPermitsAllThreeFreshCallableEntriesWithoutObservingTheOldPair) {
+    FrameworkCompletionRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    runner.qualify_registration_transport();
+    std::ifstream input(NATIVE_OBSERVATION_ORCH_PATH, std::ios::binary);
+    const std::vector<uint8_t> binary{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    ASSERT_FALSE(binary.empty());
+    const ArgDirection signature[] = {ArgDirection::IN};
+    const auto original = make_chip_callable(
+        signature, 1, "framework_observation_orch", binary.data(), binary.size(), nullptr, nullptr, 0, ""
+    );
+    const auto image = make_chip_callable(
+        signature, 1, "framework_observation_orch_b", binary.data(), binary.size(), nullptr, nullptr, 0, ""
+    );
+    ASSERT_EQ(simpler_unregister_callable(&runner, 1), 0);
+    ASSERT_EQ(simpler_kernel_mode_prepare_callable(&runner, 1, original.data(), original.size()), 0);
+    const auto original_hash = runner.callable_hash(1);
+    const size_t initial_registrations = control().registered_ids.size();
+    Attempt attempt(runner, 0, 10103);
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_poll_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    ASSERT_EQ(simpler_transfer_completed_kernel_run(&runner, attempt.storage), 0);
+    control().observed_streams.clear();
+    EXPECT_EQ(simpler_register_callable(&runner, 2, image.data()), 0);
+    EXPECT_TRUE(runner.has_callable(2));
+    EXPECT_EQ(simpler_kernel_mode_prepare_callable(&runner, 3, image.data(), image.size()), 0);
+    EXPECT_TRUE(runner.has_callable(3));
+    int32_t auto_id = -1;
+    EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &auto_id), 0);
+    EXPECT_GE(auto_id, 0);
+    EXPECT_TRUE(runner.has_callable(auto_id));
+    EXPECT_TRUE(runner.native_runs_outstanding());
+    for (void *stream : control().observed_streams)
+        EXPECT_EQ(stream, runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu));
+    EXPECT_EQ(control().registered_ids.size() - initial_registrations, primary_entry_points() == nullptr ? 3u : 0u);
+    EXPECT_EQ(runner.callable_hash(1), original_hash);
+    EXPECT_NE(simpler_unregister_callable(&runner, 1), 0);
+    EXPECT_NE(simpler_register_callable(&runner, 1, image.data()), 0);  // no reuse relaxation
+    int all = 0;
+    EXPECT_EQ(simpler_observe_framework_submissions(&runner, &all), 0);
+    EXPECT_EQ(all, 1);
+    EXPECT_FALSE(runner.native_runs_outstanding());
+}
+
+TEST_F(NativeAdmissionTest, FrameworkTransferRefusesBeforePhysicalProofAndPreservesTheOriginalOwner) {
+    FrameworkCompletionRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 10101);
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(attempt.prepare(), 0);
+    EXPECT_NE(simpler_transfer_completed_kernel_run(&runner, attempt.storage), 0);
+    EXPECT_FALSE(attempt.empty());
+    EXPECT_TRUE(runner.native_runs_outstanding());
+    EXPECT_FALSE(runner.fresh_callable_addition_allowed());
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_FALSE(runner.native_runs_outstanding());
+}
+
+TEST_F(NativeAdmissionTest, FrameworkTransferRefusesHostInputAtItsRuntimeBoundary) {
+    FrameworkCompletionRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 10102);
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    if (std::string_view(SIMPLER_RUNTIME_NAME) == "tensormap_and_ringbuffer") {
+        EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_UNSUPPORTED);
+        EXPECT_TRUE(attempt.consume_release());
+        EXPECT_TRUE(attempt.empty());
+        EXPECT_FALSE(runner.native_runs_outstanding());
+        return;
+    }
+
+    const auto host_control = attempt.args.tensor(0);
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.add_tensor(host_control);
+    runner.add_host_control_signature();
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_poll_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    const auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    ASSERT_TRUE(state->physical_complete);
+    ASSERT_TRUE(state->execution_retired);
+    ASSERT_TRUE(state->copyback_returned);
+    ASSERT_TRUE(state->bindings_released);
+    ASSERT_FALSE(state->result_observed);
+    ASSERT_EQ(state->completion_rc, 0);
+    control().observed_streams.clear();
+
+    EXPECT_EQ(simpler_transfer_completed_kernel_run(&runner, attempt.storage), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_FALSE(attempt.empty());
+    EXPECT_TRUE(runner.native_runs_outstanding());
+    EXPECT_FALSE(runner.fresh_callable_addition_allowed());
+    int all = 0;
+    EXPECT_EQ(simpler_observe_framework_submissions(&runner, &all), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(all, 1);
+    EXPECT_TRUE(control().observed_streams.empty());
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_FALSE(runner.native_runs_outstanding());
+}
+
+TEST_F(NativeAdmissionTest, FrameworkBindingDebtDeduplicatesAndDoesNotHideAnotherRunOwner) {
+    FrameworkCompletionRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    for (uint64_t epoch = 10110; epoch != 10114; ++epoch) {
+        Attempt attempt(runner, 0, epoch);
+        attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+        attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+        ASSERT_EQ(attempt.prepare(), 0);
+        int caller;
+        ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+        ASSERT_EQ(simpler_poll_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+        ASSERT_EQ(simpler_transfer_completed_kernel_run(&runner, attempt.storage), 0);
+        EXPECT_TRUE(runner.fresh_callable_addition_allowed());
+    }
+    Attempt live(runner, 1, 10120);
+    live.args.tensor(0).address_space = AddressSpace::DEVICE;
+    live.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(live.prepare(), 0);
+    EXPECT_FALSE(runner.fresh_callable_addition_allowed());
+    ASSERT_EQ(simpler_finalize_run(&runner, live.storage), 0);
+    EXPECT_TRUE(runner.fresh_callable_addition_allowed());
+    control().observed_streams.clear();
+    int all = 0;
+    EXPECT_EQ(simpler_observe_framework_submissions(&runner, &all), 0);
+    EXPECT_EQ(all, 1);
+    EXPECT_EQ(control().observed_streams.size(), 2u);
+    EXPECT_FALSE(runner.native_runs_outstanding());
+}
+
 TEST_F(NativeAdmissionTest, EntryCacheQualificationRequiresObservedSuccessAndCurrentPublication) {
     class CacheRunner : public Runner {
     public:

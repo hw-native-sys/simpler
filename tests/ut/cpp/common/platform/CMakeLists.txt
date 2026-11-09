@@ -985,6 +985,16 @@ tmr_case(test_native_admission.cpp
     DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
 
+add_library(native_observation_orch MODULE
+    ${CMAKE_SOURCE_DIR}/support/native_admission/framework_observation_orch.cpp)
+foreach(_arch IN ITEMS a2a3 a5)
+    foreach(_rt IN ITEMS tmr hbg)
+        target_compile_definitions(test_${_arch}_${_rt}_native_admission PRIVATE
+            NATIVE_OBSERVATION_ORCH_PATH="$<TARGET_FILE:native_observation_orch>")
+        add_dependencies(test_${_arch}_${_rt}_native_admission native_observation_orch)
+    endforeach()
+endforeach()
+
 # Native capture lifetime cases drive the real PMU lease through exported fake driver symbols.
 foreach(_arch IN ITEMS a2a3 a5)
     foreach(_rt IN ITEMS tmr hbg)
