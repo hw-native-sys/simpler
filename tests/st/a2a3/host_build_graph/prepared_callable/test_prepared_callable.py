@@ -122,6 +122,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         rounds=1,
         skip_golden=False,
         enable_chip_swimlane=False,
+        enable_l0_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,

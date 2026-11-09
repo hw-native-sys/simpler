@@ -12,11 +12,13 @@
 #include "aicpu/abort_aicore_startup.h"
 #include "aicpu_loader/finalize_args.h"
 #include "common/memory_barrier.h"
+#include <atomic>
 
 #include <driver/ascend_hal_base.h>
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
+#include "common/l0_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_entry_args.h"
 #include "aicpu/aicpu_device_config.h"
@@ -75,6 +77,9 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_query_topolo
  * @return 0 on success, non-zero on error
  */
 static void bind_platform_task(KernelArgs *k_args) {
+    const bool l0_flag = SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_L0_SWIMLANE);
+    const bool l0_run = l0_flag && simpler::dfx::l0::l0_live_capture_matches(k_args->run_result_epoch);
+    simpler::dfx::l0::l0_live_capture_set_armed(l0_run);
     // Per-device invariants (log config, orch device id) were latched once by
     // simpler_aicpu_init at worker init. Profiling enable bits live on
     // KernelArgs::enable_profiling_flag now (no longer mirrored into

@@ -628,6 +628,7 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    int l0_sampler_thread_count() const { return 1; }
     Handshake *get_workers() { return dev.workers; }
     const Handshake *get_workers() const { return dev.workers; }
 

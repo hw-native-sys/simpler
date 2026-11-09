@@ -1631,6 +1631,7 @@ public:
             join(other.join),
             physical_complete(other.physical_complete),
             retirement_diagnostics_rc(other.retirement_diagnostics_rc),
+            retirement_device_rc(other.retirement_device_rc),
             scheduler_runtime_mode(other.scheduler_runtime_mode) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
@@ -1695,6 +1696,9 @@ public:
         NativeRunJoin join{};
         bool physical_complete{false};
         int retirement_diagnostics_rc{0};
+        // Sticky device failure discovered during retirement, after the run
+        // boundary completed. Later poll/wait calls must preserve this result.
+        int retirement_device_rc{0};
         uint32_t scheduler_runtime_mode{0};
     };
 
@@ -1925,6 +1929,9 @@ public:
      * `InitArgs` carries no such field needs — the base fills the common ones.
      */
     virtual void fill_init_arch_fields(InitArgs & /*init_args*/) {}
+
+    /** Append architecture-owned AICPU control entries to the loader set. */
+    virtual void append_arch_aicpu_symbols(std::vector<std::string> & /*symbols*/) const {}
 
     /**
      * Cross-run retention for the DepGen collector, which lives on the arch
@@ -2449,7 +2456,7 @@ protected:
      * still submitted nothing and can roll back.
      */
     int arm_run_fence(const PreparedExecution &prepared);
-    int queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink);
+    int queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink, std::function<int()> after_publish = {});
     int queue_caller_exit(const PreparedExecution &prepared);
     RunStreams borrowed_run_streams() const;
 

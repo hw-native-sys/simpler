@@ -3231,6 +3231,7 @@ class TestMailboxConfigRoundtrip:
         cfg = CallConfig()
         cfg.aicpu_thread_num = 2
         cfg.enable_chip_swimlane = 3
+        cfg.enable_l0_swimlane = True
         cfg.enable_dump_args = 2
         cfg.enable_pmu = 5
         cfg.enable_dep_gen = True
@@ -3246,6 +3247,7 @@ class TestMailboxConfigRoundtrip:
             _OFF_CONFIG,
             cfg.aicpu_thread_num,
             cfg.enable_chip_swimlane,
+            int(cfg.enable_l0_swimlane),
             int(cfg.enable_dump_args),
             cfg.enable_pmu,
             int(cfg.enable_dep_gen),
@@ -3259,6 +3261,7 @@ class TestMailboxConfigRoundtrip:
         decoded = _read_config_from_mailbox(memoryview(buf))
         assert decoded.aicpu_thread_num == 2
         assert decoded.enable_chip_swimlane == 3
+        assert decoded.enable_l0_swimlane is True
         assert decoded.enable_dump_args == 2
         assert decoded.enable_pmu == 5
         assert decoded.enable_dep_gen is True
@@ -3311,6 +3314,7 @@ class TestMailboxConfigRoundtrip:
                 _OFF_CONFIG,
                 cfg.aicpu_thread_num,
                 cfg.enable_chip_swimlane,
+                int(cfg.enable_l0_swimlane),
                 int(cfg.enable_dump_args),
                 cfg.enable_pmu,
                 int(cfg.enable_dep_gen),

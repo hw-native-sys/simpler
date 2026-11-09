@@ -600,6 +600,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     diagnostics = effective_diagnostic_options(
         rounds,
         chip_swimlane=enable_chip_swimlane,
+        l0_swimlane=False,
         dump_args=dump_args,
         pmu=enable_pmu,
         dep_gen=enable_dep_gen,

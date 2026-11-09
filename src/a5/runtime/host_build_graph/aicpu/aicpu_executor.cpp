@@ -30,6 +30,7 @@
 #include "aicpu/device_run_result_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/device_time.h"
+#include "common/l0_profiling.h"
 #include "host_build_graph/runtime_status.h"
 #include "task_image_status.h"
 #include "runtime.h"
@@ -613,6 +614,7 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
                 run_control->expected_task_count - run_control->inline_completed_count;
             uint32_t error_poll_count = 0;
             uint64_t last_progress_cycles = ready_watchdog_.last_progress();
+            uint64_t last_l0_checkpoint_cycles = get_sys_cnt_aicpu();
             uint64_t last_resolved_task_count = run_control->resolved_task_count;
             bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
             const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
@@ -626,12 +628,16 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
                     const uint64_t copy_progress = ready_watchdog_.last_progress();
                     if (copy_progress > last_progress_cycles) last_progress_cycles = copy_progress;
                 }
-                if (resolved_task_count != last_resolved_task_count || bootstrap_complete != bootstrap_was_complete) {
+                const bool resolved_any = resolved_task_count != last_resolved_task_count;
+                if (resolved_any || bootstrap_complete != bootstrap_was_complete) {
                     last_resolved_task_count = resolved_task_count;
                     bootstrap_was_complete = bootstrap_complete;
                     last_progress_cycles = now;
                     ready_watchdog_.record_progress(now);
                 }
+                simpler::dfx::l0::tick_checkpoint(0, last_l0_checkpoint_cycles, resolved_any, [] {
+                    return get_sys_cnt_aicpu();
+                });
                 if (bootstrap_complete && tasks_resolved) {
                     break;
                 }
@@ -754,6 +760,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // the run owed. A partition that could not retire its cores returns
         // that failure and still arrives here.
         const bool cores_retired = aicore_lifecycle_.cores_retired();
+        if (cores_retired) simpler_aicpu_l0_snapshot(0, nullptr, 0);
         (void)aicore_lifecycle_.settle_run_diagnostics(
             runtime,
             run_status_.load(std::memory_order_acquire) == 0 && !shutdown_wait_timed_out && args_dump_services_stopped()

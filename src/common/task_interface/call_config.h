@@ -13,10 +13,10 @@
  * CallConfig — per-NEXT_LEVEL-task config. Carries the execution knob
  * (`aicpu_thread_num`), per-task runtime-environment overrides
  * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a per-ring array) plus the five parallel
- * diagnostics sub-features under the profiling umbrella: `enable_chip_swimlane` (swimlane), `enable_dump_args`,
- * `enable_pmu`, `enable_dep_gen`, and `enable_scope_stats`. All five require `output_prefix` because they each write
- * sibling artifacts into that directory
- * (`chip_swimlane_records.json` / `args_dump/` / `pmu.csv` / `deps.json` /
+ * diagnostics sub-features under the profiling umbrella: `enable_chip_swimlane` (swimlane), `enable_l0_swimlane`
+ * (L0 hardware sampler), `enable_dump_args`, `enable_pmu`, `enable_dep_gen`, and `enable_scope_stats`. All six require
+ * `output_prefix` because they each write sibling artifacts into that directory
+ * (`chip_swimlane_records.json` / `l0_dfx_capture/` / `args_dump/` / `pmu.csv` / `deps.json` /
  * `scope_stats/scope_stats.jsonl`).
  *
  * There is no block_dim knob: a run always takes the whole device. Onboard that
@@ -113,6 +113,8 @@ struct CallConfig {
     // Explicit normal-run values must be at least 2.
     int32_t aicpu_thread_num = 0;
     int32_t enable_chip_swimlane = 0;
+    int32_t enable_l0_swimlane =
+        0;  // 0 = disabled; 1 = arm the L0 hardware sampler (writes <output_prefix>/l0_dfx_capture/)
     int32_t enable_dump_args = 0;
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
     int32_t enable_dep_gen = 0;
@@ -121,8 +123,8 @@ struct CallConfig {
     char output_prefix[1024] = {};
 
     bool diagnostics_any() const noexcept {
-        return enable_chip_swimlane != 0 || enable_dump_args != 0 || enable_pmu != 0 || enable_dep_gen != 0 ||
-               enable_scope_stats != 0;
+        return enable_chip_swimlane != 0 || enable_l0_swimlane != 0 || enable_dump_args != 0 || enable_pmu != 0 ||
+               enable_dep_gen != 0 || enable_scope_stats != 0;
     }
 
     bool output_prefix_set() const noexcept { return output_prefix[0] != '\0'; }
@@ -135,7 +137,7 @@ struct CallConfig {
         if (diagnostics_any() && !output_prefix_set()) {
             throw std::invalid_argument(
                 "CallConfig: output_prefix must be set whenever any of "
-                "enable_chip_swimlane / enable_dump_args / enable_pmu / enable_dep_gen / "
+                "enable_chip_swimlane / enable_l0_swimlane / enable_dump_args / enable_pmu / enable_dep_gen / "
                 "enable_scope_stats is enabled"
             );
         }
@@ -145,6 +147,6 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
     "CallConfig wire layout drift"
 );

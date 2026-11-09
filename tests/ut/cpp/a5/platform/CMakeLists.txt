@@ -54,6 +54,17 @@ a5_platform_case(test_aicore_retirement.cpp
     INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu)
 set_tests_properties(test_a5_aicore_retirement PROPERTIES TIMEOUT 20)
 
+a5_platform_case(test_l0_trace_decoder.cpp)
+a5_platform_case(test_l0_aicpu_lifecycle.cpp
+    SOURCES ${SIMPLER_SRC}/a5/platform/shared/aicpu/l0_collector_aicpu.cpp)
+a5_platform_case(test_l0_capture_collector.cpp
+    SOURCES
+        ${SIMPLER_SRC}/a5/platform/shared/host/l0_capture_collector.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/host/l0_trace_records.cpp
+        ${SIMPLER_SRC}/a5/platform/sim/host/profiling_copy.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${HOST_LOG_TEST_SOURCES})
+
 # The AICore half of the return gate: it compiles the real a5sim
 # aicore/inner_kernel.h (so the sim include directory is on the path) and the
 # same production platform_regs.cpp retire path as the case above, which is what

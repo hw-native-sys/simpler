@@ -3621,6 +3621,15 @@ NB_MODULE(_task_interface, m) {
                 }
             }
         )
+        .def_prop_rw(
+            "enable_l0_swimlane",
+            [](const CallConfig &c) {
+                return static_cast<bool>(c.enable_l0_swimlane);
+            },
+            [](CallConfig &c, bool v) {
+                c.enable_l0_swimlane = v ? 1 : 0;
+            }
+        )
         // Accepts the mode's name ("off" / "partial" / "hybrid" / "full"), a
         // Python bool (`True` == "partial", the mode a bare `--dump-args`
         // selects), or the raw int. Reads back as the int, which is what the
@@ -3707,6 +3716,7 @@ NB_MODULE(_task_interface, m) {
             std::ostringstream os;
             os << "CallConfig(aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_chip_swimlane=" << self.enable_chip_swimlane
+               << ", enable_l0_swimlane=" << (self.enable_l0_swimlane ? "True" : "False")
                << ", enable_dump_args=" << self.enable_dump_args << ", enable_pmu=" << self.enable_pmu
                << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");

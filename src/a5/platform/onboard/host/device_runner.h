@@ -57,6 +57,8 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "runtime.h"
 #include "aicpu_topology_probe.h"
+#include "host/l0_capture_session.h"
+#include "host/l0_capture_collector.h"
 
 // KernelArgsHelper is defined in
 // src/common/platform/onboard/host/device_runner_helpers.h (included above).
@@ -119,7 +121,12 @@ public:
      * the boundary events such an edge would name are exactly the resources a
      * poisoned runner has quarantined rather than proved retired.
      */
-    bool ready_to_join_launch() const override { return !device_unusable_.load(std::memory_order_acquire); }
+    bool ready_to_join_launch() const override {
+        // The L0 register table has one GM destination per card, so a successor
+        // may not reconfigure it while this run's L0 capture is still producing.
+        // Runs that do not arm L0 keep the ordinary joined-launch path.
+        return !device_unusable_.load(std::memory_order_acquire) && !l0_capture_session_.active();
+    }
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
@@ -151,6 +158,7 @@ public:
      * field. The table is allocated on `mem_alloc_`.
      */
     int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
+    void append_arch_aicpu_symbols(std::vector<std::string> &symbols) const override;
 
     // `upload_chip_callable_buffer`, `register_callable`,
     // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
@@ -199,6 +207,8 @@ private:
     int prepare_kernel_arch_context(rtStream_t control_stream) override;
     int release_arch_context_resources(bool abandon_device_resources) override;
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+    int init_l0_capture_collector(PreparedExecution &prepared);
+    int collect_l0_terminal(PreparedExecution &prepared);
 
     int finalize_impl() override;
 
@@ -220,6 +230,8 @@ private:
     // dep_gen collector — captures orchestrator submit_task inputs for
     // offline replay. a5-specific (the base keeps dep_gen as a virtual hook).
     DepGenCollector dep_gen_collector_;
+    L0CaptureSession l0_capture_session_;
+    L0CaptureCollector l0_capture_collector_;
 
     // `query_max_block_dim`, `validate_block_dim`, `ensure_aicpu_runtime_registered`,
     // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited

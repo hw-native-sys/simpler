@@ -166,6 +166,7 @@ def test_standalone_driver_keeps_one_device_fixture_across_rounds(
         "effective_diagnostic_options",
         lambda *args, **kwargs: SimpleNamespace(
             chip_swimlane=0,
+            l0_swimlane=False,
             dump_args=0,
             pmu=0,
             dep_gen=False,

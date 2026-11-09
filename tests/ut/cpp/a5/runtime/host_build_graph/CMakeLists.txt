@@ -132,6 +132,7 @@ a5_hbg_case(test_hbg_retirement_wiring.cpp
         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/l0_collector_aicpu.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS ${_retirement_gc_link_option})
 
@@ -182,6 +183,7 @@ a5_hbg_case(test_hbg_resident_entry_result.cpp TIMEOUT 30
         ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/platform_aicpu_affinity.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/l0_collector_aicpu.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS ${_gc_link_option})
 

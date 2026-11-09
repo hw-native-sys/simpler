@@ -25,6 +25,7 @@
 #include "aicpu/args_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/l0_profiling.h"
 #include "common/platform_config.h"
 #include "runtime_core.h"
 #include "shared_memory.h"
@@ -915,6 +916,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
             }
             __builtin_prefetch(&core_exec_states_[i], 1, 3);
             ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            simpler::dfx::l0::l0_live_capture_note_core_type(physical_core_id, hank->core_type == CoreType::AIC);
             core_serviced[i] = true;
             remaining--;
         }
@@ -1023,6 +1025,7 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
             }
             __builtin_prefetch(&core_exec_states_[i], 1, 3);
             ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            simpler::dfx::l0::l0_live_capture_note_core_type(physical_core_id, hank->core_type == CoreType::AIC);
             core_serviced[i] = true;
             remaining--;
         }
