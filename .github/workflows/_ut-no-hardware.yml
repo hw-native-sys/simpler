@@ -117,15 +117,16 @@ jobs:
           fi
           # Real entry tests may skip in a standalone C++ build, but not in CI.
           test -f build/lib/libcpu_sim_context.so
-          # discover_runtimes is the one definition of what a runtime is — a
-          # directory under src/<arch>/runtime with a build_config.py — so a new
-          # one is asserted here without editing this list into existence. An
-          # empty result would make the loop body run zero times and the step
-          # pass having asserted nothing, which `set -e` does not catch in a
-          # `for` list, so it is rejected before the loop.
+          # default_build_runtimes is what a build that names no runtime leaves
+          # behind: discovery alone would include one that opted out of the
+          # default set, whose artifact is correctly absent here. A new runtime
+          # is still asserted without editing a list into existence. An empty
+          # result would make the loop body run zero times and the step pass
+          # having asserted nothing, which `set -e` does not catch in a `for`
+          # list, so it is rejected before the loop.
           for arch in a2a3 a5; do
             runtimes=$(python -c \
-                "from simpler_setup.platform_info import discover_runtimes; print(' '.join(discover_runtimes('$arch')))")
+                "from simpler_setup.platform_info import default_build_runtimes; print(' '.join(default_build_runtimes('$arch')))")
             test -n "$runtimes"
             for runtime in $runtimes; do
               test -f "build/lib/$arch/sim/$runtime/libhost_runtime.so"

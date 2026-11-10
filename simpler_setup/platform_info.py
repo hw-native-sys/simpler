@@ -82,6 +82,18 @@ def runtime_builds_by_default(arch: str, runtime: str) -> bool:
     return bool(getattr(module, "BUILD_BY_DEFAULT", True))
 
 
+def default_build_runtimes(arch: str) -> list[str]:
+    """The runtimes a build that names none produces for this arch.
+
+    Discovery says what a runtime is; this says which of them an unqualified
+    build leaves behind. The two were the same list until a runtime opted out,
+    so anything that reads one while meaning the other -- a check that every
+    discovered runtime has a built artifact, say -- breaks on the first one
+    that does. One definition, so such a check has something to call.
+    """
+    return [name for name in discover_runtimes(arch) if runtime_builds_by_default(arch, name)]
+
+
 def load_build_config(config_path: Path) -> dict:
     """Load BUILD_CONFIG dict from a build_config.py file."""
     spec = importlib.util.spec_from_file_location("build_config", config_path)
