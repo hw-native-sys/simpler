@@ -54,7 +54,7 @@ jobs:
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          required-packages: libgtest-dev g++-aarch64-linux-gnu
+          required-packages: libgtest-dev g++-aarch64-linux-gnu libssl-dev
           # ccache only makes the C++ build faster, and the build step below
           # reads whether it arrived rather than assuming it, so a package
           # manager that cannot serve it costs minutes and fails nothing.
@@ -64,7 +64,7 @@ jobs:
       - name: Install GoogleTest on macOS
         if: inputs.setup_variant == 'github' && runner.os != 'Linux'
         run: |
-          brew install googletest
+          brew install googletest openssl@3
           command -v ccache >/dev/null 2>&1 || brew install ccache ||
             echo "::warning::brew could not install ccache; the C++ build will compile from scratch"
 

@@ -10,6 +10,8 @@
 
 import logging
 
+import pytest
+
 from simpler_setup.toolchain import Toolchain
 
 
@@ -91,3 +93,28 @@ def test_instance_cache_is_scoped_by_sanitizer_configuration(monkeypatch):
     assert plain is not sanitized
     assert plain.host_target.toolchain.cxx_path == "g++"
     assert sanitized.host_target.toolchain.cxx_path == "g++-15"
+
+
+@pytest.mark.parametrize("has_trigger", [True, False])
+def test_a5_host_output_requires_and_stages_ccu_trigger(tmp_path, monkeypatch, has_trigger):
+    from simpler_setup import runtime_compiler  # noqa: PLC0415
+
+    compiler = runtime_compiler.RuntimeCompiler.__new__(runtime_compiler.RuntimeCompiler)
+    compiler.platform = "a5"
+    compiler._sanitizers = ""
+    compiler.host_target = runtime_compiler.BuildTarget(_StubToolchain(is_host=True), str(tmp_path), "libhost.so")
+    build_dir = tmp_path / "cache" / "host"
+    build_dir.mkdir(parents=True)
+    binary = build_dir / "libhost.so"
+    binary.write_bytes(b"host fixture")
+    if has_trigger:
+        (build_dir / "ccu_trigger.o").write_bytes(b"AIV fixture")
+    (tmp_path / "aicpu_cpu_topo_fallback.json").write_text("{}")
+    monkeypatch.setattr(compiler, "_run_compilation", lambda *args, **kwargs: binary)
+    output = tmp_path / "output"
+    if has_trigger:
+        assert compiler.compile("host", [], [], build_dir=tmp_path / "cache", output_dir=output) == output / binary.name
+        assert (output / "ccu_trigger.o").read_bytes() == b"AIV fixture"
+    else:
+        with pytest.raises(FileNotFoundError, match="Required CCU trigger binary"):
+            compiler.compile("host", [], [], build_dir=tmp_path / "cache", output_dir=output)
