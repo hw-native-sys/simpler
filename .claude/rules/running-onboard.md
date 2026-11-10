@@ -200,33 +200,6 @@ task-submit --device auto --device-num 1 --run "python ... -d \$TASK_DEVICE"
 Then read it directly (`$LOGDIR/device-*/device-*.log`) — no more `grep`-ing
 `~/ascend/log/debug/` and guessing which file is yours.
 
-### Never time a run with `--log-level info`
-
-`ASCEND_PROCESS_LOG_PATH` only moves the file and costs nothing. The **log
-level** is a different knob and is not free: `--log-level info` raises the
-device side too, and an AICPU `device_log` write serializes on the single AICPU
-op ([`codestyle.md`](codestyle.md) §7). The cost lands inside `device_wall`,
-where it looks exactly like the thing you are measuring.
-
-Measured on a5, `multi_core_dag` `mixed_fanin32_1024`, 20 warm rounds, one
-device each:
-
-| run | device_wall median |
-| --- | ------------------ |
-| default level | 271 µs |
-| `ASCEND_PROCESS_LOG_PATH` set | 270 µs |
-| `--log-level info` | **711 µs** |
-
-So a small graph can read **2.6× slow** purely from the level, and the error is
-self-concealing: the inflation is roughly a fixed per-op cost, so it hides on a
-multi-millisecond workload and only disfigures the small cases — which reads as
-"the scheduler regressed on short graphs".
-
-The habit that avoids it: **prove what ran and time it in separate runs.** Turn
-`--log-level info` on once to read the selection/fallback lines, then turn it
-off for every number you intend to quote. The default level still emits the
-`[STRACE]` spans, so a timing run loses nothing.
-
 ## `507018` triage: classify the mechanism before concluding
 
 `507018` (and `507014` / `507899`) is a **generic host-side code** —
@@ -286,9 +259,6 @@ directly.
 - ❌ Fishing your run's device log out of the shared `~/ascend/log/debug/`
   by pid/timestamp guesswork. Set `ASCEND_PROCESS_LOG_PATH` to a per-run
   dir up front (see "Device logs" above) so the log is isolated and known.
-- ❌ Quoting a `device_wall` from a run that had `--log-level info` on, or
-  comparing one against a number measured without it. The level inflates small
-  graphs by more than 2× (see "Never time a run with `--log-level info`").
 
 ## Quick reference
 
