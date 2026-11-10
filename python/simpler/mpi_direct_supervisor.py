@@ -22,9 +22,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from itertools import groupby
 from typing import Any
 
+from .mpi_direct_bootstrap import encode_startup, send_startup
 from .mpi_direct_cleanup import (
     MpiDirectCleanupLedger,
     MpiDirectCleanupReport,
@@ -189,14 +191,70 @@ def _build_command(  # noqa: PLR0913 -- launcher construction mirrors the comple
     ]
 
 
-def _startup_gate(
+def _drain_failed_startup(
     topology: MpiDirectTopology,
     token: str,
     listener: socket.socket,
     proc: subprocess.Popen[Any],
+    peers: dict[int, socket.socket],
+    failure: _StartupGateRankFailure,
+) -> None:
+    deadline = time.monotonic() + topology.session_timeout_s
+
+    def reject(peer: socket.socket) -> None:
+        remaining = max(0.001, deadline - time.monotonic())
+        with contextlib.suppress(OSError):
+            peer.settimeout(remaining)
+            _gate_send(
+                peer, {"token": token, "state": "failed", "error": str(failure)[:4096], "cleanup_timeout_s": remaining}
+            )
+
+    for peer in peers.values():
+        reject(peer)
+    while len(peers) < topology.world_size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or proc.poll() is not None:
+            return
+        listener.settimeout(min(0.25, remaining))
+        try:
+            peer, _address = listener.accept()
+        except socket.timeout:
+            continue
+        try:
+            message = _gate_recv(peer, min(deadline, time.monotonic() + 5.0))
+            rank = message.get("rank")
+            if message.get("token") == token and type(rank) is int and 0 <= rank < topology.world_size:
+                if rank not in peers and message.get("state") in ("ready", "failed"):
+                    peers[rank] = peer
+                reject(peer)
+        except (OSError, ValueError):
+            pass
+        finally:
+            if peer not in peers.values():
+                peer.close()
+
+    acknowledged = 0
+    for peer in peers.values():
+        with contextlib.suppress(OSError, ValueError):
+            message = _gate_recv(peer, deadline)
+            if message.get("token") == token and message.get("state") == "cleaned":
+                acknowledged += 1
+    if acknowledged < len(peers):
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+
+def _startup_gate(  # noqa: PLR0912 -- one owner validates bootstrap, readiness and rank failure messages
+    topology: MpiDirectTopology,
+    token: str,
+    listener: socket.socket,
+    proc: subprocess.Popen[Any],
+    startup_payloads: Mapping[int, bytes] | None = None,
 ) -> None:
     deadline = time.monotonic() + topology.startup_timeout_s
     peers: dict[int, socket.socket] = {}
+    bootstrapped: set[int] = set()
+    failure = None
     try:
         while len(peers) < topology.world_size:
             if proc.poll() is not None:
@@ -220,10 +278,20 @@ def _startup_gate(
                     raise _StartupGateRankFailure("invalid MPI startup rank") from exc
                 if rank < 0 or rank >= topology.world_size or rank in peers:
                     raise _StartupGateRankFailure(f"invalid or duplicate MPI startup rank {rank}")
+                if message.get("state") == "bootstrap":
+                    if startup_payloads is None or rank in bootstrapped:
+                        raise _StartupGateRankFailure(f"unexpected bootstrap request from rank {rank}")
+                    _gate_send(peer, {"token": token, "state": "bootstrap", "timeout_s": deadline - time.monotonic()})
+                    send_startup(peer, startup_payloads.get(rank, encode_startup({})), deadline)
+                    bootstrapped.add(rank)
+                    peer.close()
+                    continue
                 if message.get("state") == "failed":
-                    raise _StartupGateRankFailure(
+                    peers[rank] = peer
+                    failure = _StartupGateRankFailure(
                         f"rank {rank} failed before MPI initialization: {message.get('error', '')}"
                     )
+                    break
                 if message.get("state") != "ready":
                     raise _StartupGateRankFailure(f"rank {rank} sent invalid startup state")
                 peers[rank] = peer
@@ -235,8 +303,17 @@ def _startup_gate(
                 with contextlib.suppress(OSError):
                     peer.close()
                 continue
+        if failure is not None:
+            _drain_failed_startup(topology, token, listener, proc, peers, failure)
+            raise failure
         for rank in sorted(peers):
             _gate_send(peers[rank], {"token": token, "state": "go_mpi"})
+    except BaseException as exc:
+        if failure is None:
+            for peer in peers.values():
+                with contextlib.suppress(OSError):
+                    _gate_send(peer, {"token": token, "state": "failed", "error": str(exc)[:4096]})
+        raise
     finally:
         for peer in peers.values():
             with contextlib.suppress(OSError):
@@ -285,8 +362,21 @@ def run_supervisor(
     launcher_family: str = "auto",
     python_executable: str | None = None,
     cleanup_reports: dict[int, MpiDirectCleanupReport] | None = None,
+    startup_by_rank: Mapping[int, dict] | None = None,
 ) -> int:
+    """Own a static MPI job and optionally bootstrap each rank before MPI init.
+
+    Records may contain startup_artifacts (path-free byte descriptions),
+    inner_l3_worker and remote_task_dispatcher registry entries, a startup_hook
+    manifest, and controller parameters. Each encoded record is limited to
+    256 MiB and travels over the authenticated startup socket, never argv.
+    """
     topology = MpiDirectTopology.load(topology_path)
+    startup_payloads = None
+    if startup_by_rank is not None:
+        if any(type(rank) is not int or not 0 <= rank < topology.world_size for rank in startup_by_rank):
+            raise ValueError("startup_by_rank contains a rank outside the static topology")
+        startup_payloads = {rank: encode_startup(record) for rank, record in startup_by_rank.items()}
     if launcher_family == "auto":
         launcher_family = _detect_launcher_family(mpirun_path)
     mpi4py_family, mpi4py_vendor = _detect_mpi4py_family(python_executable)
@@ -303,6 +393,7 @@ def run_supervisor(
     try:
         with _job_termination_handlers(), _CleanupReceiver(topology.controller_host, gate_token, ledger) as receiver:
             manifest = topology.runtime_manifest(session_id)
+            manifest["bootstrap"] = startup_payloads is not None
             manifest["cleanup_report"] = {"job_id": job_id, "port": receiver.port}
             manifest_json = base64.urlsafe_b64encode(
                 json.dumps(manifest, separators=(",", ":")).encode("utf-8")
@@ -328,7 +419,7 @@ def run_supervisor(
                     proc = subprocess.Popen(
                         command, start_new_session=True, env={**os.environ, MPI_DIRECT_STARTUP_TOKEN_ENV: gate_token}
                     )
-                    _startup_gate(topology, gate_token, listener, proc)
+                    _startup_gate(topology, gate_token, listener, proc, startup_payloads)
                     return int(proc.wait())
             except BaseException:
                 with contextlib.suppress(OSError):
