@@ -355,6 +355,111 @@ TEST(HbgAdmission, PrepareDoesNotPublishTailOrLogAndCommitTransfersPendingOwners
     );
 }
 
+TEST(HbgAdmission, IndependentSmallSpmdTasksCanOwnDisjointCoreSets) {
+    AdmissionFixture fixture({{2, LaneMask::aic()}, {2, LaneMask::aic()}, {2, LaneMask::aic()}}, 18);
+    for (uint64_t task = 0; task < 3; ++task) {
+        ASSERT_TRUE(fixture.publish(task));
+        ASSERT_EQ(fixture.record(task)->member_count, 2u);
+    }
+    EXPECT_EQ(fixture.members(0)[0] & fixture.members(1)[0], 0u);
+    EXPECT_EQ(fixture.members(1)[0] & fixture.members(2)[0], 0u);
+    EXPECT_EQ(fixture.members(0)[0] & fixture.members(2)[0], 0u);
+    for (uint64_t rank = 0; rank < 6; ++rank) {
+        const uint64_t worker = rank * 3;
+        ASSERT_TRUE(fixture.refresh(worker));
+        EXPECT_EQ(fixture.admissions[worker].current_task_ref, static_cast<int64_t>(rank / 2));
+        EXPECT_EQ(fixture.task_control(rank / 2)->completed_blocks, 0u);
+    }
+}
+
+TEST(HbgAdmission, InterleavedResourceTypesCoverEveryEligibleWorker) {
+    std::vector<AdmissionShape> shapes;
+    for (uint32_t pair = 0; pair < 36; ++pair) {
+        shapes.push_back({2, LaneMask::aic()});
+        shapes.push_back({2, LaneMask::aiv0()});
+    }
+    for (bool permuted : {false, true}) {
+        std::vector<uint64_t> permutation(108);
+        std::iota(permutation.begin(), permutation.end(), UINT64_C(0));
+        if (permuted) std::reverse(permutation.begin(), permutation.end());
+        AdmissionFixture fixture(shapes, 108, 17, permutation);
+        std::vector<uint32_t> participation(108);
+        for (uint64_t task = 0; task < shapes.size(); ++task) {
+            ASSERT_TRUE(fixture.publish(task));
+            ASSERT_EQ(fixture.record(task)->member_count, 2u);
+            for (uint64_t worker = 0; worker < 108; ++worker)
+                participation[worker] += (fixture.members(task)[worker / 64] >> (worker % 64)) & 1u;
+        }
+        for (uint64_t worker = 0; worker < 108; ++worker) {
+            SCOPED_TRACE(worker);
+            const bool cube = fixture.storage.contexts[worker].core_type == static_cast<int32_t>(CoreType::AIC);
+            EXPECT_EQ(participation[worker], cube ? 2u : 1u);
+        }
+    }
+}
+
+TEST(HbgAdmission, VariableSmallGridsBalanceEachResourceTypeAcrossWraparound) {
+    std::vector<AdmissionShape> shapes;
+    for (uint16_t blocks : {2, 3, 4, 3}) {
+        shapes.push_back({blocks, LaneMask::aic()});
+        shapes.push_back({blocks, LaneMask::aiv1()});
+    }
+    AdmissionFixture fixture(shapes, 18);
+    std::vector<uint32_t> participation(18);
+    for (uint64_t task = 0; task < shapes.size(); ++task) {
+        ASSERT_TRUE(fixture.publish(task));
+        ASSERT_EQ(fixture.record(task)->member_count, shapes[task].blocks);
+        for (uint64_t worker = 0; worker < 18; ++worker)
+            participation[worker] += (fixture.members(task)[0] >> worker) & 1u;
+    }
+    for (uint64_t worker = 0; worker < 18; ++worker) {
+        SCOPED_TRACE(worker);
+        EXPECT_EQ(participation[worker], worker % 3 == 0 ? 2u : 1u);
+    }
+}
+
+TEST(HbgAdmission, TypePrefixesExcludeMixAndSyncStartAndResetForEveryRun) {
+    AdmissionFixture fixture(
+        {{2, LaneMask::aic()},
+         {3, LaneMask::aiv0()},
+         {2, LaneMask::all()},
+         {2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START},
+         {3, LaneMask::aic()},
+         {2, LaneMask::aiv1()}},
+        18
+    );
+    const uint64_t expected[] = {0, 0, 0, 0, 2, 3};
+    ASSERT_TRUE(fixture.publish(2));
+    EXPECT_EQ(fixture.record(2)->member_count, 18u);
+    ASSERT_TRUE(fixture.publish(3));
+    EXPECT_EQ(fixture.record(3)->member_count, 6u);
+    for (uint64_t epoch : {17u, 18u}) {
+        ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, epoch));
+        for (uint64_t task = 0; task < 6; ++task)
+            EXPECT_EQ(fixture.record(task)->member_rank_offset, expected[task]);
+    }
+}
+
+TEST(HbgAdmission, SmallVectorCohortCanWrapAcrossBitmapWords) {
+    std::vector<AdmissionShape> shapes(14, AdmissionShape{1, LaneMask::aic()});
+    shapes[0] = {42, LaneMask::aiv0()};
+    shapes.push_back({3, LaneMask::aiv0()});
+    AdmissionFixture fixture(shapes, 66);
+    ASSERT_TRUE(fixture.publish(14));
+    EXPECT_EQ(fixture.record(14)->member_count, 3u);
+    EXPECT_EQ(fixture.members(14)[0], UINT64_C(2));
+    EXPECT_EQ(fixture.members(14)[1], UINT64_C(3));
+    for (uint64_t worker : {1u, 64u, 65u}) {
+        ASSERT_TRUE(fixture.refresh(worker));
+        EXPECT_EQ(fixture.admissions[worker].current_task_ref, 14);
+    }
+    ASSERT_TRUE(fixture.refresh(2));
+    EXPECT_EQ(fixture.admissions[2].current_task_ref, SCHEDULER_TASK_REF_INVALID);
+    bool permit = false;
+    ASSERT_TRUE(fixture.ordinary_permit(2, &permit));
+    EXPECT_TRUE(permit);
+}
+
 TEST(HbgAdmission, ContendedCommitRetainsPreparedCandidateWithoutCreatingALogHole) {
     AdmissionFixture fixture({{3, LaneMask::aic()}, {4, LaneMask::aic()}});
     SchedulerReadyClaim first{};
@@ -574,7 +679,7 @@ TEST_P(HbgAdmissionMembership, FreezesCompactWorkerMembershipFromTopologyNotPhys
     AdmissionFixture fixture({{3, mask}}, 6, 19, {4, 0, 3, 1, 5, 2});
     ASSERT_TRUE(fixture.publish(0));
     const uint64_t expected = mask == LaneMask::aic() ? UINT64_C(0x12) :
-                              mask.count() == 1       ? UINT64_C(0x2d) :
+                              mask.count() == 1       ? UINT64_C(0x0d) :
                               mask == kAicAiv0        ? UINT64_C(0x33) :
                               mask == kAicAiv1        ? UINT64_C(0x1e) :
                                                         UINT64_C(0x3f);
@@ -598,7 +703,7 @@ TEST_P(HbgAdmissionMembership, FreezesCompactWorkerMembershipFromTopologyNotPhys
 INSTANTIATE_TEST_SUITE_P(PureAndMixMasks, HbgAdmissionMembership, ::testing::ValuesIn(kAllMasks));
 
 TEST(HbgAdmission, MembershipAcrossTheSixtyFourthWorkerUsesASecondWord) {
-    AdmissionFixture fixture({{3, LaneMask::aic()}}, 66);
+    AdmissionFixture fixture({{22, LaneMask::aic()}}, 66);
     ASSERT_TRUE(fixture.publish(0));
     uint64_t expected_first = 0;
     for (uint32_t worker = 0; worker < 64; worker += 3)
@@ -617,7 +722,7 @@ TEST(HbgAdmission, MembershipAcrossTheSixtyFourthWorkerUsesASecondWord) {
 }
 
 TEST(HbgAdmission, VectorMembershipSetsWorkerBitsBeyondTheFirstWord) {
-    AdmissionFixture fixture({{3, LaneMask::aiv0()}}, 66);
+    AdmissionFixture fixture({{44, LaneMask::aiv0()}}, 66);
     ASSERT_TRUE(fixture.publish(0));
     EXPECT_EQ(fixture.members(0)[1], UINT64_C(3));
     EXPECT_EQ(fixture.record(0)->member_count, 44u);
@@ -634,7 +739,8 @@ TEST(HbgAdmission, PublishedSecondBitmapWordDistinguishesMembersAndNonmembers) {
     for (LaneMask mask :
          {LaneMask::aic(), LaneMask::aiv0(), kAicAiv0, kAicAiv1, LaneMask::both_aiv(), LaneMask::all()}) {
         SCOPED_TRACE(lane_names(mask));
-        AdmissionFixture fixture({{3, mask}}, 69);
+        const uint16_t blocks = mask.count() > 1 ? 3 : (mask.has_aic() ? 23 : 46);
+        AdmissionFixture fixture({{blocks, mask}}, 69);
         ASSERT_TRUE(fixture.publish(0));
         ASSERT_EQ(fixture.admissions[0].member_word_count, 2u);
         for (uint64_t worker : {63u, 64u, 65u, 66u, 67u, 68u}) {
@@ -647,7 +753,7 @@ TEST(HbgAdmission, PublishedSecondBitmapWordDistinguishesMembersAndNonmembers) {
             EXPECT_EQ(admission.current_task_ref, member ? 0 : SCHEDULER_TASK_REF_INVALID);
             EXPECT_EQ(admission.scan_cursor, member ? 0u : 1u);
             if (member) {
-                EXPECT_EQ(admission.current_block_num, 3u);
+                EXPECT_EQ(admission.current_block_num, blocks);
                 EXPECT_EQ(admission.current_active_mask, mask);
             }
             bool permit = true;
@@ -664,7 +770,7 @@ TEST(HbgAdmission, CorruptSecondBitmapWordIsRejectedByMembersAndNonmembersWithCo
             SCOPED_TRACE(worker);
             for (uint32_t corruption = 0; corruption < 3; ++corruption) {
                 SCOPED_TRACE(corruption);
-                AdmissionFixture fixture({{3, LaneMask::aic()}}, 69);
+                AdmissionFixture fixture({{23, LaneMask::aic()}}, 69);
                 ASSERT_TRUE(fixture.publish(0));
                 ASSERT_EQ(fixture.members(0)[1], UINT64_C(4));
                 if (warm_topology) {
@@ -906,10 +1012,15 @@ TEST(HbgAdmission, OrdinaryMultiBlockPreparationDoesNotRequireAllBlocksToFitAtOn
 
 TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
     constexpr uint64_t workers = 3 * (SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD + 1);
-    constexpr uint64_t first = 1;
+    constexpr uint64_t task = 2;
+    constexpr uint64_t rank = SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1;
+    constexpr uint64_t first = rank / 2 * 3 + 1 + rank % 2;
     for (bool cross_shard : {false, true}) {
         SCOPED_TRACE(cross_shard);
-        AdmissionFixture fixture({{3, LaneMask::aiv0()}}, workers, 17, {}, true);
+        AdmissionFixture fixture(
+            {{static_cast<uint16_t>(rank), LaneMask::aiv0()}, {1, LaneMask::aic()}, {3, LaneMask::aiv0()}}, workers, 17,
+            {}, true
+        );
         uint64_t remote = workers;
         for (uint64_t worker = 0; worker < workers; ++worker) {
             const auto &context = fixture.storage.contexts[worker];
@@ -920,18 +1031,19 @@ TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
             }
         }
         ASSERT_LT(remote, workers);
-        ASSERT_EQ(fixture.storage.contexts[first].type_rank, 0);
-        ASSERT_TRUE(fixture.publish(0, first));
+        ASSERT_EQ(fixture.storage.contexts[first].type_rank, rank);
+        ASSERT_TRUE(fixture.publish(task, first));
         for (uint64_t worker : {first, remote}) {
             fixture.locals[worker]->admission = &fixture.admissions[worker];
             ASSERT_TRUE(fixture.refresh(worker));
-            ASSERT_EQ(fixture.admissions[worker].current_task_ref, 0);
+            ASSERT_EQ(fixture.admissions[worker].current_task_ref, task);
         }
 
         const std::array<uint64_t, 3> owners{first, cross_shard ? remote : first, first};
         const auto *blocks = scheduler_state_at<SchedulerProtocolBlockTrace>(
-            fixture.base(), fixture.storage.layout.protocol.blocks_offset
-        );
+                                 fixture.base(), fixture.storage.layout.protocol.blocks_offset
+                             ) +
+                             fixture.storage.metadata[task].trace_index_base;
         for (uint32_t expected = 0; expected < owners.size(); ++expected) {
             uint32_t block = UINT32_MAX;
             ASSERT_EQ(
@@ -942,7 +1054,7 @@ TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
             );
             ASSERT_EQ(block, expected);
             EXPECT_EQ(blocks[block].owner.worker_index, owners[expected]);
-            EXPECT_EQ(blocks[block].owner.task_ref, 0);
+            EXPECT_EQ(blocks[block].owner.task_ref, task);
             EXPECT_EQ(blocks[block].owner.block_idx, block);
             EXPECT_EQ(blocks[block].owner.logical_block_num, owners.size());
         }
@@ -956,8 +1068,8 @@ TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
             );
             EXPECT_EQ(block, UINT32_MAX);
         }
-        EXPECT_EQ(fixture.task_control(0)->next_block, owners.size());
-        EXPECT_EQ(fixture.task_control(0)->completed_blocks, 0u);
+        EXPECT_EQ(fixture.task_control(task)->next_block, owners.size());
+        EXPECT_EQ(fixture.task_control(task)->completed_blocks, 0u);
         EXPECT_EQ(fixture.run()->scheduler_error, 0u);
     }
 }
@@ -1210,7 +1322,7 @@ void corrupt_record(AdmissionFixture &fixture, RecordCorruption corruption, bool
 class HbgAdmissionPreparedCorruption : public ::testing::TestWithParam<RecordCorruption> {};
 
 TEST(HbgAdmission, MixCloseSealOffsetMustNameACompleteTaskRowNotAnInteriorCell) {
-    for (uint64_t delta : {UINT64_C(1), UINT64_C(8), UINT64_C(16), UINT64_C(128), UINT64_C(512)}) {
+    for (uint64_t delta : {UINT64_C(1), UINT64_C(8), UINT64_C(16), UINT64_C(64), UINT64_C(512)}) {
         SCOPED_TRACE(delta);
         AdmissionFixture fixture({{1, kAicAiv0}, {1, LaneMask::all()}}, 6);
         SchedulerReadyClaim ready{};
@@ -1361,9 +1473,10 @@ TEST(HbgAdmission, FrozenTopologyCacheIsReusedForDifferentShapesButNotAcrossRuns
         {{2, LaneMask::aic()}, {2, LaneMask::aiv0()}, {2, kAicAiv0}, {2, kAicAiv1}, {2, LaneMask::all()}}
     );
     auto &admission = fixture.admissions[0];
-    const uint64_t expected[] = {0x9, 0x36, 0x1b, 0x2d, 0x3f};
+    const uint64_t expected[] = {0x9, 0x6, 0x1b, 0x2d, 0x3f};
     for (uint64_t task = 0; task < 5; ++task) {
         SchedulerAdmissionRecord record{};
+        record.task_ref = task;
         record.flags = fixture.storage.metadata[task].flags;
         record.active_mask = fixture.storage.metadata[task].active_mask;
         record.logical_block_num = 2;
@@ -1614,7 +1727,7 @@ TEST(HbgAdmission, ConcurrentRealCommitsPublishUniqueCompleteContiguousLogEntrie
         seen[task] = true;
         EXPECT_EQ(fixture.record(task)->order_key, order);
         EXPECT_EQ(fixture.record(task)->run_epoch, 71u);
-        EXPECT_EQ(fixture.record(task)->member_count, thread_count);
+        EXPECT_EQ(fixture.record(task)->member_count, 2u);
         EXPECT_EQ(
             scheduler_gm_query(fixture.task_control(task)->admission_state),
             static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)
@@ -1800,7 +1913,8 @@ TEST(HbgAdmissionProtocol, MemberObservationIsUniqueAndNonMembersProduceNoObliga
     ASSERT_TRUE(fixture.publish(0));
     ASSERT_TRUE(fixture.publish(1));
     ASSERT_TRUE(fixture.refresh(3));
-    ASSERT_TRUE(fixture.refresh(1));
+    ASSERT_TRUE(fixture.refresh(2));
+    ASSERT_TRUE(fixture.refresh(4));
     auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
         fixture.base(), fixture.storage.layout.protocol.members_offset
     );
@@ -1808,11 +1922,12 @@ TEST(HbgAdmissionProtocol, MemberObservationIsUniqueAndNonMembersProduceNoObliga
     EXPECT_EQ(members[3].task_ref, 0);
     EXPECT_EQ(members[3].observed_tail, 2u);
     EXPECT_EQ(members[3].worker_index, 3u);
-    EXPECT_EQ(members[1].observed.sequence, 0u);
-    EXPECT_EQ(members[6 + 1].observed.sequence, 3u);
-    EXPECT_EQ(members[6 + 1].task_ref, 1);
-    EXPECT_EQ(members[6 + 1].order_key, 1u);
-    EXPECT_EQ(members[6 + 1].observed_tail, 2u);
+    EXPECT_EQ(members[2].observed.sequence, 0u);
+    EXPECT_EQ(members[6 + 2].observed.sequence, 1u);
+    EXPECT_EQ(members[6 + 2].task_ref, 1);
+    EXPECT_EQ(members[6 + 2].order_key, 1u);
+    EXPECT_EQ(members[6 + 2].observed_tail, 2u);
+    EXPECT_EQ(members[6 + 4].observed.sequence, 0u);
     const auto observed = members[3].observed.sequence;
     ASSERT_TRUE(fixture.refresh(3));
     EXPECT_EQ(members[3].observed.sequence, observed);
@@ -1922,7 +2037,7 @@ TEST(HbgAdmissionProtocol, DisabledCaptureDoesNotAllocateOrTouchProtocolState) {
 class HbgProtocolLayoutCorruption : public ::testing::TestWithParam<int> {};
 
 TEST(HbgAdmissionProtocol, CompactWorkerBeyondFirstBitmapWordKeepsItsActualIdentity) {
-    AdmissionFixture fixture({{2, LaneMask::aiv0()}}, 66, 0, {}, true);
+    AdmissionFixture fixture({{44, LaneMask::aiv0()}}, 66, 0, {}, true);
     ASSERT_TRUE(fixture.publish(0, 65));
     ASSERT_TRUE(fixture.refresh(65));
     const auto *tasks =

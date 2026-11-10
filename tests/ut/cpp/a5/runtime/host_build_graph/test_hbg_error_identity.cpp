@@ -130,17 +130,17 @@ struct ErrorFixture {
     std::array<SchedulerAdmissionLocalState, 3> admissions{};
 };
 
-TEST(HbgErrorIdentity, DedicatedStatusLinePreservesDiagnosticIdentityOffsets) {
-    EXPECT_EQ(sizeof(SchedulerRunControl), 512u);
+TEST(HbgErrorIdentity, DedicatedStatusLineSeparatesDiagnosticIdentity) {
+    EXPECT_EQ(sizeof(SchedulerRunControl), 448u);
     EXPECT_EQ(offsetof(SchedulerRunControl, error_claimed), 256u);
-    EXPECT_EQ(offsetof(SchedulerRunControl, error_site), 328u);
-    EXPECT_EQ(kIdentityOffset, 336u);
-    EXPECT_EQ(kIdentityOffset + sizeof(Identity), offsetof(SchedulerRunControl, scheduler_error));
+    EXPECT_EQ(offsetof(SchedulerRunControl, error_site), 312u);
+    EXPECT_EQ(kIdentityOffset, 320u);
+    EXPECT_LE(kIdentityOffset + sizeof(Identity), offsetof(SchedulerRunControl, scheduler_error));
 }
 
 TEST(HbgErrorIdentity, PublishedStatusHasNoAtomicWriterOnItsCacheLine) {
     constexpr size_t status_offset = offsetof(SchedulerRunControl, scheduler_error);
-    EXPECT_EQ(status_offset % 128, 0u);
+    EXPECT_EQ(status_offset % 64, 0u);
     EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_claimed) / 64);
     EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_task_ref) / 64);
     EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_identity_fields) / 64);
@@ -160,7 +160,7 @@ TEST(HbgErrorIdentity, AicpuFlushesIdentityBeforePublishingAndFlushingStatus) {
     EXPECT_TRUE(trace.events[0].flush);
     EXPECT_EQ(trace.events[0].status, 0u);
     EXPECT_EQ(trace.events[1].address, base + offsetof(SchedulerRunControl, scheduler_error));
-    EXPECT_EQ(trace.events[1].bytes, 128u);
+    EXPECT_EQ(trace.events[1].bytes, 64u);
     EXPECT_TRUE(trace.events[1].flush);
     EXPECT_EQ(trace.events[1].status, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
     EXPECT_FALSE(record_aicore_scheduler_runtime_error(
@@ -180,7 +180,7 @@ TEST(HbgErrorIdentity, ColdLogObservesTheSeparateStatusLineBeforeReloadingIdenti
     ASSERT_EQ(trace.events.size(), 2u);
     const auto *base = reinterpret_cast<const uint8_t *>(fixture.run());
     EXPECT_EQ(trace.events[0].address, base + offsetof(SchedulerRunControl, error_claimed));
-    EXPECT_EQ(trace.events[0].bytes, 256u);
+    EXPECT_EQ(trace.events[0].bytes, 192u);
     EXPECT_FALSE(trace.events[0].flush);
     EXPECT_EQ(trace.events[1].address, base + offsetof(SchedulerRunControl, error_claimed));
     EXPECT_EQ(trace.events[1].bytes, 128u);

@@ -34,15 +34,18 @@ inline void protocol_noop_kernel(__gm__ int64_t *) {}
 class SchedulerStateBuffer {
 public:
     explicit SchedulerStateBuffer(const AicoreSchedulerLayout &layout) :
-        base_(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, layout.total_size)) {
+        allocation_(std::aligned_alloc(128, (layout.total_size + 191) / 128 * 128)),
+        base_(allocation_ == nullptr ? nullptr : static_cast<uint8_t *>(allocation_) + 64) {
+        // Every fixture exercises a 64-byte-aligned base that is not 128-byte aligned.
         EXPECT_NE(base_, nullptr);
         if (base_ != nullptr)
             EXPECT_TRUE(scheduler_init_data_from_layout(base_, layout, reinterpret_cast<uint64_t>(base_)));
     }
-    ~SchedulerStateBuffer() { std::free(base_); }
+    ~SchedulerStateBuffer() { std::free(allocation_); }
     void *base() const { return base_; }
 
 private:
+    void *allocation_{nullptr};
     void *base_{nullptr};
 };
 

@@ -19,7 +19,7 @@
 #include "scheduler_types.h"
 
 inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_MAGIC = 0x35474248;
-inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 1;
+inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 2;
 inline constexpr uint32_t SCHEDULER_NATIVE_NO_INSTANCE = UINT32_MAX;
 inline constexpr uint64_t SCHEDULER_NATIVE_NO_PREDICATE = UINT64_MAX;
 
@@ -36,7 +36,6 @@ struct SchedulerNodeBinding {
     uint32_t source_index;
     uint32_t instance_index;
     SchedulerNodeKind kind;
-    uint8_t reserved[7];
 };
 
 // All offsets name regions of the scheduler backing, including the existing
@@ -44,8 +43,6 @@ struct SchedulerNodeBinding {
 struct alignas(64) SchedulerNativeGraphHeader {
     uint32_t magic;
     uint32_t version;
-    uint32_t header_bytes;
-    uint32_t flags;
     uint64_t image_bytes;
     uint64_t node_count;
     uint64_t original_task_count;
@@ -59,7 +56,7 @@ struct alignas(64) SchedulerNativeGraphHeader {
     uint64_t control_inbox_count;
     uint64_t readonly_end_offset;
     uint64_t run_epoch;
-    uint64_t reserved;
+    uint32_t header_bytes;
 };
 
 struct alignas(64) SchedulerGraphTemplate {
@@ -77,7 +74,6 @@ struct alignas(64) SchedulerGraphTemplate {
     uint64_t required_heap;
     uint64_t legacy_execution_storage_bytes;
     uint64_t graph_key;
-    uint64_t reserved[2];
 };
 
 struct alignas(64) SchedulerGraphChildPlan {
@@ -88,7 +84,6 @@ struct alignas(64) SchedulerGraphChildPlan {
     uint32_t tensor_count;
     uint32_t scalar_count;
     uint64_t execution_prefix;
-    uint64_t reserved;
 };
 
 struct alignas(64) SchedulerGraphInstance {
@@ -106,13 +101,13 @@ struct alignas(64) SchedulerGraphInstance {
     uint64_t args_base;
 };
 
-static_assert(sizeof(SchedulerNodeBinding) == 16);
+static_assert(sizeof(SchedulerNodeBinding) == 12);
 static_assert(offsetof(SchedulerNodeBinding, kind) == 8);
 static_assert(std::is_standard_layout_v<SchedulerNodeBinding> && std::is_trivially_copyable_v<SchedulerNodeBinding>);
 static_assert(sizeof(SchedulerNativeGraphHeader) == 128);
-static_assert(offsetof(SchedulerNativeGraphHeader, image_bytes) == 16);
-static_assert(offsetof(SchedulerNativeGraphHeader, bindings_offset) == 56);
-static_assert(offsetof(SchedulerNativeGraphHeader, readonly_end_offset) == 104);
+static_assert(offsetof(SchedulerNativeGraphHeader, image_bytes) == 8);
+static_assert(offsetof(SchedulerNativeGraphHeader, bindings_offset) == 48);
+static_assert(offsetof(SchedulerNativeGraphHeader, readonly_end_offset) == 96);
 static_assert(
     std::is_standard_layout_v<SchedulerNativeGraphHeader> && std::is_trivially_copyable_v<SchedulerNativeGraphHeader>
 );

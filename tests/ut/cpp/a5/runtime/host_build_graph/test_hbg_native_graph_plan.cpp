@@ -21,6 +21,7 @@
 
 #include "host_build_graph/graph_execution.h"
 #include "native_graph_plan.h"
+#include "dependency_plan.h"
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_graph_control.h"
 #include "scheduler/scheduler_graph_binding.h"
@@ -328,6 +329,45 @@ struct NativeViewFixture {
 };
 }  // namespace
 
+TEST(HbgNativeGraphPlan, DependencyCountersIncludeGraphEntryExitAndCrossInstanceEdges) {
+    DefinitionFixture definition(std::vector<std::vector<uint16_t>>{{}, {}, {0, 1}});
+    NativeViewFixture view(definition, {UINT32_MAX, 0, 0, UINT32_MAX});
+    view.original.executable(0, 0);
+    view.original.executable(1, 0, {0});
+    view.original.executable(2, 0, {1});
+    view.original.executable(3, 0, {2});
+    SchedulerDependencyPlan plan;
+    ASSERT_TRUE(scheduler_plan_dependencies(view.graph.task_count, 13, 128, &plan));
+    std::unique_ptr<void, decltype(&std::free)> storage(
+        std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, plan.total_size), &std::free
+    );
+    ASSERT_NE(storage, nullptr);
+    ASSERT_TRUE(scheduler_init_dependencies(storage.get(), plan, view.graph, {0}));
+    const auto *header = scheduler_state_at<SchedulerDependencyHeader>(storage.get(), plan.header_offset);
+    EXPECT_EQ(header->edge_count, 12);
+    std::vector<std::pair<int64_t, int64_t>> edges;
+    for (int64_t producer = 0; producer < view.graph.task_count; ++producer) {
+        for (uint32_t index = 0;; ++index) {
+            int64_t successor;
+            ASSERT_TRUE(scheduler_dependency_successor(storage.get(), *header, producer, index, &successor));
+            if (successor == SCHEDULER_WAKE_LIST_OPEN) break;
+            edges.emplace_back(producer, successor);
+        }
+    }
+    EXPECT_EQ(
+        edges, (std::vector<std::pair<int64_t, int64_t>>{
+                   {1, 2}, {1, 3}, {2, 4}, {3, 4}, {4, 5}, {5, 6}, {6, 7}, {6, 8}, {7, 9}, {8, 9}, {9, 10}, {10, 11}
+               })
+    );
+    const auto *remaining = scheduler_state_at<uint64_t>(storage.get(), header->remaining_offset);
+    EXPECT_EQ(
+        std::vector<uint64_t>(remaining, remaining + view.graph.task_count),
+        (std::vector<uint64_t>{0, 0, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1})
+    );
+    ASSERT_TRUE(scheduler_plan_dependencies(view.graph.task_count, 11, 128, &plan));
+    EXPECT_FALSE(scheduler_init_dependencies(storage.get(), plan, view.graph, {0}));
+}
+
 TEST(HbgNativeGraphPlan, AccessConstructionDoesNotObserveNativeBacking) {
     SchedulerGraphView wire = scheduler_ordinary_graph_view(4096, 1, 0);
     wire.scheduler_state_address = SCHEDULER_STATE_ALIGNMENT;
@@ -350,27 +390,28 @@ TEST(HbgNativeGraphPlan, AccessRevalidatesReusedBackingForEachRun) {
         ASSERT_TRUE(scheduler_native_node_checked(access, 1, &node));
         EXPECT_EQ(node.header->run_epoch, 1u);
         EXPECT_EQ(node.definition->graph_key, body.header.graph_key);
-        view.header().flags = 1;
+        view.header().header_bytes = 0;
         const SchedulerGraphAccess next(access);
         EXPECT_FALSE(scheduler_graph_view_valid(next));
-        view.header().flags = 0;
+        view.header().header_bytes = sizeof(SchedulerNativeGraphHeader);
     }
     view.header().run_epoch = 2;
-    view.header().flags = 1;
+    view.header().header_bytes = 0;
     {
         const SchedulerGraphAccess access(view.graph);
         EXPECT_FALSE(scheduler_graph_view_valid(access));
         SchedulerNativeNode node{};
         EXPECT_FALSE(scheduler_native_node_checked(access, 1, &node));
     }
-    view.header().flags = 0;
-    view.definition().reserved[0] = 1;
+    view.header().header_bytes = sizeof(SchedulerNativeGraphHeader);
+    const uint64_t task_count = view.definition().task_count;
+    view.definition().task_count = 0;
     {
         const SchedulerGraphAccess access(view.graph);
         SchedulerNativeNode node{};
         EXPECT_FALSE(scheduler_native_node_checked(access, 1, &node));
     }
-    view.definition().reserved[0] = 0;
+    view.definition().task_count = task_count;
     auto *definition = reinterpret_cast<GraphDefinition *>(
         static_cast<std::byte *>(view.backing.get()) + view.definition().definition_offset
     );
@@ -416,7 +457,7 @@ TEST(HbgNativeGraphPlan, AccessAlternatesDefinitionsWithoutSkippingNodeBounds) {
     auto *child = reinterpret_cast<SchedulerGraphChildPlan *>(
         static_cast<std::byte *>(view.backing.get()) + view.definition().child_plans_offset
     );
-    child->reserved = 1;
+    child->tensor_count = MAX_TENSOR_ARGS + 1;
     SchedulerTaskPayloadArguments arguments{};
     EXPECT_EQ(scheduler_parse_task_payload_arguments(access, 1, &arguments), SchedulerGraphResult::INVALID_ARGUMENTS);
 }

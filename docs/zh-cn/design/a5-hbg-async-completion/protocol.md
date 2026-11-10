@@ -43,7 +43,7 @@ CHECK 与 FINISH 分别拥有平坦位图，每个字包含 64 条记录。每�
 | task→group 映射、task 形状、header 数组基址与 token 边界 | Host 初始化并随 run 镜像发布，run 内保持只读 | run 入口完成全 DCache 获取后普通 cached 读取，不逐项重复失效 |
 | 封口身份、token | 执行核完成对应 cached 写回及实际屏障，再发布 RUNNABLE 和目录位 | 成功领取后按实际 cache 合同失效/观察，再消费数据 |
 | lease、join、目录、task 完成状态 | 专用原子操作，控制行无 cached 写入 | 权威判断使用原子观察；bypass 只能作允许过期的提示 |
-| run 异步活动标记 | 独占 128 B 行；Host 在 run 前置零，执行核在首次发布 CHECK/FINISH 前以 bypass store 写一并完成 DDR 屏障 | bypass load；本核见一后可以一直缓存 true，run 内不清零 |
+| run 异步活动标记 | 独占 64 B 行；Host 在 run 前置零，执行核在首次发布 CHECK/FINISH 前以 bypass store 写一并完成 DDR 屏障 | bypass load；本核见一后可以一直缓存 true，run 内不清零 |
 | owner 可变进度 | 独占期间 cached 写入，对应行写回及屏障完成后交权 | 下一 owner CAS 成功后失效并观察进度行，完成读取屏障后读取 |
 | payload、外部完成记录 | 遵守相应 backend 的可见性合同 | 不能将运行时 atomic-add-zero 原语用于 DMA/peer 写入的外部地址 |
 
@@ -81,21 +81,22 @@ P 暂时为零不证明计算结束，其他尚未返回的成员仍可能登记
 
 FINISH 是无业务资源需求的控制记录，由一个 lease owner 推进。基础路径始终先发布到 FINISH 目录，再由服务循环领取。它和 CHECK 使用相同的交权规则。
 
-若启用受支持的 ArgsDump AFTER，输出采集及其封口必须作为 TaskDone 之前的可续接服务完成，再进入下表的 DONE/摘链短事务；不能先公开 DONE 再等待输出采集。未接通这一边界的组合在 bind 前拒绝。
+若启用受支持的 ArgsDump AFTER，输出采集及其封口必须作为 TaskDone 之前的可续接服务完成，再进入下表的 DONE/关闭解析权短事务；不能先公开 DONE 再等待输出采集。未接通这一边界的组合在 bind 前拒绝。
 
 `resolve_step(graph, cursor, budget)` 的步骤结果区分 WAITING、READY_TO_PUBLISH、YIELD、DRAINED 和 ERROR，并说明当前节点责任是否已转移。
 
 | 阶段 | 操作与续接规则 |
 | ---- | -------------- |
-| 初始化 | 核对 join 与 run 错误，唯一发布 TaskDone 并摘取 wake-list；将链头保存进 FINISH，整个短事务不让出 |
-| 取得 waiter | 先保存旧 `next_waiter`，再推进该节点的依赖状态 |
-| 检查 fanin | 每步只检查一个 producer，已完成则推进 fanin 游标 |
-| 尝试挂链 | 每步最多一次 CAS；失败计入预算并保存状态，成功立即把 waiter 责任交给下一 producer |
+| 初始化 | 核对 join 与 run 错误，唯一发布 TaskDone 并关闭 wake head；CSR 路径要求旧 head 为空，兼容路径保存摘下的链；整个短事务不让出 |
+| CSR 通知 | 保存遍历位置，每步对一个后继 remaining 原子减一；旧值 1 取得唯一 ready 发布权，旧值 0 报错 |
+| 兼容 waiter | 无依赖 header 时先保存旧 `next_waiter`，再推进该节点的 fanin 状态 |
+| 兼容 fanin/挂链 | 每步检查一个 producer 或尝试一次 CAS；失败计入预算并保存状态，挂链成功立即转交 waiter 责任 |
 | ready 发布 | 保存总容量为 8 的唯一待发布批次、目标普通/control 队列及发布阶段 |
 | 预留后发布 | ticket 一旦预留成功，在固定尾部完成该批次；禁止让出、再次预留或重新路由已发布节点 |
 | 完成 | 所有后继、批次和诊断公开后，FINISH terminal、清目录位，最后贡献一次 `pending_completed` |
 
-挂链成功后，原 FINISH 不再读写 waiter，因为下一 producer 可立即摘链并改写它。后续只读取自己保存的旧链引用。预算耗尽或队列暂时不可开始发布时，保存唯一责任后交权；不能重新扫描原 wake-list 重建进度。
+CSR cursor 随每条已消费的边前进，lease 交权后的 owner 不得重放 decrement。
+无依赖 header 的兼容路径挂链成功后，原 FINISH 不再读写 waiter，因为下一 producer 可立即摘链并改写它。后续只读取自己保存的旧链引用。预算耗尽或队列暂时不可开始发布时，保存唯一责任后交权；不能重新扫描原 wake-list 重建进度。
 
 ready 只授予 admission 的资格，不证明实际消费者核已经获取 payload。ENTER/EXIT 和 FINISH 不执行消费者的本核获取；同步消费者同样遵守[消费者数据可见性](consumer-preparation.md)。优先复用已有读取路径，不固定新增准备状态机。
 

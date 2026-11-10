@@ -69,6 +69,7 @@
 #include "native_graph_plan.h"
 #include "async_completion_plan.h"
 #include "ready_pool_plan.h"
+#include "dependency_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_args_dump.h"
 #include "aicpu/args_dump_aicpu.h"
@@ -1621,6 +1622,25 @@ bool create_scheduler_state(
         return false;
     }
     layout.total_size = ready_pool_plan.total_size;
+    uint64_t dependency_edges = 0;
+    for (int64_t ref = 0; ref < host_graph.task_count; ++ref) {
+        uint32_t count = 0;
+        if (scheduler_node_fanin_count(host_graph, ref, &count) != SchedulerGraphResult::OK) return false;
+        dependency_edges += count;
+    }
+    for (const auto &instance : native_plan.instances) {
+        const auto &definition = native_plan.definitions[instance.definition_index];
+        dependency_edges +=
+            definition.definition.edge_count + definition.definition.root_count + definition.sinks.size();
+    }
+    SchedulerDependencyPlan dependency_plan;
+    if (!scheduler_plan_dependencies(node_count, dependency_edges, layout.total_size, &dependency_plan)) {
+        LOG_ERROR("A5 HBG: dependency layout overflow");
+        return false;
+    }
+    ready_pool_plan.header.dependencies_offset = dependency_plan.header_offset;
+    ready_pool_plan.header.storage_end_offset = dependency_plan.total_size;
+    layout.total_size = dependency_plan.total_size;
 
     // Keep the dump image in the published prefix, before the reserved async suffix.
     std::vector<SchedulerArgsDumpTask> dump_tasks;
@@ -1721,6 +1741,17 @@ bool create_scheduler_state(
         header->control_inbox_count = worker_count;
         header->run_epoch = api->run_epoch();
     }
+    SchedulerGraphView dependency_graph = host_graph;
+    if (native_graph) {
+        dependency_graph.task_count = node_count;
+        dependency_graph.scheduler_state_address = reinterpret_cast<uint64_t>(host_base);
+        dependency_graph.scheduler_state_bytes = layout.total_size;
+        dependency_graph.native_header_offset = native_image.header_offset;
+    }
+    if (!scheduler_init_dependencies(host_base, dependency_plan, dependency_graph, inline_completed_task_refs)) {
+        LOG_ERROR("A5 HBG: invalid dependency graph or insufficient edge capacity");
+        return false;
+    }
     if (protocol_profiling) {
         try {
             SchedulerGraphView snapshot = host_graph;
@@ -1791,16 +1822,13 @@ bool create_scheduler_state(
         context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
-        context.scheduler_ssbuf_reserved0 = 0;
         context.task_metadata_offset = layout.task_metadata_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.ready_inboxes_offset = layout.ready_inboxes_offset;
-        context.scheduler_ssbuf_reserved1 = 0;
         context.ready_directory_offset = layout.ready_directory_offset;
         context.mix_payloads_offset = layout.mix_payloads_offset;
         context.mix_traces_offset = layout.mix_traces_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
-        context.scheduler_ssbuf_reserved2 = 0;
         // The absolute address of the callable's registration-owned entry
         // table, with its own length: nothing in this per-bind allocation holds
         // that table, so it is named by address rather than by offset from the
@@ -1810,7 +1838,6 @@ bool create_scheduler_state(
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.graph_summary_offset = layout.graph_summary_offset;
         context.graph_storage_address = device_sm_address + device_segments.storage;
-        context.graph_reserved_address = 0;
         context.scheduler_state_base_address = aligned_address;
         context.dispatch_payload_offset = layout.dispatch_payloads_offset + static_cast<uint64_t>(i) *
                                                                                 SCHEDULER_PENDING_SLOT_COUNT *

@@ -23,7 +23,7 @@ def _group(audit, block):
         ("group", ref, owner["block_idx"]), point(owner, "publish_before"), point(owner, "publish_after")
     )
     lanes = {row["index"]: row for row in block["lanes"]}
-    resources = owner["active_mask"] | 1 if audit.resource_scoped else 7
+    resources = owner["active_mask"] | 1
     require(set(lanes) == {i for i in range(3) if resources & (1 << i)}, "missing or extra GM resource lane")
     expected_acks = [group if resources & (1 << i) else 0 for i in range(3)]
     require(owner["released_seq"] == expected_acks, "stale GM release observation")
@@ -120,14 +120,13 @@ def audit_mix(audit):
             [row["group_seq"] for row in groups] == list(range(1, len(groups) + 1)),
             "missing or duplicate cluster group sequence",
         )
-        if audit.resource_scoped:
-            previous_lane_seq = [0, 0, 0]
-            for owner in groups:
-                block = block_by_owner[id(owner)]
-                for lane in block["lanes"]:
-                    require(lane["previous_lane_seq"] == previous_lane_seq, "wrong per-lane group predecessor")
-                for lane in block["lanes"]:
-                    previous_lane_seq[lane["lane"]] = owner["group_seq"]
+        previous_lane_seq = [0, 0, 0]
+        for owner in groups:
+            block = block_by_owner[id(owner)]
+            for lane in block["lanes"]:
+                require(lane["previous_lane_seq"] == previous_lane_seq, "wrong per-lane group predecessor")
+            for lane in block["lanes"]:
+                previous_lane_seq[lane["lane"]] = owner["group_seq"]
         for previous, current in zip(groups, groups[1:], strict=False):
             audit.before(
                 point(previous, "completion_after"),

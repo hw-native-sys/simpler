@@ -390,12 +390,25 @@ TensorMap maps tensor regions to producer task IDs. For every task:
 3. OUTPUT/INOUT regions register the new task as producer.
 4. Each producer tracks its highest consumer local ID for completion metadata.
 
-There is no fanout adjacency or dependency pool. A per-slot progress state is
-the readiness truth on device.
+The public task payload stores fanins. For resident scheduling, Host converts
+these through the unified graph accessor into a deduplicated fanout CSR and
+initial remaining counters, excluding Host-completed edges. The immutable
+header/CSR and atomic-only counters occupy separate 64-byte-aligned regions.
+The legacy AICPU scheduler consumes fanins directly without this resident pool.
 
-## 6. Boot Classification and Wake Lists
+## 6. Boot Classification and Dependencies
 
-Submit does not push tasks into ready queues. After the graph arrives on device,
+Resident bootstrap classifies each node by its initial remaining count: zero
+enters ready discovery; nonzero waits for producer completion notifications.
+All scans finish before completion resolution starts. Each resolved producer
+visits its CSR successors once; the atomic transition 1→0 uniquely publishes
+a successor. The same bounded resolver supports kernel, control and async
+FINISH completion. Without a dependency header, resident helpers retain the
+intrusive wake-list path. See the
+[dependency contract](../../../../../docs/zh-cn/design/a5-hbg-graph-task/dependency-counters.md).
+
+The following boot classifier, wake/publish lists and early-dispatch description
+apply to the legacy AICPU scheduler. Submit does not push tasks into ready queues. After the graph arrives on device,
 boot classification scans every submitted task exactly once:
 
 - a task whose fanins are all complete is routed to its shape queue;
@@ -425,6 +438,8 @@ doorbells at the ready funnel (`push_ready_routed`), the moment readiness is
 decided. Completion readiness itself remains the boot classifier + wake lists.
 
 ## 7. Dispatch and Completion
+
+The legacy AICPU dispatch path has the following rules:
 
 - AIC/AIV dispatch claims ranges of logical block indices from
   `next_block_idx` and requeues unfinished wide tasks.
@@ -462,8 +477,21 @@ assignment and predecessor sequences preserve descriptor ownership when the
 resource mask changes between groups. This task-level selection does not remove
 workers from bootstrap or shutdown.
 
+Ordinary single-type SPMD tasks admit at most one eligible worker per block.
+Their frozen membership is a cyclic interval in ascending worker-index order,
+starting at `member_rank_offset % eligible_count` when the block count is
+smaller than the eligible set. Host computes the prefix of ordinary non-sync
+SPMD blocks separately for AIC and AIV, in task-ref order, and stores it in
+the existing 64-byte admission header. Other resource types, single-block
+work, MIX and sync-start do not advance that prefix. This distributes independent small tasks across
+workers without changing block ownership or completion accounting. MIX and
+`sync_start` retain their full eligible membership. The exporter writes version 10
+(ordinary graph) and version 11 (native Graph). Only these current schemas are accepted. Producers and readers must match;
+historical formats are rejected. Both use the per-resource-type prefix and
+cooperative admission. Execution identities use the strict v1 contract.
+
 Kernel Ready work uses a type-separated shared ticket pool with a fixed group
-width of eight (T/H8). The host appends its version-4 immutable header and
+width of eight (T/H8). The host appends its version-8 immutable header and
 descriptors to the run allocation and sizes each queue from actual executable
 metadata. Every eligible worker can claim from every group. Every fourth search
 prioritizes a remote group; other searches prefer the local group before
@@ -492,7 +520,11 @@ Sampling is derived from the timing-slot range.
 The host records whether any task requests sampled timing in the run control.
 Only a run with chip profiling or sampled timing enters the resident function
 specialization that allocates profiling state; the plain specialization does
-not allocate it. These functions do not inline into the common entry. Struct
+not allocate it. Four `resident_*.cpp` translation units instantiate the
+ordinary/native and profiled/plain combinations from `resident_scheduler_impl.h`;
+`CoreType` distinguishes AIC and AIV entry symbols. The shared completion resolver
+is a TU-local `static noinline` function with natural-alignment guards on its
+local argument types. Struct
 sizes exclude other function locals, worker statistics and compiler spills,
 and do not establish the dynamic AICore stack high-water mark.
 

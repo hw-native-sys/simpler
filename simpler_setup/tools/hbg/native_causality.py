@@ -16,10 +16,7 @@ from .native_order import CausalOrder
 from .native_protocol import (
     _error,
     audit_protocol_sequences,
-    has_claim_seal,
     has_native_graph,
-    protocol_version,
-    uses_resource_scoped_mix,
 )
 
 MAX = (1 << 64) - 1
@@ -42,7 +39,6 @@ def point(record, field):
 class NativeAudit:
     def __init__(self, section, identities):
         self.raw = section
-        self.resource_scoped = uses_resource_scoped_mix(section)
         self.node_map = {}
         self.control_nodes = set()
         self.sequence_result = audit_protocol_sequences(section)
@@ -184,6 +180,16 @@ class NativeAudit:
         require(set(self.blocks) == set(self.expected_blocks), "missing or extraneous block owner")
 
     def admission(self):
+        rank_offsets = {}
+        next_rank = [0, 0]
+        for ref, task in sorted(self.tasks.items()):
+            if task["flags"] & SPMD and not task["flags"] & (MIX | SYNC):
+                resource = 0 if task["active_mask"] & 1 else 1
+                rank_offsets[ref] = next_rank[resource]
+                next_rank[resource] += task["block_num"]
+                require(next_rank[resource] <= MAX, "member rank prefix overflow")
+        for ref, record in self.admissions.items():
+            require(record["member_rank_offset"] == rank_offsets.get(ref, 0), "wrong member rank prefix")
         cooperative = {ref for ref, task in self.tasks.items() if task["flags"] & (MIX | SPMD)}
         log = self.raw["admission_log"]
         require(len(log) == len(cooperative) and set(log) == cooperative, "admission log is not a task bijection")
@@ -207,10 +213,16 @@ class NativeAudit:
                 for index, worker in self.workers.items()
                 if (
                     bool((task["active_mask"] | 1) & (1 << self.positions[index][1]))
-                    if task["flags"] & MIX and self.resource_scoped
-                    else task["flags"] & MIX or (worker["core_type"] == 0) == bool(task["active_mask"] & 1)
+                    if task["flags"] & MIX
+                    else (worker["core_type"] == 0) == bool(task["active_mask"] & 1)
                 )
             }
+            if task["flags"] & SPMD and not task["flags"] & (MIX | SYNC):
+                eligible = sorted(members)
+                width = min(task["block_num"], len(eligible))
+                offset = rank_offsets[ref]
+                begin = offset % len(eligible)
+                members = {eligible[(begin + offset) % len(eligible)] for offset in range(width)}
             words = [0] * ((len(self.workers) + 63) // 64)
             for member in members:
                 words[member // 64] |= 1 << (member % 64)
@@ -233,9 +245,10 @@ class NativeAudit:
     def admission_storage(self, cooperative):
         if not self.admissions:
             return
-        stride = ((64 + ((len(self.workers) + 63) // 64) * 8 + 127) // 128) * 128
+        alignment = 64
+        stride = ((64 + ((len(self.workers) + 63) // 64) * 8 + alignment - 1) // alignment) * alignment
         first = self.admissions[0]["member_words_offset"]
-        require(first >= 64 and first % 128 == 64, "misaligned admission bitmap")
+        require(first >= 64 and (first - 64) % alignment == 0, "misaligned admission bitmap")
         seals = []
         for ref, record in sorted(self.admissions.items()):
             require(record["member_words_offset"] == first + ref * stride, "wrong task bitmap binding")
@@ -256,8 +269,8 @@ class NativeAudit:
                     record["close_seals_offset"] == 0 and record["close_seals"] == [], "non-Mix task has close seals"
                 )
         if seals:
-            require(seals[0] > 0 and seals[0] % 128 == 0, "invalid close seal base")
-            seal_stride = self.raw["close_seal_stride"] if protocol_version(self.raw) >= 7 else 8
+            require(seals[0] > 0 and seals[0] % alignment == 0, "invalid close seal base")
+            seal_stride = self.raw["close_seal_stride"]
             require(
                 seals == [seals[0] + index * self.raw["cluster_count"] * seal_stride for index in range(len(seals))],
                 "aliased or wrong task close seals",
@@ -566,8 +579,7 @@ class NativeAudit:
                 "duplicate or missing block completion ticket",
             )
             self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
-            if has_claim_seal(self.raw):
-                self.claim_certificates(ref, blocks)
+            self.claim_certificates(ref, blocks)
             owned = defaultdict(list)
             for block in blocks:
                 owned[block["owner"]["worker_index"]].append(block["owner"]["block_idx"])
@@ -575,12 +587,11 @@ class NativeAudit:
                 require(all(len(indices) == 1 for indices in owned.values()), "sync_start reused an execution position")
             for worker in self.task_members[ref]:
                 if self.tasks[ref]["flags"] & MIX and self.positions[worker][1]:
-                    if has_claim_seal(self.raw):
-                        member = self.member(ref, worker)
-                        require(
-                            member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
-                            "vector Mix member fabricated a cursor read",
-                        )
+                    member = self.member(ref, worker)
+                    require(
+                        member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
+                        "vector Mix member fabricated a cursor read",
+                    )
                     continue
                 self.close_cursor(ref, worker, owned[worker])
 
@@ -662,20 +673,13 @@ class NativeAudit:
         self.close_reads[(ref, worker)] = read
         self.causal.add(("event", worker, closed[2] - 1), read)
         self.causal.add(read, closed)
-        if has_claim_seal(self.raw):
-            self.causal.add(self.confirm_points[(ref, cursor)], read)
-            if cursor < blocks:
-                self.causal.add(read, self.confirm_points[(ref, cursor + 1)])
-            seal, observed = member["claim_seal_seen"], member["claim_cursor_seen"]
-            require(
-                (seal == observed == 0) or (seal == observed == cursor == blocks), "invalid claim seal close witness"
-            )
-            if seal:
-                self.causal.add(self.claim_seals[ref], read)
-        else:
-            self.causal.add(self.claim_points[(ref, cursor - 1)], read)
-            if cursor < blocks:
-                self.causal.add(read, self.claim_points[(ref, cursor)])
+        self.causal.add(self.confirm_points[(ref, cursor)], read)
+        if cursor < blocks:
+            self.causal.add(read, self.confirm_points[(ref, cursor + 1)])
+        seal, observed = member["claim_seal_seen"], member["claim_cursor_seen"]
+        require((seal == observed == 0) or (seal == observed == cursor == blocks), "invalid claim seal close witness")
+        if seal:
+            self.causal.add(self.claim_seals[ref], read)
 
     def completions(self):
         for ref, task in self.tasks.items():
@@ -689,25 +693,16 @@ class NativeAudit:
                 control["next_block"] == control["completed_blocks"] == (task["block_num"] if cooperative else 0),
                 "terminal block counters mismatch",
             )
-            if protocol_version(self.raw) >= 5:
-                require(control["admission_claim_lock"] == 0, "invalid terminal admission claim lock")
-            if has_claim_seal(self.raw):
-                require(
-                    control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal"
-                )
-            if self.raw["schema"] != "hbg-native-protocol-v1":
-                positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
-                minimum_blocks = (
-                    2
-                    if protocol_version(self.raw) >= 4
-                    else positions * 2 + (1 if self.raw["schema"] == "hbg-native-protocol-v2" else 0)
-                )
-                uses_tickets = cooperative and not task["flags"] & SYNC and task["block_num"] >= minimum_blocks
-                tickets = control["claim_tickets"]
-                require(
-                    task["block_num"] <= tickets <= task["block_num"] + positions if uses_tickets else tickets == 0,
-                    "invalid terminal claim ticket counter",
-                )
+            require(control["admission_claim_lock"] == 0, "invalid terminal admission claim lock")
+            require(control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal")
+            positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
+            minimum_blocks = 2
+            uses_tickets = cooperative and not task["flags"] & SYNC and task["block_num"] >= minimum_blocks
+            tickets = control["claim_tickets"]
+            require(
+                task["block_num"] <= tickets <= task["block_num"] + positions if uses_tickets else tickets == 0,
+                "invalid terminal claim ticket counter",
+            )
             if not task["flags"] & EXECUTABLE and ref not in self.control_nodes:
                 continue
             done = self.actors[ref]["completion"]

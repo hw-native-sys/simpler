@@ -11,6 +11,7 @@
 
 ## Additional rules
 
+- Maintain only the current protocol and implementation contract. Do not add or retain compatibility branches for historical formats, deprecated interfaces, or unpublished experiments. Update producers, consumers, tests, and documentation together. Active runtime variants and supported features are not historical compatibility.
 - If `CLAUDE.md` changes, read it again before continuing.
 - If relevant files under `.claude/rules/` or `.claude/skills/` change, refresh your context before proceeding.
 - If user instructions conflict with repository conventions, prioritize user intent for that task.

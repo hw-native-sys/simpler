@@ -220,7 +220,9 @@ done
 
 The report checks physical `(task, block, subtask)` invocation sets, tensor
 arguments, internal dependencies, and capture completeness. It includes
-per-kernel duration comparisons, L0 Device timing, and L3 phases. Device timing
+per-kernel duration comparisons, L0 Device timing, and L3 phases. The Host launch barrier uses bounded busy polling so a timer sleep does not
+become device-side peer wait. Binding still occurs after that barrier; Host
+`chip.run.runner_run` timestamps expose any remaining rank launch skew. Device timing
 includes cross-rank waits and launch skew; it is not pure Scalar scheduling
 time. Recompiling with different CANN/PTO versions can change kernel durations;
 compare against the full-forward capture from that same build.

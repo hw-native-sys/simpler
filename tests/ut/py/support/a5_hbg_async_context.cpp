@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
         assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         assert(!pto2::resident::seal_conditions(ctx.resident));
     } else if (scenario == 3) {
-        global.async_reserved = 1;
+        global.async_output_capture_refused = 1;
         auto ctx = get_async_ctx(args);
         assert(!async_ctx_is_deferred(ctx));
         assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);

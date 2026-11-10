@@ -50,16 +50,20 @@ inline bool scheduler_plan_ready_pool(
         ++header.entry_count;
     }
     uint64_t cursor = start_offset;
-    if (!scheduler_layout_reserve(&cursor, sizeof(header), 128, &next.header_offset) ||
+    if (!scheduler_layout_reserve(&cursor, sizeof(header), SCHEDULER_STATE_ALIGNMENT, &next.header_offset) ||
         !scheduler_layout_reserve(
-            &cursor, next.descriptors.size() * sizeof(SchedulerReadyPoolDescriptor), 128, &header.descriptors_offset
+            &cursor, next.descriptors.size() * sizeof(SchedulerReadyPoolDescriptor), SCHEDULER_STATE_ALIGNMENT,
+            &header.descriptors_offset
         ) ||
         !scheduler_layout_reserve(
-            &cursor, next.descriptors.size() * sizeof(SchedulerTicketQueue), 128, &header.controls_offset
+            &cursor, next.descriptors.size() * sizeof(SchedulerTicketQueue), SCHEDULER_STATE_ALIGNMENT,
+            &header.controls_offset
         ))
         return false;
     for (auto &descriptor : next.descriptors)
-        if (!scheduler_layout_reserve(&cursor, descriptor.capacity * sizeof(int64_t), 128, &descriptor.entries_offset))
+        if (!scheduler_layout_reserve(
+                &cursor, descriptor.capacity * sizeof(int64_t), SCHEDULER_STATE_ALIGNMENT, &descriptor.entries_offset
+            ))
             return false;
     if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) return false;
     header.storage_end_offset = next.total_size;

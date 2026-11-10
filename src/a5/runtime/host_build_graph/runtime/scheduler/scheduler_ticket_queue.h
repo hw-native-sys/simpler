@@ -15,15 +15,13 @@
 
 // Cursors occupy separate atomic-only lines. Entries live in a different,
 // bypass-published region and are never overwritten within a run.
-struct alignas(128) SchedulerTicketQueue {
+struct alignas(64) SchedulerTicketQueue {
     volatile uint64_t head{0};
-    uint8_t head_padding[120]{};
-    volatile uint64_t reserved_tail{0};
-    uint8_t tail_padding[120]{};
+    alignas(64) volatile uint64_t reserved_tail{0};
 };
 
-static_assert(sizeof(SchedulerTicketQueue) == 256);
-static_assert(offsetof(SchedulerTicketQueue, reserved_tail) == 128);
+static_assert(sizeof(SchedulerTicketQueue) == 128);
+static_assert(offsetof(SchedulerTicketQueue, reserved_tail) == 64);
 static_assert(std::is_standard_layout_v<SchedulerTicketQueue>);
 static_assert(std::is_trivially_copyable_v<SchedulerTicketQueue>);
 

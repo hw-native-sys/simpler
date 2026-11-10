@@ -19,7 +19,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "chip_worker.h"
@@ -45,6 +44,7 @@ T read(std::istream &stream) {
 
 // Host launch alignment only. Device dependencies and defer_wait remain owned
 // by the original kernels and production scheduler.
+// A timer sleep here becomes device-side peer wait for the earlier rank.
 void host_barrier(const fs::path &output, const std::string &phase, int rank, int ranks) {
     const auto prefix = output.parent_path() / phase;
     std::ofstream(prefix.string() + "." + std::to_string(rank)).put('1');
@@ -52,7 +52,6 @@ void host_barrier(const fs::path &output, const std::string &phase, int rank, in
     for (int peer = 0; peer < ranks; ++peer) {
         while (!fs::exists(prefix.string() + "." + std::to_string(peer))) {
             if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("Peer did not reach " + phase);
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }

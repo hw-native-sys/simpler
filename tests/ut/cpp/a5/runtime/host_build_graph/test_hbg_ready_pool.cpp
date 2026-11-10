@@ -22,6 +22,8 @@
 
 #include "hbg_scheduler_test_support.h"
 #include "ready_pool_plan.h"
+#include "dependency_plan.h"
+#include "scheduler/scheduler_completion_resolver.h"
 #include "scheduler/scheduler_ready_publication.h"
 
 namespace {
@@ -42,18 +44,34 @@ std::vector<SchedulerTaskMetadata> tasks(uint32_t count, uint32_t type) {
 struct PoolFixture {
     AicoreSchedulerLayout layout{};
     SchedulerReadyPoolPlan plan{};
+    SchedulerDependencyPlan dependency_plan{};
     std::unique_ptr<scheduler_test::SchedulerStateBuffer> storage;
     scheduler_test::BasicGraphBuffer<256> graph_storage;
     SchedulerGraphView graph{};
     std::vector<SchedulerLocalState> locals;
     SchedulerRunControl *run{nullptr};
 
-    PoolFixture(const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters) :
+    PoolFixture(
+        const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters,
+        const std::vector<std::vector<int32_t>> &fanins = {}, const std::vector<int64_t> &completed = {}
+    ) :
         graph_storage(metadata.size()),
         locals(clusters * 3) {
         EXPECT_TRUE(scheduler_plan_layout(metadata.size(), metadata.size(), 0, &layout));
         EXPECT_TRUE(scheduler_plan_ready_pool(metadata, clusters, layout.total_size, &plan));
         layout.total_size = plan.total_size;
+        if (!fanins.empty()) {
+            EXPECT_EQ(fanins.size(), metadata.size());
+            uint64_t edges = 0;
+            for (size_t ref = 0; ref < fanins.size(); ++ref) {
+                graph_storage.executable(ref, 0, fanins[ref]);
+                edges += fanins[ref].size();
+            }
+            EXPECT_TRUE(scheduler_plan_dependencies(metadata.size(), edges, layout.total_size, &dependency_plan));
+            plan.header.dependencies_offset = dependency_plan.header_offset;
+            plan.header.storage_end_offset = dependency_plan.total_size;
+            layout.total_size = dependency_plan.total_size;
+        }
         storage = std::make_unique<scheduler_test::SchedulerStateBuffer>(layout);
         scheduler_init_ready_pool(base(), plan);
         std::copy(
@@ -64,6 +82,7 @@ struct PoolFixture {
         graph = graph_storage.graph();
         graph.scheduler_state_address = reinterpret_cast<uint64_t>(base());
         graph.scheduler_state_bytes = layout.total_size;
+        EXPECT_TRUE(scheduler_init_dependencies(base(), dependency_plan, graph, completed));
         for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             auto &local = locals[worker];
             for (auto &slot : local.slots)
@@ -105,6 +124,170 @@ struct PoolFixture {
         );
     }
 };
+
+TEST(SchedulerReadyPoolTest, SpmdTasksEnterAdmissionOncePerLogicalTask) {
+    for (uint32_t type : {0U, 1U}) {
+        auto metadata = tasks(2, type);
+        metadata[0].flags |= SCHEDULER_TASK_SPMD;
+        metadata[0].logical_block_num = 500;
+        ASSERT_TRUE(scheduler_task_requires_admission(metadata[0]));
+        ASSERT_FALSE(scheduler_task_requires_admission(metadata[1]));
+        PoolFixture fixture(metadata, 32);
+        ASSERT_TRUE(fixture.push(0, type, {0, 1}));
+        uint32_t counts[2] = {};
+        for (uint32_t cluster = 0; cluster < 32; ++cluster) {
+            uint64_t cursor = 0;
+            SchedulerReadyClaim claim{};
+            ASSERT_TRUE(fixture.pop(cluster * 3 + type, type, &cursor, &claim));
+            if (claim.task_ref == SCHEDULER_TASK_REF_INVALID) continue;
+            ASSERT_GE(claim.task_ref, 0);
+            ASSERT_LT(claim.task_ref, 2);
+            ++counts[claim.task_ref];
+        }
+        EXPECT_EQ(counts[0], 1u);
+        EXPECT_EQ(counts[1], 1u);
+        EXPECT_FALSE(scheduler_ready_pool_may_have_work(fixture.base(), &fixture.locals[type], type));
+    }
+}
+
+TEST(SchedulerDependencyTest, DeduplicatesEdgesAndExcludesHostCompletedNodes) {
+    PoolFixture fixture(tasks(5, 0), 1, {{}, {0}, {0, 0, 1}, {1, 2}, {2, 3}}, {0, 1});
+    const auto *header = scheduler_dependencies(fixture.base(), fixture.plan.header_offset);
+    ASSERT_NE(header, nullptr);
+    ASSERT_TRUE(
+        scheduler_ready_pool_validate(fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, 5, 1)
+    );
+    EXPECT_EQ(header->edge_count, 3);
+    auto *remaining = scheduler_state_at<uint64_t>(fixture.base(), header->remaining_offset);
+    EXPECT_EQ(std::vector<uint64_t>(remaining, remaining + 5), (std::vector<uint64_t>{0, 0, 0, 1, 2}));
+    EXPECT_EQ(
+        scheduler_bootstrap_route_task(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 2, nullptr),
+        SchedulerRouteResult::READY_TO_ENQUEUE
+    );
+    EXPECT_EQ(
+        scheduler_bootstrap_route_task(fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 4, nullptr),
+        SchedulerRouteResult::WAITING
+    );
+    int64_t successor = -1;
+    ASSERT_TRUE(scheduler_dependency_successor(fixture.base(), *header, 2, 0, &successor));
+    EXPECT_EQ(successor, 3);
+    ASSERT_TRUE(scheduler_dependency_successor(fixture.base(), *header, 2, 1, &successor));
+    EXPECT_EQ(successor, 4);
+    ASSERT_TRUE(scheduler_dependency_successor(fixture.base(), *header, 2, 2, &successor));
+    EXPECT_EQ(successor, SCHEDULER_WAKE_LIST_OPEN);
+    EXPECT_FALSE(scheduler_dependency_successor(fixture.base(), *header, 2, 3, &successor));
+}
+
+TEST(SchedulerDependencyTest, ConcurrentProducerResolversPublishJoinExactlyOnce) {
+    constexpr uint32_t producers = 32;
+    std::vector<std::vector<int32_t>> edges(producers + 1);
+    edges.back().resize(producers);
+    std::iota(edges.back().begin(), edges.back().end(), 0);
+    PoolFixture fixture(tasks(producers + 1, 0), 11, edges);
+    std::atomic<bool> start{false};
+    std::atomic<uint32_t> failures{0};
+    std::vector<std::thread> threads;
+    for (uint32_t producer = 0; producer < producers; ++producer) {
+        auto *control = scheduler_task_control_at(fixture.base(), &fixture.locals[producer], producer);
+        control->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+        threads.emplace_back([&, producer] {
+            while (!start.load(std::memory_order_acquire)) {}
+            SchedulerResolveCursor cursor;
+            for (uint32_t step = 0; step < 1000; ++step) {
+                auto result = scheduler_resolve_completion_step(
+                    fixture.graph, fixture.base(), &fixture.locals[producer], fixture.run, producer, cursor, 1
+                );
+                if (result.result == SchedulerResolveResult::DONE) return;
+                if (result.result == SchedulerResolveResult::ERROR) break;
+            }
+            ++failures;
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads)
+        thread.join();
+    ASSERT_EQ(failures.load(), 0);
+    uint64_t pop_cursor = 0;
+    SchedulerReadyClaim claim;
+    ASSERT_TRUE(fixture.pop(0, 0, &pop_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, producers);
+    ASSERT_TRUE(fixture.pop(0, 0, &pop_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+    const auto *header = scheduler_dependencies(fixture.base(), fixture.plan.header_offset);
+    EXPECT_EQ(scheduler_state_at<uint64_t>(fixture.base(), header->remaining_offset)[producers], 0);
+    SchedulerResolveCursor duplicate;
+    EXPECT_EQ(
+        scheduler_resolve_completion_step(
+            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, duplicate, 1
+        )
+            .result,
+        SchedulerResolveResult::ERROR
+    );
+    EXPECT_EQ(scheduler_state_at<uint64_t>(fixture.base(), header->remaining_offset)[producers], 0);
+}
+
+TEST(SchedulerDependencyTest, FanoutSurvivesEveryBudgetBoundaryAndOwnerTransfer) {
+    constexpr uint32_t successors = 22;
+    std::vector<std::vector<int32_t>> edges(successors + 1, {0, 0});
+    edges.front().clear();
+    PoolFixture fixture(tasks(successors + 1, 0), 3, edges);
+    scheduler_task_control_at(fixture.base(), &fixture.locals[0], 0)->state =
+        static_cast<int64_t>(SchedulerTaskState::DONE);
+    SchedulerResolveCursor cursor;
+    bool done = false;
+    for (uint32_t step = 0; step < 1000; ++step) {
+        SchedulerResolveCursor restored;
+        std::memcpy(&restored, &cursor, sizeof(cursor));
+        const auto result = scheduler_resolve_completion_step(
+            fixture.graph, fixture.base(), &fixture.locals[step % fixture.locals.size()], fixture.run, 0, restored, 1
+        );
+        cursor = restored;
+        ASSERT_NE(result.result, SchedulerResolveResult::ERROR);
+        ASSERT_LE(result.work_units, 1);
+        if (result.result == SchedulerResolveResult::DONE) {
+            done = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(done);
+    EXPECT_EQ(cursor.visited_count, successors);
+    std::vector<bool> seen(successors + 1, false);
+    uint64_t pop_cursor = 0;
+    for (uint32_t i = 0; i < successors; ++i) {
+        SchedulerReadyClaim claim;
+        ASSERT_TRUE(fixture.pop(0, 0, &pop_cursor, &claim));
+        ASSERT_GT(claim.task_ref, 0);
+        ASSERT_LE(claim.task_ref, successors);
+        EXPECT_FALSE(seen[claim.task_ref]);
+        seen[claim.task_ref] = true;
+    }
+    SchedulerReadyClaim claim;
+    ASSERT_TRUE(fixture.pop(0, 0, &pop_cursor, &claim));
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+}
+
+TEST(SchedulerDependencyTest, RejectsMalformedStorageAndOutOfBoundsSuccessors) {
+    PoolFixture fixture(tasks(2, 0), 1, {{}, {0}});
+    auto *header = scheduler_state_at<SchedulerDependencyHeader>(fixture.base(), fixture.dependency_plan.header_offset);
+    const auto valid = *header;
+    header->remaining_offset = fixture.dependency_plan.header_offset;
+    EXPECT_FALSE(
+        scheduler_ready_pool_validate(fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, 2, 1)
+    );
+    *header = valid;
+    header->edge_count = header->edge_capacity + 1;
+    EXPECT_FALSE(
+        scheduler_ready_pool_validate(fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, 2, 1)
+    );
+    *header = valid;
+    auto *refs = scheduler_state_at<int32_t>(fixture.base(), header->fanout_refs_offset);
+    refs[0] = 2;
+    int64_t ref;
+    EXPECT_FALSE(scheduler_dependency_successor(fixture.base(), *header, 0, 0, &ref));
+    EXPECT_EQ(scheduler_dependency_notify(fixture.base(), *header, 2), SchedulerDependencyResult::ERROR);
+    EXPECT_EQ(scheduler_dependency_notify(fixture.base(), *header, 1), SchedulerDependencyResult::READY);
+    EXPECT_EQ(scheduler_dependency_notify(fixture.base(), *header, 1), SchedulerDependencyResult::ERROR);
+}
 
 TEST(SchedulerReadyPoolTest, TransferablePublicationsCompleteAfterOwnerHandoff) {
     PoolFixture fixture(tasks(24, 0), 9);

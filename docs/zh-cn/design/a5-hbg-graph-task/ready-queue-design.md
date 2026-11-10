@@ -242,7 +242,7 @@ bootstrap 的发布也受同一规则约束，scan gate 不得掩盖尚未持久
 
 ## 共用原语与首轮实现
 
-`scheduler_ticket_queue.h` 提供 append-only 原语：256-byte 控制块分开 head/tail，
+`scheduler_ticket_queue.h` 提供 append-only 原语：128-byte 控制块分开 head/tail，
 一次 FAA 为 batch 预留范围，immutable entry 通过独立 bypass 区发布，领取用一次 CAS 确认最多两个候选。
 零 credit 或未发布槽位不会预留未来工作；`NOT_READY` 不宣称严格空队列。
 容量错误是 terminal，失败范围不会访问数组，调用者不得在溢出后重试预留；
@@ -254,7 +254,7 @@ AIC/AIV 编译探针实例化单项与批量接口，CCEC 编译通过；CPU hoo
 原始证据保存在 `outputs/a5-hbg-graph-task/queue-refactor/`。
 共用原语及接入版本包含 `SchedulerReadyPoolHeader`、
 逐组 descriptor 和 Host 规划器；`SchedulerGraphSummary.ready_pool_offset` 明确定义新字段，
-summary 仍为 128 bytes。每个队列的 head/tail 各占 128-byte 行，entries 独立按 128-byte 对齐。
+summary 仍为 128 bytes。每个队列的 head/tail 各占 64-byte 行，entries 独立按 64-byte 对齐。
 Host 按实际 metadata 分配；同址新 run 清空全部 backing，并将每个 entry 置为 -1。
 
 bootstrap、kernel completion 和 control resolve 的 kernel batch 共用新发布入口；

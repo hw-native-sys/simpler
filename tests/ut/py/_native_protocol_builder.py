@@ -17,11 +17,18 @@ MAX = (1 << 64) - 1
 
 
 class ProtocolBuilder:
-    def __init__(self, shapes, clusters=2, epoch=0, sync_tasks=(), deferred_tasks=(), *, resource_scoped=False):
+    def __init__(
+        self,
+        shapes,
+        clusters=2,
+        epoch=0,
+        sync_tasks=(),
+        deferred_tasks=(),
+    ):
         self.raw: dict[str, Any] = capture(epoch)
         self.clock = 0
         self.groups = [0] * clusters
-        self.resource_scoped = resource_scoped
+        self.member_rank_offsets = {}
         self.lane_groups = [[0, 0, 0] for _ in range(clusters)]
         self.generations = {}
         self.identities: list[dict[str, Any]] = []
@@ -47,6 +54,7 @@ class ProtocolBuilder:
             inline_completed_count=0,
         )
         prefix = 0
+        next_rank = [0, 0]
         for ref, (mask, blocks, deps) in enumerate(shapes):
             flags = 0 if mask is None else 1 | (2 if deps else 0)
             if mask == 0:
@@ -55,6 +63,11 @@ class ProtocolBuilder:
                 flags |= (4 if mask.bit_count() > 1 else 0) | (8 if blocks > 1 else 0)
             if ref in sync_tasks:
                 flags |= 16
+            self.member_rank_offsets[ref] = 0
+            if flags & 8 and not flags & (4 | 16):
+                resource = 0 if mask & 1 else 1
+                self.member_rank_offsets[ref] = next_rank[resource]
+                next_rank[resource] += blocks
             raw["tasks"].append(
                 dict(
                     task_ref=ref,
@@ -69,7 +82,16 @@ class ProtocolBuilder:
             if mask:
                 prefix += blocks * mask.bit_count()
             raw["task_controls"].append(
-                dict(task_ref=ref, state=2, next_block=0, completed_blocks=0, admission_state=0)
+                dict(
+                    task_ref=ref,
+                    state=2,
+                    next_block=0,
+                    completed_blocks=0,
+                    admission_state=0,
+                    claim_tickets=0,
+                    admission_claim_lock=0,
+                    claim_seal=0,
+                )
             )
             raw["inline_completed_count" if mask is None else "resolved_task_count"] += 1
         raw["trace_count"] = prefix or len(shapes)
@@ -94,7 +116,7 @@ class ProtocolBuilder:
             )
         if raw["cooperative_task_count"]:
             mix_index = 0
-            stride = ((64 + 8 * ((raw["worker_count"] + 63) // 64) + 127) // 128) * 128
+            stride = ((64 + 8 * ((raw["worker_count"] + 63) // 64) + 63) // 64) * 64
             for task in raw["tasks"]:
                 mixed = bool(task["flags"] & 4)
                 raw["admissions"].append(
@@ -108,11 +130,12 @@ class ProtocolBuilder:
                         active_mask=0,
                         flags=0,
                         member_words_offset=4096 + task["task_ref"] * stride + 64,
-                        close_seals_offset=8192 + mix_index * clusters * 8 if mixed else 0,
+                        close_seals_offset=8192 + mix_index * clusters * 64 if mixed else 0,
                         member_words=[0] * ((raw["worker_count"] + 63) // 64),
                         close_seals=[0] * clusters if mixed else [],
                     )
                 )
+                raw["admissions"][-1]["member_rank_offset"] = self.member_rank_offsets[task["task_ref"]]
                 mix_index += mixed
 
     def tick(self):
@@ -147,13 +170,18 @@ class ProtocolBuilder:
 
     def members(self, task):
         spec = self.raw["tasks"][task]
-        if self.resource_scoped and spec["flags"] & 4:
+        if spec["flags"] & 4:
             return [w["index"] for w in self.raw["workers"] if (spec["active_mask"] | 1) & (1 << (w["index"] % 3))]
-        return [
+        eligible = [
             w["index"]
             for w in self.raw["workers"]
             if spec["flags"] & 4 or (w["core_type"] == 0) == bool(spec["active_mask"] & 1)
         ]
+
+        if spec["flags"] & 8 and not spec["flags"] & (4 | 16):
+            start = self.member_rank_offsets[task] % len(eligible)
+            return [eligible[(start + i) % len(eligible)] for i in range(min(spec["block_num"], len(eligible)))]
+        return eligible
 
     def complete_task(self, task, worker):
         if task in self.deferred_tasks:
@@ -188,6 +216,8 @@ class ProtocolBuilder:
                 close_seal=0,
                 last_group_seq=0,
                 pending_mask=0,
+                claim_seal_seen=0,
+                claim_cursor_seen=0,
             )
             self.raw["members"].append(row)
             if observe_members:
@@ -219,7 +249,25 @@ class ProtocolBuilder:
         self.raw["blocks"].append(result)
         self.stamp(row, "claim_before")
         self.stamp(row, "claim_after")
-        self.raw["task_controls"][task]["next_block"] += 1
+        control = self.raw["task_controls"][task]
+        control["next_block"] += 1
+        if spec["block_num"] > 1 and not spec["flags"] & 16:
+            control["claim_tickets"] += 1
+        certificate = dict(
+            run_epoch=self.raw["run_epoch"],
+            worker_index=worker,
+            block_idx=block,
+            confirmed_count=control["next_block"],
+            seal_value=0,
+            published_before=[0, 0],
+            published_after=[0, 0],
+        )
+        result["claim"] = certificate
+        if control["next_block"] == spec["block_num"]:
+            certificate["seal_value"] = spec["block_num"]
+            self.stamp(certificate, "published_before")
+            self.stamp(certificate, "published_after")
+            control["claim_seal"] = spec["block_num"]
         return result
 
     def complete_block(self, block):
@@ -311,7 +359,7 @@ class ProtocolBuilder:
         owner["group_seq"] = group
         self.stamp(owner, "publish_before")
         self.stamp(owner, "publish_after")
-        resources = owner["active_mask"] | 1 if self.resource_scoped else 7
+        resources = owner["active_mask"] | 1
         for lane, worker in enumerate(workers):
             if not resources & (1 << lane):
                 continue
@@ -328,8 +376,7 @@ class ProtocolBuilder:
                 arrived_seq=[group if resources & (1 << peer) else 0 for peer in range(3)],
                 lane_subtasks=[i if owner["active_mask"] & (1 << i) else 255 for i in range(3)],
             )
-            if self.resource_scoped:
-                row["previous_lane_seq"] = list(self.lane_groups[cluster])
+            row["previous_lane_seq"] = list(self.lane_groups[cluster])
             for name in (
                 "descriptor_ready",
                 "arrive_before",
@@ -376,6 +423,8 @@ class ProtocolBuilder:
                 self.raw["admissions"][task]["close_seals"][worker // 3] = row["close_seal"]
                 if worker % 3:
                     row["closed_cursor"] = MAX
+            if not (spec["flags"] & 4 and worker % 3) and row["closed_cursor"] == spec["block_num"]:
+                row["claim_seal_seen"] = row["claim_cursor_seen"] = spec["block_num"]
             self.stamp(row, "closed")
 
     def run(self, order=None):

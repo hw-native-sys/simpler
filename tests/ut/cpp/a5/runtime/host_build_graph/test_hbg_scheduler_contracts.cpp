@@ -539,9 +539,6 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     for (uint64_t inbox = 0; inbox < SCHEDULER_READY_INBOX_CAPACITY; ++inbox)
         EXPECT_EQ(ready[inbox].endpoints, SCHEDULER_READY_ENDPOINTS_EMPTY);
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), layout.worker_contexts_offset);
-    EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved0, 0u);
-    EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved1, 0u);
-    EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved2, 0u);
 
     auto *directory = scheduler_state_at<SchedulerReadyDirectory>(storage.base(), layout.ready_directory_offset);
     auto shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[0][0]);
@@ -552,18 +549,18 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
 }
 
 TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
-    EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
+    EXPECT_EQ(alignof(SchedulerTaskControl), 64u);
     EXPECT_EQ(alignof(SchedulerExecutorTaskTrace), alignof(uint64_t));
     EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 48u);
     EXPECT_EQ(alignof(SchedulerSsbufRegion), 64u);
-    EXPECT_EQ(alignof(SchedulerRunControl), 128u);
-    EXPECT_EQ(alignof(SchedulerWorkerContext), 128u);
-    EXPECT_EQ(alignof(SchedulerTaskTrace), 128u);
+    EXPECT_EQ(alignof(SchedulerRunControl), 64u);
+    EXPECT_EQ(alignof(SchedulerWorkerContext), 64u);
+    EXPECT_EQ(alignof(SchedulerTaskTrace), 64u);
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 384u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 384u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     // Both chain links belong to the atomic line: they are written as single
     // device words, and nothing publishes that line as a whole, so no producer's
@@ -704,16 +701,12 @@ TEST(SchedulerGraph, RejectsUnboundNonEmptyFaninRegion) {
     EXPECT_EQ(scheduler_classify_task_shape(graph.graph(), 1, &shape), SchedulerGraphResult::INVALID_FANIN_ID);
 }
 
-// The view's reserved word exists so its wire size survived the collapse from two
-// addresses to one. A non-zero read means the producer is writing a field this
-// build does not know about, so both entry points refuse rather than proceed on a
-// view they cannot fully interpret.
-TEST(SchedulerGraph, RejectsAViewWithANonZeroReservedWord) {
+TEST(SchedulerGraph, RejectsAViewWithAnUnsupportedVersion) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
 
     SchedulerGraphView dirty = graph.graph();
-    dirty.reserved = 1;
+    dirty.view_version = SCHEDULER_GRAPH_VIEW_VERSION + 1;
 
     SchedulerTaskShape shape{};
     EXPECT_EQ(scheduler_classify_task_shape(dirty, 0, &shape), SchedulerGraphResult::INVALID_ARGUMENTS);

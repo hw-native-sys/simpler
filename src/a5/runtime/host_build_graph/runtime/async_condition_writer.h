@@ -52,8 +52,8 @@ inline __aicore__ bool fail(const AsyncWriter &writer, int32_t error) {
 
 inline __aicore__ bool layout_valid(const AsyncWriter &writer, __gm__ const AsyncGroupData &data) {
     const uint32_t bytes = async_group_entry_bytes(data.capacity);
-    return data.reserved == 0 && data.task_ref >= 0 && data.subtask_slot < 3 && bytes != 0 &&
-           data.entries_bytes == bytes && data.entries_offset >= writer.group_offset + sizeof(AsyncGroupData) &&
+    return data.task_ref >= 0 && data.subtask_slot < 3 && bytes != 0 && data.entries_bytes == bytes &&
+           data.entries_offset >= writer.group_offset + sizeof(AsyncGroupData) &&
            span_valid(writer, data.entries_offset, bytes, ASYNC_RECORD_ALIGNMENT);
 }
 

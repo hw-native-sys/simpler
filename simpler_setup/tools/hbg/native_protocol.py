@@ -13,13 +13,13 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 10))
+SCHEMAS = ("hbg-native-protocol-v10", "hbg-native-protocol-v11")
 
 ROOT_NUMBERS = frozenset(
     """
 run_epoch task_count worker_count trace_count member_count cooperative_task_count
 cluster_count mix_task_count expected_task_count inline_completed_count resolved_task_count
-executed_task_count active_worker_count scheduler_count scheduler_error error_claimed commit_tail commit_lock
+close_seal_stride active_worker_count scheduler_count scheduler_error error_claimed commit_tail commit_lock
 """.split()
 )
 ROOT_TABLES = frozenset(
@@ -86,21 +86,9 @@ def protocol_version(section):
     return int(schema.rsplit("v", 1)[-1]) if schema in SCHEMAS else 0
 
 
-def uses_resource_scoped_mix(section):
-    """Versions 8 and 9 coordinate only the declared Mix resource lanes."""
-    return protocol_version(section) >= 8
-
-
 def has_native_graph(section):
-    """Native Graph v6 is distinguished from claim-seal v6 by its source tables."""
-    version = protocol_version(section)
-    return version == 9 or (version == 6 and ("node_map" in section or "graph_source" in section))
-
-
-def has_claim_seal(section):
-    """Legacy native Graph v6 predates the claim-seal contract."""
-    version = protocol_version(section)
-    return version >= 6 and not (version == 6 and has_native_graph(section))
+    """The native Graph schema includes independent source and node maps."""
+    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v11"
 
 
 def _error(message):
@@ -159,17 +147,18 @@ def _indices(rows, count, path, *, key="index", dense=False):
 
 def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
-    version = protocol_version(section)
+    if not protocol_version(section):
+        _error("unsupported schema")
     native = has_native_graph(section)
-    root_numbers = ROOT_NUMBERS | ({"close_seal_stride"} if version >= 7 else set())
+    root_numbers = ROOT_NUMBERS
     extra = {"node_map", "graph_source"} if native else set()
     _object(section, root_numbers | ROOT_TABLES | {"schema", "producer", "first_error"} | extra, "root")
-    if not version or section["producer"] != "aicore":
+    if section["producer"] != "aicore":
         _error("unknown schema or producer")
     for field in root_numbers:
         _number(section[field], field)
-    if version >= 7 and section["close_seal_stride"] != 128:
-        _error("close_seal_stride must be 128 for v7 and later")
+    if section["close_seal_stride"] != 64:
+        _error("close_seal_stride disagrees with the schema version")
     error_numbers = ERROR_NUMBERS
     _object(section["first_error"], error_numbers, "first_error")
     for field in error_numbers:
@@ -185,11 +174,10 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
-            extra = ("claim_tickets",) if kind == "control" and version >= 2 else ()
-            if kind == "control" and version >= 5:
-                extra += ("admission_claim_lock",)
-            if kind == "control" and has_claim_seal(section):
-                extra += ("claim_seal",)
+            extra = {
+                "control": ("claim_tickets", "admission_claim_lock", "claim_seal"),
+                "admission": ("member_rank_offset",),
+            }.get(kind, ())
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
         if len(row["member_words"]) != (section["worker_count"] + 63) // 64:
@@ -202,7 +190,7 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table)
         for row in section[table]:
-            extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" and has_claim_seal(section) else ()
+            extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" else ()
             _record(row, kind, f"{table}[{row['index']}]", extra)
     _read_nested_events(section)
     if native:
@@ -221,17 +209,15 @@ def _read_nested_events(section):
                 _record(row[name], "actor", f"task_events[{row['index']}].{name}")
     _indices(section["blocks"], section["trace_count"], "blocks")
     for row in section["blocks"]:
-        fields = {"index", "owner", "lanes"}
-        if has_claim_seal(section):
-            fields.add("claim")
+        fields = {"index", "owner", "lanes", "claim"}
         _object(row, fields, "block row")
-        if has_claim_seal(section) and row["claim"] is not None:
+        if row["claim"] is not None:
             _record(row["claim"], "claim", f"blocks[{row['index']}].claim")
         if row["owner"] is not None:
             _record(row["owner"], "owner", f"blocks[{row['index']}].owner")
         _indices(row["lanes"], 3, "block lanes")
         for lane in row["lanes"]:
-            extra = {"previous_lane_seq": 3} if uses_resource_scoped_mix(section) else None
+            extra = {"previous_lane_seq": 3}
             _record(lane, "lane", f"blocks[{row['index']}].lanes[{lane['index']}]", extra_arrays=extra)
 
 
@@ -241,7 +227,7 @@ def _event_records(section):
             if row[name] is not None:
                 yield row[name], "actor", f"task_events[{row['index']}].{name}"
     for row in section["blocks"]:
-        if has_claim_seal(section) and row["claim"] is not None:
+        if row["claim"] is not None:
             yield row["claim"], "claim", f"blocks[{row['index']}].claim"
         if row["owner"] is not None:
             yield row["owner"], "owner", f"blocks[{row['index']}].owner"

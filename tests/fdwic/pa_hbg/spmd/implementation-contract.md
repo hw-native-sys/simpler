@@ -141,12 +141,12 @@ images, not Host pointers. Important layout contracts have C++ static assertions
 
 | Object | Retained layout |
 | ------ | --------------- |
-| TaskControl | 640 bytes; valid claims at 128, completed blocks at 256, admission signal at 384 and atomic claim certificate at 512 |
-| Admission control | Lock and tail on separate 128-byte regions |
-| Admission record | 64-byte header plus worker bitmap; stride rounded to 128 bytes |
-| Group mailbox | 640 bytes: descriptor, sequence and three independent lane regions |
-| Close seals | One 128-byte atomic-only cell per Mix task per candidate cluster, retained until run teardown |
-| RunControl | 512 bytes; extended identity uses reserved bytes 336-383, error signal begins at 384 |
+| TaskControl | 384 bytes; claim tickets at 24, valid claims at 128, completed blocks at 192, admission signal at 256 and atomic claim certificate at 320 |
+| Admission control | 128 bytes; lock and tail on separate 64-byte regions |
+| Admission record | 64-byte header including the Host-planned per-type block prefix at offset 40; bitmap follows, stride rounded to 64 bytes |
+| Group mailbox | 384 bytes: 128-byte descriptor, 64-byte publication region and three 64-byte lane acknowledgments |
+| Close seals | One 64-byte atomic-only cell per Mix task per candidate cluster, retained until run teardown |
+| RunControl | 448 bytes; dynamic counters begin at 192, error payload at 256, identity at 320 and error signal at 384 |
 
 Topology facts may be cached until run reinitialization. A negative ready probe
 may suppress duplicate discovery only in the same fill call, after all applicable
@@ -167,21 +167,23 @@ captures identity from the actual payload; Host export preserves independent
 `hbg-execution-identity-v1` records. Predicate skips use `executed=false`.
 Compact worker IDs in swimlanes are not physical core IDs in topology records.
 
-L4 additionally exports `hbg-native-protocol-v8`: frozen graph/members, admission,
+L4 additionally exports `hbg-native-protocol-v10` (or v11 for native graph identity): frozen graph/members, admission,
 claims, entry permits, LocalDone, group publication/release, completion and terminal
 state. Readers in `simpler_setup/tools/hbg/` check per-worker sequences, exact
 execution joins, ownership and causal edges from observed values and atomic
 tickets. Cross-core timestamps are not a total-order proof.
 
-Versions v1-v7 remain strictly readable. Ticket thresholds are N>2P in v2,
-N>=2P in v3 and N>1 from v4 onward; N1/sync_start never use tickets. v5 requires
-the raw admission claim lock, zero at successful termination. v6 adds claim
-certificates, v7 requires the 128-byte close-seal stride, and v8 records scoped
-Mix membership and per-lane predecessor sequences. Missing fields
-are not synthesized, and old captures without protocol objects remain unverified.
-Native Graph captures use v9 with the same resource and claim contracts plus
-`node_map` and `graph_source`. Legacy Graph v6 is identified by those source tables
-and validated separately from the ordinary v6 claim-certificate format.
+Only the current v10/v11 schemas are accepted. Producer and reader must use
+matching contracts; historical and experimental formats are rejected. Admission
+and close-seal regions use 64-byte alignment. Ordinary multi-block tasks require
+admission and ticket claims; N1 and sync_start do not use tickets. Successful
+termination requires a free claim lock and a complete claim certificate.
+MIX membership follows its resource mask and records per-lane predecessor sequences.
+
+Native Graph v11 includes `node_map` and `graph_source` for an independent topology
+audit. Both schemas validate member_rank_offset against a per-resource-type block
+prefix reconstructed from frozen task shapes. All tasks use the current cooperative
+admission rules. Execution identities use only the strict v1 format.
 The strict CSA gate additionally matches independent dep-gen, original kernels,
 block counts, all fan-in and the full task/block/slot set. Truncated/missing
 evidence fails the gate even when golden values match. Failed runs require their
