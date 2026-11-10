@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "scheduler_compile.h"
+
 #include "async_condition_writer.h"
 #include "scheduler_async_directory.h"
 #include "scheduler_async_layout.h"
@@ -288,7 +290,7 @@ scheduler_async_has_registered_groups(SchedulerAsyncLocalState *local, int64_t t
     return true;
 }
 
-inline __aicore__ bool scheduler_async_begin_execution(
+SCHEDULER_HEAVY_INLINE __aicore__ bool scheduler_async_begin_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane, __gm__ GlobalContext &global,
     pto2::resident::AsyncWriter &writer
 ) {
@@ -308,7 +310,7 @@ inline __aicore__ bool scheduler_async_begin_execution(
     return true;
 }
 
-inline __aicore__ bool scheduler_async_seal_execution(
+SCHEDULER_HEAVY_INLINE __aicore__ bool scheduler_async_seal_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane,
     const pto2::resident::AsyncWriter &writer
 ) {
@@ -371,7 +373,7 @@ inline __aicore__ bool scheduler_async_seal_execution(
 }
 
 // All execution resources and final traces have retired before computation closes.
-inline __aicore__ bool
+SCHEDULER_HEAVY_INLINE __aicore__ bool
 scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_ref, bool &deferred) {
     using namespace scheduler_async_detail;
     deferred = false;

@@ -11,12 +11,14 @@
 
 #pragma once
 
+#include "scheduler_compile.h"
+
 #include "scheduler_ready_publication.h"
 
 // The producer is already DONE. This cursor owns its detached chain until all
 // successors are handed off and every ready publication has finished. Returning
 // DONE does not itself contribute to the run's completion counter.
-inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
+SCHEDULER_HEAVY_INLINE __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t producer_ref, SchedulerResolveCursor &cursor, uint32_t budget, SchedulerWakeStats *wake_stats = nullptr,
     SchedulerReadyStats *ready_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr,

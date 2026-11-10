@@ -59,8 +59,17 @@ foreach(INC_DIR ${CMAKE_CUSTOM_INCLUDE_DIRS})
 endforeach()
 
 # Compiler flags
+set(SIMPLER_AICORE_BUILD_PROFILE "release" CACHE STRING "A5 device compiler profile: release or dev")
+set_property(CACHE SIMPLER_AICORE_BUILD_PROFILE PROPERTY STRINGS release dev)
+if(SIMPLER_AICORE_BUILD_PROFILE STREQUAL "release")
+    set(AICORE_OPT_DEBUG_FLAGS "-O3 -g")
+elseif(SIMPLER_AICORE_BUILD_PROFILE STREQUAL "dev")
+    set(AICORE_OPT_DEBUG_FLAGS "-O1 -gline-tables-only -DSIMPLER_AICORE_DEV_OUTLINE=1")
+else()
+    message(FATAL_ERROR "Unknown AICore build profile: ${SIMPLER_AICORE_BUILD_PROFILE}")
+endif()
 set(AICORE_FLAGS
-    "-c -O3 -g -x cce -Wall -std=c++17 \
+    "-c ${AICORE_OPT_DEBUG_FLAGS} -x cce -Wall -std=c++17 \
     --cce-aicore-only \
     -mllvm -cce-aicore-stack-size=0x8000 \
     -mllvm -cce-aicore-function-stack-size=0x8000 \

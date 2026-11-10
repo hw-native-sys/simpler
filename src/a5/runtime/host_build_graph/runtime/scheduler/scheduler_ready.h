@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "scheduler_compile.h"
+
 #include "scheduler_protocol.h"
 #include "scheduler_graph.h"
 #include "scheduler_graph_binding.h"
@@ -801,7 +803,7 @@ inline __aicore__ SchedulerErrorIdentity scheduler_error_identity(
     return identity;
 }
 
-inline __aicore__ void scheduler_record_error(
+SCHEDULER_HEAVY_INLINE __aicore__ void scheduler_record_error(
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph, const SchedulerLocalState *local,
     SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN, const SchedulerLocalSlotState *slot = nullptr
@@ -813,9 +815,9 @@ inline __aicore__ void scheduler_record_error(
     );
 }
 
-inline __aicore__ void scheduler_record_dispatch_error(
+SCHEDULER_HEAVY_INLINE __aicore__ void scheduler_record_dispatch_error(
     __gm__ SchedulerRunControl *run, int64_t task_ref, SchedulerGraphResult status, const SchedulerGraphView *graph,
-    const SchedulerLocalState *local, const SchedulerLocalSlotState *slot, const SchedulerTaskMetadata &metadata,
+    const SchedulerLocalState *local, const SchedulerLocalSlotState *slot, SchedulerTaskMetadata metadata,
     SchedulerErrorSite site
 ) {
     auto identity = scheduler_error_identity(local, task_ref, slot);
@@ -2045,7 +2047,7 @@ struct SchedulerCompletionDirect {
     bool mix_prefix_published{false};
 };
 
-inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
+SCHEDULER_HEAVY_INLINE __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t producer_ref, SchedulerResolveCursor &cursor, uint32_t budget, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats, uint64_t profiling_level,

@@ -252,13 +252,26 @@ class RuntimeBuilder:
     _COMPDB_RUNTIME = "tensormap_and_ringbuffer"
     _COMPDB_VARIANT = "onboard"
 
-    def __init__(self, platform: str = "a2a3"):
+    def __init__(self, platform: str = "a2a3", *, aicore_build_profile: Optional[str] = None):
         """
         Initialize RuntimeBuilder with platform selection.
 
         Args:
             platform: Target platform ("a2a3", "a2a3sim", "a5", or "a5sim")
+            aicore_build_profile: "dev" selects A5 HBG debug compilation in
+                separate cache and artifact directories. None reads
+                SIMPLER_AICORE_BUILD_PROFILE, which defaults to "release".
         """
+        if aicore_build_profile is None:
+            aicore_build_profile = os.environ.get("SIMPLER_AICORE_BUILD_PROFILE", "release")
+        if aicore_build_profile not in ("release", "dev"):
+            raise ValueError(f"Unknown AICore build profile: {aicore_build_profile}")
+        if aicore_build_profile == "dev" and platform != "a5":
+            raise ValueError("The dev AICore build profile requires platform='a5'")
+        self.aicore_build_profile = aicore_build_profile
+        if aicore_build_profile != "release":
+            self._CACHE_DIR = self._CACHE_DIR / "profiles" / aicore_build_profile
+            self._LIB_DIR = self._LIB_DIR / "profiles" / aicore_build_profile
         self.platform = platform
         self._arch, self._variant = parse_platform(platform)
 
@@ -437,6 +450,8 @@ class RuntimeBuilder:
         Raises:
             FileNotFoundError: If build=False and pre-built binaries are missing.
         """
+        if self.aicore_build_profile == "dev" and name != "host_build_graph":
+            raise ValueError("The dev AICore build profile supports only A5 host_build_graph")
         self._validate_runtime(name)
 
         arch, variant = self._arch, self._variant
@@ -498,6 +513,8 @@ class RuntimeBuilder:
                 # _a5_async_workspace_overlay_defines).
                 if self._arch == "a5" and self._variant == "onboard":
                     defines.update(_a5_async_workspace_overlay_defines())
+            if target == "aicore" and arch == "a5" and variant == "onboard":
+                defines["SIMPLER_AICORE_BUILD_PROFILE"] = self.aicore_build_profile
             cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
