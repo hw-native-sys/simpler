@@ -508,22 +508,32 @@ inline __aicore__ void percounter_mix_release(const LaneConfig &cfg) {
  * the cohort released and promotes the next one, and every holder of a block of
  * a released cohort runs it.
  *
- * **One lane never owes a cohort block and a rendezvous at once.** The two
- * gather different sets of lanes -- a cohort's kernel holds each block at its
- * barrier until every holder is in it, a rendezvous holds each subtask until
- * every participant has arrived -- so a lane that owes both is a lane two sets
- * wait for, and whichever set it serves second waits forever.
+ * **A lane that owes a cohort block and a rendezvous at once serves them in a
+ * fixed order.** The two gather different sets of lanes -- a cohort's kernel
+ * holds each block at its barrier until every holder is in it, a rendezvous
+ * holds each subtask until every participant has arrived -- so a lane that owes
+ * both is a lane two sets wait for, and serving them in an order the sets can
+ * disagree about is what closes a cycle.
  *
- * **Both arming sites therefore refuse a mask naming a holder**:
- * `percounter_mix_arm` for a draw from the MIX list, and
- * `percounter_sync_serve_block` for a MIX cohort's own block, which arms the
- * same line and is as real an admission as the draw. A lane likewise does not
- * take a block while the line carries a generation it has not looked at.
+ * **The arming sites keep a holder out of a line it would be the last to
+ * reach.** `percounter_mix_arm` refuses a mask naming any lane whose hold it
+ * can see; `percounter_sync_serve_block`, which arms the same line for a MIX
+ * cohort's own block, refuses one naming a holder of a *strictly older* cohort,
+ * since a holder of a later one is exactly the lane this line is waiting to
+ * free. Both read the holds twice, the second time with the payload staged and
+ * the generation not yet turned, so an arming a take has overtaken is retracted
+ * rather than published. A lane likewise does not take a block while the line
+ * carries a generation it has not looked at.
  *
- * Only the window between an arming and a take leaves a lane owing both, and
- * the holder there still serves its block first. Every lane the mask named was
- * clear of the cohort when the arming read the holds, so no participant is
- * inside a cohort kernel, and the rendezvous waits only as long as that block.
+ * **What the holds cannot cover, the order does.** Neither read is atomic with
+ * the fetch_add that takes a block, so a lane can still end up holding one and
+ * named in a line armed while it was clear. `percounter_line_precedes_block`
+ * decides that case: an ordinary draw is always served before the block, a
+ * cohort rendezvous when its cohort is the older. Every lane the line names
+ * resolves it the same way, so the line completes and the blocks follow; and
+ * because a hold is published before the block can be served and cleared only
+ * after its kernel returns, no lane the arming cleared is inside a cohort
+ * kernel.
  *
  * Taking a block never blocks, and a holder never takes a second.
  */
@@ -605,15 +615,24 @@ inline __aicore__ bool percounter_mix_unseen(const LaneConfig &cfg, const Percou
 }
 
 /**
- * Whether the cluster's line carries a cohort rendezvous older than the block
- * this lane holds, and names this lane.
+ * Whether the cluster's line names this lane under a rendezvous that precedes
+ * the block this lane holds, and so is served before it.
  *
+ * **An ordinary draw always precedes it.** Both arming sites refuse a mask
+ * naming a lane whose hold they can see, so a draw this lane is named in was
+ * announced while this lane was clear -- it is the take that followed, not the
+ * line that followed the take. Serving the block first would put this lane
+ * inside a cohort kernel while every participant of that draw waits, and they
+ * cannot release it, since the lane it is missing is this one.
+ *
+ * **A cohort rendezvous precedes it when its cohort is the older one.**
  * `cohort_block` is the cohort's sequence plus one rather than a flag, so the
- * comparison needs nothing the line does not already carry. Read under the
- * same seqlock as discovery: the payload belongs to this generation only while
- * the generation has not moved.
+ * comparison needs nothing the line does not already carry.
+ *
+ * Read under the same seqlock as discovery: the payload belongs to this
+ * generation only while the generation has not moved.
  */
-inline __aicore__ bool percounter_line_owes_older(const LaneConfig &cfg, const PercounterLaneState *state) {
+inline __aicore__ bool percounter_line_precedes_block(const LaneConfig &cfg, const PercounterLaneState *state) {
     if (cfg.mix_order_count == 0) return false;
     SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
     const uint32_t generation = scheduler_ssbuf_load_acquire(&signal->armed_generation);
@@ -622,7 +641,7 @@ inline __aicore__ bool percounter_line_owes_older(const LaneConfig &cfg, const P
     const uint32_t cohort = signal->cohort_block;
     if (scheduler_ssbuf_load_acquire(&signal->armed_generation) != generation) return false;
     if ((mask & (uint32_t{1} << cfg.cluster_lane)) == 0) return false;
-    return cohort != 0 && static_cast<uint64_t>(cohort - 1) < state->sync.my_seq;
+    return cohort == 0 || static_cast<uint64_t>(cohort - 1) < state->sync.my_seq;
 }
 
 /**
@@ -723,6 +742,11 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
     signal->block_idx = sync->my_block;
     signal->block_num = static_cast<int32_t>(sync->block_num);
     signal->cohort_block = static_cast<uint32_t>(sync->my_seq + 1);
+    // The holds again, with the payload staged and nothing published, for the
+    // reason the ordinary draw re-reads them: nothing is a rendezvous until the
+    // generation turns odd, so returning here retracts the arming whole.
+    if (percounter_cohort_older_held_in(cfg, sync->active_mask & ~(uint32_t{1} << cfg.cluster_lane), sync->my_seq))
+        return true;
     scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
     sync->my_block = -1;
     // The armed line now carries this block, and is itself what holds the
@@ -753,9 +777,9 @@ inline __aicore__ bool percounter_sync_serve_released(
     *served = false;
     PercounterSyncState *sync = &state->sync;
     if (sync->my_block < 0) return true;
-    // Ahead of the watchdog: the wait is on an older cohort's kernel, which
-    // carries its own, and this block's budget is not what bounds it.
-    if (percounter_line_owes_older(cfg, state)) return true;
+    // Ahead of the watchdog: the wait is on a rendezvous that carries its own
+    // budget, and this block's is not what bounds it.
+    if (percounter_line_precedes_block(cfg, state)) return true;
     // Cohorts are promoted in sequence order, so this one is fully claimed
     // exactly when the counter passes it.
     if (scheduler_gm_query(cfg.sync_queue->released) > sync->my_seq) {
@@ -896,6 +920,11 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
     // Every arming: the previous rendezvous on this line may have been a
     // cohort block.
     signal->cohort_block = 0;
+    // The holds again, with the payload staged and nothing published: a lane
+    // that took a block since the first read is named here, and the generation
+    // is what would tell it so. Returning now retracts the whole arming, since
+    // a payload under an even generation is not a rendezvous.
+    if (percounter_cohort_held_in(cfg, mask)) return;
     scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
     claim->task_id = -1;
 }

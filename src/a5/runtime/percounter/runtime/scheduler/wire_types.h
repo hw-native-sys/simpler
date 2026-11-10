@@ -82,14 +82,19 @@ struct alignas(64) PercounterMixSignal {
     // lane that owes a block of its own needs the sequence to tell which of the
     // two it serves first, so a flag would not carry enough.
     volatile uint32_t cohort_block;
-    // Entry `i` is non-zero while cluster lane `i` holds a cohort block it has
-    // not finished, and lane `i` is its only writer. A lane's two ways of being
-    // committed -- a cohort block and a rendezvous this line names it in -- are
-    // mutually exclusive, and this is the half of that the claimer can see.
+    // Entry `i` carries the sequence plus one of the cohort whose block cluster
+    // lane `i` holds and has not finished, and zero while it holds none; lane
+    // `i` is its only writer. It is published before that block can be served
+    // and cleared only after its kernel returns, so a hold an arming reads as
+    // clear names a lane that is not inside a cohort kernel. It is what an
+    // arming can see of a lane's other commitment, not a lock: the lane's own
+    // service order resolves the case neither arming could exclude.
     volatile uint32_t cohort_hold[PLATFORM_CORES_PER_BLOCKDIM];
 };
 static_assert(sizeof(PercounterMixSignal) == 64, "the MIX signal owns exactly one cache line");
 static_assert(alignof(PercounterMixSignal) == 64, "two clusters must not share a line");
+// Every member is volatile, so the type is not trivially copyable: the line is
+// written field by field under a seqlock, never memcpy'd as a whole.
 static_assert(std::is_standard_layout_v<PercounterMixSignal>);
 
 /**
