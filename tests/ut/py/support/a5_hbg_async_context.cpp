@@ -21,6 +21,7 @@
 #include "async_kernel_api.h"
 #include "backend/sdma/sdma_completion_registration.h"
 #include "dispatch_payload.h"
+#include "scheduler/scheduler_args_dump.h"
 
 namespace {
 struct Session {};
@@ -238,6 +239,25 @@ int main(int argc, char **argv) {
             assert(*ctx.completion_error_code != 0);
             assert(!pto2::resident::seal_conditions(ctx.resident));
             if (scenario == 32) assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        }
+    } else if (scenario >= 33 && scenario <= 36) {
+        DeferredCompletionSlab legacy{};
+        payload.local_context.async_ctx = LegacyAsyncCtx::make(TaskId::make_global(1), &legacy);
+        SchedulerArgsDumpTask selected{};
+        if (scenario == 33 || scenario == 36) selected.output_tensor_mask = 1;
+        scheduler_args_dump_limit_async_output(scenario == 34 ? nullptr : &selected, global);
+        const pto2::resident::AsyncWriter writer{image, plan.total_bytes, 9, plan.layout.groups_offset, 0};
+        if (scenario == 36) {
+            // An output snapshot of an ordinary synchronous task is still allowed.
+            assert(pto2::resident::seal_conditions(writer));
+        } else {
+            auto ctx = get_async_ctx(args);
+            assert(async_ctx_is_deferred(ctx) == (scenario != 33));
+            assert(register_completion_condition(ctx, token) == (scenario != 33));
+            assert(data->count == (scenario == 33 ? 0u : 1u));
+            assert(legacy.count == 0);
+            assert(pto2::resident::seal_conditions(writer) == (scenario != 33));
+            assert(data->error_code == (scenario == 33 ? SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED : 0));
         }
     } else return 2;
     return 0;

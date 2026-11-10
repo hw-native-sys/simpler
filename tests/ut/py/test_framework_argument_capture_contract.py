@@ -244,7 +244,15 @@ def transport(consumer, monkeypatch, tmp_path):
     import torch  # noqa: PLC0415
 
     worker, events = Worker(level=2), []
-    state = SimpleNamespace(fail_boundary=False, materialized=[], refuse_dump=False, defect=None, active_stream=None)
+    state = SimpleNamespace(
+        fail_boundary=False,
+        materialized=[],
+        refuse_dump=False,
+        defect=None,
+        active_stream=None,
+        scheduler_mode=1,
+        scheduler_publish=True,
+    )
     stream = SimpleNamespace(npu_stream=17)
 
     class NativeRun:
@@ -288,6 +296,9 @@ def transport(consumer, monkeypatch, tmp_path):
                 message = "another refusal with code -1001"
             error = RuntimeError if state.defect == "untyped" else RunPreparationRefused
             raise error(message)
+        native.scheduler_runtime_mode = state.scheduler_mode
+        if state.scheduler_publish:
+            native.scheduler_mode_publish_count += 1
         for item in range(6):
             arrays[2][item] = arrays[0][item] + 2 * arrays[1][item]
         if state.defect == "recovery" and index == 3:
@@ -296,12 +307,15 @@ def transport(consumer, monkeypatch, tmp_path):
             _seed(Path(cfg.output_prefix), index, cfg.enable_dump_args, materialized=geometry)
         return NativeRun()
 
-    worker._chip_worker = SimpleNamespace(
+    native = SimpleNamespace(
         _execution_environment=(os.getpid(), 101, 1, 0, True),
         _validate_execution_context=lambda: None,
         _validate_caller_stream=lambda value: None,
         _submit_chip_run_direct=submit,
+        scheduler_runtime_mode=1,
+        scheduler_mode_publish_count=0,
     )
+    worker._chip_worker = native
     worker._lifecycle = _Lifecycle.READY
     monkeypatch.setattr(worker, "_resolve_handle", lambda *args, **kwargs: SimpleNamespace(slot_id=3))
     monkeypatch.setattr(worker, "_resolve_handle_locked", lambda *args, **kwargs: SimpleNamespace(slot_id=3))
@@ -372,49 +386,38 @@ def transport(consumer, monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     "platform,runtime",
-    [("a2a3", "tensormap_and_ringbuffer"), ("a2a3", "host_build_graph"), ("a5", "tensormap_and_ringbuffer")],
+    [
+        ("a2a3", "tensormap_and_ringbuffer"),
+        ("a2a3", "host_build_graph"),
+        ("a5", "tensormap_and_ringbuffer"),
+        ("a5", "host_build_graph"),
+    ],
 )
 def test_whole_consumer_records_intended_modes_and_retirement(consumer, transport, runtime, platform):
     result = consumer.run(runtime, 0, Path("recording.so"), transport.root, platform=platform)
     assert result["platform"] == platform
     assert result["payloads_verified"] and result["config_snapshot_verified"] and result["guards_verified"]
+    expected_modes = [None, 1, 1, None] if platform == "a5" and runtime == "host_build_graph" else [None] * 4
+    assert result["scheduler_modes"] == expected_modes
     # This trace belongs to the synchronous recording enqueue, not to real Torch scheduling.
     assert transport.events == ["submit"] * 4 + ["boundary"] + ["retire"] * 4 + ["close"]
     assert not consumer._UNPROVEN
 
 
-def test_a5_hbg_refuses_only_enabled_dumps_and_recovers_on_the_same_worker(consumer, transport):
-    transport.state.refuse_dump = True
-    result = consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
-    assert result["accepted_calls"] == result["calls"] == 2
-    assert result["args_dump_supported"] is False and result["payloads_verified"] is False
-    assert [(item["index"], item["level"]) for item in result["refusals"]] == [(1, 3), (2, 2)]
-    assert result["off_calls_verified"] and result["refusal_outputs_unchanged"]
-    assert result["caller_tensors_retained"] and result["caller_stream_after_close"]
-    assert result["payload_counts"] == [0, 0, 0, 0] and result["run_epochs"] == [None] * 4
-    assert transport.events == [
-        "submit",
-        "submit",
-        "refuse",
-        "submit",
-        "refuse",
-        "submit",
-        "boundary",
-        "retire",
-        "retire",
-        "close",
-        "boundary",
-    ]
-    assert not consumer._dump_files(transport.root) and not consumer._UNPROVEN
+@pytest.mark.parametrize("mode,publish", [(0, True), (2, True), (3, True), (4, True), (1, False)])
+def test_a5_hbg_dump_requires_a_fresh_aicore_selection(consumer, transport, mode, publish):
+    transport.state.scheduler_mode, transport.state.scheduler_publish = mode, publish
+    message = "RESIDENT_PENDING" if publish else "published no scheduler selection"
+    with pytest.raises(AssertionError, match=message):
+        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
+    assert consumer._UNPROVEN and "close" not in transport.events
 
 
-@pytest.mark.parametrize(
-    "defect", ["wrong_status", "wrong_reason", "silent_accept", "output_write", "dump_files", "recovery"]
-)
-def test_a5_hbg_contract_rejects_false_refusals_writes_and_broken_recovery(consumer, transport, defect):
-    transport.state.refuse_dump, transport.state.defect = True, defect
+def test_supported_consumer_rejects_wrong_successor_output(consumer, transport):
+    transport.state.defect = "recovery"
     with pytest.raises(AssertionError):
         consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
+    assert consumer._UNPROVEN and "close" not in transport.events
 
 
 def test_a5_hbg_does_not_translate_an_untyped_failure_into_a_refusal(consumer, transport):
@@ -424,7 +427,10 @@ def test_a5_hbg_does_not_translate_an_untyped_failure_into_a_refusal(consumer, t
     assert consumer._UNPROVEN and "close" not in transport.events
 
 
-@pytest.mark.parametrize("platform,runtime", [("a2a3", "host_build_graph"), ("a5", "tensormap_and_ringbuffer")])
+@pytest.mark.parametrize(
+    "platform,runtime",
+    [("a2a3", "host_build_graph"), ("a5", "tensormap_and_ringbuffer"), ("a5", "host_build_graph")],
+)
 def test_supported_dump_refusal_is_still_a_failure(consumer, transport, platform, runtime):
     transport.state.refuse_dump = True
     with pytest.raises(RunPreparationRefused):
@@ -432,20 +438,11 @@ def test_supported_dump_refusal_is_still_a_failure(consumer, transport, platform
     assert consumer._UNPROVEN and "close" not in transport.events
 
 
-def test_a5_hbg_unknown_boundary_retains_refused_and_accepted_caller_frames(consumer, transport):
-    transport.state.refuse_dump = transport.state.fail_boundary = True
-    with pytest.raises(RuntimeError, match="unknown completion"):
-        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
-    worker, _, frames, queued, runs, _ = consumer._UNPROVEN[0]
-    assert worker is transport.worker and len(frames) == len(queued) == 4 and len(runs) == 2
-    assert all(not buffer.closed for frame in frames for buffer in frame["buffers"])
-    assert "retire" not in transport.events and "close" not in transport.events
-
-
-def test_unknown_completion_keeps_every_caller_frame(consumer, transport):
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_unknown_completion_keeps_every_caller_frame(consumer, transport, platform):
     transport.state.fail_boundary = True
     with pytest.raises(RuntimeError, match="unknown completion"):
-        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root)
+        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform=platform)
     worker, handle, frames, queued, runs, stream = consumer._UNPROVEN[0]
     assert worker is transport.worker and handle is not None and stream.npu_stream == 17
     assert len(frames) == len(queued) == len(runs) == 4
@@ -531,6 +528,7 @@ def _summary(runtime, queue):
         run_epochs=[None, 100, 200, None],
         payload_counts=[0, 6, 3, 0],
         records_per_enabled_call=6,
+        scheduler_modes=[None] * 4,
         caller_thread=10,
         callback_threads=[10 if queue == "0" else 11] * 4,
         guards_verified=True,
@@ -555,73 +553,31 @@ def _invoke_st(tmp_path, monkeypatch, summary, *, code=0, copies=1, platform="a2
     module.test_framework_argument_dump_contract("host_build_graph", "1", Path("bridge"), tmp_path, request)
 
 
-def test_actual_st_requires_complete_result(tmp_path, monkeypatch):
-    _invoke_st(tmp_path, monkeypatch, _summary("host_build_graph", "1"))
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_actual_st_requires_complete_result(tmp_path, monkeypatch, platform):
+    summary = _summary("host_build_graph", "1")
+    summary.update(platform=platform, scheduler_modes=[None, 1, 1, None] if platform == "a5" else [None] * 4)
+    _invoke_st(tmp_path, monkeypatch, summary, platform=platform)
 
 
 def _refusal_summary() -> dict:
     summary = _summary("host_build_graph", "1")
-    summary.update(
-        platform="a5",
-        calls=2,
-        accepted_calls=2,
-        args_dump_supported=False,
-        payloads_verified=False,
-        run_epochs=[None] * 4,
-        payload_counts=[0] * 4,
-        records_per_enabled_call=0,
-        off_calls_verified=True,
-        refusal_outputs_unchanged=True,
-        caller_tensors_retained=True,
-        caller_stream_after_close=True,
-        refusals=[
-            dict(
-                index=i,
-                level=level,
-                reason=(
-                    f"prepare_native_run failed with code -1001 (run_id=0 slot=0 generation={i + 1} "
-                    f"dispatch_id=0 run_epoch={i + 1})"
-                ),
-            )
-            for i, level in [(1, 3), (2, 2)]
-        ],
-    )
+    summary.update(platform="a5", calls=2, accepted_calls=2, args_dump_supported=False, payloads_verified=False)
     return summary
 
 
-def test_actual_st_requires_the_explicit_a5_hbg_refusal_contract(tmp_path, monkeypatch):
-    _invoke_st(tmp_path, monkeypatch, _refusal_summary(), platform="a5")
+def test_actual_st_rejects_obsolete_a5_hbg_refusal_contract(tmp_path, monkeypatch):
+    with pytest.raises(AssertionError):
+        _invoke_st(tmp_path, monkeypatch, _refusal_summary(), platform="a5")
 
 
 @pytest.mark.parametrize(
-    "field,value",
-    [
-        ("calls", 4),
-        ("accepted_calls", 4),
-        ("args_dump_supported", True),
-        ("payloads_verified", True),
-        ("refusals", []),
-        ("off_calls_verified", False),
-        ("refusal_outputs_unchanged", False),
-        ("caller_tensors_retained", False),
-        ("caller_stream_after_close", False),
-        ("payload_counts", [0, 6, 3, 0]),
-        ("run_epochs", [None, 1, 2, None]),
-        ("records_per_enabled_call", 6),
-        ("guards_verified", False),
-        ("config_snapshot_verified", False),
-    ],
+    "modes",
+    [[None, 0, 1, None], [None, 2, 1, None], [None, 3, 1, None], [None, 1, 4, None], [1, 1, 1, 1]],
 )
-def test_actual_st_rejects_false_a5_hbg_recovery_claims(tmp_path, monkeypatch, field, value):
-    summary = _refusal_summary()
-    summary[field] = value
-    with pytest.raises(AssertionError):
-        _invoke_st(tmp_path, monkeypatch, summary, platform="a5")
-
-
-def test_actual_st_rejects_wrong_a5_hbg_refusal_reason(tmp_path, monkeypatch):
-    summary = _refusal_summary()
-    summary["refusals"][0]["reason"] = summary["refusals"][0]["reason"].replace("-1001", "-1004")
+def test_actual_st_rejects_non_aicore_a5_hbg_capture(tmp_path, monkeypatch, modes):
+    summary = _summary("host_build_graph", "1")
+    summary.update(platform="a5", scheduler_modes=modes)
     with pytest.raises(AssertionError):
         _invoke_st(tmp_path, monkeypatch, summary, platform="a5")
 

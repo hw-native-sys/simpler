@@ -130,3 +130,14 @@ jobs:
         uses: ./.github/actions/run-onboard-dfx-smokes
         with:
           platform: a5
+
+      - name: Upload HBG argument-dump payloads
+        if: always() && inputs.include_dfx_smokes
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: a5-hbg-args-dump-${{ github.run_id }}-${{ github.run_attempt }}-${{ runner.arch }}
+          if-no-files-found: ignore
+          path: |
+            outputs/**/args_dump.json
+            outputs/**/args.bin

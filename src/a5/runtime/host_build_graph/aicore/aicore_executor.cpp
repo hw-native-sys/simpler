@@ -17,6 +17,8 @@
 #include "scheduler/scheduler_async_finish.h"
 #include "scheduler/scheduler_graph_control.h"
 #include "scheduler/scheduler_protocol_execute.h"
+#include "scheduler/scheduler_args_dump.h"
+#include "scheduler/scheduler_args_dump_tensor.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
@@ -98,6 +100,149 @@ __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPaylo
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
+}
+
+__aicore__ __attribute__((noinline)) bool publish_args_dump_request(
+    __gm__ SchedulerArgsDumpRequest *request, uint64_t epoch, uint64_t task_id, ArgsDumpStage stage,
+    uint32_t generation, uint64_t cursor, uint64_t byte_cursor
+) {
+    const uint64_t tick = request->tick;
+    if (tick == UINT64_MAX) return false;
+    request->run_epoch = epoch;
+    request->task_id = task_id;
+    request->stage = static_cast<uint64_t>(stage);
+    request->generation = generation;
+    request->arg_index = cursor;
+    request->byte_cursor = byte_cursor;
+    OUT_OF_ORDER_STORE_BARRIER();
+    request->tick = tick + 1;
+    scheduler_publish_cache_line(request);
+    return true;
+}
+
+struct ArgsDumpLineWriter {
+    __aicore__ void operator()(uint64_t line) const {
+        scheduler_writeback_cache_line(reinterpret_cast<__gm__ void *>(line));
+    }
+};
+
+struct ArgsDumpOutputPublisher {
+    const SchedulerGraphAccess *graph;
+    int64_t task_ref;
+    __gm__ SchedulerArgsDumpTask *task;
+
+    __aicore__ bool operator()() const {
+#if defined(__CCE_AICORE__)
+        pipe_barrier(PIPE_ALL);
+#endif
+        SchedulerTaskPayloadArguments arguments{};
+        if (scheduler_parse_task_payload_arguments(*graph, task_ref, &arguments) != SchedulerGraphResult::OK ||
+            arguments.tensor_count != task->tensor_count ||
+            (arguments.tensor_count != 0 && reinterpret_cast<uint64_t>(arguments.tensors) != task->tensors_address))
+            return false;
+        for (int32_t arg = 0; arg < arguments.tensor_count; ++arg) {
+            if ((task->output_tensor_mask & (UINT64_C(1) << arg)) == 0) continue;
+            const auto *tensor = reinterpret_cast<const __gm__ simpler::hbg::Tensor *>(arguments.tensors) + arg;
+            if (!scheduler_args_dump_tensor_lines(tensor, ArgsDumpLineWriter{})) return false;
+        }
+        return true;
+    }
+};
+
+__aicore__ __attribute__((noinline)) bool args_dump_boundary(
+    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run_control,
+    int64_t task_ref, uint32_t generation, ArgsDumpStage stage, __gm__ GlobalContext &global
+) {
+    const uint64_t address = local->config.shared_context->args_dump_address;
+    if (address == 0) return true;
+    auto *image = reinterpret_cast<__gm__ SchedulerArgsDumpHeader *>(address);
+    scheduler_observe_cache_line(image);
+    scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(image) + 64);
+    if (task_ref < 0 || static_cast<uint64_t>(task_ref) >= image->task_count) return false;
+    auto *map = reinterpret_cast<__gm__ uint32_t *>(address + image->task_indices_offset);
+    scheduler_observe_cache_line(&map[task_ref]);
+    auto *task = scheduler_args_dump_task(image, task_ref);
+    if (task == nullptr) return true;
+    scheduler_observe_cache_line(task);
+    scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(task) + 64);
+    scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(task) + 128);
+    const uint32_t worker = static_cast<uint32_t>(local->worker_id());
+    if (worker >= image->worker_count || generation == 0) return false;
+    const bool before = stage == ArgsDumpStage::BEFORE_DISPATCH;
+    if (before) scheduler_args_dump_limit_async_output(task, global);
+    const ArgsDumpOutputPublisher publish_outputs{&graph, task_ref, task};
+    const auto arrival = before ? scheduler_args_dump_enter(task) : scheduler_args_dump_return(task, publish_outputs);
+    if (arrival == SchedulerArgsDumpArrival::Ready || (!before && arrival == SchedulerArgsDumpArrival::Waiting))
+        return true;
+    if (arrival == SchedulerArgsDumpArrival::Invalid) return false;
+    const bool publisher = arrival == SchedulerArgsDumpArrival::Publisher;
+    auto *request = reinterpret_cast<__gm__ SchedulerArgsDumpRequest *>(address + image->requests_offset) + worker;
+    if (publisher) {
+        scheduler_gm_store(
+            before ? task->publisher_before : task->publisher_after, scheduler_args_dump_publisher(worker, generation)
+        );
+        scheduler_cache_barrier();
+        scheduler_observe_cache_line(request);
+        if (!publish_args_dump_request(request, image->run_epoch, task_ref, stage, generation, 0, 0)) return false;
+    }
+    uint64_t progress_cycles = get_sys_cnt_aicore();
+    uint64_t last_tick = 0;
+    uint64_t last_cursor = 0;
+    uint64_t last_bytes = 0;
+    const uint64_t timeout_cycles = run_control->scheduler_timeout_cycles;
+    while (true) {
+        const uint64_t now = get_sys_cnt_aicore();
+        if (scheduler_gm_query(run_control->scheduler_error) != 0 ||
+            scheduler_watchdog_expired(progress_cycles, now, timeout_cycles)) {
+            (void)scheduler_gm_compare_exchange(task->aborted, UINT64_C(0), UINT64_C(1));
+            scheduler_record_error(
+                run_control, task_ref, SchedulerGraphResult::TIMEOUT, &graph, local,
+                SchedulerErrorSite::ARGS_DUMP_BOUNDARY_TIMEOUT
+            );
+        }
+        if (before && scheduler_args_dump_can_execute(task)) return true;
+        const bool aborted = scheduler_args_dump_load(task->aborted) != 0;
+        const uint64_t publication = scheduler_args_dump_load(before ? task->publisher_before : task->publisher_after);
+        if ((publication & UINT32_MAX) != 0 && (publication & UINT32_MAX) <= image->worker_count) {
+            const uint32_t source_worker = static_cast<uint32_t>(publication) - 1;
+            auto *ack = reinterpret_cast<__gm__ SchedulerArgsDumpAck *>(address + image->acknowledgements_offset) +
+                        source_worker;
+            scheduler_observe_cache_line(ack);
+            SchedulerArgsDumpAck observed{};
+            const bool committed = scheduler_args_dump_observe_ack(ack, &observed);
+            const auto status = scheduler_args_dump_ack_status(observed);
+            const bool same_phase =
+                committed && observed.run_epoch == image->run_epoch && observed.task_id == task->task_ref &&
+                observed.stage == static_cast<uint64_t>(stage) && observed.generation == publication >> 32;
+            if (same_phase && status == SchedulerArgsDumpStatus::Aborted) return false;
+            if (!aborted && same_phase) {
+                if (publisher && status == SchedulerArgsDumpStatus::Sealed &&
+                    scheduler_args_dump_seal(task, stage, observed, image->run_epoch))
+                    return true;
+                if (observed.tick != last_tick && status == SchedulerArgsDumpStatus::InProgress &&
+                    (observed.arg_index > last_cursor ||
+                     (observed.arg_index == last_cursor && observed.byte_cursor > last_bytes))) {
+                    last_tick = observed.tick;
+                    last_cursor = observed.arg_index;
+                    last_bytes = observed.byte_cursor;
+                    progress_cycles = now;
+                }
+                if (publisher && observed.tick == request->tick &&
+                    (status == SchedulerArgsDumpStatus::InProgress || status == SchedulerArgsDumpStatus::WouldBlock) &&
+                    !publish_args_dump_request(
+                        request, image->run_epoch, task_ref, stage, generation, observed.arg_index, observed.byte_cursor
+                    ))
+                    return false;
+            }
+        }
+        if (aborted && scheduler_watchdog_expired(progress_cycles, now, timeout_cycles)) {
+            scheduler_record_error(
+                run_control, task_ref, SchedulerGraphResult::TIMEOUT, &graph, local,
+                SchedulerErrorSite::ARGS_DUMP_ABORT_TIMEOUT
+            );
+            return false;
+        }
+    }
 }
 
 __aicore__ __attribute__((always_inline)) void local_backoff(uint32_t iterations) {
@@ -532,6 +677,17 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
                 return false;
             }
+            if (context->config.shared_context->args_dump_address != 0 &&
+                !args_dump_boundary(
+                    graph, context, run_control, task_ref, ready_generation, ArgsDumpStage::BEFORE_DISPATCH,
+                    payload->global_context
+                )) {
+                scheduler_record_error(
+                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    SchedulerErrorSite::ARGS_DUMP_REFUSED
+                );
+                return false;
+            }
             OUT_OF_ORDER_STORE_BARRIER();
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (pmu_reg_base != 0) pmu_aicore_begin();
@@ -559,6 +715,17 @@ __aicore__ bool run_ready_dispatch_loop(
                 scheduler_record_error(
                     run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
                     SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
+                );
+                return false;
+            }
+            if (context->config.shared_context->args_dump_address != 0 &&
+                !args_dump_boundary(
+                    graph, context, run_control, task_ref, ready_generation, ArgsDumpStage::AFTER_COMPLETION,
+                    payload->global_context
+                )) {
+                scheduler_record_error(
+                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    SchedulerErrorSite::ARGS_DUMP_REFUSED
                 );
                 return false;
             }

@@ -184,3 +184,10 @@ jobs:
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-scope-stats
+
+      - name: args_dump smoke (a5 HBG, task-time payloads)
+        if: inputs.include_dfx_smokes
+        run: |
+          .venv/bin/python -m pytest tests/st/a5/host_build_graph/dump_args/test_dump_args_example.py \
+            --platform a5sim --device 0 -p no:xdist --manual include --dump-args hybrid \
+            --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa
