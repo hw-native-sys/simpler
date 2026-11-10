@@ -1,0 +1,51 @@
+#include "c_api/asc_simd.h"
+#include "host_build_graph/tensor.h"
+#include "intrinsic.h"
+#pragma push_macro("__global__")
+#undef __global__
+#define __global__ inline __attribute__((always_inline))
+#pragma push_macro("__cube__")
+#undef __cube__
+#define __cube__ 
+#pragma push_macro("__vector__")
+#undef __vector__
+#define __vector__ 
+#pragma push_macro("KERNEL_TASK_TYPE_DEFAULT")
+#undef KERNEL_TASK_TYPE_DEFAULT
+#define KERNEL_TASK_TYPE_DEFAULT(...) ((void)0)
+#include "device_source.hpp"
+#pragma pop_macro("KERNEL_TASK_TYPE_DEFAULT")
+#pragma pop_macro("__vector__")
+#pragma pop_macro("__cube__")
+#pragma pop_macro("__global__")
+template<unsigned I, typename T, typename... Rest> struct PyPTOArgAt : PyPTOArgAt<I-1, Rest...> {};
+template<typename T, typename... Rest> struct PyPTOArgAt<0, T, Rest...> { using type = T; };
+template<unsigned I, typename Signature> struct PyPTODeviceArg;
+template<unsigned I, typename R, typename... Args>
+struct PyPTODeviceArg<I, R(Args...)> : PyPTOArgAt<I, Args...> {};
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    using Arg0 = typename PyPTODeviceArg<0, decltype(kernel_clear_latent)>::type;
+    static_assert(sizeof(Arg0) == 24, "device argument size mismatch");
+    auto* t0 = reinterpret_cast<__gm__ simpler::hbg::Tensor*>(args[0]);
+    Arg0 arg0{};
+    arg0.ptr = reinterpret_cast<decltype(arg0.ptr)>(t0->buffer.addr) + t0->start_offset;
+    arg0.shape[0] = t0->shapes[0];
+    arg0.stride[0] = t0->strides[0];
+    using Arg1 = typename PyPTODeviceArg<1, decltype(kernel_clear_latent)>::type;
+    static_assert(sizeof(Arg1) == 8, "device argument size mismatch");
+    Arg1 arg1 = *reinterpret_cast<__gm__ Arg1*>(&args[1]);
+    using Arg2 = typename PyPTODeviceArg<2, decltype(kernel_clear_latent)>::type;
+    static_assert(sizeof(Arg2) == 8, "device argument size mismatch");
+    Arg2 arg2 = get_block_idx(args);
+    using Arg3 = typename PyPTODeviceArg<3, decltype(kernel_clear_latent)>::type;
+    static_assert(sizeof(Arg3) == 8, "device argument size mismatch");
+    Arg3 arg3 = get_block_num(args);
+    uint64_t saved_ctrl = asc_get_ctrl();
+    set_atomic_none();
+    kernel_clear_latent(arg0, arg1, arg2, arg3);
+    pipe_barrier(PIPE_ALL);
+    asc_dcci_entire_out();
+    dsb(DSB_DDR);
+    set_atomic_none();
+    asc_set_ctrl(saved_ctrl);
+}

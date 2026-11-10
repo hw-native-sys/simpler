@@ -1,0 +1,18 @@
+# source_task_id kernel_names lane_mask block_num deferred
+1459	collapse_norm_grid	2	12	0
+1462	quantize_bf16_grid	2	12	0
+1466	project_q_a	1	10	0
+1467	normalize_quant_grid	2	5	0
+1469	project_q_b	1	32	0
+1470	query_rope_grid	2	12	0
+1471	project_kv__6	1	4	0
+1472	window_kv_grid__2	2	12	0
+1473	sparse_attention_mix_aic+sparse_attention_mix_aiv+sparse_attention_mix_aiv	7	32	0
+1476	inverse_rms_grid	2	64	0
+1477	project_hf32_grid	1	20	0
+1478	coefficients_grid__7	2	12	0
+1480	rope_quant_grid__2	2	12	0
+1481	project_o_a	1	32	0
+1482	quantize_bf16_grid__2	2	12	0
+1483	project_o_b	1	32	0
+1484	expand_grid__2	2	12	0

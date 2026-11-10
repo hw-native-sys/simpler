@@ -1,0 +1,87 @@
+{
+  "arch": "dav-3510",
+  "core_type": "aiv",
+  "device_abi": {
+    "parameters": [
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 0,
+        "offset": 0,
+        "size": 16
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 1,
+        "offset": 16,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "scalar",
+        "logical_index": 3,
+        "offset": 40,
+        "size": 8
+      },
+      {
+        "alignment": 4,
+        "kind": "scalar",
+        "logical_index": 2,
+        "offset": 48,
+        "size": 4
+      }
+    ],
+    "schema": 1,
+    "size": 52,
+    "symbol": "kernel_plan_pool_rows"
+  },
+  "export_backend": "source_bundle",
+  "hard_syncall": null,
+  "parameters": [
+    {
+      "access": "read",
+      "dtype": "i32",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 0,
+      "name": "pool_counts"
+    },
+    {
+      "access": "write",
+      "dtype": "i32",
+      "dynamic_fields": [
+        {
+          "dimension": 1,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 1,
+      "name": "runs"
+    },
+    {
+      "kind": "scalar",
+      "logical_index": 2,
+      "name": "num_tokens"
+    },
+    {
+      "kind": "scalar",
+      "logical_index": 3,
+      "name": "capacity"
+    }
+  ],
+  "symbol": "kernel_plan_pool_rows"
+}

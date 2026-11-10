@@ -1,0 +1,104 @@
+{
+  "arch": "dav-3510",
+  "core_type": "aiv",
+  "device_abi": {
+    "parameters": [
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 0,
+        "offset": 0,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 1,
+        "offset": 24,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "scalar",
+        "logical_index": 3,
+        "offset": 48,
+        "size": 8
+      },
+      {
+        "alignment": 8,
+        "kind": "scalar",
+        "logical_index": 4,
+        "offset": 56,
+        "size": 8
+      },
+      {
+        "alignment": 4,
+        "kind": "scalar",
+        "logical_index": 2,
+        "offset": 64,
+        "size": 4
+      }
+    ],
+    "schema": 1,
+    "size": 68,
+    "symbol": "kernel_reduce_index_weight_grid"
+  },
+  "export_backend": "source_bundle",
+  "hard_syncall": null,
+  "parameters": [
+    {
+      "access": "read",
+      "dtype": "f32",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 0,
+      "name": "partials"
+    },
+    {
+      "access": "write",
+      "dtype": "bf16",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 1,
+      "name": "output"
+    },
+    {
+      "kind": "scalar",
+      "logical_index": 2,
+      "name": "num_tokens"
+    },
+    {
+      "kind": "context",
+      "logical_index": 3,
+      "name": "get_block_idx"
+    },
+    {
+      "kind": "context",
+      "logical_index": 4,
+      "name": "get_block_num"
+    }
+  ],
+  "symbol": "kernel_reduce_index_weight_grid"
+}

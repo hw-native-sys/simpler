@@ -1,0 +1,262 @@
+{
+  "arch": "dav-3510",
+  "core_type": "mixed",
+  "device_abi": {
+    "parameters": [
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 0,
+        "offset": 0,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 1,
+        "offset": 24,
+        "size": 16
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 2,
+        "offset": 40,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 3,
+        "offset": 64,
+        "size": 16
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 4,
+        "offset": 80,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 5,
+        "offset": 104,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 6,
+        "offset": 128,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "pod",
+        "logical_index": 7,
+        "offset": 152,
+        "size": 24
+      },
+      {
+        "alignment": 8,
+        "kind": "scalar",
+        "logical_index": 9,
+        "offset": 176,
+        "size": 8
+      },
+      {
+        "alignment": 8,
+        "kind": "scalar",
+        "logical_index": 10,
+        "offset": 184,
+        "size": 8
+      },
+      {
+        "alignment": 8,
+        "kind": "scalar",
+        "logical_index": 11,
+        "offset": 192,
+        "size": 8
+      },
+      {
+        "alignment": 4,
+        "kind": "scalar",
+        "logical_index": 8,
+        "offset": 200,
+        "size": 4
+      }
+    ],
+    "schema": 1,
+    "size": 204,
+    "symbol": "kernel_project_query_grid"
+  },
+  "export_backend": "source_bundle",
+  "hard_syncall": null,
+  "parameters": [
+    {
+      "access": "read",
+      "dtype": "f8e4m3",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 0,
+      "name": "payload"
+    },
+    {
+      "access": "read",
+      "dtype": "f8e4m3",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 1,
+      "name": "weight"
+    },
+    {
+      "access": "read",
+      "dtype": "f8e8m0",
+      "dynamic_fields": [
+        {
+          "dimension": 1,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 2,
+      "name": "activation_scale"
+    },
+    {
+      "access": "read",
+      "dtype": "f8e8m0",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 3,
+      "name": "weight_scale"
+    },
+    {
+      "access": "read",
+      "dtype": "f32",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 4,
+      "name": "cosine"
+    },
+    {
+      "access": "read",
+      "dtype": "f32",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 5,
+      "name": "sine"
+    },
+    {
+      "access": "write",
+      "dtype": "u8",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 6,
+      "name": "output"
+    },
+    {
+      "access": "write",
+      "dtype": "f8e8m0",
+      "dynamic_fields": [
+        {
+          "dimension": 0,
+          "field": "shape",
+          "slot": 0
+        },
+        {
+          "dimension": 0,
+          "field": "stride",
+          "slot": 0
+        }
+      ],
+      "kind": "tensor",
+      "logical_index": 7,
+      "name": "output_scale"
+    },
+    {
+      "kind": "scalar",
+      "logical_index": 8,
+      "name": "num_tokens"
+    },
+    {
+      "kind": "context",
+      "logical_index": 9,
+      "name": "get_block_idx"
+    },
+    {
+      "kind": "context",
+      "logical_index": 10,
+      "name": "get_block_num"
+    },
+    {
+      "kind": "context",
+      "logical_index": 11,
+      "name": "get_subblock_id"
+    }
+  ],
+  "symbol": "kernel_project_query_grid"
+}
