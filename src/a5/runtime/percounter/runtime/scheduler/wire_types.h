@@ -179,6 +179,7 @@ struct alignas(64) PercounterCounter {
     uint8_t reserved[20];
 };
 static_assert(sizeof(PercounterCounter) == 64, "a counter owns exactly one cache line");
+static_assert(std::is_trivially_copyable_v<PercounterCounter> && std::is_standard_layout_v<PercounterCounter>);
 static_assert(alignof(PercounterCounter) == 64, "counters must not straddle lines");
 
 /**
@@ -209,6 +210,7 @@ struct alignas(64) PercounterTicket {
     uint8_t reserved[56];
 };
 static_assert(sizeof(PercounterTicket) == 64, "a ticket owns exactly one cache line");
+static_assert(std::is_trivially_copyable_v<PercounterTicket> && std::is_standard_layout_v<PercounterTicket>);
 
 // The MIX list takes two tickets where each core-type list takes one: a draw
 // point at index 0 and a completion count at index 1. The exit rule needs the
