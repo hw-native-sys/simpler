@@ -71,9 +71,9 @@ all rank writes before returning. Chunked `readinto` avoids a second whole-table
 allocation. Release temporary memoryviews and NumPy arrays on both success and
 failure; do not store them in application state.
 
-Both `allocate_domain` and `get_or_allocate_domain` accept `initializer`. It is
-supported only for L3 Host-source A5 TMR domains and may only initialize CPU
-storage: it must not submit tasks, issue Worker/control operations, recursively
+Both `allocate_domain` and `get_or_allocate_domain` accept `initializer`. On A5 it
+requires an onboard L3 Host-source TMR domain. The callback only initializes CPU
+storage. It must not submit tasks, issue Worker/control operations, recursively
 create or look up domains, or release the domain. Allocation and initialization
 must precede the run's first task submission.
 

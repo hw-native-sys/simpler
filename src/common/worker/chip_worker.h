@@ -465,10 +465,10 @@ public:
         uint64_t comm_handle, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, size_t window_offset,
         size_t window_size
     );
-    /// Collectively allocate a fresh per-rank symmetric pool for a subset of
-    /// ranks.  Multiple concurrent allocations are disambiguated by
-    /// `allocation_id`. Returns (device_ctx, local_window_base, actual_window_size). Only
-    /// participating ranks call this; non-members of the subset must not.
+    /// Allocate a fresh per-rank window for a subset identified by `rank_ids`.
+    /// Only participating ranks call this with the same `allocation_id`.
+    /// A nonempty `host_shm_name` selects Host backing. Returns
+    /// (device_ctx, local_window_base, actual_window_size).
     /// ownership_flag records cleanup responsibility, including an unpublished allocation
     /// retained after failure; a set flag does not imply a usable device context.
     std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
@@ -476,11 +476,11 @@ public:
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
         const std::string &host_shm_name = {}
     );
-    /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
-    /// pool and the device CommContext, then drop the allocation record.
-    /// `rank_count` + `domain_rank` size the subset barrier; the rank list
-    /// itself is not needed (the alloc-time identity is already cached
-    /// inside the backend's per-allocation record).
+    /// Release the rank's resources after the caller drains all domain users.
+    /// `allocation_id` identifies the allocation. `rank_count` is the subset
+    /// size and `domain_rank` is the caller's dense rank in it. Backends with
+    /// a subset barrier use those values for its participant count and rank.
+    /// A2/A3 Host domains release registrations independently after the fence.
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     /// Locally roll back a domain the coordinating owner has never published to device users.
@@ -1153,6 +1153,7 @@ private:
     // that drives this worker's control commands and its run lane.
     bool exported_device_regions_live_ = false;
     bool comm_reclamation_unconfirmed_ = false;
+    bool worker_sdma_enabled_ = false;
     // A backend retained communication references; device reset is not a cleanup proof.
     bool comm_cleanup_unconfirmed_ = false;
     std::unique_ptr<ChipRunLane> run_lane_;
