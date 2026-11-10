@@ -490,7 +490,29 @@ create synchronous mapped-window communication by default, without initializing
 any asynchronous provider. `workspace_engines=("sdma", "urma")` or `("rdma",)`
 adds the requested asynchronous resources. An omitted parameter and an empty
 sequence have identical meaning and can reuse the same retained domain.
-The native `comm_alloc_domain_windows` takes the corresponding bitmask directly;
+The same parameter also accepts a mapping from engine names to immutable
+`SdmaConfig`, `UrmaConfig` or `RdmaConfig` objects, available from `simpler`:
+
+```python
+from simpler import SdmaConfig, UrmaConfig
+
+handle = orch.allocate_domain(
+    name="exchange",
+    members=[0, 1],
+    window_size=window_bytes,
+    workspace_engines={
+        "sdma": SdmaConfig(),
+        "urma": UrmaConfig(jetties_per_aiv=2),
+    },
+)
+```
+
+A name sequence uses default configurations, so `("urma",)` and
+`{"urma": UrmaConfig()}` are equivalent. Mapping values must match their engine
+names. Reusing a retained domain requires both the same engine set and the same
+configuration; changing queue settings requires a new domain.
+The native `comm_alloc_domain_windows` takes the corresponding bitmask and optional
+`CommWorkspaceConfig`;
 zero requests synchronous mappings only. Explicit asynchronous engine selection
 is supported on L3 A5. On L3 A2/A3 Host domains, selecting SDMA enables peer
 mappings for the Worker-owned workspace. Each participating device must report
@@ -533,10 +555,38 @@ restriction is not a hardware limitation. HBG URMA completion, arbitrary subsets
 and L4 async domains are unsupported.
 
 URMA domains use `PER_PEER`: each resident AIV owns a separate queue group
-for each remote peer. The provider selects the device AIV count and uses its
-default one jetty per AIV and default SQ depth. Queue resources scale with
-both AIV and peer count. Different AIVs can submit to the same peer without
-sharing a producer queue.
+for each remote peer. `UrmaConfig(jetties_per_aiv=1, sq_depth=0)` preserves one
+jetty per AIV and the provider's default SQ depth. Increasing the jetty count
+is opt-in per domain. `sq_depth` is optional: zero keeps the provider default;
+an explicit value must be a positive power of two below 2**31 and supported by
+the provider. CQ capacity is provider-selected and checked independently.
+`sq_depth` is forwarded as a provider configuration request; it is not a promise
+of an identical number of hardware SQ entries. The runtime uses the returned
+SQ/CQ capacities for admission, and resource comparisons must use those actual
+capacities rather than the requested value.
+
+The provider supplies the device AIV count `A`. The pinned ISA permits at most
+8 jetties per AIV and 256 queue rows per peer, so `A * jetties_per_aiv <= 256`.
+Configuration is checked before window allocation. With `R` ranks and `J`
+jetties per AIV, workspace tables have `R * A * J` rows, including the self-rank
+rows; remote send queue groups account for `(R - 1) * A * J` rows. SQ/CQ payload
+storage scales with their actual depths. Workspace descriptor bytes exclude
+HCCL-owned queue storage and must not be reported as total communication memory.
+Different AIVs never share a producer queue.
+
+Each GET/PUT request is split into chunks of at most 256 MiB. Chunk `i` uses
+jetty `i % J` within that sender's group; its absolute row is
+`peer * rowsPerPeer + urma_sender_id * J + i % J`. Every request restarts at
+jetty zero, including consecutive small requests. There is no persistent
+round-robin cursor and no implicit ordering across different queues. Requests
+that require ordering must establish completion dependencies.
+
+Before posting, the runtime checks the entire request against each queue's
+actual chunk count and the task's remaining completion capacity. Each chunk
+uses one completion slot (64 slots per task, shared with other deferred work).
+All participating queue targets must complete before dependent tasks start.
+See the [multi-jetty acceptance tests](../tests/st/a5/tensormap_and_ringbuffer/urma_multi_jetty/README.md)
+for real queue-counter checks, boundary cases and the timing comparison.
 
 `get_async_ctx(args)` carries `urma_sender_id`, the scheduler's contiguous
 resident AIV ordinal, including distinct identities for both lanes of a MIX

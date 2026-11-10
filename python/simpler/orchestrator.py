@@ -63,6 +63,7 @@ from .task_interface import (
     _validate_remote_sidecar_access,
     get_element_size,
 )
+from .workspace_config import WorkspaceEngines
 
 
 def _require_handle(
@@ -554,7 +555,7 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         workers: Sequence[int] | None = None,
-        workspace_engines: Sequence[str] = (),
+        workspace_engines: WorkspaceEngines = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
         initializer: Callable[[CommDomainHandle], None] | None = None,
     ) -> CommDomainHandle:
@@ -567,7 +568,9 @@ class Orchestrator:
         ``workers`` is the legacy L3 spelling; it cannot be combined with ``members``.
         Retained domains survive successful runs until explicit release or Worker.close().
         Domains provide synchronous mapped-window communication by default.
-        On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
+        On A5, workspace_engines accepts names from sdma/urma/rdma, or a mapping
+        from those names to SdmaConfig/UrmaConfig/RdmaConfig. Name sequences use
+        default settings. Configuration is immutable for the domain's lifetime.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
         its own low-address window.
         ``memory_source=AddressSpace.HOST`` creates independent Host windows on
@@ -605,7 +608,7 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
-        workspace_engines: Sequence[str] = (),
+        workspace_engines: WorkspaceEngines = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
         initializer: Callable[[CommDomainHandle], None] | None = None,
     ) -> CommDomainHandle:

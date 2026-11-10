@@ -248,8 +248,8 @@ inline __aicore__ uint32_t load_urma_counter(uint64_t addr) {
 template <typename Session>
 inline __aicore__ bool preflight_urma_request(AsyncCtx &ctx, const Session &session, uint64_t chunks) {
     const uint32_t jetties = session.cfg.urma.qpCount;
-    if (jetties == 0 || jetties > pto::comm::urma::kUrmaMaxJettiesPerCore || chunks > UINT64_MAX / jetties ||
-        !completion_capacity_available(ctx, chunks * jetties)) {
+    if (jetties == 0 || jetties > pto::comm::urma::kUrmaMaxJettiesPerCore ||
+        !completion_capacity_available(ctx, chunks)) {
         pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         return false;
     }
@@ -257,29 +257,40 @@ inline __aicore__ bool preflight_urma_request(AsyncCtx &ctx, const Session &sess
         pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
+    auto *info = reinterpret_cast<__gm__ UrmaInfo *>(session.contextGm);
+    const bool per_peer = info->layout == UrmaLayout::PER_PEER;
+    // The capacity check bounds chunks by UINT32_MAX; at most eight jetties keep the product below 2^35.
+    if (!per_peer && !completion_capacity_available(ctx, chunks * jetties)) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        return false;
+    }
+    if (per_peer && info->railCycleLen != 0) {
+        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
     // Serialized producers reserve the entire request; only AICPU advances tails.
     for (uint32_t j = 0; j < jetties; ++j) {
+        const uint64_t required = per_peer ? chunks / jetties + (j < chunks % jetties ? 1 : 0) : chunks;
         uint32_t row = 0;
         if (session.qpIdxBase > UINT32_MAX - j ||
             !queue_row_for(session.contextGm, session.destRankId, session.qpIdxBase + j, row)) {
             pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             return false;
         }
-        auto *info = reinterpret_cast<__gm__ UrmaInfo *>(session.contextGm);
         auto *wq = reinterpret_cast<__gm__ UrmaWQCtx *>(info->sqPtr) + row;
         auto *cq = reinterpret_cast<__gm__ UrmaCqCtx *>(info->scqPtr) + row;
         if (!wq->bufAddr || !wq->headAddr || !wq->tailAddr || !wq->dbAddr || !cq->bufAddr || !cq->tailAddr ||
             !cq->dbAddr || wq->wqeShiftSize != 6 || cq->cqeShiftSize != 6 || wq->depth == 0 || cq->depth == 0 ||
             (wq->depth & (wq->depth - 1)) != 0 || (cq->depth & (cq->depth - 1)) != 0 || wq->depth >= (1u << 31) ||
-            cq->depth >= (1u << 31) || chunks > wq->depth || chunks > cq->depth) {
+            cq->depth >= (1u << 31) || required > wq->depth || required > cq->depth) {
             pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             return false;
         }
         const uint32_t head = load_urma_counter(wq->headAddr);
         const uint32_t bb_tail = load_urma_counter(wq->tailAddr);
         const uint32_t cqe_tail = load_urma_counter(cq->tailAddr);
-        if (static_cast<uint64_t>(head - bb_tail) + chunks > wq->depth ||
-            static_cast<uint64_t>(wq->submittedWqeCount - cqe_tail) + chunks > cq->depth) {
+        if (static_cast<uint64_t>(head - bb_tail) + required > wq->depth ||
+            static_cast<uint64_t>(wq->submittedWqeCount - cqe_tail) + required > cq->depth) {
             pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             return false;
         }
@@ -332,6 +343,11 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
         return false;
     }
     if (!preflight_urma_request(ctx, session, chunk_count(elem_count * sizeof(RawDType)))) return false;
+    const bool per_peer = reinterpret_cast<__gm__ UrmaInfo *>(desc.workspace)->layout == UrmaLayout::PER_PEER;
+    const uint32_t sender_base = session.qpIdxBase;
+    const uint32_t jetties = session.cfg.urma.qpCount;
+    if (per_peer) session.cfg.urma.qpCount = 1;
+    uint32_t jetty = 0;
     const uint64_t chunk_elems = pto::comm::urma::kUrmaMaxWqeTransferBytes / sizeof(RawDType);
     for (uint64_t offset = 0; offset < elem_count;) {
         const uint64_t remaining = elem_count - offset;
@@ -341,7 +357,10 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
         UrmaRequestDescriptor<decltype(dst_slice), decltype(src_slice)> chunk_desc{
             desc.op, dst_slice, src_slice, desc.workspace, desc.remote_rank
         };
+        // Each PER_PEER call targets one queue; the non-rail ISA cursor restarts on every call.
+        if (per_peer) session.qpIdxBase = sender_base + jetty;
         if (!submit_urma_request_once(ctx, chunk_desc, session)) return false;
+        jetty = (jetty + 1) % jetties;
         offset += current_elems;
     }
     return true;

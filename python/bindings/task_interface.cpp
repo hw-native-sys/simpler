@@ -4164,19 +4164,20 @@ NB_MODULE(_task_interface, m) {
             "comm_alloc_domain_windows",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
                uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t workspace_mask,
-               const std::string &host_shm_name) {
+               const std::string &host_shm_name, uint32_t urma_jetties_per_aiv, uint32_t urma_sq_depth) {
                 if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
                     throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
                 }
+                const CommWorkspaceConfig config{urma_jetties_per_aiv, urma_sq_depth};
                 auto [device_ctx, local_window_base, actual_window_size] = self.comm_alloc_domain_windows(
                     comm_handle, allocation_id, rank_ids, domain_rank, window_size, workspace_mask,
-                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), host_shm_name
+                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), host_shm_name, &config
                 );
                 return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
             nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("workspace_mask") = 0,
-            nb::arg("host_shm_name") = "",
+            nb::arg("host_shm_name") = "", nb::arg("urma_jetties_per_aiv") = 1, nb::arg("urma_sq_depth") = 0,
             "Collectively allocate a fresh per-rank pool for a subset; returns "
             "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
             "responsibility before result conversion or an allocation error; it does not imply a usable context."

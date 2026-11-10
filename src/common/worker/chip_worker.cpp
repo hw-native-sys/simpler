@@ -2772,7 +2772,8 @@ uint64_t ChipWorker::comm_derive_context(
 
 std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag, const std::string &host_shm_name
+    size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag, const std::string &host_shm_name,
+    const CommWorkspaceConfig *workspace_config
 ) {
     require_comm_cleanup_confirmed();
     if (comm_alloc_domain_windows_fn_ == nullptr) {
@@ -2801,11 +2802,12 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         host_shm_name.empty() ?
             comm_alloc_domain_windows_fn_(
                 reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-                window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
+                window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size, workspace_config
             ) :
             comm_alloc_host_domain_windows_fn_(
                 reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-                window_size, workspace_mask, host_shm_name.c_str(), &device_ctx, &local_window_base, &actual_window_size
+                window_size, workspace_mask, host_shm_name.c_str(), &device_ctx, &local_window_base,
+                &actual_window_size, workspace_config
             );
     if (ownership_flag != nullptr &&
         (rc == 0 || rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED)) {

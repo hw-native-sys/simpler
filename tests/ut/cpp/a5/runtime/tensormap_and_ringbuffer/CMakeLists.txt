@@ -69,8 +69,10 @@ endif()
 
 # Exercise the failed submission slab through the real FIN completion path.
 a5_tmr_case(test_urma_completion_kernel.cpp
-    SOURCES ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
-    DEFINES SIMPLER_DFX=0
+    SOURCES
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections)
 if(APPLE)
     target_link_options(test_a5_tmr_urma_completion_kernel PRIVATE -Wl,-dead_strip)

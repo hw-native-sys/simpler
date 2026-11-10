@@ -111,6 +111,8 @@ struct DomainAllocation {
     bool host_registered = false;
     bool initialized = false;
     bool cleanup_failed = false;
+    CommWorkspaceConfig workspace_config{1, 0};
+    uint32_t urma_aiv_count = pto::comm::urma::kUrmaAutoAivCount;
     HcclComm urma_comm = nullptr;
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
     void *urma_workspace_addr = nullptr;
@@ -869,9 +871,12 @@ static int init_urma_workspace(
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
     uint64_t workspace_size = 0;
-    pto::comm::urma::UrmaWorkspaceManager::GetWorkspaceSize(rank_count, &workspace_size);
-    if (workspace_size == 0) {
-        LOG_ERROR("[comm rank %d] URMA GetWorkspaceSize returned zero", h->rank);
+    const auto size_status = pto::comm::urma::UrmaWorkspaceManager::GetWorkspaceSize(
+        rank_count, &workspace_size, pto::comm::urma::UrmaLayout::PER_PEER, alloc.urma_aiv_count,
+        alloc.workspace_config.urma_jetties_per_aiv
+    );
+    if (size_status != ACL_SUCCESS || workspace_size == 0) {
+        LOG_ERROR("[comm rank %d] URMA GetWorkspaceSize rejected configuration", h->rank);
         return COMM_DOMAIN_URMA_INIT_FAILED;
     }
     alloc.urma_workspace = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
@@ -880,7 +885,8 @@ static int init_urma_workspace(
     }
     if (!alloc.urma_workspace->Init(
             alloc.urma_comm, domain_rank, rank_count, alloc.local_buf, alloc.mapping_size, alloc.urma_workspace_addr,
-            workspace_size
+            workspace_size, pto::comm::urma::UrmaLayout::PER_PEER, alloc.urma_aiv_count,
+            alloc.workspace_config.urma_jetties_per_aiv, alloc.workspace_config.urma_sq_depth
         )) {
         LOG_ERROR("[comm rank %d] URMA workspace initialization failed", h->rank);
         return COMM_DOMAIN_URMA_INIT_FAILED;
@@ -1945,7 +1951,7 @@ static int domain_alloc_host(
 static int allocate_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
-    uint64_t *local_window_base_out, size_t *actual_window_size_out
+    uint64_t *local_window_base_out, size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (host_shm_name != nullptr) {
@@ -1970,6 +1976,26 @@ static int allocate_domain_windows(
         !rank_ids_are_dense_prefix(rank_ids, rank_count)) {
         LOG_ERROR("[comm rank %d] alloc_domain: URMA requires dense prefix ranks", h->rank);
         return COMM_DOMAIN_URMA_CONFIG_INVALID;
+    }
+    const CommWorkspaceConfig config = workspace_config ? *workspace_config : CommWorkspaceConfig{1, 0};
+    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
+    const uint32_t jetties = config.urma_jetties_per_aiv;
+    const uint32_t depth = config.urma_sq_depth;
+    if (jetties == 0 || jetties > pto::comm::urma::kUrmaMaxJettiesPerCore ||
+        (depth != 0 && ((depth & (depth - 1)) != 0 || depth >= (1u << 31))) ||
+        (!urma_requested && (jetties != 1 || depth != 0))) {
+        return COMM_DOMAIN_URMA_CONFIG_INVALID;
+    }
+    uint32_t aiv_count = pto::comm::urma::kUrmaAutoAivCount;
+    if (urma_requested) {
+        aiv_count = pto::comm::urma::UrmaWorkspaceManager::QueryDeviceAivCount();
+        if (aiv_count == 0 || aiv_count > pto::comm::urma::kUrmaMaxRowsPerPeer / jetties) {
+            LOG_ERROR(
+                "[comm rank %d] URMA queue budget exceeds per-peer limit: AIVs=%u jetties=%u", h->rank, aiv_count,
+                jetties
+            );
+            return COMM_DOMAIN_URMA_CONFIG_INVALID;
+        }
     }
     if (h->used_domain_ids.count(allocation_id) > 0) {
         LOG_ERROR(
@@ -1998,6 +2024,8 @@ static int allocate_domain_windows(
     h->used_domain_ids.insert(allocation_id);
     auto entry = h->domain_allocations.emplace(allocation_id, std::make_unique<DomainAllocation>()).first;
     auto &alloc = entry->second;
+    alloc->workspace_config = config;
+    alloc->urma_aiv_count = aiv_count;
     alloc->rank = static_cast<int>(domain_rank);
     alloc->nranks = static_cast<int>(rank_count);
     int rc = -1;
@@ -2040,23 +2068,23 @@ static int allocate_domain_windows(
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out
+    size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
 ) {
     return allocate_domain_windows(
         h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, nullptr, device_ctx_out,
-        local_window_base_out, actual_window_size_out
+        local_window_base_out, actual_window_size_out, workspace_config
     );
 }
 
 extern "C" int comm_alloc_host_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
-    uint64_t *local_window_base_out, size_t *actual_window_size_out
+    uint64_t *local_window_base_out, size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
 ) {
     if (!comm_domain_onboard::valid_host_shm_name(host_shm_name)) return -1;
     return allocate_domain_windows(
         h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, host_shm_name, device_ctx_out,
-        local_window_base_out, actual_window_size_out
+        local_window_base_out, actual_window_size_out, workspace_config
     );
 }
 

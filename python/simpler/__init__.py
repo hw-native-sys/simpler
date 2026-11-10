@@ -34,8 +34,12 @@ from ._log import (
     get_current_config,
     get_logger,
 )
+from .workspace_config import RdmaConfig, SdmaConfig, UrmaConfig
 
 __all__ = [
+    "RdmaConfig",
+    "SdmaConfig",
+    "UrmaConfig",
     "DEFAULT_THRESHOLD",
     "Worker",
     "NUL",

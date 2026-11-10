@@ -474,7 +474,7 @@ public:
     std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
-        const std::string &host_shm_name = {}
+        const std::string &host_shm_name = {}, const CommWorkspaceConfig *workspace_config = nullptr
     );
     /// Release the rank's resources after the caller drains all domain users.
     /// `allocation_id` identifies the allocation. `rank_count` is the subset
@@ -676,11 +676,12 @@ private:
     using CommGetWindowSizeFn = int (*)(void *, size_t *);
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
     using CommAllocDomainWindowsFn = int (*)(
-        void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
+        void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *,
+        const CommWorkspaceConfig *
     );
     using CommAllocHostDomainWindowsFn = int (*)(
         void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, const char *, uint64_t *, uint64_t *,
-        size_t *
+        size_t *, const CommWorkspaceConfig *
     );
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =

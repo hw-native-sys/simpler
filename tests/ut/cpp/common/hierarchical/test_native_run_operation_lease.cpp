@@ -142,7 +142,8 @@ int stub_destroy_comm_stream(void *, void *) {
 }
 
 int stub_alloc_domain(
-    void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
+    void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *,
+    const CommWorkspaceConfig *
 ) {
     ++g_comm_alloc_calls;
     return g_comm_rc;
@@ -1240,14 +1241,21 @@ TEST(NativeRunOperationLeaseTest, DomainAllocationOwnershipPrecedesOutputValidat
     EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
 
     worker.comm_alloc_domain_windows_fn_ = [](void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t,
-                                              uint64_t *ctx, uint64_t *window, size_t *size) {
+                                              uint64_t *ctx, uint64_t *window, size_t *size,
+                                              const CommWorkspaceConfig *config) {
+        EXPECT_NE(config, nullptr);
+        if (config) {
+            EXPECT_EQ(config->urma_jetties_per_aiv, 2u);
+            EXPECT_EQ(config->urma_sq_depth, 512u);
+        }
         *ctx = 0x100;
         *window = 0x200;
         *size = 4096;
         return 0;
     };
     ownership = 0;
-    const auto result = worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2, &ownership);
+    const CommWorkspaceConfig config{2, 512};
+    const auto result = worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2, &ownership, {}, &config);
     EXPECT_EQ(std::get<0>(result), 0x100u);
     EXPECT_EQ(std::get<1>(result), 0x200u);
     EXPECT_EQ(__atomic_load_n(&ownership, __ATOMIC_ACQUIRE), 1u);
