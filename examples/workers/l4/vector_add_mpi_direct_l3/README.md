@@ -178,8 +178,13 @@ terminates the launcher's process group and restores the caller's signal
 handlers after cleanup. Each startup peer has one absolute read deadline,
 capped at five seconds and the remaining startup budget; fragmented messages
 cannot extend it. Unauthenticated connections are ignored, while authenticated
-rank or state inconsistencies fail startup immediately. MPI launcher's rank variables
-take priority over an inherited `SLURM_PROCID`, which is only a fallback.
+rank or state inconsistencies fail startup immediately. When a rank reports a
+startup error, the supervisor gives all ranks one shared `session_timeout_s`
+budget to close their workers and hooks before it terminates the job. The first
+startup error is preserved. The sender and the receiving rank both enforce
+the 64-archive limit before encoding or installing startup artifacts.
+MPI launcher's rank variables take priority over an inherited `SLURM_PROCID`,
+which is only a fallback.
 MPICH and Open MPI command construction is covered by unit tests. The CPU
 integration test exercises a real three-rank roundtrip, kills rank 0, and stops
 an executor while the controller is idle to check that no rank survives;
