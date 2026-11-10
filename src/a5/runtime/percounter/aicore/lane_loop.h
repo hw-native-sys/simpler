@@ -508,11 +508,21 @@ inline __aicore__ void percounter_mix_release(const LaneConfig &cfg) {
  * the cohort released and promotes the next one, and every holder of a block of
  * a released cohort runs it.
  *
- * **A lane serves a released block before it looks at anything else.** A holder
- * that joined another rendezvous first -- one that needs a lane already inside
- * this cohort's kernel, waiting for this block -- would never come back. Every
- * checkpoint therefore asks `percounter_sync_serve_released` before MIX
- * discovery. Taking a block never blocks, and a holder never takes a second.
+ * **One lane never owes a cohort block and a rendezvous at once.** The two
+ * gather different sets of lanes -- a cohort's kernel holds each block at its
+ * barrier until every holder is in it, a rendezvous holds each subtask until
+ * every participant has arrived -- so a lane that owes both is a lane two sets
+ * wait for, and whichever set it serves second waits forever. The claimer
+ * therefore does not arm a mask naming a holder, and a lane does not take a
+ * block while the line carries a generation it has not looked at.
+ *
+ * Only the window between those two checks leaves a lane owing both, and it
+ * resolves one way for every lane that reaches it: the rendezvous first. Every
+ * lane the mask named was clear of the cohort when the claimer read it, so the
+ * ones that raced into a block are at a checkpoint rather than inside a
+ * cohort's kernel, and the rendezvous they all owe completes.
+ *
+ * Taking a block never blocks, and a holder never takes a second.
  */
 inline constexpr uint32_t PERCOUNTER_SYNC_CHECK_INTERVAL = 8;
 
@@ -525,6 +535,43 @@ inline __aicore__ bool percounter_sync_can_serve(const LaneConfig &cfg, uint32_t
     if ((active_mask & (active_mask - 1U)) != 0) return cfg.cluster_lane == PERCOUNTER_MIX_CLAIMER_LANE;
     if (active_mask == 1U) return cfg.cluster_lane == 0;
     return cfg.cluster_lane != 0;
+}
+
+/** Publish whether this lane owes a cohort block, for its claimer to read. */
+inline __aicore__ void percounter_cohort_hold_set(const LaneConfig &cfg, uint32_t held) {
+    if (cfg.mix_order_count == 0) return;
+    scheduler_ssbuf_store_release(&cfg.mix_signal->cohort_hold[cfg.cluster_lane], held);
+}
+
+/**
+ * Whether any lane `mask` names still owes a cohort block.
+ *
+ * One cluster's line answers the whole question, because a mask names lanes of
+ * one cluster. A graph with no cohort never enters the loop.
+ */
+inline __aicore__ bool percounter_cohort_held_in(const LaneConfig &cfg, uint32_t mask) {
+    if (cfg.sync_cohort_count == 0) return false;
+    SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
+    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        if ((mask & (uint32_t{1} << lane)) != 0 && scheduler_ssbuf_load_acquire(&signal->cohort_hold[lane]) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Whether the cluster's line carries a generation this lane has not looked at.
+ *
+ * Blind to the mask on purpose: one SSBUF load against a seqlock read of the
+ * payload, and a generation that does not name this lane is marked seen at the
+ * next checkpoint, so a lane this holds back from a cohort loses a checkpoint
+ * rather than the cohort.
+ */
+inline __aicore__ bool percounter_mix_unseen(const LaneConfig &cfg, const PercounterLaneState *state) {
+    if (cfg.mix_order_count == 0) return false;
+    const uint32_t generation = scheduler_ssbuf_load_acquire(&cfg.mix_signal->armed_generation);
+    return percounter_mix_armed(generation) && generation != state->last_served;
 }
 
 /**
@@ -605,6 +652,7 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
         percounter_publish_completion(cfg, task, uint64_t{1});
         ++state->local_done;
         sync->my_block = -1;
+        percounter_cohort_hold_set(cfg, 0);
         scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
         return true;
     }
@@ -619,6 +667,9 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
     signal->cohort_block = 1;
     scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
     sync->my_block = -1;
+    // The armed line now carries this block, and is itself what holds the
+    // claimer's next draw off this lane.
+    percounter_cohort_hold_set(cfg, 0);
     return true;
 }
 
@@ -668,6 +719,10 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     // checkpoint while the cohort is open, and reading the payload first cost
     // 40% of `sparse_256_b24`.
     if (!percounter_sync_armed(generation) || sync->decided_generation == generation) return true;
+    // Ahead of the decision, which is final: a lane that still owes the line a
+    // look may be named in it, and a block taken now would leave this lane
+    // owing a cohort and a rendezvous at once.
+    if (percounter_mix_unseen(cfg, state)) return true;
     const int64_t task_id = scheduler_gm_query(cfg.sync_queue->open_task_id);
     // Slot taken, payload not yet published: deciding now would read the
     // previous cohort's shape, and a decision is final.
@@ -691,6 +746,7 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     sync->my_block = block;
     sync->my_seq = seq;
     sync->taken_cycles = get_sys_cnt_aicore();
+    percounter_cohort_hold_set(cfg, 1);
     if (static_cast<uint32_t>(block) + 1 < sync->block_num) return true;
 
     // The last block. `released` goes out before the slot is freed: it is what
@@ -756,10 +812,16 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
         return;
     }
 
+    const uint32_t mask = percounter_mix_active_mask(task);
+    // A lane this mask names that still owes a cohort block would owe two
+    // gatherings at once. The claim is kept, and announced once that block is
+    // served -- which the holder's own checkpoints reach without this cluster.
+    if (percounter_cohort_held_in(cfg, mask)) return;
+
     // The payload before the generation, and the generation with release
     // ordering: a lane that observes an odd generation observes its payload.
     signal->task_id = claim->task_id;
-    signal->active_mask = percounter_mix_active_mask(task);
+    signal->active_mask = mask;
     signal->block_idx = claim->block_idx;
     signal->block_num = claim->block_num;
     // Every arming: the previous rendezvous on this line may have been a
@@ -804,15 +866,23 @@ inline __aicore__ void percounter_mix_tick(const LaneConfig &cfg, PercounterLane
  * rather than by the lane that took it. And a lane that owes a block never
  * leaves: the cohort is released the instant its last block is taken.
  *
- * `progress` takes the sum of the counts read here, which is what the caller
- * watches the device by: both are monotone, so the sum advances exactly when
- * one of them does. The reads are the ones this test already needs, taken
- * before the short-circuit rather than after, since a graph still advancing
- * its cohorts is advancing whether or not its MIX list is done.
+ * `progress` is what the caller watches the device by, and it is the whole
+ * device: the blocks every lane has resolved, plus the MIX and cohort counts
+ * this test already reads. All three are monotone, so the sum advances exactly
+ * when one of them does.
+ *
+ * The resolved count has to be in it. A lane whose own list is spent waits here
+ * for work that may be gated on a long run of ordinary tasks elsewhere -- an
+ * AIC list that empties while the AIV chain still has a thousand tasks to go
+ * before it unlocks the one MIX. The MIX and cohort counts are flat for that
+ * whole prefix, so a watchdog on them alone reads a healthy device as a stalled
+ * one and fails the run. The cohort count is read before the MIX short-circuit
+ * for the same reason: a graph still advancing its cohorts is advancing whether
+ * or not its MIX list is done.
  */
 inline __aicore__ bool
 percounter_lane_may_exit(const LaneConfig &cfg, const PercounterLaneState *state, uint64_t *progress) {
-    uint64_t done = 0;
+    uint64_t done = scheduler_gm_query(cfg.control->completed_block_count);
     bool complete = true;
     if (cfg.mix_order_count != 0) {
         const uint64_t mix_done = scheduler_gm_query(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next);
@@ -969,9 +1039,21 @@ percounter_mix_discover(const LaneConfig &cfg, PercounterLaneState *state, uint6
  * One checkpoint's service of work other lanes may be waiting on: a released
  * cohort block first, then the cluster's MIX line. `served` reports whether
  * this lane ran or armed anything.
+ *
+ * **A lane holding a block asks the line first.** Such a lane is named in one
+ * only through the window the cohort commentary describes, and every other lane
+ * that window names is likewise at a checkpoint rather than inside a cohort's
+ * kernel, so the rendezvous completes and the block is served at the checkpoint
+ * after it. Serving the block first would instead put this lane inside a kernel
+ * its co-holders cannot leave until a rendezvous runs that this lane has to
+ * arrive at.
  */
 inline __aicore__ bool
 percounter_checkpoint_serve(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served) {
+    if (state->sync.my_block >= 0) {
+        if (!percounter_mix_discover(cfg, state, timeout_cycles, served)) return false;
+        if (*served) return true;
+    }
     if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
     if (*served) return true;
     return percounter_mix_discover(cfg, state, timeout_cycles, served);

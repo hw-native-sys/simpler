@@ -80,7 +80,11 @@ struct alignas(64) PercounterMixSignal {
     // from the MIX list: the rendezvous is identical, but its end is reported to
     // the cohort record instead of to the MIX done ticket.
     volatile uint32_t cohort_block;
-    uint32_t reserved[3];
+    // Entry `i` is non-zero while cluster lane `i` holds a cohort block it has
+    // not finished, and lane `i` is its only writer. A lane's two ways of being
+    // committed -- a cohort block and a rendezvous this line names it in -- are
+    // mutually exclusive, and this is the half of that the claimer can see.
+    volatile uint32_t cohort_hold[PLATFORM_CORES_PER_BLOCKDIM];
 };
 static_assert(sizeof(PercounterMixSignal) == 64, "the MIX signal owns exactly one cache line");
 static_assert(alignof(PercounterMixSignal) == 64, "two clusters must not share a line");
@@ -119,6 +123,7 @@ inline __aicore__ void percounter_mix_signal_clear(SCHEDULER_SSBUF PercounterMix
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         signal->arrived[lane] = 0;
         signal->finished[lane] = 0;
+        signal->cohort_hold[lane] = 0;
     }
     // Last, with release ordering: a lane that sees an even generation must see
     // the cleared payload behind it.
