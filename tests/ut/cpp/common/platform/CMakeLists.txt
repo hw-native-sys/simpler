@@ -49,6 +49,44 @@ macro(simpler_pmu_arch_a5_define stem)
     endforeach()
 endmacro()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+platform_case(test_aicore_tls_keys.cpp PER_ARCH PER_RUNTIME
+    SOURCES ${SIMPLER_SRC}/@arch@/platform/sim/aicore/kernel.cpp
+    INCLUDES ${SIMPLER_SRC}/@arch@/platform/sim/aicore
+        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/runtime
+        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/common)
+
+foreach(arch a2a3 a5)
+    if(arch STREQUAL "a2a3")
+        set(key_count 6)
+    else()
+        set(key_count 10)
+    endif()
+    foreach(runtime ${SIMPLER_RUNTIMES})
+        simpler_runtime_tag("${runtime}" tag)
+        set(fixture aicore_tls_${arch}_${tag})
+        simpler_ut_includes(${arch} ${runtime} host fixture_includes)
+        add_library(${fixture} SHARED
+            ${SIMPLER_SRC}/${arch}/platform/sim/aicore/kernel.cpp
+            ${CMAKE_SOURCE_DIR}/common/support/aicore_tls_executor_stub.cpp)
+        target_include_directories(${fixture} PRIVATE ${fixture_includes}
+            ${SIMPLER_SRC}/${arch}/platform/sim/aicore)
+        target_compile_options(${fixture} PRIVATE $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+        target_link_libraries(${fixture} PRIVATE pthread)
+        set(test_target test_${arch}_${tag}_aicore_tls_keys)
+        target_compile_definitions(${test_target} PRIVATE
+            TEST_TLS_MODULE_PATH="$<TARGET_FILE:${fixture}>" TEST_TLS_KEY_COUNT=${key_count})
+        target_link_libraries(${test_target} PRIVATE ${CMAKE_DL_LIBS})
+        target_link_options(${test_target} PRIVATE -Wl,--wrap=pthread_setspecific)
+        add_dependencies(${test_target} ${fixture})
+        set_tests_properties(${test_target} PROPERTIES TIMEOUT 30)
+    endforeach()
+endforeach()
+
+else()
+    simpler_ut_exclude_case(test_aicore_tls_keys.cpp)
+endif()
+
 # ---------------------------------------------------------------------------
 # Cases carrying production sources of their own
 # ---------------------------------------------------------------------------
@@ -1122,5 +1160,54 @@ platform_single_case(test_native_invocation_entry.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/cache_ops.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/platform_aicpu_affinity.cpp)
 set_tests_properties(test_native_invocation_entry PROPERTIES TIMEOUT 15)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    platform_single_case(test_aicpu_affinity_tls.cpp
+        SOURCES ${SIMPLER_SRC}/common/platform/onboard/aicpu/platform_aicpu_affinity.cpp
+            ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+            ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/cache_ops.cpp)
+    target_link_options(test_aicpu_affinity_tls PRIVATE
+        -Wl,--wrap=pthread_setspecific -Wl,--wrap=pthread_key_create)
+    set_tests_properties(test_aicpu_affinity_tls PROPERTIES TIMEOUT 20)
+    simpler_ut_add_target(NAME test_aicpu_affinity_tls_sim
+        SOURCES test_aicpu_affinity_tls.cpp
+            ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp
+            ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+            ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/cache_ops.cpp
+        INCLUDES ${SIMPLER_SRC}/common/platform/include ${SIMPLER_SRC}/common/log/include
+        LINK a2a3_ut_support
+        LINK_OPTIONS -Wl,--wrap=pthread_setspecific -Wl,--wrap=pthread_key_create
+        TIMEOUT 20 LABEL no_hardware)
+
+else()
+    simpler_ut_exclude_case(test_aicpu_affinity_tls.cpp)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+platform_case(test_abort_aicore_startup.cpp PER_ARCH PER_RUNTIME
+    SOURCES
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/aicore/aicore_executor.cpp
+        ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/platform_regs.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
+        ${SIMPLER_SRC}/common/platform/onboard/aicpu/platform_aicpu_affinity.cpp
+    INCLUDES ${SIMPLER_SRC}/@arch@/runtime/@runtime@/runtime
+        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/common
+        ${SIMPLER_SRC}/@arch@/platform/sim/aicore
+        ${SIMPLER_SRC}/common/platform/sim/aicpu)
+target_sources(test_a5_hbg_abort_aicore_startup PRIVATE
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/aicore_legacy_executor.cpp)
+target_compile_definitions(test_a5_hbg_abort_aicore_startup PRIVATE TEST_RESIDENT_STARTUP=1)
+foreach(arch a2a3 a5)
+    foreach(tag hbg tmr)
+        target_link_options(test_${arch}_${tag}_abort_aicore_startup PRIVATE
+            -Wl,--wrap=pthread_setspecific -Wl,--wrap=_Z29platform_aicore_exit_deadlinev)
+        set_tests_properties(test_${arch}_${tag}_abort_aicore_startup PROPERTIES TIMEOUT 30)
+    endforeach()
+endforeach()
+else()
+    simpler_ut_exclude_case(test_abort_aicore_startup.cpp)
+endif()
 
 simpler_ut_glob_cases(platform_case_without_axes)

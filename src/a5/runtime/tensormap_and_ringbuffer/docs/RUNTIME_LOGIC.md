@@ -79,7 +79,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | --------- | ----------- |
 | `device_runner.cpp` | Uses `std::thread` to simulate AICPU/AICore |
 | `memory_allocator.cpp` | Wraps `malloc`/`free` |
-| `aicore/kernel.cpp` | `aicore_execute_wrapper` sets `g_sim_reg_base` per core |
+| `aicore/kernel.cpp` | `aicore_execute_wrapper_checked` sets the borrowed register-base cell per core |
 | `upload_chip_callable_buffer` | Copy ChipCallable bytes to a host scratch, `dlopen` each child SO, `dlsym` "kernel_entry", patch the scratch's `resolved_addr_` with the function pointer |
 
 ### 2.3 Platform Constants (`platform_config.h`)

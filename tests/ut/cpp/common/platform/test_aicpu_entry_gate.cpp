@@ -75,6 +75,7 @@ TEST(AicpuEntryGate, IndependentSimCohortsDoNotShareIndicesOrInitializers) {
                 EXPECT_GE(result.callback_index, 0);
                 indices[cohort].fetch_or(1u << result.callback_index);
                 if (result.execute) ++survivors[cohort];
+                platform_aicpu_affinity_bind_thread(nullptr);
             });
         for (auto &thread : threads)
             thread.join();
@@ -114,6 +115,7 @@ TEST(AicpuEntryGate, PartialSimThreadCreationCancelsEveryStartedWorkerBeforeDevi
                                 return 0;
                             };
                             EXPECT_TRUE(entry.enter(4, {init, nullptr}).execute);
+                            platform_aicpu_affinity_bind_thread(nullptr);
                         }
                         ++executed;
                     });
