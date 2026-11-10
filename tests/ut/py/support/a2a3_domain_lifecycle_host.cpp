@@ -268,6 +268,13 @@ static void test_host_registration_lifecycle(const std::string &scenario) {
     const uint32_t ranks[] = {0, 1};
     fail_host_register = fail_init;
     const uint32_t mask = sdma ? comm_workspace_bit(CommWorkspaceKind::SDMA) : 0;
+    // A2/A3 has no URMA engine, so any non-default engine configuration is rejected.
+    const CommWorkspaceConfig urma_config{2, 0};
+    assert(
+        comm_alloc_host_domain_windows(
+            h.get(), 2, ranks, h->nranks, 0, size, 0, name.c_str(), &ctx, &base, &mapped, &urma_config
+        ) == COMM_DOMAIN_WORKSPACE_UNSUPPORTED
+    );
     const int rc =
         comm_alloc_host_domain_windows(h.get(), 1, ranks, h->nranks, 0, size, mask, name.c_str(), &ctx, &base, &mapped);
     if (fail_init || collision) {

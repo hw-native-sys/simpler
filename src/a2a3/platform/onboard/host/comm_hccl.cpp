@@ -1681,8 +1681,10 @@ init_host_domain_context(CommHandle h, uint64_t allocation_id, DomainAllocation 
 extern "C" int comm_alloc_host_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
-    uint64_t *local_window_base_out, size_t *actual_window_size_out
+    uint64_t *local_window_base_out, size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
 ) try {
+    if (workspace_config && (workspace_config->urma_jetties_per_aiv != 1 || workspace_config->urma_sq_depth != 0))
+        return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     const uint32_t sdma_mask = comm_workspace_bit(CommWorkspaceKind::SDMA);
     if ((workspace_mask & ~sdma_mask) != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (!h || !rank_ids || !comm_domain_onboard::valid_host_shm_name(host_shm_name) || !device_ctx_out ||
