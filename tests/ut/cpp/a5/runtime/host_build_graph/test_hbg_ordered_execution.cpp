@@ -774,6 +774,64 @@ TEST(HbgOrderedExecution, CursorExhaustionIsBoundedAndDoesNotCloseLiveLocalSlots
     EXPECT_EQ(fixture.admissions[3].current_task_ref, 0);
 }
 
+class HbgOrderedAdmissionProgress : public ::testing::TestWithParam<std::tuple<LaneMask, bool, bool>> {};
+
+TEST_P(HbgOrderedAdmissionProgress, BoundedRetirementReportsProgressAndCaughtUpPollingIsIdle) {
+    const auto [mask, record_protocol, pending_task] = GetParam();
+    OrderedFixture fixture(std::vector<OrderedShape>(pending_task ? 9 : 8, {2, mask}), record_protocol);
+    const uint32_t publisher = fixture.publisher(0);
+    const uint32_t late_worker = publisher + 3;
+    for (uint64_t task = 0; task < 8; ++task) {
+        ASSERT_TRUE(fixture.admit(task, publisher));
+        for (uint32_t block = 0; block < 2; ++block) {
+            ASSERT_TRUE(fixture.stage_one(publisher, 0));
+            OrderedExecution execution{};
+            ASSERT_TRUE(fixture.begin(publisher, &execution));
+            ASSERT_EQ(execution.task, task);
+            ASSERT_EQ(execution.block, block);
+            ASSERT_TRUE(fixture.complete(execution));
+        }
+        bool closed = false;
+        ASSERT_TRUE(fixture.close(publisher, &closed));
+        ASSERT_TRUE(closed);
+    }
+    if (pending_task) ASSERT_TRUE(fixture.admit(8, publisher));
+    ASSERT_EQ(fixture.admissions[late_worker].scan_cursor, 0u);
+    const auto fill_slots = record_protocol ? scheduler_fill_own_slots<true> : scheduler_fill_own_slots<false>;
+    auto fill = [&](bool *failed) {
+        return fill_slots(
+            fixture.graph.graph(), fixture.base(), fixture.locals[late_worker], fixture.run(),
+            fixture.cursors[late_worker].data(), &fixture.ready_stats[late_worker], 0, 0, failed,
+            fixture.storage.ssbuf_region, nullptr, nullptr
+        );
+    };
+    bool failed = false;
+    EXPECT_TRUE(fill(&failed));
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(fixture.admissions[late_worker].scan_cursor, 8u);
+    EXPECT_EQ(fixture.admissions[late_worker].current_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.locals[late_worker]->local_ready_mask, 0u);
+    if (pending_task) {
+        EXPECT_EQ(fixture.control(8)->next_block, 0u);
+        EXPECT_TRUE(fill(&failed));
+        ASSERT_FALSE(failed);
+        EXPECT_EQ(fixture.control(8)->next_block, 1u);
+        OrderedExecution execution{};
+        ASSERT_TRUE(fixture.begin(late_worker, &execution));
+        EXPECT_EQ(execution.task, 8);
+        EXPECT_EQ(execution.block, 0u);
+    } else {
+        EXPECT_FALSE(fill(&failed));
+        ASSERT_FALSE(failed);
+        EXPECT_EQ(fixture.admissions[late_worker].scan_cursor, 8u);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    PureCAndV, HbgOrderedAdmissionProgress,
+    ::testing::Combine(::testing::ValuesIn(kPureCAndV), ::testing::Bool(), ::testing::Bool())
+);
+
 TEST(HbgOrderedExecution, EmptyFillStillStopsOnAnAlreadyPublishedRunError) {
     OrderedFixture fixture({{2, LaneMask::aic()}, {1, LaneMask::aic()}});
     for (uint32_t poll = 0; poll < 8; ++poll)

@@ -452,6 +452,21 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
     return scheduler_admission_detail::commit_validated_record<RecordProtocol>(graph, base, local, run, admission);
 }
 
+inline __aicore__ bool scheduler_read_claim_cursor(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t *cursor, bool *used_seal = nullptr
+);
+
+inline __aicore__ void scheduler_retire_local_obligation(SchedulerAdmissionLocalState &admission) {
+    ++admission.scan_cursor;
+    admission.current_task_ref = SCHEDULER_TASK_REF_INVALID;
+    admission.current_block_num = 0;
+    admission.current_active_mask = LaneMask::none();
+    admission.current_flags = 0;
+    admission.sync_claimed = false;
+    admission.ticket_exhausted = false;
+}
+
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_refresh_local_obligation(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
@@ -508,17 +523,39 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
                 return scheduler_admission_fail(
                     graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
                 );
-            const auto binding_error = scheduler_observe_graph_arguments(graph, task);
-            if (binding_error != SchedulerGraphBindingError::NONE)
-                return scheduler_admission_fail(
-                    graph, local, run, task, scheduler_graph_binding_error_site(binding_error)
-                );
             admission->current_task_ref = task;
             admission->current_block_num = record->logical_block_num;
             admission->current_active_mask = scheduler_lane_mask_load(record->active_mask);
             admission->current_flags = record->flags;
             admission->sync_claimed = false;
             admission->ticket_exhausted = false;
+            // A late member owns no block from this newly adopted record. A
+            // strong exhaustion proof lets it close without materializing args
+            // or parking ordinary payloads. MIX and sync-start keep their gates.
+            bool owns_block = false;
+            for (const auto &slot : local->slots)
+                owns_block = owns_block || (slot.cooperative && slot.task_ref == task &&
+                                            slot.state != SchedulerDispatchSlotState::FREE);
+            if (!owns_block && !scheduler_task_is_mix(record->flags) &&
+                !scheduler_task_requires_sync_start(record->flags) &&
+                scheduler_gm_query(control->claim_seal) == record->logical_block_num) {
+                uint64_t cursor = 0;
+                bool used_seal = false;
+                if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_seal)) return false;
+                if (used_seal && cursor == record->logical_block_num) {
+                    if constexpr (RecordProtocol) {
+                        scheduler_protocol_member_observed(base, local, admission, tail);
+                        scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, true);
+                    }
+                    scheduler_retire_local_obligation(*admission);
+                    continue;
+                }
+            }
+            const auto binding_error = scheduler_observe_graph_arguments(graph, task);
+            if (binding_error != SchedulerGraphBindingError::NONE)
+                return scheduler_admission_fail(
+                    graph, local, run, task, scheduler_graph_binding_error_site(binding_error)
+                );
             if constexpr (RecordProtocol) scheduler_protocol_member_observed(base, local, admission, tail);
             return true;
         }
@@ -593,7 +630,7 @@ enum class SchedulerBlockFinishResult : uint8_t { PARTIAL, TASK_LAST, ERROR };
 
 inline __aicore__ bool scheduler_read_claim_cursor(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t *cursor, bool *used_seal = nullptr
+    uint64_t *cursor, bool *used_seal
 ) {
     if (used_seal != nullptr) *used_seal = false;
     auto *admission = local == nullptr ? nullptr : local->admission;
@@ -875,13 +912,7 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
     if constexpr (RecordProtocol)
         scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, used_claim_seal);
-    ++admission->scan_cursor;
-    admission->current_task_ref = SCHEDULER_TASK_REF_INVALID;
-    admission->current_block_num = 0;
-    admission->current_active_mask = LaneMask::none();
-    admission->current_flags = 0;
-    admission->sync_claimed = false;
-    admission->ticket_exhausted = false;
+    scheduler_retire_local_obligation(*admission);
     *closed = true;
     return true;
 }
