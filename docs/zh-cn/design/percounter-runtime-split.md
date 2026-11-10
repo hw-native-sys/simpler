@@ -120,13 +120,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 | `src/common/host_build_graph/runtime.h` | **0 行** | 只改过注释，回退 |
 | `aicpu/aicore_lifecycle.h` | 7 行 | 三个只读 accessor（核数、核类型、是否报到） |
 | `runtime/scheduler/scheduler_topology.h` | 1 行 | 给拓扑换算函数加 `__aicore__`，lane 自己要调它 |
-| `host/scheduler_extension.h` | **新增 60 行** | 两个扩展点的声明 + 三值 enum |
-| `host/runtime_maker.cpp` | +36 −8 | 两个弱扩展点 + `create_scheduler_state` 内 4 处调用点 |
-| `aicpu/aicpu_executor.h` | **新增 122 行** | `AicpuExecutor` 从 `.cpp` 提出来，声明六个步骤 |
-| `aicpu/aicpu_executor.cpp` | 352 行 | 其中约 290 行是纯搬移，真改动约 20 行 |
+| `host/scheduler_extension.h` | **新增 61 行** | 一个扩展点的声明 + 三值 enum |
+| `host/runtime_maker.cpp` | +18 −0 | 一个弱扩展点 + `create_scheduler_state` 内一处调用点 |
+| `aicpu/aicpu_executor.h` | **新增 150 行** | `AicpuExecutor` 从 `.cpp` 提出来，声明七个步骤 |
+| `aicpu/aicpu_executor.cpp` | +166 −202 | 其中绝大部分是把类型搬进头文件，真改动约 20 行 |
 
-**没有一处出现 `percounter` 字样。** 默认行为逐字不变：六个步骤和两个扩展点都是
-`__attribute__((weak))`，弱定义就是这两个文件原本做的事。cpput 398/398 在该状态下通过。
+**没有一处出现 `percounter` 字样。** 默认行为逐字不变：七个步骤和那个扩展点都是
+`__attribute__((weak))`，弱定义就是这两个文件原本做的事。cpput 480/480 在该状态下通过。
 
 ### 为什么"一行 weak"不成立
 
@@ -134,14 +134,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
 - **`create_scheduler_state` 在匿名 namespace 里**（`runtime_maker.cpp` 约 485–1898 行）。
   内部链接的符号不能充当 weak override 的弱侧，`weak` 标上去是惰性的，链接器不会用强的那个。
-  改为在匿名 namespace **外面**定义两个扩展点：一个让 GRAPH task 不被提前退出挡掉，
-  一个在 per-task walk 之后接管 bind。percounter 因此不必重写那 80 行分类循环——
-  它拿 walk 的产物，不重做 walk。
-- **`aicpu_execute` 能标 weak，但 percounter 要换的不是整个函数**，是函数体内的六个决策点。
+  改为在匿名 namespace **外面**定义那个扩展点：它在 per-task walk 之后接管 bind。
+  percounter 因此不必重写那 80 行分类循环——它拿 walk 的产物，不重做 walk。
+- **`aicpu_execute` 能标 weak，但 percounter 要换的不是整个函数**，是函数体内的七个决策点。
   整体替换意味着把线程汇合、握手屏障、完成门、终态记录、拆解这约 290 行复制一份。
-  改为把 `AicpuExecutor` 提到头文件里，六个步骤各自带弱默认。
+  改为把 `AicpuExecutor` 提到头文件里，七个步骤各自带弱默认。
 
-  这六个步骤**不是 virtual**：`test_hbg_resident_late_aicore_error` 直接 `#include` 这个
+  这七个步骤**不是 virtual**：`test_hbg_resident_late_aicore_error` 直接 `#include` 这个
   `.cpp`，并用 `-ffunction-sections` + `--gc-sections` 丢掉它不驱动的部分；vtable 会引用
   每个步骤、丢不掉，会把该测试没链的符号拖出来。原因记在头文件注释里。
 
@@ -202,8 +201,8 @@ percounter runtime 编出来和 hbg 等价。这是一个可验证的中间态�
 | 入口 | 做法 |
 | ---- | ---- |
 | `aicore_execute` | percounter 提供自己的定义，同样标 weak——每个 AICore 源码会被 AIC 和 AIV 各编一遍再合并，strong 会和自己的另一半撞 |
-| AICPU 的六个步骤 | hbg 侧弱默认即原行为；percounter 提供 strong 定义 |
-| host 的两个扩展点 | hbg 侧弱默认是弃权；percounter 提供 strong 定义，接管 walk 的产物 |
+| AICPU 的七个步骤 | hbg 侧弱默认即原行为；percounter 提供 strong 定义 |
+| host 的那个扩展点 | hbg 侧弱默认是弃权；percounter 提供 strong 定义，接管 walk 的产物 |
 
 验收：
 
