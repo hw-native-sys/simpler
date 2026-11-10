@@ -171,6 +171,7 @@ nav:
   - Multi-chip and comm:
       - Communication Domains: comm-domain.md
       - A5 Host-source Domains: a5-host-comm-domain.md
+      - A5 CCU Execution: zh-cn/design/ccu-pr1-build-validation.md
       - L3-L2 Orchestrator Comm: l3-l2-orch-comm.md
       - L3-L2 Message Queue: l3-l2-message-queue.md
       - Directed NEXT_LEVEL Scheduling: directed-next-level-scheduling.md
