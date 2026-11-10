@@ -22,12 +22,20 @@ before asking the user to decide an unresolved material trade-off. Continue
 unaffected work while that decision is pending. A short repair can go directly
 to the existing implementation and test workflow without a DAG or subagents.
 
+For a material design trade-off, use the one-question design alignment in
+[planning](references/planning.md#align-the-design); routine implementation
+choices do not need an interview.
+
 ## Plan, delegate and integrate
 
 For multi-step work read [planning](references/planning.md). Divide by testable
 artifacts and dependencies, with one meaningful feature per PR. Different people
 owning independently deliverable parts may need sub-Issues; one owner's internal
 subtasks normally stay in the same Issue.
+
+Slice multi-step work into tracer bullets with explicit blocking edges; work
+the frontier (items whose blockers are done). See
+[planning](references/planning.md#slice-the-work).
 
 When delegation is useful and authorized, read [agents](references/agents.md).
 Use native subagents or a verified local Claude/Codex CLI. Record assignments
