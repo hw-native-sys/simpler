@@ -27,7 +27,9 @@ docs/dfx/chip-swimlane-profiling.md §3.5.
 
 import argparse
 import bisect
+import gzip
 import importlib.util
+import io
 import json
 import math
 import os
@@ -904,6 +906,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
                         "worker_id",
                         "core_type",
                         "physical_core_id",
+                        "cluster_index",
+                        "cluster_lane",
                         "capture",
                     )
                 }
@@ -1136,14 +1140,12 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         if host_origin_ns <= 0:
             raise ValueError(f"invalid shared timeline origin: {host_origin_ns}")
 
-    cycles_to_us_factor = 1_000_000.0 / float(clock_freq_hz)
-
     def _to_us(cycles):
         if cycles <= 0:
             return 0.0
         if placement is not None:
             return (placement.map_cycles_to_host_ns(cycles) - host_origin_ns) / 1000.0
-        relative_device_us = (cycles - base_time_cycles) * cycles_to_us_factor
+        relative_device_us = (cycles - base_time_cycles) * 1_000_000 / clock_freq_hz
         if host_mode:
             # Fail-soft diagnostic layout: preserve both clock domains and only
             # encode the known happens-before relation. The physical gap at
@@ -1343,6 +1345,23 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     out["runtime"] = runtime_name
     if scheduler_task_producer is not None:
         out["scheduler_task_producer"] = scheduler_task_producer
+    if scheduler_records and runtime_name == "host_build_graph":
+        from simpler_setup.tools.hbg.scalar_profile import analyze_streams  # noqa: PLC0415
+
+        profiles = analyze_streams(
+            sched_phases_raw,
+            scheduler_stream_metadata,
+            data.get("aicore_tasks", []),
+            data.get("aicore_execution_identities"),
+        )
+        for profile in profiles:
+            profile["clock_freq_hz"] = clock_freq_hz
+            for key in ("rows", "exclusive"):
+                for row in profile[key]:
+                    row["start_time_us"] = _to_us(row["start_cycles"])
+                    row["end_time_us"] = _to_us(row["end_cycles"])
+        if profiles:
+            out["scalar_profiles"] = profiles
     if scheduler_records:
         out["scheduler_records"] = scheduler_records
         out["scheduler_streams"] = scheduler_stream_metadata
@@ -1612,6 +1631,67 @@ def _with_execution_identity(args, row):
         ):
             args[field] = row[field]
     return args
+
+
+def _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams):
+    """Use captured 1C2V membership for every view; retain IDs and flow endpoints."""
+    observed = defaultdict(set)
+
+    def observe(worker, row):
+        cluster, lane = row.get("cluster_index"), row.get("cluster_lane")
+        if type(worker) is int and type(cluster) is int and type(lane) is int and cluster >= 0 and 0 <= lane < 3:
+            observed[worker].add((cluster, lane))
+
+    for task in tasks:
+        observe(task["core_id"], task)
+    for stream in scheduler_streams or []:
+        if stream.get("producer") == "aicore":
+            observe(stream.get("worker_id"), stream)
+    # A legacy multi-run capture can move a worker between clusters. Such a
+    # worker has no single truthful cluster label for the whole view.
+    positions = {worker: next(iter(values)) for worker, values in observed.items() if len(values) == 1}
+    if not positions:
+        return
+    lane_workers = {}
+    for worker, tid in core_to_tid.items():
+        lane_workers[(4, tid)] = worker
+        lane_workers[(3, tid)] = worker
+        lane_workers[(3, tid + 1)] = worker
+    for index, stream in enumerate(scheduler_streams or []):
+        if stream.get("producer") == "aicore" and type(stream.get("worker_id")) is int:
+            lane_workers[(2, 30000 + index * 10)] = stream["worker_id"]
+    workers = sorted(set(lane_workers.values()), key=lambda w: (w not in positions, positions.get(w, (w, 0)), w))
+    order = {worker: index for index, worker in enumerate(workers)}
+    desired, present = {}, set()
+    for event in events:
+        if event.get("ph") != "M":
+            continue
+        key = (event.get("pid"), event.get("tid"))
+        worker = lane_workers.get(key)
+        if worker is None:
+            continue
+        sort_index = order[worker] * 10 + (key[1] - core_to_tid[worker] if key[0] == 3 else 0)
+        if event["name"] == "thread_name":
+            if worker in positions:
+                cluster, lane = positions[worker]
+                role = ("C", "V0", "V1")[lane]
+                event["args"]["name"] = f"Cluster {cluster:02d} / {role} / {event['args']['name']}"
+            desired[key] = sort_index
+        elif event["name"] == "thread_sort_index":
+            event["args"]["sort_index"] = sort_index
+            present.add(key)
+    for (pid, tid), index in desired.items():
+        if (pid, tid) not in present:
+            events.append(
+                {
+                    "ph": "M",
+                    "cat": "__metadata",
+                    "name": "thread_sort_index",
+                    "pid": pid,
+                    "tid": tid,
+                    "args": {"sort_index": index},
+                }
+            )
 
 
 # An absent (thread, run) bucket: no phases, and therefore no starts.
@@ -2274,6 +2354,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     emit_overhead=False,
     host_device_uploads=None,
     aicpu_lifecycle_records=None,
+    scalar_profiles=None,
+    scheduler_task_producer=None,
+    chip_swimlane_level=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -2291,12 +2374,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         orchestrator_phases: Optional list of per-task orchestrator phase records (chip_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
         aicpu_lifecycle_records: Optional A5 HBG AICPU control-plane lifecycle records
+        scheduler_task_producer: Per-task timing producer declared by the capture
+        chip_swimlane_level: Profiling level declared by the capture
 
     Generates processes in the trace:
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
         - pid=1 "Host/AICPU Orchestrator": orchestrator phase bars (chip_swimlane_level >= 4)
         - pid=2 "AICPU/AICore Scheduler": scheduler record bars (chip_swimlane_level >= 3)
-        - pid=3 "Scheduler View": dispatch_time_us to finish_time_us
+        - pid=3 "Scheduler View": dispatch_time_us to finish_time_us, except HBG AICore L3/L4
         - pid=4 "Worker View": per-subtask kernel execution on physical cores
     """
     if (timeline_metadata or {}).get("recorded_window"):
@@ -2456,8 +2541,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     has_scheduler_task_data = any(
         task.get("dispatch_time_us", 0) >= 0 and task.get("finish_time_us", 0) > 0 for task in tasks
     )
+    worker_scheduler_details = (
+        runtime_name == "host_build_graph" and scheduler_task_producer == "aicore" and chip_swimlane_level in (3, 4)
+    )
+    show_scheduler_view = has_scheduler_task_data and not worker_scheduler_details
 
-    if has_scheduler_task_data:
+    if show_scheduler_view:
         events.append(
             {"args": {"name": "Scheduler View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 3}
         )
@@ -2565,6 +2654,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         fanin_ids = fanin_map.get(task["task_id"], [])
         fanout_str = f"{len(fanout_ids)}: [" + ", ".join(task_display(x) for x in fanout_ids) + "]"
         fanin_str = f"{len(fanin_ids)}: [" + ", ".join(task_display(x) for x in fanin_ids) + "]"
+        timing_details = {}
+        if worker_scheduler_details and _scheduler_slice_start_us(task) != float("inf"):
+            timing_details = {
+                "dispatch-time-us": task["dispatch_time_us"],
+                "receive-time-us": ts,
+                "kernel-start-time-us": task["start_time_us"],
+                "kernel-end-time-us": task["end_time_us"],
+                "finish-time-us": task["finish_time_us"],
+                "scheduler-duration-us": task["finish_time_us"] - task["dispatch_time_us"],
+            }
 
         events.append(
             {
@@ -2577,6 +2676,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "kernel-duration-us": task["duration_us"],
                         "local_setup_us": local_setup_us,
                         "taskId": task["task_id"],
+                        **timing_details,
                     },
                     task,
                 ),
@@ -2598,7 +2698,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # Scheduler View duration events (dispatch_time to finish_time)
     # Assign overlapping tasks on the same core to different tids so Perfetto
     # renders each bar on its own row (Perfetto requires strict nesting on a tid).
-    if has_scheduler_task_data:
+    if show_scheduler_view:
         # Build per-core sorted task lists and assign sub-lanes.
         # Each core gets a base tid from core_to_tid; overlapping tasks get base+1.
         _core_scheduler_tasks: dict[int, list] = defaultdict(list)
@@ -2778,6 +2878,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         assigned_thread_indices = {
             assigned for assigned in (core_to_thread or []) if isinstance(assigned, int) and assigned >= 0
         }
+        detailed_schedulers = {profile["scheduler_id"] for profile in (scalar_profiles or [])}
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = sched_lane_tid(thread_idx, 0)
             resolve_tid = sched_lane_tid(thread_idx, 1)
@@ -2791,6 +2892,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             stream = scheduler_streams[thread_idx] if scheduler_streams and thread_idx < len(scheduler_streams) else {}
             is_aicore_scheduler = stream.get("producer") == "aicore"
             scheduler_id = stream.get("scheduler_id", thread_idx)
+            if is_aicore_scheduler and scheduler_id in detailed_schedulers:
+                continue
             worker_id = stream.get("worker_id")
             lane_name = f"Sched_{scheduler_id}"
             if is_aicore_scheduler:
@@ -2963,30 +3066,31 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     }
                 )
 
-        # Name the shared-queue pseudo-thread + give it a sort index that
-        # places it after the 3 scheduler threads but still inside the
-        # AICPU Scheduler process row, so the user reads top-to-bottom:
-        # Sched_0 / Sched_1 / Sched_2 / Shared queue (global).
-        events.append(
-            {
-                "args": {"name": "shared_ready_queue (global)"},
-                "cat": "__metadata",
-                "name": "thread_name",
-                "ph": "M",
-                "pid": 2,
-                "tid": 3999,
-            }
-        )
-        events.append(
-            {
-                "args": {"sort_index": 100},
-                "cat": "__metadata",
-                "name": "thread_sort_index",
-                "ph": "M",
-                "pid": 2,
-                "tid": 3999,
-            }
-        )
+        if producers != {"aicore"}:
+            # Name the shared-queue pseudo-thread + give it a sort index that
+            # places it after the 3 scheduler threads but still inside the
+            # AICPU Scheduler process row, so the user reads top-to-bottom:
+            # Sched_0 / Sched_1 / Sched_2 / Shared queue (global).
+            events.append(
+                {
+                    "args": {"name": "shared_ready_queue (global)"},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 2,
+                    "tid": 3999,
+                }
+            )
+            events.append(
+                {
+                    "args": {"sort_index": 100},
+                    "cat": "__metadata",
+                    "name": "thread_sort_index",
+                    "ph": "M",
+                    "pid": 2,
+                    "tid": 3999,
+                }
+            )
 
     # Host-to-device transfer lane. These are bind segments, not orchestrator
     # operations, and they are the ones a device timeline can say something about:
@@ -3015,6 +3119,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "args": {"bytes": upload.get("detail", 0)},
                 }
             )
+
+    if scalar_profiles:
+        from simpler_setup.tools.hbg.scalar_profile import trace_events  # noqa: PLC0415
+
+        events.extend(
+            trace_events(scalar_profiles, pid=2, tid_base=30000, display=task_display, streams=scheduler_streams)
+        )
 
     # AICPU Orchestrator lane (chip_swimlane_level >= 4)
     #
@@ -3237,7 +3348,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
     # Scheduler View dependency mirror (Scheduler timestamps).
-    if has_scheduler_task_data:
+    if show_scheduler_view:
         for run_task_map, pred_id, succ_ids in (
             (_m, _p, _s) for _m in task_maps_by_run.values() for _p, _s in edges_by_pred.items()
         ):
@@ -3353,7 +3464,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if r.get("finish_time_us") is not None and r["finish_time_us"] >= 0 and r.get("end_time_us") is not None
             ]
             worker_anchors = _worker_flow_anchor_rows(tid, run_task_map, spmd_task_ids)
-            scheduler_anchors = _scheduler_flow_anchor_rows(tid, run_task_map, spmd_task_ids)
+            scheduler_anchors = (
+                _scheduler_flow_anchor_rows(tid, run_task_map, spmd_task_ids) if show_scheduler_view else []
+            )
             if not valid_finishes or not worker_anchors:
                 continue
             last_finish_us, last_end_us, last_cid = max(valid_finishes, key=lambda x: x[0])
@@ -3636,6 +3749,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 flow_id += 1
 
                 # Flow: scheduler DISPATCH → Scheduler View task start
+                if not show_scheduler_view:
+                    continue
                 scheduler_event_id = task_to_scheduler_event_id.get(_execution_key(task))
                 events.append(
                     {
@@ -3748,17 +3863,25 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
+    if runtime_name == "host_build_graph":
+        _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams)
+
     trace: dict[str, object] = {"traceEvents": events}
     metadata = dict(timeline_metadata) if timeline_metadata else {}
     # Downstream tools (critical_path) re-format task ids from this trace alone, so it
     # has to name the runtime whose TaskId layout its labels and ids follow. Always set:
     # resolve_runtime above already refused a caller that named none.
     metadata["runtime"] = resolve_runtime(runtime_name)
+    if scalar_profiles:
+        metadata["scalar_function_capture"] = {
+            "minimum_cycles": sorted({p.get("function_min_cycles", 0) for p in scalar_profiles}),
+            "short_intervals_omitted": sum(p.get("short_function_intervals_omitted", 0) for p in scalar_profiles),
+            "memory_operations": "per_call",
+        }
     if metadata:
         trace["metadata"] = metadata
     if output_path is not None:
-        with open(output_path, "w") as f:
-            json.dump(trace, f, indent=2)
+        _atomic_json(Path(output_path), trace)
 
     if verbose and output_path is not None:
         print(f"JSON written to: {output_path}")
@@ -4712,15 +4835,116 @@ def _atomic_text(path, lines):
         temporary.unlink(missing_ok=True)
 
 
+def _scalar_display_lanes(events):
+    """Deduplicate run identity without sampling or changing any interval."""
+    lanes = {}
+    for event in events:
+        if event.get("ph") != "X" or event.get("cat") != "aicore_scalar":
+            continue
+        key = event["pid"], event["tid"]
+        lane = lanes.setdefault(key, {"epochs": set(), "complete": set()})
+        args = event.get("args", {})
+        if "run_epoch" in args:
+            lane["epochs"].add(args["run_epoch"])
+        if "capture_complete" in args:
+            lane["complete"].add(args["capture_complete"])
+    return lanes
+
+
+def _scalar_display_event(event, lanes):
+    """Project a Scalar display row; authoritative integer fields stay in raw."""
+    if event.get("ph") != "X" or event.get("cat") != "aicore_scalar":
+        return event
+    compact = {key: event[key] for key in ("ph", "name", "pid", "tid", "ts", "dur")}
+    args = event.get("args", {})
+    calls = args.get("scalar_calls", 1)
+    if calls != 1:
+        compact["name"] += f" [calls={calls}]"
+    # Names carry the function/operation, completion boundary, task and calls.
+    # Nesting is given by the unchanged intervals. Integer clock evidence lives
+    # in the source capture rather than being copied into every display event.
+    omitted = {
+        "kind",
+        "start_cycles",
+        "end_cycles",
+        "loop_iter",
+        "tasks_processed",
+        "task_id",
+        "scalar_calls",
+        "scalar_depth",
+        "raw_scalar_depth",
+        "scalar_schema",
+    }
+    lane = lanes[event["pid"], event["tid"]]
+    if len(lane["epochs"]) == 1:
+        omitted.add("run_epoch")
+    if len(lane["complete"]) == 1:
+        omitted.add("capture_complete")
+    retained = {key: value for key, value in args.items() if key not in omitted}
+    if retained:
+        compact["args"] = retained
+    return compact
+
+
+def _dump_trace_json(output, data):
+    """Stream compact events without building a second merged event list."""
+    events = data.get("traceEvents") if isinstance(data, dict) else None
+    if not isinstance(events, list):
+        json.dump(data, output, ensure_ascii=False, separators=(",", ":"))
+        return
+    lanes = _scalar_display_lanes(events)
+    metadata = dict(data.get("metadata", {}))
+    if lanes:
+        metadata["scalar_detail_display"] = {
+            "format": "compact-v1",
+            "authoritative_format": "chip_swimlane_records",
+            "all_events_retained": True,
+            "lanes": [
+                {
+                    "pid": pid,
+                    "tid": tid,
+                    "run_epochs": sorted(lane["epochs"]),
+                    "capture_complete_values": sorted(lane["complete"]),
+                }
+                for (pid, tid), lane in lanes.items()
+            ],
+        }
+    output.write('{"traceEvents":[\n')
+    for index, event in enumerate(events):
+        if index:
+            output.write(",\n")
+        json.dump(_scalar_display_event(event, lanes), output, ensure_ascii=False, separators=(",", ":"))
+    output.write("\n]")
+    for key, value in data.items():
+        if key in ("traceEvents", "metadata"):
+            continue
+        output.write(",")
+        json.dump(key, output)
+        output.write(":")
+        json.dump(value, output, ensure_ascii=False, separators=(",", ":"))
+    if "metadata" in data or lanes:
+        output.write(',"metadata":')
+        json.dump(metadata, output, ensure_ascii=False, separators=(",", ":"))
+    output.write("}\n")
+
+
 def _atomic_json(path, data):
     """Write the merged trace completely before replacing its previous file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with temporary.open("x") as output:
-            json.dump(data, output, indent=2)
-            output.flush()
-            os.fsync(output.fileno())
+        if path.suffix == ".gz":
+            with temporary.open("xb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                    with io.TextIOWrapper(compressed, encoding="utf-8") as output:
+                        _dump_trace_json(output, data)
+                raw.flush()
+                os.fsync(raw.fileno())
+        else:
+            with temporary.open("x", encoding="utf-8") as output:
+                _dump_trace_json(output, data)
+                output.flush()
+                os.fsync(output.fileno())
         if path.is_file():
             os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
         os.replace(temporary, path)
@@ -5356,7 +5580,10 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             args.verbose,
             orchestrator_name=artifacts["orchestrator_name"],
             scheduler_phases=data.get("scheduler_records"),
+            scalar_profiles=data.get("scalar_profiles"),
             scheduler_streams=data.get("scheduler_streams"),
+            scheduler_task_producer=data.get("scheduler_task_producer"),
+            chip_swimlane_level=data["chip_swimlane_level"],
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
             runtime_name=data.get("runtime"),
@@ -5554,7 +5781,10 @@ def main():
             args.verbose,
             orchestrator_name=orchestrator_name,
             scheduler_phases=data.get("scheduler_records"),
+            scalar_profiles=data.get("scalar_profiles"),
             scheduler_streams=data.get("scheduler_streams"),
+            scheduler_task_producer=data.get("scheduler_task_producer"),
+            chip_swimlane_level=data["chip_swimlane_level"],
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
             runtime_name=data.get("runtime"),

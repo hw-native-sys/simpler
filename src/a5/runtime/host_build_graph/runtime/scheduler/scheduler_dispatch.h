@@ -25,6 +25,7 @@ static inline __aicore__ bool scheduler_service_gm_mix(
     SchedulerCompletionStats *completion_stats, bool *progress,
     SchedulerGmMixPhase ack_prefilter_phase = SchedulerGmMixPhase::IDLE
 ) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarMix, -1);
     *progress = false;
     auto &admission = *local->admission;
     auto &group = admission.gm_mix;
@@ -94,6 +95,8 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, bool *ready_probe_empty = nullptr,
     SchedulerGmMixPhase *ack_prefilter_phase = nullptr
 ) {
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrderedPoll, -1);
+    SchedulerScalarScope scalar_local(local, SchedPhaseKind::ScalarPollLocalState);
     if (ready_probe_empty != nullptr) *ready_probe_empty = false;
     if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = SchedulerGmMixPhase::IDLE;
     const auto &admission = *local->admission;
@@ -102,15 +105,20 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
         return true;
     for (const auto &candidate : admission.candidates)
         if (!scheduler_task_ref_is_null(candidate.ready.task_ref)) return true;
+    scalar_local.close();
 
     const uint32_t queues = local->has_mix && local->is_mix_coordinator() ? 2 : 1;
     for (uint32_t index = 0; index < queues; ++index) {
+        SchedulerScalarScope scalar_queue(local, SchedPhaseKind::ScalarPollReadyQueue);
         const uint32_t type = index == 0 ? local->config.self_core_type : SCHEDULER_MIX_QUEUE;
         if (type >= SCHEDULER_READY_QUEUE_COUNT || local->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
             !scheduler_ready_queue_holder(type, local->config.self_core_type))
             return true;
         if (local->config.ready_pool_offset != 0) {
-            if (scheduler_ready_pool_may_have_work(base, local, type)) return true;
+            if (scheduler_scalar_result(local, SchedPhaseKind::ScalarPollReadyPool, [&]() __aicore__ {
+                    return scheduler_ready_pool_may_have_work(base, local, type);
+                }))
+                return true;
             continue;
         }
         const uint64_t own = local->self_type_rank();
@@ -119,7 +127,12 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
         auto *inbox = scheduler_ready_inbox_at(base, local, type, own);
         // Own work is never gated solely by the directory: a push and an
         // owner's clear can cross before the directory publication drains.
-        if (scheduler_gm_query(inbox->endpoints) != SCHEDULER_READY_ENDPOINTS_EMPTY ||
+        if (scheduler_scalar_result(
+                local, SchedPhaseKind::ScalarPollOwnInbox,
+                [&]() __aicore__ {
+                    return scheduler_gm_query(inbox->endpoints);
+                }
+            ) != SCHEDULER_READY_ENDPOINTS_EMPTY ||
             scheduler_ready_directory_nonempty<EnableNativeDiscovery>(
                 graph, base, local, local->config.scheduler_count, type
             ))
@@ -133,10 +146,13 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
         *ready_probe_empty = true;
     if (scheduler_task_ref_is_null(admission.current_task_ref)) {
         auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, admission.control_offset);
-        return scheduler_gm_query(control->commit_tail) != admission.scan_cursor;
+        return scheduler_scalar_result(local, SchedPhaseKind::ScalarPollAdmissionTail, [&]() __aicore__ {
+                   return scheduler_gm_query(control->commit_tail);
+               }) != admission.scan_cursor;
     }
     if (!scheduler_task_ref_valid(graph, admission.current_task_ref) || !scheduler_task_is_mix(admission.current_flags))
         return true;
+    SchedulerScalarScope scalar_mix(local, SchedPhaseKind::ScalarPollMixState);
     const auto &group = admission.gm_mix;
     if (group.mailbox_offset == 0 || group.cluster_index >= local->config.cluster_count) return true;
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
@@ -144,8 +160,15 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
         (group.phase == SchedulerGmMixPhase::IDLE || group.phase == SchedulerGmMixPhase::RELEASED)) {
         const auto *record = scheduler_admission_record_at(base, &admission, admission.current_task_ref);
         auto *seals = scheduler_state_at<SchedulerMixCloseSeal>(base, record->mix_close_seals_offset);
-        return scheduler_gm_query(seals[group.cluster_index].value) != 0 ||
-               scheduler_gm_query(mailbox->lanes[local->config.self_lane].assigned_seq) > group.group_seq;
+        return scheduler_scalar_result(
+                   local, SchedPhaseKind::ScalarPollMixCloseSeal,
+                   [&]() __aicore__ {
+                       return scheduler_gm_query(seals[group.cluster_index].value);
+                   }
+               ) != 0 ||
+               scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixAssignment, [&]() __aicore__ {
+                   return scheduler_gm_query(mailbox->lanes[local->config.self_lane].assigned_seq);
+               }) > group.group_seq;
     }
     const bool releases = group.phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator();
     if (group.phase == SchedulerGmMixPhase::ARRIVED || releases) {
@@ -154,7 +177,13 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
             auto &ack = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
-            if (scheduler_gm_query(ack) < group.group_seq) return false;
+            if (scheduler_scalar_result(
+                    local, releases ? SchedPhaseKind::ScalarPollMixReleased : SchedPhaseKind::ScalarPollMixArrived,
+                    [&]() __aicore__ {
+                        return scheduler_gm_query(ack);
+                    }
+                ) < group.group_seq)
+                return false;
         }
         if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = group.phase;
     }
@@ -168,6 +197,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerWakeStats *wake_stats = nullptr,
     SchedulerCompletionStats *completion_stats = nullptr
 ) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarOrderedFill, -1);
     if (failed == nullptr) return false;
     *failed = false;
     auto *admission = local == nullptr ? nullptr : local->admission;
@@ -454,6 +484,7 @@ static inline __aicore__ bool scheduler_fill_own_slots(
     uint64_t profiling_level, uint64_t skip_slot_mask, bool *failed, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region,
     SchedulerWakeStats *wake_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr
 ) {
+    SchedulerScalarScope scalar_scope(scheduler, SchedPhaseKind::ScalarFillSlots, -1);
     if (failed != nullptr) *failed = false;
     if (scheduler == nullptr) return false;
     if (scheduler->admission != nullptr)

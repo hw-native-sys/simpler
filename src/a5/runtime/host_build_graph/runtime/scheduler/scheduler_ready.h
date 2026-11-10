@@ -12,6 +12,7 @@
 #pragma once
 
 #include "scheduler_protocol.h"
+#include "scheduler_scalar_trace.h"
 #include "scheduler_graph.h"
 #include "scheduler_graph_binding.h"
 #include "scheduler_error.h"
@@ -261,6 +262,7 @@ struct SchedulerLocalConfig {
 };
 
 struct SchedulerLocalProfilingState {
+    SchedulerScalarTrace scalar;
     uint64_t trace_cells_offset{0};
     uint64_t activity_buffers_offset{0};
     uint64_t protocol_layout_offset{0};
@@ -389,7 +391,8 @@ static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 144, "64-bi
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 712, "64-bit local state size changed");
 static_assert(
-    sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248, "64-bit local profiling size changed"
+    sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248 + sizeof(SchedulerScalarTrace),
+    "64-bit local profiling size changed"
 );
 
 // Called once after READY acquire, before any bootstrap or mailbox operation.
@@ -922,7 +925,9 @@ inline __aicore__ SchedulerRouteProgress scheduler_route_task_step(
         if (observed < SCHEDULER_WAKE_LIST_OPEN || (observed >= 0 && !scheduler_task_ref_valid(graph, observed)))
             return fail(SchedulerGraphResult::INVALID_TASK_ID);
         scheduler_publish_waiter_metadata(control, observed, cursor.next_fanin, cursor.producer_ref);
-        const int64_t actual = scheduler_gm_compare_exchange(producer_control->wake_list_head, observed, task_ref);
+        const int64_t actual = scheduler_scalar_atomic_result(context, [&]() __aicore__ {
+            return scheduler_gm_compare_exchange(producer_control->wake_list_head, observed, task_ref);
+        });
         if (actual == observed) {
             if (stats != nullptr) ++stats->wake_register_count;
             cursor.result = SchedulerRouteResult::WAITING;
@@ -1256,7 +1261,9 @@ inline __aicore__ bool scheduler_ready_batch_push_queue(
         const int64_t tail = scheduler_ready_endpoints_tail(packed);
         const bool was_empty = scheduler_ready_endpoints_empty(packed);
         const uint64_t next_packed = scheduler_ready_endpoints_pack(was_empty ? batch->head : head, batch->tail);
-        if (scheduler_gm_compare_exchange(inbox->endpoints, packed, next_packed) != packed) {
+        if (scheduler_scalar_atomic_result(context, [&]() __aicore__ {
+                return scheduler_gm_compare_exchange(inbox->endpoints, packed, next_packed);
+            }) != packed) {
             if (stats != nullptr) ++stats->cas_retry_count;
             continue;
         }
@@ -1468,7 +1475,9 @@ inline __aicore__ bool scheduler_ready_pop_from_queue(
         }
         const uint64_t next_packed = next == SCHEDULER_INBOX_EMPTY ? SCHEDULER_READY_ENDPOINTS_EMPTY :
                                                                      scheduler_ready_endpoints_pack(next, tail);
-        if (scheduler_gm_compare_exchange(inbox->endpoints, packed, next_packed) != packed) {
+        if (scheduler_scalar_atomic_result(context, [&]() __aicore__ {
+                return scheduler_gm_compare_exchange(inbox->endpoints, packed, next_packed);
+            }) != packed) {
             if (stats != nullptr) ++stats->cas_retry_count;
             continue;
         }
@@ -1589,7 +1598,9 @@ inline __aicore__ bool scheduler_ready_pool_claim(
                     result = SchedulerTicketResult::NOT_READY;
                     break;
                 }
-                if (scheduler_gm_compare_exchange(queue.control->head, head, head + 1) == head) {
+                if (scheduler_scalar_atomic_result(local, [&]() __aicore__ {
+                        return scheduler_gm_compare_exchange(queue.control->head, head, head + 1);
+                    }) == head) {
                     scheduler_cache_barrier();
                     ref = candidate;
                     result = SchedulerTicketResult::SUCCESS;
@@ -1639,6 +1650,7 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
     uint64_t *victim_cursor, SchedulerReadyStats *stats, SchedulerReadyClaim *claim,
     SchedulerMixPlacement *placement = nullptr, bool allow_steal = true
 ) {
+    SchedulerScalarScope scalar_scope(context, SchedPhaseKind::ScalarReadyClaim, -1);
     if (victim_cursor == nullptr || claim == nullptr || context == nullptr || scheduler_count == 0 ||
         scheduler_count > SCHEDULER_WORKER_CAPACITY || context->config.scheduler_index >= scheduler_count ||
         core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
@@ -1734,6 +1746,7 @@ inline __aicore__ bool scheduler_ready_directory_nonempty(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, uint64_t scheduler_count,
     uint32_t core_type_index
 ) {
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarReadyDirectory, -1);
     if (scheduler_ready_directory_nonempty(base, local, scheduler_count, core_type_index)) return true;
     if (local->config.ready_pool_offset != 0) return false;
     if constexpr (EnableNativeDiscovery) {
@@ -1771,6 +1784,7 @@ inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *l
 inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
     __gm__ void *base, SchedulerLocalState *scheduler, int64_t task_ref, uint64_t profiling_level
 ) {
+    SchedulerScalarScope scalar_detail(scheduler, SchedPhaseKind::ScalarDispatchMetadata, task_ref);
     const auto *source = scheduler_task_metadata_at(base, scheduler, task_ref);
     SchedulerTaskMetadata metadata{};
     metadata.kernel_ids[0] = source->kernel_ids[0];
@@ -1791,6 +1805,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, uint8_t subtask_slot, uint64_t *prepare_start_cycles = nullptr,
     const SchedulerTaskPayloadArguments *arguments = nullptr, bool write_arguments = true
 ) {
+    SchedulerScalarScope scalar_payload(scheduler, SchedPhaseKind::ScalarPayload, ready_claim.task_ref);
     if (scheduler == nullptr || (slot_claim.mix && ssbuf_region == nullptr) ||
         !scheduler_task_ref_valid(graph, ready_claim.task_ref) ||
         slot_claim.worker_id >= scheduler->config.runtime_worker_count ||
@@ -1919,6 +1934,7 @@ inline __aicore__ void scheduler_stage_dispatch_slot(
         dispatch_control->task_ref = ready_claim.task_ref;
         dispatch_control->subtask_slot = subtask_slot;
     }
+    SchedulerScalarScope scalar_cache(scheduler, SchedPhaseKind::ScalarCachePublish, ready_claim.task_ref);
     scheduler_writeback_dispatch_payload(payload);
 }
 
@@ -1982,6 +1998,7 @@ inline __aicore__ void scheduler_publish_dispatch_slot(
     const SchedulerReadyClaim &ready_claim, const SchedulerTaskMetadata &metadata, uint64_t profiling_level,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, uint8_t subtask_slot, uint64_t prepare_start_cycles = 0
 ) {
+    SchedulerScalarScope scalar_detail(scheduler, SchedPhaseKind::ScalarDispatchPublish, ready_claim.task_ref);
     scheduler_stage_dispatch_slot(
         scheduler_state_base, scheduler, slot_claim, ready_claim, metadata, ssbuf_region, subtask_slot
     );
@@ -2002,6 +2019,7 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
     const SchedulerReadyClaim &ready_claim, uint64_t profiling_level, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
 ) {
+    SchedulerScalarScope scalar_detail(scheduler, SchedPhaseKind::ScalarDispatchFill, ready_claim.task_ref);
     if (scheduler == nullptr || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
         slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
         return false;
@@ -2085,6 +2103,7 @@ inline __aicore__ bool scheduler_complete_inline_task(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t task_ref, uint64_t profiling_level
 ) {
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarInlineComplete, task_ref);
     if (local == nullptr || !scheduler_task_ref_valid(graph, task_ref)) return false;
     const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
     if (!scheduler_task_is_executable(metadata.flags) || !scheduler_task_is_inline(metadata.flags) ||

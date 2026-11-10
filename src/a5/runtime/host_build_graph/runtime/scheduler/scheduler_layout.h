@@ -50,6 +50,7 @@ struct AicoreSchedulerLayout {
     uint64_t trace_cells_offset;
     uint64_t pmu_cells_offset;
     uint64_t activity_buffers_offset;
+    uint64_t scalar_records_offset;
     uint64_t graph_summary_offset;
     uint64_t async_layout_offset;
     uint64_t executable_task_count;

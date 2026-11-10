@@ -107,7 +107,7 @@ inline __aicore__ void publish_activity(SchedulerAsyncLocalState &local) {
     // this isolated line has no cached writes or RMW, and never returns to zero.
 #if defined(__CCE_AICORE__)
     st_dev(UINT64_C(1), const_cast<__gm__ uint64_t *>(&activity->activated), 0);
-    dsb(DSB_DDR);
+    scheduler_ddr_barrier();
 #else
     __atomic_store_n(&activity->activated, UINT64_C(1), __ATOMIC_RELEASE);
 #endif
@@ -413,19 +413,24 @@ struct SchedulerAsyncCompletionObserver {
             return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
         if (token.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
             auto *record = reinterpret_cast<__gm__ uint64_t *>(token.addr);
+            const uint64_t completed =
+                scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [record]() __aicore__ {
 #if defined(__CCE_AICORE__)
-            const uint64_t completed = __builtin_cce_ld_dev(record, 0);
+                    return static_cast<uint64_t>(__builtin_cce_ld_dev(record, 0));
 #else
-            const uint64_t completed = __atomic_load_n(record, __ATOMIC_ACQUIRE);
+                return __atomic_load_n(record, __ATOMIC_ACQUIRE);
 #endif
+                });
             return {completed >= token.backend_cookie ? CompletionPollState::READY : CompletionPollState::PENDING, 0};
         }
         auto *counter = reinterpret_cast<__gm__ uint32_t *>(token.addr);
+        const uint32_t value = scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [counter]() __aicore__ {
 #if defined(__CCE_AICORE__)
-        const uint32_t value = static_cast<uint32_t>(__builtin_cce_ld_dev(counter, 0));
+            return static_cast<uint32_t>(__builtin_cce_ld_dev(counter, 0));
 #else
-        const uint32_t value = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
+            return __atomic_load_n(counter, __ATOMIC_ACQUIRE);
 #endif
+        });
         // COUNTER is INT32. A negative sample is below every supported
         // nonnegative threshold; it is neither completion nor malformed data.
         if (value > INT32_MAX) return {CompletionPollState::PENDING, 0};

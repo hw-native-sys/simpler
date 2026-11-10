@@ -475,7 +475,7 @@ namespace {
 // The swimlane JSON's own schema key. Spelled out here rather than inline so a
 // rename of the C++ identifier cannot reach it: downstream tools parse this
 // name, so it is a wire contract and not a variable.
-constexpr const char *kSchedulerJsonTaskKey = "\"task_id\": ";
+constexpr const char *kSchedulerJsonTaskKey = "\"task_id\":";
 
 // The device storage belongs to the pipeline slot. The frozen Host graph belongs
 // to this run and remains valid after the orchestration mirror is reused.
@@ -498,6 +498,8 @@ struct SchedulerJsonRecord {
     uint64_t tasks_processed;
     uint64_t task_ref;
     bool has_task;
+    uint32_t scalar_calls{0};
+    uint32_t scalar_depth{0};
 };
 
 const char *scheduler_core_type_name(int32_t core_type) {
@@ -811,7 +813,45 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                     false
                 );
             }
-            dropped_by_worker[worker] = buffer.dropped;
+            const uint64_t scalar_offset = owner.layout.scalar_records_offset + context.scheduler_index *
+                                                                                    SCHEDULER_SCALAR_RECORD_CAPACITY *
+                                                                                    sizeof(SchedulerScalarRecord);
+            if (buffer.scalar_committed > SCHEDULER_SCALAR_RECORD_CAPACITY ||
+                buffer.scalar_records_offset != scalar_offset || buffer.scalar_storage_format != 1 ||
+                buffer.scalar_storage_slots < buffer.scalar_committed ||
+                buffer.scalar_storage_slots > 2 * buffer.scalar_committed) {
+                LOG_WARN("A5 HBG: invalid Scalar record count for worker=%" PRIu64, worker);
+                return false;
+            }
+            const auto *scalar_slots = scheduler_state_at<SchedulerScalarStorageSlot>(host_base, scalar_offset);
+            uint32_t slot_cursor = 0;
+            for (uint32_t index = 0; index < buffer.scalar_committed; ++index) {
+                SchedulerScalarRecord record{};
+                if (!scheduler_decode_scalar_storage(scalar_slots, buffer.scalar_storage_slots, slot_cursor, record)) {
+                    LOG_WARN("A5 HBG: invalid compact Scalar row for worker=%" PRIu64, worker);
+                    return false;
+                }
+                const uint32_t kind = record.kind & UINT32_C(0xffff);
+                if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) ||
+                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishBarrier) ||
+                    std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
+                    record.start_time == 0 || record.end_time < record.start_time) {
+                    LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
+                    return false;
+                }
+                append_scheduler_record(
+                    &records[worker], record.start_time, record.end_time, 0, static_cast<SchedPhaseKind>(kind), 0,
+                    static_cast<uint64_t>(record.task_ref), record.task_ref >= 0
+                );
+                records[worker].back().scalar_calls = record.count;
+                records[worker].back().scalar_depth = record.kind >> 16;
+            }
+            if (slot_cursor != buffer.scalar_storage_slots) {
+                LOG_WARN("A5 HBG: trailing compact Scalar storage for worker=%" PRIu64, worker);
+                return false;
+            }
+            const uint64_t dropped = static_cast<uint64_t>(buffer.dropped) + buffer.scalar_dropped;
+            dropped_by_worker[worker] = static_cast<uint32_t>(std::min(dropped, uint64_t{UINT32_MAX}));
         }
     }
 
@@ -831,27 +871,61 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             return std::strcmp(sched_phase_kind_name(lhs.kind), sched_phase_kind_name(rhs.kind)) < 0;
         });
         if (!first_stream) scheduler_json << ",";
+        uint32_t cluster_lane = 0;
+        while (cluster_lane < PLATFORM_CORES_PER_BLOCKDIM && context.cluster_worker_ids[cluster_lane] != worker)
+            ++cluster_lane;
+        const bool cluster_valid =
+            context.cluster_index < context.cluster_count && cluster_lane < PLATFORM_CORES_PER_BLOCKDIM;
         scheduler_json << "\n      {\"platform\": \"a5\", \"producer\": \"aicore\", "
                           "\"scheduler_id\": "
                        << context.scheduler_index << ", \"worker_id\": " << worker << ", \"core_type\": \""
                        << scheduler_core_type_name(context.core_type)
-                       << "\", \"physical_core_id\": " << context.physical_core_id
-                       << ", \"capture\": {\"committed\": " << records[worker].size() << ", \"dropped\": " << dropped
+                       << "\", \"physical_core_id\": " << context.physical_core_id << ", \"cluster_index\": ";
+        if (cluster_valid) scheduler_json << context.cluster_index;
+        else scheduler_json << "null";
+        scheduler_json << ", \"cluster_lane\": ";
+        if (cluster_valid) scheduler_json << cluster_lane;
+        else scheduler_json << "null";
+        scheduler_json << ", \"capture\": {\"committed\": " << records[worker].size() << ", \"dropped\": " << dropped
                        << ", \"truncated\": " << (dropped == 0 ? "false" : "true") << "}, \"records\": [";
         for (size_t index = 0; index < records[worker].size(); ++index) {
             const SchedulerJsonRecord &record = records[worker][index];
             if (index != 0) scheduler_json << ",";
-            scheduler_json << "\n        {\"start_cycles\": " << record.start_cycles
-                           << ", \"end_cycles\": " << record.end_cycles << ", \"run_epoch\": " << api->run_epoch()
-                           << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \""
-                           << sched_phase_kind_name(record.kind)
-                           << "\", \"tasks_processed\": " << record.tasks_processed << ", " << kSchedulerJsonTaskKey;
+            scheduler_json << "\n{\"start_cycles\":" << record.start_cycles << ",\"end_cycles\":" << record.end_cycles
+                           << ",\"run_epoch\":" << api->run_epoch() << ",\"loop_iter\":" << record.loop_iter
+                           << ",\"kind\":\"" << sched_phase_kind_name(record.kind)
+                           << "\",\"tasks_processed\":" << record.tasks_processed << "," << kSchedulerJsonTaskKey;
             if (record.has_task) scheduler_json << public_id(record.task_ref);
             else scheduler_json << "null";
             scheduler_json << "}";
         }
         if (!records[worker].empty()) scheduler_json << "\n      ";
-        scheduler_json << "], \"metrics\": []}";
+        scheduler_json << "], \"metrics\": [";
+        bool first_metric = true;
+        for (size_t index = 0; index < records[worker].size(); ++index) {
+            const auto &record = records[worker][index];
+            if (record.scalar_calls == 0) continue;
+            if (!first_metric) scheduler_json << ",";
+            first_metric = false;
+            scheduler_json << "{\"record_index\":" << index << ",\"scalar_calls\":" << record.scalar_calls
+                           << ",\"scalar_depth\":" << record.scalar_depth;
+            if (record.kind == SchedPhaseKind::ScalarWindow) {
+                const auto &buffer = scheduler_state_at<SchedulerActivityBuffer>(
+                    host_base, owner.layout.activity_buffers_offset
+                )[context.scheduler_index];
+                scheduler_json << ",\"scalar_schema\":2,\"batch_write_cycles\":" << buffer.scalar_write_cycles
+                               << ",\"no_progress_loops\":" << buffer.scalar_poll_loops
+                               << ",\"short_function_intervals_omitted\":" << buffer.scalar_short_intervals
+                               << ",\"function_min_cycles\":" << buffer.scalar_function_min_cycles
+                               << ",\"scalar_storage_format\":" << buffer.scalar_storage_format
+                               << ",\"scalar_storage_bytes\":"
+                               << uint64_t{buffer.scalar_storage_slots} * sizeof(SchedulerScalarStorageSlot)
+                               << ",\"scalar_logical_records\":" << buffer.scalar_committed
+                               << ",\"iterations_detailed\":true";
+            }
+            scheduler_json << "}";
+        }
+        scheduler_json << "]}";
         first_stream = false;
     }
     if (!first_stream) scheduler_json << "\n    ";
@@ -1687,6 +1761,11 @@ bool create_scheduler_state(
     layout.aic_worker_demand = aic_worker_demand;
     layout.aiv_worker_demand = aiv_worker_demand;
 
+    if (!scheduler_plan_scalar_storage(&layout)) {
+        LOG_ERROR("A5 HBG: Scalar record storage overflow");
+        return false;
+    }
+
     if (layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) return false;
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
     // The slot's retained pair, each side aligned with at least total_size
@@ -1708,7 +1787,10 @@ bool create_scheduler_state(
     }
     const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
 
-    const uint64_t initialized_bytes = async_plan.layout_offset == 0 ? layout.total_size : async_plan.initialized_bytes;
+    const uint64_t initialized_bytes =
+        async_plan.layout_offset == 0 ?
+            (layout.scalar_records_offset == 0 ? layout.total_size : layout.scalar_records_offset) :
+            async_plan.initialized_bytes;
     if (!scheduler_init_data_from_layout(host_base, layout, aligned_address, initialized_bytes)) {
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
         return false;
@@ -1718,6 +1800,9 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: failed to initialize async completion storage");
         return false;
     }
+    if (layout.async_layout_offset != 0)
+        scheduler_state_at<SchedulerAsyncLayout>(host_base, layout.async_layout_offset)->image_bytes =
+            layout.total_size;
 
     if (dump_layout.total_size != 0) {
         void *dump_image = static_cast<char *>(host_base) + dump_offset;

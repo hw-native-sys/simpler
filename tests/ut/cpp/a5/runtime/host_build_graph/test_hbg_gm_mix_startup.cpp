@@ -319,6 +319,7 @@ TEST(HbgGmMixStartupExit, MissingCoordinatorSealTimeoutIdentifiesTheWaitingTaskA
 
 TEST(HbgProtocolStartupExit, RealExecutorFinishesLateZeroWorkMembersAfterClosingEveryObligation) {
     StartupFixture fixture({LaneMask::both_aiv(), LaneMask::all()}, true);
+    ASSERT_EQ(fixture.storage.layout.activity_buffers_offset, 0u);
     fixture.finish_both_tasks_on_cluster_zero();
     auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
         fixture.base(), fixture.storage.layout.protocol.workers_offset
@@ -328,6 +329,7 @@ TEST(HbgProtocolStartupExit, RealExecutorFinishesLateZeroWorkMembersAfterClosing
     );
     for (uint32_t worker = 3; worker < 6; ++worker) {
         fixture.run_late_worker(worker);
+        EXPECT_EQ(scheduler_scalar_current(), nullptr);
         ASSERT_EQ(fixture.storage.run_control->scheduler_error, 0u);
         EXPECT_EQ(workers[worker].finished, 1u);
         EXPECT_EQ(workers[worker].error_flags, 0u);

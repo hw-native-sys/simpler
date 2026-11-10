@@ -21,7 +21,22 @@ from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _build_l3_task_args, _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools.hbg.scalar_profile import analyze_streams
 from simpler_setup.tools.strace_timing import parse_spans
+
+
+def _verify_scalar_streams(raw, streams):
+    records = []
+    for stream in streams:
+        rows = [dict(record) for record in stream["records"]]
+        for metric in stream.get("metrics", []):
+            rows[metric["record_index"]].update({key: value for key, value in metric.items() if key != "record_index"})
+        records.append(rows)
+    profiles = analyze_streams(records, streams, raw["aicore_tasks"], raw.get("aicore_execution_identities"))
+    assert len(profiles) == len(streams)
+    assert all(profile["complete"] for profile in profiles)
+    for profile in profiles:
+        assert sum(profile["exclusive_cycles"].values()) == profile["window_cycles"]
 
 
 def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
@@ -214,13 +229,14 @@ class TestSchedulerPhases(SceneTestCase):
                 )
                 for stream in streams:
                     ordered = sorted(
-                        stream["records"],
+                        (record for record in stream["records"] if not record["kind"].startswith("scalar_")),
                         key=lambda record: (record["start_cycles"], record["end_cycles"]),
                     )
                     assert all(
                         previous["end_cycles"] <= current["start_cycles"]
                         for previous, current in zip(ordered, ordered[1:])
                     )
+                _verify_scalar_streams(raw, streams)
                 probe_by_task = {
                     int(record["task_id"]): record
                     for record in records
