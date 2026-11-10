@@ -76,9 +76,11 @@ struct alignas(64) PercounterMixSignal {
     // is part of the payload and moves under the same release as the task id.
     volatile int32_t block_idx;
     volatile int32_t block_num;
-    // Non-zero when this arming is one block of a sync cohort rather than a draw
-    // from the MIX list: the rendezvous is identical, but its end is reported to
-    // the cohort record instead of to the MIX done ticket.
+    // Zero when this arming is a draw from the MIX list; otherwise the cohort's
+    // sequence plus one. The rendezvous is identical either way, but its end is
+    // reported to the cohort record rather than to the MIX done ticket -- and a
+    // lane that owes a block of its own needs the sequence to tell which of the
+    // two it serves first, so a flag would not carry enough.
     volatile uint32_t cohort_block;
     // Entry `i` is non-zero while cluster lane `i` holds a cohort block it has
     // not finished, and lane `i` is its only writer. A lane's two ways of being
