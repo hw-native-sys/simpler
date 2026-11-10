@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from simpler import worker as worker_mod
+from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
 
 from tests.st import automatic_admission_support as support
 from tests.st.a2a3.tensormap_and_ringbuffer.early_enqueue import test_early_enqueue as stream_evidence
@@ -171,7 +172,47 @@ def _controlled_admission_fault(monkeypatch, tmp_path, fault="propagated"):
     monkeypatch.setattr(support, "until", lambda predicate, label: original_until(predicate, label, timeout=0.1))
     monkeypatch.setattr(case, "submit", submit)
     worker = SimpleNamespace(_chip_pids=[pid], _config={"device_ids": [device]}, create_buffer=Buffer)
-    return SimpleNamespace(invoke=lambda: case.error_and_close(worker), handles=handles, waits=waits)
+    return SimpleNamespace(
+        invoke=lambda: case.error_and_close(worker), handles=handles, waits=waits, case=case, worker=worker
+    )
+
+
+def test_automatic_admission_drops_exports_held_by_failure_traceback(monkeypatch, tmp_path):
+    controlled = _controlled_admission_fault(monkeypatch, tmp_path, "hbg_prepare")
+    buffers, errors = [], []
+    owner = mint_owner_instance_id()
+
+    def create_buffer(size):
+        buffer = create_host_shared_buffer(size, owner, len(buffers) + 1)
+        buffers.append(buffer)
+        return buffer
+
+    submit = controlled.case.submit
+
+    def retain_failure(*args, **kwargs):
+        try:
+            return submit(*args, **kwargs)
+        except RuntimeError as error:
+            errors.append(error)
+            raise
+
+    monkeypatch.setattr(controlled.worker, "create_buffer", create_buffer)
+    monkeypatch.setattr(controlled.case, "submit", retain_failure)
+    try:
+        controlled.invoke()
+        assert len(errors) == 1 and errors[0].__traceback__ is not None
+        # The synthetic handles own output views; real handles retain descriptors.
+        for handle in controlled.handles:
+            handle.output = None
+        for buffer in buffers:
+            buffer.close()
+    finally:
+        for error in errors:
+            error.__traceback__ = None
+        for handle in controlled.handles:
+            handle.output = None
+        for buffer in buffers:
+            buffer.close()
 
 
 @pytest.mark.parametrize("fault", ["propagated", "good_success", "hbg_prepare"])

@@ -109,6 +109,192 @@ def test_prepare_is_not_submit_and_unregister_refusal_preserves_handle(prepared)
     chip.worker.unregister(chip.callable)
 
 
+def test_borrowed_host_control_wait_releases_buffer(prepared):
+    from simpler.task_interface import ArgDirection, ChipCallable, DataType, TaskArgs, TensorTransfer  # noqa: PLC0415
+
+    chip, pending = prepared
+    env = chip.impl._execution_environment
+    chip.impl._execution_environment = (*env[:4], True)
+    entry = chip.worker.register(
+        ChipCallable.build(signature=[ArgDirection.IN], func_name="host_control", binary=b"\0", children=[])
+    )
+    buffer = chip.worker.create_buffer(64)
+    args = TaskArgs()
+    args.add_tensor(buffer.tensor((4,), DataType.INT32), transfer=TensorTransfer.NONE)
+    handle = chip.worker.prepare_submission(entry, args, caller_stream=123)
+    run_id = handle._run_id
+    pending[0].submit()
+    handle.wait()
+    assert handle.safe_to_release and not chip.live
+    assert run_id not in chip.worker._chip_import_registry.host_mappings._uses
+    chip.worker.release_buffer(buffer)
+    chip.worker.close()
+    assert buffer.closed and chip.impl.finalized
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_prepared_map_keeps_device_binding_and_reservation_through_retirement(prepared, monkeypatch, cancel):
+    import ctypes  # noqa: PLC0415
+    import struct  # noqa: PLC0415
+
+    from simpler.buffer import AddressSpace  # noqa: PLC0415
+    from simpler.task_interface import ArgDirection, ChipCallable, DataType, TaskArgs, TensorTransfer  # noqa: PLC0415
+
+    chip, pending = prepared
+    unmapped = []
+    monkeypatch.setattr(chip.impl, "_host_ddr_mapping_supported", True, raising=False)
+    monkeypatch.setattr(chip.impl, "_map_host_ddr", lambda *_: 0x40000000, raising=False)
+    monkeypatch.setattr(chip.impl, "_unmap_host_ddr", unmapped.append, raising=False)
+    entry = chip.worker.register(
+        ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.IN], func_name="map_probe", binary=b"\0", children=[]
+        )
+    )
+    table = chip.worker.create_buffer(64)
+    with table.host_view() as memory:
+        struct.pack_into("<i", memory, 16, 17)
+    tensor = table.tensor((4,), DataType.INT32, byte_offset=16)
+    args = TaskArgs()
+    args.add_tensor(tensor, transfer=TensorTransfer.NONE)
+    args.add_tensor(tensor, transfer=TensorTransfer.MAP)
+
+    handle = chip.worker.prepare_submission(entry, args, caller_stream=123)
+    bound = pending[0].values[1]
+    assert bound.tensor(0).data != table.base + 16
+    assert ctypes.c_int32.from_address(bound.tensor(0).data).value == 17
+    assert bound.tensor(1).data == 0x40000010
+    assert bound.tensor(1).address_space == AddressSpace.DEVICE
+    assert bound.transfer(1) == TensorTransfer.NONE
+    assert args.tensor(1).buffer.address_space == AddressSpace.HOST
+    assert args.transfer(1) == TensorTransfer.MAP
+    with pytest.raises(RuntimeError, match="in-flight"):
+        chip.worker.release_buffer(table)
+    assert not unmapped
+
+    if cancel:
+        assert handle.cancel()
+    else:
+        pending[0].submit()
+        handle.wait()
+    assert pending[0].retired
+    assert not chip.worker._chip_import_registry.host_mappings._uses
+    chip.worker.release_buffer(table)
+    assert table.closed and unmapped == [table.base]
+
+
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("transfer_name", ["H2D", "MAP"])
+def test_failed_host_use_retires_with_native_release_proof(prepared, monkeypatch, queued, transfer_name):
+    from simpler.task_interface import ArgDirection, ChipCallable, DataType, TaskArgs, TensorTransfer  # noqa: PLC0415
+
+    chip, pending = prepared
+    unmapped = []
+    monkeypatch.setattr(chip.impl, "_host_ddr_mapping_supported", True, raising=False)
+    monkeypatch.setattr(chip.impl, "_map_host_ddr", lambda *_: 0x40000000, raising=False)
+    monkeypatch.setattr(chip.impl, "_unmap_host_ddr", unmapped.append, raising=False)
+    entry = chip.worker.register(
+        ChipCallable.build(signature=[ArgDirection.IN], func_name="host_failure", binary=b"\0", children=[])
+    )
+    buffer = chip.worker.create_buffer(64)
+    args = TaskArgs()
+    args.add_tensor(buffer.tensor((4,), DataType.INT32), transfer=getattr(TensorTransfer, transfer_name))
+    if queued:
+        handle = chip.worker.prepare_submission(entry, args, caller_stream=123)
+        pending[0].submit()
+        pending[0].recovery_required = False
+    else:
+        handle = chip.worker.submit(entry, args)
+    run_id = handle._run_id
+    chip.runs[0]._owner_recovery_required = False
+    chip.runs[0].lane_poisoned = False
+    chip.state.error = RuntimeError("execution failed after last use ended")
+    # The recording native boundary has proved last use, although execution failed.
+    chip.live.clear()
+    with pytest.raises(RuntimeError, match="execution failed after last use ended"):
+        handle.wait()
+    assert run_id not in chip.worker._chip_import_registry.host_mappings._uses
+    assert run_id not in chip.worker._chip_call_values
+    assert not chip.worker._source_context_failed
+    chip.worker.release_buffer(buffer)
+    assert buffer.closed
+    assert unmapped == ([buffer.base] if transfer_name == "MAP" else [])
+    chip.worker.close()
+    assert chip.impl.finalized
+
+
+@pytest.mark.parametrize("mapped_use_unproven", [False, True])
+@pytest.mark.parametrize("unregister_fails", [False, True])
+def test_owner_recovery_reclaims_idle_mappings_before_native_close(
+    chip_fixture, monkeypatch, mapped_use_unproven, unregister_fails
+):
+    from simpler.task_interface import ArgDirection, ChipCallable, DataType, TaskArgs, TensorTransfer  # noqa: PLC0415
+
+    chip = chip_fixture
+    registrations, events = set(), []
+
+    def register(base, _size):
+        registrations.add(base)
+        return 0x40000000
+
+    def unregister(base):
+        events.append("unregister")
+        if unregister_fails:
+            raise RuntimeError("unregister failed")
+        registrations.remove(base)
+
+    monkeypatch.setattr(chip.impl, "_host_ddr_mapping_supported", True, raising=False)
+    monkeypatch.setattr(chip.impl, "_map_host_ddr", register, raising=False)
+    monkeypatch.setattr(chip.impl, "_unmap_host_ddr", unregister, raising=False)
+    entry = chip.worker.register(
+        ChipCallable.build(signature=[ArgDirection.IN], func_name="cached_map", binary=b"\0", children=[])
+    )
+    buffer = chip.worker.create_buffer(64)
+    args = TaskArgs()
+    args.add_tensor(buffer.tensor((4,), DataType.INT32), transfer=TensorTransfer.MAP)
+    chip.worker.submit(entry, args).wait()
+    registry = chip.worker._chip_import_registry.host_mappings
+    assert registrations and not registry._uses
+    handle = chip.worker.submit(entry, args) if mapped_use_unproven else chip.worker.submit(chip.callable)
+    chip.runs[-1]._owner_recovery_required = True
+    chip.runs[-1].lane_poisoned = True
+    chip.state.error = RuntimeError("owner recovery needed")
+    with pytest.raises(RuntimeError, match="owner recovery needed"):
+        handle.wait()
+    original_finalize = chip.impl.finalize
+
+    def finalize():
+        # Mirror the production C++ guard. No hardware recovery is modeled here.
+        if registrations:
+            raise RuntimeError("Host DDR mappings still retained")
+        events.append("finalize")
+        chip.live.clear()
+        original_finalize()
+
+    monkeypatch.setattr(chip.impl, "finalize", finalize)
+    try:
+        if mapped_use_unproven or unregister_fails:
+            message = "Host DDR mappings still retained" if mapped_use_unproven else "unregister failed"
+            with pytest.raises(RuntimeError, match=message):
+                chip.worker.close()
+            assert registrations and not buffer.closed and not chip.impl.finalized
+            assert events == ([] if mapped_use_unproven else ["unregister"])
+            if mapped_use_unproven:
+                assert registry._uses
+                return
+            unregister_fails = False
+        chip.worker.close()
+        assert not registrations and buffer.closed and chip.impl.finalized
+        assert events[-2:] == ["unregister", "finalize"]
+    finally:
+        # Only the fake transport is discharged here; unknown native use stays tested above.
+        unregister_fails = False
+        for run_id in tuple(registry._uses):
+            chip.worker._release_source_uses(run_id)
+        chip.worker._chip_run_touched_identities.clear()
+        chip.worker.release_buffer(buffer)
+        chip.live.clear()
+
+
 def test_cancel_wakes_wait_and_retires_owners(prepared):
     chip, pending = prepared
 

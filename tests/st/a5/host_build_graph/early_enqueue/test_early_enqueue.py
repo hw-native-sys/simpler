@@ -1783,12 +1783,12 @@ class TestA5ThreeRunCapacity(_A5EarlyEnqueueBase):
         self._require_three_sets(st_worker)
         worker = st_worker
 
-        x_buffer, _ = self._tensor_from_host_buffer(worker, 2.0)
-        control_buffer, _ = self._tensor_from_host_buffer(worker, 0.5)
+        x_buffer = self._tensor_from_host_buffer(worker, 2.0)[0]
+        control_buffer = self._tensor_from_host_buffer(worker, 0.5)[0]
         # The host destination of the explicit copy, and separately the read-back buffer, so a
         # later read cannot overwrite the control value the accepted run is still naming.
-        copied_control_buffer, _ = self._tensor_from_host_buffer(worker, 0.0)
-        readback_buffer, readback = self._tensor_from_host_buffer(worker, 0.0)
+        copied_control_buffer = self._tensor_from_host_buffer(worker, 0.0)[0]
+        readback_buffer = self._tensor_from_host_buffer(worker, 0.0)[0]
         intermediates = [worker.alloc_child_tensor(0, (_SIZE,), DataType.FLOAT32) for _ in range(3)]
         y, z, w = intermediates
         expected_y = self._link(2.0, 0.5)
@@ -1837,6 +1837,8 @@ class TestA5ThreeRunCapacity(_A5EarlyEnqueueBase):
             refusal_verified = True
 
             worker.copy_from(readback_buffer, y)
+            # Cached refusal tracebacks retain this frame; keep only independent CPU values.
+            readback = torch.frombuffer(readback_buffer.shm.buf, dtype=torch.float32, count=_SIZE).clone()
             assert torch.allclose(readback, torch.full((_SIZE,), expected_y)), (
                 f"the predecessor's own result is wrong, so the successor's refusal cannot be read from "
                 f"this case: got {readback[0].item()}, expected {expected_y}; trace kept at {output_prefix}"
@@ -1849,6 +1851,7 @@ class TestA5ThreeRunCapacity(_A5EarlyEnqueueBase):
             handles.append(self._submit_link(worker, x_buffer, copied_control_buffer, w, output_prefix, spin_iters=0))
             handles[-1].wait()
             worker.copy_from(readback_buffer, w)
+            readback = torch.frombuffer(readback_buffer.shm.buf, dtype=torch.float32, count=_SIZE).clone()
             assert torch.allclose(readback, torch.full((_SIZE,), expected_w)), (
                 f"the run whose control tensor was copied to the host first did not compute from those "
                 f"bytes: got {readback[0].item()}, expected {expected_w}; trace kept at {output_prefix}"

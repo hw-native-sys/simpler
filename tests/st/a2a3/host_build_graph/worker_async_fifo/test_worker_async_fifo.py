@@ -431,7 +431,7 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
             )
             # HBG reads the scalar from b during native host construction;
             # TMR's device orchestration uses its constant step increment.
-            first_scalar = first_b[0] if self._st_runtime == "host_build_graph" else 1
+            first_scalar = first_b[0].item() if self._st_runtime == "host_build_graph" else 1
             first_expected = first_a + first_b + _CHAIN_LENGTH * first_scalar
             # Run-level acceptance also includes the intentionally blocked SUB
             # task, whose compatibility endpoint acknowledges only on return.
@@ -477,7 +477,7 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                 raise third_result["error"]
             assert third_callback.is_set(), "the third submission did not enter after the first run freed its slot"
             second.wait(10.0)
-            second_scalar = second_b[0] if self._st_runtime == "host_build_graph" else 1
+            second_scalar = second_b[0].item() if self._st_runtime == "host_build_graph" else 1
             second_expected = second_a + second_b + _CHAIN_LENGTH * second_scalar
             assert torch.allclose(first_out, first_expected), "the first run did not execute correctly on the NPU"
             assert torch.allclose(second_out, second_expected), "the prepared run did not execute correctly on the NPU"

@@ -112,7 +112,6 @@ public:
 };
 
 // The mailbox argument slot reserves one byte of the view padding for the invocation request.
-// Tensor itself remains a view: standalone Tensor serialization leaves all three bytes padding.
 inline constexpr size_t TASK_ARG_TRANSFER_OFFSET = offsetof(Tensor, _pad);
 static_assert(TASK_ARG_TRANSFER_OFFSET == 141, "mailbox transfer offset is wire ABI");
 

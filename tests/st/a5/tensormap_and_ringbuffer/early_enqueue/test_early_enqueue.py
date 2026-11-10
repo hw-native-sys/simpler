@@ -956,6 +956,11 @@ class _A5TmrEarlyEnqueueBase(SceneTestCase):
         a, b, out = tensors
         return buffers, out, self._expected(a, b)
 
+    @staticmethod
+    def _snapshot_host_output(buffer):
+        """A retired output copy can survive in an assertion traceback without pinning Host storage."""
+        return torch.frombuffer(buffer.shm.buf, dtype=torch.float32, count=_SIZE).clone()
+
     def _observe_two_launched_runs(self, frames, timeout, case_runs):
         """Watch for two different runs launched and accepted at once.
 
@@ -1395,7 +1400,9 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
                     failing_error = None
                     try:
                         good_group, good_out, good_expected = self._three_buffers(st_worker, 2.0, 3.0)
+                        del good_out
                         failing_group, failing_out, failing_expected = self._three_buffers(st_worker, 5.0, 7.0)
+                        del failing_out
                         buffers.extend(good_group)
                         buffers.extend(failing_group)
                         good_handle = self._submit_vector(
@@ -1442,8 +1449,8 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
             pid,
             case_runs,
             [
-                (good_out, good_expected, good_failure[0] if good_failure else None),
-                (failing_out, failing_expected, failing_error),
+                (self._snapshot_host_output(good_group[2]), good_expected, good_failure[0] if good_failure else None),
+                (self._snapshot_host_output(failing_group[2]), failing_expected, failing_error),
             ],
             records,
             "a5 TMR queued stream failure",
@@ -1972,12 +1979,14 @@ class TestA5TmrWideFailureAttribution(_A5TmrEarlyEnqueueBase):
                             group, out, expected = self._three_buffers(
                                 st_worker, float(2 * index + 2), float(2 * index + 3)
                             )
+                            del out
                             buffers.extend(group)
-                            expectations.append((out, expected))
+                            expectations.append((group[2], expected))
                             good_handles.append(
                                 self._submit_vector(st_worker, group, output_prefix, spin_iters=_DEVICE_SPIN_ITERS)
                             )
                         failing_group, failing_out, failing_expected = self._three_buffers(st_worker, 11.0, 13.0)
+                        del failing_out
                         buffers.extend(failing_group)
                         failing_handle = self._submit_vector(
                             st_worker, failing_group, output_prefix, callable_name="reported_fatal"
@@ -2005,8 +2014,11 @@ class TestA5TmrWideFailureAttribution(_A5TmrEarlyEnqueueBase):
             f"this case's five accepted native identities were not all observed above floor "
             f"{case_runs.floor}: {case_runs.sorted_keys()}"
         )
-        outcomes = [(out, expected, error) for (out, expected), error in zip(expectations, good_errors)]
-        outcomes.append((failing_out, failing_expected, failing_error))
+        outcomes = [
+            (self._snapshot_host_output(buffer), expected, error)
+            for (buffer, expected), error in zip(expectations, good_errors)
+        ]
+        outcomes.append((self._snapshot_host_output(failing_group[2]), failing_expected, failing_error))
         _assert_stream_observations(trace, pid, case_runs, outcomes, [], "a5 TMR wide stream observation")
 
 

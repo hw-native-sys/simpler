@@ -993,6 +993,11 @@ class _A2a3TmrEarlyEnqueueBase(SceneTestCase):
         a, b, out = tensors
         return buffers, out, self._expected(a, b)
 
+    @staticmethod
+    def _snapshot_host_output(buffer):
+        """A retired output copy can survive in an assertion traceback without pinning Host storage."""
+        return torch.frombuffer(buffer.shm.buf, dtype=torch.float32, count=_SIZE).clone()
+
     def _observe_two_launched_runs(self, frames, timeout, case_runs):
         """Watch for two different runs launched and accepted at once.
 
@@ -1347,7 +1352,9 @@ class TestA2a3TmrEarlyEnqueueErrorAttribution(_A2a3TmrEarlyEnqueueBase):
                     failing_error = None
                     try:
                         good_group, good_out, good_expected = self._three_buffers(st_worker, 2.0, 3.0)
+                        del good_out
                         failing_group, failing_out, failing_expected = self._three_buffers(st_worker, 5.0, 7.0)
+                        del failing_out
                         buffers.extend(good_group)
                         buffers.extend(failing_group)
                         good_handle = self._submit_vector(
@@ -1394,8 +1401,8 @@ class TestA2a3TmrEarlyEnqueueErrorAttribution(_A2a3TmrEarlyEnqueueBase):
             pid,
             case_runs,
             [
-                (good_out, good_expected, good_failure[0] if good_failure else None),
-                (failing_out, failing_expected, failing_error),
+                (self._snapshot_host_output(good_group[2]), good_expected, good_failure[0] if good_failure else None),
+                (self._snapshot_host_output(failing_group[2]), failing_expected, failing_error),
             ],
             records,
             "a2a3 TMR queued stream failure",
@@ -1671,6 +1678,7 @@ class TestA2a3TmrEarlyEnqueueLifetimes(_A2a3TmrEarlyEnqueueBase):
         first_a, first_a_tensor = self._tensor_from_host_buffer(st_worker, 2.0)
         first_out, first_out_tensor = self._tensor_from_host_buffer(st_worker, 0.0)
         first_expected = self._expected(first_a_tensor, addend_tensor)
+        del first_a_tensor
         second_group, second_out, second_expected = self._three_buffers(st_worker, 5.0, 7.0)
         with _frame_views(st_worker, 0) as frames:
             with tempfile.TemporaryDirectory(prefix="simpler-a2a3-tmr-owned-") as output_prefix:
