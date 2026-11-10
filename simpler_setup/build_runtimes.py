@@ -154,20 +154,38 @@ def requested_runtimes(explicit: Optional[list] = None) -> list[str]:
 
 
 def select_runtimes(arch: str, discovered: list[str], only: Optional[list] = None) -> tuple[list[str], list[str]]:
-    """Split discovered runtimes into the ones to build and the ones left out.
+    """Split this arch's discovered runtimes into the ones to build and the rest.
 
-    A name the caller asked for is built whatever its build_config says, and an
-    unknown name is an error rather than a silent empty build -- a typo in a
-    runtime name would otherwise look like a runtime that needs no work.
+    A name the caller asked for is built whatever its build_config says. A name
+    this arch does not carry is simply not among its runtimes: an arch-exclusive
+    runtime is a legal thing to ask for while building several platforms, and
+    rejecting it here would end the build at whichever arch came first. Whether
+    the name exists anywhere is `reject_unknown_runtimes`, once, over the set of
+    platforms actually requested.
     """
     named = requested_runtimes(only)
     if named:
-        unknown = [name for name in named if name not in discovered]
-        if unknown:
-            raise ValueError(f"No runtime under src/{arch}/runtime/ goes by: {', '.join(sorted(unknown))}")
         return [name for name in discovered if name in named], []
     keep = [name for name in discovered if runtime_builds_by_default(arch, name)]
     return keep, [name for name in discovered if name not in keep]
+
+
+def reject_unknown_runtimes(platforms: list, only: Optional[list] = None) -> None:
+    """Fail on a requested runtime no requested platform's arch carries.
+
+    A typo would otherwise read as a runtime that needs no work, and the build
+    would succeed having produced nothing the caller asked for.
+    """
+    named = requested_runtimes(only)
+    if not named:
+        return
+    arches = sorted({parse_platform(p)[0] for p in platforms})
+    carried = {name for arch in arches for name in discover_runtimes(arch)}
+    unknown = sorted(name for name in named if name not in carried)
+    if unknown:
+        raise ValueError(
+            f"No runtime goes by: {', '.join(unknown)} under any of the requested arches [{', '.join(arches)}]"
+        )
 
 
 def _platform_runtimes(platform: str, arch: str, only: Optional[list]) -> list[str]:
@@ -237,6 +255,9 @@ def build_all(
         return
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
+    # Once, against every arch this build will visit: a name one of them lacks
+    # is ordinary, a name none of them carries is a typo.
+    reject_unknown_runtimes(platforms, only)
     pto_isa_root_for_metadata: Optional[str] = None
     pto_isa_runtime_keys: list[str] = []
 
