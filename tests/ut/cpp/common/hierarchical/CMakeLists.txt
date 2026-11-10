@@ -104,4 +104,7 @@ simpler_ut_glob_cases(hierarchical_case)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(test_device_execution_owners PRIVATE "LINKER:--wrap=pthread_atfork")
+    # libstdc++ condition_variable::wait(unique_lock<mutex>&), called by the predicate overload.
+    target_link_options(test_three_run_capacity PRIVATE
+        "LINKER:--wrap=_ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE")
 endif()

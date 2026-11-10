@@ -53,7 +53,8 @@ inline __aicore__ uint32_t scheduler_graph_element_size(DataType dtype) {
         dtype == DataType::UINT16)
         return 2;
     if (dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::BOOL ||
-        dtype == DataType::FP8E4M3FN || dtype == DataType::FP8E8M0 || dtype == DataType::FP4E2M1)
+        dtype == DataType::FP8E4M3FN || dtype == DataType::FP8E8M0 || dtype == DataType::FP4E2M1 ||
+        dtype == DataType::FP8E5M2)
         return 1;
     return 0;
 }

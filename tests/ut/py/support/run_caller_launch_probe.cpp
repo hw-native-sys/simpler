@@ -719,6 +719,12 @@ static void initialize_borrowed_context(DeviceRunnerBase &runner) {
     };
     assert(runner.kernel_execution_state().initialize(0, ops) == 0);
 }
+// Private-record controls explicitly request detail through an existing DFX selection.
+static DfxRunConfig requested_native_result() {
+    DfxRunConfig dfx;
+    dfx.scope_stats_enabled = true;
+    return dfx;
+}
 class ProbeRunner : public DeviceRunner {
 public:
     // Partial ownership is real; only the late-health case exercises recovery.
@@ -910,7 +916,8 @@ static void check(int fault, bool capturing) {
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
 }
-static void check_joined_callers(void *first_caller, void *second_caller, bool fail_proof = false) {
+static void
+check_joined_callers(void *first_caller, void *second_caller, bool fail_proof = false, bool image_publication = false) {
     fail_at = 0;
     capture = false;
     next_stream = next_event = submits = syncs = copies = 0;
@@ -923,6 +930,12 @@ static void check_joined_callers(void *first_caller, void *second_caller, bool f
     first_runtime.dev = second_runtime.dev = {};
     MemoryAllocator allocator;
     SlotPersistentArgs first_slot, second_slot;
+    uint64_t image_target = 0, image_source = 37;
+    if (image_publication) {
+        const HostMetadataRegion image{&image_target, &image_source, sizeof(image_source)};
+        assert(second_slot.staged_launch_metadata.prepare(&image, 1) == 0);
+        image_source = 99;
+    }
     const NativeRunIdentity first_id{1, 1, 1, 0}, second_id{2, 1, 2, 1};
     auto first = std::make_unique<DeviceRunnerBase::PreparedExecution>(first_id, first_runtime, CallConfig{}, 0);
     first->caller_stream = first_caller;
@@ -937,22 +950,38 @@ static void check_joined_callers(void *first_caller, void *second_caller, bool f
     second->joinable_boundary = true;
     second->join = NativeRunJoin{preceding.active->prepared.get(), first_id};
     assert(second->kernel_args.prepare_runtime_args(second_runtime, allocator, second_slot) == 0);
+    assert(image_target == 0);
     submits = 0;
     trace.clear();
     stream_trace.clear();
     event_trace.clear();
-    fail_at = fail_proof ? 2 : 0;
+    fail_at = fail_proof ? (image_publication ? 3 : 2) : 0;
     auto following = runner.launch_execution(std::move(second), NativeRunExecutionTestPeer::mint(second_id));
     assert(syncs == 0);
     assert(following.active != nullptr);
     const auto streams = following.active->prepared->streams;
     if (second_caller != nullptr) assert(streams.aicpu == second_caller);
+    if (image_publication) {
+        assert(trace[0] == "wait" && "run image must follow the predecessor whole-operator boundary");
+    }
     assert(trace[0] == "wait" && trace[1] == "record");
     assert(stream_trace[0] == streams.aicpu && stream_trace[1] == streams.aicpu);
     assert(event_trace[0] == whole_done);
     if (fail_proof) {
         assert(following.rc == -777 && following.progress == LaunchProgress::Partial);
-        assert(trace.size() == 2);
+        assert(trace.size() == (image_publication ? 3u : 2u));
+        if (image_publication) {
+            assert(trace[2] == "publish" && stream_trace[2] == streams.aicpu);
+            assert(image_target == 0);
+            assert(second_slot.runtime_upload_source != nullptr);
+            assert(runner.discharge_boundary_waits(*preceding.active->prepared, true) == 0);
+            assert(runner.retire_boundary(first_id) == 0);
+            void *const pinned_source = second_slot.runtime_upload_source;
+            preceding.active->prepared->kernel_args.release_run_view();
+            following.active->prepared->kernel_args.release_run_view();
+            assert(second_slot.runtime_upload_source == pinned_source);
+            return;
+        }
         const size_t pending = runner.queued_boundary_wait_count();
         assert(pending == 2);
         for (int retry = 0; retry != 2; ++retry) {
@@ -964,9 +993,14 @@ static void check_joined_callers(void *first_caller, void *second_caller, bool f
     } else {
         assert(following.rc == 0 && following.progress == LaunchProgress::Complete);
         assert(trace[2] == "publish" && stream_trace[2] == streams.aicpu);
-        assert(trace[3] == "record" && stream_trace[3] == streams.aicpu);
-        assert(trace[4] == "wait" && stream_trace[4] == streams.aicore);
-        assert(event_trace[3] == event_trace[4]);
+        const size_t fork_index = image_publication ? 4 : 3;
+        if (image_publication) {
+            assert(trace[3] == "publish" && stream_trace[3] == streams.aicpu);
+            assert(image_target == 37);
+        }
+        assert(trace[fork_index] == "record" && stream_trace[fork_index] == streams.aicpu);
+        assert(trace[fork_index + 1] == "wait" && stream_trace[fork_index + 1] == streams.aicore);
+        assert(event_trace[fork_index] == event_trace[fork_index + 1]);
         assert(runner.retire_boundary(first_id) == PTO_RUNTIME_ERR_INTERNAL);
         assert(runner.discharge_boundary_waits(*preceding.active->prepared, true) == 0);
         assert(runner.retire_boundary(first_id) == 0);
@@ -1032,7 +1066,8 @@ public:
     ) override {
         *out = std::make_unique<PreparedExecution>(identity, runtime, config, slot);
         (*out)->resources_owned = true;
-        int rc = ensure_device_run_result_region(slot, identity.run_epoch, (*out)->kernel_args);
+        const auto result_request = observation_probe ? requested_native_result() : (*out)->dfx;
+        int rc = ensure_device_run_result_region(identity, (*out)->kernel_args, result_request);
         if (observation_probe) {
             (*out)->scheduler_runtime_mode = observation_mode;
             observation_record = reinterpret_cast<void *>((*out)->kernel_args.args.run_result_data_base);
@@ -1517,7 +1552,9 @@ static void check_original_core_observation(uint32_t mode, bool stream_fails, bo
         prepared->resources_owned = true;
         if (identity.run_epoch == first_id.run_epoch && stream_fails) {
             prepared->scheduler_runtime_mode = mode;
-            assert(runner.ensure_device_run_result_region(0, identity.run_epoch, prepared->kernel_args) == 0);
+            assert(
+                runner.ensure_device_run_result_region(identity, prepared->kernel_args, requested_native_result()) == 0
+            );
             first_record = reinterpret_cast<void *>(prepared->kernel_args.args.run_result_data_base);
         }
         assert(
@@ -1750,15 +1787,19 @@ static void check_result_prepare_refusal() {
     const NativeRunIdentity id{1, 1, 1, 0};
     DeviceRunnerBase::PreparedExecution prepared(id, runtime, CallConfig{}, 0);
     const int before = allocation_attempts;
-    assert(runner.ensure_device_run_result_region(0, 0, prepared.kernel_args) != 0);
+    assert(
+        runner.ensure_device_run_result_region(
+            NativeRunIdentity{0, 1, 1, 0}, prepared.kernel_args, requested_native_result()
+        ) != 0
+    );
     assert(allocation_attempts == before);
     fail_allocation = allocation_attempts + 1;
-    assert(runner.ensure_device_run_result_region(0, 1, prepared.kernel_args) != 0);
+    assert(runner.ensure_device_run_result_region(id, prepared.kernel_args, requested_native_result()) != 0);
     assert(prepared.kernel_args.args.run_result_data_base == 0);
     fail_allocation = 0;
     for (int retry = 0; retry < 2; ++retry) {
         prepared.resources_owned = true;
-        assert(runner.ensure_device_run_result_region(0, 1, prepared.kernel_args) == 0);
+        assert(runner.ensure_device_run_result_region(id, prepared.kernel_args, requested_native_result()) == 0);
         assert(runner.result_initialized());
         assert(runner.slot_persistent_args(0).staged_launch_metadata.size() == 0);
         runner.abandon_prepared_execution(prepared);
@@ -1785,7 +1826,7 @@ static void check_result_publication(bool has_caller, int failure_step) {
     if (has_caller) prepared->caller_stream = caller;
     auto &slot = runner.slot_persistent_args(0);
     fail_result_initialization = true;
-    assert(runner.ensure_device_run_result_region(0, id.run_epoch, prepared->kernel_args) == -785);
+    assert(runner.ensure_device_run_result_region(id, prepared->kernel_args, requested_native_result()) == -785);
     assert(prepared->kernel_args.args.run_result_data_base == 0);
     assert(!runner.result_initialized());
     // The allocator's uninitialized bytes can even forge success for this call.
@@ -1799,7 +1840,7 @@ static void check_result_publication(bool has_caller, int failure_step) {
     assert(runner.device_run_result_read_status(0, id.run_epoch) == RunRecordRead::NotAttempted);
     assert(runner.device_run_terminal(0, id.run_epoch).state == DeviceRunTerminalState::Undecided);
     fail_result_initialization = false;
-    assert(runner.ensure_device_run_result_region(0, id.run_epoch, prepared->kernel_args) == 0);
+    assert(runner.ensure_device_run_result_region(id, prepared->kernel_args, requested_native_result()) == 0);
     assert(runner.result_initialized());
     const auto *result =
         reinterpret_cast<const NativeInvocationResultStorage *>(prepared->kernel_args.args.run_result_data_base);
@@ -1824,7 +1865,7 @@ static void check_result_publication(bool has_caller, int failure_step) {
     // Capacity reuse cannot overwrite an earlier call's unconsumed observation.
     assert(runner.prepare_run_storage(0) == 0);
     KernelArgsHelper next;
-    assert(runner.ensure_device_run_result_region(0, 2, next) == 0);
+    assert(runner.ensure_device_run_result_region(NativeRunIdentity{2, 1, 2, 0}, next, requested_native_result()) == 0);
     assert(next.args.run_result_data_base != reinterpret_cast<uint64_t>(result));
     runner.release_result(2);
     runner.release_result();
@@ -1984,6 +2025,7 @@ public:
     }
     void add_unrelated_callable() { callables_.emplace(2, CallableState{}); }
     void *result_address() const { return submission_storage_[0]->device_result; }
+    void *runtime_address() const { return submission_storage_[0]->args.runtime_args; }
     int finish_common() { return finalize_common(); }
     void start_scope_readers() { scope_stats_collector_.start({}); }
     bool scope_readers_started() const { return scope_stats_collector_.collector_threads_started(); }
@@ -2055,7 +2097,7 @@ public:
     ) override {
         *out = std::make_unique<PreparedExecution>(identity, runtime, config, slot);
         (*out)->resources_owned = true;
-        int rc = ensure_device_run_result_region(slot, identity.run_epoch, (*out)->kernel_args);
+        int rc = ensure_device_run_result_region(identity, (*out)->kernel_args, (*out)->dfx);
         return rc == 0 ? (*out)->kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot_persistent_args(slot)) : rc;
     }
 };
@@ -2345,7 +2387,7 @@ static void check_retained_submission_storage(bool grow) {
     auto old = runner.submission();
     assert(old->fence->prepare_resources() == 0);
     assert(old->caller_order->prepare_resources() == 0);
-    assert(runner.ensure_device_run_result_region(0, 1, prepared->kernel_args) == 0);
+    assert(runner.ensure_device_run_result_region(id, prepared->kernel_args, requested_native_result()) == 0);
     assert(runner.ensure_device_wall_buffer(0, prepared->kernel_args) == 0);
     assert(prepared->kernel_args.prepare_runtime_args(runtime, runner.allocator(), old->args) == 0);
     std::memset(old->args.runtime_upload_source, 0x5a, old->args.runtime_upload_bytes);
@@ -2371,7 +2413,9 @@ static void check_retained_submission_storage(bool grow) {
         HostMetadataRegion region{old_result, metadata.data(), metadata.size()};
         assert(current->args.staged_launch_metadata.prepare(&region, 1) == 0);
     }
-    assert(runner.ensure_device_run_result_region(0, 2, next_args) == 0);
+    assert(
+        runner.ensure_device_run_result_region(NativeRunIdentity{2, 1, 2, 0}, next_args, requested_native_result()) == 0
+    );
     assert(next_args.prepare_runtime_args(runtime, runner.allocator(), current->args) == 0);
     assert(current->args.runtime_upload_source != old_source);
     assert(current->args.runtime_args != old_device);
@@ -2497,6 +2541,9 @@ static void check_external_resource_api(bool borrowed, bool grow = false) {
         staging_snapshot.assign(bytes, bytes + staging_bytes);
     }
     void *first_result = runner.result_address();
+    assert(borrowed ? first_result == nullptr : first_result != nullptr);
+    void *first_owned_backing = borrowed ? runner.runtime_address() : first_result;
+    assert(first_owned_backing != nullptr);
     const auto first_arena = runner.arena_bank_gm_heap_base(0);
     auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(storage);
     std::weak_ptr<const PreparedRunResources> first_prepared = state->prepared_execution->prepared_resources;
@@ -2556,7 +2603,12 @@ static void check_external_resource_api(bool borrowed, bool grow = false) {
     }
     descriptor.run_epoch = descriptor.dispatch_id = 2;
     assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
-    assert(runner.result_address() != first_result);
+    if (borrowed) {
+        assert(runner.result_address() == nullptr);
+        assert(runner.runtime_address() != first_owned_backing);
+    } else {
+        assert(runner.result_address() != first_result);
+    }
     if (!borrowed) {
         void *second_staging = nullptr;
         runner.get_retained_temp_buffer(0, &second_staging, nullptr);
@@ -2571,13 +2623,13 @@ static void check_external_resource_api(bool borrowed, bool grow = false) {
     assert(simpler_release_run_resources(&runner, first) == -781);
     assert(!first_prepared.expired());
     sync_error = 0;
-    failed_free = first_result;
+    failed_free = first_owned_backing;
     assert(simpler_release_run_resources(&runner, first) != 0);
-    assert(live_allocations.count(first_result) == 1);
+    assert(live_allocations.count(first_owned_backing) == 1);
     assert(runner.finish_common() == PTO_RUNTIME_ERR_INVALID_STATE);
     assert(simpler_unregister_callable(&runner, 1) == PTO_RUNTIME_ERR_INVALID_STATE);
     assert(simpler_release_run_resources(&runner, first) == 0);
-    assert(first_prepared.expired() && live_allocations.count(first_result) == 0);
+    assert(first_prepared.expired() && live_allocations.count(first_owned_backing) == 0);
     assert(simpler_release_run_resources(&runner, first) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     assert(simpler_unregister_callable(&runner, 1) == PTO_RUNTIME_ERR_INVALID_STATE);
     assert(simpler_release_run_resources(&runner, second) == 0);
@@ -2810,6 +2862,9 @@ int main(int argc, char **argv) {
     check_external_resource_api(false);
     check_external_resource_api(false, true);
     check_submission_resource_binding();
+    check_joined_callers(nullptr, nullptr, false, true);
+    check_joined_callers(caller, &tokens[62], false, true);
+    check_joined_callers(caller, &tokens[62], true, true);
     check_joined_callers(nullptr, nullptr);
     check_joined_callers(nullptr, caller);
     check_joined_callers(caller, nullptr);

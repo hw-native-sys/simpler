@@ -20,6 +20,8 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -56,10 +58,12 @@
 #include <vector>
 
 #include "arg_direction.h"
+#include "call_argument_snapshot.h"
 #include "callable.h"
 #include "callable_protocol.h"
 #include "chip_run_lane.h"
 #include "chip_worker.h"
+#include "native_submission_bind.h"
 #include "common/host_span_names.h"
 #include "common/host_span_scope.h"
 #include "common/log_clock.h"
@@ -2069,7 +2073,8 @@ NB_MODULE(_task_interface, m) {
         .value("UINT32", DataType::UINT32)
         .value("FP8E4M3FN", DataType::FP8E4M3FN)  // A5 only
         .value("FP8E8M0", DataType::FP8E8M0)      // A5 only
-        .value("FP4E2M1", DataType::FP4E2M1);     // A5 only
+        .value("FP4E2M1", DataType::FP4E2M1)      // A5 only
+        .value("FP8E5M2", DataType::FP8E5M2);     // A5 only
 
     // --- Free functions ---
     m.def(
@@ -2958,6 +2963,10 @@ NB_MODULE(_task_interface, m) {
         "Copy and validate one local submission's views, tags, requests and scalar values before binding."
     );
 
+    nb::class_<CallArgumentSnapshot>(m, "_CallArgumentSnapshot")
+        .def(nb::init<const ChipStorageTaskArgs &, const std::vector<ArgDirection> &>())
+        .def_prop_ro("args", &CallArgumentSnapshot::args, nb::rv_policy::reference_internal);
+
     // --- ProvenanceTable ---
     // The owner's live child device allocations, as the dispatch path consumes them. The Python
     // Worker writes it alongside its own registry and reads it back only through `check_dispatch`.
@@ -3601,6 +3610,7 @@ NB_MODULE(_task_interface, m) {
         );
 
     // --- ChipWorker ---
+    bind_native_submission(m);
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
         .def(
@@ -3680,7 +3690,7 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
                 self.register_callable(callable_id, callable.buffer_.data());
             },
-            nb::arg("callable_id"), nb::arg("callable"),
+            nb::arg("callable_id"), nb::arg("callable"), nb::call_guard<nb::gil_scoped_release>(),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
             "via run. Variants without per-callable_id support raise."
         )
@@ -3689,7 +3699,7 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
                 self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
             },
-            nb::arg("callable_id"), nb::arg("blob_ptr"),
+            nb::arg("callable_id"), nb::arg("blob_ptr"), nb::call_guard<nb::gil_scoped_release>(),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
             "bytes via shared memory; see docs/callable-identity-registration.md). "
@@ -3752,7 +3762,12 @@ NB_MODULE(_task_interface, m) {
             "copied into the POD under the GIL, which the submission itself then releases."
         )
         .def(
-            "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::call_guard<nb::gil_scoped_release>(),
+            "_observe_framework_submissions", &ChipWorker::observe_framework_submissions,
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
+            "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::arg("report_run_error") = true,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
         .def(
@@ -3761,6 +3776,15 @@ NB_MODULE(_task_interface, m) {
             "Stop the run lane admitting anything further and finish every not-yet-launched run without "
             "launching it. For a caller that has established nothing more may reach the device; the ordinary "
             "close cannot serve that, because a drain launches before it waits."
+        )
+        .def(
+            "_prepare_chip_submission",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+               uintptr_t caller_stream) {
+                return self.prepare_chip_submission(callable_id, args, config, reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream"),
+            nb::call_guard<nb::gil_scoped_release>()
         )
         .def(
             "_submit_chip_run_direct",
@@ -4135,18 +4159,20 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_alloc_domain_windows",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
-               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t workspace_mask) {
+               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t workspace_mask,
+               const std::string &host_shm_name) {
                 if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
                     throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
                 }
                 auto [device_ctx, local_window_base, actual_window_size] = self.comm_alloc_domain_windows(
                     comm_handle, allocation_id, rank_ids, domain_rank, window_size, workspace_mask,
-                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address))
+                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), host_shm_name
                 );
                 return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
             nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("workspace_mask") = 0,
+            nb::arg("host_shm_name") = "",
             "Collectively allocate a fresh per-rank pool for a subset; returns "
             "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
             "responsibility before result conversion or an allocation error; it does not imply a usable context."

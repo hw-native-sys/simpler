@@ -420,10 +420,9 @@ int DeviceRunner::prepare_execution(
     rc = ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
     if (rc != 0) return rc;
 
-    // A run without somewhere to publish its result must not launch: it would
-    // leave the host with no way to recover the run's own error scene, and a
-    // region still holding a predecessor's payload.
-    rc = ensure_device_run_result_region(pipeline_slot, identity.run_epoch, execution->kernel_args);
+    // Kernel execution keeps its invocation identity without requesting private
+    // detail when diagnostics are off. Program retains its structured errors.
+    rc = ensure_device_run_result_region(identity, execution->kernel_args, execution->dfx);
     if (rc != 0) return rc;
 
     if (block_dim < 1) {
@@ -1629,7 +1628,8 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     if (rc != 0) return rc;
     // A per-run bank is acquired only after all enabled storage is ready.
     // Collector admission and thread startup remain in the launch transaction.
-    if (prepared.dfx.chip_swimlane_enabled()) {
+    if (prepared.dfx.chip_swimlane_enabled() && !prepared.recording &&
+        !chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch)) {
         prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
             arm_chip_swimlane_run_terminal_bank(prepared.identity.run_epoch);
     }

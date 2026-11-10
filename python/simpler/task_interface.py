@@ -127,7 +127,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef, normalize_workspace_engines
+from .comm_domain import CommDomainRef, normalize_workspace_engines, seal_host_mappings
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -1158,6 +1158,8 @@ class CommDomainHandle:
         "allocation_id",
         "_domain_size",
         "_allocation_pending",
+        "_initializing",
+        "_initialization_failed",
         "_domain_ranks",
         "_release_fn",
         "_release_scope",
@@ -1174,6 +1176,8 @@ class CommDomainHandle:
         "_config",
         "_ref",
         "requested_window_size",
+        "memory_source",
+        "_host_mappings",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1195,14 +1199,19 @@ class CommDomainHandle:
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
         requested_window_size: int | None = None,
+        memory_source: AddressSpace = AddressSpace.DEVICE,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
         _use_fn: Callable[[CommDomainHandle], None] | None = None,
     ) -> None:
         self.name = name
+        self.memory_source = memory_source
+        self._host_mappings = []
         self.workers = tuple(workers)
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
         self._allocation_pending = False
+        self._initializing = False
+        self._initialization_failed = False
         self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
@@ -1234,6 +1243,7 @@ class CommDomainHandle:
         handle. Engine selection is immutable for its lifetime. This method also
         records scalar-only context use in the current orchestration run.
         """
+        self._require_ready()
         context = self[worker]
         required = normalize_workspace_engines(workspace_engines)
         initialized = self._config.workspace_engines if self._config is not None else ()
@@ -1249,7 +1259,14 @@ class CommDomainHandle:
             self._use_fn(self)
         return context.device_ctx
 
+    def _require_ready(self) -> None:
+        self._require_live()
+        if self._initializing:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is initializing")
+
     def _require_live(self) -> None:
+        if self._initialization_failed:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) initialization failed")
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
@@ -1292,11 +1309,12 @@ class CommDomainHandle:
 
     @property
     def released(self) -> bool:
-        """True once ``release()`` (or ``with`` exit) has been called.
+        """True once release has been accepted (including ``with`` exit).
 
         Backend memory may still be alive — it is freed by the Worker after
         DAG drain at end-of-run.  Use this to gate further indexing /
         submission, not to assert physical teardown (use ``freed`` for that).
+        A release refused because of live Host CPU exports leaves this false.
         """
         return self._released
 
@@ -1319,11 +1337,17 @@ class CommDomainHandle:
         this domain's ``device_ctx`` see live memory through execution.
         Serial release after run completion frees a retained domain immediately.
 
+        Host CPU arrays and memoryviews must be dropped first. Live exports
+        raise ``BufferError`` without marking the domain released; retry after
+        dropping them. Accepted release prevents new CPU exports immediately.
+
         After this returns, the handle is treated as released for the
         user's purposes: ``__getitem__`` raises, repeated ``release()`` is
         a no-op, and the orch function must not pass it to further
         ``submit_*`` calls.
         """
+        if self._initializing:
+            raise RuntimeError("cannot release a domain from its initializer")
         if self.borrowed:
             raise RuntimeError("borrowed domain handles cannot release their owner")
         if self._released:
@@ -1331,6 +1355,7 @@ class CommDomainHandle:
         with self._release_scope(self):
             if self._released:
                 return
+            seal_host_mappings(self._host_mappings)
             self._released = True
             assert self._release_fn is not None
             self._release_fn(self)

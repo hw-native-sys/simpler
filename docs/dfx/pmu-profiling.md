@@ -809,11 +809,14 @@ implementation detail of the device firmware, which is not open and which a
 CANN upgrade may change with no signal here. That is why
 `TestPmuCountingWindow`
 ([test_pmu_counting_window.py](../../tests/st/a2a3/host_build_graph/dfx/pmu/test_pmu_counting_window.py))
-asserts per row rather than in aggregate, and asserts a floor on the spinning
-task as well: a window disabled partway through leaves a row that is non-zero
-but short, which was observed at 1.1% of the expected count with every row
-non-zero. An aggregate check, or a check for zeros alone, reads that run as a
-pass.
+uses the arithmetic event group in automatic A2/A3 onboard DFX CI. The first
+task completes the first half of a fixed FP32 vector add and acknowledges a
+device gate. The host runs a utilization query against that chip and then
+releases the gate so the task can finish the other half. The test reads the
+CSV for that run, checks all 513 task identities, and expects 256 FP32 repeats
+per task. A 128 × 128 float32 tile contains 256 repeats of 256 bytes each.
+This detects both zero counts and partial loss, without a cycle threshold or
+an assumed overlap between the query and device execution.
 
 ### 7.1 a2a3
 
@@ -878,12 +881,14 @@ collection is suppressed by the harness. With
 `collect_across_runs=True` the file may simply not be finished yet —
 call `Worker.flush_diagnostics()` first (§3.4).
 
-**`flush_diagnostics()` raises but `pmu.csv` is there.** Expected, and
-the file is not the answer. A CSV has no column that can say "partial",
+**`flush_diagnostics()` raises but `pmu.csv` is there.** For retained eager
+collection (`collect_across_runs=True`) this is expected, and the file is not the answer. A CSV has no column that can say "partial",
 so a run whose records or transport cut could not be proved complete
 publishes the rows it has *and* fails the flush. The error string names
 the run, its verdict and its counts. The failure is sticky for the
-device runner's life, so every later call raises too (§3.4).
+device runner's life, so every later call raises too (§3.4). With retention
+disabled, device drops and count mismatches only log warnings; flush can
+succeed with an incomplete CSV.
 
 **A run is refused before it starts, with "both retained PMU runs are
 still unpublished".** Two unpublished runs is the capacity. Call
@@ -936,3 +941,89 @@ host drain/replenish path has more buffer headroom.
   program boundaries the PMU path spans.
 - [task-flow.md](../task-flow.md) — where AICPU dispatch and completion
   sit in the per-task state machine.
+
+## Native A3 capture/replay
+
+PMU alone is supported by native Kernel cold capture on A3 TMR and HBG.
+Both use their AICPU task-completion PMU producer and the common native
+prepare/launch/resource-reference path. Program remains eager-only. A5,
+framework graph capture and combinations with other diagnostic families are
+not supported by this contract.
+
+Prepare with `SIMPLER_PREPARE_CAPTURE`, `CallConfig.enable_pmu > 0` and an
+`output_prefix`; retain the existing resource reference **before** RTS
+CaptureBegin. Prepare snapshots the resolved event group, including a valid
+`SIMPLER_PMU_EVENT_TYPE` override, and the output path. Later configuration or
+environment changes cannot alter the captured descriptor or its CSV columns.
+Capture records work without executing the computation; each replay performs
+the ordinary device PMU init, task collection and buffer flush. Replay requires
+no Host PMU callback, new epoch or diagnostic-success query.
+
+The external reference retains the collection window and the existing best-effort
+PMU driver protection after the original Host run finalizes. A held driver channel
+can deny another profiler for the model's lifetime. `occupied`, `refused` and
+`absent` protection observations do not reject business execution or promise
+accurate counters; inspect actual samples and the protection observation.
+
+All PMU-enabled models and eager producers sharing one context's pool must run
+in one caller-ordered domain. Multiple references/windows may coexist. Before
+releasing any reference, stop **all** producers sharing that pool, including
+raw replays on other streams, and start none until release returns. Closing one
+window does not close another. The caller's promise plus the retained stream's
+synchronization establishes the device boundary; reader quiescence transfers its
+ready samples into Host shards. A failed stream proof keeps the same reference,
+window and lease for cleanup retry. Successful resource release is independent
+of later CSV publication or diagnostic flush failure.
+
+### Aggregate samples and quality
+
+Replays reuse task IDs and one fixed diagnostic window identity. Every replay's
+device entry resets its counters, so the final replay's counters cannot certify
+cumulative device totals, device drops or fatal status. The output preserves all
+received rows, including repeated task IDs. Neither `run_epoch` nor a buffer's
+sequence identifies a replay. Do not deduplicate those rows or infer exact
+per-replay duration, grouping or completeness.
+
+A recorded output consists of `pmu.csv` with the existing columns and the mandatory
+`pmu.collection.json`. The latter records `recorded_window: true`, frozen event
+selection/columns, actual `written_records`, observed protection and
+`counts_unknown: true`. Cumulative `device_total_records`,
+`device_dropped_records` and `device_fatal` are null. Transport retirements that
+cannot be attributed to a window also remain null at window level; the descriptor
+exposes the known collector-wide retirement and unknown-epoch counts separately.
+A healthy recorded result has `collection_verdict: "aggregate_counts_unknown"`
+and can flush successfully. Real transport/Host loss, clamped buffers, failed
+ownership proofs and write failures still fail diagnostic flush. Retained eager
+results keep strict accounting and CSV-only output. Ordinary eager collection
+with retention disabled keeps its existing warning-only reconciliation for
+device drops and count mismatches.
+
+End/cancel the model, release its resource reference, and successfully call the
+existing `simpler_flush_diagnostics_ctx` before consuming the recorded pair.
+Neither file's existence alone proves success. Metadata is invalidated before
+an accepted destination is reused, including ordinary CSV reuse, and published
+last; failed publication preserves temporary evidence and never preserves a stale
+recorded success descriptor. Zero-replay release publishes a fresh header-only
+CSV and zero `written_records`, rather than exposing older samples. Zero rows by
+themselves do not prove that no replay was attempted.
+
+Use the checked reader after successful flush:
+
+```bash
+python -m simpler_setup.tools.pmu_samples path/to/pmu.csv --recorded
+```
+
+Or call `read_pmu_samples(path, recorded=True)` from the same module. It validates
+the descriptor against the actual CSV columns, event/window identity and row
+count, rejects known loss and preserves repeated task samples. The CLI prints
+sample count and quality; it does not manufacture aggregate cycle totals.
+Existing `csv.DictReader` consumers may inspect raw rows but cannot assess
+recorded completeness. An ordinary eager result needs no sidecar and can be read
+without `--recorded`.
+
+Collection uses the existing bounded paired PMU pool and two finite export slots.
+The initial A3 buffer pool is two 32,832-byte buffers per core, plus header/core
+state and provider mapping storage; existing paired-cap limits bound growth.
+Readers remain alive while the model is retained; idle warnings do not end
+collection. CSV rows stream to disk, whose capacity and write failures remain
+independent diagnostic limits. No diagnostic result controls arithmetic success.

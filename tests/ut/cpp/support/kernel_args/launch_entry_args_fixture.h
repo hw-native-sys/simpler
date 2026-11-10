@@ -21,6 +21,8 @@ constexpr unsigned char kDeviceMark = 0xa5;
 struct RtsState {
     int copy_rc = 0;
     int copies = 0;
+    bool recording = false;
+    bool allow_sync_initialization = false;
     LaunchProgressSink sink;
     uint64_t last_copy_bytes = 0;
     // Bytes to write before reporting `copy_rc`. Zero is the all-or-nothing

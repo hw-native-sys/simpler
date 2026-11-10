@@ -353,6 +353,38 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 
     LaunchTransactionResult transaction;
     try {
+        if (!outcome.prepared->recording && outcome.prepared->dfx.diagnostics_any()) {
+            std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
+            for (auto &[key, reference] : external_run_references_) {
+                if (reference->identity != outcome.prepared->identity) continue;
+                if (reference->scope_stats_window) {
+                    scope_stats_collector_.abandon_run(reference->identity.run_epoch);
+                    reference->scope_stats_window = false;
+                }
+                if (reference->swimlane_window) {
+                    if (!chip_swimlane_collector_.abandon_run(reference->identity.run_epoch)) {
+                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+                        return outcome;
+                    }
+                    reference->swimlane_window = false;
+                }
+                if (reference->args_dump_window) {
+                    if (!dump_collector_.abandon_run(reference->identity.run_epoch)) {
+                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+                        return outcome;
+                    }
+                    reference->args_dump_window = false;
+                }
+                if (reference->pmu_window) {
+                    if (!pmu_collector_.abandon_run(reference->identity.run_epoch)) {
+                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+                        return outcome;
+                    }
+                    pmu_lease_.release(reference->identity.run_epoch);
+                    reference->pmu_window = false;
+                }
+            }
+        }
         transaction = launch_execution_impl(*outcome.prepared, std::move(permit));
     } catch (...) {
         // Backend exceptions carry no proof that the device saw no submission.
@@ -3577,11 +3609,12 @@ DeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, 
 }
 
 int DeviceRunnerBase::ensure_device_run_result_region(
-    uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args
+    const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
 ) {
-    std::lock_guard<std::mutex> lock(run_result_mu_);
+    const uint32_t pipeline_slot = identity.pipeline_slot;
+    const uint64_t run_epoch = identity.run_epoch;
     kernel_args.args.run_result_data_base = 0;
-    kernel_args.args.run_result_epoch = 0;
+    kernel_args.args.run_result_epoch = run_epoch;
     if (pipeline_slot >= submission_storage_.size()) {
         LOG_ERROR("run-result region: pipeline slot %u is out of range", pipeline_slot);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -3592,6 +3625,8 @@ int DeviceRunnerBase::ensure_device_run_result_region(
         LOG_ERROR("run-result region: run epoch 0 cannot be published");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (execution_mode_latch().is_kernel() && !dfx.diagnostics_any()) return 0;
+    std::lock_guard<std::mutex> lock(run_result_mu_);
     auto [it, inserted] = run_result_storage_.try_emplace(run_epoch);
     RunResultStorage &storage = it->second;
     if (inserted) storage.pipeline_slot = pipeline_slot;
@@ -3860,8 +3895,20 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller, bool *recording)
     return 0;
 }
 
+bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &prepared) const {
+    const auto &dfx = prepared.dfx;
+    if (!dfx.diagnostics_any()) return true;
+    if (dfx.dep_gen_enabled || dfx.output_prefix.empty()) return false;
+    if (dfx.chip_swimlane_enabled())
+        return supports_swimlane_capture() && !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
+    if (dfx.dump_args_enabled()) return supports_args_dump_capture() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
+    if (dfx.pmu_enabled) return supports_pmu_capture() && !dfx.scope_stats_enabled;
+    return supports_scope_stats_capture() && prepared.scope_stats_capacity.required &&
+           prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled;
+}
+
 int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
-    if (!execution_mode_latch().is_kernel() || prepared.dfx.diagnostics_any() ||
+    if (!execution_mode_latch().is_kernel() || !capture_diagnostics_supported(prepared) ||
         prepared.join.predecessor_owner != nullptr)
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
@@ -3874,7 +3921,8 @@ int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
             return PTO_RUNTIME_ERR_INVALID_STATE;
         reference->recording = true;
         prepared.recording = true;
-        submission_storage_[prepared.pipeline_slot]->retain_replay_evidence = true;
+        if (prepared.kernel_args.args.run_result_data_base != 0)
+            submission_storage_[prepared.pipeline_slot]->retain_replay_evidence = true;
         // A retained block must publish even if eager left an identical prefix.
         submission_storage_[prepared.pipeline_slot]->args.published_prefix_bytes = 0;
         return 0;
@@ -3972,9 +4020,9 @@ int DeviceRunnerBase::retain_external_run_resources(
     if (out_reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     *out_reference = nullptr;
     if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    // Diagnostic pools still need their independent preparation/lifetime
-    // contract. Program input staging, however, is actual retained backing.
-    if (prepared.dfx.diagnostics_any()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (!capture_diagnostics_supported(prepared) ||
+        (prepared.dfx.diagnostics_any() && !execution_mode_latch().is_kernel()))
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
     int rc = validate_caller_stream(caller_stream);
     if (rc != 0) return rc;
@@ -3986,6 +4034,21 @@ int DeviceRunnerBase::retain_external_run_resources(
         resources->submission_->args.runtime_args == nullptr ||
         resources->submission_->args.runtime_upload_source == nullptr)
         return PTO_RUNTIME_ERR_INVALID_STATE;
+    // External -> native -> storage is the diagnostic admission lock order.
+    // Duplicate retention must be refused before pool allocation or replacement
+    // of an earlier successful artifact, including after that reference ended.
+    std::unique_lock<std::mutex> native_lock;
+    if (prepared.dfx.diagnostics_any()) {
+        native_lock = std::unique_lock<std::mutex>(native_run_mu_);
+        if (active_native_run_count_ != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    {
+        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
+        const auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
+            return entry.identity == prepared.identity;
+        });
+        if (use == prepared_uses_.end() || !use->use.can_retain_external_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     rc = prepare_submission_resources(prepared);
     if (rc != 0) return rc;
     auto reference = std::make_unique<ExternalRunReference>();
@@ -3998,6 +4061,103 @@ int DeviceRunnerBase::retain_external_run_resources(
     if (resources->temporary_ && resources->temporary_->backing)
         reference->managed_backing.emplace_back(resources->temporary_->backing);
     reference->caller_stream = caller_stream;
+    // The native claim remains excluded throughout pool construction/window admission.
+    if (prepared.dfx.diagnostics_any()) {
+        if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+            pmu_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+            chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+            dump_collector_.recorded_window_open(prepared.identity.run_epoch))
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        rc = prepare_collector_storage(*prepared.runtime, prepared);
+        if (rc != 0) return rc;
+    }
+    bool dump_armed = false;
+    bool pmu_armed = false;
+    bool swimlane_armed = false;
+    bool published = false;
+    RAIIScopeGuard rollback_window([&] {
+        if (published) return;
+        if (swimlane_armed) chip_swimlane_collector_.abandon_run(prepared.identity.run_epoch);
+        if (prepared.dfx.scope_stats_enabled) scope_stats_collector_.abandon_run(prepared.identity.run_epoch);
+        if (dump_armed) dump_collector_.abandon_run(prepared.identity.run_epoch);
+        if (pmu_armed) {
+            pmu_collector_.abandon_run(prepared.identity.run_epoch);
+            pmu_lease_.release(prepared.identity.run_epoch);
+        }
+    });
+    if (prepared.dfx.chip_swimlane_enabled()) {
+        ChipSwimlaneCollector::RunExport metadata;
+        metadata.output_prefix = prepared.dfx.output_prefix;
+        metadata.level = prepared.dfx.chip_swimlane_level;
+        metadata.artifact_identity = prepared.artifact_identity;
+        metadata.num_aicore = prepared.num_aicore;
+        if (prepared.num_aicore < 0 || prepared.num_aicore > PLATFORM_MAX_CORES) return PTO_RUNTIME_ERR_INVALID_STATE;
+        std::vector<CoreType> core_types(static_cast<size_t>(prepared.num_aicore));
+        for (int core = 0; core < prepared.num_aicore; ++core)
+            core_types[static_cast<size_t>(core)] = prepared.runtime->core_type_rule(core);
+        const auto &host = host_phase_runs_[prepared.pipeline_slot];
+        metadata.host_orchestrated = host.host_orchestrated;
+        if (host.records.finished()) {
+            metadata.host_phase_records_present = true;
+            metadata.host_phase_submitted_tasks = host.records.submitted_tasks();
+            metadata.host_phase_total_records = host.records.total_records();
+            metadata.host_phase_dropped_records = host.records.dropped_records();
+        }
+        if (metadata.level == ChipSwimlaneLevel::ORCH_PHASES && !metadata.host_orchestrated)
+            metadata.num_orch_phase_threads = 1;  // A3 device orchestration publishes one phase pool.
+        chip_swimlane_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        swimlane_armed = true;
+        auto refusal = simpler::dfx::runs::AdmissionRefusal::None;
+        if (!chip_swimlane_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, metadata, core_types.data(), prepared.num_aicore,
+                host.records.finished() ? &host.records : nullptr, &refusal
+            ))
+            return refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                       SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                       PTO_RUNTIME_ERR_INTERNAL;
+        reference->swimlane_window = true;
+        prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+    }
+    if (prepared.dfx.dump_args_enabled()) {
+        dump_armed = true;
+        dump_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        if (!dump_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.dfx.dump_args_level
+            ))
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        reference->args_dump_window = true;
+        prepared.kernel_args.args.args_dump_run_terminal_bank = 0;
+    }
+    if (prepared.dfx.pmu_enabled) {
+        pmu_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        (void)pmu_lease_.acquire(device_id(), prepared.identity.run_epoch);
+        pmu_armed = true;
+        if (!pmu_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, make_pmu_csv_path(prepared.dfx.output_prefix), prepared.dfx.pmu_event_type,
+                pmu_lease_.state_name()
+            ))
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        reference->pmu_window = true;
+        prepared.kernel_args.args.pmu_run_terminal_bank = 0;
+    }
+    if (prepared.dfx.scope_stats_enabled) {
+        scope_stats_collector_.start([this](std::function<void()> function) {
+            return create_thread(std::move(function));
+        });
+        if (!scope_stats_collector_.begin_recorded_window(
+                prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.scope_stats_capacity
+            ))
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        reference->scope_stats_window = true;
+        // Replay overwrites terminal counters; none can certify a window total.
+        prepared.kernel_args.args.scope_stats_run_terminal_bank = 0;
+    }
     void *key = reference.get();
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
     auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
@@ -4016,6 +4176,7 @@ int DeviceRunnerBase::retain_external_run_resources(
     prebuilt_runtime_arena_cache_.invalidate();
     prepared.caller_stream = caller_stream;
     *out_reference = key;
+    published = true;
     return 0;
 }
 
@@ -4052,6 +4213,40 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
             if (rc == 0) rc = storage.caller_order->retire(reference->identity);
             if (rc == 0) rc = storage.fence->retire(reference->identity);
             if (rc != 0) return rc;
+        }
+        if (reference->scope_stats_window || reference->pmu_window || reference->swimlane_window ||
+            reference->args_dump_window) {
+            // Raw replay is caller-ordered. Its drained stream plus the external
+            // end promise stops producers; the lock excludes a new native run
+            // while the collector establishes its reader-quiescence boundary.
+            std::lock_guard<std::mutex> native_lock(native_run_mu_);
+            for (size_t index = 0; index < active_native_run_count_; ++index) {
+                if (!reference->recording || active_native_runs_[index].identity != reference->identity)
+                    return PTO_RUNTIME_ERR_INVALID_STATE;
+            }
+            if (reference->swimlane_window) {
+                if (!chip_swimlane_collector_.close_recorded_window(
+                        reference->identity.run_epoch, timeout_config_.stream_sync_timeout_ms
+                    ))
+                    return PTO_RUNTIME_ERR_INTERNAL;
+                reference->swimlane_window = false;
+            }
+            if (reference->scope_stats_window) {
+                rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
+                if (rc != 0) return rc;
+                reference->scope_stats_window = false;
+            }
+            if (reference->args_dump_window) {
+                rc = dump_collector_.close_recorded_window(reference->identity.run_epoch);
+                if (rc != 0) return rc;
+                reference->args_dump_window = false;
+            }
+            if (reference->pmu_window) {
+                rc = pmu_collector_.close_recorded_window(reference->identity.run_epoch);
+                if (rc != 0) return rc;
+                pmu_lease_.release(reference->identity.run_epoch);
+                reference->pmu_window = false;
+            }
         }
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
         auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
@@ -4891,7 +5086,7 @@ void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {
 int DeviceRunnerBase::init_runtime_args_with_metadata(
     Runtime &runtime, KernelArgsHelper &kernel_args, SlotPersistentArgs &slot
 ) {
-    int rc = kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot);
+    int rc = kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot, execution_mode_latch_.is_kernel());
     if (rc != 0) {
         LOG_ERROR("prepare_runtime_args failed: %d", rc);
         return rc;
@@ -5133,14 +5328,14 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };
-    if (dfx.chip_swimlane_enabled()) {
+    if (dfx.chip_swimlane_enabled() && !chip_swimlane_collector_.recorded_window_open(run_epoch)) {
         // Which of the two paths a run takes is decided by configuration, not
         // by what the collector answers: `run_begin` refusing means this run
         // cannot be retained, and falling back to `begin_run` would then reset
         // a store a predecessor is still publishing into. So a refusal fails
         // the run, here, before any kernel is submitted and before any
         // predecessor's records or slots are touched.
-        if (chip_swimlane_collector_.retains_runs()) {
+        if (chip_swimlane_collector_.retains_runs() || chip_swimlane_collector_.has_retained_run_table()) {
             // Reader shards before admission: admitting a run waits for every
             // shard to acknowledge the new run table, and a shard that has not
             // been spawned cannot acknowledge anything. From the second run on
@@ -5211,7 +5406,10 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
         } else {
             // The default path keeps its order: the window is opened, then the
             // threads that serve it start.
-            pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
+            if (!pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, run_epoch)) {
+                decline("pmu");
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
             pmu_collector_.start(thread_factory);
         }
     }
@@ -5234,8 +5432,8 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
-            // The host window opens before its collector threads start;
-            // producer state is initialized at this run's device entry.
+            // Recorded windows can keep the collector threads resident.
+            // Producer state is initialized at this run's device entry.
             scope_stats_collector_.begin_run(run_epoch, run_metadata.scope_stats_capacity);
             scope_stats_collector_.start(thread_factory);
         }
@@ -5282,7 +5480,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     // it or is fatal answers no. The caller needs the distinction because only
     // the first is a restoration of what every waiter already saw.
     bool restored = true;
-    if (dfx.pmu_enabled && pmu_collector_.retains_runs()) {
+    if (dfx.pmu_enabled && pmu_collector_.retains_runs() && !pmu_collector_.recorded_window_open(run_epoch)) {
         // Nothing may escape a rollback path, for the reason given below. A
         // throw is not a proof of release, so it settles the way a refusal does.
         try {
@@ -5291,7 +5489,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
             restored = false;
         }
     }
-    if (dfx.pmu_enabled) {
+    if (dfx.pmu_enabled && !pmu_collector_.recorded_window_open(run_epoch)) {
         // Unconditional on purpose: the lease drops a reference only for an
         // epoch that holds one, so a run refused before the acquire ran and a
         // run whose acquire failed both give back nothing here.
@@ -5299,7 +5497,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
             pmu_lease_.release(run_epoch);
         } catch (...) {}
     }
-    if (dfx.dump_args_enabled() && dump_collector_.retains_runs()) {
+    if (dfx.dump_args_enabled() && dump_collector_.retains_runs() && !dump_collector_.recorded_window_open(run_epoch)) {
         try {
             restored = dump_collector_.abandon_run(run_epoch) && restored;
         } catch (...) {
@@ -5324,7 +5522,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     if (dfx.dep_gen_enabled && dep_gen_retains_runs()) {
         withdraw_dep_gen_run(run_epoch);
     }
-    if (!dfx.chip_swimlane_enabled()) return restored;
+    if (!dfx.chip_swimlane_enabled() || chip_swimlane_collector_.recorded_window_open(run_epoch)) return restored;
     // Nothing may escape a rollback path: the caller owes the layer above its
     // own transaction's rc and the ownership of this run's `prepared`. The
     // withdrawal publishes its outcome — a released slot, or a quarantine with
@@ -5332,7 +5530,7 @@ bool DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     // this boundary cannot be what hides unreachable capacity; it exists so a
     // failure past that point cannot displace the launch failure either.
     try {
-        if (chip_swimlane_collector_.retains_runs()) {
+        if (chip_swimlane_collector_.retains_runs() || chip_swimlane_collector_.has_retained_run_table()) {
             restored = chip_swimlane_collector_.abandon_run(run_epoch) && restored;
         } else {
             // A terminal bank is taken per run whether or not this collector
@@ -5457,6 +5655,7 @@ void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &outp
 int DeviceRunnerBase::close_args_dump_run_boundary(
     const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
+    if (dump_collector_.recorded_window_open(run_epoch)) return 0;
     if (!dump_collector_.retains_runs()) {
         return dump_collector_.close_ordinary_run(device_execution_complete || device_producers_stopped);
     }
@@ -5485,6 +5684,7 @@ int DeviceRunnerBase::close_args_dump_run_boundary(
 void DeviceRunnerBase::close_pmu_run_boundary(
     const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
+    if (pmu_collector_.recorded_window_open(run_epoch)) return;
     // The lease covers the device-side counting window, which this boundary
     // ends; the host-side writing that follows touches no PMU register. A
     // successor already past its own open holds its own reference, so the
@@ -5545,13 +5745,12 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
     // Diagnostic exports use the per-task output prefix the user set on
     // CallConfig (CallConfig::validate() enforces non-empty upstream).
     //
-    // Only ArgsDump's close reports anything here: a retained run whose
-    // published buffers it could not prove processed inside the execution claim
-    // is an ownership failure the caller has to see, because releasing the
-    // claim past one would let the successor reuse an arena whose bytes nobody
-    // copied. Every other collector's close is void, as it was.
-    int args_dump_rc = 0;
-    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
+    // Collector publication and ownership failures follow any device error in
+    // the caller's result. Retained ordinary publication remains asynchronous.
+    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.recorded_window_open(run_epoch)) return 0;
+    int diagnostic_rc = 0;
+    if (dfx.chip_swimlane_enabled() &&
+        (chip_swimlane_collector_.retains_runs() || chip_swimlane_collector_.has_retained_run_table())) {
         // A retained run keeps the run boundary's device-side reads — terminal
         // and live counters — and hands the rest to the writer. No quiesce: the
         // pipeline is shared with the successor and draining it here is what
@@ -5576,15 +5775,25 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
                 publish_host_phase_records_to_swimlane(pipeline_slot);
             }
         );
+        if (!chip_swimlane_collector_.retains_runs()) {
+            std::string error;
+            if (!chip_swimlane_collector_.flush_retained_runs(
+                    simpler::dfx::runs::kCutAckBudgetMs * 8, &error, run_epoch
+                )) {
+                LOG_ERROR("ChipSwimlane ordinary publication failed: %s", error.c_str());
+                diagnostic_rc = PTO_RUNTIME_ERR_INTERNAL;
+            }
+        }
         write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
         // Every owner is settled on the same terms as the swimlane above: a
         // real device's producers do not become observable from a host
         // teardown, so no stop is proved here and a failed run's bank is
         // withdrawn rather than returned.
         if (dfx.dump_args_enabled()) {
-            args_dump_rc = close_args_dump_run_boundary(
+            const int rc = close_args_dump_run_boundary(
                 dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false
             );
+            if (diagnostic_rc == 0) diagnostic_rc = rc;
         }
         if (dfx.pmu_enabled) {
             close_pmu_run_boundary(dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false);
@@ -5594,7 +5803,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
                 dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false
             );
         }
-        return args_dump_rc;
+        return diagnostic_rc;
     }
     if (dfx.chip_swimlane_enabled()) {
         chip_swimlane_collector_.quiesce();
@@ -5627,7 +5836,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
     write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
 
     if (dfx.dump_args_enabled()) {
-        args_dump_rc =
+        diagnostic_rc =
             close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false);
     }
 
@@ -5638,7 +5847,7 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
     if (dfx.scope_stats_enabled) {
         close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete, /*device_producers_stopped=*/false);
     }
-    return args_dump_rc;
+    return diagnostic_rc;
 }
 
 bool DeviceRunnerBase::try_acquire_native_run(
@@ -5751,7 +5960,7 @@ bool DeviceRunnerBase::try_reserve_native_run(
 
     for (NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) {
-            native_run_observations_.insert(owner);
+            native_run_observations_.insert(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}});
             reservation =
                 NativeRunReservation{owner, pipeline_slot, arena_bank, allow_prepared_successor, capture_preparation};
             return true;
@@ -5825,12 +6034,13 @@ bool DeviceRunnerBase::retire_run_workspace(
 
 void DeviceRunnerBase::release_native_run_observation(const void *owner) {
     std::lock_guard<std::mutex> lk(native_run_mu_);
-    native_run_observations_.erase(owner);
+    native_run_observations_.erase(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}});
 }
 
 bool DeviceRunnerBase::owns_native_run_observation(const void *owner) const {
     std::lock_guard<std::mutex> lock(native_run_mu_);
-    return native_run_observations_.find(owner) != native_run_observations_.end();
+    return native_run_observations_.find(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}}) !=
+           native_run_observations_.end();
 }
 
 bool DeviceRunnerBase::native_runs_outstanding() const {
@@ -5840,6 +6050,89 @@ bool DeviceRunnerBase::native_runs_outstanding() const {
         if (reservation.owner != nullptr) return true;
     }
     return false;
+}
+
+bool DeviceRunnerBase::fresh_callable_addition_allowed() const {
+    const auto control = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
+    bool bindings = false;
+    {
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        for (const auto &row : native_run_observations_) {
+            if (row.kind == NativeRunObservation::Kind::RunOwner) return false;
+            bindings = true;
+            // Registration may wait its own control task, never an old caller pair.
+            if (row.streams.aicpu == control || row.streams.aicore == control) return false;
+        }
+        for (const auto &reservation : native_run_reservations_)
+            if (reservation.owner != nullptr) return false;
+        if (bindings && active_native_run_count_ != 0) return false;
+    }
+    if (!bindings) return true;
+    return execution_mode_latch_.is_kernel() && kernel_exec_state_.accepts_dispatch() && accepts_new_run() &&
+           !prepared_storage_in_use();
+}
+
+bool DeviceRunnerBase::has_external_run_reference(const NativeRunIdentity &identity) const {
+    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
+    return std::any_of(external_run_references_.begin(), external_run_references_.end(), [&](const auto &row) {
+        return row.second->identity == identity;
+    });
+}
+
+void DeviceRunnerBase::retain_framework_observation(const RunStreams &streams) {
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    native_run_observations_.insert(
+        NativeRunObservation{NativeRunObservation::Kind::FrameworkBinding, nullptr, streams}
+    );
+}
+
+int DeviceRunnerBase::observe_framework_submissions(int *all_observed) {
+    if (all_observed == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *all_observed = 0;
+    if (!execution_mode_latch_.is_kernel()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    const int context_rc = validate_current_context();
+    if (context_rc != 0) {
+        kernel_exec_state_.poison(context_rc);
+        return kernel_exec_state_.last_runtime_error();
+    }
+    try {
+        std::vector<RunStreams> bindings;
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            for (const auto &row : native_run_observations_)
+                if (row.kind == NativeRunObservation::Kind::FrameworkBinding) bindings.push_back(row.streams);
+        }
+        // The caller serializes this pass with launch/transfer. A nonzero raw
+        // return is not a terminal-error classifier or permission to clear debt.
+        for (const auto &streams : bindings) {
+            int rc = PTO_RUNTIME_ERR_INTERNAL;
+            try {
+                rc = sync_stream_pair(streams.aicpu, streams.aicore);
+            } catch (...) {}
+            if (rc != 0) {
+                kernel_exec_state_.poison(rc);
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            native_run_observations_.erase(
+                NativeRunObservation{NativeRunObservation::Kind::FrameworkBinding, nullptr, streams}
+            );
+        }
+        {
+            std::lock_guard<std::mutex> lock(native_run_mu_);
+            *all_observed = std::none_of(
+                                native_run_observations_.begin(), native_run_observations_.end(),
+                                [](const auto &row) {
+                                    return row.kind == NativeRunObservation::Kind::FrameworkBinding;
+                                }
+                            ) ?
+                                1 :
+                                0;
+        }
+    } catch (...) {
+        kernel_exec_state_.poison(PTO_RUNTIME_ERR_INTERNAL);
+    }
+    return kernel_exec_state_.last_runtime_error();
 }
 
 void DeviceRunnerBase::install_credit_release_notifiers() {

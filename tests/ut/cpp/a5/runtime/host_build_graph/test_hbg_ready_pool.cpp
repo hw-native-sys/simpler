@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <thread>
@@ -21,6 +22,7 @@
 
 #include "hbg_scheduler_test_support.h"
 #include "ready_pool_plan.h"
+#include "scheduler/scheduler_ready_publication.h"
 
 namespace {
 std::vector<SchedulerTaskMetadata> tasks(uint32_t count, uint32_t type) {
@@ -46,14 +48,11 @@ struct PoolFixture {
     std::vector<SchedulerLocalState> locals;
     SchedulerRunControl *run{nullptr};
 
-    PoolFixture(
-        const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters, uint32_t width,
-        SchedulerReadyPoolKind kind = SchedulerReadyPoolKind::TICKET, uint32_t chunk_window = 0
-    ) :
+    PoolFixture(const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters) :
         graph_storage(metadata.size()),
         locals(clusters * 3) {
         EXPECT_TRUE(scheduler_plan_layout(metadata.size(), metadata.size(), 0, &layout));
-        EXPECT_TRUE(scheduler_plan_ready_pool(metadata, clusters, width, layout.total_size, &plan, kind, chunk_window));
+        EXPECT_TRUE(scheduler_plan_ready_pool(metadata, clusters, layout.total_size, &plan));
         layout.total_size = plan.total_size;
         storage = std::make_unique<scheduler_test::SchedulerStateBuffer>(layout);
         scheduler_init_ready_pool(base(), plan);
@@ -107,17 +106,141 @@ struct PoolFixture {
     }
 };
 
-TEST(SchedulerReadyPoolTest, AllocatesExactlyOneEntryPerExecutableMetadataAcrossAllTopologies) {
+TEST(SchedulerReadyPoolTest, TransferablePublicationsCompleteAfterOwnerHandoff) {
+    PoolFixture fixture(tasks(24, 0), 9);
+    SchedulerReadyPublication publication;
+    uint32_t owner = 0;
+    auto flush = [&] {
+        for (uint32_t attempts = 0; attempts < 1000; ++attempts) {
+            SchedulerReadyPublication moved;
+            std::memcpy(&moved, &publication, sizeof(moved));
+            auto &local = fixture.locals[++owner % fixture.locals.size()];
+            const auto result = scheduler_ready_publication_step(fixture.graph, fixture.base(), &local, moved);
+            publication = moved;
+            EXPECT_NE(result, SchedulerReadyPublishResult::ERROR);
+            if (result != SchedulerReadyPublishResult::YIELD) return result;
+        }
+        return SchedulerReadyPublishResult::ERROR;
+    };
+    for (int64_t ref = 0; ref < 24; ++ref) {
+        auto result =
+            scheduler_ready_publication_append(fixture.graph, fixture.base(), &fixture.locals[0], ref, publication);
+        if (result == SchedulerReadyAppendResult::FULL) {
+            ASSERT_EQ(flush(), SchedulerReadyPublishResult::DONE);
+            publication = {};
+            result =
+                scheduler_ready_publication_append(fixture.graph, fixture.base(), &fixture.locals[0], ref, publication);
+        }
+        ASSERT_EQ(result, SchedulerReadyAppendResult::ADDED);
+    }
+    ASSERT_EQ(flush(), SchedulerReadyPublishResult::DONE);
+    std::vector<bool> found(24, false);
+    uint64_t cursor = 0;
+    for (uint32_t count = 0; count < 24; ++count) {
+        SchedulerReadyClaim claim;
+        ASSERT_TRUE(fixture.pop(0, 0, &cursor, &claim));
+        ASSERT_GE(claim.task_ref, 0);
+        ASSERT_LT(claim.task_ref, 24);
+        EXPECT_FALSE(found[claim.task_ref]);
+        found[claim.task_ref] = true;
+    }
+    SchedulerReadyClaim empty;
+    ASSERT_TRUE(fixture.pop(0, 0, &cursor, &empty));
+    EXPECT_EQ(empty.task_ref, SCHEDULER_TASK_REF_INVALID);
+}
+
+TEST(SchedulerReadyPoolTest, ConcurrentTransferablePublishersAndConsumersDeliverEachTaskOnce) {
+    constexpr uint32_t task_count = 192;
+    PoolFixture fixture(tasks(task_count, 1), 12);
+    std::vector<std::atomic<uint32_t>> seen(task_count);
+    for (auto &value : seen)
+        value.store(0);
+    std::atomic<bool> start{false};
+    std::atomic<uint32_t> consumed{0}, failures{0};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::vector<std::thread> threads;
+    for (uint32_t producer = 0; producer < 6; ++producer) {
+        threads.emplace_back([&, producer] {
+            while (!start.load(std::memory_order_acquire)) {}
+            SchedulerReadyPublication publication;
+            auto &local = fixture.locals[producer * 3];
+            auto flush = [&] {
+                while (std::chrono::steady_clock::now() < deadline) {
+                    SchedulerReadyPublication restored;
+                    std::memcpy(&restored, &publication, sizeof(restored));
+                    const auto result =
+                        scheduler_ready_publication_step(fixture.graph, fixture.base(), &local, restored);
+                    publication = restored;
+                    if (result == SchedulerReadyPublishResult::ERROR) return false;
+                    if (result == SchedulerReadyPublishResult::DONE) {
+                        return scheduler_ready_publication_step(fixture.graph, fixture.base(), &local, publication) ==
+                               SchedulerReadyPublishResult::DONE;
+                    }
+                }
+                return false;
+            };
+            for (uint32_t index = 0; index < 32; ++index) {
+                const int64_t ref = producer * 32 + index;
+                auto result =
+                    scheduler_ready_publication_append(fixture.graph, fixture.base(), &local, ref, publication);
+                if (result == SchedulerReadyAppendResult::FULL) {
+                    if (!flush()) {
+                        ++failures;
+                        return;
+                    }
+                    publication = {};
+                    result =
+                        scheduler_ready_publication_append(fixture.graph, fixture.base(), &local, ref, publication);
+                }
+                if (result != SchedulerReadyAppendResult::ADDED) {
+                    ++failures;
+                    return;
+                }
+            }
+            if (!flush()) ++failures;
+        });
+    }
+    for (uint32_t consumer = 0; consumer < 6; ++consumer) {
+        threads.emplace_back([&, consumer] {
+            while (!start.load(std::memory_order_acquire)) {}
+            uint64_t cursor = 0;
+            while (consumed.load() < task_count && failures.load() == 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                SchedulerReadyClaim claim;
+                if (!fixture.pop(consumer * 3 + 1, 1, &cursor, &claim)) {
+                    ++failures;
+                    return;
+                }
+                if (claim.task_ref == SCHEDULER_TASK_REF_INVALID) continue;
+                if (claim.task_ref < 0 || claim.task_ref >= task_count) {
+                    ++failures;
+                    return;
+                }
+                if (seen[claim.task_ref].fetch_add(1) != 0) ++failures;
+                ++consumed;
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads)
+        thread.join();
+    EXPECT_EQ(failures.load(), 0u);
+    EXPECT_EQ(consumed.load(), task_count);
+    for (const auto &value : seen)
+        EXPECT_EQ(value.load(), 1u);
+}
+
+TEST(SchedulerReadyPoolTest, AllocatesExactlyOneEntryPerExecutableMetadataAcrossGroupBoundaries) {
     auto metadata = tasks(97, 0);
     for (uint32_t ref = 0; ref < metadata.size(); ++ref) {
         if (ref % 5 == 0) metadata[ref].flags = 0;
         else if (ref % 3 == 0) metadata[ref] = tasks(1, 1)[0];
         else if (ref % 3 == 1) metadata[ref] = tasks(1, SCHEDULER_MIX_QUEUE)[0];
     }
-    for (uint32_t width : {0, 4, 8}) {
-        PoolFixture fixture(metadata, 11, width);
+    for (uint32_t clusters : {1, 7, 8, 9, 11, 32}) {
+        PoolFixture fixture(metadata, clusters);
         ASSERT_TRUE(scheduler_ready_pool_validate(
-            fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, metadata.size(), 11
+            fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, metadata.size(), clusters
         ));
         uint64_t total = 0;
         for (uint32_t queue = 0; queue < fixture.plan.header.queue_count; ++queue) {
@@ -130,24 +253,22 @@ TEST(SchedulerReadyPoolTest, AllocatesExactlyOneEntryPerExecutableMetadataAcross
         }
         EXPECT_EQ(total, 77u);
         EXPECT_EQ(total, fixture.plan.header.entry_count);
-        EXPECT_EQ(fixture.plan.header.group_counts[1], width == 0 ? 1u : (22 + width - 1) / width);
+        EXPECT_EQ(fixture.plan.header.group_counts[1], (2 * clusters + 7) / 8);
     }
 }
 
 TEST(SchedulerReadyPoolTest, AnyEligibleWorkerClaimsOrdinaryWorkAcrossFormerShardBoundaries) {
-    for (uint32_t width : {0, 4, 8}) {
-        for (uint32_t type : {0U, 1U, SCHEDULER_MIX_QUEUE}) {
-            PoolFixture fixture(tasks(1, type), 12, width);
-            ASSERT_TRUE(fixture.push(0, type, {0}));
-            const uint32_t worker = type == 1 ? 34 : 33;
-            uint64_t cursor = 0;
-            SchedulerReadyClaim claim{};
-            ASSERT_TRUE(fixture.pop(worker, type, &cursor, &claim));
-            EXPECT_EQ(claim.task_ref, 0);
-            EXPECT_FALSE(scheduler_ready_pool_may_have_work(fixture.base(), &fixture.locals[worker], type));
-            ASSERT_TRUE(fixture.pop(worker, type, &cursor, &claim));
-            EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
-        }
+    for (uint32_t type : {0U, 1U, SCHEDULER_MIX_QUEUE}) {
+        PoolFixture fixture(tasks(1, type), 12);
+        ASSERT_TRUE(fixture.push(0, type, {0}));
+        const uint32_t worker = type == 1 ? 34 : 33;
+        uint64_t cursor = 0;
+        SchedulerReadyClaim claim{};
+        ASSERT_TRUE(fixture.pop(worker, type, &cursor, &claim));
+        EXPECT_EQ(claim.task_ref, 0);
+        EXPECT_FALSE(scheduler_ready_pool_may_have_work(fixture.base(), &fixture.locals[worker], type));
+        ASSERT_TRUE(fixture.pop(worker, type, &cursor, &claim));
+        EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
     }
 }
 
@@ -155,7 +276,7 @@ TEST(SchedulerReadyPoolTest, TypeEligibilityDoesNotDependOnWhichWorkerPublishes)
     auto metadata = tasks(3, 0);
     metadata[1] = tasks(1, 1)[0];
     metadata[2] = tasks(1, SCHEDULER_MIX_QUEUE)[0];
-    PoolFixture fixture(metadata, 9, 4);
+    PoolFixture fixture(metadata, 9);
     for (uint32_t type = 0; type < 3; ++type)
         ASSERT_TRUE(fixture.push(1, type, {type}));
     SchedulerReadyClaim claim{};
@@ -172,7 +293,7 @@ TEST(SchedulerReadyPoolTest, TypeEligibilityDoesNotDependOnWhichWorkerPublishes)
 }
 
 TEST(SchedulerReadyPoolTest, RemoteTasksProgressWhileTheLocalGroupRemainsNonempty) {
-    PoolFixture fixture(tasks(128, 0), 12, 4);
+    PoolFixture fixture(tasks(128, 0), 24);
     std::vector<int64_t> own, remote;
     for (int64_t ref = 0; ref < 128; ++ref) {
         const auto group = scheduler_ready_pool_ref_group(ref, 3);
@@ -195,36 +316,34 @@ TEST(SchedulerReadyPoolTest, RemoteTasksProgressWhileTheLocalGroupRemainsNonempt
 }
 
 TEST(SchedulerReadyPoolTest, RemotePriorityRotatesAcrossContinuouslyNonemptyGroups) {
-    for (uint32_t width : {4, 8}) {
-        for (uint64_t initial_cursor : {0, 1}) {
-            PoolFixture fixture(tasks(256, 0), 24, width);
-            const uint32_t groups = fixture.plan.header.group_counts[0];
-            std::vector<std::vector<int64_t>> refs(groups);
-            for (int64_t ref = 0; ref < 256; ++ref)
-                refs[scheduler_ready_pool_ref_group(ref, groups)].push_back(ref);
-            ASSERT_GT(refs[0].size(), 6 * (groups - 1));
-            for (const auto &group_refs : refs) {
-                ASSERT_GT(group_refs.size(), 2u);
-                ASSERT_TRUE(fixture.push(0, 0, group_refs));
+    for (uint64_t initial_cursor : {0, 1}) {
+        PoolFixture fixture(tasks(256, 0), 24);
+        const uint32_t groups = fixture.plan.header.group_counts[0];
+        std::vector<std::vector<int64_t>> refs(groups);
+        for (int64_t ref = 0; ref < 256; ++ref)
+            refs[scheduler_ready_pool_ref_group(ref, groups)].push_back(ref);
+        ASSERT_GT(refs[0].size(), 6 * (groups - 1));
+        for (const auto &group_refs : refs) {
+            ASSERT_GT(group_refs.size(), 2u);
+            ASSERT_TRUE(fixture.push(0, 0, group_refs));
+        }
+        uint64_t cursor = initial_cursor;
+        for (uint32_t cycle = 0; cycle < 2; ++cycle) {
+            std::vector<uint32_t> claims(groups);
+            for (uint32_t poll = 0; poll < 4 * (groups - 1); ++poll) {
+                SchedulerReadyClaim claim{};
+                ASSERT_TRUE(fixture.pop(0, 0, &cursor, &claim));
+                ASSERT_GE(claim.task_ref, 0);
+                ++claims[scheduler_ready_pool_ref_group(claim.task_ref, groups)];
             }
-            uint64_t cursor = initial_cursor;
-            for (uint32_t cycle = 0; cycle < 2; ++cycle) {
-                std::vector<uint32_t> claims(groups);
-                for (uint32_t poll = 0; poll < 4 * (groups - 1); ++poll) {
-                    SchedulerReadyClaim claim{};
-                    ASSERT_TRUE(fixture.pop(0, 0, &cursor, &claim));
-                    ASSERT_GE(claim.task_ref, 0);
-                    ++claims[scheduler_ready_pool_ref_group(claim.task_ref, groups)];
-                }
-                for (uint32_t group = 1; group < groups; ++group)
-                    EXPECT_EQ(claims[group], 1u);
-            }
+            for (uint32_t group = 1; group < groups; ++group)
+                EXPECT_EQ(claims[group], 1u);
         }
     }
 }
 
 TEST(SchedulerReadyPoolTest, UnplaceableMixRemainsSharedUntilAnotherCoordinatorClaimsIt) {
-    PoolFixture fixture(tasks(1, SCHEDULER_MIX_QUEUE), 9, 4);
+    PoolFixture fixture(tasks(1, SCHEDULER_MIX_QUEUE), 9);
     ASSERT_TRUE(fixture.push(1, SCHEDULER_MIX_QUEUE, {0}));
     for (auto &slot : fixture.locals[0].slots)
         slot.state = SchedulerDispatchSlotState::FILLING;
@@ -239,73 +358,58 @@ TEST(SchedulerReadyPoolTest, UnplaceableMixRemainsSharedUntilAnotherCoordinatorC
 }
 
 TEST(SchedulerReadyPoolTest, ConcurrentProducersAndRemoteConsumersNeverLoseOrDuplicateTasks) {
-    for (uint32_t variant = 0; variant < 6; ++variant) {
-        const uint32_t widths[] = {0, 4, 8, 0, 0, 0};
-        PoolFixture fixture(
-            tasks(192, 1), 12, widths[variant],
-            variant >= 4 ? SchedulerReadyPoolKind::CHUNK :
-                           (variant == 3 ? SchedulerReadyPoolKind::LINKED : SchedulerReadyPoolKind::TICKET),
-            variant >= 4 ? (variant == 4 ? 1 : 4) : 0
-        );
-        std::vector<std::atomic<uint32_t>> seen(192);
-        for (auto &entry : seen)
-            entry.store(0);
-        std::atomic<bool> start{false};
-        std::atomic<uint32_t> consumed{0}, failures{0};
-        std::vector<std::thread> threads;
-        for (uint32_t producer = 0; producer < 6; ++producer) {
-            threads.emplace_back([&, producer] {
-                while (!start.load()) {}
-                std::vector<int64_t> refs(32);
-                std::iota(refs.begin(), refs.end(), producer * 32);
-                if (!fixture.push(producer * 3, 1, refs)) ++failures;
-                auto &local = fixture.locals[producer * 3];
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-                while (scheduler_ready_pool_has_pending(&local) && failures.load() == 0) {
-                    if (!scheduler_ready_pool_service_pending(fixture.base(), &local, fixture.run, nullptr, nullptr) ||
-                        std::chrono::steady_clock::now() >= deadline)
-                        ++failures;
-                }
-            });
-        }
-        for (uint32_t consumer = 0; consumer < 12; ++consumer) {
-            threads.emplace_back([&, consumer] {
-                while (!start.load()) {}
-                uint64_t cursor = consumer;
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-                while (consumed.load() < 192 && failures.load() == 0) {
-                    SchedulerReadyClaim claim{};
-                    if (!fixture.pop(consumer * 3 + 1, 1, &cursor, &claim)) {
-                        ++failures;
-                        break;
-                    }
-                    if (claim.task_ref < 0) {
-                        if (std::chrono::steady_clock::now() >= deadline) {
-                            ++failures;
-                            break;
-                        }
-                        continue;
-                    }
-                    if (claim.task_ref >= 192 || ++seen[claim.task_ref] != 1) {
-                        ++failures;
-                        break;
-                    }
-                    ++consumed;
-                }
-            });
-        }
-        start.store(true);
-        for (auto &thread : threads)
-            thread.join();
-        EXPECT_EQ(failures.load(), 0u);
-        EXPECT_EQ(consumed.load(), 192u);
-        for (const auto &entry : seen)
-            EXPECT_EQ(entry.load(), 1u);
+    PoolFixture fixture(tasks(192, 1), 12);
+    std::vector<std::atomic<uint32_t>> seen(192);
+    for (auto &entry : seen)
+        entry.store(0);
+    std::atomic<bool> start{false};
+    std::atomic<uint32_t> consumed{0}, failures{0};
+    std::vector<std::thread> threads;
+    for (uint32_t producer = 0; producer < 6; ++producer) {
+        threads.emplace_back([&, producer] {
+            while (!start.load()) {}
+            std::vector<int64_t> refs(32);
+            std::iota(refs.begin(), refs.end(), producer * 32);
+            if (!fixture.push(producer * 3, 1, refs)) ++failures;
+        });
     }
+    for (uint32_t consumer = 0; consumer < 12; ++consumer) {
+        threads.emplace_back([&, consumer] {
+            while (!start.load()) {}
+            uint64_t cursor = consumer;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (consumed.load() < 192 && failures.load() == 0) {
+                SchedulerReadyClaim claim{};
+                if (!fixture.pop(consumer * 3 + 1, 1, &cursor, &claim)) {
+                    ++failures;
+                    break;
+                }
+                if (claim.task_ref < 0) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        ++failures;
+                        break;
+                    }
+                    continue;
+                }
+                if (claim.task_ref >= 192 || ++seen[claim.task_ref] != 1) {
+                    ++failures;
+                    break;
+                }
+                ++consumed;
+            }
+        });
+    }
+    start.store(true);
+    for (auto &thread : threads)
+        thread.join();
+    EXPECT_EQ(failures.load(), 0u);
+    EXPECT_EQ(consumed.load(), 192u);
+    for (const auto &entry : seen)
+        EXPECT_EQ(entry.load(), 1u);
 }
 
 TEST(SchedulerReadyPoolTest, RejectsCorruptDescriptorsBeforeAnyQueueAccess) {
-    PoolFixture fixture(tasks(12, 0), 9, 4);
+    PoolFixture fixture(tasks(12, 0), 9);
     auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.plan.header_offset);
     auto *descriptors = scheduler_state_at<SchedulerReadyPoolDescriptor>(fixture.base(), pool->descriptors_offset);
     const auto valid = [&] {
@@ -314,6 +418,14 @@ TEST(SchedulerReadyPoolTest, RejectsCorruptDescriptorsBeforeAnyQueueAccess) {
         );
     };
     ASSERT_TRUE(valid());
+    for (uint32_t width : {0U, 4U}) {
+        pool->group_width = width;
+        EXPECT_FALSE(valid());
+    }
+    *pool = fixture.plan.header;
+    pool->version = 3;
+    EXPECT_FALSE(valid());
+    *pool = fixture.plan.header;
     pool->queue_count = UINT32_MAX;
     EXPECT_FALSE(valid());
     *pool = fixture.plan.header;
@@ -329,328 +441,12 @@ TEST(SchedulerReadyPoolTest, RejectsCorruptDescriptorsBeforeAnyQueueAccess) {
 
 TEST(SchedulerReadyPoolTest, RejectsInvalidTopologyAndOverflowWithoutChangingThePreviousPlan) {
     SchedulerReadyPoolPlan plan{};
-    ASSERT_TRUE(scheduler_plan_ready_pool(tasks(1, 0), 1, 0, 128, &plan));
+    ASSERT_TRUE(scheduler_plan_ready_pool(tasks(1, 0), 1, 128, &plan));
     const uint64_t size = plan.total_size;
-    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 0, 0, 128, &plan));
-    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, 3, 128, &plan));
-    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, 0, UINT64_MAX - 64, &plan));
+    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 0, 128, &plan));
+    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), SCHEDULER_CLUSTER_CAPACITY + 1, 128, &plan));
+    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, UINT64_MAX - 64, &plan));
     EXPECT_EQ(plan.total_size, size);
-}
-
-TEST(SchedulerReadyPoolTest, LinkedQueuesUsePersistentNodesAndDistinctTypeSentinels) {
-    auto metadata = tasks(97, 0);
-    metadata[1] = tasks(1, 1)[0];
-    metadata[2] = tasks(1, SCHEDULER_MIX_QUEUE)[0];
-    PoolFixture fixture(metadata, 12, 0, SchedulerReadyPoolKind::LINKED);
-    ASSERT_TRUE(scheduler_ready_pool_validate(
-        fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, metadata.size(), 12
-    ));
-    for (uint32_t type = 0; type < 3; ++type) {
-        auto queue = scheduler_ready_pool_linked_queue(fixture.base(), fixture.plan.header, type);
-        EXPECT_EQ(queue.control->head, 97 + type);
-        EXPECT_EQ(queue.control->tail, 97 + type);
-        EXPECT_EQ(queue.links[queue.sentinel], SCHEDULER_TASK_REF_INVALID);
-        ASSERT_TRUE(fixture.push(1, type, {type}));
-        const uint32_t worker = type == 1 ? 34 : 33;
-        uint64_t cursor = 0;
-        SchedulerReadyClaim claim{};
-        ASSERT_TRUE(fixture.pop(worker, type, &cursor, &claim));
-        EXPECT_EQ(claim.task_ref, type);
-        EXPECT_FALSE(scheduler_ready_pool_may_have_work(fixture.base(), &fixture.locals[worker], type));
-    }
-}
-
-TEST(SchedulerReadyPoolTest, LinkedMixPlacementFailureLeavesTaskAvailableToRemoteCoordinator) {
-    PoolFixture fixture(tasks(1, SCHEDULER_MIX_QUEUE), 12, 0, SchedulerReadyPoolKind::LINKED);
-    ASSERT_TRUE(fixture.push(1, SCHEDULER_MIX_QUEUE, {0}));
-    for (auto &slot : fixture.locals[0].slots)
-        slot.state = SchedulerDispatchSlotState::FILLING;
-    uint64_t cursor = 0;
-    SchedulerReadyClaim claim{};
-    SchedulerMixPlacement placement{};
-    ASSERT_TRUE(fixture.pop(0, SCHEDULER_MIX_QUEUE, &cursor, &claim, &placement));
-    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
-    ASSERT_TRUE(fixture.pop(33, SCHEDULER_MIX_QUEUE, &cursor, &claim, &placement));
-    EXPECT_EQ(claim.task_ref, 0);
-    EXPECT_EQ(placement.count, 2u);
-}
-
-TEST(SchedulerReadyPoolTest, LinkedPendingBatchSurvivesRetryAndMergesCompletionWorkWhileSlotsAreFull) {
-    PoolFixture fixture(tasks(8, 0), 12, 0, SchedulerReadyPoolKind::LINKED);
-    auto queue = scheduler_ready_pool_linked_queue(fixture.base(), fixture.plan.header, 0);
-    const int64_t initial[] = {0, 1, 2, 3};
-    SchedulerLinkedBatch paused{};
-    ASSERT_EQ(scheduler_linked_prepare(queue, initial, 4, &paused), SchedulerLinkedResult::SUCCESS);
-    ASSERT_EQ(
-        scheduler_gm_compare_exchange(queue.links[queue.sentinel], SCHEDULER_TASK_REF_INVALID, paused.first),
-        SCHEDULER_TASK_REF_INVALID
-    );
-    // The first publisher pauses after its linearization point, before moving tail.
-    auto &local = fixture.locals[0];
-    for (auto &slot : local.slots)
-        slot.state = SchedulerDispatchSlotState::FILLING;
-    for (auto &lane : local.mix_slots)
-        for (auto &slot : lane)
-            slot.state = SchedulerDispatchSlotState::FILLING;
-    ASSERT_TRUE(fixture.push(0, 0, {4, 5}));
-    ASSERT_EQ(local.pending_publications[0].count, 2u);
-    ASSERT_TRUE(fixture.push(0, 0, {6, 7}));
-    ASSERT_EQ(local.pending_publications[0].count, 4u);
-    bool progress = false;
-    ASSERT_TRUE(scheduler_ready_pool_service_pending(fixture.base(), &local, fixture.run, nullptr, &progress));
-    EXPECT_TRUE(progress);
-    EXPECT_FALSE(scheduler_ready_pool_has_pending(&local));
-    uint64_t cursor = 0;
-    for (int64_t ref = 0; ref < 8; ++ref) {
-        SchedulerReadyClaim claim{};
-        ASSERT_TRUE(fixture.pop(33, 0, &cursor, &claim));
-        EXPECT_EQ(claim.task_ref, ref);
-    }
-}
-
-TEST(SchedulerReadyPoolTest, LinkedAbortKeepsPrivateBatchUnpublishedUntilRunStorageIsDiscarded) {
-    PoolFixture fixture(tasks(2, 0), 1, 0, SchedulerReadyPoolKind::LINKED);
-    auto queue = scheduler_ready_pool_linked_queue(fixture.base(), fixture.plan.header, 0);
-    const int64_t refs[] = {0, 1};
-    auto &local = fixture.locals[0];
-    ASSERT_EQ(scheduler_linked_prepare(queue, refs, 2, &local.pending_publications[0]), SchedulerLinkedResult::SUCCESS);
-    scheduler_publish_error(fixture.run, 1);
-    bool progress = true;
-    ASSERT_TRUE(scheduler_ready_pool_service_pending(fixture.base(), &local, fixture.run, nullptr, &progress));
-    EXPECT_FALSE(progress);
-    EXPECT_EQ(local.pending_publications[0].count, 2u);
-    EXPECT_EQ(queue.links[queue.sentinel], SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(queue.control->tail, queue.sentinel);
-}
-
-TEST(SchedulerReadyPoolTest, LinkedLayoutRejectsOverlappingOrTruncatedLinksAndUnsupportedTopology) {
-    PoolFixture fixture(tasks(12, 0), 9, 0, SchedulerReadyPoolKind::LINKED);
-    auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.plan.header_offset);
-    const auto valid = [&] {
-        return scheduler_ready_pool_validate(
-            fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, 12, 9
-        );
-    };
-    ASSERT_TRUE(valid());
-    pool->links_offset = pool->controls_offset;
-    EXPECT_FALSE(valid());
-    *pool = fixture.plan.header;
-    pool->storage_end_offset = pool->links_offset + 14 * sizeof(int64_t);
-    EXPECT_FALSE(valid());
-    *pool = fixture.plan.header;
-    pool->group_width = 8;
-    EXPECT_FALSE(valid());
-    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 9, 8, 128, &fixture.plan, SchedulerReadyPoolKind::LINKED));
-}
-
-TEST(SchedulerReadyPoolTest, LinkedCorruptNextFailsWithoutClaimingOrDereferencingInvalidTask) {
-    PoolFixture fixture(tasks(2, 0), 1, 0, SchedulerReadyPoolKind::LINKED);
-    auto queue = scheduler_ready_pool_linked_queue(fixture.base(), fixture.plan.header, 0);
-    scheduler_gm_store(queue.links[queue.sentinel], INT64_MAX);
-    uint64_t cursor = 0;
-    SchedulerReadyClaim claim{};
-    EXPECT_FALSE(fixture.pop(0, 0, &cursor, &claim));
-    EXPECT_EQ(queue.control->head, queue.sentinel);
-    EXPECT_NE(scheduler_read_error(fixture.run), 0u);
-}
-
-TEST(SchedulerReadyPoolTest, LinkedServicePublishesAllPendingTypesAndReinitializesAfterQuiescence) {
-    auto metadata = tasks(3, 0);
-    metadata[1] = tasks(1, 1)[0];
-    metadata[2] = tasks(1, SCHEDULER_MIX_QUEUE)[0];
-    PoolFixture fixture(metadata, 2, 0, SchedulerReadyPoolKind::LINKED);
-    for (uint32_t epoch = 0; epoch < 2; ++epoch) {
-        if (epoch != 0) scheduler_init_ready_pool(fixture.base(), fixture.plan);
-        auto &local = fixture.locals[0];
-        for (uint32_t type = 0; type < 3; ++type) {
-            auto queue = scheduler_ready_pool_linked_queue(fixture.base(), fixture.plan.header, type);
-            const int64_t ref = type;
-            ASSERT_EQ(
-                scheduler_linked_prepare(queue, &ref, 1, &local.pending_publications[type]),
-                SchedulerLinkedResult::SUCCESS
-            );
-        }
-        // A service budget of zero models a yielded bootstrap publisher.
-        bool progress = true;
-        ASSERT_TRUE(scheduler_ready_pool_service_pending(fixture.base(), &local, fixture.run, nullptr, &progress, 0));
-        EXPECT_FALSE(progress);
-        ASSERT_TRUE(scheduler_ready_pool_has_pending(&local));
-        ASSERT_TRUE(scheduler_ready_pool_service_pending(fixture.base(), &local, fixture.run, nullptr, &progress));
-        EXPECT_TRUE(progress);
-        EXPECT_FALSE(scheduler_ready_pool_has_pending(&local));
-        for (uint32_t type = 0; type < 3; ++type) {
-            uint64_t cursor = 0;
-            SchedulerReadyClaim claim{};
-            ASSERT_TRUE(fixture.pop(type == 1 ? 4 : 3, type, &cursor, &claim));
-            EXPECT_EQ(claim.task_ref, type);
-        }
-    }
-}
-
-TEST(SchedulerReadyPoolTest, ChunkLayoutsInitializeEveryNodeAndRouteAllTypesGlobally) {
-    auto metadata = tasks(6, 0);
-    for (uint32_t type = 0; type < 3; ++type)
-        for (uint32_t index = 0; index < 2; ++index)
-            metadata[type * 2 + index] = tasks(1, type)[0];
-    for (uint32_t window : {1, 4}) {
-        PoolFixture fixture(metadata, 12, 0, SchedulerReadyPoolKind::CHUNK, window);
-        ASSERT_TRUE(
-            scheduler_ready_pool_validate(fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, 6, 12)
-        );
-        auto *chunks = scheduler_state_at<SchedulerReadyChunk>(fixture.base(), fixture.plan.header.chunks_offset);
-        for (uint32_t ref = 0; ref < 6; ++ref) {
-            EXPECT_EQ(chunks[ref].count, 0u);
-            EXPECT_EQ(chunks[ref].cursor, 0u);
-            for (auto entry : chunks[ref].refs)
-                EXPECT_EQ(entry, SCHEDULER_TASK_REF_INVALID);
-        }
-        for (uint32_t type = 0; type < 3; ++type) {
-            ASSERT_TRUE(fixture.push(1, type, {type * 2, type * 2 + 1}));
-            uint64_t cursor = 0;
-            for (uint32_t index = 0; index < 2; ++index) {
-                SchedulerReadyClaim claim{};
-                ASSERT_TRUE(fixture.pop(type == 1 ? 34 : 33, type, &cursor, &claim));
-                EXPECT_EQ(claim.task_ref, type * 2 + index);
-            }
-        }
-    }
-}
-
-TEST(SchedulerReadyPoolTest, ChunkWindowPeriodicallyServicesTheOldestNonemptyChunk) {
-    PoolFixture fixture(tasks(32, 0), 12, 0, SchedulerReadyPoolKind::CHUNK, 4);
-    std::vector<int64_t> refs(32);
-    std::iota(refs.begin(), refs.end(), 0);
-    ASSERT_TRUE(fixture.push(0, 0, refs));
-    uint64_t cursor = 0;
-    for (uint32_t index = 0; index < 8; ++index) {
-        SchedulerReadyClaim claim{};
-        ASSERT_TRUE(fixture.pop(0, 0, &cursor, &claim));
-        ASSERT_GE(claim.task_ref, 0);
-        if ((index & 3U) == 3) EXPECT_EQ(claim.task_ref, index / 4);
-    }
-}
-
-TEST(SchedulerReadyPoolTest, ChunkPendingCountsDescriptorsAndPublishesWithFullSlotsAfterRetry) {
-    PoolFixture fixture(tasks(8, 0), 12, 0, SchedulerReadyPoolKind::CHUNK, 1);
-    auto queue = scheduler_ready_pool_chunk_queue(fixture.base(), fixture.plan.header, 0);
-    SchedulerLinkedBatch paused{};
-    for (int64_t ref = 0; ref < 4; ++ref) {
-        SchedulerLinkedBatch incoming{};
-        ASSERT_EQ(scheduler_chunk_prepare(queue, &ref, 1, &incoming), SchedulerLinkedResult::SUCCESS);
-        ASSERT_EQ(scheduler_linked_append_private(queue.chain, &paused, &incoming), SchedulerLinkedResult::SUCCESS);
-    }
-    ASSERT_EQ(
-        scheduler_gm_compare_exchange(
-            queue.chain.links[queue.chain.sentinel], SCHEDULER_TASK_REF_INVALID, paused.first
-        ),
-        SCHEDULER_TASK_REF_INVALID
-    );
-    auto &local = fixture.locals[0];
-    for (auto &slot : local.slots)
-        slot.state = SchedulerDispatchSlotState::FILLING;
-    for (auto &lane : local.mix_slots)
-        for (auto &slot : lane)
-            slot.state = SchedulerDispatchSlotState::FILLING;
-    ASSERT_TRUE(fixture.push(0, 0, {4, 5}));
-    ASSERT_EQ(local.pending_publications[0].count, 1u);
-    ASSERT_TRUE(fixture.push(0, 0, {6, 7}));
-    ASSERT_EQ(local.pending_publications[0].count, 2u);
-    EXPECT_EQ(queue.chunks[4].count, 2u);
-    EXPECT_EQ(queue.chunks[6].count, 2u);
-    bool progress = false;
-    ASSERT_TRUE(scheduler_ready_pool_service_pending(fixture.base(), &local, fixture.run, nullptr, &progress));
-    EXPECT_TRUE(progress);
-    EXPECT_FALSE(scheduler_ready_pool_has_pending(&local));
-    uint64_t cursor = 0;
-    for (int64_t ref = 0; ref < 8; ++ref) {
-        SchedulerReadyClaim claim{};
-        ASSERT_TRUE(fixture.pop(33, 0, &cursor, &claim));
-        EXPECT_EQ(claim.task_ref, ref);
-    }
-}
-
-TEST(SchedulerReadyPoolTest, ChunkAbortLeavesSealedPrivatePayloadUnclaimedAndUnpublished) {
-    PoolFixture fixture(tasks(4, 0), 1, 0, SchedulerReadyPoolKind::CHUNK, 4);
-    auto queue = scheduler_ready_pool_chunk_queue(fixture.base(), fixture.plan.header, 0);
-    auto &local = fixture.locals[0];
-    for (int64_t first : {0, 2}) {
-        const int64_t refs[] = {first, first + 1};
-        SchedulerLinkedBatch incoming{};
-        ASSERT_EQ(scheduler_chunk_prepare(queue, refs, 2, &incoming), SchedulerLinkedResult::SUCCESS);
-        ASSERT_EQ(
-            scheduler_linked_append_private(queue.chain, &local.pending_publications[0], &incoming),
-            SchedulerLinkedResult::SUCCESS
-        );
-    }
-    scheduler_publish_error(fixture.run, 1);
-    bool progress = true;
-    ASSERT_TRUE(scheduler_ready_pool_service_pending(fixture.base(), &local, fixture.run, nullptr, &progress));
-    EXPECT_FALSE(progress);
-    EXPECT_EQ(local.pending_publications[0].count, 2u);
-    EXPECT_EQ(queue.chain.links[queue.chain.sentinel], SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(queue.chain.control->head, queue.chain.sentinel);
-    EXPECT_EQ(queue.chain.control->tail, queue.chain.sentinel);
-    EXPECT_EQ(queue.chain.links[0], 2);
-    for (int64_t first : {0, 2}) {
-        EXPECT_EQ(queue.chunks[first].cursor, 0u);
-        EXPECT_EQ(queue.chunks[first].count, 2u);
-        EXPECT_EQ(queue.chunks[first].refs[1], first + 1);
-    }
-}
-
-TEST(SchedulerReadyPoolTest, ChunkWorkHintSeesSuccessorsBehindAnExhaustedHead) {
-    PoolFixture fixture(tasks(9, 0), 1, 0, SchedulerReadyPoolKind::CHUNK, 1);
-    std::vector<int64_t> refs(9);
-    std::iota(refs.begin(), refs.end(), 0);
-    ASSERT_TRUE(fixture.push(0, 0, refs));
-    uint64_t cursor = 0;
-    SchedulerReadyClaim claim{};
-    for (uint32_t index = 0; index < 8; ++index) {
-        ASSERT_TRUE(fixture.pop(0, 0, &cursor, &claim));
-        EXPECT_EQ(claim.task_ref, index);
-    }
-    ASSERT_TRUE(scheduler_ready_pool_may_have_work(fixture.base(), &fixture.locals[0], 0));
-    ASSERT_TRUE(fixture.pop(0, 0, &cursor, &claim));
-    EXPECT_EQ(claim.task_ref, 8);
-    EXPECT_FALSE(scheduler_ready_pool_may_have_work(fixture.base(), &fixture.locals[0], 0));
-}
-
-TEST(SchedulerReadyPoolTest, ChunkMixWithoutPlacementRemainsGloballyAvailable) {
-    PoolFixture fixture(tasks(9, SCHEDULER_MIX_QUEUE), 12, 0, SchedulerReadyPoolKind::CHUNK, 4);
-    std::vector<int64_t> refs(9);
-    std::iota(refs.begin(), refs.end(), 0);
-    ASSERT_TRUE(fixture.push(1, SCHEDULER_MIX_QUEUE, refs));
-    for (auto &slot : fixture.locals[0].slots)
-        slot.state = SchedulerDispatchSlotState::FILLING;
-    uint64_t cursor = 0;
-    SchedulerReadyClaim claim{};
-    SchedulerMixPlacement placement{};
-    ASSERT_TRUE(fixture.pop(0, SCHEDULER_MIX_QUEUE, &cursor, &claim, &placement));
-    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
-    ASSERT_TRUE(fixture.pop(33, SCHEDULER_MIX_QUEUE, &cursor, &claim, &placement));
-    EXPECT_GE(claim.task_ref, 0);
-    EXPECT_EQ(placement.count, 2u);
-}
-
-TEST(SchedulerReadyPoolTest, ChunkLayoutRejectsPayloadOverlapAndUnknownWindow) {
-    PoolFixture fixture(tasks(12, 0), 9, 0, SchedulerReadyPoolKind::CHUNK, 4);
-    auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.plan.header_offset);
-    const auto valid = [&] {
-        return scheduler_ready_pool_validate(
-            fixture.base(), fixture.layout.total_size, fixture.plan.header_offset, 12, 9
-        );
-    };
-    ASSERT_TRUE(valid());
-    pool->chunks_offset = pool->links_offset;
-    EXPECT_FALSE(valid());
-    *pool = fixture.plan.header;
-    pool->chunk_window = 2;
-    EXPECT_FALSE(valid());
-    *pool = fixture.plan.header;
-    pool->storage_end_offset = pool->chunks_offset + sizeof(SchedulerReadyChunk) * 11;
-    EXPECT_FALSE(valid());
-    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, 0, 128, &fixture.plan, SchedulerReadyPoolKind::CHUNK, 0));
-    EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, 0, 128, &fixture.plan, SchedulerReadyPoolKind::TICKET, 4));
 }
 
 }  // namespace

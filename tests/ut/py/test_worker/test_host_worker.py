@@ -5932,12 +5932,27 @@ class TestDirectControlOrdering:
     def _alloc(worker):
         return worker.alloc_child_tensor(0, (16,), DataType.FLOAT32)
 
-    def test_control_inside_a_run_waits_for_that_run_to_hold_the_fifo_head(self):
+    @pytest.mark.parametrize("admission_fails", [False, True])
+    def test_control_inside_a_run_passes_admission_before_malloc(self, admission_fails):
         worker = Worker(level=3, num_sub_workers=0)
-        orch, native = self._orch(worker)
+        _, native = self._orch(worker)
+
+        def await_admission(run_id):
+            assert run_id == 7
+            native.malloc.assert_not_called()
+            if admission_fails:
+                raise RuntimeError("admission failed")
+
+        native.await_run_admission.side_effect = await_admission
 
         with orch_mod._callback_run(7, worker):
-            self._alloc(worker)
+            if admission_fails:
+                with pytest.raises(RuntimeError, match="admission failed"):
+                    self._alloc(worker)
+                native.malloc.assert_not_called()
+            else:
+                self._alloc(worker)
+                native.malloc.assert_called_once()
         native.await_run_admission.assert_called_once_with(7)
 
     def test_control_after_a_task_submission_in_the_same_run_is_refused(self):

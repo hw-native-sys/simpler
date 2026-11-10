@@ -56,7 +56,7 @@ _PYUT_MANIFEST = _REPO_ROOT / "tests" / "ut" / "cpp" / "build" / "pyut_binaries.
 _COLLECTOR_HANDLE = "chip_swimlane_collector"
 
 
-def _collectors() -> dict[tuple[str, str], Path]:
+def _collectors(handle=_COLLECTOR_HANDLE) -> dict[tuple[str, str], Path]:
     """The exported collector binary for each pair, as the C++ tree recorded it."""
     if not _PYUT_MANIFEST.exists():
         pytest.skip(
@@ -66,13 +66,13 @@ def _collectors() -> dict[tuple[str, str], Path]:
     exported = {
         (entry["arch"], entry["runtime"]): Path(entry["path"])
         for entry in json.loads(_PYUT_MANIFEST.read_text())
-        if entry["handle"] == _COLLECTOR_HANDLE
+        if entry["handle"] == handle
     }
     # The manifest states what configure intended to build, so a pair missing
     # from it is a declaration that lost an axis — not an unbuilt tree, which
     # the existence check below is for.
     assert set(exported) == set(_COLLECTOR_BUILDS), (
-        f"the C++ tree exports {sorted(exported)} for handle {_COLLECTOR_HANDLE!r}, "
+        f"the C++ tree exports {sorted(exported)} for handle {handle!r}, "
         f"but the roundtrip covers {sorted(_COLLECTOR_BUILDS)}. Its declaration in "
         "tests/ut/cpp/common/platform/CMakeLists.txt has lost a combination."
     )
@@ -298,3 +298,57 @@ def test_two_runs_do_not_report_a_happens_before_violation(tmp_path):
     events = json.loads(out.read_text())["traceEvents"]
     violations = [e for e in events if e.get("name") == "hb_violation"]
     assert not violations, f"cross-run pairing produced {len(violations)} bogus happens-before violation(s)"
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _COLLECTOR_BUILDS)
+def test_recorded_window_real_producer_export_keeps_duplicate_rows(tmp_path, monkeypatch, arch, runtime):
+    from simpler_setup.tools import swimlane_converter as sc  # noqa: PLC0415
+
+    exported = _collectors("chip_swimlane_retained_runs")
+    if not any(path.exists() for path in exported.values()):
+        pytest.skip("the exporter roundtrip follows the C++ build")
+    binary = exported[(arch, runtime)]
+    assert binary.exists(), f"the C++ tree is built but {binary} is absent"
+    completed = subprocess.run(
+        [str(binary), "--gtest_filter=*RecordedWindowKeepsRepeatedProducerRowsAndOnePreparation"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    path = tmp_path / "chip_swimlane_recorded_window" / arch / runtime / "records.json"
+    before = path.read_bytes()
+    raw = json.loads(before)
+    assert raw["metadata"]["runtime"] == runtime
+    collection = raw["metadata"]["collection"]
+    assert collection["recorded_window"] is True and collection["counts_unknown"] is True
+    assert all(collection[key] is None for key in ("device_total", "device_dropped", "fatal", "reconciliation"))
+    for population in ("aicore_tasks", "scheduler_tasks"):
+        assert collection["host_receipts"][population]["received_records"] == 5
+        assert collection["host_receipts"][population]["retained_records"] == 5
+    assert len(raw["aicore_tasks"]) == len(raw["scheduler_tasks"]["records"]) == 5
+    assert [row[2] for row in raw["aicore_tasks"]] == [1, 2, 1, 2, 3]
+    assert raw["scheduler_records"]["streams"][0]["capture"] == {
+        "committed": 2,
+        "dropped": None,
+        "truncated": None,
+    }
+    output = tmp_path / "window.perfetto.json"
+    monkeypatch.setattr(sc.sys, "argv", ["swimlane_converter", str(path), "--output", str(output)])
+    assert sc.main() == 0
+    device = json.loads(output.read_text())
+    host = json.loads(output.with_name(device["metadata"]["host_preparation_file"]).read_text())
+    assert device["metadata"]["clock_domain"] == "device_syscnt_cycles"
+    assert device["metadata"]["collection"] == collection
+    intervals = [event for event in device["traceEvents"] if event["ph"] == "X"]
+    assert len(intervals) == 12
+    for population, count in (("aicore_tasks", 5), ("scheduler_tasks", 5), ("scheduler_records", 2)):
+        observed = [event for event in intervals if event["args"]["population"] == population]
+        assert len(observed) == count
+        assert [event["args"]["record_index"] for event in observed] == list(range(count))
+    assert all(event["ph"] in ("M", "X") for event in device["traceEvents"])
+    assert host["metadata"]["clock_domain"] == "host_monotonic_ns" and host["metadata"]["preparation_only"] is True
+    assert len([event for event in host["traceEvents"] if event["ph"] == "X"]) == 1
+    assert path.read_bytes() == before

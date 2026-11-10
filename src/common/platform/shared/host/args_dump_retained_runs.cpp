@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <system_error>
 
@@ -97,6 +98,8 @@ void ArgsDumpCollector::RetainedEpoch::reset_run_state(size_t bucket_count, int 
     abandonment_recorded = false;
     cut_settled_at_close = false;
     fixed_charge = 0;
+    recorded_window = false;
+    recorded_transport_loss.store(false, std::memory_order_relaxed);
 }
 
 void ArgsDumpCollector::configure_retained_runs(bool enabled, size_t budget_bytes) {
@@ -165,12 +168,8 @@ int ArgsDumpCollector::retained_find_slot(uint64_t run_epoch) const {
     return -1;
 }
 
-bool ArgsDumpCollector::retained_ensure_ready() {
-    if (retained_ready_.load(std::memory_order_acquire)) return true;
-    if (!retain_across_runs_) return false;
-    if (shm_host_ == nullptr || dump_shared_mem_dev_ == nullptr) return false;
-    if (num_dump_threads_ <= 0) return false;
-
+bool ArgsDumpCollector::ensure_host_budget() {
+    if (retained_budget_.limit() != 0) return true;
     const size_t bucket_count = static_cast<size_t>(manager_.shard_count()) + 1;
     // The fixed reservation covers each epoch's frozen path strings, its
     // per-lane ledger and admission snapshots, and its bucket headers —
@@ -180,35 +179,43 @@ bool ArgsDumpCollector::retained_ensure_ready() {
     per_epoch_fixed += static_cast<size_t>(num_dump_threads_) *
                        (sizeof(simpler::dfx::args_dump::LaneReceipt) + sizeof(uint64_t) + sizeof(uint32_t));
     per_epoch_fixed += bucket_count * (sizeof(std::vector<DumpedArg>) + sizeof(size_t));
-    if (!retained_budget_.open(retained_budget_bytes_, per_epoch_fixed * kMaxOpenEpochs)) return false;
+    return retained_budget_.open(retained_budget_bytes_, per_epoch_fixed * kMaxOpenEpochs);
+}
 
-    for (auto &epoch : retained_epochs_) {
-        epoch.state.store(static_cast<int>(EpochState::Free), std::memory_order_relaxed);
-        epoch.epoch.store(0, std::memory_order_relaxed);
-        epoch.reset_run_state(bucket_count, num_dump_threads_);
-    }
-    for (auto &view : shard_views_)
-        view = ShardEpochView{};
-    // The *gate* is per retention window, so a re-prepared collector can admit
-    // runs again. The record of the fatal is in the summary, which is never
-    // cleared.
-    retained_fatal_.store(false, std::memory_order_release);
-    retained_fatal_reason_.clear();
-    retained_release_deferred_.store(false, std::memory_order_release);
-    retained_close_watermark_.store(0, std::memory_order_release);
-    // A finite quantum so a quiet queue's cut is not starved by a busy sibling,
-    // and the per-entry counters a cut's targets compare against.
-    set_drain_quantum(simpler::dfx::runs::kDrainQuantum);
-    set_run_counters(true);
-    retained_ready_.store(true, std::memory_order_release);
+bool ArgsDumpCollector::retained_ensure_ready(bool recorded_window) {
+    if (retained_ready_.load(std::memory_order_acquire)) return true;
+    if (!retain_across_runs_ && !recorded_window) return false;
+    if (shm_host_ == nullptr || dump_shared_mem_dev_ == nullptr) return false;
+    if (num_dump_threads_ <= 0) return false;
+
+    if (!ensure_host_budget()) return false;
+    const size_t bucket_count = static_cast<size_t>(manager_.shard_count()) + 1;
     try {
-        retained_start_writer();
+        for (auto &epoch : retained_epochs_) {
+            epoch.state.store(static_cast<int>(EpochState::Free), std::memory_order_relaxed);
+            epoch.epoch.store(0, std::memory_order_relaxed);
+            epoch.reset_run_state(bucket_count, num_dump_threads_);
+        }
+        for (auto &view : shard_views_)
+            view = ShardEpochView{};
+        // The *gate* is per retention window, so a re-prepared collector can admit
+        // runs again. The record of the fatal is in the summary, which is never
+        // cleared.
+        retained_fatal_.store(false, std::memory_order_release);
+        retained_fatal_reason_.clear();
+        retained_release_deferred_.store(false, std::memory_order_release);
+        retained_close_watermark_.store(0, std::memory_order_release);
+        // A finite quantum so a quiet queue's cut is not starved by a busy sibling,
+        // and the per-entry counters a cut's targets compare against.
+        set_drain_quantum(simpler::dfx::runs::kDrainQuantum);
+        set_run_counters(true);
+        retained_ready_.store(true, std::memory_order_release);
+        start_payload_writer();
     } catch (...) {
         retained_ready_.store(false, std::memory_order_release);
         set_run_counters(false);
         set_drain_quantum(0);
-        retained_budget_.close();
-        LOG_ERROR("Args dump: the retained-run writer could not be started");
+        LOG_ERROR("Args dump: retained storage or its writer could not be prepared");
         return false;
     }
     LOG_INFO(
@@ -218,32 +225,83 @@ bool ArgsDumpCollector::retained_ensure_ready() {
     return true;
 }
 
-void ArgsDumpCollector::retained_start_writer() {
-    if (!retained_ready_.load(std::memory_order_acquire)) return;
+void ArgsDumpCollector::start_payload_writer() {
     // Joinability, not a flag: a flag left set by a throwing construction would
     // claim a writer that does not exist and can never be replaced.
-    if (retained_writer_thread_.joinable()) return;
-    retained_writer_running_.store(true, std::memory_order_release);
+    if (writer_thread_.joinable()) return;
+    writer_running_.store(true, std::memory_order_release);
     try {
-        retained_writer_thread_ = std::thread(&ArgsDumpCollector::retained_writer_loop, this);
+        writer_thread_ = std::thread(&ArgsDumpCollector::payload_writer_loop, this);
     } catch (...) {
-        retained_writer_running_.store(false, std::memory_order_release);
+        writer_running_.store(false, std::memory_order_release);
         throw;
     }
 }
 
-void ArgsDumpCollector::retained_stop_writer() {
-    if (!retained_writer_thread_.joinable()) return;
+void ArgsDumpCollector::stop_payload_writer() {
+    if (!writer_thread_.joinable()) return;
     {
         std::scoped_lock<std::mutex> lock(write_mutex_);
         // A held writer must not be joined while it is holding: releasing here
         // is what keeps a case that unwound mid-test from hanging teardown.
-        retained_writer_held_.store(false, std::memory_order_release);
-        retained_writer_running_.store(false, std::memory_order_release);
+        writer_held_.store(false, std::memory_order_release);
+        writer_running_.store(false, std::memory_order_release);
         retained_progress_++;
     }
     write_cv_.notify_all();
-    retained_writer_thread_.join();
+    writer_thread_.join();
+}
+
+bool ArgsDumpCollector::begin_recorded_window(uint64_t epoch, const std::string &path, DumpArgsLevel level) {
+    if (recorded_window_open(epoch)) return false;
+    return run_begin(epoch, path, level, nullptr, true);
+}
+
+bool ArgsDumpCollector::recorded_window_open(uint64_t epoch) const {
+    std::lock_guard<std::mutex> lock(retained_mu_);
+    const int slot = retained_find_slot(epoch);
+    return slot >= 0 && retained_epochs_[static_cast<size_t>(slot)].recorded_window;
+}
+
+std::filesystem::path ArgsDumpCollector::resolve_run_directory(const std::string &output_prefix) {
+    if (output_prefix.size() + 128 > kPathAllowanceBytes)
+        throw std::runtime_error("Args dump output prefix exceeds the path allowance");
+    // The directory owns the manifest and payloads, including when args_dump
+    // itself is a symlink. It can be resolved before the first file exists.
+    auto destination = std::filesystem::weakly_canonical(
+        std::filesystem::absolute(std::filesystem::path(output_prefix) / "args_dump")
+    );
+    if (destination.string().size() + 128 > kPathAllowanceBytes)
+        throw std::runtime_error("Args dump resolved destination exceeds the path allowance");
+    return destination;
+}
+
+bool ArgsDumpCollector::destination_available(const std::filesystem::path &destination) const {
+    std::lock_guard<std::mutex> lock(retained_mu_);
+    for (const auto &epoch : retained_epochs_)
+        if (epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free) &&
+            epoch.run_dir == destination)
+            return false;
+    return true;
+}
+
+void ArgsDumpCollector::on_handoff_retired(const profiling_common::RetiredHandoff<DumpModule> &) {
+    std::lock_guard<std::mutex> lock(retained_mu_);
+    for (auto &epoch : retained_epochs_)
+        if (epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free) && epoch.recorded_window)
+            epoch.recorded_transport_loss.store(true, std::memory_order_release);
+}
+
+int ArgsDumpCollector::close_recorded_window(uint64_t epoch) {
+    {
+        std::lock_guard<std::mutex> lock(retained_mu_);
+        const int slot = retained_find_slot(epoch);
+        if (slot < 0 || !retained_epochs_[static_cast<size_t>(slot)].recorded_window ||
+            retained_epochs_[static_cast<size_t>(slot)].target_installed)
+            return 0;
+    }
+    quiesce();
+    return run_close(epoch, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -252,36 +310,31 @@ void ArgsDumpCollector::retained_stop_writer() {
 
 bool ArgsDumpCollector::run_begin(
     uint64_t run_epoch, const std::string &output_prefix, DumpArgsLevel dump_args_level,
-    simpler::dfx::runs::AdmissionRefusal *why
+    simpler::dfx::runs::AdmissionRefusal *why, bool recorded_window
 ) {
     if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
     // A guard, not the configuration question's answer: a caller that reaches
     // here on a collector that retains nothing has already taken the wrong path.
-    if (!retain_across_runs_) return false;
-    if (!retained_ensure_ready()) {
-        LOG_ERROR(
-            "Args dump: run %llu refused, retention could not be prepared", static_cast<unsigned long long>(run_epoch)
-        );
-        return false;
+    if (!retain_across_runs_ && !recorded_window) return false;
+    {
+        // Ordinary receive callbacks use the same budget and writer. Drop this
+        // lock before waiting for their run-table acknowledgement.
+        std::scoped_lock<std::mutex> configuration(writer_start_mutex_);
+        if (!retained_ensure_ready(recorded_window)) {
+            LOG_ERROR(
+                "Args dump: run %llu refused, retention could not be prepared",
+                static_cast<unsigned long long>(run_epoch)
+            );
+            return false;
+        }
     }
     if (retained_fatal_.load(std::memory_order_acquire)) {
         LOG_ERROR("Args dump: run %llu refused, the collector is fatal", static_cast<unsigned long long>(run_epoch));
         return false;
     }
-    // Refused before a slot is claimed: every path this run retains is reserved
-    // against the allowance rather than charged, so one that cannot fit is
-    // turned away here. The margin covers the token-bearing suffixes.
-    if (output_prefix.size() + 128 > kPathAllowanceBytes) {
-        LOG_ERROR(
-            "Args dump: run %llu refused, its output prefix of %zu bytes exceeds the %zu byte allowance",
-            static_cast<unsigned long long>(run_epoch), output_prefix.size(), kPathAllowanceBytes
-        );
-        return false;
-    }
-
     std::filesystem::path run_dir;
     try {
-        run_dir = std::filesystem::path(output_prefix) / "args_dump";
+        run_dir = resolve_run_directory(output_prefix);
         std::filesystem::create_directories(run_dir);
     } catch (const std::exception &e) {
         LOG_ERROR("Args dump: run %llu refused, %s", static_cast<unsigned long long>(run_epoch), e.what());
@@ -340,6 +393,7 @@ bool ArgsDumpCollector::run_begin(
     epoch.epoch.store(run_epoch, std::memory_order_relaxed);
     epoch.run_dir = run_dir;
     epoch.level = dump_args_level;
+    epoch.recorded_window = recorded_window;
 
     // One exclusive token owns both this run's payload file and its temporary
     // manifest, reserved before either is opened.
@@ -414,7 +468,7 @@ bool ArgsDumpCollector::run_begin(
     // The bank this run's producers publish into. Refused like every other
     // resource an admission needs: a run that cannot be accounted for runs
     // without diagnostics rather than unaccounted.
-    if (terminal_banks_.opened()) {
+    if (!recorded_window && terminal_banks_.opened()) {
         epoch.terminal_bank = terminal_banks_.reserve(run_epoch);
         if (!epoch.terminal_bank.held()) {
             if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
@@ -428,6 +482,9 @@ bool ArgsDumpCollector::run_begin(
             return false;
         }
     }
+
+    // The previous manifest remains readable until this window atomically
+    // publishes its replacement. Refused admission never removes evidence.
 
     {
         std::scoped_lock<std::mutex> lock(retained_mu_);
@@ -886,6 +943,9 @@ int ArgsDumpCollector::run_close(uint64_t run_epoch, bool device_execution_compl
     if (found < 0) return 0;
     const size_t slot = static_cast<size_t>(found);
     RetainedEpoch &epoch = retained_epochs_[slot];
+    if (epoch.recorded_window && epoch.cut_slot >= 0 &&
+        transport_failure_snapshot(epoch.cut_slot).cut_state == static_cast<int>(CutState::Retiring))
+        return PTO_RUNTIME_ERR_INTERNAL;
     epoch.records.device_execution_complete = device_execution_complete;
     int rc = 0;
 
@@ -898,14 +958,34 @@ int ArgsDumpCollector::run_close(uint64_t run_epoch, bool device_execution_compl
         // readings of a shared lifetime cursor, which is this run's figure only
         // while no successor has produced between them — and that is the
         // reading `retained_read_terminal_state` falls back to.
-        (void)retained_read_terminal_state(epoch);
+        if (!epoch.recorded_window) (void)retained_read_terminal_state(epoch);
 
         // Every buffer this run will ever publish is already in a device ready
         // queue at this instant, so each queue's target is finite and a
         // successor's later traffic cannot discharge it.
+        if (epoch.recorded_window && epoch.cut_slot >= 0) {
+            int failed_queues = 0;
+            if (cut_failed_queues(epoch.cut_slot, epoch.cut_request, &failed_queues) && failed_queues != 0) {
+                // A captured failure is immutable. Retire its readers before
+                // obtaining another snapshot; a timed-out retirement keeps the
+                // old slot and window until all readers are joined.
+                if (!cut_release(epoch.cut_slot, kCutAckBudgetMs)) {
+                    retained_set_fatal("a recorded ArgsDump cut could not retire its readers");
+                    return PTO_RUNTIME_ERR_INTERNAL;
+                }
+                epoch.cut_slot = -1;
+                epoch.cut_request = 0;
+                epoch.records.unknown_lanes = 0;
+                epoch.records.processing_proved = false;
+            }
+        }
         uint64_t request = 0;
-        epoch.cut_slot = cut_arm(&request);
-        epoch.cut_request = request;
+        if (epoch.cut_slot < 0) {
+            epoch.cut_slot = cut_arm(&request);
+            epoch.cut_request = request;
+        } else {
+            request = epoch.cut_request;
+        }
         bool processed = false;
         if (epoch.cut_slot < 0) {
             LOG_ERROR(
@@ -943,8 +1023,9 @@ int ArgsDumpCollector::run_close(uint64_t run_epoch, bool device_execution_compl
         // own `live_at_close` states what it held, which is what the decision
         // was for. Neither is the third case: processing that was never proved,
         // which reads nothing and fails.
-        const bool close_proved = processed && epoch.records.terminal_readable;
-        if (close_proved && terminal_banks_.opened()) {
+        const bool close_proved = processed && (epoch.recorded_window || epoch.records.terminal_readable);
+        if (epoch.recorded_window) epoch.records.processing_proved = processed;
+        if (close_proved && (epoch.recorded_window || terminal_banks_.opened())) {
             // Settled from the run's own producers. No lane's live buffer is
             // inspected and nothing here is an error.
         } else if (close_proved) {
@@ -984,6 +1065,11 @@ int ArgsDumpCollector::run_close(uint64_t run_epoch, bool device_execution_compl
         epoch.cut_settled_at_close = true;
     }
 
+    if (epoch.recorded_window && rc != 0) {
+        epoch.cut_settled_at_close = false;
+        return rc;
+    }
+
     {
         std::scoped_lock<std::mutex> lock(retained_mu_);
         epoch.target_installed = true;
@@ -1003,6 +1089,16 @@ int ArgsDumpCollector::run_close(uint64_t run_epoch, bool device_execution_compl
 // The background writer
 // ---------------------------------------------------------------------------
 
+void ArgsDumpCollector::complete_ordinary_payload() {
+    {
+        // Close checks this predicate under the same mutex before atomically
+        // entering its CV wait; completion cannot notify inside that gap.
+        std::scoped_lock<std::mutex> lock(write_mutex_);
+        ordinary_queued_payloads_.fetch_sub(1, std::memory_order_release);
+    }
+    write_cv_.notify_all();
+}
+
 bool ArgsDumpCollector::retained_drain_payload_batch(int max_requests) {
     bool drained_any = false;
     for (int taken = 0; taken < max_requests; taken++) {
@@ -1015,6 +1111,29 @@ bool ArgsDumpCollector::retained_drain_payload_batch(int max_requests) {
         }
         drained_any = true;
         const size_t payload_bytes = request.bytes.size();
+        if (request.epoch_slot < 0) {
+            try {
+                if (payload_bytes > 0) {
+                    if (!bin_file_.is_open()) bin_file_.open(run_dir_ / "args.bin", std::ios::binary);
+                    bin_file_.write(
+                        reinterpret_cast<const char *>(request.bytes.data()),
+                        static_cast<std::streamsize>(payload_bytes)
+                    );
+                    if (!bin_file_.good()) ordinary_artifact_failed_.store(true, std::memory_order_release);
+                }
+                bytes_written_ += payload_bytes;
+            } catch (...) {
+                ordinary_artifact_failed_.store(true, std::memory_order_release);
+                std::vector<uint8_t>().swap(request.bytes);
+                retained_budget_.credit(payload_bytes + kRetainedQueueNodeBytes);
+                complete_ordinary_payload();
+                throw;
+            }
+            std::vector<uint8_t>().swap(request.bytes);
+            retained_budget_.credit(payload_bytes + kRetainedQueueNodeBytes);
+            complete_ordinary_payload();
+            continue;
+        }
         if (request.epoch_slot >= 0 && static_cast<size_t>(request.epoch_slot) < retained_epochs_.size()) {
             RetainedEpoch &epoch = retained_epochs_[static_cast<size_t>(request.epoch_slot)];
             if (epoch.epoch.load(std::memory_order_acquire) != request.epoch) {
@@ -1037,9 +1156,6 @@ bool ArgsDumpCollector::retained_drain_payload_batch(int max_requests) {
                     epoch.io_failed.store(true, std::memory_order_relaxed);
                 } else {
                     epoch.payload_bytes_written.fetch_add(payload_bytes, std::memory_order_relaxed);
-                    // Only a write the stream accepted credits a lane: an
-                    // unwritten payload must never be acknowledged.
-                    written_payload_counts_[request.thread_index].fetch_add(1, std::memory_order_release);
                 }
             }
         }
@@ -1053,8 +1169,7 @@ bool ArgsDumpCollector::retained_drain_payload_batch(int max_requests) {
 }
 
 void ArgsDumpCollector::retained_drain_copied_payloads() {
-    if (!retain_across_runs_) return;
-    // Every producer and both writers are joined. Only copied host payloads
+    // Every producer and the payload writer are joined. Only copied host payloads
     // remain; sealing would ask stopped shards to release their references.
     try {
         while (retained_drain_payload_batch(kWriterPayloadBatch)) {}
@@ -1070,8 +1185,8 @@ void ArgsDumpCollector::retained_drain_copied_payloads() {
     }
 }
 
-void ArgsDumpCollector::retained_writer_loop() {
-    while (retained_writer_running_.load(std::memory_order_acquire)) {
+void ArgsDumpCollector::payload_writer_loop() {
+    while (writer_running_.load(std::memory_order_acquire)) {
         uint64_t seen = 0;
         {
             std::scoped_lock<std::mutex> lock(write_mutex_);
@@ -1083,7 +1198,7 @@ void ArgsDumpCollector::retained_writer_loop() {
         // shards keep routing, keep acknowledging the run table, and keep taking
         // payloads into host-owned storage. That is what lets a case stand at
         // the instant where the bytes are owned and the disk has not moved.
-        const bool held = retained_writer_held_.load(std::memory_order_acquire);
+        const bool held = writer_held_.load(std::memory_order_acquire);
         try {
             if (!held) {
                 // Payload first and bounded, then the seals: a continuously
@@ -1098,7 +1213,7 @@ void ArgsDumpCollector::retained_writer_loop() {
             retained_set_fatal("the retained-run writer failed");
         }
         std::unique_lock<std::mutex> lock(write_mutex_);
-        if (!retained_writer_running_.load(std::memory_order_acquire)) break;
+        if (!writer_running_.load(std::memory_order_acquire)) break;
         if (!held && (drained || !write_queue_.empty())) continue;
         if (retained_progress_ != seen) continue;
         // Nothing here needs a clock: a closed run carries the cut proof its
@@ -1199,6 +1314,13 @@ void ArgsDumpCollector::retained_seal(size_t slot) {
     loss.io_failed = epoch.io_failed.load(std::memory_order_relaxed);
     const uint64_t collected = epoch.collected_records.load(std::memory_order_relaxed);
     Verdict verdict = classify(epoch.cut, epoch.records, loss, collected);
+    if (epoch.recorded_window && verdict == Verdict::CountsUnknown && epoch.records.processing_proved &&
+        epoch.cut.cut_known && epoch.cut.failed_queues == 0 && epoch.cut.stage2_done) {
+        if (loss.io_failed) verdict = Verdict::WriteFailed;
+        else if (epoch.recorded_transport_loss.load(std::memory_order_acquire)) verdict = Verdict::CountsUnknown;
+        else if (loss.discarded_args != 0 || loss.discarded_metadata_records != 0) verdict = Verdict::PublishedShort;
+        else verdict = Verdict::RecordedAggregate;
+    }
 
     char detail[kErrorMsgBytes];
     std::snprintf(
@@ -1238,11 +1360,14 @@ bool ArgsDumpCollector::retained_publish_manifest(RetainedEpoch &epoch, Verdict 
     meta.run_dir_name = epoch.run_dir.filename().string();
     meta.dump_args_level = static_cast<uint32_t>(epoch.level);
     meta.truncated_args = epoch.truncated_records.load(std::memory_order_relaxed);
-    meta.dropped_records = epoch.records.dropped_records;
+    meta.dropped_records =
+        epoch.recorded_window ? std::nullopt : std::optional<uint64_t>(epoch.records.dropped_records);
+    meta.recorded_window = epoch.recorded_window;
+    if (epoch.recorded_window) meta.dropped_records_complete = false;
     meta.retained = true;
     meta.host_discarded_args = epoch.discarded_args.load(std::memory_order_relaxed);
     meta.metadata_discarded_records = epoch.discarded_metadata_records.load(std::memory_order_relaxed);
-    meta.counts_unknown = !simpler::dfx::args_dump::verdict_succeeds(verdict);
+    meta.counts_unknown = epoch.recorded_window || !simpler::dfx::args_dump::verdict_succeeds(verdict);
     meta.verdict = simpler::dfx::args_dump::verdict_name(verdict);
     for (const auto &bucket : epoch.buckets) {
         for (const DumpedArg &dt : bucket) {
@@ -1540,7 +1665,7 @@ void ArgsDumpCollector::retained_release_quarantined() {
 void ArgsDumpCollector::hold_retained_writer_for_test(bool held) {
     {
         std::scoped_lock<std::mutex> lock(write_mutex_);
-        retained_writer_held_.store(held, std::memory_order_release);
+        writer_held_.store(held, std::memory_order_release);
         retained_progress_++;
     }
     write_cv_.notify_all();
@@ -1620,7 +1745,6 @@ bool ArgsDumpCollector::can_admit_retained_run() const {
 }
 
 bool ArgsDumpCollector::retained_runs_idle() const {
-    if (!retain_across_runs_) return true;
     std::lock_guard<std::mutex> lk(retained_mu_);
     for (const RetainedEpoch &epoch : retained_epochs_) {
         if (epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) return false;

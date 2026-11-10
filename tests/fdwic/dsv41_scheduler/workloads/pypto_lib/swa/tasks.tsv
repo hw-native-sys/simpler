@@ -1,0 +1,26 @@
+# source_task_id kernel_names lane_mask block_num deferred
+8	hc_collapse_norm	2	10	0
+9	decode_sp_zero_padding	2	80	0
+12	attention_qkv_input_quant_pooled	2	32	0
+16	_proj_q_a	1	20	0
+17	attention_q_norm_quant	2	5	0
+18	attention_q_norm_quant	2	5	0
+19	attention_q_norm_quant	2	5	0
+20	attention_q_norm_quant	2	5	0
+21	attention_q_norm_quant	2	5	0
+22	_proj_q_b	1	32	0
+23	attention_q_rope	2	32	0
+24	_proj_kv	1	8	0
+25	norm_kv	2	9	0
+26	rope_kv	2	5	0
+27	pub_win	2	12	0
+29	swa_decode_cache	2	32	0
+30	swa_attn_shared_aic+swa_attn_shared_aiv	3	32	0
+32	mhc_rms	2	10	0
+34	_hc_linear	1	4	0
+35	mhc_sinkhorn	2	12	0
+37	rope_quant_o_pooled	2	64	0
+38	_o_proj_a	1	32	0
+39	quant_o_a	2	64	0
+40	_o_proj_b	1	20	0
+41	hc_post	2	64	0

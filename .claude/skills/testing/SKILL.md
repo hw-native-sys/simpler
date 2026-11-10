@@ -192,11 +192,21 @@ git diff --name-only
 1. Create a directory under the appropriate arch and runtime:
    - Examples: `examples/{arch}/<runtime>/<name>/`
    - Device-only scene tests: `tests/st/{arch}/<runtime>/<name>/`
-2. Add `test_<name>.py` with a `@scene_test`-decorated class (see [docs/testing.md](../../docs/testing.md) for the full template: `CALLABLE`, `CASES`, `generate_args`, `compute_golden`). End with `if __name__ == "__main__": SceneTestCase.run_module(__name__)` so the file runs standalone.
+2. Add `test_<name>.py` with a `@scene_test`-decorated class (see [writing scene tests](../../../docs/testing/writing-tests.md#new-scene-test) for the full template: `CALLABLE`, `CASES`, `generate_args`, `compute_golden`). End with `if __name__ == "__main__": SceneTestCase.run_module(__name__)` so the file runs standalone.
 3. Omit `CASES[*]["config"]["aicpu_thread_num"]` unless the test specifically exercises a thread-count or scheduler-topology behavior. The default automatically selects the correct count for each architecture; do not copy or pin that default. When an override is necessary, add a nearby comment explaining the test dependency. The framework rejects unknown `config` keys at import time; the accepted keys are `aicpu_thread_num`, `runtime_env`, `device_count`, and `num_sub_workers`, with `ring_task_window`, `ring_heap`, and `ring_dep_pool` under `runtime_env`. Do not set `ring_heap` on a `host_build_graph` case — that runtime commits its graph heap to the size orchestration measured and warns that the knob reached nothing.
 4. Add kernel source files under `kernels/aic/`, `kernels/aiv/`, and/or `kernels/orchestration/` — referenced by `CALLABLE["orchestration"]["source"]` / `CALLABLE["incores"][*]["source"]` as paths relative to the test file.
 5. Pytest auto-discovers any `test_*.py` under `examples/` and `tests/st/`; no registration needed.
-6. If a kernel waits for its siblings — a Mix task's 1C2V, or a sync_start cohort's blocks — **bound the wait by elapsed time, not by a poll count**, and write a poison value when it expires. A poll costs a different amount in the CPU-stub build than on silicon and more again when the machine is busy, so a count calibrated on a quiet box runs out beside other work and the case dies as a killed op instead of reporting its own give-up. Convert a millisecond budget with `PLATFORM_PROF_SYS_CNT_FREQ`, and select the stub clock on `#ifdef PTO_CPUSTUB_HPP` — never on `#ifndef dcci`, which is unconditionally true and compiles the onboard cache maintenance away. Conversely, **do not decide co-residency from whether the wait expired**: use the `assert_cohorts_were_coresident` fixture, which judges interval intersection from the swimlane record. See [docs/testing.md](../../docs/testing.md#kernels-that-wait-for-siblings-mix-sync_start).
+6. If a kernel waits for its siblings — a Mix task's 1C2V, or a sync_start cohort's blocks — **bound the wait by elapsed time, not by a poll count**, and write a poison value when it expires. A poll costs a different amount in the CPU-stub build than on silicon and more again when the machine is busy, so a count calibrated on a quiet box runs out beside other work and the case dies as a killed op instead of reporting its own give-up. Use the clock's matching tick rate: `1'000'000'000` ticks/s for the stub's nanosecond clock and `PLATFORM_PROF_SYS_CNT_FREQ` on device. Select the stub clock on `#ifdef PTO_CPUSTUB_HPP` — never on `#ifndef dcci`, which is unconditionally true and compiles the onboard cache maintenance away. Conversely, **do not decide co-residency from whether the wait expired**: use the `assert_cohorts_were_coresident` fixture, which judges interval intersection from the swimlane record. See [kernels that wait for siblings](../../../docs/testing/writing-tests.md#kernels-that-wait-for-siblings-mix-sync_start).
+
+`assert_cohorts_were_coresident` is discovered automatically only under
+`tests/st/a5/host_build_graph`. Tests outside that subtree must expose the
+fixture in their own test module or local `conftest.py`, for example:
+
+```python
+from tests.st.a5.host_build_graph.conftest import (
+    assert_cohorts_were_coresident as assert_cohorts_were_coresident,
+)
+```
 
 ## Related Skills
 

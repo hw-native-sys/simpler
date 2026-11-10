@@ -24,11 +24,14 @@ import argparse
 import json
 import logging
 import math
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Callable, NamedTuple
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
+_RECORDED_PREVIEW_ROWS = 1000
 
 
 class Resource(NamedTuple):
@@ -93,11 +96,21 @@ def _metrics(resource: str) -> list[Metric]:
     ]
 
 
-def _load(jsonl_path: Path) -> tuple[dict, list[dict]]:
-    lines = jsonl_path.read_text().splitlines()
-    meta = json.loads(lines[0]) if lines else {}
-    records = [json.loads(line) for line in lines[1:] if line.strip()]
-    return meta, records
+def _load(jsonl_path: Path) -> tuple[dict, list[dict], int]:
+    with jsonl_path.open() as source:
+        first = source.readline()
+        meta = json.loads(first) if first else {}
+        recorded = meta.get("recorded_window")
+        records = []
+        sample_count = 0
+        for line in source:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            sample_count += 1
+            if not recorded or len(records) < _RECORDED_PREVIEW_ROWS:
+                records.append(record)
+    return meta, records, sample_count
 
 
 def _resource_size(meta: dict, resource: str, ring: int) -> int | None:
@@ -422,6 +435,78 @@ def _summary_html(meta: dict, pairs_by_ring: dict[int, list[tuple[dict, dict]]],
 {_formula_guide_html(resources)}
 {_top_peaks_html(entries)}
 """
+
+
+def _recorded_window_html(meta: dict, records: list[dict], jsonl_name: str, sample_count: int, jsonl_href: str) -> str:
+    counts = []
+    for key, label in (("host_received_records", "Host received"), ("host_retained_records", "Host retained")):
+        count = meta.get(key)
+        counts.append(
+            f"<span>{label}: {int(count)} records</span>" if count is not None else f"<span>{label}: unknown</span>"
+        )
+    received, retained = meta.get("host_received_records"), meta.get("host_retained_records")
+    storage_loss = ""
+    if received is not None and retained is not None and received > retained:
+        storage_loss = (
+            f"<p>Host storage did not retain {int(received - retained)} received samples; device loss is unknown.</p>"
+        )
+    capacities = []
+    for resource, info in RESOURCES.items():
+        values = meta.get(f"{resource}_max")
+        rings = range(len(values)) if isinstance(values, list) else (None,)
+        for ring in rings:
+            value = _resource_size(meta, resource, ring or 0)
+            size = _fmt_value(value / info.divisor, info.unit) if value is not None else "unknown"
+            scope = "global" if ring is None else f"ring_depth {ring}"
+            capacities.append(f"<tr><td>{_esc(info.label)}</td><td>{scope}</td><td>{size}</td></tr>")
+    fields = (
+        ("site", "Site"),
+        ("phase", "Phase"),
+        ("depth", "Depth"),
+        ("ring", "Ring"),
+        ("run_epoch", "Window identity"),
+        ("buf_seq", "Buffer sequence"),
+        ("task_window_start", "Task tail"),
+        ("task_window_end", "Task head"),
+        ("heap_start", "Heap tail (bytes)"),
+        ("heap_end", "Heap head (bytes)"),
+        ("dep_pool_start", "Dep tail"),
+        ("dep_pool_end", "Dep head"),
+        ("tensormap", "TensorMap live"),
+    )
+    headings = "<th>Sample</th>" + "".join(f"<th>{label}</th>" for _key, label in fields)
+    rows = [
+        f"<tr><td>{index}</td>"
+        + "".join(f"<td>{_esc(record.get(key, 'unknown'))}</td>" for key, _label in fields)
+        + "</tr>"
+        for index, record in enumerate(records)
+    ]
+    if not rows:
+        rows.append(f'<tr><td colspan="{len(fields) + 1}">No retained boundary samples.</td></tr>')
+    preview = (
+        f"Showing the first {len(records):,} of {sample_count:,} boundary samples in this JSONL. Preview truncated."
+        if len(records) < sample_count
+        else f"Showing all {sample_count:,} boundary samples in this JSONL."
+    )
+    return (
+        '<header class="report-head"><p class="eyebrow">scope_stats report</p>'
+        f"<h1>{_esc(jsonl_name)}</h1><h2>Recorded collection window</h2>"
+        '<div class="run-meta"><span class="status warn">Device statistics unknown</span>'
+        "<span>Device total: unknown</span><span>Device dropped: unknown</span>"
+        f"<span>Device fatal: unknown</span>{''.join(counts)}</div>"
+        '<p class="subtle">Replays carry the same window identity. Buffer sequence is not a replay identifier. '
+        "Samples are not paired across replays; per-scope allocation, duration and peak are not inferred. "
+        f"An empty window does not prove zero replays or zero loss.</p>{storage_loss}</header>"
+        '<section class="panel"><h2>Bound capacities</h2>'
+        "<p>These capacities were saved when the node was prepared.</p>"
+        "<table><thead><tr><th>Resource</th><th>Scope</th><th>Capacity</th></tr></thead>"
+        f"<tbody>{''.join(capacities)}</tbody></table></section>"
+        '<section class="panel"><h2>Raw boundary samples</h2>'
+        f'<p>{preview} <a href="{_esc(jsonl_href)}">Complete raw JSONL</a>.</p>'
+        "<p>Rows preserve received sample order and measured boundary values; missing fields remain unknown.</p>"
+        f'<div style="overflow-x:auto"><table><thead><tr>{headings}</tr></thead>'
+        f"<tbody>{''.join(rows)}</tbody></table></div></section>"
+    )
 
 
 def _top_peaks_html(entries: list[dict]) -> str:
@@ -923,22 +1008,26 @@ _SCRIPT = """
 def process(jsonl_path: Path, out_dir: Path | None = None) -> list[Path]:
     out_dir = out_dir or jsonl_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    meta, records = _load(jsonl_path)
-    pairs_by_ring = _pair_by_ring(records)
+    meta, records, sample_count = _load(jsonl_path)
+    if meta.get("recorded_window"):
+        jsonl_href = quote(os.path.relpath(jsonl_path.resolve(), out_dir.resolve()))
+        body = [_recorded_window_html(meta, records, jsonl_path.name, sample_count, jsonl_href)]
+    else:
+        pairs_by_ring = _pair_by_ring(records)
 
-    body = [_summary_html(meta, pairs_by_ring, jsonl_path.name)]
-    unpaired_count = len(records) - 2 * sum(len(pairs) for pairs in pairs_by_ring.values())
-    if unpaired_count:
-        body.append(
-            '<section class="panel"><h2>Unpaired evidence</h2>'
-            f"<p>{unpaired_count} unpaired records are excluded from per-scope charts. "
-            f'See the raw JSONL in <span class="mono">{_esc(jsonl_path.name)}</span> for these samples; '
-            "no matching scope boundary was retained.</p></section>"
-        )
-    for resource in RESOURCES:
-        section = _resource_section(resource, meta, pairs_by_ring)
-        if section:
-            body.append(section)
+        body = [_summary_html(meta, pairs_by_ring, jsonl_path.name)]
+        unpaired_count = len(records) - 2 * sum(len(pairs) for pairs in pairs_by_ring.values())
+        if unpaired_count:
+            body.append(
+                '<section class="panel"><h2>Unpaired evidence</h2>'
+                f"<p>{unpaired_count} unpaired records are excluded from per-scope charts. "
+                f'See the raw JSONL in <span class="mono">{_esc(jsonl_path.name)}</span> for these samples; '
+                "no matching scope boundary was retained.</p></section>"
+            )
+        for resource in RESOURCES:
+            section = _resource_section(resource, meta, pairs_by_ring)
+            if section:
+                body.append(section)
 
     out_path = out_dir / "scope_stats.html"
     html = (

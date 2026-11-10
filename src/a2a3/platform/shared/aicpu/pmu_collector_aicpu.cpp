@@ -40,15 +40,11 @@
 static uint64_t g_platform_pmu_base = 0;
 static bool g_enable_pmu = false;
 
-// Where this run's producer accounting is published, and which bank of it is
-// this run's. Zero means the host mapped none, which is the default path: the
-// host owns the counter reset and reads the live counters, as it does without
-// retention.
 /**
- * This run's terminal bank — the address of its first producer entry — pushed
- * at kernel entry from the launching run's KernelArgs. 0 means the host
- * resolved none, which is every run with this collector's retention off, and
- * is what keeps the device off an address nobody mapped.
+ * Optional per-invocation producer-accounting bank, supplied by KernelArgs.
+ * Zero disables terminal publication: ordinary serialized collection reads live
+ * accounting, while recorded windows cannot use replay-reset counters as a
+ * cumulative total. Device entry resets per-core accounting in either case.
  */
 static uint64_t s_run_terminal_bank = 0;
 

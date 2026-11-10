@@ -89,8 +89,26 @@ TEST(NativeInvocationEntry, MissingRegionCompatibilityAndHalfBindingRefusal) {
     publisher.take({DeviceRunVerdict::Ok, 0, DeviceRunCodeSource::None}, nullptr, 0);
     ASSERT_TRUE(publisher.handoff());
     EXPECT_EQ(aicpu_finish_native_invocation(0, 0), 0);
-    ASSERT_NE(aicpu_begin_native_invocation(1, 0, 7), 0);
+    NativeInvocationResultStorage storage;
+    ASSERT_NE(aicpu_begin_native_invocation(1, reinterpret_cast<uint64_t>(&storage), 0), 0);
     EXPECT_NE(aicpu_finish_native_invocation(0, -1), 0);
+}
+
+TEST(NativeInvocationEntry, UnrequestedRecordKeepsTheInvocationIdentityAndSignedErrors) {
+    for (int error : {0, -73}) {
+        ASSERT_EQ(aicpu_begin_native_invocation(2, 0, 719), 0);
+        EXPECT_EQ(get_platform_run_result_epoch(), 719u);
+        RunTerminalPublisher publisher;
+        publisher.take({DeviceRunVerdict::Ok, 0, DeviceRunCodeSource::None}, nullptr, 0);
+        ASSERT_TRUE(publisher.handoff());
+        EXPECT_EQ(aicpu_finish_native_invocation(0, error), 0);
+        EXPECT_EQ(aicpu_finish_native_invocation(1, 0), error);
+    }
+    ASSERT_EQ(aicpu_begin_native_invocation(1, 0, 720), 0);
+    EXPECT_NE(aicpu_finish_native_invocation(0, 0), 0);
+    ASSERT_EQ(aicpu_begin_native_invocation(1, 0, 721), 0);
+    ASSERT_TRUE(aicpu_accept_runtime_terminal({DeviceRunVerdict::Error, -74, DeviceRunCodeSource::Header}, nullptr, 0));
+    EXPECT_EQ(aicpu_finish_native_invocation(0, 0), -74);
 }
 
 TEST(NativeInvocationEntry, InitializerFailureIsReturnedOnlyByLastCallback) {
@@ -220,7 +238,7 @@ TEST(NativeInvocationEntry, InvalidPublicationBindingFailsSuccessButPreservesOri
         );
         ASSERT_TRUE(publisher.handoff());
         // Deliberately violate the binding contract, not a simulated DMA fault.
-        set_platform_run_result(0, 7);
+        set_platform_run_result(reinterpret_cast<uint64_t>(&storage), 0);
         EXPECT_EQ(aicpu_finish_native_invocation(0, 0), code == 0 ? -1 : code);
         EXPECT_EQ(storage.result.published, 0u);
         EXPECT_EQ(

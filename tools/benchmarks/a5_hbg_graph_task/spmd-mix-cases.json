@@ -1,0 +1,423 @@
+{
+  "selection": "Supplemental SPMD/MIX scene matrix; protocol/refusal/forced-diagnostic tests retain their functional contracts and are not timed as normal L1 throughput.",
+  "scenes": [
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "chain16_mask7",
+      "params": {
+        "graph_case": 0,
+        "mask": 7
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "ordinary_mix_interleaved",
+      "params": {
+        "graph_case": 2,
+        "mask": 7
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_mixed_waves/test_spmd_mixed_waves.py",
+      "class": "TestSpmdMixedWaves",
+      "case": "waves_40x24_stress",
+      "params": {
+        "rounds": 40,
+        "width": 24,
+        "seed": 1
+      },
+      "config": {
+        "runtime_env": {
+          "ring_task_window": 4096
+        }
+      },
+      "manual": true,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_multiblock_aic/test_spmd_multiblock_aic.py",
+      "class": "TestSpmdMultiblockAic",
+      "case": "aiv_block_num_128_waves",
+      "params": {
+        "blocks": 128,
+        "aiv": 1
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestMixKernelRendezvous",
+      "case": "burst256_mask6",
+      "params": {
+        "mask": 6,
+        "task_count": 256
+      },
+      "config": {},
+      "manual": false,
+      "markers": [],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestMixKernelRendezvous",
+      "case": "burst256_mask7",
+      "params": {
+        "mask": 7,
+        "task_count": 256
+      },
+      "config": {},
+      "manual": false,
+      "markers": [],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "chain16_mask3",
+      "params": {
+        "graph_case": 0,
+        "mask": 3
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "chain16_mask5",
+      "params": {
+        "graph_case": 0,
+        "mask": 5
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "chain16_mask6",
+      "params": {
+        "graph_case": 0,
+        "mask": 6
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "burst16_mask3",
+      "params": {
+        "graph_case": 1,
+        "mask": 3
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "burst16_mask5",
+      "params": {
+        "graph_case": 1,
+        "mask": 5
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "burst16_mask6",
+      "params": {
+        "graph_case": 1,
+        "mask": 6
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "burst16_mask7",
+      "params": {
+        "graph_case": 1,
+        "mask": 7
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_last_block_releases/test_spmd_last_block_releases.py",
+      "class": "TestSpmdLastBlockReleases",
+      "case": "sum_of_8_blocks",
+      "params": {
+        "blocks": 8,
+        "repeats": 200000
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_legacy_fallback/test_spmd_legacy_fallback.py",
+      "class": "TestSpmdShapeSelection",
+      "case": "aic_root_block_num_2",
+      "params": {
+        "require_sync_start": false
+      },
+      "config": {},
+      "manual": false,
+      "markers": [],
+      "measure": true,
+      "timing_requires_golden": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_legacy_fallback/test_spmd_legacy_fallback.py",
+      "class": "TestSpmdShapeSelection",
+      "case": "aic_root_sync_start_block_num_2",
+      "params": {
+        "require_sync_start": true
+      },
+      "config": {},
+      "manual": false,
+      "markers": [],
+      "measure": true,
+      "timing_requires_golden": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_mix_block_closes_last/test_spmd_mix_block_closes_last.py",
+      "class": "TestSpmdMixBlockClosesLast",
+      "case": "mix_blocks_6",
+      "params": {
+        "blocks": 6,
+        "repeats": 200000
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_mixed_waves/test_spmd_mixed_waves.py",
+      "class": "TestSpmdMixedWaves",
+      "case": "waves_4x8",
+      "params": {
+        "rounds": 4,
+        "width": 8,
+        "seed": 0
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_mixed_waves/test_spmd_mixed_waves.py",
+      "class": "TestSpmdMixedWaves",
+      "case": "waves_4x8_shifted",
+      "params": {
+        "rounds": 4,
+        "width": 8,
+        "seed": 3
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_multi_fanin/test_spmd_multi_fanin.py",
+      "class": "TestSpmdMultiFanin",
+      "case": "fanin_4_into_spmd",
+      "params": {
+        "aic_blocks": 4,
+        "aiv_blocks": 3,
+        "consumer_blocks": 6,
+        "repeats": 40000
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_multiblock_aic/test_spmd_multiblock_aic.py",
+      "class": "TestSpmdMultiblockAic",
+      "case": "aic_block_num_8",
+      "params": {
+        "blocks": 8,
+        "aiv": 0
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_multiblock_aic/test_spmd_multiblock_aic.py",
+      "class": "TestSpmdMultiblockAic",
+      "case": "aiv_block_num_16",
+      "params": {
+        "blocks": 16,
+        "aiv": 1
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_paged_attention/test_spmd_paged_attention.py",
+      "class": "TestSpmdPagedAttentionHbgA5",
+      "case": "Case1",
+      "params": {
+        "batch": 256,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": true,
+      "markers": [],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_paged_attention/test_spmd_paged_attention.py",
+      "class": "TestSpmdPagedAttentionHbgA5",
+      "case": "Case2",
+      "params": {
+        "batch": 64,
+        "num_heads": 64,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 64,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": true,
+      "markers": [],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_paged_attention/test_spmd_paged_attention.py",
+      "class": "TestSpmdPagedAttentionHbgA5",
+      "case": "SmallCase1",
+      "params": {
+        "batch": 24,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16"
+      },
+      "config": {},
+      "manual": true,
+      "markers": [],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_releases_spmd/test_spmd_releases_spmd.py",
+      "class": "TestSpmdReleasesSpmd",
+      "case": "chain_of_4_spmd_stages",
+      "params": {
+        "blocks": 6,
+        "stages": 4,
+        "repeats": 30000
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_sync_start_mix_aiv/test_spmd_sync_start_mix_aiv.py",
+      "class": "TestSpmdSyncStartMixAiv",
+      "case": "mix_aiv_cohort_8",
+      "params": {
+        "blocks": 8
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true
+    }
+  ]
+}

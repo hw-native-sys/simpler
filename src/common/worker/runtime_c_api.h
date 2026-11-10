@@ -1163,7 +1163,8 @@ int simpler_validate_execution_context(DeviceContextHandle ctx);
  * execution environment, stream and device tensors remain valid through all
  * model/external uses and resource-reference release. Prepare runs outside
  * capture. An active capture requires a resource reference retained before
- * CaptureBegin, no diagnostics, and no predecessor. The same task sequence is
+ * CaptureBegin and no predecessor. Supported diagnostics are ScopeStats alone
+ * on A3 TMR, or one of PMU, ArgsDump and Swimlane on A3 TMR/HBG. The same task sequence is
  * recorded once; an invalidated capture is refused before publication.
  * `predecessor`, when non-null outside capture, has the joined-launch contract.
  *
@@ -1281,6 +1282,13 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  */
 int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs);
 
+// Internal same-build framework owner operations. Transfer requires independently
+// retired eager DEVICE/NONE work without requested diagnostics/model references.
+// Observation acknowledges a stored original pair only on a returned zero.
+// A prior error remains the return verdict even after all_observed becomes one.
+int simpler_transfer_completed_kernel_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+int simpler_observe_framework_submissions(DeviceContextHandle ctx, int *all_observed);
+
 /**
  * Retain preparation backing independently of the original run. Call before
  * CaptureBegin on a Prepared run; exactly one retention is allowed per run.
@@ -1289,9 +1297,14 @@ int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle ru
  * does not advertise capture/replay support on this backend.
  *
  * Onboard Program and Kernel retain their actual internal backing, including
- * Program input staging. Diagnostic backing is not yet covered and is refused;
- * sim returns UNSUPPORTED. Borrowed context, caller stream and device tensor
- * addresses must remain valid through successful release. Internal code,
+ * Program input staging; Program execution remains eager-only. Kernel A3 TMR
+ * additionally retains ScopeStats-only diagnostic windows; A3 TMR/HBG retain
+ * PMU-only, ArgsDump-only or Swimlane-only windows. All producers sharing a
+ * diagnostic pool must be caller-ordered
+ * and stopped during resource-reference release. Other diagnostic combinations
+ * are refused; sim returns
+ * UNSUPPORTED. Borrowed context, caller stream and device tensor addresses
+ * must remain valid through successful release. Internal code,
  * workspace, staging, arguments, streams and events stay protected.
  */
 int simpler_retain_run_resources(

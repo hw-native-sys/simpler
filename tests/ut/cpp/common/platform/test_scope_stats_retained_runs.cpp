@@ -32,6 +32,7 @@
 
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
+#include "host/raii_scope_guard.h"
 
 #include <chrono>
 #include <cstdint>
@@ -40,15 +41,55 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <mutex>
 #include <iterator>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 #include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 namespace runs = simpler::dfx::runs;
 namespace scope_runs = simpler::dfx::scope_stats_runs;
+
+struct ScopeStatsCollectorTestPeer {
+    static std::unique_lock<std::mutex> hold_records(ScopeStatsCollector &collector) {
+        return std::unique_lock<std::mutex>(collector.records_mutex_);
+    }
+    static auto records_native_handle(ScopeStatsCollector &collector) {
+        return collector.records_mutex_.native_handle();
+    }
+    // The caller owns the same lock as append_buffer_records.
+    static bool ordinary_epoch_bound(const ScopeStatsCollector &collector) {
+        return collector.ordinary_run_epoch_.has_value();
+    }
+};
+
+#if defined(__linux__)
+namespace {
+struct ScopeAdmissionLockGate {
+    pthread_mutex_t *target;
+    std::promise<void> reached;
+    std::shared_future<void> proceed;
+};
+thread_local ScopeAdmissionLockGate *scope_admission_lock_gate = nullptr;
+}  // namespace
+
+extern "C" int __real_pthread_mutex_lock(pthread_mutex_t *mutex);
+extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
+    auto *gate = scope_admission_lock_gate;
+    if (gate != nullptr && gate->target == mutex) {
+        scope_admission_lock_gate = nullptr;
+        gate->reached.set_value();
+        gate->proceed.wait();
+    }
+    return __real_pthread_mutex_lock(mutex);
+}
+#endif
 
 namespace {
 
@@ -98,9 +139,9 @@ struct RetainedFixture {
     OutputRoot root;
     void *shm = nullptr;
 
-    explicit RetainedFixture(const char *name) :
+    explicit RetainedFixture(const char *name, bool retain = true) :
         root(name) {
-        collector.configure_retained_runs(true, runs::kDefaultBudgetBytes);
+        collector.configure_retained_runs(retain, runs::kDefaultBudgetBytes);
         EXPECT_EQ(collector.init(/*num_threads=*/1, retained_alloc, nullptr, retained_free, /*device_id=*/0), 0);
         shm = collector.get_scope_stats_shm_device_ptr();
         EXPECT_NE(shm, nullptr);
@@ -1075,4 +1116,351 @@ TEST(ScopeStatsRunTerminal, RuntimeWithoutRingCapacitiesKeepsItsExistingMetadata
     std::string error;
     ASSERT_TRUE(fx.flush(&error)) << error;
     EXPECT_NE(read_file(fx.root.artifact("run-a")).find("\"tensormap_max\": 0"), std::string::npos);
+}
+
+TEST(ScopeStatsRetainedRuns, RepeatedFixedIdentityExportsDeliveredRecordsWithoutPerReplayTotals) {
+    RetainedFixture f("fixed_identity");
+    constexpr uint64_t epoch = 0x7711;
+    scope_runs::CapacityMetadata capacities{
+        true, scope_runs::Capacities{{8, 16, 32, 64}, {5, 7, 9, 11}, {1025, 2049, 4097, 8193}, 17}
+    };
+    f.collector.start(retained_thread_factory);
+    ASSERT_TRUE(f.collector.begin_recorded_window(epoch, f.root.prefix("model").string(), capacities));
+    set_platform_run_result(0, epoch);
+    for (int round = 0; round < 3; ++round) {
+        set_platform_scope_stats_base(reinterpret_cast<uint64_t>(f.shm));
+        scope_stats_aicpu_begin_run();
+        scope_stats_set_pending_site("recorded.cpp", 310 + round);
+        scope_stats_begin(0, round, round + 1, 1024, 2048 + round, 1, 2, 3);
+        scope_stats_end(0, round, round + 2, 1024, 3072 + round, 1, 3, 4);
+        scope_stats_aicpu_flush_buffers();
+        scope_stats_aicpu_close_run();
+    }
+    capacities.values->task_window[0] = 999;
+    f.collector.begin_run(0x7722, &capacities);
+    ASSERT_EQ(f.collector.close_recorded_window(epoch), 0);
+    std::string error;
+    EXPECT_TRUE(f.flush(&error)) << error;
+    const std::string artifact = read_file(f.root.artifact("model"));
+    EXPECT_EQ(record_lines(artifact), 6u);
+    EXPECT_NE(artifact.find("\"task_window_max\": [8, 16, 32, 64]"), std::string::npos) << artifact;
+    EXPECT_EQ(artifact.find("999"), std::string::npos) << artifact;
+    EXPECT_NE(artifact.find("\"total\": null"), std::string::npos) << artifact;
+    EXPECT_NE(artifact.find("\"dropped\": null"), std::string::npos) << artifact;
+    EXPECT_NE(artifact.find("\"fatal\": null"), std::string::npos) << artifact;
+    EXPECT_NE(artifact.find("\"counts_unknown\": true"), std::string::npos) << artifact;
+    EXPECT_NE(artifact.find("\"recorded_window\": true"), std::string::npos) << artifact;
+}
+
+TEST(ScopeStatsRetainedRuns, ExplicitZeroBudgetRefusesOrdinaryAndRecordedAdmission) {
+    RetainedFixture f("zero-budget");
+    f.collector.configure_retained_runs(true, 0);
+    EXPECT_FALSE(f.collector.run_begin(7001, f.root.prefix("ordinary").string()));
+    scope_runs::CapacityMetadata capacities;
+    capacities.required = false;
+    EXPECT_FALSE(f.collector.begin_recorded_window(7002, f.root.prefix("recorded").string(), capacities));
+    EXPECT_EQ(f.collector.retained_run_stats_for_test().open_slots, 0u);
+    EXPECT_EQ(f.collector.retained_run_stats_for_test().charged_bytes, 0u);
+}
+
+TEST(ScopeStatsRetainedRuns, ARecordedHandoffFailureSettlesResourcesAndReportsDiagnosticLossOnce) {
+    RetainedFixture f("recorded-handoff");
+    constexpr uint64_t epoch = 7100;
+    scope_runs::CapacityMetadata capacities;
+    capacities.required = false;
+    f.collector.start(retained_thread_factory);
+    ASSERT_TRUE(f.collector.begin_recorded_window(epoch, f.root.prefix("model").string(), capacities));
+    set_platform_run_result(0, epoch);
+    scope_stats_aicpu_begin_run();
+    f.produce(epoch, 1, true, "lost.cpp");
+    f.collector.fail_handoff_for_test(true);
+    EXPECT_EQ(f.collector.close_recorded_window(epoch), 0);
+    const auto settled = f.collector.retained_run_stats_for_test();
+    EXPECT_FALSE(f.collector.recorded_windows_open());
+    EXPECT_EQ(settled.open_slots, 0u);
+    EXPECT_EQ(settled.write_failed, 1u);
+    EXPECT_TRUE(settled.has_error);
+    EXPECT_FALSE(fs::exists(f.root.artifact("model")));
+    EXPECT_EQ(f.collector.close_recorded_window(epoch), 0);
+    const auto repeated = f.collector.retained_run_stats_for_test();
+    EXPECT_EQ(repeated.write_failed, settled.write_failed);
+    EXPECT_EQ(repeated.charged_bytes, settled.charged_bytes);
+}
+
+TEST(ScopeStatsRetainedRuns, TwoRecordedWindowsSurviveRepeatedProducerInitAndOrdinaryReset) {
+    for (bool retain : {false, true}) {
+        SCOPED_TRACE(retain);
+        RetainedFixture f(retain ? "windows-retained" : "windows-ordinary", retain);
+        scope_runs::CapacityMetadata capacities;
+        capacities.required = false;
+        f.collector.start(retained_thread_factory);
+        ASSERT_TRUE(f.collector.begin_recorded_window(7201, f.root.prefix("a").string(), capacities));
+        ASSERT_TRUE(f.collector.begin_recorded_window(7202, f.root.prefix("b").string(), capacities));
+        EXPECT_FALSE(f.collector.begin_recorded_window(7203, f.root.prefix("full").string(), capacities));
+        for (int round = 0; round < 3; ++round) {
+            for (uint64_t epoch : {7201, 7202}) {
+                set_platform_scope_stats_base(reinterpret_cast<uint64_t>(f.shm));
+                set_platform_run_result(0, epoch);
+                scope_stats_aicpu_begin_run();
+                scope_stats_set_pending_site(epoch == 7201 ? "a.cpp" : "b.cpp", 400 + round);
+                scope_stats_begin(0, round, round + 1, epoch, epoch + round, 1, 2, 3);
+                scope_stats_end(0, round, round + 2, epoch, epoch + round + 1, 1, 3, 4);
+                scope_stats_aicpu_flush_buffers();
+                scope_stats_aicpu_close_run();
+            }
+        }
+        if (!retain) {
+            f.collector.begin_run(7300, &capacities);
+            set_platform_run_result(0, 7300);
+            scope_stats_aicpu_begin_run();
+            f.produce(7300, 1, true, "ordinary.cpp");
+            ASSERT_EQ(f.collector.close_ordinary_run(f.root.prefix("ordinary").string(), true), 0);
+        }
+        EXPECT_EQ(f.collector.close_recorded_window(7201), 0);
+        EXPECT_TRUE(f.collector.recorded_window_open(7202));
+        set_platform_run_result(0, 7202);
+        scope_stats_aicpu_begin_run();
+        f.produce(7202, 1, true, "b-more.cpp");
+        scope_stats_aicpu_close_run();
+        EXPECT_EQ(f.collector.close_recorded_window(7202), 0);
+        std::string error;
+        EXPECT_TRUE(f.flush(&error)) << error;
+        const auto a = read_file(f.root.artifact("a"));
+        const auto b = read_file(f.root.artifact("b"));
+        EXPECT_EQ(record_lines(a), 6u) << a;
+        EXPECT_EQ(record_lines(b), 8u) << b;
+        EXPECT_EQ(a.find("b.cpp"), std::string::npos);
+        EXPECT_EQ(b.find("a.cpp"), std::string::npos);
+        EXPECT_NE(a.find("\"total\": null"), std::string::npos);
+        EXPECT_NE(b.find("\"total\": null"), std::string::npos);
+        EXPECT_FALSE(f.collector.recorded_windows_open());
+    }
+}
+
+TEST(ScopeStatsRetainedRuns, LateRecordedReceiptsDoNotChangeOrdinaryRunAccounting) {
+    for (bool retain : {false, true}) {
+        SCOPED_TRACE(retain);
+        RetainedFixture f(retain ? "late-recorded-retained" : "late-recorded-ordinary", retain);
+        scope_runs::CapacityMetadata capacities;
+        capacities.required = false;
+        ASSERT_TRUE(f.collector.begin_recorded_window(7401, f.root.prefix("recorded").string(), capacities));
+        set_platform_run_result(0, 7401);
+        scope_stats_aicpu_begin_run();
+        f.produce(7401, 1, true, "recorded-late.cpp");
+        scope_stats_aicpu_close_run();
+        if (retain) {
+            ASSERT_TRUE(f.collector.run_begin(7402, f.root.prefix("ordinary").string(), nullptr, &capacities));
+        } else {
+            f.collector.begin_run(7402, &capacities);
+        }
+        set_platform_run_result(0, 7402);
+        scope_stats_aicpu_begin_run();
+        f.produce(7402, 1, true, "ordinary-only.cpp");
+        scope_stats_aicpu_close_run();
+        // Both real producer publications wait in the device-ready queue until
+        // the ordinary accumulator has begun. Only then do real readers start.
+        f.collector.start(retained_thread_factory);
+        ASSERT_TRUE(f.wait_for_collected(4));
+        EXPECT_TRUE(f.collector.reconcile_counters());
+        if (retain) {
+            f.collector.run_close(7402, true);
+        } else {
+            ASSERT_EQ(f.collector.close_ordinary_run(f.root.prefix("ordinary").string(), false), 0);
+        }
+        EXPECT_EQ(f.collector.close_recorded_window(7401), 0);
+        std::string error;
+        EXPECT_TRUE(f.flush(&error)) << error;
+        const auto ordinary = read_file(f.root.artifact("ordinary"));
+        EXPECT_EQ(record_lines(ordinary), 2u) << ordinary;
+        EXPECT_NE(ordinary.find("ordinary-only.cpp"), std::string::npos) << ordinary;
+        EXPECT_EQ(ordinary.find("recorded-late.cpp"), std::string::npos) << ordinary;
+        EXPECT_NE(ordinary.find("\"host_received_records\": 2"), std::string::npos) << ordinary;
+        if (retain) EXPECT_NE(ordinary.find("\"counts_unknown\": false"), std::string::npos) << ordinary;
+        const auto recorded = read_file(f.root.artifact("recorded"));
+        EXPECT_EQ(record_lines(recorded), 2u) << recorded;
+        EXPECT_EQ(recorded.find("ordinary-only.cpp"), std::string::npos) << recorded;
+    }
+}
+
+TEST(ScopeStatsRetainedRuns, RecordedWriterFailureReportsLossWithoutReopeningDeviceOwnership) {
+    RetainedFixture f("recorded-writer-failure", false);
+    const scope_runs::CapacityMetadata capacities{false, std::nullopt};
+    ASSERT_TRUE(f.collector.begin_recorded_window(7501, f.root.prefix("model").string(), capacities));
+    f.collector.start(retained_thread_factory);
+    set_platform_run_result(0, 7501);
+    scope_stats_aicpu_begin_run();
+    f.produce(7501, 1, true, "writer-failure.cpp");
+    scope_stats_aicpu_close_run();
+    f.collector.throw_in_writer_for_test(true);
+    EXPECT_EQ(f.collector.close_recorded_window(7501), 0);
+    EXPECT_FALSE(f.collector.recorded_windows_open());
+    std::string error;
+    EXPECT_FALSE(f.flush(&error));
+    EXPECT_FALSE(fs::exists(f.root.artifact("model")));
+    EXPECT_EQ(f.collector.close_recorded_window(7501), 0);
+    const auto stats = f.collector.retained_run_stats_for_test();
+    EXPECT_EQ(stats.open_slots, 0u);
+    EXPECT_EQ(stats.write_failed, 1u);
+    EXPECT_TRUE(stats.has_error);
+}
+
+TEST(ScopeStatsRetainedRuns, RecordedHostBudgetLossRemainsVisibleAfterSafeClose) {
+    RetainedFixture f("recorded-budget", false);
+    f.collector.configure_retained_runs(false, 18ull * 1024 * 1024);
+    const scope_runs::CapacityMetadata capacities{false, std::nullopt};
+    ASSERT_TRUE(f.collector.begin_recorded_window(7502, f.root.prefix("model").string(), capacities));
+    ScopeStatsBuffer buffer{};
+    buffer.run_epoch = 7502;
+    buffer.count = PLATFORM_SCOPE_STATS_RECORDS_PER_BUFFER;
+    for (uint32_t i = 0; i < buffer.count; ++i) {
+        std::strcpy(buffer.records[i].site_file_basename, "host-budget.cpp");
+        buffer.records[i].phase = SCOPE_STATS_PHASE_BEGIN;
+    }
+    ScopeStatsReadyBufferInfo info{};
+    info.host_buffer_ptr = &buffer;
+    for (unsigned batch = 0; batch < 600; ++batch)
+        f.collector.on_buffer_collected(info);
+    EXPECT_EQ(f.collector.close_recorded_window(7502), 0);
+    EXPECT_FALSE(f.collector.recorded_windows_open());
+    std::string error;
+    EXPECT_FALSE(f.flush(&error));
+    const std::string artifact = read_file(f.root.artifact("model"));
+    const uint64_t received = 600ull * PLATFORM_SCOPE_STATS_RECORDS_PER_BUFFER;
+    EXPECT_NE(artifact.find("\"host_received_records\": " + std::to_string(received)), std::string::npos);
+    EXPECT_NE(artifact.find("\"recorded_window\": true"), std::string::npos);
+    EXPECT_NE(artifact.find("\"counts_unknown\": true"), std::string::npos);
+    EXPECT_LT(record_lines(artifact), received);
+    EXPECT_GT(f.collector.retained_run_stats_for_test().refused_records, 0u);
+    EXPECT_EQ(f.collector.retained_run_stats_for_test().open_slots, 0u);
+}
+
+TEST(ScopeStatsRetainedRuns, RecordedLossSummaryExcludesAnOpenOrdinaryAccumulatorsRefusals) {
+    RetainedFixture f("recorded-vs-ordinary-loss");
+    f.collector.configure_retained_runs(true, 18ull * 1024 * 1024);
+    const scope_runs::CapacityMetadata capacities{false, std::nullopt};
+    ASSERT_TRUE(f.collector.begin_recorded_window(7601, f.root.prefix("model").string(), capacities));
+    ASSERT_TRUE(f.collector.run_begin(7602, f.root.prefix("ordinary").string(), nullptr, &capacities));
+    ScopeStatsBuffer buffer{};
+    buffer.run_epoch = 7602;
+    buffer.count = PLATFORM_SCOPE_STATS_RECORDS_PER_BUFFER;
+    ScopeStatsReadyBufferInfo info{};
+    info.host_buffer_ptr = &buffer;
+    for (unsigned batch = 0; batch < 600; ++batch)
+        f.collector.on_buffer_collected(info);
+    // The shared host budget is exhausted by the still-open ordinary run.
+    // Only this two-record refusal belongs to the recorded window being closed.
+    buffer.run_epoch = 7601;
+    buffer.count = 2;
+    f.collector.on_buffer_collected(info);
+    EXPECT_EQ(f.collector.close_recorded_window(7601), 0);
+    EXPECT_EQ(f.collector.retained_run_stats_for_test().refused_records, 2u);
+    std::string error;
+    EXPECT_FALSE(f.flush(&error));
+    const auto artifact = read_file(f.root.artifact("model"));
+    EXPECT_NE(artifact.find("\"host_received_records\": 2"), std::string::npos);
+    EXPECT_NE(artifact.find("\"host_retained_records\": 0"), std::string::npos);
+    f.collector.abandon_run(7602);
+}
+
+TEST(ScopeStatsRetainedRuns, RecordedTransportLossSurvivesAnOrdinaryReconcileAndSafeClose) {
+    RetainedFixture f("recorded-transport-loss", false);
+    const scope_runs::CapacityMetadata capacities{false, std::nullopt};
+    ASSERT_TRUE(f.collector.begin_recorded_window(7701, f.root.prefix("model").string(), capacities));
+    // The malformed instance has no readable payload or recoverable record count.
+    // The production drain must retire its entry instead of inventing samples.
+    set_platform_run_result(0, 7701);
+    scope_stats_aicpu_begin_run();
+    f.produce(7701, 1, true, "malformed.cpp");
+    auto *header = f.header();
+    ASSERT_EQ(header->queue_tails[0], 1u);
+    ASSERT_NE(header->queues[0][0].buffer_ptr, 0u);
+    header->queues[0][0].instance_index = UINT32_MAX;
+    f.collector.start(retained_thread_factory);
+    f.collector.quiesce();
+    EXPECT_EQ(f.collector.drain_dropped_buffers(), 1u);
+    f.collector.begin_run(7702, &capacities);
+    set_platform_run_result(0, 7702);
+    scope_stats_aicpu_begin_run();
+    EXPECT_TRUE(f.collector.reconcile_counters());
+    EXPECT_EQ(f.collector.drain_dropped_buffers(), 0u) << "ordinary reporting did not consume the transport counter";
+    EXPECT_EQ(f.collector.close_recorded_window(7701), 0);
+    std::string error;
+    EXPECT_FALSE(f.flush(&error));
+    const auto settled = f.collector.retained_run_stats_for_test();
+    EXPECT_EQ(settled.host_failures, 1u);
+    EXPECT_TRUE(settled.has_error);
+    EXPECT_EQ(settled.open_slots, 0u);
+    EXPECT_EQ(f.collector.close_recorded_window(7701), 0);
+    EXPECT_EQ(f.collector.retained_run_stats_for_test().host_failures, settled.host_failures);
+    const auto artifact = read_file(f.root.artifact("model"));
+    EXPECT_EQ(record_lines(artifact), 0u);
+    EXPECT_NE(artifact.find("\"total\": null"), std::string::npos);
+}
+
+TEST(ScopeStatsRetainedRuns, PersistentReadersSerializeOrdinaryAdmissionAndKeepBothArtifacts) {
+    for (bool retain : {false, true}) {
+        SCOPED_TRACE(retain);
+        RetainedFixture f(retain ? "admission-lock-retained" : "admission-lock-ordinary", retain);
+        scope_runs::CapacityMetadata capacities;
+        capacities.required = false;
+        f.collector.start(retained_thread_factory);
+        ASSERT_TRUE(f.collector.begin_recorded_window(7801, f.root.prefix("recorded").string(), capacities));
+        auto admit = [&] {
+            if (retain) return f.collector.run_begin(7802, f.root.prefix("ordinary").string(), nullptr, &capacities);
+            f.collector.begin_run(7802, &capacities);
+            return true;
+        };
+#if defined(__linux__)
+        // The GNU link wrapper exposes this admission thread's actual mutex entry.
+        auto records_lock = ScopeStatsCollectorTestPeer::hold_records(f.collector);
+        ASSERT_FALSE(ScopeStatsCollectorTestPeer::ordinary_epoch_bound(f.collector));
+        std::promise<void> proceed;
+        ScopeAdmissionLockGate gate{
+            ScopeStatsCollectorTestPeer::records_native_handle(f.collector), {}, proceed.get_future().share()
+        };
+        auto reached = gate.reached.get_future();
+        auto admission = std::async(std::launch::async, [&] {
+            scope_admission_lock_gate = &gate;
+            auto clear_gate = RAIIScopeGuard([] {
+                scope_admission_lock_gate = nullptr;
+            });
+            return admit();
+        });
+        auto release = RAIIScopeGuard([&] {
+            records_lock.unlock();
+            proceed.set_value();
+        });
+        ASSERT_EQ(reached.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        // Lock-entry acknowledgement precedes this read; the admission thread is gated.
+        EXPECT_FALSE(ScopeStatsCollectorTestPeer::ordinary_epoch_bound(f.collector));
+        records_lock.unlock();
+        proceed.set_value();
+        release.dismiss();
+        ASSERT_TRUE(admission.get());
+#else
+        ASSERT_TRUE(admit());
+#endif
+
+        for (const auto epoch : {7801u, 7802u}) {
+            set_platform_run_result(0, epoch);
+            scope_stats_aicpu_begin_run();
+            f.produce(epoch, 1, true, epoch == 7801 ? "persistent-recorded.cpp" : "successful-ordinary.cpp");
+            scope_stats_aicpu_close_run();
+        }
+        ASSERT_TRUE(f.wait_for_collected(4));
+        if (retain) f.collector.run_close(7802, true);
+        else ASSERT_EQ(f.collector.close_ordinary_run(f.root.prefix("ordinary").string(), true), 0);
+        ASSERT_EQ(f.collector.close_recorded_window(7801), 0);
+        std::string error;
+        ASSERT_TRUE(f.flush(&error)) << error;
+        const auto ordinary = read_file(f.root.artifact("ordinary"));
+        const auto recorded = read_file(f.root.artifact("recorded"));
+        EXPECT_EQ(record_lines(ordinary), 2u) << ordinary;
+        EXPECT_NE(ordinary.find("successful-ordinary.cpp"), std::string::npos);
+        EXPECT_EQ(ordinary.find("persistent-recorded.cpp"), std::string::npos);
+        EXPECT_EQ(record_lines(recorded), 2u) << recorded;
+        EXPECT_NE(recorded.find("persistent-recorded.cpp"), std::string::npos);
+        EXPECT_EQ(recorded.find("successful-ordinary.cpp"), std::string::npos);
+        EXPECT_EQ(f.collector.retains_runs(), retain);
+    }
 }

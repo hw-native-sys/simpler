@@ -36,6 +36,9 @@
 #include "runtime_c_api.h"
 #include "types.h"
 
+template <class Run>
+class QueuedSubmission;
+
 /** Opaque identity for one prepared native run owned by a ChipWorker. */
 struct ChipWorkerNativeRun {
     uint32_t slot_id{0};
@@ -297,9 +300,19 @@ public:
     // run() is the blocking composition without caller stream ordering.
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr,
+        bool framework_owned = false
     );
-    void close_chip_run_lane();
+    // The owner retains this worker, callable, storage and stream through
+    // consumption and safe retirement; preparation does not launch device work.
+    std::shared_ptr<QueuedSubmission<ChipRun>> prepare_chip_submission(
+        int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, void *caller_stream
+    );
+
+    std::pair<int, bool> observe_framework_submissions();
+    bool transfer_native_run(const ChipWorkerNativeRun &run, bool *context_destroyed);
+
+    void close_chip_run_lane(bool report_run_error = true);
     /**
      * Stop the run lane admitting anything further, finishing every run that
      * has not launched without launching it. @see ChipRunLane::stop_admission.
@@ -428,7 +441,8 @@ public:
     /// retained after failure; a set flag does not imply a usable device context.
     std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-        size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr
+        size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
+        const std::string &host_shm_name = {}
     );
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
@@ -598,6 +612,7 @@ private:
     using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
     using SimplerFinalizeRunFn = decltype(&simpler_finalize_run_with_delivery);
+    using ObserveFrameworkSubmissionsFn = decltype(&simpler_observe_framework_submissions);
     using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
     using ValidateExecutionContextFn = decltype(&simpler_validate_execution_context);
     using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
@@ -626,6 +641,10 @@ private:
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
     using CommAllocDomainWindowsFn = int (*)(
         void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
+    );
+    using CommAllocHostDomainWindowsFn = int (*)(
+        void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, const char *, uint64_t *, uint64_t *,
+        size_t *
     );
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
@@ -689,6 +708,8 @@ private:
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_completion_fn_ = nullptr;
     SimplerFinalizeRunFn finalize_run_fn_ = nullptr;
+    SimplerNativeRunFn transfer_completed_run_fn_ = nullptr;
+    ObserveFrameworkSubmissionsFn observe_framework_submissions_fn_ = nullptr;
     SimplerProbeRunRetentionFn probe_run_retention_fn_ = nullptr;
     GetTeardownReportFn get_teardown_report_fn_ = nullptr;
     // The first captured teardown observation, kept by value so it outlives
@@ -766,6 +787,7 @@ private:
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
+    CommAllocHostDomainWindowsFn comm_alloc_host_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
@@ -1018,7 +1040,7 @@ private:
     /** Remove an entry that never got past preparation. */
     void drop_preparing_native_run(uint64_t run_epoch) noexcept;
     /** Whether a finalization reports to a caller or is closing this worker down. */
-    enum class FinalizeMode : uint8_t { Caller, Teardown };
+    enum class FinalizeMode : uint8_t { Caller, Teardown, FrameworkTransfer };
     /** Why a finalization has something to report; the message belongs to whoever raises it. */
     enum class FinalizeFault : uint8_t {
         None,

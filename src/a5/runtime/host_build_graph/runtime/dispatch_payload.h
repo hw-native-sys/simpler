@@ -126,7 +126,7 @@ struct alignas(64) DispatchPayload {
      *  the legacy scheduler seeds the equivalent per-core value at startup.
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
-    // No explicit tail padding: alignas(64) rounds sizeof up to 512 (8 cache lines).
+    // The argument vector and global context fill the remaining seven cache lines.
 
     static_assert(sizeof(args[0]) == 8);
     static_assert(

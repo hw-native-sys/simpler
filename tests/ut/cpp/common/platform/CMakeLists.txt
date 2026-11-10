@@ -178,6 +178,12 @@ platform_case(test_scope_stats_retained_runs.cpp PER_ARCH
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
     TIER aicpu)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        target_link_options(test_${arch}_scope_stats_retained_runs PRIVATE "-Wl,--wrap=pthread_mutex_lock")
+    endforeach()
+endif()
+
 # Who owns a host-built dependency graph between its thread and its file. Not
 # per-arch or per-runtime: the exporter names no runtime symbol — the hand-off
 # arrives as a function pointer — and holds nothing a device writes.
@@ -564,6 +570,14 @@ platform_case(test_args_dump_ownership.cpp PER_ARCH PER_RUNTIME
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        foreach(runtime tmr hbg)
+            target_link_options(test_${arch}_${runtime}_args_dump_ownership PRIVATE "-Wl,--wrap=pthread_mutex_lock")
+        endforeach()
+    endforeach()
+endif()
+
 platform_case(test_args_dump_retained_runs.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
@@ -823,9 +837,26 @@ platform_cases(
     test_chip_swimlane_handoff_accounting.cpp
     test_chip_swimlane_handoff_identity.cpp
     test_chip_swimlane_joined_diagnostics.cpp
-    test_chip_swimlane_retained_runs.cpp
     PER_ARCH PER_RUNTIME TIER aicpu
     SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})
+
+# The raw-window converter consumes the same real producer/export fixture.
+platform_case(test_chip_swimlane_retained_runs.cpp
+    PER_ARCH PER_RUNTIME TIER aicpu
+    PYUT_EXPORT chip_swimlane_retained_runs
+    SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(_arch IN ITEMS a2a3 a5)
+        foreach(_rt IN ITEMS tmr hbg)
+            target_link_options(test_${_arch}_${_rt}_chip_swimlane_retained_runs PRIVATE
+                -Wl,--wrap=link
+                -Wl,--wrap=pthread_mutex_lock
+                -Wl,--wrap=_ZdlPvm
+                -Wl,--wrap=_ZdlPv
+                -Wl,--wrap=_ZnwmSt11align_val_t)
+        endforeach()
+    endforeach()
+endif()
 
 # Both axes, and neither is about what the case covers: the decision under test
 # is header-only and arch-independent, but it names `ChipSwimlaneLevel` and
@@ -896,6 +927,7 @@ set(NATIVE_ADMISSION_SOURCES
     ${SIMPLER_SRC}/common/worker/runtime_module.cpp
     ${SIMPLER_SRC}/common/worker/device_fault_monitor_host.cpp
     ${CMAKE_SOURCE_DIR}/support/native_admission/transport.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/chip_swimlane_collector_aicpu.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/c_api_shared.cpp
@@ -930,9 +962,19 @@ hbg_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(_arch IN ITEMS a2a3 a5)
+        target_sources(test_${_arch}_hbg_native_admission PRIVATE
+            ${CMAKE_SOURCE_DIR}/../py/support/prepare_release_faults.cpp)
+        target_compile_definitions(test_${_arch}_hbg_native_admission PRIVATE SIMPLER_TEST_LINKER_WRAP=1)
+        target_link_options(test_${_arch}_hbg_native_admission PRIVATE
+            "-Wl,--wrap=publish_run_image_impl" "-Wl,--wrap=release_run_bindings_impl")
+    endforeach()
+endif()
 if(TARGET test_a5_hbg_native_admission)
     target_sources(test_a5_hbg_native_admission PRIVATE
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
 endif()
 tmr_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}
@@ -942,6 +984,26 @@ tmr_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+
+add_library(native_observation_orch MODULE
+    ${CMAKE_SOURCE_DIR}/support/native_admission/framework_observation_orch.cpp)
+foreach(_arch IN ITEMS a2a3 a5)
+    foreach(_rt IN ITEMS tmr hbg)
+        target_compile_definitions(test_${_arch}_${_rt}_native_admission PRIVATE
+            NATIVE_OBSERVATION_ORCH_PATH="$<TARGET_FILE:native_observation_orch>")
+        add_dependencies(test_${_arch}_${_rt}_native_admission native_observation_orch)
+    endforeach()
+endforeach()
+
+# Native capture lifetime cases drive the real PMU lease through exported fake driver symbols.
+foreach(_arch IN ITEMS a2a3 a5)
+    foreach(_rt IN ITEMS tmr hbg)
+        set_target_properties(test_${_arch}_${_rt}_native_admission PROPERTIES ENABLE_EXPORTS ON)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            target_link_options(test_${_arch}_${_rt}_native_admission PRIVATE -Wl,--wrap=_ZnwmSt11align_val_t)
+        endif()
+    endforeach()
+endforeach()
 
 # The lease's own case. Declared apart from the bulk list below because it needs
 # the implementation compiled in, and because it resolves the driver's prof

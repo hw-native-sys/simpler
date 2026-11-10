@@ -5,7 +5,7 @@
 本页承接[实施约定](implementation.md)，首轮研究时间为 2026-11-02。
 跨分片发现和队列重构均已接入并实测，历史阶段以候选名称和证据文件标识，论文结果不作为 A5 性能证据。
 用户要求同时实现全局唯一队列与分级队列进行比较，并允许阶段版本保留明确记录的性能退化。
-当前代码恢复到 `queue-ordinary-credit-v1` 的 T/H8 普通领取额度版本；独立 block 重构已撤回为[后续候选](block-ready-scheduling.md)。
+当前代码只提供 T/H8 普通领取额度实现。T/G、T/H4、L/G、C/W1/W4 未完成当前异步验证，相关代码已删除，未来须依据[当前异步协议](../a5-hbg-async-completion/choices.md#ready-queue-implementation-scope)重新实现和验收。下文其他配置、接口与测量均为历史设计记录，不代表当前源码仍提供对应实现。独立 block 重构仍为[后续候选](block-ready-scheduling.md)。
 
 首轮只实现了 **一种底层 ticket 算法、两种拓扑、G/H4/H8 三个测试配置**，不代表算法选型完成。
 2026-11-03 起继续研究与实现不同发布/领取协议，状态与实现细节见[队列算法比较](ready-queue-algorithms.md)。

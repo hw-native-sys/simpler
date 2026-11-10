@@ -54,9 +54,13 @@ extern "C" rtError_t rtFreeHost(void *ptr) {
     std::free(ptr);
     return 0;
 }
-extern "C" rtError_t rtMemcpy(void *, uint64_t, const void *, uint64_t, rtMemcpyKind_t) {
-    ADD_FAILURE() << "descriptor publication must be asynchronous";
-    return -99;
+extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+    EXPECT_TRUE(rts.allow_sync_initialization) << "descriptor publication must be asynchronous";
+    if (!rts.allow_sync_initialization) return -99;
+    EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
+    EXPECT_EQ(capacity, bytes);
+    std::memcpy(dst, src, bytes);
+    return 0;
 }
 extern "C" rtError_t
 rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
@@ -70,7 +74,7 @@ rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtM
         }
         return rts.copy_rc;
     }
-    std::memcpy(dst, src, bytes);
+    if (!rts.recording) std::memcpy(dst, src, bytes);
     return 0;
 }
 extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }

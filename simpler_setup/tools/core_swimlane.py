@@ -343,6 +343,10 @@ def reconstruct_task_args(manifest: Path, func_id_list, task_id=None):
     `task_id` pins a specific instance; default = lowest.
     """
     data = json.loads(manifest.read_text())
+    if data.get("recorded_window"):
+        raise ValueError(
+            "recorded ArgsDump samples do not identify a single invocation; inspect entries with dump_viewer"
+        )
     entries = data["args"]
 
     def fids(t):

@@ -286,6 +286,12 @@ public:
     bool
     retire_run_workspace(uint32_t slot, uint64_t run_epoch, bool retain_host_outputs, void **retired_unmanaged_staging);
     bool native_runs_outstanding() const;
+    struct RunStreams;
+    // Only fresh callable additions may ignore already-retired observer debt.
+    bool fresh_callable_addition_allowed() const;
+    void retain_framework_observation(const RunStreams &streams);
+    int observe_framework_submissions(int *all_observed);
+    bool has_external_run_reference(const NativeRunIdentity &identity) const;
 
     /**
      * Whether a live reservation other than `owner`'s holds `arena_bank`.
@@ -1681,6 +1687,8 @@ public:
         uint32_t scheduler_runtime_mode{0};
     };
 
+    virtual int prepare_collector_storage(const Runtime &, PreparedExecution &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
     // Reads host-owned run/registration state before device recovery or cleanup.
     void log_run_failure(const PreparedExecution &prepared, int rc) const;
 
@@ -1841,6 +1849,11 @@ public:
     int retain_external_run_resources(PreparedExecution &prepared, void *caller_stream, void **out_reference);
     int release_external_run_resources(void *reference);
     int admit_recording(PreparedExecution &prepared);
+    bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
+    virtual bool supports_scope_stats_capture() const { return false; }
+    virtual bool supports_pmu_capture() const { return false; }
+    virtual bool supports_swimlane_capture() const { return false; }
+    virtual bool supports_args_dump_capture() const { return false; }
     bool prepared_storage_in_use() const;
     bool prepared_resources_block_fatal_reset() const;
     bool prepared_resources_can_abandon() const;
@@ -2353,14 +2366,14 @@ protected:
     int ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
 
     /**
-     * Point this run's KernelArgs at its slot's result region and stamp the run
-     * epoch the device must publish. Allocated lazily per slot and, unlike the
-     * timing buffer, never gated on diagnostics. Its first publication stages
-     * an unpublished marker into the slot's launch metadata; warm reuse needs
-     * no clear. Preparation does not write the device block. Returns non-zero
-     * when allocation or staging fails; no kernel may launch without a region.
+     * Preserve this run's identity and bind private result backing when requested.
+     * Kernel diagnostics-off calls have no record. Program and requested Kernel
+     * calls initialize lazily before publication. Warm backing preserves any
+     * existing replay-evidence obligation.
      */
-    int ensure_device_run_result_region(uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args);
+    int ensure_device_run_result_region(
+        const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
+    );
 
     /**
      * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
@@ -2712,8 +2725,8 @@ protected:
      * observed this run's completion fence.
      */
     /**
-     * Returns non-zero when a collector's close reported an ownership failure
-     * the caller must surface — today only retained ArgsDump. A caller folds it
+     * Returns non-zero when a collector's close reports an ownership failure
+     * or required ordinary publication fails. A caller folds it
      * into its own rc behind any device error, which stays the more useful
      * diagnosis.
      */
@@ -2745,11 +2758,9 @@ protected:
      *
      * The release frees device memory the collectors are holding, so it is only
      * safe while no other run is executing against them. Nothing here enforces
-     * that. What guarantees it is the caller: `arm_collectors_for_run()` is the
-     * sole user, and it runs from the launch arming, under the execution claim.
-     * Do not move the call back into preparation — a prepared successor overlaps
-     * its predecessor's device window, so this would free pools that predecessor
-     * is still writing into.
+     * that. Ordinary arming holds the execution claim; cold diagnostic arming
+     * instead holds native_run_mu_ with no claim active until its retained
+     * window pins the shape. Both exclude a new execution during pool rebuild.
      */
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&
@@ -2944,7 +2955,25 @@ protected:
     };
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
-    std::unordered_set<const void *> native_run_observations_;
+    struct NativeRunObservation {
+        enum class Kind { RunOwner, FrameworkBinding };
+        Kind kind{Kind::RunOwner};
+        const void *owner{nullptr};
+        RunStreams streams{};
+        bool operator==(const NativeRunObservation &other) const {
+            return kind == other.kind && owner == other.owner && streams.aicpu == other.streams.aicpu &&
+                   streams.aicore == other.streams.aicore;
+        }
+    };
+    struct NativeRunObservationHash {
+        size_t operator()(const NativeRunObservation &value) const {
+            const auto first = std::hash<const void *>{}(value.owner);
+            const auto cpu = std::hash<const void *>{}(value.streams.aicpu);
+            const auto core = std::hash<const void *>{}(value.streams.aicore);
+            return first ^ (cpu << 1) ^ (core << 2) ^ static_cast<size_t>(value.kind);
+        }
+    };
+    std::unordered_set<NativeRunObservation, NativeRunObservationHash> native_run_observations_;
     std::optional<uint64_t> terminal_close_generation_;
     struct NativeRunClaim {
         const void *owner{nullptr};
@@ -3154,6 +3183,10 @@ protected:
         std::vector<WorkspaceManager::BackingIdentity> managed_backing;
         void *caller_stream{nullptr};
         bool recording{false};
+        bool scope_stats_window{false};
+        bool pmu_window{false};
+        bool swimlane_window{false};
+        bool args_dump_window{false};
         bool release_requested{false};
         bool closing{false};
     };

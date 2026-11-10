@@ -1579,7 +1579,8 @@ class TestWorkerNativeChip:
                     worker.copy_from(result, backing)
                 assert control.test_memory_calls() == before and result == bytearray(16)
                 assert worker._abandoned_run_handles == [run] and run._keepalive
-                with pytest.raises(RuntimeError, match="ordered cleanup failed"):
+                # The unproven run keeps its touched identity, so the L2 in-flight guard refuses first.
+                with pytest.raises(RuntimeError, match="in-flight L2 run"):
                     worker.free(backing)
                 assert worker._child_alloc.get(backing.identity) is not None
                 with pytest.raises(RuntimeError, match="device teardown failed.*-77"):

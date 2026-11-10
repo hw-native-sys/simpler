@@ -437,10 +437,10 @@ scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type, 
     return false;
 }
 
-// Fill this core's own free dispatch slots. One core, one core type, two slots:
-// a Scheduler schedules only itself, so there is no peer to prefer, no reserved
-// capacity to hold back, and no reason to defer a slot it is about to execute
-// from. `skip_slot_mask` names slots a completion pass already refilled.
+// Claim only the next ordinary execution. Reserving another ready task behind
+// a running kernel can hide work needed by that kernel from every idle core.
+// Cooperative admission retains its separate slot/participant protocol.
+// `skip_slot_mask` names slots a completion pass already refilled.
 //
 // The return value reports whether this pass made progress; `failed` separately
 // reports an aborted pass.
@@ -458,6 +458,7 @@ static inline __aicore__ bool scheduler_fill_own_slots(
             graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors, ready_stats, profiling_level,
             failed, ssbuf_region, wake_stats, completion_stats
         );
+    if (scheduler->local_ready_mask != 0) return false;
     const uint32_t core_type = scheduler->config.self_core_type;
     if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask)) return false;
     // A core polls its own inbox on every pass. The directory gates only the
@@ -502,7 +503,7 @@ static inline __aicore__ bool scheduler_fill_own_slots(
             return progress;
         }
         progress = true;
-        state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+        break;
     }
     return progress;
 }

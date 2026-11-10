@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -65,6 +66,46 @@
 #include "chip_run_lane.h"
 
 #include <gtest/gtest.h>
+
+#if defined(__linux__) && defined(__GLIBCXX__)
+namespace {
+
+enum class ControlWaitEvent : char { WAITING, RETURNED };
+
+struct ControlWaitObservation {
+    std::condition_variable *cv{nullptr};
+    std::mutex *mutex{nullptr};
+    int fd{-1};
+};
+
+thread_local ControlWaitObservation control_wait_observation;
+
+void signal_control_wait(ControlWaitEvent event) noexcept {
+    const int fd = std::exchange(control_wait_observation.fd, -1);
+    if (fd < 0) return;
+    // The private pipe is empty and receives exactly one byte.
+    ssize_t count;
+    do {
+        count = write(fd, &event, sizeof(event));
+    } while (count < 0 && errno == EINTR);
+    if (count != 1) std::abort();
+}
+
+}  // namespace
+
+extern "C" void __real__ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE(
+    std::condition_variable *, std::unique_lock<std::mutex> &
+) noexcept;
+extern "C" void __wrap__ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE(
+    std::condition_variable *cv, std::unique_lock<std::mutex> &lock
+) noexcept {
+    if (control_wait_observation.fd >= 0 && cv == control_wait_observation.cv) {
+        if (!lock.owns_lock() || lock.mutex() != control_wait_observation.mutex) std::abort();
+        signal_control_wait(ControlWaitEvent::WAITING);
+    }
+    __real__ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE(cv, lock);
+}
+#endif
 
 namespace {
 
@@ -678,7 +719,7 @@ const char *admission_outcome_text(int code) {
     case 12:
         return "the parked submission failed instead of waiting";
     case 13:
-        return "no submission was ever counted in admission, so the bound was never met";
+        return "the caller never reached the expected admission wait";
     case 14:
         return "a further run was admitted while the granted sets were all held";
     case 15:
@@ -834,6 +875,50 @@ TEST(ThreeRunCapacityOrchestratorTest, AGrantOfTwoParksTheThirdRunInAdmission) {
     const int outcome = isolated_admission_outcome(parks_until_one_of_two_retires);
     EXPECT_EQ(outcome, 0) << admission_outcome_text(outcome);
 }
+
+#if defined(__linux__) && defined(__GLIBCXX__)
+TEST(ThreeRunCapacityOrchestratorTest, DirectControlReturnsWhenItsBuildingRunBecomesHead) {
+    const int outcome = isolated_admission_outcome([] {
+        CapacityHarness h(/*depth=*/2, /*launch_depth=*/1);
+        const auto first = h.build_closed_run(1);
+        const RunId second = h.orch.begin_run();
+        h.accept(first);
+        if (h.orch.active_run_id() != first.id) return outcome_code(AdmissionOutcome::HEAD_NOT_ACTIVE);
+        h.orch.await_run_admission(first.id);
+        h.orch.await_run_admission(INVALID_RUN_ID);
+        h.orch.await_run_admission(99999);
+
+        int events[2];
+        if (pipe(events) != 0) return outcome_code(AdmissionOutcome::SCENARIO_THREW);
+        RunId head_on_return = INVALID_RUN_ID;
+        std::thread control([&] {
+            control_wait_observation = {&h.orch.runs_cv_, &h.orch.runs_mu_, events[1]};
+            h.orch.await_run_admission(second);
+            head_on_return = h.orch.active_run_id();
+            signal_control_wait(ControlWaitEvent::RETURNED);
+        });
+        ControlWaitEvent event;
+        ssize_t count;
+        do {
+            count = read(events[0], &event, sizeof(event));
+        } while (count < 0 && errno == EINTR);
+        if (count != 1) std::abort();
+        // FIFO retirement must take the mutex that the real wait releases.
+        const bool reached_wait = event == ControlWaitEvent::WAITING;
+        const bool retired = reached_wait && h.complete(first);
+        control.join();
+        close(events[0]);
+        close(events[1]);
+        if (head_on_return == first.id) return outcome_code(AdmissionOutcome::ADMITTED_WHILE_HELD);
+        if (!reached_wait) return outcome_code(AdmissionOutcome::NEVER_PARKED);
+        if (!retired) return outcome_code(AdmissionOutcome::RETIREMENT_REFUSED);
+        if (head_on_return != second) return outcome_code(AdmissionOutcome::NOT_RELEASED_BY_RETIREMENT);
+        h.orch.close_run_submission(second);
+        return outcome_code(AdmissionOutcome::OK);
+    });
+    EXPECT_EQ(outcome, outcome_code(AdmissionOutcome::OK)) << admission_outcome_text(outcome);
+}
+#endif
 
 TEST(ThreeRunCapacityOrchestratorTest, BothSuccessorsArePreparableAtCapacityThree) {
     CapacityHarness h(/*depth=*/3, /*launch_depth=*/3);

@@ -1,0 +1,106 @@
+{
+  "source_deps_sha256": "bb44d3569a8e732be4de26ee62ed6f9273ecf57947e27016c58bbaad6ab88c72",
+  "source_names_sha256": "fc5a223b7dbf0429e251273b8992c230562b956d6f85e981b08d0aa81bbcbc1f",
+  "source_tasks": 2081,
+  "source_runtime": "host_build_graph",
+  "cases": {
+    "swa": {
+      "tasks": 19,
+      "executions": 339,
+      "edges": 21,
+      "first_source_task": "8",
+      "last_source_task": "35",
+      "task_table_sha256": "6144cf9ca3eaa787fc6f9c93d5d2aa8fb3a59db283585c00add71f56e3663b9f",
+      "edge_table_sha256": "1577eafe63d7b8c080b227edd486d86fdafc55a2f0e720ff0462312b0d6d0c4a",
+      "incoming_edges": 42
+    },
+    "c2a_full": {
+      "tasks": 30,
+      "executions": 666,
+      "edges": 42,
+      "first_source_task": "159",
+      "last_source_task": "200",
+      "task_table_sha256": "c4f8b3418c8decddf39635d2336af70da9203c6cc3968a561a8f981ec1514787",
+      "edge_table_sha256": "999bde444f8eb3bae204f02649bc4fa465462377df21131e860a3e30fb6228bc",
+      "incoming_edges": 76
+    },
+    "c2a_reuse": {
+      "tasks": 17,
+      "executions": 391,
+      "edges": 19,
+      "first_source_task": "239",
+      "last_source_task": "264",
+      "task_table_sha256": "5acd818699f6b56a172b4b66537963e77f22c5e11342a8c4ce6678d949b1206f",
+      "edge_table_sha256": "87fa3f4a3bc469eabc4edfc2278afff3b4ec1c5659e899746a3310a9338e7625",
+      "incoming_edges": 51
+    },
+    "c1a_full": {
+      "tasks": 25,
+      "executions": 550,
+      "edges": 36,
+      "first_source_task": "1386",
+      "last_source_task": "1420",
+      "task_table_sha256": "b599fc9d40c217a4a5370630ff41caebc36969d6373604375adf65463e5d0be5",
+      "edge_table_sha256": "ee10c886abdf0c40e1abff2aa44034c07ecf45529c382a46fc090c7f6ed055ee",
+      "incoming_edges": 68
+    },
+    "c1a_reindex": {
+      "tasks": 23,
+      "executions": 625,
+      "edges": 29,
+      "first_source_task": "1651",
+      "last_source_task": "1689",
+      "task_table_sha256": "20bcb5fcd7591d71f7b2aa3fb38494fa9f9430e45f8ace08d9345c07ca6a1209",
+      "edge_table_sha256": "2374a2e6e2dcfe041d2cf58df81929033de24457cee43fa35ee7ce52739b0735",
+      "incoming_edges": 80
+    },
+    "c1a_reuse": {
+      "tasks": 17,
+      "executions": 391,
+      "edges": 19,
+      "first_source_task": "1459",
+      "last_source_task": "1484",
+      "task_table_sha256": "d73e30aeca84446597cc4c05c5b330619bc30887864554936f6f5f4e718d479f",
+      "edge_table_sha256": "87fa3f4a3bc469eabc4edfc2278afff3b4ec1c5659e899746a3310a9338e7625",
+      "incoming_edges": 51
+    },
+    "moe": {
+      "tasks": 32,
+      "executions": 913,
+      "edges": 52,
+      "first_source_task": "38",
+      "last_source_task": "71",
+      "task_table_sha256": "ae86255b9f10b97e54f409623d8dcf88b53cd02fcf755851be7e439c56a019e8",
+      "edge_table_sha256": "32412e133fea7fb8c6ed561f04e3de7b9325c411990013a0231f94d5d63627be",
+      "incoming_edges": 43
+    },
+    "engram": {
+      "tasks": 12,
+      "executions": 960,
+      "edges": 11,
+      "first_source_task": "74",
+      "last_source_task": "89",
+      "task_table_sha256": "c3b5e116a40a922002046822f98c8aef0f6881a09392dd16a4bd98e5f0256577",
+      "edge_table_sha256": "f73b6f1ee8dd52be9b1225f732232f78b8fcc44880467753d947842fcf3b73cf",
+      "incoming_edges": 18
+    },
+    "layers_19_21": {
+      "tasks": 159,
+      "executions": 4168,
+      "edges": 280,
+      "first_source_task": "1315",
+      "last_source_task": "1520",
+      "task_table_sha256": "e31a55d1fd0a12834ec4f980cc0b5ed0f58e6414df454d7dbfc04b993fab5d12",
+      "edge_table_sha256": "e880ef810ea2c9deb23317529a84ff88a11fbb4d1c8b8394c8c312204753f856",
+      "incoming_edges": 285
+    }
+  },
+  "boundary": "Incoming values are produced by executing the real original prefix before measuring the case.",
+  "preserved": [
+    "original kernel sources",
+    "tensor views and scalar values",
+    "task and block boundaries",
+    "SPMD/MIX/sync-start launch attributes",
+    "internal dependencies"
+  ]
+}

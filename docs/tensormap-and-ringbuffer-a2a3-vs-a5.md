@@ -318,8 +318,13 @@ Both TMR platforms advertise `joined_native_launch_supported_impl()`: a
 compatible successor can be submitted while its predecessor is live, but
 whole-operator device execution stays serial. Ordering waits for the
 predecessor's AICore end before the successor may reset the shared arena. Live
-preparation requires a prebuilt-arena cache hit; rebuilding/uploading that arena
-is refused while a predecessor owns it.
+preparation requires a prebuilt-arena cache hit; rebuilding or resizing that arena
+is refused while a predecessor owns it. Each preparation snapshots the complete
+host image, including cache hits. Launch publishes that image on its AICPU stream
+after the predecessor's whole-operator boundary and before the run descriptor.
+An enqueued image is not evidence that a captured graph has executed. The default
+image is approximately 24.7 MB per run; the run retains a host snapshot and pinned
+upload storage through its existing resource lifetime.
 
 The two construct that ordering differently, because their stream shapes differ.
 A5 aggregates, so a successor's AICPU payload enters one stream's FIFO behind

@@ -132,6 +132,8 @@ struct AsyncCtx {
     volatile __gm__ int32_t *completion_error_code;
     volatile __gm__ DeferredCompletionEntry *completion_entries;
     uint32_t completion_capacity;
+    // Stable resident AIV index; AIC and manually constructed contexts have no sender.
+    uint32_t urma_sender_id{UINT32_MAX};
     TaskId task_token;
 
     static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {

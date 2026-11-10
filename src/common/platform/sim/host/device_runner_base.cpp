@@ -1225,7 +1225,10 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
         } else {
             // The default path keeps its order: the window is opened, then the
             // threads that serve it start.
-            pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
+            if (!pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, run_epoch)) {
+                decline("pmu");
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
             pmu_collector_.start(thread_factory);
         }
     }

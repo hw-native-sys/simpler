@@ -699,6 +699,11 @@ public:
         ProgressCall call(*this);
         std::lock_guard<std::mutex> lk(mu_);
         ++activation_attempts_[run_id];
+        if (std::any_of(outstanding_.begin(), outstanding_.end(), [run_id](const auto &entry) {
+                return entry.second.run_id != INVALID_RUN_ID && entry.second.run_id < run_id;
+            })) {
+            activation_while_older_run_outstanding_.insert(run_id);
+        }
         for (const auto &[dispatch_id, outstanding] : outstanding_) {
             (void)dispatch_id;
             if (outstanding.dispatch.prepare_only && outstanding.run_id == run_id) {
@@ -752,6 +757,11 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         auto found = activation_attempts_.find(run_id);
         return found == activation_attempts_.end() ? 0 : found->second;
+    }
+
+    bool activation_while_older_run_outstanding(RunId run_id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return activation_while_older_run_outstanding_.count(run_id) != 0;
     }
 
     void decline_next_activation_attempts(size_t attempts) {
@@ -926,6 +936,7 @@ private:
     std::deque<WorkerEndpointProgress> events_;
     std::set<RunId> activated_runs_;
     std::map<RunId, size_t> activation_attempts_;
+    std::set<RunId> activation_while_older_run_outstanding_;
     size_t declined_activation_attempts_{0};
     bool stop_requested_{false};
     bool stop_terminalized_{false};
@@ -3521,11 +3532,14 @@ TEST_F(ProgressSchedulerFixture, SuccessorStagesButActivatesOnlyAfterFifoPromoti
     EXPECT_TRUE(second_dispatch->prepare_only);
     EXPECT_EQ(orchestrator.active_run_id(), first_run);
     EXPECT_EQ(orchestrator.preparable_run_id(), second_run);
-    EXPECT_FALSE(endpoint0->wait_activated(second_run, std::chrono::milliseconds(20)));
 
+    // Deliver staging before the predecessor's completion. Endpoint progress
+    // services requested activations before polling the next event.
+    endpoint0->emit_staged(*second_dispatch, MailboxPreparationDisposition::NATIVE_PREPARED);
     endpoint0->emit(WorkerProgressKind::ACCEPTED, *first_dispatch);
     endpoint0->emit(WorkerProgressKind::COMPLETED, *first_dispatch);
     EXPECT_TRUE(endpoint0->wait_activated(second_run));
+    EXPECT_FALSE(endpoint0->activation_while_older_run_outstanding(second_run));
     EXPECT_EQ(orchestrator.active_run_id(), second_run);
 
     endpoint0->emit(WorkerProgressKind::ACCEPTED, *second_dispatch);

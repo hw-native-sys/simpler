@@ -157,7 +157,61 @@ bool ScopeStatsCollector::run_begin(
 ) {
     if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
     if (!retain_across_runs_) return false;
-    if (terminal_banks_.opened() && (capacities == nullptr || !capacities->complete())) {
+    return open_run_slot(run_epoch, output_prefix, why, capacities, false);
+}
+
+bool ScopeStatsCollector::begin_recorded_window(
+    uint64_t run_epoch, const std::string &output_prefix, const scope_runs::CapacityMetadata &capacities
+) {
+    if (recorded_window_open(run_epoch)) return false;
+    return open_run_slot(run_epoch, output_prefix, nullptr, &capacities, true);
+}
+
+bool ScopeStatsCollector::recorded_window_open(uint64_t run_epoch) const {
+    std::lock_guard<std::mutex> lock(retained_mu_);
+    for (const auto &slot : slots_)
+        if (slot.recorded_window && slot.run_epoch == run_epoch && slot.state == SlotState::Open) return true;
+    return false;
+}
+
+bool ScopeStatsCollector::recorded_windows_open() const {
+    std::lock_guard<std::mutex> lock(retained_mu_);
+    for (const auto &slot : slots_)
+        if (slot.recorded_window && (slot.state == SlotState::Open || slot.state == SlotState::Quarantined))
+            return true;
+    return false;
+}
+
+int ScopeStatsCollector::close_recorded_window(uint64_t run_epoch) {
+    {
+        std::lock_guard<std::mutex> lock(retained_mu_);
+        for (const auto &slot : slots_)
+            if (slot.recorded_window && slot.run_epoch == run_epoch && slot.state == SlotState::Quarantined)
+                return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (!recorded_window_open(run_epoch)) return 0;
+    try {
+        run_close_locked_path(run_epoch, true);
+    } catch (...) {
+        note_host_failure("closing a recorded collection window failed");
+    }
+    // Taking the receipts ends their pool-reader ownership. A later writer
+    // failure can discard host records and report WriteFailed, but cannot make
+    // a drained device pool live again. Zero is resource settlement, not export.
+    std::lock_guard<std::mutex> lock(retained_mu_);
+    for (const auto &slot : slots_)
+        if (slot.recorded_window && slot.run_epoch == run_epoch &&
+            (slot.state == SlotState::Open || slot.state == SlotState::Quarantined))
+            return PTO_RUNTIME_ERR_INTERNAL;
+    return 0;
+}
+
+bool ScopeStatsCollector::open_run_slot(
+    uint64_t run_epoch, const std::string &output_prefix, simpler::dfx::runs::AdmissionRefusal *why,
+    const scope_runs::CapacityMetadata *capacities, bool recorded_window
+) {
+    if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
+    if ((recorded_window || terminal_banks_.opened()) && (capacities == nullptr || !capacities->complete())) {
         LOG_ERROR("scope_stats: run %llu has no bound capacity metadata", static_cast<unsigned long long>(run_epoch));
         return false;
     }
@@ -176,7 +230,11 @@ bool ScopeStatsCollector::run_begin(
     {
         std::unique_lock<std::mutex> lk(retained_mu_);
         if (!retained_ready_) {
-            if (!host_budget_.open(retained_budget_bytes_, retained_fixed_overhead())) return false;
+            if (!host_budget_.open(
+                    retained_budget_bytes_.value_or(recorded_window ? runs::kDefaultBudgetBytes : 0),
+                    retained_fixed_overhead()
+                ))
+                return false;
             retained_ready_ = true;
         }
         // A quarantine holds the collector's live record store, and `begin_run`
@@ -216,13 +274,14 @@ bool ScopeStatsCollector::run_begin(
             return false;
         }
         slots_[free_slot].state = SlotState::Open;
+        slots_[free_slot].recorded_window = recorded_window;
         slots_[free_slot].run_epoch = run_epoch;
         if (capacities != nullptr) slots_[free_slot].capacities = *capacities;
         // The bank this run's producer publishes into. Refusing here fails the
         // run before anything reaches the device, which is the same rule the
         // output slot above follows: a run that cannot be accounted for must
         // not run with diagnostics rather than run unaccounted.
-        if (terminal_banks_.opened()) {
+        if (!recorded_window && terminal_banks_.opened()) {
             slots_[free_slot].terminal_bank = terminal_banks_.reserve(run_epoch);
             if (!slots_[free_slot].terminal_bank.held()) {
                 slots_[free_slot] = Slot{};
@@ -255,7 +314,7 @@ bool ScopeStatsCollector::run_begin(
     // Mapped runs keep their own host receipts while a predecessor may still
     // be open. The producer initializes counters and held buffers on-device in
     // both collection modes; host admission only owns the collection window.
-    if (terminal_banks_.opened()) {
+    if (recorded_window || terminal_banks_.opened()) {
         if (!open_run_receipts(run_epoch)) {
             {
                 std::lock_guard<std::mutex> lk(retained_mu_);
@@ -314,7 +373,8 @@ void ScopeStatsCollector::run_close(uint64_t run_epoch, bool device_execution_co
 }
 
 void ScopeStatsCollector::run_close_locked_path(uint64_t run_epoch, bool device_execution_complete) {
-    if (!retain_across_runs_ || !retained_ready_) return;
+    const bool recorded_window = recorded_window_open(run_epoch);
+    if ((!retain_across_runs_ && !recorded_window) || !retained_ready_) return;
 
     // Before anything this run decides: a record naming no admitted run is the
     // collector's loss, not this run's, so it is reported on its own channel
@@ -340,7 +400,7 @@ void ScopeStatsCollector::run_close_locked_path(uint64_t run_epoch, bool device_
     // likewise withdrawn — a successor adopts that buffer at its own device
     // init, and the run's own `live_at_close` already reports what it held.
     scope_runs::DeviceSnapshot device;
-    if (!terminal_banks_.opened()) {
+    if (!recorded_window && !terminal_banks_.opened()) {
         if (!read_terminal_checked(&device) || !recover_unpublished_buffer_checked()) {
             std::lock_guard<std::mutex> lk(retained_mu_);
             quarantine_locked(run_epoch, "the terminal read failed; no artifact is written");
@@ -351,7 +411,7 @@ void ScopeStatsCollector::run_close_locked_path(uint64_t run_epoch, bool device_
     // Taken before the records lock, never under it: every other path that
     // holds both takes the records lock first.
     credit::Reservation bank;
-    if (terminal_banks_.opened()) {
+    if (recorded_window || terminal_banks_.opened()) {
         std::lock_guard<std::mutex> lk(retained_mu_);
         for (Slot &slot : slots_) {
             if (slot.run_epoch != run_epoch || slot.state != SlotState::Open) continue;
@@ -374,7 +434,7 @@ void ScopeStatsCollector::run_close_locked_path(uint64_t run_epoch, bool device_
     scope_runs::RunExport data;
     data.run_epoch = run_epoch;
     data.device = device;
-    if (terminal_banks_.opened()) {
+    if (recorded_window || terminal_banks_.opened()) {
         // This run's own records and receipts, taken from the entry it has
         // owned since admission. A predecessor's or a successor's are in their
         // own entries and are not touched here, which is what lets both be open
@@ -388,20 +448,31 @@ void ScopeStatsCollector::run_close_locked_path(uint64_t run_epoch, bool device_
         // admission — the one reading that cannot be straddling a producer
         // transition. Settling consumes the reservation, which frees the bank
         // for the next run while this one's artifact is still unwritten.
-        const uint64_t received = data.collection.received;
-        const uint64_t retained = data.collection.retained;
-        const credit::RunReconciliation settled = terminal_banks_.settle(bank, run_epoch, received);
-        data.collection = scope_runs::classify_reconciled(settled, retained);
-        // Counters name this bank's completed run; capacities name the immutable
-        // binding admitted into the same epoch's slot.
-        data.device.valid = settled.terminal_seen;
-        data.device.total_records = static_cast<uint32_t>(settled.produced);
-        data.device.dropped_records = static_cast<uint32_t>(settled.dropped);
-        data.device.fatal_latched = settled.fatal_latched ? 1u : 0u;
+        if (recorded_window) {
+            std::lock_guard<std::mutex> lock(retained_mu_);
+            for (const auto &slot : slots_)
+                if (slot.state == SlotState::Open && slot.run_epoch == run_epoch)
+                    data.aggregate_capacities = slot.capacities;
+            data.collection.counts_unknown = true;
+            data.collection.recorded_window = true;
+            data.collection.verdict = data.collection.retained < data.collection.received ? runs::Verdict::PartialSafe :
+                                                                                            runs::Verdict::CutUnknown;
+        } else {
+            const uint64_t received = data.collection.received;
+            const uint64_t retained = data.collection.retained;
+            const credit::RunReconciliation settled = terminal_banks_.settle(bank, run_epoch, received);
+            data.collection = scope_runs::classify_reconciled(settled, retained);
+            // Counters name this bank's completed run; capacities name the immutable
+            // binding admitted into the same epoch's slot.
+            data.device.valid = settled.terminal_seen;
+            data.device.total_records = static_cast<uint32_t>(settled.produced);
+            data.device.dropped_records = static_cast<uint32_t>(settled.dropped);
+            data.device.fatal_latched = settled.fatal_latched ? 1u : 0u;
+        }
     } else {
         std::scoped_lock lock(records_mutex_);
-        const uint64_t received = total_collected_;
-        const uint64_t retained = total_collected_ - refused_records_;
+        const uint64_t received = records_.size() + refused_records_;
+        const uint64_t retained = records_.size();
         data.collection = scope_runs::classify(device, received, retained);
         data.records = std::move(records_);
         records_ = scope_runs::RecordBlocks{};
@@ -461,8 +532,8 @@ void ScopeStatsCollector::run_close_locked_path(uint64_t run_epoch, bool device_
             data.output_dir = slots_[i].output_dir;
             break;
         }
-        stats_.refused_records += refused_records_;
-        if (data.collection.counts_unknown) {
+        stats_.refused_records += data.collection.received - data.collection.retained;
+        if (data.collection.counts_unknown && !data.collection.recorded_window) {
             stats_.counts_unknown++;
         } else if (data.collection.verdict == runs::Verdict::PartialSafe) {
             stats_.partial++;
@@ -524,7 +595,10 @@ int ScopeStatsCollector::publish_export(const scope_runs::RunExport &data) {
             }
         } temp{tmp};
 
-        rc = render_jsonl_to(fp, data.device, data.records, &data.collection);
+        rc = render_jsonl_to(
+            fp, data.device, data.records, &data.collection,
+            data.aggregate_capacities ? &*data.aggregate_capacities : nullptr
+        );
         // A close failure is a write failure: the bytes may never have reached
         // the file, so it must not be published under the name that means
         // complete. Closed here rather than by the guard so its status is
@@ -593,6 +667,10 @@ void ScopeStatsCollector::writer_loop() {
                 threw ? "publishing the artifact failed to allocate" : "the artifact could not be published"
             );
             if (threw) stats_.host_failures++;
+        } else if (data.collection.recorded_window && data.collection.retained == data.collection.received) {
+            // A fixed capture tag cannot prove replay totals; this unknown is
+            // declared in the artifact and is not a failed publication.
+            stats_.published++;
         } else {
             run_errors_.record(data.run_epoch, data.collection.verdict, "collection did not settle clean");
             if (data.collection.verdict == runs::Verdict::Published) stats_.published++;
@@ -766,7 +844,6 @@ bool ScopeStatsCollector::can_admit_retained_run() const {
 }
 
 bool ScopeStatsCollector::retained_runs_idle() const {
-    if (!retain_across_runs_) return true;
     std::lock_guard<std::mutex> lk(retained_mu_);
     for (const Slot &slot : slots_) {
         if (slot.state != SlotState::Free) return false;

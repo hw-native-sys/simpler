@@ -237,7 +237,7 @@ public:
     //
     // The collector initializes once and serves every run, so this is the only
     // point at which a run's shard files and CSV columns are established.
-    void begin_run(const std::string &csv_path, PmuEventType event_type);
+    bool begin_run(const std::string &csv_path, PmuEventType event_type, uint64_t run_epoch = 0);
 
     void start(const profiling_common::ThreadFactory &thread_factory);
 
@@ -292,9 +292,9 @@ public:
      * Map the device bank array this collector's cores publish their per-run
      * accounting into, one entry per core in use.
      *
-     * Until this is called the collector resets the per-core counters at
-     * admission and reads them back at close, which attributes a run only while
-     * runs are serialized. The address only reaches the device through the
+     * Device entry resets per-core counters. Without a bank, an ordinary
+     * serialized run reads the live counters at close; a recorded window leaves
+     * cumulative accounting unknown. The address only reaches the device through the
      * launching run's kernel arguments, so a mapped array with nobody
      * publishing into it would report every core missing.
      */
@@ -317,7 +317,8 @@ public:
      *
      * Resolved from the bank the run's own admission reserved, so two runs open
      * at once get two addresses. 0 when the run holds no reservation — it was
-     * never admitted, its admission was refused, or retention is off — which is
+     * never admitted, its admission was refused, ordinary retention is off, or
+     * it is a recorded aggregate — which is
      * what the device reads as "publish no accounting".
      */
     uint64_t run_terminal_bank_address(uint64_t run_epoch) const {
@@ -394,6 +395,15 @@ public:
     ) {
         return retained_runs_.run_begin(run_epoch, csv_path, event_type, why);
     }
+
+    bool begin_recorded_window(uint64_t epoch, const std::string &path, PmuEventType event, const char *protection) {
+        if (!retained_runs_.begin_recorded_window(epoch, path, event)) return false;
+        retained_runs_.note_recorded_protection(epoch, protection);
+        return true;
+    }
+    bool recorded_window_open(uint64_t epoch) const { return retained_runs_.recorded_window_open(epoch); }
+    bool recorded_windows_open() const { return retained_runs_.recorded_windows_open(); }
+    int close_recorded_window(uint64_t epoch) { return retained_runs_.close_recorded_window(epoch); }
 
     /**
      * Close one run's collection window while it still holds the execution
@@ -615,6 +625,7 @@ private:
 
     // Constructed with a reference to this collector, so it stays a member and
     // is never copied.
+    std::atomic<uint64_t> ordinary_run_epoch_{0};
     RetainedRunTable retained_runs_{*this};
 };
 

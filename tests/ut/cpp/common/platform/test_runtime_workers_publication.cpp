@@ -10,9 +10,9 @@
  */
 // Which prefix each publication carries, driven through the real onboard
 // helper and allocator with host-backed RTS storage. The question these cases
-// answer is per device allocation, not per slot: a block that has never been
-// published onto gets the handshake region, and only a block that has starts
-// receiving the shorter prefix.
+// answer is per device allocation, not per slot: Program initializes handshake
+// storage in its first publication; replayable preparation initializes it
+// before recording and excludes it from every recorded publication.
 #include <gtest/gtest.h>
 
 #include <cstdlib>
@@ -32,6 +32,8 @@ struct RtsState {
     int free_host_rc = 0;
     int copy_rc = 0;
     int copies = 0;
+    int initialization_rc = 0;
+    int initializations = 0;
     LaunchProgressSink sink;
     int allocations = 0;
     int frees = 0;
@@ -104,9 +106,13 @@ extern "C" rtError_t rtFreeHost(void *ptr) {
     std::free(ptr);
     return 0;
 }
-extern "C" rtError_t rtMemcpy(void *, uint64_t, const void *, uint64_t, rtMemcpyKind_t) {
-    ADD_FAILURE() << "runtime descriptor publication must be asynchronous";
-    return -99;
+extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+    ++rts.initializations;
+    EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
+    EXPECT_EQ(capacity, bytes);
+    if (rts.initialization_rc != 0) return rts.initialization_rc;
+    std::memcpy(dst, src, bytes);
+    return 0;
 }
 extern "C" rtError_t
 rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
@@ -204,6 +210,7 @@ TEST_F(WorkersPublication, PreparingWithoutPublishingCommitsNothing) {
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
     EXPECT_FALSE(slot.workers_initialized);
     EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(rts.initializations, 0);
 
     helper.release_run_view();
     EXPECT_FALSE(slot.workers_initialized);
@@ -211,6 +218,46 @@ TEST_F(WorkersPublication, PreparingWithoutPublishingCommitsNothing) {
     ASSERT_EQ(publish_once(), 0);
     EXPECT_EQ(rts.last_copy_bytes, initializing_bytes());
     EXPECT_TRUE(slot.workers_initialized);
+}
+
+TEST_F(WorkersPublication, ReplayablePublicationCannotOverwriteDeviceReports) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    EXPECT_TRUE(slot.workers_initialized);
+    EXPECT_EQ(rts.initializations, 1);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_TRUE(device_workers_all(0u));
+    const auto *device = reinterpret_cast<const unsigned char *>(slot.runtime_args);
+    for (size_t i = 0; i < steady_bytes(); ++i)
+        ASSERT_EQ(device[i], kDeviceMark);
+    for (size_t i = initializing_bytes(); i < slot.runtime_bytes; ++i)
+        ASSERT_EQ(device[i], kDeviceMark);
+
+    ASSERT_EQ(helper.publish_runtime_args(false, this, rts.sink), 0);
+    EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
+    std::memset(const_cast<unsigned char *>(device_workers()), 0x5a, sizeof(DeviceRuntimeLaunchDesc::workers));
+    // Replay the captured DMA after the device has published a later report.
+    std::memcpy(slot.runtime_args, slot.runtime_upload_source, rts.last_copy_bytes);
+    EXPECT_TRUE(device_workers_all(0x5a));
+    helper.release_run_view();
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    EXPECT_EQ(rts.initializations, 1);
+    EXPECT_TRUE(device_workers_all(0x5a));
+}
+
+TEST_F(WorkersPublication, FailedReplayInitializationIsRetriedOnTheRetainedAllocation) {
+    rts.initialization_rc = -82;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), -82);
+    EXPECT_FALSE(slot.workers_initialized);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(rts.initializations, 1);
+    auto *allocation = slot.runtime_args;
+    ASSERT_NE(allocation, nullptr);
+    rts.initialization_rc = 0;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    EXPECT_EQ(slot.runtime_args, allocation);
+    EXPECT_EQ(rts.allocations, 1);
+    EXPECT_EQ(rts.initializations, 2);
+    EXPECT_TRUE(device_workers_all(0u));
 }
 
 TEST_F(WorkersPublication, FailedDeviceFreeRetainsTrimHistoryUntilAllocationEnds) {

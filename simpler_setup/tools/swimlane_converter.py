@@ -200,8 +200,215 @@ class _StoredClockAlignment:
         )
 
 
+def _is_recorded_window(raw):
+    collection = (raw.get("metadata") or {}).get("collection")
+    return isinstance(collection, dict) and collection.get("recorded_window") is True
+
+
+def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
+    """Keep received intervals without inventing a replay identity or task join."""
+    level = int(raw.get("chip_swimlane_level"))
+    if level not in (1, 2, 3, 4):
+        raise ValueError(f"Unsupported chip_swimlane_level: {level} (expected 1, 2, 3, or 4)")
+    metadata = raw.get("metadata") or {}
+    frequency = metadata.get("clock_freq_hz")
+    if type(frequency) is not int or frequency <= 0:
+        raise ValueError("recorded window needs a positive clock_freq_hz")
+    for name in ("aicpu_lifecycle_records", "aicore_execution_identities", "aicore_protocol"):
+        if raw.get(name):
+            raise ValueError(f"recorded window has no replay-local provenance for {name}")
+    device, host = [], []
+
+    def rows(value, population):
+        if not isinstance(value, list):
+            raise ValueError(f"{population} must be an array")
+        return value
+
+    def append(destination, population, index, lane, start, end, fields, stream_index=None):
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+            raise ValueError(f"invalid {population} interval {index}")
+        if type(lane) is not int or lane < 0:
+            raise ValueError(f"invalid {population} lane {lane!r}")
+        destination.append(
+            {
+                "population": population,
+                "record_index": index,
+                "stream_index": stream_index,
+                "lane": lane,
+                "start_raw": start,
+                "end_raw": end,
+                "fields": fields,
+            }
+        )
+
+    for index, row in enumerate(rows(raw.get("aicore_tasks", []), "aicore_tasks")):
+        if not isinstance(row, list) or len(row) != 7:
+            raise ValueError("recorded aicore_tasks must contain seven-column arrays")
+        core, token, reg, start, end, receive, epoch = row
+        if type(receive) is not int or not 0 <= receive < start:
+            raise ValueError(f"invalid aicore_tasks receive_to_start_cycles at {index}")
+        append(
+            device,
+            "aicore_tasks",
+            index,
+            core,
+            start,
+            end,
+            {
+                "core_id": core,
+                "task_id": token,
+                "reg_task_id": reg,
+                "receive_to_start_cycles": receive,
+                "run_epoch": epoch,
+            },
+        )
+    scheduler = raw.get("scheduler_tasks")
+    if scheduler is not None:
+        if not isinstance(scheduler, dict) or scheduler.get("producer") not in ("aicpu", "aicore"):
+            raise ValueError("scheduler_tasks needs an aicpu/aicore producer")
+        for index, row in enumerate(rows(scheduler.get("records"), "scheduler_tasks.records")):
+            if not isinstance(row, list) or len(row) != 5:
+                raise ValueError("recorded scheduler_tasks.records must contain five-column arrays")
+            core, reg, start, end, epoch = row
+            append(
+                device,
+                "scheduler_tasks",
+                index,
+                core,
+                start,
+                end,
+                {
+                    "core_id": core,
+                    "reg_task_id": reg,
+                    "run_epoch": epoch,
+                    "producer": scheduler["producer"],
+                },
+            )
+    section = raw.get("scheduler_records")
+    if section is not None:
+        if not isinstance(section, dict):
+            raise ValueError("scheduler_records must be an object")
+        for stream_index, stream in enumerate(rows(section.get("streams"), "scheduler_records.streams")):
+            if not isinstance(stream, dict):
+                raise ValueError("scheduler stream must be an object")
+            records = rows(stream.get("records"), "scheduler stream records")
+            stream_fields = {key: value for key, value in stream.items() if key not in ("records", "metrics")}
+            metrics = {}
+            for metric in rows(stream.get("metrics", []), "scheduler stream metrics"):
+                if not isinstance(metric, dict):
+                    raise ValueError("scheduler metric must be an object")
+                index = metric.get("record_index")
+                if type(index) is not int or not 0 <= index < len(records) or index in metrics:
+                    raise ValueError("scheduler metric needs one valid record_index")
+                metrics[index] = {key: value for key, value in metric.items() if key != "record_index"}
+            for index, record in enumerate(records):
+                record_fields = {
+                    "start_cycles",
+                    "end_cycles",
+                    "run_epoch",
+                    "loop_iter",
+                    "kind",
+                    "tasks_processed",
+                    "task_id",
+                }
+                if not isinstance(record, dict) or set(record) != record_fields:
+                    raise ValueError(f"scheduler record must contain exactly {sorted(record_fields)}")
+                metric = metrics.get(index, {})
+                if record.keys() & metric.keys() or stream_fields.keys() & (record.keys() | metric.keys()):
+                    raise ValueError("scheduler metrics and stream metadata must not replace record fields")
+                append(
+                    device,
+                    "scheduler_records",
+                    index,
+                    stream.get("scheduler_id"),
+                    record.get("start_cycles"),
+                    record.get("end_cycles"),
+                    {**stream_fields, **record, **metric},
+                    stream_index,
+                )
+    for population, destination, start_key, end_key in (
+        ("aicpu_orchestrator_phases", device, "start_cycles", "end_cycles"),
+        ("host_orchestrator_phases", host, "start_host_ns", "end_host_ns"),
+    ):
+        for lane, records in enumerate(rows(raw.get(population, []), population)):
+            for index, record in enumerate(rows(records, population)):
+                if not isinstance(record, dict):
+                    raise ValueError(f"{population} record must be an object")
+                append(
+                    destination, population, index, lane, record.get(start_key), record.get(end_key), dict(record), lane
+                )
+    for index, record in enumerate(rows(raw.get("host_device_uploads", []), "host_device_uploads")):
+        if not isinstance(record, dict):
+            raise ValueError("host_device_uploads record must be an object")
+        append(
+            host, "host_device_uploads", index, 0, record.get("start_host_ns"), record.get("end_host_ns"), dict(record)
+        )
+    return {
+        "chip_swimlane_level": level,
+        "runtime": resolve_runtime(metadata.get("runtime")),
+        "tasks": device,
+        "host_preparation": host,
+        "timeline_metadata": {
+            "recorded_window": True,
+            "clock_domain": "device_syscnt_cycles",
+            "clock_freq_hz": frequency,
+            "device_origin_cycles": min((row["start_raw"] for row in device), default=0),
+            "host_origin_ns": min((row["start_raw"] for row in host), default=0),
+            "cross_domain_latency_available": False,
+            "clock_alignment": {"status": "unavailable", "reason": "recorded window has no replay-local Host anchors"},
+            "collection": metadata.get("collection"),
+        },
+    }
+
+
+def _recorded_trace(tasks, output_path, runtime_name, timeline_metadata):
+    metadata = dict(timeline_metadata)
+    domain = metadata.get("clock_domain")
+    if domain not in ("device_syscnt_cycles", "host_monotonic_ns"):
+        raise ValueError("recorded window needs one explicit trace clock domain")
+    host = domain == "host_monotonic_ns"
+    origin = metadata["host_origin_ns"] if host else metadata["device_origin_cycles"]
+    scale = 0.001 if host else 1_000_000 / metadata["clock_freq_hz"]
+    populations = {row["population"] for row in tasks}
+    if any(population.startswith("host_") != host for population in populations):
+        raise ValueError("recorded Host and Device intervals need separate trace files")
+    lanes = {name: index + 1 for index, name in enumerate(sorted(populations))}
+    events = [
+        {"ph": "M", "cat": "__metadata", "name": "process_name", "pid": pid, "args": {"name": f"{name} [{domain}]"}}
+        for name, pid in lanes.items()
+    ]
+    for row in tasks:
+        events.append(
+            {
+                "ph": "X",
+                "cat": "event",
+                "name": row["population"],
+                "pid": lanes[row["population"]],
+                "tid": row["lane"],
+                "ts": (row["start_raw"] - origin) * scale,
+                "dur": (row["end_raw"] - row["start_raw"]) * scale,
+                "args": {
+                    **row["fields"],
+                    "clock_domain": domain,
+                    "population": row["population"],
+                    "stream_index": row["stream_index"],
+                    "record_index": row["record_index"],
+                    "start_raw": row["start_raw"],
+                    "end_raw": row["end_raw"],
+                },
+            }
+        )
+    metadata["runtime"] = resolve_runtime(runtime_name)
+    trace = {"traceEvents": events, "metadata": metadata}
+    if output_path is not None:
+        _atomic_json(Path(output_path), trace)
+    return trace
+
+
 def _read_clock_alignment(raw):
     """Validate saved anchors, bounds, and the capture counter frequency."""
+    if _is_recorded_window(raw):
+        return None
     metadata = raw.get("metadata") or {}
     record = metadata.get("clock_alignment")
     if record is None:
@@ -445,6 +652,10 @@ def _prepare_capture_clock_alignment(path, host_logs=None):
     """
     path = Path(path)
     raw = json.loads(path.read_text())
+    if _is_recorded_window(raw):
+        if host_logs is not None:
+            raise ValueError("recorded windows cannot use single-invocation Host placement")
+        return raw, None
     if not _is_host_orchestrated_capture(raw):
         return raw, None
     try:
@@ -583,6 +794,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     Raises:
         ValueError: If the JSON is malformed.
     """
+    if _is_recorded_window(data):
+        if placement is not None or timeline_origin_ns is not None:
+            raise ValueError("recorded windows cannot use single-invocation Host placement")
+        return _decode_recorded_window(data)
     level = int(data.get("chip_swimlane_level"))
     if level not in [1, 2, 3, 4]:
         raise ValueError(f"Unsupported chip_swimlane_level: {level} (expected 1, 2, 3, or 4)")
@@ -2084,6 +2299,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         - pid=3 "Scheduler View": dispatch_time_us to finish_time_us
         - pid=4 "Worker View": per-subtask kernel execution on physical cores
     """
+    if (timeline_metadata or {}).get("recorded_window"):
+        if deps_edges is not None or emit_overhead:
+            raise ValueError("recorded windows cannot derive dependency flows or invocation overhead")
+        return _recorded_trace(tasks, output_path, runtime_name, timeline_metadata)
     if verbose:
         print("Generating Chrome Trace JSON...")
         print(f"  Tasks: {len(tasks)}")
@@ -5036,6 +5255,8 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     for rank, records_path in rank_inputs:
         with records_path.open() as f:
             raw_inputs[rank] = json.load(f)
+        if _is_recorded_window(raw_inputs[rank]):
+            raise ValueError("recorded windows cannot be merged into a single-invocation Host timeline")
         # Resolved once per Rank and reused for every companion read below. For
         # a fixed-name capture this is the file's own directory; for a retained
         # artifact it is the capture directory one level up, and only after
@@ -5236,6 +5457,28 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
     return output_path, rank_metadata
 
 
+def _convert_recorded_window(data, input_path, output_path):
+    """Publish separate traces while leaving the original observations untouched."""
+    timeline = dict(data["timeline_metadata"])
+    companion = output_path.with_name(f"{output_path.stem}.host-preparation.{uuid.uuid4().hex}.json")
+    destinations = [output_path, companion] if data["host_preparation"] else [output_path]
+    for destination in destinations:
+        if destination.resolve() == input_path.resolve() or (destination.exists() and destination.samefile(input_path)):
+            raise ValueError("recorded trace output must not replace its raw input")
+    if data["host_preparation"]:
+        timeline["host_preparation_file"] = companion.name
+        host_timeline = {**timeline, "clock_domain": "host_monotonic_ns", "preparation_only": True}
+        _recorded_trace(data["host_preparation"], companion, data["runtime"], host_timeline)
+    try:
+        _recorded_trace(data["tasks"], output_path, data["runtime"], timeline)
+    except BaseException:
+        if data["host_preparation"]:
+            companion.unlink(missing_ok=True)
+        raise
+    print(f"Recorded-window observations: {output_path} (no replay identity or Host alignment)")
+    return 0
+
+
 def main():
     args = _build_parser().parse_args()
 
@@ -5274,6 +5517,10 @@ def main():
             print(f"Reading performance data from: {input_path}")
         raw, placement = _prepare_capture_clock_alignment(input_path, args.host_log)
         data = _decode_perf_data(raw, placement=placement)
+        if (data.get("timeline_metadata") or {}).get("recorded_window"):
+            if args.overhead or args.deps_json:
+                raise ValueError("recorded windows cannot derive dependency flows or invocation overhead")
+            return _convert_recorded_window(data, input_path, _resolve_output_path(args, input_path))
         _print_verbose_data_info(data, args.verbose)
 
         func_names, orchestrator_name = _load_func_names(args, input_path)

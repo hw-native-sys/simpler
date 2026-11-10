@@ -823,8 +823,8 @@ static inline __aicore__ SchedulerBlockFinishResult scheduler_contribute_ordered
                                                           SchedulerBlockFinishResult::PARTIAL;
 }
 
-// Generation consumption belongs to the completion caller. Its successful
-// generation check makes this contribution unique; an error terminates the run.
+// Generation consumption and trace publication belong to the completion caller.
+// Slot retirement precedes the shared contribution that can close computation.
 template <bool RecordProtocol = true>
 static inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_block(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
@@ -840,13 +840,14 @@ static inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_blo
         );
         return SchedulerBlockFinishResult::ERROR;
     }
-    const auto &slot = local->slots[slot_index];
+    const auto slot = local->slots[slot_index];
     if (!slot.cooperative || slot.state != SchedulerDispatchSlotState::READY ||
         slot.task_ref != admission->current_task_ref || !scheduler_task_ref_valid(graph, slot.task_ref) ||
         slot.block_idx >= admission->current_block_num || scheduler_task_is_mix(admission->current_flags)) {
         scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::BLOCK_COMPLETION_INVALID, &slot);
         return SchedulerBlockFinishResult::ERROR;
     }
+    scheduler_initialize_free_slot(&local->slots[slot_index]);
     return scheduler_contribute_ordered_block<RecordProtocol>(graph, base, local, run, &slot);
 }
 

@@ -1,0 +1,2249 @@
+{
+  "schema": 1,
+  "origin": "pypto_lib generated DSV4.1 forward snapshot, 2026-11-09",
+  "platform": "a5",
+  "entry_signature": [
+    1,
+    1,
+    1,
+    1,
+    3,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    3,
+    3,
+    3,
+    1,
+    1,
+    3,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    1,
+    2,
+    1
+  ],
+  "host_tensor_indices": [
+    7,
+    47,
+    68,
+    69
+  ],
+  "kernels": [
+    {
+      "func_id": 0,
+      "name": "v41_rope_rows",
+      "core_type": "aiv",
+      "source": "vendor/aiv/v41_rope_rows.cpp",
+      "signature": [
+        2,
+        2,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 1,
+      "name": "v41_rope_rows_1",
+      "core_type": "aiv",
+      "source": "vendor/aiv/v41_rope_rows_1.cpp",
+      "signature": [
+        2,
+        2,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 2,
+      "name": "prepare_compressed_lens",
+      "core_type": "aiv",
+      "source": "vendor/aiv/prepare_compressed_lens.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 3,
+      "name": "engram_quant",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_quant.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 4,
+      "name": "engram_projection_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/engram_projection_aic.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 5,
+      "name": "engram_projection_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_projection_aiv.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 6,
+      "name": "engram_widen",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_widen.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 7,
+      "name": "engram_gate",
+      "core_type": "aiv",
+      "source": "vendor/aiv/engram_gate.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 8,
+      "name": "hc_collapse_norm",
+      "core_type": "aiv",
+      "source": "vendor/aiv/hc_collapse_norm.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 9,
+      "name": "decode_sp_zero_padding",
+      "core_type": "aiv",
+      "source": "vendor/aiv/decode_sp_zero_padding.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 10,
+      "name": "attention_qkv_input_quant_pooled",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_qkv_input_quant_pooled.cpp",
+      "signature": [
+        3,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 11,
+      "name": "_proj_q_a",
+      "core_type": "aic",
+      "source": "vendor/external/projection/proj_q_a.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 12,
+      "name": "attention_q_norm_quant",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_q_norm_quant.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 13,
+      "name": "_proj_q_b",
+      "core_type": "aic",
+      "source": "vendor/external/projection/proj_q_b.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 14,
+      "name": "attention_q_rope",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_q_rope.cpp",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 15,
+      "name": "_proj_kv",
+      "core_type": "aic",
+      "source": "vendor/external/projection/proj_kv.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 16,
+      "name": "norm_kv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/norm_kv.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 17,
+      "name": "rope_kv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/rope_kv.cpp",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 18,
+      "name": "pub_win",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_win.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 19,
+      "name": "swa_gather",
+      "core_type": "aiv",
+      "source": "vendor/aiv/swa_gather.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 20,
+      "name": "swa_attn_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/swa_attn_aic.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 21,
+      "name": "swa_attn_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/swa_attn_aiv.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 22,
+      "name": "swa_decode_cache",
+      "core_type": "aiv",
+      "source": "vendor/aiv/swa_decode_cache.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 23,
+      "name": "swa_attn_shared_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/swa_attn_shared_aic.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 24,
+      "name": "swa_attn_shared_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/swa_attn_shared_aiv.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 25,
+      "name": "swa_plan_runs",
+      "core_type": "aiv",
+      "source": "vendor/aiv/swa_plan_runs.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 26,
+      "name": "swa_attn_shared_0_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/swa_attn_shared_0_aic.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 27,
+      "name": "swa_attn_shared_0_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/swa_attn_shared_0_aiv.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 28,
+      "name": "mhc_rms",
+      "core_type": "aiv",
+      "source": "vendor/aiv/mhc_rms.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 29,
+      "name": "_hc_linear",
+      "core_type": "aic",
+      "source": "vendor/external/projection/hc_linear.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 30,
+      "name": "mhc_sinkhorn",
+      "core_type": "aiv",
+      "source": "vendor/aiv/mhc_sinkhorn.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 31,
+      "name": "rope_quant_o_pooled",
+      "core_type": "aiv",
+      "source": "vendor/aiv/rope_quant_o_pooled.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 32,
+      "name": "_o_proj_a",
+      "core_type": "aic",
+      "source": "vendor/external/projection/o_proj_a.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 33,
+      "name": "quant_o_a",
+      "core_type": "aiv",
+      "source": "vendor/aiv/quant_o_a.cpp",
+      "signature": [
+        3,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 34,
+      "name": "_o_proj_b",
+      "core_type": "aic",
+      "source": "vendor/external/projection/o_proj_b.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 35,
+      "name": "hc_post",
+      "core_type": "aiv",
+      "source": "vendor/aiv/hc_post.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 36,
+      "name": "attention_q_norm_quant_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_q_norm_quant_0.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 37,
+      "name": "pub_win_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_win_0.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 38,
+      "name": "proj_cmp",
+      "core_type": "aic",
+      "source": "vendor/aic/proj_cmp.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 39,
+      "name": "pool_cmp",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pool_cmp.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 40,
+      "name": "state_cmp",
+      "core_type": "aiv",
+      "source": "vendor/aiv/state_cmp.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 41,
+      "name": "proj_idx_k",
+      "core_type": "aic",
+      "source": "vendor/aic/proj_idx_k.cpp",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 42,
+      "name": "norm_idx_k",
+      "core_type": "aiv",
+      "source": "vendor/aiv/norm_idx_k.cpp",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 43,
+      "name": "rope_idx_k",
+      "core_type": "aiv",
+      "source": "vendor/aiv/rope_idx_k.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 44,
+      "name": "pub_idx",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_idx.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 45,
+      "name": "_proj_idx_q",
+      "core_type": "aic",
+      "source": "vendor/external/projection/proj_idx_q.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 46,
+      "name": "idx_q_fp4",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_q_fp4.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 47,
+      "name": "proj_idx_w",
+      "core_type": "aic",
+      "source": "vendor/aic/proj_idx_w.cpp",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 48,
+      "name": "reduce_idx_w",
+      "core_type": "aiv",
+      "source": "vendor/aiv/reduce_idx_w.cpp",
+      "signature": [
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 49,
+      "name": "idx_plan_req",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_plan_req.cpp",
+      "signature": [
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 50,
+      "name": "_request_index_scores_aic",
+      "core_type": "aic",
+      "source": "vendor/external/projection/index_scores.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 51,
+      "name": "_request_index_scores_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/projection/index_scores.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 52,
+      "name": "idx_topk_short",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_topk_short.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 53,
+      "name": "idx_topk_leaf",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_topk_leaf.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 54,
+      "name": "idx_topk_merge",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_topk_merge.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 55,
+      "name": "idx_topk_order",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_topk_order.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 56,
+      "name": "rope_pub_cmp",
+      "core_type": "aiv",
+      "source": "vendor/aiv/rope_pub_cmp.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 57,
+      "name": "c1a_gather_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/c1a_gather_0.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 58,
+      "name": "c1a_sparse_attn_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/c1a_sparse_attn_aic.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 59,
+      "name": "c1a_sparse_attn_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/c1a_sparse_attn_aiv.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 60,
+      "name": "c1a_gather",
+      "core_type": "aiv",
+      "source": "vendor/aiv/c1a_gather.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 61,
+      "name": "sparse_online_cube_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/sparse_online_cube_aic.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 62,
+      "name": "sparse_online_cube_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/sparse_online_cube_aiv.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 63,
+      "name": "attention_q_norm_quant_1",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_q_norm_quant_1.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 64,
+      "name": "pub_win_1",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_win_1.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 65,
+      "name": "mhc_sinkhorn_2",
+      "core_type": "aiv",
+      "source": "vendor/aiv/mhc_sinkhorn_2.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 66,
+      "name": "hc_collapse",
+      "core_type": "aiv",
+      "source": "vendor/aiv/hc_collapse.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 67,
+      "name": "rms_norm",
+      "core_type": "aiv",
+      "source": "vendor/aiv/rms_norm.cpp",
+      "signature": [
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 68,
+      "name": "x_norm_mx_quant",
+      "core_type": "aiv",
+      "source": "vendor/aiv/x_norm_mx_quant.cpp",
+      "signature": [
+        3,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 69,
+      "name": "gate_pre_route",
+      "core_type": "aiv",
+      "source": "vendor/aiv/gate_pre_route.cpp",
+      "signature": [
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 70,
+      "name": "gate_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/gate_aic.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 71,
+      "name": "gate_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/gate_aiv.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 72,
+      "name": "route_sort",
+      "core_type": "aiv",
+      "source": "vendor/aiv/route_sort.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 73,
+      "name": "sh_gate_mx_mm",
+      "core_type": "aic",
+      "source": "vendor/aic/sh_gate_mx_mm.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 74,
+      "name": "sh_gate_up_act",
+      "core_type": "aiv",
+      "source": "vendor/aiv/sh_gate_up_act.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 75,
+      "name": "sh_w2_mm_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/sh_w2_mm_aic.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 76,
+      "name": "sh_w2_mm_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/sh_w2_mm_aiv.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 77,
+      "name": "dispatch_stage",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_stage.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 78,
+      "name": "dispatch_meta_publish",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_meta_publish.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 79,
+      "name": "dispatch_meta_wait",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_meta_wait.cpp",
+      "signature": [
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 80,
+      "name": "dispatch_meta_finalize",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_meta_finalize.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 81,
+      "name": "dispatch_push",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_push.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        1,
+        3,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 82,
+      "name": "combine_notify",
+      "core_type": "aiv",
+      "source": "vendor/aiv/combine_notify.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 83,
+      "name": "combine_wait",
+      "core_type": "aiv",
+      "source": "vendor/aiv/combine_wait.cpp",
+      "signature": [
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 84,
+      "name": "dispatch_gather",
+      "core_type": "aiv",
+      "source": "vendor/aiv/dispatch_gather.cpp",
+      "signature": [
+        3,
+        3,
+        3,
+        1,
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 85,
+      "name": "exp_gate_mxfp4_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/exp_gate_mxfp4_aiv.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 86,
+      "name": "exp_gate_up_mxfp4_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/exp_gate_up_mxfp4_aic.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 87,
+      "name": "exp_gate_up_act_quant",
+      "core_type": "aiv",
+      "source": "vendor/aiv/exp_gate_up_act_quant.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 88,
+      "name": "exp_w2_mxfp4_aiv",
+      "core_type": "aiv",
+      "source": "vendor/aiv/exp_w2_mxfp4_aiv.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 89,
+      "name": "exp_w2_mxfp4_aic",
+      "core_type": "aic",
+      "source": "vendor/aic/exp_w2_mxfp4_aic.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 90,
+      "name": "expert_tile_scatter",
+      "core_type": "aiv",
+      "source": "vendor/aiv/expert_tile_scatter.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 91,
+      "name": "combine_reduce",
+      "core_type": "aiv",
+      "source": "vendor/aiv/combine_reduce.cpp",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 92,
+      "name": "hc_post_2",
+      "core_type": "aiv",
+      "source": "vendor/aiv/hc_post_2.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 93,
+      "name": "prepare_compressed_lens_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/prepare_compressed_lens_0.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 94,
+      "name": "attention_q_norm_quant_2",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_q_norm_quant_2.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 95,
+      "name": "pub_win_2",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_win_2.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 96,
+      "name": "l2_decode_fwd_incore_120",
+      "core_type": "aic",
+      "source": "vendor/aic/l2_decode_fwd_incore_120.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 97,
+      "name": "norm_cmp",
+      "core_type": "aiv",
+      "source": "vendor/aiv/norm_cmp.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 98,
+      "name": "norm_idx_k_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/norm_idx_k_0.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 99,
+      "name": "rope_cmp",
+      "core_type": "aiv",
+      "source": "vendor/aiv/rope_cmp.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 100,
+      "name": "pub_cmp",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_cmp.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 101,
+      "name": "idx_plan_req_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_plan_req_0.cpp",
+      "signature": [
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 102,
+      "name": "idx_topk_short_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_topk_short_0.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 103,
+      "name": "idx_topk_leaf_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_topk_leaf_0.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 104,
+      "name": "idx_topk_merge_0",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_topk_merge_0.cpp",
+      "signature": [
+        3,
+        1,
+        1,
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 105,
+      "name": "pool_all",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pool_all.cpp",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 106,
+      "name": "pool_score",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pool_score.cpp",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 107,
+      "name": "pool_select",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pool_select.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 108,
+      "name": "pool_count",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pool_count.cpp",
+      "signature": [
+        1,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 109,
+      "name": "attention_q_norm_quant_3",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_q_norm_quant_3.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 110,
+      "name": "pub_win_3",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_win_3.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 111,
+      "name": "idx_plan_pool",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_plan_pool.cpp",
+      "signature": [
+        3,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 112,
+      "name": "idx_clear_pool",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_clear_pool.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 113,
+      "name": "idx_gather_pool",
+      "core_type": "aiv",
+      "source": "vendor/aiv/idx_gather_pool.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 114,
+      "name": "_pool_index_scores_aic",
+      "core_type": "aic",
+      "source": "vendor/external/projection/index_scores.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 115,
+      "name": "_pool_index_scores_aiv",
+      "core_type": "aiv",
+      "source": "vendor/external/projection/index_scores.cpp",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/external/projection"
+      ]
+    },
+    {
+      "func_id": 116,
+      "name": "pool_topk_short",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pool_topk_short.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 117,
+      "name": "pool_topk_merge",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pool_topk_merge.cpp",
+      "signature": [
+        3,
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 118,
+      "name": "attention_q_norm_quant_4",
+      "core_type": "aiv",
+      "source": "vendor/aiv/attention_q_norm_quant_4.cpp",
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 119,
+      "name": "pub_win_4",
+      "core_type": "aiv",
+      "source": "vendor/aiv/pub_win_4.cpp",
+      "signature": [
+        3,
+        3,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 120,
+      "name": "moe_signal_clear",
+      "core_type": "aiv",
+      "source": "vendor/aiv/moe_signal_clear.cpp",
+      "signature": [
+        3,
+        3,
+        3,
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 121,
+      "name": "hc_collapse",
+      "core_type": "aiv",
+      "source": "vendor/aiv/hc_collapse.cpp",
+      "signature": [
+        1,
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 122,
+      "name": "final_rms_norm",
+      "core_type": "aiv",
+      "source": "vendor/aiv/final_rms_norm.cpp",
+      "signature": [
+        1,
+        2,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 123,
+      "name": "lm_head_dispatch_push",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_dispatch_push.cpp",
+      "signature": [
+        1,
+        3,
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 124,
+      "name": "lm_head_combine_wait",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_combine_wait.cpp",
+      "signature": [],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 125,
+      "name": "lm_head_dispatch_gather",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_dispatch_gather.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 126,
+      "name": "lm_head_matmul",
+      "core_type": "aic",
+      "source": "vendor/aic/lm_head_matmul.cpp",
+      "signature": [
+        2,
+        1,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aic"
+      ]
+    },
+    {
+      "func_id": 127,
+      "name": "lm_head_combine_push",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_combine_push.cpp",
+      "signature": [
+        2,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 128,
+      "name": "lm_head_combine_gather",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_combine_gather.cpp",
+      "signature": [
+        2,
+        1
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 129,
+      "name": "lm_head_signal_retire",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_signal_retire.cpp",
+      "signature": [
+        3
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    },
+    {
+      "func_id": 130,
+      "name": "lm_head_greedy_sample",
+      "core_type": "aiv",
+      "source": "vendor/aiv/lm_head_greedy_sample.cpp",
+      "signature": [
+        1,
+        2
+      ],
+      "include_dirs": [
+        "vendor/aiv"
+      ]
+    }
+  ],
+  "imported_source_sha256": {
+    "vendor/aic/c1a_sparse_attn_aic.cpp": "a538d642b5c51e1f7d40f6853a09a409459362c844be85fdb658856036ab9d49",
+    "vendor/aic/engram_projection_aic.cpp": "fea93dbc06493295ad6b87d67829f4863e80737d893b6e9a1bfbb52da8555bc2",
+    "vendor/aic/exp_gate_up_mxfp4_aic.cpp": "4ca2330789d8998a36e049c52e192dfd906bf8b754cf9a89c0b802d2b0a9648e",
+    "vendor/aic/exp_w2_mxfp4_aic.cpp": "689b037dcbfbe81d1e9c49bdca8ff6c9d589881d8e303cc3482214c344079f00",
+    "vendor/aic/gate_aic.cpp": "2d37d6a52d85164c868e22fc2345bb6087c238460051d2cd1c0f04ffe7527d68",
+    "vendor/aic/l2_decode_fwd_incore_120.cpp": "6f2002943cc4cfdaa2d2ba51101fab3d43d3261fe45023c4ab8b8538dc15939c",
+    "vendor/aic/lm_head_matmul.cpp": "786836694350faeaa9376c6a778ec91f85f9d1d05ec6575310ecca3d709be180",
+    "vendor/aic/proj_cmp.cpp": "5d056e7a32521f362f1a6041648f103bb7b083d941797ed878901a1f9ee80ad4",
+    "vendor/aic/proj_idx_k.cpp": "f81d8ce98de7020d33a2a20f852982d9b1ef2a7f75b2d20c504659ef9827297b",
+    "vendor/aic/proj_idx_w.cpp": "075707ae982d98e8bf37019269e7e2666eff9ffe54a3afc829994da136226f81",
+    "vendor/aic/sh_gate_mx_mm.cpp": "fc4569242545a2566acb338b8518f9a5d0d7f5142c12c5adda41f6df1d8ca275",
+    "vendor/aic/sh_w2_mm_aic.cpp": "3394c207a4de80fe8b801c1bb4e9d88d14fdc7a6f147c6ae6f3be7ec02ba3aeb",
+    "vendor/aic/sparse_online_cube_aic.cpp": "e949826a92bad3c0efaddd66f18f4f0487e8a18254aaa5a4a8d31edcde536618",
+    "vendor/aic/swa_attn_aic.cpp": "f072c2ad8d26fd5e6706afbcfa8d975e14ca3d5c6d27a6e6941307acedfd91d3",
+    "vendor/aic/swa_attn_shared_0_aic.cpp": "a29ef34ca58853eec671488b09fe3609641145c261d8f18a49daf51dd205a1bc",
+    "vendor/aic/swa_attn_shared_aic.cpp": "50de93b05254f45ede16da186e496db73fc0f043972687a86960a581c71318a3",
+    "vendor/aiv/attention_q_norm_quant.cpp": "b1a3da82b6abc5fc0ed223b816a3ed79288de80c5b72b73e0cb6c5e6c941cdee",
+    "vendor/aiv/attention_q_norm_quant_0.cpp": "c9baa00047aac4a0cb407b3c3a2b6f2042fffbabb7416f39e163b9eebdbaa5bf",
+    "vendor/aiv/attention_q_norm_quant_1.cpp": "da005c6ba0b3f7fdb511a45fff191d07735bbb6b5d893c5bb9a0e59a7ed0a767",
+    "vendor/aiv/attention_q_norm_quant_2.cpp": "ed98b178366d79085c31b8360ba0055abe366a2fe346d33bee2e6ceca253a849",
+    "vendor/aiv/attention_q_norm_quant_3.cpp": "f5babc1e997f074ae8f4869e7dc3146c03295b221f86cf7365458075852fe8c8",
+    "vendor/aiv/attention_q_norm_quant_4.cpp": "7d37f61d932329bfc01d622e16c361d9cf9a069546aed4ee74f055a95c1cfbf6",
+    "vendor/aiv/attention_q_rope.cpp": "5742ebdc43700991bf9cf86dda74d4d3b8bb1d4d02d429af9211f3dc4682db06",
+    "vendor/aiv/attention_qkv_input_quant_pooled.cpp": "9f49ec33fdc24c261cf860659379b615928228878c25a6b066c4c510d63aef4a",
+    "vendor/aiv/c1a_gather.cpp": "848ffdf0d2cffd209d7593ec6806b643221ae55015f2860823cdadd60e3448ec",
+    "vendor/aiv/c1a_gather_0.cpp": "4eaeee4dcf9f9fb27dc42b4290551a1d4712eae7a4aa09861933c596c20c2719",
+    "vendor/aiv/c1a_sparse_attn_aiv.cpp": "fce095b2dd23f8f85269260fa42ce217924ffcf65195d7da1df4fb18a20ab97b",
+    "vendor/aiv/combine_notify.cpp": "79bb4a80395f6f2269d7e595f96c6be729c32a91a26ac0efdbee04b34ae7116e",
+    "vendor/aiv/combine_reduce.cpp": "9cb8bab0cbf8df419e046a53404ce851982cd6ea31c417d870c157a10e4b1735",
+    "vendor/aiv/combine_wait.cpp": "bae2c76355e7fc4f1f4e4f98eb52eace809317bb2edb075e5ca5979c0eb67ec8",
+    "vendor/aiv/decode_sp_zero_padding.cpp": "dc20ba1447e51aceefcc94abec1d4702c068d46ad1f4e8e5415e59eeb46a8aba",
+    "vendor/aiv/dispatch_gather.cpp": "c98958b1c557f55016d8ba80d9fb5f276ae5e6e537bd765dc69cb21114eeb4e8",
+    "vendor/aiv/dispatch_meta_finalize.cpp": "96b44efb37d44a54b5294c50a068869de027b9cbef44e4e4439a933c70097895",
+    "vendor/aiv/dispatch_meta_publish.cpp": "77220a21010c7c12917cd0716f403ab2830ddeb975799c75b47e23dacc1361b2",
+    "vendor/aiv/dispatch_meta_wait.cpp": "7f660e5891577ca37b85af1528b063c0380491ea2e93a3195678fe638e9272bd",
+    "vendor/aiv/dispatch_push.cpp": "3d65a803991a5f22d9573afd649e51848d21de602b13b0e35c423807235b903f",
+    "vendor/aiv/dispatch_stage.cpp": "21b88e61ce2a07e7f3f55f47de6d836697d60bbb623b986387ca71be2f572f3a",
+    "vendor/aiv/engram_gate.cpp": "927b31fe7715b528d08281a362ca046d00308b26ae91a5a176a0e44350fa142f",
+    "vendor/aiv/engram_projection_aiv.cpp": "4d741ddcdb956160805cbf887b3dbfe299b3fe274f6f7140380d416acce1c309",
+    "vendor/aiv/engram_quant.cpp": "130890208b18fd96ade54879e6a2b05f5b9d895b997107cfd3966a5b31380c56",
+    "vendor/aiv/engram_widen.cpp": "f81aa14ecd46457a65fcc944147210ab5b525f43a7bc759984b67dd9f67bbb84",
+    "vendor/aiv/exp_gate_mxfp4_aiv.cpp": "738ca623f263986f8b1979900a5100b82be3167fe034d42a67dd2954d5d958d7",
+    "vendor/aiv/exp_gate_up_act_quant.cpp": "001d9da0cebcc2ec8fbce24ace470eeee2dccde79eb4be2712950d6cf4a6f38b",
+    "vendor/aiv/exp_w2_mxfp4_aiv.cpp": "284c69df1c0f33cb496b2e66a0380759d555ef1abf61e590f3926d160fb02150",
+    "vendor/aiv/expert_tile_scatter.cpp": "a7fc7bbbeb1e6dc37606976ba7a08af87606d703dd5d993e98f94f8eca66a129",
+    "vendor/aiv/final_rms_norm.cpp": "93120171aa0a984a6d022ae4bf16cdea7e2983a3f8a632ca3e3759e2d84a7ba6",
+    "vendor/aiv/gate_aiv.cpp": "262705ba9aba12803b4986e59d2b988d666d72060b8fb7752890f84fd04aa5b0",
+    "vendor/aiv/gate_pre_route.cpp": "f652bf1b1f507af2e83dc1bd1cd456558fd5c6049b73e8b2675d4e14a89c3ffb",
+    "vendor/aiv/hc_collapse.cpp": "d953a5dd4388c628cb239211cc29ad566ac16fcdf126a15695bc3ee16121ead4",
+    "vendor/aiv/hc_collapse_norm.cpp": "7ece01cbcc8b3ad9d9a17073fa64678f89e2bcf19e458be66827782ce1349f16",
+    "vendor/aiv/hc_post.cpp": "84967552a7a614fd9b442bdca009f0eccd407ddb65737114a37ac3cf4d05e3bc",
+    "vendor/aiv/hc_post_2.cpp": "a8ccd7345da82bf1d65cd9e04da1c97f1bb90646e50e009126638e00b11ccedf",
+    "vendor/aiv/idx_clear_pool.cpp": "650b778d3440d3e8db229efece9e3f95abdfcda20d84df63258349437a1f7b2e",
+    "vendor/aiv/idx_gather_pool.cpp": "729587e21457ea42c09debccd36fc78cc6c7394d5d75e86bfca82ceb2e49255b",
+    "vendor/aiv/idx_plan_pool.cpp": "2c9d3060426926614deb90aa02d65ec9f5deafe0f4ced8933bf6833c4c21ad5b",
+    "vendor/aiv/idx_plan_req.cpp": "cdc1293b7c1ad6e25402d98e256eb005c65a8d0b27195a47219e795ffd6c6de7",
+    "vendor/aiv/idx_plan_req_0.cpp": "5c2bd341b3a220f8381c9614231e2dc35b303e3e2c9dccc1ab094c21e2269c28",
+    "vendor/aiv/idx_q_fp4.cpp": "d2dbb4d7d8298dd2d1f390ca108a16d464ccc4f2a9c0bc55b37c8d4b1dca3923",
+    "vendor/aiv/idx_topk_leaf.cpp": "4618763a99f923f73fe8f0b4673e137a2f131f0157165c4b244db1f6c633b282",
+    "vendor/aiv/idx_topk_leaf_0.cpp": "821fdd7e0d4eebb8338007b1429f5073792328ec11c657e8376832ddfb7c1482",
+    "vendor/aiv/idx_topk_merge.cpp": "fab2ce4a8a470817a995c18f5b3e90c9a933a92b2482f9ca7bb1ffb02c454c5c",
+    "vendor/aiv/idx_topk_merge_0.cpp": "d58b38e9307fe245d0130edf65120f501f59a00e3bc75f73e6e0e372a3ae7f2e",
+    "vendor/aiv/idx_topk_order.cpp": "42075fe2397898cd9882718a4fb3867430927b93920011bdcfa80c5ab793bf64",
+    "vendor/aiv/idx_topk_short.cpp": "ca92ef273ea583af7678e8c67049565c2198a2ae99f5446782025f2111699844",
+    "vendor/aiv/idx_topk_short_0.cpp": "26092ed11beab53e768e9afd2a29a56ac34de9e558de919a43714fceaffb5297",
+    "vendor/aiv/lm_head_combine_gather.cpp": "b8a461d2a1a5f700967bced65fa965f55da4e92d55df606d832cf86fcee34a98",
+    "vendor/aiv/lm_head_combine_push.cpp": "5be4eaa35c6b01304a7f96ee5b5ca7fa395c5425f14bfe32a793901173468c91",
+    "vendor/aiv/lm_head_combine_wait.cpp": "65484e3ca08d3114c89b99fcdda0f486d00c70d050ac72086f14720c636201aa",
+    "vendor/aiv/lm_head_dispatch_gather.cpp": "b7d045b871d82508346ee9fd4cc2fd6ae68762eba8caca05055b677f425f32c5",
+    "vendor/aiv/lm_head_dispatch_push.cpp": "f735cb71a06b76fc89e4ed8a0e3f96a8857a5f5cabfa41762cfd9662df4da194",
+    "vendor/aiv/lm_head_greedy_sample.cpp": "8665954129beb13a129374dd0019487560c514cba31984e28ee44994b74a271c",
+    "vendor/aiv/lm_head_signal_retire.cpp": "161ad0d75113cba39949daf1b6e95fb4b797d95f514280aac8bd865072ceae9e",
+    "vendor/aiv/mhc_rms.cpp": "072620626ef0d8bfb4ae11c808177d4ffabe6f0afe22e7d96188e32995ce2dc9",
+    "vendor/aiv/mhc_sinkhorn.cpp": "0de49a625e4842b1bcc32c0868e0a74e5783560ff2a73a426ba880821acf3653",
+    "vendor/aiv/mhc_sinkhorn_2.cpp": "d572ee2b2c50e228fb14c78f0c6089930d57536ddf7efcc2179007a5e699b70f",
+    "vendor/aiv/moe_signal_clear.cpp": "ef203bfa11be63cd5c33fd6fb149a20dff84e704258c6b3402c53ba3f561207a",
+    "vendor/aiv/norm_cmp.cpp": "188ff53e5f192ca006d40f4f7400168b3ee4a68d78f2891295b329d5097aafa3",
+    "vendor/aiv/norm_idx_k.cpp": "152c251de3bf118049eba77464a406560c4fa821e77fe7627b0eaddbde4b54fb",
+    "vendor/aiv/norm_idx_k_0.cpp": "06cfac1bcfe68085503a0c89ec055a9459120d7e67f89227adf06abcb7984908",
+    "vendor/aiv/norm_kv.cpp": "cb02f9fccf8382fd1ade830f756f0ff6828c7eb7ffad71b28b623109345772ad",
+    "vendor/aiv/pool_all.cpp": "9c82ff45c9e26a75e816e4c48938bc05f94d3562d8330e44034bf928e4704c7f",
+    "vendor/aiv/pool_cmp.cpp": "c2ab27a9df36a3d73f42ed6483cfebb688e1634f3ba07acdecec8774db92a84a",
+    "vendor/aiv/pool_count.cpp": "88c2d4457a3a79ad5ee61888141479721c4a3d3c30dd32c6a36a50e17332edc8",
+    "vendor/aiv/pool_score.cpp": "7a3af4d823abd5a3d476ff4923ff95a5e97ee363569a430ded44b026463441ff",
+    "vendor/aiv/pool_select.cpp": "328fabfdcc60b0482a142d87b4360270ef2040db14740485d8823060cef6535e",
+    "vendor/aiv/pool_topk_merge.cpp": "2eced93a17d5791fa5f2f6f3761ead8bb18c8b7eae5f3c347d9c131b618d7b43",
+    "vendor/aiv/pool_topk_short.cpp": "87d6186b10a868ac26791d50e8f030416650788ea8439449162e822e9633a69f",
+    "vendor/aiv/prepare_compressed_lens.cpp": "8ba5c47622ea6b1706822b4f8b1cab68da9f8032eebd42a511b44cbff8397a2d",
+    "vendor/aiv/prepare_compressed_lens_0.cpp": "2a1efcce48b0ab5b6dc93a196dfd5f5b59ddb2f96ddae7599f270b0450bd37f2",
+    "vendor/aiv/pub_cmp.cpp": "95eecb1ff65244faad700de372e69b0242cdbd82002f379cd5b223008366398f",
+    "vendor/aiv/pub_idx.cpp": "1ba30aff3f51f26149623a839e77af23ff14360f0c3d2509404ef12625ff34c9",
+    "vendor/aiv/pub_win.cpp": "812eeacb8e497c63a88f4b975c6a7637ab64405ed292b4d7d1dac51a554d5aeb",
+    "vendor/aiv/pub_win_0.cpp": "ace535339223b97df12cf9b6c96d828edfe5f515087597094e1d19977e19df2a",
+    "vendor/aiv/pub_win_1.cpp": "6493ace1673dcc816d671708bee4ac296527c869e6cceab148908dbdf8c3afa4",
+    "vendor/aiv/pub_win_2.cpp": "d8a3eab91ed2fc65ebb0df3a81faf1f50b09f4ae98f1a7f8293b4adeac61d9f4",
+    "vendor/aiv/pub_win_3.cpp": "456c01f372f19530c40d376cc519ae5ebffc37307c4534bf67140c70554e8992",
+    "vendor/aiv/pub_win_4.cpp": "cb4d3794777fdc1ae43b9ac75c250356bf74587f6891199111c0148584df697e",
+    "vendor/aiv/quant_o_a.cpp": "e3193db3b730c1f051a8678861efdef895300eb725c29b5cd8a8de3ad3c65bad",
+    "vendor/aiv/reduce_idx_w.cpp": "11a5904c24afc67337527928ebf8329c31ca7adeae98ff025b54e261b4244dd7",
+    "vendor/aiv/rms_norm.cpp": "f64fa39578d8a889476052537249e9459ddd455d59cb734eec91a88a74775118",
+    "vendor/aiv/rope_cmp.cpp": "1890492a1d2b5e185bad74d286c2dfa3a9ba6288d7cad6778d49b488a96fee19",
+    "vendor/aiv/rope_idx_k.cpp": "47395368ec68af01af2c4b745bb7620401a1d976a03d0c2187f503b34bd3ad5d",
+    "vendor/aiv/rope_kv.cpp": "de42e2ac1f8ed4b9b791164ac9bc7233886ec1b3751082ae235d1595e84be984",
+    "vendor/aiv/rope_pub_cmp.cpp": "279aefb1f9642b02a65eea1be2b4351a4b795379ab97fbc98f74068cfba2bc5c",
+    "vendor/aiv/rope_quant_o_pooled.cpp": "53e7f62572b972108fafba256055d0cf28cfd94762f01aaf6f18f765de8825fe",
+    "vendor/aiv/route_sort.cpp": "869c6175bad0653607a2341324a008db258695342286c18ce3398e9fdcd92bd2",
+    "vendor/aiv/sh_gate_up_act.cpp": "9cdf85d58a61913d214a25a220336aaa5cd950de69868d3f8b1013f3c518af7b",
+    "vendor/aiv/sh_w2_mm_aiv.cpp": "72fbd57068e1dc33f94f28e3f39745b75b9e249e406d2ece10fd2e9b1cff9888",
+    "vendor/aiv/sparse_online_cube_aiv.cpp": "136e7cc19ffacfedef563264b21a7537ee1533b2d9f17afe04c198411e9be5e2",
+    "vendor/aiv/state_cmp.cpp": "f54ec274ecbf38cee35a85c9eda03878b907e676189126de4d22a52471c2d98f",
+    "vendor/aiv/swa_attn_aiv.cpp": "9576558d93f71102e80c4bf49248162c653797c908fb47824c3eae2d2758cf70",
+    "vendor/aiv/swa_attn_shared_0_aiv.cpp": "f9b31debb3b36108c8daf425a3a92d2560b2bd6f26e8abd1d2d8c5248b3c8f3b",
+    "vendor/aiv/swa_attn_shared_aiv.cpp": "e96192b56e4d547d19cdc733d204e53f49f18fcbe30753ab61bb6bd0f58a3a5e",
+    "vendor/aiv/swa_decode_cache.cpp": "6eecbd73845f2da1e21587d454254fcbbf5345efe6cb7134229f7fb4b36899be",
+    "vendor/aiv/swa_gather.cpp": "743ec15cb010624edc0b1e40b05f08ae4f6639a67ee9e776c287e776cb6ed065",
+    "vendor/aiv/swa_plan_runs.cpp": "e9d8fa3309f0bc35a5d5fc992d931cb4d677b7a5a154c7d71932f4a69ea8d647",
+    "vendor/aiv/v41_rope_rows.cpp": "4b60720d1b6328146db964ab66e3e199376de8985e02bdb3b4589090e0c7d851",
+    "vendor/aiv/v41_rope_rows_1.cpp": "72fbad43ca53ce2ba25cc625a721d90f8433120ab76dbca653434069a618d35a",
+    "vendor/aiv/x_norm_mx_quant.cpp": "afe4d6f6074c4ecd3700bae8bec2bfffe699cc1a4069cface2fa5b8d5d0f7cd8",
+    "vendor/external/projection/hc_linear.cpp": "37828a7401eb92c8665f47b193185271305b5b1c084298307b27b14daaecf568",
+    "vendor/external/projection/index_scores.cpp": "dff3cb0737cb400c3775e7ac58f6b422287a9c1fdaedda82db9cf58318534c95",
+    "vendor/external/projection/mxfp8_projection.hpp": "2225810510096897386041ae243dfdb0decc4e8f8b0903e116e07742808113c4",
+    "vendor/external/projection/o_proj_a.cpp": "5af78e227804ff48d9b7b0da5818d1cdf2db2e077d9e4033f141d5e5b15ed320",
+    "vendor/external/projection/o_proj_b.cpp": "fbfa608f39ff3bc9117c3afd3f740df5817f6794fb009f824913b765905e19f2",
+    "vendor/external/projection/proj_idx_q.cpp": "691582a38eda21bc5fc664d297a9ce7953042abc5abbc885e8967d0b6404114d",
+    "vendor/external/projection/proj_kv.cpp": "349d1a12c319e6a5f322ad8414dcca8cb08adbe22782135bb8cd00690a612d01",
+    "vendor/external/projection/proj_q_a.cpp": "e8a38325abecb1c5a712f6b5df5e4189a38048c54901c049d82cd4979be2355e",
+    "vendor/external/projection/proj_q_b.cpp": "42fbab1d69e4f956426fbf2a1a0385cdf4dcfe93c916e45de5dc06152bde291b",
+    "vendor/external/projection/q_lora_projection.hpp": "7afe01e8e5e33679cd2df9c05eb2b8890031da034a258b5c3593d78d55c52208"
+  }
+}

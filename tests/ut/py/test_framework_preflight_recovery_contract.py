@@ -205,6 +205,7 @@ def transport(consumer, monkeypatch):
     )
     worker._lifecycle = _Lifecycle.READY
     monkeypatch.setattr(worker, "_resolve_handle", lambda *args, **kwargs: SimpleNamespace(slot_id=3))
+    monkeypatch.setattr(worker, "_resolve_handle_locked", lambda *args, **kwargs: SimpleNamespace(slot_id=3))
     monkeypatch.setattr(worker, "register", lambda spec: object())
     monkeypatch.setattr(worker, "init", lambda **kwargs: None)
 

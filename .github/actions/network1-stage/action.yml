@@ -122,6 +122,7 @@ runs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
+          pip install 'ninja>=1.11'
           pip install --config-settings=build.targets=build_package_$NETWORK1_PLATFORM '.[test]'
         REMOTE_STAGE
 

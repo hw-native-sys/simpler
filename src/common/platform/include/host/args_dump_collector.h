@@ -319,9 +319,10 @@ public:
      * that run's boundary.
      *
      * Latched by the runner at device init from `collect_across_runs`. Default
-     * false, and with it false every path below is unreachable: the collector
-     * keeps its single-run window, its per-run counter resets, its `args.bin`
-     * and its boundary join, byte for byte.
+     * false keeps ordinary calls in their single-run window, with per-run
+     * counters and `args.bin`. Recorded models retain their own windows under
+     * either policy. Both paths share the payload writer; ordinary export waits
+     * for its queued payloads without joining the resident writer.
      */
     void configure_retained_runs(bool enabled, size_t budget_bytes);
     bool retains_runs() const { return retain_across_runs_; }
@@ -346,8 +347,13 @@ public:
      */
     bool run_begin(
         uint64_t run_epoch, const std::string &output_prefix, DumpArgsLevel dump_args_level,
-        simpler::dfx::runs::AdmissionRefusal *why = nullptr
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr, bool recorded_window = false
     );
+
+    bool begin_recorded_window(uint64_t epoch, const std::string &path, DumpArgsLevel level);
+    bool recorded_window_open(uint64_t epoch) const;
+    int close_recorded_window(uint64_t epoch);
+    void on_handoff_retired(const profiling_common::RetiredHandoff<DumpModule> &retired);
 
     /**
      * Map the device bank array this collector's producers publish their
@@ -433,10 +439,9 @@ public:
     /**
      * Whether this collector holds no unpublished retained run.
      *
-     * True with retention off, and true once every admitted run's writer has
-     * published. What it answers is whether a writer may still be reading
-     * this collector's pools — which outlives a run's native retirement, so
-     * it is not the same question as whether a run is executing.
+     * True once every admitted ordinary or recorded window has published. What it answers is whether a writer may still
+     * be reading this collector's pools — which outlives a run's native retirement, so it is not the same question as
+     * whether a run is executing.
      */
     bool retained_runs_idle() const;
 
@@ -573,6 +578,8 @@ public:
 
 private:
     friend struct ArgsDumpCollectorTestPeer;
+    static std::filesystem::path resolve_run_directory(const std::string &output_prefix);
+    bool destination_available(const std::filesystem::path &run_dir) const;
     // Declared here so the receive path can take one by pointer; defined with
     // the rest of the retention state below.
     struct RetainedEpoch;
@@ -612,10 +619,6 @@ private:
      */
     DumpUnregisterCallback bank_unregister_cb_{nullptr};
 
-    // Per-task output directory captured at initialize() time. The writer
-    // thread builds run_dir_ = output_prefix_ / "args_dump" lazily on the
-    // first on_buffer_collected.
-    std::string output_prefix_;
     uint64_t run_epoch_{0};
 
     // Per-thread arena pointers (device + host shadow)
@@ -638,17 +641,17 @@ private:
     // Stats
     std::atomic<uint32_t> total_dropped_record_count_{0};
     bool dropped_records_complete_{false};
-    bool ordinary_drain_loss_{false};
+    std::atomic<bool> ordinary_drain_loss_{false};
+    std::atomic<uint64_t> ordinary_discarded_args_{0};
+    std::atomic<uint64_t> ordinary_discarded_metadata_{0};
     struct RecoveredCurrentBuffer {
         uint64_t dev_buffer_ptr{0};
         uint32_t buffer_seq{0};
     };
     std::vector<RecoveredCurrentBuffer> recovered_current_buffers_;
     std::atomic<uint32_t> total_truncated_count_{0};
-    std::array<std::atomic<uint64_t>, PLATFORM_MAX_AICPU_THREADS> written_payload_counts_{};
 
-    // Run-scoped state for the writer thread (lazily started on first
-    // on_buffer_collected and joined by export_dump_files).
+    // Ordinary sink state. The payload writer serves every sink until teardown.
     std::chrono::steady_clock::time_point run_start_time_;
     std::atomic<int64_t> last_progress_ms_{0};
     bool writer_started_{false};
@@ -669,11 +672,12 @@ private:
      */
     void process_dump_buffer(
         const DumpReadyBufferInfo &info, int collector_shard, RetainedEpoch *forced_epoch = nullptr,
-        size_t forced_bucket = 0
+        size_t forced_bucket = 0, bool transport_published = true
     );
+    // Both callers hold writer_start_mutex_ across configuration reads and payload routing.
     void start_writer_thread_once();
 
-    // Writer thread: streams arg payloads to a single args.bin
+    // One writer routes owned payloads to the ordinary or window-specific file.
     struct PayloadWriteRequest {
         uint32_t thread_index;
         // Which retained epoch's payload file these bytes belong to, and the
@@ -683,12 +687,13 @@ private:
         uint64_t epoch{0};
         std::vector<uint8_t> bytes;
     };
-    std::thread writer_thread_;
+    // Resident callbacks and ordinary admission share configuration, including progress timestamps.
     std::mutex writer_start_mutex_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
     std::queue<PayloadWriteRequest> write_queue_;
-    std::atomic<bool> writer_done_{false};
+    std::atomic<uint64_t> ordinary_queued_payloads_{0};
+    std::atomic<bool> ordinary_artifact_failed_{false};
 
     // What one queued payload request costs beyond its own bytes: the request
     // and a bound on its share of the deque block it lives in. Charged with the
@@ -707,17 +712,6 @@ private:
 
     // Writer stats
     std::atomic<uint64_t> bytes_written_{0};
-
-    void writer_loop();
-
-    /**
-     * Ask the writer thread to finish, in the one order that cannot lose the
-     * wakeup: set the stop flag under `write_mutex_`, then notify. Both stop
-     * sites (export and finalize) go through here so neither can regress to a
-     * bare atomic store — see the definition for why the mutex is required even
-     * though the flag is atomic.
-     */
-    void request_writer_stop();
 
     // -----------------------------------------------------------------------
     // Cross-run retention state
@@ -743,6 +737,8 @@ private:
         std::filesystem::path run_dir;
         simpler::dfx::args_dump::OutputToken token;
         DumpArgsLevel level{DumpArgsLevel::OFF};
+        bool recorded_window{false};
+        std::atomic<bool> recorded_transport_loss{false};
 
         // One metadata bucket per collector shard plus one the close boundary
         // owns for what it recovers, so a recovered buffer never shares a
@@ -839,23 +835,23 @@ private:
     uint64_t retained_progress_{0};
     std::atomic<uint64_t> retained_close_watermark_{0};
     std::atomic<bool> retained_release_deferred_{false};
-    std::atomic<bool> retained_writer_held_{false};
+    std::atomic<bool> writer_held_{false};
     // Test seam only; see `fail_arena_copy_for_test`. Production never sets it,
     // so the retained receive path pays one relaxed load per buffer.
     std::atomic<bool> retained_fail_arena_copy_{false};
-    // Per lane, host dispositions that did not write a payload byte. Counted
-    // beside the writer's own count so the arena acknowledgement can settle a
-    // lane whose payload was deliberately written off.
+    // Per-lane published payloads deliberately discarded by the host. These
+    // settle physical ownership while the corresponding output records loss.
     std::array<std::atomic<uint64_t>, PLATFORM_MAX_AICPU_THREADS> discarded_payload_counts_{};
     // Per lane, payloads this host has taken out of the arena into storage it
-    // owns. On the retained path this — not the disk count — is what releases
+    // owns. This — not the disk count — is what releases
     // the producer's arena barrier: once the bytes are host-owned the arena is
     // free whatever the disk is doing, and disk completion is proved by the
     // flush instead. Monotonic for the collector's life, like the lane counters
     // it is compared against.
     std::array<std::atomic<uint64_t>, PLATFORM_MAX_AICPU_THREADS> received_payload_counts_{};
 
-    bool retained_ensure_ready();
+    bool ensure_host_budget();
+    bool retained_ensure_ready(bool recorded_window = false);
     void retained_set_fatal(const char *reason);
     int retained_find_slot(uint64_t run_epoch) const;
     void retained_release_slot(size_t slot);
@@ -897,12 +893,13 @@ private:
         RetainedEpoch &epoch, size_t bucket, DumpedArg &&arg, uint32_t lane, bool has_payload, bool transport_published
     );
     void retained_withdraw_unpublished_slot(size_t slot);
-    void retained_writer_loop();
+    void payload_writer_loop();
     bool retained_drain_payload_batch(int max_requests);
+    void complete_ordinary_payload();
     bool retained_wait_for_processing(RetainedEpoch &epoch, uint64_t run_epoch);
     void retained_bump_progress();
-    void retained_start_writer();
-    void retained_stop_writer();
+    void start_payload_writer();
+    void stop_payload_writer();
     void retained_drain_copied_payloads();
     void retained_note_unpublished_runs_abandoned();
     void retained_finish();
@@ -910,8 +907,8 @@ private:
     void retained_release_quarantined();
     int retained_recover_leftover_records(RetainedEpoch &epoch, int lane, uint64_t dev_ptr, uint32_t expected_seq);
 
-    std::thread retained_writer_thread_;
-    std::atomic<bool> retained_writer_running_{false};
+    std::thread writer_thread_;
+    std::atomic<bool> writer_running_{false};
 };
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_ARGS_DUMP_COLLECTOR_H_

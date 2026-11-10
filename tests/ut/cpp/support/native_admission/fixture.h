@@ -67,7 +67,9 @@ public:
     int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
         KernelArgsHelper args;
         submission_storage_[slot]->retain_replay_evidence = true;
-        return ensure_device_run_result_region(slot, epoch, args);
+        DfxRunConfig dfx;
+        dfx.scope_stats_enabled = true;
+        return ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
     }
     PreparedSubmissionStorage &result_storage(uint32_t slot = 0) { return *submission_storage_[slot]; }
     int close_result(uint32_t slot = 0) { return release_submission_storage(*submission_storage_[slot], false); }
@@ -227,6 +229,8 @@ struct Attempt {
     CallConfig config{};
     NativeRunDescriptor descriptor{};
 };
+
+std::unique_ptr<Runner> make_fenced_completion_runner();
 
 class NativeAdmissionTest : public ::testing::Test {
 protected:

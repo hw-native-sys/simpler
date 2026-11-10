@@ -11,10 +11,10 @@
 
 #pragma once
 
-#include "scheduler_ready.h"
+#include "scheduler_completion_resolver.h"
 
 inline constexpr uint32_t SCHEDULER_CONTROL_NODE_BUDGET = 8;
-inline constexpr uint32_t SCHEDULER_CONTROL_WAITER_BUDGET = 64;
+inline constexpr uint32_t SCHEDULER_CONTROL_WORK_BUDGET = 64;
 
 // A detached wake chain belongs to one worker until fully routed. No reference
 // is recycled during a run; keeping the remaining head needs no epoch protocol.
@@ -26,10 +26,9 @@ inline __aicore__ bool scheduler_service_controls(
     if (local->config.control_inboxes_offset == 0) return true;
     if (scheduler_read_error(run) != 0) return false;
     if (scheduler_gm_query(run->bootstrap_scan_complete) == 0) return true;
-    uint32_t started = 0, routed = 0, completed = 0;
-    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
+    uint32_t started = 0, work = 0, completed = 0;
     auto &continuation = local->control_resolve;
-    while (routed < SCHEDULER_CONTROL_WAITER_BUDGET) {
+    while (work < SCHEDULER_CONTROL_WORK_BUDGET) {
         if (continuation.producer_ref < 0) {
             if (started == SCHEDULER_CONTROL_NODE_BUDGET) break;
             int64_t ref = SCHEDULER_TASK_REF_INVALID;
@@ -69,72 +68,25 @@ inline __aicore__ bool scheduler_service_controls(
                 return false;
             }
             scheduler_protocol_task_done(base, local, ref, false);
-            const int64_t head = scheduler_gm_exchange(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
-            if (head < SCHEDULER_WAKE_LIST_OPEN) {
-                scheduler_record_error(
-                    run, ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
-                    SchedulerErrorSite::COMPLETION_WAKE_ALREADY_CLOSED
-                );
-                return false;
-            }
             continuation.producer_ref = ref;
-            continuation.next_waiter = head;
+            ++work;
             ++started;
             *progress = true;
         }
-        while (continuation.next_waiter >= 0 && routed < SCHEDULER_CONTROL_WAITER_BUDGET) {
-            const int64_t waiter = continuation.next_waiter;
-            if (!scheduler_task_ref_valid(graph, waiter)) {
-                scheduler_record_error(
-                    run, continuation.producer_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, local
-                );
-                return false;
-            }
-            auto *control = scheduler_task_control_at(base, local, waiter);
-            const int64_t next = scheduler_observe_next_waiter(control);
-            if (next < SCHEDULER_WAKE_LIST_OPEN) {
-                scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
-                return false;
-            }
-            const auto route = scheduler_route_task(graph, base, local, run, waiter, nullptr);
-            if (route == SchedulerRouteResult::ERROR) return false;
-            if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-                SchedulerNodeKind kind{};
-                if (scheduler_node_kind(graph, waiter, &kind) != SchedulerGraphResult::OK) {
-                    scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
-                    return false;
-                }
-                if (scheduler_node_is_control(kind)) {
-                    if (!scheduler_control_enqueue(graph, base, local, run, waiter)) return false;
-                } else {
-                    auto *metadata = scheduler_task_metadata_at(base, local, waiter);
-                    const auto lanes = scheduler_task_lanes(*metadata);
-                    const uint32_t queue = scheduler_task_ready_queue(metadata->flags, lanes);
-                    if (!scheduler_task_is_executable(metadata->flags) || queue >= SCHEDULER_READY_QUEUE_COUNT ||
-                        !scheduler_ready_batch_append(base, local, waiter, &batches[queue], nullptr, profiling_level)) {
-                        scheduler_record_error(run, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
-                        return false;
-                    }
-                }
-            }
-            continuation.next_waiter = next;
-            ++routed;
-            *progress = true;
-        }
-        if (continuation.next_waiter >= 0) break;
+        if (work == SCHEDULER_CONTROL_WORK_BUDGET) break;
+        const auto outcome = scheduler_resolve_completion_step(
+            graph, base, local, run, continuation.producer_ref, continuation, SCHEDULER_CONTROL_WORK_BUDGET - work,
+            nullptr, nullptr, nullptr, profiling_level
+        );
+        work += outcome.work_units;
+        *progress = *progress || outcome.work_units != 0;
+        if (outcome.result == SchedulerResolveResult::ERROR) return false;
+        if (outcome.result == SchedulerResolveResult::YIELD) break;
         ++completed;
         continuation = {};
     }
-    // Successors become visible before their producer contributes to the exit
-    // count. A peer may already have resolved EXIT while this tail was owned here.
-    if (scheduler_read_error(run) != 0) return false;
-    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue)
-        if (!scheduler_ready_batch_push(base, local, queue, &batches[queue], nullptr)) {
-            scheduler_record_error(
-                run, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local
-            );
-            return false;
-        }
+    // A drained cursor has published every successor before its producer
+    // contributes to the run's completion count.
     local->pending_completed += completed;
     return true;
 }

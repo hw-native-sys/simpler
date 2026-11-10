@@ -462,39 +462,20 @@ assignment and predecessor sequences preserve descriptor ownership when the
 resource mask changes between groups. This task-level selection does not remove
 workers from bootstrap or shutdown.
 
-Kernel Ready work uses a type-separated shared ticket pool. The host appends
-its immutable header and descriptors to the run allocation and sizes each queue
-from actual executable metadata. A zero group width gives one queue for each of
-AIC, AIV and MIX; widths four and eight group consumers while allowing every
-eligible worker to claim from every group. Entries are immutable until the run
-fence, with separate atomic-only head/tail lines and bypass-published entry
-regions. Native control nodes retain their separate control inboxes. The detailed
-trade-offs and candidate-validation status are recorded in the
-[queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-task/ready-queue-design.md).
+Kernel Ready work uses a type-separated shared ticket pool with a fixed group
+width of eight (T/H8). The host appends its version-4 immutable header and
+descriptors to the run allocation and sizes each queue from actual executable
+metadata. Every eligible worker can claim from every group. Every fourth search
+prioritizes a remote group; other searches prefer the local group before
+visiting remote groups. Entries are immutable until the run fence, with separate
+atomic-only head/tail lines and bypass-published entry regions. Native control
+nodes retain their separate control inboxes.
 
-The linked global candidate uses one persistent node per task and one sentinel
-per type. The version-3 pool header selects ticket, linked or chunk storage without a
-runtime environment switch. A linked batch becomes shared at its link CAS;
-tail is a helpable hint and does not restrict consumption. Its independent
-atomic-only links remain valid until the run fence, including after execution.
-Each scheduler owns three 24-byte pending publication descriptors. Bounded
-publication retries retain their private chains and can merge newly resolved
-work. Bootstrap preserves them into the dispatch loop, which services them
-after completion/control resolution and before starting another kernel. Pending
-work does not suspend admission, error or exit polling. A run error preserves
-unpublished backing until the existing exit fence; queue emptiness is never a
-run-completion criterion.
-
-The chunk candidate seals up to eight task refs into an immutable payload,
-using the first task ref as a unique descriptor ID. Each 256-byte descriptor
-separates its atomic cursor from bypass-published payload. At most N descriptors
-are needed for N tasks; no run-time allocation or reuse occurs. The shared head
-advances only past exhausted chunks, while a consumer claims individual refs
-through a chunk-local cursor CAS. A one- or four-chunk window exposes shared
-work without privately acquiring a whole chunk. Every fourth search prioritizes
-the oldest visible chunk; other searches distribute their preferred chunk by
-worker rank and poll count. MIX still follows its existing placement/admission
-contract, and the initial production claimant takes only one task per credit.
+A ticket reservation and publication complete in one bounded tail. Transferable
+FINISH/control resolution keeps its own eight-ref publication buffer and cursor;
+no ready-pool publication is held in a worker-local pending list. Historical
+alternative algorithms and the requirements for implementing them again are
+recorded in the [queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-task/ready-queue-design.md).
 
 Owner pending endpoints and publication masks are private to the Scheduler.
 Self-execution notifications contain only a pending-slot mask: the slot stays
@@ -502,20 +483,18 @@ READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
 prevents stale notifications from freeing or refilling a pending slot.
 
-The local configuration occupies 144 bytes and the base local state 632 bytes
-under the 64-bit ABI, including its optional profiling pointer. A separate
-248-byte profiling state holds six timing slots, two self-execution traces,
-worker trace caches, profiling offsets, and the loop counter/valid mask.
-Remote traces reside in SSBUF. Sampling is derived from the timing-slot range.
+Local configuration, execution slots, control resolution and the optional
+profiling pointer belong to the core-local state. A separate profiling state
+holds timing slots, self-execution traces, worker trace caches, profiling
+offsets, and the loop counter/valid mask. Remote traces reside in SSBUF.
+Sampling is derived from the timing-slot range.
 
 The host records whether any task requests sampled timing in the run control.
 Only a run with chip profiling or sampled timing enters the resident function
 specialization that allocates profiling state; the plain specialization does
-not allocate it. These functions do not inline into the common entry. The
-combined local state with profiling is 880 bytes. These sizes exclude other
-function locals, worker statistics and compiler spills. Compile-time assertions
-anchor the 64-bit configuration, slot, base and profiling state sizes; they do
-not establish the dynamic AICore stack high-water mark.
+not allocate it. These functions do not inline into the common entry. Struct
+sizes exclude other function locals, worker statistics and compiler spills,
+and do not establish the dynamic AICore stack high-water mark.
 
 Before bootstrap, every participating core invalidates its entire data cache.
 The callable table and task metadata are immutable throughout that run, allowing
@@ -615,14 +594,11 @@ latency from the recorded timestamps.
 
 ## 8. Scalar Access During Construction
 
-`get_tensor_data` and `set_tensor_data` operate on registered host views of
-external tensors, and only on tensors that no submitted task produces. A producer
-— named either by the tensor's `owner_task_id` or by an overlapping TensorMap
-entry — fails the call with `INVALID_ARGS`, because the device scheduler starts
-only after orchestration returns and nothing it produces exists yet. A runtime
-allocation is rejected by the same rule; its graph-heap buffer has no host view
-either. See [SCALAR_DATA_ACCESS.md](SCALAR_DATA_ACCESS.md) for the supported
-contract.
+`get_tensor_data` and `set_tensor_data` operate only on explicit `HOST/NONE`
+arguments with registered bounds and compatible directions. Device arguments
+and graph-heap allocations are refused; there is no implicit mapping or device
+copy fallback. See [SCALAR_DATA_ACCESS.md](SCALAR_DATA_ACCESS.md) and the shared
+[HBG host data access contract](../../../../../docs/hbg-host-data-access.md).
 
 ## 9. Errors and Diagnostics
 

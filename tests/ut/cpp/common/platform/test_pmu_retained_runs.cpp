@@ -187,11 +187,11 @@ struct RetainedPmuFixture {
     void *shm = nullptr;
     PmuDataHeader *header = nullptr;
 
-    RetainedPmuFixture(const char *name, int cores = 1, int threads = 1) :
+    RetainedPmuFixture(const char *name, int cores = 1, int threads = 1, bool retention = true) :
         root(name),
         num_cores(cores),
         num_threads(threads) {
-        collector.configure_retained_runs(true);
+        collector.configure_retained_runs(retention);
         EXPECT_EQ(collector.init(cores, threads, retained_alloc, nullptr, retained_free, /*device_id=*/0), 0);
         shm = collector.get_pmu_shm_device_ptr();
         EXPECT_NE(shm, nullptr);
@@ -865,4 +865,305 @@ TEST(PmuRetainedRuns, FatalLossSurvivesConfirmedResetWithoutInvokingReleaseCallb
     std::string error;
     EXPECT_FALSE(collector.flush_retained_runs(100, &error));
     EXPECT_NE(error.find("abandoned=1"), std::string::npos) << error;
+}
+
+TEST(PmuRecordedWindow, ReplaysKeepEveryRowWithFrozenColumnsAndUnknownDeviceTotals) {
+    RetainedPmuFixture fx("recorded-replays", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1801, csv.string(), PmuEventType::MEMORY, "held"));
+    EXPECT_FALSE(fx.collector.retains_runs());
+    EXPECT_FALSE(fx.collector.retained_runs_idle());
+    for (int replay = 0; replay < 2; ++replay) {
+        fx.produce(1801, 2);
+        fx.collector.quiesce();
+        EXPECT_EQ(fx.device_total(), 2u) << "device accounting resets at each replay entry";
+    }
+    // Reopening ordinary host state must not steal the recorded window's columns.
+    const auto eager = fx.root.csv("eager");
+    ASSERT_TRUE(fx.collector.begin_run(eager.string(), PmuEventType::PIPE_UTILIZATION, 1802));
+    fx.collector.start(retained_thread_factory);
+    fx.produce(1802, 1);
+    fx.collector.quiesce();
+    fx.collector.reconcile_counters();
+    fx.produce(1801, 2);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1801), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto tasks = csv_column(read_file(csv), "task_id");
+    ASSERT_EQ(tasks.size(), 6u);
+    EXPECT_EQ(tasks[0], tasks[2]);
+    EXPECT_EQ(tasks[0], tasks[4]);
+    EXPECT_EQ(csv_column(read_file(csv), "event_type"), std::vector<std::string>(6, "4"));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"written_records\": 6"), std::string::npos);
+    EXPECT_NE(metadata.find("\"device_total_records\": null"), std::string::npos);
+    EXPECT_NE(metadata.find("aggregate_counts_unknown"), std::string::npos);
+    EXPECT_EQ(csv_column(read_file(eager), "run_epoch"), std::vector<std::string>({"1802"}));
+    EXPECT_FALSE(fs::exists(eager.parent_path() / "pmu.collection.json"));
+}
+
+TEST(PmuRecordedWindow, ZeroReplayAndDestinationReuseCannotPublishStaleRecordedSuccess) {
+    RetainedPmuFixture fx("recorded-reuse", 1, 1, false);
+    const auto csv = fx.root.csv("same-destination");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1811, csv.string(), PmuEventType::MEMORY, "absent"));
+    fx.produce(1811, 1);
+    ASSERT_EQ(fx.collector.close_recorded_window(1811), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto metadata = csv.parent_path() / "pmu.collection.json";
+    ASSERT_TRUE(fs::exists(metadata));
+    ASSERT_TRUE(fx.collector.begin_run(csv.string(), PmuEventType::PIPE_UTILIZATION, 1812));
+    EXPECT_FALSE(fs::exists(metadata));
+    fx.produce(1812, 1);
+    fx.collector.quiesce();
+    fx.collector.reconcile_counters();
+    EXPECT_FALSE(fs::exists(metadata));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1813, csv.string(), PmuEventType::MEMORY, "absent"));
+    ASSERT_EQ(fx.collector.close_recorded_window(1813), 0);
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_TRUE(csv_column(read_file(csv), "task_id").empty());
+    EXPECT_NE(read_file(metadata).find("\"written_records\": 0"), std::string::npos);
+    EXPECT_NE(read_file(metadata).find("\"run_epoch\": 1813"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, DestinationRefusalPreservesTheCurrentOwnersMetadata) {
+    RetainedPmuFixture fx("recorded-destination", 1, 1, false);
+    const auto csv = fx.root.csv("owned");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1821, csv.string(), PmuEventType::MEMORY, "held"));
+    const auto metadata = csv.parent_path() / "pmu.collection.json";
+    {
+        std::ofstream old(metadata);
+        old << "owner evidence";
+    }
+    EXPECT_FALSE(fx.collector.begin_recorded_window(1822, csv.string(), PmuEventType::MEMORY, "held"));
+    EXPECT_FALSE(fx.collector.begin_run(csv.string(), PmuEventType::MEMORY));
+    EXPECT_EQ(read_file(metadata), "owner evidence");
+    EXPECT_TRUE(fx.collector.abandon_run(1821));
+}
+
+TEST(PmuRecordedWindow, TwoIndependentWindowsDoNotChangeOrdinaryRetention) {
+    RetainedPmuFixture fx("recorded-two", 1, 1, false);
+    const auto a = fx.root.csv("a"), b = fx.root.csv("b"), c = fx.root.csv("c");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1831, a.string(), PmuEventType::MEMORY, "held"));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1832, b.string(), PmuEventType::PIPE_UTILIZATION, "held"));
+    EXPECT_FALSE(fx.collector.begin_recorded_window(1833, c.string(), PmuEventType::MEMORY, "held"));
+    fx.produce(1831, 1);
+    fx.collector.quiesce();
+    fx.produce(1832, 2);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1831), 0);
+    EXPECT_TRUE(fx.collector.recorded_window_open(1832));
+    fx.produce(1832, 2);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1832), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_EQ(csv_column(read_file(a), "event_type"), std::vector<std::string>(1, "4"));
+    EXPECT_EQ(csv_column(read_file(b), "event_type"), std::vector<std::string>(4, "2"));
+    EXPECT_FALSE(fx.collector.retains_runs());
+}
+
+TEST(PmuRecordedWindow, WriterFailureDoesNotReopenSettledResourceRelease) {
+    RetainedPmuFixture fx("recorded-writer-failure", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1841, csv.string(), PmuEventType::MEMORY, "refused"));
+    // An incompatible destination guarantees rename failure without root-sensitive permissions.
+    fs::create_directory(csv.parent_path() / "pmu.collection.json");
+    fx.produce(1841, 1);
+    ASSERT_EQ(fx.collector.close_recorded_window(1841), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    EXPECT_TRUE(fs::is_directory(csv.parent_path() / "pmu.collection.json"));
+    EXPECT_FALSE(evidence_files(csv.parent_path()).empty());
+    EXPECT_EQ(fx.collector.close_recorded_window(1841), 0);
+}
+
+TEST(PmuRecordedWindow, UnattributedLateTrafficCannotBecomeHealthyAggregateUnknown) {
+    RetainedPmuFixture fx("recorded-unknown-traffic", 1, 1, true);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1851, csv.string(), PmuEventType::MEMORY, "occupied"));
+    fx.produce(9999, 1);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1851), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"collector_unknown_epoch_buffers\": 1"), std::string::npos);
+    EXPECT_EQ(metadata.find("aggregate_counts_unknown"), std::string::npos);
+    EXPECT_NE(metadata.find("\"transport_retired_buffers\": null"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, UnmappableTransportRetirementRemainsUnattributedAndFailsFlush) {
+    RetainedPmuFixture fx("recorded-transport-retirement", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1861, csv.string(), PmuEventType::MEMORY, "held"));
+    uint64_t unmapped = 0;
+    const uint32_t tail = fx.header->queue_tails[0];
+    auto &entry = fx.header->queues[0][tail % PLATFORM_PMU_READYQUEUE_SIZE];
+    entry.core_index = 0;
+    entry.buffer_ptr = reinterpret_cast<uint64_t>(&unmapped);
+    entry.buffer_seq = 0;
+    wmb();
+    fx.header->queue_tails[0] = tail + 1;
+    wmb();
+    ASSERT_EQ(fx.collector.close_recorded_window(1861), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"collector_transport_retired_buffers\": 1"), std::string::npos);
+    EXPECT_NE(metadata.find("\"transport_retired_buffers\": null"), std::string::npos);
+    EXPECT_EQ(metadata.find("aggregate_counts_unknown"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, ClampedProducerBufferIsLossRatherThanExpectedUnknownAccounting) {
+    RetainedPmuFixture fx("recorded-clamped", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1871, csv.string(), PmuEventType::MEMORY, "held"));
+    set_platform_run_result(0, 1871);
+    const uint32_t physical[] = {0};
+    pmu_aicpu_init(physical, 1, PmuEventType::MEMORY);
+    fx.fill_records(fx.state(0)->current_buf_ptr, PLATFORM_PMU_RECORDS_PER_BUFFER, 0);
+    reinterpret_cast<PmuBuffer *>(fx.state(0)->current_buf_ptr)->count = PLATFORM_PMU_RECORDS_PER_BUFFER + 1;
+    const int core[] = {0};
+    pmu_aicpu_flush_buffers(0, core, 1);
+    ASSERT_EQ(fx.collector.close_recorded_window(1871), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"clamped_buffers\": 1"), std::string::npos);
+    EXPECT_EQ(metadata.find("aggregate_counts_unknown"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, TerminalBankRefusalPreservesPreviouslyPublishedMetadata) {
+    MappedPmuFixture fx("recorded-bank-refusal");
+    const auto csv = fx.root.csv("previous");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1900, csv.string(), PmuEventType::MEMORY, "held"));
+    ASSERT_EQ(fx.collector.close_recorded_window(1900), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto metadata = csv.parent_path() / "pmu.collection.json";
+    const auto previous_csv = read_file(csv), previous_metadata = read_file(metadata);
+    ASSERT_FALSE(previous_metadata.empty());
+    for (size_t bank = 0; bank < PLATFORM_DIAGNOSTIC_TERMINAL_BANKS; bank++) {
+        const auto epoch = 1901 + bank;
+        ASSERT_TRUE(fx.begin(epoch, fx.root.csv(("unproved-" + std::to_string(bank)).c_str())));
+        fx.close(epoch, false);
+        EXPECT_FALSE(fx.flush(&error));
+        ASSERT_EQ(fx.collector.run_terminal_banks_in_use(), bank + 1);
+    }
+    simpler::dfx::runs::AdmissionRefusal why{};
+    EXPECT_FALSE(fx.collector.run_begin(1910, csv.string(), PmuEventType::MEMORY, &why));
+    EXPECT_EQ(why, simpler::dfx::runs::AdmissionRefusal::Capacity);
+    EXPECT_EQ(read_file(csv), previous_csv);
+    EXPECT_EQ(read_file(metadata), previous_metadata);
+}
+
+TEST(PmuRecordedWindow, DirectoryAliasesCannotTakeAnOpenWindowsDestination) {
+    for (int alias_kind = 0; alias_kind < 3; alias_kind++) {
+        SCOPED_TRACE(alias_kind);
+        RetainedPmuFixture fx("recorded-alias", 1, 1, false);
+        const auto csv = fx.root.csv("owned");
+        ASSERT_TRUE(fx.collector.begin_recorded_window(1920, csv.string(), PmuEventType::MEMORY, "held"));
+        const auto metadata = csv.parent_path() / "pmu.collection.json";
+        {
+            std::ofstream previous(metadata);
+            previous << "owner evidence";
+        }
+        fs::path alias;
+        if (alias_kind == 0) {
+            alias = csv.parent_path() / "." / csv.filename();
+        } else if (alias_kind == 1) {
+            ASSERT_TRUE(fs::create_directory(csv.parent_path() / "child"));
+            alias = csv.parent_path() / "child" / ".." / csv.filename();
+        } else {
+            const auto link = fx.root.path() / "linked";
+            fs::create_directory_symlink(csv.parent_path(), link);
+            alias = link / csv.filename();
+        }
+        EXPECT_FALSE(fx.collector.begin_run(alias.string(), PmuEventType::PIPE_UTILIZATION, 1921));
+        const bool admitted = fx.collector.begin_recorded_window(1922, alias.string(), PmuEventType::MEMORY, "held");
+        EXPECT_FALSE(admitted);
+        EXPECT_EQ(read_file(metadata), "owner evidence");
+        EXPECT_TRUE(fx.collector.recorded_window_open(1920));
+        if (admitted) EXPECT_TRUE(fx.collector.abandon_run(1922));
+        EXPECT_TRUE(fx.collector.begin_run(fx.root.csv("distinct").string(), PmuEventType::PIPE_UTILIZATION, 1923));
+        fx.produce(1920, 1);
+        ASSERT_EQ(fx.collector.close_recorded_window(1920), 0);
+        std::string error;
+        ASSERT_TRUE(fx.flush(&error)) << error;
+        EXPECT_EQ(csv_column(read_file(csv), "event_type"), std::vector<std::string>({"4"}));
+        EXPECT_EQ(csv_column(read_file(csv), "run_epoch"), std::vector<std::string>({"1920"}));
+        EXPECT_EQ(csv_column(read_file(csv), "pmu_total_cycles"), std::vector<std::string>({"4000"}));
+    }
+}
+
+TEST(PmuRecordedWindow, MetadataRefusalReturnsTheReservedTerminalBank) {
+    MappedPmuFixture fx("recorded-bank-rollback");
+    const auto csv = fx.root.csv("refused");
+    ASSERT_TRUE(fs::create_directory(csv.parent_path() / "pmu.collection.json"));
+    EXPECT_FALSE(fx.collector.run_begin(1930, csv.string(), PmuEventType::MEMORY));
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 0u);
+    ASSERT_TRUE(fx.begin(1931, fx.root.csv("accepted")));
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 1u);
+    EXPECT_TRUE(fx.collector.abandon_run(1931));
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 0u);
+}
+
+TEST(PmuRecordedWindow, PublicationReplacesTheFinalSymlinkRatherThanItsTarget) {
+    RetainedPmuFixture fx("recorded-final-symlink", 1, 1, false);
+    const auto csv = fx.root.csv("published");
+    const auto target = fx.root.path() / "target.csv";
+    {
+        std::ofstream previous(target);
+        previous << "unrelated target";
+    }
+    fs::create_symlink(target, csv);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1940, csv.string(), PmuEventType::MEMORY, "held"));
+    ASSERT_EQ(fx.collector.close_recorded_window(1940), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_FALSE(fs::is_symlink(csv));
+    EXPECT_EQ(read_file(target), "unrelated target");
+    EXPECT_NE(read_file(csv).find("thread_id,core_id"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, AdmittedRelativeDestinationsSurviveWorkingDirectoryChanges) {
+    for (bool recorded : {false, true}) {
+        SCOPED_TRACE(recorded);
+        RetainedPmuFixture fx("frozen-relative-destination", 1, 1, false);
+        const auto csv = fx.root.csv("published");
+        const auto other = fx.root.path() / "other-working-directory";
+        ASSERT_TRUE(fs::create_directories(other / "published"));
+        {
+            struct RestoreDirectory {
+                fs::path previous{fs::current_path()};
+                ~RestoreDirectory() {
+                    std::error_code error;
+                    fs::current_path(previous, error);
+                }
+            } restore;
+            fs::current_path(fx.root.path());
+            const auto relative = fs::path("published") / "pmu.csv";
+            if (recorded) {
+                ASSERT_TRUE(fx.collector.begin_recorded_window(1950, relative.string(), PmuEventType::MEMORY, "held"));
+            } else {
+                ASSERT_TRUE(fx.collector.begin_run(relative.string(), PmuEventType::MEMORY, 1950));
+            }
+            fs::current_path(other);
+            fx.produce(1950, 1);
+            if (recorded) {
+                EXPECT_EQ(fx.collector.close_recorded_window(1950), 0);
+                std::string error;
+                EXPECT_TRUE(fx.flush(&error)) << error;
+            } else {
+                fx.collector.quiesce();
+                fx.collector.reconcile_counters();
+            }
+        }
+        EXPECT_EQ(csv_column(read_file(csv), "event_type"), std::vector<std::string>({"4"}));
+        EXPECT_EQ(csv_column(read_file(csv), "run_epoch"), std::vector<std::string>({"1950"}));
+        EXPECT_EQ(csv_column(read_file(csv), "pmu_total_cycles"), std::vector<std::string>({"4000"}));
+        EXPECT_FALSE(fs::exists(other / "published" / "pmu.csv"));
+    }
 }

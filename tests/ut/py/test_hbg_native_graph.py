@@ -20,10 +20,11 @@ from simpler_setup.tools.hbg.native_protocol import read_native_protocol
 from simpler_setup.tools.sched_overhead_analysis import build_task_graph
 
 
-def native_capture(version=9):
+def native_capture(version=9, *, deferred_tasks=()):
     # Outer kernel -> Graph(kernel -> dummy) -> outer consumer.
     raw, identities = ProtocolBuilder(
-        [(2, 1, ()), (0, 1, (0,)), (2, 1, (1,)), (0, 1, (2,)), (0, 1, (3,)), (2, 1, (4,))]
+        [(2, 1, ()), (0, 1, (0,)), (2, 1, (1,)), (0, 1, (2,)), (0, 1, (3,)), (2, 1, (4,))],
+        deferred_tasks=deferred_tasks,
     ).run()
     raw["schema"] = "hbg-native-protocol-v6"
     for control in raw["task_controls"]:
@@ -101,6 +102,19 @@ def test_native_graph_full_causality_and_public_identity_join(version):
     result = audit_native_protocol(raw, identities)
     assert result["protocol_verified"] and result["device_logical_tasks"] == 6
     assert result["executions"] == 3
+
+
+@pytest.mark.parametrize("version", (6, 9))
+@pytest.mark.parametrize("task_ref", (0, 2, 5))
+def test_native_graph_deferred_finish_preserves_public_identity_and_dependencies(version, task_ref):
+    raw, identities = native_capture(version, deferred_tasks=(task_ref,))
+    result = audit_native_protocol(raw, identities)
+    assert result["protocol_verified"]
+    assert result["device_logical_tasks"] == 6 and result["executions"] == 3
+    completion = next(event for event in raw["task_events"] if event["index"] == task_ref)["completion"]
+    completion["flags"] &= ~(1 << 31)
+    with pytest.raises(ValueError, match="TaskDone"):
+        audit_native_protocol(raw, identities)
 
 
 @pytest.mark.parametrize("field", ("graph_source", "node_map", "close_seal_stride"))

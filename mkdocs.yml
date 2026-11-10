@@ -113,11 +113,13 @@ nav:
       - Hierarchical Level Runtime: hierarchical-level-runtime.md
       - Task Flow: task-flow.md
       - Buffer Memory Model: buffer-abi.md
+      - HBG host data access: hbg-host-data-access.md
       - Orchestrator: orchestrator.md
       - Scheduler: scheduler.md
       - TMR A2/A3 vs A5: tensormap-and-ringbuffer-a2a3-vs-a5.md
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
       - Run completion fences: design/run-completion-fence.md
+      - Native framework submission: design/native-framework-submission.md
       - A5 HBG Graph task 设计:
           - 设计总览: zh-cn/design/a5-hbg-graph-task.md
           - 数据布局与 Host 绑定: zh-cn/design/a5-hbg-graph-task/data-layout.md
@@ -137,6 +139,15 @@ nav:
           - Execution and API: design/native-capture-common-contract.md
           - Resource lifetime: design/native-hbg-prepared-lifetime.md
           - HBG state restoration: design/native-hbg-resource-reset.md
+      - A5 HBG 异步完成设计:
+          - 设计总览: zh-cn/design/a5-hbg-async-completion.md
+          - 接口与数据布局: zh-cn/design/a5-hbg-async-completion/interfaces-and-layout.md
+          - 调度与完成协议: zh-cn/design/a5-hbg-async-completion/protocol.md
+          - 后端与资源生命周期: zh-cn/design/a5-hbg-async-completion/backends-and-lifetime.md
+          - 消费准备与准入: zh-cn/design/a5-hbg-async-completion/consumer-preparation.md
+          - 实现方案: zh-cn/design/a5-hbg-async-completion/implementation.md
+          - 验证与性能验收: zh-cn/design/a5-hbg-async-completion/validation.md
+          - 待验证选型: zh-cn/design/a5-hbg-async-completion/choices.md
       - Worker Manager: worker-manager.md
       - Hardware:
           - Overview: hardware/README.md
@@ -160,6 +171,7 @@ nav:
       - Python Callable Serialization: python-callable-serialization.md
   - Multi-chip and comm:
       - Communication Domains: comm-domain.md
+      - A5 Host-source Domains: a5-host-comm-domain.md
       - L3-L2 Orchestrator Comm: l3-l2-orch-comm.md
       - L3-L2 Message Queue: l3-l2-message-queue.md
       - Directed NEXT_LEVEL Scheduling: directed-next-level-scheduling.md
@@ -188,8 +200,15 @@ nav:
       - Buffer capacity audit: dfx/dfx-buffer-capacity-audit.md
   - Build and test:
       - Developer Guide: developer-guide.md
-      - Testing: testing.md
-      - Adding a C++ unit test: testing/adding-a-cpp-unit-test.md
+      - Testing:
+          - Overview: testing.md
+          - Environments and hardware: testing/environments.md
+          - CLI and logging: testing/cli.md
+          - Parallel execution: testing/parallel-execution.md
+          - Test suites and unit tests: testing/unit-tests.md
+          - Writing scene tests: testing/writing-tests.md
+          - Adding a C++ unit test: testing/adding-a-cpp-unit-test.md
+          - Scene-test device-memory fixtures: testing/child-memory.md
       - CI Pipeline: ci.md
       - Python Packaging: python-packaging.md
       - Sanitizers: sanitizers.md

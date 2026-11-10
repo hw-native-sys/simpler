@@ -1,6 +1,6 @@
 # Communication Domains — Dynamic Allocation
 
-A **communication domain** is a symmetric device-memory window shared by a
+A **communication domain** provides symmetric Device-addressable windows shared by a
 subset of ranks, used for cross-rank reads/writes (collectives, SDMA, notify
 protocols). Domains are allocated **dynamically from inside the orchestration
 function** via `orch.allocate_domain(...)` — there is no init-time / static
@@ -137,6 +137,26 @@ continues; child exit alone does not prove device reclamation.
 Kernels read peer windows through `device_ctx` (which holds every rank's
 window base, local + imported peer); `buffers[name]` is the local slice —
 name it in a task arg with `buffers[name].tensor(shapes, dtype)`.
+
+### A5 Host-source windows
+
+L3 A5 `tensormap_and_ringbuffer` domains accept `memory_source=AddressSpace.HOST`.
+The default remains `AddressSpace.DEVICE`. Each participating L2 owns independent
+Host shared memory, maps it to its Device, and optionally registers an URMA
+workspace with `workspace_engines=("urma",)`. Other Host workspace engines and
+L4 Host domains are rejected before allocation.
+
+The L3 creator accesses the rank's entire Host window through
+`domain.member(rank).buffers[name].shm.buf` and selects a named slice with
+`domain.buffer_range(name)`. Its `.tensor(...)` already addresses the named
+slice through the owning Device's mapping. L2 owns allocation and unlink;
+L3 borrows the `SharedMemory` mapping until domain release. CPU access is explicit and
+requires ordering against Device tasks. Peer reads use the domain URMA workspace;
+only the local `windowsIn`/`windowsOut` entry is populated. Host and Device domains
+share the same retention, reuse checks, failure policy, and release fences.
+
+See [A5 Host-source domains](a5-host-comm-domain.md) for initialization, kernel
+addressing, and the retained Engram-table example.
 
 ### Global CommDomain across local and remote L3 nodes
 
@@ -480,6 +500,32 @@ manager rejects single-rank initialization. The successful
 uses two endpoints and has not been integrated into that provider; the provider
 restriction is not a hardware limitation. HBG URMA completion, arbitrary subsets
 and L4 async domains are unsupported.
+
+URMA domains use `PER_PEER`: each resident AIV owns a separate queue group
+for each remote peer. The provider selects the device AIV count and uses its
+default one jetty per AIV and default SQ depth. Queue resources scale with
+both AIV and peer count. Different AIVs can submit to the same peer without
+sharing a producer queue.
+
+`get_async_ctx(args)` carries `urma_sender_id`, the scheduler's contiguous
+resident AIV ordinal, including distinct identities for both lanes of a MIX
+cluster. It remains the same across tasks and both dispatch buffers. It is
+neither a hardware core ID nor a task-local block index. AIC and unbound
+contexts have no valid sender and cannot submit URMA requests.
+
+The URMA adapter constructs its session directly from this identity and the
+chosen workspace; it does not use CCE block IDs. It checks the workspace
+layout, peer and queue bounds before posting. The same adapter binds AIV
+requests to Host or Device URMA workspaces without changing peer MR addressing.
+ISA-specific session activation is isolated in the adapter's session helper
+and must be checked when updating the ISA pin.
+
+The queue's submitted and completed counters persist across task switches;
+the AICPU completion poller is the only tail publisher. An AIV returning does
+not complete its network requests: dependencies and buffer lifetimes remain
+protected by the existing deferred-completion protocol. Requests that exceed
+the available queue or completion-slab capacity fail before posting.
+
 The legacy `device_ctx` field remains a raw address for synchronous consumers;
 it does not declare or validate an asynchronous engine requirement. No compiled
 capability query or `enable_urma` initialization switch is needed.

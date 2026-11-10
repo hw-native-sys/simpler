@@ -1813,6 +1813,40 @@ TEST(HbgAdmissionProtocol, CompactWorkerBeyondFirstBitmapWordKeepsItsActualIdent
     EXPECT_NE(fixture.storage.contexts[65].physical_core_id, 65);
 }
 
+TEST(HbgAdmissionProtocol, DeferredFinishUsesPublishedOrderWithoutLocalCohort) {
+    AdmissionFixture fixture({{2, LaneMask::aiv0()}}, 6, 17, {}, true);
+    ASSERT_TRUE(fixture.publish(0, 1));
+    ASSERT_EQ(fixture.locals[2]->admission, nullptr);
+    ASSERT_EQ(fixture.admissions[2].current_task_ref, SCHEDULER_TASK_REF_INVALID);
+    scheduler_protocol_task_done(fixture.base(), fixture.locals[2], 0, true, true);
+    scheduler_protocol_task_done(fixture.base(), fixture.locals[2], 0, false, true);
+    const auto *tasks =
+        scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(tasks[0].completion.worker_index, 2u);
+    EXPECT_EQ(tasks[0].completion.order_key, tasks[0].admission.order_key);
+    EXPECT_EQ(tasks[0].completion.run_epoch, 17u);
+    EXPECT_EQ(tasks[0].completion.flags, tasks[0].admission.flags | SCHEDULER_PROTOCOL_DEFERRED_FINISH);
+    EXPECT_GT(tasks[0].completion.after.sequence, tasks[0].completion.before.sequence);
+    EXPECT_EQ(workers[2].error_flags, 0u);
+}
+
+TEST(HbgAdmissionProtocol, DeferredFinishRejectsForeignAdmissionEpoch) {
+    AdmissionFixture fixture({{2, LaneMask::aiv0()}}, 6, 17, {}, true);
+    ASSERT_TRUE(fixture.publish(0, 1));
+    auto *tasks =
+        scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
+    ++tasks[0].admission.run_epoch;
+    scheduler_protocol_task_done(fixture.base(), fixture.locals[2], 0, true, true);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(tasks[0].completion.before.sequence, 0u);
+    EXPECT_EQ(workers[2].error_flags, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+}
+
 TEST_P(HbgProtocolLayoutCorruption, BootstrapRejectsBadLayoutAndRetainedWorkerState) {
     AdmissionFixture fixture({{2, LaneMask::aic()}}, 6, 17, {}, true);
     auto *layout =

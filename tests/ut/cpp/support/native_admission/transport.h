@@ -17,6 +17,11 @@
 #include <utility>
 #include <vector>
 namespace native_admission_transport {
+struct AsyncCopy {
+    void *destination;
+    const void *source;
+    size_t bytes;
+};
 struct Control {
     size_t ceiling{std::numeric_limits<size_t>::max()};
     size_t bytes{0};
@@ -29,12 +34,19 @@ struct Control {
     bool retired{false};
     size_t calls_after_retire{0};
     int attach_rc{0};
+    int pmu_start_rc{0};
+    size_t pmu_start_calls{0};
+    size_t pmu_stop_calls{0};
     int op_timeout_rc{0};
     bool replace_op_timeout{false};
     uint64_t actual_op_timeout_us{0};
     uint64_t requested_op_timeout_us{0};
     size_t op_timeout_calls{0};
     int copy_rc{0};
+    bool defer_async_copies{false};
+    void *failed_async_destination{nullptr};
+    int async_copy_rc{0};
+    std::vector<AsyncCopy> deferred_copies;
     int free_rc{0};
     void *selected_free{nullptr};
     int selected_free_rc{0};
@@ -44,10 +56,16 @@ struct Control {
     size_t d2h_calls{0};
     size_t d2h_bytes{0};
     std::vector<const void *> downloads;
+    // Opt-in registration leaf; the real maker/registry/control-stream wait remain above it.
+    bool allow_registration{false};
+    int registration_launch_rc{0};
+    std::vector<int> registered_ids;
+    std::vector<void *> registration_streams;
     int stream_sync_rc{0};
     std::function<void()> stream_sync_hook;
     std::vector<void *> observed_streams;
     bool events_complete{true};
+    bool recording_active{false};
     int event_wait_rc{0};
     std::vector<std::pair<void *, const void *>> uploads;
 };

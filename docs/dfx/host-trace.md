@@ -170,7 +170,7 @@ output sees the original text; a consumer reading the raw log does not.
 chip.run                                      (= host_wall)
 ├─ chip.run.bind
 │  ├─ chip.run.bind.args        (ntensor=N: per-tensor retained-buffer slice + H2D)
-│  ├─ chip.run.bind.prebuilt    (TMR: prebuilt runtime-arena cache hit or build + upload)
+│  ├─ chip.run.bind.prebuilt    (TMR: prebuilt runtime-arena lookup/build + host image snapshot)
 │  └─ .{arena_build,static_arena,gm_heap,shared_mem,runtime_init,host_orch,
 │       graph_pack,arena_h2d,host_view_close}
 │           HBG host prepare-path segments, with SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1

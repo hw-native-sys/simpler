@@ -784,7 +784,7 @@ TEST(SchedulerNormalDispatch, FindsOwnQueuedWorkWithItsDirectoryBitClear) {
     EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
 }
 
-TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
+TEST(SchedulerNormalDispatch, LeavesLaterWorkSharedWhileOneExecutionIsQueued) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
     graph.executable(0, 0);
@@ -817,15 +817,24 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
         graph.graph(), storage.scheduler_state->base(), local, storage.run_control, victim_cursors, &ready_stats, 0, 0,
         &failed, storage.ssbuf_region
     ));
-    EXPECT_TRUE(failed);
+    EXPECT_FALSE(failed);
     EXPECT_EQ(local->own_slots()[0].task_ref, 0);
     EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
     EXPECT_EQ(local->own_slots()[1].task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(local->own_slots()[1].state, SchedulerDispatchSlotState::FILLING);
-    // Slot 0 dispatched and slot 1 did not, so only slot 0 is published.
+    EXPECT_EQ(local->own_slots()[1].state, SchedulerDispatchSlotState::FREE);
     EXPECT_EQ(local->local_ready_mask, 1u);
-    EXPECT_NE(storage.run_control->scheduler_error, 0u);
-    EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
+    EXPECT_EQ(storage.run_control->scheduler_error, 0u);
+    EXPECT_FALSE(scheduler_fill_own_slots(
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, victim_cursors, &ready_stats, 0, 0,
+        &failed, storage.ssbuf_region
+    ));
+    EXPECT_FALSE(failed);
+    // The later task remains in the shared inbox for another execution core.
+    int64_t remaining = SCHEDULER_TASK_REF_INVALID;
+    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &remaining, &ready_stats
+    ));
+    EXPECT_EQ(remaining, 1);
 }
 
 TEST(SchedulerLocalReady, OlderDispatchPrecedesReusedLowerSlot) {

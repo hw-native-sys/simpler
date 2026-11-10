@@ -54,9 +54,11 @@ TORCH_AUTOLOAD_LINE = re.compile(
 # Instrumented subtotal, not the full interval before device execution.
 # Graph task binding, compact execution-image preparation and A5 scheduler work
 # have no segment in this sum; Definition packing is inside `graph_pack`.
+# `image_stage` is a host snapshot; historical `arena_h2d` measured synchronous
+# image copying. Keep both names distinct rather than equating their costs.
 # `args` is a per-byte staging cost. `host_view_close` remains excluded for
 # comparison with historical mapped-view logs; current binds close no mappings.
-CONTROL_PLANE = ("host_orch", "graph_pack", "arena_h2d")
+CONTROL_PLANE = ("host_orch", "graph_pack", "arena_h2d", "image_stage")
 
 # Historical display order; spans carry timestamps for the actual execution order.
 PHASE_ORDER = (
@@ -69,6 +71,7 @@ PHASE_ORDER = (
     "shared_mem",
     "gm_heap",
     "arena_h2d",
+    "image_stage",
     "host_view_close",
 )
 
@@ -83,9 +86,13 @@ def parse_binds(paths: Sequence[Path]) -> list[dict]:
 
     Each bind is `{"pid", "inv", "ts", <segment>: ms, ...}`; `ts` is its earliest
     segment start, which orders the binds a rank ran.
+
+    Historical image copies and current host staging cannot share one report,
+    even if independent logs reuse the same `(pid, inv)`.
     """
     prefix = f"{BIND_SPAN}."
     binds: dict[tuple, dict] = {}
+    image_scopes: set[str] = set()
     for path in paths:
         with open(path, encoding="utf-8", errors="replace") as handle:
             for span in parse_spans(handle):
@@ -95,6 +102,13 @@ def parse_binds(paths: Sequence[Path]) -> list[dict]:
                 if "." in phase:
                     # An orchestrator operation inside host_orch, not a segment.
                     continue
+                if phase in ("arena_h2d", "image_stage"):
+                    image_scopes.add(phase)
+                    if len(image_scopes) > 1:
+                        raise ValueError(
+                            "mixed arena_h2d and image_stage scopes are not comparable; "
+                            "parse historical and staged-image logs separately"
+                        )
                 bind = binds.setdefault((span.pid, span.inv), {"pid": span.pid, "inv": span.inv, "ts": span.ts})
                 bind[phase] = span.dur / 1e6
                 bind["ts"] = min(bind["ts"], span.ts)
@@ -163,7 +177,11 @@ def main() -> int:
 
     paths = [path for source in args.log for path in expand_log_source(source)]
 
-    binds = parse_binds(paths)
+    try:
+        binds = parse_binds(paths)
+    except ValueError as error:
+        print(f"{' '.join(args.log)}: {error}", file=sys.stderr)
+        return 1
     if not binds:
         print(
             f"{' '.join(args.log)}: no `chip.run.bind.<segment>` spans. Either "
@@ -196,12 +214,14 @@ def main() -> int:
         print("   to be established by hand before comparing them to anything)")
     torch_autoload = parse_torch_autoload(paths)
     if torch_autoload:
-        for record in torch_autoload:
-            print(f"  {record}")
+        print("\n".join(f"  {record}" for record in torch_autoload))
     else:
         print("  (no `torch_backend_autoload` record: backend-autoload state")
         print("   must be established before comparing this log)")
     print(f"  {len(binds)} binds, {len(warm)} warm ({len(cold)} cold dropped, ranks={ranks})\n")
+    if any("image_stage" in bind for bind in warm):
+        print("  image_stage is host staging; asynchronous H2D enqueue and completion are outside this span.")
+        print("  Its scope and subtotal are not comparable with historical arena_h2d measurements.\n")
     print(f"  {'phase':<18}{'min':>10}{'median':>10}{'max':>10}   n")
     for phase in PHASE_ORDER:
         values = [b[phase] for b in warm if phase in b]

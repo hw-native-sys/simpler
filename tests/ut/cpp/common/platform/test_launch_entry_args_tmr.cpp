@@ -50,6 +50,8 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     EXPECT_EQ(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime));
     KernelArgs header{};
     std::memcpy(&header, helper.launch_payload(), sizeof(header));
+    EXPECT_EQ(header.run_result_data_base, 0u);
+    EXPECT_EQ(header.run_result_epoch, 19u);
     EXPECT_EQ(header.entry_args_source, static_cast<uint32_t>(EntryArgsSource::KernelInvocation));
     PlatformEntryArgs view{
         helper.launch_payload(), header.entry_args_offset, header.entry_tensor_count, header.entry_scalar_count,
@@ -57,13 +59,22 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     };
     const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
     simpler::tmr::EntryArgsStorage decoded{};
-    ASSERT_TRUE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 19, &decoded));
+    ASSERT_TRUE(
+        simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, header.run_result_epoch, &decoded)
+    );
     EXPECT_EQ(decoded.scalar(0), 0x1111U);
     auto next_occupant = registered;
     ++next_occupant.generation;
     EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, next_occupant, 19, &decoded));
     EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 20, &decoded));
+    EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 0, &decoded));
     EXPECT_EQ(decoded.scalar(0), 0x1111U);
+    Handshake report{};
+    report.aicore_done = 1;
+    report.report_epoch = header.run_result_epoch - 1;
+    EXPECT_FALSE(aicore_report_accepted(&report, header.run_result_epoch));
+    report.report_epoch = header.run_result_epoch;
+    EXPECT_TRUE(aicore_report_accepted(&report, header.run_result_epoch));
 }
 
 TEST_F(LaunchEntryArgs, KernelPacketRejectsUndeclaredScalarBeforePublication) {
@@ -496,6 +507,68 @@ TEST_F(LaunchEntryArgs, ADescriptorFallbackLeavesNoRecordToMatch) {
     ASSERT_EQ(run_once(true), 0);
     EXPECT_EQ(rts.copies, 1) << "the launch route re-records before it can skip";
     EXPECT_GT(slot.published_prefix_bytes, 0U);
+}
+
+TEST_F(LaunchEntryArgs, ColdUnexecutedRecordingCannotSuppressFirstEagerCopy) {
+    runtime.set_orch_args(entry_args(2, 1, 0x7777));
+    runtime.set_aicpu_thread_num(3);
+    rts.allow_sync_initialization = true;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    ASSERT_TRUE(slot.workers_initialized);
+    const size_t prefix_bytes = runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched;
+    const std::vector<std::byte> untouched(prefix_bytes, std::byte{kDeviceMark});
+
+    rts.recording = true;
+    ASSERT_EQ(publish_for_launch(helper, this, rts.sink, true), 0);
+    EXPECT_EQ(rts.copies, 1);
+    EXPECT_EQ(std::memcmp(slot.runtime_args, untouched.data(), prefix_bytes), 0);
+    helper.release_run_view();
+
+    rts = {};
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    ASSERT_EQ(publish(true), 0);
+    EXPECT_EQ(rts.copies, 1);
+    EXPECT_EQ(device_descriptor().aicpu_thread_num, 3);
+}
+
+TEST_F(LaunchEntryArgs, UnexecutedRecordingCannotSuppressTheFollowingEagerCopy) {
+    runtime.set_orch_args(entry_args(2, 1, 0x7777));
+    ASSERT_EQ(run_once(true), 0);
+    helper.release_run_view();
+    const size_t prefix_bytes = runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched;
+    std::vector<std::byte> previous(prefix_bytes);
+    std::memcpy(previous.data(), slot.runtime_args, prefix_bytes);
+
+    runtime.set_aicpu_thread_num(3);
+    ASSERT_EQ(prepare(), 0);
+    rts = {};
+    rts.recording = true;
+    ASSERT_EQ(publish_for_launch(helper, this, rts.sink, true), 0);
+    EXPECT_EQ(rts.copies, 1);
+    EXPECT_EQ(std::memcmp(slot.runtime_args, previous.data(), prefix_bytes), 0);
+    EXPECT_EQ(slot.published_prefix_bytes, 0U);
+    helper.release_run_view();
+
+    rts = {};
+    ASSERT_EQ(run_once(true), 0);
+    EXPECT_EQ(rts.copies, 1);
+    EXPECT_EQ(device_descriptor().aicpu_thread_num, 3);
+}
+
+TEST_F(LaunchEntryArgs, RecordingIncludesAPrefixThatAlreadyMatchesTheDevice) {
+    runtime.set_orch_args(entry_args(2, 1, 0x7777));
+    ASSERT_EQ(run_once(true), 0);
+    helper.release_run_view();
+    ASSERT_EQ(run_once(true), 0);
+    ASSERT_GT(slot.published_prefix_bytes, 0U);
+    helper.release_run_view();
+
+    ASSERT_EQ(prepare(), 0);
+    rts = {};
+    rts.recording = true;
+    ASSERT_EQ(publish_for_launch(helper, this, rts.sink, true), 0);
+    EXPECT_EQ(rts.copies, 1);
+    EXPECT_EQ(slot.published_prefix_bytes, 0U);
 }
 
 // The record describes an allocation, not a slot: releasing the block takes it

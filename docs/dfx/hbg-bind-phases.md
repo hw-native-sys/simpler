@@ -2,7 +2,9 @@
 
 `host_build_graph` builds the whole task graph on the host before the device
 executes anything, so the host-side **`bind` stage** — argument copy-in,
-orchestration, the Graph Definition, and every H2D copy — is a first-class cost.
+orchestration, the Graph Definition, and execution-image staging — is a first-class cost.
+The onboard launch owns image H2D enqueue after bind; that work is outside these
+bind segments, and enqueue duration does not measure device-copy completion.
 `bind` is the `chip.run.bind` `[STRACE]` span both runtimes emit; only this one
 subdivides it into **segments**, one `chip.run.bind.<segment>` span each. This
 page is what those segments are, how to measure them on the two decode networks that exercise
@@ -30,11 +32,13 @@ the `chip.run.bind` span:
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
 | `host_orch` | orchestration and recording: every task submitted and every sub-task recorded; excludes the later Definition packing and Graph task binding in `bind_graph_definitions` |
 | `graph_pack` | assembling this run's Definition section in `bind_graph_definitions` — staging growth, header writes, spill copies. Legacy Graph hands this section to the AICPU launch package; A5 native Graph retains it in the host plan and publishes a separate scheduler image later. This segment has no H2D of its own. Excludes Graph task binding. Absent when there is no Definition |
-| `arena_h2d` | one H2D of the arena's copied zone and the shared-memory image |
+| `image_stage` | snapshotting prerequisites and the compact execution image into run-owned host metadata. Onboard H2D queues during launch, outside this segment. Synchronous CPU transports copy in the same call; their timing is not the onboard staging cost |
+| `arena_h2d` | historical synchronous H2D of the arena's copied zone and shared-memory image; retained for old traces, not emitted by the current image-staging path |
 | `host_view_close` | dropping the explicit HOST/NONE access registrations after host orchestration and recorder completion; no mapping or device-copy fallback is performed. Historical `count`, `bytes`, and `devcopy` attributes are no longer emitted |
 
 The parser's **control plane** label is the instrumented subtotal
-`host_orch + graph_pack + arena_h2d`, not the complete cost between "the
+`host_orch + graph_pack + image_stage` for current logs (historical logs use
+`arena_h2d` instead), not the complete cost between "the
 caller's data is in place" and "the device can start". `bind_graph_definitions`
 runs after `BindHostOrch` is recorded: its Graph task binding is outside all
 three segments, while its staging growth, header writes and spill copies are now
@@ -51,9 +55,9 @@ span is useful for checking work absent from the segments, but also includes
 
 **Two kinds were retired from the set, not merely from the output.** `relocate`
 and `sm_h2d` dated from when the shared-memory image was relocated and copied on
-its own; it now travels inside the single `arena_h2d` copy as that segment's
-`sm=`. Both were removed from `HostPhaseKind`. The table lists ten possible
-segments; the parser selects three for its subtotal and reports missing ones.
+its own; it now travels with the compact execution image, itemized by `sm=`.
+Both were removed from `HostPhaseKind`. The parser keeps `arena_h2d` for
+historical input and `image_stage` for current input; it reports absent segments.
 
 **The subtotal is a sum of measured costs, not an interval.** On a successful
 A2/A3 bind with Definitions, execution follows this order (unmarked work is
@@ -66,16 +70,21 @@ bind_callable_to_runtime_impl:
   static_arena, shared_mem, gm_heap,
   [compact execution-image preparation], host_view_close
 publish_run_image_impl:
-  arena_h2d
+  image_stage
 ```
 
-A5 additionally prepares resident scheduler state during bind. Onboard
-`publish_run_image_impl` snapshots that metadata before `arena_h2d`; the actual
-scheduler-state H2D queues in the later launch transaction, before the Runtime
-descriptor and entry fork. CPU transports without a staging callback retain
-synchronous publication before `arena_h2d`. Neither route has a dedicated
+A5 additionally prepares resident scheduler state during bind. Both onboard
+runtimes snapshot prerequisites followed by the main image inside `image_stage`.
+Their H2D copies queue in that order in the later launch transaction, before the
+Runtime descriptor and entry fork. CPU transports without a staging callback
+retain synchronous publication inside this call. Neither route has a dedicated
 scheduler segment, and the onboard enqueue cost is outside `chip.run.bind`.
 The legacy A5 path has no separate resident scheduler publication.
+
+`image_stage` is host preparation, not a device-upload clock anchor. The phase
+artifact excludes it from the upload projection. A skipped-device timing run
+measures the host snapshot but does not execute the later image upload. Do not
+compare its segment or subtotal directly with a historical `arena_h2d` result.
 
 A5 native Graph includes the original Definitions, per-Definition plans and
 instance mappings in that scheduler image. It does not attach a Definition
@@ -216,12 +225,13 @@ grep -oE 'name=chip\.run\.bind\.[a-z0-9_]+ ts=[0-9]+ dur=[0-9]+[^[]*' outputs/hb
 ```
 
 The character class has to admit digits, or it drops every `arena_h2d` — the
-segment name containing digits, and the one that itemizes the execution-image upload.
+historical segment name containing digits. Current `image_stage` itemizes the
+execution-image snapshot, not an executed H2D.
 
 Each span carries `ts` (a `CLOCK_MONOTONIC` timestamp), `dur`, `pid` and `inv`,
 plus the segment's own attributes — the six kernel counters on all of them, then
 `tasks=` and `heap_used=` on `host_orch`, `defs=`, `bytes=`, `submissions=` and
-`spilled=` on `graph_pack`, and `arena_h2d`'s itemized upload. **A bind is one
+`spilled=` on `graph_pack`, and `image_stage`'s itemized image snapshot. **A bind is one
 `(pid, inv)`**, so grouping needs no inference from order: `inv` is the run epoch
 the enclosing `chip.run.bind` allocated, and two ranks writing one stream cannot
 be confused for each other. Sum the control-plane segments **within each bind**
@@ -234,18 +244,18 @@ objects the recorders could not build inside the retained staging, which
 reported on `graph_pack`, and that host copy is inside its timing window.
 The first bind of a process has nothing retained and so spills all of them; a later bind that still spills means the run's
 Definitions outgrew the high-water mark the previous one left, and the copies are
-back. It is not spelled `copied=` on purpose: on `arena_h2d` that name means a
+back. It is not spelled `copied=` on purpose: on `image_stage` that name means a
 zone, not a count.
 
-**A segment's `bytes=` is what that segment itself copied, so no copy is counted
-twice.** `graph_pack` counts the Definition objects it packs, which are all it
-copies; `arena_h2d`'s `bytes=` is its single copy, exactly partitioned by the
-`copied=` and `sm=` beside it. A Graph invocation's boundary values are inside that
-`sm=`: they live in the outer Graph task's ordinary argument pools, so they travel
-with every other task's arguments rather than as a population of their own.
-(`shared_mem`'s `bytes=` is the image the arena grew to hold, which `arena_h2d`
-then ships as `sm=`; that is the one figure two segments both report, and neither
-is a copy count of the other.)
+**A segment's `bytes=` describes its named operation, not a total transfer
+counter.** `graph_pack` counts the Definition objects it packs. `image_stage`'s
+`bytes=` describes the main image, partitioned by `copied=` and `sm=`; prerequisite
+metadata can also be snapshotted in the interval but is not part of that image
+size. These are host-staged bytes, not completed H2D bytes. A Graph invocation's
+boundary values live inside `sm=` with the outer Graph task's ordinary argument
+pools. `shared_mem` also reports that image's size; neither figure is an additional
+device copy count. Historical `arena_h2d` logs measured the synchronous main-image
+copy and use the same image-size partition.
 
 The first bind of each rank is warm-up and belongs in neither statistic; drop it
 explicitly rather than letting a minimum quietly exclude it.
@@ -303,6 +313,14 @@ grep -oE 'device_wall ts=0 dur=[0-9]+' <log> | \
 
 A branch comparison is a different measurement from a single reading, and two of
 its failure modes have already produced wrong answers on this box.
+
+**Image staging and image transfer are different measurement scopes.** Current
+`image_stage` measures run-owned host snapshotting. Historical `arena_h2d`
+measured a synchronous main-image copy. Moving image H2D to the existing launch
+transaction removes that device-transfer cost from bind; a lower bind subtotal
+alone does not prove lower end-to-end latency. The parser recognizes both names
+and warns on `image_stage` reports. Their costs and subtotals are not comparable
+across this boundary; measure launch publication and completion separately.
 
 **Check source coverage before comparing identically named segments.** This
 segment's scope has moved twice, and a log carries only the name. At #2353 the

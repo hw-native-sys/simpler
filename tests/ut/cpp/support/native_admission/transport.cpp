@@ -51,7 +51,10 @@ int rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     ++c.allocations;
     *out = nullptr;
     if (c.allocations == c.fail_allocation || c.bytes > c.ceiling || bytes > c.ceiling - c.bytes) return -12;
-    *out = std::calloc(1, bytes);
+    // Match the device allocator's address alignment, including real callable
+    // images; calloc's max_align_t alignment is insufficient for that contract.
+    if (posix_memalign(out, 64, bytes == 0 ? 1 : bytes) != 0) *out = nullptr;
+    if (*out != nullptr) std::memset(*out, 0, bytes);
     if (!*out) return -12;
     ++c.successful_allocations;
     allocations[*out] = bytes;
@@ -85,6 +88,12 @@ int rtFreeHost(void *ptr) {
     return 0;
 }
 int rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
+    auto &c = native_admission_transport::control();
+    if (c.defer_async_copies && kind == RT_MEMCPY_HOST_TO_DEVICE) {
+        if (bytes > capacity || (bytes != 0 && (dst == nullptr || src == nullptr))) return -2;
+        c.deferred_copies.push_back({dst, src, static_cast<size_t>(bytes)});
+        return dst == c.failed_async_destination ? c.async_copy_rc : 0;
+    }
     return rtMemcpy(dst, capacity, src, bytes, kind);
 }
 int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
@@ -193,7 +202,8 @@ int aclrtStreamGetId(aclrtStream, int32_t *out) {
     return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
-    *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    *status = native_admission_transport::control().recording_active ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE :
+                                                                       ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     *model = nullptr;
     return 0;
 }
@@ -209,10 +219,42 @@ int LoadAicpuOp::Finalize(rtStream_t) {
 void LoadAicpuOp::ForgetWithoutUnload() {}
 int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) { return -1; }
 int LoadAicpuOp::Init(const std::vector<std::string> &) { return -1; }
-int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &) { return -1; }
+int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &name) {
+    auto &c = native_admission_transport::control();
+    if (!c.allow_registration || name != KernelNames::RegisterCallableName || bytes != sizeof(RegisterCallableArgs))
+        return -1;
+    c.registered_ids.push_back(static_cast<RegisterCallableArgs *>(args)->active_callable_id);
+    c.registration_streams.push_back(stream);
+    return c.registration_launch_rc;
+}
 }  // namespace host
 
-KernelContextOps make_onboard_kernel_context_ops() { return {}; }
+KernelContextOps make_onboard_kernel_context_ops() {
+    return {
+        nullptr,
+        [](void *, int *device) noexcept {
+            *device = 0;
+            return 0;
+        },
+        [](void *, void **context) noexcept {
+            static int token;
+            *context = &token;
+            return 0;
+        },
+        [](void *, void **stream) noexcept {
+            return rtStreamCreate(stream, 0);
+        },
+        [](void *, void *stream) noexcept {
+            return rtStreamDestroy(stream);
+        },
+        [](void *, void **event) noexcept {
+            return aclrtCreateEventExWithFlag(event, ACL_EVENT_SYNC);
+        },
+        [](void *, void *event) noexcept {
+            return aclrtDestroyEvent(event);
+        }
+    };
+}
 
 // The late-read hardware probe needs real stream-pair ownership. This transport
 // cannot retire that ownership; native admission/close uses the real base runner.
@@ -224,3 +266,19 @@ void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const Prep
     std::fputs("native admission CPU transport cannot adopt hardware drain ownership\n", stderr);
     std::abort();
 }
+
+// The native-admission binary exports these for the real PMU lease's dlsym.
+extern "C" int prof_drv_start(unsigned int, unsigned int, void *) {
+    auto &state = native_admission_transport::control();
+    ++state.pmu_start_calls;
+    return state.pmu_start_rc;
+}
+extern "C" int prof_stop(unsigned int, unsigned int) {
+    ++native_admission_transport::control().pmu_stop_calls;
+    return 0;
+}
+extern "C" int halProfDataFlush(unsigned int, unsigned int, unsigned int *bytes) {
+    *bytes = 0;
+    return 0;
+}
+extern "C" int prof_channel_read(unsigned int, unsigned int, char *, unsigned int) { return 0; }

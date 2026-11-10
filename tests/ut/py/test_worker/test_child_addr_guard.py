@@ -887,6 +887,7 @@ class TestDomainReleaseOrdering:
             _domain_size=2,
             _domain_ranks={0: 0, 1: 1},
             _allocation_pending=False,
+            _host_mappings=[],
         )
         return w, handle, bufs
 

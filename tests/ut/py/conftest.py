@@ -15,10 +15,43 @@ are importable by bare name under ``--import-mode=importlib``.
 """
 
 import sys
+from multiprocessing import resource_tracker
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent.parent.parent
 for _d in [_ROOT, _ROOT / "python", Path(__file__).resolve().parent]:
     _s = str(_d)
     if _s not in sys.path:
         sys.path.insert(0, _s)
+
+
+@pytest.fixture
+def native_host_memory():
+    """Emulate native POSIX ownership without Python resource-tracker ownership."""
+    posixshmem = pytest.importorskip("_posixshmem")
+
+    class NativeOwner(SharedMemory):
+        def __init__(self, *, size, name=None):
+            super().__init__(name=name, create=True, size=size)
+            resource_tracker.unregister(self._name, "shared_memory")
+
+        def unlink(self):
+            posixshmem.shm_unlink(self._name)
+
+    owners = []
+
+    def create(*, size=4096, name=None):
+        owner = NativeOwner(size=size, name=name)
+        owners.append(owner)
+        return owner
+
+    yield create
+    for owner in owners:
+        owner.close()
+        try:
+            owner.unlink()
+        except FileNotFoundError:
+            pass

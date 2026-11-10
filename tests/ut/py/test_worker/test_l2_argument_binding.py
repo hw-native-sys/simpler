@@ -36,7 +36,8 @@ def l2():
     impl = SimpleNamespace(
         _execution_environment=(os.getpid(), 1, 1, 0, False),
         _validate_execution_context=lambda: None,
-        _submit_chip_run_direct=lambda cid, args, cfg: calls.append(args) or SimpleNamespace(lane_poisoned=False),
+        _submit_chip_run_direct=lambda cid, args, cfg: calls.append(args)
+        or SimpleNamespace(lane_poisoned=False, _owner_recovery_required=True),
     )
     impl.free = frees.append
     worker._chip_worker = impl
@@ -545,7 +546,7 @@ def test_valid_context_device_failure_remains_terminal_and_retains_source(l2, me
         raise failure
 
     impl = worker._chip_worker
-    impl._submit_chip_run_direct = lambda *_args: SimpleNamespace(wait=wait)
+    impl._submit_chip_run_direct = lambda *_args: SimpleNamespace(wait=wait, _owner_recovery_required=True)
     backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
     handle = worker._submit_l2_locked(3, arguments(backing), CallConfig())
     for _ in range(2):

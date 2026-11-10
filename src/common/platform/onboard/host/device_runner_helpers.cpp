@@ -111,7 +111,7 @@ int publish_for_launch(
     // A retained recording has passed resource admission; RTS records the
     // same launch packet used by eager, including KernelInvocation identity.
     const bool permitted = retained_recording || launch_entry_args_permitted(aicpu_stream);
-    const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink);
+    const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink, retained_recording);
     if (rc != 0) {
         LOG_ERROR("publish_for_launch: launch metadata publication failed: %d", rc);
     }
@@ -119,7 +119,7 @@ int publish_for_launch(
 }
 
 int KernelArgsHelper::prepare_runtime_args(
-    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
+    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, bool replayable
 ) {
     if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
     entry_cache_eligible_ = slot.entry_cache_qualification.consume();
@@ -168,6 +168,21 @@ int KernelArgsHelper::prepare_runtime_args(
         // freed pointer has not been through either, so the transition is made
         // here rather than inherited.
         slot.published_prefix_bytes = 0;
+    }
+    if (replayable && !slot.workers_initialized) {
+        // A captured DMA repeats on every replay. Device-owned handshake words
+        // are initialized only while this allocation is exclusively prepared,
+        // before capture can record a publication over them.
+        const size_t begin = runtime_device_copy_size(host_runtime);
+        const size_t end = runtime_device_initialized_prefix_size(host_runtime);
+        if (end < begin || end > runtime_extent) return PTO_RUNTIME_ERR_INTERNAL;
+        const size_t bytes = end - begin;
+        const int init_rc = rtMemcpy(
+            reinterpret_cast<std::byte *>(slot.runtime_args) + begin, bytes,
+            reinterpret_cast<const std::byte *>(&host_runtime) + begin, bytes, RT_MEMCPY_HOST_TO_DEVICE
+        );
+        if (init_rc != 0) return init_rc;
+        slot.workers_initialized = true;
     }
     const uint64_t metadata_bytes = slot.staged_launch_metadata.size();
     if (metadata_bytes > UINT64_MAX - runtime_extent) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
@@ -318,7 +333,9 @@ void *KernelArgsHelper::launch_payload() {
     return launch_payload_;
 }
 
-int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink) {
+int KernelArgsHelper::publish_runtime_args(
+    bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink, bool retained_recording
+) {
     if (runtime_args_state_ != RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (args.runtime_args == nullptr || slot_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (stream == nullptr || slot_->runtime_upload_source == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -425,9 +442,11 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
     // Every other publication — the first onto a block, the descriptor
     // fallback, a runtime with no launch route — writes a range nothing
     // recorded, so it copies and records nothing.
-    const bool prefix_cacheable = launch_route && plan_.supported && initializing_slot_ == nullptr &&
-                                  publish_bytes == plan_.descriptor_bytes_when_launched &&
-                                  publish_bytes <= LAUNCH_ROUTE_PREFIX_CACHE_BYTES;
+    // Recording queues no DMA execution and cannot establish device contents.
+    // The graph needs its own copy even when a preceding eager run matches.
+    const bool prefix_cacheable =
+        !retained_recording && launch_route && plan_.supported && initializing_slot_ == nullptr &&
+        publish_bytes == plan_.descriptor_bytes_when_launched && publish_bytes <= LAUNCH_ROUTE_PREFIX_CACHE_BYTES;
     // The consumed snapshot is neither pending nor published during the copy.
     // Reentrant publish is rejected; copy failure leaves fresh prepare admissible.
     runtime_args_state_ = RuntimeArgsState::Empty;
