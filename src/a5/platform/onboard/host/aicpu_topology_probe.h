@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace pto::a5 {
+namespace simpler::a5 {
 
 // aicpu_topology_probe.cpp owns driver queries. aicpu_affinity_select.cpp
 // owns topology assembly, fallback and CPU selection without CANN dependencies.
@@ -210,4 +210,4 @@ bool build_aicpu_topology(
 
 }  // namespace detail
 
-}  // namespace pto::a5
+}  // namespace simpler::a5

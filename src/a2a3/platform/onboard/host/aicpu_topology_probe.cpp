@@ -19,7 +19,7 @@
 #include "common/unified_log.h"
 #include "common/acl_hal_device.h"
 
-namespace pto::a2a3 {
+namespace simpler::a2a3 {
 
 namespace {
 
@@ -130,4 +130,4 @@ bool probe_aicpu_topology(uint32_t device_id, std::vector<AicpuLogicalCpu> &out_
     return true;
 }
 
-}  // namespace pto::a2a3
+}  // namespace simpler::a2a3

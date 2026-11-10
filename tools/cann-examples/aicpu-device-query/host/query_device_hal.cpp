@@ -498,7 +498,7 @@ int main(int argc, char **argv) {
     );
 
     if (json_output) {
-        pto::a5::AicpuDeviceOccupancy occupancy;
+        simpler::a5::AicpuDeviceOccupancy occupancy;
         occupancy.os_sched = static_cast<uint64_t>(results[kOsSchedRequestIndex].value);
         occupancy.os_sched_valid = results[kOsSchedRequestIndex].rc == 0;
         occupancy.occupy = static_cast<uint64_t>(results[kOccupyRequestIndex].value);
@@ -506,8 +506,8 @@ int main(int argc, char **argv) {
         occupancy.pf_occupy = static_cast<uint64_t>(results[kPfOccupyRequestIndex].value);
         occupancy.pf_occupy_valid = results[kPfOccupyRequestIndex].rc == 0;
 
-        pto::a5::AicpuTopology topology;
-        if (!pto::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id), occupancy, topology)) {
+        simpler::a5::AicpuTopology topology;
+        if (!simpler::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id), occupancy, topology)) {
             std::fprintf(stderr, "A5 AICPU topology probe failed for device %d\n", device_id);
             return 1;
         }
@@ -516,25 +516,25 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        pto::a5::AicpuLaunchPlan launch_plan;
+        simpler::a5::AicpuLaunchPlan launch_plan;
         std::string plan_error;
-        if (!pto::a5::build_aicpu_launch_plan(topology, 0, launch_plan, plan_error)) {
+        if (!simpler::a5::build_aicpu_launch_plan(topology, 0, launch_plan, plan_error)) {
             std::fprintf(stderr, "A5 AICPU launch planning failed: %s\n", plan_error.c_str());
             return 1;
         }
 
-        pto::a5::AicpuSelectionPolicy policy = pto::a5::AicpuSelectionPolicy::kScenario;
+        simpler::a5::AicpuSelectionPolicy policy = simpler::a5::AicpuSelectionPolicy::kScenario;
         if (topology.generic_selection_only) {
-            policy = pto::a5::AicpuSelectionPolicy::kGeneric;
-        } else if (topology.scenario_type == pto::a5::AicpuScenarioType::kUnknown) {
-            policy = pto::a5::AicpuSelectionPolicy::kSequentialFallback;
+            policy = simpler::a5::AicpuSelectionPolicy::kGeneric;
+        } else if (topology.scenario_type == simpler::a5::AicpuScenarioType::kUnknown) {
+            policy = simpler::a5::AicpuSelectionPolicy::kSequentialFallback;
             std::fprintf(
                 stderr,
                 "WARNING: AICPU topology UNKNOWN; selected %d active roles from %d stable CPUs; launch count=%d\n",
                 launch_plan.effective_active_count, launch_plan.stable_reachable_count, launch_plan.launch_count
             );
         }
-        std::fputs(pto::a5::format_aicpu_topology_json(topology, policy, launch_plan).c_str(), stdout);
+        std::fputs(simpler::a5::format_aicpu_topology_json(topology, policy, launch_plan).c_str(), stdout);
     } else {
         // ---- Pretty-print ----
         std::printf("\n=== device=%d  device-side HAL view (via dispatcher + inner SO) ===\n", device_id);

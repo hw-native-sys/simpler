@@ -28,7 +28,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 
-namespace pto::a5 {
+namespace simpler::a5 {
 
 using detail::CpuTopologyData;
 using detail::CpuTopologyEntry;
@@ -1125,4 +1125,4 @@ std::string format_aicpu_topology_json(
     return out.str();
 }
 
-}  // namespace pto::a5
+}  // namespace simpler::a5

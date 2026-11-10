@@ -18,7 +18,7 @@
 #include "common/acl_hal_device.h"
 #include "common/unified_log.h"
 
-namespace pto::a5 {
+namespace simpler::a5 {
 namespace {
 
 using pto::driver::CpuTopology;
@@ -107,4 +107,4 @@ bool probe_aicpu_topology(
     return detail::build_aicpu_topology(device_occupancy, soc_name, available, topo, out_topology);
 }
 
-}  // namespace pto::a5
+}  // namespace simpler::a5
