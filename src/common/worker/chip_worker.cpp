@@ -814,14 +814,13 @@ void ChipWorker::finalize() {
         if (run_lane_ != nullptr) run_lane_->detach_after_failed_teardown(lane_error);
         run_lane_.reset();
     }
+    if (comm_reclamation_unconfirmed_ && (!comm_sessions_.empty() || !global_domain_ids_.empty())) {
+        // Forced device reset also tears down the SDK communication context.
+        // Live SDK receive threads can still use that context after a failed run.
+        retain_unconfirmed_comm_cleanup();
+    }
     require_comm_cleanup_confirmed();
-    if (comm_reclamation_unconfirmed_) {
-        // Carrier destruction does not prove device users stopped. Keep comm
-        // owners and their code alive, but allow the device's reset path below.
-        if ((!comm_sessions_.empty() || !global_domain_ids_.empty()) && runtime_module_ != nullptr) {
-            runtime_module_->retain_until_process_exit();
-        }
-    } else {
+    if (!comm_reclamation_unconfirmed_) {
         // Release windows while the host runtime and device context are alive.
         if (comm_global_domain_release_fn_ != nullptr) {
             for (uint64_t domain_id : global_domain_ids_) {
