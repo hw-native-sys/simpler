@@ -20,29 +20,42 @@
 #include <stdexcept>
 #include <unistd.h>
 
+class NativeSubmissionState;
+
 // The action and Run contain native values only. Python owns storage lifetimes
 // separately, until a completion verdict permits retirement.
 template <class Run>
 class QueuedSubmission : public std::enable_shared_from_this<QueuedSubmission<Run>> {
 public:
     using Deadline = typename Run::Deadline;
+    enum class Disposition { Pending, Submitting, Submitted, Cancelled, Retired };
 
-    explicit QueuedSubmission(std::function<Run()> action) :
+    explicit QueuedSubmission(std::function<Run()> action, std::shared_ptr<void> native_owner = {}) :
         action_([action = std::move(action)](bool) {
             return action();
-        }) {}
+        }),
+        native_owner_(std::move(native_owner)) {}
 
-    explicit QueuedSubmission(std::function<Run(bool)> action, bool framework_eligible = true) :
+    explicit QueuedSubmission(
+        std::function<Run(bool)> action, bool framework_eligible = true, std::shared_ptr<void> native_owner = {}
+    ) :
         framework_eligible_(framework_eligible),
-        action_(std::move(action)) {}
+        action_(std::move(action)),
+        native_owner_(std::move(native_owner)) {}
 
     void claim_framework() {
+        claim_framework([] {});
+    }
+
+    template <class Claim>
+    void claim_framework(Claim &&claim) {
         validate_process();
         std::lock_guard<std::mutex> lock(mutex_);
         if (phase_ != Phase::Pending || exported_ || public_observation_ || framework_claimed_)
             throw std::logic_error("framework ownership requires an unexported, unconsumed native token");
         if (!framework_eligible_)
             throw std::logic_error("native token does not support framework observation transfer");
+        std::forward<Claim>(claim)();
         framework_claimed_ = true;
     }
 
@@ -94,17 +107,31 @@ public:
     }
 
     void submit() {
+        submit([] {});
+    }
+
+    template <class Preflight>
+    void submit(Preflight &&preflight) {
+        submit([] {}, std::forward<Preflight>(preflight));
+    }
+
+    template <class Claim, class Preflight>
+    void submit(Claim &&claim, Preflight &&preflight) {
         validate_process();
         bool framework = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (phase_ != Phase::Pending) throw std::logic_error("submission token is already consumed or cancelled");
+            std::forward<Claim>(claim)();
             framework = framework_claimed_;
             phase_ = Phase::Submitting;
         }
         std::optional<Run> result;
         std::exception_ptr error;
         try {
+            // Validation and the action belong to this one claimed attempt;
+            // neither runs while the submission mutex is held.
+            std::forward<Preflight>(preflight)();
             result.emplace(action_(framework));
         } catch (...) {
             error = std::current_exception();
@@ -125,10 +152,7 @@ public:
         if (!reason) throw std::invalid_argument("cancellation requires a reason");
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (phase_ != Phase::Pending) return false;
-            error_ = reason;
-            action_ = {};
-            phase_ = Phase::Submitted;
+            if (!cancel_locked(reason)) return false;
         }
         changed_.notify_all();
         return true;
@@ -161,7 +185,7 @@ private:
                 throw std::logic_error("native submission observation belongs to a different owner");
             if (!framework) public_observation_ = true;
             auto ready = [&] {
-                return phase_ == Phase::Submitted || phase_ == Phase::Retired;
+                return phase_ == Phase::Submitted || phase_ == Phase::Cancelled || phase_ == Phase::Retired;
             };
             if (deadline == Deadline::max()) {
                 changed_.wait(lock, ready);
@@ -176,6 +200,12 @@ private:
     }
 
 public:
+    Disposition disposition() {
+        validate_process();
+        std::lock_guard<std::mutex> lock(mutex_);
+        return phase_;
+    }
+
     bool owner_recovery_required() {
         validate_process();
         std::optional<Run> run;
@@ -192,18 +222,30 @@ public:
     // without a returned Run requires the owner's recovery proof.
     void retire() {
         validate_process();
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (phase_ == Phase::Pending || phase_ == Phase::Submitting)
-            throw std::logic_error("cannot retire a pending submission");
-        run_.reset();
-        phase_ = Phase::Retired;
+        std::shared_ptr<void> native_owner;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (phase_ == Phase::Pending || phase_ == Phase::Submitting)
+                throw std::logic_error("cannot retire a pending submission");
+            run_.reset();
+            native_owner = std::move(native_owner_);
+            phase_ = Phase::Retired;
+        }
     }
 
 private:
+    friend class NativeSubmissionState;
+    bool cancel_locked(std::exception_ptr reason) {
+        if (phase_ != Phase::Pending) return false;
+        error_ = reason;
+        action_ = {};
+        phase_ = Phase::Cancelled;
+        return true;
+    }
     void validate_process() const {
         if (getpid() != process_) throw std::logic_error("submission token belongs to another process");
     }
-    enum class Phase { Pending, Submitting, Submitted, Retired };
+    using Phase = Disposition;
     const pid_t process_ = getpid();
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -216,4 +258,5 @@ private:
     std::function<Run(bool)> action_;
     std::optional<Run> run_;
     std::exception_ptr error_;
+    std::shared_ptr<void> native_owner_;
 };

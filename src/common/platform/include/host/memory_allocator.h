@@ -26,8 +26,7 @@
  * - Idempotent finalize() for explicit cleanup with error checking
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -62,9 +61,13 @@ public:
      * - sim: Allocates 64-byte-aligned host memory
      *
      * @param size  Size in bytes to allocate
-     * @return Memory pointer on success, nullptr on failure
+     * @param status Optional raw platform status. When supplied, return any
+     *               nonnull output even on error so the caller can retain it.
+     * @return The allocation on success. Without status, failure returns null.
+     *         Every nonnull platform output is tracked for checked cleanup;
+     *         an error does not establish that its contents are usable.
      */
-    void *alloc(size_t size);
+    void *alloc(size_t size, int *status = nullptr);
 
     /**
      * Free memory if tracked
@@ -128,10 +131,13 @@ public:
         /**
          * Allocate `size` bytes and commit this slot's bookkeeping.
          *
-         * @return the allocation, or nullptr when the platform call failed or
-         *         this reservation is not valid. Nothing is changed on failure.
+         * @param status Optional raw platform status, with the same error-output
+         *               ownership contract as alloc().
+         * @return the allocation on success; null on error when status is absent.
+         *         A nonnull error output is tracked. An invalid reservation or
+         *         null platform output commits no allocation.
          */
-        void *commit_alloc(size_t size);
+        void *commit_alloc(size_t size, int *status = nullptr);
 
     private:
         friend class MemoryAllocator;
@@ -268,5 +274,3 @@ private:
     size_t committed_bytes_ = 0;
     uint64_t relinquished_bytes_ = 0;
 };
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_

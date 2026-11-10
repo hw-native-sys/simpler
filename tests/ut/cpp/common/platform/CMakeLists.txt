@@ -924,6 +924,7 @@ set(NATIVE_ADMISSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test_entry_cache_qualification.cpp
     ${SIMPLER_SRC}/common/worker/chip_run_lane.cpp
     ${SIMPLER_SRC}/common/worker/chip_worker.cpp
+    ${SIMPLER_SRC}/common/worker/native_submission_state.cpp
     ${SIMPLER_SRC}/common/worker/runtime_module.cpp
     ${SIMPLER_SRC}/common/worker/device_fault_monitor_host.cpp
     ${CMAKE_SOURCE_DIR}/support/native_admission/transport.cpp
@@ -936,6 +937,9 @@ set(NATIVE_ADMISSION_SOURCES
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_phase_capture.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/run_retention_probe.cpp
     ${SIMPLER_SRC}/@arch@/platform/onboard/host/memory_allocator.cpp
+    ${SIMPLER_SRC}/@arch@/platform/onboard/host/context_preparation.cpp
+    ${SIMPLER_SRC}/@arch@/platform/onboard/host/host_regs.cpp
+    ${SIMPLER_SRC}/@arch@/platform/onboard/host/aicpu_affinity_select.cpp
     ${NATIVE_ADMISSION_SHARED_HOST}
     ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
     ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
@@ -945,6 +949,7 @@ set(NATIVE_ADMISSION_SOURCES
 set(NATIVE_ADMISSION_INCLUDES
     ${CMAKE_SOURCE_DIR}/support/native_admission
     ${CMAKE_SOURCE_DIR}/support/kernel_args
+    ${SIMPLER_SRC}/@arch@/platform/onboard/host
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
     ${SIMPLER_SRC}/common/log
@@ -1001,6 +1006,12 @@ foreach(_arch IN ITEMS a2a3 a5)
         set_target_properties(test_${_arch}_${_rt}_native_admission PROPERTIES ENABLE_EXPORTS ON)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_link_options(test_${_arch}_${_rt}_native_admission PRIVATE -Wl,--wrap=_ZnwmSt11align_val_t)
+        endif()
+        if(_arch STREQUAL "a5")
+            target_compile_definitions(test_${_arch}_${_rt}_native_admission PRIVATE CONTEXT_ARCH_A5=1)
+        else()
+            target_sources(test_${_arch}_${_rt}_native_admission PRIVATE
+                ${SIMPLER_SRC}/a2a3/platform/onboard/host/aicpu_topology_probe.cpp)
         endif()
     endforeach()
 endforeach()

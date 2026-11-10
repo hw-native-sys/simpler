@@ -67,9 +67,24 @@ public:
     int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
         KernelArgsHelper args;
         submission_storage_[slot]->retain_replay_evidence = true;
+        // This low-level evidence fixture explicitly requests the native record.
         DfxRunConfig dfx;
         dfx.scope_stats_enabled = true;
         return ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+    }
+    int warm_capture_result_caches() {
+        // Fake context initialization omits real Kernel init's optional warm-up.
+        // Requested-capture tests still need actual initialized result backing.
+        DfxRunConfig dfx;
+        dfx.scope_stats_enabled = true;
+        for (uint32_t slot = 0; slot < submission_storage_.size(); ++slot) {
+            const uint64_t epoch = std::numeric_limits<uint64_t>::max() - slot;
+            KernelArgsHelper args;
+            const int rc = ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+            if (rc != 0) return rc;
+            release_device_run_result(slot, epoch, true);
+        }
+        return 0;
     }
     PreparedSubmissionStorage &result_storage(uint32_t slot = 0) { return *submission_storage_[slot]; }
     int close_result(uint32_t slot = 0) { return release_submission_storage(*submission_storage_[slot], false); }

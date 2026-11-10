@@ -20,12 +20,26 @@ result address means no private publication, independently of that identity.
 Required terminal handoff, signed callback errors and explicit RTS observation
 remain part of execution without a private record.
 
+Kernel context initialization reserves mandatory execution resources before
+warming the initial granted result caches. Only an allocation returning the
+explicit out-of-memory status with no address may leave an optional cache
+missing; other allocation and initialization-copy errors still fail init.
+A requested capture preparation requires initialized backing and refuses before
+publication when it is unavailable. Program and requested eager preparation
+retain strict lazy initialization. No request silently falls back to no record.
+
 For a requested record, cold preparation initializes
 `NativeInvocationResultStorage` once, including its result prefix and private
 replay-evidence tail. Device entry invalidates the current publication before
 every execution. This does not add a host reset task to the captured sequence
 or erase evidence on replay. A failed cold copy retains the original allocation
 for checked cleanup.
+
+Kernel result allocation failures retain the platform's original status.
+Program preserves its existing INTERNAL allocation-failure result and lazy
+record allocation. Initialization-copy and checked-free failures retain their
+original status in both modes; a failed allocation's nonnull output remains
+owned but unusable until checked free succeeds.
 
 Execution progress and normal successful observation perform no private-result
 D2H. An SDK error can request the original call's optional structured detail;

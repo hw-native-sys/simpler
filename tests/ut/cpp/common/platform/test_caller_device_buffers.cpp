@@ -12,8 +12,26 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <new>
 
 #include "host/caller_device_buffers.h"
+
+namespace {
+thread_local size_t fail_after = std::numeric_limits<size_t>::max();
+}  // namespace
+
+void *operator new(std::size_t bytes) {
+    if (fail_after != std::numeric_limits<size_t>::max()) {
+        if (fail_after-- == 0) {
+            fail_after = std::numeric_limits<size_t>::max();
+            throw std::bad_alloc();
+        }
+    }
+    if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
+    throw std::bad_alloc();
+}
 
 namespace {
 
@@ -336,4 +354,98 @@ TEST(CallerDeviceBuffers, ARunNamingNoSpanHoldsNoBorrow) {
     EXPECT_TRUE(buffers.forget_if_unborrowed(at(kBase)));
     // A borrow with no identity is refused: a release could not name it.
     EXPECT_FALSE(buffers.borrow(0, nullptr, 0));
+}
+
+TEST(CallerDeviceBuffers, RetainedAliasesDetachBeforeTheSameSlotAcquiresADifferentWriter) {
+    CallerDeviceBuffers buffers;
+    buffers.record(at(kBase), kSize);
+    buffers.record(at(kBase + kSize), kSize);
+    const auto a = span(kBase, 64), b = span(kBase + kSize, 64);
+    int ar, br;
+    ASSERT_TRUE(buffers.borrow(kRunA, &a, 1));
+    ASSERT_TRUE(buffers.declare_writes(kRunA, &a, 1));
+    EXPECT_TRUE(buffers.written_by_other_run(0, a.addr, a.bytes));
+    ASSERT_TRUE(buffers.retain_reference(&ar, kRunA));
+    EXPECT_FALSE(buffers.written_by_other_run(kRunA, a.addr, a.bytes));
+    EXPECT_TRUE(buffers.written_by_other_run(0, a.addr, a.bytes));
+    EXPECT_EQ(buffers.borrow_count(), 1u);
+    buffers.detach_reference(&ar);
+    buffers.release(kRunA, false);
+    EXPECT_TRUE(buffers.written_by_other_run(kRunA, a.addr, a.bytes));
+    EXPECT_TRUE(buffers.written_by_other_run(0, a.addr, a.bytes));
+    ASSERT_TRUE(buffers.borrow(kRunA, &b, 1));
+    ASSERT_TRUE(buffers.declare_writes(kRunA, &b, 1));
+    ASSERT_TRUE(buffers.retain_reference(&br, kRunA));
+    EXPECT_FALSE(buffers.written_by_other_run(kRunA, b.addr, b.bytes));
+    EXPECT_TRUE(buffers.borrowed(at(kBase)));
+    buffers.release_reference(&ar, false);
+    EXPECT_FALSE(buffers.borrowed(at(kBase)));
+    EXPECT_TRUE(buffers.borrowed(at(kBase + kSize)));
+    EXPECT_TRUE(buffers.written_by_other_run(kRunB, b.addr, b.bytes));
+    buffers.release_reference(&br, false);
+    EXPECT_TRUE(buffers.borrowed(at(kBase + kSize)));
+    buffers.release(kRunA, false);
+    EXPECT_FALSE(buffers.borrowed(at(kBase + kSize)));
+}
+
+TEST(CallerDeviceBuffers, SnapshotAllocationFailuresRollbackOnlyTheUnpublishedReference) {
+    size_t failures = 0;
+    for (size_t cut = 0; cut < 12; ++cut) {
+        CallerDeviceBuffers buffers;
+        buffers.record(at(kBase), kSize);
+        buffers.record(at(kBase + kSize), kSize);
+        const auto a = span(kBase, 64), b = span(kBase + kSize, 64);
+        int old, next;
+        ASSERT_TRUE(buffers.borrow(kRunB, &b, 1));
+        ASSERT_TRUE(buffers.declare_writes(kRunB, &b, 1));
+        ASSERT_TRUE(buffers.retain_reference(&old, kRunB));
+        buffers.detach_reference(&old);
+        buffers.release(kRunB, false);
+        ASSERT_TRUE(buffers.borrow(kRunA, &a, 1));
+        ASSERT_TRUE(buffers.declare_writes(kRunA, &a, 1));
+        fail_after = cut;
+        bool injected = false;
+        try {
+            EXPECT_TRUE(buffers.retain_reference(&next, kRunA));
+        } catch (const std::bad_alloc &) {
+            injected = true;
+        }
+        fail_after = std::numeric_limits<size_t>::max();
+        if (injected) {
+            ++failures;
+            EXPECT_TRUE(buffers.borrowed(at(kBase)));
+            EXPECT_FALSE(buffers.written_by_other_run(kRunA, a.addr, a.bytes));
+            buffers.release(kRunA, false);
+            EXPECT_FALSE(buffers.borrowed(at(kBase)));
+            EXPECT_FALSE(buffers.written_by_other_run(kRunB, a.addr, a.bytes));
+            EXPECT_TRUE(buffers.borrowed(at(kBase + kSize)));
+            EXPECT_TRUE(buffers.written_by_other_run(kRunA, b.addr, b.bytes));
+            ASSERT_TRUE(buffers.borrow(kRunA, &a, 1));
+            ASSERT_TRUE(buffers.declare_writes(kRunA, &a, 1));
+            EXPECT_TRUE(buffers.retain_reference(&next, kRunA));
+        }
+        buffers.release_reference(&next, false);
+        buffers.release(kRunA, false);
+        buffers.release_reference(&old, false);
+        EXPECT_FALSE(buffers.borrowed(at(kBase)));
+        EXPECT_FALSE(buffers.borrowed(at(kBase + kSize)));
+    }
+    EXPECT_GE(failures, 4u);
+}
+
+TEST(CallerDeviceBuffers, PartialKnownSnapshotAndAbandonKeepPermanentRefusalFacts) {
+    CallerDeviceBuffers buffers;
+    buffers.record(at(kBase), kSize);
+    const CallerDeviceBuffers::Span spans[] = {span(kBase, 64), span(kBase + 0x100000, 64)};
+    int reference;
+    EXPECT_FALSE(buffers.borrow(kRunA, spans, 2));
+    ASSERT_TRUE(buffers.declare_writes(kRunA, spans, 2));
+    ASSERT_TRUE(buffers.retain_reference(&reference, kRunA));
+    buffers.detach_reference(&reference);
+    buffers.release(kRunA, false);
+    buffers.release_reference(&reference, true);
+    EXPECT_TRUE(buffers.borrowed(at(kBase)));
+    EXPECT_FALSE(buffers.forget_if_unborrowed(at(kBase)));
+    EXPECT_TRUE(buffers.written_by_other_run(kRunA, kBase, 64));
+    EXPECT_EQ(buffers.retained_count(), 1u);
 }

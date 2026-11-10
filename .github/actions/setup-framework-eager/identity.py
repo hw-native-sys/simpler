@@ -15,6 +15,7 @@ import json
 import platform
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 
@@ -42,6 +43,9 @@ def main():
 
     environment = importlib.import_module("simpler_setup.test_environments").preflight("torch_npu")
     project_root = importlib.import_module("simpler_setup.environment").PROJECT_ROOT
+    installed_assets = Path(sysconfig.get_path("platlib")) / "simpler_setup" / "_assets"
+    if project_root.resolve() != installed_assets.resolve():
+        raise RuntimeError(f"Framework runtime assets must come from {installed_assets}, got {project_root}")
     native = importlib.import_module("_task_interface")
     torch = importlib.import_module("torch")
     torch_npu = importlib.import_module("torch_npu")

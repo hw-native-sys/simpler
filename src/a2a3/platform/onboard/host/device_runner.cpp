@@ -43,6 +43,7 @@
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
 #include "aicpu_topology_probe.h"
+#include "context_preparation.h"
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -192,6 +193,22 @@ int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_
         return rc;
     }
     return 0;
+}
+
+int DeviceRunner::ensure_aicpu_topology() {
+    if (!aicpu_topology_.empty()) return 0;
+    std::vector<pto::a2a3::AicpuLogicalCpu> topology;
+    if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), topology)) return PTO_RUNTIME_ERR_INTERNAL;
+    aicpu_topology_ = std::move(topology);
+    return 0;
+}
+
+int DeviceRunner::prepare_kernel_arch_context(rtStream_t /*control_stream*/) {
+    int rc = ensure_aicore_reg_table(AicoreRegKind::Ctrl);
+    if (rc != 0) return rc;
+    rc = pto::a2a3::ensure_c2c_ctrl_address(c2c_ctrl_address_, c2c_ctrl_address_valid_);
+    if (rc != 0) return rc;
+    return ensure_aicpu_topology();
 }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
@@ -457,14 +474,14 @@ int DeviceRunner::prepare_execution(
     // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
     // gate only matches sched_getcpu() against this table.
     {
-        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
         std::vector<int32_t> allowed;
         runtime.set_aicpu_allowed_cpu_count(0);
         runtime.set_aicpu_launch_count(0);
-        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+        if (ensure_aicpu_topology() != 0) {
             LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        const auto &user_cpus = aicpu_topology_;
         int resolved_aicpu = resolve_aicpu_thread_num(
             runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
         );
@@ -514,7 +531,13 @@ int DeviceRunner::prepare_execution(
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
-    rc = kernel_args_init_ffts_base_addr(execution->kernel_args);
+    if (execution_mode_latch().is_kernel()) {
+        if (!c2c_ctrl_address_valid_) return PTO_RUNTIME_ERR_INVALID_STATE;
+        execution->kernel_args.args.ffts_base_addr = c2c_ctrl_address_;
+        rc = 0;
+    } else {
+        rc = kernel_args_init_ffts_base_addr(execution->kernel_args);
+    }
     if (rc != 0) {
         LOG_ERROR("init_ffts_base_addr failed: %d", rc);
         return rc;
@@ -714,6 +737,10 @@ int DeviceRunner::ensure_run_streams() {
 // observe a newer mask than the dispatch table it is measuring. A gating change
 // mid-worker is not something a per-run PMU re-query could have made safe.
 int DeviceRunner::ensure_aicore_reg_table(AicoreRegKind kind) {
+    if (kind == AicoreRegKind::Ctrl)
+        return pto::a2a3::ensure_ctrl_table(
+            mem_alloc_, device_id_, aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_
+        );
     const bool is_pmu = kind == AicoreRegKind::Pmu;
     uint64_t &table = is_pmu ? aicore_pmu_reg_table_dev_ : aicore_ctrl_reg_table_dev_;
     bool &committed = is_pmu ? aicore_pmu_reg_table_committed_ : aicore_ctrl_reg_table_committed_;
@@ -1512,6 +1539,9 @@ int DeviceRunner::finalize_impl() {
         }
 
         if (abandon_rc == 0) {
+            aicpu_topology_.clear();
+            c2c_ctrl_address_valid_ = false;
+            c2c_ctrl_address_ = 0;
             device_id_ = -1;
             device_unusable_.store(false, std::memory_order_release);
         }
@@ -1610,6 +1640,9 @@ int DeviceRunner::finalize_impl() {
     // A poisoned card returned from the fatal branch at the top of finalize(),
     // which owns the force reset, so the card reaching here is not poisoned.
     // Resource cleanup and the device reset have succeeded here.
+    aicpu_topology_.clear();
+    c2c_ctrl_address_valid_ = false;
+    c2c_ctrl_address_ = 0;
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);
     // Last in priority, and after every device decision has been taken: a

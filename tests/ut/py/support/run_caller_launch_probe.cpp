@@ -665,6 +665,15 @@ extern "C" aclError aclrtDestroyStream(aclrtStream stream) {
     ++resource_release_calls;
     return rtStreamDestroy(stream);
 }
+static thread_local aclmdlRICaptureMode capture_mode = ACL_MODEL_RI_CAPTURE_MODE_GLOBAL;
+static thread_local unsigned int capture_mode_exchanges = 0;
+
+extern "C" aclError aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *mode) {
+    std::swap(*mode, capture_mode);
+    ++capture_mode_exchanges;
+    return ACL_SUCCESS;
+}
+
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
     *status = capture ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     *model = nullptr;
@@ -2690,7 +2699,10 @@ static int check_capture_submission(bool borrowed, int fault) {
         assert(before == std::make_tuple(submits, syncs, copies, allocation_attempts));
         descriptor.prepare_purpose = SIMPLER_PREPARE_EAGER;
     }
+    const auto prior_exchanges = capture_mode_exchanges;
     assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
+    assert(capture_mode_exchanges == prior_exchanges + (borrowed ? 2u : 0u));
+    assert(capture_mode == ACL_MODEL_RI_CAPTURE_MODE_GLOBAL);
     auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(storage);
     if (!borrowed) {
         const auto before = std::make_tuple(submits, syncs, copies, allocation_attempts);

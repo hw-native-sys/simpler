@@ -30,7 +30,7 @@ def _helpers():
     return load("native_submit_helpers", Path(__file__).with_name("main.py"))
 
 
-def _check_refusals(worker, bridge, callable, stream, args, tickets, queue):
+def _check_refusals(worker, bridge, callable, stream, args, tensors, tickets, queue):
     """Check duplicate refusal, then that a failed native submission fails its framework operator."""
     try:
         bridge.submit_native(tickets[0].native_handle)
@@ -43,9 +43,9 @@ def _check_refusals(worker, bridge, callable, stream, args, tickets, queue):
     # queue enabled, torch_npu discards all later queued work and raises at the
     # next framework call, so no framework call precedes the expected error.
     raw_stream = stream.npu_stream
-    cancelled = worker.prepare_submission(callable, args, caller_stream=raw_stream)
+    cancelled = worker.prepare_submission(callable, args, caller_stream=raw_stream, keepalive=(stream, *tensors))
     tickets.append(cancelled)
-    successor = worker.prepare_submission(callable, args, caller_stream=raw_stream)
+    successor = worker.prepare_submission(callable, args, caller_stream=raw_stream, keepalive=(stream, *tensors))
     tickets.append(successor)
     assert cancelled.cancel()
     assert cancelled.safe_to_release
@@ -54,8 +54,8 @@ def _check_refusals(worker, bridge, callable, stream, args, tickets, queue):
         # failing one runs and the successor is discarded rather than refused.
         gate = bridge.enqueue_gate()
         try:
-            failed = bridge.enqueue_native(cancelled.native_handle)
-            bridge.enqueue_native(successor.native_handle)
+            failed = bridge.enqueue_native(cancelled.native_handle, tensors)
+            bridge.enqueue_native(successor.native_handle, tensors)
         finally:
             gate.release()
         try:
@@ -74,7 +74,7 @@ def _check_refusals(worker, bridge, callable, stream, args, tickets, queue):
         assert successor.safe_to_release
     else:
         try:
-            bridge.enqueue_native(cancelled.native_handle)
+            bridge.enqueue_native(cancelled.native_handle, tensors)
         except RuntimeError as error:
             assert "cancelled" in str(error)
         else:
@@ -120,7 +120,7 @@ def run(runtime, device, bridge_path, *, platform="a2a3"):
                 )
                 tickets.append(ticket)
                 try:
-                    queued.append(bridge.enqueue_native(ticket.native_handle))
+                    queued.append(bridge.enqueue_native(ticket.native_handle, frame["tensors"]))
                 except BaseException:
                     # A queue error does not prove that its callback never started.
                     # Even if cancel returns false, tickets retains this invocation
@@ -139,7 +139,7 @@ def run(runtime, device, bridge_path, *, platform="a2a3"):
                     frame["result"].cpu(), torch.full(helpers.SHAPE, frame["expected"], dtype=torch.float32)
                 )
 
-            _check_refusals(worker, bridge, callable, stream, frames[0]["args"], tickets, queue)
+            _check_refusals(worker, bridge, callable, stream, frames[0]["args"], frames[0]["tensors"], tickets, queue)
         worker.close()
         if queue != "1":
             assert stream.query()

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 /**
@@ -46,7 +47,9 @@
  * **A borrow belongs to a run identity, not to a count.** `borrow` is keyed on the run's own
  * identity, so a release names the run that took it and cannot discharge another run's reference.
  * Re-borrowing under one identity replaces that identity's set, which is what a re-prepared run
- * needs.
+ * needs. For capture, the existing external reference snapshots these facts while the active
+ * slot still aliases the same call. Checked Host-carrier retirement detaches that alias before
+ * slot reuse; checked external last-use ends the retained facts.
  *
  * **A borrow is about lifetime, and says nothing about readability.** Holding an allocation is not
  * producing it: two runs may legitimately take the same immutable input, and neither makes the
@@ -61,10 +64,10 @@
  * declared by nobody and stays readable, which is what keeps every path that does not produce a
  * device tensor on the behaviour it already had.
  *
- * A declaration is keyed on the same identity as the borrow and released with it, so it cannot
- * outlive the run that made it — including when that run held no borrow, which is why the release
- * discharges the two facts independently. A span that resolves to no recorded allocation is
- * ignored: there is nothing to protect.
+ * A declaration shares the borrow's identity and lifetime. A capture's external reference keeps
+ * both facts after its Host carrier ends, until checked external last-use releases them. The two
+ * facts are discharged independently, including when the call held no borrow. A span that resolves
+ * to no recorded allocation is ignored: there is nothing to protect.
  *
  * **An unproven run's facts are permanent, and they belong to the allocation.** When a run ended
  * without its last consumer being proven finished, the device may still be reading those bytes and
@@ -84,6 +87,32 @@
  * Its own mutex, and a leaf: nothing called while it is held takes another lock.
  */
 class CallerDeviceBuffers {
+    struct Identity {
+        uint64_t active{0};
+        const void *reference{nullptr};
+        Identity(uint64_t value = 0) :
+            active(value) {}
+        static Identity retained(const void *value) {
+            Identity key;
+            key.reference = value;
+            return key;
+        }
+        bool operator==(const Identity &other) const { return active == other.active && reference == other.reference; }
+    };
+    struct IdentityHash {
+        size_t operator()(const Identity &key) const noexcept {
+            return std::hash<uint64_t>{}(key.active) ^ std::hash<const void *>{}(key.reference);
+        }
+    };
+    struct Records {
+        std::vector<uint64_t> bases;
+        uint64_t active_alias{0};
+        Records() = default;
+        Records(std::vector<uint64_t> values, uint64_t alias = 0) :
+            bases(std::move(values)),
+            active_alias(alias) {}
+    };
+
 public:
     /** One span of a caller allocation a run names. */
     struct Span {
@@ -178,27 +207,47 @@ public:
      */
     void release(uint64_t identity, bool keep) {
         std::scoped_lock lk(mu_);
-        const auto borrowed = borrows_.find(identity);
-        if (borrowed != borrows_.end()) {
-            if (keep) {
-                for (const uint64_t base : borrowed->second)
-                    mark_release_refused(base);
-            }
-            borrows_.erase(borrowed);
+        release_locked(Identity(identity), keep);
+    }
+
+    /** Snapshot this carrier's facts into its existing external reference. */
+    bool retain_reference(const void *reference, uint64_t active_identity) {
+        if (reference == nullptr || active_identity == 0) return false;
+        std::scoped_lock lk(mu_);
+        const auto key = Identity::retained(reference);
+        if (borrows_.count(key) != 0 || writes_.count(key) != 0) return false;
+        const auto borrowed = borrows_.find(active_identity);
+        const auto written = writes_.find(active_identity);
+        Records retained_borrows(
+            borrowed == borrows_.end() ? std::vector<uint64_t>{} : borrowed->second.bases, active_identity
+        );
+        Records retained_writes(
+            written == writes_.end() ? std::vector<uint64_t>{} : written->second.bases, active_identity
+        );
+        borrows_.emplace(key, std::move(retained_borrows));
+        try {
+            writes_.emplace(key, std::move(retained_writes));
+        } catch (...) {
+            borrows_.erase(key);
+            throw;
         }
-        const auto written = writes_.find(identity);
-        if (written == writes_.end()) return;
-        if (keep) {
-            for (const uint64_t base : written->second) {
-                // Both marks, for the same reason: a consumer that may still be writing these
-                // bytes may still be reading them too, so the pages cannot go back either. The
-                // borrow usually said that already — this reaches the allocation a run declared
-                // through a declaration even if no admission borrow was taken.
-                mark_write_unproven(base);
-                mark_release_refused(base);
-            }
-        }
-        writes_.erase(written);
+        return true;
+    }
+
+    /** The runner proves this exact reference's carrier retired before detaching its alias. */
+    void detach_reference(const void *reference) {
+        std::scoped_lock lk(mu_);
+        const auto key = Identity::retained(reference);
+        const auto borrowed = borrows_.find(key);
+        const auto written = writes_.find(key);
+        if (borrowed != borrows_.end()) borrowed->second.active_alias = 0;
+        if (written != writes_.end()) written->second.active_alias = 0;
+    }
+
+    /** End only this reference; the carrier's active records are independent. */
+    void release_reference(const void *reference, bool keep) {
+        std::scoped_lock lk(mu_);
+        release_locked(Identity::retained(reference), keep);
     }
 
     /**
@@ -284,8 +333,8 @@ public:
         const auto entry = allocations_.find(allocation.base);
         if (entry != allocations_.end() && entry->second.write_unproven) return true;
         for (const auto &[writer, written] : writes_) {
-            if (writer == identity) continue;
-            for (const uint64_t one : written) {
+            if (writer == Identity(identity) || (identity != 0 && written.active_alias == identity)) continue;
+            for (const uint64_t one : written.bases) {
                 if (one == allocation.base) return true;
             }
         }
@@ -314,13 +363,19 @@ public:
     /** How many runs have declared a write. */
     std::size_t write_declaration_count() const {
         std::scoped_lock lk(mu_);
-        return writes_.size();
+        std::size_t count = 0;
+        for (const auto &[key, records] : writes_)
+            if (!records.bases.empty() && records.active_alias == 0) ++count;
+        return count;
     }
 
     /** How many runs hold a borrow. */
     std::size_t borrow_count() const {
         std::scoped_lock lk(mu_);
-        return borrows_.size();
+        std::size_t count = 0;
+        for (const auto &[key, records] : borrows_)
+            if (!records.bases.empty() && records.active_alias == 0) ++count;
+        return count;
     }
 
     /** How many allocations are retained for the process's remaining life. */
@@ -341,6 +396,30 @@ public:
     }
 
 private:
+    void release_locked(Identity identity, bool keep) {
+        const auto borrowed = borrows_.find(identity);
+        if (borrowed != borrows_.end()) {
+            if (keep) {
+                for (const uint64_t base : borrowed->second.bases)
+                    mark_release_refused(base);
+            }
+            borrows_.erase(borrowed);
+        }
+        const auto written = writes_.find(identity);
+        if (written == writes_.end()) return;
+        if (keep) {
+            for (const uint64_t base : written->second.bases) {
+                // Both marks, for the same reason: a consumer that may still be writing these
+                // bytes may still be reading them too, so the pages cannot go back either. The
+                // borrow usually said that already — this reaches the allocation a run declared
+                // through a declaration even if no admission borrow was taken.
+                mark_write_unproven(base);
+                mark_release_refused(base);
+            }
+        }
+        writes_.erase(written);
+    }
+
     /** One recorded caller mint: its extent, and the two facts that can outlive every run. */
     struct Entry {
         uint64_t bytes{0};
@@ -385,7 +464,7 @@ private:
         if (entry != allocations_.end() && entry->second.release_refused) return true;
         for (const auto &[identity, held] : borrows_) {
             (void)identity;
-            for (const uint64_t one : held) {
+            for (const uint64_t one : held.bases) {
                 if (one == base) return true;
             }
         }
@@ -394,9 +473,9 @@ private:
 
     mutable std::mutex mu_;
     std::unordered_map<uint64_t, Entry> allocations_;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> borrows_;
+    std::unordered_map<Identity, Records, IdentityHash> borrows_;
     // Which allocations each run has said it produces. Separate from `borrows_` because the two
     // answer different questions and are established at different moments: the borrow at
     // admission, the declaration at that run's own bind.
-    std::unordered_map<uint64_t, std::vector<uint64_t>> writes_;
+    std::unordered_map<Identity, Records, IdentityHash> writes_;
 };

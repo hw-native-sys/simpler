@@ -102,17 +102,30 @@ assert lib.{entry}(0) == -4321
 assert lib.reset_call_count() == 1
 assert lib.{entry}(0) == 0
 assert lib.reset_call_count() == 2, lib.reset_call_count()
-lib.rtFree.argtypes = [ctypes.c_void_p]
-lib.arm_destroy_failure_after(4, 0)
-assert lib.rtFree(0x1000) == -4321
-assert lib.failed_free_retry_attempts() == 1
-assert lib.failed_free_retry_successes() == 0
-assert lib.rtFree(0x2000) == 0
-assert lib.failed_free_retry_attempts() == 1
-assert lib.failed_free_retry_successes() == 0
-assert lib.rtFree(0x1000) == 0
-assert lib.failed_free_retry_attempts() == 2
-assert lib.failed_free_retry_successes() == 1
+for kind, destroy in ((2, lib.aclrtDestroyEvent), (4, lib.rtFree)):
+    destroy.argtypes = [ctypes.c_void_p]
+    lib.arm_destroy_failure_after(kind, 0)
+    assert destroy(0x1000) == -4321
+    assert lib.failed_destroy_retry_attempts() == 1
+    assert lib.failed_destroy_retry_successes() == 0
+    assert destroy(0x2000) == 0
+    assert lib.failed_destroy_retry_attempts() == 1
+    assert lib.failed_destroy_retry_successes() == 0
+    assert destroy(0x1000) == 0
+    assert lib.failed_destroy_retry_attempts() == 2
+    assert lib.failed_destroy_retry_successes() == 1
+lib.arm_capture_query_failure.argtypes = [ctypes.c_void_p, ctypes.c_int]
+lib.aclmdlRICaptureGetInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p)]
+status, model = ctypes.c_int(-1), ctypes.c_void_p()
+lib.arm_capture_query_failure(0x1000, 5)
+for _ in range(4):
+    assert lib.aclmdlRICaptureGetInfo(0x1000, ctypes.byref(status), ctypes.byref(model)) == 0
+assert lib.aclmdlRICaptureGetInfo(0x2000, ctypes.byref(status), ctypes.byref(model)) == 0
+assert lib.capture_query_failure_hits() == 0
+assert lib.aclmdlRICaptureGetInfo(0x1000, ctypes.byref(status), ctypes.byref(model)) == -4321
+assert lib.aclmdlRICaptureGetInfo(0x1000, ctypes.byref(status), ctypes.byref(model)) == 0
+assert status.value == 0 and model.value is None
+assert lib.capture_query_failure_hits() == 1
 """
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -227,10 +240,15 @@ class CallConfig(ctypes.Structure):
     ]
 
 
-def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
+def _host_runtime_path(arch: str, variant: str, runtime: str) -> Path:
     path = _PROJECT_ROOT / "build" / "lib" / arch / variant / runtime / "libhost_runtime.so"
     if not path.exists():
         pytest.skip(f"{path} not built")
+    return path
+
+
+def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
+    path = _host_runtime_path(arch, variant, runtime)
     if variant == "sim":
         # A simulated host runtime resolves its device entries against the
         # simulator context, which the worker normally loads for it.
@@ -297,14 +315,18 @@ def _minimal_callable_image() -> bytes:
     return _ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
 
 
-def _binaries(arch: str, runtime: str) -> tuple[bytes, bytes, bytes]:
+def _onboard_binary_paths(arch: str, runtime: str) -> tuple[Path, Path, Path]:
     base = _PROJECT_ROOT / "build" / "lib" / arch / "onboard" / runtime
     dispatcher = _PROJECT_ROOT / "build" / "lib" / arch / "dispatcher" / "libsimpler_aicpu_dispatcher.so"
     files = (base / "libaicpu_kernel.so", base / "aicore_kernel.o", dispatcher)
     for path in files:
         if not path.exists():
             pytest.skip(f"{path} not built")
-    return tuple(path.read_bytes() for path in files)  # type: ignore[return-value]
+    return files
+
+
+def _binaries(arch: str, runtime: str) -> tuple[bytes, bytes, bytes]:
+    return tuple(path.read_bytes() for path in _onboard_binary_paths(arch, runtime))  # type: ignore[return-value]
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -462,15 +484,15 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             # stops; their frees must not be confused with this owner's retry.
             faults.arm_destroy_failure_after(4, 1)
             assert lib.finalize_device(ctx) != 0
-            assert faults.failed_free_retry_attempts() == 1
-            assert faults.failed_free_retry_successes() == 0
+            assert faults.failed_destroy_retry_attempts() == 1
+            assert faults.failed_destroy_retry_successes() == 0
             assert lib.committed_device_memory_ctx(ctx) > 0
             assert lib.finalize_device(ctx) == 0
-            assert faults.failed_free_retry_attempts() == 2
-            assert faults.failed_free_retry_successes() == 1
+            assert faults.failed_destroy_retry_attempts() == 2
+            assert faults.failed_destroy_retry_successes() == 1
             assert lib.committed_device_memory_ctx(ctx) == 0
             assert lib.finalize_device(ctx) == 0
-            assert faults.failed_free_retry_attempts() == 2
+            assert faults.failed_destroy_retry_attempts() == 2
             finalized = True
         elif scenario in ("repeat_init", "init_failure"):
             assert lib.simpler_kernel_mode_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
@@ -478,12 +500,7 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             assert lib.finalize_device(ctx) == 0
             finalized = True
         else:
-            faults.arm_destroy_failure(1 if scenario == "stream_close" else 2)
-            assert lib.finalize_device(ctx) == -4321
-            first_attempts = faults.destroy_attempts()
-            assert first_attempts > 0
-            assert lib.finalize_device(ctx) == 0
-            assert faults.destroy_attempts() == first_attempts + 1
+            _check_stream_or_event_close_retry(lib, ctx, faults, scenario)
             finalized = True
     finally:
         if not finalized:
@@ -503,6 +520,30 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
         faults.disarm_acl_guard()
         if scenario != "fatal_device":
             _reset_caller_device(lib, device)
+
+
+def _check_stream_or_event_close_retry(lib, ctx, faults, scenario):
+    if scenario == "stream_close":
+        faults.arm_destroy_failure(1)
+        assert lib.finalize_device(ctx) == -4321
+        first_attempts = faults.destroy_attempts()
+        assert first_attempts > 0
+        assert lib.finalize_device(ctx) == 0
+        assert faults.destroy_attempts() == first_attempts + 1
+        return
+
+    # Other event owners may still have work on retry. Track only
+    # the completion event whose first destroy was refused.
+    faults.arm_destroy_failure(2)
+    assert lib.finalize_device(ctx) == -4321
+    assert faults.failed_destroy_retry_attempts() == 1
+    assert faults.failed_destroy_retry_successes() == 0
+    assert lib.finalize_device(ctx) == 0
+    assert faults.failed_destroy_retry_attempts() == 2
+    assert faults.failed_destroy_retry_successes() == 1
+    assert lib.finalize_device(ctx) == 0
+    assert faults.failed_destroy_retry_attempts() == 2
+    assert faults.failed_destroy_retry_successes() == 1
 
 
 def _reset_caller_device(lib, device):
@@ -642,15 +683,10 @@ def test_unclaimed_sim_close_preserves_the_callers_device(arch, runtime):
         sim.pto_cpu_sim_bind_device(previous)
 
 
-@pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
-def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, runtime: str, request):
-    """A kernel context comes up on a device the caller owns, refuses the
-    program-mode entry for the rest of its life, and releases everything it
-    created on close."""
+def _run_borrowed_bringup(arch: str, runtime: str, device_id: int):
     lib = _load(arch, "onboard", runtime)
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
-    device_id = int(str(request.config.getoption("--device")).split("-")[0].split(",")[0])
     lib.rtSetDevice.argtypes = [ctypes.c_int]
     lib.rtSetDevice.restype = ctypes.c_int
     assert lib.rtSetDevice(device_id) == 0
@@ -696,6 +732,24 @@ def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, run
         # Destroying after a clean close is allowed; an unclosed kernel
         # context would be refused and leaked instead.
         lib.destroy_device_context(ctx)
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
+def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, runtime: str, request):
+    """Bring up and close a borrowed kernel context with an exclusive mode claim."""
+    _host_runtime_path(arch, "onboard", runtime)
+    _onboard_binary_paths(arch, runtime)
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    # The caller's RTS primary context lives until the child exits. Keeping it
+    # out of the xdist worker lets later tests reuse that worker's device.
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "borrowed_bringup"],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
@@ -1736,6 +1790,8 @@ if __name__ == "__main__":
             128 << 20,
             refusal_phase="launch" if sys.argv[4] == "public_launch_retry" else "prepare",
         )
+    elif sys.argv[4] == "borrowed_bringup":
+        _run_borrowed_bringup(sys.argv[1], sys.argv[2], int(sys.argv[3]))
     elif sys.argv[4].startswith("borrowed_prepare"):
         _run_borrowed_prepare(
             sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "borrowed_prepare_failed_release"

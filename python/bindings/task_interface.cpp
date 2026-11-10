@@ -3612,7 +3612,9 @@ NB_MODULE(_task_interface, m) {
     // --- ChipWorker ---
     bind_native_submission(m);
     nb::class_<ChipWorker>(m, "_ChipWorker")
-        .def(nb::init<>())
+        .def(nb::new_([] {
+            return std::make_shared<ChipWorker>();
+        }))
         .def(
             "init",
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
@@ -3779,11 +3781,13 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "_prepare_chip_submission",
-            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+            [](ChipWorker &self, int32_t callable_id, const CallArgumentSnapshot &values, const CallConfig &config,
                uintptr_t caller_stream) {
-                return self.prepare_chip_submission(callable_id, args, config, reinterpret_cast<void *>(caller_stream));
+                return self.prepare_chip_submission(
+                    callable_id, values, config, reinterpret_cast<void *>(caller_stream)
+                );
             },
-            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream"),
+            nb::arg("callable_id"), nb::arg("values"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream"),
             nb::call_guard<nb::gil_scoped_release>()
         )
         .def(

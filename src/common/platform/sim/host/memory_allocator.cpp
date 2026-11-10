@@ -22,17 +22,9 @@
 
 MemoryAllocator::~MemoryAllocator() { finalize(); }
 
-void *MemoryAllocator::alloc(size_t size) {
-    void *ptr = simpler::platform::aligned_host_alloc(size);
-    if (ptr == nullptr) {
-        LOG_ERROR("malloc failed (size=%zu)", size);
-        return nullptr;
-    }
-
-    std::scoped_lock<std::mutex> lk(mu_);
-    ptr_size_map_[ptr] = size;
-    committed_bytes_ += size;
-    return ptr;
+void *MemoryAllocator::alloc(size_t size, int *status) {
+    auto reservation = begin_reservation();
+    return reservation.commit_alloc(size, status);
 }
 
 int MemoryAllocator::free(void *ptr) {
@@ -62,7 +54,8 @@ int MemoryAllocator::finalize() {
     return 0;
 }
 
-void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
+void *MemoryAllocator::Reservation::commit_alloc(size_t size, int *status) {
+    if (status != nullptr) *status = -1;
     if (!valid()) {
         LOG_ERROR("commit_alloc without a valid reservation (size=%zu)", size);
         return nullptr;
@@ -78,6 +71,7 @@ void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
     node_.mapped() = size;
     owner_->ptr_size_map_.insert(std::move(node_));
     owner_->committed_bytes_ += size;
+    if (status != nullptr) *status = 0;
     return ptr;
 }
 

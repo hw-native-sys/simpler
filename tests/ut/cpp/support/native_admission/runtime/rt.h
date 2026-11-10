@@ -42,6 +42,7 @@ int rtMemcpyAsync(
     void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream
 );
 int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind);
+int rtGetC2cCtrlAddr(uint64_t *address, uint32_t *bytes);
 int rtSetDevice(int32_t device);
 int rtDeviceReset(int32_t device);
 int rtStreamCreate(rtStream_t *stream, int32_t priority);

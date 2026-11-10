@@ -67,7 +67,7 @@ def main():
             call_args.clear()
             del control_arg, control, scalar_wrappers, call_args, config
             gc.collect()
-            queued = bridge.enqueue_native(ticket.native_handle)
+            queued = bridge.enqueue_native(ticket.native_handle, (source, output))
             successor = output + 0.5
             stream.synchronize()
             queued.check()
