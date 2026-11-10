@@ -18,6 +18,7 @@
 #include "device_execution_owners.h"
 #include "host_log.h"
 #include "pipeline_contract.h"
+#include "../platform_comm/comm_context.h"
 #include "runtime_module.h"
 #include "host/raii_scope_guard.h"
 
@@ -724,6 +725,7 @@ void ChipWorker::init(
     // of a runtime this worker is not bound to.
     pipeline_contract_ = resolved_contract;
     native_runs_closing_ = false;
+    worker_sdma_enabled_ = enable_sdma;
     initialized_ = true;
 
     run_lane_ = std::make_unique<ChipRunLane>(*this);
@@ -2658,6 +2660,10 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     size_t actual_window_size = 0;
     if (!host_shm_name.empty() && comm_alloc_host_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("Host-source communication domains are not supported by this runtime");
+    }
+    constexpr uint32_t kSdmaWorkspace = comm_workspace_bit(CommWorkspaceKind::SDMA);
+    if (!host_shm_name.empty() && (workspace_mask & kSdmaWorkspace) != 0 && !worker_sdma_enabled_) {
+        throw std::runtime_error("Host-domain SDMA requires an SDMA-enabled Worker");
     }
     const int rc =
         host_shm_name.empty() ?

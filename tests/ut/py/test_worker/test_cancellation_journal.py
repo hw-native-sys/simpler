@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import simpler.worker as worker_mod
@@ -438,6 +439,82 @@ class TestShmNames:
                 nested_shm.unlink()
             with contextlib.suppress(FileNotFoundError):
                 foreign_shm.unlink()
+
+    def test_a3_backing_sweep_waits_for_the_creator_group(self, monkeypatch):
+        posixshmem = pytest.importorskip("_posixshmem")
+        nested = Worker(level=3, num_sub_workers=0)
+        root = Worker(level=4, num_sub_workers=0)
+        root.add_worker(nested)
+        root._assign_shm_namespace()
+        own_group = os.getpgrp()
+        child_group = own_group + 1
+        backing = _shm_name(nested._shm_token, f"a3-{child_group:x}-backing")
+        local = _shm_name(root._shm_token, f"a3-{own_group:x}-local")
+        foreign = _shm_name(uuid.uuid4().hex, f"a3-{child_group:x}-foreign")
+        invalid = _shm_name(nested._shm_token, "a3-0-invalid")
+        names = [backing, local, foreign, invalid]
+        unlinked = []
+        probe_error = None
+
+        def probe(group, sig):
+            assert (group, sig) == (child_group, 0)
+            if probe_error is not None:
+                raise probe_error
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os.path, "isdir", lambda path: path == "/dev/shm")
+            patch.setattr(os, "scandir", lambda _path: [SimpleNamespace(name=name) for name in names])
+            patch.setattr(os, "killpg", probe)
+            patch.setattr(posixshmem, "shm_unlink", unlinked.append)
+            with pytest.raises(RuntimeError, match="still alive"):
+                root._reclaim_child_groups(time.monotonic())
+            assert unlinked == [] and not root._cleanup_journal.empty
+
+            probe_error = PermissionError("group visibility denied")
+            assert root._cleanup_journal.drive_kinds({"shm"}) is probe_error
+            assert unlinked == [] and not root._cleanup_journal.empty
+
+            probe_error = ProcessLookupError()
+            assert root._cleanup_journal.drive_kinds({"shm"}) is None
+            assert root._cleanup_journal.empty
+            assert unlinked == [f"/{backing}"]
+
+    def test_a3_local_backing_sweep_waits_for_l2_and_retries_unlink(self, monkeypatch):
+        posixshmem = pytest.importorskip("_posixshmem")
+        worker = Worker(level=3, num_sub_workers=0)
+        worker._assign_shm_namespace()
+        backing = _shm_name(worker._shm_token, f"a3-{os.getpgrp():x}-backing")
+        calls = []
+        child_alive = True
+        unlink_fails = True
+
+        def reap_l2():
+            if child_alive:
+                raise RuntimeError("L2 still alive")
+
+        def unlink(name):
+            calls.append(name)
+            if unlink_fails:
+                raise PermissionError("injected Host unlink failure")
+
+        monkeypatch.setattr(os.path, "isdir", lambda _path: True)
+        monkeypatch.setattr(os, "scandir", lambda _path: [SimpleNamespace(name=backing)])
+        monkeypatch.setattr(posixshmem, "shm_unlink", unlink)
+        worker._cleanup_journal.add("child", "chip survivor", reap_l2)
+        with pytest.raises(RuntimeError, match="unconfirmed L2 child exit"):
+            worker._reclaim_child_groups(time.monotonic())
+        assert calls == []
+
+        child_alive = False
+        assert worker._cleanup_journal.drive_kinds({"child"}) is None
+        error = worker._cleanup_journal.drive_kinds({"shm"})
+        assert isinstance(error, PermissionError)
+        assert not worker._cleanup_journal.empty
+
+        unlink_fails = False
+        assert worker._cleanup_journal.drive_kinds({"shm"}) is None
+        assert worker._cleanup_journal.empty
+        assert calls == [f"/{backing}"] * 2
 
 
 class TestNewWorkerClose:

@@ -95,13 +95,16 @@ but not freed; its cleanup obligation stays tracked and is reported, while
 independent worker-tree cleanup continues.
 `Worker.live_domains` includes both backends.
 
-`copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
+`copy_to_domain` and `copy_from_domain` on Device-source domains use domain rank and the same named-buffer
 bounds checks. They synchronously stage data without issuing an implicit run/DAG
 fence. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
 returns the slice's window offset and byte size. `requested_window_size` preserves the request;
 `mapping_size` reports the backend's actual mapping extent. Complete buffer definitions remain available.
+
+For Host-source domains, use `Buffer.shm.buf` and `domain.buffer_range(name)` for CPU access.
+Domain copy helpers and `Worker.copy_to` / `Worker.copy_from` reject the mapped device address.
 
 L4 Buffer/Tensor views reach their owning chip through local or remote L3s, preserving canonical
 identity without exposing remote device addresses. Pass an immutable `CommDomainRef` (creator instance,
@@ -134,9 +137,9 @@ continues; child exit alone does not prove device reclamation.
 | `actual_window_size` | window size actually allocated |
 | `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec` (device `VMM_WINDOW`, owned by this chip) |
 
-Kernels read peer windows through `device_ctx` (which holds every rank's
-window base, local + imported peer); `buffers[name]` is the local slice —
-name it in a task arg with `buffers[name].tensor(shapes, dtype)`.
+For Device-source domains, `device_ctx` exposes the local and imported peer
+window bases. For Host-source domains, peer access follows the platform rules
+below. Use `buffers[name].tensor(shapes, dtype)` to pass a local slice to a task.
 
 ### A5 Host-source windows
 
@@ -157,6 +160,29 @@ share the same retention, reuse checks, failure policy, and release fences.
 
 See [A5 Host-source domains](a5-host-comm-domain.md) for initialization, kernel
 addressing, and the retained Engram-table example.
+
+### A2/A3 Host-source windows
+
+Onboard L3 `tensormap_and_ringbuffer` domains use the same Host-source API.
+As on A5, L2 creates and unlinks its rank's POSIX backing and L3 borrows the CPU
+mapping. Worker teardown reclaims orphan windows in the startup namespace after
+the relevant L2 children or enclosing process group have exited.
+Local reads use MTE. For peer SDMA, initialize the Worker with `enable_sdma=True`
+and request `workspace_engines=("sdma",)` to map the peer windows. The kernel
+gets the source address from `CommContext` and the Worker workspace from
+`get_dma_workspace(args, DMA_WORKSPACE_SDMA)`. CPU access and release use the
+same borrowed views and fences as on A5.
+
+Both MTE and SDMA require the installed stack to register POSIX mappings.
+The CANN 9.0 [`aclrtHostRegister` documentation](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/runtimeapi/aclcppdevg_03_1804.html)
+specifies runtime-allocated page-locked memory on Linux 5.10 and earlier.
+A3 onboard MTE and SDMA passed with CANN 9.0.0 on HCE kernel `5.10.0-182.0.0.95.r1941_123.hce2.aarch64`.
+
+Pass `initializer(domain)` to `allocate_domain` or `get_or_allocate_domain` to
+fill the rank windows synchronously before submitting tasks in the same
+orchestration. The callback runs once per new domain instance and is skipped
+on retained reuse. It follows the shared Host initializer restrictions and
+rollback rules described in [A5 Host-source domains](a5-host-comm-domain.md).
 
 ### Global CommDomain across local and remote L3 nodes
 
@@ -437,8 +463,8 @@ and is warned about twice: by the runtime builder and again at Worker init. A
 warmup whose device launch or sync *fails* is not in this category at all — it
 fails Worker init, because the card it faulted on must not reach the first run.
 
-On a2a3, communication-domain allocation does not create SDMA streams or carry the
-workspace through `CommContext`. Because an SDMA-enabled Worker's 48 STARS
+On a2a3, SDMA uses the Worker-owned workspace for both Device- and Host-source
+domains. Because an SDMA-enabled Worker's 48 STARS
 streams sit in the device fault/sync domain, a fault on that Worker slows its
 teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
 so ordinary workloads are unaffected — see
@@ -466,11 +492,16 @@ adds the requested asynchronous resources. An omitted parameter and an empty
 sequence have identical meaning and can reuse the same retained domain.
 The native `comm_alloc_domain_windows` takes the corresponding bitmask directly;
 zero requests synchronous mappings only. Explicit asynchronous engine selection
-is supported on L3 A5; A2/A3 keeps its Worker-owned SDMA path. Simulation and L4
+is supported on L3 A5. On L3 A2/A3 Host domains, selecting SDMA enables peer
+mappings for the Worker-owned workspace. Each participating device must report
+`ACL_RT_HOST_MEM_MAP_SUPPORTED` for `ACL_RT_HAC_TYPE_SDMA` through
+`aclrtHostMemMapCapabilities`; unsupported or failed queries abort allocation
+through the existing domain rollback path. Host registration or AIV access alone
+does not establish SDMA support. Simulation and L4
 domains support synchronous mappings, with no domain-owned asynchronous engines.
 
-Each `CommContext` stores a POD array `workspaces`, indexed by
-`CommWorkspaceKind::{SDMA, URMA, RDMA}`. Kernels use
+Domain-owned workspace descriptors are stored in `CommContext.workspaces`,
+indexed by `CommWorkspaceKind::{SDMA, URMA, RDMA}`. Kernels use
 `comm_workspace<CommWorkspaceKind::URMA>(*ctx)` (or the corresponding engine),
 whose template argument is checked at compile time. Host publication rejects
 out-of-range enum values before indexing. An absent backend has zero address
@@ -583,7 +614,7 @@ The workspace coverage is split by platform and execution layer:
 | A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
 | A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
 | A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
-| A2/A3 | Existing Worker-owned SDMA and `enable_sdma` behavior | Existing SDMA and single-card prefetch tests; domain allocation does not provision SDMA |
+| A2/A3 | Worker-owned SDMA and optional peer mappings for L3 TMR Host domains | SDMA and prefetch examples, and `test_a3_host_source_domain.py` for Host MTE and peer SDMA |
 | Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |
 
 The A5 mixed hardware examples use the full two-rank communicator. They do not

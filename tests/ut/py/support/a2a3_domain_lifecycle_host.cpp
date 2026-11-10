@@ -11,17 +11,40 @@
 #include <sys/mman.h>
 
 #include <cassert>
+#include <array>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+namespace {
+bool fail_host_unlink = false;
+int unlink_host_window(const char *path);
+}  // namespace
+
+#define shm_unlink unlink_host_window
 #include "comm_hccl.cpp"
+#undef shm_unlink
 
 namespace {
+int unlink_host_window(const char *path) {
+    if (fail_host_unlink) {
+        errno = EACCES;
+        return -1;
+    }
+    return shm_unlink(path);
+}
+
 std::unordered_map<void *, size_t> mappings;
 int physical_handles = 0;
+std::unordered_set<void *> registered_hosts;
+bool fail_host_register = false;
+bool fail_host_unregister = false;
+bool fail_host_capability = false;
+aclrtHostMemMapCapability host_sdma_capability = ACL_RT_HOST_MEM_MAP_SUPPORTED;
+int host_capability_calls = 0;
 bool fail_get_device = false;
 int device_calls = 0;
 bool fail_physical_free = false;
@@ -63,10 +86,29 @@ aclError unmap_buffer(void *p) {
 }
 }  // namespace
 
+extern "C" aclError aclrtHostRegister(void *cpu, uint64_t, aclrtHostRegisterType, void **device) {
+    if (fail_host_register) return ACL_ERROR_FAILURE;
+    assert(registered_hosts.insert(cpu).second);
+    *device = cpu;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtHostUnregister(void *cpu) {
+    if (fail_host_unregister) return ACL_ERROR_FAILURE;
+    assert(registered_hosts.erase(cpu) == 1);
+    return ACL_SUCCESS;
+}
+
 extern "C" aclError aclrtGetDevice(int32_t *id) {
     ++device_calls;
     if (fail_get_device && device_calls == (fabric_supported ? 1 : 2)) return 1;
     *id = 0;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtHostMemMapCapabilities(uint32_t, aclrtHacType engine, aclrtHostMemMapCapability *capability) {
+    ++host_capability_calls;
+    assert(engine == ACL_RT_HAC_TYPE_SDMA);
+    if (fail_host_capability) return ACL_ERROR_FAILURE;
+    *capability = host_sdma_capability;
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
@@ -201,11 +243,216 @@ static void prepare_peer(CommHandle h, uint64_t id, bool release_marker) {
     }
 }
 
+static void test_host_registration_lifecycle(const std::string &scenario) {
+    const bool fail_init = scenario == "host_register_failure";
+    const bool sdma = scenario == "host_borrow_sdma";
+    const bool collision = scenario == "host_name_collision";
+    fail_host_capability = !sdma;
+    auto h = std::make_unique<CommHandle_>();
+    h->rank = 0;
+    h->nranks = sdma ? 1 : 2;
+    char folder[] = "/tmp/simpler-host-lifecycle-XXXXXX";
+    if (sdma) {
+        assert(mkdtemp(folder));
+        h->rootinfo_path = std::string(folder) + "/root";
+    }
+    const auto size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const auto name = "simpler_host_ut_" + std::to_string(getpid());
+    const auto path = "/" + name;
+    if (collision) {
+        const int fd = shm_open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        assert(fd >= 0 && ftruncate(fd, static_cast<off_t>(size)) == 0 && close(fd) == 0);
+    }
+    uint64_t ctx = 0, base = 0;
+    size_t mapped = 0;
+    const uint32_t ranks[] = {0, 1};
+    fail_host_register = fail_init;
+    const uint32_t mask = sdma ? comm_workspace_bit(CommWorkspaceKind::SDMA) : 0;
+    const int rc =
+        comm_alloc_host_domain_windows(h.get(), 1, ranks, h->nranks, 0, size, mask, name.c_str(), &ctx, &base, &mapped);
+    if (fail_init || collision) {
+        assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && registered_hosts.empty());
+        assert(comm_abort_domain_windows(h.get(), 1, 2, 0) == 0);
+    } else {
+        assert(rc == 0 && mapped == size && registered_hosts.size() == 1);
+        const auto *context = reinterpret_cast<const CommContext *>(ctx);
+        assert(context->windowsIn[0] == base && context->windowsIn[1] == 0);
+        assert(comm_workspace<CommWorkspaceKind::SDMA>(*context).addr == 0);
+        if (!sdma) {
+            fail_host_unregister = true;
+            assert(comm_destroy(h.get()) == COMM_RECLAMATION_UNCONFIRMED);
+            assert(h->domain_allocations.count(1) == 1 && registered_hosts.size() == 1);
+            fail_host_unregister = false;
+            fail_host_unlink = true;
+            assert(comm_release_domain_windows(h.get(), 1, h->nranks, 0) == COMM_RECLAMATION_UNCONFIRMED);
+            assert(h->domain_allocations.count(1) == 1 && registered_hosts.empty() && mappings.empty());
+            fail_host_unlink = false;
+        }
+        assert(comm_release_domain_windows(h.get(), 1, h->nranks, 0) == 0);
+    }
+    assert(h->domain_allocations.empty() && registered_hosts.empty() && mappings.empty());
+    assert(host_capability_calls == (sdma ? 1 : 0));
+    const int owner_fd = shm_open(path.c_str(), O_RDWR, 0);
+    if (collision) {
+        assert(owner_fd >= 0 && close(owner_fd) == 0 && shm_unlink(path.c_str()) == 0);
+    } else {
+        assert(owner_fd == -1 && errno == ENOENT);
+    }
+    if (sdma) {
+        const auto marker =
+            barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(1, "host_window"), 0);
+        assert(std::remove(marker.c_str()) == 0 && rmdir(folder) == 0);
+    }
+}
+
+static void test_host_sdma_capability_rejection(const std::string &scenario) {
+    auto folder = "/tmp/simpler-host-capability-" + std::to_string(getpid()) + "-XXXXXX";
+    assert(mkdtemp(folder.data()));
+    const auto size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const uint32_t ranks[] = {0, 1};
+    std::array<std::unique_ptr<CommHandle_>, 2> handles;
+    std::array<std::string, 2> names, markers;
+    for (uint32_t rank = 0; rank < 2; ++rank) {
+        auto &h = handles[rank];
+        h = std::make_unique<CommHandle_>();
+        h->rank = static_cast<int>(rank);
+        h->nranks = 2;
+        h->rootinfo_path = std::string(folder) + "/root";
+        names[rank] = "simpler_cap_ut_" + std::to_string(getpid()) + "_" + std::to_string(rank);
+        markers[rank] = barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(1, "host_window"), rank);
+    }
+    std::ofstream(markers[1]) << names[1] << '\n';
+    for (uint32_t rank = 0; rank < 2; ++rank) {
+        host_sdma_capability = rank == 0 ? ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED : ACL_RT_HOST_MEM_MAP_SUPPORTED;
+        fail_host_capability = rank == 0 && scenario == "host_sdma_capability_failure";
+        fail_get_device = rank == 0 && scenario == "host_sdma_device_failure";
+        uint64_t ctx = 0, base = 0;
+        size_t mapped = 0;
+        assert(
+            comm_alloc_host_domain_windows(
+                handles[rank].get(), 1, ranks, 2, rank, size, comm_workspace_bit(CommWorkspaceKind::SDMA),
+                names[rank].c_str(), &ctx, &base, &mapped
+            ) == COMM_INITIALIZATION_ABORT_REQUIRED
+        );
+        assert(ctx == 0 && base == 0 && mapped == 0 && handles[rank]->domain_allocations.count(1) == 1);
+        if (rank == 0) {
+            std::string announcement;
+            std::ifstream(markers[0]) >> announcement;
+            assert(announcement == "!" && registered_hosts.empty());
+        }
+    }
+    assert(host_capability_calls == (scenario == "host_sdma_device_failure" ? 1 : 2));
+    assert(registered_hosts.size() == 1);
+    for (uint32_t rank = 0; rank < 2; ++rank) {
+        assert(comm_abort_domain_windows(handles[rank].get(), 1, 2, rank) == 0);
+        assert(handles[rank]->domain_allocations.empty());
+        const auto path = "/" + names[rank];
+        const int fd = shm_open(path.c_str(), O_RDWR, 0);
+        assert(fd == -1 && errno == ENOENT);
+        assert(std::remove(markers[rank].c_str()) == 0);
+    }
+    assert(registered_hosts.empty() && mappings.empty() && rmdir(folder.c_str()) == 0);
+}
+
+static void test_host_cleanup_failure_notifies_peer(const std::string &scenario) {
+    auto folder = (std::filesystem::temp_directory_path() / "simpler-host-notify-XXXXXX").string();
+    assert(mkdtemp(folder.data()));
+    const auto root = folder + "/root";
+    const uint32_t failed_rank = scenario == "host_notify_abort" ? 1 : 0;
+    const int peer_rank = 1 - static_cast<int>(failed_rank);
+    auto failed = std::make_unique<CommHandle_>();
+    auto peer = std::make_unique<CommHandle_>();
+    failed->rank = static_cast<int>(failed_rank);
+    peer->rank = peer_rank;
+    for (auto *h : {failed.get(), peer.get()}) {
+        h->nranks = 2;
+        h->rootinfo_path = root;
+        h->run_token = 2;
+    }
+    const uint32_t ranks[] = {0, 1};
+    const size_t size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const auto name = "simpler_notify_" + std::to_string(getpid());
+    const auto path = "/" + name;
+    uint64_t ctx = 0, base = 0;
+    size_t mapped = 0;
+    assert(
+        comm_alloc_host_domain_windows(
+            failed.get(), 1, ranks, 2, failed_rank, size, 0, name.c_str(), &ctx, &base, &mapped
+        ) == 0
+    );
+    const auto old_failure = barrier_marker_path(root, 1, "a3_host_cleanup_failed", 0);
+    assert(file_marker_handshake::publish_marker(old_failure));
+    assert(!host_cleanup_failed(peer.get()));
+    auto device_domain = std::make_unique<DomainAllocation>();
+    device_domain->rank = peer_rank;
+    device_domain->nranks = 2;
+    device_domain->initialized = true;
+    peer->domain_allocations.emplace(2, std::move(device_domain));
+    auto result = std::async(std::launch::async, [&] {
+        return comm_destroy(peer.get());
+    });
+    const auto arrival = barrier_marker_path(root, peer->run_token, "destroy", peer_rank);
+    assert(
+        file_marker_handshake::wait_for_path(
+            arrival, file_marker_handshake::Stage::ARRIVAL_WAIT, peer_rank,
+            std::chrono::steady_clock::now() + std::chrono::seconds(2), std::chrono::milliseconds(1)
+        )
+            .ok()
+    );
+
+    fail_host_unregister = true;
+    int rc = COMM_RECLAMATION_UNCONFIRMED;
+    if (scenario == "host_notify_release") {
+        rc = comm_release_domain_windows(failed.get(), 1, 2, failed_rank);
+    } else if (scenario == "host_notify_abort") {
+        rc = comm_abort_domain_windows(failed.get(), 1, 2, failed_rank);
+    } else {
+        rc = comm_destroy(failed.get());
+    }
+    assert(rc == COMM_RECLAMATION_UNCONFIRMED);
+    const auto peer_status = result.wait_for(std::chrono::seconds(2));
+    assert(failed->domain_allocations.count(1) == 1 && registered_hosts.size() == 1);
+    const int fd = shm_open(path.c_str(), O_RDWR, 0);
+    assert(fd >= 0 && close(fd) == 0);
+
+    fail_host_unregister = false;
+    assert(comm_abort_domain_windows(failed.get(), 1, 2, failed_rank) == 0);
+    assert(mappings.empty() && registered_hosts.empty());
+    assert(shm_open(path.c_str(), O_RDWR, 0) == -1 && errno == ENOENT);
+    assert(peer_status == std::future_status::ready && result.get() == COMM_RECLAMATION_UNCONFIRMED);
+    assert(comm_release_domain_windows(peer.get(), 2, 2, peer_rank) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(peer->domain_allocations.count(2) == 1);
+    assert(
+        comm_alloc_domain_windows(peer.get(), 3, ranks, 2, peer_rank, size, 0, &ctx, &base, &mapped) ==
+        COMM_RECLAMATION_UNCONFIRMED
+    );
+    assert(
+        comm_alloc_host_domain_windows(
+            peer.get(), 3, ranks, 2, peer_rank, size, 0, name.c_str(), &ctx, &base, &mapped
+        ) == COMM_RECLAMATION_UNCONFIRMED
+    );
+    assert(file_marker_handshake::cleanup(root).ok() && rmdir(folder.c_str()) == 0);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     fabric_supported = std::string(argv[1]) == "fabric";
     reject_explicit_access = std::string(argv[2]) == "map_grants_access";
     const std::string scenario = reject_explicit_access ? "success" : argv[2];
+    if (scenario == "host_notify_release" || scenario == "host_notify_abort" || scenario == "host_notify_destroy") {
+        test_host_cleanup_failure_notifies_peer(scenario);
+        return 0;
+    }
+    if (scenario == "host_sdma_unsupported" || scenario == "host_sdma_capability_failure" ||
+        scenario == "host_sdma_device_failure") {
+        test_host_sdma_capability_rejection(scenario);
+        return 0;
+    }
+    if (scenario == "host_register_failure" || scenario == "host_unregister_failure" ||
+        scenario == "host_borrow_sdma" || scenario == "host_name_collision") {
+        test_host_registration_lifecycle(scenario);
+        return 0;
+    }
     fail_physical_free = scenario == "fallback_cleanup";
     fail_context_upload = scenario == "late_import";
     fail_get_device = scenario == "early_get_device";

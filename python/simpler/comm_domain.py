@@ -183,8 +183,8 @@ class HostBufferMapping(SharedMemory):
             super().close()
 
 
-def seal_host_mappings(mappings: Iterable[HostBufferMapping]) -> None:
-    """Reject live exports, then prevent new ones across the entire release set.
+def seal_host_mappings(mappings: Iterable[HostBufferMapping], *, seal: bool = True) -> None:
+    """Reject live exports and optionally prevent new ones across the release set.
 
     Nothing changes if any mapping is borrowed. Locks cover admission only;
     callers may wait for device fences and release native resources afterwards.
@@ -199,5 +199,6 @@ def seal_host_mappings(mappings: Iterable[HostBufferMapping]) -> None:
                     f"Host domain mapping {mapping.name!r} has live CPU exports; "
                     "drop arrays and release memoryviews before closing or releasing the domain"
                 )
-        for mapping in ordered:
-            mapping._closing = True
+        if seal:
+            for mapping in ordered:
+                mapping._closing = True

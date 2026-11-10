@@ -24,6 +24,7 @@
 
 #include "platform_comm/comm.h"
 #include "platform_comm/comm_context.h"
+#include "platform_comm/comm_domain_onboard.h"
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
@@ -1749,18 +1750,7 @@ static int domain_alloc_via_ipc(
         }
     }
 
-    void *newDevMem = nullptr;
-    aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
-        return -1;
-    }
-    out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
-    aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
-        return -1;
-    }
+    if (comm_domain_onboard::upload_context(ctx, out->device_ctx, h->rank, "alloc_domain") != ACL_SUCCESS) return -1;
     out->mapping_size = aligned_size;
     return 0;
 }
@@ -1902,18 +1892,6 @@ extern "C" int comm_barrier(CommHandle h) {
     return 0;
 }
 
-static bool valid_host_shm_name(const char *name) {
-    if (name == nullptr) return false;
-    const size_t length = strnlen(name, 32);
-    if (length == 0 || length > 31) return false;
-    for (size_t i = 0; i < length; ++i) {
-        const char c = name[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
-            return false;
-    }
-    return true;
-}
-
 static int domain_alloc_host(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, DomainAllocation &alloc
@@ -1961,11 +1939,7 @@ static int domain_alloc_host(
             alloc.urma_workspace->GetWorkspaceSize()
         );
     }
-    void *device_ctx = nullptr;
-    status = aclrtMalloc(&device_ctx, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (status != ACL_SUCCESS) return -1;
-    alloc.device_ctx = static_cast<CommContext *>(device_ctx);
-    return aclrtMemcpy(device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE) == ACL_SUCCESS ? 0 : -1;
+    return comm_domain_onboard::upload_context(ctx, alloc.device_ctx, h->rank, "Host domain") == ACL_SUCCESS ? 0 : -1;
 }
 
 static int allocate_domain_windows(
@@ -1975,7 +1949,7 @@ static int allocate_domain_windows(
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (host_shm_name != nullptr) {
-        if (!valid_host_shm_name(host_shm_name)) return -1;
+        if (!comm_domain_onboard::valid_host_shm_name(host_shm_name)) return -1;
         if ((workspace_mask & ~comm_workspace_bit(CommWorkspaceKind::URMA)) != 0)
             return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     }
@@ -2079,7 +2053,7 @@ extern "C" int comm_alloc_host_domain_windows(
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
     uint64_t *local_window_base_out, size_t *actual_window_size_out
 ) {
-    if (!valid_host_shm_name(host_shm_name)) return -1;
+    if (!comm_domain_onboard::valid_host_shm_name(host_shm_name)) return -1;
     return allocate_domain_windows(
         h, allocation_id, rank_ids, rank_count, domain_rank, window_size, workspace_mask, host_shm_name, device_ctx_out,
         local_window_base_out, actual_window_size_out
