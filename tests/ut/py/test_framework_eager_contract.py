@@ -236,10 +236,10 @@ def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path, ver
 @pytest.mark.parametrize("platform", ["a2a3", "a5"])
 @pytest.mark.parametrize("mode", ["exclude", "include", "only", "invalid"])
 def test_framework_workflow_propagates_manual_selection(tmp_path, mode, platform):
-    workflow = yaml.load((_ROOT / ".github/workflows/_st-torch-npu.yml").read_text(), Loader=yaml.BaseLoader)
+    workflow = yaml.load((_ROOT / ".github/workflows/_st-framework-eager.yml").read_text(), Loader=yaml.BaseLoader)
     assert workflow["on"]["workflow_call"]["inputs"]["manual_mode"]["default"] == "exclude"
     daily = yaml.load((_ROOT / ".github/workflows/daily.yml").read_text(), Loader=yaml.BaseLoader)
-    assert daily["jobs"][f"st-torch-npu-{platform}"]["with"]["manual_mode"] == "include"
+    assert daily["jobs"][f"st-framework-eager-{platform}"]["with"]["manual_mode"] == "include"
     step = next(step for step in workflow["jobs"]["run"]["steps"] if "run" in step)
     assert step["env"]["MANUAL_MODE"] == "${{ inputs.manual_mode }}"
     assert step["env"]["PLATFORM"] == "${{ inputs.platform }}"

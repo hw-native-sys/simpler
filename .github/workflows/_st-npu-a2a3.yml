@@ -96,7 +96,7 @@ jobs:
               --platform a2a3 --compile-only --compile-workers 32
           done
 
-      # Torch-NPU cases have their own dependency-isolated job. The remaining
+      # Framework eager has its own dependency-isolated job. The remaining
       # three selections are disjoint and exhaustive over this corpus: a test with
       # neither marker lands here, `sdma` alone in the demo task, and
       # `sdma_fault` in the isolated one whether or not it also carries `sdma`.
