@@ -18,6 +18,7 @@ using aclmdlRI = void *;
 constexpr int ACL_SUCCESS = 0;
 constexpr int ACL_HBM_MEM = 0;
 constexpr int ACL_ERROR_NONE = 0;
+constexpr int ACL_ERROR_RT_MEMORY_ALLOCATION = 207001;
 constexpr int ACL_ERROR_RT_STREAM_SYNC_TIMEOUT = 507046;
 constexpr int ACL_ERROR_RT_EVENT_SYNC_TIMEOUT = 507047;
 constexpr uint32_t ACL_EVENT_SYNC = 1;
@@ -29,6 +30,11 @@ enum aclmdlRICaptureStatus {
     ACL_MODEL_RI_CAPTURE_STATUS_NONE,
     ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE,
     ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED
+};
+enum aclmdlRICaptureMode {
+    ACL_MODEL_RI_CAPTURE_MODE_GLOBAL,
+    ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL,
+    ACL_MODEL_RI_CAPTURE_MODE_RELAXED,
 };
 extern "C" {
 const char *aclGetRecentErrMsg();
@@ -49,4 +55,5 @@ int aclrtMemset(void *, size_t, int32_t, size_t);
 int aclrtSetOpExecuteTimeOutV2(uint64_t, uint64_t *);
 int aclrtStreamGetId(aclrtStream, int32_t *);
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *, aclmdlRI *);
+int aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *);
 }

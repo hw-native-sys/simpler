@@ -14,9 +14,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 #include "aicore_lifecycle.h"
 #include "aicpu_executor.h"
+#include "args_dump_service.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
@@ -307,6 +309,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     if (is_leader) {
         LOG_INFO("AicpuExecutor: Initializing");
+        args_dump_services_allocated_this_init_ = false;
+        if (args_dump_services_ != nullptr) init_failed_.store(true, std::memory_order_release);
         // The 0 → 1 fixup already applied above.
         aicpu_thread_num_ = nthreads;
 
@@ -344,6 +348,23 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         completion_gate_.reset();
         if (!init_failed_.load(std::memory_order_acquire) && post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
+        }
+        if (!init_failed_.load(std::memory_order_acquire)) {
+            const auto *context = aicore_scheduler_bootstrap_context(runtime);
+            if (context != nullptr && context->args_dump_address != 0) {
+                args_dump_services_ = new (std::nothrow) ResidentArgsDumpService[nthreads];
+                if (args_dump_services_ == nullptr) init_failed_.store(true, std::memory_order_release);
+                else {
+                    args_dump_service_count_ = nthreads;
+                    args_dump_services_allocated_this_init_ = true;
+                    for (int32_t thread = 0; thread < nthreads; ++thread)
+                        if (!args_dump_services_[thread].initialize(
+                                reinterpret_cast<void *>(context->args_dump_address), runtime->dev.callable_table_addr_,
+                                runtime->dev.callable_table_len_, thread, nthreads
+                            ))
+                            init_failed_.store(true, std::memory_order_release);
+                }
+            }
         }
         hs_config_done_.store(true, std::memory_order_release);
     } else {
@@ -416,6 +437,16 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
     const int32_t nthreads = aicpu_thread_num_;
     const bool last = init_failure_arrived_.fetch_add(1, std::memory_order_acq_rel) + 1 == nthreads;
     if (last) {
+        if (args_dump_services_allocated_this_init_ && aicore_lifecycle_.cores_retired()) {
+            for (int32_t thread = 0; thread < args_dump_service_count_; ++thread)
+                args_dump_services_[thread].stop();
+            if (args_dump_services_stopped()) {
+                delete[] args_dump_services_;
+                args_dump_services_ = nullptr;
+                args_dump_service_count_ = 0;
+                args_dump_services_allocated_this_init_ = false;
+            }
+        }
         aicore_lifecycle_.deinit();
         completion_gate_.reset();
         ready_watchdog_.reset();
@@ -462,7 +493,12 @@ __attribute__((weak)) void AicpuExecutor::publish_partition(Runtime *runtime, in
     aicore_lifecycle_.publish_context_partition(runtime, tidx);
 }
 
-__attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime) {
+void AicpuExecutor::service_args_dump(int32_t thread_idx) {
+    if (args_dump_services_ != nullptr && args_dump_services_[thread_idx].step())
+        ready_watchdog_.record_progress(get_sys_cnt_aicpu());
+}
+
+__attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t thread_idx) {
     int32_t supervisor_rc = 0;
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context == nullptr || runtime->dev.host_total_tasks < 0) {
@@ -489,11 +525,16 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime) {
             bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
             const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
             while (true) {
+                service_args_dump(thread_idx);
                 const uint64_t poll_start = trace_enabled ? get_sys_cnt_aicpu() : 0;
                 const bool bootstrap_complete = run_control->bootstrap_complete != 0;
                 const uint64_t resolved_task_count = run_control->resolved_task_count;
                 const bool tasks_resolved = resolved_task_count == executable_task_count;
                 const uint64_t now = get_sys_cnt_aicpu();
+                if (args_dump_services_ != nullptr) {
+                    const uint64_t copy_progress = ready_watchdog_.last_progress();
+                    if (copy_progress > last_progress_cycles) last_progress_cycles = copy_progress;
+                }
                 if (resolved_task_count != last_resolved_task_count || bootstrap_complete != bootstrap_was_complete) {
                     last_resolved_task_count = resolved_task_count;
                     bootstrap_was_complete = bootstrap_complete;
@@ -571,7 +612,7 @@ __attribute__((weak)) int32_t AicpuExecutor::settle_run_error(Runtime *runtime) 
     return publish_aicore_scheduler_runtime_error(runtime, "terminal");
 }
 
-__attribute__((weak)) bool AicpuExecutor::await_shutdown(Runtime *runtime) {
+__attribute__((weak)) bool AicpuExecutor::await_shutdown(Runtime *runtime, int32_t thread_idx) {
     if (!ready_watchdog_.wait_until_ready(
             [this] {
                 return shutdown_ready_.load(std::memory_order_acquire);
@@ -579,7 +620,8 @@ __attribute__((weak)) bool AicpuExecutor::await_shutdown(Runtime *runtime) {
             [] {
                 return get_sys_cnt_aicpu();
             },
-            [] {
+            [&] {
+                service_args_dump(thread_idx);
                 SPIN_WAIT_HINT();
             },
             resident_scheduler_timeout_cycles()
@@ -602,14 +644,15 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     }
     bool shutdown_wait_timed_out = false;
     if (thread_idx == aicpu_thread_num_ - 1) {
-        run_status_.store(supervise(runtime), std::memory_order_release);
+        run_status_.store(supervise(runtime, thread_idx), std::memory_order_release);
         shutdown_ready_.store(true, std::memory_order_release);
     } else {
-        shutdown_wait_timed_out = await_shutdown(runtime);
+        shutdown_wait_timed_out = await_shutdown(runtime, thread_idx);
     }
 
     int32_t run_rc =
         shutdown_wait_timed_out ? -SIMPLER_ERROR_SCHEDULER_TIMEOUT : run_status_.load(std::memory_order_acquire);
+    if (args_dump_services_ != nullptr) args_dump_services_[thread_idx].stop();
     aicore_lifecycle_.signal_shutdown_partition(thread_idx);
     shutdown_signaled_.fetch_add(1, std::memory_order_acq_rel);
     if (!wait_with_scheduler_timeout([this] {
@@ -643,7 +686,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // that failure and still arrives here.
         const bool cores_retired = aicore_lifecycle_.cores_retired();
         (void)aicore_lifecycle_.settle_run_diagnostics(
-            runtime, run_status_.load(std::memory_order_acquire) == 0 && !shutdown_wait_timed_out
+            runtime,
+            run_status_.load(std::memory_order_acquire) == 0 && !shutdown_wait_timed_out && args_dump_services_stopped()
         );
         // The record is published either way — a run the host cannot read a
         // verdict for is worse than one that reports a failure — but a run
@@ -720,6 +764,12 @@ void AicpuExecutor::reset_entry_state() {
 }
 
 void AicpuExecutor::deinit(Runtime * /*runtime*/) {
+    if (aicore_lifecycle_.cores_retired() && args_dump_services_stopped()) {
+        delete[] args_dump_services_;
+        args_dump_services_ = nullptr;
+        args_dump_service_count_ = 0;
+        args_dump_services_allocated_this_init_ = false;
+    }
     aicore_lifecycle_.deinit();
 
     reset_entry_state();

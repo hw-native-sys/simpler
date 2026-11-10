@@ -33,6 +33,7 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_run_lane.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    ${WORKER_SRC_DIR}/native_submission_state.cpp
     ${WORKER_SRC_DIR}/runtime_module.cpp
     # ChipWorker binds the process's device-fault monitor into every host
     # runtime it loads, so the owner that defines it comes along. In production
@@ -107,4 +108,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # libstdc++ condition_variable::wait(unique_lock<mutex>&), called by the predicate overload.
     target_link_options(test_three_run_capacity PRIVATE
         "LINKER:--wrap=_ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE")
+    target_link_options(test_chip_run_lane PRIVATE
+        "LINKER:--wrap=pthread_mutex_lock"
+        "LINKER:--wrap=pthread_cond_wait"
+        "LINKER:--wrap=pthread_cond_timedwait"
+        "LINKER:--wrap=pthread_cond_clockwait"
+        "LINKER:--wrap=_ZNSt18condition_variable10notify_allEv")
 endif()

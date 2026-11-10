@@ -107,6 +107,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
         SPIN_WAIT_HINT();
     }
+    // Entry rejection can cancel before tasks or profiling state are published.
+    // Acknowledge without accessing those buffers or writing an initial IDLE.
+    if (read_reg(RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL) {
+        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        return;
+    }
     // Report initial idle status via register (FAST_PATH is now open).
     write_reg(RegId::COND, AICORE_IDLE_VALUE);
 

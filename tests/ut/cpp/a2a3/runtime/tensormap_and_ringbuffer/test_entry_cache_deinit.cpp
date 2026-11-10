@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include <utility>
 #include <vector>
+#include "host/raii_scope_guard.h"
 
 // Include the implementation to exercise the private executor, without a
 // production test hook or an alternative teardown implementation.
@@ -33,7 +34,12 @@ TEST(EntryCacheDeinit, FailedSnapshotFallsBackToFullThroughExecutor) {
         &runtime, LAUNCH_ENVELOPE_HEADER_BYTES, 4, 0, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)
     };
     view.cache_maintenance = static_cast<uint32_t>(EntryCacheMaintenance::Live);
-    platform_aicpu_affinity_set_thread_idx(0);
+    // Direct executor tests provide the affinity cell normally bound by the wrapper.
+    int32_t affinity_index = 0;
+    ASSERT_EQ(platform_aicpu_affinity_bind_thread(&affinity_index), 0);
+    auto unbind = RAIIScopeGuard([] {
+        platform_aicpu_affinity_bind_thread(nullptr);
+    });
     set_platform_entry_args(0, view);
     AicpuExecutor executor;
     for (auto verdict : {DeviceRunVerdict::Ok, DeviceRunVerdict::Error, DeviceRunVerdict::None, DeviceRunVerdict::Ok}) {
@@ -62,5 +68,4 @@ TEST(EntryCacheDeinit, FailedSnapshotFallsBackToFullThroughExecutor) {
         EXPECT_EQ(executor.terminal_publisher_.snapshot_is_ok(), success);
     }
     set_platform_entry_args(0, {});
-    platform_aicpu_affinity_set_thread_idx(-1);
 }

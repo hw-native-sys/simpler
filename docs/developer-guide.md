@@ -210,10 +210,10 @@ This builds the nanobind `_task_interface` extension **and** pre-builds runtime 
 
 `_task_interface` records the commit it was compiled from, and
 `simpler.task_interface` compares it against the working tree at import,
-raising when they differ. It is git-based for the same reason
-`RuntimeBuilder._build_cache_stamp` is — mtimes do not survive a branch switch —
-and deliberately keyed on the whole HEAD rather than on the binding sources
-alone: a root `CMakeLists.txt`, `pyproject.toml` or nanobind change alters the
+raising when they differ. It is git-based because mtimes do not survive a
+branch switch, and is deliberately keyed on the whole HEAD rather than on the
+binding sources alone: a root `CMakeLists.txt`, `pyproject.toml` or nanobind
+change alters the
 extension without touching `python/bindings/`, and under-detecting here means
 silently wrong values. The cost of over-detecting is one ~20 s reinstall, and
 120 of the last 200 commits touched the ABI surface anyway — so most of those

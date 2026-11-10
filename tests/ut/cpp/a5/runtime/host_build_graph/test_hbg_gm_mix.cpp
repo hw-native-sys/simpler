@@ -26,6 +26,7 @@
 #include "scheduler/scheduler_gm_mix.h"
 #include "scheduler/scheduler_dispatch.h"
 #include "scheduler/scheduler_protocol_execute.h"
+#include "scheduler/scheduler_args_dump.h"
 
 namespace {
 
@@ -286,6 +287,80 @@ struct GmMixFixture {
     std::vector<SchedulerLocalState *> locals;
     std::vector<std::array<uint64_t, SCHEDULER_READY_QUEUE_COUNT>> cursors;
 };
+
+TEST(HbgGmMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
+    GmMixFixture fixture({{3, LaneMask::all()}, {1, LaneMask::aiv0()}}, false, 1);
+    fixture.graph.executable(1, 1, {0});
+    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    auto *local = fixture.locals[0];
+    ASSERT_EQ(
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, nullptr),
+        SchedulerRouteResult::WAITING
+    );
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    SchedulerArgsDumpTask dump{};
+    dump.task_ref = 0;
+    dump.active_mask = 7;
+    dump.expected_participants = 9;
+    ASSERT_EQ(scheduler_args_dump_enter(&dump), SchedulerArgsDumpArrival::Publisher);
+    dump.publisher_before = scheduler_args_dump_publisher(0, 1);
+    SchedulerArgsDumpAck before{11, 0, 0, 1, 1, 0, 0, 0};
+    before.status = scheduler_args_dump_ack_commit(1, 0, SchedulerArgsDumpStatus::Sealed);
+    ASSERT_TRUE(scheduler_args_dump_seal(&dump, ArgsDumpStage::BEFORE_DISPATCH, before, 11));
+    std::array<uint32_t, 9> visible{};
+    GmExecution held{};
+    for (uint32_t block = 0; block < 3; ++block) {
+        ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+        ASSERT_TRUE(fixture.publish(0));
+        ASSERT_TRUE(fixture.rendezvous(0));
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            GmExecution execution{};
+            ASSERT_TRUE(fixture.begin(worker, &execution));
+            ASSERT_EQ(scheduler_args_dump_enter(&dump), SchedulerArgsDumpArrival::Ready);
+            const uint32_t index = block * 3 + worker;
+            const auto arrival = scheduler_args_dump_return(&dump, [&] {
+                visible[index] = index + 1;
+                return true;
+            });
+            if (index == 8) {
+                ASSERT_EQ(arrival, SchedulerArgsDumpArrival::Publisher);
+                held = execution;
+            } else {
+                ASSERT_EQ(arrival, SchedulerArgsDumpArrival::Waiting);
+                ASSERT_TRUE(fixture.complete(execution));
+            }
+        }
+        ASSERT_EQ(fixture.retire(0), block == 2 ? SchedulerGmMixResult::WAIT : SchedulerGmMixResult::PROGRESS);
+        EXPECT_EQ(scheduler_gm_load(fixture.control(0)->wake_list_head), 1);
+        EXPECT_EQ(scheduler_observe_next_waiter(fixture.control(1)), SCHEDULER_WAKE_LIST_OPEN);
+        EXPECT_EQ(local->pending_completed, 0u);
+    }
+    EXPECT_EQ(visible, (std::array<uint32_t, 9>{1, 2, 3, 4, 5, 6, 7, 8, 9}));
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 2u);
+    dump.publisher_after = scheduler_args_dump_publisher(held.worker, held.generation);
+    SchedulerArgsDumpAck after{11, 0, 1, held.generation, 1, 0, 0, 0};
+    after.status = scheduler_args_dump_ack_commit(held.generation, 1, SchedulerArgsDumpStatus::Sealed);
+    ASSERT_TRUE(scheduler_args_dump_seal(&dump, ArgsDumpStage::AFTER_COMPLETION, after, 11));
+    ASSERT_TRUE(fixture.complete(held));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
+    ASSERT_TRUE(fixture.complete_task(0, 0));
+    EXPECT_EQ(scheduler_gm_load(fixture.control(0)->wake_list_head), SCHEDULER_WAKE_LIST_CLOSED);
+    EXPECT_EQ(local->pending_completed, 1u);
+    const auto &successor = fixture.storage.metadata[1];
+    const uint32_t queue = scheduler_task_ready_queue(successor.flags, successor.active_mask);
+    const uint32_t inbox = scheduler_ready_push_target(local, queue, 1);
+    int64_t ready = SCHEDULER_TASK_REF_INVALID;
+    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), queue, inbox, &ready, nullptr
+    ));
+    EXPECT_EQ(ready, 1);
+    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), queue, inbox, &ready, nullptr
+    ));
+    EXPECT_EQ(ready, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
 
 class HbgGmMixResourceScope : public ::testing::TestWithParam<LaneMask> {};
 

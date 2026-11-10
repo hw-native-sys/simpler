@@ -24,6 +24,8 @@
 #include "aicpu/pmu_collector_aicpu.h"
 #include "common/args_dump.h"
 #include "common/native_invocation_evidence.h"
+#include "host/raii_scope_guard.h"
+#include <cerrno>
 
 namespace {
 
@@ -126,12 +128,6 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     return success ? 0 : -1;
 }
 
-// This fixture owns no enabled argument-dump producer.
-extern "C" bool is_dump_args_enabled() { return false; }
-void dump_args_flush(int) {}
-void dump_args_close_run(int) {}
-void dump_args_init(int, DumpArgsLevel) {}
-
 extern "C" void aicpu_reset_legacy_execution_entry() {}
 
 extern "C" int32_t legacy_aicpu_execute(Runtime *) {
@@ -206,7 +202,7 @@ protected:
         set_platform_run_result(reinterpret_cast<uint64_t>(&result), kEpoch);
     }
 
-    std::array<int32_t, kParticipants> execute() {
+    std::array<int32_t, kParticipants> execute(int (*bind)(int32_t *) = platform_aicpu_affinity_bind_thread) {
         std::array<int32_t, kParticipants> statuses{};
         std::array<int32_t, kParticipants> native_statuses{};
         EXPECT_EQ(
@@ -218,18 +214,40 @@ protected:
         );
         aicpu_reset_execution_entry();
         std::array<std::thread, kParticipants> threads;
+        std::mutex startup_mutex;
+        std::condition_variable startup_changed;
+        int ready = 0;
+        bool binding_failed = false;
         for (int32_t i = 0; i < kParticipants; ++i) {
             threads[i] = std::thread([&, i] {
-                platform_aicpu_affinity_set_thread_idx(i);
-                statuses[i] = aicpu_execute(runtime.get());
-                // Keep the runtime's own status assertions and additionally
-                // exercise the production owner that publishes after teardown.
-                native_statuses[i] = aicpu_finish_native_invocation(i, statuses[i]);
+                // The fixture enters the executor directly, outside DeviceRunner startup.
+                int32_t affinity_index = i;
+                auto finished = RAIIScopeGuard([&] {
+                    EXPECT_EQ(platform_aicpu_affinity_bind_thread(nullptr), 0);
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->returned[i] = true;
+                    }
+                    state->changed.notify_all();
+                });
+                const int error = bind(&affinity_index);
                 {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->returned[i] = true;
+                    std::unique_lock<std::mutex> lock(startup_mutex);
+                    binding_failed = binding_failed || error != 0;
+                    ++ready;
+                    startup_changed.notify_all();
+                    startup_changed.wait(lock, [&] {
+                        return ready == kParticipants;
+                    });
+                    // The executor itself has barriers: none may enter if a peer failed binding.
+                    if (binding_failed) {
+                        statuses[i] = -1;
+                        native_statuses[i] = aicpu_finish_native_invocation(i, statuses[i]);
+                        return;
+                    }
                 }
-                state->changed.notify_all();
+                statuses[i] = aicpu_execute(runtime.get());
+                native_statuses[i] = aicpu_finish_native_invocation(i, statuses[i]);
             });
         }
         for (auto &thread : threads)
@@ -278,6 +296,15 @@ protected:
     DeviceRunResultRegion &result{result_storage.result};
     bool private_result{true};
 };
+
+TEST_F(ResidentEntryResult, BindingFailureReturnsEveryParticipantWithoutEnteringExecutor) {
+    const auto statuses = execute([](int32_t *cell) {
+        return *cell == 1 ? ENOMEM : platform_aicpu_affinity_bind_thread(cell);
+    });
+    EXPECT_EQ(statuses, (std::array<int32_t, kParticipants>{-1, -1, -1}));
+    EXPECT_EQ(state->returned, (std::array<bool, kParticipants>{true, true, true}));
+    EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
+}
 
 TEST_F(ResidentEntryResult, BothResidentModesReturnSuccessThroughTheMixedTopologyLifecycle) {
     for (uint32_t mode : {SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, SCHEDULER_RUNTIME_MODE_RESIDENT_READY}) {

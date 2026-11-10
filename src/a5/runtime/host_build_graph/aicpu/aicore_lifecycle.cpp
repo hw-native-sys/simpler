@@ -12,6 +12,7 @@
 #include "aicore_lifecycle.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
+#include "args_dump_service.h"
 
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_topology.h"
@@ -86,16 +87,8 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
 
     const bool chip_swimlane_enabled = is_chip_swimlane_enabled();
     if (is_dump_args_enabled()) {
-        // Unreachable while the host gate holds: `args_dump_capture_supported_impl`
-        // answers zero for this runtime and `simpler_prepare_run` refuses the
-        // request before a bind, so no launched run carries this flag. Reaching
-        // here means the gate stopped holding, and the honest report is that
-        // this run collects no argument dump rather than one taken at the run's
-        // boundaries under per-task stage labels.
-        LOG_ERROR(
-            "%s", "A5 HBG AICore Scheduler has no per-task argument capture: tasks are dispatched and completed "
-                  "on-core, so this run's argument dump is unavailable rather than collected"
-        );
+        if (get_platform_dump_base() == 0) return -1;
+        dump_args_init(aicpu_thread_num, static_cast<DumpArgsLevel>(runtime->dev.dump_args_level));
     }
     if (chip_swimlane_enabled) {
         chip_swimlane_aicpu_init(core_count_, static_cast<ChipSwimlaneLevel>(runtime->dev.chip_swimlane_level));
@@ -169,6 +162,11 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
 
     auto *run_control = aicore_scheduler_run_control(bootstrap_context);
     if (scheduler_state_base == nullptr || run_control == nullptr) return -1;
+    if (!initialize_resident_args_dump_outputs(
+            reinterpret_cast<void *>(bootstrap_context->args_dump_address), runtime->dev.callable_table_addr_,
+            runtime->dev.callable_table_len_
+        ))
+        return -1;
     auto *contexts =
         scheduler_state_at<SchedulerWorkerContext>(scheduler_state_base, bootstrap_context->worker_contexts_offset);
     auto *lifecycle_traces = scheduler_state_at<AicpuThreadLifecycleTrace>(
@@ -562,6 +560,12 @@ bool AicoreLifecycle::settle_run_diagnostics(Runtime *runtime, bool graph_comple
             retired, core_count_
         );
         return false;
+    }
+    if (is_dump_args_enabled()) {
+        for (int32_t thread = 0; thread < aicpu_thread_num_; ++thread) {
+            dump_args_flush(thread);
+            if (graph_completed) dump_args_close_run(thread);
+        }
     }
     if (!is_pmu_enabled()) return true;
 

@@ -58,6 +58,10 @@ runs:
           'scikit-build-core>=0.10' 'cmake>=3.20' ninja setuptools
         python -m pip install -c "$constraints" --no-build-isolation \
           --config-settings="build.targets=$BUILD_TARGET" '.[test]'
+        # Pytest and its dispatcher children prioritize the installed runtime assets.
+        site_packages=$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')
+        printf 'FRAMEWORK_WHEEL_SITE=%s\n' "$site_packages" >> "$GITHUB_ENV"
+        printf 'PYTEST_ADDOPTS=%s-o pythonpath=%s\n' "${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }" "$site_packages" >> "$GITHUB_ENV"
         python - <<'PYEOF'
         import json
         import sys

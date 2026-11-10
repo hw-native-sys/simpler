@@ -1237,11 +1237,11 @@ class CommDomainHandle:
         return self.contexts[chip_idx]
 
     def device_context(self, worker: int, *, workspace_engines=()) -> int:
-        """Return a live context requiring the named initialized domain workspaces.
+        """Return a live context requiring the named communication engines.
 
-        Native allocation validates provider descriptors before publishing this
-        handle. Engine selection is immutable for its lifetime. This method also
-        records scalar-only context use in the current orchestration run.
+        Engine selection is immutable for the domain's lifetime. A2/A3 SDMA
+        uses the Worker's workspace with the domain's peer mappings.
+        This method records scalar-only context use in the orchestration run.
         """
         self._require_ready()
         context = self[worker]
@@ -1336,7 +1336,6 @@ class CommDomainHandle:
         the owning run's completion wait so that tasks already submitted with
         this domain's ``device_ctx`` see live memory through execution.
         Serial release after run completion frees a retained domain immediately.
-
         Host CPU arrays and memoryviews must be dropped first. Live exports
         raise ``BufferError`` without marking the domain released; retry after
         dropping them. Accepted release prevents new CPU exports immediately.

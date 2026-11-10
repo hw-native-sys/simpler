@@ -84,6 +84,7 @@ extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
 // answer; every other stub here stands in for the same CANN surface the
 // KernelArgsHelper cases already replace.
 
+extern "C" aclError aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *) { return -1; }
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream stream, aclmdlRICaptureStatus *status, aclmdlRI *modelRI) {
     ++capture.queries;
     capture.last_stream = stream;

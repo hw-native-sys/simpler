@@ -22,11 +22,13 @@
 
 #include "platform_comm/comm.h"
 #include "platform_comm/comm_context.h"
+#include "platform_comm/comm_domain_onboard.h"
 #include "runtime_c_api.h"
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +43,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "acl/acl.h"
@@ -75,8 +80,13 @@ struct VmmWindow {
     VmmWindow &operator=(VmmWindow &&other) noexcept;
 };
 
-// Per-domain dynamic allocation. One of these exists per
-// orch.allocate_domain call and owns every VMM mapping for that domain.
+struct HostWindow {
+    void *cpu = nullptr;
+    uint64_t device_base = 0;
+    bool registered = false;
+};
+
+// Each rank owns its local Host backing and its local and peer device mappings.
 struct DomainAllocation {
     ~DomainAllocation();
 
@@ -86,6 +96,10 @@ struct DomainAllocation {
     bool release_failed = false;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
+    std::vector<HostWindow> host_windows;
+    size_t host_window_size = 0;
+    std::string host_shm_name;
+    bool host_shm_owned = false;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
 
@@ -1052,20 +1066,8 @@ static int domain_alloc_via_ipc(
         ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peer_window.base);
     }
 
-    void *new_dev_mem = nullptr;
-    status = aclrtMalloc(&new_dev_mem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (status != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(status));
-        return -1;
-    }
-    out->device_ctx = reinterpret_cast<CommContext *>(new_dev_mem);
-    status = aclrtMemcpy(new_dev_mem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (status != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(status));
-        return -1;
-    }
-
-    return 0;
+    status = comm_domain_onboard::upload_context(ctx, out->device_ctx, h->rank, "alloc_domain ipc");
+    return status == ACL_SUCCESS ? 0 : -1;
 }
 
 // Host wrapper owning one SDMA-enabled Worker's provisioned resources. The
@@ -1151,6 +1153,80 @@ extern "C" void dma_workspace_release(void *handle) {
     } catch (...) {
         LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
     }
+}
+
+static std::string host_cleanup_failure_path(CommHandle h) {
+    if (h->nranks < 2 || h->rootinfo_path.empty()) return {};
+    return barrier_marker_path(h->rootinfo_path, h->run_token, "a3_host_cleanup_failed", 0);
+}
+
+static bool host_cleanup_failed(CommHandle h) {
+    const auto path = host_cleanup_failure_path(h);
+    return !path.empty() && std::ifstream(path).good();
+}
+
+static void publish_host_cleanup_failure(CommHandle h) noexcept try {
+    const auto path = host_cleanup_failure_path(h);
+    if (path.empty()) return;
+    // Existence is the entire message. Any rank can publish it once.
+    const int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        close(fd);
+    } else if (errno != EEXIST) {
+        LOG_WARN("[comm rank %d] Host cleanup failure marker could not be published: errno=%d", h->rank, errno);
+    }
+} catch (...) {
+    LOG_WARN("[comm rank %d] Host cleanup failure marker could not be published", h->rank);
+}
+
+static int release_host_domain_windows(CommHandle h, DomainAllocation &alloc) {
+    const auto unconfirmed = [h] {
+        publish_host_cleanup_failure(h);
+        return COMM_RECLAMATION_UNCONFIRMED;
+    };
+    if (alloc.device_ctx != nullptr) {
+        const aclError status = aclrtFree(alloc.device_ctx);
+        if (status != ACL_SUCCESS) {
+            LOG_ERROR(
+                "[comm rank %d] Host domain: aclrtFree CommContext failed: %d", h->rank, static_cast<int>(status)
+            );
+            return unconfirmed();
+        }
+        alloc.device_ctx = nullptr;
+    }
+    aclError first_error = ACL_SUCCESS;
+    for (size_t rank = 0; rank < alloc.host_windows.size(); ++rank) {
+        auto &window = alloc.host_windows[rank];
+        if (window.registered) {
+            const aclError status = aclrtHostUnregister(window.cpu);
+            if (status != ACL_SUCCESS) {
+                LOG_ERROR(
+                    "[comm rank %d] Host domain: aclrtHostUnregister for window %zu failed: %d", h->rank, rank,
+                    static_cast<int>(status)
+                );
+                record_first_error(status, &first_error);
+                continue;
+            }
+            window.registered = false;
+        }
+        if (window.cpu != nullptr) {
+            if (munmap(window.cpu, alloc.host_window_size) != 0) {
+                LOG_ERROR("[comm rank %d] Host domain: munmap for window %zu failed: errno=%d", h->rank, rank, errno);
+                record_first_error(ACL_ERROR_FAILURE, &first_error);
+            } else {
+                window.cpu = nullptr;
+            }
+        }
+    }
+    if (first_error != ACL_SUCCESS) return unconfirmed();
+    if (alloc.host_shm_owned) {
+        if (shm_unlink(alloc.host_shm_name.c_str()) != 0 && errno != ENOENT) {
+            LOG_ERROR("Host domain: shm_unlink failed: errno=%d", errno);
+            return unconfirmed();
+        }
+        alloc.host_shm_owned = false;
+    }
+    return 0;
 }
 
 // Performs the per-allocation Fabric V2 exchange for one subset rank. rank_ids
@@ -1258,19 +1334,8 @@ static FabricAttempt domain_alloc_via_fabric(
         ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peer_window.base);
     }
 
-    void *newDevMem = nullptr;
-    aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
-        return FabricAttempt::kError;
-    }
-    out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
-    aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
-        return FabricAttempt::kError;
-    }
-    return FabricAttempt::kSuccess;
+    aret = comm_domain_onboard::upload_context(ctx, out->device_ctx, h->rank, "alloc_domain");
+    return aret == ACL_SUCCESS ? FabricAttempt::kSuccess : FabricAttempt::kError;
 }
 
 }  // namespace
@@ -1415,10 +1480,13 @@ extern "C" int comm_barrier(CommHandle h) {
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out
+    size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
 ) try {
+    if (workspace_config && (workspace_config->urma_jetties_per_aiv != 1 || workspace_config->urma_sq_depth != 0))
+        return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
+    if (host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
@@ -1486,6 +1554,171 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+static bool map_host_domain_window(DomainAllocation &owner, uint32_t rank, const char *name, bool create) {
+    const std::string path = std::string("/") + name;
+    if (create) owner.host_shm_name = path;
+    const int flags = O_RDWR | O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
+    const int fd = shm_open(path.c_str(), flags, 0600);
+    if (fd < 0) {
+        LOG_ERROR("Host domain: shm_open for window %u failed: errno=%d", rank, errno);
+        return false;
+    }
+    const auto size = static_cast<off_t>(owner.host_window_size);
+    if (create) {
+        owner.host_shm_owned = true;
+        if (ftruncate(fd, size) != 0) {
+            const int error = errno;
+            close(fd);
+            LOG_ERROR("Host domain: ftruncate for window %u failed: errno=%d", rank, error);
+            return false;
+        }
+    } else {
+        struct stat info{};
+        if (fstat(fd, &info) != 0) {
+            const int error = errno;
+            close(fd);
+            LOG_ERROR("Host domain: fstat for window %u failed: errno=%d", rank, error);
+            return false;
+        }
+        if (info.st_size != size) {
+            close(fd);
+            LOG_ERROR(
+                "Host domain: window %u size mismatch: expected=%llu actual=%lld", rank,
+                static_cast<unsigned long long>(owner.host_window_size), static_cast<long long>(info.st_size)
+            );
+            return false;
+        }
+    }
+    void *cpu = mmap(nullptr, owner.host_window_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    const int map_error = errno;
+    close(fd);
+    if (cpu == MAP_FAILED) {
+        LOG_ERROR("Host domain: mmap for window %u failed: errno=%d", rank, map_error);
+        return false;
+    }
+    auto &window = owner.host_windows[rank];
+    window.cpu = cpu;
+    void *device = nullptr;
+    const aclError status = aclrtHostRegister(cpu, owner.host_window_size, ACL_HOST_REGISTER_MAPPED, &device);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("Host domain: aclrtHostRegister for window %u failed: %d", rank, static_cast<int>(status));
+        return false;
+    }
+    window.registered = true;
+    window.device_base = reinterpret_cast<uint64_t>(device);
+    return device != nullptr;
+}
+
+static bool exchange_host_window_names(
+    CommHandle h, uint64_t allocation_id, const DomainAllocation &owner, const char *local_name,
+    std::vector<std::string> &names
+) {
+    const auto tag = domain_barrier_tag(allocation_id, "host_window");
+    const auto local = barrier_marker_path(h->rootinfo_path, h->run_token, tag, owner.rank);
+    if (!file_marker_handshake::publish_marker(local, local_name != nullptr ? local_name : "!")) return false;
+    if (local_name == nullptr) return false;
+    names.resize(owner.nranks);
+    names[owner.rank] = local_name;
+    const file_marker_handshake::WaitOptions options;
+    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
+    for (int peer = 0; peer < owner.nranks; ++peer) {
+        if (peer == owner.rank) continue;
+        const auto path = barrier_marker_path(h->rootinfo_path, h->run_token, tag, peer);
+        const auto ready = file_marker_handshake::wait_for_path(
+            path, file_marker_handshake::Stage::ARRIVAL_WAIT, peer, deadline, options.poll_interval
+        );
+        if (!ready.ok()) {
+            LOG_ERROR("Host domain: timed out waiting for window announcement from rank %d", peer);
+            return false;
+        }
+        std::ifstream in(path);
+        if (!(in >> names[peer]) || !comm_domain_onboard::valid_host_shm_name(names[peer].c_str())) return false;
+    }
+    return true;
+}
+
+static bool host_domain_sdma_supported() {
+    int32_t device = -1;
+    auto capability = ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED;
+    aclError status = aclrtGetDevice(&device);
+    if (status == ACL_SUCCESS) {
+        status = aclrtHostMemMapCapabilities(static_cast<uint32_t>(device), ACL_RT_HAC_TYPE_SDMA, &capability);
+    }
+    if (status != ACL_SUCCESS || capability != ACL_RT_HOST_MEM_MAP_SUPPORTED) {
+        LOG_ERROR(
+            "Host domain SDMA unsupported: device=%d query_status=%d capability=%d", device, static_cast<int>(status),
+            static_cast<int>(capability)
+        );
+        return false;
+    }
+    return true;
+}
+
+static bool
+init_host_domain_context(CommHandle h, uint64_t allocation_id, DomainAllocation &owner, const char *name, bool sdma) {
+    CommContext ctx{};
+    ctx.rankId = static_cast<uint32_t>(owner.rank);
+    ctx.rankNum = static_cast<uint32_t>(owner.nranks);
+    ctx.winSize = owner.host_window_size;
+    owner.host_windows.resize(ctx.rankNum);
+    const bool mapped =
+        (!sdma || host_domain_sdma_supported()) && map_host_domain_window(owner, ctx.rankId, name, true);
+    if (sdma) {
+        std::vector<std::string> names;
+        if (!exchange_host_window_names(h, allocation_id, owner, mapped ? name : nullptr, names)) return false;
+        for (uint32_t peer = 0; peer < ctx.rankNum; ++peer) {
+            if (peer == ctx.rankId) continue;
+            if (!map_host_domain_window(owner, peer, names[peer].c_str(), false)) return false;
+            ctx.windowsIn[peer] = owner.host_windows[peer].device_base;
+        }
+    } else if (!mapped) {
+        return false;
+    }
+    ctx.windowsIn[ctx.rankId] = ctx.windowsOut[ctx.rankId] = owner.host_windows[ctx.rankId].device_base;
+    return comm_domain_onboard::upload_context(ctx, owner.device_ctx, owner.rank, "Host domain") == ACL_SUCCESS;
+}
+
+extern "C" int comm_alloc_host_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
+    uint64_t *local_window_base_out, size_t *actual_window_size_out, const CommWorkspaceConfig *workspace_config
+) try {
+    if (workspace_config && (workspace_config->urma_jetties_per_aiv != 1 || workspace_config->urma_sq_depth != 0))
+        return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    const uint32_t sdma_mask = comm_workspace_bit(CommWorkspaceKind::SDMA);
+    if ((workspace_mask & ~sdma_mask) != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    if (!h || !rank_ids || !comm_domain_onboard::valid_host_shm_name(host_shm_name) || !device_ctx_out ||
+        !local_window_base_out || !actual_window_size_out || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM ||
+        domain_rank >= rank_count || window_size == 0 || rank_ids[domain_rank] != static_cast<uint32_t>(h->rank))
+        return -1;
+    if (host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || window_size > static_cast<size_t>(std::numeric_limits<off_t>::max()) - page_size) return -1;
+    const size_t page = static_cast<size_t>(page_size);
+    const size_t size = ((window_size + page - 1) / page) * page;
+    auto alloc = std::make_unique<DomainAllocation>();
+    alloc->rank = static_cast<int>(domain_rank);
+    alloc->nranks = static_cast<int>(rank_count);
+    alloc->host_window_size = size;
+    auto [it, inserted] = h->domain_allocations.emplace(allocation_id, std::move(alloc));
+    if (!inserted) return -1;
+    auto &owner = *it->second;
+    try {
+        if (!init_host_domain_context(h, allocation_id, owner, host_shm_name, workspace_mask != 0)) {
+            return COMM_INITIALIZATION_ABORT_REQUIRED;
+        }
+        owner.initialized = true;
+        *device_ctx_out = reinterpret_cast<uint64_t>(owner.device_ctx);
+        *local_window_base_out = owner.host_windows[domain_rank].device_base;
+        *actual_window_size_out = size;
+        return 0;
+    } catch (...) {
+        return COMM_INITIALIZATION_ABORT_REQUIRED;
+    }
+} catch (...) {
+    return -1;
+}
+
 static int release_domain_allocation(
     CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool collective
 ) try {
@@ -1511,6 +1744,13 @@ static int release_domain_allocation(
         );
         return -1;
     }
+    if (alloc->host_window_size != 0) {
+        // L3 has drained accepted uses; registrations can retire independently.
+        const int rc = release_host_domain_windows(h, *alloc);
+        if (rc == 0) h->domain_allocations.erase(it);
+        return rc;
+    }
+    if (collective && host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
     int rc = 0;
     // Published domains enter the subset barrier before local teardown.
     // Abort runs locally only after the parent joins every initializer.
@@ -1745,12 +1985,30 @@ extern "C" int comm_global_domain_release(uint64_t domain_id) try {
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
 
+    // Keep registration owners and the runtime alive if retirement is unconfirmed.
+    for (auto it = h->domain_allocations.begin(); it != h->domain_allocations.end();) {
+        auto &alloc = *it->second;
+        if (alloc.host_window_size == 0) {
+            ++it;
+            continue;
+        }
+        const int status = release_host_domain_windows(h, alloc);
+        if (status != 0) return status;
+        it = h->domain_allocations.erase(it);
+    }
+
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.
     int rc = 0;
+    file_marker_handshake::WaitOptions options;
+    options.abort_path = host_cleanup_failure_path(h);
     const auto destroy_handshake =
-        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token, options);
     if (!destroy_handshake.ok()) {
+        if (destroy_handshake.error == file_marker_handshake::Error::ABORTED || host_cleanup_failed(h)) {
+            LOG_WARN("[comm rank %d] comm_destroy: peer Host cleanup failed; retaining communicator", h->rank);
+            return COMM_RECLAMATION_UNCONFIRMED;
+        }
         LOG_WARN(
             "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; releasing local state anyway",
             h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank

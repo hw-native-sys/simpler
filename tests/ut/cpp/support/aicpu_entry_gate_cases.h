@@ -43,6 +43,7 @@ inline void check_cycles(Gate gate) {
         auto enter = [&] {
             const bool survives = gate(2, 3, initialize_entry);
             if (survives) EXPECT_EQ(entry_state, 0);
+            platform_aicpu_affinity_bind_thread(nullptr);
             return survives;
         };
         threads.push_back(std::async(std::launch::async, enter));
@@ -119,6 +120,7 @@ inline void check_native(NativeGate gate, bool invalid_participant, int32_t init
                     }
                 );
                 returned.fetch_add(1, std::memory_order_release);
+                platform_aicpu_affinity_bind_thread(nullptr);
             });
         }
         for (auto &thread : threads)

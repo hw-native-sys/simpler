@@ -23,6 +23,7 @@
 #include "run_resource_arena.h"
 
 class ChipWorker;
+class ChipRunResources;
 struct ChipRunLaneState;
 struct ChipRunState;
 
@@ -64,9 +65,18 @@ public:
     bool lane_poisoned() const;
     bool owner_recovery_required() const;
     ChipRunPreparationDisposition preparation_disposition() const;
+    std::unique_ptr<ChipRunResources> retain_resources();
 
 private:
     friend class ChipRunLane;
+    friend class ChipWorker;
+    friend class ChipRunResources;
+    friend class NativeSubmissionState;
+    void retain_resources_into(std::unique_ptr<ChipRunResources> &out);
+    bool carrier_retired_for_submission() const;
+    void external_resource_acquire_failed() const;
+    void external_resources_released() const;
+    void require_carrier_retired() const;
     ChipRun(std::shared_ptr<ChipRunLaneState> lane, std::shared_ptr<ChipRunState> run);
 
     std::shared_ptr<ChipRunLaneState> lane_;
@@ -94,6 +104,7 @@ public:
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
         volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr,
+        NativeRunPreparePurpose purpose = SIMPLER_PREPARE_EAGER, ChipRun *prepared_out = nullptr,
         bool framework_owned = false
     );
 

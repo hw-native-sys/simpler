@@ -23,20 +23,17 @@ from typing import TYPE_CHECKING
 
 from _task_interface import AddressSpace
 
+from .workspace_config import (
+    UrmaConfig,
+    WorkspaceEngineConfig,
+    normalize_workspace_configs,
+)
+from .workspace_config import (
+    normalize_workspace_engines as normalize_workspace_engines,  # noqa: PLC0414 -- preserve this module's export
+)
+
 if TYPE_CHECKING:
     from .task_interface import CommBufferSpec
-
-
-def normalize_workspace_engines(workspace_engines) -> tuple[str, ...]:
-    if isinstance(workspace_engines, str) or workspace_engines is None:
-        raise TypeError("workspace_engines must be a sequence of engine names")
-    names = tuple(workspace_engines)
-    if any(name not in ("sdma", "urma", "rdma") for name in names) or len(set(names)) != len(names):
-        raise ValueError("workspace_engines requires distinct names from sdma, urma, rdma")
-    workspace_engines = tuple(sorted(names))
-    if "rdma" in workspace_engines and len(workspace_engines) > 1:
-        raise ValueError("RDMA domains do not map peer windows; use separate domains for other engines")
-    return workspace_engines
 
 
 @dataclass(frozen=True)
@@ -63,6 +60,7 @@ class DomainConfig:
     topology: tuple
     workspace_engines: tuple[str, ...] = ()
     memory_source: AddressSpace = AddressSpace.DEVICE
+    workspace_configs: tuple[tuple[str, WorkspaceEngineConfig], ...] = ()
 
     @classmethod
     def capture(
@@ -106,10 +104,17 @@ class DomainConfig:
             raise ValueError("domain buffers exceed window_size")
         if memory_source not in (AddressSpace.HOST, AddressSpace.DEVICE):
             raise ValueError("domain memory_source must be AddressSpace.HOST or AddressSpace.DEVICE")
-        workspace_engines = normalize_workspace_engines(workspace_engines)
+        configs = normalize_workspace_configs(workspace_engines)
+        names = tuple(name for name, _ in configs)
         return cls(
-            members, window_size, snapshot, bool(retain_after_run), tuple(topology), workspace_engines, memory_source
+            members, window_size, snapshot, bool(retain_after_run), tuple(topology), names, memory_source, configs
         )
+
+    def urma_config(self) -> UrmaConfig:
+        for _, config in self.workspace_configs:
+            if isinstance(config, UrmaConfig):
+                return config
+        return UrmaConfig()
 
     def workspace_mask(self) -> int:
         return sum(1 << ("sdma", "urma", "rdma").index(name) for name in self.workspace_engines)
@@ -183,8 +188,8 @@ class HostBufferMapping(SharedMemory):
             super().close()
 
 
-def seal_host_mappings(mappings: Iterable[HostBufferMapping]) -> None:
-    """Reject live exports, then prevent new ones across the entire release set.
+def seal_host_mappings(mappings: Iterable[HostBufferMapping], *, seal: bool = True) -> None:
+    """Reject live exports and optionally prevent new ones across the release set.
 
     Nothing changes if any mapping is borrowed. Locks cover admission only;
     callers may wait for device fences and release native resources afterwards.
@@ -199,5 +204,6 @@ def seal_host_mappings(mappings: Iterable[HostBufferMapping]) -> None:
                     f"Host domain mapping {mapping.name!r} has live CPU exports; "
                     "drop arrays and release memoryviews before closing or releasing the domain"
                 )
-        for mapping in ordered:
-            mapping._closing = True
+        if seal:
+            for mapping in ordered:
+                mapping._closing = True

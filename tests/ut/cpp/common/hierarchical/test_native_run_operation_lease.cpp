@@ -142,7 +142,8 @@ int stub_destroy_comm_stream(void *, void *) {
 }
 
 int stub_alloc_domain(
-    void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
+    void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *,
+    const CommWorkspaceConfig *
 ) {
     ++g_comm_alloc_calls;
     return g_comm_rc;
@@ -1088,8 +1089,8 @@ TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProv
     EXPECT_TRUE(worker.native_runs_.empty());
 }
 
-// A destroyed carrier permits device teardown, but a poisoned lane cannot authorize comm free.
-TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeardownRetry) {
+// Carrier destruction leaves communication owners live when the lane has failed.
+TEST(NativeRunOperationLeaseTest, PoisonedLaneRefusesDeviceTeardownWithLiveCommunication) {
     for (bool failed : {false, true}) {
         SCOPED_TRACE(failed);
         ChipWorker worker;
@@ -1139,19 +1140,15 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
             EXPECT_EQ(worker.global_domain_ids_.count(7), 1u);
         };
         expect_refused();
-        g_device_finalize_rc = -9;
         EXPECT_THROW(worker.finalize(), std::runtime_error);
-        EXPECT_EQ(g_device_finalize_calls, 1);
+        EXPECT_EQ(g_device_finalize_calls, 0);
         EXPECT_EQ(g_destroy_context_calls, 0);
         EXPECT_FALSE(module->unload_allowed_);
+        EXPECT_NE(worker.device_ctx_, nullptr);
         expect_refused();
-        g_device_finalize_rc = 0;
-        EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_device_finalize_calls, 2);
-        EXPECT_EQ(g_destroy_context_calls, 1);
-        expect_refused();
-        EXPECT_NO_THROW(worker.finalize());
-        EXPECT_EQ(g_device_finalize_calls, 2);
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        EXPECT_EQ(g_device_finalize_calls, 0);
+        EXPECT_EQ(g_destroy_context_calls, 0);
         EXPECT_EQ(g_comm_free_calls, 0);
     }
 }
@@ -1244,14 +1241,21 @@ TEST(NativeRunOperationLeaseTest, DomainAllocationOwnershipPrecedesOutputValidat
     EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
 
     worker.comm_alloc_domain_windows_fn_ = [](void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t,
-                                              uint64_t *ctx, uint64_t *window, size_t *size) {
+                                              uint64_t *ctx, uint64_t *window, size_t *size,
+                                              const CommWorkspaceConfig *config) {
+        EXPECT_NE(config, nullptr);
+        if (config) {
+            EXPECT_EQ(config->urma_jetties_per_aiv, 2u);
+            EXPECT_EQ(config->urma_sq_depth, 512u);
+        }
         *ctx = 0x100;
         *window = 0x200;
         *size = 4096;
         return 0;
     };
     ownership = 0;
-    const auto result = worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2, &ownership);
+    const CommWorkspaceConfig config{2, 512};
+    const auto result = worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2, &ownership, {}, &config);
     EXPECT_EQ(std::get<0>(result), 0x100u);
     EXPECT_EQ(std::get<1>(result), 0x200u);
     EXPECT_EQ(__atomic_load_n(&ownership, __ATOMIC_ACQUIRE), 1u);

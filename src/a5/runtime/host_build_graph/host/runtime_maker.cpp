@@ -70,6 +70,8 @@
 #include "async_completion_plan.h"
 #include "ready_pool_plan.h"
 #include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_args_dump.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler_protocol_export.h"
 #include "scheduler_protocol_graph_source.h"
@@ -190,14 +192,14 @@ extern "C" int joined_native_launch_supported_impl(void) {
 }
 
 extern "C" int joined_diagnostic_launch_supported_impl(void) {
-    // Every device owner this runtime admits can hold two runs open on it —
-    // which is the four other than the argument dump, whose request this
-    // runtime refuses below. Every producer stamps the run epoch its AICPU op
+    // Every diagnostic producer this runtime admits can hold two runs open.
+    // Argument dumping is admitted only on the AICore-scheduler route.
+    // Every producer stamps the run epoch its AICPU op
     // was launched with onto the buffer it publishes, and settles that run's
     // own accounting into the terminal bank its pipeline slot reserves, so the
     // host tells the two apart by identity rather than by arrival order.
     //
-    // Both AICPU routes bring those producers up and settle them: the legacy
+    // The other diagnostics initialize and settle on both routes: the legacy
     // scheduler does it across its cold path and its dispatch exits, and the
     // AICore-scheduler route does it across `AicoreLifecycle`'s own init and
     // shutdown partitions. A run on either route therefore publishes a
@@ -205,28 +207,7 @@ extern "C" int joined_diagnostic_launch_supported_impl(void) {
     return 1;
 }
 
-extern "C" int args_dump_capture_supported_impl(void) {
-    // No per-task argument capture on this runtime. Its route is the AICore
-    // Scheduler, where the on-core schedulers both dispatch tasks and reap
-    // their completions, so no AICPU thread holds a task's own boundaries and
-    // `dump_args_for_task` has no instant to run at. The two instants an AICPU
-    // thread does own are the run's, and a read there is not that task's data:
-    // a consumer's input would carry the content from before its producer ran,
-    // and a buffer several tasks write in turn would report the last write as
-    // every one of their outputs.
-    //
-    // Zero for the runtime, not for a bind. The AICPU-scheduled fallback this
-    // runtime keeps is selected inside `create_scheduler_state` from the
-    // graph's own task kinds, and from nothing a caller states, so an answer
-    // that followed the selection would make the capture available or not
-    // depending on whether a graph happened to hold a task the resident route
-    // declines.
-    //
-    // `docs/investigations/2026-10-a5-resident-per-task-args-capture.md` is the
-    // design for a task-boundary producer here; the capability is deferred to
-    // its own change.
-    return 0;
-}
+extern "C" int args_dump_capture_supported_impl(void) { return 1; }
 
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
@@ -1233,9 +1214,75 @@ void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode
     }
 }
 
+bool plan_scheduler_args_dump(
+    Runtime *runtime, const void *uploaded_sm, const sm_layout::SegmentOffsets &segments,
+    const std::vector<SchedulerTaskMetadata> &metadata, const NativeGraphHostPlan &native_plan,
+    std::vector<SchedulerArgsDumpTask> *selected
+) {
+    const auto level = static_cast<DumpArgsLevel>(runtime->dev.dump_args_level);
+    if (level == DumpArgsLevel::OFF) return true;
+    const auto *storage =
+        reinterpret_cast<const ChipTaskStorage *>(static_cast<const char *>(uploaded_sm) + segments.storage);
+    const uint64_t device_sm = reinterpret_cast<uint64_t>(runtime->dev.gm_sm_ptr_);
+    const auto image_address = [&](const void *address) {
+        return address == nullptr ?
+                   UINT64_C(0) :
+                   device_sm + (static_cast<const char *>(address) - static_cast<const char *>(uploaded_sm));
+    };
+    for (uint64_t ref = 0; ref < metadata.size(); ++ref) {
+        const auto &shape = metadata[ref];
+        if (!scheduler_task_is_executable(shape.flags) || scheduler_task_is_inline(shape.flags)) continue;
+        SchedulerArgsDumpTask task{};
+        task.task_ref = ref;
+        for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+            task.kernel_id[lane] = shape.kernel_ids[lane];
+            if (shape.active_mask.has(static_cast<SubtaskSlot>(lane))) task.active_mask |= UINT64_C(1) << lane;
+        }
+        task.expected_participants = static_cast<uint64_t>(shape.logical_block_num) * shape.active_mask.count();
+        if (task.expected_participants == 0 || task.expected_participants > INT16_MAX) return false;
+        const SchedulerNodeBinding *binding = native_plan.instances.empty() ? nullptr : &native_plan.bindings[ref];
+        if (binding != nullptr && binding->kind == SchedulerNodeKind::CHILD_KERNEL) {
+            const auto &instance = native_plan.instances[binding->instance_index];
+            const auto &definition = native_plan.definitions[instance.definition_index];
+            const auto &child = definition.children[binding->source_index];
+            const auto *definitions = reinterpret_cast<const SubTaskDefinition *>(
+                definition.image.data() + definition.definition.off_sub_tasks
+            );
+            task.dump_metadata = definitions[binding->source_index].dump_metadata;
+            task.task_id = TaskId::make_sub_task(instance.original_shell_id, binding->source_index);
+            task.tensor_count = child.tensor_count;
+            task.scalar_count = child.scalar_count;
+            task.tensors_address = child.tensor_count == 0 ? 0 : instance.args_base + child.tensors_offset;
+            task.scalars_address = child.scalar_count == 0 ? 0 : instance.args_base + child.scalars_offset;
+            task.argument_region_base = instance.args_base;
+            task.argument_region_bytes = definition.args_bytes;
+        } else {
+            if (binding != nullptr && binding->kind != SchedulerNodeKind::TOP_KERNEL) continue;
+            const uint64_t original = binding == nullptr ? ref : binding->source_index;
+            const auto &payload = storage[original].payload;
+            if (payload.tensor_count < 0 || payload.tensor_count > CORE_MAX_TENSOR_ARGS || payload.scalar_count < 0 ||
+                payload.scalar_count > CORE_MAX_SCALAR_ARGS)
+                return false;
+            task.dump_metadata = payload.dump_metadata;
+            task.task_id = storage[original].task.task_id;
+            task.tensor_count = payload.tensor_count;
+            task.scalar_count = payload.scalar_count;
+            task.tensors_address = task.tensor_count == 0 ? 0 : image_address(payload.tensor_data());
+            task.scalars_address = task.scalar_count == 0 ? 0 : image_address(payload.scalar_data());
+            task.argument_region_base = device_sm;
+            task.argument_region_bytes = runtime->dev.sm_image_bytes;
+        }
+        if ((task.tensor_count != 0 || task.scalar_count != 0) &&
+            dump_args_task_selected(level, task.dump_metadata.dump_arg_mask))
+            selected->push_back(task);
+    }
+    return true;
+}
+
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan
+    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
+    const void *uploaded_sm
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1592,6 +1639,26 @@ bool create_scheduler_state(
         return false;
     }
     layout.total_size = ready_pool_plan.total_size;
+
+    // Keep the dump image in the published prefix, before the reserved async suffix.
+    std::vector<SchedulerArgsDumpTask> dump_tasks;
+    SchedulerArgsDumpLayout dump_layout{};
+    uint64_t dump_offset = 0;
+    if (!plan_scheduler_args_dump(runtime, uploaded_sm, device_segments, task_metadata, native_plan, &dump_tasks) ||
+        !scheduler_args_dump_plan_layout(
+            node_count, dump_tasks.size(), worker_count, !dump_tasks.empty(), &dump_layout
+        ) ||
+        (dump_layout.total_size != 0 &&
+         (!scheduler_layout_reserve(
+              &layout.total_size, dump_layout.total_size, alignof(SchedulerArgsDumpHeader), &dump_offset
+          ) ||
+          !scheduler_layout_checked_align(
+              layout.total_size, pto2::resident::ASYNC_RECORD_ALIGNMENT, &layout.total_size
+          )))) {
+        LOG_ERROR("A5 HBG: task argument diagnostic image overflow");
+        return false;
+    }
+
     AsyncCompletionHostPlan async_plan;
     std::vector<AsyncTaskPlanInput> async_inputs;
     for (uint32_t ref = 0; ref < task_metadata.size(); ++ref) {
@@ -1618,6 +1685,7 @@ bool create_scheduler_state(
     layout.aic_worker_demand = aic_worker_demand;
     layout.aiv_worker_demand = aiv_worker_demand;
 
+    if (layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) return false;
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
     // The slot's retained pair, each side aligned with at least total_size
     // behind it. Handed over uninitialized and never carrying anything between
@@ -1649,6 +1717,16 @@ bool create_scheduler_state(
         return false;
     }
 
+    if (dump_layout.total_size != 0) {
+        void *dump_image = static_cast<char *>(host_base) + dump_offset;
+        if (!scheduler_args_dump_init_image(
+                dump_image, dump_layout.total_size, dump_layout, api->run_epoch(),
+                static_cast<DumpArgsLevel>(runtime->dev.dump_args_level)
+            ))
+            return false;
+        for (const auto &task : dump_tasks)
+            if (!scheduler_args_dump_select_task(dump_image, task)) return false;
+    }
     if (native_graph) {
         std::memcpy(
             static_cast<std::byte *>(host_base) + sizeof(SchedulerRunControl),
@@ -1757,6 +1835,7 @@ bool create_scheduler_state(
                                                                                 sizeof(DispatchPayload);
         context.trace_cells_offset = layout.trace_cells_offset;
         context.pmu_cells_offset = layout.pmu_cells_offset;
+        context.args_dump_address = dump_layout.total_size == 0 ? 0 : aligned_address + dump_offset;
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = node_count;
         context.native_header_offset = native_image.header_offset;
@@ -1910,10 +1989,14 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         instance.args_base = instance.heap_base + definition.required_heap;
     }
     if (!create_scheduler_state(
-            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph,
+            upload_base + copied_bytes
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (runtime->dev.dump_args_level != static_cast<uint32_t>(DumpArgsLevel::OFF) &&
+        runtime->dev.scheduler_bootstrap.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (!plan.native_graph.legacy_section.empty() &&
         runtime->dev.scheduler_bootstrap.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING) {
         uint32_t source = static_cast<uint32_t>(GraphSectionSource::None);

@@ -165,8 +165,8 @@ oracle 至少检查 ENTER gate、所有 sink→EXIT、外部消费者映射、ex
 membership、block ownership、release/TaskDone 顺序以及 abort 后的结果。
 oracle 时间判定遵守原有跨核时钟约束，不能只凭不同核裸 timestamp 的大小断言因果。
 chip swimlane、dep_gen、error dump 均应恢复公共身份；未采集的指标报告为缺失，不填零。
-当前 A5 HBG 的 `args_dump_capture_supported_impl` 明确返回不支持逐 task 参数采集；
-该能力限制延续至 native Graph，不在 run 边界伪造 task 输入/输出采样。
+A5 HBG 的 AICore 调度路径在真实 task 边界采集参数，native Graph 子 task 复用相同协议并保留公共父/子身份。
+多 block/Mix 的 AFTER 采样等待全部参与者写入可见后完成，再发布既有 task completion；详见[参数采集合同](../../../dfx/args-dump.md#311-task-time-boundaries-on-a5-hbg)。
 
 设备真实性能诊断使用仓库 DFX 工具；最终性能数字关闭重型采集。
 每次数据都保留 collector/schema 版本、run epoch、revision、case、round、scheduler mode 和有效性标记。

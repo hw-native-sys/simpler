@@ -151,6 +151,7 @@ extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
 // These cases drive the publication step with the launch route refused, so the
 // permit never consults a live stream; the query only has to link.
+extern "C" aclError aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *) { return -1; }
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *) {
     if (status != nullptr) *status = ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
     return ACL_SUCCESS;

@@ -15,7 +15,7 @@
 
 #include "common/unified_log.h"
 
-namespace pto::a2a3 {
+namespace simpler::a2a3 {
 
 bool resolve_aicpu_cpu_id_base(int64_t phy_die_id, int32_t &out_cpu_id_base) {
     out_cpu_id_base = 0;
@@ -87,4 +87,4 @@ bool compute_allowed_cpus(
     return true;
 }
 
-}  // namespace pto::a2a3
+}  // namespace simpler::a2a3

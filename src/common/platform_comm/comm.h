@@ -32,10 +32,21 @@
 #include "common/dma_workspace.h"
 
 #ifdef __cplusplus
+#include <type_traits>
 extern "C" {
 #endif
 
 typedef struct CommHandle_ *CommHandle;
+
+// Host-side options copied through the domain-allocation control request.
+typedef struct CommWorkspaceConfig {
+    uint32_t urma_jetties_per_aiv;
+    uint32_t urma_sq_depth;
+} CommWorkspaceConfig;
+#ifdef __cplusplus
+static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
+static_assert(sizeof(CommWorkspaceConfig) == 8);
+#endif
 
 // Domain allocation failures that callers can distinguish from generic ACL errors.
 typedef enum CommDomainStatus {
@@ -275,6 +286,9 @@ int comm_derive_context(
  *                                address (for buffer carving on the
  *                                caller side).
  * @param actual_window_size_out  Receives the allocated per-rank byte extent.
+ * @param workspace_config       Optional engine configuration; null uses one URMA
+ *                               jetty per AIV and provider-default SQ depth.
+ *                               All members must request the same configuration.
  * @return 0 on success. COMM_INITIALIZATION_ABORT_REQUIRED means initialization
  *         failed with an unpublished owner: join all allocation requests, then
  *         call comm_abort_domain_windows for this allocation. Output pointers
@@ -284,44 +298,53 @@ int comm_derive_context(
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
-    size_t *actual_window_size_out
+    size_t *actual_window_size_out,
+    const CommWorkspaceConfig *workspace_config
+#ifdef __cplusplus
+    = nullptr
+#endif
 );
 
 /**
- * Allocate an A5 Host-backed domain. The runtime owns the exclusive POSIX shm
- * named by host_shm_name (a bare name of at most 31 ASCII letters/digits/_/-).
- * The mapping extent is page-aligned. Only the local windowsIn/windowsOut entry
- * is directly addressable; peers are reached through the URMA workspace.
- * workspace_mask accepts zero or URMA. Ownership and abort/release semantics
- * match comm_alloc_domain_windows. This symbol is optional on other backends.
+ * Initialize a Host-backed domain window identified by host_shm_name, a bare
+ * name of at most 31 ASCII letters, digits, underscores or hyphens.
+ * The native rank creates, registers and unlinks its local POSIX backing.
+ * The caller supplies the name and may borrow a CPU mapping. Local device
+ * mappings support MTE. A5 reaches peers through an optional domain-owned
+ * URMA workspace. On A2/A3, the SDMA bit enables peer mappings for the
+ * Worker-owned SDMA workspace.
+ * Abort and release use the same entry points as comm_alloc_domain_windows.
+ * This symbol is optional on other backends.
  */
 int comm_alloc_host_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
-    uint64_t *local_window_base_out, size_t *actual_window_size_out
+    uint64_t *local_window_base_out, size_t *actual_window_size_out,
+    const CommWorkspaceConfig *workspace_config
+#ifdef __cplusplus
+    = nullptr
+#endif
 );
 
 /**
- * Collectively release a domain window pool allocated by
- * comm_alloc_domain_windows().
+ * Release the per-rank resources of a published communication domain.
  *
  * Frees domain-owned local/peer windows, communication resources and the
- * device-side CommContext. Synchronises subset members via a
- * release barrier scoped by `allocation_id` + the caller's `domain_rank`
- * within the subset.  `rank_count` is the subset size — used only to
- * size the barrier wait, not the rank list (which was already established
- * during alloc).
+ * device-side CommContext. The caller must prove all domain users have
+ * stopped before invoking this API. A2/A3 Host-backed domains release
+ * each rank's resources independently after that fence. Backends that
+ * use a native subset barrier scope it by `allocation_id` and use
+ * `rank_count` for its participant count and `domain_rank` for the caller's position.
  *
  * Domain VMM mappings and imported physical handles are released explicitly.
  * Shared workspace borrows end here; process-wide EnablePeerAccess routes and
  * communicator-owned workspaces remain owned by their enclosing lifetime.
- * The caller must prove all domain users have stopped before invoking this API.
  * COMM_RECLAMATION_UNCONFIRMED retains the domain on h, including on allocation
  * rollback, and forbids further use or destruction of the enclosing session.
  *
  * @param h               Base handle from comm_init().
- * @param allocation_id   Same id passed to comm_alloc_domain_windows.
- * @param rank_count      Number of subset members (for barrier sizing).
+ * @param allocation_id   Same id passed to the domain allocation entry point.
+ * @param rank_count      Number of subset members.
  * @param domain_rank     This caller's dense rank in the subset.
  * @return 0 on success, non-zero on failure.
  */

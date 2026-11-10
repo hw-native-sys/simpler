@@ -116,6 +116,13 @@ nav:
       - HBG host data access: hbg-host-data-access.md
       - Orchestrator: orchestrator.md
       - Scheduler: scheduler.md
+      - A5 HBG AICore Walkthrough:
+          - Execution flow: zh-cn/a5-hbg-aicore-walkthrough/README.md
+          - Structure scopes: zh-cn/a5-hbg-aicore-walkthrough/00-data-structure-scopes.md
+          - Initialization: zh-cn/a5-hbg-aicore-walkthrough/01-initialization.md
+          - Ready queues and execution: zh-cn/a5-hbg-aicore-walkthrough/02-ready-execution.md
+          - Cooperative tasks and completion: zh-cn/a5-hbg-aicore-walkthrough/03-cooperative-completion.md
+          - Native graphs and async completion: zh-cn/a5-hbg-aicore-walkthrough/04-native-async.md
       - TMR A2/A3 vs A5: tensormap-and-ringbuffer-a2a3-vs-a5.md
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
       - Run completion fences: design/run-completion-fence.md
@@ -129,6 +136,7 @@ nav:
           - 独立 block 调度待选方案: zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md
           - 实施与功能验收: zh-cn/design/a5-hbg-graph-task/implementation.md
           - 性能与自主迭代流程: zh-cn/design/a5-hbg-graph-task/performance.md
+          - Admission 方案排查记录: zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md
           - 设计复审: zh-cn/design/a5-hbg-graph-task/review.md
           - 已否定的性能尝试: zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md
           - 无 Graph 性能实测: zh-cn/design/a5-hbg-graph-task/no-graph-performance.md

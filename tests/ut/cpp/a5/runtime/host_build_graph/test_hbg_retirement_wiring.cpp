@@ -44,6 +44,11 @@ uint64_t released_despite_failure = 0;
 Runtime *observed_retirement_runtime = nullptr;
 std::mutex retire_mutex;
 int scheduler_timeout_ms = 0;
+bool dump_enabled = false;
+uint64_t dump_base = 0;
+int32_t dump_initializations = 0;
+std::vector<int> dump_flushes;
+std::vector<int> dump_closes;
 }  // namespace
 
 uint32_t platform_get_physical_cores_count() { return 3; }
@@ -82,12 +87,18 @@ uint64_t get_platform_regs() {
     return reinterpret_cast<uint64_t>(registers.data());
 }
 extern "C" int get_scheduler_timeout_ms() { return scheduler_timeout_ms; }
-extern "C" bool is_dump_args_enabled() { return false; }
-// The shutdown partition settles its dump lane; this target links no args-dump
-// producer, and the stub above keeps either from being reached.
-void dump_args_flush(int) {}
-void dump_args_close_run(int) {}
-void dump_args_init(int, DumpArgsLevel) {}
+extern "C" bool is_dump_args_enabled() { return dump_enabled; }
+extern "C" uint64_t get_platform_dump_base() { return dump_base; }
+void dump_args_flush(int thread) { dump_flushes.push_back(thread); }
+void dump_args_close_run(int thread) { dump_closes.push_back(thread); }
+void dump_args_init(int, DumpArgsLevel) { ++dump_initializations; }
+
+// This retirement fixture owns no task-copy image; real copy initialization is
+// exercised by test_hbg_args_dump_service and the end-to-end dump scenes.
+bool initialize_resident_args_dump_outputs(void *image, uint64_t, uint64_t) {
+    EXPECT_EQ(image, nullptr);
+    return image == nullptr;
+}
 
 class SchedulerContextTestPeer {
 public:
@@ -190,6 +201,11 @@ protected:
         released_despite_failure = 0;
         observed_retirement_runtime = nullptr;
         scheduler_timeout_ms = 0;
+        dump_enabled = false;
+        dump_base = 0;
+        dump_initializations = 0;
+        dump_flushes.clear();
+        dump_closes.clear();
         set_pmu_enabled(false);
     }
 
@@ -635,3 +651,31 @@ TEST_F(HbgRetirementWiring, AnUnprovedStopIsRefusedBeforeAnyCellIsRead) {
     EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), /*graph_completed=*/true));
 }
 }  // namespace
+
+TEST_F(HbgRetirementWiring, EnabledDumpWithoutItsTransportRefusesBeforeProducerInitialization) {
+    auto runtime = std::make_unique<Runtime>();
+    runtime->set_worker_count(3);
+    dump_enabled = true;
+    AicoreLifecycle lifecycle;
+    EXPECT_NE(lifecycle.pre_handshake_init(runtime.get(), 1, 0), 0);
+    EXPECT_EQ(dump_initializations, 0);
+}
+
+TEST_F(HbgRetirementWiring, ArgumentAccountingWaitsForRetirementAndDoesNotCertifyAnIncompleteGraph) {
+    auto runtime = std::make_unique<Runtime>();
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::seed(lifecycle, kAddrs, 3);
+    dump_enabled = true;
+    EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), true));
+    EXPECT_TRUE(dump_flushes.empty());
+    EXPECT_TRUE(dump_closes.empty());
+    for (int thread = 0; thread < 3; ++thread)
+        ASSERT_EQ(lifecycle.finish_shutdown_partition(thread, runtime.get()), 0);
+    ASSERT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), false));
+    EXPECT_EQ(dump_flushes, (std::vector<int>{0, 1, 2}));
+    EXPECT_TRUE(dump_closes.empty());
+    dump_flushes.clear();
+    ASSERT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), true));
+    EXPECT_EQ(dump_flushes, (std::vector<int>{0, 1, 2}));
+    EXPECT_EQ(dump_closes, (std::vector<int>{0, 1, 2}));
+}

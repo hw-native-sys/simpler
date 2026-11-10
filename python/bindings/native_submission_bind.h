@@ -21,8 +21,7 @@
 #include "chip_worker.h"
 #include "native_submission.h"
 #include "queued_submission.h"
-
-using NativeSubmissionState = QueuedSubmission<ChipRun>;
+#include "native_submission_state.h"
 
 inline ChipRun::Deadline native_submission_wait_deadline(double timeout) {
     if (std::isnan(timeout)) throw std::invalid_argument("submission wait timeout must not be NaN");
@@ -33,34 +32,6 @@ inline ChipRun::Deadline native_submission_wait_deadline(double timeout) {
                    std::chrono::duration_cast<ChipRun::Clock::duration>(std::chrono::duration<double>(timeout));
     return deadline;
 }
-
-struct NativeSubmissionCapsule {
-    explicit NativeSubmissionCapsule(std::shared_ptr<NativeSubmissionState> state) :
-        state(std::move(state)) {
-        api = {this, retain, release, submit};
-    }
-    static void retain(void *context) noexcept {
-        static_cast<NativeSubmissionCapsule *>(context)->references.fetch_add(1, std::memory_order_relaxed);
-    }
-    static void release(void *context) noexcept {
-        auto *self = static_cast<NativeSubmissionCapsule *>(context);
-        if (self->references.fetch_sub(1, std::memory_order_acq_rel) == 1) delete self;
-    }
-    static int submit(void *context, char *message, size_t capacity) noexcept {
-        try {
-            static_cast<NativeSubmissionCapsule *>(context)->state->submit();
-            return 0;
-        } catch (const std::exception &error) {
-            if (message && capacity) std::snprintf(message, capacity, "%s", error.what());
-        } catch (...) {
-            if (message && capacity) std::snprintf(message, capacity, "unknown native submission failure");
-        }
-        return -1;
-    }
-    SimplerNativeSubmission api{};
-    std::atomic<size_t> references{1};
-    std::shared_ptr<NativeSubmissionState> state;
-};
 
 inline void bind_native_submission(nanobind::module_ &m) {
     nanobind::class_<NativeSubmissionState>(m, "_NativeSubmission")
@@ -85,26 +56,35 @@ inline void bind_native_submission(nanobind::module_ &m) {
             "_retire_framework",
             [](NativeSubmissionState &self, bool wait_for_own_completion, double timeout) {
                 const auto deadline = native_submission_wait_deadline(timeout);
-                return self.with_framework_run(
-                    wait_for_own_completion,
-                    [&](ChipRun &run) {
-                        try {
-                            const bool retired = run.retire_framework(wait_for_own_completion, deadline);
-                            if (run.framework_transferred()) self.note_framework_transfer();
-                            return retired;
-                        } catch (...) {
-                            // Destruction and error delivery are independent facts.
-                            if (run.framework_transferred()) self.note_framework_transfer();
-                            throw;
-                        }
-                    },
-                    deadline
-                );
+                return self.retire_framework(wait_for_own_completion, deadline);
             },
             nanobind::arg("wait_for_own_completion") = false, nanobind::arg("timeout") = -1.0,
             nanobind::call_guard<nanobind::gil_scoped_release>()
         )
         .def("_retire", &NativeSubmissionState::retire, nanobind::call_guard<nanobind::gil_scoped_release>())
+        .def(
+            "_retain_model_resources",
+            [](NativeSubmissionState &self, const NativeSubmissionState *anchor) {
+                int started = 0;
+                self.retain_model_resources(started, anchor);
+            },
+            nanobind::arg("anchor").none() = nullptr, nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
+        .def(
+            "_model_destroyed", &NativeSubmissionState::model_destroyed,
+            nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
+        .def(
+            "_release_model_resources",
+            [](NativeSubmissionState &self) {
+                NativeSubmissionCleanup outcome;
+                self.cancel_pending(outcome);
+                if (!outcome.carrier_retired) throw RunPreparationRefused("native capture carrier is still live");
+                self.release_resources();
+                return outcome.disposition == NativeSubmissionDisposition::Cancelled;
+            },
+            nanobind::call_guard<nanobind::gil_scoped_release>()
+        )
         .def(
             "cancel",
             [](NativeSubmissionState &self) {

@@ -31,6 +31,7 @@
 #include <cstdint>
 
 #include "aicore_lifecycle.h"
+#include "args_dump_service.h"
 #include "aicpu/device_run_result_aicpu.h"
 #include "common/run_terminal_accumulator.h"
 #include "scheduler_ready_watchdog.h"
@@ -90,10 +91,20 @@ struct AicpuExecutor {
     // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
     // dependency resolution, Ready scheduling, and task execution.
     AicoreLifecycle aicore_lifecycle_;
+    ResidentArgsDumpService *args_dump_services_{nullptr};
+    int32_t args_dump_service_count_{0};
+    bool args_dump_services_allocated_this_init_{false};
+    bool args_dump_services_stopped() const {
+        for (int32_t thread = 0; args_dump_services_ != nullptr && thread < args_dump_service_count_; ++thread)
+            if (args_dump_services_[thread].has_open_record() || dump_arg_has_open_record(thread)) return false;
+        return true;
+    }
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
+    // Copy one pending argument record for this thread, if the run dumps args.
+    void service_args_dump(int32_t thread_idx);
     void deinit(Runtime *runtime);
     void reset_entry_state();
     int32_t finish_failed_init(Runtime *runtime);
@@ -126,10 +137,10 @@ struct AicpuExecutor {
     SIMPLER_SCHEDULER_STEP bool awaits_bootstrap() const;
     // Watch the run to completion. Runs on the last thread, and its return
     // value is this run's status.
-    SIMPLER_SCHEDULER_STEP int32_t supervise(Runtime *runtime);
+    SIMPLER_SCHEDULER_STEP int32_t supervise(Runtime *runtime, int32_t thread_idx);
     // Wait for the supervisor to declare shutdown. Runs on every other thread.
     // Returns whether the wait timed out.
-    SIMPLER_SCHEDULER_STEP bool await_shutdown(Runtime *runtime);
+    SIMPLER_SCHEDULER_STEP bool await_shutdown(Runtime *runtime, int32_t thread_idx);
     // Settle this run's error into the shared header and return the status it
     // then carries. Runs inside snapshot_run_terminal, on the last participant
     // out, which is the first point at which every core has stopped writing:

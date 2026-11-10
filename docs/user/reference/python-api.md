@@ -181,13 +181,14 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
 | `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | Reuse the same live handle after full configuration validation, or create it |
 | `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
-| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
+| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging for Device-source domains before task submission. L3 requires declared slices. |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
-A5 TMR L3 domains may select `memory_source=AddressSpace.HOST`; each rank owns a
-Host window and the L3 creator accesses it with `buffer.shm.buf`, selecting named
-slices with `domain.buffer_range(name)`. L2 owns allocation and unlink.
-See [Host-source domains](../../a5-host-comm-domain.md).
+Onboard A2/A3 and A5 TMR L3 domains may select `memory_source=AddressSpace.HOST`.
+Each rank has a Host window. L3 accesses it with `buffer.shm.buf` and selects named
+slices with `domain.buffer_range(name)`. Both allocation methods accept a synchronous
+`initializer(domain)` for new Host domains. See [A5 Host-source domains](../../a5-host-comm-domain.md)
+and [A2/A3 Host-source windows](../../comm-domain.md#a2a3-host-source-windows).
 
 `domain.member(rank).buffers[name].tensor(...)` has the same L3/L4 semantics and routes to its owning chip.
 `domain.ref` is immutable across nodes; `local_context(rank)` requires a local mapping.

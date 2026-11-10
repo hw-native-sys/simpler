@@ -155,6 +155,9 @@ struct AicoreExitTarget {
     AicoreTeardownControl *teardown;
 };
 
+// Enable exit signalling without releasing a core into normal initialization.
+void platform_open_aicore_exit_window(uint64_t reg_addr);
+
 // Retires one exclusively claimed set of cores. Each target's request and
 // release gate must be reset before READY or any EXIT; Native and unstamped
 // launches use the same reserved COND nonce protocol. Each core echoes its

@@ -13,3 +13,9 @@
 extern "C" int rtDeviceReset(int) { return 0; }
 extern "C" int aclrtResetDevice(int device) { return rtDeviceReset(device); }
 extern "C" int rtFree(void *) { return 0; }
+extern "C" int aclrtDestroyEvent(void *) { return 0; }
+extern "C" int aclmdlRICaptureGetInfo(void *, void *status, void **model) {
+    *static_cast<int *>(status) = 0;
+    *model = nullptr;
+    return 0;
+}

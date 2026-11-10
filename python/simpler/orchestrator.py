@@ -63,6 +63,7 @@ from .task_interface import (
     _validate_remote_sidecar_access,
     get_element_size,
 )
+from .workspace_config import WorkspaceEngines
 
 
 def _require_handle(
@@ -554,7 +555,7 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         workers: Sequence[int] | None = None,
-        workspace_engines: Sequence[str] = (),
+        workspace_engines: WorkspaceEngines = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
         initializer: Callable[[CommDomainHandle], None] | None = None,
     ) -> CommDomainHandle:
@@ -567,12 +568,16 @@ class Orchestrator:
         ``workers`` is the legacy L3 spelling; it cannot be combined with ``members``.
         Retained domains survive successful runs until explicit release or Worker.close().
         Domains provide synchronous mapped-window communication by default.
-        On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
+        On A5, workspace_engines accepts names from sdma/urma/rdma, or a mapping
+        from those names to SdmaConfig/UrmaConfig/RdmaConfig. Name sequences use
+        default settings. Configuration is immutable for the domain's lifetime.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
-        its own low-address window. Explicit selection is limited to L3 A5.
+        its own low-address window.
         ``memory_source=AddressSpace.HOST`` creates independent Host windows on
-        L3 A5 TMR ranks, with local device access and optional URMA peer access.
-        Their named Buffers expose CPU bytes through ``buffer.buffer`` on L3.
+        onboard L3 A2/A3 and A5 TMR. Local device access uses MTE. For A5 peer
+        access, request ``workspace_engines=("urma",)``. For A2/A3 peer access,
+        enable SDMA on the Worker and request ``workspace_engines=("sdma",)``.
+        L3 CPU access uses ``Buffer.shm.buf`` and ``domain.buffer_range(name)``.
         ``initializer(domain)`` optionally fills all Host rank windows synchronously
         on the L3 CPU after mapping/registration and before this call returns.
         Only L3 Host-source domains support it. It must return None and may not
@@ -603,7 +608,7 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
-        workspace_engines: Sequence[str] = (),
+        workspace_engines: WorkspaceEngines = (),
         memory_source: AddressSpace = AddressSpace.DEVICE,
         initializer: Callable[[CommDomainHandle], None] | None = None,
     ) -> CommDomainHandle:
@@ -718,10 +723,10 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage bytes; does not wait for queued tasks.
+        """Synchronously stage bytes into a Device-source domain.
 
         L3 staging precedes task submission and stays within declared buffer slices.
-        L4 keeps its existing window copy path.
+        Use `Buffer.shm.buf` and `domain.buffer_range(name)` for Host-source domains.
         """
         self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
 
@@ -734,7 +739,7 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> bytes:
-        """Synchronously read bytes with the same range and ordering rules as copy_to_domain."""
+        """Synchronously read Device-source bytes with the same rules as copy_to_domain."""
         return cast(bytes, self._copy_domain(handle, domain_rank, int(nbytes), buffer, offset, writing=False))
 
     copy_to_global_domain = copy_to_domain

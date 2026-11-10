@@ -14,14 +14,12 @@
 #include <dlfcn.h>
 
 #include <algorithm>
-#include <mutex>
-#include <unordered_map>
 
 #include "ascend_hal.h"
 #include "common/unified_log.h"
 #include "common/acl_hal_device.h"
 
-namespace pto::a2a3 {
+namespace simpler::a2a3 {
 
 namespace {
 
@@ -82,9 +80,6 @@ bool query_phy_die_id(uint32_t device_id, int64_t &out_phy_die_id) {
     return true;
 }
 
-std::mutex s_topo_cache_mu;
-std::unordered_map<uint32_t, std::vector<AicpuLogicalCpu>> s_topo_cache;
-
 bool probe_aicpu_topology_uncached(uint32_t device_id, std::vector<AicpuLogicalCpu> &out_user_cpus) {
     out_user_cpus.clear();
 
@@ -122,15 +117,6 @@ bool probe_aicpu_topology_uncached(uint32_t device_id, std::vector<AicpuLogicalC
 }  // namespace
 
 bool probe_aicpu_topology(uint32_t device_id, std::vector<AicpuLogicalCpu> &out_user_cpus) {
-    {
-        std::lock_guard<std::mutex> lk(s_topo_cache_mu);
-        auto it = s_topo_cache.find(device_id);
-        if (it != s_topo_cache.end()) {
-            out_user_cpus = it->second;
-            return !out_user_cpus.empty();
-        }
-    }
-
     std::vector<AicpuLogicalCpu> probed;
     bool ok = probe_aicpu_topology_uncached(device_id, probed);
     if (!ok) {
@@ -140,12 +126,8 @@ bool probe_aicpu_topology(uint32_t device_id, std::vector<AicpuLogicalCpu> &out_
 
     LOG_INFO("A2A3 AICPU topology probed for device %u: %zu user-schedulable cpu_ids", device_id, probed.size());
 
-    {
-        std::lock_guard<std::mutex> lk(s_topo_cache_mu);
-        s_topo_cache[device_id] = probed;
-    }
     out_user_cpus = std::move(probed);
     return true;
 }
 
-}  // namespace pto::a2a3
+}  // namespace simpler::a2a3

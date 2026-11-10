@@ -467,6 +467,20 @@ int publish_for_launch(
     KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording = false
 );
 
+enum class RuntimeWorkerInit { OnPublication, BeforeRecording, DuringRecording };
+
+/**
+ * Reserve the slot's fixed Runtime device extent and pinned publication span.
+ * Metadata bytes extend the pinned span only. Replayable backing needs a
+ * one-time initialization of its private worker reports before publication.
+ * Failed frees retain ownership. Failed allocations preserve committed device
+ * storage and leave missing pinned backing retryable.
+ */
+int reserve_slot_runtime_args(
+    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, uint64_t metadata_bytes,
+    RuntimeWorkerInit worker_init = RuntimeWorkerInit::OnPublication, int *capture_mode_restore_error = nullptr
+);
+
 /**
  * Release a retired slot's device block and pinned source, retaining failed frees.
  *

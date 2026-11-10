@@ -166,6 +166,19 @@ runs:
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py" \
           --manual include --dump-args full
 
+        if [[ "$platform" == "a5" ]]; then
+          for mode in full hybrid partial; do
+            start_job "args_dump (host_build_graph, $mode)" \
+              tests/st/a5/host_build_graph/dump_args/test_dump_args_example.py \
+              --manual include --dump-args "$mode"
+            # Mode runs share scene output names even on different devices.
+            wait_job "$((${#job_labels[@]} - 1))"
+          done
+          start_job "args_dump (host_build_graph Mix, full)" \
+            tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py \
+            --manual include --dump-args full
+        fi
+
         # The directory, not a named file: every case here needs --enable-dep-gen
         # to assert anything, so one this job does not select reports a pass
         # having checked no graph. Both arches have a host-built dep_gen suite,

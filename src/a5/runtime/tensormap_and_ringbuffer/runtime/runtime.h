@@ -184,7 +184,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
 
     // Filter-style affinity gate input (a5 onboard). Host fills before
     // launch from device-side OCCUPY + DSMI CPU_TOPO via
-    // pto::a5::compute_allowed_cpus. The on-device gate keeps threads whose
+    // simpler::a5::compute_allowed_cpus. The on-device gate keeps threads whose
     // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
     // this array drives sched/orch role assignment. Indices 0..count-2 are
     // scheduler slots, index count-1 is the orchestrator slot. Sized to

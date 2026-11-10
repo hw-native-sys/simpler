@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace pto::a2a3 {
+namespace simpler::a2a3 {
 
 // Two translation units implement this header. aicpu_topology_probe.cpp owns
 // probe_aicpu_topology and includes the CANN driver header for it;
@@ -49,4 +49,4 @@ bool compute_allowed_cpus(
     const std::vector<AicpuLogicalCpu> &user_cpus, int32_t active_count, std::vector<int32_t> &out_allowed_cpus
 );
 
-}  // namespace pto::a2a3
+}  // namespace simpler::a2a3

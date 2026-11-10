@@ -31,6 +31,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
@@ -84,6 +85,7 @@ public:
     bool supports_args_dump_capture() const override { return SIMPLER_DFX != 0; }
 
 private:
+    int prepare_kernel_arch_context(rtStream_t control_stream) override;
     // #2267's retention probe retires only this run's stream-pair ownership,
     // on real boundary completion and without the drain that normally
     // accompanies it, so its successor's `ensure()` is accepted while the
@@ -322,6 +324,10 @@ private:
     // handing the device an uncommitted table would deadlock the next task on a
     // stream-sync timeout rather than fail the prepare (see host_regs.cpp).
     int ensure_aicore_reg_table(AicoreRegKind kind);
+    int ensure_aicpu_topology();
+    uint64_t c2c_ctrl_address_{0};
+    bool c2c_ctrl_address_valid_{false};
+    std::vector<simpler::a2a3::AicpuLogicalCpu> aicpu_topology_;
 
     // Release the resources this run owns, in runtime-argument, register-buffer,
     // then stream order. Collectors are not among them: their device resources

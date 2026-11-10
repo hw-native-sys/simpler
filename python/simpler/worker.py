@@ -935,13 +935,16 @@ _PY_CALLABLE_HEADER = struct.Struct("<4sBBHQ")
 # uses only the first slot.
 _CTRL_SHM_NAME_BYTES = 32
 
-# Domain-allocation request shm layout: 32-byte header + buffer_nbytes (u64) +
+# Domain-allocation request shm layout: 40-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
-_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
+_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI12x")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
-#         window_size (u64), buffer_count (u32), workspace_mask (u32)
-assert _DOMAIN_REQ_HEADER.size == 32
+#         window_size (u64), buffer_count (u32), workspace_mask (u32),
+#         urma_jetties_per_aiv (u32), urma_sq_depth (u32)
+assert _DOMAIN_REQ_HEADER.size == 40
+_DOMAIN_URMA_CONFIG_OFFSET = 32
+_DOMAIN_URMA_CONFIG = struct.Struct("<II")
 _DOMAIN_WORKSPACE_MASK_OFFSET = struct.calcsize("<QIIQI")
 
 # Domain-allocation reply shm layout: 40-byte header + buffer_ptrs (u64).
@@ -2893,6 +2896,7 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
     try:
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
         workspace_mask = struct.unpack_from("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET)[0]
+        urma_jetties, urma_sq_depth = _DOMAIN_URMA_CONFIG.unpack_from(req_buf, _DOMAIN_URMA_CONFIG_OFFSET)
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
@@ -2926,6 +2930,8 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
             workspace_mask=workspace_mask,
             **({"host_shm_name": host_shm_name} if host_shm_name else {}),
+            urma_jetties_per_aiv=urma_jetties,
+            urma_sq_depth=urma_sq_depth,
         )
 
         # Carve buffer pointers sequentially inside the local window.
@@ -4807,6 +4813,9 @@ class CleanupJournal:
         if errors:
             self._errors.extend(errors)
         return errors[0] if errors else None
+
+    def has_kind(self, kind: str) -> bool:
+        return any(entry_kind == kind for entry_kind, _identity, _cleanup in self._entries)
 
     def drive_kinds(self, kinds: set[str]):
         """Drive every retained entry whose resource kind is in ``kinds``."""
@@ -9312,7 +9321,7 @@ class Worker:
             self._startup_error = None
             self._init_owner_thread = threading.current_thread()
             self._cancel_token = False
-            if _startup_deadline is None:
+            if _startup_deadline is None or not self._shm_token:
                 self._assign_shm_namespace()
             if bytes(self._buffer_identity_allocator.owner_instance_id) != self._owner_instance_id:
                 raise RuntimeError("Worker buffer identity allocator is not bound to the HOST owner nonce")
@@ -10678,7 +10687,7 @@ class Worker:
             after_success=lambda: setattr(self, "_comm_base_ready", True),
         )
 
-    def _domain_config(
+    def _domain_config(  # noqa: PLR0912 -- validate domain topology and platform-specific engines
         self, members, window_size, buffers, retain_after_run, workspace_engines=(), memory_source=AddressSpace.DEVICE
     ) -> DomainConfig:
         if self.level == 3:
@@ -10716,10 +10725,16 @@ class Worker:
         if config.memory_source == AddressSpace.HOST:
             if (
                 self.level != 3
-                or self._config.get("platform") != "a5"
+                or self._config.get("platform") not in ("a2a3", "a5")
                 or self._config.get("runtime") != "tensormap_and_ringbuffer"
             ):
-                raise ValueError("Host-source domains require L3 A5 tensormap_and_ringbuffer")
+                raise ValueError("Host-source domains require onboard L3 A2/A3 or A5 tensormap_and_ringbuffer")
+            if self._config.get("platform") == "a2a3":
+                if config.workspace_engines not in ((), ("sdma",)):
+                    raise ValueError("Host-source domains on a2a3 support only the SDMA workspace")
+                if config.workspace_engines and not self._config.get("enable_sdma", False):
+                    raise ValueError("A2/A3 Host-domain SDMA requires Worker(enable_sdma=True)")
+                return config
             if any(engine != "urma" for engine in config.workspace_engines):
                 raise ValueError("Host-source domains support only the URMA workspace")
         if config.workspace_engines:
@@ -10820,6 +10835,8 @@ class Worker:
                         **(
                             {"memory_source": config.memory_source} if config.memory_source == AddressSpace.HOST else {}
                         ),
+                        urma_jetties_per_aiv=config.urma_config().jetties_per_aiv,
+                        urma_sq_depth=config.urma_config().sq_depth,
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -10948,6 +10965,8 @@ class Worker:
         buffers: list[CommBufferSpec],
         workspace_mask: int = 0,
         memory_source: AddressSpace = AddressSpace.DEVICE,
+        urma_jetties_per_aiv: int = 1,
+        urma_sq_depth: int = 0,
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -10972,8 +10991,12 @@ class Worker:
         host_names = {}
         if memory_source == AddressSpace.HOST:
             # Host windows belong to this startup tree even before allocation replies arrive.
+            prefix = "h-"
+            if self._config.get("platform") == "a2a3":
+                prefix = f"a3-{os.getpgrp():x}-"
+            nonce_length = 18 - len(prefix)  # The startup-tree prefix takes 12 bytes.
             for chip in workers:
-                host_name = _shm_name(self._shm_token, f"h-{uuid.uuid4().hex[:16]}")
+                host_name = _shm_name(self._shm_token, prefix + uuid.uuid4().hex[:nonce_length])
                 assert host_name is not None
                 host_names[chip] = host_name
             req_size += _CTRL_SHM_NAME_BYTES
@@ -11012,6 +11035,9 @@ class Worker:
                         req_buf,
                         _DOMAIN_WORKSPACE_MASK_OFFSET,
                         workspace_mask,
+                    )
+                    _DOMAIN_URMA_CONFIG.pack_into(
+                        req_buf, _DOMAIN_URMA_CONFIG_OFFSET, urma_jetties_per_aiv, urma_sq_depth
                     )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:
@@ -11417,18 +11443,22 @@ class Worker:
             )
 
         def retire_live_handle() -> None:
-            for mapping in handle._host_mappings:
-                mapping.close()
-            handle._host_mappings.clear()
             if self._live_domains.get(handle.name) is handle:
                 self._live_domains.pop(handle.name)
 
-        _run_with_owned_shared_memory(
-            len(workers),
-            release,
-            name_prefix="shm-domain-release-lifecycle-",
-            after_success=retire_live_handle,
-        )
+        try:
+            _run_with_owned_shared_memory(
+                len(workers),
+                release,
+                name_prefix="shm-domain-release-lifecycle-",
+                after_success=retire_live_handle,
+            )
+        finally:
+            # CPU exports are sealed. These borrows can close even if the
+            # backend release was unconfirmed and still owes device cleanup.
+            for mapping in handle._host_mappings:
+                mapping.close()
+            handle._host_mappings.clear()
 
     def _dispatch_control_domain(
         self,
@@ -12457,8 +12487,9 @@ class Worker:
         )
         return decode_copy_result(reply)
 
-    def _seal_domain_cpu_exports(self) -> None:
-        seal_host_mappings(mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings)
+    def _seal_domain_cpu_exports(self, *, seal: bool = True) -> None:
+        mappings = (mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings)
+        seal_host_mappings(mappings, seal=seal)
 
     def _release_all_live_domains(
         self, resources: _RunResources | None = None, *, include_retained: bool = True
@@ -12780,6 +12811,11 @@ class Worker:
                 f"Worker.{api}: {identity} is not a live device allocation on this worker "
                 f"(never allocated here, already freed, or its domain was released)"
             )
+        if isinstance(handle.shm, HostBufferMapping) and capability in (
+            BufferCapability.COPY_TO,
+            BufferCapability.COPY_FROM,
+        ):
+            raise ValueError(f"Worker.{api}: use Buffer.shm.buf for CPU copies of Host-source domain buffers")
         kind, _profile = select_adapter(handle.to_descriptor(), self._owner_endpoint_context(), where=f"Worker.{api}")
         granted = capabilities_for_adapter(kind, handle.access)
         if capability not in granted:
@@ -13816,8 +13852,10 @@ class Worker:
         Preparation snapshots arguments/configuration without device launch or
         waiting for lane capacity. caller_stream and external storage owners must
         remain alive until wait/close; pass their Python owners in keepalive.
-        The callback's successful native submit establishes the caller exit wait.
-        This API does not support capture or L3 Python orchestration.
+        Ordinary native submit establishes the caller exit wait. The stock graph
+        adapter registers this same token with the ACL model before submit. The
+        ticket keeps its owners until the model destroy notice and checked native
+        release. Capture supports Kernels on direct L2 Workers.
         """
         if self.level != 2:
             raise ValueError("prepare_submission requires a direct L2 Worker")
@@ -13829,11 +13867,11 @@ class Worker:
             if getattr(cfg, "output_prefix", ""):
                 _bind_host_log_session_directory()
             run_id, args, chip_args, values = self._prepare_l2_args(
-                state.slot_id, args, caller_stream=stream, original_handle=callable
+                state.slot_id, args, caller_stream=stream, original_handle=callable, snapshot_only=True
             )
             assert self._chip_worker is not None
             try:
-                native = self._chip_worker._prepare_chip_submission(state.slot_id, chip_args, cfg, caller_stream=stream)
+                native = self._chip_worker._prepare_chip_submission(state.slot_id, values, cfg, caller_stream=stream)
             except BaseException:
                 self._discard_l2_reservation(run_id, safe=True)
                 raise
@@ -14228,7 +14266,13 @@ class Worker:
         return None
 
     def _prepare_l2_args(
-        self, callable_id: int, args, *, caller_stream: int | None, original_handle: CallableHandle | None = None
+        self,
+        callable_id: int,
+        args,
+        *,
+        caller_stream: int | None,
+        original_handle: CallableHandle | None = None,
+        snapshot_only: bool = False,
     ):
         """Snapshot and reserve call values before native execution or queue handoff."""
         assert self._chip_worker is not None
@@ -14238,7 +14282,7 @@ class Worker:
         borrowed = environment is not None and environment[4]
         if borrowed and caller_stream is None:
             raise ValueError("borrowed submission requires caller_stream")
-        if caller_stream is not None:
+        if caller_stream is not None and not snapshot_only:
             self._chip_worker._validate_caller_stream(caller_stream)
         args = _snapshot_local_task_args(TaskArgs() if args is None else args)
         if borrowed and any(args.transfer(i) == TensorTransfer.H2D for i in range(args.tensor_count())):
@@ -14958,7 +15002,7 @@ class Worker:
         - Reentrant ``close()`` from inside a leased operation is rejected.
         - Live Host-domain CPU exports reject close with ``BufferError`` before
           the claim. Drop arrays and release memoryviews, then retry. If an
-          admitted run exports a new window during drain, teardown is deferred
+          admitted run leaves a live export during drain, teardown is deferred
           and close remains retryable with the worker CLOSED.
         - ``close()`` during an in-progress ``init()`` on another thread
           cooperatively cancels it: the init epoch unwinds and this call
@@ -15090,7 +15134,8 @@ class Worker:
                         "init()'d it (native teardown is thread-bound)"
                     )
                 self._validate_chip_execution_context()
-                self._seal_domain_cpu_exports()
+                # Admitted callbacks can still borrow Host windows during drain.
+                self._seal_domain_cpu_exports(seal=self._active_ops == 0)
                 deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.
@@ -15180,8 +15225,7 @@ class Worker:
                                 f"({_ROLLBACK_GRACEFUL_TIMEOUT_S}s); teardown deferred (worker stays CLOSED)"
                             )
                     else:
-                        # An operation admitted before CLOSED may have created
-                        # another Host domain while close drained its run.
+                        # Recheck all mappings after admitted runs finish.
                         self._seal_domain_cpu_exports()
                         teardown_tree = self._has_live_resources()
                         # Fence drain makes this close terminal even when the
@@ -15452,6 +15496,25 @@ class Worker:
         if errors:
             raise errors[0]
 
+    def _a3_backing_owner_exited(self, parts: list[str]) -> bool:
+        if len(parts) != 5 or not re.fullmatch(r"[0-9a-f]{1,8}", parts[3]):
+            return False
+        pgid = int(parts[3], 16)
+        if not 0 < pgid <= 0x7FFFFFFF:
+            return False
+        if pgid == os.getpgrp():
+            if self.level != 3 or parts[1] != self._shm_token[:8]:
+                return False
+            if self._chip_pids or self._cleanup_journal.has_kind("child"):
+                raise RuntimeError("Host backing still has unconfirmed L2 child exit")
+            return True
+        # A reaped nested L3 may have left L2 descendants in its group.
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        raise RuntimeError(f"Host backing process group {pgid} is still alive")
+
     def _unlink_shm_namespace(self, protected_names: set[str]) -> None:
         """Unlink orphan shared memory belonging to this exact startup tree."""
         shm_dir = "/dev/shm"
@@ -15463,11 +15526,20 @@ class Worker:
             if entry.name in protected_names or not entry.name.startswith(prefixes):
                 continue
             try:
-                orphan = SharedMemory(name=entry.name)
-                try:
-                    orphan.unlink()
-                finally:
-                    orphan.close()
+                parts = entry.name.split("-", 4)
+                if parts[2] == "a3" and not self._a3_backing_owner_exited(parts):
+                    continue
+                if parts[2] in ("a3", "h"):
+                    # Native creators are untracked and may die before ftruncate.
+                    import _posixshmem  # noqa: PLC0415
+
+                    _posixshmem.shm_unlink(f"/{entry.name}")
+                else:
+                    orphan = SharedMemory(name=entry.name)
+                    try:
+                        orphan.unlink()
+                    finally:
+                        orphan.close()
             except FileNotFoundError:
                 pass
             except BaseException as exc:  # noqa: BLE001
@@ -15748,9 +15820,10 @@ class Worker:
             # this attempt has delivered SHUTDOWN and reaped the live groups;
             # otherwise an unreaped child can fence the very work that lets it
             # converge. Namespace/orphan-shm debt belongs to the same phase.
-            post_child_err = self._cleanup_journal.drive_kinds({"child", "shm"})
-            if post_child_err is not None:
-                errors.append(post_child_err)
+            for kind in ("child", "shm"):
+                cleanup_error = self._cleanup_journal.drive_kinds({kind})
+                if cleanup_error is not None:
+                    errors.append(cleanup_error)
             # Drop next-level worker refs only once their pids/shms are reclaimed.
             if not self._next_level_pids and not self._next_level_shms:
                 self._next_level_workers.clear()

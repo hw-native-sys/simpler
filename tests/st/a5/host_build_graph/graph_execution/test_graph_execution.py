@@ -80,6 +80,13 @@ class TestGraphExecutionHostBuildGraphA5(SceneTestCase):
         args.output_3[:] = (base + 100.0) * (base + 4.0)
         args.output_5[:] = (base + 5.0) * (base + 6.0)
 
+    @pytest.mark.skipif(
+        "config.getoption('--platform') != 'a5sim'",
+        reason="AICore shared objects are reloaded only by the simulator",
+    )
+    def test_repeated_aicore_so_load(self, st_platform, st_worker):
+        self._run_and_validate_l2(st_worker, self.build_callable(st_platform), self.CASES[1], rounds=180)
+
 
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)
