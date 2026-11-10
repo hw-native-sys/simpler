@@ -10,13 +10,13 @@
 """Regenerate the nine case bundles by running the included original orchestration."""
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
 from pathlib import Path
 
 from export_cases import export
+from materialize import materialize
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,10 +40,9 @@ def main():
     for name in runtime_files:
         if not (runtime / name).is_file():
             parser.error(f"Required production runtime file is missing: {runtime / name}")
-    hashes = {name: hashlib.sha256((runtime / name).read_bytes()).hexdigest() for name in runtime_files}
     output.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "DSV41_RUNNER": str(build / "host/native-runner")}
-    (output / "runtime.json").write_text(json.dumps({"path": str(runtime), "sha256": hashes}, indent=2) + "\n")
+    (output / "runtime.json").write_text(json.dumps({"path": str(runtime)}, indent=2) + "\n")
     flavors = ("pypto_lib", "pypto_lib_dsl") if args.flavor == "both" else (args.flavor,)
     for flavor in flavors:
         bundle = build / "forward" / flavor
@@ -54,6 +53,9 @@ def main():
             check=True,
         )
         export(bundle, capture, flavor, output / "cases", build / "host")
+        for case in sorted((output / "cases" / flavor).iterdir()):
+            if json.loads((case / "case.json").read_text())["device_count"] == 1:
+                materialize(case, runtime, output / "preparation" / flavor / case.name, env)
     print(f"Prepared cases: {output / 'cases'}")
 
 

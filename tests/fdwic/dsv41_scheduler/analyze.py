@@ -72,6 +72,10 @@ def device_wall_samples(directory, result):
         )
     spans.sort(key=lambda span: (span.pid, span.inv))
     warmup, rounds = result["warmup"], result["rounds"]
+    if result.get("snapshot_inputs"):
+        if len(spans) != warmup + rounds + 2:
+            raise ValueError(f"Missing single-device timing spans: {directory}")
+        return [span.dur / 1e6 for span in spans[warmup : warmup + rounds]]
     # The driver performs fused-reference, then prefix/case pairs. Require
     # every actual device span before selecting the measured case calls.
     if len(spans) != 1 + 2 * (warmup + rounds + 2):
@@ -125,7 +129,7 @@ def audit(root, cases, original, names, destination, convert):
     for case_dir in sorted(cases.iterdir()):
         case = load(case_dir / "case.json")
         expected = case["source"]
-        for rank in range(2):
+        for rank in range(case.get("device_count", 2)):
             directory = root / case["case"] / f"rank{rank}"
             result = load(directory / "result.json")
             if not result["passed"] or not result["validated_against_fused_prefix"]:

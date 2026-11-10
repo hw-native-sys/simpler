@@ -86,19 +86,25 @@ jobs:
 
       - name: Find missing build and lint tools
         id: apt-packages
-        if: inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'
+        if: steps.lint-build.outputs.needs_build == 'true'
+        env:
+          SETUP_VARIANT: ${{ inputs.setup_variant }}
         run: |
+          if [[ "$SETUP_VARIANT" == self-cpu ]] && ! command -v apt-get >/dev/null 2>&1; then
+            exit 0
+          fi
           missing_packages=()
           command -v cmake >/dev/null 2>&1 || missing_packages+=(cmake)
           command -v ninja >/dev/null 2>&1 || missing_packages+=(ninja-build)
           command -v g++ >/dev/null 2>&1 || missing_packages+=(g++)
-          if ! command -v clang-tidy >/dev/null 2>&1; then
+          if ! command -v clang-tidy >/dev/null 2>&1 &&
+             ! { [[ "$SETUP_VARIANT" == self-cpu ]] && command -v clang-tidy-18 >/dev/null 2>&1; }; then
             missing_packages+=(clang-tidy)
           fi
           echo "required-packages=${missing_packages[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Install build and lint tools
-        if: inputs.setup_variant == 'github' && runner.os == 'Linux' && steps.lint-build.outputs.needs_build == 'true' && steps.apt-packages.outputs.required-packages != ''
+        if: runner.os == 'Linux' && steps.lint-build.outputs.needs_build == 'true' && steps.apt-packages.outputs.required-packages != ''
         uses: ./.github/actions/apt-install
         with:
           required-packages: ${{ steps.apt-packages.outputs.required-packages }}
@@ -110,7 +116,6 @@ jobs:
           command -v cmake
           command -v ninja
           command -v g++
-          command -v clang-tidy
           if ! command -v g++-15 >/dev/null 2>&1; then
             mkdir -p "$RUNNER_TEMP/bin"
             ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"

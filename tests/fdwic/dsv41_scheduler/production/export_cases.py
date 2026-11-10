@@ -10,7 +10,6 @@
 """Assemble nine original-kernel cases from a production Host submission capture."""
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -40,7 +39,6 @@ def export(bundle, capture, flavor, output, tools):
             )
             if (detail["tasks"], detail["executions"]) != (case["tasks"], case["executions"]):
                 raise ValueError(f"{flavor}/{name}: original task or physical execution count changed")
-            detail["plan_sha256"] = hashlib.sha256(plan.read_bytes()).hexdigest()
             metadata.append(detail)
             link(plan, destination / f"plan-rank{rank}.bin")
             lines = (bundle / f"rank{rank}.txt").read_text().splitlines()
@@ -98,9 +96,7 @@ def export(bundle, capture, flavor, output, tools):
                     "case": name,
                     "source": case,
                     "ranks": metadata,
-                    "original_callable_sha256": hashlib.sha256(
-                        (bundle / "original-callable.bin").read_bytes()
-                    ).hexdigest(),
+                    "device_count": 2 if name in ("moe", "layers_19_21") else 1,
                     "preparation": "Run the original prefix into persistent cut inputs; exclude it from measured runs.",
                     "validation": "Compare writable backing against a fused original-prefix-plus-case run.",
                 },

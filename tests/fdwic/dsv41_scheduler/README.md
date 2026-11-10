@@ -6,10 +6,11 @@ scheduler, replacement arithmetic, timed busy loop, or simulated notification.
 The previous reference scanner has been removed. Its historical measurements
 are **not a production performance baseline**.
 
-The configuration is fixed at EP2, 72 valid tokens per rank (80 padded rows),
+The source forward uses EP2, 72 valid tokens per rank (80 padded rows),
 64 local experts, and the original zero-weight inputs. This is a scheduling
-experiment, not checkpoint accuracy validation. Both ranks execute real
-communication and deferred waits.
+experiment, not checkpoint accuracy validation. Isolated Attention and Engram
+cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
+full forward run on **two devices** with real communication and deferred waits.
 
 ## Cases
 
@@ -37,14 +38,23 @@ completion, MIX admission, and `defer_wait` use the unchanged production code.
 
 ## Boundary preparation and validation
 
-Each case runs in three steps:
+Local cases (`swa`, `c2a_full`, `c2a_reuse`, `c1a_full`, `c1a_reindex`,
+`c1a_reuse`, and `engram`) use materialized rank-0 inputs:
 
-1. Once, execute the original prefix and case together to obtain reference
-   values for writable entry and boundary buffers.
-2. Restore mutable original inputs and execute the real prefix into persistent
-   boundary buffers. This preparation is outside the measured case.
-3. Execute only the selected case through the production runtime and compare
-   writable buffers with the reference. Repeat preparation before each sample.
+1. During preparation, run the original prefix and case together to save reference
+   values. Then run the prefix separately and save the actual cut inputs.
+   Prefixes that contain MoE retain EP2; local prefixes such as SWA use one device.
+2. Validate an isolated replay against the fused reference before publishing the
+   snapshot. Reject slices that reference communication contexts or windows.
+3. Reserve one device, restore the saved inputs before each sample, and execute
+   only the selected case. No communicator, peer process, Host rank barrier, or
+   prefix is created during these single-device runs. Compare writable bytes
+   directly with the saved reference; uniform data uses one repeated byte.
+
+The communicating cases retain two ranks and regenerate the original prefix
+before each sample. The launcher reads the bundle's topology before requesting
+resources and rejects mismatched or duplicate reserved devices. Unprepared local
+bundles are rejected instead of silently running as EP2.
 
 The prefix includes the real producers needed by reuse and cross-layer cases;
 dependencies are not declared ready without producing their data. Buffers that
@@ -135,7 +145,7 @@ The default build directory is `$DSV41/build/portable`. Model compilation reuses
 Simpler's existing content-addressed cache, including local/PTO header and compiler
 identities. SDK headers use the toolchain/package identity for the DSL entries,
 following the existing compiler cache policy for SDK-provided headers. Build output includes `forward/<flavor>/build.json` with compiler
-flags and binary hashes, plus `name_map.json` for the production trace converter.
+flags and kernel registrations, plus `name_map.json` for the production trace converter.
 Capture console output if exact compiler commands are needed:
 
 ```bash
@@ -146,7 +156,7 @@ bash "$DSV41/build.sh" --pto-isa "$PWD/build/pto-isa" > /tmp/dsv41-build.log 2>&
 
 Preparation executes each included original full forward once on two A5 devices
 and captures its Host submissions. It then generates nine replay bundles per
-organization. Start with a new output directory:
+organization and materializes the seven local cases using their original prefixes. Start with a new output directory:
 
 ```bash
 export DSV41_RUNTIME="$PWD/build/lib/a5/onboard"
@@ -170,9 +180,12 @@ for flavor in pypto_lib pypto_lib_dsl; do
 done
 ```
 
-The wrapper uses `task-submit` to reserve two devices, or `TASK_DEVICE` within
-an existing reservation. On a machine without that service, explicitly set
-`DSV41_DEVICES=0,1` to two available A5 devices assigned to this run. Existing
+The wrapper uses `task-submit` to reserve the bundle's required number of devices,
+or validates `TASK_DEVICE` within an existing reservation. `DSV41_DEVICES=0`
+selects a device for a local case; `DSV41_DEVICES=0,1` selects the pair for MoE.
+Both explicit and automatic selection go through the reservation service.
+Do not wrap all cases in a single EP2 reservation: that would hold an unused card
+while running Attention. Existing
 outputs are never overwritten. `DSV41_MAX_TIME` controls the queue's per-job
 runtime limit (default 300 seconds); avoid grouping all cases under a single
 short reservation. `DSV41_RUNNER` optionally selects a frozen native executable.
@@ -197,6 +210,19 @@ python3 "$DSV41/production/export_cases.py" \
   "$DSV41/build/prepared/capture/pypto_lib" \
   "$DSV41/build/new-cases" --flavor pypto_lib
 ```
+
+Before running an exported local bundle, materialize its inputs and reference:
+
+```bash
+python3 "$DSV41/production/materialize.py" \
+  "$DSV41/build/new-cases/pypto_lib/swa" "$DSV41_RUNTIME" \
+  "$DSV41/outputs/preparation/pypto_lib/swa"
+```
+
+`prepare.py` performs this conversion automatically. Snapshot data is specific to
+the included fixture, source capture, and compatible runtime ABI. Regenerate it
+when those inputs change; it is not a model checkpoint or a numerical accuracy
+reference for arbitrary inputs.
 
 The Host adapter occupies the original orchestration slot, with trailing ELF
 padding, so model kernels retain their original offsets in the uploaded
@@ -227,7 +253,7 @@ includes cross-rank waits and launch skew; it is not pure Scalar scheduling
 time. Recompiling with different CANN/PTO versions can change kernel durations;
 compare against the full-forward capture from that same build.
 
-Keep binary bundles, compiler logs, runtime hashes, validation results, and
+Keep binary bundles, compiler logs, runtime provenance, validation results, and
 traces under ignored `build/` and `outputs/` directories. The source/data package
 supports functional and scheduling reproduction, not identical timing across
 machines or compiler versions.
