@@ -47,6 +47,7 @@ enum class TensorTransfer : uint8_t {
     NONE = 0,
     H2D = 1,
     D2H = 2,  // Reserved request; automatic D2H parameters are not supported.
+    MAP = 3,
 };
 
 inline constexpr TensorTransfer legacy_tensor_transfer(AddressSpace space) {
@@ -60,6 +61,8 @@ inline constexpr const char *tensor_transfer_error(AddressSpace space, TensorTra
         return nullptr;
     case TensorTransfer::H2D:
         return space == AddressSpace::HOST ? nullptr : "H2D requires HOST backing";
+    case TensorTransfer::MAP:
+        return space == AddressSpace::HOST ? nullptr : "MAP requires HOST backing";
     case TensorTransfer::D2H:
         return "automatic D2H parameters are unsupported; use explicit copy_from";
     default:

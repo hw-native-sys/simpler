@@ -27,7 +27,9 @@ import ctypes
 import operator
 import os
 import threading
+import weakref
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
@@ -46,6 +48,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     read_args_from_blob,
 )
 
+from ._host_exports import HostSharedMemory
 from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
@@ -58,6 +61,7 @@ from .comm_endpoints import (
     RegionAccessReasonCode,
     buffer_adapter_candidates,
 )
+from .host_ddr import HostMappingRegistry
 
 __all__ = [
     "AccessMode",
@@ -346,6 +350,31 @@ class Buffer:
         default=None, init=False, compare=False, repr=False
     )
 
+    _host_lock: Any = field(default_factory=threading.RLock, init=False, compare=False, repr=False)
+
+    _mapping_registration: tuple[HostMappingRegistry, CanonicalIdentity] | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+    def host_view(self) -> memoryview:
+        """Export Host bytes. Release this view (and its derivatives) before closing storage.
+
+        The export retains the underlying mapping; close refuses while exports exist.
+        CPU writes must finish before submitting readers of mapped device views.
+        """
+        if self.shm is not None and hasattr(self.shm, "_check_pid"):
+            self.shm._check_pid()
+        with self._host_lock:
+            if self.closed or self.address_space != AddressSpace.HOST or self.shm is None:
+                raise ValueError("host_view requires live local Host storage")
+            if self.access not in (AccessMode.READ, AccessMode.READWRITE):
+                raise ValueError("host_view requires a readable Host grant")
+            memory = self.shm.buf
+            if memory is None:
+                raise ValueError("host_view requires live local Host storage")
+            view = memory[: self.nbytes]
+            return view.toreadonly() if self.access == AccessMode.READ else view
+
     @classmethod
     def wrap(
         cls, *, address: int, nbytes: int, location: BufferLocation, access: AccessMode = AccessMode.READWRITE
@@ -408,34 +437,52 @@ class Buffer:
         return Tensor(self, shapes=shapes, dtype=dtype, strides=strides, byte_offset=byte_offset)
 
     def close(self) -> None:
-        """Release the backing. The owner unlinks it, so a later consumer map fails rather than
-        resolving a name whose bytes are gone. Idempotent; a released Buffer's ``tensor()``/
-        ``to_descriptor()`` are refused rather than building a view over memory that may already be
-        gone — that refusal holds from the first call on, whether or not the release itself
-        succeeded, since a partly-released backing is no safer to hand out than a fully released one.
+        """Release owned backing after exports and accepted uses have retired.
 
-        Each OS action succeeds at most once and is retried until it does. ``shm.close()`` runs
-        first and never gates the unlink: the named backing outlives this process, so it is the leak
-        worth removing even when the local unmap raised. An unlink that raises leaves ``shm`` in
-        place, so a second ``close()`` attempts it again — that retry is what
-        ``Worker._release_all_buffers`` leaves the registry entry behind for.
+        A failed unregister retains the sealed backing for cleanup retry. A busy
+        refusal leaves healthy storage available; close is not a device fence.
         """
         if self.backend_kind == BackendKind.VMM_WINDOW and self.shm is not None:
             raise ValueError("Host domain buffers borrow shared memory; use domain.release()")
-        if self._source_registration is not None:
-            source, identity = self._source_registration
-            source.close(identity)
-        self.closed = True
-        shm = self.shm
-        if shm is None:
-            return
-        try:
-            shm.close()
-        finally:
-            if not self.unlinked:
-                shm.unlink()
-                self.unlinked = True
-        self.shm = None
+        if self._mapping_registration is not None:
+            self._mapping_registration[0]._check_pid()
+        if self.shm is not None and hasattr(self.shm, "_check_pid"):
+            self.shm._check_pid()
+        with self._host_lock:
+            if self._mapping_registration is not None:
+                registry, identity = self._mapping_registration
+                registry.check_unused(identity)
+            if self.shm is not None and hasattr(self.shm, "seal"):
+                self.shm.seal()
+            if self._mapping_registration is not None:
+                registry.close(identity)
+            if self._source_registration is not None:
+                source, identity = self._source_registration
+                source.close(identity)
+            self.closed = True
+            shm = self.shm
+            if shm is None:
+                return
+            try:
+                shm.close()
+            finally:
+                if not self.unlinked:
+                    shm.unlink()
+                    self.unlinked = True
+            self.shm = None
+
+
+@contextmanager
+def _owned_host_release(buffer_ref):
+    buffer = buffer_ref()
+    if buffer is None:
+        yield
+        return
+    with buffer._host_lock:
+        if buffer._mapping_registration is not None:
+            registry, identity = buffer._mapping_registration
+            registry.check_unregistered(identity)
+        yield
 
 
 def create_host_shared_buffer(
@@ -452,9 +499,9 @@ def create_host_shared_buffer(
     """
     if nbytes <= 0:
         raise ValueError(f"create_host_shared_buffer: nbytes must be positive, got {nbytes}")
-    shm = SharedMemory(create=True, size=nbytes)
+    shm = HostSharedMemory(create=True, size=nbytes)
     identity = CanonicalIdentity(owner_instance_id, buffer_id, generation)
-    return Buffer(
+    buffer = Buffer(
         identity=identity,
         owner_worker_path_id=intern_worker_path(owner_worker_path),
         address_space=AddressSpace.HOST,
@@ -465,6 +512,9 @@ def create_host_shared_buffer(
         shm=shm,
         base=_shm_base_addr(shm),
     )
+    buffer_ref = weakref.ref(buffer)
+    shm._release_guard = lambda: _owned_host_release(buffer_ref)
+    return buffer
 
 
 def re_export(source: BufferDescriptor) -> Buffer:
@@ -478,6 +528,7 @@ def re_export(source: BufferDescriptor) -> Buffer:
     materializes lazily. Dependency inference keys on the (invariant) identity, so an alias /
     retain-release does not split across layers. Re-export is per-backing (memoize by identity), so
     pure forwarding carries no per-tensor map cost.
+
     """
     return Buffer(
         identity=source.identity,
@@ -1095,6 +1146,7 @@ class ImportRegistry:
     def __init__(self, context: ImportContext) -> None:
         self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
         self._context = context
+        self.host_mappings: HostMappingRegistry | None = None
 
     def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
@@ -1154,14 +1206,20 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args) -> dict[CanonicalIdentity, tuple[int, int]]:
-        """Materialize every embedded descriptor in a ``TaskArgs`` and return the resolved map:
-        identity -> (local base, address_space), scoped to this call's own tensors."""
-        resolved: dict[CanonicalIdentity, tuple[int, int]] = {}
+    def materialize_args(self, args) -> list[tuple[int, int, int]]:
+        """Resolve each invocation argument without changing canonical backing identity."""
+        resolved = []
         for i in range(args.tensor_count()):
-            desc = args.tensor(i).buffer
-            imported = self.materialize(desc)
-            resolved[desc.identity] = (imported.base, int(imported.address_space))
+            tensor = args.tensor(i)
+            transfer = args.transfer(i)
+            if transfer == TensorTransfer.MAP:
+                if self.host_mappings is None:
+                    raise ValueError("MAP requires its owning direct L2 Worker")
+                base, space = self.host_mappings.resolve(tensor)
+                resolved.append((base, space, int(TensorTransfer.NONE)))
+            else:
+                imported = self.materialize(tensor.buffer)
+                resolved.append((imported.base, int(imported.address_space), int(transfer)))
         return resolved
 
     def mapped_args_from_blob(self, blob_ptr: int, capacity: int) -> MappedArgs:
@@ -1174,6 +1232,8 @@ class ImportRegistry:
         tensors = []
         for i in range(args.tensor_count()):
             t = args.tensor(i)
+            if args.transfer(i) == TensorTransfer.MAP:
+                raise ValueError("MAP cannot be forwarded to Host compute leaves")
             if t.buffer.address_space == AddressSpace.DEVICE:
                 # Depth behind the submit-time endpoint check: this process is a host compute leaf, so
                 # a device address here would be handed to torch as a host pointer.
@@ -1243,6 +1303,8 @@ class ImportRegistry:
         error is raised once the sweep is done, so a caller still learns the endpoint leaked rather
         than seeing a silent success.
         """
+        if self.host_mappings is not None:
+            self.host_mappings.require_closed()
         errors: list[BaseException] = []
         for identity, imported in list(self._by_identity.items()):
             if imported.shm is not None:

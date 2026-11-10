@@ -17,7 +17,14 @@ from types import SimpleNamespace
 import pytest
 from simpler import worker as worker_module
 from simpler.buffer import _DeviceBufferSource
-from simpler.task_interface import ExecutionContextRefused
+from simpler.task_interface import (
+    ArgDirection,
+    ChipCallable,
+    DataType,
+    ExecutionContextRefused,
+    TaskArgs,
+    TensorTransfer,
+)
 
 from . import test_native_submission
 
@@ -26,17 +33,27 @@ chip_fixture = test_native_submission.chip_fixture
 
 
 @pytest.fixture
-def transferred(prepared, monkeypatch):
+def transferred(prepared, monkeypatch, request):
     chip, pending = prepared
     env = chip.impl._execution_environment
     chip.impl._execution_environment = (*env[:4], True)
     state = SimpleNamespace(complete=False, transfers=0, own_waits=0, observe_rc=0, all_observed=True, observes=0)
+    state.control_buffer = None
+    args = None
+    if getattr(request, "param", False):
+        state.control_buffer = chip.worker.create_buffer(64)
+        chip.callable = chip.worker.register(
+            ChipCallable.build(signature=[ArgDirection.IN], func_name="host_control", binary=b"\0", children=[])
+        )
+        args = TaskArgs()
+        args.add_tensor(state.control_buffer.tensor((4,), DataType.INT32), transfer=TensorTransfer.NONE)
 
     class Stream:
         raw = 123
 
     stream = Stream()
-    handle = chip.worker.prepare_submission(chip.callable, caller_stream=123)
+    handle = chip.worker.prepare_submission(chip.callable, args, caller_stream=123)
+    state.run_id = handle._run_id
     native = pending[0]
     native._framework_claimed = False
     native._framework_transferred = False
@@ -99,6 +116,107 @@ def transferred(prepared, monkeypatch):
         pass
     # Recording transport cleanup only, after assertions; no native work exists.
     worker_module._native_submission_roots.pop(handle, None)
+    if state.control_buffer is not None and not state.control_buffer.closed:
+        chip.worker._chip_import_registry.host_mappings.release(state.run_id)
+        chip.worker.release_buffer(state.control_buffer)
+
+
+@pytest.mark.parametrize("transferred", [True], indirect=True)
+@pytest.mark.parametrize("completion", ["retire", "wait", "cancel", "close"])
+def test_framework_host_control_releases_uses_after_proven_completion(transferred, completion):
+    chip, handle, native, state, _, _ = transferred
+    buffer = state.control_buffer
+    run_id = state.run_id
+    registry = chip.worker._chip_import_registry.host_mappings
+    assert registry._uses[run_id] == frozenset((buffer.identity,))
+    assert not handle._retire_framework()
+    with pytest.raises(RuntimeError, match="in-flight"):
+        chip.worker.release_buffer(buffer)
+    if completion == "cancel":
+        assert handle.cancel()
+    else:
+        native.submit()
+        assert not handle._retire_framework()
+        assert not handle.safe_to_release and run_id in registry._uses
+        state.complete = True
+        if completion == "wait":
+            native.recovery_required = False
+            handle._wait_framework()
+        elif completion == "close":
+            chip.worker.close()
+        else:
+            assert handle._retire_framework()
+    assert handle.safe_to_release and not chip.live
+    assert run_id not in registry._uses
+    if completion != "close":
+        chip.worker.release_buffer(buffer)
+        chip.worker.close()
+    assert buffer.closed and chip.impl.finalized
+
+
+@pytest.mark.parametrize("transferred", [True], indirect=True)
+def test_framework_host_control_retains_uses_when_completion_is_unknown(transferred, monkeypatch):
+    chip, handle, native, state, _, _ = transferred
+    native.submit()
+    run_id = state.run_id
+    registry = chip.worker._chip_import_registry.host_mappings
+
+    def unknown(*_):
+        raise RuntimeError("completion unknown")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "_retire_framework", unknown)
+        with pytest.raises(RuntimeError, match="completion unknown"):
+            handle._retire_framework()
+    assert not handle.safe_to_release and run_id in registry._uses
+    with pytest.raises(RuntimeError, match="in-flight"):
+        chip.worker.release_buffer(state.control_buffer)
+    state.complete = True
+    with pytest.raises(RuntimeError, match="completion unknown"):
+        handle._retire_framework()
+    assert handle.safe_to_release and run_id not in registry._uses
+    chip.worker.release_buffer(state.control_buffer)
+    chip.worker.close()
+    assert chip.impl.finalized
+
+
+@pytest.mark.parametrize("transferred", [True], indirect=True)
+@pytest.mark.parametrize("released_before_error", [False, True])
+def test_framework_host_release_retry_does_not_repeat_device_decrement(transferred, monkeypatch, released_before_error):
+    chip, handle, native, state, _, _ = transferred
+    native.submit()
+    state.complete = True
+    run_id = handle._run_id
+    device_releases = []
+    chip.worker._chip_source_uses[run_id] = ("source",)
+    chip.worker._device_buffer_source = SimpleNamespace(release=device_releases.append)
+    registry = chip.worker._chip_import_registry.host_mappings
+    release = registry.release
+
+    def fail_release(run):
+        if released_before_error:
+            release(run)
+        raise RuntimeError("Host release interrupted")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(registry, "release", fail_release)
+            with pytest.raises(RuntimeError, match="Host release interrupted"):
+                handle._retire_framework()
+        assert device_releases == [("source",)]
+        assert run_id not in chip.worker._chip_source_uses
+        assert run_id in chip.worker._chip_call_values and run_id in chip.worker._chip_runs
+        assert not handle.safe_to_release and not native.retired
+        assert not handle._framework_source_release_unknown
+        with pytest.raises(RuntimeError, match="Host release interrupted"):
+            handle._retire_framework()
+        assert device_releases == [("source",)]
+        assert handle.safe_to_release and run_id not in registry._uses
+    finally:
+        chip.worker._device_buffer_source = None
+    chip.worker.release_buffer(state.control_buffer)
+    chip.worker.close()
+    assert chip.impl.finalized
 
 
 def test_private_retirement_does_not_call_public_wait_and_releases_call_roots(transferred):
@@ -211,6 +329,7 @@ def test_destroyed_with_cleanup_error_retires_roots_but_preserves_first_error(tr
     assert state.transfers == 1
 
 
+@pytest.mark.parametrize("transferred", [False, True], indirect=True)
 def test_actual_two_identity_partial_release_is_never_replayed(transferred):
     chip, handle, native, state, _, _ = transferred
     native.submit()
@@ -239,6 +358,10 @@ def test_actual_two_identity_partial_release_is_never_replayed(transferred):
         assert not chip.worker._close_completion._outcome.cleanup_complete
     assert source._records["first"].uses == 0 and state.observes == 0
     assert not handle.safe_to_release and handle in worker_module._native_submission_roots
+    if state.control_buffer is not None:
+        assert run_id in chip.worker._chip_import_registry.host_mappings._uses
+        with pytest.raises(RuntimeError, match="in-flight"):
+            chip.worker.release_buffer(state.control_buffer)
     chip.worker._chip_source_uses.pop(run_id)
     chip.worker._device_buffer_source = None
 

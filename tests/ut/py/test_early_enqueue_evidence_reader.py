@@ -38,6 +38,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
 
 #: The suites carrying this reader. Both are loaded, because they hold separate copies of it and a
 #: repair applied to one would otherwise go missing from the other.
@@ -236,6 +237,67 @@ def _load_suite(name, relative_path, monkeypatch):
     return module
 
 
+@pytest.mark.parametrize("wrong_output", [False, True])
+def test_hbg_control_refusal_traceback_does_not_pin_host_views(monkeypatch, wrong_output):
+    import torch  # noqa: PLC0415
+
+    module = _load_suite("a5_hbg", "st/a5/host_build_graph/early_enqueue/test_early_enqueue.py", monkeypatch)
+    case = module.TestA5ThreeRunCapacity()
+    buffers, errors = [], []
+    owner = mint_owner_instance_id()
+
+    def create_buffer(size):
+        buffer = create_host_shared_buffer(size, owner, len(buffers) + 1)
+        buffers.append(buffer)
+        return buffer
+
+    def copy_from(buffer, device):
+        torch.frombuffer(buffer.shm.buf, dtype=torch.float32).copy_(device)
+
+    class Handle:
+        def __init__(self, source, control, target):
+            self.source, self.control, self.target = source, control, target
+            self.error = RuntimeError("prepare_native_run failed") if isinstance(control, torch.Tensor) else None
+            if self.error is not None:
+                errors.append(self.error)
+
+        def wait(self):
+            if self.error is not None:
+                raise self.error
+            source = torch.frombuffer(self.source.shm.buf, dtype=torch.float32)
+            control = torch.frombuffer(self.control.shm.buf, dtype=torch.float32)
+            self.target.copy_(case._link(source, control))
+            if wrong_output:
+                self.target[-1] += 1
+
+    monkeypatch.setattr(case, "_require_three_sets", lambda *_: None)
+    monkeypatch.setattr(
+        case, "_submit_link", lambda _worker, source, control, target, *_a, **_kw: Handle(source, control, target)
+    )
+    monkeypatch.setattr(module, "_RunTrace", lambda *_: None)
+    monkeypatch.setattr(module, "_await_child_log_line", lambda *_: "require_host_tensor refused DEVICE")
+    worker = SimpleNamespace(
+        create_buffer=create_buffer,
+        alloc_child_tensor=lambda _device, shape, _dtype: torch.empty(shape),
+        copy_from=copy_from,
+        free=lambda *_: None,
+    )
+    try:
+        if wrong_output:
+            with pytest.raises(AssertionError, match="predecessor's own result"):
+                case.test_a_device_control_tensor_is_refused_until_it_is_copied_to_the_host("a5", worker)
+        else:
+            case.test_a_device_control_tensor_is_refused_until_it_is_copied_to_the_host("a5", worker)
+        assert errors and errors[0].__traceback__ is not None
+        for buffer in buffers:
+            buffer.close()
+    finally:
+        for error in errors:
+            error.__traceback__ = None
+        for buffer in buffers:
+            buffer.close()
+
+
 def _controlled_stream_fault_case(
     scene,
     monkeypatch,
@@ -401,7 +463,50 @@ def _controlled_stream_fault_case(
         count=count,
         log=log,
         sampler_events=sampler_events,
+        worker=worker,
+        handle_type=Handle,
     )
+
+
+@pytest.mark.parametrize("scene", ["a2a3_narrow", "a5_narrow", "a5_wide"])
+@pytest.mark.parametrize("wrong_success_output", [False, True])
+def test_fault_tracebacks_do_not_pin_host_outputs(scene, wrong_success_output, monkeypatch, tmp_path):
+    controlled = _controlled_stream_fault_case(
+        scene, monkeypatch, tmp_path, fault_index=1, wrong_success_output=wrong_success_output
+    )
+    buffers, errors = [], []
+    owner = mint_owner_instance_id()
+
+    def create_buffer(size):
+        buffer = create_host_shared_buffer(size, owner, len(buffers) + 1)
+        buffers.append(buffer)
+        return buffer
+
+    original_wait = controlled.handle_type.wait
+
+    def retain_failure(handle):
+        try:
+            return original_wait(handle)
+        except RuntimeError as error:
+            errors.append(error)
+            raise
+
+    monkeypatch.setattr(controlled.worker, "create_buffer", create_buffer)
+    monkeypatch.setattr(controlled.handle_type, "wait", retain_failure)
+    try:
+        if wrong_success_output:
+            with pytest.raises(AssertionError, match="successful call.*incorrect output"):
+                controlled.invoke()
+        else:
+            controlled.invoke()
+        assert errors and all(error.__traceback__ is not None for error in errors)
+        for buffer in buffers:
+            buffer.close()
+    finally:
+        for error in errors:
+            error.__traceback__ = None
+        for buffer in buffers:
+            buffer.close()
 
 
 @pytest.mark.parametrize(

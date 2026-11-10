@@ -191,3 +191,29 @@ TEST(ChildMemory, ReusingAnOwnedViewAcrossGrowthPreservesEachRequest) {
         EXPECT_EQ(args.transfer(i), i % 2 ? TensorTransfer::NONE : TensorTransfer::H2D);
     }
 }
+
+TEST(ChildMemory, MapAndNativeTransfersSurviveMailboxWithoutChangingIdentity) {
+    const Tensor tensor = make_wire_tensor(1, AddressSpace::HOST);
+    TaskArgs args;
+    args.add_tensor(tensor);
+    args.add_tensor(tensor, TensorArgType::INPUT, TensorTransfer::NONE);
+    args.add_tensor(tensor, TensorArgType::OUTPUT_EXISTING, TensorTransfer::MAP);
+    args.add_tensor(tensor, TensorArgType::INOUT, TensorTransfer::MAP);
+    EXPECT_EQ(args.tag(2), TensorArgType::OUTPUT_EXISTING);
+    EXPECT_EQ(args.tag(3), TensorArgType::INOUT);
+    std::vector<uint8_t> blob(task_args_blob_size(args));
+    write_blob(blob.data(), args);
+    const auto view = read_blob(blob.data(), blob.size());
+    EXPECT_EQ(view.transfer(0), TensorTransfer::H2D);
+    EXPECT_EQ(view.transfer(1), TensorTransfer::NONE);
+    for (int32_t i = 2; i < 4; ++i) {
+        EXPECT_EQ(view.tensors(i).buffer, tensor.buffer);
+        EXPECT_EQ(view.transfer(i), TensorTransfer::MAP);
+    }
+    blob[8 + sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET] = 255;
+    EXPECT_THROW(view.transfer(1), std::invalid_argument);
+    EXPECT_THROW(
+        args.add_tensor(make_wire_tensor(2, AddressSpace::DEVICE), TensorArgType::INPUT, TensorTransfer::MAP),
+        std::invalid_argument
+    );
+}
