@@ -97,7 +97,8 @@ legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Phase 2: Wait for the AICPU to open our register window. A kernel launch
-    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon); the AICPU writes
+    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon; a5 shares this
+    // register protocol and relies on CI); the AICPU writes
     // DATA_MAIN_BASE = AICPU_IDLE_TASK_ID (non-zero) to open the window, so a
     // non-zero read means the window is open and reads/writes are valid. The
     // AICPU runs assign_cores_to_threads (µs) between opening the window and the
@@ -108,6 +109,8 @@ legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type
     while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
         SPIN_WAIT_HINT();
     }
+    // The outer executor owns the exit ACK; no task/profiling state exists yet.
+    if (read_reg(RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL) return;
     // Report initial idle status via register (the window is now open).
     write_reg(RegId::COND, AICORE_IDLE_VALUE);
 

@@ -41,8 +41,10 @@ void aicore_execute(Runtime *, int block_idx, CoreType) {
     calls.fetch_add(1, std::memory_order_relaxed);
 }
 
-extern "C" void
-aicore_execute_wrapper(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern "C" int aicore_execute_wrapper_checked(
+    Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    bool (*)(void *, int), void *
+);
 
 extern "C" uint64_t run_sim_tls_wrapper_probe(uint64_t epoch, pthread_key_t protected_key) {
     Runtime runtime;
@@ -57,9 +59,13 @@ extern "C" uint64_t run_sim_tls_wrapper_probe(uint64_t epoch, pthread_key_t prot
         workers.emplace_back([&, worker] {
             void *sentinel = reinterpret_cast<void *>(UINT64_C(0x12345678));
             if (pthread_setspecific(protected_key, sentinel) != 0) errors.fetch_add(1);
-            aicore_execute_wrapper(
+            aicore_execute_wrapper_checked(
                 &runtime, worker, worker < 2 ? CoreType::AIC : CoreType::AIV, worker,
-                reinterpret_cast<uint64_t>(register_addresses), 0, 0, 0, epoch, UINT64_C(0x8000) + worker * 128
+                reinterpret_cast<uint64_t>(register_addresses), 0, 0, 0, epoch, UINT64_C(0x8000) + worker * 128,
+                [](void *, int error) {
+                    return error == 0;
+                },
+                nullptr
             );
             if (pthread_getspecific(protected_key) != sentinel) errors.fetch_add(1);
         });

@@ -69,16 +69,16 @@ void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size);
 #ifdef __cplusplus
 
 /**
- * Set the current thread's simulated subblock_id.
- * Called by aicore_execute_wrapper (via function pointer injection).
+ * Set the current thread's simulated subblock_id; return a pthread error on failure.
+ * Called by aicore_execute_wrapper_checked (via function pointer injection).
  */
-void sim_context_set_subblock_id(uint32_t subblock_id);
+int sim_context_set_subblock_id(uint32_t subblock_id);
 
 /**
- * Set the current thread's simulated cluster_id.
- * Called by aicore_execute_wrapper (via function pointer injection).
+ * Set the current thread's simulated cluster_id; return a pthread error on failure.
+ * Called by aicore_execute_wrapper_checked (via function pointer injection).
  */
-void sim_context_set_cluster_id(uint32_t cluster_id);
+int sim_context_set_cluster_id(uint32_t cluster_id);
 
 /** Clear pipe shared state for the current thread's device. */
 void clear_cpu_sim_shared_storage();

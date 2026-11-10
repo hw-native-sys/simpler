@@ -118,7 +118,7 @@ def test_sim_partial_startup_failure_is_drained(arch, runtime, mode, thread, sta
         assert f"thread={thread} pthread_error={errno.ENOMEM}" in output, output
     assert code == 1, output
     assert "TIMEOUT:" not in output, output
-    assert "launch_native_run failed with code -1" in output, output
+    assert "launch_native_run failed with code -1 (" in output, output
     # This diagnostic follows stop_run_producers/join in each real runner.
     assert "All threads completed" in output, output
     assert "AICPU execution failed with rc=-1" in output, output
@@ -139,3 +139,90 @@ def test_creation_fault_ignores_unrelated_parent(startup_faults, tmp_path):
     result = subprocess.run([str(executable)], check=False, env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stderr.count("SIM_STARTUP_CREATE_EAGAIN") == 1
+
+
+@pytest.mark.parametrize("arch", ["a2a3", "a5"])
+@pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
+@pytest.mark.parametrize("binding", ["core_tls", "subblock", "cluster", "affinity"])
+def test_sim_core_identity_failure_is_drained(arch, runtime, binding, tmp_path):
+    # Wrapper key count is checked indirectly by the exact identity-source assertion below.
+    key_count = 6 if arch == "a2a3" else 10
+    skip = {"core_tls": 1, "subblock": key_count + 1, "cluster": key_count + 2, "affinity": 1}[binding]
+    thread = "sim-aicpu-1" if binding == "affinity" else "sim-aic-1"
+    template = Path(__file__).with_name("support").joinpath("sim_startup_fault.cpp").read_text()
+    source = tmp_path / "identity.cpp"
+    source.write_text(
+        template.replace("@THREAD@", thread).replace(
+            "constexpr int skip_bindings = 0;", f"constexpr int skip_bindings = {skip};"
+        )
+    )
+    library = source.with_suffix(".so")
+    subprocess.run(
+        ["c++", "-std=c++17", "-shared", "-fPIC", str(source), "-pthread", "-ldl", "-o", str(library)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    code, output = _run_scene(arch, runtime, library)
+    assert output.count("SIM_STARTUP_BIND_ENOMEM") == 1, output
+    diagnostic = "AICPU affinity TLS" if binding == "affinity" else "AICore thread TLS"
+    assert f"{diagnostic} binding failed: {errno.ENOMEM}" in output, output
+    if binding in ("subblock", "cluster"):
+        assert f"Sim {binding} identity binding failed: {errno.ENOMEM}" in output, output
+    assert code == 1, output
+    assert "launch_native_run failed with code -1000 (" in output, output
+    assert "Simulated startup cancelled; all created core threads joined" in output, output
+    assert "TIMEOUT:" not in output, output
+
+
+@pytest.mark.parametrize("arch", ["a2a3", "a5"])
+def test_sim_key_creation_failure_allows_same_worker_retry(arch, tmp_path):
+    source = Path(__file__).with_name("support") / "sim_key_create_fault.cpp"
+    library = tmp_path / "key-fault.so"
+    subprocess.run(
+        ["c++", "-std=c++17", "-shared", "-fPIC", str(source), "-ldl", "-o", str(library)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    script = r"""
+import importlib
+import sys
+from simpler import Worker
+arch = sys.argv[1]
+module = importlib.import_module(f"tests.st.{arch}.host_build_graph.graph_execution.test_graph_execution")
+cls = getattr(module, "TestGraphExecutionHostBuildGraph" + ("A5" if arch == "a5" else ""))
+scene = cls()
+compiled = scene.build_callable(arch + "sim")
+worker = Worker(level=2, device_id=0, platform=arch + "sim", runtime="host_build_graph")
+try:
+    worker.init()
+    try:
+        scene._run_and_validate_l2(worker, compiled, scene.CASES[1])
+    except RuntimeError as error:
+        print("EXPECTED_LOAD_FAILURE", str(error), flush=True)
+    else:
+        raise AssertionError("injected key creation failure did not reject the run")
+    scene._run_and_validate_l2(worker, compiled, scene.CASES[1])
+    print("SAME_WORKER_RETRY_PASSED", flush=True)
+finally:
+    cls._st_l2_handle = None
+    worker.close()
+"""
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = str(library) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    result = subprocess.run(
+        [sys.executable, "-c", script, arch],
+        check=False,
+        cwd=_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert output.count("SIM_CORE_KEY_CREATE_EAGAIN") == 1, output
+    assert f"AICore SO failed to create TLS keys: {errno.EAGAIN}" in output, output
+    assert "EXPECTED_LOAD_FAILURE" in output, output
+    assert "SAME_WORKER_RETRY_PASSED" in output, output

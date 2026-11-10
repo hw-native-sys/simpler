@@ -31,12 +31,34 @@ struct NativeInvocationEntry {
     }
     AicpuEntryGateInitializer initializer() { return {initialize, this}; }
 
+    template <typename Work, typename Reject, typename Release>
+    int32_t complete(AicpuEntryGateResult gate, Work work, Reject reject, Release release) const {
+        if (gate.callback_index < 0) {
+            const int error = release();
+            return gate.status != 0 ? gate.status : (error != 0 ? -1 : 0);
+        }
+        // A cohort-wide rejection has no execution owner. Callback 0 owns
+        // cancellation independently of TLS and holds its finish contribution
+        // until cleanup ends, so the final result cannot overtake retirement.
+        if (gate.callback_index == 0 && gate.status != 0) reject();
+        int32_t rc = gate.execute ? work() : gate.status;
+        // Work and rejection cleanup no longer use the thread identity.
+        // Release failures contribute before native completion is published.
+        const int release_error = release();
+        if (rc == 0 && release_error != 0) rc = -1;
+        return finish != nullptr ? finish(gate.callback_index, rc) : -1;
+    }
+    // Callers that hold an affinity binding must use the release overload; the
+    // defaults below are for callers that never bound a record.
+    template <typename Work, typename Reject>
+    int32_t complete(AicpuEntryGateResult gate, Work work, Reject reject) const {
+        return complete(gate, work, reject, [] {
+            return 0;
+        });
+    }
     template <typename Work>
     int32_t complete(AicpuEntryGateResult gate, Work work) const {
-        if (gate.callback_index < 0) return gate.status;
-        const int32_t rc = gate.execute ? work() : gate.status;
-        // Work has left all local cleanup scopes before its unique contribution.
-        return finish != nullptr ? finish(gate.callback_index, rc) : -1;
+        return complete(gate, work, [] {});
     }
 };
 

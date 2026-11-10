@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "aicpu/native_invocation_entry.h"
+#include "aicpu/abort_aicore_startup.h"
 #include "aicpu_loader/finalize_args.h"
 #include "common/memory_barrier.h"
 
@@ -159,9 +160,18 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), invocation.callbacks,
         invocation.initializer()
     );
-    return invocation.complete(entry, [arg] {
-        return execute_platform_task(arg);
-    });
+    return invocation.complete(
+        entry,
+        [arg] {
+            return execute_platform_task(arg);
+        },
+        [runtime, args] {
+            (void)abort_aicore_startup(runtime, args->regs, args->run_result_epoch);
+        },
+        [] {
+            return platform_aicpu_affinity_bind_thread(nullptr);
+        }
+    );
 }
 
 /**

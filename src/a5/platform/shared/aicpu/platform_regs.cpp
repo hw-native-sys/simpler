@@ -36,6 +36,10 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
+void platform_open_aicore_exit_window(uint64_t) {
+    // A5 has no separate FAST_PATH enable register. EXIT itself opens the window.
+}
+
 void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL); }
 
 // Timeout is variant-specific (sim wider than onboard) — see
