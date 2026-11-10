@@ -605,6 +605,27 @@ inline __aicore__ bool percounter_mix_unseen(const LaneConfig &cfg, const Percou
 }
 
 /**
+ * Whether the cluster's line carries a cohort rendezvous older than the block
+ * this lane holds, and names this lane.
+ *
+ * `cohort_block` is the cohort's sequence plus one rather than a flag, so the
+ * comparison needs nothing the line does not already carry. Read under the
+ * same seqlock as discovery: the payload belongs to this generation only while
+ * the generation has not moved.
+ */
+inline __aicore__ bool percounter_line_owes_older(const LaneConfig &cfg, const PercounterLaneState *state) {
+    if (cfg.mix_order_count == 0) return false;
+    SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
+    const uint32_t generation = scheduler_ssbuf_load_acquire(&signal->armed_generation);
+    if (!percounter_mix_armed(generation) || generation == state->last_served) return false;
+    const uint32_t mask = signal->active_mask;
+    const uint32_t cohort = signal->cohort_block;
+    if (scheduler_ssbuf_load_acquire(&signal->armed_generation) != generation) return false;
+    if ((mask & (uint32_t{1} << cfg.cluster_lane)) == 0) return false;
+    return cohort != 0 && static_cast<uint64_t>(cohort - 1) < state->sync.my_seq;
+}
+
+/**
  * Move the next queued cohort into the open slot, if the slot is free.
  *
  * Only an enqueuer and a releaser call this; a general poll would put the
@@ -715,6 +736,14 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
  * reports whether a block was run or armed. Checked at every checkpoint, ahead
  * of MIX discovery, and costs one load only while a block is held.
  *
+ * **This is the only way a held block enters its kernel, and the cohort order
+ * is enforced here rather than in the callers.** A lane holding a block of
+ * cohort N that is named in cohort N-1's rendezvous yields: entering N would
+ * put this lane inside N's kernel while every participant of N-1 waits, and N
+ * cannot complete until they are released, because the lanes it is still
+ * missing are among them. The yield is to a strictly smaller sequence of one
+ * global counter, so the order it imposes is acyclic.
+ *
  * Returns false on an error, including a cohort that has not filled within the
  * watchdog since this lane took its block.
  */
@@ -724,6 +753,9 @@ inline __aicore__ bool percounter_sync_serve_released(
     *served = false;
     PercounterSyncState *sync = &state->sync;
     if (sync->my_block < 0) return true;
+    // Ahead of the watchdog: the wait is on an older cohort's kernel, which
+    // carries its own, and this block's budget is not what bounds it.
+    if (percounter_line_owes_older(cfg, state)) return true;
     // Cohorts are promoted in sequence order, so this one is fully claimed
     // exactly when the counter passes it.
     if (scheduler_gm_query(cfg.sync_queue->released) > sync->my_seq) {
@@ -1041,27 +1073,6 @@ inline __aicore__ bool percounter_serve_mix(
 }
 
 /**
- * Whether the cluster's line carries a cohort rendezvous older than the block
- * this lane holds, and names this lane.
- *
- * `cohort_block` is the cohort's sequence plus one rather than a flag, so the
- * comparison needs nothing the line does not already carry. Read under the
- * same seqlock as discovery: the payload belongs to this generation only while
- * the generation has not moved.
- */
-inline __aicore__ bool percounter_line_owes_older(const LaneConfig &cfg, const PercounterLaneState *state) {
-    if (cfg.mix_order_count == 0) return false;
-    SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
-    const uint32_t generation = scheduler_ssbuf_load_acquire(&signal->armed_generation);
-    if (!percounter_mix_armed(generation) || generation == state->last_served) return false;
-    const uint32_t mask = signal->active_mask;
-    const uint32_t cohort = signal->cohort_block;
-    if (scheduler_ssbuf_load_acquire(&signal->armed_generation) != generation) return false;
-    if ((mask & (uint32_t{1} << cfg.cluster_lane)) == 0) return false;
-    return cohort != 0 && static_cast<uint64_t>(cohort - 1) < state->sync.my_seq;
-}
-
-/**
  * Serve the cluster's line if it names this lane under a generation it has not
  * seen yet. `served` reports whether it did.
  *
@@ -1098,26 +1109,20 @@ percounter_mix_discover(const LaneConfig &cfg, PercounterLaneState *state, uint6
  * cohort block first, then the cluster's MIX line. `served` reports whether
  * this lane ran or armed anything.
  *
- * **The block goes first, and a holder is never named in an armed line.** Both
- * arming sites refuse a mask naming a holder, so a rendezvous this lane is named
- * in was armed while this lane was clear of the cohort, and serving the block
- * first strands nobody. Asking the line first would instead run another task's
- * kernel while a co-holder sits at this cohort's barrier waiting for the block
- * this lane still owes.
+ * **The block goes first, and a holder is never named in an armed line of its
+ * own or a later cohort.** Both arming sites refuse a mask naming a holder of a
+ * cohort no older than the line's, so a rendezvous served after the block was
+ * armed while this lane was clear, and serving the block first strands nobody.
+ * Asking the line first would instead run another task's kernel while a
+ * co-holder sits at this cohort's barrier waiting for the block this lane still
+ * owes.
  *
- * **A cohort rendezvous older than the held block is the exception**, and the
- * admission order is what makes it reachable: a lane holding a block of cohort
- * N may be named in cohort N-1's rendezvous, which was published while this
- * lane was clear. Serving N first puts this lane inside N's kernel while every
- * participant of N-1 waits -- and N cannot complete until they are released,
- * because the lanes it is still missing are among them. Order decides here for
- * the same reason it decides at the arming.
+ * **An older cohort's rendezvous is the exception, and it is decided one level
+ * down**: `percounter_sync_serve_released` yields the block to it, so this order
+ * holds for the last claimer's direct service too.
  */
 inline __aicore__ bool
 percounter_checkpoint_serve(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served) {
-    if (state->sync.my_block >= 0 && percounter_line_owes_older(cfg, state)) {
-        return percounter_mix_discover(cfg, state, timeout_cycles, served);
-    }
     if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
     if (*served) return true;
     return percounter_mix_discover(cfg, state, timeout_cycles, served);
