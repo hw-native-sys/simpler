@@ -128,6 +128,7 @@ nav:
           - 独立 block 调度待选方案: zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md
           - 实施与功能验收: zh-cn/design/a5-hbg-graph-task/implementation.md
           - 性能与自主迭代流程: zh-cn/design/a5-hbg-graph-task/performance.md
+          - Admission 方案排查记录: zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md
           - 设计复审: zh-cn/design/a5-hbg-graph-task/review.md
           - 已否定的性能尝试: zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md
           - 无 Graph 性能实测: zh-cn/design/a5-hbg-graph-task/no-graph-performance.md

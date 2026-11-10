@@ -85,7 +85,7 @@ inherited scalar 取本次 boundary scalar，固定 scalar 取只读 Definition�
 | 路径 | 唯一参数写者 | 绑定位置 | 消费者 |
 | ---- | ------------ | -------- | ------ |
 | 单 lane、单 block | bootstrap node 分区 owner | scan arrival 前 | ready owner 首次观察参数后派发 |
-| SPMD、MIX、sync_start | bootstrap node 分区 owner | scan arrival 前 | 固定 membership 中首次 adopt 的 worker |
+| SPMD、MIX、sync_start | bootstrap node 分区 owner | scan arrival 前 | 固定 membership 中需要尝试领取或执行 block 的 worker |
 | predicated 单 lane、单 block | bootstrap node 分区 owner | 只提前绑定地址；取值仍在 ready 后 | 跳过路径或本 worker |
 | ENTER/EXIT/DUMMY | 无 | 无参数绑定 | 无 |
 
@@ -96,7 +96,12 @@ inherited scalar 取本次 boundary scalar，固定 scalar 取只读 Definition�
 
 普通 ready owner 可能不是参数写者，首次准备 payload 前必须 invalidate 参数范围并执行 barrier。
 私有 pending candidate 用 `args_observed` 保存已观察状态，随 task_ref park/restore，最终释放或 run 失败才清除。
-cooperative 的 claim owner 只准备 admission record；所有成员首次 adopt 时仍观察参数，后续 block 复用。
+cooperative 的 claim owner 只准备 admission record；成员首次 adopt 后、尝试领取 block 前观察参数，后续 block 复用。
+普通纯 SPMD 的迟到成员若不持有该任务的执行 slot，且通过原有强 atomic 路径确认 claim seal 已覆盖全部 block，
+可以记录 observed/closed 并直接推进本地 obligation，无须读取参数或暂存普通 payload。
+该路径仍校验 epoch、全局顺序、任务形状和 membership，每轮最多扫描八条记录；
+扫描游标推进也计为调度进展，即使本轮未保留 current task，也不会触发空闲退避。
+不增加 completed_blocks、不标记逻辑任务完成，MIX 和 sync_start 仍走原有准入与关闭路径。
 现有 PREPARED/ADMITTED、membership、短 commit lock 和 kernel 资源准入均不提前。
 
 `SchedulerLocalSlotState` 用三态 predicate（未求值、通过、不通过）保存一次求值的结果，

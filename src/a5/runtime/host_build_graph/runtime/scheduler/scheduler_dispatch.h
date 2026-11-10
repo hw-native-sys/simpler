@@ -273,10 +273,13 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     // Discovery and completion service regain control after at most two
     // closed obligations; no member waits for a peer inside this pass.
     for (uint32_t step = 0; step < SCHEDULER_PENDING_SLOT_COUNT; ++step) {
+        const uint64_t scan_cursor_before = admission->scan_cursor;
         if (!scheduler_refresh_local_obligation<RecordProtocol>(graph, base, local, run, admission)) {
             *failed = true;
             return progress;
         }
+        // A bounded scan can retire obligations without retaining a current task.
+        progress = progress || admission->scan_cursor != scan_cursor_before;
         if (scheduler_task_ref_is_null(admission->current_task_ref)) break;
         if (!scheduler_ordered_park_ordinary(graph, local, run)) {
             *failed = true;
