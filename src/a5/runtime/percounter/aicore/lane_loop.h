@@ -512,15 +512,18 @@ inline __aicore__ void percounter_mix_release(const LaneConfig &cfg) {
  * gather different sets of lanes -- a cohort's kernel holds each block at its
  * barrier until every holder is in it, a rendezvous holds each subtask until
  * every participant has arrived -- so a lane that owes both is a lane two sets
- * wait for, and whichever set it serves second waits forever. The claimer
- * therefore does not arm a mask naming a holder, and a lane does not take a
- * block while the line carries a generation it has not looked at.
+ * wait for, and whichever set it serves second waits forever.
  *
- * Only the window between those two checks leaves a lane owing both, and it
- * resolves one way for every lane that reaches it: the rendezvous first. Every
- * lane the mask named was clear of the cohort when the claimer read it, so the
- * ones that raced into a block are at a checkpoint rather than inside a
- * cohort's kernel, and the rendezvous they all owe completes.
+ * **Both arming sites therefore refuse a mask naming a holder**:
+ * `percounter_mix_arm` for a draw from the MIX list, and
+ * `percounter_sync_serve_block` for a MIX cohort's own block, which arms the
+ * same line and is as real an admission as the draw. A lane likewise does not
+ * take a block while the line carries a generation it has not looked at.
+ *
+ * Only the window between an arming and a take leaves a lane owing both, and
+ * the holder there still serves its block first. Every lane the mask named was
+ * clear of the cohort when the arming read the holds, so no participant is
+ * inside a cohort kernel, and the rendezvous waits only as long as that block.
  *
  * Taking a block never blocks, and a holder never takes a second.
  */
@@ -660,6 +663,12 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
     SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
     const uint32_t generation = scheduler_ssbuf_load_acquire(&signal->armed_generation);
     if (percounter_mix_armed(generation)) return true;
+    // The second arming site, under the rule the first one keeps: a participant
+    // still owing a block of another cohort would owe two gatherings at once.
+    // This lane's own hold is the block being armed, so it is not in question --
+    // only claimer lanes take MIX cohort blocks, so no lane the mask names can
+    // hold one of this cohort.
+    if (percounter_cohort_held_in(cfg, sync->active_mask & ~(uint32_t{1} << cfg.cluster_lane))) return true;
     signal->task_id = sync->task_id;
     signal->active_mask = sync->active_mask;
     signal->block_idx = sync->my_block;
@@ -1040,20 +1049,15 @@ percounter_mix_discover(const LaneConfig &cfg, PercounterLaneState *state, uint6
  * cohort block first, then the cluster's MIX line. `served` reports whether
  * this lane ran or armed anything.
  *
- * **A lane holding a block asks the line first.** Such a lane is named in one
- * only through the window the cohort commentary describes, and every other lane
- * that window names is likewise at a checkpoint rather than inside a cohort's
- * kernel, so the rendezvous completes and the block is served at the checkpoint
- * after it. Serving the block first would instead put this lane inside a kernel
- * its co-holders cannot leave until a rendezvous runs that this lane has to
- * arrive at.
+ * **The block goes first, and a holder is never named in an armed line.** Both
+ * arming sites refuse a mask naming a holder, so a rendezvous this lane is named
+ * in was armed while this lane was clear of the cohort, and serving the block
+ * first strands nobody. Asking the line first would instead run another task's
+ * kernel while a co-holder sits at this cohort's barrier waiting for the block
+ * this lane still owes.
  */
 inline __aicore__ bool
 percounter_checkpoint_serve(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served) {
-    if (state->sync.my_block >= 0) {
-        if (!percounter_mix_discover(cfg, state, timeout_cycles, served)) return false;
-        if (*served) return true;
-    }
     if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
     if (*served) return true;
     return percounter_mix_discover(cfg, state, timeout_cycles, served);
