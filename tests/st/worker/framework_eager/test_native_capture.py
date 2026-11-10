@@ -56,6 +56,5 @@ def test_native_cold_capture(runtime, task_queue, framework_module, tmp_path, re
     _run_capture(runtime, task_queue, framework_module, tmp_path, request, monkeypatch)
 
 
-@pytest.mark.platforms(["a2a3"])
 def test_native_cold_capture_destroy_refusal(framework_module, tmp_path, request, monkeypatch):
     _run_capture("tensormap_and_ringbuffer", "0", framework_module, tmp_path, request, monkeypatch, "--destroy-refusal")
