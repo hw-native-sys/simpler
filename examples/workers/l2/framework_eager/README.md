@@ -157,9 +157,9 @@ CLIs load the unique existing artifact, building only when it is absent; the
 original same-stream CLI still checks its incremental build cache. All use
 the original `build_bridge` / `_load_bridge` helpers. The
 `test_environment("torch_npu")` marker selects an isolated framework venv in the
-dedicated `st-framework-eager-a2a3` and `st-framework-eager-a5` PR and Daily jobs. The default environment
-automatically deselects these tests; no directory exclusion is needed.
-Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3-and-a5) for the pinned compatibility contract. Run this suite
+dedicated `st-torch-npu-a2a3` and `st-torch-npu-a5` jobs, shared by eager and
+cold capture cases. Ordinary onboard sweeps select the default environment.
+Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#torch-npu-qualification-a2a3-and-a5) for the pinned compatibility contract. Run this suite
 serially inside one exclusive `task-submit` allocation of one device, as below;
 resource-parallel dispatch and xdist are not qualified by this example:
 

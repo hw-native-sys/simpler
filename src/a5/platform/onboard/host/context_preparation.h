@@ -19,7 +19,7 @@ namespace host {
 class LoadAicpuOp;
 }
 
-namespace pto::a5 {
+namespace simpler::a5 {
 int ensure_ctrl_table(MemoryAllocator &allocator, int device_id, uint64_t &table, bool &committed);
 // Scratch and pending-write state belong to the calling DeviceRunner.
 int query_device_aicpu_occupancy(
@@ -27,4 +27,4 @@ int query_device_aicpu_occupancy(
     AicpuDeviceOccupancy &out
 );
 int release_aicpu_query_result(MemoryAllocator &allocator, rtStream_t stream, void *&scratch, bool &pending);
-}  // namespace pto::a5
+}  // namespace simpler::a5

@@ -20,7 +20,7 @@
 #include "common/platform_config.h"
 #include "runtime_c_api.h"
 
-namespace pto::a5 {
+namespace simpler::a5 {
 int ensure_ctrl_table(MemoryAllocator &allocator, int device_id, uint64_t &table, bool &committed) {
     if (committed) return 0;
     const int rc = init_aicore_register_addresses(&table, static_cast<uint64_t>(device_id), allocator);
@@ -74,4 +74,4 @@ int query_device_aicpu_occupancy(
     out.os_sched_valid = result.os_sched_rc == 0;
     return 0;
 }
-}  // namespace pto::a5
+}  // namespace simpler::a5

@@ -21,7 +21,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 _SUITES = {
     "ut-a5": "_ut-npu-a5.yml",
     "st-onboard-a5": "_st-npu-a5.yml",
-    "st-framework-eager-a5": "_st-framework-eager.yml",
+    "st-torch-npu-a5": "_st-torch-npu.yml",
 }
 _SHA = "1234567890abcdef" * 2 + "12345678"
 _NODE = r"""
@@ -106,7 +106,7 @@ def test_only_three_hardware_suites_move_from_automatic_ci():
     assert all(name in _workflow("ci-self")["jobs"] for name in _SUITES)
     daily = _workflow("daily")["jobs"]
     assert "ut-a5" not in daily
-    assert "st-onboard-a5" in daily and "st-framework-eager-a5" in daily
+    assert "st-onboard-a5" in daily and "st-torch-npu-a5" in daily
 
 
 def test_authorized_topology_pins_all_suites_and_keeps_reporting_permission_separate():
@@ -148,7 +148,7 @@ def test_authorized_topology_pins_all_suites_and_keeps_reporting_permission_sepa
             assert step["with"]["ref"] == "${{ inputs.ref || github.ref }}"
     assert jobs["ut-a5"]["with"]["include_cann_examples"] == "true"
     assert jobs["st-onboard-a5"]["with"]["include_dfx_smokes"] == "true"
-    assert jobs["st-framework-eager-a5"]["with"]["platform"] == "a5"
+    assert jobs["st-torch-npu-a5"]["with"]["platform"] == "a5"
     report = jobs["report"]
     assert set(report["needs"]) == {"gate-and-resolve", *_SUITES}
     assert report["if"].startswith("always() &&")

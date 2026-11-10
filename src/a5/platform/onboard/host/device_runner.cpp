@@ -201,7 +201,7 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 int DeviceRunner::prepare_kernel_arch_context(rtStream_t control_stream) {
     const int rc = ensure_aicore_reg_table();
     if (rc != 0) return rc;
-    pto::a5::AicpuTopology topology;
+    simpler::a5::AicpuTopology topology;
     return query_aicpu_topology(topology, control_stream);
 }
 
@@ -212,21 +212,21 @@ int DeviceRunner::release_arch_context_resources(bool abandon_device_resources) 
         aicpu_topology_query_stream_ = nullptr;
         return 0;
     }
-    const int rc = pto::a5::release_aicpu_query_result(
+    const int rc = simpler::a5::release_aicpu_query_result(
         mem_alloc_, aicpu_topology_query_stream_, aicpu_topology_query_result_, aicpu_topology_query_pending_
     );
     if (rc == 0) aicpu_topology_query_stream_ = nullptr;
     return rc;
 }
 
-int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out, rtStream_t control_stream) {
+int DeviceRunner::query_aicpu_device_occupancy(simpler::a5::AicpuDeviceOccupancy &out, rtStream_t control_stream) {
     if (aicpu_device_occupancy_cached_) {
         out = aicpu_device_occupancy_;
         return 0;
     }
     if (!aicpu_topology_query_pending_) aicpu_topology_query_stream_ = control_stream;
-    pto::a5::AicpuDeviceOccupancy occupancy;
-    const int rc = pto::a5::query_device_aicpu_occupancy(
+    simpler::a5::AicpuDeviceOccupancy occupancy;
+    const int rc = simpler::a5::query_device_aicpu_occupancy(
         mem_alloc_, load_aicpu_op_, control_stream, aicpu_topology_query_result_, aicpu_topology_query_pending_,
         occupancy
     );
@@ -243,18 +243,18 @@ int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &ou
     return 0;
 }
 
-int DeviceRunner::query_aicpu_topology(pto::a5::AicpuTopology &out, rtStream_t control_stream) {
+int DeviceRunner::query_aicpu_topology(simpler::a5::AicpuTopology &out, rtStream_t control_stream) {
     if (aicpu_topology_cached_) {
         out = aicpu_topology_;
         return 0;
     }
 
-    pto::a5::AicpuDeviceOccupancy occupancy;
+    simpler::a5::AicpuDeviceOccupancy occupancy;
     int rc = query_aicpu_device_occupancy(occupancy, control_stream);
     if (rc != 0) return rc;
 
-    pto::a5::AicpuTopology topology;
-    if (!pto::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id_), occupancy, topology))
+    simpler::a5::AicpuTopology topology;
+    if (!simpler::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id_), occupancy, topology))
         return PTO_RUNTIME_ERR_INTERNAL;
 
     aicpu_topology_ = std::move(topology);
@@ -429,7 +429,7 @@ int DeviceRunner::prepare_execution(
     // active count to the available pool, but execution keeps at least one of
     // each role.
     {
-        pto::a5::AicpuTopology topology;
+        simpler::a5::AicpuTopology topology;
         runtime.set_aicpu_allowed_cpu_count(0);
         const rtStream_t control_stream =
             execution_mode_latch().is_kernel() ?
@@ -439,13 +439,13 @@ int DeviceRunner::prepare_execution(
             LOG_ERROR("AICPU topology probe failed; affinity gate will not launch");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        pto::a5::AicpuLaunchPlan launch_plan;
+        simpler::a5::AicpuLaunchPlan launch_plan;
         std::string plan_error;
-        if (!pto::a5::build_aicpu_launch_plan(topology, requested_aicpu_num, launch_plan, plan_error)) {
+        if (!simpler::a5::build_aicpu_launch_plan(topology, requested_aicpu_num, launch_plan, plan_error)) {
             LOG_ERROR(
                 "cannot build AICPU launch plan: soc=%s scenario=%s occupy=0x%llx reason=%s",
                 topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type),
+                simpler::a5::aicpu_scenario_name(topology.scenario_type),
                 static_cast<unsigned long long>(topology.device_occupancy.occupy), plan_error.c_str()
             );
             return PTO_RUNTIME_ERR_INTERNAL;
@@ -474,11 +474,11 @@ int DeviceRunner::prepare_execution(
                 LOG_WARN(
                     "AICPU CPU_TOPO unavailable; using %s: soc=%s occupy=0x%llx "
                     "stable_reachable=%d requested=%d effective=%d affinity=[%s]%s",
-                    pto::a5::aicpu_topology_source_name(topology.source),
+                    simpler::a5::aicpu_topology_source_name(topology.source),
                     topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
                     static_cast<unsigned long long>(topology.device_occupancy.occupy),
                     launch_plan.stable_reachable_count, requested_aicpu_num, active_aicpu_num, dump.c_str(),
-                    topology.source == pto::a5::AicpuTopologySource::kOccupyFallback ?
+                    topology.source == simpler::a5::AicpuTopologySource::kOccupyFallback ?
                         "; physical/SMT/cluster/die placement is unknown" :
                         ""
                 );
@@ -488,7 +488,7 @@ int DeviceRunner::prepare_execution(
                     "AICPU stable reachable CPUs below active capacity: soc=%s scenario=%s occupy=0x%llx "
                     "stable_reachable=%d capacity=%d requested=%d effective=%d affinity=[%s]",
                     topology.soc_name.empty() ? "(unknown)" : topology.soc_name.c_str(),
-                    pto::a5::aicpu_scenario_name(topology.scenario_type),
+                    simpler::a5::aicpu_scenario_name(topology.scenario_type),
                     static_cast<unsigned long long>(topology.device_occupancy.occupy),
                     launch_plan.stable_reachable_count, PLATFORM_DEFAULT_AICPU_THREAD_NUM, requested_aicpu_num,
                     active_aicpu_num, dump.c_str()
@@ -496,7 +496,7 @@ int DeviceRunner::prepare_execution(
             }
             LOG_INFO(
                 "AICPU ALLOWED_CPUS = [%s] (scenario=%s active=%d launch=%d user_cpus=%zu)", dump.c_str(),
-                pto::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
+                simpler::a5::aicpu_scenario_name(topology.scenario_type), active_aicpu_num, launch_plan.launch_count,
                 topology.os_schedulable_cpus.size()
             );
         }
@@ -1445,7 +1445,7 @@ int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
 // halves the per-core halResMap loop and the live driver-side mappings a worker
 // holds.
 int DeviceRunner::ensure_aicore_reg_table() {
-    return pto::a5::ensure_ctrl_table(
+    return simpler::a5::ensure_ctrl_table(
         mem_alloc_, device_id_, aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_
     );
 }

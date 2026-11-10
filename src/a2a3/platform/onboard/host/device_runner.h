@@ -327,7 +327,7 @@ private:
     int ensure_aicpu_topology();
     uint64_t c2c_ctrl_address_{0};
     bool c2c_ctrl_address_valid_{false};
-    std::vector<pto::a2a3::AicpuLogicalCpu> aicpu_topology_;
+    std::vector<simpler::a2a3::AicpuLogicalCpu> aicpu_topology_;
 
     // Release the resources this run owns, in runtime-argument, register-buffer,
     // then stream order. Collectors are not among them: their device resources

@@ -197,8 +197,9 @@ int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_
 
 int DeviceRunner::ensure_aicpu_topology() {
     if (!aicpu_topology_.empty()) return 0;
-    std::vector<pto::a2a3::AicpuLogicalCpu> topology;
-    if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), topology)) return PTO_RUNTIME_ERR_INTERNAL;
+    std::vector<simpler::a2a3::AicpuLogicalCpu> topology;
+    if (!simpler::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), topology))
+        return PTO_RUNTIME_ERR_INTERNAL;
     aicpu_topology_ = std::move(topology);
     return 0;
 }
@@ -206,7 +207,7 @@ int DeviceRunner::ensure_aicpu_topology() {
 int DeviceRunner::prepare_kernel_arch_context(rtStream_t /*control_stream*/) {
     int rc = ensure_aicore_reg_table(AicoreRegKind::Ctrl);
     if (rc != 0) return rc;
-    rc = pto::a2a3::ensure_c2c_ctrl_address(c2c_ctrl_address_, c2c_ctrl_address_valid_);
+    rc = simpler::a2a3::ensure_c2c_ctrl_address(c2c_ctrl_address_, c2c_ctrl_address_valid_);
     if (rc != 0) return rc;
     return ensure_aicpu_topology();
 }
@@ -486,7 +487,7 @@ int DeviceRunner::prepare_execution(
             runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
         );
         if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
+        if (!simpler::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
             LOG_ERROR(
                 "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
             );
@@ -738,7 +739,7 @@ int DeviceRunner::ensure_run_streams() {
 // mid-worker is not something a per-run PMU re-query could have made safe.
 int DeviceRunner::ensure_aicore_reg_table(AicoreRegKind kind) {
     if (kind == AicoreRegKind::Ctrl)
-        return pto::a2a3::ensure_ctrl_table(
+        return simpler::a2a3::ensure_ctrl_table(
             mem_alloc_, device_id_, aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_
         );
     const bool is_pmu = kind == AicoreRegKind::Pmu;

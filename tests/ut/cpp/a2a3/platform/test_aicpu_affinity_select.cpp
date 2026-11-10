@@ -43,9 +43,9 @@ void unified_log_info(const char *, const char *, ...) {}
 void unified_log_debug(const char *, const char *, ...) {}
 }
 
-using pto::a2a3::AicpuLogicalCpu;
-using pto::a2a3::compute_allowed_cpus;
-using pto::a2a3::resolve_aicpu_cpu_id_base;
+using simpler::a2a3::AicpuLogicalCpu;
+using simpler::a2a3::compute_allowed_cpus;
+using simpler::a2a3::resolve_aicpu_cpu_id_base;
 
 namespace {
 

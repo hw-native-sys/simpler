@@ -5005,21 +5005,21 @@ public:
 #ifdef CONTEXT_ARCH_A5
     void *scratch{nullptr};
     bool pending{false};
-    pto::a5::AicpuDeviceOccupancy occupancy{};
-    pto::a5::AicpuTopology topology{};
+    simpler::a5::AicpuDeviceOccupancy occupancy{};
+    simpler::a5::AicpuTopology topology{};
     bool selected(int threads, std::vector<int32_t> &allowed) {
-        pto::a5::AicpuLaunchPlan plan;
+        simpler::a5::AicpuLaunchPlan plan;
         std::string error;
-        if (!pto::a5::build_aicpu_launch_plan(topology, threads, plan, error)) return false;
+        if (!simpler::a5::build_aicpu_launch_plan(topology, threads, plan, error)) return false;
         allowed = plan.allowed_cpus;
         return true;
     }
 #else
     uint64_t c2c_address{0};
     bool c2c_valid{false};
-    std::vector<pto::a2a3::AicpuLogicalCpu> topology;
+    std::vector<simpler::a2a3::AicpuLogicalCpu> topology;
     bool selected(int threads, std::vector<int32_t> &allowed) {
-        return pto::a2a3::compute_allowed_cpus(topology, threads, allowed);
+        return simpler::a2a3::compute_allowed_cpus(topology, threads, allowed);
     }
 #endif
 protected:
@@ -5027,24 +5027,24 @@ protected:
         ++prepare_arch_calls;
         observed_control_stream = stream;
 #ifdef CONTEXT_ARCH_A5
-        int rc = pto::a5::ensure_ctrl_table(
+        int rc = simpler::a5::ensure_ctrl_table(
             mem_alloc_, device_id_, aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_
         );
         if (rc != 0 || occupancy.occupy_valid) return rc;
-        rc = pto::a5::query_device_aicpu_occupancy(mem_alloc_, load_aicpu_op_, stream, scratch, pending, occupancy);
+        rc = simpler::a5::query_device_aicpu_occupancy(mem_alloc_, load_aicpu_op_, stream, scratch, pending, occupancy);
         if (rc != 0) return rc;
-        pto::a5::detail::CpuTopologyData driver{};
-        return pto::a5::detail::build_aicpu_topology(occupancy, "CPU-control-fixture", false, driver, topology) ?
+        simpler::a5::detail::CpuTopologyData driver{};
+        return simpler::a5::detail::build_aicpu_topology(occupancy, "CPU-control-fixture", false, driver, topology) ?
                    0 :
                    PTO_RUNTIME_ERR_INTERNAL;
 #else
-        int rc = pto::a2a3::ensure_ctrl_table(
+        int rc = simpler::a2a3::ensure_ctrl_table(
             mem_alloc_, device_id_, aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_
         );
         if (rc != 0) return rc;
-        rc = pto::a2a3::ensure_c2c_ctrl_address(c2c_address, c2c_valid);
+        rc = simpler::a2a3::ensure_c2c_ctrl_address(c2c_address, c2c_valid);
         if (rc != 0) return rc;
-        if (topology.empty() && !pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), topology))
+        if (topology.empty() && !simpler::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), topology))
             return PTO_RUNTIME_ERR_INTERNAL;
         return 0;
 #endif
@@ -5056,7 +5056,7 @@ protected:
             pending = false;
             return 0;
         }
-        return pto::a5::release_aicpu_query_result(mem_alloc_, observed_control_stream, scratch, pending);
+        return simpler::a5::release_aicpu_query_result(mem_alloc_, observed_control_stream, scratch, pending);
 #else
         (void)abandon;
         return 0;

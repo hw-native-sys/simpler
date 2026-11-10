@@ -16,7 +16,7 @@
 
 #include "runtime/rt.h"
 
-namespace pto::a2a3 {
+namespace simpler::a2a3 {
 int ensure_ctrl_table(MemoryAllocator &allocator, int device_id, uint64_t &table, bool &committed) {
     if (committed) return 0;
     const int rc =
@@ -35,4 +35,4 @@ int ensure_c2c_ctrl_address(uint64_t &address, bool &valid) {
     valid = true;
     return 0;
 }
-}  // namespace pto::a2a3
+}  // namespace simpler::a2a3

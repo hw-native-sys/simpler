@@ -24,7 +24,7 @@ The complete test-type × hardware-tier matrix across automatic CI, the A5 comme
 | Category | github-hosted (no hardware) | a2a3 runner | a5 runner |
 | -------- | --------------------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-torch-npu-a2a3` | `st-onboard-a5`, `st-torch-npu-a5` |
 
 ## GitHub Actions Jobs
 
@@ -35,9 +35,9 @@ shape. The executable job bodies live in reusable workflows:
 `_packaging.yml`, `_profiling-flags-smoke.yml`, `_st-sim-a2a3.yml`,
 `_st-sim-a5.yml`, `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml`,
 `_st-npu-a2a3.yml`, `_st-npu-a5.yml`, `_st-network1.yml`,
-`_st-deepseek-a2a3.yml`, and `_st-framework-eager.yml`. The simulation,
+`_st-deepseek-a2a3.yml`, and `_st-torch-npu.yml`. The simulation,
 ordinary onboard, and NPU unit-test bodies are split by architecture so each
-job renders only its own steps. Framework eager shares `_st-framework-eager.yml`;
+job renders only its own steps. Torch-NPU scene tests share `_st-torch-npu.yml`;
 callers supply matching `platform` and `runs_on` inputs. Shared step scaffolding
 that is safe to run after checkout lives in composite actions under `.github/actions/`
 (`apt-install`, `cache-pip`, `cache-ccache`, `setup-gcc-15`, `setup-venv`, and the three `network1-*` actions).
@@ -79,7 +79,7 @@ PullRequest
   ├── st-sim-a5              (ubuntu-24.04)          — a5_changed && st_affected
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
-  ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
+  ├── st-torch-npu-a2a3      (a2a3 self-hosted)     — a2a3_changed && st_affected
   ├── st-network1-onboard-a2a3    (a2a3pod pair)          — a2a3_changed && st_affected
   └── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
 
@@ -87,7 +87,7 @@ Admin PR comment /run-a5
   └── gate-and-resolve       (ubuntu-24.04)          — open PR to this repo main; pinned head
       ├── ut-a5             (a5 self-hosted)        — Python UT and CANN examples
       ├── st-onboard-a5     (a5 self-hosted)        — onboard ST and DFX smokes
-      └── st-framework-eager-a5 (a5 self-hosted)     — framework eager ST
+      └── st-torch-npu-a5      (a5 self-hosted)     — Torch-NPU ST
 ```
 
 | Job | Runner | What it runs |
@@ -97,10 +97,10 @@ Admin PR comment /run-a5
 | `st-sim-a5` | `ubuntu-24.04` | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
-| `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
+| `st-torch-npu-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA, the active URMA regressions and mixed SDMA/URMA cases, then adaptive-parallel DFX feature smokes |
-| `st-framework-eager-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
+| `st-torch-npu-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
 
@@ -350,22 +350,23 @@ not need `--max-parallel` manually.
 
 - **SDMA tests run in isolated tasks inside `st-onboard-a2a3`.** Within the default test environment, three selections partition the corpus (`examples tests/st`): the ordinary sweep takes `-m "not sdma and not sdma_fault"` with `--exclude-level 4`, one queued task runs `-m "sdma and not sdma_fault"` for the demos, and a separate one-device task runs `-m sdma_fault` for the AICore fault-injection case. The three are disjoint and exhaustive over both markers, and all three name the same paths, so a case cannot land in two tasks or in none. Provisioning the SDMA workspace creates 48 device-only STARS streams that live in the device fault domain, and tearing them down once any AICore task has poisoned that card blocks minutes rather than milliseconds — whether the teardown is a device reset or an explicit stream destroy ([#1425](https://github.com/hw-native-sys/simpler/issues/1425)). The cost therefore falls on whichever process still holds those streams when the fault happens, which is why the fault-injection case gets a task containing nothing else. Separate `task-submit` tasks preserve that on every onboard runner, independent of pytest ordering. Network1 tests are selected by `--level 4` in `st-network1-onboard-a2a3` and explicitly excluded from ordinary onboard ST lanes.
 
-### Framework eager qualification (a2a3 and a5)
+### Torch-NPU qualification (a2a3 and a5)
 
-`st-framework-eager-a2a3` runs automatically on affected PRs. A5 framework
-eager validation for ordinary PRs is part of `/run-a5`. Both run in the emergency
+`st-torch-npu-a2a3` runs automatically on affected PRs. Torch-NPU
+validation on A5 for ordinary PRs is part of `/run-a5`. Both run in the emergency
 lane and Daily. Automatic and emergency callers use the corresponding
 `a2a3_changed && st_affected` or `a5_changed && st_affected` gate; the explicit
 A5 command runs without a change gate. Each uses its architecture runner pool.
-All callers reuse `_st-framework-eager.yml` with an explicit platform. Setup validates `a2a3|a5`, builds `build_package_<platform>`,
+All callers reuse `_st-torch-npu.yml` with an explicit platform. Setup validates `a2a3|a5`, builds `build_package_<platform>`,
 and records the matching onboard runtime roots. The exclusive task checks actual
 silicon before backend import and passes the same platform to identity recording
 and pytest. Artifacts are named separately by platform; a green A3 job does not
 qualify A5.
-Tests declare `@pytest.mark.test_environment("torch_npu")`. The job discovers
-them across `examples tests/st` with `--test-environment torch_npu`; it does
-not enumerate directories or cases. Ordinary sweeps and compile warm-up select
-the implicit `default` environment, including in Daily. Framework dependencies
+Eager submission and cold capture tests declare
+`@pytest.mark.test_environment("torch_npu")`. The job discovers cases across
+`examples tests/st` with `--test-environment torch_npu`. Ordinary onboard
+sweeps and compile warm-up select the implicit `default` environment, including
+in Daily. Torch-NPU dependencies
 live only in `.venv-framework`, separate from the Program/fork sweep's `.venv`.
 Environment selection is independent of `manual`. The reusable job accepts the
 same `manual_mode` contract as other scene-test jobs: Per-PR and emergency
@@ -463,14 +464,14 @@ source/native build identities, runtime and framework module hashes, compiled
 bridge identity and consumer results; when artifact upload succeeds,
 `framework-eager-<platform>-*` retains JUnit and per-case logs even on test failure.
 Artifact upload is best-effort and does not override the verified test result.
-This qualifies the reference
-consumers' same-stream and cross-stream eager ordering, caller-owned lifetimes,
+The eager cases qualify the reference consumers' same-stream and cross-stream eager ordering, caller-owned lifetimes,
 bounded aliased INOUT assertions, ordinary callback-error recovery and per-call
 value semantics and bounded DEVICE-controlled persistent cache state. It does
 not qualify native failed-drain recovery, pending
 framework-callback close or early HOST-backing release. It does not establish
-overlap, arbitrary strides/cross-tile aliasing, PyPTO dispatch or capture/replay.
-Qualification is limited to the actual platform and environment in each receipt.
+overlap, arbitrary strides/cross-tile aliasing or PyPTO dispatch. The cold
+capture cases separately check replay values and graph resource lifetime.
+Qualification is limited to the cases, platform and environment in each receipt.
 
 ### A5 hardware validation (`/run-a5`)
 
@@ -482,7 +483,7 @@ and full commit SHA, including fork PRs. Non-PR comments and unverified or
 non-admin requests cannot schedule hardware work.
 
 Every admitted request runs `ut-a5` with CANN examples, `st-onboard-a5` with DFX
-smokes, and `st-framework-eager-a5` through the existing reusable workflows.
+smokes, and `st-torch-npu-a5` through the existing reusable workflows.
 No change detector filters an explicit request, including a documentation-only
 PR. A new admitted request cancels the previous same-PR job for each suite;
 unmatched and denied comments cannot cancel admitted jobs. Pushes do not

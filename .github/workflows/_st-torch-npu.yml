@@ -1,4 +1,4 @@
-name: Framework Eager Scene Tests
+name: Torch-NPU Scene Tests
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ on:
 
 jobs:
   run:
-    name: st-framework-eager-${{ inputs.platform }}
+    name: st-torch-npu-${{ inputs.platform }}
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 45
     env:
@@ -41,13 +41,13 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
-      - name: Set up framework environment
+      - name: Set up Torch-NPU environment
         id: framework
         uses: ./.github/actions/setup-framework-eager
         with:
           platform: ${{ inputs.platform }}
 
-      - name: Run the declared framework environment exclusively
+      - name: Run Torch-NPU scene tests exclusively
         env:
           CANN_ENV: ${{ steps.framework.outputs.cann_env }}
           MANUAL_MODE: ${{ inputs.manual_mode }}
@@ -76,7 +76,7 @@ jobs:
               --basetemp outputs/framework-eager-ci/pytest --junitxml outputs/framework-eager-ci/results.xml"
           .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-eager-ci/results.plan.json outputs/framework-eager-ci/results.xml
 
-      - name: Retain framework eager identities and logs
+      - name: Retain Torch-NPU identities and logs
         if: always()
         # The test result is already checked above; artifact service failures only lose diagnostics.
         continue-on-error: true

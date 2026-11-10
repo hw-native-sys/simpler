@@ -21,7 +21,7 @@ import yaml
 
 _ROOT = Path(__file__).resolve().parents[3]
 _ACTION = _ROOT / ".github/actions/setup-framework-eager"
-_WORKFLOW = _ROOT / ".github/workflows/_st-framework-eager.yml"
+_WORKFLOW = _ROOT / ".github/workflows/_st-torch-npu.yml"
 
 
 def _yaml(path):
@@ -292,15 +292,15 @@ def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller)
     jobs = _yaml(_ROOT / f".github/workflows/{caller}.yml")["jobs"]
     for platform_name in ("a2a3", "a5"):
         if caller == "ci" and platform_name == "a5":
-            assert "st-framework-eager-a5" not in jobs
-            job = _yaml(_ROOT / ".github/workflows/ci-a5-comment.yml")["jobs"]["st-framework-eager-a5"]
-            assert job["uses"] == "./.github/workflows/_st-framework-eager.yml"
+            assert "st-torch-npu-a5" not in jobs
+            job = _yaml(_ROOT / ".github/workflows/ci-a5-comment.yml")["jobs"]["st-torch-npu-a5"]
+            assert job["uses"] == "./.github/workflows/_st-torch-npu.yml"
             assert job["with"]["platform"] == "a5"
             assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
             assert job["needs"] == ["gate-and-resolve"]
             continue
-        job = jobs[f"st-framework-eager-{platform_name}"]
-        assert job["uses"] == "./.github/workflows/_st-framework-eager.yml"
+        job = jobs[f"st-torch-npu-{platform_name}"]
+        assert job["uses"] == "./.github/workflows/_st-torch-npu.yml"
         assert job["with"]["platform"] == platform_name
         assert json.loads(job["with"]["runs_on"]) == ["self-hosted", platform_name]
         if caller == "daily":
@@ -310,6 +310,7 @@ def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller)
             assert "outputs.st_affected == 'true'" in job["if"]
             assert job["needs"] == ["detect-changes", "pre-commit"]
     workflow = _yaml(_WORKFLOW)
+    assert workflow["jobs"]["run"]["name"] == "st-torch-npu-${{ inputs.platform }}"
     assert workflow["jobs"]["run"]["timeout-minutes"] == "45"
     assert workflow["jobs"]["run"]["steps"][-1]["with"]["name"] == (
         "framework-eager-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}"

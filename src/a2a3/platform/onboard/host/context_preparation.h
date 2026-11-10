@@ -15,8 +15,8 @@
 
 class MemoryAllocator;
 
-namespace pto::a2a3 {
+namespace simpler::a2a3 {
 int ensure_ctrl_table(MemoryAllocator &allocator, int device_id, uint64_t &table, bool &committed);
 // A successful zero address is still a completed query. The caller owns the snapshot.
 int ensure_c2c_ctrl_address(uint64_t &address, bool &valid);
-}  // namespace pto::a2a3
+}  // namespace simpler::a2a3

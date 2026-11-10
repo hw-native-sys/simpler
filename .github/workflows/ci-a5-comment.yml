@@ -91,13 +91,13 @@ jobs:
       runs_on: '["self-hosted","a5"]'
       include_dfx_smokes: true
 
-  st-framework-eager-a5:
+  st-torch-npu-a5:
     needs: [gate-and-resolve]
     if: needs.gate-and-resolve.outputs.ready == 'true'
     concurrency:
       group: ci-a5-framework-${{ needs.gate-and-resolve.outputs.pr_number }}
       cancel-in-progress: true
-    uses: ./.github/workflows/_st-framework-eager.yml
+    uses: ./.github/workflows/_st-torch-npu.yml
     with:
       platform: a5
       repository: ${{ needs.gate-and-resolve.outputs.repository }}
@@ -105,7 +105,7 @@ jobs:
       runs_on: '["self-hosted","a5"]'
 
   report:
-    needs: [gate-and-resolve, ut-a5, st-onboard-a5, st-framework-eager-a5]
+    needs: [gate-and-resolve, ut-a5, st-onboard-a5, st-torch-npu-a5]
     if: always() && needs.gate-and-resolve.result == 'success' && needs.gate-and-resolve.outputs.ready == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -122,7 +122,7 @@ jobs:
             const gate = needs['gate-and-resolve'];
             if (gate.result !== 'success' || gate.outputs.ready !== 'true') return;
             const { repository, ref, pr_number: number } = gate.outputs;
-            const suites = ['ut-a5', 'st-onboard-a5', 'st-framework-eager-a5'];
+            const suites = ['ut-a5', 'st-onboard-a5', 'st-torch-npu-a5'];
             const results = suites.map(name => ({ name, result: needs[name]?.result || 'unknown' }));
             const passed = results.every(job => job.result === 'success');
             const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
