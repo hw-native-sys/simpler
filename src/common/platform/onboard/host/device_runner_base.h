@@ -820,6 +820,8 @@ public:
      */
     static void begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept;
     static void end_workspace_plan() noexcept;
+    static void allow_ordered_graph_heap_sharing(bool allowed) noexcept;
+    void publish_graph_heap_launch(const NativeRunIdentity &identity);
 
     /**
      * Name the consumer region this thread's next workspace request serves.
@@ -3167,10 +3169,10 @@ protected:
     // then takes a separate buffer, including for an equal-size request.
     RunResourceSlots<std::shared_ptr<PreparedRunResources::ImageStorage>> run_image_stagings_;
 
-    // One independently committed set of the three pooled device regions. A
+    // One image bank with a separately owned heap generation. A
     // run reaches its set through the arena bank its lease selects, so
-    // preparing one bank never mutates a region the active run is executing
-    // out of. `cached_*` back `setup_static_arena`'s "fits" check: a later
+    // preparing one bank never rewrites another run's image. Heap backing may
+    // be shared only within an ordered execution domain. `cached_*` back `setup_static_arena`'s "fits" check: a later
     // init asking for an equal-or-smaller layout on an already-committed
     // arena reuses it instead of re-allocating when no prepared owner holds it.
     using ArenaBank = PreparedRunResources::ArenaBank;
@@ -3178,6 +3180,7 @@ protected:
     // bank is constructed in place with its allocator rather than default-built
     // with the rest of its set.
     RunResourceSlots<std::shared_ptr<ArenaBank>> arena_banks_;
+    std::weak_ptr<PreparedRunResources::HeapGeneration> shared_graph_heap_;
     mutable std::mutex prepared_storage_mutex_;
     std::vector<PreparedRunResources::RetiredArena> retired_prepared_arenas_;
     std::vector<std::shared_ptr<RetainedSchedulerStorage>> retired_prepared_schedulers_;

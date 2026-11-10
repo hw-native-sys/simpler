@@ -2516,6 +2516,184 @@ TEST_F(NativeAdmissionTest, FinalizePrefixAllocationFailureKeepsLaunchedOwnerRet
     }
 }
 
+class SharedHeapRunner : public FencedCompletionRunner {
+public:
+    explicit SharedHeapRunner(bool automatic = false) :
+        FencedCompletionRunner(true, automatic) {
+        static int binary;
+        aicore_bin_handle_ = &binary;
+        EXPECT_EQ(execution_mode_latch().latch(SIMPLER_MODE_PROGRAM), 0);
+    }
+    int reclaim_retired_images() { return reclaim_prepared_storage(); }
+    std::function<void()> before_launch;
+    bool refuse_capacity{false};
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        if (before_launch) before_launch();
+        if (refuse_capacity) {
+            return exact_launch_transaction(
+                prepared.identity, std::move(permit),
+                [](LaunchProgressSink &) {
+                    return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+                },
+                [](LaunchProgressSink &) {
+                    ADD_FAILURE() << "unexpected CPU submit";
+                    return 0;
+                }
+            );
+        }
+        auto result = FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+        if (result.rc == 0) EXPECT_EQ(queue_caller_exit(prepared), 0);
+        return result;
+    }
+};
+
+static void finish_heap_attempt(SharedHeapRunner &runner, Attempt &attempt) {
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    if (!attempt.empty()) EXPECT_TRUE(attempt.consume_release());
+    EXPECT_TRUE(attempt.empty());
+}
+
+TEST_F(NativeAdmissionTest, OrderedGraphHeapSharesBackingButKeepsImagesSeparate) {
+    if (arena_bank(1) == 0) GTEST_SKIP() << "per-run HBG arena required";
+    SharedHeapRunner runner;
+    Attempt first(runner, 0, 9300), second(runner, 1, 9301);
+    ASSERT_EQ(first.prepare(), 0);
+    const auto heap = runner.arena_bank_gm_heap_base(0);
+    ASSERT_NE(heap, 0u);
+    void *image = runner.arena_region_backing(0, 2);
+    ASSERT_NE(image, nullptr);
+    ASSERT_EQ(simpler_launch_run(&runner, first.storage), 0);
+    ASSERT_EQ(second.prepare(), 0);
+    EXPECT_EQ(runner.arena_bank_gm_heap_base(1), heap);
+    EXPECT_NE(runner.arena_region_backing(1, 2), image);
+    finish_heap_attempt(runner, first);
+    // Reclaiming the predecessor's run cannot destroy the successor's lease.
+    EXPECT_EQ(runner.arena_bank_gm_heap_base(1), heap);
+    finish_heap_attempt(runner, second);
+}
+
+TEST_F(NativeAdmissionTest, AutomaticAdmissionKeepsIndependentGraphHeaps) {
+    if (arena_bank(1) == 0) GTEST_SKIP() << "per-run HBG arena required";
+    SharedHeapRunner runner(true);
+    Attempt first(runner, 0, 9310), second(runner, 1, 9311);
+    ASSERT_EQ(first.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, first.storage), 0);
+    ASSERT_EQ(second.prepare(), 0);
+    EXPECT_NE(runner.arena_bank_gm_heap_base(1), runner.arena_bank_gm_heap_base(0));
+    finish_heap_attempt(runner, first);
+    finish_heap_attempt(runner, second);
+}
+
+TEST_F(NativeAdmissionTest, SubmittingGraphHeapIsNotBorrowedAndRefusedRunCanRetain) {
+    if (arena_bank(1) == 0) GTEST_SKIP() << "per-run HBG arena required";
+    SharedHeapRunner runner;
+    Attempt first(runner, 0, 9320), successor(runner, 1, 9321);
+    ASSERT_EQ(first.prepare(), 0);
+    const auto heap = runner.arena_bank_gm_heap_base(0);
+    runner.refuse_capacity = true;
+    runner.before_launch = [&] {
+        auto preparation = std::async(std::launch::async, [&] {
+            return successor.prepare();
+        });
+        ASSERT_EQ(preparation.get(), 0);
+        EXPECT_NE(runner.arena_bank_gm_heap_base(1), heap);
+    };
+    ASSERT_EQ(simpler_launch_run(&runner, first.storage), SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+    runner.before_launch = {};
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(first.storage);
+    ASSERT_EQ(state->phase.load(), NativeRunPhase::Prepared);
+    int caller = 0;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, first.storage, &caller, &reference), 0);
+    ASSERT_NE(reference, nullptr);
+    EXPECT_EQ(runner.arena_bank_gm_heap_base(0), heap);
+    finish_heap_attempt(runner, first);
+    finish_heap_attempt(runner, successor);
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), 0);
+}
+
+TEST_F(NativeAdmissionTest, RetainedGraphHeapCannotBecomeSharedAfterLaunch) {
+    if (arena_bank(1) == 0) GTEST_SKIP() << "per-run HBG arena required";
+    SharedHeapRunner runner;
+    Attempt first(runner, 0, 9330), successor(runner, 1, 9331);
+    ASSERT_EQ(first.prepare(), 0);
+    int caller = 0;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, first.storage, &caller, &reference), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, first.storage), 0);
+    ASSERT_EQ(successor.prepare(), 0);
+    EXPECT_NE(runner.arena_bank_gm_heap_base(0), runner.arena_bank_gm_heap_base(1));
+    finish_heap_attempt(runner, first);
+    finish_heap_attempt(runner, successor);
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), 0);
+}
+
+TEST_F(NativeAdmissionTest, GraphHeapGrowthPreservesOldBackingAndSmallerSuccessorReusesNewGeneration) {
+    if (arena_bank(1) == 0) GTEST_SKIP() << "per-run HBG arena required";
+    SharedHeapRunner runner;
+    Attempt first(runner, 0, 9340), larger(runner, 1, 9341), smaller(runner, 2, 9342);
+    ASSERT_EQ(first.prepare(), 0);
+    const auto old_heap = runner.arena_bank_gm_heap_base(0);
+    ASSERT_NE(old_heap, 0u);
+    std::memset(reinterpret_cast<void *>(old_heap), 0x5a, 16);
+    ASSERT_EQ(simpler_launch_run(&runner, first.storage), 0);
+    graph_heap_elements = 32768;
+    ASSERT_EQ(larger.prepare(), 0);
+    const auto new_heap = runner.arena_bank_gm_heap_base(1);
+    EXPECT_NE(new_heap, old_heap);
+    for (size_t i = 0; i != 16; ++i)
+        EXPECT_EQ(reinterpret_cast<uint8_t *>(old_heap)[i], 0x5a);
+    finish_heap_attempt(runner, first);
+    ASSERT_EQ(simpler_launch_run(&runner, larger.storage), 0);
+    graph_heap_elements = 16;
+    ASSERT_EQ(smaller.prepare(), 0);
+    EXPECT_EQ(runner.arena_bank_gm_heap_base(2), new_heap);
+    finish_heap_attempt(runner, larger);
+    finish_heap_attempt(runner, smaller);
+}
+
+TEST_F(NativeAdmissionTest, PreparedGraphHeapDoesNotBypassExistingAdmission) {
+    if (arena_bank(1) == 0) GTEST_SKIP() << "per-run HBG arena required";
+    SharedHeapRunner runner;
+    Attempt first(runner, 0, 9350), successor(runner, 1, 9351);
+    ASSERT_EQ(first.prepare(), 0);
+    const auto allocations = control().allocations;
+    EXPECT_NE(successor.prepare(), 0);
+    EXPECT_EQ(control().allocations, allocations);
+    int caller = 0;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, first.storage, &caller, &reference), 0);
+    finish_heap_attempt(runner, first);
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), 0);
+}
+
+TEST_F(NativeAdmissionTest, RetiringOldImageBankDoesNotReleaseAnotherRunsSharedHeap) {
+    if (arena_bank(1) == 0) GTEST_SKIP() << "per-run HBG arena required";
+    SharedHeapRunner runner;
+    Attempt first(runner, 0, 9360), second(runner, 1, 9361), reused_slot(runner, 0, 9362);
+    ASSERT_EQ(first.prepare(), 0);
+    const auto heap = runner.arena_bank_gm_heap_base(0);
+    ASSERT_EQ(simpler_launch_run(&runner, first.storage), 0);
+    ASSERT_EQ(second.prepare(), 0);
+    ASSERT_EQ(runner.arena_bank_gm_heap_base(1), heap);
+    ASSERT_EQ(simpler_wait_run_completion(&runner, first.storage), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, second.storage), 0);
+    ASSERT_EQ(reused_slot.prepare(), 0);
+    ASSERT_EQ(runner.arena_bank_gm_heap_base(0), heap);
+    void *raw = runner.arena_region_backing(1, 0);
+    std::memset(reinterpret_cast<void *>(heap), 0x69, 16);
+    control().selected_free = raw;
+    control().selected_free_attempts = 0;
+    finish_heap_attempt(runner, first);
+    ASSERT_EQ(runner.reclaim_retired_images(), 0);
+    ASSERT_EQ(runner.reclaim_workspace_obsolete(), 0);
+    EXPECT_EQ(control().selected_free_attempts, 0u);
+    for (size_t i = 0; i != 16; ++i)
+        EXPECT_EQ(reinterpret_cast<uint8_t *>(heap)[i], 0x69);
+    finish_heap_attempt(runner, second);
+    finish_heap_attempt(runner, reused_slot);
+    control().selected_free = nullptr;
+}
 }  // namespace native_admission_test
 
 namespace native_admission_test {

@@ -298,8 +298,8 @@ TEST(PreparedRunResources, RetiredUnmanagedArenaFreesExactlyOnce) {
         },
         &frees
     );
-    bank->gm_heap.reserve(64, 64);
-    ASSERT_NE(bank->gm_heap.commit(), nullptr);
+    bank->heap->arena.reserve(64, 64);
+    ASSERT_NE(bank->heap->arena.commit(), nullptr);
     PreparedRunResources::RetiredArena retired;
     ASSERT_EQ(retired.retain(bank, workspace), 0);
     EXPECT_NE(retired.reclaim(workspace), 0);
