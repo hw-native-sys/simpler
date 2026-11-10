@@ -111,7 +111,7 @@ def test_missing_input_manifest_fails_closed(tmp_path):
     assert not obj.exists()
 
 
-@pytest.mark.parametrize("manifest", [[], {"stamp": "same", "files": {"source": None}}])
+@pytest.mark.parametrize("manifest", [[], {"stamp": "same"}, {"stamp": "same", "files": {"source": None}}])
 def test_malformed_input_manifest_fails_closed(tmp_path, manifest):
     cache = tmp_path / "cache"
     cache.mkdir()

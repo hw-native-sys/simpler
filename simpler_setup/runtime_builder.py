@@ -157,11 +157,12 @@ def _invalidate_cache_if_stale(target_cache_dir: Path, current_stamp: str, *, in
         previous = {}
     if not isinstance(previous, dict):
         previous = {}
-    old_inputs = previous.get("files", {})
-    valid_inputs = isinstance(old_inputs, dict) and all(
+    raw_files = previous.get("files")
+    valid_inputs = isinstance(raw_files, dict) and all(
         isinstance(entry, dict) and isinstance(entry.get("sha256"), str) and isinstance(entry.get("mtime_ns"), int)
-        for entry in old_inputs.values()
+        for entry in raw_files.values()
     )
+    old_inputs = raw_files if isinstance(raw_files, dict) else {}
     trusted = inputs is not None and previous.get("stamp") == cached_stamp and valid_inputs
     changed = []
     if trusted and inputs is not None:
@@ -315,12 +316,12 @@ class RuntimeBuilder:
 
         When host code embeds pto-isa headers (a2a3 or a5 onboard), a pto-isa
         bump must invalidate that build's
-        cmake cache even when the runtime repo HEAD is unchanged (issue #1139:
+        cmake cache even when the runtime source content is unchanged (issue #1139:
         a stale host_runtime.so compiled against the old headers otherwise
         survives a reinstall). A5 simulation includes ISA workspace types too,
         so its cache stamp includes the pin. Other simulation builds return ""
         and leave the
-        stamp keyed on the runtime HEAD.
+        stamp keyed on the runtime source content.
 
         ``pto_isa.pin`` is the single source of truth. If the pin is missing or
         invalid, let ``read_pto_isa_pin`` raise so an embedding onboard build
