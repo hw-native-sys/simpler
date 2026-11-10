@@ -125,7 +125,7 @@ jobs:
           PATH="$RUNNER_TEMP/bin:$PATH" clang-tidy --version
 
       - name: Cache pip packages
-        if: inputs.setup_variant == 'self-cpu' || steps.lint-build.outputs.needs_build == 'true'
+        if: inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'
         uses: ./.github/actions/cache-pip
 
       - name: Install package (for clang-tidy compile databases)

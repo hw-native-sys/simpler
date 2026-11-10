@@ -287,7 +287,7 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     assert commands[2][:3] == ["-m", "simpler_setup.test_environments", "verify"]
 
 
-@pytest.mark.parametrize("caller", ["ci", "ci-self", "daily"])
+@pytest.mark.parametrize("caller", ["ci", "daily"])
 def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller):
     jobs = _yaml(_ROOT / f".github/workflows/{caller}.yml")["jobs"]
     for platform_name in ("a2a3", "a5"):

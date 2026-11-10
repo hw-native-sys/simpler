@@ -30,7 +30,6 @@ WORKFLOW_PATHS = (
     REPO_ROOT / ".github/workflows/_st-npu-a2a3.yml",
     REPO_ROOT / ".github/workflows/_st-sim-a2a3.yml",
     REPO_ROOT / ".github/workflows/_st-sim-a5.yml",
-    REPO_ROOT / ".github/workflows/ci-self.yml",
     REPO_ROOT / ".github/workflows/ci.yml",
     REPO_ROOT / ".github/workflows/daily.yml",
     REPO_ROOT / ".github/workflows/sanitizers.yml",
@@ -485,7 +484,7 @@ def test_a2a3_scene_workflow_has_no_legacy_sdma_mode() -> None:
     assert names.count("Run pytest scene tests (a2a3)") == 1
     assert names.count("SDMA pytest (a2a3)") == 1
     assert not any("legacy SDMA paths" in name for name in names)
-    for caller_name in ("ci.yml", "ci-self.yml", "daily.yml"):
+    for caller_name in ("ci.yml", "daily.yml"):
         assert "a2a3_sdma_mode" not in (REPO_ROOT / ".github/workflows" / caller_name).read_text()
 
 
