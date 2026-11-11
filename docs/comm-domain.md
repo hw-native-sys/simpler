@@ -545,14 +545,20 @@ or zero size before publishing the context, and propagates initialization failur
 as host errors. Callers must treat handle/context metadata as read-only and obtain
 the checked context in every orchestration run rather than caching its raw address.
 
-URMA requests require A5 TMR L3 domains with ranks in dense prefix order. Simpler
-does not impose a two-rank minimum: single-rank requests reach the provider and
-initialization failures are reported on the host. The currently pinned PTO URMA
-manager rejects single-rank initialization. The successful
+URMA requests require A5 TMR L3 domains. Device domains take an ordered subset of
+the Worker's chips. For example, chip 1 has domain rank 0 in `[1, 2]` and domain
+rank 1 in `[2, 1]`. The HCCL child communicator and the window and peer MR tables
+use that same domain-rank order. Overlapping Device domains can stay live and be
+used in successive runs, with each domain owning its communicator and URMA
+workspace. Host-source URMA domains require ranks in dense prefix order.
+
+Single-rank requests reach the provider, and initialization failures are
+reported on the host. The currently pinned PTO URMA manager rejects single-rank
+initialization. The successful
 [single-device CANN Hcomm loopback probe](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)
 uses two endpoints and has not been integrated into that provider; the provider
-restriction is not a hardware limitation. HBG URMA completion, arbitrary subsets
-and L4 async domains are unsupported.
+restriction is not a hardware limitation. HBG URMA completion and L4 async
+domains are unsupported.
 
 URMA domains use `PER_PEER`: each resident AIV owns a separate queue group
 for each remote peer. `UrmaConfig(jetties_per_aiv=1, sq_depth=0)` preserves one

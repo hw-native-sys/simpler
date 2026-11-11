@@ -21,7 +21,11 @@
 
 namespace {
 std::unordered_map<HcclComm, std::vector<CommMem>> registrations;
-std::unordered_set<HcclComm> child_comms;
+struct SubComm {
+    std::vector<uint32_t> base_ranks;
+    uint32_t rank;
+};
+std::unordered_map<HcclComm, SubComm> child_comms;
 int fail_registration = 0;
 int registration_calls = 0;
 bool fail_destroy = false;
@@ -35,6 +39,8 @@ struct ChannelState {
     SqContext sq{};
     CqContext cq{};
     RegedBufferEntity buffers[2]{};
+    RegedBufferEntity remote_buffers[2]{};
+    CommMem remote_mems[2]{};
     uint32_t sq_head = 0, sq_tail = 0, cq_head = 0, cq_tail = 0, sq_db = 0, cq_db = 0;
     char sq_buffer[64]{}, cq_buffer[64]{};
 };
@@ -60,6 +66,10 @@ int peer_import_calls = 0;
 int injected_peer_failures = 0;
 std::unordered_set<aclrtDrvMemHandle> imported_handles;
 std::unordered_set<void *> peer_mappings;
+
+uint64_t remote_window_address(HcclComm comm, uint32_t base_rank) {
+    return 0x300000000000ULL + (reinterpret_cast<uintptr_t>(comm) * COMM_MAX_RANK_NUM + base_rank) * 8192;
+}
 
 aclError map_buffer(void **out, size_t bytes) {
     static uintptr_t hint = UINT64_C(0x1000000000);
@@ -192,10 +202,12 @@ extern "C" HcclResult HcclCommDestroy(HcclComm comm) {
     child_comms.erase(comm);
     return HCCL_SUCCESS;
 }
-extern "C" HcclResult
-HcclCreateSubCommConfig(HcclComm *, uint32_t, uint32_t *, uint64_t id, uint32_t, HcclCommConfig *, HcclComm *out) {
+extern "C" HcclResult HcclCreateSubCommConfig(
+    HcclComm *base, uint32_t count, uint32_t *ranks, uint64_t id, uint32_t rank, HcclCommConfig *, HcclComm *out
+) {
+    assert(*base == reinterpret_cast<HcclComm>(1) && rank < count);
     *out = reinterpret_cast<HcclComm>(id + 100);
-    child_comms.insert(*out);
+    assert(child_comms.emplace(*out, SubComm{{ranks, ranks + count}, rank}).second);
     return HCCL_SUCCESS;
 }
 extern "C" HcclResult HcclCommMemReg(HcclComm comm, const char *, const CommMem *mem, HcclMemHandle *out) {
@@ -204,7 +216,10 @@ extern "C" HcclResult HcclCommMemReg(HcclComm comm, const char *, const CommMem 
     *out = mem->addr;
     return HCCL_SUCCESS;
 }
-extern "C" HcclResult HcclRankGraphGetLinks(HcclComm, uint32_t, uint32_t, uint32_t, CommLink **links, uint32_t *count) {
+extern "C" HcclResult
+HcclRankGraphGetLinks(HcclComm comm, uint32_t, uint32_t src, uint32_t dst, CommLink **links, uint32_t *count) {
+    const auto size = child_comms.at(comm).base_ranks.size();
+    assert(src < size && dst < size && src != dst);
     static CommLink link{};
     link.linkAttr.linkProtocol = static_cast<CommProtocol>(4);
     *links = &link;
@@ -212,10 +227,13 @@ extern "C" HcclResult HcclRankGraphGetLinks(HcclComm, uint32_t, uint32_t, uint32
     return HCCL_SUCCESS;
 }
 extern "C" HcclResult
-HcclChannelAcquire(HcclComm comm, CommEngine, const HcclChannelDesc *, uint32_t count, ChannelHandle *out) {
+HcclChannelAcquire(HcclComm comm, CommEngine, const HcclChannelDesc *desc, uint32_t count, ChannelHandle *out) {
     ++channel_calls;
     if (fail_channels) return HCCL_E_INTERNAL;
     assert(count == 1);
+    const auto &group = child_comms.at(comm);
+    assert(desc->remoteRank != group.rank);
+    const auto remote_addr = remote_window_address(comm, group.base_ranks.at(desc->remoteRank));
     static uintptr_t hint = 0x200000000000ULL;
     void *region =
         mmap(reinterpret_cast<void *>(hint), 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -226,13 +244,18 @@ HcclChannelAcquire(HcclComm comm, CommEngine, const HcclChannelDesc *, uint32_t 
     c->entity.engine = COMM_ENGINE_AIV;
     c->entity.sqNum = c->entity.cqNum = 1;
     c->entity.localBufferNum = c->entity.remoteBufferNum = 2;
-    c->entity.localBufferAddr = c->entity.remoteBufferAddr = c->buffers;
+    c->entity.localBufferAddr = c->buffers;
+    c->entity.remoteBufferAddr = c->remote_buffers;
     c->entity.sqContextAddr = &c->sq;
     c->entity.cqContextAddr = &c->cq;
     for (size_t i = 0; i < 2; ++i) {
         c->buffers[i].type = REGED_BUFFER_RMA;
         c->buffers[i].bufferInfo.rma.addr = reinterpret_cast<uint64_t>(registrations.at(comm)[i].addr);
         c->buffers[i].bufferInfo.rma.size = registrations.at(comm)[i].size;
+        c->remote_buffers[i] = c->buffers[i];
+        c->remote_buffers[i].bufferInfo.rma.addr = remote_addr + i * 4096;
+        c->remote_mems[i] = registrations.at(comm)[i];
+        c->remote_mems[i].addr = reinterpret_cast<void *>(c->remote_buffers[i].bufferInfo.rma.addr);
     }
     auto &sq = c->sq.contextInfo.ubJfs;
     sq.sqVa = reinterpret_cast<uint64_t>(c->sq_buffer);
@@ -254,18 +277,95 @@ HcclChannelAcquire(HcclComm comm, CommEngine, const HcclChannelDesc *, uint32_t 
     return HCCL_SUCCESS;
 }
 extern "C" HcclResult
-HcclChannelGetRemoteMems(HcclComm comm, ChannelHandle, uint32_t *count, CommMem **mems, char ***tags) {
+HcclChannelGetRemoteMems(HcclComm comm, ChannelHandle handle, uint32_t *count, CommMem **mems, char ***tags) {
     static char sym[] = "pto_urma_sym";
     static char notify[] = "pto_urma_notify";
     static char *names[] = {sym, notify};
+    auto &channel = *channels.at(comm);
+    assert(handle == reinterpret_cast<ChannelHandle>(&channel.entity));
     *count = 2;
-    *mems = registrations.at(comm).data();
+    *mems = channel.remote_mems;
     *tags = names;
     return HCCL_SUCCESS;
 }
 extern "C" aclError aclrtGetDeviceInfo(uint32_t, aclrtDevAttr, int64_t *value) {
     *value = 1;
     return ACL_SUCCESS;
+}
+
+static void test_overlapping_domains(CommHandle h, const std::vector<uint32_t> &bc, bool fail_release) {
+    h->rank = 1;
+    h->nranks = 3;
+    fail_channels = false;
+    const std::vector<uint32_t> ab{0, 1};
+    const uint32_t bc_rank = bc.front() == 1 ? 0 : 1;
+    const uint32_t urma = comm_workspace_bit(CommWorkspaceKind::URMA);
+    auto allocate = [&](uint64_t id, const std::vector<uint32_t> &ranks, uint32_t rank) {
+        const uint32_t peer = 1 - rank;
+        assert(domain_write_announce(h->rootinfo_path, id, peer, h->run_token, getpid(), ranks[peer], 42));
+        for (const char *phase : {"p2p_ready", "release"}) {
+            std::ofstream marker(
+                barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), peer)
+            );
+            marker << "1";
+            assert(marker.good());
+        }
+        uint64_t ctx = 0, base = 0;
+        size_t size = 0;
+        const int rc =
+            comm_alloc_domain_windows(h, id, ranks.data(), ranks.size(), rank, 4096, urma, &ctx, &base, &size);
+        if (rc == 0) {
+            assert(ctx != 0 && base != 0 && size == 4096);
+        } else {
+            assert(ctx == 0 && base == 0 && size == 0);
+        }
+        return rc;
+    };
+    auto check_domain = [&](uint64_t id, const std::vector<uint32_t> &ranks, uint32_t rank) {
+        const auto &alloc = *h->domain_allocations.at(id);
+        const auto &group = child_comms.at(alloc.urma_comm);
+        assert(group.base_ranks == ranks && group.rank == rank);
+        assert(registrations.at(alloc.urma_comm).front().addr == alloc.local_buf);
+        const auto &ctx = *alloc.device_ctx;
+        const uint32_t peer = 1 - rank;
+        assert(ctx.rankId == rank && ctx.rankNum == ranks.size());
+        assert(ctx.windowsIn[rank] == reinterpret_cast<uint64_t>(alloc.local_buf));
+        assert(ctx.windowsIn[peer] == reinterpret_cast<uint64_t>(alloc.peer_windows.at(0).address));
+        const auto *info =
+            reinterpret_cast<const pto::comm::urma::UrmaInfo *>(comm_workspace<CommWorkspaceKind::URMA>(ctx).addr);
+        const auto *mr = reinterpret_cast<const pto::comm::urma::UrmaMemInfo *>(info->memPtr);
+        assert(mr[rank * info->rowsPerPeer].addr == ctx.windowsIn[rank]);
+        assert(mr[peer * info->rowsPerPeer].addr == remote_window_address(alloc.urma_comm, ranks[peer]));
+    };
+    assert(allocate(1, ab, 1) == 0);
+    const auto ab_mappings = mappings.size();
+    const int ab_channel_calls = channel_calls;
+    fail_channels = true;
+    assert(allocate(2, bc, bc_rank) == COMM_INITIALIZATION_ABORT_REQUIRED);
+    assert(channel_calls == ab_channel_calls + 1 && child_comms.size() == 2 && registrations.size() == 2);
+    assert(comm_abort_domain_windows(h, 2, 2, bc_rank) == 0);
+    assert(child_comms.size() == 1 && mappings.size() == ab_mappings && unsafe_frees == 0);
+    check_domain(1, ab, 1);
+    fail_channels = false;
+    assert(allocate(3, bc, bc_rank) == 0);
+    check_domain(3, bc, bc_rank);
+    if (fail_release) {
+        fail_destroy = true;
+        const auto held = mappings.size();
+        assert(comm_release_domain_windows(h, 3, 2, bc_rank) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(child_comms.size() == 2 && mappings.size() == held && unsafe_frees == 0);
+        assert(h->cleanup_failed && h->domain_allocations.at(3)->cleanup_failed);
+        assert(!h->domain_allocations.at(1)->cleanup_failed);
+        check_domain(1, ab, 1);
+        check_domain(3, bc, bc_rank);
+        return;
+    }
+    assert(comm_release_domain_windows(h, 1, 2, 1) == 0);
+    assert(child_comms.size() == 1 && unsafe_frees == 0);
+    check_domain(3, bc, bc_rank);
+    assert(comm_release_domain_windows(h, 3, 2, bc_rank) == 0);
+    assert(child_comms.empty() && registrations.empty() && mappings.empty() && unsafe_frees == 0);
+    delete h;
 }
 
 int main(int argc, char **argv) {
@@ -287,6 +387,12 @@ int main(int argc, char **argv) {
     h->nranks = 2;
     h->rootinfo_path = std::string(folder) + "/root";
     h->hccl_comm = reinterpret_cast<HcclComm>(1);
+    if (scenario == "overlap_subset" || scenario == "overlap_reordered" || scenario == "overlap_release_failure") {
+        const auto ranks = scenario == "overlap_subset" ? std::vector<uint32_t>{1, 2} : std::vector<uint32_t>{2, 1};
+        test_overlapping_domains(h, ranks, scenario == "overlap_release_failure");
+        std::filesystem::remove_all(folder);
+        return 0;
+    }
     if (scenario == "base_destroy") {
         h->nranks = 1;
         fail_destroy = true;

@@ -1,6 +1,6 @@
 # URMA deferred completion validation
 
-These A5 `tensormap_and_ringbuffer` regression tests run two ranks with a registered
+These A5 `tensormap_and_ringbuffer` transfer regressions run two ranks with a registered
 communication window. Every transfer is followed by an add-one consumer that
 depends on the transfer output. Both the copied bytes and consumer result are
 checked against a host golden.
@@ -13,6 +13,12 @@ checked against a host golden.
 | `TestUrmaRepeatedPut` | TPUT plus dependent readback | 16 |
 | `TestUrmaChunkedFetch` (temporarily skipped) | Static-shape TGET of 256 MiB + 32 KiB | 1 logical request, split by the adapter |
 | `TestUrmaChunkedPut` | Dynamic-shape TPUT of 256 MiB + 32 KiB plus dependent readback | 1 logical request, split by the adapter |
+
+The lifecycle test requires three devices for two overlapping two-rank domains:
+AB uses members `[0, 1]`, and BC uses `[1, 2]` or `[2, 1]`. Both domains stay live
+while TGET and TPUT run in alternation. The test checks payloads, dependent
+consumers, receive windows, and independent release and recreation in both
+directions. It does not exercise simultaneous transfers across domains.
 
 The repeated cases check the number of registered completion entries against
 the first request and the requested repeat count. Identical final tensor values
@@ -38,6 +44,7 @@ the smaller transfer with packed strides rather than retain the original extent.
 
 Use a project-local venv and an A5 machine. SDMA and URMA providers are compiled by default.
 Domains request URMA resources explicitly and validate their context before submission.
+Reserve three devices to run the full directory, including both lifecycle cases.
 
 ```bash
 python3 -m venv --system-site-packages .venv
@@ -50,21 +57,21 @@ python -m simpler_setup.tools.scene_test_compile \
 mkdir -p outputs/urma/ascend
 export ASCEND_PROCESS_LOG_PATH="$PWD/outputs/urma/ascend"
 .claude/skills/onboard-arch-precheck/check.sh a5
-task-submit --device auto --device-num 2 --timeout 1800 --max-time 1800 \
+task-submit --device auto --device-num 3 --timeout 1800 --max-time 1800 \
   --run ".venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/urma_deferred_completion --platform a5 --device \$TASK_DEVICE --require-pto-isa --pto-session-timeout 1200 -v"
 ```
 
-The run currently reports five passed and one skipped (`TestUrmaChunkedFetch`,
-after a device scheduler timeout in
-[CI run 41609948645](https://github.com/hw-native-sys/simpler/actions/runs/41609948645)).
+`TestUrmaChunkedFetch` is temporarily skipped after a device scheduler timeout in
+[CI run 41609948645](https://github.com/hw-native-sys/simpler/actions/runs/41609948645).
 Check the build's ISA revision against `pto_isa.pin` and retain the build log
 and pytest output, including each resource child result. Device logs remain
 under `outputs/urma/`.
 
-## CI integration dependency
+## Validation scope
 
-The `st-onboard-a5` CI job runs five active cases alongside the SDMA example and
-mixed-workspace regressions using the default A5 providers. RDMA remains OFF.
+The main PR CI workflow does not include an A5 onboard job. Hardware validation
+of these transfers and lifecycle cases requires a separate A5 run using the
+three-device command above. RDMA remains OFF by default.
 
 These cases request `workspace_engines=("urma",)` and obtain a checked context
 with `handle.device_context(rank, workspace_engines=("urma",))`. Kernels read

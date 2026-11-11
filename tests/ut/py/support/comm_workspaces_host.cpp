@@ -471,12 +471,23 @@ int main(int argc, char **argv) {
     uint64_t first = 0, first_ctx = 0;
     uint64_t base = 0;
     size_t size = 0;
-    const uint32_t sparse_ranks[] = {0, 2};
+    const uint32_t out_of_range_ranks[] = {0, 2};
+    const uint32_t duplicate_ranks[] = {0, 0};
+    const uint32_t wrong_local_rank[] = {1, 0};
+    for (const auto *invalid_ranks : {out_of_range_ranks, duplicate_ranks, wrong_local_rank}) {
+        assert(
+            comm_alloc_domain_windows(h, next_id, invalid_ranks, 2, 0, 4096, 2, &first_ctx, &base, &size) ==
+            COMM_DOMAIN_URMA_CONFIG_INVALID
+        );
+        assert(h->used_domain_ids.empty() && h->domain_allocations.empty());
+        assert(first_ctx == 0 && base == 0 && size == 0 && mappings.empty() && started[1] == 0);
+    }
     assert(
-        comm_alloc_domain_windows(h, next_id++, sparse_ranks, 2, 0, 4096, 2, &first_ctx, &base, &size) ==
-        COMM_DOMAIN_URMA_CONFIG_INVALID
+        comm_alloc_host_domain_windows(
+            h, next_id, wrong_local_rank, 2, 1, 4096, 2, "host-reordered", &first_ctx, &base, &size
+        ) == COMM_DOMAIN_URMA_CONFIG_INVALID
     );
-    assert(mappings.empty() && started[1] == 0);
+    assert(h->used_domain_ids.empty() && h->domain_allocations.empty() && mappings.empty());
     assert(allocate(0, first, first_ctx) == 0);
     assert(started[0] == 0 && started[1] == 0 && started[2] == 0);
     release(first);
