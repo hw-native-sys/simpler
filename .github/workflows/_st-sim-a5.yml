@@ -29,6 +29,7 @@ on:
         default: exclude
         type: string
       python_version:
+        description: Hosted Python version; CI requires Python 3.10 or newer.
         required: false
         default: "3.10"
         type: string
@@ -64,6 +65,27 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Checkout Python setup action
+        if: inputs.setup_variant == 'github'
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/setup-python
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        if: inputs.setup_variant == 'github'
+        uses: ./.ci-support/.github/actions/setup-python
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Verify Python >= 3.10
+        run: |
+          python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
+
       - name: Validate manual mode
         run: |
           case "$MANUAL_MODE" in
@@ -91,12 +113,6 @@ jobs:
             ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"
             echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           fi
-
-      - name: Set up Python ${{ inputs.python_version }}
-        if: inputs.setup_variant == 'github'
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ inputs.python_version }}
 
       - name: Cache pip packages
         if: inputs.setup_variant == 'github'

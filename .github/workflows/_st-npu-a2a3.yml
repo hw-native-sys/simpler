@@ -129,27 +129,40 @@ jobs:
         with:
           platform: a2a3
 
-      - name: Retain native HBG capture logs
-        if: always()
-        # Artifact service failures do not change the scene-test verdict.
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: hbg-capture-a2a3-${{ github.run_id }}-${{ github.run_attempt }}
-          path: outputs/hbg-capture
-          if-no-files-found: warn
-          retention-days: 7
-
       - name: Verify and summarize default environment coverage
         if: always()
         run: |
           .venv/bin/python -m simpler_setup.tools.feature_coverage_report \
             --root outputs/default-ci --environment default --platform a2a3 --manual "$MANUAL_MODE"
 
-      - name: Retain default environment plans and receipts
+      - name: Checkout diagnostic upload action
+        id: diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/upload-diagnostics
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Retain native HBG capture logs
+        if: always() && steps.diagnostics.outcome == 'success'
+        # Artifact service failures do not change the scene-test verdict.
+        continue-on-error: true
+        uses: ./.ci-support/.github/actions/upload-diagnostics
+        with:
+          name: hbg-capture-a2a3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/hbg-capture
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Retain default environment plans and receipts
+        if: always() && steps.diagnostics.outcome == 'success'
+        continue-on-error: true
+        uses: ./.ci-support/.github/actions/upload-diagnostics
         with:
           name: default-a2a3-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: outputs/default-ci

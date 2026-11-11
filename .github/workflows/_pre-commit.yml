@@ -19,7 +19,7 @@ on:
         required: false
         type: string
       base_sha:
-        description: Exact base SHA for GitHub-hosted PR runs.
+        description: Exact base SHA for the admitted PR revision.
         required: false
         type: string
       head_sha:
@@ -46,23 +46,63 @@ jobs:
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
-          fetch-depth: 0
+          fetch-depth: 100
           persist-credentials: false
 
-      - name: Set up Python 3.10
+      - name: Checkout Python setup action
         if: inputs.setup_variant == 'github'
-        uses: actions/setup-python@v6
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/setup-python
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        if: inputs.setup_variant == 'github'
+        uses: ./.ci-support/.github/actions/setup-python
         with:
           python-version: "3.10"
+
+      - name: Verify Python >= 3.10
+        run: |
+          python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
 
       - name: Resolve base SHA
         id: base
         if: inputs.setup_variant == 'self-cpu'
         env:
           BASE_REPOSITORY: ${{ inputs.base_repository || github.repository }}
+          BASE_SHA: ${{ inputs.base_sha }}
         run: |
-          git fetch --no-tags "https://github.com/${BASE_REPOSITORY}.git" main
-          echo "base_sha=$(git merge-base FETCH_HEAD HEAD)" >> "$GITHUB_OUTPUT"
+          BASE_URL="https://github.com/${BASE_REPOSITORY}.git"
+          BASE="$BASE_SHA"
+          if [ -z "$BASE" ]; then
+            git fetch --no-tags --depth=100 "$BASE_URL" main
+            BASE=$(git rev-parse FETCH_HEAD)
+          elif ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=100 "$BASE_URL" "$BASE"
+          fi
+
+          HEAD_REV=$(git rev-parse HEAD)
+          for deepen in 100 400; do
+            if git merge-base "$BASE" "$HEAD_REV" >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$(git rev-parse --is-shallow-repository)" != true ]; then
+              break
+            fi
+            git fetch --no-tags --deepen="$deepen" origin "$HEAD_REV" || break
+            git fetch --no-tags --deepen="$deepen" "$BASE_URL" "$BASE" || break
+          done
+
+          if ! MERGE_BASE=$(git merge-base "$BASE" "$HEAD_REV"); then
+            echo "::error::Cannot resolve the PR merge-base after bounded history fetching"
+            exit 1
+          fi
+          echo "base_sha=$MERGE_BASE" >> "$GITHUB_OUTPUT"
 
       - name: Select lint build target
         id: lint-build
@@ -154,8 +194,10 @@ jobs:
         run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run pre-commit
-        uses: pre-commit/action@v3.0.0
-        with:
-          extra_args: >-
-            --from-ref ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
-            --to-ref ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}
+        env:
+          BASE_SHA: ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}
+        run: |
+          python -m pip install pre-commit
+          python -m pre_commit run --show-diff-on-failure --color=always \
+            --from-ref "$BASE_SHA" --to-ref "$HEAD_SHA"

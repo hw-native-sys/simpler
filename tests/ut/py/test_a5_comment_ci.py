@@ -156,10 +156,18 @@ def test_authorized_topology_pins_all_suites_and_keeps_reporting_permission_sepa
         jobs_of_suite = _workflow(reusable.removesuffix(".yml"))["jobs"].values()
         steps = [step for job in jobs_of_suite for step in job.get("steps", [])]
         checkouts = [step for step in steps if step.get("uses", "").startswith("actions/checkout@")]
-        assert checkouts, reusable
+        source_checkouts = [step for step in checkouts if "path" not in step["with"]]
+        assert len(source_checkouts) == 1, reusable
         for step in checkouts:
-            assert step["with"]["repository"] == "${{ inputs.repository || github.repository }}"
-            assert step["with"]["ref"] == "${{ inputs.ref || github.ref }}"
+            if step in source_checkouts:
+                assert step["with"]["repository"] == "${{ inputs.repository || github.repository }}"
+                assert step["with"]["ref"] == "${{ inputs.ref || github.ref }}"
+            else:
+                assert step["with"]["path"] == ".ci-support"
+                assert step["with"]["repository"] == "${{ github.repository }}"
+                assert step["with"]["ref"] == "${{ github.workflow_sha }}"
+                assert step["with"]["sparse-checkout"] == ".github/actions/upload-diagnostics"
+                assert step["continue-on-error"] == "true"
     assert jobs["ut-a5"]["with"]["include_cann_examples"] == "true"
     assert jobs["st-onboard-a5"]["with"]["include_dfx_smokes"] == "true"
     assert jobs["st-framework-a5"]["with"]["platform"] == "a5"

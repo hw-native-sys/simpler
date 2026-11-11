@@ -131,10 +131,29 @@ jobs:
         with:
           platform: a5
 
-      - name: Upload HBG argument-dump payloads
-        if: always() && inputs.include_dfx_smokes
+      - name: Verify and summarize default environment coverage
+        if: always()
+        run: |
+          .venv/bin/python -m simpler_setup.tools.feature_coverage_report \
+            --root outputs/default-ci --environment default --platform a5 --manual "$MANUAL_MODE"
+
+      - name: Checkout diagnostic upload action
+        id: diagnostics
+        if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/upload-diagnostics
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Upload HBG argument-dump payloads
+        if: always() && inputs.include_dfx_smokes && steps.diagnostics.outcome == 'success'
+        continue-on-error: true
+        uses: ./.ci-support/.github/actions/upload-diagnostics
         with:
           name: a5-hbg-args-dump-${{ github.run_id }}-${{ github.run_attempt }}-${{ runner.arch }}
           if-no-files-found: ignore
@@ -142,16 +161,10 @@ jobs:
             outputs/**/args_dump.json
             outputs/**/args.bin
 
-      - name: Verify and summarize default environment coverage
-        if: always()
-        run: |
-          .venv/bin/python -m simpler_setup.tools.feature_coverage_report \
-            --root outputs/default-ci --environment default --platform a5 --manual "$MANUAL_MODE"
-
       - name: Retain default environment plans and receipts
-        if: always()
+        if: always() && steps.diagnostics.outcome == 'success'
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: ./.ci-support/.github/actions/upload-diagnostics
         with:
           name: default-a5-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: outputs/default-ci
