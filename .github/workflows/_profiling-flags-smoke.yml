@@ -37,6 +37,17 @@ jobs:
         if: inputs.setup_variant == 'github'
         uses: ./.github/actions/setup-gcc-15
 
+      - name: Verify provisioned toolchain
+        if: inputs.setup_variant == 'self-cpu'
+        run: |
+          command -v ninja
+          command -v g++
+          if ! command -v g++-15 >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/bin"
+            ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          fi
+
       - name: Set up Python 3.10
         if: inputs.setup_variant == 'github'
         uses: actions/setup-python@v6
@@ -44,6 +55,7 @@ jobs:
           python-version: "3.10"
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
 
       - name: Set up environment

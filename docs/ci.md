@@ -7,28 +7,28 @@ The CI pipeline maps test categories (st, ut-py, ut-cpp) × hardware tiers to Gi
 Design principles:
 
 1. **Merge by runner, not by language** — Python and applicable C++ unit tests share setup cost and run as steps within a single job per runner tier. A runner with no platform-specific C++ tests does not carry an empty CTest step; currently `ut-a5` is Python-only.
-2. **Runner matches hardware tier** — no-hardware tests run on GitHub-hosted `ubuntu-24.04` per PR, with macOS coverage in Daily; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
+2. **Runner matches hardware tier** — no-hardware PR jobs run on `[self-hosted, cpu]`, with Ubuntu/macOS coverage in Daily; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
 3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
-4. **sim = no hardware** — `a2a3sim`/`a5sim` jobs run on github-hosted runners alongside unit tests.
+4. **sim = no hardware** — `a2a3sim`/`a5sim` PR jobs run on the self-hosted CPU pool alongside unit tests.
 5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so pure-a5 PRs skip a2a3 scene-test runs and vice versa. **UT jobs are still not gated by platform** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings. They *are* gated by test category: a diff confined to `tests/st/` or `examples/` cannot break a unit test, and one confined to `tests/ut/` cannot break a scene test, because the two suites execute disjoint trees (`pytest examples tests/st` vs `pytest tests/ut` plus the C++ ctest) and no unit test reads `examples/` or `tests/st/`. Shared test infrastructure — the root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/` — belongs to neither category and runs both.
 6. **Non-code PRs automatically run pre-commit and docs, and nothing else** — `detect-changes` sets `non_code_only` when *no* changed file falls outside the `NON_CODE` set. Skipping the UT jobs is riskless there because nothing in that set can change what the code does, and each member already has its own gate: markdownlint inside `pre-commit` reads the markdown, `docs.yml` (unconditional on every PR) builds the site with `--strict`, and `pre-commit` itself is ungated so a `.pre-commit-config.yaml` change is fully exercised by it.
 
 A5 hardware validation for ordinary PRs is requested by an admin with `/run-a5`.
 A5 simulation, CPU tests and profiling remain automatic under their existing
-change gates. The `/run-self` emergency lane and Daily retain their A5 jobs.
+change gates. Daily retains its A5 jobs.
 
 ## Full Job Matrix
 
-The complete test-type × hardware-tier matrix across automatic CI, the A5 comment workflow, the emergency lane and Daily. A5 hardware jobs in this table use `/run-a5` for ordinary PR validation.
+The complete test-type × hardware-tier matrix across automatic CI, the A5 comment workflow and Daily. A5 hardware jobs in this table use `/run-a5` for ordinary PR validation.
 
-| Category | github-hosted (no hardware) | a2a3 runner | a5 runner |
-| -------- | --------------------------- | ----------- | --------- |
+| Category | CPU (no hardware) | a2a3 runner | a5 runner |
+| -------- | ----------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
 | **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
 
 ## GitHub Actions Jobs
 
-`ci.yml`, `ci-a5-comment.yml` and `ci-self.yml` are thin topology callers: they own
+`ci.yml`, `ci-a5-comment.yml` and `daily.yml` are thin topology callers: they own
 triggers, `needs:`, gate `if:` expressions, runner/setup inputs, and matrix
 shape. The executable job bodies live in reusable workflows:
 `_detect-changes.yml`, `_pre-commit.yml`, `_ut-no-hardware.yml`,
@@ -70,13 +70,13 @@ timeouts remain a per-connection safeguard, not a wall-clock guarantee.
 
 ```text
 PullRequest
-  ├── pre-commit             (ubuntu-24.04)
-  ├── packaging-matrix       (ubuntu-24.04)          — [needs !examples_only && !tests_only]
-  ├── profiling-flags-smoke  (ubuntu-24.04)         — (a2a3_changed || a5_changed) && !examples_only && !tests_only
-  ├── ut                     (ubuntu-24.04)          — Python + C++ UT, no hardware [needs ut_affected]
-  ├── detect-changes         (reusable; ubuntu-24.04 in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
-  ├── st-sim-a2a3            (ubuntu-24.04)          — a2a3_changed && st_affected
-  ├── st-sim-a5              (ubuntu-24.04)          — a5_changed && st_affected
+  ├── pre-commit             (self-hosted CPU)
+  ├── packaging-matrix       (self-hosted CPU, Python 3.10)          — [needs !examples_only && !tests_only]
+  ├── profiling-flags-smoke  (self-hosted CPU)         — (a2a3_changed || a5_changed) && !examples_only && !tests_only
+  ├── ut                     (self-hosted CPU, Python 3.10)          — Python + C++ UT, no hardware [needs ut_affected]
+  ├── detect-changes         (reusable; self-hosted CPU in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
+  ├── st-sim-a2a3            (self-hosted CPU)          — a2a3_changed && st_affected
+  ├── st-sim-a5              (self-hosted CPU)          — a5_changed && st_affected
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
@@ -92,9 +92,9 @@ Admin PR comment /run-a5
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut` | `ubuntu-24.04` | `pytest tests/ut` + `ctest -LE requires_hardware` |
-| `st-sim-a2a3` | `ubuntu-24.04` | `pytest examples tests/st --platform a2a3sim` |
-| `st-sim-a5` | `ubuntu-24.04` | `pytest examples tests/st --platform a5sim` |
+| `ut` | self-hosted CPU, Python 3.10 | `pytest tests/ut` + `ctest -LE requires_hardware` |
+| `st-sim-a2a3` | self-hosted CPU | `pytest examples tests/st --platform a2a3sim` |
+| `st-sim-a5` | self-hosted CPU | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
@@ -312,8 +312,8 @@ itself.
 
 ### Sim jobs on CPU-constrained runners
 
-The Ubuntu cells of sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-24.04`, whose standard
-GitHub-hosted runner currently has **4 vCPUs**. `--device 0-15` is still the
+PR simulation jobs (`st-sim-a2a3`, `st-sim-a5`) share the self-hosted CPU pool.
+Daily also runs Ubuntu and macOS cells; a standard GitHub-hosted Ubuntu runner has **4 vCPUs**. `--device 0-15` is still the
 right choice for the **pool size** (some L3 cases need several virtual ids), but
 the default `--max-parallel auto` caps the in-flight subprocess count to
 `min(nproc, len(--device))` — on a 4-core runner that becomes `4`. Note
@@ -338,12 +338,12 @@ not need `--max-parallel` manually.
 
 ### Scheduling constraints
 
-- Sim scene tests and no-hardware unit tests run on github-hosted runners (no hardware).
-- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the opposite platform's tree (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/ci-self.yml`, `.github/workflows/_*.yml`) — flips both flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. Explicit `/run-a5` hardware suites remain manual.
-- **Test-category axis:** `ST_ONLY='^(tests/st/|examples/)'` and `UT_ONLY='^tests/ut/'`, applied in the same shape as the arch patterns — a category is unaffected only when *every* changed file is exclusively the other's. `st_affected` gates automatic scene-test jobs; `ut_affected` gates automatic `ut` and `ut-a2a3`. The emergency lane retains its existing gates, including `ut-a5`; explicit `/run-a5` requests run all three A5 hardware suites without change detection. Anything belonging to neither (root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/`) flips both, so shared infrastructure always runs both suites.
+- PR simulation and no-hardware unit tests run on the self-hosted CPU pool; Daily retains GitHub-hosted coverage.
+- `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the opposite platform's tree (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/_*.yml`) — flips both flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. Explicit `/run-a5` hardware suites remain manual.
+- **Test-category axis:** `ST_ONLY='^(tests/st/|examples/)'` and `UT_ONLY='^tests/ut/'`, applied in the same shape as the arch patterns — a category is unaffected only when *every* changed file is exclusively the other's. `st_affected` gates automatic scene-test jobs; `ut_affected` gates automatic `ut` and `ut-a2a3`. Explicit `/run-a5` requests run all three A5 hardware suites without change detection. Anything belonging to neither (root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/`) flips both, so shared infrastructure always runs both suites.
 - **Corpus axis:** `EXAMPLES_ONLY='^examples/'` and `TESTS_ONLY='^(tests/)'`, same shape again, one per side of the product jobs' payload. `packaging-matrix` and `profiling-flags-smoke` build and install the product and then exercise it with a fixed, tiny payload — one entry-point script (a `tests/st/` file) and one `vector_example` — so neither reads either suite as a corpus, and a diff confined to `examples/` or to `tests/` cannot reach them: `wheel.packages` is `["simpler_setup", "python/simpler"]`, so both partitions are provably absent from the product. A payload file changed under either is still exercised by the scene-test job that reads the same corpus.
-- **Gated jobs (scene tests):** automatic `st-sim-{a2a3,a5}` and `st-onboard-a2a3` run iff their platform's flag **and** `st_affected` are `true`. The emergency lane also applies these gates to `st-onboard-a5`; `/run-a5` does not.
-- **Platform-independent jobs (UT + packaging):** automatic `ut`, `ut-a2a3` and `packaging-matrix`, plus emergency-lane `ut-a5`, ignore the *platform* flags — unit tests exercise shared contracts (nanobind bindings, RuntimeBuilder, ring buffers, etc.) and the risk of silently skipping a regression outweighs the CI minutes saved. The `tests/ut/cpp/{arch}/` entry in the gating regex only *attributes* an arch-specific C++ UT change to that platform (so it does not spuriously flip the other arch's scene-test flag); it does not gate the UT jobs themselves. The gated UT jobs do respect `ut_affected`, which is a statement about test category rather than silicon. `packaging-matrix` respects the corpus axis, which is a statement about which corpus a job reads: neither `examples/` nor `tests/` is in `wheel.packages`, so a diff confined to either partition cannot change what the packaging job builds.
+- **Gated jobs (scene tests):** automatic `st-sim-{a2a3,a5}` and `st-onboard-a2a3` run iff their platform's flag **and** `st_affected` are `true`. Explicit `/run-a5` requests are not filtered by these gates.
+- **Platform-independent jobs (UT + packaging):** automatic `ut`, `ut-a2a3` and `packaging-matrix` ignore the *platform* flags — unit tests exercise shared contracts (nanobind bindings, RuntimeBuilder, ring buffers, etc.) and the risk of silently skipping a regression outweighs the CI minutes saved. The `tests/ut/cpp/{arch}/` entry in the gating regex only *attributes* an arch-specific C++ UT change to that platform (so it does not spuriously flip the other arch's scene-test flag); it does not gate the UT jobs themselves. The gated UT jobs do respect `ut_affected`, which is a statement about test category rather than silicon. `packaging-matrix` respects the corpus axis, which is a statement about which corpus a job reads: neither `examples/` nor `tests/` is in `wheel.packages`, so a diff confined to either partition cannot change what the packaging job builds.
 - **`non_code_only` is the same `NON_CODE` set, not a narrower one.** It is `true` when no changed file falls outside it. Nothing in the set can change what the code does, and no workflow consumes any of it beyond its own gate: `pre-commit` is ungated so it always exercises `.pre-commit-config.yaml`, `docs.yml` is unconditional on every PR so it always exercises `mkdocs.yml` / `docs/`, and **no workflow invokes anything under `.claude/`** (`grep -rn '\.claude' .github/workflows/` finds only comments). An **empty diff short-circuits the whole step**: attribution is impossible, so a single guard sets `non_code_only=false`, every arch and category flag `true`, and both corpus flags (`examples_only`, `tests_only`) `false`, then returns — running the full matrix, packaging and the profiling smoke included. That guard is deliberately one place; testing emptiness per flag is what previously left `non_code_only` false while both arch flags also came out false, running UT and packaging but skipping every scene test.
 
   The arch flags subtract `NON_CODE` before deciding, so a non-code-only change already makes both `false`. An arch-gated job therefore needs no separate non-code check. See [`.claude/rules/ci-change-detection.md`](../.claude/rules/ci-change-detection.md) for the invariants these gates must keep.
@@ -353,10 +353,9 @@ not need `--max-parallel` manually.
 ### Framework eager qualification (a2a3 and a5)
 
 `st-framework-eager-a2a3` runs automatically on affected PRs. A5 framework
-eager validation for ordinary PRs is part of `/run-a5`. Both run in the emergency
-lane and Daily. Automatic and emergency callers use the corresponding
-`a2a3_changed && st_affected` or `a5_changed && st_affected` gate; the explicit
-A5 command runs without a change gate. Each uses its architecture runner pool.
+eager validation for ordinary PRs is part of `/run-a5`. Both also run in
+Daily. Automatic A2/A3 validation uses the `a2a3_changed && st_affected`
+gate; the explicit A5 command runs without a change gate. Each uses its architecture runner pool.
 All callers reuse `_st-framework-eager.yml` with an explicit platform. Setup validates `a2a3|a5`, builds `build_package_<platform>`,
 and records the matching onboard runtime roots. The exclusive task checks actual
 silicon before backend import and passes the same platform to identity recording
@@ -368,8 +367,8 @@ not enumerate directories or cases. Ordinary sweeps and compile warm-up select
 the implicit `default` environment, including in Daily. Framework dependencies
 live only in `.venv-framework`, separate from the Program/fork sweep's `.venv`.
 Environment selection is independent of `manual`. The reusable job accepts the
-same `manual_mode` contract as other scene-test jobs: Per-PR and emergency
-callers default to `exclude`, while Daily passes `include`. The existing
+same `manual_mode` contract as other scene-test jobs: PR callers default
+to `exclude`, while Daily passes `include`. The existing
 framework cases are automated, but a future manual case in this environment is
 discovered and included by Daily without another workflow edit.
 
@@ -500,30 +499,20 @@ default branch's definition, so this new command cannot execute on GitHub until
 `ci-a5-comment.yml` is merged into the default branch. Local mocked-API tests
 validate its scripts and topology before that deployment.
 
-### Self-hosted emergency lane (`ci-self.yml`) and the `/run-self` comment
+### Self-hosted CPU runner contract
 
-When GitHub-hosted runners are congested, a repo admin can validate a PR on the
-repo-level self-hosted runners via the emergency lane, bypassing GitHub-hosted
-queueing entirely:
+All seven no-hardware PR jobs (`detect-changes`, `pre-commit`, `ut`,
+`packaging-matrix`, `profiling-flags-smoke`, `st-sim-a2a3`, `st-sim-a5`) use
+`[self-hosted, cpu]`. The runner label accepts either ARM64 or X64 hosts.
+`ut` and `packaging-matrix` verify that the provisioned `python3` matches
+Python 3.10 before creating their project-local venvs. Daily retains separate
+GitHub-hosted Ubuntu/macOS coverage. The A5 comment gate/report and docs jobs
+also use GitHub-hosted runners.
 
-- **Trigger**: comment `/run-self` on the PR (`ci-self-comment.yml`), or
-  `gh workflow run ci-self.yml -f repository=<repo> -f ref=<sha>` manually
-  (covers forks and arbitrary SHAs). The comment gate is
-  `permission(commenter) == 'admin'` only (`getCollaboratorPermissionLevel`).
-  `issue_comment` from fork PRs runs with a read-only token, so the permission
-  check must work under it — verify on first fork-PR use.
-- **What it runs**: checks out `repository@ref` (the PR head), then T1 — the
-  no-hardware Linux jobs (`pre-commit`, `ut`, `packaging`, `profiling-flags-smoke`,
-  `st-sim-{a2a3,a5}`) on `[self-hosted, cpu]` — and T3 — the NPU jobs
-  (`ut-a2a3`, `st-onboard-a2a3`, `ut-a5`, `st-onboard-a5`) on
-  `[self-hosted, a2a3/a5]`. T2 (macOS) is intentionally absent. The lane calls
-  the same reusable job-body workflows as `ci.yml`, passing
-  `setup_variant=self-cpu`, `repository`, `ref`, and self-hosted runner labels
-  where the main CI passes `setup_variant=github` and GitHub-hosted runners.
-  Gate outputs still come from the canonical `detect-changes` workflow, executed
-  on `[self-hosted, cpu]` in this lane.
-- **cpu runner contract**: dnf-installed `cmake ninja-build gcc-c++ clang-tools-extra graphviz gtest-devel python3-devel`, plus a pip-installable torch aarch64 CPU wheel. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on this lane and on the github-hosted ones. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim.
-- The lane run is standalone — it attaches no checks to the PR; results are read from the run.
+Provision Python 3.10, GCC 15, CMake, Ninja, GoogleTest, Graphviz, clang-tidy 18 and a matching CPU Torch wheel on each CPU runner. The distribution package names depend on the host OS. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on CPU and GitHub-hosted runners. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim.
+
+Pip and compiler caches persist on these hosts; CPU jobs use their on-disk
+caches without uploading or downloading them through `actions/cache`.
 
 ## Hardware Classification
 
@@ -531,7 +520,7 @@ Three hardware tiers, applied to all test categories. See [hardware classificati
 
 | Tier | CI Runner | Job examples |
 | ---- | --------- | ------------ |
-| No hardware | `ubuntu-24.04`, `macos-latest` | `ut`, `st-sim-*` |
+| No hardware | `[self-hosted, cpu]` (PR), `ubuntu-24.04` / `macos-latest` (Daily) | `ut`, `st-sim-*` |
 | Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-a2a3`, `st-onboard-a2a3` |
 | Platform-specific (a5) | `[self-hosted, a5]` | `ut-a5`, `st-onboard-a5` |
 
@@ -564,8 +553,9 @@ Both onboard jobs pass `--compile-workers 8`, which caps the entire warm-up at
 eight compiler processes. Class-level concurrency and the parallel artifacts
 inside a large callable share that budget instead of multiplying it. Without an
 override the automatic budget reserves two logical CPUs and caps at eight. The
-sim jobs run on ephemeral GitHub-hosted runners with no restored cache, so they
-compile cold every time and get no warm-up step.
+simulation jobs have no separate warm-up step. PR simulation jobs can reuse
+the CPU runner's on-disk caches; Daily GitHub-hosted jobs start with a cold
+local kernel cache.
 
 The DFX smokes reuse the runner's device allocation after the main scene-test
 sweep. The `run-onboard-dfx-smokes` CI action distributes `dep_gen`, chip
@@ -666,7 +656,7 @@ launcher is passed only when `ccache` is on `PATH`, so a runner whose package
 manager could not serve it still builds; the step prints `ccache --show-stats`
 after the build, which is the only place a restored-but-unusable cache is
 distinguishable from a cold one. Self-hosted runners keep their home directory
-between runs, so the self-hosted emergency lane uses the on-disk cache and skips the
+between runs, so self-hosted CPU runs use the on-disk cache and skip the
 upload.
 
 ### `examples/` — Small examples (sim + onboard)
