@@ -9,6 +9,18 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "scheduler/scheduler_scalar_policy.h"
+
+#if defined(__CCE_AICORE__)
+namespace {
+// Scalar observer binding belongs to the resident translation units.
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = false;
+};
+}  // namespace
+#endif
+
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
 #include "aicore/pmu_collector_aicore.h"

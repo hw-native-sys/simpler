@@ -87,7 +87,7 @@ static inline __aicore__ bool scheduler_service_gm_mix(
 // changes ownership, a frontier, an acknowledgement, or a completion count.
 // Stale observations may postpone work; every positive hint takes the normal
 // ownership validation path before doing that work.
-inline __aicore__ bool scheduler_ordered_poll_may_progress(
+static inline __aicore__ bool scheduler_ordered_poll_may_progress(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, bool *ready_probe_empty = nullptr,
     SchedulerGmMixPhase *ack_prefilter_phase = nullptr
 ) {

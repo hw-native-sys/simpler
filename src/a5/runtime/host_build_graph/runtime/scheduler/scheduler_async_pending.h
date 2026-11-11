@@ -57,16 +57,20 @@ constexpr inline __aicore__ bool ready_to_finish(uint64_t word) {
 
 namespace detail {
 
+namespace {
+
 struct GmAtomics {
     __gm__ volatile uint64_t &word;
     inline __aicore__ uint64_t fetch_add(uint64_t delta) { return scheduler_gm_fetch_add(word, delta); }
 };
 
+}  // namespace
+
 // Registration precedes CHECK publication and the execution's release. The
 // existing block/lane join authorizes exactly one close after every release.
 // Error results can follow an invalid RMW and require failing the run.
 template <typename Atomics>
-inline __aicore__ Outcome register_group(Atomics &atomics) {
+static inline __aicore__ Outcome register_group(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(REGISTERED_UNIT + 1);
     if (!valid(previous)) return {Result::INVALID_WORD, previous};
     if (closed(previous)) return {Result::INVALID_TRANSITION, previous};
@@ -75,7 +79,7 @@ inline __aicore__ Outcome register_group(Atomics &atomics) {
 }
 
 template <typename Atomics>
-inline __aicore__ Outcome close_computation(Atomics &atomics) {
+static inline __aicore__ Outcome close_computation(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(COMPUTATION_CLOSED);
     if (!valid(previous)) return {Result::INVALID_WORD, previous};
     if (closed(previous)) return {Result::INVALID_TRANSITION, previous};
@@ -84,7 +88,7 @@ inline __aicore__ Outcome close_computation(Atomics &atomics) {
 }
 
 template <typename Atomics>
-inline __aicore__ Outcome complete_group(Atomics &atomics) {
+static inline __aicore__ Outcome complete_group(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(UINT64_MAX);
     if (!valid(previous)) return {Result::INVALID_WORD, previous};
     if (pending(previous) == 0) return {Result::COUNT_UNDERFLOW, previous};
@@ -93,17 +97,17 @@ inline __aicore__ Outcome complete_group(Atomics &atomics) {
 
 }  // namespace detail
 
-inline __aicore__ Outcome register_group(__gm__ Join &join) {
+static inline __aicore__ Outcome register_group(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::register_group(atomics);
 }
 
-inline __aicore__ Outcome close_computation(__gm__ Join &join) {
+static inline __aicore__ Outcome close_computation(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::close_computation(atomics);
 }
 
-inline __aicore__ Outcome complete_group(__gm__ Join &join) {
+static inline __aicore__ Outcome complete_group(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::complete_group(atomics);
 }

@@ -18,7 +18,7 @@ inline constexpr uint32_t SCHEDULER_CONTROL_WORK_BUDGET = 64;
 
 // A detached wake chain belongs to one worker until fully routed. No reference
 // is recycled during a run; keeping the remaining head needs no epoch protocol.
-inline __aicore__ bool scheduler_service_controls(
+static inline __aicore__ bool scheduler_service_controls(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool *progress
 ) {

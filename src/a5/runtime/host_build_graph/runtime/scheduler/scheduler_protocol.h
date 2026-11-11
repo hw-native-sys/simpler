@@ -31,7 +31,7 @@ scheduler_protocol_check_region(uint64_t offset, uint64_t count, uint64_t stride
 }
 
 template <typename Local>
-inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const Local *local) {
+static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const Local *local) {
     if (base == nullptr || local == nullptr || local->config.graph == nullptr ||
         local->config.graph_summary_offset == 0)
         return false;
@@ -98,7 +98,7 @@ scheduler_protocol_worker_at(__gm__ void *base, const Local *local, __gm__ const
 }
 
 template <typename Local>
-inline __aicore__ void scheduler_protocol_fail(
+static inline __aicore__ void scheduler_protocol_fail(
     __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout, uint64_t error
 ) {
     auto *worker = scheduler_protocol_worker_at(base, local, layout);
@@ -107,7 +107,7 @@ inline __aicore__ void scheduler_protocol_fail(
 }
 
 template <typename Local>
-inline __aicore__ bool scheduler_protocol_stamp_at(
+static inline __aicore__ bool scheduler_protocol_stamp_at(
     __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout,
     __gm__ SchedulerProtocolStamp *stamp, uint64_t cycles
 ) {
@@ -132,7 +132,7 @@ inline __aicore__ bool scheduler_protocol_stamp_at(
 }
 
 template <typename Local>
-inline __aicore__ bool scheduler_protocol_stamp(
+static inline __aicore__ bool scheduler_protocol_stamp(
     __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout,
     __gm__ SchedulerProtocolStamp *stamp
 ) {
@@ -150,21 +150,21 @@ inline __aicore__ uint64_t scheduler_protocol_cycles(const Local *local) {
 }
 
 template <typename T>
-inline __aicore__ void scheduler_protocol_publish_record(__gm__ T *record) {
+static inline __aicore__ void scheduler_protocol_publish_record(__gm__ T *record) {
     for (uint64_t offset = 0; offset < sizeof(T); offset += 64)
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(record) + offset);
     scheduler_cache_barrier();
 }
 
 template <typename T>
-inline __aicore__ void scheduler_protocol_observe_record(__gm__ T *record) {
+static inline __aicore__ void scheduler_protocol_observe_record(__gm__ T *record) {
     for (uint64_t offset = 0; offset < sizeof(T); offset += 64)
         scheduler_invalidate_cache_line(reinterpret_cast<__gm__ uint8_t *>(record) + offset);
     scheduler_cache_barrier();
 }
 
 template <typename Local>
-inline __aicore__ void scheduler_protocol_task_actor(
+static inline __aicore__ void scheduler_protocol_task_actor(
     __gm__ void *base, const Local *local, int64_t task, uint64_t order, uint32_t flags, bool completion, bool before
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -196,7 +196,7 @@ inline __aicore__ void scheduler_protocol_task_actor(
 }
 
 template <typename Local>
-inline __aicore__ __gm__ SchedulerProtocolExecutionTrace *scheduler_protocol_execution_at(
+static inline __aicore__ __gm__ SchedulerProtocolExecutionTrace *scheduler_protocol_execution_at(
     __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout, int64_t task, uint32_t block,
     uint32_t subtask
 ) {
@@ -220,7 +220,7 @@ inline __aicore__ __gm__ SchedulerProtocolExecutionTrace *scheduler_protocol_exe
 }
 
 template <typename Local, typename Claim, typename Ready>
-inline __aicore__ void scheduler_protocol_payload_publication(
+static inline __aicore__ void scheduler_protocol_payload_publication(
     __gm__ void *base, Local *local, const Claim &claim, const Ready &ready, bool before
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -284,14 +284,14 @@ inline __aicore__ void scheduler_protocol_payload_publication(
 }
 
 template <typename Local>
-inline __aicore__ void scheduler_protocol_admission(
+static inline __aicore__ void scheduler_protocol_admission(
     __gm__ void *base, const Local *local, int64_t task, uint64_t order, uint32_t flags, bool before
 ) {
     scheduler_protocol_task_actor(base, local, task, order, flags, false, before);
 }
 
 template <typename Local>
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task, bool before, bool deferred = false) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -331,7 +331,7 @@ scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task
 }
 
 template <typename Local, typename Admission>
-inline __aicore__ __gm__ SchedulerProtocolMemberTrace *scheduler_protocol_member_at(
+static inline __aicore__ __gm__ SchedulerProtocolMemberTrace *scheduler_protocol_member_at(
     __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout, const Admission *admission
 ) {
     if (admission == nullptr || admission->epoch != layout->run_epoch ||
@@ -345,7 +345,7 @@ inline __aicore__ __gm__ SchedulerProtocolMemberTrace *scheduler_protocol_member
 }
 
 template <typename Local, typename Admission>
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_protocol_member_observed(__gm__ void *base, const Local *local, const Admission *admission, uint64_t tail) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -365,7 +365,7 @@ scheduler_protocol_member_observed(__gm__ void *base, const Local *local, const 
 }
 
 template <typename Local, typename Admission>
-inline __aicore__ void scheduler_protocol_member_closed(
+static inline __aicore__ void scheduler_protocol_member_closed(
     __gm__ void *base, const Local *local, const Admission *admission, uint64_t cursor, uint64_t seal,
     uint64_t last_group_seq, bool used_claim_seal = false
 ) {
@@ -397,7 +397,7 @@ inline __aicore__ void scheduler_protocol_member_closed(
 }
 
 template <typename Local>
-inline __aicore__ void scheduler_protocol_finish(__gm__ void *base, const Local *local, bool success) {
+static inline __aicore__ void scheduler_protocol_finish(__gm__ void *base, const Local *local, bool success) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
     auto *worker = scheduler_protocol_worker_at(base, local, layout);

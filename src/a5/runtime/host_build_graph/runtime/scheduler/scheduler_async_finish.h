@@ -15,7 +15,7 @@
 #include "scheduler_completion_resolver.h"
 #include "scheduler_protocol_execution.h"
 
-inline __aicore__ bool scheduler_async_finish_step(
+static inline __aicore__ bool scheduler_async_finish_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAsyncLocalState &async, uint32_t budget, bool &made_progress, uint64_t profiling_level = 0
 ) {
@@ -80,7 +80,7 @@ inline __aicore__ bool scheduler_async_finish_step(
     return true;
 }
 
-inline __aicore__ bool scheduler_service_async_slice(
+static inline __aicore__ bool scheduler_service_async_slice(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool &made_progress
 ) {

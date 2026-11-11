@@ -30,15 +30,15 @@ static_assert(sizeof(SchedulerErrorIdentity) == 48, "error identity capture size
 // The status line has a single writer and never uses AICore atomics. A
 // device load therefore reads the publication itself, not an atomic's
 // potentially undrained copy. Identity fields retain their atomic access.
-inline __aicore__ uint64_t scheduler_read_error(__gm__ SchedulerRunControl *run_control) {
+static inline __aicore__ uint64_t scheduler_read_error(__gm__ SchedulerRunControl *run_control) {
     return scheduler_gm_query(run_control->scheduler_error);
 }
 
-inline __aicore__ void scheduler_publish_error(__gm__ SchedulerRunControl *run_control, uint64_t status) {
+static inline __aicore__ void scheduler_publish_error(__gm__ SchedulerRunControl *run_control, uint64_t status) {
     scheduler_publish_signal(run_control->scheduler_error, status);
 }
 
-inline __aicore__ void scheduler_record_error(
+static inline __aicore__ void scheduler_record_error(
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph = nullptr, __gm__ const SchedulerWorkerContext *context = nullptr,
     SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN, const SchedulerErrorIdentity *identity = nullptr

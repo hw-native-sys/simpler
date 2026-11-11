@@ -74,6 +74,8 @@ struct SchedulerAsyncLeaseOutcome {
 
 namespace scheduler_async_state_detail {
 
+namespace {
+
 struct GmAtomics {
     __gm__ volatile uint64_t &word;
 
@@ -83,6 +85,8 @@ struct GmAtomics {
     }
     inline __aicore__ uint64_t fetch_add(uint64_t delta) { return scheduler_gm_fetch_add(word, delta); }
 };
+
+}  // namespace
 
 template <typename Atomics>
 inline __aicore__ SchedulerAsyncLeaseOutcome transition(Atomics &atomics, uint64_t expected, uint64_t desired) {
@@ -96,7 +100,7 @@ inline __aicore__ SchedulerAsyncLeaseOutcome transition(Atomics &atomics, uint64
 }
 
 template <typename Atomics>
-inline __aicore__ SchedulerAsyncLeaseOutcome claim(Atomics &atomics, uint64_t observed) {
+static inline __aicore__ SchedulerAsyncLeaseOutcome claim(Atomics &atomics, uint64_t observed) {
     if (!scheduler_async_lease_word_valid(observed)) return {SchedulerAsyncLeaseResult::INVALID_WORD, observed};
     if (scheduler_async_lease_phase(observed) != SchedulerAsyncPhase::RUNNABLE)
         return {SchedulerAsyncLeaseResult::NOT_RUNNABLE, observed};
@@ -133,11 +137,11 @@ owner_transition(Atomics &atomics, uint64_t owned, SchedulerAsyncPhase desired_p
 // All live accesses are atomic. No lease is reset while any run participant may
 // retain an old word. Run identity, execution ownership and data/progress
 // barriers belong to the caller.
-inline __aicore__ uint64_t scheduler_async_lease_load(__gm__ SchedulerAsyncLease &lease) {
+static inline __aicore__ uint64_t scheduler_async_lease_load(__gm__ SchedulerAsyncLease &lease) {
     return scheduler_gm_fetch_add(lease.word, UINT64_C(0));
 }
 
-inline __aicore__ SchedulerAsyncLeaseOutcome scheduler_async_lease_publish(__gm__ SchedulerAsyncLease &lease) {
+static inline __aicore__ SchedulerAsyncLeaseOutcome scheduler_async_lease_publish(__gm__ SchedulerAsyncLease &lease) {
     scheduler_async_state_detail::GmAtomics atomics{lease.word};
     return scheduler_async_state_detail::transition(
         atomics, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT),
@@ -145,25 +149,25 @@ inline __aicore__ SchedulerAsyncLeaseOutcome scheduler_async_lease_publish(__gm_
     );
 }
 
-inline __aicore__ SchedulerAsyncLeaseOutcome
+static inline __aicore__ SchedulerAsyncLeaseOutcome
 scheduler_async_lease_try_claim(__gm__ SchedulerAsyncLease &lease, uint64_t observed) {
     scheduler_async_state_detail::GmAtomics atomics{lease.word};
     return scheduler_async_state_detail::claim(atomics, observed);
 }
 
-inline __aicore__ SchedulerAsyncLeaseOutcome
+static inline __aicore__ SchedulerAsyncLeaseOutcome
 scheduler_async_lease_release(__gm__ SchedulerAsyncLease &lease, uint64_t owned) {
     scheduler_async_state_detail::GmAtomics atomics{lease.word};
     return scheduler_async_state_detail::owner_transition(atomics, owned, SchedulerAsyncPhase::RUNNABLE);
 }
 
-inline __aicore__ SchedulerAsyncLeaseOutcome
+static inline __aicore__ SchedulerAsyncLeaseOutcome
 scheduler_async_lease_finish(__gm__ SchedulerAsyncLease &lease, uint64_t owned) {
     scheduler_async_state_detail::GmAtomics atomics{lease.word};
     return scheduler_async_state_detail::owner_transition(atomics, owned, SchedulerAsyncPhase::TERMINAL);
 }
 
-inline __aicore__ SchedulerAsyncLeaseOutcome
+static inline __aicore__ SchedulerAsyncLeaseOutcome
 scheduler_async_lease_fail(__gm__ SchedulerAsyncLease &lease, uint64_t expected) {
     if (!scheduler_async_lease_word_valid(expected)) return {SchedulerAsyncLeaseResult::INVALID_WORD, expected};
     const auto phase = scheduler_async_lease_phase(expected);

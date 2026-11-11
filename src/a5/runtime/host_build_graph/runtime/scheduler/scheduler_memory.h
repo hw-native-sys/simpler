@@ -20,7 +20,7 @@
 // Capture ordinary operands and address values by value at observer calls.
 // GM words retain reference captures so their accesses stay inside the timed
 // primitive, while caller temporaries do not escape through the callback.
-inline __aicore__ void scheduler_writeback_cache_line(__gm__ void *address) {
+static inline __aicore__ void scheduler_writeback_cache_line(__gm__ void *address) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDcciOut, 1, [address]() __aicore__ {
 #if defined(__CCE_AICORE__)
         dcci(address, SINGLE_CACHE_LINE, CACHELINE_OUT);
@@ -30,11 +30,11 @@ inline __aicore__ void scheduler_writeback_cache_line(__gm__ void *address) {
     });
 }
 
-inline __aicore__ void scheduler_writeback_cache_line(volatile __gm__ void *address) {
+static inline __aicore__ void scheduler_writeback_cache_line(volatile __gm__ void *address) {
     scheduler_writeback_cache_line(const_cast<__gm__ void *>(address));
 }
 
-inline __aicore__ void scheduler_cache_barrier() {
+static inline __aicore__ void scheduler_cache_barrier() {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDsbAll, 1, []() __aicore__ {
 #if defined(__CCE_AICORE__)
         dsb((mem_dsb_t)0);
@@ -44,16 +44,16 @@ inline __aicore__ void scheduler_cache_barrier() {
     });
 }
 
-inline __aicore__ void scheduler_publish_cache_line(__gm__ void *address) {
+static inline __aicore__ void scheduler_publish_cache_line(__gm__ void *address) {
     scheduler_writeback_cache_line(address);
     scheduler_cache_barrier();
 }
 
-inline __aicore__ void scheduler_publish_cache_line(volatile __gm__ void *address) {
+static inline __aicore__ void scheduler_publish_cache_line(volatile __gm__ void *address) {
     scheduler_publish_cache_line(const_cast<__gm__ void *>(address));
 }
 
-inline __aicore__ void scheduler_invalidate_cache_line(__gm__ void *address) {
+static inline __aicore__ void scheduler_invalidate_cache_line(__gm__ void *address) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDcciSingle, 1, [address]() __aicore__ {
 #if defined(__CCE_AICORE__)
         dcci(address, SINGLE_CACHE_LINE);
@@ -63,20 +63,20 @@ inline __aicore__ void scheduler_invalidate_cache_line(__gm__ void *address) {
     });
 }
 
-inline __aicore__ void scheduler_invalidate_cache_line(volatile __gm__ void *address) {
+static inline __aicore__ void scheduler_invalidate_cache_line(volatile __gm__ void *address) {
     scheduler_invalidate_cache_line(const_cast<__gm__ void *>(address));
 }
 
-inline __aicore__ void scheduler_observe_cache_line(__gm__ void *address) {
+static inline __aicore__ void scheduler_observe_cache_line(__gm__ void *address) {
     scheduler_invalidate_cache_line(address);
     scheduler_cache_barrier();
 }
 
-inline __aicore__ void scheduler_observe_cache_line(volatile __gm__ void *address) {
+static inline __aicore__ void scheduler_observe_cache_line(volatile __gm__ void *address) {
     scheduler_observe_cache_line(const_cast<__gm__ void *>(address));
 }
 
-inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address) {
+static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address) {
 #if defined(__CCE_AICORE__)
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDcciEntire, 1, [address]() __aicore__ {
         dcci(address, ENTIRE_DATA_CACHE);
@@ -88,12 +88,12 @@ inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address) {
 #endif
 }
 
-inline __aicore__ void scheduler_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
+static inline __aicore__ void scheduler_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
     for (uint64_t offset = 0; offset < sizeof(DispatchPayload); offset += 64)
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(payload) + offset);
 }
 
-inline __aicore__ void scheduler_observe_dispatch_payload_control(__gm__ DispatchPayload *payload) {
+static inline __aicore__ void scheduler_observe_dispatch_payload_control(__gm__ DispatchPayload *payload) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDcciSingle, 1, [payload]() __aicore__ {
 #if defined(__CCE_AICORE__)
         dcci(payload, SINGLE_CACHE_LINE);
@@ -103,12 +103,12 @@ inline __aicore__ void scheduler_observe_dispatch_payload_control(__gm__ Dispatc
     });
 }
 
-inline __aicore__ void scheduler_observe_dispatch_payload_arguments(__gm__ DispatchPayload *payload) {
+static inline __aicore__ void scheduler_observe_dispatch_payload_arguments(__gm__ DispatchPayload *payload) {
     for (uint64_t offset = 64; offset < sizeof(DispatchPayload); offset += 64)
         scheduler_invalidate_cache_line(reinterpret_cast<__gm__ uint8_t *>(payload) + offset);
 }
 
-inline __aicore__ void scheduler_observe_dispatch_payload_barrier() {
+static inline __aicore__ void scheduler_observe_dispatch_payload_barrier() {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDsbAll, 1, []() __aicore__ {
 #if defined(__CCE_AICORE__)
         dsb((mem_dsb_t)0);
@@ -125,7 +125,7 @@ inline __aicore__ void scheduler_observe_dispatch_payload_barrier() {
 // Reserve it for words whose staleness breaks a protocol -- it is a
 // read-modify-write, so a hot poll shared by every core stays on
 // scheduler_gm_query.
-inline __aicore__ int64_t scheduler_gm_load(__gm__ volatile int64_t &value) {
+static inline __aicore__ int64_t scheduler_gm_load(__gm__ volatile int64_t &value) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicLoad, [&value]() __aicore__ {
 #if defined(__CCE_AICORE__)
         __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value));
@@ -143,7 +143,7 @@ inline __aicore__ int64_t scheduler_gm_load(__gm__ volatile int64_t &value) {
 // The memory order every wrapper below takes is honored by the host and sim
 // build, whose implementation is a C++ atomic. An AICore reaches ordering
 // through explicit barriers instead, so the parameter is inert there.
-inline __aicore__ int64_t scheduler_gm_query(__gm__ volatile int64_t &value, int order = __ATOMIC_ACQUIRE) {
+static inline __aicore__ int64_t scheduler_gm_query(__gm__ volatile int64_t &value, int order = __ATOMIC_ACQUIRE) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [&value, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)order;
@@ -156,7 +156,7 @@ inline __aicore__ int64_t scheduler_gm_query(__gm__ volatile int64_t &value, int
     });
 }
 
-inline __aicore__ uint64_t scheduler_gm_query(__gm__ volatile uint64_t &value, int order = __ATOMIC_ACQUIRE) {
+static inline __aicore__ uint64_t scheduler_gm_query(__gm__ volatile uint64_t &value, int order = __ATOMIC_ACQUIRE) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [&value, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)order;
@@ -167,7 +167,8 @@ inline __aicore__ uint64_t scheduler_gm_query(__gm__ volatile uint64_t &value, i
     });
 }
 
-inline __aicore__ uint64_t scheduler_gm_query_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
+static inline __aicore__ uint64_t
+scheduler_gm_query_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [values, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)order;
@@ -182,7 +183,7 @@ inline __aicore__ uint64_t scheduler_gm_query_u32_pair(__gm__ volatile uint32_t 
     });
 }
 
-inline __aicore__ void scheduler_store_barrier() {
+static inline __aicore__ void scheduler_store_barrier() {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDsbDdr, 1, []() __aicore__ {
 #if defined(__CCE_AICORE__)
         dsb(DSB_DDR);
@@ -194,7 +195,7 @@ inline __aicore__ void scheduler_store_barrier() {
     });
 }
 
-inline __aicore__ void scheduler_ddr_barrier() {
+static inline __aicore__ void scheduler_ddr_barrier() {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDsbDdr, 1, []() __aicore__ {
 #if defined(__CCE_AICORE__)
         dsb(DSB_DDR);
@@ -208,7 +209,7 @@ inline __aicore__ void scheduler_ddr_barrier() {
 // handoff. While workers run, its whole cache line excludes AICore RMW,
 // cached stores and dirty writeback. Payload ordering belongs to the caller.
 template <typename Word>
-inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Word desired) {
+static inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Word desired) {
     static_assert(std::is_same_v<Word, int64_t> || std::is_same_v<Word, uint64_t>);
 #if defined(__CCE_AICORE__)
     auto *address = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ Word *>(&value));
@@ -223,7 +224,7 @@ inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Wor
 
 // Shared ownership words and atomic-published data retain atomic exchange.
 // Their lines exclude cached writes that could restore old values.
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_gm_store(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarAtomicStoreIssue, 1, [&value, desired, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
@@ -235,7 +236,7 @@ scheduler_gm_store(__gm__ volatile int64_t &value, int64_t desired, int order = 
     });
 }
 
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_gm_store(__gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarAtomicStoreIssue, 1, [&value, desired, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
@@ -247,7 +248,7 @@ scheduler_gm_store(__gm__ volatile uint64_t &value, uint64_t desired, int order 
     });
 }
 
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_gm_store(__gm__ volatile uint32_t &value, uint32_t desired, int order = __ATOMIC_RELEASE) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarAtomicStoreIssue, 1, [&value, desired, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
@@ -259,7 +260,7 @@ scheduler_gm_store(__gm__ volatile uint32_t &value, uint32_t desired, int order 
     });
 }
 
-inline __aicore__ int64_t
+static inline __aicore__ int64_t
 scheduler_gm_exchange(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_ACQ_REL) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicExchange, [&value, desired, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
@@ -271,7 +272,7 @@ scheduler_gm_exchange(__gm__ volatile int64_t &value, int64_t desired, int order
     });
 }
 
-inline __aicore__ uint64_t
+static inline __aicore__ uint64_t
 scheduler_gm_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta, int order = __ATOMIC_ACQ_REL) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicFetchAdd, [&value, delta, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
@@ -283,7 +284,7 @@ scheduler_gm_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta, int orde
     });
 }
 
-inline __aicore__ int64_t scheduler_gm_compare_exchange(
+static inline __aicore__ int64_t scheduler_gm_compare_exchange(
     __gm__ volatile int64_t &value, int64_t expected, int64_t desired, int success_order = __ATOMIC_ACQ_REL,
     int failure_order = __ATOMIC_ACQUIRE
 ) {
@@ -302,7 +303,7 @@ inline __aicore__ int64_t scheduler_gm_compare_exchange(
     );
 }
 
-inline __aicore__ uint64_t scheduler_gm_compare_exchange(
+static inline __aicore__ uint64_t scheduler_gm_compare_exchange(
     __gm__ volatile uint64_t &value, uint64_t expected, uint64_t desired, int success_order = __ATOMIC_ACQ_REL,
     int failure_order = __ATOMIC_ACQUIRE
 ) {
@@ -321,7 +322,7 @@ inline __aicore__ uint64_t scheduler_gm_compare_exchange(
     );
 }
 
-inline __aicore__ uint64_t
+static inline __aicore__ uint64_t
 scheduler_gm_fetch_or(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)
     (void)order;
@@ -337,7 +338,7 @@ scheduler_gm_fetch_or(__gm__ volatile uint64_t &value, uint64_t bits, int order 
 #endif
 }
 
-inline __aicore__ uint64_t
+static inline __aicore__ uint64_t
 scheduler_gm_fetch_and(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
 #if defined(__CCE_AICORE__)
     (void)order;
@@ -353,7 +354,7 @@ scheduler_gm_fetch_and(__gm__ volatile uint64_t &value, uint64_t bits, int order
 #endif
 }
 
-inline __aicore__ void scheduler_gm_fetch_add_discard(__gm__ volatile uint64_t &value, uint64_t delta) {
+static inline __aicore__ void scheduler_gm_fetch_add_discard(__gm__ volatile uint64_t &value, uint64_t delta) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarAtomicFetchAddIssue, 1, [&value, delta]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);

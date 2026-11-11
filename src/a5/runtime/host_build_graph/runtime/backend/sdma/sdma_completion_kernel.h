@@ -36,6 +36,8 @@ inline constexpr uint32_t SDMA_SCRATCH_ALIGNMENT = pto::comm::sdma::UB_ALIGN_SIZ
 
 namespace pto2::detail {
 
+namespace {
+
 class SdmaSubmissionScope {
 public:
     __aicore__ SdmaSubmissionScope() = default;
@@ -85,6 +87,8 @@ private:
     bool owned_{false};
 };
 
+}  // namespace
+
 }  // namespace pto2::detail
 
 // SdmaRequestDescriptor bundles everything send_request_entry needs to drive
@@ -129,7 +133,7 @@ inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> Sdma
 // AsyncCtx deferred-wait slab and flushes. Returns false on submit/session
 // failure (also records the error in ctx.completion_error_code).
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
-inline __aicore__ bool
+static inline __aicore__ bool
 send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
     if (!async_ctx_is_deferred(ctx) ||
         (ctx.resident_enabled == 0 && (ctx.completion_count == nullptr || ctx.completion_entries == nullptr ||

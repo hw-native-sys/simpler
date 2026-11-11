@@ -123,16 +123,20 @@ inline __aicore__ SchedulerArgsDumpStatus scheduler_args_dump_ack_status(const S
                SchedulerArgsDumpStatus::Idle;
 }
 
+namespace {
+
 struct SchedulerArgsDumpAckReader {
     inline __aicore__ uint64_t load(__gm__ uint64_t &word) const { return scheduler_gm_query(word); }
     inline __aicore__ void barrier() const { scheduler_cache_barrier(); }
 };
 
+}  // namespace
+
 // ld_dev does not implement C++ acquire ordering. Explicit DSBs separate the
 // probes and body loads. The final tick probe follows the second commit probe
 // so a same-state chunk update cannot hide behind a reused commit value.
 template <typename Reader = SchedulerArgsDumpAckReader>
-inline __aicore__ bool scheduler_args_dump_observe_ack(
+static inline __aicore__ bool scheduler_args_dump_observe_ack(
     __gm__ SchedulerArgsDumpAck *ack, SchedulerArgsDumpAck *observed, Reader reader = Reader{}
 ) {
     *observed = {};
@@ -305,7 +309,7 @@ inline __aicore__ uint64_t scheduler_args_dump_publisher(uint32_t worker) {
 // These phase words are published by AICore atomics. On A5, ld_dev can
 // observe stale atomic results even after DSB; confirmation uses an atomic
 // read. AICPU only reads its invalidated copy and never mutates this line.
-inline __aicore__ uint64_t scheduler_args_dump_load(__gm__ volatile uint64_t &word) {
+static inline __aicore__ uint64_t scheduler_args_dump_load(__gm__ volatile uint64_t &word) {
 #if defined(__CCE_AICORE__)
     return scheduler_gm_fetch_add(word, UINT64_C(0));
 #else
@@ -313,14 +317,14 @@ inline __aicore__ uint64_t scheduler_args_dump_load(__gm__ volatile uint64_t &wo
 #endif
 }
 
-inline __aicore__ bool scheduler_args_dump_task_valid(__gm__ SchedulerArgsDumpTask *task) {
+static inline __aicore__ bool scheduler_args_dump_task_valid(__gm__ SchedulerArgsDumpTask *task) {
     return task != nullptr && task->active_mask != 0 && (task->active_mask & ~UINT64_C(7)) == 0 &&
            task->expected_participants != 0 && task->expected_participants <= INT16_MAX &&
            scheduler_args_dump_load(task->aborted) == 0;
 }
 
 // BEFORE does not await future blocks: a task may occupy more than one wave.
-inline __aicore__ SchedulerArgsDumpArrival scheduler_args_dump_enter(__gm__ SchedulerArgsDumpTask *task) {
+static inline __aicore__ SchedulerArgsDumpArrival scheduler_args_dump_enter(__gm__ SchedulerArgsDumpTask *task) {
     if (!scheduler_args_dump_task_valid(task)) return SchedulerArgsDumpArrival::Invalid;
     const uint64_t prior = scheduler_gm_compare_exchange(task->before_state, UINT64_C(0), UINT64_C(1));
     if (prior == 0) return SchedulerArgsDumpArrival::Publisher;
@@ -328,7 +332,7 @@ inline __aicore__ SchedulerArgsDumpArrival scheduler_args_dump_enter(__gm__ Sche
     return prior == 2 ? SchedulerArgsDumpArrival::Ready : SchedulerArgsDumpArrival::Invalid;
 }
 
-inline __aicore__ bool scheduler_args_dump_can_execute(__gm__ SchedulerArgsDumpTask *task) {
+static inline __aicore__ bool scheduler_args_dump_can_execute(__gm__ SchedulerArgsDumpTask *task) {
     if (!scheduler_args_dump_task_valid(task) || scheduler_args_dump_load(task->before_state) != 2) return false;
     scheduler_cache_barrier();
     return true;
@@ -337,7 +341,7 @@ inline __aicore__ bool scheduler_args_dump_can_execute(__gm__ SchedulerArgsDumpT
 // Every caller publishes its output cache writes before this RMW. Earlier
 // blocks retire normally; the last one holds the task's final completion.
 template <typename Publish>
-inline __aicore__ SchedulerArgsDumpArrival
+static inline __aicore__ SchedulerArgsDumpArrival
 scheduler_args_dump_return(__gm__ SchedulerArgsDumpTask *task, Publish publish) {
     if (!scheduler_args_dump_can_execute(task)) return SchedulerArgsDumpArrival::Invalid;
     if (!publish()) {
@@ -355,7 +359,7 @@ scheduler_args_dump_return(__gm__ SchedulerArgsDumpTask *task, Publish publish) 
                                                       SchedulerArgsDumpArrival::Waiting;
 }
 
-inline __aicore__ bool scheduler_args_dump_seal(
+static inline __aicore__ bool scheduler_args_dump_seal(
     __gm__ SchedulerArgsDumpTask *task, ArgsDumpStage stage, const SchedulerArgsDumpAck &ack, uint64_t epoch,
     uint64_t request_tick
 ) {
@@ -375,7 +379,7 @@ inline __aicore__ bool scheduler_args_dump_seal(
     return true;
 }
 
-inline __aicore__ bool scheduler_args_dump_can_complete(__gm__ SchedulerArgsDumpTask *task) {
+static inline __aicore__ bool scheduler_args_dump_can_complete(__gm__ SchedulerArgsDumpTask *task) {
     return scheduler_args_dump_can_execute(task) &&
            scheduler_args_dump_load(task->returned_participants) == task->expected_participants &&
            scheduler_args_dump_load(task->after_sealed) == 1;

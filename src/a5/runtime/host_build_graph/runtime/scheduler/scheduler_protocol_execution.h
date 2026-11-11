@@ -22,7 +22,7 @@ inline __aicore__ bool scheduler_protocol_execution_matches(
            record->pending_slot == pending_slot;
 }
 
-inline __aicore__ void scheduler_protocol_execution_permit(
+static inline __aicore__ void scheduler_protocol_execution_permit(
     __gm__ void *base, const SchedulerLocalState *local, uint32_t pending_slot, uint64_t tail, bool has_log
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -72,7 +72,7 @@ inline __aicore__ void scheduler_protocol_execution_permit(
     scheduler_protocol_publish_record(record);
 }
 
-inline __aicore__ void scheduler_protocol_execution_entry(
+static inline __aicore__ void scheduler_protocol_execution_entry(
     __gm__ void *base, SchedulerLocalState *local, uint32_t pending_slot, __gm__ const DispatchPayload *payload
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -100,7 +100,7 @@ inline __aicore__ void scheduler_protocol_execution_entry(
     scheduler_protocol_publish_record(record);
 }
 
-inline __aicore__ void scheduler_protocol_execution_returned(
+static inline __aicore__ void scheduler_protocol_execution_returned(
     __gm__ void *base, const SchedulerLocalState *local, uint32_t pending_slot, uint64_t returned, uint64_t visible
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -123,7 +123,7 @@ inline __aicore__ void scheduler_protocol_execution_returned(
     scheduler_protocol_publish_record(record);
 }
 
-inline __aicore__ void scheduler_protocol_execution_consumed(
+static inline __aicore__ void scheduler_protocol_execution_consumed(
     __gm__ void *base, const SchedulerLocalState *local, uint32_t pending_slot, const SchedulerLocalSlotState &slot
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -140,7 +140,7 @@ inline __aicore__ void scheduler_protocol_execution_consumed(
     scheduler_protocol_publish_record(record);
 }
 
-inline __aicore__ void scheduler_protocol_execution_trace_published(
+static inline __aicore__ void scheduler_protocol_execution_trace_published(
     __gm__ void *base, const SchedulerLocalState *local, int64_t task, uint32_t block, uint32_t subtask,
     uint32_t pending_slot
 ) {

@@ -17,7 +17,7 @@
 
 // Idle and the run epilogue flush pending counts; native runs also publish
 // bounded progress batches. Trace/error publication precedes the exit count.
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLocalState *local) {
     const uint64_t completed = local->pending_completed;
     if (completed == 0) return;
@@ -26,7 +26,7 @@ scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLo
     local->pending_completed = 0;
 }
 
-inline __aicore__ void scheduler_account_failed_completion(
+static inline __aicore__ void scheduler_account_failed_completion(
     const SchedulerGraphAccess &graph, SchedulerLocalState *scheduler, __gm__ SchedulerRunControl *run_control,
     int64_t task_ref, SchedulerErrorSite error_site
 ) {

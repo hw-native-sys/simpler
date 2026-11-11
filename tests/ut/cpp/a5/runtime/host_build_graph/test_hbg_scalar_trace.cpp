@@ -18,6 +18,7 @@
 
 #include "scheduler/scheduler_async_control.h"
 #include "scheduler/scheduler_scalar_trace.h"
+#include "scalar_policy_test_support.h"
 
 namespace {
 uint32_t kind(const SchedulerScalarRecord &record) { return record.kind & 0xffffU; }
@@ -489,4 +490,20 @@ TEST(HbgScalarTrace, FinishCoversAllDirectWritesAndReportsTerminalPublication) {
     EXPECT_EQ(buffer->scalar_storage_slots, trace.storage_slots);
     EXPECT_EQ(buffer->scalar_committed, trace.committed);
     EXPECT_EQ(buffer->scalar_dropped, 0u);
+}
+
+TEST(HbgScalarTrace, LinkedTranslationUnitsRetainTheirInstrumentationPolicy) {
+    for (int invocation = 0; invocation < 2; ++invocation) {
+        const auto plain = scalar_policy_plain();
+        EXPECT_EQ(plain.value, 37u);
+        EXPECT_EQ(plain.join_word, scheduler_async_pending::REGISTERED_UNIT + 1);
+        EXPECT_EQ(plain.records, 0u);
+        const auto profiled = scalar_policy_profiled();
+        EXPECT_EQ(profiled.value, plain.value);
+        EXPECT_EQ(profiled.join_word, plain.join_word);
+        EXPECT_EQ(profiled.bypass_loads, 1u);
+        EXPECT_EQ(profiled.atomic_adds, 1u);
+        EXPECT_EQ(profiled.ordered_polls, 1u);
+        EXPECT_EQ(scheduler_scalar_current(), nullptr);
+    }
 }

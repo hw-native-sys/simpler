@@ -12,6 +12,7 @@
 #pragma once
 
 #include "scheduler_types.h"
+#include "scheduler_scalar_policy.h"
 #include "host_build_graph/sched_phase_kind.h"
 
 #if defined(__CPU_SIM)
@@ -56,7 +57,7 @@ struct SchedulerScalarTrace {
     uint32_t dropped{0};
     uint32_t depth{0};
 
-    inline __aicore__ void write(const SchedulerScalarRecord &record) {
+    inline __aicore__ __attribute__((always_inline)) void write(const SchedulerScalarRecord &record) {
         if (record.end_time < record.start_time || committed >= SCHEDULER_SCALAR_RECORD_CAPACITY ||
             (record.kind & SCHEDULER_SCALAR_STORAGE_EXTENDED) != 0) {
             if (dropped != UINT32_MAX) ++dropped;
@@ -122,6 +123,12 @@ struct SchedulerScalarTrace {
         );
     }
 
+    inline __aicore__ __attribute__((always_inline)) void
+    append_memory(SchedPhaseKind kind, uint64_t begin, uint64_t end, uint32_t calls = 1) {
+        if (buffer == nullptr) return;
+        write({begin, end, -1, static_cast<uint32_t>(kind) | ((depth + 1) << 16), calls});
+    }
+
     inline __aicore__ void end_iteration(bool progress) {
         if (buffer != nullptr && !progress) ++poll_loops;
     }
@@ -177,20 +184,24 @@ struct SchedulerScalarTrace {
 
 // The slot belongs to this physical core (or one CPU test thread). Binding is
 // confined to the resident scheduler lifetime and never survives its return.
+static constexpr bool kSchedulerScalarInstrumentation = SchedulerScalarCompilation<>::enabled;
 #if defined(__CCE_AICORE__)
 [[block_local]] static SchedulerScalarTrace *scheduler_scalar_active = nullptr;
-// A block-local object's address is invariant during this core's invocation.
-// Reuse its address calculation across memory accesses, but always load the
-// slot's current value: binding changes between initialization and teardown.
-static __aicore__ __attribute__((noinline, const)) auto scheduler_scalar_slot() {
+// Primitive wrappers own the slot address calculation and load its current
+// binding; no observer pointer survives initialization or teardown.
+static inline __aicore__ __attribute__((always_inline)) auto scheduler_scalar_slot() {
     auto *slot = &scheduler_scalar_active;
-    // Preserve the shared address computation through constant-return folding.
-    // The register identity does not read memory or change the slot address.
+    // The register identity preserves the core-local address through folding.
     asm("MOV %0, %0" : "+l"(slot));
     return slot;
 }
-inline __aicore__ SchedulerScalarTrace *scheduler_scalar_current() { return *scheduler_scalar_slot(); }
-inline __aicore__ void scheduler_scalar_bind(SchedulerScalarTrace *trace) { *scheduler_scalar_slot() = trace; }
+static inline __aicore__ SchedulerScalarTrace *scheduler_scalar_current() {
+    if constexpr (kSchedulerScalarInstrumentation) return *scheduler_scalar_slot();
+    return nullptr;
+}
+static inline __aicore__ void scheduler_scalar_bind(SchedulerScalarTrace *trace) {
+    if constexpr (kSchedulerScalarInstrumentation) *scheduler_scalar_slot() = trace;
+}
 #elif defined(__CPU_SIM)
 #include <pthread.h>
 
@@ -218,6 +229,8 @@ inline SchedulerScalarTrace *scheduler_scalar_current() { return nullptr; }
 inline void scheduler_scalar_bind(SchedulerScalarTrace *) {}
 #endif
 
+namespace {
+
 class SchedulerScalarBinding {
 public:
     inline __aicore__ SchedulerScalarBinding() = default;
@@ -229,6 +242,8 @@ public:
     SchedulerScalarBinding &operator=(const SchedulerScalarBinding &) = delete;
 };
 
+}  // namespace
+
 // Observer helpers have internal linkage because AIC and AIV objects share
 // the final ELF. Clocks and record submission stay inside the bounded
 // primitive wrapper; scheduler functions call that wrapper as one unit.
@@ -238,7 +253,7 @@ scheduler_scalar_observed_issue(SchedulerScalarTrace *trace, SchedPhaseKind kind
     const uint64_t begin = scheduler_scalar_clock();
     operation();
     const uint64_t end = scheduler_scalar_clock();
-    trace->append(kind, begin, end, -1, trace->depth + 1, calls);
+    trace->append_memory(kind, begin, end, calls);
 }
 
 template <typename Operation>
@@ -253,7 +268,7 @@ scheduler_scalar_observed_result(SchedulerScalarTrace *trace, SchedPhaseKind kin
 #else
     end = scheduler_scalar_clock();
 #endif
-    trace->append(kind, begin, end, -1, trace->depth + 1);
+    trace->append_memory(kind, begin, end);
     return result;
 }
 
@@ -262,7 +277,7 @@ scheduler_scalar_observed_result(SchedulerScalarTrace *trace, SchedPhaseKind kin
 // work without splitting the timed primitive across another function call.
 template <typename Operation>
 static __aicore__ __attribute__((noinline)) void
-scheduler_scalar_memory_issue(SchedPhaseKind kind, uint32_t calls, Operation operation) {
+scheduler_scalar_memory_issue_runtime(SchedPhaseKind kind, uint32_t calls, Operation operation) {
     auto *trace = scheduler_scalar_current();
     if (trace == nullptr) operation();
     else scheduler_scalar_observed_issue(trace, kind, calls, operation);
@@ -270,8 +285,22 @@ scheduler_scalar_memory_issue(SchedPhaseKind kind, uint32_t calls, Operation ope
 
 template <typename Operation>
 static __aicore__ __attribute__((noinline)) auto
-scheduler_scalar_memory_result(SchedPhaseKind kind, Operation operation) {
+scheduler_scalar_memory_result_runtime(SchedPhaseKind kind, Operation operation) {
     auto *trace = scheduler_scalar_current();
     if (trace == nullptr) return operation();
     return scheduler_scalar_observed_result(trace, kind, operation);
+}
+
+template <typename Operation>
+static inline __aicore__ __attribute__((always_inline)) void
+scheduler_scalar_memory_issue(SchedPhaseKind kind, uint32_t calls, Operation operation) {
+    if constexpr (kSchedulerScalarInstrumentation) scheduler_scalar_memory_issue_runtime(kind, calls, operation);
+    else operation();
+}
+
+template <typename Operation>
+static inline __aicore__ __attribute__((always_inline)) auto
+scheduler_scalar_memory_result(SchedPhaseKind kind, Operation operation) {
+    if constexpr (kSchedulerScalarInstrumentation) return scheduler_scalar_memory_result_runtime(kind, operation);
+    else return operation();
 }

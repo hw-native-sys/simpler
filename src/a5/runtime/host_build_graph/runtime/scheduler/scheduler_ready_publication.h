@@ -64,7 +64,7 @@ inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
 
 // Executable tickets publish a bounded batch in one call. Control inboxes
 // persist preparation before atomically appending their immutable chain.
-inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
+static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local,
     SchedulerReadyPublication &publication
 ) {
