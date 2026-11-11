@@ -231,13 +231,9 @@ struct GraphRecording {
     }
 };
 
-// Entry capacity for one recorded body's hazard map. A Definition is capped at
-// SUB_TASK_MAX_NUM tasks and each recorded task registers at most its INOUT/OUTPUT_EXISTING
-// args, so this bounds the worst realistic body while staying a small fraction of
-// the ordinary path's whole-orchestration pool (CHIP_TENSORMAP_POOL_SIZE). Exhausting
-// it marks the recording unsupported, which graph_commit reports as
-// SIMPLER_ERROR_INVALID_ARGS -- the outer shell is already submitted by then, so there
-// is no ordinary-path fallback left to take.
+// Initial entry chunk for one recorded body. Hazard entries grow on demand
+// without moving producers; allocation failure abandons the recording before
+// upload. Task-id and tensor-argument limits remain independent bounds.
 constexpr int32_t GRAPH_RECORD_TENSORMAP_POOL_SIZE = 16384;
 
 // Elements in the recording's tensor pool: every sub-task a body can hold, times

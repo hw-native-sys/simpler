@@ -17,11 +17,11 @@
  * - Used by rt_submit_task() to find dependencies
  *
  * host_build_graph runs its orchestrator on the host, so this map is host-only
- * state: it owns its four arrays outright rather than addressing them as offsets
+ * state: it owns its storage outright rather than addressing it as offsets
  * into a device-shaped arena. Nothing here is copied to the device.
  *
  * Key design features:
- * 1. Fixed-capacity entry pool (no per-entry malloc/free)
+ * 1. Pointer-stable entry chunks (no per-entry malloc/free)
  * 2. Task completion does not retire entries; a producer stays visible until
  *    dependency computation explicitly removes it as semantically covered
  * 3. Per-task entry tracking for explicit removal
@@ -343,20 +343,19 @@ static_assert(
 /**
  * TensorMap structure
  *
- * Hash table with a fixed-capacity entry pool and no watermark invalidation.
- * Owns its four arrays; init() sizes them and leaves the map empty.
+ * Hash table with pointer-stable entry chunks and no watermark invalidation.
+ * init() reserves an initial chunk and leaves the map empty.
  */
 struct ChipTensorMap {
     // Hash table buckets (fixed size, power of 2). An empty bucket is nullptr.
     std::unique_ptr<ChipTensorMapEntry *[]> buckets;
     int32_t num_buckets{0};  // Must be power of 2 for fast modulo
 
-    // Entry pool: bump allocation plus reuse of explicitly removed entries. A
-    // linked entry is reached by pointer, so the pool is allocated once at
-    // pool_size and never resized.
+    // The first entry chunk stays at this address. Further chunks never move
+    // it or each other; bucket/task chains and free-list entries retain pointers.
     std::unique_ptr<ChipTensorMapEntry[]> entry_pool;
     std::unique_ptr<ChipTensorMapEntry *[]> free_entry_list;
-    int32_t pool_size{0};       // Total pool capacity
+    int32_t pool_size{0};       // Total allocated chunk capacity
     int32_t next_entry_idx{0};  // id when next entry insert
     int32_t free_num{0};        // free entry number in entry pool
 
@@ -366,11 +365,14 @@ struct ChipTensorMap {
     int32_t max_tasks{0};            // Active task-id domain
     int32_t task_entry_capacity{0};  // Retained task-head allocation, grows only
 
-    // Pool occupancy, read by the tensormap-exhaustion diagnostic and by the
-    // Graph recording's capacity precheck.
+    // Occupancy excludes entries dependency computation explicitly removed.
     int32_t current_used() const { return next_entry_idx - free_num; }
     int32_t pool_capacity() const { return pool_size; }
     int32_t free_entries() const { return pool_size - current_used(); }
+
+    // Reserve room before registering outputs. Failure preserves existing
+    // entries, chains, cursors and capacity; no device progress is required.
+    bool ensure_free_entries(int32_t needed);
 
     // new_entry allocates a slot and initializes only its linkage (bucket_index
     // and the four link pointers) to the clean unlinked state; insert() assigns
@@ -382,7 +384,14 @@ struct ChipTensorMap {
             return res;
         }
         always_assert(next_entry_idx < pool_size);
-        ChipTensorMapEntry *res = &entry_pool[next_entry_idx++];
+        if (next_entry_idx >= bump_chunk_end) {
+            const int32_t chunk = next_entry_idx / entry_chunk_size;
+            bump_chunk_begin = chunk * entry_chunk_size;
+            const int64_t end = static_cast<int64_t>(bump_chunk_begin) + entry_chunk_size;
+            bump_chunk_end = static_cast<int32_t>(end < pool_size ? end : pool_size);
+            bump_chunk = overflow_chunks[chunk - 1].get();
+        }
+        ChipTensorMapEntry *res = bump_chunk + (next_entry_idx++ - bump_chunk_begin);
         // Init-on-write: the pool is not pre-zeroed (init() skips
         // the O(pool_size) memset), so put this fresh slot into the same clean
         // unlinked state free_entry() leaves recycled slots in. The insert path
@@ -432,8 +441,8 @@ struct ChipTensorMap {
      * per task id the caller can place.
      *
      * Returns false without changing the map when an allocation fails. Bucket
-     * and pool sizes are exact; task-head storage retains its largest capacity.
-     * A smaller active task domain never shrinks or reconstructs the entry pool.
+     * and initial chunk sizes are exact; matching initialization retains grown
+     * chunks and task-head storage. A smaller task domain does not shrink them.
      *
      * Clearing retained storage is O(num_buckets + task_entry_capacity). A fresh
      * entry pool also constructs every TaskId; new_entry() puts each slot into
@@ -459,8 +468,7 @@ struct ChipTensorMap {
     void reset();
 
     /**
-     * Same as init() with default sizes (CHIP_TENSORMAP_NUM_BUCKETS,
-     * CHIP_TENSORMAP_POOL_SIZE).
+     * Same as init() with default bucket and initial chunk sizes.
      */
     bool init_default(int32_t new_max_tasks);
 
@@ -632,6 +640,22 @@ struct ChipTensorMap {
      * Get count of valid entries
      */
     int32_t valid_count();
+
+private:
+    std::unique_ptr<std::unique_ptr<ChipTensorMapEntry[]>[]> overflow_chunks;
+    int32_t entry_chunk_size{0};
+    int32_t entry_chunk_count{0};
+    int32_t overflow_chunk_capacity{0};
+    int32_t free_list_capacity{0};
+    ChipTensorMapEntry *bump_chunk{nullptr};
+    int32_t bump_chunk_begin{0};
+    int32_t bump_chunk_end{0};
+
+    const ChipTensorMapEntry &entry_at(int32_t index) const {
+        debug_assert(index >= 0 && index < pool_size);
+        if (index < entry_chunk_size) return entry_pool[index];
+        return overflow_chunks[index / entry_chunk_size - 1][index % entry_chunk_size];
+    }
 };
 
 #if SIMPLER_TENSORMAP_PROFILING

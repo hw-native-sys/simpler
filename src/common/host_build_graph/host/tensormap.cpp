@@ -11,7 +11,7 @@
 /**
  * host_build_graph TensorMap implementation
  *
- * Implements TensorMap with a fixed-capacity entry pool. Task completion does
+ * Implements TensorMap with pointer-stable entry chunks. Task completion does
  * not invalidate entries; dependency computation explicitly removes only
  * producers made redundant by coverage.
  *
@@ -28,6 +28,7 @@
 
 #include <stdlib.h>
 
+#include <limits>
 #include <new>
 
 #include "assert_compat.h"
@@ -75,7 +76,7 @@ bool ChipTensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
         return false;
     };
     const bool replace_buckets = num_buckets != new_num_buckets || !buckets;
-    const bool replace_pool = pool_size != new_pool_size || !entry_pool || !free_entry_list;
+    const bool replace_pool = entry_chunk_size != new_pool_size || !entry_pool || !free_entry_list;
     const bool grow_heads = task_entry_capacity < new_max_tasks || !task_entry_heads;
     std::unique_ptr<ChipTensorMapEntry *[]> new_buckets;
     std::unique_ptr<ChipTensorMapEntry[]> new_entries;
@@ -102,15 +103,87 @@ bool ChipTensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
     if (replace_pool) {
         entry_pool = std::move(new_entries);
         free_entry_list = std::move(new_free_list);
+        overflow_chunks.reset();
+        entry_chunk_size = new_pool_size;
+        entry_chunk_count = 1;
+        overflow_chunk_capacity = 0;
+        free_list_capacity = new_pool_size;
+        pool_size = new_pool_size;
     }
     if (grow_heads) {
         task_entry_heads = std::move(new_heads);
         task_entry_capacity = new_max_tasks;
     }
     num_buckets = new_num_buckets;
-    pool_size = new_pool_size;
     max_tasks = new_max_tasks;
     reset();
+    return true;
+}
+
+bool ChipTensorMap::ensure_free_entries(int32_t needed) {
+    if (needed < 0 || !entry_pool || !free_entry_list) return false;
+    if (free_entries() >= needed) return true;
+
+    constexpr int64_t max_entries = std::numeric_limits<int32_t>::max();
+    const int64_t required = static_cast<int64_t>(current_used()) + needed;
+    if (required > max_entries) return false;
+    const int32_t chunks = static_cast<int32_t>((required + entry_chunk_size - 1) / entry_chunk_size);
+    const int32_t added = chunks - entry_chunk_count;
+    const int64_t rounded = static_cast<int64_t>(chunks) * entry_chunk_size;
+    const int32_t capacity = static_cast<int32_t>(rounded < max_entries ? rounded : max_entries);
+
+    // Stage every fallible allocation before moving owners or publishing sizes.
+    std::unique_ptr<std::unique_ptr<ChipTensorMapEntry[]>[]> pending(new (std::nothrow)
+                                                                         std::unique_ptr<ChipTensorMapEntry[]>[added]);
+    if (!pending) return false;
+    for (int32_t i = 0; i < added; ++i) {
+        const int64_t begin = static_cast<int64_t>(entry_chunk_count + i) * entry_chunk_size;
+        const int32_t length =
+            static_cast<int32_t>(begin + entry_chunk_size < max_entries ? entry_chunk_size : max_entries - begin);
+        pending[i].reset(new (std::nothrow) ChipTensorMapEntry[length]);
+        if (!pending[i]) return false;
+    }
+
+    auto expanded_capacity = [](int32_t old, int32_t minimum) {
+        int64_t result = old > 0 ? old : 1;
+        while (result < minimum) {
+            result *= 2;
+            if (result > std::numeric_limits<int32_t>::max()) {
+                result = std::numeric_limits<int32_t>::max();
+            }
+        }
+        return static_cast<int32_t>(result);
+    };
+    std::unique_ptr<std::unique_ptr<ChipTensorMapEntry[]>[]> directory;
+    const int32_t directory_capacity = expanded_capacity(overflow_chunk_capacity, chunks - 1);
+    if (chunks - 1 > overflow_chunk_capacity) {
+        directory.reset(new (std::nothrow) std::unique_ptr<ChipTensorMapEntry[]>[directory_capacity]);
+        if (!directory) return false;
+    }
+    std::unique_ptr<ChipTensorMapEntry *[]> free_list;
+    const int32_t free_capacity = expanded_capacity(free_list_capacity, capacity);
+    if (capacity > free_list_capacity) {
+        free_list.reset(new (std::nothrow) ChipTensorMapEntry *[free_capacity]);
+        if (!free_list) return false;
+        for (int32_t i = 0; i < free_num; ++i)
+            free_list[i] = free_entry_list[i];
+    }
+
+    if (directory) {
+        for (int32_t i = 0; i < entry_chunk_count - 1; ++i)
+            directory[i] = std::move(overflow_chunks[i]);
+        overflow_chunks = std::move(directory);
+        overflow_chunk_capacity = directory_capacity;
+    }
+    for (int32_t i = 0; i < added; ++i) {
+        overflow_chunks[entry_chunk_count - 1 + i] = std::move(pending[i]);
+    }
+    if (free_list) {
+        free_entry_list = std::move(free_list);
+        free_list_capacity = free_capacity;
+    }
+    entry_chunk_count = chunks;
+    pool_size = capacity;
     return true;
 }
 
@@ -131,6 +204,9 @@ void ChipTensorMap::reset() {
     // the slot into the unlinked state, exactly as after init().
     next_entry_idx = 0;
     free_num = 0;
+    bump_chunk = entry_pool.get();
+    bump_chunk_begin = 0;
+    bump_chunk_end = entry_chunk_size;
 }
 
 bool ChipTensorMap::init_default(int32_t new_max_tasks) {
@@ -152,7 +228,7 @@ void ChipTensorMap::print_stats() {
     // Init-on-write: only [0, next_entry_idx) slots have ever been allocated and
     // thus initialized; slots beyond that are untouched and must not be read.
     for (int32_t i = 0; i < next_entry_idx; i++) {
-        if (entry_pool[i].bucket_index != -1) {
+        if (entry_at(i).bucket_index != -1) {
             valid++;
         }
     }
@@ -196,7 +272,7 @@ int32_t ChipTensorMap::valid_count() {
     // Init-on-write: only [0, next_entry_idx) slots have ever been allocated and
     // thus initialized; slots beyond that are untouched and must not be read.
     for (int32_t i = 0; i < next_entry_idx; i++) {
-        if (entry_pool[i].bucket_index != -1) {
+        if (entry_at(i).bucket_index != -1) {
             count++;
         }
     }

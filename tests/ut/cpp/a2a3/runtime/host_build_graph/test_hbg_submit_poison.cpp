@@ -227,3 +227,53 @@ TEST_F(HbgSubmitPoisonTest, OutOfRangeDispatchPredicateIndexIsRejected) {
     EXPECT_EQ(orch.task_allocator.active_count(), 0);
     EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_INVALID_ARGS);
 }
+
+// The output registration path must grow a full host-only hazard map without
+// moving the producers that bucket and task chains already reach by pointer.
+TEST_F(HbgSubmitPoisonTest, TensorMapGrowthKeepsExistingProducers) {
+    constexpr int32_t INITIAL_ENTRIES = 64;
+    ASSERT_TRUE(orch.tensor_map.init(16, INITIAL_ENTRIES, CHIP_DEFAULT_GRAPH_TASKS));
+    uint32_t shape[] = {16};
+    for (int32_t i = 0; i < INITIAL_ENTRIES; ++i) {
+        auto tensor = simpler::hbg::make_tensor_external(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(0x10000 + i * 0x100)), shape, 1, DataType::FLOAT32
+        );
+        orch.tensor_map.insert(tensor, TaskId::make_global(0));
+    }
+    auto *first_entries = orch.tensor_map.entry_pool.get();
+    ASSERT_EQ(orch.tensor_map.free_entries(), 0);
+
+    orch.begin_scope();
+    std::array<float, 16> output{};
+    auto tensor = simpler::hbg::make_tensor_external(output.data(), shape, 1, DataType::FLOAT32);
+    CoreTaskArgs args;
+    args.add_inout(tensor);
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    const auto submitted = orch.submit_task(kernels, args);
+    EXPECT_TRUE(submitted.task_id().is_valid());
+    EXPECT_FALSE(orch.is_fatal());
+    EXPECT_EQ(orch.tensor_map.current_used(), INITIAL_ENTRIES + 1);
+    EXPECT_EQ(orch.tensor_map.entry_pool.get(), first_entries);
+    EXPECT_EQ(first_entries[0].buffer_addr, 0x10000u);
+    for (int32_t i = 0; i < INITIAL_ENTRIES; ++i) {
+        auto seeded = simpler::hbg::make_tensor_external(
+            reinterpret_cast<void *>(static_cast<uintptr_t>(0x10000 + i * 0x100)), shape, 1, DataType::FLOAT32
+        );
+        int matches = 0;
+        orch.tensor_map.lookup(seeded, [&](ChipTensorMapEntry &entry, OverlapStatus) {
+            EXPECT_EQ(&entry, &first_entries[i]);
+            ++matches;
+            return true;
+        });
+        EXPECT_EQ(matches, 1);
+        bool reachable = false;
+        int traversed = 0;
+        for (auto *entry = orch.tensor_map.task_entry_heads[0]; entry != nullptr && traversed < INITIAL_ENTRIES + 1;
+             entry = entry->next_in_task, ++traversed) {
+            reachable |= entry == &first_entries[i];
+        }
+        EXPECT_TRUE(reachable);
+    }
+    orch.end_scope();
+}

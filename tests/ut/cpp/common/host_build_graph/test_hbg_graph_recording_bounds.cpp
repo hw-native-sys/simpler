@@ -29,6 +29,7 @@
 
 #include "graph_execution.h"
 #include "graph_host_state.h"
+#include "graph_recording.h"
 #include "scheduler/scheduler.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
@@ -376,3 +377,76 @@ TEST_P(HbgGraphExplicitDependencyRejectionTest, RejectsSelfAndFuturePredecessors
 }
 
 INSTANTIATE_TEST_SUITE_P(ColdInflightCached, HbgGraphExplicitDependencyRejectionTest, ::testing::Range(0, 6));
+
+TEST_F(HbgGraphRecordingBoundsTest, GrowthKeepsDependenciesAcrossEntryChunks) {
+    // A small initial chunk exercises growth with disjoint regions. The final
+    // consumer must retain dependencies on both early and late producers.
+    constexpr uint32_t WRITERS = 512;
+    constexpr uint32_t VIEWS_PER_WRITER = 3;
+    constexpr uint32_t VIEW_ELEMENTS = 16;
+    static_assert(WRITERS + 1 <= SUB_TASK_MAX_NUM);
+    orch.graph_host_state = nullptr;
+    graph_state.reset();
+    definition_staging.assign(2 * 1024 * 1024, std::byte{0});
+    GraphDefinitionArena arena{};
+    arena.base = definition_staging.data();
+    arena.capacity = definition_staging.size();
+    arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+    arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
+    graph_state = make_graph_host_state(arena);
+    ASSERT_NE(graph_state, nullptr);
+    orch.graph_host_state = graph_state.get();
+
+    std::vector<uint32_t> storage(WRITERS * VIEWS_PER_WRITER * VIEW_ELEMENTS);
+    uint32_t full_shape[] = {static_cast<uint32_t>(storage.size())};
+    auto boundary = simpler::hbg::make_tensor_external(storage.data(), full_shape, 1);
+    orch.begin_scope();
+    GraphTaskArgs boundary_args;
+    boundary_args.add_inout(boundary);
+    const auto graph = orch.graph_begin(0x20E50A12, boundary_args);
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
+    ASSERT_TRUE(recorder_recording().tensor_map.init(CHIP_TENSORMAP_NUM_BUCKETS, 64, SUB_TASK_MAX_NUM));
+    const auto &param = graph.params->tensor(0).ref();
+    uint32_t view_shape[] = {VIEW_ELEMENTS};
+    for (uint32_t task = 0; task < WRITERS; ++task) {
+        std::array<simpler::hbg::Tensor, VIEWS_PER_WRITER> views;
+        CoreTaskArgs args;
+        for (uint32_t output = 0; output < VIEWS_PER_WRITER; ++output) {
+            uint32_t offset[] = {(task * VIEWS_PER_WRITER + output) * VIEW_ELEMENTS};
+            views[output] = param.view(view_shape, offset);
+            args.add_inout(views[output]);
+        }
+        ASSERT_TRUE(orch.submit_dummy_task(args).task_id().is_valid());
+    }
+    uint32_t first_offset[] = {0};
+    uint32_t last_offset[] = {(WRITERS * VIEWS_PER_WRITER - 1) * VIEW_ELEMENTS};
+    auto first = param.view(view_shape, first_offset);
+    auto last = param.view(view_shape, last_offset);
+    CoreTaskArgs consumer;
+    consumer.add_input(first);
+    consumer.add_input(last);
+    ASSERT_TRUE(orch.submit_dummy_task(consumer).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+    EXPECT_FALSE(orch.is_fatal());
+    const auto published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.entries.size(), 1u);
+    const auto &entry = published.entries.front();
+    ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
+    const auto *definition = reinterpret_cast<const GraphDefinition *>(
+        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
+    );
+    ASSERT_EQ(definition->task_count, WRITERS + 1);
+    ASSERT_EQ(definition->edge_count, 2u);
+    EXPECT_EQ(definition->root_count, WRITERS);
+    const auto *fanin_offsets =
+        graph_definition_array<int32_t>(*definition, definition->off_fanin_offsets, WRITERS + 2);
+    const auto *fanin_indices =
+        graph_definition_array<uint16_t>(*definition, definition->off_fanin_indices, definition->edge_count);
+    ASSERT_NE(fanin_offsets, nullptr);
+    ASSERT_NE(fanin_indices, nullptr);
+    ASSERT_EQ(fanin_offsets[WRITERS], 0);
+    ASSERT_EQ(fanin_offsets[WRITERS + 1], 2);
+    EXPECT_EQ(std::min(fanin_indices[0], fanin_indices[1]), 0);
+    EXPECT_EQ(std::max(fanin_indices[0], fanin_indices[1]), WRITERS - 1);
+}
