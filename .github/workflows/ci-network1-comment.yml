@@ -1,0 +1,109 @@
+name: CI Network1 Comment
+run-name: /run-network PR ${{ github.event.issue.number }}
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  gate-and-resolve:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/run-network')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ready: ${{ steps.resolve.outputs.ready }}
+      repository: ${{ steps.resolve.outputs.repository }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+    steps:
+      - name: Authorize command and resolve PR head
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.setOutput('ready', 'false');
+            if (!context.payload.issue.pull_request ||
+                context.payload.comment.body.trim() !== '/run-network') return;
+            // A re-executed gate would resolve the PR's current head, not the head the comment admitted.
+            if (process.env.GITHUB_RUN_ATTEMPT !== '1') {
+              core.setFailed('/run-network admits one head per comment; comment /run-network again instead of re-running the gate');
+              return;
+            }
+            const user = context.payload.comment.user.login;
+            let permission = null;
+            try {
+              const response = await github.rest.repos.getCollaboratorPermissionLevel({
+                ...context.repo, username: user,
+              });
+              permission = response.data.permission;
+            } catch (error) {
+              core.info(`cannot verify repo permission for ${user}`);
+            }
+            if (permission !== 'admin') {
+              core.setFailed(`denied: ${user} requires admin repo permission to trigger /run-network`);
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: context.payload.issue.number,
+            });
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            if (pr.state !== 'open' || pr.number !== context.payload.issue.number ||
+                pr.base.ref !== 'main' ||
+                pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase() ||
+                !pr.head.repo || !/^[\w.-]+\/[\w.-]+$/.test(pr.head.repo.full_name) ||
+                !/^[0-9a-f]{40}$/i.test(pr.head.sha)) {
+              core.setFailed('/run-network requires an open PR targeting this repo main with an available head');
+              return;
+            }
+            core.setOutput('repository', pr.head.repo.full_name);
+            core.setOutput('ref', pr.head.sha);
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('ready', 'true');
+
+  st-network1-onboard-a2a3:
+    needs: [gate-and-resolve]
+    if: needs.gate-and-resolve.outputs.ready == 'true'
+    concurrency:
+      group: ci-network1-a2a3-${{ needs.gate-and-resolve.outputs.pr_number }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/_st-network1.yml
+    with:
+      platform: a2a3
+      repository: ${{ needs.gate-and-resolve.outputs.repository }}
+      ref: ${{ needs.gate-and-resolve.outputs.ref }}
+      runs_on: '["self-hosted","Linux","ARM64","a2a3pod"]'
+
+  report:
+    needs: [gate-and-resolve, st-network1-onboard-a2a3]
+    if: always() && needs.gate-and-resolve.result == 'success' && needs.gate-and-resolve.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Report the tested head and suite results
+        uses: actions/github-script@v7
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS_JSON);
+            const gate = needs['gate-and-resolve'];
+            if (gate.result !== 'success' || gate.outputs.ready !== 'true') return;
+            const { repository, ref, pr_number: number } = gate.outputs;
+            const suites = ['st-network1-onboard-a2a3'];
+            const results = suites.map(name => ({ name, result: needs[name]?.result || 'unknown' }));
+            const passed = results.every(job => job.result === 'success');
+            const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const lines = results.map(job => `- ${job.name}: **${job.result}**`);
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: Number(number),
+              body: `**/run-network ${passed ? 'passed' : 'finished without all suites passing'}**\n\n` +
+                    `Tested head: \`${repository}@${ref}\`\n[Workflow run](${url})\n\n${lines.join('\n')}`,
+            });

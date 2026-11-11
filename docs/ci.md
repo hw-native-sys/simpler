@@ -15,20 +15,21 @@ Design principles:
 
 A5 hardware validation for ordinary PRs is requested by an admin with `/run-a5`.
 A5 simulation, CPU tests and profiling remain automatic under their existing
-change gates. Daily retains its A5 jobs.
+change gates. A2/A3 multi-machine Network1 validation for ordinary PRs is
+requested by an admin with `/run-network`. Daily retains both A5 and Network1 coverage.
 
 ## Full Job Matrix
 
-The complete test-type × hardware-tier matrix across automatic CI, the A5 comment workflow and Daily. A5 hardware jobs in this table use `/run-a5` for ordinary PR validation.
+The complete test-type × hardware-tier matrix across automatic CI, comment workflows and Daily. A5 hardware jobs use `/run-a5` and A2/A3 multi-machine Network1 uses `/run-network` for ordinary PR validation.
 
 | Category | CPU (no hardware) | a2a3 runner | a5 runner |
 | -------- | ----------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily or `/run-network`), `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
 
 ## GitHub Actions Jobs
 
-`ci.yml`, `ci-a5-comment.yml` and `daily.yml` are thin topology callers: they own
+`ci.yml`, `ci-a5-comment.yml`, `ci-network1-comment.yml` and `daily.yml` are thin topology callers: they own
 triggers, `needs:`, gate `if:` expressions, runner/setup inputs, and matrix
 shape. The executable job bodies live in reusable workflows:
 `_detect-changes.yml`, `_pre-commit.yml`, `_ut-no-hardware.yml`,
@@ -80,7 +81,6 @@ PullRequest
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
-  ├── st-network1-onboard-a2a3    (a2a3pod pair)          — a2a3_changed && st_affected
   └── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
 
 Admin PR comment /run-a5
@@ -88,6 +88,10 @@ Admin PR comment /run-a5
       ├── ut-a5             (a5 self-hosted)        — Python UT and CANN examples
       ├── st-onboard-a5     (a5 self-hosted)        — onboard ST and DFX smokes
       └── st-framework-eager-a5 (a5 self-hosted)     — framework eager ST
+
+Admin PR comment /run-network
+  └── gate-and-resolve       (ubuntu-24.04)          — open PR to this repo main; pinned head
+      └── st-network1-onboard-a2a3 (a2a3pod pair)    — multi-machine Network1 ST
 ```
 
 | Job | Runner | What it runs |
@@ -101,12 +105,13 @@ Admin PR comment /run-a5
 | `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA, the active URMA regressions and mixed SDMA/URMA cases, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
-| `st-network1-onboard-a2a3` | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
+| `st-network1-onboard-a2a3` (Daily or `/run-network`) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
 
 ### Multi-machine network1 jobs
 
-`st-network1-onboard-a2a3` is the only job spanning two machines. The runner it
+`st-network1-onboard-a2a3` runs in Daily and on an explicit admin `/run-network`
+PR comment, and is the only job spanning two machines. The runner it
 lands on becomes the L4 parent and drives its peer entirely over ssh; the peer
 runs no workflow code at all. Everything that identifies either machine —
 addresses, the device split, ports, the staging root, proxies — comes from a
@@ -499,6 +504,27 @@ default branch's definition, so this new command cannot execute on GitHub until
 `ci-a5-comment.yml` is merged into the default branch. Local mocked-API tests
 validate its scripts and topology before that deployment.
 
+### A2/A3 multi-machine validation (`/run-network`)
+
+A repo admin can comment exactly `/run-network` on an open PR targeting this
+repo's `main`. `ci-network1-comment.yml` applies the same admission policy as
+`/run-a5`: current admin permission, an available fork or same-repo head, and a
+full commit SHA pinned when the comment is admitted. Surrounding whitespace is
+accepted; extra arguments and non-PR comments are ignored.
+
+The admitted request runs only `st-network1-onboard-a2a3`, through
+`_st-network1.yml` on the existing `a2a3pod` pair. It bypasses change detection,
+including for documentation-only PRs. Each admitted same-PR request replaces
+the previous Network1 job; unrelated or rejected comments cannot cancel it.
+Pushes do not retrigger the job. Comment again for a new head; rerunning the
+gate is refused, while rerunning a failed suite retains the admitted SHA.
+
+The GitHub-hosted gate and report keep write permission out of the hardware
+job. The final PR comment records the tested repository/SHA, actual job result
+and run link, including skipped or cancelled results. Daily keeps its existing
+Network1 job. The command becomes available after this workflow reaches the
+default branch; local mocked-API tests cover admission and reporting before then.
+
 ### Self-hosted CPU runner contract
 
 All seven no-hardware PR jobs (`detect-changes`, `pre-commit`, `ut`,
@@ -506,7 +532,7 @@ All seven no-hardware PR jobs (`detect-changes`, `pre-commit`, `ut`,
 `[self-hosted, cpu]`. The runner label accepts either ARM64 or X64 hosts.
 `ut` and `packaging-matrix` verify that the provisioned `python3` matches
 Python 3.10 before creating their project-local venvs. Daily retains separate
-GitHub-hosted Ubuntu/macOS coverage. The A5 comment gate/report and docs jobs
+GitHub-hosted Ubuntu/macOS coverage. The A5 and Network1 comment gate/report and docs jobs
 also use GitHub-hosted runners.
 
 Provision Python 3.10, GCC 15, CMake, Ninja, GoogleTest, Graphviz, clang-tidy 18 and a matching CPU Torch wheel on each CPU runner. The distribution package names depend on the host OS. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on CPU and GitHub-hosted runners. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim.

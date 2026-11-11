@@ -82,11 +82,11 @@ def _fixture():
     }
 
 
-def _execute(job, fixture):
+def _execute(job, fixture, workflow="ci-a5-comment"):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is required to execute the workflow's github-script controls")
-    step = _workflow()["jobs"][job]["steps"][0]
+    step = _workflow(workflow)["jobs"][job]["steps"][0]
     result = subprocess.run(
         [node, "-e", _NODE],
         input=json.dumps({**fixture, "script": step["with"]["script"]}),
