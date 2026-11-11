@@ -255,10 +255,18 @@ inline constexpr uint32_t PERCOUNTER_MIX_TICKET_DONE = 1;
  * nothing can resolve is two cohorts each holding part of the pool -- 32
  * clusters, two cohorts of 24 holding 20 each, neither able to fill. With one
  * claimable at a time there is never more than one partially claimed cohort,
- * and the open one always fills, because no cohort is wider than the pool:
- * every sync-start task passes `scheduler_resident_worker_demand_checked`
- * against the bind's worker count, a task-table one in upstream's own walk and
- * a Graph body one in `build_graph_template`.
+ * and the open one fills as long as no cohort is wider than the pool. Every
+ * sync-start task is held to that by `scheduler_resident_worker_demand_checked`
+ * -- a task-table one in upstream's own walk, a Graph body one in
+ * `build_graph_template`.
+ *
+ * Both are measured against the bind's worker count, and the pool a cohort
+ * actually meets is the one the handshake reports, which `cluster_count`
+ * carries. A run whose reported topology is smaller than the bind assumed --
+ * every core of some cluster silent, since a partial cluster fails the
+ * handshake outright -- can therefore still hold a cohort it cannot fill. The
+ * reported count is never compared against the admitted width; upstream's
+ * resident path is bounded the same way and has the same gap.
  *
  * The second rule holds the open slot for the gather alone rather than the whole
  * execution, so the next cohort is already collecting claims while the previous

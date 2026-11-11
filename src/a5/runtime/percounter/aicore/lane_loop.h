@@ -970,8 +970,14 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     scheduler_gm_store(q->open_task_id, int64_t{-1});
     scheduler_gm_store(q->released, seq + 1);
     // Before the slot frees, so a promotion that sees it free also sees what
-    // this cohort still owes: the pair is what says whether one is outstanding.
+    // this cohort still owes: the pair is what says whether one is
+    // outstanding. Program order alone does not carry that -- two atomic
+    // writes to different words are not ordered for a reader by the order
+    // this lane issued them -- and a promotion that saw the free slot over the
+    // old count would read `completed == claimed_blocks` while none of this
+    // cohort's blocks had run, and open the next one on top of it.
     scheduler_gm_fetch_add(q->claimed_blocks, static_cast<uint64_t>(sync->block_num));
+    percounter_publish_fence();
     scheduler_gm_store(q->open_generation, generation + 1);
     percounter_sync_promote(cfg);
     return percounter_sync_serve_released(cfg, state, timeout_cycles, served);
