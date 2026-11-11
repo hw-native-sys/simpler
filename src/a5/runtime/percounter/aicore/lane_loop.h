@@ -581,9 +581,10 @@ inline __aicore__ void percounter_publish_fence() {
  * Two of them can observe two atomic writes out of order, so a word that was
  * published before the one this lane just read can still come back stale --
  * measured on a5 at roughly one in 70,000 sampled pairs, with the two words
- * in one cache line or in two, and the writing core's own store order made no
- * difference to it. A reader that gates on one word and then reads what that
- * word vouches for therefore needs this between the two.
+ * in one cache line or in two. Separating the writer's two stores with a
+ * barrier did not stop it; separating the reader's two loads did. A reader
+ * that gates on one word and then reads what that word vouches for therefore
+ * needs this between the two.
  *
  * SSBUF needs no equivalent: `scheduler_ssbuf_load_acquire` is a load
  * *followed* by the barrier, so consecutive acquire loads already carry it.
@@ -599,8 +600,8 @@ inline __aicore__ void percounter_observe_fence() {
 /**
  * Publish which cohort this lane owes a block of, as `seq + 1`; 0 is none.
  *
- * The sequence, not a flag: an arming has to tell a lane that owes an older
- * cohort from one that owes a newer, and the two want opposite answers.
+ * Only whether it is zero is read. The sequence is kept because it names the
+ * cohort in a dump, and because `seq + 1` leaves 0 free to mean none.
  *
  * **The fence is half of a mutual exclusion**, not a publication barrier: an
  * arming stages its mask and then reads these holds, and this lane publishes
@@ -711,9 +712,6 @@ inline __aicore__ bool percounter_line_staging_for(const LaneConfig &cfg) {
  */
 inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     __gm__ PercounterSyncQueue *q = cfg.sync_queue;
-    const uint64_t generation = scheduler_gm_query(q->open_generation);
-    if (percounter_sync_armed(generation)) return;
-    const uint64_t seq = generation / 2;
     // Every word this decision rests on is read as an atomic -- adding zero
     // returns the value and leaves it -- because each is published by an
     // atomic from a lane that is often not this one, and across cores a bypass
@@ -721,7 +719,15 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     // core's *own* atomic write, measured on a5 over 440k back-to-back
     // write-then-read trials, but an enqueuer whose call finds the slot busy
     // leaves this cohort to whichever lane finishes the outstanding one, and
-    // that lane did not write these.
+    // that lane wrote none of them.
+    //
+    // The generation included, and the compare-exchange below is no substitute
+    // for it: a lane that reads the previous generation still sees the slot
+    // armed and returns above, never reaching the exchange that would have
+    // caught it.
+    const uint64_t generation = scheduler_gm_fetch_add(q->open_generation, uint64_t{0});
+    if (percounter_sync_armed(generation)) return;
+    const uint64_t seq = generation / 2;
     if (seq >= scheduler_gm_fetch_add(q->tail, uint64_t{0})) return;
     // `tail` counts every attempt, including one the enqueue refused for being
     // past the ring, so it alone does not bound this read.
