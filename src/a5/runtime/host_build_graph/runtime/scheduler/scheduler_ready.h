@@ -406,9 +406,6 @@ inline __aicore__ bool scheduler_initialize_local_config(
         context->graph_view_version != graph->view_version || context->graph_view_bytes != graph->view_bytes ||
         context->native_header_offset != graph->native_header_offset)
         return false;
-    if (context->scheduler_ssbuf_reserved0 != 0 || context->scheduler_ssbuf_reserved1 != 0 ||
-        context->scheduler_ssbuf_reserved2 != 0 || context->topology_reserved[0] != 0)
-        return false;
     SchedulerLocalConfig &config = local->config;
     const uint64_t payload_stride = SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
     if (context->worker_contexts_offset > UINT32_MAX || context->callable_addresses_count > UINT32_MAX ||
@@ -490,7 +487,6 @@ inline __aicore__ bool scheduler_initialize_local_config(
         const int32_t core_type = target->core_type;
         if (core_type != static_cast<int32_t>(lane == 0 ? CoreType::AIC : CoreType::AIV)) return false;
         if (target->dispatch_payload_offset != payload_base + worker_id * payload_stride) return false;
-        if (target->worker_reserved != 0) return false;
         const int32_t rank = target->type_rank;
         if (rank < 0 || static_cast<uint32_t>(rank) >= scheduler_ready_queue_capacity(lane == 0 ? 0U : 1U))
             return false;
@@ -755,9 +751,8 @@ inline __aicore__ void scheduler_append_idle_activity(
     record->start_time = start_cycles;
     record->end_time = end_cycles;
     record->loop_iter = static_cast<uint32_t>(context->profiling->loop_iter);
-    record->reserved = 0;
     scheduler_writeback_cache_line(record);
-    scheduler_writeback_cache_line(&record->reserved);
+    scheduler_writeback_cache_line(&record->loop_iter);
     scheduler_cache_barrier();
     scheduler_gm_store(buffer->committed, committed + 1);
 }
@@ -975,6 +970,8 @@ inline __aicore__ bool scheduler_bootstrap_bind_arguments(
     return false;
 }
 
+// Dependency counters retain their Host-initialized values until the scan gate
+// opens. Without a counter table, bootstrap registers intrusive wake links.
 // The bootstrap barrier is closed for the whole of every core's registration
 // pass: a core announces arrival only after its last registration, and the gate
 // opens only once every core has arrived. No resolver can detach a wake list
@@ -989,6 +986,17 @@ inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
     if (!scheduler_task_ref_valid(graph, task_ref)) {
         scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, context);
         return SchedulerRouteResult::ERROR;
+    }
+    const auto *dependencies = scheduler_dependencies(scheduler_state_base, context->config.ready_pool_offset);
+    if (dependencies != nullptr) {
+        const uint64_t remaining = scheduler_gm_fetch_add(
+            scheduler_state_at<uint64_t>(scheduler_state_base, dependencies->remaining_offset)[task_ref], UINT64_C(0)
+        );
+        if (remaining > static_cast<uint64_t>(task_ref)) {
+            scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_COUNT, &graph, context);
+            return SchedulerRouteResult::ERROR;
+        }
+        return remaining == 0 ? SchedulerRouteResult::READY_TO_ENQUEUE : SchedulerRouteResult::WAITING;
     }
     SchedulerFaninView fanin{};
     const auto fanin_status = scheduler_node_fanin_view(graph, task_ref, &fanin);
@@ -2045,7 +2053,7 @@ struct SchedulerCompletionDirect {
     bool mix_prefix_published{false};
 };
 
-inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
+static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_resolve_completion_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t producer_ref, SchedulerResolveCursor &cursor, uint32_t budget, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats, uint64_t profiling_level,

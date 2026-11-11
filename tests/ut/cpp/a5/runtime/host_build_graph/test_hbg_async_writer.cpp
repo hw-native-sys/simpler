@@ -182,15 +182,12 @@ TEST(HbgAsyncWriter, ExpectedWidthEngineTypeAndCookieAreCheckedBeforeWriting) {
 }
 
 TEST(HbgAsyncWriter, InvalidImageSpansAndCapacityAreRejectedBeforeArrayAccess) {
-    const std::array<std::function<void(AsyncGroupData &)>, 10> mutations{
+    const std::array<std::function<void(AsyncGroupData &)>, 9> mutations{
         [](auto &g) {
             g.capacity = 0;
         },
         [](auto &g) {
             g.capacity = 65;
-        },
-        [](auto &g) {
-            g.reserved = 1;
         },
         [](auto &g) {
             g.entries_bytes = UINT32_MAX;

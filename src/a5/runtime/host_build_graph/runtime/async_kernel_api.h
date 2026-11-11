@@ -137,7 +137,7 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
         ctx.resident.run_epoch = global->async_run_epoch;
         ctx.resident.group_offset = global->async_group_offset;
         ctx.resident.group_index = global->async_group_index;
-        if (ctx.resident_enabled != 1 || global->async_reserved != 0) {
+        if (ctx.resident_enabled != 1 || global->async_output_capture_refused != 0) {
             pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
             ctx.resident_enabled = UINT32_MAX;
             return ctx;

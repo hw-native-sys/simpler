@@ -1,6 +1,6 @@
 # A5 原生 Graph 的数据布局与 Host 绑定
 
-本文是[总设计](../a5-hbg-graph-task.md)的数据契约。类型名为拟新增内部接口。
+本文是[总设计](../a5-hbg-graph-task.md)的数据契约。类型名为内部接口。
 使用 C++17 固定宽度 POD；所有 wire 类型必须通过 standard-layout、trivially-copyable、
 `sizeof` 和关键 `offsetof` 检查，并在 Host、AICPU、AICore 编译目标上核对。
 
@@ -32,43 +32,63 @@ Graph recording 中的 DUMMY 在每次 invocation 中仍是控制节点，不因
 此时 `completion_ref = [0, 4, 5]`。任何使用 `task_ref` 直接寻址原始 SM table 的代码都必须改走访问器。
 ENTER 和 EXIT 可共享 shell 身份，但没有 kernel execution identity，不能伪造两次 shell kernel 执行。
 
-拟新增 `SchedulerNodeKind`：`TOP_KERNEL`、`CHILD_KERNEL`、`CONTROL_DUMMY`、`GRAPH_ENTER`、
+`SchedulerNodeKind`：`TOP_KERNEL`、`CHILD_KERNEL`、`CONTROL_DUMMY`、`GRAPH_ENTER`、
 `GRAPH_EXIT`、`HOST_DONE`。kind 独立于现有 task flags；不占用 admission 校验中保留的 flag bit。
 
-拟新增 16-byte `SchedulerNodeBinding`：
+12-byte `SchedulerNodeBinding`：
 
 | 字段 | 类型 | 含义 |
 | ---- | ---- | ---- |
 | source_index | `uint32_t` | 顶层原始 ID，或实例内 child index |
 | instance_index | `uint32_t` | 实例下标；非 Graph 节点为 `UINT32_MAX` |
 | kind | `uint8_t` | 上述 enum 的 wire 值 |
-| reserved | `uint8_t[7]` | 写零，读端拒绝非零 |
 
 CONTROL_DUMMY 的来源由 instance_index 判别。kernel 身份由 kind、source_index 与实例的 original_shell_id 导出。
 不存在 Graph 时 `native_header_offset == 0`，不分配 node bindings，保持当前普通任务 ref 与 SM slot 一一对应的访问路径。
 存在 Graph 时所有节点均有 binding，禁止部分调用点假设普通任务仍使用原始 ID。
 
-主线基线的 `SchedulerGraphView` 为 32 bytes，reserved 必须为零。native 实现扩为 64 bytes，保留前 32 bytes 的字段含义，
-追加 `scheduler_state_address`、`native_header_offset`、`scheduler_state_bytes` 三个 `uint64_t`，
-以及 `original_task_count` 一个 `uint32_t`、`view_version` 和 `view_bytes` 两个 `uint16_t`。
-原始任务数受公共 TaskId 的 20-bit parent 容量约束，写入 `uint32_t` 前仍显式检查。
-新 writer/reader 使用 version 2、bytes 64；
-无 Graph 时 header offset 为零，原路径保持直接寻址。不得把旧 reserved 无声改成指针。
-WorkerContext 同步增加传递这些值的字段，更新布局 static_assert、Host/CCEC/sim 构造与错误诊断。
-runtime 的 Host/AICPU/AICore 必须配套重编译；不承诺旧二进制读取新 view。
+`SchedulerGraphView` 为 56 bytes，version 3。字段为 storage_address、task_count、
+task_window_last_index、scheduler_state_address、native_header_offset、scheduler_state_bytes
+六个 `uint64_t`，original_task_count 一个 `uint32_t`，view_version/view_bytes 两个 `uint16_t`。
+原始任务数受公共 TaskId 的 20-bit parent 容量约束，写入 `uint32_t` 前显式检查。
+无 Graph 时 header offset 为零；Host/AICPU/AICore 必须配套重编译，不承诺旧二进制读取新 view。
 
-主线基线的 WorkerContext 第三个配置组在 `topology_reserved[1]` 后有 32 字节对齐填充。
-在 offset 352/360/368/372 分别新增 `native_header_offset`、`original_task_count`、
-`graph_view_version`、`graph_view_bytes`，再在 offset 376 新增 `scheduler_state_bytes`，
-使用完整 32 字节，保留原 reserved 字段为零；
-通过 static_assert 固定统计组仍从 offset 384 开始，避免无 Graph 路径扩大启动时观察的配置范围。
-`scheduler_state_base_address` 复用已有语义一致的字段。
+以下 scheduler 结构按 64-byte cache line 排布，不以命名 reserved/padding 字段占位；
+独立写者通过 `alignas(64)` 隔离，结构体尾部的自然对齐空隙不承载协议含义。
 
-native header 为 128-byte POD：`magic/version/header_bytes/flags` 四个 `uint32_t`，
-随后依次为 `image_bytes/node_count/original_task_count/definition_count/instance_count`、
-`bindings_offset/completion_refs_offset/templates_offset/instances_offset/control_inboxes_offset`、
-`control_inbox_count/readonly_end_offset/run_epoch/reserved` 十四个 `uint64_t`。
-flags/reserved 首版为零，native header version 为 1。image_bytes 覆盖整个 scheduler backing；
+| 类型 | 大小 | cacheline 所有权 |
+| ---- | ---- | ---------------- |
+| SchedulerTaskControl | 384 B | state/claim tickets、resolver metadata、block cursor、completion、admission signal、claim seal 各一行 |
+| SchedulerWorkerContext | 384 B | 5 行 READY 发布的配置，1 行本核写回诊断 |
+| SchedulerTaskTrace | 320 B | publication header；kernel timing；dispatch/completion；refill/startup；execution identity，各一行 |
+| SchedulerRunControl | 448 B | 配置、生命周期原子、错误身份和独立错误 signal |
+| SchedulerTicketQueue | 128 B | head 和 reserved_tail 各一行；reserved_tail 是有效预留游标 |
+| SchedulerGroupMailbox | 384 B | descriptor 128 B、publication 64 B、三个 lane ack 各 64 B |
+| SchedulerMixCloseSeal / SchedulerReadyInbox | 64 B | 每项独立原子行 |
+
+TaskControl 的 state、wake_list_head、next_waiter、claim_tickets、admission_claim_lock 共用原子行。
+next_block、completed_blocks 与 claim_seal 分别占用独立的 64 B 行，隔离并发领取、退休与领取结束观察。
+所有原子行禁止 cached 整行写回；resolver metadata 与 admission bypass signal 保持各自独立的写入区域。
+next_fanin_index、waiting_producer 和 resolver timing 在第二行；admission_state 单独 bypass 发布。
+等待链、MIX admission、sync_start、defer_wait 和可恢复 resolver 的状态均保留。
+
+AdmissionRecord 为 64B，offset 40 的 `uint64_t member_rank_offset` 保存同类型普通非同步 SPMD 的 block 前缀，
+与 block 数/成员数同处 header 行。Host 按 task_ref 分别累计 AIC/AIV，并检查加法溢出；
+设备对 eligible_count 取模后构造冻结成员集合，不增加共享计数器或逐任务前缀扫描。
+
+WorkerContext 的首行保存 core_type/physical_core_id/type_rank/is_scheduler，以及 run_control_offset、
+task_controls_offset、scheduler_state_base_address、dispatch_payload_offset、worker_index、worker_contexts_offset。
+启动 watchdog 与 peer route 校验只需观察这一行。第二行保存 graph view 与 graph_summary_offset；
+第三行是 dispatch/queue/kernel-entry offsets；第四行是 topology 与 AICPU lifecycle offset；
+第五行是 trace/activity/PMU offsets 与 args_dump_address。offset 320 开始的本核诊断行保存 bootstrap_task_count、
+bootstrap_start_cycles、target_bootstrap_end_cycles 和四个 trace 启动时间戳。
+未被读取的聚合统计不写入 GM；本地 completion ID 计数和退出时间戳仍参与调度控制。
+
+native header 为 128-byte、64-byte 对齐 POD，version 2。magic/version 是两个 `uint32_t`，
+随后为 image_bytes/node_count/original_task_count/definition_count/instance_count、
+bindings_offset/completion_refs_offset/templates_offset/instances_offset/control_inboxes_offset、
+control_inbox_count/readonly_end_offset/run_epoch 共十三个 `uint64_t`，最后为 `uint32_t header_bytes`。
+image_bytes 覆盖整个 scheduler backing；
 保留现有 offset 0 的 `SchedulerRunControl` 固定前缀；其后的 native 只读区域按 header、binding、
 completion_ref、template、instance、blob、child plan、sink 的顺序排列。
 每个 region 按其 ABI 对齐；除固定 run control 前缀以外，其余 mutable control/queue 等区域放在 readonly_end 后。
@@ -92,12 +112,12 @@ AICore 读端使用 address-space-aware 的 POD 访问辅助函数，不复制 C
 
 每个唯一 Definition 生成一份 128-byte A5 template：`definition_offset/definition_bytes/child_plans_offset/`
 `fanin_offsets_offset/fanin_indices_offset/sinks_offset/task_count/edge_count/sink_count/args_bytes/`
-`execution_count/required_heap/legacy_execution_storage_bytes/graph_key` 十四个 `uint64_t`，再加两个保留零值。
+`execution_count/required_heap/legacy_execution_storage_bytes/graph_key` 十四个 `uint64_t`。
 fanin offset/indices 指向 blob 内既有 CSR，不另复制一份 CSR；sink 为额外的 `uint16_t[]`。
 所有偏移以 native scheduler image 起点为基准，使用 `uint64_t`；数量在转换为 unsigned wire 前先拒绝负值。
 Definition 内原始 32-bit section offsets 保持原布局，解析时做 checked widening/addition。
 
-拟新增 64-byte `SchedulerGraphChildPlan`：
+64-byte `SchedulerGraphChildPlan`：
 
 | 字段 | 大小 | 含义 |
 | ---- | ---- | ---- |
@@ -105,9 +125,8 @@ Definition 内原始 32-bit section offsets 保持原布局，解析时做 check
 | tensors_offset / scalars_offset / predicate_offset | 3 × 8 B | 相对实例 args_base；缺失 predicate 用 `UINT64_MAX` |
 | tensor_count / scalar_count | 2 × 4 B | 实际数量，受原 kernel ABI 容量限制 |
 | execution_prefix | 8 B | Definition 内此前 kernel 的 block×active-lane 总数 |
-| reserved | 8 B | 零 |
 
-拟新增 64-byte `SchedulerGraphInstance`：
+64-byte `SchedulerGraphInstance`：
 
 | 字段 | 类型 |
 | ---- | ---- |
@@ -121,24 +140,17 @@ Definition 内原始 32-bit section offsets 保持原布局，解析时做 check
 同一 native image 内部引用使用 offset；不把 Host pointer 或虚拟 heap 地址写进这些字段。
 boundary 地址取 compacted device SM 的 payload regions；不能取尚未 rebase 的 host_sm_handle。
 
-每个 node 仍保留独立的 16-byte metadata 与 512-byte control，方便原调度热路径直接寻址。
+每个 node 仍保留独立的 16-byte metadata 与 384-byte control，方便原调度热路径直接寻址。
 child metadata 由 template 复制 shape，并设置实例自己的 trace base；不重新执行 shape 推导或依赖发现。
 ENTER/EXIT/CONTROL_DUMMY 无 active lane，trace index 为无效值。读端必须先按 kind 分流，
 不得将空 lane 解释成非法 kernel，也不得用 `is_executable(flags)` 单独跳过控制节点。
 
 ## 依赖与参数访问器
 
-将当前直接读取 `TaskPayload` fanin_count 的位置统一改为以下拟定接口：
-
-```cpp
-uint32_t scheduler_node_fanin_count(const SchedulerGraphView&, int64_t ref);
-int64_t scheduler_node_fanin_ref(const SchedulerGraphView&, int64_t ref, uint32_t row);
-SchedulerNodeKind scheduler_node_kind(const SchedulerGraphView&, int64_t ref);
-SchedulerTaskPayloadArguments scheduler_node_arguments(const SchedulerGraphView&, int64_t ref);
-TaskId scheduler_node_task_id(const SchedulerGraphView&, int64_t ref);
-```
-
-签名只表达语义，实际接口还要传递错误结果；非法 kind、越界、溢出不得伪装成零 fanin 或空参数。
+`SchedulerGraphAccess` 统一普通/native 的只读访问，`SchedulerFaninView` 保存已校验的 fanin 行。
+Host 依赖计划与设备兼容路由使用同一套访问器；kind、参数与公共身份也从该视图解析。
+非法 kind、越界、溢出不得伪装成零 fanin 或空参数。实际接口见
+[scheduler_graph.h](../../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h)。
 
 | 节点 | fanin 来源 |
 | ---- | ---------- |
@@ -148,7 +160,9 @@ TaskId scheduler_node_task_id(const SchedulerGraphView&, int64_t ref);
 | EXIT | template 的所有 sink local index，加 child_begin |
 | HOST_DONE | 无须注册；消费者观察其 DONE |
 
-保持 fanin 游标单调前进和 CLOSED sentinel 的现有语义。首版不为 Graph 单独翻转扫描方向。
+Host 由这些 fanin 行生成统一的 fanout CSR 与 remaining，去重并过滤 HostDone 边；
+其 header/数组为 ready pool 的独立追加区，见[前向依赖计数](dependency-counters.md)。
+未配置依赖区时使用兼容 wake-list，保留 fanin 游标单调前进和 CLOSED sentinel 语义。
 Graph 的内部 row 可达 1023 个 producer，EXIT 可有 1024 个 sink；使用至少 32-bit count/cursor，
 不套用普通顶层 `CHIP_MAX_FANIN=128` 的准入限制。
 
@@ -230,7 +244,7 @@ Host 展开 binding/metadata、初始化 control 和设备 bootstrap 仍是 O(N)
 ```text
 native_scheduler_bytes = header + Definition blobs + templates + child plans + sinks
                        + 8*T completion refs + 64*G instances
-                       + 16*N node bindings + 16*N metadata + 512*N controls
+                       + 12*N node bindings + 16*N metadata + 384*N controls
                        + control inboxes + actual cooperative records/log/seals
                        + ready pool descriptors/controls + actual kernel ready entries
                        + existing worker/run/ready regions + alignment padding
@@ -243,7 +257,7 @@ native_scheduler_bytes 是 scheduler backing 总量，不是相对于旧 schedul
 cooperative metadata 只计合法 kernel，ENTER/EXIT/DUMMY 不增加 admission log capacity。
 首版可保留现有按 N 索引的 admission records；必须如实计算这种稀疏分配成本。
 
-当前 task trace 为 384 bytes，layout 不因采集关闭自动省略它；执行数按 block×lane 累加。
+当前 task trace 为 320 bytes，layout 不因采集关闭自动省略它；执行数按 block×lane 累加。
 实施时显式传入诊断需求：无执行/采样采集时 trace offset 可为 0，PMU/protocol 各按真实需求分配。
 必须先审计所有 trace 读写者，包括 host export 和错误路径，再允许零 offset；有采样时仍按其需要保留索引。
 如果暂未完成这项审计，验收必须按保留 trace 的实际成本报告，不能用条件分配的理想数字代替。

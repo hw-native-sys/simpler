@@ -136,14 +136,14 @@ TEST_P(HbgInlineDispatch, CompletesWithoutPayloadSlotGenerationOrKernelTrace) {
     std::array<uint8_t, sizeof(DispatchPayload)> previous{};
     std::memset(payload, 0x5a, sizeof(*payload));
     std::memcpy(previous.data(), payload, previous.size());
-    fixture.trace(2).ready_transition_cycles = 123456;
+    fixture.trace(2).kernel_start_cycles = 123456;
     ASSERT_TRUE(fixture.enqueue(1));
     ASSERT_TRUE(fixture.fill());
     EXPECT_EQ(scheduler_gm_load(fixture.control(1).state), static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(local->pending_completed, 1u);
     fixture.expect_no_dispatch(1);
     EXPECT_EQ(std::memcmp(previous.data(), payload, previous.size()), 0);
-    EXPECT_EQ(fixture.trace(2).ready_transition_cycles, 123456u);
+    EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 123456u);
     EXPECT_EQ(fixture.trace(2).valid, 0u);
     ASSERT_TRUE(fixture.fill());
     scheduler_flush_completions(fixture.run(), local);
@@ -167,7 +167,7 @@ TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
 TEST(HbgInlineService, BootstrapAndOrdinaryReadyDoNotWriteTheNextKernelTrace) {
     for (bool bootstrap : {false, true}) {
         InlineFixture fixture;
-        fixture.trace(2).ready_transition_cycles = 987654;
+        fixture.trace(2).kernel_start_cycles = 987654;
         SchedulerReadyBatch batch{};
         const bool appended =
             bootstrap ?
@@ -175,7 +175,7 @@ TEST(HbgInlineService, BootstrapAndOrdinaryReadyDoNotWriteTheNextKernelTrace) {
                 scheduler_ready_batch_append(fixture.base(), fixture.locals[1], 1, &batch, nullptr, 4);
         ASSERT_TRUE(appended);
         EXPECT_EQ(batch.count, 1u);
-        EXPECT_EQ(fixture.trace(2).ready_transition_cycles, 987654u);
+        EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 987654u);
     }
 }
 
@@ -183,7 +183,7 @@ TEST(HbgInlineService, DirectReadyTransitionDoesNotWriteTheNextKernelTrace) {
     InlineFixture fixture;
     fixture.dependency(1, 0);
     ASSERT_EQ(fixture.route(1), SchedulerRouteResult::WAITING);
-    fixture.trace(2).ready_transition_cycles = 987654;
+    fixture.trace(2).kernel_start_cycles = 987654;
     scheduler_gm_store(fixture.control(0).state, static_cast<int64_t>(SchedulerTaskState::DONE));
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(scheduler_resolve_completion(
@@ -191,7 +191,7 @@ TEST(HbgInlineService, DirectReadyTransitionDoesNotWriteTheNextKernelTrace) {
         &ready, fixture.locals[1]->config.self_core_type
     ));
     EXPECT_EQ(ready.task_ref, 1);
-    EXPECT_EQ(fixture.trace(2).ready_transition_cycles, 987654u);
+    EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 987654u);
 }
 
 TEST(HbgInlineService, DirectCompletionServicesDummyWithoutReportingKernelRefill) {

@@ -9,7 +9,9 @@
 
 ## 执行约定与阶段门禁
 
-**当前执行决策（2026-11-03）：用户不接受独立 block 原型的编译成本，要求代码整体恢复到 38.454 ms 的 `queue-ordinary-credit-v1`。原型已归档为后续优化候选，当前以该实现准备单一合入提交，不自动重启优化。**
+**历史决策（2026-11-03）：独立 block 原型因编译成本撤回，当时恢复到测得 38.454 ms 的 `queue-ordinary-credit-v1`。该数值只属于当时的版本。**
+
+当前继续使用全任务 cooperative admission，并包含 64B 共享布局、Host CSR/remaining、ordinary 小 grid 的循环成员集合及 resident 编译单元拆分。当前代码合同见[数据布局](data-layout.md)、[依赖计数](dependency-counters.md)与[调度协议](protocol.md)；历史阶段的验证不自动覆盖后续改动。
 
 **用户约定：方案确定后按阶段自主实现，遇到问题自行分析、修复、验证和迭代，不因常规实现选择反复询问用户。**
 每阶段保留代码差异、验证结果、未解决问题和下一步，不把上下文切换当作停止任务或重新确认的理由。
@@ -82,7 +84,8 @@ Qwen 性能接近目标后再执行完整性能回归；已有局部退化如实
 | A5 `runtime/scheduler/scheduler_ready.h` | bootstrap/route/resolve 的 fanin 读取统一，控制与 kernel 分流，direct refill 保持 kernel 专用 |
 | A5 `runtime/scheduler/scheduler_admission.h` | PREPARED publication，成员首次观察 bootstrap 已发布的参数 |
 | A5 `runtime/scheduler/scheduler_types.h`、layout 创建处 | node/instance/template/header wire、counts、inbox/continuation 与 checked size |
-| A5 `aicore/aicore_executor.cpp` | bootstrap 分区参数准备与 gate、每轮控制服务、真实完成批量 flush、退出 drain |
+| A5 `aicore/aicore_executor.cpp`、`resident_scheduler.h` | 启动握手、变体选择与窄入口声明 |
+| A5 `aicore/resident_scheduler_impl.h` 及四个 `resident_*.cpp` | bootstrap、每轮调度/控制服务、完成 flush 与退出；普通/native × profile 开关显式实例化 |
 | A5 `aicpu/aicpu_executor.cpp` | N-node supervision、mapped error identity、保持原 run fence |
 | A5 `host/scheduler_protocol_export.h` 及 DFX reader | 双身份、控制事件、独立 expected graph、schema version |
 
@@ -144,7 +147,8 @@ ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的�
 
 主线 native protocol JSON 的 v5 reader 不能猜测新映射语义；新增 schema 版本与明确 node map。
 同步修改 `simpler_setup/tools/hbg/native_protocol.py`、export UT 和 Python oracle UT，保留旧版本读取能力。
-当前实现的 `hbg-native-protocol-v9` 保留 v8 的领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
+当前实现导出 `hbg-native-protocol-v11`，保留领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
+以及 v10 起按资源类型累计 block 前缀的 ordinary 有界循环成员规则，
 并包含两部分原生 Graph 来源：
 
 - `node_map`：每个 internal ref 的 kind、public TaskId、original task/shell id 与 local child id；
@@ -155,8 +159,10 @@ ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的�
 `native_graph.py` 从该源重建 ENTER、body、全部 sink→EXIT 及 outer completion 映射，
 再与运行视图导出的 `tasks`/`node_map` 比较；`native_causality.py` 继续验证发布、成员、block 和完成顺序。
 control 节点使用 protocol TaskDone actor，不伪造 kernel execution 或 legacy GraphPrepare。
-无 Graph capture 输出 v8。reader 保留 v1–v8 兼容性；历史 Graph v6 通过
-`node_map` 和 `graph_source` 区分于领取结束证明 v6，分别执行各自的严格字段校验。
+无 Graph capture 输出 v10，native Graph 输出 v11；读端仅接受这两个当前格式，生产者与工具必须配套。
+不维护历史或内部实验格式的兼容分支。execution identity 保持严格 v1，多 block 记录不得缺失 order_key。
+当前 native audit 从冻结任务形状独立重建 member_rank_offset 并核对成员集合，不以导出的偏移值作为 oracle。
+所有受支持任务均遵守 cooperative admission。
 
 expected graph 必须由原始外部 dep_gen 与原始 Definition 独立展开得到；
 不能把被测 NativeGraphHostPlan 自己输出的边再当 oracle，否则同一种漏边会同时通过两边。

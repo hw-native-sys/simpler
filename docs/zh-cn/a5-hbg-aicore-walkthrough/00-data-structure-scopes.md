@@ -2,7 +2,7 @@
 
 [回到执行流程](README.md)
 
-本表覆盖走读材料涉及的 resident 数据结构，以及直接相关的视图、临时结果和采集结构。host 实现与 legacy 调度内部结构继续跳过。字段含义仍放在各执行阶段文档中，先用这里判断“这一份数据属于谁”。
+本表覆盖走读材料涉及的 resident 数据结构，以及直接相关的视图、临时结果和采集结构。Host 只说明其输出的数据合同，legacy 调度内部结构继续跳过。字段含义仍放在各执行阶段文档中，先用这里判断“这一份数据属于谁”。
 
 ## 读表约定与结构关系
 
@@ -24,6 +24,7 @@ flowchart TD
     R --> WC["WorkerContext：每个 worker 一份"]
     R --> TM["TaskMetadata：每个节点一份"]
     R --> TC["TaskControl：每个节点一份"]
+    R --> DEP["依赖 header / CSR / remaining：本轮共享"]
     R --> DP["DispatchPayload：每 worker 两个 own 槽"]
     R --> MB["GroupMailbox：每 cluster 一份，MIX 复用"]
     WC --> LC["本核 LocalConfig：缓存配置"]
@@ -66,10 +67,10 @@ flowchart TD
 | 结构 | 作用范围 / 逻辑份数 | 存放位置 | 用途与主要读写者 | 生命周期 |
 | ---- | ------------------- | -------- | ---------------- | -------- |
 | `AicpuThreadLifecycleTrace` | 每个 AICPU 生命周期线程 1 条 | GM | 对应线程写自己的握手/发布/退出时间，leader 补全配置阶段时间 | 本轮记录；退休后用于汇总 |
-| `SchedulerWorkerStats` | 每个 worker 1 份 | AICore 私有 | 本核执行/轮询/阶段统计的累计器；最终写回 WorkerContext 统计区 | 本轮累计 |
-| `SchedulerWakeStats` | 本核统计对象内 1 份 | AICore 私有 | 统计依赖读取、挂链、关闭、迁移 | 本轮累计，未启用采集时可不传 |
-| `SchedulerReadyStats` | 本核统计对象内 1 份 | AICore 私有 | 统计 ready 入队、批次、领取、偷取、CAS 等 | 本轮累计，未启用采集时可不传 |
-| `SchedulerCompletionStats` | 本核统计对象内 1 份 | AICore 私有 | 统计本地完成登记与依赖完成解析 | 本轮累计，未启用采集时可不传 |
+| `SchedulerWorkerStats` | 每个 worker 1 份 | AICore 私有 | 保存 bootstrap 时间、扫描数和本地执行记录序号；只把保留的启动统计写回 WorkerContext | 本轮累计 |
+| `SchedulerWakeStats` | 调用方按需提供的统计值 | AICore 私有 | 统计依赖读取、挂链、关闭、迁移 | 由调用方持有；不是 WorkerContext 的常驻聚合字段 |
+| `SchedulerReadyStats` | 调用方按需提供的统计值 | AICore 私有 | 统计 ready 入队、批次、领取、偷取、CAS 等 | 由调用方持有；不是 WorkerContext 的常驻聚合字段 |
+| `SchedulerCompletionStats` | 调用方按需提供的统计值 | AICore 私有 | 统计本地完成登记与依赖完成解析 | 由调用方持有；不是 WorkerContext 的常驻聚合字段 |
 | `SchedulerLocalProfilingState` | 启用对应采集的 worker 各 1 份 | AICore 私有 | 保存本核采集配置、各 slot 暂存执行记录和循环编号 | 本轮；不开启时没有该类型的有效采集对象 |
 | `SchedulerNoProfilingState` | 未启用采集模板中的空占位类型 | AICore 私有 | 模板实例化时避免分配完整 profiling 状态，无业务字段 | 本轮调用内 |
 | `SchedulerWorkerTraceCache` | 本地 profiling 中按 cluster lane 缓存 | AICore 私有 | 缓存目标核的启动时间记录，避免反复读取 WorkerContext | 本轮，首次需要时填充 |
@@ -100,6 +101,9 @@ flowchart TD
 | `SchedulerTaskShape` | 一次任务形状解析的结果 | 调用者局部值 | 保存任务的 kernel IDs 和 active mask，供分类/校验 | 当前分类调用 |
 | `SchedulerTaskPayloadArguments` | 一次参数解析/共享 materialize 的视图 | AICore 私有，指向 GM | 缓存 tensors/scalars 区地址及数量；实际参数不归它所有 | 本次准备过程 |
 | `SchedulerDispatchPredicate` | 某任务的派发条件描述 | 从 GM 参数/任务存储读取，可形成局部值 | 指定读取地址、比较值、类型宽度和操作；执行前求值 | 条件描述随任务，求值结果保留在候选/slot |
+| `SchedulerDependencyHeader` | 启用静态计数路径的本轮 1 份 | GM，64B 只读 header | 定位 remaining 与 fanout CSR；Host 初始化、device 校验后读取 | 本轮；偏移均相对 scheduler backing |
+| remaining 数组 | 每个 resident 节点一个 uint64_t | GM，独立原子区域 | Host 设未完成前驱数；每条 producer 完成边原子递减，1→0 的 owner 发布 ready | 从 bootstrap 到该节点 ready |
+| fanout offsets/refs | N+1 个 uint64_t 偏移及 E 个 int32_t 后继引用 | GM，只读 CSR | Host 从统一图访问器生成并去重；resolver 按 producer 遍历其后继 | 本轮；与 remaining 原子区分离 |
 | `SchedulerReadyPoolHeader` | 启用 pool 的本轮 1 份 | GM，只读 | 定义按 AIC/AIV/MIX 和 group 切分的 ticket 队列布局 | 本轮 |
 | `SchedulerReadyPoolDescriptor` | 每条 pool queue 1 份 | GM，只读数组 | 给出该队列 entry 区和容量 | 本轮 |
 | `SchedulerTicketQueue` | 每条 pool queue 1 份 | GM，原子控制区 | 多核发布者预留 tail，多核消费者 CAS head 领取任务 | 本轮，游标单调推进，entry 不覆盖重用 |
@@ -137,7 +141,7 @@ flowchart TD
 | `SchedulerRouteCursor` | 一个waiter的一次依赖路由过程 | 私有局部值，或嵌在可持久化resolver中 | 保存当前fanin/producer，预算耗尽可续行；成功挂链后责任交给下一个resolver | 该waiter本次路由过程 |
 | `SchedulerRouteProgress` | 一次route_step返回值 | 调用者私有 | 返回推进结果与消耗预算，不保存共享任务状态 | 当前返回值使用期间 |
 | `SchedulerReadyPublication` | 一个resolver当前待发布批次 | 私有或作为resolver续行的一部分存GM | 保存最多8个ready ref及发布阶段，确保未完成的发布责任不会丢失 | 批次从收集到完整发布 |
-| `SchedulerResolveCursor` | 一个producer完成后的wake链解析过程 | 普通路径局部；native在LocalState持久化；async在GM续行区持久化 | 拥有已摘下的链、当前waiter和未发布批次；这是“正在做哪一步”的记录 | 直到所有后继责任交接完；位置随所用路径不同 |
+| `SchedulerResolveCursor` | 一个 producer 完成后的后继解析过程 | 普通路径局部；native在LocalState持久化；async在GM续行区持久化 | 保存 CSR 遍历位置或兼容路径已摘下的链、当前 waiter 和未发布批次 | 直到所有后继责任交接完；位置随所用路径不同 |
 | `SchedulerResolveProgress` | 一次resolve_step返回值 | 调用者私有 | DONE/YIELD/ERROR及本片work units | 当前调用返回值使用期间 |
 
 关闭一个 worker 的当前 admission 义务，不等于整个任务已经完成。

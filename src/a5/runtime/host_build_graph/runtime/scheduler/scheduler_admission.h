@@ -57,7 +57,8 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             summary->cluster_count != clusters || local->config.graph->task_count > static_cast<uint64_t>(INT32_MAX) ||
             next.member_word_count != (workers + 63) / 64 || next.control_offset == 0 || next.records_offset == 0 ||
             next.log_offset == 0 ||
-            ((next.control_offset | next.records_offset | next.log_offset | next.record_stride) & 127) != 0 ||
+            ((next.control_offset | next.records_offset | next.log_offset | next.record_stride) &
+             (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
             next.record_stride < sizeof(SchedulerAdmissionRecord) + next.member_word_count * sizeof(uint64_t) ||
             !scheduler_admission_range_end(next.control_offset, 1, sizeof(SchedulerAdmissionControl), &control_end) ||
             !scheduler_admission_range_end(
@@ -74,7 +75,8 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
         if (local->config.shared_context == nullptr) return false;
         const uint64_t cluster = local->config.shared_context->cluster_index;
         if (cluster >= clusters || summary->group_mailboxes_offset == 0 ||
-            (summary->group_mailboxes_offset & 127) != 0 || (summary->mix_close_seals_offset & 127) != 0 ||
+            (summary->group_mailboxes_offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
+            (summary->mix_close_seals_offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
             summary->group_mailboxes_offset < next.log_offset + next.capacity * sizeof(int64_t) ||
             !scheduler_admission_range_end(
                 summary->group_mailboxes_offset, clusters, sizeof(SchedulerGroupMailbox), &mailbox_end
@@ -183,6 +185,8 @@ inline __aicore__ bool scheduler_admission_static_record_valid(
         meta.timing_slot >= SCHEDULER_TASK_TIMING_SLOT_COUNT || record->task_ref != task_ref ||
         record->logical_block_num != meta.logical_block_num ||
         scheduler_lane_mask_load(record->active_mask) != meta.active_mask || record->flags != meta.flags ||
+        ((scheduler_task_is_mix(meta.flags) || scheduler_task_requires_sync_start(meta.flags)) &&
+         record->member_rank_offset != 0) ||
         record->member_words_offset != admission->records_offset +
                                            static_cast<uint64_t>(task_ref) * admission->record_stride +
                                            sizeof(SchedulerAdmissionRecord))
@@ -216,7 +220,6 @@ inline __aicore__ bool scheduler_admission_expected_members(
         for (uint64_t worker = 0; worker < workers; ++worker) {
             auto *context = scheduler_worker_context_at(base, local, worker);
             scheduler_observe_cache_line(context);
-            scheduler_observe_cache_line(&context->worker_index);
             const int32_t type = context->core_type;
             if (context->worker_index != worker ||
                 (type != static_cast<int32_t>(CoreType::AIC) && type != static_cast<int32_t>(CoreType::AIV)))
@@ -271,6 +274,28 @@ inline __aicore__ bool scheduler_admission_expected_members(
         mix ? cubes * scheduler_mix_resource_mask(scheduler_lane_mask_load(record->active_mask)).count() :
               (cube_task ? cubes : workers - cubes)
     );
+    // Ordinary SPMD uses a cyclic interval of type ranks, at most one rank
+    // per block. Its Host-planned prefix counts only this resource type's
+    // ordinary SPMD blocks; Mix and sync-start do not consume that prefix.
+    if (!mix && scheduler_task_is_spmd(record->flags) && !scheduler_task_requires_sync_start(record->flags) &&
+        record->logical_block_num < *member_count) {
+        const uint32_t count = *member_count;
+        const uint32_t limit = record->logical_block_num;
+        const uint32_t begin = static_cast<uint32_t>(record->member_rank_offset % count);
+        const uint32_t end = begin + limit;
+        uint32_t rank = 0;
+        for (uint64_t word = 0; word < admission->member_word_count; ++word) {
+            uint64_t available = words[word];
+            words[word] = 0;
+            while (available != 0) {
+                const uint64_t bit = available & (UINT64_C(0) - available);
+                if ((rank >= begin && rank < end) || (end > count && rank < end - count)) words[word] |= bit;
+                available ^= bit;
+                ++rank;
+            }
+        }
+        *member_count = limit;
+    }
     const uint32_t positions = mix ? cubes : *member_count;
     return *member_count != 0 &&
            (!scheduler_task_requires_sync_start(record->flags) || record->logical_block_num <= positions);

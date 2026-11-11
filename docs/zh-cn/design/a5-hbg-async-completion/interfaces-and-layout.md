@@ -14,19 +14,19 @@
 
 ## 2. 每次物理执行的完成记录
 
-`AsyncGroupData` 是 128 B 对齐的 header，记录 run epoch、task ref、block、lane、group index、容量、登记数量、首错、预留状态和封口状态。所有 header 连续排列在初始化前缀中；token 数组位于预留后缀。`entries_offset` 使用 header 的既有对齐余量，`entries_bytes` 只记录对齐后的 token 区长度，容量 1/64 对应 128/2048 B，加上 header 后仍分别预留 256/2176 B。header 与 token 分别检查边界和对齐，二者不得重叠。不增加资源 binding 表或每条件 binding index。
+`AsyncGroupData` 是 128 B 长、64 B 对齐的 header，记录 run epoch、task ref、block、lane、group index、容量、登记数量、首错、预留状态和封口状态。所有 header 连续排列在初始化前缀中；token 数组位于预留后缀。`entries_offset` 使用 header 的既有对齐余量，`entries_bytes` 只记录对齐后的 token 区长度，容量 1/64 对应 64/2048 B，加上 header 后分别预留 192/2176 B。header 与 token 分别检查边界和对齐，二者不得重叠。不增加资源 binding 表或每条件 binding index。
 
 `AsyncWriter` 是 kernel 栈上的访问视图，只包含稳定 image 基址、长度、epoch、group offset/index。它不持有完成条件本体；复制视图仍操作同一个 group，容量、预留和首错不会因复制而分叉。
 
-header 中还保存 run 内 SDMA 提交互斥数组的 offset 和数量，占用既有对齐余量，header 总长仍为 128 B。该数组按实际 cluster 数分配，每项 128 B；同 cluster 的 AIV 使用同一项，在 session 构造和提交期间互斥。它不描述外部资源身份，不持有 payload，也不参与完成等待。
+header 中还保存 run 内 SDMA 提交互斥数组的 offset 和数量，占用既有对齐余量，header 总长仍为 128 B。该数组按实际 cluster 数分配，每项 64 B；同 cluster 的 AIV 使用同一项，在 session 构造和提交期间互斥。它不描述外部资源身份，不持有 payload，也不参与完成等待。
 
-header 的前 64 B 包含本执行可变字段，后半部的 SDMA guard 和 token 边界由 Host 初始化后保持只读。登记区只有当前物理执行写入。正常返回或 predicate skip 后 runtime 封口并发布；后续观察不能依赖已经释放的 dispatch payload、原核栈或 UB。首错不可覆盖，未关闭预留、越界或忽略登记失败都使封口失败。
+header 的前 64 B 包含本执行可变字段，以及 Host 初始化后保持不变的 group_index、run_epoch、task_ref、entries_offset 和 sdma_guards_offset；后 64 B 保存只读的 block_index、subtask_slot、entries_bytes、sdma_guard_count 和 capacity。首行回写同时覆盖其内不变的 Host 字段。登记区只有当前物理执行写入。正常返回或 predicate skip 后 runtime 封口并发布；后续观察不能依赖已经释放的 dispatch payload、原核栈或 UB。首错不可覆盖，未关闭预留、越界或忽略登记失败都使封口失败。
 
 后端提交若需要预留，在副作用前用内部 `reserve_conditions` 占用足够容量；提交后按实际公共完成记录数 commit，再关闭预留。登记普通 COUNTER 时一次调用内部完成这三个步骤，不要求业务代码提供额外绑定对象。
 
 ## 3. 内部上下文
 
-`LocalContext` 保持 48 B，已有 slab 上下文保持 40 B，`DispatchPayload.args` 起点保持 64，完整 payload 保持 512 B。48 B `GlobalContext` 的 resident 字段提供当前执行的稳定完成记录地址与身份；`async_present` 只表示这个 dispatch 是否带 resident 上下文，不是跨 runtime 的注册协议版本。
+`LocalContext` 保持 48 B，已有 slab 上下文保持 40 B，`DispatchPayload.args` 起点保持 64，完整 payload 保持 512 B。48 B `GlobalContext` 的 resident 字段提供当前执行的稳定完成记录地址与身份；`async_present` 只表示这个 dispatch 是否带 resident 上下文，不是跨 runtime 的注册协议版本。`async_output_capture_refused` 表示参数诊断请求了不能在异步完成前读取的输出；每次 resident dispatch 清零，命中诊断限制时设置，并由 kernel 注册入口拒绝。
 
 旧调度路径仍使用原 slab；resident 路径使用稳定 group。二者由当前 dispatch 填入的上下文决定，公开登记函数不要求调用方选择或重写接口。
 
@@ -38,9 +38,9 @@ Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block
 
 基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行封口后直接释放资源，不创建 CHECK 责任。预留容量与每轮初始化、上传范围分开：Host/Device backing 保留完整容量，但 `initialized_bytes` 只覆盖原调度状态及异步元数据、join、目录、SDMA guard、连续 header。token、CHECK/FINISH lease 与进度位于后缀，首次实际发布前由唯一写者初始化。Host 使用既有 pending metadata 路径上传此前缀，不清零或上传未使用后缀。空间、bind 和 H2D 成本分别计量，不将减少上传宣称为省掉全部预留内存。
 
-`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、连续 header 基址 `groups_offset`、lease、CHECK 进度、task join、FINISH 游标、活动位图及 run 活动标记的位置。offset 120 使用原布局余量保存 activity_offset；标记独占 128 B 行，禁止与 cached 数据共用回写行。FINISH 的完整 resolver 游标为 160 B，放在独立 256 B 进度记录内。lease、发布数据和 cached 进度分别隔离到 128 B cache line。
+`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、连续 header 基址 `groups_offset`、lease、CHECK 进度、task join、FINISH 游标、活动位图及 run 活动标记的位置。offset 120 使用原布局余量保存 activity_offset；标记独占 64 B 行，禁止与 cached 数据共用回写行。FINISH 的完整 resolver 游标为 160 B，放在独立 192 B 进度记录内。lease、发布数据和 cached 进度分别隔离到 64 B cache line。
 
-SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。32 个实际 cluster 对应 4096 B 互斥存储，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
+SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。32 个实际 cluster 对应 2048 B 互斥存储，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
 
 run bootstrap 校验整个连续 header 数组；执行入口根据 task/block/lane 计算稳定索引，不读取未使用的 header。kernel 请求 `AsyncCtx` 时校验记录格式与 OPEN 状态，返回封口时再次核对实际 task/block/lane 和登记状态。token-only 长度须与容量一致，不能接受把 header 长度混入 token 区的记录。
 

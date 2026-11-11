@@ -19,11 +19,11 @@ inline constexpr uint32_t COUNT_MAX = INT16_MAX;
 inline constexpr uint64_t REGISTERED_UNIT = UINT64_C(1) << 16;
 inline constexpr uint64_t COMPUTATION_CLOSED = UINT64_C(1) << 32;
 
-struct alignas(128) Join {
+struct alignas(64) Join {
     volatile uint64_t word{0};
 };
 
-static_assert(sizeof(Join) == 128 && alignof(Join) == 128);
+static_assert(sizeof(Join) == 64 && alignof(Join) == 64);
 static_assert(std::is_standard_layout_v<Join> && std::is_trivially_copyable_v<Join>);
 
 enum class Result : uint8_t {

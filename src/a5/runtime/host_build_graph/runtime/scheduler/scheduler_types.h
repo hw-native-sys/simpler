@@ -128,7 +128,6 @@ struct alignas(64) CoreExecState {
     uint32_t dispatch_seq;                  // offset 32: monotonic dispatch counter
     SubtaskSlot running_subslot;            // offset 36: which subtask slot is running
     SubtaskSlot pending_subslot;            // offset 37: which subtask slot is pending
-    uint8_t pad0_[2];                       // offset 38: alignment padding
     // Precomputed COND register pointer; resolved once in handshake so the
     // hot completion poll does a single volatile load instead of recomputing
     // reg_base + reg_offset(COND) on every iteration.
@@ -142,7 +141,6 @@ struct alignas(64) CoreExecState {
     int32_t worker_id;          // offset 48: index in runtime.workers[]
     uint32_t physical_core_id;  // offset 52: hardware physical core ID
     CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
-    uint8_t pad2_[4];           // offset 60: pad to 64 bytes
 #endif
 };
 static_assert(sizeof(CoreExecState) == 64, "CoreExecState must occupy exactly one cache line");
@@ -637,7 +635,7 @@ inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
 //
 // These types are shared by Host, AICPU lifecycle, and AICore workers.
 // =============================================================================
-inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 128;
+inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 64;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
 // A Mix task's AIV subtasks land on slots whose only writer is the cluster's
@@ -763,14 +761,12 @@ struct SchedulerIdleRecord {
     uint64_t start_time;
     uint64_t end_time;
     uint32_t loop_iter;
-    uint32_t reserved;
 };
 static_assert(sizeof(SchedulerIdleRecord) == 24, "Scheduler idle record layout changed");
 
 struct alignas(64) SchedulerActivityBuffer {
     volatile uint32_t committed;
     volatile uint32_t dropped;
-    uint32_t reserved[2];
     SchedulerIdleRecord records[SCHEDULER_ACTIVITY_CAPACITY];
 };
 static_assert(sizeof(SchedulerActivityBuffer) % 64 == 0, "scheduler activity buffer must be cache aligned");
@@ -931,46 +927,33 @@ enum class SchedulerAdmissionState : uint64_t {
     ADMITTED = 3,
 };
 
-struct alignas(128) SchedulerTaskControl {
-    // Cross-core state publication, the wake-list RMWs, and the chain link share
-    // the first line. Every field here is reached only through the atomic
-    // wrappers, which is what the link needs on two counts: a Ready inbox has
-    // several producers now, so the link transfers ownership of a node and must
-    // be written as an atomic rather than observed-and-published; and nothing
-    // publishes this line as a whole, so no producer's line writeback can
-    // restore its stale copy of a link another producer just wrote.
+struct alignas(64) SchedulerTaskControl {
+    // Only atomic wrappers write this line. The link belongs to at most one
+    // dependency list, Ready inbox or unpublished Ready batch at a time.
     volatile int64_t state;
     volatile int64_t wake_list_head;
-    // Links the task while it belongs to a dependency wake list, to a Ready
-    // inbox, or to the local batch staged for one. A task is in at most one of
-    // them: a resolver detaches a whole wake list before routing its waiters,
-    // and a batch is spliced into an inbox without rewriting its links.
     volatile int64_t next_waiter;
     volatile uint64_t claim_tickets;
-    uint8_t control_padding[8];
     volatile uint64_t admission_claim_lock;
-    uint8_t atomic_line_padding[16];
 
-    int32_t next_fanin_index;
+    // The resolver owns cached metadata; its writeback cannot touch atomics.
+    alignas(64) int32_t next_fanin_index;
     int32_t waiting_producer;
     uint64_t completion_resolve_start_cycles;
     uint64_t completion_resolve_end_cycles;
     uint64_t scheduler_worker_id;
     uint64_t completion_resolve_loop_iter;
-    uint8_t scheduler_line_padding[24];
 
-    alignas(128) volatile uint64_t next_block;
-    uint8_t block_cursor_padding[120];
-    alignas(128) volatile uint64_t completed_blocks;
-    uint8_t block_completion_padding[120];
-    // Only the claimed owner publishes the admission phase. This region
-    // excludes RMW and cached writes, including writes to its padding.
-    alignas(128) volatile uint64_t admission_state;
-    uint8_t admission_phase_padding[120];
-    // The final valid block confirmer publishes this immutable certificate.
-    // Its atomic-only region excludes cached writes and bypass stores.
-    alignas(128) volatile uint64_t claim_seal;
-    uint8_t claim_seal_padding[120];
+    // Block claimers and retiring workers update these counters concurrently.
+    alignas(64) volatile uint64_t next_block;
+    alignas(64) volatile uint64_t completed_blocks;
+
+    // Only the admission owner bypass-publishes this signal. No cached store
+    // or atomic RMW may target its line.
+    alignas(64) volatile uint64_t admission_state;
+
+    // The final block claimer publishes this immutable claim certificate.
+    alignas(64) volatile uint64_t claim_seal;
 };
 
 // Each record's bitmap follows its header within an independently aligned
@@ -981,28 +964,27 @@ struct alignas(64) SchedulerAdmissionRecord {
     uint64_t order_key;
     uint64_t member_words_offset;
     uint64_t mix_close_seals_offset;
+    // Host prefix of ordinary SPMD blocks of this resource type in task-ref order.
+    uint64_t member_rank_offset;
     uint32_t logical_block_num;
     uint32_t member_count;
     LaneMask active_mask;
     uint8_t flags;
-    uint8_t reserved[14];
 };
 
 // Each cluster's retained close seal occupies an independent atomic region.
-struct alignas(128) SchedulerMixCloseSeal {
+struct alignas(64) SchedulerMixCloseSeal {
     volatile uint64_t value;
 };
 
-struct alignas(128) SchedulerAdmissionControl {
+struct alignas(64) SchedulerAdmissionControl {
     // Only the lock uses atomics. Tail publishers are serialized by the lock
     // and complete their bypass store before releasing it.
     volatile uint64_t commit_lock;
-    uint8_t lock_padding[120];
-    alignas(128) volatile uint64_t commit_tail;
-    uint8_t tail_padding[120];
+    alignas(64) volatile uint64_t commit_tail;
 };
 
-struct alignas(128) SchedulerGroupDescriptor {
+struct alignas(64) SchedulerGroupDescriptor {
     uint64_t run_epoch;
     int64_t task_ref;
     uint64_t order_key;
@@ -1015,20 +997,17 @@ struct alignas(128) SchedulerGroupDescriptor {
     uint8_t lane_subtasks[3];
     uint8_t flags;
     uint64_t previous_lane_seq[3];
-    uint8_t reserved[48];
 };
 
-struct alignas(128) SchedulerGroupLaneAck {
+struct alignas(64) SchedulerGroupLaneAck {
     volatile uint64_t arrived_seq;
     volatile uint64_t released_seq;
     volatile uint64_t assigned_seq;
-    uint8_t reserved[104];
 };
 
-struct alignas(128) SchedulerGroupMailbox {
+struct alignas(64) SchedulerGroupMailbox {
     SchedulerGroupDescriptor descriptor;
-    volatile uint64_t published_seq;
-    uint8_t publication_padding[120];
+    alignas(64) volatile uint64_t published_seq;
     SchedulerGroupLaneAck lanes[3];
 };
 
@@ -1045,16 +1024,15 @@ struct alignas(128) SchedulerGroupMailbox {
 // producer appending and a consumer taking contend on every operation, even
 // though they touch opposite ends of a non-empty queue. Separate head and tail
 // on their own cache lines decouple that. Which one wins here is not measured.
-struct alignas(128) SchedulerReadyInbox {
+struct alignas(64) SchedulerReadyInbox {
     volatile uint64_t endpoints;
-    uint8_t atomic_line_padding[120];
 };
 
 enum class SchedulerTopologyLayout : uint64_t { GENERAL = 0, COMPACT_LAUNCH = 1 };
 
 // Facts frozen by READY: the host supplies graph facts, and AICPU discovery
 // validates the topology. Workers only read this region during the run.
-struct alignas(128) SchedulerGraphSummary {
+struct alignas(64) SchedulerGraphSummary {
     uint64_t mix_task_count;
     uint64_t cooperative_task_count;
     uint64_t worker_count;
@@ -1075,10 +1053,9 @@ struct alignas(128) SchedulerGraphSummary {
 
 struct alignas(64) SchedulerReadyDirectoryShard {
     volatile uint64_t bits;
-    uint8_t cache_line_padding[64 - sizeof(uint64_t)];
 };
 
-struct alignas(128) SchedulerReadyDirectory {
+struct alignas(64) SchedulerReadyDirectory {
     SchedulerReadyDirectoryShard core_types[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
 };
 
@@ -1172,7 +1149,7 @@ enum SchedulerErrorIdentityField : uint32_t {
     SCHEDULER_ERROR_HAS_LANE = 1U << 5,
 };
 
-struct alignas(128) SchedulerRunControl {
+struct alignas(64) SchedulerRunControl {
     uint64_t aic_task_count;
     uint64_t aiv_task_count;
     uint64_t active_worker_count;
@@ -1188,36 +1165,22 @@ struct alignas(128) SchedulerRunControl {
     uint64_t aiv_worker_demand;
     uint64_t graph_summary_offset;
     uint64_t scheduler_count;
-    // Pads the host-written configuration to one full cache line, which is what
-    // keeps the counters below on a line of their own. The static_assert on
-    // executed_task_count's offset is the check that says so.
-    uint64_t configuration_line_padding;
-
-    volatile uint64_t executed_task_count;
-    volatile uint64_t resolved_task_count;
-    volatile uint64_t bootstrap_arrived_count;
-    volatile uint64_t bootstrap_complete;
-    uint64_t completion_wait_start_cycles;
-    uint64_t bootstrap_complete_cycles;
-    uint64_t all_tasks_resolved_cycles;
-    uint64_t shutdown_ready_cycles;
-    uint64_t completion_poll_count;
-    uint64_t completion_poll_cycles;
-    uint64_t error_poll_count;
-    volatile uint64_t bootstrap_scan_arrived_count;
-    volatile uint64_t bootstrap_scan_complete;
     volatile uint64_t scheduler_timeout_cycles;
     volatile uint64_t chip_swimlane_level;
     volatile uint64_t sampled_task_timing_enabled;
 
-    volatile uint64_t error_claimed;
-    uint64_t error_status_padding;
+    alignas(64) volatile uint64_t resolved_task_count;
+    volatile uint64_t bootstrap_arrived_count;
+    volatile uint64_t bootstrap_complete;
+    volatile uint64_t bootstrap_scan_arrived_count;
+    volatile uint64_t bootstrap_scan_complete;
+
+    alignas(64) volatile uint64_t error_claimed;
     volatile uint64_t error_task_ref;
     volatile uint64_t error_core_id;
     volatile uint64_t error_core_type;
     volatile uint64_t error_graph_task_count;
     volatile uint64_t error_storage_address;
-    volatile uint64_t error_reserved_address;
     volatile uint64_t error_task_window_last_index;
     volatile uint64_t error_site;
     volatile uint64_t error_run_epoch;
@@ -1229,10 +1192,10 @@ struct alignas(128) SchedulerRunControl {
     volatile uint32_t error_identity_fields;
     // Only the elected error writer publishes this word. Its line has no
     // atomic RMW or cached AICore store, including readers that add zero.
-    alignas(128) volatile uint64_t scheduler_error;
+    alignas(64) volatile uint64_t scheduler_error;
 };
 
-struct alignas(128) AicpuThreadLifecycleTrace {
+struct alignas(64) AicpuThreadLifecycleTrace {
     uint64_t aicpu_thread_id;
     uint64_t handshake_start_cycles;
     uint64_t handshake_complete_cycles;
@@ -1248,130 +1211,64 @@ struct alignas(128) AicpuThreadLifecycleTrace {
     uint64_t exit_signal_end_cycles;
     uint64_t exit_wait_start_cycles;
     uint64_t exit_wait_end_cycles;
-    uint64_t reserved;
 };
 
-struct alignas(128) SchedulerWorkerContext {
-    // Routing and address fields are immutable from READY publication to retirement.
+struct alignas(64) SchedulerWorkerContext {
+    // READY publishes the configuration prefix. Peer routing and the pre-READY
+    // watchdog read only this first line.
     int32_t core_type;
     int32_t physical_core_id;
     int32_t type_rank;
-    uint32_t worker_reserved;
+    uint32_t is_scheduler;
     uint64_t run_control_offset;
     uint64_t task_controls_offset;
-    // Base of this run's ChipTaskStorage array. One address: a task's descriptor
-    // and payload are members of one entry, so AICore strides by the storage.
-    uint64_t graph_storage_address;
-    // Held so the wire layout survived the collapse from two addresses to one.
-    // Whoever wires this context up must write 0 here and reject a non-zero read,
-    // or a later field can be reintroduced over a value someone else is using.
-    uint64_t graph_reserved_address;
     uint64_t scheduler_state_base_address;
     uint64_t dispatch_payload_offset;
-    uint64_t trace_cells_offset;
-    uint64_t task_window_last_index;
-    uint64_t graph_task_count;
     uint64_t worker_index;
-    uint64_t scheduler_ssbuf_reserved0;
-    uint64_t scheduler_ssbuf_reserved1;
-    uint64_t aicpu_lifecycle_traces_offset;
-
-    alignas(128) uint64_t task_metadata_offset;
-    uint64_t ready_inboxes_offset;
-    uint64_t ready_directory_offset;
-    uint64_t activity_buffers_offset;
     uint64_t worker_contexts_offset;
-    uint64_t scheduler_ssbuf_reserved2;
-    // The active callable's registration-owned kernel-entry table: an absolute
-    // device address, not a scheduler-state offset, because the table lives in
-    // that callable's registration block and outlives every run bound to it.
-    // `callable_addresses_count` is the table's own length, and the only
-    // bound available here: the scheduler state reserves no callable array.
-    uint64_t callable_addresses_address;
-    uint64_t runtime_worker_count;
-    uint64_t bootstrap_scan_end_cycles;
-    uint64_t target_bootstrap_start_cycles;
-    uint64_t target_bootstrap_end_cycles;
-    uint64_t bootstrap_target_aic_cycles;
-    uint64_t bootstrap_target_aiv_cycles;
-    uint64_t callable_addresses_count;
-    // This run's per-subtask PMU staging array, in the same index space as the
-    // trace cells. Taken from this group rather than from `topology_reserved`
-    // below: that tail is contract-checked zero by `scheduler_initialize_local_config`
-    // and consuming one of its words would make a context carrying this offset
-    // read as malformed.
-    uint64_t pmu_cells_offset;
-    uint64_t args_dump_address;
 
-    alignas(128) uint64_t graph_summary_offset;
-    uint64_t scheduler_count;
-    uint64_t cluster_count;
-    uint64_t cluster_index;
-    uint64_t scheduler_index;
-    uint64_t is_scheduler;
-    uint64_t cluster_worker_ids[3];
-    // Mix slots' payloads and executor traces, both addressed by the holding
-    // AIV's rank within its type rather than by worker id. They sit in the
-    // configuration prefix because that is the span a core observes before
-    // reading any of it; a config offset outside it reads as whatever the line
-    // last held.
-    uint64_t mix_payloads_offset;
-    uint64_t mix_traces_offset;
-    uint64_t topology_reserved[1];
+    // The complete graph view shares one line, including its format and extent.
+    uint64_t graph_storage_address;
+    uint64_t graph_task_count;
+    uint64_t task_window_last_index;
     volatile uint64_t native_header_offset;
+    volatile uint64_t scheduler_state_bytes;
     volatile uint64_t original_task_count;
     volatile uint32_t graph_view_version;
     volatile uint32_t graph_view_bytes;
-    volatile uint64_t scheduler_state_bytes;
+    uint64_t graph_summary_offset;
 
-    alignas(128) uint64_t bootstrap_task_count;
-    uint64_t ready_enqueue_count;
-    uint64_t ready_batch_count;
-    uint64_t ready_pop_count;
-    uint64_t ready_steal_count;
-    uint64_t ready_cas_retry_count;
-    uint64_t ready_contention_giveup_count;
-    uint64_t ready_stats_reserved[3];
-    uint64_t executed_task_count;
-    uint64_t task_state_poll_count;
-    uint64_t fanin_state_load_count;
-    uint64_t wake_register_count;
-    uint64_t idle_iteration_count;
-    uint64_t backoff_cycles;
+    uint64_t task_metadata_offset;
+    uint64_t ready_inboxes_offset;
+    uint64_t ready_directory_offset;
+    // The callable's registration-owned entry table is outside this run's state.
+    uint64_t callable_addresses_address;
+    uint64_t callable_addresses_count;
+    uint64_t runtime_worker_count;
+    uint64_t mix_payloads_offset;
+    uint64_t mix_traces_offset;
 
-    uint64_t wake_cas_retry_count;
-    uint64_t wake_closed_retry_count;
-    uint64_t wake_migrate_count;
-    uint64_t wake_close_count;
-    uint64_t completion_enqueue_count;
-    uint64_t completion_resolve_count;
+    uint64_t scheduler_count;
+    uint64_t scheduler_index;
+    uint64_t cluster_count;
+    uint64_t cluster_index;
+    uint64_t cluster_worker_ids[3];
+    uint64_t aicpu_lifecycle_traces_offset;
+
+    uint64_t trace_cells_offset;
+    uint64_t activity_buffers_offset;
+    uint64_t pmu_cells_offset;
+    uint64_t args_dump_address;
+
+    // Only this worker writes the diagnostic line; peers read its startup
+    // timestamps when consolidating executed-task traces.
+    alignas(64) uint64_t bootstrap_task_count;
+    uint64_t bootstrap_start_cycles;
+    uint64_t target_bootstrap_end_cycles;
     uint64_t trace_aicore_entry_cycles;
     uint64_t trace_handshake_publish_cycles;
     uint64_t trace_register_release_cycles;
     uint64_t trace_descriptor_cache_observed_cycles;
-    uint64_t completion_stats_reserved[2];
-    uint64_t reserved_ready_to_kernel_cycles;
-    uint64_t reserved_ready_to_kernel_max_cycles;
-    uint64_t payload_cycles;
-    uint64_t kernel_cycles;
-
-    uint64_t completion_enqueue_cycles;
-    uint64_t bootstrap_start_cycles;
-    uint64_t bootstrap_end_reserved;
-    uint64_t drain_start_cycles;
-    uint64_t drain_end_cycles;
-    uint64_t exit_wait_start_cycles;
-    uint64_t exit_observed_cycles;
-    uint64_t final_stats_publish_start_cycles;
-    uint64_t final_stats_publish_end_cycles;
-    uint64_t exit_ack_publish_cycles;
-    uint64_t bootstrap_slot_fill_aic_cycles;
-    uint64_t bootstrap_slot_fill_aiv_cycles;
-    uint64_t termination_reserved[4];
-
-    // Preserve the shared wire layout after retiring the unconsumed
-    // Scheduler-tail profiling payload.
-    uint64_t scheduler_tail_reserved[32];
 };
 
 enum SchedulerExecutionIdentityFlags : uint32_t {
@@ -1381,7 +1278,7 @@ enum SchedulerExecutionIdentityFlags : uint32_t {
     SCHEDULER_TRACE_GROUP = 1U << 3,
 };
 
-struct alignas(128) SchedulerTaskTrace {
+struct alignas(64) SchedulerTaskTrace {
     // Dispatch publishes this line before READY; completion publishes valid.
     volatile uint64_t valid;
     uint64_t ready_source;
@@ -1399,15 +1296,8 @@ struct alignas(128) SchedulerTaskTrace {
     uint64_t completion_id;
     uint64_t completion_inbox_index;
 
-    // Reserved profiling word; Ready publication does not write execution traces.
-    alignas(64) uint64_t ready_transition_cycles;
-    uint64_t fanin_timing_reserved[4];
-    uint64_t aicore_entry_cycles;
-    uint64_t handshake_publish_cycles;
-    uint64_t register_release_cycles;
-
     // The dispatching Scheduler owns this cache line through completion.
-    uint64_t dispatch_start_cycles;
+    alignas(64) uint64_t dispatch_start_cycles;
     uint64_t dispatch_end_cycles;
     uint64_t dispatch_scheduler_worker_id;
     uint64_t dispatch_loop_iter;
@@ -1420,7 +1310,9 @@ struct alignas(128) SchedulerTaskTrace {
     uint64_t refill_end_cycles;
     uint64_t refill_task_ref;
     uint64_t refill_loop_iter;
-    uint64_t completion_reserved[3];
+    uint64_t aicore_entry_cycles;
+    uint64_t handshake_publish_cycles;
+    uint64_t register_release_cycles;
 
     // The completion Scheduler consolidates the Executor's staged timing here.
     uint64_t descriptor_cache_observed_cycles;
@@ -1454,7 +1346,6 @@ struct alignas(64) SchedulerTaskPmuCell {
     uint32_t counters[PMU_COUNTER_COUNT_A5];
     uint32_t worker_id;
     volatile uint32_t published;
-    uint32_t pmu_reserved;
 };
 
 static_assert(sizeof(SchedulerTaskPmuCell) == 64, "one PMU cell per cache line");
@@ -1465,31 +1356,34 @@ static_assert(std::is_trivially_copyable_v<SchedulerTaskMetadata> && std::is_sta
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
 static_assert(offsetof(SchedulerTaskMetadata, timing_slot) == 12, "timing tag offset changed");
 static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block count must occupy the metadata tail");
-static_assert(sizeof(SchedulerTaskControl) == 640, "task control layout changed");
-static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
+static_assert(sizeof(SchedulerTaskControl) == 384, "task control layout changed");
+static_assert(alignof(SchedulerTaskControl) == 64, "task control alignment changed");
 static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 24, "ticket cursor must use the atomic region");
-static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor must own its atomic region");
-static_assert(offsetof(SchedulerTaskControl, completed_blocks) == 256, "completion counter must own its atomic region");
+static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor requires an isolated atomic line");
 static_assert(
-    offsetof(SchedulerTaskControl, admission_claim_lock) == 40, "admission claim lock must use the atomic line"
+    offsetof(SchedulerTaskControl, completed_blocks) == 192, "completion counter requires an isolated atomic line"
 );
 static_assert(
-    offsetof(SchedulerTaskControl, admission_state) == 384, "admission state requires an isolated signal region"
+    offsetof(SchedulerTaskControl, admission_claim_lock) == 32, "admission claim lock must use the atomic line"
 );
-static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated atomic region");
+static_assert(
+    offsetof(SchedulerTaskControl, admission_state) == 256, "admission state requires an isolated signal region"
+);
+static_assert(offsetof(SchedulerTaskControl, claim_seal) == 320, "claim seal requires an isolated atomic line");
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
-static_assert(sizeof(SchedulerMixCloseSeal) == 128, "close seals require independent atomic regions");
-static_assert(alignof(SchedulerMixCloseSeal) == 128, "close seals require isolated alignment");
+static_assert(offsetof(SchedulerAdmissionRecord, member_rank_offset) == 40, "membership prefix offset changed");
+static_assert(sizeof(SchedulerMixCloseSeal) == 64, "close seals require independent atomic regions");
+static_assert(alignof(SchedulerMixCloseSeal) == 64, "close seals require isolated alignment");
 static_assert(offsetof(SchedulerMixCloseSeal, value) == 0, "close seal value must lead its region");
 static_assert(std::is_standard_layout_v<SchedulerMixCloseSeal> && std::is_trivially_copyable_v<SchedulerMixCloseSeal>);
-static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
-static_assert(alignof(SchedulerAdmissionControl) == 128, "admission control requires isolated atomic regions");
-static_assert(offsetof(SchedulerAdmissionControl, commit_tail) == 128, "tail must not share the lock's atomic region");
+static_assert(sizeof(SchedulerAdmissionControl) == 128, "admission control layout changed");
+static_assert(alignof(SchedulerAdmissionControl) == 64, "admission control requires isolated atomic regions");
+static_assert(offsetof(SchedulerAdmissionControl, commit_tail) == 64, "tail must not share the lock's atomic region");
 static_assert(sizeof(SchedulerGroupDescriptor) == 128, "group descriptor layout changed");
-static_assert(sizeof(SchedulerGroupLaneAck) == 128, "lane acknowledgements require separate atomic regions");
-static_assert(sizeof(SchedulerGroupMailbox) == 640, "group mailbox layout changed");
+static_assert(sizeof(SchedulerGroupLaneAck) == 64, "lane acknowledgements require separate atomic regions");
+static_assert(sizeof(SchedulerGroupMailbox) == 384, "group mailbox layout changed");
 static_assert(offsetof(SchedulerGroupMailbox, published_seq) == 128, "descriptor and publication must be separate");
-static_assert(offsetof(SchedulerGroupMailbox, lanes) == 256, "each lane must own its acknowledgement region");
+static_assert(offsetof(SchedulerGroupMailbox, lanes) == 192, "each lane must own its acknowledgement region");
 // Both chain links share the atomic line. A link has several producers, so it is
 // written as a single device word; keeping it off the line-published half is what
 // stops one producer's writeback from restoring its stale copy of the link.
@@ -1497,11 +1391,11 @@ static_assert(offsetof(SchedulerTaskControl, next_waiter) < 64, "wake link must 
 static_assert(
     offsetof(SchedulerTaskControl, next_fanin_index) == 64, "line-published waiter metadata needs its own line"
 );
-static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
-static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
+static_assert(sizeof(SchedulerReadyInbox) == 64, "ready inbox layout changed");
+static_assert(alignof(SchedulerReadyInbox) == 64, "ready inbox alignment changed");
 static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");
 static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 120);
-static_assert(alignof(SchedulerGraphSummary) == 128, "graph summary alignment changed");
+static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment changed");
 static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard must occupy one cache line");
 static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
 static_assert(
@@ -1521,43 +1415,43 @@ static_assert(
     "per-type inbox segments must be contiguous"
 );
 static_assert(
-    sizeof(SchedulerReadyDirectory) ==
-        (SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64 + 127) / 128 * 128,
+    sizeof(SchedulerReadyDirectory) == SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
     "ready directory layout changed"
 );
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
 static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 40, "executor trace layout changed");
-static_assert(sizeof(SchedulerRunControl) == 512, "run control layout changed");
-static_assert(alignof(SchedulerRunControl) == 128, "run control alignment changed");
-static_assert(offsetof(SchedulerRunControl, executed_task_count) == 128, "lifecycle atomics need their own line");
+static_assert(sizeof(SchedulerRunControl) == 448, "run control layout changed");
+static_assert(alignof(SchedulerRunControl) == 64, "run control alignment changed");
+static_assert(offsetof(SchedulerRunControl, resolved_task_count) == 192, "lifecycle atomics need their own line");
 static_assert(offsetof(SchedulerRunControl, error_claimed) == 256, "error state needs its own line");
-static_assert(offsetof(SchedulerRunControl, error_site) == 328, "error site ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_run_epoch) == 336, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_order_key) == 344, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_block_idx) == 352, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_group_seq) == 360, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_worker_index) == 368, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 376, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 380, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_site) == 312, "error site ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_run_epoch) == 320, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_order_key) == 328, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_block_idx) == 336, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_group_seq) == 344, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_worker_index) == 352, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 360, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 364, "error identity ABI changed");
 static_assert(offsetof(SchedulerRunControl, scheduler_error) == 384, "error publication needs its own line");
 static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
-static_assert(sizeof(SchedulerWorkerContext) == 1024, "worker context layout changed");
-static_assert(alignof(SchedulerWorkerContext) == 128, "worker context alignment changed");
-static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "runtime offsets changed");
-static_assert(offsetof(SchedulerWorkerContext, graph_summary_offset) == 256, "topology offsets changed");
-static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 384, "worker stats offset changed");
-static_assert(offsetof(SchedulerWorkerContext, native_header_offset) == 352);
-static_assert(offsetof(SchedulerWorkerContext, original_task_count) == 360);
-static_assert(offsetof(SchedulerWorkerContext, graph_view_version) == 368);
-static_assert(offsetof(SchedulerWorkerContext, graph_view_bytes) == 372);
-static_assert(offsetof(SchedulerWorkerContext, scheduler_state_bytes) == 376);
-static_assert(offsetof(SchedulerWorkerContext, wake_cas_retry_count) == 512, "wake stats offset changed");
-static_assert(offsetof(SchedulerWorkerContext, completion_enqueue_cycles) == 640, "termination stats offset changed");
-static_assert(offsetof(SchedulerWorkerContext, scheduler_tail_reserved) == 768, "worker reserved tail offset changed");
-static_assert(sizeof(SchedulerTaskTrace) == 384, "task trace layout changed");
-static_assert(offsetof(SchedulerTaskTrace, execution_run_epoch) == 328, "execution identity offset changed");
-static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 380, "execution identity exceeds trace tail");
+static_assert(sizeof(SchedulerWorkerContext) == 384, "worker context layout changed");
+static_assert(alignof(SchedulerWorkerContext) == 64, "worker context alignment changed");
+static_assert(offsetof(SchedulerWorkerContext, worker_contexts_offset) == 56, "peer routing must share the first line");
+static_assert(offsetof(SchedulerWorkerContext, graph_storage_address) == 64, "graph view must share one line");
+static_assert(offsetof(SchedulerWorkerContext, graph_summary_offset) == 120, "graph view exceeds its line");
+static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "dispatch configuration line changed");
+static_assert(offsetof(SchedulerWorkerContext, scheduler_count) == 192, "topology configuration line changed");
+static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 256, "diagnostic offsets changed");
+static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 280, "argument capture address changed");
+static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 320, "worker diagnostics need an owned line");
+static_assert(
+    offsetof(SchedulerWorkerContext, trace_descriptor_cache_observed_cycles) == 368,
+    "worker timestamps must share their owner's line"
+);
+static_assert(sizeof(SchedulerTaskTrace) == 320, "task trace layout changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_run_epoch) == 264, "execution identity offset changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 316, "execution identity exceeds trace tail");
 static_assert(
     offsetof(SchedulerTaskTrace, dispatch_start_cycles) % 64 == 0,
     "Scheduler-owned dispatch and completion fields must begin on a cache-line boundary"
@@ -1929,6 +1823,8 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
             workers[worker].run_epoch = run_epoch;
     }
     uint64_t mix_index = 0;
+    uint64_t cube_rank_offset = 0;
+    uint64_t vector_rank_offset = 0;
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         const auto &meta = metadata[task];
         if (!scheduler_task_requires_admission(meta)) continue;
@@ -1939,10 +1835,15 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
         record->logical_block_num = meta.logical_block_num;
         record->active_mask = meta.active_mask;
         record->flags = meta.flags;
+        record->member_rank_offset = 0;
         if (scheduler_task_is_mix(meta.flags)) {
             record->mix_close_seals_offset =
                 layout.mix_close_seals_offset + mix_index * layout.spmd.cluster_count * sizeof(SchedulerMixCloseSeal);
             ++mix_index;
+        } else if (scheduler_task_is_spmd(meta.flags) && !scheduler_task_requires_sync_start(meta.flags)) {
+            auto &offset = meta.active_mask.has_aic() ? cube_rank_offset : vector_rank_offset;
+            record->member_rank_offset = offset;
+            if (!scheduler_layout_checked_add(offset, meta.logical_block_num, &offset)) return false;
         }
     }
     return true;

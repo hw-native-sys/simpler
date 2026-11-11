@@ -2948,7 +2948,6 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
             reinterpret_cast<const SchedulerWorkerContext *>(runtime.dev.scheduler_bootstrap.worker_context_base);
         SchedulerGraphView view{
             device_context->graph_storage_address,
-            device_context->graph_reserved_address,
             device_context->graph_task_count,
             device_context->task_window_last_index,
             device_context->scheduler_state_base_address,

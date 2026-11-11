@@ -13,10 +13,21 @@
 
 #include "scheduler_ready_publication.h"
 
-// The producer is already DONE. This cursor owns its detached chain until all
-// successors are handed off and every ready publication has finished. Returning
+// CCEC has failed when over-aligned stack objects escape through an outlined
+// call (#2973). Local arguments at this boundary use natural alignment; shared
+// scheduler records are passed through their explicitly qualified GM pointers.
+static_assert(
+    alignof(SchedulerGraphAccess) <= 8 && alignof(SchedulerLocalState) <= 8 && alignof(SchedulerResolveCursor) <= 8 &&
+        alignof(SchedulerWakeStats) <= 8 && alignof(SchedulerReadyStats) <= 8 &&
+        alignof(SchedulerCompletionStats) <= 8 && alignof(SchedulerCompletionDirect) <= 8 &&
+        alignof(SchedulerReadyClaim) <= 8,
+    "outlined resolver local arguments must not require over-aligned stack storage"
+);
+
+// The producer is already DONE. This cursor owns its successor traversal until
+// every ready publication and direct handoff has finished. Returning
 // DONE does not itself contribute to the run's completion counter.
-inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
+static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_resolve_completion_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t producer_ref, SchedulerResolveCursor &cursor, uint32_t budget, SchedulerWakeStats *wake_stats = nullptr,
     SchedulerReadyStats *ready_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr,
@@ -39,6 +50,7 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
         cursor.phase = SchedulerResolvePhase::FAILED;
         return {SchedulerResolveResult::ERROR, 0};
     }
+    const auto *dependencies = scheduler_dependencies(base, local->config.ready_pool_offset);
     const bool timing = scheduler_phase_timing_enabled(profiling_level);
     if (timing && local->profiling == nullptr) return fail();
     while (used < budget) {
@@ -67,6 +79,10 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
             cursor.next_waiter = scheduler_gm_exchange(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
             if (cursor.next_waiter < SCHEDULER_WAKE_LIST_OPEN)
                 return fail(SchedulerErrorSite::COMPLETION_WAKE_ALREADY_CLOSED);
+            if (dependencies != nullptr &&
+                (cursor.next_waiter != SCHEDULER_WAKE_LIST_OPEN ||
+                 !scheduler_dependency_successor(base, *dependencies, producer_ref, 0, &cursor.next_waiter)))
+                return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
             if (wake_stats != nullptr) ++wake_stats->wake_close_count;
             cursor.phase = SchedulerResolvePhase::SELECT;
             break;
@@ -90,6 +106,24 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
             }
             if (!scheduler_task_ref_valid(graph, cursor.next_waiter) || cursor.visited_count >= graph.task_count)
                 return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+            if (dependencies != nullptr) {
+                cursor.waiter_ref = cursor.next_waiter;
+                if (!scheduler_dependency_successor(
+                        base, *dependencies, producer_ref, cursor.visited_count + 1, &cursor.saved_next
+                    ))
+                    return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+                ++cursor.visited_count;
+                const auto result = scheduler_dependency_notify(base, *dependencies, cursor.waiter_ref);
+                if (result == SchedulerDependencyResult::ERROR)
+                    return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+                if (result == SchedulerDependencyResult::READY) {
+                    cursor.phase = SchedulerResolvePhase::APPEND;
+                } else {
+                    cursor.next_waiter = cursor.saved_next;
+                    cursor.waiter_ref = SCHEDULER_TASK_REF_INVALID;
+                }
+                break;
+            }
             uint32_t fanin_count = 0;
             if ((direct != nullptr || cursor.publication.count != 0) &&
                 scheduler_node_fanin_count(graph, cursor.next_waiter, &fanin_count) != SchedulerGraphResult::OK)

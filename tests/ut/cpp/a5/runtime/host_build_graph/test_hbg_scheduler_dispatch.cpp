@@ -455,7 +455,7 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     producer->completion_resolve_start_cycles = 1;
     producer->completion_resolve_end_cycles = 1;
     producer->scheduler_worker_id = UINT64_MAX;
-    traces[1].ready_transition_cycles = 1;
+    traces[1].kernel_start_cycles = 1;
 
     SchedulerReadyStats ready_stats{};
     SchedulerCompletionStats completion_stats{};
@@ -467,7 +467,7 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     EXPECT_EQ(producer->completion_resolve_start_cycles, 0u);
     EXPECT_EQ(producer->completion_resolve_end_cycles, 0u);
     EXPECT_EQ(producer->scheduler_worker_id, scheduler.worker_index);
-    EXPECT_EQ(traces[1].ready_transition_cycles, 1u);
+    EXPECT_EQ(traces[1].kernel_start_cycles, 1u);
     EXPECT_EQ(traces[0].valid, 1u);
     EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
     EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
@@ -975,26 +975,6 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) 
     ++storage.contexts[0].dispatch_payload_offset;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
     --storage.contexts[0].dispatch_payload_offset;
-    context.worker_reserved = 1;
-    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-    context.worker_reserved = 0;
-    for (auto field :
-         {&SchedulerWorkerContext::scheduler_ssbuf_reserved0, &SchedulerWorkerContext::scheduler_ssbuf_reserved1,
-          &SchedulerWorkerContext::scheduler_ssbuf_reserved2}) {
-        context.*field = 1;
-        EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-        context.*field = 0;
-    }
-    // Every word of the reserved tail, by its own extent. A field taken out of
-    // this array is a field a producer writes, so a validation whose bound
-    // outlives the array would read the next member instead — and this loop is
-    // what makes that a test failure rather than a run that refuses to boot.
-    for (size_t index = 0; index < std::size(context.topology_reserved); ++index) {
-        context.topology_reserved[index] = 1;
-        EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local))
-            << "reserved tail word " << index << " is not validated";
-        context.topology_reserved[index] = 0;
-    }
     for (auto field : {&SchedulerWorkerContext::mix_payloads_offset, &SchedulerWorkerContext::mix_traces_offset}) {
         const uint64_t saved = context.*field;
         context.*field = 0;

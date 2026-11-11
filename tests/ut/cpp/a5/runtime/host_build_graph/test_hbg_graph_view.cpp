@@ -20,7 +20,7 @@ namespace {
 SchedulerGraphView current_view(const scheduler_test::BasicGraphBuffer<8> &buffer) {
     auto view = buffer.graph();
     view.original_task_count = static_cast<uint32_t>(view.task_count);
-    view.view_version = 2;
+    view.view_version = SCHEDULER_GRAPH_VIEW_VERSION;
     view.view_bytes = sizeof(SchedulerGraphView);
     return view;
 }
@@ -62,13 +62,10 @@ TEST(AicoreGraphView, RejectsAnUnversionedOrMalformedViewBeforeReadingStorage) {
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
     uint32_t count = 0;
     EXPECT_EQ(scheduler_node_fanin_count(graph, 0, &count), SchedulerGraphResult::INVALID_ARGUMENTS);
-    graph.view_version = 2;
+    graph.view_version = SCHEDULER_GRAPH_VIEW_VERSION;
     graph.view_bytes = 32;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
     graph.view_bytes = sizeof(SchedulerGraphView);
-    graph.reserved = 1;
-    EXPECT_FALSE(scheduler_graph_view_valid(graph));
-    graph.reserved = 0;
     graph.original_task_count = 1;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
     graph.original_task_count = 2;

@@ -42,14 +42,14 @@ constexpr inline __aicore__ bool scheduler_async_lease_word_valid(uint64_t word)
                word;
 }
 
-struct alignas(128) SchedulerAsyncLease {
+struct alignas(64) SchedulerAsyncLease {
     volatile uint64_t word{scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT)};
 };
 
 using SchedulerAsyncTaskJoin = scheduler_async_pending::Join;
 
-static_assert(sizeof(SchedulerAsyncLease) == 128 && alignof(SchedulerAsyncLease) == 128);
-static_assert(sizeof(SchedulerAsyncTaskJoin) == 128 && alignof(SchedulerAsyncTaskJoin) == 128);
+static_assert(sizeof(SchedulerAsyncLease) == 64 && alignof(SchedulerAsyncLease) == 64);
+static_assert(sizeof(SchedulerAsyncTaskJoin) == 64 && alignof(SchedulerAsyncTaskJoin) == 64);
 static_assert(offsetof(SchedulerAsyncLease, word) == 0 && offsetof(SchedulerAsyncTaskJoin, word) == 0);
 static_assert(std::is_standard_layout_v<SchedulerAsyncLease> && std::is_trivially_copyable_v<SchedulerAsyncLease>);
 static_assert(

@@ -14,7 +14,7 @@ import pytest
 from _capture_builder import Capture
 from _native_protocol_builder import ProtocolBuilder
 
-from simpler_setup.tools.hbg.native_causality import MIX, SPMD, SYNC, audit_native_protocol
+from simpler_setup.tools.hbg.native_causality import MIX, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import (
     STAMPS,
     _event_records,
@@ -26,89 +26,30 @@ from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, r
 
 def _claim_seal_capture(mask, blocks, *, sync=False, sealed=True):
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,) if sync else ()).run()
-    return _add_claim_seal_certificates(raw, identities, sealed=sealed)
+    return _set_claim_seal_observation(raw, identities, sealed=sealed)
 
 
-def _add_claim_seal_certificates(raw, identities, *, sealed=True):
-    original = [
-        record[name] for record, kind, _ in _event_records(raw) for name in STAMPS[kind].split() if record[name][1]
-    ]
-    per_worker = {}
-    for record, kind, _ in _event_records(raw):
-        per_worker.setdefault(record["worker_index"], []).extend(
-            record[name] for name in STAMPS[kind].split() if record[name][1]
-        )
-    raw["schema"] = "hbg-native-protocol-v6"
+def _set_claim_seal_observation(raw, identities, *, sealed=True):
     tasks = {task["task_ref"]: task for task in raw["tasks"]}
-    for control in raw["task_controls"]:
-        task = tasks[control["task_ref"]]
-        control.update(
-            claim_tickets=task["block_num"] if task["flags"] & SPMD and not task["flags"] & SYNC else 0,
-            admission_claim_lock=0,
-            claim_seal=task["block_num"] if task["flags"] & (MIX | SPMD) else 0,
-        )
-    insertion = {}
-    for block in raw["blocks"]:
-        owner = block["owner"]
-        assert owner is not None
-        certificate = dict(
-            run_epoch=raw["run_epoch"],
-            worker_index=owner["worker_index"],
-            block_idx=owner["block_idx"],
-            confirmed_count=owner["block_idx"] + 1,
-            seal_value=0,
-            published_before=[0, 0],
-            published_after=[0, 0],
-        )
-        block["claim"] = certificate
-        blocks = tasks[owner["task_ref"]]["block_num"]
-        if certificate["confirmed_count"] == blocks:
-            certificate["seal_value"] = blocks
-            certificate["published_before"] = [owner["claim_after"][0], 0]
-            certificate["published_after"] = [owner["claim_after"][0], 0]
-            insertion[id(owner["claim_after"])] = [certificate["published_before"], certificate["published_after"]]
-    for worker in raw["workers"]:
-        events = sorted(per_worker.get(worker["index"], []), key=lambda stamp: stamp[1])
-        expanded = []
-        for stamp in events:
-            expanded.append(stamp)
-            expanded.extend(insertion.get(id(stamp), []))
-        for ordinal, stamp in enumerate(expanded, 1):
-            stamp[1] = ordinal
-        worker["next_sequence"] = len(expanded)
-    assert len(original) + 2 * raw["cooperative_task_count"] == sum(row["next_sequence"] for row in raw["workers"])
     for member in raw["members"]:
         task = tasks[member["task_ref"]]
         blocks = task["block_num"]
-        cursor_reader = not (task["flags"] & MIX and member["worker_index"] % 3)
-        use = sealed and cursor_reader and member["closed_cursor"] == blocks
+        use = sealed and not (task["flags"] & MIX and member["worker_index"] % 3) and member["closed_cursor"] == blocks
         member.update(claim_seal_seen=blocks if use else 0, claim_cursor_seen=blocks if use else 0)
     return raw, identities
 
 
-def _isolated_close_seals(raw):
-    raw.update(schema="hbg-native-protocol-v7", close_seal_stride=128)
-    mixed = [row for row in raw["admissions"] if row["close_seals"]]
-    if mixed:
-        base = mixed[0]["close_seals_offset"]
-        for index, row in enumerate(mixed):
-            row["close_seals_offset"] = base + index * raw["cluster_count"] * 128
-
-
 def _resource_scoped_capture(masks=(3, 5, 3, 7, 6), clusters=2, blocks=3):
-    raw, identities = ProtocolBuilder(
-        [(mask, blocks, ()) for mask in masks], clusters=clusters, resource_scoped=True
-    ).run()
-    _add_claim_seal_certificates(raw, identities)
-    _isolated_close_seals(raw)
-    raw["schema"] = "hbg-native-protocol-v8"
+    raw, identities = ProtocolBuilder([(mask, blocks, ()) for mask in masks], clusters=clusters).run()
+    _set_claim_seal_observation(raw, identities)
+    raw["schema"] = "hbg-native-protocol-v10"
     return raw, identities
 
 
 @pytest.mark.parametrize("clusters", (1, 2, 22, 32))
 @pytest.mark.parametrize("blocks", (1, 2, 3, 8))
 @pytest.mark.parametrize("masks", ((3,), (5,), (7,), (6,), (3, 5, 3, 7, 6)))
-def test_v8_resource_scope_preserves_all_clusters_and_lane_predecessors(clusters, blocks, masks):
+def test_current_resource_scope_preserves_all_clusters_and_lane_predecessors(clusters, blocks, masks):
     raw, identities = _resource_scoped_capture(masks, clusters, blocks)
     result = audit_native_protocol(raw, identities)
     assert result["protocol_verified"] is True
@@ -116,7 +57,7 @@ def test_v8_resource_scope_preserves_all_clusters_and_lane_predecessors(clusters
 
 
 @pytest.mark.parametrize("value", (None, [], [0, 0], [0, 0, 0, 0], [True, 0, 0], [-1, 0, 0], [1 << 64, 0, 0]))
-def test_v8_requires_exact_typed_lane_predecessors(value):
+def test_current_requires_exact_typed_lane_predecessors(value):
     raw, _ = _resource_scoped_capture((3,))
     assert read_native_protocol(raw) == raw
     lane = raw["blocks"][0]["lanes"][0]
@@ -128,17 +69,8 @@ def test_v8_requires_exact_typed_lane_predecessors(value):
         read_native_protocol(raw)
 
 
-def test_v7_does_not_silently_accept_resource_scoped_lane_fields():
-    raw, _ = _claim_seal_capture(7, 2)
-    _isolated_close_seals(raw)
-    assert read_native_protocol(raw) == raw
-    raw["blocks"][0]["lanes"][0]["previous_lane_seq"] = [0, 0, 0]
-    with pytest.raises(ValueError, match="unknown fields"):
-        read_native_protocol(raw)
-
-
 @pytest.mark.parametrize("mutation", ("missing_lane", "extra_lane", "wrong_resources", "stale_ack", "wrong_previous"))
-def test_v8_resource_scope_rejects_wrong_membership_and_stale_group_proof(mutation):
+def test_current_resource_scope_rejects_wrong_membership_and_stale_group_proof(mutation):
     raw, identities = _resource_scoped_capture()
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     group = next(row for row in raw["blocks"] if row["owner"]["task_ref"] == 3)
@@ -163,45 +95,31 @@ def test_v8_resource_scope_rejects_wrong_membership_and_stale_group_proof(mutati
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks,sync", ((1, False), (2, False), (16, False), (2, True)))
 @pytest.mark.parametrize("sealed", (False, True))
-def test_v7_close_layout_preserves_claim_seal_and_sync_start_proof(mask, blocks, sync, sealed):
+def test_current_close_layout_preserves_claim_seal_and_sync_start_proof(mask, blocks, sync, sealed):
     raw, identities = _claim_seal_capture(mask, blocks, sync=sync, sealed=sealed)
-    _isolated_close_seals(raw)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
-@pytest.mark.parametrize("version", (1, 2, 3, 4, 5, 6, 7))
 @pytest.mark.parametrize("clusters", (1, 2, 22))
-def test_close_seal_rows_follow_each_production_version_without_aliasing(version, clusters):
+def test_current_close_seal_rows_do_not_alias(clusters):
     raw, identities = ProtocolBuilder([(3, 1, ()), (2, 1, ()), (6, 1, ()), (7, 1, ())], clusters=clusters).run()
-    if version >= 6:
-        raw, identities = _add_claim_seal_certificates(raw, identities)
-    else:
-        raw["schema"] = f"hbg-native-protocol-v{version}"
-        for control in raw["task_controls"]:
-            if version > 1:
-                control["claim_tickets"] = 0
-            if version == 5:
-                control["admission_claim_lock"] = 0
-    if version == 7:
-        _isolated_close_seals(raw)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     mixed = [row for row in raw["admissions"] if row["close_seals"]]
-    mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + clusters * (8 if version == 7 else 128)
+    mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + clusters * 8
     with pytest.raises(ValueError, match="aliased or wrong task close seals"):
         audit_native_protocol(raw, identities)
 
 
 @pytest.mark.parametrize("fault", ("alias", "interior", "swap", "unaligned", "gap", "claim_seal"))
-def test_v7_close_seal_rows_and_claim_seal_evidence_are_both_mandatory(fault):
+def test_current_close_seal_rows_and_claim_seal_evidence_are_both_mandatory(fault):
     raw, identities = ProtocolBuilder([(3, 1, ()), (6, 1, ()), (7, 1, ())]).run()
-    raw, identities = _add_claim_seal_certificates(raw, identities)
-    _isolated_close_seals(raw)
+    raw, identities = _set_claim_seal_observation(raw, identities)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     mixed = [row for row in raw["admissions"] if row["close_seals"]]
     if fault == "alias":
         mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"]
     elif fault == "interior":
-        mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + 128
+        mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + 64
     elif fault == "swap":
         mixed[1]["close_seals_offset"], mixed[2]["close_seals_offset"] = (
             mixed[2]["close_seals_offset"],
@@ -221,14 +139,14 @@ def test_v7_close_seal_rows_and_claim_seal_evidence_are_both_mandatory(fault):
 @pytest.mark.parametrize("mask", (1, 2, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 3, 16))
 @pytest.mark.parametrize("sealed", (False, True))
-def test_v6_claim_seal_and_strong_fallback_keep_the_complete_causal_chain(mask, blocks, sealed):
+def test_current_claim_seal_and_strong_fallback_keep_the_complete_causal_chain(mask, blocks, sealed):
     raw, identities = _claim_seal_capture(mask, blocks, sealed=sealed)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
 @pytest.mark.parametrize("mask", (1, 2, 3, 5, 6, 7))
 @pytest.mark.parametrize("sealed", (False, True))
-def test_v6_sync_start_partial_cursor_closure_remains_valid(mask, sealed):
+def test_current_sync_start_partial_cursor_closure_remains_valid(mask, sealed):
     raw, identities = _claim_seal_capture(mask, 2, sync=True, sealed=sealed)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
@@ -237,7 +155,7 @@ def test_v6_sync_start_partial_cursor_closure_remains_valid(mask, sealed):
 @pytest.mark.parametrize(
     "fault", ("missing", "duplicate", "publisher", "value", "early", "epoch", "witness", "terminal")
 )
-def test_v6_rejects_invalid_claim_seal_proof(mask, fault):
+def test_current_rejects_invalid_claim_seal_proof(mask, fault):
     raw, identities = _claim_seal_capture(mask, 3)
     last = next(block for block in raw["blocks"] if block["claim"]["confirmed_count"] == 3)
     certificate = last["claim"]
@@ -293,10 +211,10 @@ def test_pure_completion_join_after_retirement_requires_the_final_trace(mask, pa
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 3, 16))
 @pytest.mark.parametrize("tail", (False, True))
-def test_v5_terminal_claim_lock_is_free_without_changing_ticket_policy(mask, blocks, tail):
+def test_current_terminal_claim_lock_is_free_without_changing_ticket_policy(mask, blocks, tail):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v5"
+    raw["schema"] = "hbg-native-protocol-v10"
     control = raw["task_controls"][0]
     control.update(admission_claim_lock=0, claim_tickets=blocks + (positions if tail else 0) if blocks > 1 else 0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
@@ -306,10 +224,10 @@ def test_v5_terminal_claim_lock_is_free_without_changing_ticket_policy(mask, blo
 
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-def test_v5_sync_start_remains_ticket_free_and_releases_claim_lock(mask):
+def test_current_sync_start_remains_ticket_free_and_releases_claim_lock(mask):
     blocks = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v5"
+    raw["schema"] = "hbg-native-protocol-v10"
     raw["task_controls"][0].update(claim_tickets=0, admission_claim_lock=0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_controls"][0]["claim_tickets"] = 1
@@ -320,37 +238,19 @@ def test_v5_sync_start_remains_ticket_free_and_releases_claim_lock(mask):
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 3, 7, 9, 16))
 @pytest.mark.parametrize("tail", (False, True))
-def test_v4_ordinary_multiblock_counts_require_tickets_but_single_block_does_not(mask, blocks, tail):
+def test_current_ordinary_multiblock_counts_require_tickets_but_single_block_does_not(mask, blocks, tail):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v4"
+    raw["schema"] = "hbg-native-protocol-v10"
     raw["task_controls"][0]["claim_tickets"] = blocks + (positions if tail else 0) if blocks > 1 else 0
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("blocks", (2, 3))
-@pytest.mark.parametrize("legacy", ("hbg-native-protocol-v2", "hbg-native-protocol-v3"))
-def test_v4_small_claims_do_not_reinterpret_legacy_zero_ticket_records(mask, blocks, legacy):
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = legacy
-    raw["task_controls"][0]["claim_tickets"] = 0
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["schema"] = "hbg-native-protocol-v4"
-    with pytest.raises(ValueError, match="ticket"):
-        audit_native_protocol(raw, identities)
-    raw["task_controls"][0]["claim_tickets"] = blocks
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["schema"] = legacy
-    with pytest.raises(ValueError, match="ticket"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-def test_v4_sync_start_must_keep_zero_tickets(mask):
+def test_current_sync_start_must_keep_zero_tickets(mask):
     blocks = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v4"
+    raw["schema"] = "hbg-native-protocol-v10"
     raw["task_controls"][0]["claim_tickets"] = 0
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_controls"][0]["claim_tickets"] = 1
@@ -360,11 +260,13 @@ def test_v4_sync_start_must_keep_zero_tickets(mask):
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("fault", ("missing", "short", "excess", "bool", "negative", "wrap"))
-def test_v4_small_claims_reject_invalid_raw_ticket_values(mask, fault):
+def test_current_small_claims_reject_invalid_raw_ticket_values(mask, fault):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v4"
-    if fault != "missing":
+    raw["schema"] = "hbg-native-protocol-v10"
+    if fault == "missing":
+        del raw["task_controls"][0]["claim_tickets"]
+    else:
         raw["task_controls"][0]["claim_tickets"] = {
             "short": 1,
             "excess": 3 + positions,
@@ -379,144 +281,10 @@ def test_v4_small_claims_reject_invalid_raw_ticket_values(mask, fault):
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("delta", (-1, 1))
 @pytest.mark.parametrize("counter", ("next_block", "completed_blocks"))
-def test_v4_valid_raw_tickets_do_not_excuse_wrong_valid_or_completion_counts(mask, delta, counter):
+def test_current_valid_raw_tickets_do_not_excuse_wrong_valid_or_completion_counts(mask, delta, counter):
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v4"
+    raw["schema"] = "hbg-native-protocol-v10"
     raw["task_controls"][0].update(claim_tickets=2, **{counter: 2 + delta})
-    with pytest.raises(ValueError, match="terminal block counters"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("delta", (-1, 0, 1))
-@pytest.mark.parametrize("tail", (False, True))
-def test_v3_inclusive_boundary_and_neighbours_require_the_exact_claim_policy(mask, delta, tail):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions * 2 + delta
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v3"
-    raw["task_controls"][0]["claim_tickets"] = blocks + (positions if tail else 0) if delta >= 0 else 0
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-def test_v3_boundary_does_not_silently_reinterpret_v2_records(mask):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions * 2
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["task_controls"][0]["claim_tickets"] = blocks
-    raw["schema"] = "hbg-native-protocol-v3"
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["schema"] = "hbg-native-protocol-v2"
-    with pytest.raises(ValueError, match="ticket"):
-        audit_native_protocol(raw, identities)
-    raw["task_controls"][0]["claim_tickets"] = 0
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["schema"] = "hbg-native-protocol-v3"
-    with pytest.raises(ValueError, match="ticket"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("sync", (False, True))
-def test_v3_single_block_and_sync_start_still_require_zero_tickets(mask, sync):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions if sync else 1
-    raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,) if sync else ()).run()
-    raw["schema"] = "hbg-native-protocol-v3"
-    raw["task_controls"][0]["claim_tickets"] = 0
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["task_controls"][0]["claim_tickets"] = 1
-    with pytest.raises(ValueError, match="ticket"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("fault", ("missing", "short", "excess", "bool", "negative", "wrap"))
-def test_v3_boundary_rejects_missing_or_out_of_range_tickets(mask, fault):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions * 2
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v3"
-    if fault != "missing":
-        raw["task_controls"][0]["claim_tickets"] = {
-            "short": blocks - 1,
-            "excess": blocks + positions + 1,
-            "bool": True,
-            "negative": -1,
-            "wrap": (1 << 64) - 1,
-        }[fault]
-    with pytest.raises(ValueError, match="protocol"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("delta", (-1, 1))
-def test_v3_boundary_does_not_relax_exact_valid_claim_count(mask, delta):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions * 2
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v3"
-    raw["task_controls"][0]["claim_tickets"] = blocks
-    raw["task_controls"][0]["next_block"] = blocks + delta
-    with pytest.raises(ValueError, match="terminal block counters"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("extra", (0, 1, 2))
-def test_v2_ticket_claims_keep_legacy_captures_and_exact_valid_counts(mask, extra):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions * 2 + 1
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["schema"] = "hbg-native-protocol-v2"
-    raw["task_controls"][0]["claim_tickets"] = blocks + min(extra, positions)
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("sync", (False, True))
-def test_v2_small_and_sync_tasks_must_not_use_ticket_claims(mask, sync):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions if sync else positions * 2
-    raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,) if sync else ()).run()
-    raw["schema"] = "hbg-native-protocol-v2"
-    raw["task_controls"][0]["claim_tickets"] = 0
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["task_controls"][0]["claim_tickets"] = 1
-    with pytest.raises(ValueError, match="ticket"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("fault", ("missing", "short", "excess", "bool", "negative", "wrap"))
-def test_v2_rejects_missing_or_out_of_range_ticket_counter(mask, fault):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions * 2 + 1
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v2"
-    if fault != "missing":
-        raw["task_controls"][0]["claim_tickets"] = {
-            "short": blocks - 1,
-            "excess": blocks + positions + 1,
-            "bool": True,
-            "negative": -1,
-            "wrap": (1 << 64) - 1,
-        }[fault]
-    with pytest.raises(ValueError, match="protocol"):
-        audit_native_protocol(raw, identities)
-
-
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("delta", (-1, 1))
-def test_v2_tickets_do_not_relax_the_exact_valid_claim_counter(mask, delta):
-    positions = 4 if mask in (2, 4) else 2
-    blocks = positions * 2 + 1
-    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v2"
-    raw["task_controls"][0]["claim_tickets"] = blocks
-    raw["task_controls"][0]["next_block"] = blocks + delta
     with pytest.raises(ValueError, match="terminal block counters"):
         audit_native_protocol(raw, identities)
 
@@ -819,14 +587,14 @@ def test_real_converter_preserves_native_audit_in_perfetto_metadata(tmp_path):
     path.write_text(json.dumps(wire_capture()))
     parsed = read_perf_data(path)
     assert parsed["protocol_audit"]["protocol_verified"] is True
-    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol-v1"
+    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol-v10"
     trace = generate_chrome_trace_json(
         parsed["tasks"], None, runtime_name="host_build_graph", timeline_metadata=parsed["timeline_metadata"]
     )
     assert trace["metadata"]["hbg_protocol_audit"] == parsed["protocol_audit"]
 
 
-def test_historical_capture_is_readable_but_has_no_native_proof(tmp_path):
+def test_capture_without_protocol_has_no_native_proof(tmp_path):
     raw = wire_capture()
     del raw["aicore_protocol"]
     path = tmp_path / "capture.json"
@@ -918,13 +686,8 @@ def test_counts_and_complete_sequences_cannot_hide_protocol_corruption(mutation)
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2))
-@pytest.mark.parametrize("resource_scoped", (False, True))
-def test_deferred_finish_can_move_to_another_worker_after_execution_release(mask, blocks, resource_scoped):
-    raw, identities = ProtocolBuilder([(mask, blocks, ())], deferred_tasks=(0,), resource_scoped=resource_scoped).run()
-    if resource_scoped:
-        _add_claim_seal_certificates(raw, identities)
-        _isolated_close_seals(raw)
-        raw["schema"] = "hbg-native-protocol-v8"
+def test_deferred_finish_can_move_to_another_worker_after_execution_release(mask, blocks):
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], deferred_tasks=(0,)).run()
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_events"][0]["completion"]["flags"] &= ~(1 << 31)
     with pytest.raises(ValueError, match="TaskDone"):
@@ -939,4 +702,58 @@ def test_deferred_finish_flag_cannot_relabel_admission_or_inline_control():
     raw, identities = ProtocolBuilder([(0, 1, ())]).run()
     raw["task_events"][0]["completion"]["flags"] |= 1 << 31
     with pytest.raises(ValueError, match="deferred"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("blocks", ((2,) * 6, (2, 3, 4, 3)))
+def test_resource_type_rotation_covers_interleaved_and_variable_grids(blocks):
+    shapes = [(mask, count, ()) for count in blocks for mask in (1, 2)]
+    builder = ProtocolBuilder(shapes, clusters=6)
+    raw, identities = builder.run()
+    _set_claim_seal_observation(raw, identities)
+    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    counts = [0] * 18
+    for record in raw["admissions"]:
+        for worker in range(18):
+            counts[worker] += (record["member_words"][0] >> worker) & 1
+    assert counts == [2 if worker % 3 == 0 else 1 for worker in range(18)]
+    raw["admissions"][2]["member_rank_offset"] += 1
+    with pytest.raises(ValueError, match="member rank prefix"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mutation", (None, "bitmap_alignment", "bitmap_alias", "seal_alignment", "seal_alias"))
+def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_regions(mutation):
+    raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, (0,))], clusters=2).run()
+    _set_claim_seal_observation(raw, identities)
+    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    for index, row in enumerate(raw["admissions"]):
+        row["member_words_offset"] += 64
+        row["close_seals_offset"] = 8192 + 64 + index * raw["cluster_count"] * 64
+    assert (raw["admissions"][0]["member_words_offset"] - 64) % 128 == 64
+    assert raw["admissions"][0]["close_seals_offset"] % 128 == 64
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    if mutation is None:
+        return
+    first, second = raw["admissions"]
+    if mutation == "bitmap_alignment":
+        first["member_words_offset"] += 8
+    elif mutation == "bitmap_alias":
+        second["member_words_offset"] = first["member_words_offset"]
+    elif mutation == "seal_alignment":
+        first["close_seals_offset"] += 8
+    else:
+        second["close_seals_offset"] = first["close_seals_offset"]
+    with pytest.raises(ValueError, match="bitmap|seal"):
+        audit_native_protocol(raw, identities)
+
+
+def test_current_cooperative_capture_rejects_independent_flag():
+    raw, identities = ProtocolBuilder([(1, 2, ())]).run()
+    _set_claim_seal_observation(raw, identities)
+    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    raw["tasks"][0]["flags"] |= 128
+    with pytest.raises(ValueError, match="unknown task flags"):
         audit_native_protocol(raw, identities)

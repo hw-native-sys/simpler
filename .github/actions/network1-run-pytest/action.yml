@@ -105,7 +105,16 @@ runs:
         while :; do
           status=$(task-submit --status "$local_id")
           if [[ "$status" =~ ^completed\ \(exit=([0-9]+)\)$ ]]; then
-            exit "${BASH_REMATCH[1]}"
+            task_exit=${BASH_REMATCH[1]}
+            if (( task_exit != 0 )); then
+              echo "network1 local task $local_id exited with code $task_exit"
+              if [[ -r "$RUN_DIR/pytest/local-task/work.log" ]]; then
+                tail -n 200 "$RUN_DIR/pytest/local-task/work.log" || true
+              else
+                echo 'network1 pytest log was not created'
+              fi
+            fi
+            exit "$task_exit"
           fi
           [[ "$status" == pending || "$status" == running ]] || { echo "local task: $status" >&2; exit 1; }
           peer_status=$(network1_ssh "task-submit --status $remote_id")

@@ -570,13 +570,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             } else {
                 const uint64_t executable_task_count =
                     run_control->expected_task_count - run_control->inline_completed_count;
-                const bool trace_enabled = is_chip_swimlane_enabled();
-                const uint64_t completion_wait_start_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
-                uint64_t bootstrap_complete_cycles = 0;
-                uint64_t all_tasks_resolved_cycles = 0;
-                uint64_t completion_poll_count = 0;
-                uint64_t completion_poll_cycles = 0;
-                uint64_t error_poll_total = 0;
                 uint32_t error_poll_count = 0;
                 uint64_t last_progress_cycles = ready_watchdog_.last_progress();
                 uint64_t last_resolved_task_count = run_control->resolved_task_count;
@@ -584,7 +577,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
                 while (true) {
                     service_args_dump();
-                    const uint64_t poll_start = trace_enabled ? get_sys_cnt_aicpu() : 0;
                     const bool bootstrap_complete = run_control->bootstrap_complete != 0;
                     const uint64_t resolved_task_count = run_control->resolved_task_count;
                     const bool tasks_resolved = resolved_task_count == executable_task_count;
@@ -600,23 +592,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         last_progress_cycles = now;
                         ready_watchdog_.record_progress(now);
                     }
-                    if (trace_enabled) {
-                        const uint64_t poll_end = get_sys_cnt_aicpu();
-                        ++completion_poll_count;
-                        completion_poll_cycles += poll_end - poll_start;
-                        if (bootstrap_complete && bootstrap_complete_cycles == 0) {
-                            bootstrap_complete_cycles = poll_end;
-                        }
-                        if (bootstrap_complete && tasks_resolved && all_tasks_resolved_cycles == 0) {
-                            all_tasks_resolved_cycles = poll_end;
-                        }
-                    }
                     if (bootstrap_complete && tasks_resolved) {
                         break;
                     }
                     if (++error_poll_count == 64) {
                         error_poll_count = 0;
-                        ++error_poll_total;
                         if (run_control->scheduler_error != 0) break;
                     }
                     if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
@@ -632,14 +612,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     LOG_ERROR(
                         "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
                         " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " storage=0x%" PRIx64
-                        " reserved=0x%" PRIx64 " window_last_index=0x%" PRIx64 " site=%" PRIu64 " executed=%" PRIu64
-                        " resolved=%" PRIu64 " expected=%" PRIu64 " inline=%" PRIu64,
+                        " window_last_index=0x%" PRIx64 " site=%" PRIu64 " resolved=%" PRIu64 " expected=%" PRIu64
+                        " inline=%" PRIu64,
                         run_control->error_task_ref, scheduler_error, run_control->error_core_id,
                         run_control->error_core_type, run_control->error_graph_task_count,
-                        run_control->error_storage_address, run_control->error_reserved_address,
-                        run_control->error_task_window_last_index, run_control->error_site,
-                        run_control->executed_task_count, run_control->resolved_task_count,
-                        run_control->expected_task_count, run_control->inline_completed_count
+                        run_control->error_storage_address, run_control->error_task_window_last_index,
+                        run_control->error_site, run_control->resolved_task_count, run_control->expected_task_count,
+                        run_control->inline_completed_count
                     );
                     supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
                     if (supervisor_rc == 0) supervisor_rc = -1;
@@ -653,15 +632,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         run_control->expected_task_count, resolved_task_count, run_control->inline_completed_count
                     );
                     supervisor_rc = -1;
-                }
-                if (trace_enabled) {
-                    run_control->completion_wait_start_cycles = completion_wait_start_cycles;
-                    run_control->bootstrap_complete_cycles = bootstrap_complete_cycles;
-                    run_control->all_tasks_resolved_cycles = all_tasks_resolved_cycles;
-                    run_control->shutdown_ready_cycles = get_sys_cnt_aicpu();
-                    run_control->completion_poll_count = completion_poll_count;
-                    run_control->completion_poll_cycles = completion_poll_cycles;
-                    run_control->error_poll_count = error_poll_total;
                 }
             }
         }

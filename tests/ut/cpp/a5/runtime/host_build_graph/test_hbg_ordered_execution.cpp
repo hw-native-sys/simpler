@@ -156,6 +156,25 @@ struct OrderedFixture {
         );
         return !failed;
     }
+    std::vector<uint32_t> members(uint64_t task) {
+        const auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
+            base(), storage.layout.admission_records_offset + task * storage.layout.admission_record_stride
+        );
+        uint64_t words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
+        uint32_t count = 0;
+        EXPECT_TRUE(scheduler_admission_expected_members(base(), locals[0], &admissions[0], record, words, &count));
+        std::vector<uint32_t> result;
+        for (uint32_t worker = 0; worker < locals.size(); ++worker)
+            if ((words[worker / 64] & (UINT64_C(1) << (worker % 64))) != 0) result.push_back(worker);
+        EXPECT_EQ(result.size(), count);
+        return result;
+    }
+    uint32_t member(uint64_t task, uint32_t preferred) {
+        const auto workers = members(task);
+        EXPECT_FALSE(workers.empty());
+        if (workers.empty()) return preferred;
+        return std::find(workers.begin(), workers.end(), preferred) != workers.end() ? preferred : workers.front();
+    }
     bool stage_one(uint32_t worker, uint32_t slot) {
         auto *local = locals[worker];
         if (!scheduler_refresh_local_obligation(graph.graph(), base(), local, run(), &admissions[worker]) ||
@@ -347,7 +366,7 @@ TEST_P(HbgOrderedSharedOrdinaryWork, OrdinaryDiscoveryLeavesWorkForAnotherWorker
 TEST_P(HbgOrderedSharedOrdinaryWork, APreviouslyRetainedCooperativeCandidateStillPublishes) {
     for (uint32_t ordinary_index = 0; ordinary_index < 2; ++ordinary_index) {
         OrderedFixture fixture({{1, GetParam()}, {2, GetParam()}}, true);
-        const uint32_t worker = fixture.publisher(0);
+        const uint32_t worker = fixture.member(1, fixture.publisher(0));
         auto &candidates = fixture.admissions[worker].candidates;
         ASSERT_TRUE(fixture.pop(0, worker, &candidates[ordinary_index].ready));
         ASSERT_TRUE(fixture.pop(1, worker, &candidates[1 - ordinary_index].ready));
@@ -780,19 +799,28 @@ TEST_P(HbgOrderedAdmissionProgress, BoundedRetirementReportsProgressAndCaughtUpP
     const auto [mask, record_protocol, pending_task] = GetParam();
     OrderedFixture fixture(std::vector<OrderedShape>(pending_task ? 9 : 8, {2, mask}), record_protocol);
     const uint32_t publisher = fixture.publisher(0);
-    const uint32_t late_worker = publisher + 3;
+    const auto first_members = fixture.members(0);
+    ASSERT_GE(first_members.size(), 2u);
+    const uint32_t late_worker = first_members.back();
     for (uint64_t task = 0; task < 8; ++task) {
         ASSERT_TRUE(fixture.admit(task, publisher));
+        // Keep the delayed worker idle while an actual member consumes each
+        // record. Ordinary cohorts can select different workers across tasks.
+        const auto members = fixture.members(task);
+        const auto executor = std::find_if(members.begin(), members.end(), [&](uint32_t worker) {
+            return worker != late_worker;
+        });
+        ASSERT_NE(executor, members.end());
         for (uint32_t block = 0; block < 2; ++block) {
-            ASSERT_TRUE(fixture.stage_one(publisher, 0));
+            ASSERT_TRUE(fixture.stage_one(*executor, 0));
             OrderedExecution execution{};
-            ASSERT_TRUE(fixture.begin(publisher, &execution));
+            ASSERT_TRUE(fixture.begin(*executor, &execution));
             ASSERT_EQ(execution.task, task);
             ASSERT_EQ(execution.block, block);
             ASSERT_TRUE(fixture.complete(execution));
         }
         bool closed = false;
-        ASSERT_TRUE(fixture.close(publisher, &closed));
+        ASSERT_TRUE(fixture.close(*executor, &closed));
         ASSERT_TRUE(closed);
     }
     if (pending_task) ASSERT_TRUE(fixture.admit(8, publisher));
@@ -1142,13 +1170,14 @@ struct OrderedPendingEntryCase {
 class HbgOrderedPendingEarlierEntry : public ::testing::TestWithParam<OrderedPendingEntryCase> {};
 
 TEST_P(HbgOrderedPendingEarlierEntry, CurrentBlockRetiresWhileLaterPublicationRemainsPending) {
-    const auto scenario = GetParam();
+    auto scenario = GetParam();
     const LaneMask mask = scenario.worker % 3 == 0 ? LaneMask::aic() : LaneMask::aiv0();
     const uint32_t current_task = scenario.reversed_task_ids ? 1 : 0;
     const uint32_t later_task = current_task ^ 1U;
     std::vector<OrderedShape> shapes{{2, mask}, {2, mask}, {2, mask}};
     shapes[current_task] = {scenario.blocks, mask, scenario.sync};
     OrderedFixture fixture(shapes, scenario.protocol);
+    scenario.worker = fixture.member(current_task, scenario.worker);
     if (!scenario.protocol)
         for (auto *local : fixture.locals)
             local->profiling = nullptr;
@@ -1545,7 +1574,8 @@ TEST_P(HbgOrderedTicketCursor, LargeOrdinaryClaimsKeepExactValidCountAndBoundThe
 TEST_P(HbgOrderedTicketCursor, AReservedLastTicketCannotBecomeAnEarlyCloseOrAnotherBlock) {
     const LaneMask mask = GetParam();
     for (uint32_t count : {2u, 3u, mask == LaneMask::aic() ? 4u : 8u}) {
-        OrderedFixture fixture({{static_cast<uint16_t>(count), mask}, {2, mask}}, true);
+        const uint16_t later_blocks = mask.has_aic() ? 2 : 4;
+        OrderedFixture fixture({{static_cast<uint16_t>(count), mask}, {later_blocks, mask}}, true);
         const uint32_t worker = fixture.publisher(0);
         ASSERT_TRUE(fixture.admit(0, worker));
         ASSERT_TRUE(fixture.admit(1, worker));
@@ -1660,10 +1690,11 @@ TEST_P(HbgOrderedTicketCursor, InconsistentReservationAndConfirmationStopBeforeR
 
 TEST_P(HbgOrderedTicketCursor, ConcurrentTailLosersStopWithoutHidingTheUnpublishedValidTicket) {
     const LaneMask mask = GetParam();
-    const std::vector<uint32_t> workers =
+    const std::vector<uint32_t> eligible =
         mask == LaneMask::aic() ? std::vector<uint32_t>{0, 3} : std::vector<uint32_t>{1, 2, 4, 5};
-    for (uint16_t count : {uint16_t{2}, uint16_t{3}, static_cast<uint16_t>(workers.size() * 2 + 1)}) {
+    for (uint16_t count : {uint16_t{2}, uint16_t{3}, static_cast<uint16_t>(eligible.size() * 2 + 1)}) {
         OrderedFixture fixture({{count, mask}});
+        const auto workers = fixture.members(0);
         ASSERT_TRUE(fixture.admit(0, workers.front()));
         for (uint32_t worker : workers)
             ASSERT_TRUE(scheduler_refresh_local_obligation(
@@ -1872,9 +1903,8 @@ class HbgOrderedConcurrentProtocol : public ::testing::TestWithParam<std::tuple<
 
 TEST_P(HbgOrderedConcurrentProtocol, ConcurrentWorkersKeepUniqueOwnersAndContiguousLocalSequences) {
     const auto [mask, count] = GetParam();
-    const std::vector<uint32_t> participants =
-        mask == LaneMask::aic() ? std::vector<uint32_t>{0, 3} : std::vector<uint32_t>{1, 2, 4, 5};
     OrderedFixture fixture({{count, mask}}, true);
+    const auto participants = fixture.members(0);
     ASSERT_TRUE(fixture.admit(0, participants.front()));
     for (uint32_t worker : participants)
         ASSERT_TRUE(scheduler_refresh_local_obligation(

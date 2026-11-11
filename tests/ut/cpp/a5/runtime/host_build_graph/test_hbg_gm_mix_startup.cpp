@@ -21,8 +21,7 @@
 
 #include "hbg_scheduler_test_support.h"
 
-// The startup branch and dispatch-loop branch share this production translation unit.
-#include "aicore/aicore_executor.cpp"
+#include "aicore/resident_scheduler_impl.h"
 
 namespace {
 
@@ -96,7 +95,6 @@ struct StartupFixture {
             context.scheduler_count = 6;
             context.physical_core_id = static_cast<int32_t>(worker);
             context.graph_storage_address = graph_view.storage_address;
-            context.graph_reserved_address = 0;
             context.graph_task_count = graph_view.task_count;
             context.original_task_count = graph_view.original_task_count;
             context.graph_view_version = graph_view.view_version;
@@ -569,8 +567,6 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
     EXPECT_GE(observations, 5u);
     EXPECT_EQ(startup_kernel_calls, arrival == IdleDispatchArrival::READY ? 1u : 0u);
     EXPECT_EQ(queued, arrival == IdleDispatchArrival::READY);
-    if (level >= 3) EXPECT_GE(stats.idle_iteration_count, 4u);
-    else EXPECT_EQ(stats.idle_iteration_count, 0u);
     if (ordered) {
         EXPECT_EQ(admission.scan_cursor, 0u);
         EXPECT_EQ(admission.current_task_ref, SCHEDULER_TASK_REF_INVALID);

@@ -12,27 +12,30 @@
 #pragma once
 
 #include "scheduler_ticket_queue.h"
+#include "scheduler_dependency.h"
 
-inline constexpr uint32_t SCHEDULER_READY_POOL_VERSION = 4;
+inline constexpr uint32_t SCHEDULER_READY_POOL_VERSION = 8;
 inline constexpr uint32_t SCHEDULER_READY_POOL_REF_CHUNK = 4;
 
 inline constexpr uint32_t SCHEDULER_READY_POOL_GROUP_WIDTH = 8;
 
 // Immutable offsets into one run's scheduler allocation. No pointer fix-up
 // or device-side allocation is needed; entries persist through the run fence.
-struct alignas(128) SchedulerReadyPoolHeader {
-    uint32_t version{SCHEDULER_READY_POOL_VERSION};
-    uint32_t group_width{SCHEDULER_READY_POOL_GROUP_WIDTH};
+struct alignas(64) SchedulerReadyPoolHeader {
+    // Dispatch, publication and completion share this immutable first line.
     uint64_t task_count{0};
-    uint32_t group_counts[SCHEDULER_READY_QUEUE_COUNT]{};
-    uint32_t queue_begins[SCHEDULER_READY_QUEUE_COUNT]{};
     uint64_t descriptors_offset{0};
     uint64_t controls_offset{0};
-    uint64_t storage_end_offset{0};
+    uint64_t dependencies_offset{0};
+    uint32_t group_counts[SCHEDULER_READY_QUEUE_COUNT]{};
+    uint32_t queue_begins[SCHEDULER_READY_QUEUE_COUNT]{};
     uint32_t queue_count{0};
+
+    uint32_t version{SCHEDULER_READY_POOL_VERSION};
+    uint32_t group_width{SCHEDULER_READY_POOL_GROUP_WIDTH};
     uint32_t ref_chunk{SCHEDULER_READY_POOL_REF_CHUNK};
+    uint64_t storage_end_offset{0};
     uint64_t entry_count{0};
-    uint8_t padding[48]{};
 };
 
 struct SchedulerReadyPoolDescriptor {
@@ -41,6 +44,7 @@ struct SchedulerReadyPoolDescriptor {
 };
 
 static_assert(sizeof(SchedulerReadyPoolHeader) == 128);
+static_assert(offsetof(SchedulerReadyPoolHeader, queue_count) < 64);
 static_assert(sizeof(SchedulerReadyPoolDescriptor) == 16);
 static_assert(
     std::is_standard_layout_v<SchedulerReadyPoolHeader> && std::is_trivially_copyable_v<SchedulerReadyPoolHeader>
@@ -84,8 +88,8 @@ scheduler_ready_pool_queue(__gm__ void *base, const __gm__ SchedulerReadyPoolHea
 inline __aicore__ bool scheduler_ready_pool_validate(
     __gm__ void *base, uint64_t state_bytes, uint64_t pool_offset, uint64_t task_count, uint32_t clusters
 ) {
-    if (base == nullptr || pool_offset == 0 || pool_offset % 128 != 0 || pool_offset > state_bytes ||
-        sizeof(SchedulerReadyPoolHeader) > state_bytes - pool_offset || clusters == 0 ||
+    if (base == nullptr || pool_offset == 0 || pool_offset % SCHEDULER_STATE_ALIGNMENT != 0 ||
+        pool_offset > state_bytes || sizeof(SchedulerReadyPoolHeader) > state_bytes - pool_offset || clusters == 0 ||
         clusters > SCHEDULER_CLUSTER_CAPACITY || task_count > INT32_MAX)
         return false;
     auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, pool_offset);
@@ -102,7 +106,8 @@ inline __aicore__ bool scheduler_ready_pool_validate(
         queue_count += groups;
     }
     if (pool->queue_count != queue_count || pool->descriptors_offset < pool_offset + sizeof(*pool) ||
-        pool->descriptors_offset % 128 != 0 || pool->controls_offset % 128 != 0)
+        pool->descriptors_offset % SCHEDULER_STATE_ALIGNMENT != 0 ||
+        pool->controls_offset % SCHEDULER_STATE_ALIGNMENT != 0)
         return false;
     uint64_t cursor = pool->descriptors_offset;
     const uint64_t descriptor_bytes = queue_count * sizeof(SchedulerReadyPoolDescriptor);
@@ -120,11 +125,24 @@ inline __aicore__ bool scheduler_ready_pool_validate(
         const auto &descriptor = descriptors[queue];
         if (descriptor.capacity > task_count - entries) return false;
         entries += descriptor.capacity;
-        if (descriptor.entries_offset < cursor || descriptor.entries_offset % 128 != 0 ||
+        if (descriptor.entries_offset < cursor || descriptor.entries_offset % SCHEDULER_STATE_ALIGNMENT != 0 ||
             descriptor.entries_offset > pool->storage_end_offset ||
             descriptor.capacity > (pool->storage_end_offset - descriptor.entries_offset) / sizeof(int64_t))
             return false;
         cursor = descriptor.entries_offset + descriptor.capacity * sizeof(int64_t);
     }
+    if (pool->dependencies_offset != 0 &&
+        (pool->dependencies_offset < cursor ||
+         !scheduler_dependency_validate(base, pool->storage_end_offset, pool->dependencies_offset, task_count)))
+        return false;
     return entries == pool->entry_count;
+}
+
+inline __aicore__ const __gm__ SchedulerDependencyHeader *
+scheduler_dependencies(__gm__ void *base, uint64_t pool_offset) {
+    if (pool_offset == 0) return nullptr;
+    const auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, pool_offset);
+    return pool->dependencies_offset == 0 ?
+               nullptr :
+               scheduler_state_at<SchedulerDependencyHeader>(base, pool->dependencies_offset);
 }

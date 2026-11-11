@@ -13,14 +13,13 @@
 | 字段 | 作用 |
 | ---- | ---- |
 | `storage_address` | 原始 ChipTaskStorage 数组 GM 基址 |
-| `reserved` | 必须为 0 |
 | `task_count` | 当前 resident 节点总数 |
 | `task_window_last_index` | 原始存储容量边界；HBG 不对 task_ref 取模 |
 | `scheduler_state_address` | 调度状态 GM 基址 |
 | `native_header_offset` | native graph 头偏移；0 为普通图 |
 | `scheduler_state_bytes` | 调度状态范围 |
 | `original_task_count` | 原始任务存储条目数 |
-| `view_version / view_bytes` | 视图版本和大小，当前版本为 2 |
+| `view_version / view_bytes` | 视图版本和大小，当前版本为 3，sizeof 为 56B |
 
 [ChipTaskStorage](../../../src/common/host_build_graph/runtime_types.h#L799)（第 799 行） 的三个成员：`task` 是描述符；`slot` 是共享任务存储里的调度信息，resident 可变依赖状态另在 SchedulerTaskControl；`payload` 是参数与依赖区域的入口。当前 sizeof 为 320，不要自行按旧版本跨度寻址。
 
@@ -40,7 +39,7 @@
 
 其 early-dispatch 区属于跳过的另一套调度协议，不沿该区展开。resident 通过 graph accessor 得到 fanin 和参数，不使用该区发布 kernel。
 
-[SchedulerTaskMetadata](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L817)（第 817 行） 是 16B 的紧凑调度入口：
+[SchedulerTaskMetadata](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L813)（第 813 行） 是 16B 的紧凑调度入口：
 
 **范围与用途：** 每个 resident 节点一份 GM 元数据，整轮按 task_ref 读取。它回答“这个任务是什么形状、用什么 kernel”，多个 worker 执行该任务的不同 block 时读取同一条元数据。
 
@@ -58,10 +57,11 @@
 
 ## 2.2 依赖不是每轮扫描整图
 
-[bootstrap_route_task](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L985)（第 985 行） 为一个任务找第一个需要等待的前驱，并把自己挂到它的 wake list 上。
-普通输入中已经完成的前驱会跳过；native 输入中 HOST_DONE 会跳过。
+当前优先使用 Host 预建的静态依赖计数。[bootstrap_route_task](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L982) 读取 remaining，
+为 0 才发布初始 ready；非零等待实际前驱完成通知。Host 已去掉输入时完成的节点和重复边。
+没有依赖 header 时，才使用下文的 wake-list 兼容路径。
 
-[SchedulerTaskControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L934)（第 934 行） 每字段的含义：
+[SchedulerTaskControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L930)（第 930 行） 为 384B、64B 对齐，每字段的含义：
 
 **范围与用途：** 每个 resident 节点一份 GM 可变控制记录，所有 scheduler 共同推进这一份。它跟随逻辑任务，而不是跟随某个 worker；同一任务被多个核执行时，block join 和依赖完成都必须汇总到这里。
 
@@ -81,63 +81,80 @@
 | `completed_blocks` | 已完成的逻辑 block 数；MIX 一个 group 汇总后贡献一个 block |
 | `admission_state` | UNCLAIMED → CLAIMED → PREPARED → ADMITTED |
 | `claim_seal` | 全部有效 block 已确认领取的不可变凭据，值为逻辑 block 总数 |
-| `control_padding / atomic_line_padding / scheduler_line_padding / block_cursor_padding / block_completion_padding / admission_phase_padding / claim_seal_padding` | 隔离不同访问协议和写者的填充字节，不承载业务状态 |
 
-例如 `T2` 依赖 `T0,T1`：
+TaskControl 共六行：首行是原子 state/链指针/claim tickets；第二行是 resolver 的 cached metadata；
+`next_block`、`completed_blocks`、`admission_state` 和 `claim_seal` 分别独占后四行。
+完成与领取会并发访问，缓存行布局本身就是各字段访问协议的一部分。
+
+[SchedulerDependencyHeader](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dependency.h#L18) 为一条 64B 只读记录，version=2：
+
+| 字段 | 作用 |
+| ---- | ---- |
+| `version / task_count` | 格式版本与 resident 节点数 |
+| `edge_capacity / edge_count` | 后继边的预留容量和去重后的有效边数 |
+| `remaining_offset` | N 个 uint64_t 原子剩余依赖数 |
+| `fanout_offsets_offset` | N+1 个 uint64_t CSR 行边界 |
+| `fanout_refs_offset` | int32_t 后继 task_ref 数组 |
+| `storage_end_offset` | 依赖存储末端，校验所有数组边界 |
+
+例如 `T2` 依赖尚未完成的 `T0,T1`：
 
 ```text
-bootstrap：T2 先挂到 T0.wake_list_head
-T0 完成：摘出 T2，继续检查依赖
-         若 T1 未完成 → T2 改挂 T1
-         若 T1 已完成 → T2 进入 ready
-T1 完成：若 T2 挂在这里，则把 T2 推进 ready
+Host：remaining[T2]=2，T0 和 T1 的 fanout CSR 各含 T2 一次
+bootstrap：T2 不进入 ready
+T0 完成解析：remaining[T2] 2→1，仍等待
+T1 完成解析：remaining[T2] 1→0，由这次通知的 owner 发布 ready
 ```
 
-运行期调用 [scheduler_route_task_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L852)（第 852 行），挂链使用 CAS：
-先发布 waiter 的保存位置和 next，再 CAS producer 的 head；若 producer 已经把 head 置 CLOSED，就继续检查下一依赖。
-bootstrap 使用 exchange 挂链，因为整个扫描屏障尚未开放，没有 resolver 同时摘链。这两个函数的发布顺序不能随意互换。
+两个前驱可以以任意顺序完成，只有取到旧值 1 的通知者使后继 ready。
+CSR 与计数器沿用同一个图访问器的依赖身份和越界检查，不改变 predicate、MIX 或 async 的 DONE 条件。
 
-[SchedulerFaninView](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h#L431)（第 431 行）：
+**无依赖 header 的兼容路径：** bootstrap 为 waiter 找到第一个未完成前驱，用 exchange 挂入 wake list；
+producer 完成时摘链，[scheduler_route_task_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L847) 继续扫描剩余 fanin，必要时用 CAS 迁移到下一个 producer。
+稳态 CAS 路由必须先发布 waiter 的 next 和扫描位置，再挂入新链；遇到 CLOSED 则继续路由。
+bootstrap 的 exchange-before-link 只在扫描屏障尚未开放、没有 resolver 并发摘链时使用。
+
+[SchedulerFaninView](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h#L425)（第 425 行）：
 `global_refs` 是普通图 int32 前驱索引数组；`local_refs` 是 native definition 的局部前驱索引；
 `completion_refs` 是原始任务到调度完成节点的映射；`base_ref` 是局部引用转换的基数；
 `count` 是边数；`source_limit` 用来验证源索引范围。
 
 ## 2.3 ready 的两种存储都是 resident
 
-在 [scheduler_claim_ready_for_slot](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L1628)（第 1628 行） 看分支。
+在 [scheduler_claim_ready_for_slot](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L1636)（第 1636 行） 看分支。
 类型索引统一为 0=AIC、1=AIV、2=MIX；MIX 由 AIC coordinator 领取。
 
 `ready_pool_offset != 0` 时使用分组 ticket pool：
 发布者原子增加 reserved_tail 取得写槽；写入 task_ref 后，该 entry 本轮不再改写。
 消费者读 head 对应 entry，成功 CAS head 才拥有任务。
 reserved_tail 增加只代表预留，尚不代表 entry 已经发布；NOT_READY 不等于全图结束。
-见 [ticket reserve/publish/pop](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h#L59)（第 59 行）。
+见 [ticket reserve/publish/pop](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h#L57)（第 57 行）。
 
-[SchedulerReadyPoolHeader](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready_pool.h#L23)（第 23 行）：
+[SchedulerReadyPoolHeader](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready_pool.h#L24)（第 24 行）：
 
 **范围与用途：** Header 是整轮一份的只读布局；Descriptor 和 TicketQueue 则按每条分组队列各一份。它们是 GM 共享对象；TicketQueueView、TicketRange 是当前操作的本地访问视图和预留结果，不能把后两者当作新的队列实例。
 
 | 字段 | 作用 |
 | ---- | ---- |
-| `version` | pool 协议版本，当前 4 |
+| `version` | pool 协议版本，当前 8 |
 | `group_width` | 每组目标核数量参数，当前 8 |
 | `task_count` | 合法 task_ref 的上界 |
 | `group_counts[3]` | AIC/AIV/MIX 各有多少组 |
 | `queue_begins[3]` | 三类队列在扁平数组中的起始索引 |
 | `descriptors_offset` | 队列描述符数组偏移 |
 | `controls_offset` | 队列 head/tail 控制数组偏移 |
+| `dependencies_offset` | 静态依赖 header 偏移，0 表示采用 wake-list 兼容路径 |
 | `storage_end_offset` | pool 存储的末端边界 |
 | `queue_count` | 总队列数 |
 | `ref_chunk` | 路由 task_ref 的分块粒度，当前 4 |
 | `entry_count` | 全部队列 entry 容量之和 |
-| `padding[48]` | 填充 |
 
 相关小结构全部字段：
 
 | 结构 | 字段及作用 |
 | ---- | ---------- |
 | `SchedulerReadyPoolDescriptor` | `entries_offset`：entry 区偏移；`capacity`：此队列容量 |
-| `SchedulerTicketQueue` | `head`：下一消费位置；`reserved_tail`：下一个未预留位置；`head_padding/tail_padding`：隔离原子区域 |
+| `SchedulerTicketQueue` | `head`：下一消费位置；`reserved_tail`：下一个未预留位置；head 与 reserved_tail 分别以 64B 对齐，总长 128B |
 | `SchedulerTicketQueueView` | `control`：控制对象指针；`entries`：entry 指针；`capacity`：队列容量；`task_count`：ref 边界 |
 | `SchedulerTicketRange` | `begin/count`：本发布者取得的连续写入区间 |
 
@@ -147,8 +164,8 @@ reserved_tail 增加只代表预留，尚不代表 entry 已经发布；NOT_READ
 
 | 结构 | 字段及作用 |
 | ---- | ---------- |
-| `SchedulerReadyInbox` | `endpoints`：低 32 位为 head、高 32 位为 tail，作为一个 64 位 CAS 对象更新；`atomic_line_padding`：隔离填充 |
-| `SchedulerReadyDirectoryShard` | `bits`：哪些 owner inbox 可能非空；`cache_line_padding`：填充 |
+| `SchedulerReadyInbox` | `endpoints`：低 32 位为 head、高 32 位为 tail，作为一个 64 位 CAS 对象更新；总长/对齐均为 64B |
+| `SchedulerReadyDirectoryShard` | `bits`：哪些 owner inbox 可能非空；总长/对齐均为 64B |
 | `SchedulerReadyDirectory` | `core_types[3][shard_count]`：按类型和 shard 索引的目录 |
 | `SchedulerReadyBatch` | `head/tail`：批次链表首尾；`count`：节点数 |
 
@@ -240,8 +257,8 @@ slot 生命周期为 `EMPTY → FREE → FILLING → READY → FREE`。执行时
 
 ## 2.5 把任务变成函数调用
 
-从 [fill_own_slots](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L448)（第 448 行） 跟到
-[fill_dispatch_slot](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L1992)（第 1992 行）。
+从 [fill_own_slots](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L451)（第 451 行） 跟到
+[fill_dispatch_slot](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L2000)（第 2000 行）。
 
 没有 admission 时，每轮只领取下一次普通执行需要的任务；即使有两个 slot，也不会无条件把所有 slot 填满后才运行。
 有 admission 则转到下一篇的 `fill_ordered_slots`。
@@ -267,7 +284,7 @@ slot 生命周期为 `EMPTY → FREE → FILLING → READY → FREE`。执行时
 | `args[50]` | tensor 描述符指针、scalar 值和末尾两个 context 指针 |
 | `global_context` | 当前物理 AIV lane 与 resident async 执行身份 |
 
-[materialize](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h#L674)（第 674 行） 的参数布局：
+[materialize](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h#L667)（第 667 行） 的参数布局：
 
 ```text
 args[0 .. tensor_count-1]            = Tensor 描述符地址
@@ -295,7 +312,7 @@ tensor 槽保存的是 Tensor 描述符地址，不是直接把数据 buffer 地
 | `GlobalContext.async_image_address / async_image_bytes` | async 所在 image 的基址/范围 |
 | `GlobalContext.async_run_epoch` | 本轮 async 身份 |
 | `GlobalContext.async_group_offset / async_group_index` | 当前执行对应的 async group |
-| `GlobalContext.async_reserved` | 保留，写 0 |
+| `GlobalContext.async_output_capture_refused` | 参数抓取选中了不能在异步完成前读取的输出时置位；每次 resident 执行重置，kernel 注册入口据此拒绝 |
 
 kernel 用 `get_block_idx(args)`、`get_block_num(args)`、`get_sub_block_id(args)` 读取这些信息；它们与平台入口使用的无参数硬件 intrinsic 不是同一语义。
 
@@ -309,7 +326,7 @@ Tensor 的字段定义在 [TensorData](../../../src/common/host_build_graph/tens
 
 ## 2.6 主循环实际执行次序
 
-回到 [run_ready_dispatch_loop](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L376)（第 376 行）：
+回到 [run_ready_dispatch_loop](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L448)（第 448 行）：
 
 ```text
 检查 DMB EXIT；间隔检查共享错误
@@ -320,8 +337,10 @@ fill own slots：领取/准入/准备任务
 pop 最旧 ready generation
 最终 admission 许可检查；不允许则把 ready bit 放回
 建立本次 async writer
+启用参数抓取时完成 BEFORE_DISPATCH 边界
 调用 function_bin_addr(args)
 seal 本次 async 注册
+启用参数抓取时完成 AFTER_COMPLETION 边界
 local_completed_generations[slot] = generation
 回到循环开头
 ```

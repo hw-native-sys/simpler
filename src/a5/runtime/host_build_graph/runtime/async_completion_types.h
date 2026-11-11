@@ -19,21 +19,14 @@
 
 namespace pto2::resident {
 
-inline constexpr uint32_t ASYNC_RECORD_ALIGNMENT = 128;
+inline constexpr uint32_t ASYNC_RECORD_ALIGNMENT = 64;
 inline constexpr uint32_t ASYNC_INVALID_INDEX = UINT32_MAX;
 enum class AsyncPublicationState : uint32_t { OPEN = 0, SEALED = 1, FAILED = 2 };
 
 // One physical execution owns these lines until its return publishes them.
 // Scheduler leases and progress occupy separate cache lines.
 struct alignas(ASYNC_RECORD_ALIGNMENT) AsyncGroupData {
-    uint64_t run_epoch;
-    int64_t task_ref;
-    uint32_t group_index;
-    uint32_t block_index;
-    uint32_t subtask_slot;
-    uint16_t capacity;
-    uint16_t reserved;
-    uint32_t entries_bytes;
+    // The invocation updates registration state in its first cache line.
     volatile uint32_t count;
     volatile int32_t error_code;
     volatile uint32_t reservation_serial;
@@ -41,9 +34,17 @@ struct alignas(ASYNC_RECORD_ALIGNMENT) AsyncGroupData {
     volatile uint32_t reservation_begin;
     volatile uint32_t reservation_written;
     volatile AsyncPublicationState state;
-    uint64_t sdma_guards_offset;
-    uint32_t sdma_guard_count;
+    uint32_t group_index;
+    uint64_t run_epoch;
+    int64_t task_ref;
     uint64_t entries_offset;
+    uint64_t sdma_guards_offset;
+
+    uint32_t block_index;
+    uint32_t subtask_slot;
+    uint32_t entries_bytes;
+    uint32_t sdma_guard_count;
+    uint16_t capacity;
 };
 
 // SDK session creation and SQ/post-id updates share one writer per physical
@@ -66,14 +67,14 @@ constexpr inline __aicore__ uint32_t async_group_entry_bytes(uint32_t capacity) 
 }
 
 static_assert(sizeof(AsyncGroupData) == 128 && alignof(AsyncGroupData) == ASYNC_RECORD_ALIGNMENT);
-static_assert(offsetof(AsyncGroupData, count) == 36 && offsetof(AsyncGroupData, state) == 60);
-static_assert(offsetof(AsyncGroupData, sdma_guards_offset) == 64 && offsetof(AsyncGroupData, entries_offset) == 80);
+static_assert(offsetof(AsyncGroupData, count) == 0 && offsetof(AsyncGroupData, state) == 24);
+static_assert(offsetof(AsyncGroupData, sdma_guards_offset) == 56 && offsetof(AsyncGroupData, entries_offset) == 48);
 static_assert(std::is_standard_layout_v<AsyncGroupData> && std::is_trivially_copyable_v<AsyncGroupData>);
 static_assert(sizeof(AsyncReservation) == 24);
-static_assert(sizeof(AsyncSdmaSubmissionGuard) == 128);
+static_assert(sizeof(AsyncSdmaSubmissionGuard) == 64);
 static_assert(
     std::is_standard_layout_v<AsyncSdmaSubmissionGuard> && std::is_trivially_copyable_v<AsyncSdmaSubmissionGuard>
 );
-static_assert(async_group_entry_bytes(1) == 128 && async_group_entry_bytes(64) == 2048);
+static_assert(async_group_entry_bytes(1) == 64 && async_group_entry_bytes(64) == 2048);
 
 }  // namespace pto2::resident

@@ -116,7 +116,7 @@ struct GlobalContext {
     uint64_t async_run_epoch;
     uint64_t async_group_offset;
     uint32_t async_group_index;
-    uint32_t async_reserved;
+    uint32_t async_output_capture_refused;
 };
 
 struct LegacyAsyncCtx {

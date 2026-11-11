@@ -1011,7 +1011,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             dp.global_context.async_run_epoch = 0;
             dp.global_context.async_group_offset = 0;
             dp.global_context.async_group_index = UINT32_MAX;
-            dp.global_context.async_reserved = 0;
+            dp.global_context.async_output_capture_refused = 0;
             LegacyAsyncCtx &ac = dp.local_context.async_ctx;
             volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
             ac.completion_count = &slab->count;

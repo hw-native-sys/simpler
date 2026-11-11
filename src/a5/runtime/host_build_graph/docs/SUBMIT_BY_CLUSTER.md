@@ -86,15 +86,23 @@ describes the rendezvous itself and what the cohort is scoped to.
 2. TensorMap and explicit dependencies append producer local IDs to the payload's
    fanin region.
 3. Submit publishes only the finished graph data; it does not push ready tasks.
-4. After H2D, device boot scans every submitted task exactly once.
-5. A task with every fanin complete is routed to its ready queue; otherwise it
-   registers on its latest-submitted unmet producer's wake list, minimising
-   transfers between wake lists and their CAS contention.
-6. Producer completion reclassifies wake-list consumers until they become ready.
+4. Host prepares resident fanout CSR and remaining counters through the unified
+   graph view; device bootstrap scans the resulting nodes after H2D.
+5. A resident node with zero remaining dependencies enters its ready queue.
+6. Each resolved producer notifies its CSR successors; the unique remaining
+   transition 1→0 publishes ready. Helpers without a dependency header retain
+   the intrusive wake-list fallback.
 
-Completion flags are monotonic, so a task never needs periodic fanin polling.
+The legacy AICPU path scans fanins and registers each blocked task on its
+latest-submitted unmet producer. Producer completion reclassifies detached
+waiters. Neither path periodically scans all tasks for dependency readiness.
 
 ## Dispatch and Completion
+
+Resident workers use cooperative admission, frozen membership and logical-block
+completion; the [resident walkthrough](../../../../../docs/zh-cn/a5-hbg-aicore-walkthrough/README.md)
+describes its shared 64-byte layout and completion resolver. The following
+range-claim and drain behavior applies to legacy AICPU scheduling.
 
 - AIC and AIV tasks claim as many free cores as the current scheduler owns and
   requeue remaining logical blocks for later waves.
@@ -108,8 +116,9 @@ Completion flags are monotonic, so a task never needs periodic fanin polling.
 ## Executor Model
 
 The host loads and executes the orchestration shared object synchronously. The
-device has no orchestration thread: every launched AICPU thread participates in
-scheduling its assigned cores after the boot thread attaches the prebuilt graph.
+device has no orchestration thread. In resident mode AICore schedules and AICPU
+supervises startup, progress and exit. In legacy mode every launched AICPU thread
+schedules its assigned cores after the boot thread attaches the prebuilt graph.
 Cluster ownership is assigned during the AICore handshake and remains stable for
 the run.
 

@@ -23,7 +23,9 @@ inline __aicore__ uint64_t scheduler_cycles() {
 
 inline __aicore__ bool
 scheduler_protocol_check_region(uint64_t offset, uint64_t count, uint64_t stride, uint64_t limit, uint64_t *end) {
-    if ((offset & 127) != 0 || offset < *end || offset > limit || count > (limit - offset) / stride) return false;
+    if ((offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 || offset < *end || offset > limit ||
+        count > (limit - offset) / stride)
+        return false;
     *end = offset + count * stride;
     return true;
 }
@@ -38,7 +40,7 @@ inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const Local *l
     scheduler_observe_cache_line(&summary->protocol_layout_offset);
     const uint64_t offset = summary->protocol_layout_offset;
     if (offset == 0) return true;
-    if (local->profiling == nullptr || (offset & 127) != 0 ||
+    if (local->profiling == nullptr || (offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
         offset > UINT64_MAX - reinterpret_cast<uintptr_t>(base) - sizeof(SchedulerProtocolLayout))
         return false;
     auto *layout = scheduler_state_at<SchedulerProtocolLayout>(base, offset);
