@@ -72,6 +72,9 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     int32_t aic_count = 0;
     int32_t aiv_count = 0;
     for (int32_t i = 0; i < lifecycle.core_count(); ++i) {
+        // A silent core's slot is zero-initialized, so its type reads as AIC.
+        // Counting it would make an incomplete cluster look like a whole one.
+        if (!lifecycle.core_reported(i)) continue;
         if (lifecycle.core_type(i) == CoreType::AIC) {
             ++aic_count;
         } else if (lifecycle.core_type(i) == CoreType::AIV) {
