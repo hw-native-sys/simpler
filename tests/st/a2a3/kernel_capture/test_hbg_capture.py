@@ -90,7 +90,14 @@ def build_probe(
         "-std=c++17",
         "-O2",
         str(_NATIVE / ("hbg_retained_models.cpp" if retained_models else "hbg_driver.cpp")),
-        *([] if retained_models else [str(_NATIVE / "capture_submit_fault.cpp")]),
+        *(
+            []
+            if retained_models
+            else [
+                str(_NATIVE / "capture_submit_fault.cpp"),
+                str(_NATIVE / {"a2a3": "capture_recovery_a2a3.cpp", "a5": "capture_recovery_a5.cpp"}[platform]),
+            ]
+        ),
         f"-I{_ROOT / 'src/common/worker'}",
         f"-I{_ROOT / 'src/common/task_interface'}",
         f"-I{_ROOT / 'src/common'}",
@@ -182,14 +189,36 @@ def _run_capture_probe(command, run, env):
     return result
 
 
+def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path) -> None:
+    if scenario == 12:
+        for round_id in (1, 2):
+            assert f"fault-replay={round_id} sync=507011" in stdout
+            assert f"fault-replay={round_id} executed=16" in stdout
+        if platform == "a5":
+            assert stdout.count("stage=resident-progress-timeout rc=0") == 2
+        else:
+            device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
+            assert device_log.count("TIMEOUT_EXIT after_idle_iterations=") == 2, device_log
+    if scenario == 13:
+        for round_id in (1, 2):
+            assert f"boot-failure={round_id} sync=507011" in stdout
+        assert stdout.count("stage=boot-failure-no-user-task rc=0") == 2
+        assert stdout.count("stage=boot-failure-retains-callable rc=0") == 2
+        assert stdout.count("stage=boot-failure-execution-ended rc=0") == 2
+        if platform == "a5":
+            assert stdout.count("stage=resident-bootstrap-failed rc=0") == 2
+            assert "stage=restore-injected-graph-view rc=0" in stdout
+        else:
+            assert "stage=restore-injected-arena-binding rc=0" in stdout
+            device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
+            assert device_log.count("host-orch: prebuilt_arena_base is null") == 2, device_log
+    assert stdout.count("verified=16") == 3
+    assert "stage=release-after-destroy rc=0" in stdout
+
+
 @pytest.mark.parametrize(
     "scenario",
-    [
-        *(pytest.param(scenario, marks=pytest.mark.platforms(["a2a3", "a5"])) for scenario in range(12)),
-        # These two injections assert the A2/A3 scheduler and boot failure paths.
-        12,
-        13,
-    ],
+    [pytest.param(scenario, marks=pytest.mark.platforms(["a2a3", "a5"])) for scenario in range(14)],
     ids=[
         "dependency",
         "early-dispatch",
@@ -209,6 +238,7 @@ def _run_capture_probe(command, run, env):
 )
 def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scenario):
     _, binaries = hbg_capture_probe
+    platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     output = _ROOT / "outputs/hbg-capture"
     output.mkdir(parents=True, exist_ok=True)
@@ -252,25 +282,8 @@ def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scena
         assert "partial-capture core=1 cpu=0 after=0 boundary=0 conflict=107032 launch=107032" in result.stdout
         assert "stage=partial-capture-stops-submission rc=0" in result.stdout
         assert "finalize-capture rc=107032 expected=107032" in result.stdout
-    if scenario == 12:
-        for round_id in (1, 2):
-            assert f"fault-replay={round_id} sync=507011" in result.stdout
-            assert f"fault-replay={round_id} executed=16" in result.stdout
-        device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
-        assert device_log.count("TIMEOUT_EXIT after_idle_iterations=") == 2, device_log
-        assert result.stdout.count("verified=16") == 3
-        assert "stage=release-after-destroy rc=0" in result.stdout
-    if scenario == 13:
-        for round_id in (1, 2):
-            assert f"boot-failure={round_id} sync=507011" in result.stdout
-        assert result.stdout.count("stage=boot-failure-no-user-task rc=0") == 2
-        assert result.stdout.count("stage=boot-failure-retains-callable rc=0") == 2
-        assert result.stdout.count("stage=boot-failure-execution-ended rc=0") == 2
-        assert "stage=restore-injected-arena-binding rc=0" in result.stdout
-        device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
-        assert device_log.count("host-orch: prebuilt_arena_base is null") == 2, device_log
-        assert result.stdout.count("verified=16") == 3
-        assert "stage=release-after-destroy rc=0" in result.stdout
+    if scenario in (12, 13):
+        _check_fault_recovery(scenario, platform, result.stdout, logs)
     captures = 2 if 7 <= scenario <= 11 else 1
     replays = 0 if scenario == 3 else (5 if scenario in (12, 13) else 3)
     assert (
