@@ -183,9 +183,9 @@ percounter 目录本身为空。产出与 hbg 等价的第三套二进制。
 percounter 自己的头，并**在同一步删掉 hbg 对它们的全部引用**——头文件一旦移走，hbg 的
 `#include` 就失效，所以搬运和拆接缝必须同时做，不能像本页最初写的那样分成两步。
 
-同样移走的还有那四个 cpput 单元测试：它们测的是 percounter 的主机侧规划，却寄居在
-`tests/ut/cpp/a5/runtime/host_build_graph/` 里，而那个 `CMakeLists.txt` 正是现存两个
-上游冲突之一。
+那四个 cpput 单元测试则是**删掉**的：它们测的是 percounter 的主机侧规划，却寄居在
+`tests/ut/cpp/a5/runtime/host_build_graph/` 里。percounter 的测试与 CI 接入一并放到
+后续 PR，所以本 PR 之后它没有任何用例——这是"CI 开销：零"那一节的代价。
 
 做完这一步，**hbg 干净了，而 percounter 还没接上**——它的八个头躺在新树里没人 include，
 percounter runtime 编出来和 hbg 等价。这是一个可验证的中间态。
@@ -207,7 +207,7 @@ percounter runtime 编出来和 hbg 等价。这是一个可验证的中间态�
 验收：
 
 - hbg 树内 `grep -ri percounter` 为空
-- cpput 全绿（证明 hbg 行为未变）
+- cpput 全绿（证明 hbg 行为未变；其中不含 percounter 自己的用例）
 - percounter runtime 能跑通 a5 的 scene test，数字与拆分前一致
 
 ### 第 4 步：收紧 percounter 内部
