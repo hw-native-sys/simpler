@@ -81,10 +81,11 @@ enum class GraphRecordingStatus : uint8_t { RECORDING = 0, READY = 1, FAILED = 2
 // thread is handed this address at graph_begin and dereferences it without
 // taking recording_mutex.
 //
-// The entry carries the boundary, submit identity, and status, not the recorded body: the body's
-// storage belongs to the recorder thread that will fill it (recorder_recording()), so
-// nothing here is sized by the graph.
+// Pool workers own their recording scratch. A caller without worker scratch
+// borrows from the graph's cache; this entry owns that scratch until retirement
+// returns it to the cache. The boundary, submit identity and status live here.
 struct GraphInflightRecording {
+    std::unique_ptr<GraphRecording> fallback_scratch;
     uint64_t graph_key{0};
     GraphBoundary boundary;
     // Atomic because graph_prepare reads it on the recording thread without
@@ -120,6 +121,8 @@ struct GraphDefinitionRecord {
 };
 
 struct GraphHostState {
+    // Synchronous callers lease independent scratch; retired entries return it here.
+    std::array<std::unique_ptr<GraphRecording>, GRAPH_MAX_DEFINITIONS> fallback_scratch_cache;
     explicit GraphHostState(const GraphDefinitionArena &arena) :
         arena(arena) {}
 

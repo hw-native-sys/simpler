@@ -13,7 +13,7 @@
 /**
  * The bounded pool of threads that record Graph bodies.
  *
- * Runtime-owned, and only in the host target: one pool per process, serving every
+ * Runtime-owned, and only in the host target: one pool per runtime SO, serving every
  * registered callable. It used to live in orchestration_api.h, which put a
  * function-local static — and therefore a pool and eight threads — inside every
  * orchestration .so. Those are dlopen'd one per callable with RTLD_LOCAL and are not
@@ -37,16 +37,19 @@
  *     start() forwards that reference rather than copying the arguments, so the entry
  *     must outlive the job. It does: graph_end only marks the entry, and graph_commit
  *     frees it only after waiting for every recording to finish. Teardown does not
- *     escape that either -- shutdown() drains the queue before it sets stopping_, so a
+ *     escape that either -- shutdown() closes admission before draining the queue, so a
  *     worker's stopping_ exit always finds an empty queue and no job runs after the
  *     entry it would read.
  */
 
+#include <optional>
 #include <pthread.h>
 
 #include <array>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -239,7 +242,16 @@ private:
         // recording storage is standing. A worker that could not stand its storage up
         // still reports ready and prewarm() fails: the lazy stand-up in
         // graph_recording_reset is the backstop for the workers start() adds later.
-        if (!graph_recorder_stand_up_storage()) {
+        GraphRecording storage;
+        std::optional<ScopedRecorderScratchBinding> storage_scope;
+        bool storage_ready = false;
+        try {
+            storage_scope.emplace(storage);
+            storage_ready = graph_recorder_stand_up_storage(storage);
+        } catch (...) {
+            // The ready handshake must complete even when TLS cannot bind.
+        }
+        if (!storage_ready) {
             std::scoped_lock lock(mutex_);
             storage_failed_ = true;
         }
@@ -278,12 +290,30 @@ private:
         }
     }
 
+public:
+    // Close admission before draining. Concurrent closers wait for the same joins.
     void shutdown() {
-        wait();
         std::vector<std::thread> draining;
         {
-            std::scoped_lock lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
+            // Release runs outside recorder workers. A worker joining the pool
+            // would wait for its own job, so fail closed instead of parking the
+            // module forever.
+            if (is_worker_thread_locked(std::this_thread::get_id())) {
+                std::fprintf(stderr, "graph recorder pool shutdown from a recorder worker\n");
+                std::terminate();
+            }
+            if (stopping_) {
+                cv_.wait(lock, [&] {
+                    return stopped_;
+                });
+                return;
+            }
             stopping_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] {
+                return job_count_ == 0 && active_jobs_ == 0;
+            });
             // The handles leave workers_ under the lock and are joined without it.
             // Joining while holding mutex_ deadlocks: a worker reacquires it inside
             // cv_.wait to observe stopping_ and return. Emptying workers_ here is also
@@ -295,8 +325,15 @@ private:
         for (std::thread &worker : draining) {
             if (worker.joinable()) worker.join();
         }
+        {
+            std::scoped_lock lock(mutex_);
+            stopped_ = true;
+        }
+        cv_.notify_all();
     }
 
+private:
+    bool stopped_{false};
     std::vector<std::thread> workers_;
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -311,10 +348,13 @@ private:
 };
 
 /**
- * The process's one recorder pool.
+ * The loaded runtime's recorder pool, shared by all its module owners.
  *
- * A function-local static here is one instance per *runtime* .so rather than per
- * orchestration .so, which is the whole point of the move.
+ * Callers must keep a host-service lease through every use of the returned
+ * reference. A draining job may also look up the pool: final release keeps it
+ * alive until jobs and their closures retire. The mutex protects lookup, not
+ * the lifetime of the returned reference; never cache it beyond the lease.
+ * See worker/runtime_host_services.h for the acquire/release contract.
  */
 GraphAsyncRecordingState &graph_recorder_pool();
 
@@ -323,7 +363,7 @@ GraphAsyncRecordingState &graph_recorder_pool();
  *
  * Called from callable registration. Idempotent across callables: the second and later
  * registrations find the pool already at kPrewarmedWorkerCount and return immediately,
- * which is what makes one pool per process work.
+ * which is what keeps callable registration from multiplying workers.
  *
  * @return false when a worker could not be created or could not stand its storage up.
  */

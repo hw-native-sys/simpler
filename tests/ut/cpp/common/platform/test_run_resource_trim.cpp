@@ -123,6 +123,8 @@ private:
  * needs the device SDK and is not linkable in this suite.
  */
 class Endpoint final : public RunResourceEndpoint {
+    AutoAdmissionState::ClaimScope prepare_claims_;
+
 public:
     Endpoint(std::size_t sets, std::uint64_t capacity, bool sizes_itself = true, std::size_t base_align = 1) :
         backend(capacity),

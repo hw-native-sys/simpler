@@ -2261,7 +2261,7 @@ TEST_F(NativeAdmissionTest, NoncapacityAdmissionFailureNeverParks) {
 TEST_F(NativeAdmissionTest, MultiregionFailureKeepsEveryPublishedBackingAndRollsBackOnlyNewClaims) {
     Runner runner;
     {
-        DeviceRunnerBase::WorkspacePlanScope scope(0, 10);
+        DeviceRunnerBase::PrepareWorkspaceScope scope(0, 10);
         ASSERT_EQ(runner.setup_static_arena(0, 2 * kUnit, 2 * kUnit, 2 * kUnit), 0);
         runner.note_run_resources_proven(0, 10);
     }
@@ -2275,7 +2275,7 @@ TEST_F(NativeAdmissionTest, MultiregionFailureKeepsEveryPublishedBackingAndRolls
     for (uint64_t epoch : {20u, 30u, 40u}) {
         const auto staged = control().successful_allocations;
         {
-            DeviceRunnerBase::WorkspacePlanScope scope(0, epoch);
+            DeviceRunnerBase::PrepareWorkspaceScope scope(0, epoch);
             EXPECT_EQ(
                 runner.setup_static_arena(0, 4 * kUnit, 4 * kUnit, 4 * kUnit), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE
             );
@@ -2303,7 +2303,7 @@ TEST_F(NativeAdmissionTest, MultiregionFailureKeepsEveryPublishedBackingAndRolls
     }
     // No further prepare: close is the final attached reclamation boundary.
     {
-        DeviceRunnerBase::WorkspacePlanScope scope(0, 50);
+        DeviceRunnerBase::PrepareWorkspaceScope scope(0, 50);
         EXPECT_EQ(
             runner.setup_static_arena(0, 4 * kUnit, 4 * kUnit, 4 * kUnit), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE
         );
@@ -2312,6 +2312,24 @@ TEST_F(NativeAdmissionTest, MultiregionFailureKeepsEveryPublishedBackingAndRolls
     EXPECT_GT(runner.charged(), charged);
     EXPECT_EQ(runner.finalize(), 0);
     EXPECT_EQ(control().bytes, 0u);
+}
+
+TEST_F(NativeAdmissionTest, UnscopedArenaSetupKeepsContextRegionBackingsDistinct) {
+    // This is the unscoped entry used by simpler_init prewarm: the GM heap,
+    // shared memory and runtime image must still publish into distinct regions.
+    Runner runner;
+    const auto before = control().successful_allocations;
+    ASSERT_EQ(runner.setup_static_arena(0, 4096, 2048, 1024), 0);
+    void *heap = runner.arena_region_backing(0, 0);
+    void *shared = runner.arena_region_backing(0, 1);
+    void *runtime = runner.arena_region_backing(0, 2);
+    ASSERT_NE(heap, nullptr);
+    ASSERT_NE(shared, nullptr);
+    ASSERT_NE(runtime, nullptr);
+    EXPECT_NE(heap, shared);
+    EXPECT_NE(heap, runtime);
+    EXPECT_NE(shared, runtime);
+    EXPECT_EQ(control().successful_allocations - before, 3u);
 }
 
 TEST_F(NativeAdmissionTest, NativePrepareParksAndDestroysTheAttemptBeforeAnEarlyRetryAttachFailure) {

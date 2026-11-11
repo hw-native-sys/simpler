@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "common/module_thread_value.h"
 #include <stdint.h>
 
 #include <array>
@@ -292,7 +293,25 @@ void graph_classify_scalars(GraphRecording &recording, const ArgT &args, int32_t
 
 bool graph_boundary_relocate_params(GraphBoundary &boundary);
 
-GraphRecording &recorder_recording();
+// Binds borrowed scratch to this thread and restores the prior binding on exit.
+// The caller owns storage and must outlive the binding; a worker destroys its
+// storage before being joined. No TLS destructor retains the runtime SO.
+class ScopedRecorderScratchBinding {
+public:
+    explicit ScopedRecorderScratchBinding(GraphRecording &storage) :
+        previous_(current_.get()) {
+        current_.set(&storage);
+    }
+    ~ScopedRecorderScratchBinding() { current_.restore(previous_); }
+    ScopedRecorderScratchBinding(const ScopedRecorderScratchBinding &) = delete;
+    ScopedRecorderScratchBinding &operator=(const ScopedRecorderScratchBinding &) = delete;
+    static GraphRecording *current() { return current_.get(); }
+
+private:
+    inline static __attribute__((visibility("hidden"))) simpler::ModuleThreadValue<GraphRecording *> current_;
+    GraphRecording *previous_;
+};
+inline GraphRecording *recorder_recording() { return ScopedRecorderScratchBinding::current(); }
 
 bool graph_recording_stand_up(GraphRecording &recording);
 
@@ -300,7 +319,7 @@ bool graph_recording_stand_up(GraphRecording &recording);
  * Stand the calling thread's recording storage up — hazard map, sub-task slots, the
  * flat per-task arrays and the task tensor pool — without recording anything.
  *
- * graph_recording_stand_up() against this thread's own recorder_recording(), with the
+ * graph_recording_stand_up() against the supplied worker storage, with the
  * failure counted rather than only returned.
  *
  * A recorder worker calls this once as it starts, so the allocations land at callable
@@ -313,7 +332,7 @@ bool graph_recording_stand_up(GraphRecording &recording);
  *         graph_recorder_storage_failures(), which is how the host notices across the
  *         .so boundary that carries no return value.
  */
-bool graph_recorder_stand_up_storage();
+bool graph_recorder_stand_up_storage(GraphRecording &recording);
 
 /** Stand-up failures since the process started. Monotonic. */
 size_t graph_recorder_storage_failures();

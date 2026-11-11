@@ -23,10 +23,19 @@ RuntimeModule::RuntimeModule(const char *path) {
         const char *error = dlerror();
         throw std::runtime_error(std::string("dlopen failed: ") + (error != nullptr ? error : "unknown error"));
     }
+    auto acquire = optional<simpler::AcquireHostServices>(simpler::kAcquireHostServicesSymbol);
+    release_host_services_ = optional<simpler::ReleaseHostServices>(simpler::kReleaseHostServicesSymbol);
+    if ((acquire == nullptr) != (release_host_services_ == nullptr) || (acquire && acquire() != 0)) {
+        dlclose(handle_);
+        throw std::runtime_error("runtime host-service ownership initialization failed");
+    }
 }
 
 RuntimeModule::~RuntimeModule() {
-    if (unload_allowed_) dlclose(handle_);
+    if (unload_allowed_) {
+        if (release_host_services_) release_host_services_();
+        dlclose(handle_);
+    }
 }
 
 void *RuntimeModule::required_symbol(const char *name) const {

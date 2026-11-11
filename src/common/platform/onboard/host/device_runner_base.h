@@ -811,17 +811,6 @@ public:
     void note_workspace_run_fact(const NativeRunIdentity &identity, WorkspaceManager::RunFact fact);
 
     /**
-     * Publish the run identity this thread's workspace requests belong to.
-     *
-     * The arena callbacks and the retained-temp grow carry no identity of their
-     * own, so the prepare driving them names one around the call. Thread-scoped
-     * because a prepared successor may be built on another thread while this
-     * one still holds its own plan.
-     */
-    static void begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept;
-    static void end_workspace_plan() noexcept;
-
-    /**
      * Name the consumer region this thread's next workspace request serves.
      *
      * The arena allocation callback receives only a byte count, so the setup
@@ -839,15 +828,31 @@ public:
     void *arena_region_backing(uint32_t bank_id, std::size_t region_index) const;
     static WorkspaceManager::RegionKey workspace_plan_region() noexcept;
 
-    /** Scopes one thread's workspace plan identity to a prepare. */
-    class WorkspacePlanScope {
+    struct WorkspacePrepareState {
+        std::uint64_t epoch{0};
+        uint32_t pipeline_slot{0};
+        WorkspaceManager::RegionKey region{};
+        void *region_backing{nullptr};
+        WorkspaceManager::AcquireRefusal last_refusal{WorkspaceManager::AcquireRefusal::None};
+    };
+
+    // Owns temporary prepare state and its claim ledger through catch cleanup.
+    // Destruction restores selectors and frees the ledger, but does not release
+    // workspace blocks. The prepare success/failure paths commit or roll back
+    // claims explicitly before this scope ends.
+    class PrepareWorkspaceScope {
     public:
-        WorkspacePlanScope(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept {
-            begin_workspace_plan(pipeline_slot, run_epoch);
-        }
-        ~WorkspacePlanScope() { end_workspace_plan(); }
-        WorkspacePlanScope(const WorkspacePlanScope &) = delete;
-        WorkspacePlanScope &operator=(const WorkspacePlanScope &) = delete;
+        explicit PrepareWorkspaceScope(uint32_t pipeline_slot = 0, std::uint64_t run_epoch = 0);
+        ~PrepareWorkspaceScope();
+        // Assign after native-run admission, before callbacks acquire workspace.
+        void set_run_identity(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept;
+        PrepareWorkspaceScope(const PrepareWorkspaceScope &) = delete;
+        PrepareWorkspaceScope &operator=(const PrepareWorkspaceScope &) = delete;
+
+    private:
+        WorkspacePrepareState state_;
+        WorkspacePrepareState *previous_;
+        AutoAdmissionState::ClaimScope claims_;
     };
 
     /** Runs still holding workspace whose completion a caller can still prove. */
@@ -1922,26 +1927,13 @@ public:
     virtual void fill_init_arch_fields(InitArgs & /*init_args*/) {}
 
     /**
-     * Arm or disarm this thread's host-side dep_gen capture, from the run's own
-     * config, before it binds.
-     *
-     * A host-orchestrating runtime holds the captured graph in thread-local
-     * state between orchestration and emit, so this has to run on the thread
-     * that is about to bind, for every prepare — including one that overlaps an
-     * active predecessor, which skips `apply_call_config`. It writes nothing the
-     * runner shares between runs. An arch without dep_gen keeps the no-op.
-     */
-    virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
-
-    /**
      * Cross-run retention for the DepGen collector, which lives on the arch
      * `DeviceRunner` rather than on this base.
      *
      * The base owns the latch, the flush and the teardown, so it reaches that
      * collector through these. Defaults are no-ops, so a runner without a
      * DepGen collector inherits today's behaviour and a runtime that captures
-     * its graph on the host is unaffected. Same ownership split as
-     * `arm_host_dep_gen_capture` above.
+     * its graph on the host is unaffected.
      */
     virtual void configure_dep_gen_retention(bool /*enabled*/, std::size_t /*budget_bytes*/) {}
     virtual bool dep_gen_retains_runs() const { return false; }

@@ -29,11 +29,15 @@
  * five vectors rather than a copy. The serializer lives in that same header.
  */
 
+#include "host/host_dependency_capture_scope.h"
+#include "common/module_thread_value.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -114,11 +118,10 @@ void fill_producer(hg::EdgeEntry &e, const ChipTensorMapEntry &entry) {
 }
 
 // ---------------------------------------------------------------------------
-// Capture state — thread-local, handed over on the same thread
+// Prepare-owned capture state — selected on the calling thread
 // ---------------------------------------------------------------------------
 
-struct HostGraphState {
-    bool enabled = false;
+struct HostDependencyCaptureState {
     /**
      * An orchestration started on this thread since the last hand-off.
      *
@@ -151,16 +154,19 @@ struct HostGraphState {
     }
 };
 
-// Thread-local, not process-global: see the isolation note in the header.
-HostGraphState &state() {
-    static thread_local HostGraphState s;
-    return s;
+// The prepare scope owns an enabled session; TLS only borrows its address.
+// Configuration cannot survive a session and affect a later prepare.
+simpler::ModuleThreadValue<HostDependencyCaptureState *> &capture_selector() {
+    static simpler::ModuleThreadValue<HostDependencyCaptureState *> selector;
+    return selector;
 }
+
+HostDependencyCaptureState *current_capture() { return capture_selector().get(); }
 
 // Register a tensor in the tensors[] table on first sight of (addr, version).
 // buffer_numel describes the underlying storage size in elements; per-edge
 // fields describe the slice via (start_offset, strides[]).
-uint64_t register_tensor(HostGraphState &s, const simpler::hbg::Tensor &t) {
+uint64_t register_tensor(HostDependencyCaptureState &s, const simpler::hbg::Tensor &t) {
     uint64_t id = make_tensor_id(t.buffer.addr, t.version);
     if (s.tensor_index.find(id) != s.tensor_index.end()) {
         return id;
@@ -207,24 +213,25 @@ bool write_graph_truncating(const char *path, const hg::HostGraphExport &graph) 
 // Capture surface
 // ---------------------------------------------------------------------------
 
-bool dep_gen_host_graph_enabled() { return state().enabled; }
+bool dep_gen_host_graph_enabled() { return current_capture() != nullptr; }
 
 void dep_gen_host_graph_begin_capture() {
-    HostGraphState &s = state();
+    auto *active_capture = current_capture();
+    if (active_capture == nullptr) return;
+    HostDependencyCaptureState &s = *active_capture;
     s.reset();
-    // Only when armed: a thread that ran an orchestration with capture off has
-    // no graph to claim, and must not be mistaken for one that does.
-    s.capture_open = s.enabled;
+    // A session alone is not a captured graph. Even an empty orchestration
+    // must pass this entry before take() can report a complete capture.
+    s.capture_open = true;
 }
 
 void dep_gen_host_graph_begin_task(
     TaskId task_id, bool in_manual_scope, bool early_dispatch, const int32_t kernel_ids[3], int32_t block_num,
     int32_t tensor_count, const TensorRef *tensors, const TensorArgType *arg_types
 ) {
-    HostGraphState &s = state();
-    if (!s.enabled) {
-        return;
-    }
+    auto *active_capture = current_capture();
+    if (active_capture == nullptr) return;
+    HostDependencyCaptureState &s = *active_capture;
     s.task_preds.clear();
     s.current_task_id = TaskId::to_uint64(task_id);
     s.in_task = true;
@@ -277,11 +284,15 @@ void dep_gen_host_graph_begin_task(
     s.graph.task_arg_offsets.push_back(static_cast<uint32_t>(s.graph.task_args.size()));
 }
 
-void dep_gen_host_graph_end_task() { state().in_task = false; }
+void dep_gen_host_graph_end_task() {
+    if (auto *active_capture = current_capture()) active_capture->in_task = false;
+}
 
 void dep_gen_host_graph_add_explicit_edge(TaskId producer) {
-    HostGraphState &s = state();
-    if (!s.enabled || !s.in_task) {
+    auto *active_capture = current_capture();
+    if (active_capture == nullptr) return;
+    HostDependencyCaptureState &s = *active_capture;
+    if (!s.in_task) {
         return;
     }
     if (!s.task_preds.insert(producer).second) {
@@ -296,8 +307,10 @@ void dep_gen_host_graph_add_explicit_edge(TaskId producer) {
 }
 
 void dep_gen_host_graph_add_creator_edge(TaskId producer, int32_t arg_idx, const simpler::hbg::Tensor &consumer) {
-    HostGraphState &s = state();
-    if (!s.enabled || !s.in_task) {
+    auto *active_capture = current_capture();
+    if (active_capture == nullptr) return;
+    HostDependencyCaptureState &s = *active_capture;
+    if (!s.in_task) {
         return;
     }
     if (!s.task_preds.insert(producer).second) {
@@ -317,8 +330,10 @@ void dep_gen_host_graph_add_tensormap_edge(
     TaskId producer, int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry,
     OverlapStatus overlap
 ) {
-    HostGraphState &s = state();
-    if (!s.enabled || !s.in_task) {
+    auto *active_capture = current_capture();
+    if (active_capture == nullptr) return;
+    HostDependencyCaptureState &s = *active_capture;
+    if (!s.in_task) {
         return;
     }
     // Every overlapping producer slice is its own edge; the pred set is still
@@ -340,12 +355,29 @@ void dep_gen_host_graph_add_tensormap_edge(
 // Control surface
 // ---------------------------------------------------------------------------
 
-extern "C" void dep_gen_host_graph_set_enabled(bool enable) { state().enabled = enable; }
+extern "C" void *dep_gen_host_graph_create_capture_session() {
+    if (current_capture() != nullptr) throw std::logic_error("nested host graph capture");
+    auto session = std::make_unique<HostDependencyCaptureState>();
+    capture_selector().set(session.get());
+    return session.release();
+}
+
+extern "C" void dep_gen_host_graph_destroy_capture_session(void *opaque) noexcept {
+    auto *session = static_cast<HostDependencyCaptureState *>(opaque);
+    if (current_capture() == session) {
+        // Returning with a dangling selector would let later calls use freed
+        // storage. A valid-key clear is expected to succeed; fail closed if not.
+        capture_selector().restore(nullptr);
+    }
+    delete session;
+}
 
 extern "C" bool dep_gen_host_graph_active() { return true; }
 
 extern "C" int dep_gen_host_graph_take(hg::HostGraphExport *out) {
-    HostGraphState &s = state();
+    auto *active_capture = current_capture();
+    if (active_capture == nullptr) return static_cast<int>(hg::TakeOutcome::NotCaptured);
+    HostDependencyCaptureState &s = *active_capture;
     if (out == nullptr) return static_cast<int>(hg::TakeOutcome::NotCaptured);
     if (!s.capture_open) {
         // Either capture was never armed for this run, or this run's
@@ -353,7 +385,7 @@ extern "C" int dep_gen_host_graph_take(hg::HostGraphExport *out) {
         return static_cast<int>(hg::TakeOutcome::NotCaptured);
     }
     const bool task_left_open = s.in_task;
-    // Moved, not copied: after this the thread-local holds empty vectors and
+    // Moved, not copied: after this the capture scope holds empty vectors and
     // the next `begin_capture` has nothing of this graph to overwrite. The
     // caller owns every byte the writer will read.
     out->tasks = std::move(s.graph.tasks);
@@ -374,7 +406,9 @@ extern "C" int dep_gen_host_graph_take(hg::HostGraphExport *out) {
 }
 
 extern "C" void dep_gen_host_graph_restore_for_export(hg::HostGraphExport *graph, int outcome) {
-    HostGraphState &s = state();
+    auto *active_capture = current_capture();
+    if (active_capture == nullptr) return;
+    HostDependencyCaptureState &s = *active_capture;
     s.reset();
     if (graph == nullptr || outcome == static_cast<int>(hg::TakeOutcome::NotCaptured)) return;
     s.graph = std::move(*graph);

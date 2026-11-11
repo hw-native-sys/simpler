@@ -39,6 +39,7 @@
  */
 template <typename OnMissing>
 inline void rollback_workspace_claims(WorkspaceManager &ledger, OnMissing on_missing) {
+    if (!AutoAdmissionState::has_claim_scope()) return;
     std::vector<AutoAdmissionState::Claim> &claims = AutoAdmissionState::claims();
     // Newest first: a later claim can only be a block an earlier one does not
     // own, so undoing in reverse keeps each step independent of the rest.

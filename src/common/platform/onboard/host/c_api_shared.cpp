@@ -24,6 +24,8 @@
  * real implementations, a5 has stubs.
  */
 
+#include "host/host_dependency_capture_scope.h"
+#include <optional>
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -72,6 +74,13 @@ extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
 // in the host_build_graph runtime .so, and its header pulls in that runtime's own
 // types. Each platform .so carries weak `false` / `-1` fallbacks for the runtimes
 // that capture on the device instead — see each arch's device_runner.cpp.
+// Runtimes without host graph capture own no capture session.
+extern "C" __attribute__((weak, visibility("hidden"))) void *dep_gen_host_graph_create_capture_session() {
+    return nullptr;
+}
+extern "C" __attribute__((weak, visibility("hidden"))) void
+dep_gen_host_graph_destroy_capture_session(void *) noexcept {}
+
 extern "C" bool dep_gen_host_graph_active();
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
 
@@ -1005,6 +1014,10 @@ int simpler_init(
     // sizing is read.
     if (prewarm_config != NULL) {
         try {
+            // Prewarm allocates the context's arena regions before any run
+            // exists; give it the context epoch so those blocks are owned by
+            // the context rather than a run.
+            DeviceRunnerBase::PrepareWorkspaceScope prewarm_workspace(0, WorkspaceManager::kContextEpoch);
             const HostApi prewarm_api(runner, 0, 0, 0, &g_host_api_ops);
             rc = prewarm_config_impl(
                 &prewarm_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
@@ -1800,11 +1813,15 @@ int simpler_prepare_run(
     // preparation whose release result has not been consumed by a raw caller.
     if (magic == kNativeRunPrepareReleasedMagic) std::memset(runtime, 0, kNativeRunPrepareReleaseBytes);
 
+    std::optional<DeviceRunnerBase::PrepareWorkspaceScope> workspace_scope;
+    std::optional<HostDependencyCaptureScope> capture_scope;
     OnboardNativeRunContext *state = nullptr;
     const uint64_t trace_hid = runner->callable_hash(callable_id);
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
+        workspace_scope.emplace();
+        capture_scope.emplace(config->enable_dep_gen != 0);
         // The bank is resolved from this runtime's own declaration before the
         // context is built, so every consumer of it — the reservation, the
         // HostApi the bind receives, `setup_static_arena` — reads one value with
@@ -1857,9 +1874,7 @@ int simpler_prepare_run(
         // Names the run every workspace request inside this prepare belongs to:
         // the arena commits below and the retained-temp grow record their
         // references against this identity.
-        DeviceRunnerBase::WorkspacePlanScope workspace_plan(
-            state->descriptor.pipeline_slot, state->descriptor.run_epoch
-        );
+        workspace_scope->set_run_identity(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
         const bool overlaps_active_run = allow_prepared_successor && runner->native_run_active();
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;
@@ -1976,15 +1991,8 @@ int simpler_prepare_run(
         // is the one that query must keep reporting until it retires.
         if (!overlaps_active_run) runner->apply_call_config(state->config);
 
-        // Unconditional, and from this run's own config: a host-orchestrating
-        // runtime holds the captured graph in thread-local state between
-        // orchestration and emit, so the arming has to happen on this thread
-        // ahead of its bind whether or not it overlaps a predecessor. It writes
-        // nothing the two runs share.
-        runner->arm_host_dep_gen_capture(config->enable_dep_gen != 0);
-        // Same reason, different state: a host-orchestrating bind records phase
-        // events that belong to the run doing the binding rather than to
-        // whichever run last held the claim.
+        // Host phase events belong to this bind, including when a predecessor
+        // is still active and apply_call_config was skipped.
         runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(*config));
 
         {

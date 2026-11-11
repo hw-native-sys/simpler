@@ -43,6 +43,10 @@ class ReloadableThreadLocalTest(unittest.TestCase):
             "void f() { static thread_local int value = 7; }",
             "namespace detail { thread_local int value = 7; }",
             "static /* storage */ thread_local int value = 7;",
+            "__thread int value = 7;",
+            "static __thread int value = 7;",
+            "_Thread_local int value = 7;",
+            "static _Thread_local int value = 7;",
         ):
             with self.subTest(source=source):
                 result = self.run_checker(source)
@@ -78,15 +82,41 @@ class ReloadableThreadLocalTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("src/probe.cpp:2:", result.stdout)
 
-    def test_allowlist_requires_the_exact_path_and_line(self):
+    def test_rejects_the_former_recorder_allowlist(self):
         path = "src/common/host_build_graph/host/graph_submit.cpp"
-        allowed = "thread_local GraphRecording *g_active_graph_recording = nullptr;"
-        result = self.run_checker(allowed, path)
+        declaration = "thread_local GraphRecording *g_active_graph_recording = nullptr;"
+        result = self.run_checker(declaration, path)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("new thread_local in a reloadable SO", result.stdout)
+
+    def test_rejects_unreviewed_key_creation(self):
+        result = self.run_checker("void f() { pthread_key_create(&key, nullptr); }\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("src/probe.cpp: pthread key creation sites: 1; reviewed: 0", result.stdout)
+
+    def test_accepts_the_reviewed_key_count(self):
+        path = "src/common/log/host_log.cpp"
+        result = self.run_checker("void f() { pthread_key_create(&key, std::free); }\n", path)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = self.run_checker(allowed)
+
+    def test_rejects_an_extra_key_in_a_reviewed_file(self):
+        path = "src/common/log/host_log.cpp"
+        source = "void f() { pthread_key_create(&a, nullptr); pthread_key_create(&b, nullptr); }\n"
+        result = self.run_checker(source, path)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        result = self.run_checker(allowed.replace("nullptr", "other_recording"), path)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(
+            "src/common/log/host_log.cpp: pthread key creation sites: 2; reviewed: 1",
+            result.stdout,
+        )
+
+    def test_ignores_key_calls_in_comments_and_literals(self):
+        source = (
+            "// pthread_key_create(&key, nullptr);\n"
+            'const char *text = "pthread_key_create";\n'
+            "/* pthread_key_create(&key, nullptr); */\n"
+        )
+        result = self.run_checker(source)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

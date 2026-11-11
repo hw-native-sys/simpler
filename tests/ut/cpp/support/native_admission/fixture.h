@@ -33,7 +33,6 @@ namespace native_admission_test {
 // resulting behavior directly in their own source files.
 void *primary_entry_points();
 void *alternate_entry_points();
-void set_dep_gen_capture(bool enabled);
 uint32_t arena_bank(uint32_t slot);
 
 using native_admission_transport::control;
@@ -178,7 +177,6 @@ public:
         return drain_result;
     }
     int finalize_impl() override { return finalize_common(); }
-    void arm_host_dep_gen_capture(bool enabled) override { set_dep_gen_capture(enabled); }
     AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
     size_t charged() const { return workspace_.reserved_bytes(); }
     bool holds_epoch(uint64_t epoch) const { return workspace_.holds_references(epoch); }
@@ -272,7 +270,7 @@ protected:
     }
     std::string diagnostic_path;
     static int staging(Runner &r, uint32_t slot, uint64_t epoch, size_t bytes) {
-        DeviceRunnerBase::WorkspacePlanScope plan(slot, epoch);
+        DeviceRunnerBase::PrepareWorkspaceScope plan(slot, epoch);
         void *ptr = nullptr;
         size_t capacity = 0;
         return r.acquire_retained_temp(slot, bytes, &ptr, &capacity);
