@@ -238,9 +238,10 @@ class TestNativeRunLifecycle(SceneTestCase):
                     self.compute_golden(run_golden, case["params"])
                     return run_args, run_chip_args, run_output_names, run_golden
 
-                # The successor owns a distinct bank while A still owns the
-                # execution claim. Preparation touches no stream — the run pair
-                # is readied at launch, under the claim — so neither prepare
+                # The successor owns a distinct image bank while A still owns the
+                # execution claim; the ordered HBG execution domain shares one GM
+                # heap scratch generation. Preparation touches no stream — the run
+                # pair is readied at launch, under the claim — so neither prepare
                 # advances the creation count. A failed early launch must leave B
                 # prepared so the same token can launch after A's complete fence
                 # and finalization.
@@ -260,7 +261,7 @@ class TestNativeRunLifecycle(SceneTestCase):
                 bank1 = chip_worker.arena_bank_gm_heap_base(1)
                 assert bank0 != 0
                 assert bank1 != 0
-                assert bank0 != bank1
+                assert bank0 == bank1, f"ordered HBG slots should share one GM heap: {bank0:#x}, {bank1:#x}"
                 assert torch.count_nonzero(successor_args.out) == 0
 
                 with pytest.raises(RuntimeError, match="launch_native_run failed") as claim_error:

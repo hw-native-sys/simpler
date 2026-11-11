@@ -20,7 +20,7 @@ OrchContext *other_orchestrator = nullptr;
 void record_entry(const ChipTaskArgs &args, OrchContext *&binding) {
     ++callbacks;
     auto &orch = *binding->orchestrator;
-    uint32_t shape[] = {16};
+    uint32_t shape[] = {graph_heap_elements};
     GraphTaskArgs boundary;
     boundary.add_input(args.tensor(0).ref());
     auto graph = orch.graph_begin(0x521, boundary);

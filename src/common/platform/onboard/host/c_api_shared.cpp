@@ -1860,6 +1860,11 @@ int simpler_prepare_run(
         DeviceRunnerBase::WorkspacePlanScope workspace_plan(
             state->descriptor.pipeline_slot, state->descriptor.run_epoch
         );
+        runner->allow_ordered_graph_heap_sharing(
+            allow_prepared_successor && declares_per_run_arena() &&
+            state->descriptor.prepare_purpose != SIMPLER_PREPARE_CAPTURE &&
+            !DfxRunConfig::from(*config).diagnostics_any()
+        );
         const bool overlaps_active_run = allow_prepared_successor && runner->native_run_active();
         state->trace_inv = trace_inv;
         state->trace_start_ns = trace_start_ns;
@@ -2389,6 +2394,7 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
     }
     state->completion_rc = 0;
     state->phase.store(NativeRunPhase::Running, std::memory_order_release);
+    state->runner->publish_graph_heap_launch(state->identity());
     return 0;
 }
 

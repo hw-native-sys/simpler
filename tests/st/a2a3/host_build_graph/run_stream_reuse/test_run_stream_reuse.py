@@ -337,8 +337,13 @@ class TestRunStreamReuseHbg(SceneTestCase):
         finally:
             st_worker.unregister(add_handle)
 
-    def test_depth_two_slots_own_separate_resources(self, st_platform, st_worker):
-        """Four live calls preserve their outputs while both execution slots are reused."""
+    def test_depth_two_slots_share_heap_but_own_separate_images(self, st_platform, st_worker):
+        """Four live calls preserve their outputs while both execution slots are reused.
+
+        Onboard HBG shares the GM heap as scratch in the ordered execution
+        domain; the simulation backend keeps a heap per bank. Either way the
+        per-slot image bank (runtime storage and staging) stays separate.
+        """
         if not st_platform.startswith("a2a3"):
             pytest.skip("pipeline slot banks are an a2a3 resource")
 
@@ -395,7 +400,10 @@ class TestRunStreamReuseHbg(SceneTestCase):
             bank0 = chip_worker.arena_bank_gm_heap_base(0)
             bank1 = chip_worker.arena_bank_gm_heap_base(1)
             assert bank0 != 0 and bank1 != 0, f"a served bank is uncommitted: {bank0:#x}, {bank1:#x}"
-            assert bank0 != bank1, f"both arena banks resolve to one GM heap: {bank0:#x}"
+            if st_platform == "a2a3":
+                assert bank0 == bank1, f"ordered HBG slots should share one GM heap: {bank0:#x}, {bank1:#x}"
+            else:
+                assert bank0 != bank1, f"simulation banks should own separate GM heaps: {bank0:#x}, {bank1:#x}"
             # Both same-slot successors are admitted before any strong observation.
             while records:
                 record = records[-1]

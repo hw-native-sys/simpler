@@ -26,7 +26,8 @@
 struct PreparedSubmissionStorage;
 
 // Actual backing held by a prepared execution. Slot/bank caches may retain the
-// same storage, but must replace it before writing while this owner holds it.
+// same storage. Images detach before writes; ordered scratch heaps carry their
+// own sharing permission and allocation lifetime.
 // Device cleanup belongs to the runner on a valid device context, not to the
 // destruction of the last arbitrary host reference.
 class PreparedRunResources {
@@ -74,15 +75,29 @@ public:
 
     using ImageStorage = AlignedImageStorage;
 
+    // Shared independently of the image bank. The ledger lease protects a
+    // cached alias even after the bank that allocated it retires.
+    struct HeapGeneration {
+        HeapGeneration(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
+            arena(alloc, free_fn, ctx) {}
+        DeviceArena arena;
+        size_t capacity{0};
+        WorkspaceManager::BackingLease backing;
+        // A prepare closes borrowing until that exact run publishes a successful
+        // launch. Retention permanently closes this generation to new borrowers.
+        uint64_t preparing_epoch{0};
+        bool eligible{false};
+        bool closed{false};
+    };
+
     struct ArenaBank {
         ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
-            gm_heap(alloc, free_fn, ctx),
+            heap(std::make_shared<HeapGeneration>(alloc, free_fn, ctx)),
             gm_sm(alloc, free_fn, ctx),
             runtime_pool(alloc, free_fn, ctx) {}
-        DeviceArena gm_heap;
+        std::shared_ptr<HeapGeneration> heap;
         DeviceArena gm_sm;
         DeviceArena runtime_pool;
-        size_t cached_gm_heap_size{0};
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
     };
@@ -97,7 +112,7 @@ public:
             std::vector<WorkspaceManager::BackingLease> backing;
             backing.reserve(3);
             for (void *raw :
-                 {bank->gm_heap.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
+                 {bank->heap->arena.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
                 if (raw == nullptr || !workspace.owns(raw)) continue;
                 auto lease = workspace.retain_backing(raw);
                 if (!lease) return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -114,7 +129,12 @@ public:
         int reclaim(WorkspaceManager &workspace) {
             if (!bank_) return 0;
             if (in_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
-            for (DeviceArena *arena : {&bank_->gm_heap, &bank_->gm_sm, &bank_->runtime_pool}) {
+            if (bank_->heap.use_count() == 1) {
+                workspace.note_unpublished(bank_->heap->arena.raw_backing());
+                bank_->heap->arena.release();
+                bank_->heap->backing.reset();
+            }
+            for (DeviceArena *arena : {&bank_->gm_sm, &bank_->runtime_pool}) {
                 workspace.note_unpublished(arena->raw_backing());
                 arena->release();
             }
@@ -125,7 +145,7 @@ public:
 
         void abandon_after_device_failure() {
             if (bank_) {
-                bank_->gm_heap.abandon_after_device_failure();
+                bank_->heap->arena.abandon_after_device_failure();
                 bank_->gm_sm.abandon_after_device_failure();
                 bank_->runtime_pool.abandon_after_device_failure();
             }

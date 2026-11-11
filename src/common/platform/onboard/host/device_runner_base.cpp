@@ -537,7 +537,7 @@ bool DeviceRunnerBase::set_run_resource_grant(size_t granted) {
     }
     for (const std::shared_ptr<ArenaBank> &bank : arena_banks_) {
         if (bank != nullptr &&
-            (bank->gm_heap.is_committed() || bank->gm_sm.is_committed() || bank->runtime_pool.is_committed())) {
+            (bank->heap->arena.is_committed() || bank->gm_sm.is_committed() || bank->runtime_pool.is_committed())) {
             return false;
         }
     }
@@ -565,7 +565,7 @@ bool DeviceRunnerBase::set_run_resource_grant(size_t granted) {
 uint64_t DeviceRunnerBase::arena_bank_gm_heap_base(uint32_t bank_id) const {
     if (bank_id >= arena_banks_.size()) return 0;
     const ArenaBank &bank = *arena_banks_[bank_id];
-    return bank.gm_heap.is_committed() ? reinterpret_cast<uint64_t>(bank.gm_heap.base()) : 0;
+    return bank.heap->arena.is_committed() ? reinterpret_cast<uint64_t>(bank.heap->arena.base()) : 0;
 }
 
 uint64_t DeviceRunnerBase::retained_temp_addr(uint32_t slot_id) const {
@@ -738,6 +738,7 @@ const char *workspace_refusal_text(WorkspaceManager::AcquireRefusal why) {
 // a prepared successor built on another thread cannot be charged to this one.
 struct WorkspacePlanIdentity {
     std::uint64_t epoch{0};
+    bool share_graph_heap{false};
     uint32_t pipeline_slot{0};
     WorkspaceManager::RegionKey region{};
     // What the named region is published at right now, so a block the allocator
@@ -759,6 +760,10 @@ void DeviceRunnerBase::begin_workspace_plan(uint32_t pipeline_slot, std::uint64_
     g_workspace_plan.region = WorkspaceManager::staging_region(pipeline_slot);
 }
 
+void DeviceRunnerBase::allow_ordered_graph_heap_sharing(bool allowed) noexcept {
+    g_workspace_plan.share_graph_heap = allowed;
+}
+
 void DeviceRunnerBase::end_workspace_plan() noexcept { g_workspace_plan = WorkspacePlanIdentity{}; }
 
 void DeviceRunnerBase::set_workspace_plan_region(const WorkspaceManager::RegionKey &region) noexcept {
@@ -774,7 +779,7 @@ void *DeviceRunnerBase::arena_region_backing(uint32_t bank_id, std::size_t regio
     const ArenaBank &bank = *arena_banks_[bank_id];
     switch (static_cast<WorkspaceManager::ArenaRegion>(region_index)) {
     case WorkspaceManager::ArenaRegion::GmHeap:
-        return bank.gm_heap.raw_backing();
+        return bank.heap->arena.raw_backing();
     case WorkspaceManager::ArenaRegion::GmSm:
         return bank.gm_sm.raw_backing();
     case WorkspaceManager::ArenaRegion::RuntimePool:
@@ -862,9 +867,8 @@ public:
             a->runner->note_arena_region_disposition(a->bank, what, base);
         };
         void *announce_ctx = &announces_[slot];
-        out[0] =
-            ArenaRegionRequest{&bank.gm_heap, &bank.cached_gm_heap_size, 0, "gm_heap", nullptr, nullptr, region_gave_up,
-                               announce_ctx};
+        out[0] = ArenaRegionRequest{&bank.heap->arena, &bank.heap->capacity, 0,           "gm_heap", nullptr,
+                                    nullptr,           region_gave_up,       announce_ctx};
         out[1] = ArenaRegionRequest{&bank.gm_sm, &bank.cached_gm_sm_size, 0,           "gm_sm", nullptr,
                                     nullptr,     region_gave_up,          announce_ctx};
         out[2] = ArenaRegionRequest{
@@ -1504,7 +1508,7 @@ int DeviceRunnerBase::clear_temporary_buffer() {
 
 void *DeviceRunnerBase::acquire_pooled_gm_heap(uint32_t arena_bank) {
     if (arena_bank >= arena_banks_.size()) return nullptr;
-    DeviceArena &arena = this->arena_bank(arena_bank).gm_heap;
+    DeviceArena &arena = this->arena_bank(arena_bank).heap->arena;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
 }
@@ -1596,6 +1600,36 @@ int DeviceRunnerBase::setup_static_arena(
         }
     });
     ArenaBank &bank = this->arena_bank(arena_bank);
+    std::shared_ptr<PreparedRunResources::HeapGeneration> previous_heap;
+    // Automatic admission keeps its original region/trim accounting. Only
+    // ordinary ordered HBG preparations may borrow another image bank's heap.
+    const bool share_heap = g_workspace_plan.share_graph_heap && !auto_admission_.enabled() &&
+                            execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM && can_accept_run();
+    {
+        std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
+        auto candidate = shared_graph_heap_.lock();
+        if (share_heap && candidate && candidate->eligible && !candidate->closed &&
+            candidate->capacity >= gm_heap_size && gm_heap_size != 0) {
+            if (bank.heap != candidate) {
+                previous_heap = bank.heap;
+                bank.heap = std::move(candidate);
+            }
+        } else if (bank.heap.use_count() > 1 || bank.heap->closed) {
+            previous_heap = bank.heap;
+            bank.heap = std::make_shared<PreparedRunResources::HeapGeneration>(
+                &arena_alloc_trampoline, &arena_free_trampoline, this
+            );
+        }
+        bank.heap->eligible = false;
+        bank.heap->preparing_epoch = g_workspace_plan.epoch;
+    }
+    // Failure keeps the borrowed generation closed: its run never published
+    // a successful launch. The previous cache remains valid for rollback.
+    auto restore_heap = RAIIScopeGuard([&] {
+        if (!previous_heap) return;
+        if (!bank_committed) bank.heap = std::move(previous_heap);
+        else if (previous_heap.use_count() == 1) workspace_.note_unpublished(previous_heap->arena.raw_backing());
+    });
 
     // The ledger keys a block by the one region that owns it, and the arena
     // allocation callback sees only a byte count, so each region names itself
@@ -1617,7 +1651,7 @@ int DeviceRunnerBase::setup_static_arena(
         a->runner->note_arena_region_disposition(a->bank, what, base);
     };
     ArenaRegionRequest requests[] = {
-        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap", name_region, &announce, region_gave_up,
+        {&bank.heap->arena, &bank.heap->capacity, gm_heap_size, "gm_heap", name_region, &announce, region_gave_up,
          &announce},
         {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm", name_region, &announce, region_gave_up, &announce},
         {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool", name_region,
@@ -1692,6 +1726,18 @@ int DeviceRunnerBase::setup_static_arena(
             g_workspace_plan.pipeline_slot, AutoAdmissionState::Phase::Committing, requested, growth
         );
         if (refusal != 0) return refusal;
+    }
+    if (outcome.rc == 0) {
+        std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
+        if (share_heap) {
+            void *raw = bank.heap->arena.raw_backing();
+            if (raw != nullptr && workspace_.owns(raw)) {
+                auto backing = workspace_.retain_backing(raw);
+                if (!backing) return PTO_RUNTIME_ERR_INVALID_STATE;
+                bank.heap->backing = std::move(backing);
+            }
+            shared_graph_heap_ = bank.heap;
+        }
     }
     return outcome.rc;
 }
@@ -3353,15 +3399,17 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // allocator, not after it.
     for (auto &bank : arena_banks_) {
         if (abandon_device_resources) {
-            bank->gm_heap.abandon_after_device_failure();
+            bank->heap->arena.abandon_after_device_failure();
             bank->gm_sm.abandon_after_device_failure();
             bank->runtime_pool.abandon_after_device_failure();
         } else {
-            bank->gm_heap.release();
+            bank->heap->arena.release();
             bank->gm_sm.release();
             bank->runtime_pool.release();
         }
+        bank->heap->backing.reset();
     }
+    shared_graph_heap_.reset();
     prebuilt_runtime_arena_cache_.invalidate();
 
     if (abandon_device_resources) {
@@ -3528,7 +3576,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     max_vector_cores_ = 0;
     aicore_kernel_binary_.clear();
     for (auto &bank : arena_banks_) {
-        bank->cached_gm_heap_size = 0;
+        bank->heap->capacity = 0;
         bank->cached_gm_sm_size = 0;
         bank->cached_runtime_arena_size = 0;
     }
@@ -4036,7 +4084,7 @@ int DeviceRunnerBase::retain_prepared_run_resources(
         return PTO_RUNTIME_ERR_INVALID_STATE;
     auto bank = arena_banks_[bank_id];
     std::vector<WorkspaceManager::BackingLease> leases;
-    for (void *raw : {bank->gm_heap.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
+    for (void *raw : {bank->heap->arena.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
         if (raw == nullptr || !workspace_.owns(raw)) continue;
         auto lease = workspace_.retain_backing(raw);
         if (!lease) return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -4074,6 +4122,16 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     prepared_uses_.push_back({prepared.identity, PreparedRunUse(std::move(resources))});
     prepared.prepared_resources = std::move(published);
     return 0;
+}
+
+void DeviceRunnerBase::publish_graph_heap_launch(const NativeRunIdentity &identity) {
+    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
+    for (const auto &entry : prepared_uses_) {
+        if (!(entry.identity == identity)) continue;
+        auto &heap = entry.use.resources()->arena_->heap;
+        if (heap->preparing_epoch == identity.run_epoch && !heap->closed) heap->eligible = true;
+        return;
+    }
 }
 
 int DeviceRunnerBase::retain_external_run_resources(
@@ -4241,6 +4299,8 @@ int DeviceRunnerBase::retain_external_run_resources(
          !caller_device_buffers_.retain_reference(key, static_cast<uint64_t>(prepared.pipeline_slot) + 1)) ||
         !use->use.retain_external_use())
         return PTO_RUNTIME_ERR_INVALID_STATE;
+    resources->arena_->heap->closed = true;
+    resources->arena_->heap->eligible = false;
     // A cached TMR image names this bank. Its next bind must take the normal
     // arena acquisition path so retention can replace the backing before writes.
     prebuilt_runtime_arena_cache_.invalidate();
