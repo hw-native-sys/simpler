@@ -117,6 +117,7 @@ inline uint64_t UrmaPeerMrBaseAddr(uint8_t *, uint32_t) { return 0; }
 // The adapter must not depend on the implicit CCE block identity.
 uint32_t get_block_idx() = delete;
 
+#include "urma/urma_request.h"
 #include "backend/urma/urma_completion_kernel.h"
 #include "scheduler/scheduler_context.h"
 #include <pto/comm/async/urma/urma_types.hpp>
@@ -161,11 +162,11 @@ AsyncEvent post_for_test(bool put, Dst dst, Src src, const AsyncSession &session
         event.urmaJettyBase = session.qpIdxBase;
         event.urmaJettyCount = session.cfg.urma.qpCount;
         const uint64_t bytes = static_cast<uint64_t>(src.shape.values[4]) * sizeof(typename Src::RawDType);
-        const uint64_t wqes = pto2::urma_backend::chunk_count(bytes);
+        const uint64_t wqes = simpler::urma::chunk_count(bytes);
         for (uint32_t j = 0; j < event.urmaJettyCount; ++j) {
             uint32_t row = 0;
             EXPECT_TRUE(
-                pto2::urma_backend::queue_row_for(session.contextGm, session.destRankId, session.qpIdxBase + j, row)
+                simpler::urma::queue_row_for(session.contextGm, session.destRankId, session.qpIdxBase + j, row)
             );
             auto &queue = queues[row];
             auto *head = reinterpret_cast<uint32_t *>(queue.headAddr);
@@ -230,6 +231,7 @@ struct RegistrationFixture {
     alignas(64) std::array<std::array<uint8_t, 16 * 64>, 8> cq_storage{};
     DeferredCompletionSlab slab{};
     AsyncCtx ctx{AsyncCtx::make(TaskId::make(0, 7), &slab)};
+    simpler::urma::TmrRequestAdapter runtime{ctx};
     TestSession session{};
     TestEvent event{};
 
@@ -260,7 +262,7 @@ struct RegistrationFixture {
 
     uint8_t *workspace() { return reinterpret_cast<uint8_t *>(&info); }
 
-    bool register_event() { return pto2::detail::register_urma_async_event(ctx, event, session, workspace()); }
+    bool register_event() { return simpler::urma::register_urma_async_event(runtime, event, session, workspace()); }
 };
 
 }  // namespace
@@ -402,8 +404,8 @@ TEST(A5UrmaCompletionKernel, CapacityBudgetAccountsForEachParticipatingChunk) {
     fixture.ctx.completion_capacity = 8;
     fixture.slab.count = 3;
 
-    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 5));
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 6));
+    EXPECT_TRUE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 5));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 6));
     EXPECT_EQ(fixture.slab.count, 3u);
 }
 
@@ -412,7 +414,7 @@ TEST(A5UrmaCompletionKernel, InvalidPublishedCountCannotUnderflowCapacity) {
     fixture.ctx.completion_capacity = 2;
     fixture.slab.count = 3;
 
-    EXPECT_FALSE(pto2::urma_backend::completion_capacity_available(fixture.ctx, 1));
+    EXPECT_FALSE(fixture.runtime.capacity_available(1));
     EXPECT_FALSE(fixture.register_event());
     EXPECT_EQ(fixture.slab.count, 3u);
     EXPECT_EQ(fixture.event.wait_calls, 0u);
@@ -422,7 +424,7 @@ TEST(A5UrmaCompletionKernel, FailedContextCannotAdmitMoreWork) {
     RegistrationFixture fixture;
     fixture.slab.error_code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
 
-    EXPECT_FALSE(pto2::urma_backend::completion_capacity_available(fixture.ctx, 1));
+    EXPECT_FALSE(fixture.runtime.capacity_available(1));
     EXPECT_FALSE(fixture.register_event());
     EXPECT_EQ(fixture.slab.count, 0u);
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
@@ -430,16 +432,16 @@ TEST(A5UrmaCompletionKernel, FailedContextCannotAdmitMoreWork) {
 
 TEST(A5UrmaCompletionKernel, ChunkBudgetHandlesEmptyBoundaryAndMaximumSize) {
     constexpr uint64_t limit = pto::comm::urma::kUrmaMaxWqeTransferBytes;
-    EXPECT_EQ(pto2::urma_backend::chunk_count(0), 0u);
-    EXPECT_EQ(pto2::urma_backend::chunk_count(limit), 1u);
-    EXPECT_EQ(pto2::urma_backend::chunk_count(limit + 1), 2u);
-    EXPECT_EQ(pto2::urma_backend::chunk_count(UINT64_MAX), 1u + (UINT64_MAX - 1u) / limit);
+    EXPECT_EQ(simpler::urma::chunk_count(0), 0u);
+    EXPECT_EQ(simpler::urma::chunk_count(limit), 1u);
+    EXPECT_EQ(simpler::urma::chunk_count(limit + 1), 2u);
+    EXPECT_EQ(simpler::urma::chunk_count(UINT64_MAX), 1u + (UINT64_MAX - 1u) / limit);
 }
 
 TEST(A5UrmaCompletionKernel, OversizedChunkBudgetFailsBeforeQueueAccess) {
     RegistrationFixture fixture;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, UINT64_MAX));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, UINT64_MAX));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     EXPECT_EQ(fixture.slab.count, 0u);
 }
@@ -459,7 +461,7 @@ TEST(A5UrmaCompletionKernel, SharedPoolResolvesQueueIndependentlyOfPeer) {
 TEST(A5UrmaCompletionKernel, WholeRequestPreflightAcceptsRoomInEveryQueue) {
     RegistrationFixture fixture;
 
-    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
+    EXPECT_TRUE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 3));
     EXPECT_EQ(fixture.slab.count, 0u);
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.sq_head[6], 0u);
@@ -474,7 +476,7 @@ TEST(A5UrmaCompletionKernel, PreflightReservesOnlyTheChunksAssignedToEachQueue) 
     fixture.sq_head[7] = 15;
     fixture.sq[7].submittedWqeCount = 15;
 
-    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
+    EXPECT_TRUE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 3));
     EXPECT_EQ(fixture.slab.count, 0u);
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.sq_doorbell[6], 0u);
@@ -486,7 +488,7 @@ TEST(A5UrmaCompletionKernel, FullUnusedJettyDoesNotRejectSmallRequest) {
     fixture.sq_head[7] = 16;
     fixture.sq[7].submittedWqeCount = 16;
 
-    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 1));
+    EXPECT_TRUE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 1));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.sq_head[7], 16u);
 }
@@ -498,7 +500,7 @@ TEST(A5UrmaCompletionKernel, SharedPoolKeepsFullGroupCompletionBudget) {
     fixture.info.jettyCount = 4;
     fixture.ctx.completion_capacity = 3;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 2));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 2));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     EXPECT_EQ(fixture.slab.count, 0u);
 }
@@ -508,7 +510,7 @@ TEST(A5UrmaCompletionKernel, PerPeerCannotUseRailSelectedQueueOffsets) {
     fixture.info.railCycleLen = 1;
     fixture.info.railCycle[0] = 1;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 2));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 2));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(fixture.slab.count, 0u);
     EXPECT_EQ(fixture.sq_doorbell[6], 0u);
@@ -519,7 +521,7 @@ TEST(A5UrmaCompletionKernel, FullSqInOneJettyRejectsWholeRequest) {
     RegistrationFixture fixture;
     fixture.sq_head[6] = 16;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 1));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 1));
     EXPECT_EQ(fixture.slab.count, 0u);
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(fixture.sq_head[6], 16u);
@@ -532,7 +534,7 @@ TEST(A5UrmaCompletionKernel, FullCqInAnotherJettyRejectsWholeRequest) {
     RegistrationFixture fixture;
     fixture.sq[7].submittedWqeCount = 16;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 2));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 2));
     EXPECT_EQ(fixture.slab.count, 0u);
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(fixture.sq[7].submittedWqeCount, 16u);
@@ -545,7 +547,7 @@ TEST(A5UrmaCompletionKernel, PreflightReservesAllChunksBeforeFirstSubmission) {
     fixture.sq_head[6] = 14;
     fixture.sq[6].submittedWqeCount = 14;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 5));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 5));
     EXPECT_EQ(fixture.sq_head[6], 14u);
     EXPECT_EQ(fixture.sq[6].submittedWqeCount, 14u);
     EXPECT_EQ(fixture.slab.count, 0u);
@@ -556,7 +558,7 @@ TEST(A5UrmaCompletionKernel, ExactRemainingRingCapacityCanBeReserved) {
     fixture.sq_head[6] = 14;
     fixture.sq[6].submittedWqeCount = 14;
 
-    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
+    EXPECT_TRUE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 3));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.sq_head[6], 14u);
     EXPECT_EQ(fixture.sq[6].submittedWqeCount, 14u);
@@ -569,7 +571,7 @@ TEST(A5UrmaCompletionKernel, PreflightUsesUnsignedDistancesAcrossCounterWrap) {
     fixture.sq[6].submittedWqeCount = 2;
     fixture.cq_tail[6] = UINT32_MAX;
 
-    EXPECT_TRUE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
+    EXPECT_TRUE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 3));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(fixture.sq_tail[6], UINT32_MAX);
     EXPECT_EQ(fixture.cq_tail[6], UINT32_MAX);
@@ -581,7 +583,7 @@ TEST(A5UrmaCompletionKernel, CompletionBudgetRejectsBeforeReadingQueueTables) {
     fixture.info.sqPtr = 0;
     fixture.info.scqPtr = 0;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 3));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 3));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     EXPECT_EQ(fixture.slab.count, 0u);
 }
@@ -590,7 +592,7 @@ TEST(A5UrmaCompletionKernel, PreflightRejectsMalformedRingDepth) {
     RegistrationFixture fixture;
     fixture.cq[7].depth = 15;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 1));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 1));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(fixture.sq_head[6], 0u);
     EXPECT_EQ(fixture.sq_head[7], 0u);
@@ -601,7 +603,7 @@ TEST(A5UrmaCompletionKernel, PreflightRejectsJettyOutsideWorkspace) {
     RegistrationFixture fixture;
     fixture.session.qpIdxBase = 3;
 
-    EXPECT_FALSE(pto2::urma_backend::preflight_urma_request(fixture.ctx, fixture.session, 1));
+    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 1));
     EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(fixture.sq_head[7], 0u);
     EXPECT_EQ(fixture.slab.count, 0u);
@@ -624,7 +626,7 @@ protected:
 
     bool build(uint32_t sender, TestSession &bound) {
         ctx.urma_sender_id = sender;
-        return pto2::urma_backend::build_urma_session(ctx, workspace(), 1, bound);
+        return simpler::urma::build_urma_session(ctx.urma_sender_id, workspace(), 1, bound);
     }
 
     uint32_t completions_per_small_request() const {
@@ -739,7 +741,7 @@ TEST_P(A5UrmaSessionBinding, IndependentLogicalBlockZeroTasksUseResidentAivQueue
         EXPECT_EQ(get_sub_block_id(args.data()), lane);
         AsyncCtx loaded = get_async_ctx(args.data());
         EXPECT_EQ(loaded.urma_sender_id, lane);
-        ASSERT_TRUE(pto2::urma_backend::build_urma_session(loaded, workspace(), 1, bound[lane]));
+        ASSERT_TRUE(simpler::urma::build_urma_session(loaded.urma_sender_id, workspace(), 1, bound[lane]));
         EXPECT_EQ(bound[lane].qpIdxBase, lane * 2);
     }
     EXPECT_NE(bound[0].qpIdxBase, bound[1].qpIdxBase);
@@ -750,7 +752,7 @@ TEST_P(A5UrmaSessionBinding, IndependentLogicalBlockZeroTasksUseResidentAivQueue
     args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&local[1]);
     args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&global[1]);
     AsyncCtx loaded = get_async_ctx(args.data());
-    ASSERT_TRUE(pto2::urma_backend::build_urma_session(loaded, workspace(), 1, bound[1]));
+    ASSERT_TRUE(simpler::urma::build_urma_session(loaded.urma_sender_id, workspace(), 1, bound[1]));
     EXPECT_EQ(bound[1].qpIdxBase, 2u);
     EXPECT_EQ(bound[1].cfg.urma.qpCount, 2u);
     EXPECT_EQ(bound[1].engine, pto::comm::DmaEngine::URMA);
@@ -767,7 +769,7 @@ TEST_P(A5UrmaSessionBinding, SameResidentSenderReusesQueueAcrossTasksAndPeers) {
     ASSERT_TRUE(build(1, next));
     EXPECT_EQ(first.qpIdxBase, 2u);
     EXPECT_EQ(next.qpIdxBase, first.qpIdxBase);
-    ASSERT_TRUE(pto2::urma_backend::build_urma_session(ctx, workspace(), 0, next));
+    ASSERT_TRUE(simpler::urma::build_urma_session(ctx.urma_sender_id, workspace(), 0, next));
     EXPECT_EQ(next.qpIdxBase, first.qpIdxBase);
     EXPECT_EQ(next.destRankId, 0u);
 }
@@ -797,9 +799,9 @@ TEST_P(A5UrmaSessionBinding, RejectsMalformedLayoutAndQueueGeometry) {
 
 TEST_P(A5UrmaSessionBinding, RejectsMissingWorkspaceAndOutOfRangePeer) {
     TestSession bound;
-    EXPECT_FALSE(pto2::urma_backend::build_urma_session(ctx, nullptr, 1, bound));
+    EXPECT_FALSE(simpler::urma::build_urma_session(ctx.urma_sender_id, nullptr, 1, bound));
     EXPECT_FALSE(bound.valid);
-    EXPECT_FALSE(pto2::urma_backend::build_urma_session(ctx, workspace(), info.rankCount, bound));
+    EXPECT_FALSE(simpler::urma::build_urma_session(ctx.urma_sender_id, workspace(), info.rankCount, bound));
     EXPECT_FALSE(bound.valid);
 }
 
@@ -836,13 +838,18 @@ protected:
 
     template <typename T = float>
     bool submit(uint64_t elements = kElements) {
+        return submit_with<T>(runtime, elements);
+    }
+
+    template <typename T = float, typename Runtime>
+    bool submit_with(Runtime &adapter, uint64_t elements = kElements) {
         using Shape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
         using Stride = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>;
         using Tensor = pto::GlobalTensor<T, Shape, Stride>;
         Tensor dst({kDstBase}, Shape(1, 1, 1, 1, elements), Stride(elements, elements, elements, elements, 1));
         Tensor src({kSrcBase}, Shape(1, 1, 1, 1, elements), Stride(elements, elements, elements, elements, 1));
-        return pto2::urma_backend::submit_chunked_urma_request(
-            ctx, UrmaRequestDescriptor<Tensor, Tensor>{GetParam(), dst, src, workspace(), session.destRankId}
+        return simpler::urma::submit_chunked_urma_request(
+            adapter, UrmaRequestDescriptor<Tensor, Tensor>{GetParam(), dst, src, workspace(), session.destRankId}
         );
     }
 
@@ -1155,7 +1162,7 @@ TEST_P(A5UrmaChunkedSubmission, SecondChunkPartialFailureRetainsTargetsAndBlocks
     for (uint32_t i = 0; i < slab.count; ++i)
         EXPECT_EQ(slab.entries[i].backend_cookie, reinterpret_cast<uint64_t>(workspace()));
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-    pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+    runtime.set_error(simpler::urma::RequestError::REGISTRATION_FAILED);
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     EXPECT_EQ(total_wait_calls, 0u);
     expect_consumer_blocked();
@@ -1204,6 +1211,79 @@ TEST_P(A5UrmaChunkedSubmission, EmptyRequestDoesNotBuildSessionOrPost) {
     EXPECT_EQ(script.activation_calls, 0u);
     EXPECT_TRUE(script.submissions.empty());
     EXPECT_EQ(slab.error_code, SIMPLER_ERROR_NONE);
+}
+
+namespace {
+struct IndependentRuntime {
+    uint32_t sender{1};
+    uint64_t capacity{8};
+    uint64_t reserved{};
+    uint32_t finishes{};
+    bool reject_reservation{};
+    bool failed{};
+    simpler::urma::RequestError error{};
+    std::vector<simpler::urma::CompletionTarget> targets;
+
+    uint32_t sender_id() const { return sender; }
+    bool capacity_available(uint64_t count) const { return !failed && count <= capacity - targets.size(); }
+    bool reserve(uint64_t count) {
+        EXPECT_TRUE(active_script->submissions.empty());
+        if (reject_reservation) return false;
+        reserved = count;
+        return true;
+    }
+    bool register_target(const simpler::urma::CompletionTarget &target) {
+        EXPECT_LT(targets.size(), reserved);
+        targets.push_back(target);
+        return true;
+    }
+    void set_error(simpler::urma::RequestError value) {
+        if (!failed) error = value;
+        failed = true;
+    }
+    bool finish() {
+        ++finishes;
+        return !failed;
+    }
+};
+}  // namespace
+
+TEST_P(A5UrmaChunkedSubmission, IndependentRuntimeReceivesExactQueueTargets) {
+    IndependentRuntime adapter;
+    ASSERT_TRUE(submit_with(adapter));
+    ASSERT_EQ(adapter.targets.size(), 3u);
+    EXPECT_EQ(adapter.reserved, 3u);
+    EXPECT_EQ(adapter.finishes, 1u);
+    EXPECT_EQ(slab.count, 0u);
+    for (uint32_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(adapter.targets[i].workspace, workspace());
+        EXPECT_EQ(adapter.targets[i].queue_row, 6 + i % 2);
+        EXPECT_EQ(adapter.targets[i].target_bb, script.events[i].urmaTargetBbPerJetty[0]);
+        EXPECT_EQ(adapter.targets[i].target_cqe, script.events[i].urmaTargetCqePerJetty[0]);
+    }
+}
+
+TEST_P(A5UrmaChunkedSubmission, FailedReservationDoesNotPost) {
+    IndependentRuntime adapter;
+    adapter.reject_reservation = true;
+    EXPECT_FALSE(submit_with(adapter));
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_TRUE(adapter.targets.empty());
+    EXPECT_EQ(adapter.finishes, 0u);
+    EXPECT_EQ(adapter.error, simpler::urma::RequestError::REGISTRATION_FAILED);
+}
+
+TEST_P(A5UrmaChunkedSubmission, PartialFailureFinishesReservationWithSubmittedPrefix) {
+    IndependentRuntime adapter;
+    script.events[1].postFailed = true;
+    EXPECT_FALSE(submit_with(adapter));
+    ASSERT_EQ(script.submissions.size(), 2u);
+    ASSERT_EQ(adapter.targets.size(), 2u);
+    EXPECT_EQ(adapter.targets[1].target_bb, script.events[1].urmaTargetBbPerJetty[0]);
+    EXPECT_EQ(adapter.targets[1].target_cqe, script.events[1].urmaTargetCqePerJetty[0]);
+    EXPECT_EQ(adapter.finishes, 1u);
+    EXPECT_EQ(adapter.error, simpler::urma::RequestError::INVALID);
+    EXPECT_EQ(total_wait_calls, 0u);
 }
 
 INSTANTIATE_TEST_SUITE_P(GetAndPut, A5UrmaChunkedSubmission, testing::Values(UrmaOp::TGET, UrmaOp::TPUT));

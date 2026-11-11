@@ -44,8 +44,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             }
             auto *wq = reinterpret_cast<__gm__ pto::comm::urma::UrmaWQCtx *>(info->sqPtr) + row;
             auto *cq = reinterpret_cast<__gm__ pto::comm::urma::UrmaCqCtx *>(info->scqPtr) + row;
-            observed.queues[j].completed_bb = pto2::urma_backend::load_urma_counter(wq->tailAddr);
-            observed.queues[j].completed_cqe = pto2::urma_backend::load_urma_counter(cq->tailAddr);
+            observed.queues[j].completed_bb = simpler::urma::load_urma_counter(wq->tailAddr);
+            observed.queues[j].completed_cqe = simpler::urma::load_urma_counter(cq->tailAddr);
         }
     }
     pto2::detail::defer_flush_range(&observed, sizeof(observed));

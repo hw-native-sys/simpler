@@ -607,6 +607,25 @@ requests to Host or Device URMA workspaces without changing peer MR addressing.
 ISA-specific session activation is isolated in the adapter's session helper
 and must be checked when updating the ISA pin.
 
+The A5 common request layer (`src/a5/runtime/urma/urma_request.h`) handles
+session binding, queue preflight, chunking and conversion of ISA events into
+workspace/queue-row/BB/CQE completion targets. Its runtime adapter supplies the
+sender identity, checks and reserves completion capacity before the first post,
+registers each actual target, finishes the reservation on success or partial
+failure, and records the first error. TMR converts these targets into its
+existing completion tokens and publishes the slab at the kernel request entry.
+Reservation failure posts nothing; partial posting retains the accepted targets.
+The common request layer neither consumes CQEs nor advances queue tails.
+
+`capacity_available` is checked both before reservation and before target
+registration. After `reserve` succeeds, it must count unused reserved slots as
+available to this request, even if reservation reduced the runtime's free pool.
+A successful reservation must make valid target registration reliable. If
+registration can still fail, the runtime must retain resources used by posted
+requests and enter its failure-recovery path. `finish` ends the reservation;
+it does not establish network completion or permit freeing resources still
+used by submitted work.
+
 The queue's submitted and completed counters persist across task switches;
 the AICPU completion poller is the only tail publisher. An AIV returning does
 not complete its network requests: dependencies and buffer lifetimes remain

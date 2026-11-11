@@ -298,10 +298,13 @@ class KernelCompiler:
         headers (e.g. ``intrinsic.h``) can pull shared platform headers like
         ``common/dma_workspace.h`` regardless of what the call site passes.
         """
-        return [
+        include_dirs = [
             str(Path(__file__).resolve().parent / "incore"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
+        if self.platform in ("a5", "a5sim"):
+            include_dirs.append(str(self.project_root / "src" / "a5" / "runtime"))
+        return include_dirs
 
     def _incore_feature_defines(self) -> list[str]:
         """Feature macros forwarded to incore compiles for the RDMA overlay."""

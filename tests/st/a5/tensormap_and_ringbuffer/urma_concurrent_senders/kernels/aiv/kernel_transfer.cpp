@@ -94,8 +94,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     record[22] = second_wq ? second_wq->submittedWqeCount : 0;
     record[23] = info->rowsPerPeer;
     record[15] = static_cast<uint32_t>(info->layout);
-    record[16] = pto2::urma_backend::load_urma_counter(wq[0].headAddr);
-    record[19] = pto2::urma_backend::load_urma_counter(cq[0].tailAddr);
+    record[16] = simpler::urma::load_urma_counter(wq[0].headAddr);
+    record[19] = simpler::urma::load_urma_counter(cq[0].tailAddr);
     record[20] = peers;
     record[0] = 2;
     flush(record);
@@ -159,7 +159,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     record[7] = *ctx.completion_count - before;
     record[13] = wq[0].submittedWqeCount;
     record[14] = second_wq ? second_wq->submittedWqeCount : 0;
-    record[17] = pto2::urma_backend::load_urma_counter(wq[0].headAddr);
+    record[17] = simpler::urma::load_urma_counter(wq[0].headAddr);
     record[18] = get_sub_block_id(args);
     record[21] = independent;
     record[28] = receive_offset;
