@@ -576,6 +576,27 @@ inline __aicore__ void percounter_publish_fence() {
 }
 
 /**
+ * Order a bypass load of GM against the bypass loads that follow it.
+ *
+ * Two of them can observe two atomic writes out of order, so a word that was
+ * published before the one this lane just read can still come back stale --
+ * measured on a5 at roughly one in 70,000 sampled pairs, with the two words
+ * in one cache line or in two, and the writing core's own store order made no
+ * difference to it. A reader that gates on one word and then reads what that
+ * word vouches for therefore needs this between the two.
+ *
+ * SSBUF needs no equivalent: `scheduler_ssbuf_load_acquire` is a load
+ * *followed* by the barrier, so consecutive acquire loads already carry it.
+ */
+inline __aicore__ void percounter_observe_fence() {
+#if defined(__CCE_AICORE__)
+    dsb((mem_dsb_t)0);
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+/**
  * Publish which cohort this lane owes a block of, as `seq + 1`; 0 is none.
  *
  * The sequence, not a flag: an arming has to tell a lane that owes an older
@@ -693,11 +714,19 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     const uint64_t generation = scheduler_gm_query(q->open_generation);
     if (percounter_sync_armed(generation)) return;
     const uint64_t seq = generation / 2;
-    if (seq >= scheduler_gm_query(q->tail)) return;
+    // Every word this decision rests on is read as an atomic -- adding zero
+    // returns the value and leaves it -- because each is published by an
+    // atomic from a lane that is often not this one, and across cores a bypass
+    // load of such a word can lag. A bypass load does observe the writing
+    // core's *own* atomic write, measured on a5 over 440k back-to-back
+    // write-then-read trials, but an enqueuer whose call finds the slot busy
+    // leaves this cohort to whichever lane finishes the outstanding one, and
+    // that lane did not write these.
+    if (seq >= scheduler_gm_fetch_add(q->tail, uint64_t{0})) return;
     // `tail` counts every attempt, including one the enqueue refused for being
     // past the ring, so it alone does not bound this read.
     if (seq >= cfg.sync_cohort_count) return;
-    const uint64_t desc = scheduler_gm_query(cfg.sync_pending[seq]);
+    const uint64_t desc = scheduler_gm_fetch_add(cfg.sync_pending[seq], uint64_t{0});
     // Reserved but not yet written: its own enqueuer will promote it.
     if (desc == 0) return;
     // **Only one cohort is ever outstanding.** A cohort whose blocks have not
@@ -706,10 +735,9 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     // lanes the second needs -- each one's kernel is entered a block at a time
     // and cannot be left, so the two hold each other there. Opening the next
     // one only once the last has run is what keeps that pair from existing.
-    // Read as atomics -- adding zero returns the value and leaves it -- because
-    // both words are published by `fetch_add`, and a device load does not
-    // observe one of those until it has drained. A spin can afford to be
-    // behind; this decides once, and a stale read abandons the cohort for good.
+    // Atomic reads for the same reason as the two above. A spin can afford to
+    // be behind; this decides once, and a stale read abandons the cohort for
+    // good.
     const uint64_t done = scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{0});
     const uint64_t owed = scheduler_gm_fetch_add(cfg.sync_queue->claimed_blocks, uint64_t{0});
     if (done != owed) return;
@@ -897,10 +925,17 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
         percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
         return false;
     }
+    // The task id is what vouches for the rest of the payload, so the loads it
+    // gates must not be allowed to precede it.
+    percounter_observe_fence();
     const uint64_t seq = scheduler_gm_query(cfg.sync_queue->open_seq);
     const uint64_t shape = scheduler_gm_query_u32_pair(&cfg.sync_queue->open_block_num);
     // A seqlock: the slot may have been released and refilled between these
-    // loads, and the task, sequence and shape must all be one cohort's.
+    // loads, and the task, sequence and shape must all be one cohort's. It is
+    // read last and must observe at least what they did -- a generation load
+    // that ran ahead of them would return the value this lane already holds
+    // and pass a check that exists to fail.
+    percounter_observe_fence();
     if (scheduler_gm_query(cfg.sync_queue->open_generation) != generation) return true;
     sync->decided_generation = generation;
     sync->task_id = task_id;
