@@ -51,7 +51,7 @@ namespace simpler::hbg {
  *   completed slots from Scheduler threads to a dedicated resolution thread, so these
  *   are standalone bars rather than nested ones. Resolve is the AICore completion walk.
  *
- *   AICORE SCHEDULER: Bootstrap, StateProbe, Worksteal, Refill and Idle, plus Dispatch,
+ *   AICORE SCHEDULER: Bootstrap, StateProbe, Refill and Idle, plus Dispatch,
  *   Complete and Resolve. These come from the scheduler running on an AICore rather
  *   than the AICPU. Idle is a measured record here — that scheduler publishes a
  *   SchedulerIdleRecord per spin — not the host-side gap reconstruction a report
@@ -82,11 +82,9 @@ enum class SchedPhaseKind : uint8_t {
     Bootstrap = 11,          // AICore scheduler bring-up.
                              // tasks_processed = tasks held at bootstrap.
     StateProbe = 12,         // Scheduler-local Dispatch Slot / Ready state read.
-    Worksteal = 13,          // Remote Inbox claim and dispatch.
     Refill = 14,             // Completed Slot reuse.
     Idle = 15,               // AICore scheduler spin with no progress.
     ScalarWindow = 16,
-    ScalarReadyRefresh = 17,
     ScalarCompletions = 18,
     ScalarGraphControl = 19,
     ScalarFillSlots = 20,
@@ -123,7 +121,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarBlockCursorRead = 53,
     ScalarAdmissionClose = 54,
     ScalarOrdinaryPermit = 55,
-    ScalarReadyDirectory = 56,
     ScalarDispatchMetadata = 57,
     ScalarDispatchFill = 58,
     ScalarDispatchPublish = 59,
@@ -136,7 +133,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarPollLocalState = 66,
     ScalarPollReadyQueue = 67,
     ScalarPollReadyPool = 68,
-    ScalarPollOwnInbox = 69,
     ScalarPollAdmissionTail = 70,
     ScalarPollMixState = 71,
     ScalarPollMixCloseSeal = 72,
@@ -193,16 +189,12 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "bootstrap";
     case SchedPhaseKind::StateProbe:
         return "state_probe";
-    case SchedPhaseKind::Worksteal:
-        return "worksteal";
     case SchedPhaseKind::Refill:
         return "refill";
     case SchedPhaseKind::Idle:
         return "idle";
     case SchedPhaseKind::ScalarWindow:
         return "scalar_window";
-    case SchedPhaseKind::ScalarReadyRefresh:
-        return "scalar_ready_refresh";
     case SchedPhaseKind::ScalarCompletions:
         return "scalar_completions";
     case SchedPhaseKind::ScalarGraphControl:
@@ -275,8 +267,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_admission_close";
     case SchedPhaseKind::ScalarOrdinaryPermit:
         return "scalar_ordinary_permit";
-    case SchedPhaseKind::ScalarReadyDirectory:
-        return "scalar_ready_directory";
     case SchedPhaseKind::ScalarDispatchMetadata:
         return "scalar_dispatch_metadata";
     case SchedPhaseKind::ScalarDispatchFill:
@@ -301,8 +291,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_poll_ready_queue";
     case SchedPhaseKind::ScalarPollReadyPool:
         return "scalar_poll_ready_pool";
-    case SchedPhaseKind::ScalarPollOwnInbox:
-        return "scalar_poll_own_inbox";
     case SchedPhaseKind::ScalarPollAdmissionTail:
         return "scalar_poll_admission_tail";
     case SchedPhaseKind::ScalarPollMixState:

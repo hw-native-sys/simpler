@@ -21,9 +21,7 @@
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_service_gm_mix(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
-    SchedulerCompletionStats *completion_stats, bool *progress,
-    SchedulerGmMixPhase ack_prefilter_phase = SchedulerGmMixPhase::IDLE
+    uint64_t profiling_level, bool *progress, SchedulerGmMixPhase ack_prefilter_phase = SchedulerGmMixPhase::IDLE
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarMix, -1);
     *progress = false;
@@ -45,8 +43,7 @@ static inline __aicore__ bool scheduler_service_gm_mix(
             if (retired == SchedulerGmMixResult::ERROR) return false;
             if (retired == SchedulerGmMixResult::TASK_LAST &&
                 !scheduler_complete_ordered_task<RecordProtocol>(
-                    graph, base, local, run, admission.current_task_ref, profiling_level, wake_stats, ready_stats,
-                    completion_stats
+                    graph, base, local, run, admission.current_task_ref, profiling_level
                 ))
                 return false;
             if (retired == SchedulerGmMixResult::PROGRESS || retired == SchedulerGmMixResult::TASK_LAST) {
@@ -90,7 +87,6 @@ static inline __aicore__ bool scheduler_service_gm_mix(
 // changes ownership, a frontier, an acknowledgement, or a completion count.
 // Stale observations may postpone work; every positive hint takes the normal
 // ownership validation path before doing that work.
-template <bool EnableNativeDiscovery = true>
 inline __aicore__ bool scheduler_ordered_poll_may_progress(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, bool *ready_probe_empty = nullptr,
     SchedulerGmMixPhase *ack_prefilter_phase = nullptr
@@ -107,35 +103,15 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
         if (!scheduler_task_ref_is_null(candidate.ready.task_ref)) return true;
     scalar_local.close();
 
-    const uint32_t queues = local->has_mix && local->is_mix_coordinator() ? 2 : 1;
-    for (uint32_t index = 0; index < queues; ++index) {
+    const uint32_t type = local->config.self_core_type;
+    if (type >= SCHEDULER_READY_QUEUE_COUNT || local->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
+        !scheduler_ready_queue_holder(type, local->config.self_core_type))
+        return true;
+    {
         SchedulerScalarScope scalar_queue(local, SchedPhaseKind::ScalarPollReadyQueue);
-        const uint32_t type = index == 0 ? local->config.self_core_type : SCHEDULER_MIX_QUEUE;
-        if (type >= SCHEDULER_READY_QUEUE_COUNT || local->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
-            !scheduler_ready_queue_holder(type, local->config.self_core_type))
-            return true;
-        if (local->config.ready_pool_offset != 0) {
-            if (scheduler_scalar_result(local, SchedPhaseKind::ScalarPollReadyPool, [&]() __aicore__ {
-                    return scheduler_ready_pool_may_have_work(base, local, type);
-                }))
-                return true;
-            continue;
-        }
-        const uint64_t own = local->self_type_rank();
-        if (own >= scheduler_ready_queue_owner_count(local, type) || own >= scheduler_ready_queue_capacity(type))
-            return true;
-        auto *inbox = scheduler_ready_inbox_at(base, local, type, own);
-        // Own work is never gated solely by the directory: a push and an
-        // owner's clear can cross before the directory publication drains.
-        if (scheduler_scalar_result(
-                local, SchedPhaseKind::ScalarPollOwnInbox,
-                [&]() __aicore__ {
-                    return scheduler_gm_query(inbox->endpoints);
-                }
-            ) != SCHEDULER_READY_ENDPOINTS_EMPTY ||
-            scheduler_ready_directory_nonempty<EnableNativeDiscovery>(
-                graph, base, local, local->config.scheduler_count, type
-            ))
+        if (scheduler_scalar_result(local, SchedPhaseKind::ScalarPollReadyPool, [&]() __aicore__ {
+                return scheduler_ready_pool_may_have_work(base, local, type);
+            }))
             return true;
     }
     // Reuse only this poll's completed negative Ready probes. Invalid discovery
@@ -190,12 +166,10 @@ inline __aicore__ bool scheduler_ordered_poll_may_progress(
     return true;
 }
 
-template <bool RecordProtocol = true, bool EnableNativeDiscovery = true>
+template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_fill_ordered_slots(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t *victim_cursors, SchedulerReadyStats *ready_stats, uint64_t profiling_level, bool *failed,
-    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerWakeStats *wake_stats = nullptr,
-    SchedulerCompletionStats *completion_stats = nullptr
+    uint64_t profiling_level, bool *failed
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarOrderedFill, -1);
     if (failed == nullptr) return false;
@@ -207,9 +181,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     }
     bool ready_probe_empty = false;
     auto ack_prefilter_phase = SchedulerGmMixPhase::IDLE;
-    if (!scheduler_ordered_poll_may_progress<EnableNativeDiscovery>(
-            graph, base, local, &ready_probe_empty, &ack_prefilter_phase
-        ))
+    if (!scheduler_ordered_poll_may_progress(graph, base, local, &ready_probe_empty, &ack_prefilter_phase))
         return false;
     if (scheduler_read_error(run) != 0) {
         *failed = true;
@@ -233,39 +205,28 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     }
     // Discovery is bounded by candidate credits, not by physical slot capacity.
     // A later cooperative task may be admitted while an earlier one is in flight.
-    const uint32_t queues = local->has_mix && local->is_mix_coordinator() ? 2 : 1;
     // A concurrent Ready publication may wait for the next finite poll. The
     // hint grants no ownership or entry permit and never survives this fill.
-    for (uint32_t index = 0; (!ready_probe_empty || victim_cursors == nullptr) &&
-                             index < SCHEDULER_PENDING_SLOT_COUNT && published != SchedulerAdmissionResult::RETRY;
+    for (uint32_t index = 0;
+         !ready_probe_empty && index < SCHEDULER_PENDING_SLOT_COUNT && published != SchedulerAdmissionResult::RETRY;
          ++index) {
         auto &candidate = admission->candidates[index];
         if (scheduler_task_ref_is_null(candidate.ready.task_ref)) {
-            // Leave shared work available to peers while an ordinary task is
-            // privately held. Existing cooperative candidates still progress.
+            // Existing cooperative candidates progress while ordinary work is held privately.
             if (holds_ordinary) continue;
             candidate = {};
-            for (uint32_t attempt = 0; attempt < queues; ++attempt) {
-                const uint32_t choice = (index + admission->next_candidate + attempt) % queues;
-                const uint32_t type = choice == 0 ? local->config.self_core_type : SCHEDULER_MIX_QUEUE;
-                const bool steal = scheduler_ready_directory_nonempty<EnableNativeDiscovery>(
-                    graph, base, local, local->config.scheduler_count, type
-                );
-                const uint64_t probe_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-                if (!scheduler_claim_ready_for_slot<EnableNativeDiscovery>(
-                        graph, base, local, run, local->config.scheduler_count, type, &victim_cursors[type],
-                        ready_stats, &candidate.ready, nullptr, steal
-                    )) {
-                    *failed = true;
-                    return progress;
-                }
-                if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
-                candidate.ready.state_probe_start_cycles = probe_start;
-                candidate.ready.state_probe_end_cycles =
-                    scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-                break;
+            const uint64_t probe_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+            if (!scheduler_claim_ready_for_slot(
+                    graph, base, local, run, local->config.scheduler_count, local->config.self_core_type,
+                    &candidate.ready
+                )) {
+                *failed = true;
+                return progress;
             }
             if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
+            candidate.ready.state_probe_start_cycles = probe_start;
+            candidate.ready.state_probe_end_cycles =
+                scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             progress = true;
         }
         const auto metadata = scheduler_load_dispatch_metadata(base, local, candidate.ready.task_ref, profiling_level);
@@ -318,8 +279,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         if (scheduler_task_is_mix(admission->current_flags)) {
             bool group_progress = false;
             if (!scheduler_service_gm_mix<RecordProtocol>(
-                    graph, base, local, run, profiling_level, wake_stats, ready_stats, completion_stats,
-                    &group_progress, ack_prefilter_phase
+                    graph, base, local, run, profiling_level, &group_progress, ack_prefilter_phase
                 )) {
                 *failed = true;
                 return progress || group_progress;
@@ -341,7 +301,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             ready.task_ref = slot.task_ref;
             ready.source = SchedulerReadySource::COOPERATIVE;
             const SchedulerFreeSlotClaim claim{local->worker_id(), index, slot.generation, local->config.self_lane};
-            if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, ready, profiling_level, ssbuf_region)) {
+            if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, ready, profiling_level)) {
                 *failed = true;
                 return progress;
             }
@@ -381,9 +341,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             slot.state = SchedulerDispatchSlotState::FILLING;
             candidate.ready.publication_mode = SchedulerPublicationMode::DISPATCH;
             const SchedulerFreeSlotClaim claim{local->worker_id(), index, slot.generation, local->config.self_lane};
-            if (!scheduler_fill_dispatch_slot(
-                    graph, base, local, run, claim, candidate.ready, profiling_level, ssbuf_region
-                )) {
+            if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, candidate.ready, profiling_level)) {
                 *failed = true;
                 return progress;
             }
@@ -456,9 +414,9 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
     return true;
 }
 
-// A directory load is useful only when the corresponding work can be claimed,
+// A ready probe is useful only when the corresponding work can be claimed,
 // so this must admit every slot scheduler_fill_own_slots would fill: rejecting
-// a fillable slot suppresses the directory query and starves its work.
+// a fillable slot suppresses discovery and starves its work.
 inline __aicore__ bool
 scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type, uint64_t skip_slot_mask) {
     if (local->config.self_core_type != core_type) return false;
@@ -477,34 +435,21 @@ scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type, 
 //
 // The return value reports whether this pass made progress; `failed` separately
 // reports an aborted pass.
-template <bool RecordProtocol = true, bool EnableNativeDiscovery = true>
+template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_fill_own_slots(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, uint64_t *ready_victim_cursors, SchedulerReadyStats *ready_stats,
-    uint64_t profiling_level, uint64_t skip_slot_mask, bool *failed, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region,
-    SchedulerWakeStats *wake_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr
+    __gm__ SchedulerRunControl *run_control, uint64_t profiling_level, uint64_t skip_slot_mask, bool *failed
 ) {
     SchedulerScalarScope scalar_scope(scheduler, SchedPhaseKind::ScalarFillSlots, -1);
     if (failed != nullptr) *failed = false;
     if (scheduler == nullptr) return false;
     if (scheduler->admission != nullptr)
-        return scheduler_fill_ordered_slots<RecordProtocol, EnableNativeDiscovery>(
-            graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors, ready_stats, profiling_level,
-            failed, ssbuf_region, wake_stats, completion_stats
+        return scheduler_fill_ordered_slots<RecordProtocol>(
+            graph, scheduler_state_base, scheduler, run_control, profiling_level, failed
         );
     if (scheduler->local_ready_mask != 0) return false;
     const uint32_t core_type = scheduler->config.self_core_type;
     if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask)) return false;
-    // A core polls its own inbox on every pass. The directory gates only the
-    // steal scan, which reads one peer endpoint per victim. Any publisher sets
-    // an owner's bit and only that owner clears it, after observing its own
-    // inbox empty -- so gating the owner's own pop on that bit would strand
-    // whatever is queued when a clear and a push cross, until a later push
-    // sets the bit again.
-    const bool allow_steal = scheduler_ready_directory_nonempty<EnableNativeDiscovery>(
-        graph, scheduler_state_base, scheduler, scheduler->config.scheduler_count, core_type
-    );
-
     const uint64_t worker_id = scheduler->worker_id();
     const uint32_t self_lane = scheduler->config.self_lane;
     uint64_t state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
@@ -516,14 +461,14 @@ static inline __aicore__ bool scheduler_fill_own_slots(
         if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
 
         SchedulerReadyClaim ready{};
-        if (!scheduler_claim_ready_for_slot<EnableNativeDiscovery>(
+        if (!scheduler_claim_ready_for_slot(
                 graph, scheduler_state_base, scheduler, run_control, scheduler->config.scheduler_count, core_type,
-                &ready_victim_cursors[core_type], ready_stats, &ready, nullptr, allow_steal
+                &ready
             )) {
             if (failed != nullptr) *failed = true;
             return progress;
         }
-        // An empty inbox ends the pass: the next slot would query the same one.
+        // An unpublished head ends this discovery pass; other scheduler duties still progress.
         if (scheduler_task_ref_is_null(ready.task_ref)) break;
 
         ready.state_probe_start_cycles = state_probe_start_cycles;
@@ -531,7 +476,7 @@ static inline __aicore__ bool scheduler_fill_own_slots(
         const SchedulerFreeSlotClaim claim{worker_id, slot, local_slot->generation, self_lane};
         local_slot->state = SchedulerDispatchSlotState::FILLING;
         if (!scheduler_fill_dispatch_slot(
-                graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level, ssbuf_region
+                graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
             )) {
             if (failed != nullptr) *failed = true;
             return progress;

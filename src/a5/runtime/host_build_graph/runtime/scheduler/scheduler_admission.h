@@ -870,7 +870,6 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block
     slot.gm_mix = false;
     slot.candidate_index = UINT8_MAX;
     slot.predicate = SchedulerPredicateState::UNEVALUATED;
-    slot.mix_tracker = UINT8_MAX;
     slot.subtask_slot = scheduler_metadata_single_subtask_slot(admission->current_active_mask);
     slot.state = SchedulerDispatchSlotState::FILLING;
     return SchedulerBlockClaimResult::CLAIMED;

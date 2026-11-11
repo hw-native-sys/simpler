@@ -81,6 +81,7 @@ struct AdmissionFixture {
             for (uint8_t lane = 0; lane < 3; ++lane)
                 metadata.kernel_ids[lane] = shape.mask.has(static_cast<SubtaskSlot>(lane)) ? 1 : UINT16_MAX;
         }
+        storage.prepare_ready_pool();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, epoch));
         if (permutation.empty()) {
             permutation.resize(workers);
@@ -136,21 +137,17 @@ struct AdmissionFixture {
 
     bool ready_pop(uint64_t task, uint64_t worker, SchedulerReadyClaim *claim) {
         auto *local = locals[worker];
-        if (scheduler_route_task(graph.graph(), base(), local, run(), task, nullptr) !=
-            SchedulerRouteResult::READY_TO_ENQUEUE)
+        if (scheduler_route_task(graph.graph(), base(), local, run(), task) != SchedulerRouteResult::READY_TO_ENQUEUE)
             return false;
         const auto &metadata = storage.metadata[task];
         const uint32_t queue = scheduler_task_ready_queue(metadata.flags, metadata.active_mask);
         if (!scheduler_ready_queue_holder(queue, local->config.self_core_type)) return false;
-        const uint64_t target = scheduler_ready_push_target(local, queue, static_cast<int64_t>(task));
         SchedulerReadyBatch batch{};
-        if (!scheduler_ready_batch_append(base(), local, task, &batch, nullptr) ||
-            !scheduler_ready_batch_push(base(), local, queue, &batch, nullptr))
+        if (!scheduler_ready_batch_append(base(), local, task, &batch) ||
+            !scheduler_ready_batch_push(base(), local, queue, &batch))
             return false;
-        *claim = {};
-        claim->inbox_index = target;
-        return scheduler_ready_pop_from_inbox(
-                   graph.graph(), base(), local, run(), queue, target, &claim->task_ref, nullptr
+        return scheduler_claim_ready_for_slot(
+                   graph.graph(), base(), local, run(), local->config.scheduler_count, queue, claim
                ) &&
                claim->task_ref == static_cast<int64_t>(task);
     }
@@ -657,7 +654,7 @@ TEST(HbgAdmission, ReadyTaskBMayCommitBeforeTaskAWhoseDependencyIsNotReady) {
     fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 17));
     ASSERT_EQ(
-        scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1, nullptr),
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1),
         SchedulerRouteResult::WAITING
     );
     ASSERT_TRUE(fixture.publish(2));
@@ -1010,13 +1007,13 @@ TEST(HbgAdmission, OrdinaryMultiBlockPreparationDoesNotRequireAllBlocksToFitAtOn
     }
 }
 
-TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
-    constexpr uint64_t workers = 3 * (SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD + 1);
+TEST(HbgAdmission, OrdinaryBlocksCanMoveBetweenHighRankWorkers) {
+    constexpr uint64_t workers = 96;
     constexpr uint64_t task = 2;
-    constexpr uint64_t rank = SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1;
+    constexpr uint64_t rank = 62;
     constexpr uint64_t first = rank / 2 * 3 + 1 + rank % 2;
-    for (bool cross_shard : {false, true}) {
-        SCOPED_TRACE(cross_shard);
+    for (bool cross_worker : {false, true}) {
+        SCOPED_TRACE(cross_worker);
         AdmissionFixture fixture(
             {{static_cast<uint16_t>(rank), LaneMask::aiv0()}, {1, LaneMask::aic()}, {3, LaneMask::aiv0()}}, workers, 17,
             {}, true
@@ -1025,7 +1022,7 @@ TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
         for (uint64_t worker = 0; worker < workers; ++worker) {
             const auto &context = fixture.storage.contexts[worker];
             if (context.core_type == static_cast<int32_t>(CoreType::AIV) &&
-                context.type_rank >= static_cast<int32_t>(SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD)) {
+                context.type_rank >= static_cast<int32_t>(63)) {
                 remote = worker;
                 break;
             }
@@ -1039,7 +1036,7 @@ TEST(HbgAdmission, OrdinaryBlocksCanStayOnOneWorkerOrCrossDirectoryShards) {
             ASSERT_EQ(fixture.admissions[worker].current_task_ref, task);
         }
 
-        const std::array<uint64_t, 3> owners{first, cross_shard ? remote : first, first};
+        const std::array<uint64_t, 3> owners{first, cross_worker ? remote : first, first};
         const auto *blocks = scheduler_state_at<SchedulerProtocolBlockTrace>(
                                  fixture.base(), fixture.storage.layout.protocol.blocks_offset
                              ) +

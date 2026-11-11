@@ -50,7 +50,7 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   share a label, not one shared phase. See
   `src/common/{host_build_graph,tensormap_and_ringbuffer}/sched_phase_kind.h`.
   Within a runtime the vocabulary splits again by producer, because a stream is
-  written by one: `host_build_graph`'s `bootstrap` / `state_probe` / `worksteal` /
+  written by one: `host_build_graph`'s `bootstrap` / `state_probe` /
   `refill` / `idle` and its plain `resolve` come only from its AICore scheduler,
   `graph_prepare` / `resolve_standalone` / `dummy` / `early_dispatch` / `drain` /
   `async_poll` only from its AICPU one, and `complete` / `dispatch` from either.
@@ -95,11 +95,11 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   Prestage was renamed EarlyDispatch).
   A5 `host_build_graph` uses the AICore Scheduler as the producer and emits one
   flat lane per Scheduler. Every executed task has exactly one publication
-  phase: `dispatch`, `worksteal`, or `refill`. Tasks acquired from a Ready Inbox
-  first emit `state_probe`; a compatible single-fanin successor selected by
+  phase: `dispatch` or `refill`. Tasks acquired from the shared ready pool
+  first emit `state_probe`; an eligible non-MIX successor selected by
   `DIRECT_RESOLVE` moves from `resolve` directly to `refill` and emits no
   `state_probe`. The converter displays these phases as Completion, Resolve,
-  StateProbe, Dispatch, Worksteal, and Refill. Bootstrap ends before the initial
+  StateProbe, Dispatch, and Refill. Bootstrap ends before the initial
   task dispatch, and its dependency initialization is not emitted again as a
   nested `fanin` phase.
 - **Orchestrator submit envelope** — one record per `submit_task()`
@@ -161,8 +161,8 @@ The outer `window` interval is used for accounting but is not drawn.
 `scheduler_fill_own_slots` expands into its actual callees. Its ordered path
 shows the progress probe, admission claim/publication/preparation/commit,
 local-obligation refresh, ordinary-task parking, block claim and cursor read,
-obligation close, and ordinary-entry permit. Both paths expose ready-directory
-probing, dispatch metadata loads, slot preparation/publication, and inline-task
+obligation close, and ordinary-entry permit. Both paths expose shared-ready-queue
+claiming, dispatch metadata loads, slot preparation/publication, and inline-task
 completion. Function spans below the level's threshold are omitted on device,
 including short empty polls. Atomic, bypass, DCCI and DSB leaves are retained
 regardless of duration; recorder and backoff intervals are also retained.
@@ -174,6 +174,12 @@ in the parent's exclusive time.
 hint and atomic confirmation, and the next-block hint and atomic fallback.
 `scheduler_ordered_poll_may_progress` separates local state, ready-queue
 probes, admission-tail checks, and MIX assignment/close/arrival/release checks.
+Each worker probes only its AIC or AIV business queue. AIC includes all MIX
+tasks, whose execution masks and coordinator rules remain unchanged. The fixed
+two-queue implementation is in place; complete hardware and performance acceptance
+is still in progress. An empty business queue does not suppress admission, MIX,
+Graph control-inbox, or async CHECK/FINISH service. DFX's own collection shards
+are independent of these business queues.
 Conditional probes retain their original short-circuit behavior: an unexecuted
 branch has no interval. Read-result endpoints use a return-dependent Scalar
 instruction before reading the counter; they measure local result availability,
@@ -729,8 +735,7 @@ field but render differently in Perfetto:
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter; A5 HBG ends this phase before dependency resolution |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
-| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Scheduler-local Dispatch Slot / Ready state checked, a task acquired from a Ready Inbox, and immediate or deferred placement decided |
-| `worksteal` | A5 HBG AICore outer | AICore Scheduler lane | a task acquired from another non-empty Inbox is published |
+| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | local Dispatch Slot / Ready state checked and one logical task acquired from its shared AIC or AIV ready queue |
 | `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task; `DIRECT_RESOLVE` omits a preceding `state_probe` |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | `dummy_ready_queue` entries handled this iter (explicit dummies and false-predicate tasks) |
@@ -764,15 +769,22 @@ For the A5 HBG AICore producer, all phases render on the single
 If `worker_id` is missing or null, the suffix falls back to `scheduler_id`.
 Completion, Resolve, StateProbe when present, and the selected publication phase
 are mutually time-exclusive.
-StateProbe includes Ready claim or steal and ends when immediate or deferred
-placement has been decided. Deferred waiting is intentionally left as an empty
-interval before the eventual Dispatch, Worksteal, or Refill. Worksteal
-identifies a task whose Ready source was another Inbox when its publication
-mode is not Refill; a completed Slot reused for a replacement task remains
-Refill regardless of its Ready source. A Ready-Inbox replacement retains its
+StateProbe includes the shared queue claim. A task may then wait for admission
+or a slot before its eventual Dispatch or Refill; that wait is outside the
+StateProbe interval. A completed Slot reused for a replacement task remains
+Refill regardless of its Ready source. A pool-acquired replacement retains its
 StateProbe, while a `DIRECT_RESOLVE` replacement proceeds directly from
-Resolve to Refill without one. The steal operation itself is included in
-StateProbe. The `ready_claim`, `ready_steal` and `direct_refill` names were
+Resolve to Refill without one. MIX tasks enter the pool and cooperative protocol,
+not the ordinary direct-refill path.
+
+The current [`SchedulerReadySource`](../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)
+values are `POOL=0`, `DIRECT_RESOLVE=2`, and `COOPERATIVE=3`. These identify the
+ownership path, not three queue types: there are only two business queues.
+Value 1 is not a current source. Entry ownership uses an atomic-confirmed ref
+and head CAS, so L3 can distinguish bypass-load hints from atomic confirmation
+and the completion barrier. See the [ready-pool publication contract](../zh-cn/design/a5-hbg-graph-task/protocol.md).
+
+The `ready_claim`, `ready_steal` and `direct_refill` names were
 emitted by this scheduler between #2104 and #2178; no current scheduler emits
 them and nothing reads them. `fanin` names a host-side orchestration step, not a
 scheduler phase, and has never appeared in this stream.

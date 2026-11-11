@@ -638,20 +638,9 @@ inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
 inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 64;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
-// A Mix task's AIV subtasks land on slots whose only writer is the cluster's
-// AIC, held separately from each AIV's own two slots. Sole ownership is what
-// makes the AIC's capacity probe exact: it sees only its own history there, so
-// a placement it plans cannot be taken away between the probe and the claim,
-// and no back-pressure protocol is needed.
-//
-// Deliberately a second constant rather than widening SCHEDULER_PENDING_SLOT_COUNT:
-// five places pack two 32-bit generations into one 64-bit word (scheduler_ssbuf.h,
-// scheduler_ready.h, scheduler_completion.h, scheduler_dispatch.h), and a count
-// of four would overflow every one of them.
-inline constexpr uint32_t SCHEDULER_MIX_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
-inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
-inline constexpr uint32_t SCHEDULER_MIX_QUEUE = 2;
+enum class SchedulerReadyClass : uint32_t { AIC = 0, AIV = 1 };
+inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
 inline constexpr uint32_t SCHEDULER_ACTIVITY_CAPACITY = 1024;
 inline constexpr uint64_t SCHEDULER_PROFILING_TASK_TIMING_LEVEL = 1;
@@ -673,54 +662,6 @@ inline __aicore__ bool scheduler_phase_timing_enabled(uint64_t level) {
 inline constexpr bool scheduler_activity_record_count_valid(uint32_t committed) noexcept {
     return committed <= SCHEDULER_ACTIVITY_CAPACITY;
 }
-inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7;
-
-// A ready queue is consumed only by cores of one type, so it needs one inbox per
-// such core rather than one per worker: the AIC and Mix queues are held by the
-// 36 AIC cores, the AIV queue by the 72 AIV cores. Each is addressed by the
-// core's type_rank, which the AICPU already assigns during core discovery, so
-// 3 x 108 slots collapse to 36 + 72 + 36 with no new numbering.
-//
-// Addressing by rank also makes a directory shard type-homogeneous. Addressed by
-// worker id the 7 owners of a shard interleave AIC and AIV cores, so a thief
-// scanning its shard of the AIC queue finds at most a third of those bits ever
-// set; by rank all 7 are cores that can hold the work it is looking for.
-//
-// It narrows how far one publisher's work can travel, which is the other half
-// of the same property. A cluster's two AIV lanes take adjacent ranks, so both
-// land in one shard, where their worker ids had straddled a shard boundary and
-// reached two. Ordinary graphs confine a single-root fanout to one AIC shard
-// plus one AIV shard; native Graph workers also search remote shards when their
-// local shard has no claimable work.
-inline __aicore__ constexpr uint32_t scheduler_ready_queue_capacity(uint32_t core_type_index) {
-    return core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM :
-                                   SCHEDULER_CLUSTER_CAPACITY;
-}
-
-inline __aicore__ constexpr uint32_t scheduler_ready_queue_base(uint32_t core_type_index) {
-    return core_type_index == 0U ? 0U :
-           core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY :
-                                   SCHEDULER_CLUSTER_CAPACITY * (1U + PLATFORM_AIV_CORES_PER_BLOCKDIM);
-}
-
-inline constexpr uint32_t SCHEDULER_READY_INBOX_CAPACITY =
-    SCHEDULER_CLUSTER_CAPACITY * (2U + PLATFORM_AIV_CORES_PER_BLOCKDIM);
-
-// Mix slots exist on AIV cores, so their payloads and executor traces are
-// addressed by the holder's AIV rank -- the same rank that addresses the AIV
-// ready queue. The traces sit in global memory rather than the cluster's SSBUF
-// because the SSBUF's remaining room goes to the dispatch and completion
-// tokens, which are on the dispatch path where the traces are not.
-inline constexpr uint32_t SCHEDULER_MIX_SLOT_CAPACITY =
-    SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM * SCHEDULER_MIX_SLOT_COUNT;
-
-// Shards are allocated per queue at the widest queue's count so the directory
-// stays a rectangular array; the unused tail of a narrower queue is never set,
-// because scheduler_ready_queue_capacity bounds what can be addressed.
-inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_SHARD_COUNT =
-    (SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1) /
-    SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
-
 // A task ref names one task to the resident Scheduler. Its encoding today is a
 // GLOBAL task's index into the whole-graph-resident tables, which is why it is
 // compared against graph.task_count and used as a subscript directly.
@@ -746,8 +687,7 @@ enum class SchedulerTaskState : int64_t {
 };
 
 enum class SchedulerReadySource : uint8_t {
-    LOCAL = 0,
-    STOLEN = 1,
+    POOL = 0,
     DIRECT_RESOLVE = 2,
     COOPERATIVE = 3,
 };
@@ -933,7 +873,9 @@ inline __aicore__ uint32_t scheduler_task_trace_index(
     return static_cast<uint32_t>(static_cast<uint64_t>(trace_index_base) + offset);
 }
 inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, LaneMask active_mask) {
-    return (flags & SCHEDULER_TASK_MIX) != 0 ? SCHEDULER_MIX_QUEUE : (active_mask.has_aic() ? 0U : 1U);
+    return static_cast<uint32_t>(
+        (flags & SCHEDULER_TASK_MIX) != 0 || active_mask.has_aic() ? SchedulerReadyClass::AIC : SchedulerReadyClass::AIV
+    );
 }
 
 inline __aicore__ bool scheduler_task_is_executable(uint8_t flags) { return (flags & SCHEDULER_TASK_EXECUTABLE) != 0; }
@@ -1068,19 +1010,8 @@ struct alignas(64) SchedulerGroupMailbox {
     SchedulerGroupLaneAck lanes[3];
 };
 
-// A FIFO ready queue, addressed by both endpoints packed into one word.
-//
-// Sharing a word makes the endpoint pair atomic, which is what lets a consumer
-// take the last task: head and tail have to be cleared together, and across two
-// words an append landing between the two stores is overwritten and its whole
-// batch lost. The alternative that keeps two words has to carry a sentinel node
-// per queue so the queue is never structurally empty and that transition never
-// arises.
-//
-// The cost is that one word is the single contention point for both ends: a
-// producer appending and a consumer taking contend on every operation, even
-// though they touch opposite ends of a non-empty queue. Separate head and tail
-// on their own cache lines decouple that. Which one wins here is not measured.
+// Control-node FIFO endpoints share one atomic word so removing the last
+// element cannot race an append between separate head and tail stores.
 struct alignas(64) SchedulerReadyInbox {
     volatile uint64_t endpoints;
 };
@@ -1108,18 +1039,8 @@ struct alignas(64) SchedulerGraphSummary {
     uint64_t async_layout_offset;
 };
 
-struct alignas(64) SchedulerReadyDirectoryShard {
-    volatile uint64_t bits;
-};
-
-struct alignas(64) SchedulerReadyDirectory {
-    SchedulerReadyDirectoryShard core_types[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
-};
-
-// The Executor publishes this per-slot payload before the Completion Inbox
-// generation. Neither side writes the final per-task trace concurrently.
-// Local copies have natural alignment; SchedulerSsbufLane supplies the
-// 64-byte alignment and stride of shared trace storage.
+// Each core stages its execution trace locally before publishing completion.
+// Completion service copies it into the final per-task trace.
 struct SchedulerExecutorTaskTrace {
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
@@ -1217,8 +1138,6 @@ struct alignas(64) SchedulerRunControl {
     uint64_t aic_worker_demand;
     volatile uint64_t dispatch_payloads_offset;
     uint64_t task_metadata_offset;
-    uint64_t ready_inboxes_offset;
-    uint64_t ready_directory_offset;
     uint64_t aiv_worker_demand;
     uint64_t graph_summary_offset;
     uint64_t scheduler_count;
@@ -1296,14 +1215,10 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t graph_summary_offset;
 
     uint64_t task_metadata_offset;
-    uint64_t ready_inboxes_offset;
-    uint64_t ready_directory_offset;
     // The callable's registration-owned entry table is outside this run's state.
     uint64_t callable_addresses_address;
     uint64_t callable_addresses_count;
     uint64_t runtime_worker_count;
-    uint64_t mix_payloads_offset;
-    uint64_t mix_traces_offset;
 
     uint64_t scheduler_count;
     uint64_t scheduler_index;
@@ -1448,62 +1363,40 @@ static_assert(offsetof(SchedulerTaskControl, next_waiter) < 64, "wake link must 
 static_assert(
     offsetof(SchedulerTaskControl, next_fanin_index) == 64, "line-published waiter metadata needs its own line"
 );
-static_assert(sizeof(SchedulerReadyInbox) == 64, "ready inbox layout changed");
-static_assert(alignof(SchedulerReadyInbox) == 64, "ready inbox alignment changed");
+static_assert(sizeof(SchedulerReadyInbox) == 64, "control inbox layout changed");
+static_assert(alignof(SchedulerReadyInbox) == 64, "control inbox alignment changed");
 static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");
 static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 120);
 static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment changed");
-static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard must occupy one cache line");
-static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
-static_assert(
-    SCHEDULER_READY_DIRECTORY_SHARD_COUNT * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD >=
-        scheduler_ready_queue_capacity(1),
-    "ready directory does not cover the widest ready queue"
-);
-static_assert(
-    scheduler_ready_queue_base(SCHEDULER_READY_QUEUE_COUNT - 1) +
-            scheduler_ready_queue_capacity(SCHEDULER_READY_QUEUE_COUNT - 1) ==
-        SCHEDULER_READY_INBOX_CAPACITY,
-    "per-type inbox segments must tile the inbox array exactly"
-);
-static_assert(
-    scheduler_ready_queue_base(1) == scheduler_ready_queue_capacity(0) &&
-        scheduler_ready_queue_base(2) == scheduler_ready_queue_base(1) + scheduler_ready_queue_capacity(1),
-    "per-type inbox segments must be contiguous"
-);
-static_assert(
-    sizeof(SchedulerReadyDirectory) == SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
-    "ready directory layout changed"
-);
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
 static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 40, "executor trace layout changed");
-static_assert(sizeof(SchedulerRunControl) == 448, "run control layout changed");
+static_assert(sizeof(SchedulerRunControl) == 384, "run control layout changed");
 static_assert(alignof(SchedulerRunControl) == 64, "run control alignment changed");
-static_assert(offsetof(SchedulerRunControl, resolved_task_count) == 192, "lifecycle atomics need their own line");
-static_assert(offsetof(SchedulerRunControl, error_claimed) == 256, "error state needs its own line");
-static_assert(offsetof(SchedulerRunControl, error_site) == 312, "error site ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_run_epoch) == 320, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_order_key) == 328, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_block_idx) == 336, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_group_seq) == 344, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_worker_index) == 352, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 360, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 364, "error identity ABI changed");
-static_assert(offsetof(SchedulerRunControl, scheduler_error) == 384, "error publication needs its own line");
+static_assert(offsetof(SchedulerRunControl, resolved_task_count) == 128, "lifecycle atomics need their own line");
+static_assert(offsetof(SchedulerRunControl, error_claimed) == 192, "error state needs its own line");
+static_assert(offsetof(SchedulerRunControl, error_site) == 248, "error site ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_run_epoch) == 256, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_order_key) == 264, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_block_idx) == 272, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_group_seq) == 280, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_worker_index) == 288, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 296, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 300, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, scheduler_error) == 320, "error publication needs its own line");
 static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
-static_assert(sizeof(SchedulerWorkerContext) == 384, "worker context layout changed");
+static_assert(sizeof(SchedulerWorkerContext) == 320, "worker context layout changed");
 static_assert(alignof(SchedulerWorkerContext) == 64, "worker context alignment changed");
 static_assert(offsetof(SchedulerWorkerContext, worker_contexts_offset) == 56, "peer routing must share the first line");
 static_assert(offsetof(SchedulerWorkerContext, graph_storage_address) == 64, "graph view must share one line");
 static_assert(offsetof(SchedulerWorkerContext, graph_summary_offset) == 120, "graph view exceeds its line");
 static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "dispatch configuration line changed");
-static_assert(offsetof(SchedulerWorkerContext, scheduler_count) == 192, "topology configuration line changed");
-static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 256, "diagnostic offsets changed");
-static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 280, "argument capture address changed");
-static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 320, "worker diagnostics need an owned line");
+static_assert(offsetof(SchedulerWorkerContext, scheduler_count) == 160, "topology configuration offset changed");
+static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 224, "diagnostic offsets changed");
+static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 248, "argument capture address changed");
+static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 256, "worker diagnostics need an owned line");
 static_assert(
-    offsetof(SchedulerWorkerContext, trace_descriptor_cache_observed_cycles) == 368,
+    offsetof(SchedulerWorkerContext, trace_descriptor_cache_observed_cycles) == 304,
     "worker timestamps must share their owner's line"
 );
 static_assert(sizeof(SchedulerTaskTrace) == 320, "task trace layout changed");
@@ -1564,9 +1457,6 @@ static_assert(std::is_standard_layout_v<SchedulerGroupLaneAck> && std::is_trivia
 static_assert(std::is_standard_layout_v<SchedulerGroupMailbox> && std::is_trivially_copyable_v<SchedulerGroupMailbox>);
 static_assert(std::is_standard_layout_v<SchedulerReadyInbox> && std::is_trivially_copyable_v<SchedulerReadyInbox>);
 static_assert(std::is_standard_layout_v<SchedulerGraphSummary> && std::is_trivially_copyable_v<SchedulerGraphSummary>);
-static_assert(
-    std::is_standard_layout_v<SchedulerReadyDirectory> && std::is_trivially_copyable_v<SchedulerReadyDirectory>
-);
 static_assert(std::is_standard_layout_v<SchedulerRunControl> && std::is_trivially_copyable_v<SchedulerRunControl>);
 static_assert(
     std::is_standard_layout_v<AicpuThreadLifecycleTrace> && std::is_trivially_copyable_v<AicpuThreadLifecycleTrace>
@@ -1714,12 +1604,6 @@ inline bool scheduler_plan_layout(
         ) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_READY_INBOX_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset) ||
-        !scheduler_layout_reserve(
-            &cursor, sizeof(SchedulerReadyDirectory), alignof(SchedulerReadyDirectory), &next.ready_directory_offset
-        ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_MIX_SLOT_CAPACITY, DispatchPayload, mix_payloads_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_MIX_SLOT_CAPACITY, SchedulerExecutorTaskTrace, mix_traces_offset) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), &next.graph_summary_offset
         ) ||
@@ -1794,9 +1678,6 @@ inline bool scheduler_init_data_from_layout(
         controls[i].next_waiter = SCHEDULER_TASK_REF_INVALID;
         controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_REF_INVALID);
     }
-    auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
-    for (uint64_t i = 0; i < SCHEDULER_READY_INBOX_CAPACITY; ++i)
-        ready[i].endpoints = SCHEDULER_READY_ENDPOINTS_EMPTY;
     if (layout.control_inboxes_offset != 0) {
         auto *control_ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.control_inboxes_offset);
         for (uint64_t i = 0; i < layout.spmd.worker_count; ++i)
@@ -1824,7 +1705,6 @@ inline bool scheduler_init_data_from_layout(
         }
     };
     initialize_payloads(layout.dispatch_payloads_offset, SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT);
-    initialize_payloads(layout.mix_payloads_offset, SCHEDULER_MIX_SLOT_CAPACITY);
     auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, layout.graph_summary_offset);
     summary->mix_task_count = layout.spmd.mix_task_count;
     summary->cooperative_task_count = layout.spmd.cooperative_task_count;

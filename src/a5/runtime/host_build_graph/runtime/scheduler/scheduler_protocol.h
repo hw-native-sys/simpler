@@ -224,7 +224,7 @@ inline __aicore__ void scheduler_protocol_payload_publication(
     __gm__ void *base, Local *local, const Claim &claim, const Ready &ready, bool before
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr || claim.mix || claim.worker_id != local->worker_id()) return;
+    if (layout == nullptr || claim.worker_id != local->worker_id()) return;
     if (claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;

@@ -1041,7 +1041,7 @@ INSTANTIATE_TEST_SUITE_P(ActualWorkers, HbgProtocolTraceLayout, ::testing::Value
 
 TEST(HbgProtocolTrace, CompactRunAndTraceLayoutSeparatesConcurrentWriters) {
     EXPECT_EQ(sizeof(SchedulerGraphSummary), 128u);
-    EXPECT_EQ(sizeof(SchedulerRunControl), 448u);
+    EXPECT_EQ(sizeof(SchedulerRunControl), 384u);
     EXPECT_EQ(sizeof(SchedulerTaskTrace), 320u);
     EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 96u);
     EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 64u);

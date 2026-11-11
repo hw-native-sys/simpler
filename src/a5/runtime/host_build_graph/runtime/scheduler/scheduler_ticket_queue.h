@@ -13,8 +13,8 @@
 
 #include "scheduler_memory.h"
 
-// Cursors occupy separate atomic-only lines. Entries live in a different,
-// bypass-published region and are never overwritten within a run.
+// Cursors and entry publication words occupy separate atomic-only lines.
+// A published entry remains immutable until every worker crosses the run fence.
 struct alignas(64) SchedulerTicketQueue {
     volatile uint64_t head{0};
     alignas(64) volatile uint64_t reserved_tail{0};
@@ -25,11 +25,21 @@ static_assert(offsetof(SchedulerTicketQueue, reserved_tail) == 64);
 static_assert(std::is_standard_layout_v<SchedulerTicketQueue>);
 static_assert(std::is_trivially_copyable_v<SchedulerTicketQueue>);
 
+struct alignas(64) SchedulerTicketEntry {
+    volatile int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
+};
+
+static_assert(sizeof(SchedulerTicketEntry) == 64);
+static_assert(alignof(SchedulerTicketEntry) == 64);
+static_assert(offsetof(SchedulerTicketEntry, task_ref) == 0);
+static_assert(std::is_standard_layout_v<SchedulerTicketEntry>);
+static_assert(std::is_trivially_copyable_v<SchedulerTicketEntry>);
+
 // Core-local access descriptor; this is not a wire structure. The backing
 // owns the control and all entries until every worker crosses the run fence.
 struct SchedulerTicketQueueView {
     __gm__ SchedulerTicketQueue *control{nullptr};
-    __gm__ volatile int64_t *entries{nullptr};
+    __gm__ SchedulerTicketEntry *entries{nullptr};
     uint64_t capacity{0};
     uint64_t task_count{0};
 };
@@ -81,15 +91,8 @@ inline __aicore__ SchedulerTicketResult scheduler_ticket_publish(
             return SchedulerTicketResult::INVALID;
     if (range.count == 0) return SchedulerTicketResult::SUCCESS;
     scheduler_cache_barrier();
-    for (uint64_t index = 0; index < range.count; ++index) {
-#if defined(__CCE_AICORE__)
-        auto *entry =
-            reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&queue.entries[range.begin + index]));
-        st_dev(static_cast<uint64_t>(refs[index]), entry, 0);
-#else
-        __atomic_store_n(&queue.entries[range.begin + index], refs[index], __ATOMIC_RELEASE);
-#endif
-    }
+    for (uint64_t index = 0; index < range.count; ++index)
+        scheduler_gm_store(queue.entries[range.begin + index].task_ref, refs[index]);
     scheduler_cache_barrier();
     return SchedulerTicketResult::SUCCESS;
 }
@@ -116,7 +119,9 @@ inline __aicore__ SchedulerTicketResult scheduler_ticket_try_pop_batch(
         int64_t prefix[Capacity]{};
         uint32_t available = 0;
         while (available < credit && available < queue.capacity - head) {
-            const int64_t ref = scheduler_gm_query(queue.entries[head + available]);
+            auto &entry = queue.entries[head + available].task_ref;
+            if (scheduler_gm_query(entry) == SCHEDULER_TASK_REF_INVALID) break;
+            const int64_t ref = scheduler_gm_load(entry);
             if (ref == SCHEDULER_TASK_REF_INVALID) break;
             if (ref < 0 || static_cast<uint64_t>(ref) >= queue.task_count) return SchedulerTicketResult::INVALID;
             prefix[available++] = ref;

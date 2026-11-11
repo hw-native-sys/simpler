@@ -751,15 +751,12 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 trace.state_probe_end_cycles, trace.dispatch_loop_iter, SchedPhaseKind::StateProbe, 1, task_ref
             );
         }
-        const auto ready_source = static_cast<SchedulerReadySource>(trace.ready_source);
         const auto publication_mode = static_cast<SchedulerPublicationMode>(trace.publication_mode);
         const bool refill = publication_mode == SchedulerPublicationMode::REFILL;
         if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY && !refill) {
             append_scheduler_record(
                 &records[trace.dispatch_scheduler_worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
-                trace.dispatch_loop_iter,
-                ready_source == SchedulerReadySource::STOLEN ? SchedPhaseKind::Worksteal : SchedPhaseKind::Dispatch, 1,
-                task_ref
+                trace.dispatch_loop_iter, SchedPhaseKind::Dispatch, 1, task_ref
             );
         }
         if (trace.complete_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
@@ -1686,8 +1683,7 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
         return false;
     }
-    // Groups of eight bound preferred consumers while retaining global
-    // visibility of all ready tasks.
+    // Each logical executable task occupies one entry in its shared core-class queue.
     SchedulerReadyPoolPlan ready_pool_plan;
     if (!scheduler_plan_ready_pool(
             task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &ready_pool_plan
@@ -1890,8 +1886,6 @@ bool create_scheduler_state(
     run_control->sampled_task_timing_enabled = sampled_task_timing_enabled ? 1 : 0;
     run_control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
     run_control->task_metadata_offset = layout.task_metadata_offset;
-    run_control->ready_inboxes_offset = layout.ready_inboxes_offset;
-    run_control->ready_directory_offset = layout.ready_directory_offset;
     run_control->graph_summary_offset = layout.graph_summary_offset;
     run_control->scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
     run_control->error_task_ref = UINT64_MAX;
@@ -1909,10 +1903,6 @@ bool create_scheduler_state(
         context.task_controls_offset = layout.task_controls_offset;
         context.task_metadata_offset = layout.task_metadata_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
-        context.ready_inboxes_offset = layout.ready_inboxes_offset;
-        context.ready_directory_offset = layout.ready_directory_offset;
-        context.mix_payloads_offset = layout.mix_payloads_offset;
-        context.mix_traces_offset = layout.mix_traces_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
         // The absolute address of the callable's registration-owned entry
         // table, with its own length: nothing in this per-bind allocation holds

@@ -88,6 +88,7 @@ struct AsyncFixture {
                 graph.storage()[input.task_ref].task.kernel_id[lane] =
                     input.active_mask.has(static_cast<SubtaskSlot>(lane)) ? 1 : INVALID_KERNEL_ID;
         }
+        storage.prepare_ready_pool();
         for (uint32_t worker = 0; worker < 3; ++worker) {
             for (uint32_t lane = 0; lane < 3; ++lane)
                 storage.contexts[worker].cluster_worker_ids[lane] = lane;
@@ -100,6 +101,13 @@ struct AsyncFixture {
 
     void *base() { return storage.scheduler_state->base(); }
     SchedulerLocalState *local(uint32_t worker = 0) { return storage.local_context(&storage.contexts[worker]); }
+    bool pop_ready(int64_t *task) {
+        SchedulerReadyClaim claim{};
+        const bool ok =
+            scheduler_claim_ready_for_slot(graph.graph(), base(), local(), storage.run_control, 3, 0, &claim);
+        *task = claim.task_ref;
+        return ok;
+    }
     SchedulerTaskControl *task_control(int64_t ref) { return scheduler_task_control_at(base(), local(), ref); }
     SchedulerAsyncTaskJoin &join(uint32_t index = 0) {
         return scheduler_state_at<SchedulerAsyncTaskJoin>(base(), plan.layout.joins_offset)[index];
@@ -200,7 +208,7 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     AsyncFixture f;
     f.graph.executable(1, 0, {0});
     ASSERT_EQ(
-        scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, nullptr),
+        scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1),
         SchedulerRouteResult::WAITING
     );
     const auto writer = f.start();
@@ -213,8 +221,7 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     slot.state = SchedulerDispatchSlotState::READY;
     slot.generation = 1;
     ASSERT_TRUE(scheduler_service_cluster_completion_slot(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, 1, nullptr, nullptr, nullptr, 0, nullptr,
-        nullptr, nullptr
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, 1, 0, nullptr, nullptr
     ));
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
     EXPECT_TRUE(scheduler_async_pending::closed(f.join().word));
@@ -223,7 +230,7 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     EXPECT_FALSE(f.check(1));
     EXPECT_FALSE(f.finish(2));
     EXPECT_EQ(f.local()->pending_completed, 0u);
-    EXPECT_EQ(scheduler_ready_inbox_at(f.base(), f.local(), 0, 0)->endpoints, SCHEDULER_READY_ENDPOINTS_EMPTY);
+    EXPECT_FALSE(scheduler_ready_pool_may_have_work(f.base(), f.local(), 0));
     __atomic_store_n(&f.signal[0], 1u, __ATOMIC_RELEASE);
     EXPECT_TRUE(f.check(2));
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
@@ -234,9 +241,7 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::TERMINAL);
     EXPECT_EQ(f.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     int64_t ready = -1;
-    EXPECT_TRUE(scheduler_ready_pop_from_inbox(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, &ready, nullptr
-    ));
+    EXPECT_TRUE(f.pop_ready(&ready));
     EXPECT_EQ(ready, 1);
     for (uint32_t worker = 0; worker < 3; ++worker)
         scheduler_flush_completions(f.storage.run_control, f.local(worker));
@@ -268,7 +273,7 @@ TEST(HbgAsyncControl, ZeroConditionSingleExecutionKeepsItsSuccessorOnTheCompleti
     f.storage.callable_addresses[1] = 0x1000;
     f.graph.executable(1, 0, {0});
     ASSERT_EQ(
-        scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, nullptr),
+        scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1),
         SchedulerRouteResult::WAITING
     );
     (void)f.start();
@@ -281,8 +286,7 @@ TEST(HbgAsyncControl, ZeroConditionSingleExecutionKeepsItsSuccessorOnTheCompleti
     slot.generation = 1;
     bool refilled = false;
     ASSERT_TRUE(scheduler_service_cluster_completion_slot(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, 1, nullptr, nullptr, nullptr, 0, nullptr,
-        &refilled, nullptr
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, 1, 0, nullptr, &refilled
     ));
     EXPECT_TRUE(refilled);
     EXPECT_EQ(slot.task_ref, 1);
@@ -416,7 +420,7 @@ TEST(HbgAsyncControl, ContinuousBusinessReturnsServiceCheckAndFinishBeforeWorkRu
     AsyncFixture f(2);
     f.graph.executable(1, 0, {0});
     ASSERT_EQ(
-        scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, nullptr),
+        scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1),
         SchedulerRouteResult::WAITING
     );
     const auto writer = f.start();
@@ -439,9 +443,7 @@ TEST(HbgAsyncControl, ContinuousBusinessReturnsServiceCheckAndFinishBeforeWorkRu
     ASSERT_LT(completed, returns);
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
     int64_t consumer = SCHEDULER_TASK_REF_INVALID;
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, &consumer, nullptr
-    ));
+    ASSERT_TRUE(f.pop_ready(&consumer));
     EXPECT_EQ(consumer, 1);
     EXPECT_EQ(scheduler_read_error(f.storage.run_control), 0u);
 }
@@ -562,7 +564,7 @@ TEST(HbgAsyncControl, FinishMigratesWithAnUnpublishedBatchAndCountsOnlyAfterDrai
     for (uint32_t task = 1; task < 12; ++task) {
         f.graph.executable(task, 0, {0});
         ASSERT_EQ(
-            scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, task, nullptr),
+            scheduler_route_task(f.graph.graph(), f.base(), f.local(), f.storage.run_control, task),
             SchedulerRouteResult::WAITING
         );
     }
@@ -588,9 +590,7 @@ TEST(HbgAsyncControl, FinishMigratesWithAnUnpublishedBatchAndCountsOnlyAfterDrai
     std::array<bool, 12> seen{};
     for (uint32_t count = 0; count < 11; ++count) {
         int64_t task = -1;
-        ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-            f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, &task, nullptr
-        ));
+        ASSERT_TRUE(f.pop_ready(&task));
         ASSERT_GE(task, 1);
         ASSERT_LT(task, 12);
         EXPECT_FALSE(seen[task]);

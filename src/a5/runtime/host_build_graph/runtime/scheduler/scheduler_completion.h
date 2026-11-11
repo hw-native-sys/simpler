@@ -38,19 +38,13 @@ inline __aicore__ void scheduler_account_failed_completion(
     ++scheduler->pending_completed;
 }
 
-// Non-ordered Mix dispatch retains a ready successor for coordinator placement.
-struct SchedulerRefillCandidates {
-    SchedulerReadyClaim mix_ready{};
-};
-
 // The caller's execution trace, or all released Mix lane traces, precedes
 // this logical completion. Mix successors enter the ready queue; own-type
 // successors may retain one persistent admission candidate.
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_complete_ordered_task(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level, SchedulerWakeStats *wake_stats,
-    SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level
 ) {
     if (scheduler == nullptr || scheduler->admission == nullptr || !scheduler_task_ref_valid(graph, task_ref))
         return false;
@@ -68,9 +62,8 @@ static inline __aicore__ bool scheduler_complete_ordered_task(
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
     if (!scheduler_resolve_completion(
-            graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats, completion_stats,
-            profiling_level, false, scheduler_ordered_direct_sink(scheduler->admission),
-            scheduler->config.self_core_type, nullptr
+            graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, false,
+            scheduler_ordered_direct_sink(scheduler->admission), scheduler->config.self_core_type
         )) {
         scheduler_record_error(
             run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -86,24 +79,21 @@ template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t cluster_lane, uint32_t pending_slot,
-    uint32_t completed_generation, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
-    SchedulerCompletionStats *completion_stats, uint64_t profiling_level, const SchedulerReadyClaim *replacement_ready,
-    bool *direct_refilled, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region,
-    SchedulerRefillCandidates *candidates = nullptr, bool mix_slot = false
+    uint32_t completed_generation, uint64_t profiling_level, const SchedulerReadyClaim *replacement_ready,
+    bool *direct_refilled
 ) {
     if (direct_refilled != nullptr) *direct_refilled = false;
-    if (scheduler == nullptr || (mix_slot && ssbuf_region == nullptr) || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
-        pending_slot >= (mix_slot ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT) ||
-        completed_generation == 0)
+    if (scheduler == nullptr || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
+        pending_slot >= SCHEDULER_PENDING_SLOT_COUNT || completed_generation == 0)
         return false;
     // Callers prefilter consumed tokens. Keep this mutating helper fail-fast if
     // that precondition is violated, so a completion cannot be serviced twice.
-    if (!scheduler_completion_generation_is_new(scheduler, cluster_lane, pending_slot, completed_generation, mix_slot))
+    if (!scheduler_completion_generation_is_new(scheduler, cluster_lane, pending_slot, completed_generation))
         return false;
     const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
     if (worker_id >= scheduler->config.runtime_worker_count) return false;
     __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
-    const SchedulerFreeSlotClaim completed_claim{worker_id, pending_slot, completed_generation, cluster_lane, mix_slot};
+    const SchedulerFreeSlotClaim completed_claim{worker_id, pending_slot, completed_generation, cluster_lane};
     SchedulerLocalSlotState *local_slot = scheduler->slot_state(completed_claim);
     const int64_t published_task_ref = local_slot->task_ref;
     if (local_slot->state != SchedulerDispatchSlotState::READY || local_slot->generation != completed_generation) {
@@ -123,17 +113,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, scheduler);
         return false;
     }
-    SchedulerMixTracker *mix_tracker = nullptr;
-    bool valid_subtask = local_slot->subtask_slot < 3;
-    if (local_slot->mix_tracker != UINT8_MAX) {
-        if (local_slot->mix_tracker >= SCHEDULER_MIX_TRACKER_COUNT) valid_subtask = false;
-        else {
-            mix_tracker = &scheduler->mix_trackers[local_slot->mix_tracker];
-            const auto subtask = static_cast<SubtaskSlot>(local_slot->subtask_slot);
-            valid_subtask = valid_subtask && mix_tracker->task_ref == task_ref &&
-                            mix_tracker->active_mask.has(subtask) && !mix_tracker->completed_mask.has(subtask);
-        }
-    }
+    const bool valid_subtask = local_slot->subtask_slot < 3;
     if (!valid_subtask) {
         scheduler_record_error(
             run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -143,25 +123,8 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     }
     const bool sampled_task_timing_enabled = scheduler->sampled_task_timing(cluster_lane, pending_slot);
     SchedulerExecutorTaskTrace executor_trace{};
-    if (chip_task_timing_enabled || sampled_task_timing_enabled) {
-        if (mix_slot) {
-            // A Mix slot's executor trace is in global memory: the cluster's
-            // SSBUF has room for the dispatch and completion tokens, which are
-            // on the dispatch path, and not for a second set of trace cells.
-            __gm__ SchedulerExecutorTaskTrace *published_trace = scheduler_state_at<SchedulerExecutorTaskTrace>(
-                scheduler_state_base, scheduler->mix_trace_offset(cluster_lane, pending_slot)
-            );
-            scheduler_observe_cache_line(published_trace);
-            executor_trace.kernel_start_cycles = published_trace->kernel_start_cycles;
-            executor_trace.kernel_end_cycles = published_trace->kernel_end_cycles;
-            executor_trace.ready_scan_start_cycles = published_trace->ready_scan_start_cycles;
-            executor_trace.ready_observe_cycles = published_trace->ready_observe_cycles;
-            executor_trace.completion_id = published_trace->completion_id;
-            executor_trace.completion_inbox_index = published_trace->completion_inbox_index;
-        } else {
-            executor_trace = scheduler->profiling->executor_traces[pending_slot];
-        }
-    }
+    if (chip_task_timing_enabled || sampled_task_timing_enabled)
+        executor_trace = scheduler->profiling->executor_traces[pending_slot];
     __gm__ SchedulerTaskTrace *completed_trace = nullptr;
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
@@ -214,7 +177,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const uint8_t completed_subtask_slot = local_slot->subtask_slot;
     const uint32_t completed_block_idx = local_slot->block_idx;
     const bool gm_mix = local_slot->gm_mix;
-    if (gm_mix && (!local_slot->cooperative || scheduler->admission == nullptr || mix_slot || mix_tracker != nullptr ||
+    if (gm_mix && (!local_slot->cooperative || scheduler->admission == nullptr ||
                    cluster_lane != scheduler->config.self_lane || replacement_ready != nullptr)) {
         scheduler_record_error(
             run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -225,7 +188,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const bool ordered_block = local_slot->cooperative && !gm_mix;
     bool task_complete = !gm_mix && !ordered_block;
     if (ordered_block) {
-        if (mix_slot || mix_tracker != nullptr || cluster_lane != scheduler->config.self_lane) {
+        if (cluster_lane != scheduler->config.self_lane) {
             scheduler_record_error(
                 run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
                 SchedulerErrorSite::BLOCK_COMPLETION_INVALID, local_slot
@@ -233,18 +196,12 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
             return false;
         }
     }
-    scheduler_mark_completion_consumed(scheduler, cluster_lane, pending_slot, completed_generation, mix_slot);
+    scheduler_mark_completion_consumed(scheduler, cluster_lane, pending_slot, completed_generation);
     if constexpr (RecordProtocol)
-        if (!mix_slot)
-            scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, *local_slot);
+        scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, *local_slot);
     uint64_t refill_start_cycles = 0;
     uint64_t refill_end_cycles = 0;
     bool refilled = false;
-    if (mix_tracker != nullptr) {
-        mix_tracker->completed_mask.activate(static_cast<SubtaskSlot>(completed_subtask_slot));
-        task_complete = mix_tracker->completed_mask == mix_tracker->active_mask;
-        if (task_complete) mix_tracker->task_ref = SCHEDULER_TASK_REF_INVALID;
-    }
     if (!ordered_block) scheduler_initialize_free_slot(local_slot);
     scheduler->set_timing_slot(cluster_lane, pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
@@ -263,18 +220,13 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
         if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
-        // A peer AIV's remote Mix slot belongs to coordinator placement.
         SchedulerReadyClaim *direct_ready = nullptr;
-        if (replacement_ready == nullptr && !mix_slot) {
+        if (replacement_ready == nullptr) {
             direct_ready = &resolved_ready;
         }
         if (!scheduler_resolve_completion(
-                graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats,
-                completion_stats, profiling_level, false, direct_ready,
-                scheduler_metadata_core_type_index(completed_subtask_slot),
-                scheduler->has_mix && scheduler->is_mix_coordinator() && candidates != nullptr ?
-                    &candidates->mix_ready :
-                    nullptr
+                graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, false, direct_ready,
+                scheduler_metadata_core_type_index(completed_subtask_slot)
             )) {
             scheduler_account_failed_completion(
                 graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
@@ -310,7 +262,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
             };
             local_slot->state = SchedulerDispatchSlotState::FILLING;
             if (!scheduler_fill_dispatch_slot(
-                    graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level, ssbuf_region
+                    graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
                 )) {
                 scheduler_account_failed_completion(
                     graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_REFILL_DISPATCH_FAILED
@@ -341,11 +293,10 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         scheduler_cache_barrier();
         scheduler_gm_store(completed_trace->valid, UINT64_C(1));
         if constexpr (RecordProtocol)
-            if (!mix_slot)
-                scheduler_protocol_execution_trace_published(
-                    scheduler_state_base, scheduler, task_ref, completed_block_idx, completed_subtask_slot,
-                    pending_slot, completed_generation
-                );
+            scheduler_protocol_execution_trace_published(
+                scheduler_state_base, scheduler, task_ref, completed_block_idx, completed_subtask_slot, pending_slot,
+                completed_generation
+            );
         // The preceding barrier publishes trace lines before valid. The store
         // drains valid before pending_completed reaches resolved_task_count.
     } else if (completed_trace != nullptr) {
@@ -369,8 +320,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
         if (task_complete) {
             if (scheduler->admission != nullptr) {
                 if (!scheduler_complete_ordered_task<RecordProtocol>(
-                        graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,
-                        ready_stats, completion_stats
+                        graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level
                     ))
                     return false;
             } else if (deferred) {
@@ -394,17 +344,13 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_service_cluster_completions(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
-    SchedulerCompletionStats *completion_stats, uint64_t profiling_level, uint64_t *direct_refilled_slot_mask,
-    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerRefillCandidates *candidates = nullptr
+    __gm__ SchedulerRunControl *run_control, uint64_t profiling_level, uint64_t *direct_refilled_slot_mask
 ) {
-    if (scheduler == nullptr || (scheduler->admission == nullptr && scheduler->has_mix && ssbuf_region == nullptr))
-        return false;
+    if (scheduler == nullptr) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
     bool progress = false;
     // This core's own slots. A core retires only the slots it fills, so their
-    // completions are in local state and no other lane's own slots are its
-    // business; what does cross a lane boundary is Mix, handled below.
+    // completions are in local state.
     for (uint32_t pending_slot = 0; pending_slot < SCHEDULER_PENDING_SLOT_COUNT; ++pending_slot) {
         const uint32_t completed_generation = scheduler->local_completed_generations[pending_slot];
         if (!scheduler_completion_generation_is_new(
@@ -414,8 +360,7 @@ static inline __aicore__ bool scheduler_service_cluster_completions(
         bool direct_refilled = false;
         if (!scheduler_service_cluster_completion_slot<RecordProtocol>(
                 graph, scheduler_state_base, scheduler, run_control, scheduler->config.self_lane, pending_slot,
-                completed_generation, wake_stats, ready_stats, completion_stats, profiling_level, nullptr,
-                &direct_refilled, ssbuf_region, candidates
+                completed_generation, profiling_level, nullptr, &direct_refilled
             )) {
             return false;
         }
@@ -423,33 +368,6 @@ static inline __aicore__ bool scheduler_service_cluster_completions(
             *direct_refilled_slot_mask |=
                 UINT64_C(1) << (scheduler->config.self_lane * SCHEDULER_PENDING_SLOT_COUNT + pending_slot);
         progress = true;
-    }
-    if (scheduler->admission != nullptr || !scheduler->has_mix || !scheduler->is_mix_coordinator()) return progress;
-    // The Mix slots this core coordinates, whose completions arrive in their own
-    // inbox. Its own subtask of a Mix task sits in its own slots, covered above.
-    for (uint32_t cluster_lane = 1; cluster_lane < PLATFORM_CORES_PER_BLOCKDIM; ++cluster_lane) {
-        const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
-        if (worker_id >= scheduler->config.runtime_worker_count) continue;
-        const uint64_t mix_publication =
-            scheduler_ssbuf_load_relaxed(&ssbuf_region->lanes[cluster_lane].mix_completion.publication);
-        bool mix_acquired = false;
-        for (uint32_t mix_slot = 0; mix_slot < SCHEDULER_MIX_SLOT_COUNT; ++mix_slot) {
-            const uint32_t completed_generation = static_cast<uint32_t>(mix_publication >> (mix_slot * 32));
-            if (!scheduler_completion_generation_is_new(scheduler, cluster_lane, mix_slot, completed_generation, true))
-                continue;
-            if (!mix_acquired) {
-                scheduler_cache_barrier();
-                mix_acquired = true;
-            }
-            if (!scheduler_service_cluster_completion_slot<RecordProtocol>(
-                    graph, scheduler_state_base, scheduler, run_control, cluster_lane, mix_slot, completed_generation,
-                    wake_stats, ready_stats, completion_stats, profiling_level, nullptr, nullptr, ssbuf_region,
-                    candidates, true
-                )) {
-                return false;
-            }
-            progress = true;
-        }
     }
     return progress;
 }

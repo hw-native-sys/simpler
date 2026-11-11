@@ -418,7 +418,7 @@ def _scheduler_phases_for_report(threads, runtime):
     """Return phase rows that are represented by the current capture.
 
     The order is the runtime's own (see its OUTER_PHASES): for hbg that keeps
-    the AICore scheduler's loop -- state_probe, dispatch, worksteal, refill --
+    the AICore scheduler's loop -- state_probe, dispatch, refill --
     reading in the order it runs. ``idle`` trails both because it is the tool's
     own reconstructed row rather than one the runtime lists.
     """

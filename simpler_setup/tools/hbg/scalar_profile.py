@@ -14,7 +14,6 @@ from collections import defaultdict
 from pathlib import Path
 
 SCALAR_FUNCTIONS = {
-    "scalar_ready_refresh": "scheduler_refresh_ready_inbox",
     "scalar_completions": "scheduler_service_cluster_completions",
     "scalar_graph_control": "scheduler_service_controls",
     "scalar_fill_slots": "scheduler_fill_own_slots",
@@ -51,7 +50,6 @@ SCALAR_FUNCTIONS = {
     "scalar_block_cursor_read": "scheduler_read_claim_cursor",
     "scalar_admission_close": "scheduler_close_ordered_obligation",
     "scalar_ordinary_permit": "scheduler_can_enter_ordinary",
-    "scalar_ready_directory": "scheduler_ready_directory_nonempty",
     "scalar_dispatch_metadata": "scheduler_load_dispatch_metadata",
     "scalar_dispatch_fill": "scheduler_fill_dispatch_slot",
     "scalar_dispatch_publish": "scheduler_publish_dispatch_slot",
@@ -64,7 +62,6 @@ SCALAR_FUNCTIONS = {
     "scalar_poll_local_state": "scheduler_ordered_poll_may_progress: local state",
     "scalar_poll_ready_queue": "scheduler_ordered_poll_may_progress: ready queue",
     "scalar_poll_ready_pool": "scheduler_ready_pool_may_have_work",
-    "scalar_poll_own_inbox": "scheduler_ordered_poll_may_progress: own inbox endpoints",
     "scalar_poll_admission_tail": "scheduler_ordered_poll_may_progress: admission commit_tail",
     "scalar_poll_mix_state": "scheduler_ordered_poll_may_progress: MIX state",
     "scalar_poll_mix_close_seal": "scheduler_ordered_poll_may_progress: MIX close seal",

@@ -22,84 +22,70 @@ void append_ready(FixtureStorage &storage, int64_t first, int64_t end) {
     SchedulerReadyBatch batch{};
     auto *local = storage.local_context(&storage.contexts[0]);
     for (int64_t task = first; task < end; ++task) {
-        ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, task, &batch, nullptr));
+        ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, task, &batch));
     }
-    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, nullptr));
+    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch));
 }
 
-TEST(HbgSpmdPrimitiveBoundary, GenericPopSnapshotDoesNotPinTheExpectedTask) {
-    FixtureStorage storage(3, 3);
+TEST(HbgSpmdPrimitiveBoundary, PositiveHintDoesNotOwnOrPinTheNextTask) {
+    FixtureStorage storage(3, 6);
+    storage.prepare_ready_pool();
     GraphBuffer graph(3);
     append_ready(storage, 0, 3);
-    auto *local = storage.local_context(&storage.contexts[0]);
-    auto *inbox = scheduler_ready_inbox_at(storage.scheduler_state->base(), local, 0, 0);
-    const uint64_t observed_a = scheduler_gm_query(inbox->endpoints);
-    SchedulerReadyStats stats{};
-    int64_t popped = SCHEDULER_TASK_REF_INVALID;
-
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &popped, &stats, nullptr,
-        &observed_a
+    auto *first = storage.local_context(&storage.contexts[0]);
+    auto *second = storage.local_context(&storage.contexts[3]);
+    EXPECT_TRUE(scheduler_ready_pool_may_have_work(storage.scheduler_state->base(), first, 0));
+    SchedulerReadyClaim claim{};
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        graph.graph(), storage.scheduler_state->base(), second, storage.run_control, 6, 0, &claim
     ));
-    EXPECT_EQ(popped, 0);
-
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &popped, &stats, nullptr,
-        &observed_a
+    EXPECT_EQ(claim.task_ref, 0);
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        graph.graph(), storage.scheduler_state->base(), first, storage.run_control, 6, 0, &claim
     ));
-    EXPECT_EQ(popped, 1);
-    EXPECT_EQ(stats.cas_retry_count, 1u);
-    EXPECT_EQ(scheduler_ready_endpoints_head(scheduler_gm_query(inbox->endpoints)), 2);
+    EXPECT_EQ(claim.task_ref, 1);
+    const auto *pool =
+        scheduler_state_at<SchedulerReadyPoolHeader>(storage.scheduler_state->base(), first->config.ready_pool_offset);
+    const auto queue = scheduler_ready_pool_queue(storage.scheduler_state->base(), *pool, 0);
+    EXPECT_EQ(queue.control->head, 2u);
 }
 
-TEST(HbgSpmdPrimitiveBoundary, TailAppendChangesEndpointsWithoutChangingTheHead) {
+TEST(HbgSpmdPrimitiveBoundary, TailAppendDoesNotChangeTheHead) {
     FixtureStorage storage(2, 3);
+    storage.prepare_ready_pool();
     GraphBuffer graph(2);
     append_ready(storage, 0, 1);
     auto *local = storage.local_context(&storage.contexts[0]);
-    auto *inbox = scheduler_ready_inbox_at(storage.scheduler_state->base(), local, 0, 0);
-    const uint64_t before_append = scheduler_gm_query(inbox->endpoints);
+    const auto *pool =
+        scheduler_state_at<SchedulerReadyPoolHeader>(storage.scheduler_state->base(), local->config.ready_pool_offset);
+    const auto queue = scheduler_ready_pool_queue(storage.scheduler_state->base(), *pool, 0);
+    const uint64_t head = scheduler_gm_query(queue.control->head);
+    EXPECT_EQ(queue.control->reserved_tail, 1u);
     append_ready(storage, 1, 2);
-    SchedulerReadyStats stats{};
-    int64_t popped = SCHEDULER_TASK_REF_INVALID;
-
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &popped, &stats, nullptr,
-        &before_append
+    EXPECT_EQ(queue.control->head, head);
+    EXPECT_EQ(queue.control->reserved_tail, 2u);
+    SchedulerReadyClaim claim{};
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 3, 0, &claim
     ));
-    EXPECT_EQ(popped, 0);
-    EXPECT_EQ(stats.cas_retry_count, 1u);
-    EXPECT_EQ(scheduler_ready_endpoints_head(scheduler_gm_query(inbox->endpoints)), 1);
+    EXPECT_EQ(claim.task_ref, 0);
+    EXPECT_EQ(queue.control->head, head + 1);
 }
 
-TEST(HbgSpmdPrimitiveBoundary, AnEmptySnapshotDoesNotProveCurrentQueueQuiescence) {
+TEST(HbgSpmdPrimitiveBoundary, AnEmptyHintDoesNotProveFutureQueueQuiescence) {
     FixtureStorage storage(1, 3);
+    storage.prepare_ready_pool();
     GraphBuffer graph(1);
     auto *local = storage.local_context(&storage.contexts[0]);
-    const uint64_t empty = SCHEDULER_READY_ENDPOINTS_EMPTY;
+    const bool empty_hint = !scheduler_ready_pool_may_have_work(storage.scheduler_state->base(), local, 0);
+    ASSERT_TRUE(empty_hint);
     append_ready(storage, 0, 1);
-    int64_t popped = SCHEDULER_TASK_REF_INVALID;
-
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &popped, nullptr, nullptr,
-        &empty
+    EXPECT_TRUE(scheduler_ready_pool_may_have_work(storage.scheduler_state->base(), local, 0));
+    SchedulerReadyClaim claim{};
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 3, 0, &claim
     ));
-    EXPECT_EQ(popped, SCHEDULER_TASK_REF_INVALID);
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &popped, nullptr
-    ));
-    EXPECT_EQ(popped, 0);
-}
-
-TEST(HbgSpmdPrimitiveBoundary, OwnAndRemoteMixGenerationsAreIndependentDomains) {
-    SchedulerLocalState local{};
-    local.dispatch_sequence = 100;
-    const SchedulerFreeSlotClaim own{0, 0, 0, 0, false};
-    const SchedulerFreeSlotClaim remote_mix{1, 0, 0, 1, true};
-    EXPECT_EQ(local.next_slot_generation(own), 101u);
-    EXPECT_EQ(local.next_slot_generation(remote_mix), 1u);
-    EXPECT_EQ(local.dispatch_sequence, 101u);
-    EXPECT_EQ(local.mix_dispatch_sequences[1], 1u);
+    EXPECT_EQ(claim.task_ref, 0);
 }
 
 }  // namespace

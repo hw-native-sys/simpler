@@ -1,5 +1,9 @@
 # A5 HBG SSBUF completion-generation mismatch
 
+This page records experiments on the historical SSBUF implementation. The
+current resident scheduler uses local slots and GM MIX mailboxes; see the
+[current runtime contract](../../src/a5/runtime/host_build_graph/docs/RUNTIME_LOGIC.md#71-resident-scheduler-local-state).
+
 ## Failure signature and scope
 
 The initial SSBUF mailbox implementation failed on A5 at
@@ -41,7 +45,7 @@ this compiled implementation and a working source-level workaround. They do
 not identify a specific faulty compiler pass, prove that every over-aligned
 local object is broken, or establish an eight-argument hardware limit.
 
-## Implementation contract
+## Implementation used in these experiments
 
 - `SchedulerExecutorTaskTrace` is a naturally aligned 48-byte payload. Its
   local copies do not impose cache-line alignment on `SchedulerLocalState`.

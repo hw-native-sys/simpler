@@ -23,7 +23,8 @@ namespace {
 
 struct InlineFixture {
     explicit InlineFixture(
-        bool ordered = true, bool mix = false, bool protocol = false, LaneMask mix_mask = LaneMask(true, true, false)
+        bool ordered = true, bool mix = false, bool protocol = false, LaneMask mix_mask = LaneMask(true, true, false),
+        bool host_completed_service = false
     ) :
         storage(3, 3, 4, SchedulerSpmdRequirements{3, 1, 1, mix ? 1u : 0u}, protocol) {
         graph.mixed(0, mix ? mix_mask : LaneMask::aiv0());
@@ -35,12 +36,14 @@ struct InlineFixture {
             metadata.flags = SCHEDULER_TASK_EXECUTABLE;
             if (task == 0) metadata.flags |= SCHEDULER_TASK_SPMD | (mix ? SCHEDULER_TASK_MIX : 0);
             if (task == 1) metadata.flags |= SCHEDULER_TASK_INLINE;
+            if (task == 1 && host_completed_service) metadata.flags = 0;
             metadata.trace_index_base = task == 0 ? 0 : (mix ? 2 * mix_mask.count() : 2);
             metadata.timing_slot = -1;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 metadata.kernel_ids[lane] =
                     task != 1 && metadata.active_mask.has(static_cast<SubtaskSlot>(lane)) ? 1 : UINT16_MAX;
         }
+        storage.prepare_ready_pool();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 61));
         run()->active_worker_count = 3;
         run()->aic_active_worker_count = 1;
@@ -54,7 +57,7 @@ struct InlineFixture {
                 context.cluster_worker_ids[lane] = lane;
             storage.test_graphs[worker] = graph.graph();
             locals[worker] = storage.local_context(&context);
-            locals[worker]->has_mix = mix;
+
             if (!ordered && protocol) EXPECT_TRUE(scheduler_protocol_bind(base(), locals[worker]));
             if (ordered) {
                 EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
@@ -77,23 +80,20 @@ struct InlineFixture {
         storage.metadata[consumer].flags |= SCHEDULER_TASK_HAS_FANIN;
     }
     SchedulerRouteResult route(uint32_t task, uint32_t worker = 1) {
-        return scheduler_route_task(graph.graph(), base(), locals[worker], run(), task, nullptr);
+        return scheduler_route_task(graph.graph(), base(), locals[worker], run(), task);
     }
     bool enqueue(uint32_t task, uint32_t worker = 1) {
         if (route(task, worker) != SchedulerRouteResult::READY_TO_ENQUEUE) return false;
         SchedulerReadyBatch batch{};
         const auto &metadata = storage.metadata[task];
-        return scheduler_ready_batch_append(base(), locals[worker], task, &batch, nullptr, 4) &&
+        return scheduler_ready_batch_append(base(), locals[worker], task, &batch) &&
                scheduler_ready_batch_push(
-                   base(), locals[worker], scheduler_task_ready_queue(metadata.flags, metadata.active_mask), &batch,
-                   nullptr
+                   base(), locals[worker], scheduler_task_ready_queue(metadata.flags, metadata.active_mask), &batch
                );
     }
     bool fill(uint32_t worker = 1) {
         bool failed = false;
-        scheduler_fill_own_slots(
-            graph.graph(), base(), locals[worker], run(), cursors[worker].data(), nullptr, 4, 0, &failed, nullptr
-        );
+        scheduler_fill_own_slots(graph.graph(), base(), locals[worker], run(), 4, 0, &failed);
         return !failed;
     }
     bool complete(uint32_t worker, uint32_t slot) {
@@ -104,9 +104,7 @@ struct InlineFixture {
             return false;
         local->local_ready_mask &= static_cast<uint8_t>(~(1U << slot));
         local->local_completed_generations[slot] = local->slots[slot].generation;
-        return scheduler_service_cluster_completions(
-            graph.graph(), base(), local, run(), nullptr, nullptr, nullptr, 4, &refilled, nullptr
-        );
+        return scheduler_service_cluster_completions(graph.graph(), base(), local, run(), 4, &refilled);
     }
     void expect_no_dispatch(uint32_t worker) {
         EXPECT_EQ(locals[worker]->local_ready_mask, 0u);
@@ -122,7 +120,6 @@ struct InlineFixture {
     scheduler_test::BasicGraphBuffer<4> graph{3};
     std::array<SchedulerLocalState *, 3> locals{};
     std::array<SchedulerAdmissionLocalState, 3> admissions{};
-    std::array<std::array<uint64_t, SCHEDULER_READY_QUEUE_COUNT>, 3> cursors{};
     uint64_t refilled{0};
 };
 
@@ -164,19 +161,13 @@ TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
     fixture.expect_no_dispatch(1);
 }
 
-TEST(HbgInlineService, BootstrapAndOrdinaryReadyDoNotWriteTheNextKernelTrace) {
-    for (bool bootstrap : {false, true}) {
-        InlineFixture fixture;
-        fixture.trace(2).kernel_start_cycles = 987654;
-        SchedulerReadyBatch batch{};
-        const bool appended =
-            bootstrap ?
-                scheduler_bootstrap_ready_batch_append(fixture.base(), fixture.locals[1], 1, &batch, nullptr, 4) :
-                scheduler_ready_batch_append(fixture.base(), fixture.locals[1], 1, &batch, nullptr, 4);
-        ASSERT_TRUE(appended);
-        EXPECT_EQ(batch.count, 1u);
-        EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 987654u);
-    }
+TEST(HbgInlineService, ReadyAppendDoesNotWriteTheNextKernelTrace) {
+    InlineFixture fixture;
+    fixture.trace(2).kernel_start_cycles = 987654;
+    SchedulerReadyBatch batch{};
+    ASSERT_TRUE(scheduler_ready_batch_append(fixture.base(), fixture.locals[1], 1, &batch));
+    EXPECT_EQ(batch.count, 1u);
+    EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 987654u);
 }
 
 TEST(HbgInlineService, DirectReadyTransitionDoesNotWriteTheNextKernelTrace) {
@@ -187,8 +178,8 @@ TEST(HbgInlineService, DirectReadyTransitionDoesNotWriteTheNextKernelTrace) {
     scheduler_gm_store(fixture.control(0).state, static_cast<int64_t>(SchedulerTaskState::DONE));
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(scheduler_resolve_completion(
-        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, nullptr, nullptr, nullptr, 4, true,
-        &ready, fixture.locals[1]->config.self_core_type
+        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, 4, true, &ready,
+        fixture.locals[1]->config.self_core_type
     ));
     EXPECT_EQ(ready.task_ref, 1);
     EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 987654u);
@@ -277,8 +268,9 @@ TEST(HbgInlineService, AServiceChainIsBoundedByCandidateCreditsAndDoesNotRecurse
 }
 
 TEST(HbgInlineService, HostCompletedServiceDoesNotCompleteAgainOnDevice) {
-    InlineFixture fixture;
-    fixture.storage.metadata[1].flags = 0;
+    InlineFixture fixture(true, false, false, LaneMask(true, true, false), true);
+    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+    EXPECT_EQ(pool.entry_count, 2u);
     scheduler_gm_store(fixture.control(1).state, static_cast<int64_t>(SchedulerTaskState::DONE));
     ASSERT_EQ(fixture.route(1), SchedulerRouteResult::COMPLETED);
     ASSERT_TRUE(fixture.fill());

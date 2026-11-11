@@ -45,11 +45,17 @@ static_assert(offsetof(SchedulerRouteCursor, task_ref) == 0 && offsetof(Schedule
 static_assert(offsetof(SchedulerRouteCursor, next_fanin) == 16 && offsetof(SchedulerRouteCursor, result) == 24);
 static_assert(std::is_standard_layout_v<SchedulerRouteCursor> && std::is_trivially_copyable_v<SchedulerRouteCursor>);
 
-enum class SchedulerReadyPublishPhase : uint32_t { COLLECTING, PREPARED, DIRECTORY, DONE, FAILED };
+enum class SchedulerReadyPublishPhase : uint32_t { COLLECTING, PREPARED, DONE, FAILED };
 enum class SchedulerReadyAppendResult : uint8_t { ADDED, FULL, ERROR };
 enum class SchedulerReadyPublishResult : uint8_t { DONE, YIELD, ERROR };
 inline constexpr uint32_t SCHEDULER_READY_PUBLICATION_CAPACITY = 8;
-inline constexpr uint32_t SCHEDULER_CONTROL_PUBLICATION_QUEUE = SCHEDULER_READY_QUEUE_COUNT;
+enum class SchedulerReadyDestination : uint32_t { AIC, AIV, CONTROL, INVALID = UINT32_MAX };
+
+inline __aicore__ SchedulerReadyDestination scheduler_ready_destination(uint32_t queue_class) {
+    if (queue_class == 0) return SchedulerReadyDestination::AIC;
+    if (queue_class == 1) return SchedulerReadyDestination::AIV;
+    return SchedulerReadyDestination::INVALID;
+}
 
 // The resolver owns this entire record. No part of its continuation belongs
 // to SchedulerLocalState.
@@ -57,7 +63,7 @@ struct SchedulerReadyPublication {
     int64_t refs[SCHEDULER_READY_PUBLICATION_CAPACITY]{};
     uint64_t inbox_offset{0};
     uint32_t count{0};
-    uint32_t type{UINT32_MAX};
+    SchedulerReadyDestination destination{SchedulerReadyDestination::INVALID};
     uint32_t target{0};
     SchedulerReadyPublishPhase phase{SchedulerReadyPublishPhase::COLLECTING};
 };

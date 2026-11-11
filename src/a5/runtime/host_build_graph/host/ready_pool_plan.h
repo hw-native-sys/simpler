@@ -35,18 +35,13 @@ inline bool scheduler_plan_ready_pool(
     SchedulerReadyPoolPlan next{};
     auto &header = next.header;
     header.task_count = metadata.size();
-    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
-        header.queue_begins[type] = header.queue_count;
-        header.group_counts[type] = scheduler_ready_pool_groups(clusters, type);
-        header.queue_count += header.group_counts[type];
-    }
-    next.descriptors.resize(header.queue_count);
+    next.descriptors.resize(SCHEDULER_READY_QUEUE_COUNT);
     for (uint64_t ref = 0; ref < metadata.size(); ++ref) {
         const auto &task = metadata[ref];
         if (!scheduler_task_is_executable(task.flags)) continue;
         const uint32_t type = scheduler_task_ready_queue(task.flags, task.active_mask);
-        const uint32_t group = scheduler_ready_pool_ref_group(ref, header.group_counts[type]);
-        ++next.descriptors[header.queue_begins[type] + group].capacity;
+        if (type >= SCHEDULER_READY_QUEUE_COUNT) return false;
+        ++next.descriptors[type].capacity;
         ++header.entry_count;
     }
     uint64_t cursor = start_offset;
@@ -62,7 +57,8 @@ inline bool scheduler_plan_ready_pool(
         return false;
     for (auto &descriptor : next.descriptors)
         if (!scheduler_layout_reserve(
-                &cursor, descriptor.capacity * sizeof(int64_t), SCHEDULER_STATE_ALIGNMENT, &descriptor.entries_offset
+                &cursor, descriptor.capacity * sizeof(SchedulerTicketEntry), SCHEDULER_STATE_ALIGNMENT,
+                &descriptor.entries_offset
             ))
             return false;
     if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) return false;
@@ -77,7 +73,8 @@ inline void scheduler_init_ready_pool(void *base, const SchedulerReadyPoolPlan &
     auto *descriptors = scheduler_state_at<SchedulerReadyPoolDescriptor>(base, plan.header.descriptors_offset);
     std::copy(plan.descriptors.begin(), plan.descriptors.end(), descriptors);
     for (const auto &descriptor : plan.descriptors) {
-        auto *entries = scheduler_state_at<int64_t>(base, descriptor.entries_offset);
-        std::fill(entries, entries + descriptor.capacity, SCHEDULER_TASK_REF_INVALID);
+        auto *entries = scheduler_state_at<SchedulerTicketEntry>(base, descriptor.entries_offset);
+        for (uint64_t index = 0; index < descriptor.capacity; ++index)
+            entries[index].task_ref = SCHEDULER_TASK_REF_INVALID;
     }
 }

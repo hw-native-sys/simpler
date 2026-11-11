@@ -4,7 +4,7 @@
 SPMD 使用既有 cooperative admission，每个逻辑任务只进入 ready 队列一次。
 
 本文规定 `host_build_graph` 的 Graph task 如何接入 A5 AICore resident scheduler。
-**状态：native Graph 与共享 ready 队列已实现，默认 T/H8；开发基线同时包含 CSA/SWA 的普通调度优化。**
+**状态：native Graph 与两个共享 ready 队列已实现：纯 AIC 和所有 MIX 共用 AIC 队列，纯 AIV 使用 AIV 队列；开发基线同时包含 CSA/SWA 的普通调度优化。**
 双 lane MIX 按资源选择成员，并使用独立的 atomic 领取结束证明；原生 Graph 协议为 v11，普通任务协议为 v10。
 历史测量与证据见[实施记录](../../../tests/docs/a5-hbg-graph-task/README.zh-CN.md)。
 性能页的数据只对应各节标注的被测提交，不代表叠加普通调度优化后的开发基线性能。
@@ -33,6 +33,7 @@ Graph 内合法但 resident 尚不支持的形状在 bind 前整 run 选择 lega
 | [数据布局与 Host 绑定](a5-hbg-graph-task/data-layout.md) | node 编号、wire 类型、地址来源、容量、GM 载体、prepare 重试 |
 | [调度与发布协议](a5-hbg-graph-task/protocol.md) | 控制队列、参数唯一写者、cache 发布、SPMD/MIX、完成与退出 |
 | [全局与分级 ready 队列设计](a5-hbg-graph-task/ready-queue-design.md) | 业界方案、A5 原子争用、候选实现与对比验证 |
+| [两个 ready 队列设计与开发参考](a5-hbg-graph-task/two-ready-queues.md) | 已实现：AIC/MIX 共用一队列、AIV 使用一队列，无分片；发布领取合同、改动位置与验收 |
 | [独立 block 调度待选方案](a5-hbg-graph-task/block-ready-scheduling.md) | 已撤回原型的设计、收益/成本、同步安全与重启条件 |
 | [实施与功能验收](a5-hbg-graph-task/implementation.md) | 改动入口、分阶段自主实施、功能矩阵、DFX |
 | [性能与自主迭代流程](a5-hbg-graph-task/performance.md) | 主线基线、ST 筛选、无 Graph 门禁、现有 A5 Qwen 的验证与优化闭环 |
@@ -150,5 +151,5 @@ bootstrap 并行绑定会增加首 kernel 前的工作量；虽然移出 ready�
 
 首版复用公共 Graph 已预留的 legacy execution tail 作为参数 backing。
 **不写 `ChipTaskStorage` 不等于不预留这段 heap**；实际内存节省必须在后续 allocator 改造后单独证明。
-当前 resident 的 512-byte task control 和按 block/lane 放大的 trace 存储必须纳入预算。
+当前 resident 的 384-byte task control 和按 block/lane 放大的 trace 存储必须纳入预算。
 验收同时报告 Host bind、首任务延迟、设备总时间、尾延迟、初始化/H2D 字节和峰值内存。

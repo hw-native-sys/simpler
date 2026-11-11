@@ -43,7 +43,7 @@ def _trace(*args, **kwargs):
     clock placement and rank merging rather than anything a runtime decides. A test
     whose fixture carries runtime-specific data -- a task id in one layout, or a phase
     only one runtime emits (hbg: graph_prepare, resolve_standalone, and its AICore
-    scheduler's bootstrap / state_probe / worksteal / refill / idle; tmr: release,
+    scheduler's bootstrap / state_probe / refill / idle; tmr: release,
     dummy_task, predicated_skip) -- must name its runtime explicitly instead, so
     the document it builds is one a real run could produce.
 
@@ -2569,7 +2569,7 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
             sched_record(phase="resolve", start=2.0, end=3.0, tasks_processed=1, task_id=23),
             sched_record(phase="state_probe", start=4.0, end=5.0, tasks_processed=1, task_id=5),
             sched_record(phase="dispatch", start=5.0, end=6.0, tasks_processed=1, task_id=5),
-            sched_record(phase="worksteal", start=6.0, end=7.0, tasks_processed=1, task_id=7),
+            sched_record(phase="dispatch", start=6.0, end=7.0, tasks_processed=1, task_id=7),
             sched_record(phase="refill", start=7.0, end=8.0, tasks_processed=1, task_id=9),
         ]
     ]
@@ -2609,7 +2609,7 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
         "Resolve(t23)",
         "StateProbe(t5)",
         "Dispatch(t5)",
-        "Worksteal(t7)",
+        "Dispatch(t7)",
         "Refill(t9)",
     ]
     assert [event["args"]["task_id"] for event in phases] == [23, 23, 5, 5, 7, 9]

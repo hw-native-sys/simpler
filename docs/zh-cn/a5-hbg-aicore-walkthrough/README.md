@@ -1,6 +1,6 @@
 # A5 HBG AICore 调度：按执行顺序走读
 
-本文对应当前 64B 共享布局、GraphView v3、ready pool v8 与 native protocol v10/v11 的 A5 HBG resident 实现。
+本文对应当前采用两个共享业务 ready 队列与 GM MIX 的 A5 HBG resident 实现：GraphView 为 v3，ready pool 为 v11，native graph image 为 v2。
 范围：从 device 已拿到本次运行的 GM 数据开始，覆盖初始化、依赖、取任务、准入、kernel 调用、完成传播和退出。Host 预建的 CSR/remaining 作为输入合同介绍，不展开 Host 构图实现；legacy 只标入口。
 本文的源码链接使用相对于本 Markdown 文件的路径，并通过 `#L行号` 跳转到指定行；链接旁也保留行号供对照。VS Code Markdown 会将 `/` 开头的链接按工作区根目录解析，因此此处不使用磁盘绝对路径。切换版本后，行号应重新核对。
 
@@ -24,17 +24,17 @@
 | 3 | AICPU 多线程 | [handshake_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L99)（第 99 行） | 接受本轮报告，按物理核查寄存器地址 |
 | 4 | AICPU leader | [post_handshake_init](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L154)（第 154 行） | 校验 1 AIC + 2 AIV 拓扑，填写每核 context |
 | 5 | AICPU 多线程 | [publish_context_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L300)（第 300 行） | 先写 context 地址，再发布 GM READY |
-| 6 | 每个 AICore | [aicore_execute 的 READY 接收](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L139)（第 139 行） → [run_resident_scheduler](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L685)（第 685 行） | 重新观察 context，初始化本核私有调度状态 |
+| 6 | 每个 AICore | [aicore_execute 的 READY 接收](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L141)（第 141 行） → [run_resident_scheduler](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L687)（第 687 行） | 重新观察 context，初始化本核私有调度状态 |
 | 7 | 所有 AICore | [bootstrap_ready_graph](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L268)（第 268 行） | 分片扫描图，按 remaining 或兼容 wake-list 路由，发布初始 ready、准备首批 slot |
 | 8 | AICPU leader / 各线程 | [wait_bootstrap_complete](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L338)（第 338 行） → [release_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L385)（第 385 行） | 等 bootstrap 完成，写 DMB=IDLE，开放 kernel 执行 |
-| 9 | 每个 AICore | [run_ready_dispatch_loop](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L403)（第 403 行） | 在本核循环做调度和执行 |
-| 10 | 每个 AICore | [service_cluster_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h#L395)（第 395 行） | 消费上一轮执行完成，完成逻辑 join，唤醒后继 |
-| 11 | 每个 AICore | [fill_own_slots](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L451)（第 451 行） | 领取 ready，必要时走有序准入，再准备自己的 payload |
-| 12 | 每个 AICore | [local_ready_pop 与最终准入](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L514)（第 514 行） | 选最旧 ready slot，确认该次执行现在可进入 |
+| 9 | 每个 AICore | [run_ready_dispatch_loop](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L392)（第 392 行） | 在本核循环做调度和执行 |
+| 10 | 每个 AICore | [service_cluster_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h#L345)（第 345 行） | 消费上一轮执行完成，完成逻辑 join，唤醒后继 |
+| 11 | 每个 AICore | [fill_own_slots](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L439)（第 439 行） | 领取 ready，必要时走有序准入，再准备自己的 payload |
+| 12 | 每个 AICore | [local_ready_pop 与最终准入](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L497)（第 497 行） | 选最旧 ready slot，确认该次执行现在可进入 |
 | 13 | 每个 AICore | [execute_task](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L81)（第 81 行） | 间接调用 `function_bin_addr(args)` |
-| 14 | 每个 AICore | [本地完成发布](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L635)（第 635 行） | seal async，完成可选参数抓取，写本地完成 generation，回到步骤 9 |
-| 15 | AICPU supervisor | [run](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp#L544)（第 544 行） | 等整个图的 resolved 计数满足完成条件 |
-| 16 | 双方 | [AICore 收尾](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L805)（第 805 行） / [AICPU shutdown](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L424)（第 424 行） | EXIT → 清理调度义务 → nonce ACK → 窗口收尾 → GM release → 返回 |
+| 14 | 每个 AICore | [本地完成发布](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L628)（第 628 行） | seal async，完成可选参数抓取，写本地完成 generation，回到步骤 9 |
+| 15 | AICPU supervisor | [run](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp#L617)（第 617 行） | 等整个图的 resolved 计数满足完成条件 |
+| 16 | 双方 | [AICore 收尾](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L827)（第 827 行） / [AICPU shutdown](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L424)（第 424 行） | EXIT → 清理调度义务 → nonce ACK → 窗口收尾 → GM release → 返回 |
 
 步骤 1 与 2 是并行启动，不能理解为 AICPU 先完整执行完所有初始化，AICore 才开始运行。
 
@@ -72,7 +72,7 @@ sequenceDiagram
 `resident_ordinary.cpp`、`resident_native.cpp` 及对应 `_profiled.cpp` 分别实例化普通/native 与采集开/关四种组合。
 入口模板的 `CoreType` 参数区分 AIC 与 AIV 符号，内部实现保持 TU 局部链接；每个实例仍执行同一套协议。
 
-[completion resolver](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h#L30) 是显式 `static noinline` 边界，
+[completion resolver](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h#L28) 是显式 `static noinline` 边界，
 局部参数类型由 `alignof <= 8` 断言约束。函数边界不改变 DONE、依赖推进、预算续行或 ready 发布合同。
 构建方式与 device 调度行为应分别理解，不能仅由外联推断执行耗时下降。
 
@@ -82,7 +82,7 @@ sequenceDiagram
 | ---- | ---- |
 | `worker_index` / 入口 `block_idx` | runtime 的启动编号；用于 workers/context 数组索引 |
 | `physical_core_id` | 硬件核编号；用于寄存器寻址，不保证连续 |
-| `type_rank` | 在同类型核中的紧凑编号；用于 ready inbox 等寻址 |
+| `type_rank` | 在同类型核中的紧凑编号；业务 ready 队列按 AIC/AIV 共享，不按此编号分片 |
 | `cluster_index` | 1 AIC + 2 AIV 所在组的编号 |
 | `cluster_lane / self_lane` | 0=AIC，1=第一个 AIV，2=第二个 AIV |
 | `task_ref` | resident 调度节点索引；不是物理核，也不是公开 TaskId 的完整编码 |
@@ -95,10 +95,12 @@ sequenceDiagram
 
 数据分为三处：GM 中的跨核状态、每个 AICore 私有的本地状态、用于生命周期的 DMB/COND 寄存器。普通 resident 任务的领取和完成不经过 AICPU 的逐任务寄存器投递。
 
+业务 ready 只有两个队列：AIC 队列接收纯 AIC 和所有 MIX 任务，AIV 队列接收纯 AIV 任务。Graph 控制节点使用独立 control inbox。领取 ready 决定任务由谁接手；admission、SPMD block 领取和 MIX mailbox 决定哪些核参与执行。每个参与核都用自己的两个 slot 准备、执行和回收 payload。
+
 ## legacy 只标入口
 
-- [AICPU 入口判断](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp#L819)（第 819 行）：`!aicore_scheduler_runtime_enabled(runtime)` 进入 `legacy_aicpu_execute`。
-- [AICore 入口判断](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L62)（第 62 行）：mode 不是 `RESIDENT_PENDING` 或 `RESIDENT_READY` 时进入 `legacy_aicore_execute`。
+- [AICPU 入口判断](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp#L892)（第 892 行）：`!aicore_scheduler_runtime_enabled(runtime)` 进入 `legacy_aicpu_execute`。
+- [AICore 入口判断](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L64)（第 64 行）：mode 不是 `RESIDENT_PENDING` 或 `RESIDENT_READY` 时进入 `legacy_aicore_execute`。
 - [mode 常量](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_layout.h#L18)（第 18 行）：resident 为 1/2，明确 legacy 为 3/4。0 表示未发布选择。
 - 以下只走读 resident 路径。
 

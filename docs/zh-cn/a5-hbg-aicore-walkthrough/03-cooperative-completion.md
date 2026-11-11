@@ -6,16 +6,16 @@
 
 ## 3.1 什么任务需要有序准入
 
-在 [scheduler_task_requires_admission](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L917)（第 917 行） 看条件：
+在 [scheduler_task_requires_admission](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L916)（第 916 行） 看条件：
 任务 executable、非 inline，并满足 logical_block_num>1、MIX、SYNC_START 之一。
 
 若图中此类任务数为 0，`local.admission=nullptr`，走普通路径。
 若非 0，`scheduler_initialize_admission` 挂上本地状态，这一轮图中的普通任务也受准入顺序约束。
 
-[fill_ordered_slots](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L165)（第 165 行） 按下面的顺序推进：
+[fill_ordered_slots](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L170)（第 170 行） 按下面的顺序推进：
 
 1. 尝试发布自己上轮已认领的协作任务。
-2. 在有限候选槽内从本类型/MIX ready 队列发现工作。
+2. 在有限候选槽内从本类型共享 ready 队列发现工作；AIC 队列同时包含纯 AIC 和 MIX。
 3. 普通任务先保留候选；协作任务独占认领，构造 record，再提交全局顺序日志。
 4. 扫描本核尚未处理的 admission 日志。不是成员则跳过，是成员则建立 current obligation。
 5. MIX 推进 GM mailbox；非 MIX SPMD 领取 block 并准备 own slot。
@@ -31,14 +31,14 @@ Host 按 task_ref 顺序分别累计 AIC/AIV 的普通非同步 SPMD block 数�
 MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 compact worker index，不能套用物理核编号或交错编号假设。
 一般拓扑仍经过合法性检查，COMPACT_LAUNCH 只是已验证拓扑的快速构建路径。
 
-[SchedulerAdmissionControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L980)（第 980 行）：
+[SchedulerAdmissionControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L979)（第 979 行）：
 
 **范围与用途：** 存在协作任务时，本轮 GM 中一份共享控制对象。多个核竞争提交锁以发布同一条全局 admission 日志；每个核自己的阅读位置放在 AdmissionLocalState，不放在这里。
 `commit_lock` 串行化日志提交，持锁者只做有界发布；
 `commit_tail` 为已经完整提交的日志长度；
 两者各占独立 64B 行，控制对象总长 128B。
 
-[SchedulerAdmissionRecord](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L961)（第 961 行）：
+[SchedulerAdmissionRecord](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L960)（第 960 行）：
 
 **范围与用途：** 每个协作任务一条有效 GM 记录，header 为 64B，位图跟在独立对齐的 record stride 内，存储按 task_ref 寻址。任务的独占认领者准备并发布它，参与该任务的所有 worker 读取同一条记录；提交后不再改写。
 
@@ -55,11 +55,11 @@ MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 
 | `active_mask` | 本任务有效 subtask |
 | `flags` | 任务属性副本 |
 
-提交次序见 [commit_validated_record](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L406)（第 406 行）：
+提交次序见 [commit_validated_record](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L410)（第 410 行）：
 `record.order_key` → 发布 record → `log[tail]=task` → `admission_state=ADMITTED` → `commit_tail=tail+1`。
 读取 tail 的核必须能读到前面完整发布的记录。
 
-[SchedulerAdmissionLocalState](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L144)（第 144 行）：
+[SchedulerAdmissionLocalState](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L121)（第 121 行）：
 
 **范围与用途：** 每个 worker 各一份本地进度，当前图存在协作任务时启用。它表示“我读到哪条 admission、我现在欠哪个任务的参与义务”，因此各核的 scan_cursor/current_task_ref 可以暂时不同；共享顺序仍来自同一条 GM 日志。
 
@@ -89,7 +89,7 @@ MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 
 
 ## 3.2 SPMD 如何领取和完成 block
 
-读 [scheduler_claim_ordered_cursor](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L715)（第 715 行）。
+读 [scheduler_claim_ordered_cursor](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L734)（第 734 行）。
 
 非 SYNC_START 的多 block 任务走 ticket：
 原子增加 `claim_tickets` 得到唯一 ticket，ticket 小于 block_num 才拥有合法 block；
@@ -99,10 +99,10 @@ MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 
 另一分支用 CAS 推进 `next_block`，SYNC_START 成员成功一次后设置 `sync_claimed`，不继续包办多个 block。
 这里的 SYNC_START 资源/领取约束不能直接理解为所有核在同一个时钟周期进入 kernel。
 
-[claim_ordered_block](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L826)（第 826 行） 把 task、block、cooperative 标记放入本核 slot。
+[claim_ordered_block](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L845)（第 845 行） 把 task、block、cooperative 标记放入本核 slot。
 同一逻辑任务可以分多波执行，payload.block_num 始终是总 block 数。
 
-每个 block 返回后，[finish_ordered_block](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L891)（第 891 行） 先释放本地 slot，再原子增加 `completed_blocks`。
+每个 block 返回后，[finish_ordered_block](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h#L910)（第 910 行） 先释放本地 slot，再原子增加 `completed_blocks`。
 只有使其达到 logical_block_num 的最后一个 block，才能进入整个任务的完成处理。
 
 ## 3.3 MIX：一个 cluster 内各核自己准备和执行
@@ -124,7 +124,10 @@ MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 
 即使是纯双 AIV MIX，AIC 仍作为 coordinator 进入 resource_mask；它可能没有业务 kernel。
 当前主线 descriptor 的逻辑 subtask 与物理通信 lane 保持对应。
 
-[SchedulerGroupMailbox](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L1008)（第 1008 行）：
+ready 领取、组协调与 slot 管理是三个不同职责：AIC 从共享队列认领 MIX task 并发布 admission；各 cluster 的 AIC 领取该 task 的 block、协调 mailbox；每个执行成员通过 [scheduler_gm_mix_prepare_lane](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_gm_mix.h#L374) 选择并填写自己的 `local->slots[index]`。
+每个 worker 只有两个 own slot，普通任务与 MIX 共用 generation、payload 和本地完成消费流程。coordinator 汇总成员 release，不替其他成员填写或回收 slot。
+
+[SchedulerGroupMailbox](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L1007)（第 1007 行）：
 
 **范围与用途：** 每个 cluster 一份 GM mailbox，多个 MIX task/block 按 group_seq 先后复用它。descriptor 由该 cluster 的 AIC 发布；每个 lane 的 arrived/released ACK 由该 lane 发布，assigned_seq 由 AIC 发布。不能把它理解成每个 MIX 任务各有一个 mailbox。
 `descriptor` 保存下面的 group 描述；`published_seq` 是其发布标记；
@@ -168,12 +171,12 @@ descriptor 占 128B，published_seq 位于单独的 64B 行；`lanes[3]` 各占 
 
 ## 3.4 kernel 返回怎样变成逻辑任务完成
 
-读 [executor 的返回路径](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L635)（第 635 行）：
+读 [executor 的返回路径](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L628)（第 628 行）：
 校验 generation、seal async，然后写
 `local_completed_generations[slot]=ready_generation`。
 这一步只登记本核执行返回。
 
-下一轮 [scheduler_service_cluster_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h#L395)（第 395 行）：
+下一轮 [scheduler_service_cluster_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h#L345)（第 345 行）：
 
 1. 对每个 own slot 检查完成 generation 非零且尚未消费。
 2. 校验它匹配 slot.task_ref、slot.generation 和 READY 状态。
@@ -186,7 +189,7 @@ generation 的作用不是给 kernel 编号，而是防止同一个 slot 复用�
 
 ## 3.5 完成传播：CSR 计数与 wake-list 共用 resolver
 
-入口 [scheduler_resolve_completion_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h#L30) 是 `static noinline` 函数，普通完成、native 控制节点与 async FINISH 都使用它。
+入口 [scheduler_resolve_completion_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h#L28) 是 `static noinline` 函数，普通完成、native 控制节点与 async FINISH 都使用它。
 外联不改变每片预算和唯一 owner 的规则。
 
 ```text
@@ -202,7 +205,7 @@ DONE    该 producer 的全部后继已经处理或责任已交接
 
 wake-list 路径必须先保存旧 next，因为 route 可能改写 waiter 的 next_waiter。
 计数路径按 immutable CSR 前进，visited_count 同时定位当前行中的边，不重复通知已经消费的边。
-计数从 1→0 的后继同样可以 direct refill；其他后继发布到 kernel/control 队列。
+计数从 1→0 的后继同样可以 direct refill：调用方提供直接交接位置、后继为同核类型的非 MIX kernel 时，resolver 可保留一个 ready claim；实际准备和执行仍受普通/有序派发入口的约束。其他 kernel 按 AIC（含 MIX）/AIV 发布到两个共享队列，控制节点进入 control inbox。
 
 [解析游标](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_resolve_state.h#L31)（第 31 行） 的所有字段：
 
@@ -212,9 +215,11 @@ wake-list 路径必须先保存旧 next，因为 route 可能改写 waiter 的 n
 | ---- | ---------- |
 | `SchedulerRouteCursor` | `task_ref`：正在路由的 waiter；`producer_ref`：待注册前驱；`next_fanin`：当前依赖位置；`fanin_count`：总依赖数；`result`：就绪、等待、已完成、错误或续行 |
 | `SchedulerRouteProgress` | `result`：这次推进结果；`work_units`：消耗的预算单位 |
-| `SchedulerReadyPublication` | `refs[8]`：待发布任务；`inbox_offset`：目标队列定位/准备状态；`count`：数量；`type`：AIC/AIV/MIX/control；`target`：目标队列；`phase`：收集/准备/目录/结束/失败阶段 |
+| `SchedulerReadyPublication` | `refs[8]`：待发布任务；`count`：数量；`destination`：AIC/AIV/CONTROL；`inbox_offset/target`：仅 CONTROL 使用，分别定位 inbox 和 worker，业务队列时均为 0；`phase`：COLLECTING/PREPARED/DONE/FAILED |
 | `SchedulerResolveCursor` | `producer_ref`：正在解析哪个完成任务；`next_waiter`：下一个 CSR 后继或链节点；`waiter_ref`：当前节点；`saved_next`：下一个 CSR 后继或迁移前保存的 next；`route`：依赖检查子游标；`publication`：ready 发布子状态；`phase`：上述 START..DONE 状态；`visited_count`：已消费的 CSR 边/链节点数，亦用于边界检查 |
 | `SchedulerResolveProgress` | `result`：DONE/YIELD/ERROR；`work_units`：本片工作量 |
+
+一个发布批次最多容纳 8 个同 destination 的 ref；AIC 与 MIX 可以共用一个批次。业务队列在一次有界调用内完成预留和原子发布；control inbox 则先准备链，再 CAS 追加，争用时保留 PREPARED 状态续行。续行保存整个 publication，不能只保存下一个后继索引。
 
 解析完成后才增加本地 `pending_completed`。在空闲、收尾，以及 native 的有界批次条件下，
 [flush_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h#L21)（第 21 行） 先屏障，再原子相加到 `run_control.resolved_task_count`。
@@ -223,7 +228,7 @@ wake-list 路径必须先保存旧 next，因为 route 可能改写 waiter 的 n
 
 ## 3.6 图完成与双向退出
 
-[AicpuExecutor::run](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp#L571)（第 571 行） 的 supervisor 使用：
+[AicpuExecutor::run](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp#L644)（第 644 行） 的 supervisor 使用：
 
 ```cpp
 bootstrap_complete &&
@@ -233,7 +238,7 @@ resolved_task_count == expected_task_count - inline_completed_count
 同时检查共享错误和无进展超时。不是等每个 kernel 的 COND 完成 token。
 
 随后各线程 [广播 EXIT](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L424)（第 424 行）。
-AICore 观察 EXIT 后，刷新 pending 完成计数，确保已观察本轮 EXIT，再 [drain ordered obligations](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L371)（第 371 行）。
+AICore 观察 EXIT 后，刷新 pending 完成计数，确保已观察本轮 EXIT，再 [drain ordered obligations](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.h#L359)（第 359 行）。
 正常成功路径要求无未提交候选、无仍占用 slot，并让本核 admission 进度收敛。
 
 退出握手数据为 [AicoreTeardownControl](../../../src/common/task_interface/aicore_teardown.h#L25)（第 25 行）：

@@ -22,6 +22,7 @@
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
 #include "aicpu/aicpu_device_config.h"
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_run_result_aicpu.h"
@@ -31,6 +32,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler/scheduler_ready_pool.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
 
@@ -145,6 +147,99 @@ static bool wait_with_scheduler_timeout(Predicate predicate) {
     return true;
 }
 
+static void log_resident_ready_pool(void *base, const SchedulerWorkerContext &context) {
+    const uint64_t state_bytes = context.scheduler_state_bytes;
+    const auto address = reinterpret_cast<uintptr_t>(base);
+    auto range_valid = [&](uint64_t offset, uint64_t count, uint64_t stride, uint64_t alignment, uint64_t limit) {
+        return offset != 0 && offset % alignment == 0 && offset <= limit && count <= (limit - offset) / stride;
+    };
+    if (base == nullptr || address % alignof(SchedulerGraphSummary) != 0 || state_bytes > UINTPTR_MAX - address ||
+        !range_valid(
+            context.graph_summary_offset, 1, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), state_bytes
+        )) {
+        LOG_ERROR("A5 HBG ready pool snapshot: invalid state or graph summary range");
+        return;
+    }
+    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, context.graph_summary_offset);
+    cache_invalidate_range(summary, sizeof(*summary));
+    rmb();
+    const uint64_t pool_offset = summary->ready_pool_offset;
+    if (!range_valid(
+            pool_offset, 1, sizeof(SchedulerReadyPoolHeader), alignof(SchedulerReadyPoolHeader), state_bytes
+        )) {
+        LOG_ERROR("A5 HBG ready pool snapshot: invalid header offset=%" PRIu64, pool_offset);
+        return;
+    }
+    const auto *shared_pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, pool_offset);
+    cache_invalidate_range(shared_pool, sizeof(*shared_pool));
+    rmb();
+    const auto pool = *shared_pool;
+    const uint64_t limit = pool.storage_end_offset;
+    const uint64_t descriptor_bytes = SCHEDULER_READY_QUEUE_COUNT * sizeof(SchedulerReadyPoolDescriptor);
+    const uint64_t control_bytes = SCHEDULER_READY_QUEUE_COUNT * sizeof(SchedulerTicketQueue);
+    if (pool.version != SCHEDULER_READY_POOL_VERSION || pool.task_count != context.graph_task_count ||
+        pool.entry_count > pool.task_count || limit > state_bytes ||
+        pool.descriptors_offset < pool_offset + sizeof(pool) ||
+        !range_valid(
+            pool.descriptors_offset, SCHEDULER_READY_QUEUE_COUNT, sizeof(SchedulerReadyPoolDescriptor),
+            SCHEDULER_STATE_ALIGNMENT, limit
+        ) ||
+        pool.controls_offset < pool.descriptors_offset + descriptor_bytes ||
+        !range_valid(
+            pool.controls_offset, SCHEDULER_READY_QUEUE_COUNT, sizeof(SchedulerTicketQueue), SCHEDULER_STATE_ALIGNMENT,
+            limit
+        )) {
+        LOG_ERROR("A5 HBG ready pool snapshot: invalid header or queue table");
+        return;
+    }
+    const auto *shared_descriptors = scheduler_state_at<SchedulerReadyPoolDescriptor>(base, pool.descriptors_offset);
+    cache_invalidate_range(shared_descriptors, descriptor_bytes);
+    rmb();
+    SchedulerReadyPoolDescriptor descriptors[SCHEDULER_READY_QUEUE_COUNT]{};
+    uint64_t cursor = pool.controls_offset + control_bytes;
+    uint64_t entries = 0;
+    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue) {
+        descriptors[queue] = shared_descriptors[queue];
+        const auto &descriptor = descriptors[queue];
+        if (descriptor.capacity > pool.task_count - entries || descriptor.entries_offset < cursor ||
+            !range_valid(
+                descriptor.entries_offset, descriptor.capacity, sizeof(SchedulerTicketEntry),
+                alignof(SchedulerTicketEntry), limit
+            )) {
+            LOG_ERROR("A5 HBG ready pool snapshot: invalid queue=%u descriptor", queue);
+            return;
+        }
+        entries += descriptor.capacity;
+        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(SchedulerTicketEntry);
+    }
+    if (entries != pool.entry_count) {
+        LOG_ERROR("A5 HBG ready pool snapshot: inconsistent entry count");
+        return;
+    }
+    const auto *controls = scheduler_state_at<SchedulerTicketQueue>(base, pool.controls_offset);
+    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue) {
+        const auto &descriptor = descriptors[queue];
+        cache_invalidate_range(&controls[queue], sizeof(controls[queue]));
+        rmb();
+        const uint64_t head = controls[queue].head;
+        const uint64_t reserved_tail = controls[queue].reserved_tail;
+        int64_t head_ref = SCHEDULER_TASK_REF_INVALID;
+        if (head < descriptor.capacity) {
+            const auto *entry = scheduler_state_at<SchedulerTicketEntry>(base, descriptor.entries_offset) + head;
+            cache_invalidate_range(entry, sizeof(*entry));
+            rmb();
+            head_ref = entry->task_ref;
+        }
+        // This is a read-only snapshot while publishers and consumers can move.
+        // Invalidation never writes back the queues' atomic-only cache lines.
+        LOG_ERROR(
+            "A5 HBG ready pool: queue=%u head=%" PRIu64 " reserved_tail=%" PRIu64 " capacity=%" PRIu64
+            " head_ref=%" PRId64,
+            queue, head, reserved_tail, descriptor.capacity, head_ref
+        );
+    }
+}
+
 // A stalled run leaves its state still: the tasks that never finished keep the
 // fields that say what they were waiting for. Naming them is what separates a
 // waiter nobody woke from a task that was never routed at all.
@@ -214,29 +309,7 @@ static void log_unfinished_tasks(Runtime *runtime) {
             metadata[task].active_mask.raw(), metadata[task].flags
         );
     }
-    // A task that is neither on a wake list nor in a queue was dropped between
-    // the two; one still queued was never dispatched. The inboxes say which.
-    auto *inboxes = scheduler_state_at<SchedulerReadyInbox>(scheduler_state_base, context->ready_inboxes_offset);
-    for (uint32_t index = 0; index < SCHEDULER_READY_INBOX_CAPACITY; ++index) {
-        const uint64_t packed = inboxes[index].endpoints;
-        // The endpoints pack two int32 task refs, head in the low half.
-        const int32_t head = static_cast<int32_t>(static_cast<uint32_t>(packed));
-        const int32_t tail = static_cast<int32_t>(static_cast<uint32_t>(packed >> 32));
-        if (head < 0 && tail < 0) continue;
-        LOG_ERROR("A5 HBG AICore scheduler: inbox %u not drained: head=%" PRId32 " tail=%" PRId32, index, head, tail);
-    }
-    // The directory is what a thief consults before looking at an inbox, so a
-    // bit set over an empty inbox wastes scans and a bit clear over a full one
-    // hides the work. Either way it belongs next to the endpoints above.
-    auto *directory =
-        scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->ready_directory_offset);
-    for (uint32_t type = 0; type < 3; ++type) {
-        for (uint32_t shard = 0; shard < SCHEDULER_READY_DIRECTORY_SHARD_COUNT; ++shard) {
-            const uint64_t bits = directory->core_types[type][shard].bits;
-            if (bits == 0) continue;
-            LOG_ERROR("A5 HBG AICore scheduler: directory type %u shard %u still flags 0x%" PRIx64, type, shard, bits);
-        }
-    }
+    log_resident_ready_pool(scheduler_state_base, *context);
     // The AICores are still running when this timeout fires, so one pass cannot
     // tell a chain nobody will drain from one being walked at this instant. A
     // second pass over the same tasks names whatever moved in between.
