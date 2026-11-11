@@ -897,3 +897,22 @@ simpler stays framework-free — torch/numpy appear only on the caller's side.
 - `examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/` — host
   staging via `copy_to` + cross-rank `SdmaTget`; the SDMA workspace is
   provisioned by constructing the `Worker` with `enable_sdma=True`.
+
+### HBG resident URMA registration
+
+The A5 HBG resident request adapter uses the executing AIV's dense topology
+rank as its sender identity. Each MIX sibling has its own rank; logical task
+block indices do not select queues. AIC and legacy contexts cannot submit
+through this adapter.
+
+The adapter reserves resident conditions before posting and records each
+actual workspace, queue row and BB/CQE target in the existing writer. A
+partial posting error retains its accepted targets, ends the unused part of
+the reservation and poisons publication. Stale writer or reservation identities
+fail without erasing accepted entries. Run failure handling retains resources
+that may still be referenced by submitted work.
+
+HBG URMA domains remain disabled at the public Worker entry. The resident
+completion observer rejects URMA records until CQ observation and queue-tail
+ownership are implemented; registration alone does not provide a usable
+communication path.

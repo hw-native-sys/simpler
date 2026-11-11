@@ -84,11 +84,13 @@ int main(int argc, char **argv) {
     global.async_run_epoch = 9;
     global.async_group_offset = plan.layout.groups_offset;
     global.async_group_index = 0;
+    global.urma_sender_id = 7;
     auto *args = reinterpret_cast<int64_t *>(payload.args);
     const CompletionToken token{0x10000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
     if (scenario == 0) {
         auto ctx = get_async_ctx(args);
         assert(async_ctx_is_deferred(ctx));
+        assert(ctx.urma_sender_id == (global.async_present == 1 ? 7u : UINT32_MAX));
         assert(register_completion_condition(ctx, token));
         auto second = get_async_ctx(args);
         save_expected_notification_counter(second, reinterpret_cast<void *>(token.addr), 2);
@@ -125,6 +127,7 @@ int main(int argc, char **argv) {
         payload.local_context.async_ctx = LegacyAsyncCtx::make(TaskId::make_global(1), &slab);
         auto ctx = get_async_ctx(args);
         assert(async_ctx_is_deferred(ctx));
+        assert(ctx.urma_sender_id == (global.async_present == 1 ? 7u : UINT32_MAX));
         assert(register_completion_condition(ctx, token));
         assert(slab.count == 1 && slab.entries[0].expected_value == 1);
         assert(data->count == 0 && data->error_code == 0);
@@ -259,6 +262,11 @@ int main(int argc, char **argv) {
             assert(pto2::resident::seal_conditions(writer) == (scenario != 33));
             assert(data->error_code == (scenario == 33 ? SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED : 0));
         }
+    } else if (scenario == 37) {
+        global.urma_sender_id = UINT16_MAX;
+        const auto ctx = get_async_ctx(args);
+        assert(ctx.urma_sender_id == UINT32_MAX);
+        assert(async_ctx_is_deferred(ctx));
     } else return 2;
     return 0;
 }

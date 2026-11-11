@@ -116,7 +116,8 @@ struct GlobalContext {
     uint64_t async_run_epoch;
     uint64_t async_group_offset;
     uint32_t async_group_index;
-    uint32_t async_output_capture_refused;
+    uint16_t async_output_capture_refused;
+    uint16_t urma_sender_id;
 };
 
 struct LegacyAsyncCtx {
@@ -148,6 +149,7 @@ struct LegacyAsyncCtx {
  *
  */
 static_assert(sizeof(GlobalContext) == 48 && sizeof(LegacyAsyncCtx) == 40);
+static_assert(offsetof(GlobalContext, urma_sender_id) == 46);
 static_assert(offsetof(GlobalContext, async_present) == 4 && offsetof(GlobalContext, async_group_index) == 40);
 static_assert(std::is_standard_layout_v<GlobalContext> && std::is_trivially_copyable_v<GlobalContext>);
 static_assert(std::is_standard_layout_v<LegacyAsyncCtx> && std::is_trivially_copyable_v<LegacyAsyncCtx>);

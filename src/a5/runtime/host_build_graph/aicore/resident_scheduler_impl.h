@@ -576,7 +576,10 @@ __aicore__ bool run_ready_dispatch_loop(
                 pto2::resident::AsyncWriter writer{};
                 if (!scheduler_async_begin_execution(
                         context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot,
-                        payload->global_context, writer
+                        payload->global_context, writer,
+                        scheduler_async_urma_sender(
+                            context->config.self_lane, context->config.shared_context->type_rank
+                        )
                     )) {
                     scheduler_record_error(
                         run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,

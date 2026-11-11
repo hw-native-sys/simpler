@@ -35,6 +35,7 @@
 // state is addressed explicitly through the GlobalContext fields.
 struct AsyncCtx : LegacyAsyncCtx {
     uint32_t resident_enabled{0};
+    uint32_t urma_sender_id{UINT32_MAX};
     pto2::resident::AsyncWriter resident{};
 
     static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
@@ -139,6 +140,7 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
         ctx.resident.run_epoch = global->async_run_epoch;
         ctx.resident.group_offset = global->async_group_offset;
         ctx.resident.group_index = global->async_group_index;
+        ctx.urma_sender_id = global->urma_sender_id == UINT16_MAX ? UINT32_MAX : global->urma_sender_id;
         if (ctx.resident_enabled != 1 || global->async_output_capture_refused != 0) {
             pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
             ctx.resident_enabled = UINT32_MAX;

@@ -882,4 +882,26 @@ TEST(HbgAsyncControl, ConcurrentObserversAndBlockReleaseGrantOneFinish) {
     EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::TERMINAL);
 }
 
+TEST(HbgAsyncControl, ResidentSenderFollowsAivIdentityAcrossLogicalBlocks) {
+    AsyncFixture f(1, {async_task(0, 2, LaneMask::all())});
+    for (uint32_t block = 0; block < 2; ++block) {
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            GlobalContext global{};
+            AsyncWriter writer;
+            const uint32_t sender = scheduler_async_urma_sender(lane, lane == 2 ? 7 : 6);
+            ASSERT_TRUE(scheduler_async_begin_execution(&f.workers[lane], 0, block, lane, global, writer, sender));
+            EXPECT_EQ(global.urma_sender_id, lane == 0 ? UINT16_MAX : lane == 1 ? 6u : 7u);
+        }
+    }
+    EXPECT_EQ(scheduler_async_urma_sender(3, 0), UINT32_MAX);
+}
+
+TEST(HbgAsyncControl, UrmaRecordCannotFallThroughToCounterObservation) {
+    const CompletionToken token{0, 0, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE, 0x10000};
+    ASSERT_TRUE(pto2::resident::detail::token_valid(token));
+    const auto result = SchedulerAsyncCompletionObserver{}(token, 1);
+    EXPECT_EQ(result.state, CompletionPollState::FAILED);
+    EXPECT_EQ(result.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+}
+
 }  // namespace

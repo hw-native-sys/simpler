@@ -308,12 +308,18 @@ scheduler_async_has_registered_groups(SchedulerAsyncLocalState *local, int64_t t
     return true;
 }
 
+// The resident topology assigns a dense rank to each AIV independently of task blocks.
+inline __aicore__ uint32_t scheduler_async_urma_sender(uint32_t lane, uint32_t type_rank) {
+    return lane == 1 || lane == 2 ? type_rank : UINT32_MAX;
+}
+
 inline __aicore__ bool scheduler_async_begin_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane, __gm__ GlobalContext &global,
-    pto2::resident::AsyncWriter &writer
+    pto2::resident::AsyncWriter &writer, uint32_t urma_sender_id = UINT32_MAX
 ) {
     using namespace scheduler_async_detail;
     writer = AsyncWriter{};
+    global.urma_sender_id = urma_sender_id < UINT16_MAX ? static_cast<uint16_t>(urma_sender_id) : UINT16_MAX;
     if (local == nullptr) return true;
     global.async_present = 0;
     if (!scheduler_async_map_execution(*local, task_ref, block, lane, writer)) return false;
@@ -424,7 +430,8 @@ namespace {
 
 struct SchedulerAsyncCompletionObserver {
     inline __aicore__ CompletionPollResult operator()(const CompletionToken &token, uint32_t observer_mask) const {
-        if (observer_mask == 0 || (observer_mask & ~3U) != 0 || !pto2::resident::detail::token_valid(token))
+        if (observer_mask == 0 || (observer_mask & ~3U) != 0 || token.engine == COMPLETION_ENGINE_URMA ||
+            !pto2::resident::detail::token_valid(token))
             return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
         if (token.completion_type == COMPLETION_TYPE_CCU) {
             auto *event = reinterpret_cast<__gm__ uint64_t *>(token.addr);

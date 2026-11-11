@@ -94,6 +94,9 @@ inline __aicore__ bool seal_open_conditions(const AsyncWriter &writer, __gm__ As
 // The runtime validates the record format; existing run/communication owners
 // retain its storage until all accepted work has retired.
 inline __aicore__ bool token_valid(const CompletionToken &token) {
+    if (token.engine == COMPLETION_ENGINE_URMA)
+        return token.completion_type == COMPLETION_TYPE_URMA_EVENT_HANDLE && token.backend_cookie != 0 &&
+               token.backend_cookie % sizeof(uint64_t) == 0;
     if (token.addr == 0) return false;
     if (token.engine == COMPLETION_ENGINE_CCU && token.completion_type == COMPLETION_TYPE_CCU)
         return token.addr % alignof(uint64_t) == 0 && token.expected_value == 0 &&

@@ -162,7 +162,9 @@ build_urma_session(uint32_t sender_id, __gm__ uint8_t *workspace, uint32_t peer,
     session.valid = false;
     session.contextGm = workspace;
     session.destRankId = peer;
-    if (workspace == nullptr || sender_id == UINT32_MAX) return false;
+    if (workspace == nullptr || reinterpret_cast<uintptr_t>(workspace) % alignof(UrmaInfo) != 0 ||
+        sender_id == UINT32_MAX)
+        return false;
     auto *info = reinterpret_cast<__gm__ UrmaInfo *>(workspace);
     const uint32_t per_sender = info->jettiesPerCore;
     if (peer >= info->rankCount || per_sender == 0 || per_sender > pto::comm::urma::kUrmaMaxJettiesPerCore)
