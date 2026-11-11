@@ -23,6 +23,57 @@
 #include <string.h>
 #include "common/unified_log.h"
 
+template <bool Prepared>
+static void init_header_fields(
+    SharedMemoryHeader *header, uint64_t sm_size, const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
+    const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const PreparedRunLayout *prepared
+) {
+    // Per-ring flow control (start at 0)
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        header->rings[r].fc.init();
+    }
+
+    header->orchestrator_done.store(0, std::memory_order_relaxed);
+
+    // Per-ring layout info
+    uint64_t offset = CHIP_ALIGN_UP(sizeof(SharedMemoryHeader), CHIP_ALIGN_SIZE);
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        header->rings[r].task_window_size = task_window_sizes[r];
+        header->rings[r].task_window_mask = static_cast<int32_t>(task_window_sizes[r] - 1);
+        header->rings[r].heap_size = heap_sizes[r];
+        if constexpr (Prepared) {
+            header->rings[r].task_descriptors_offset = prepared->rings[r].descriptors;
+        } else {
+            header->rings[r].task_descriptors_offset = offset;
+            offset += CHIP_ALIGN_UP(task_window_sizes[r] * sizeof(TaskDescriptor), CHIP_ALIGN_SIZE);
+            offset += CHIP_ALIGN_UP(task_window_sizes[r] * sizeof(TaskPayload), CHIP_ALIGN_SIZE);
+            offset += CHIP_ALIGN_UP(task_window_sizes[r] * sizeof(ChipTaskSlotState), CHIP_ALIGN_SIZE);
+        }
+    }
+
+    header->total_size = sm_size;
+
+    // Error reporting
+    header->orch_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
+    header->sched_error_bitmap.store(0, std::memory_order_relaxed);
+    header->sched_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
+    header->sched_error_thread.store(-1, std::memory_order_relaxed);
+    header->sched_stall_detail.store(SIMPLER_STALL_DETAIL_NONE, std::memory_order_relaxed);
+    header->sched_stall_completed.store(0, std::memory_order_relaxed);
+    header->sched_stall_total.store(0, std::memory_order_relaxed);
+    header->sched_stall_cnt_running.store(0, std::memory_order_relaxed);
+    header->sched_stall_cnt_ready.store(0, std::memory_order_relaxed);
+    header->sched_stall_cnt_waiting.store(0, std::memory_order_relaxed);
+    header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
+    header->sched_stall_task_id.store(TaskId::invalid(), std::memory_order_relaxed);
+    header->sched_stall_core.store(-1, std::memory_order_relaxed);
+
+    // No per-slot loop: prepare_task resets each slot when it allocates it, and
+    // the scheduler only scans submitted task_ids [last_task_alive,
+    // current_task_index), so unsubmitted slots are never read. Per-boot reset
+    // is just the header fields above; per-slot state is set lazily at submit.
+}
+
 // =============================================================================
 // Size Calculation
 // =============================================================================
@@ -94,6 +145,28 @@ bool SharedMemoryHandle::init_per_ring(
     return true;
 }
 
+bool SharedMemoryHandle::init_prepared(
+    void *sm_base_arg, uint64_t sm_size_arg, const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
+    const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const PreparedRunLayout &prepared
+) {
+    const uint64_t required_sm = prepared.sm_bytes;
+    if (!sm_base_arg || sm_size_arg == 0 || required_sm == 0 || sm_size_arg < required_sm) return false;
+    sm_base = sm_base_arg;
+    sm_size = sm_size_arg;
+    is_owner = false;
+    char *base = static_cast<char *>(sm_base);
+    header = reinterpret_cast<SharedMemoryHeader *>(base);
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+        const auto &off = prepared.rings[r];
+        auto &ring = header->rings[r];
+        ring.task_descriptors = reinterpret_cast<TaskDescriptor *>(base + off.descriptors);
+        ring.task_payloads = reinterpret_cast<TaskPayload *>(base + off.payloads);
+        ring.slot_states = reinterpret_cast<ChipTaskSlotState *>(base + off.slot_states);
+    }
+    init_header_fields<true>(header, sm_size, task_window_sizes, heap_sizes, &prepared);
+    return true;
+}
+
 SharedMemoryHandle *SharedMemoryHandle::create_and_init_default(DeviceArena &arena) {
     const uint64_t buffer_size = calculate_size(CHIP_TASK_WINDOW_SIZE);
     const size_t off_handle = arena.reserve(sizeof(SharedMemoryHandle), alignof(SharedMemoryHandle));
@@ -135,46 +208,7 @@ void SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_si
 void SharedMemoryHandle::init_header_per_ring(
     const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH], const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH]
 ) {
-    // Per-ring flow control (start at 0)
-    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
-        header->rings[r].fc.init();
-    }
-
-    header->orchestrator_done.store(0, std::memory_order_relaxed);
-
-    // Per-ring layout info
-    uint64_t offset = CHIP_ALIGN_UP(sizeof(SharedMemoryHeader), CHIP_ALIGN_SIZE);
-    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
-        header->rings[r].task_window_size = task_window_sizes[r];
-        header->rings[r].task_window_mask = static_cast<int32_t>(task_window_sizes[r] - 1);
-        header->rings[r].heap_size = heap_sizes[r];
-        header->rings[r].task_descriptors_offset = offset;
-        offset += CHIP_ALIGN_UP(task_window_sizes[r] * sizeof(TaskDescriptor), CHIP_ALIGN_SIZE);
-        offset += CHIP_ALIGN_UP(task_window_sizes[r] * sizeof(TaskPayload), CHIP_ALIGN_SIZE);
-        offset += CHIP_ALIGN_UP(task_window_sizes[r] * sizeof(ChipTaskSlotState), CHIP_ALIGN_SIZE);
-    }
-
-    header->total_size = sm_size;
-
-    // Error reporting
-    header->orch_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
-    header->sched_error_bitmap.store(0, std::memory_order_relaxed);
-    header->sched_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
-    header->sched_error_thread.store(-1, std::memory_order_relaxed);
-    header->sched_stall_detail.store(SIMPLER_STALL_DETAIL_NONE, std::memory_order_relaxed);
-    header->sched_stall_completed.store(0, std::memory_order_relaxed);
-    header->sched_stall_total.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_running.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_ready.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_waiting.store(0, std::memory_order_relaxed);
-    header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
-    header->sched_stall_task_id.store(TaskId::invalid(), std::memory_order_relaxed);
-    header->sched_stall_core.store(-1, std::memory_order_relaxed);
-
-    // No per-slot loop: prepare_task resets each slot when it allocates it, and
-    // the scheduler only scans submitted task_ids [last_task_alive,
-    // current_task_index), so unsubmitted slots are never read. Per-boot reset
-    // is just the header fields above; per-slot state is set lazily at submit.
+    init_header_fields<false>(header, sm_size, task_window_sizes, heap_sizes, nullptr);
 }
 
 // =============================================================================

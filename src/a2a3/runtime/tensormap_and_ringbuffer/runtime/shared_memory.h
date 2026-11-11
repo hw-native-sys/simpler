@@ -38,6 +38,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include <stddef.h>
 
 #include "utils/device_arena.h"
@@ -192,6 +194,22 @@ static_assert(SHARED_MEMORY_ERROR_TAIL_BYTES == 112, "SharedMemoryHeader error t
 // Shared Memory Handle
 // =============================================================================
 
+// Host-validated geometry for one immutable runtime image. Offsets are
+// relative to its SM base; backing addresses and sizing remain valid together.
+struct PreparedRingOffsets {
+    uint64_t descriptors;
+    uint64_t payloads;
+    uint64_t slot_states;
+};
+
+struct PreparedRunLayout {
+    PreparedRingOffsets rings[CHIP_MAX_RING_DEPTH];
+    uint64_t sm_bytes;
+    uint64_t heap_bytes;
+};
+static_assert(sizeof(PreparedRunLayout) == 24 * CHIP_MAX_RING_DEPTH + 16);
+static_assert(std::is_trivially_copyable_v<PreparedRunLayout> && std::is_standard_layout_v<PreparedRunLayout>);
+
 /**
  * Handle for shared memory lifecycle management (create/destroy).
  * Runtime components (orchestrator, scheduler) use SharedMemoryHeader* directly.
@@ -226,6 +244,11 @@ struct SharedMemoryHandle {
     bool init_per_ring(
         void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
         const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH]
+    );
+
+    bool init_prepared(
+        void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
+        const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const PreparedRunLayout &prepared
     );
 
     void destroy();
