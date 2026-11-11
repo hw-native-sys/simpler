@@ -69,6 +69,11 @@ inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
 struct alignas(64) PercounterMixSignal {
     volatile int64_t task_id;
     volatile uint32_t armed_generation;  // odd = armed, even = free
+    // Which cluster lanes this rendezvous gathers. It is staged before the
+    // generation turns odd and cleared on every path that frees or abandons
+    // the line, so a mask under an even generation is an arming in flight for
+    // exactly those lanes -- which is what holds one of them back from a
+    // cohort block the holds were read too early to see.
     volatile uint32_t active_mask;
     volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];   // entry i written by cluster lane i
     volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];  // entry i written by cluster lane i
@@ -82,14 +87,11 @@ struct alignas(64) PercounterMixSignal {
     // lane that owes a block of its own needs the sequence to tell which of the
     // two it serves first, so a flag would not carry enough.
     volatile uint32_t cohort_block;
-    // `active_mask` is staged before the generation turns odd and cleared on
-    // every path that frees or abandons the line, so a mask under an even
-    // generation means an arming is in flight for exactly those lanes.
     // Entry `i` carries the sequence plus one of the cohort whose block cluster
     // lane `i` holds and has not finished, and zero while it holds none; lane
-    // `i` is its only writer. It is published before that block can be served
-    // and cleared only after its kernel returns, so a hold an arming reads as
-    // clear names a lane that was not inside a cohort kernel when it was read.
+    // `i` is its only writer. It is published before that block can be served,
+    // and for a block one lane runs alone it is cleared only after that kernel
+    // returns; a MIX cohort's claimer clears it where it arms the line instead.
     // It is what an arming can see of a lane's other commitment, not a lock:
     // the reads are not atomic with the fetch_add that takes a block, so the
     // lane's own service order resolves what they could not exclude.

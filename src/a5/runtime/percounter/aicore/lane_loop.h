@@ -534,10 +534,14 @@ inline __aicore__ void percounter_mix_release(const LaneConfig &cfg) {
  * named in a line armed while it was clear. `percounter_line_precedes_block`
  * decides that case: an ordinary draw is always served before the block, a
  * cohort rendezvous when its cohort is the older. Every lane the line names
- * resolves it the same way, so the line completes and the blocks follow; and
- * because a hold is published before the block can be served and cleared only
- * after its kernel returns, no lane the arming cleared is inside a cohort
- * kernel.
+ * resolves it the same way, so the line completes and the blocks follow.
+ *
+ * A hold is published before its block can be served, and for a single-lane
+ * block it is cleared only after that kernel returns, so a lane the arming read
+ * clear is not inside one. **A MIX cohort block is the exception**: its claimer
+ * clears the hold where it arms the line instead, before the rendezvous runs.
+ * Nothing is stranded by that -- the line it just armed is what refuses this
+ * cluster's next arming -- but the hold alone does not say where that lane is.
  *
  * Taking a block never blocks, and a holder never takes a second.
  */
@@ -645,12 +649,16 @@ inline __aicore__ bool percounter_mix_unseen(const LaneConfig &cfg, const Percou
  * Whether the cluster's line names this lane under a rendezvous that precedes
  * the block this lane holds, and so is served before it.
  *
- * **An ordinary draw always precedes it.** Both arming sites refuse a mask
- * naming a lane whose hold they can see, so a draw this lane is named in was
+ * **An ordinary draw always precedes it.** Its arming site refuses a mask
+ * naming any lane whose hold it can see, so a draw this lane is named in was
  * announced while this lane was clear -- it is the take that followed, not the
  * line that followed the take. Serving the block first would put this lane
  * inside a cohort kernel while every participant of that draw waits, and they
  * cannot release it, since the lane it is missing is this one.
+ *
+ * The other arming site, a MIX cohort's own block, refuses only a holder of a
+ * *strictly older* cohort: a holder of a later one is the lane that line is
+ * waiting to free, and refusing over it is the deadlock the order replaced.
  *
  * **A cohort rendezvous precedes it when its cohort is the older one.**
  * `cohort_block` is the cohort's sequence plus one rather than a flag, so the
