@@ -16,8 +16,9 @@
 
 using namespace launch_entry_args_test;
 TEST_F(LaunchEntryArgs, DescriptorSelectionPreservesTheHandshakeBoundary) {
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, sm_image_bytes), 224U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers), 256U);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, ccu_workspace_addr), 72U);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, sm_image_bytes), 232U);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers), 320U);
 }
 
 // The other runtime's half of the seam: no launch route, and a launch payload

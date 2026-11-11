@@ -180,6 +180,7 @@ int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int e
  * provenance requires.
  */
 int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
+extern "C" int set_run_ccu_workspace_impl(Runtime *, uint64_t) __attribute__((weak));
 __attribute__((weak)) int concurrent_native_prepare_supported_impl(void) { return 0; }
 /**
  * Whether this runtime publishes a device-teardown report.
@@ -2008,6 +2009,12 @@ int simpler_prepare_run(
             // stood down rather than ended.
             if (is_resource_wait(rc)) return park_prepare(state, rc);
             return cleanup_failed_prepare(state, rc);
+        }
+        if (set_run_ccu_workspace_impl != nullptr) {
+            rc = set_run_ccu_workspace_impl(state->runtime.get(), state->descriptor.ccu_workspace_addr);
+            if (rc != 0) return cleanup_failed_prepare(state, rc);
+        } else if (state->descriptor.ccu_workspace_addr != 0) {
+            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INVALID_ARGUMENT);
         }
         // Bind owns the source image. Snapshot it into this run's launch
         // metadata. Launch publishes those pinned bytes before the descriptor

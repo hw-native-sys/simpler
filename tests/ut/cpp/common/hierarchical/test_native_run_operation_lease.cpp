@@ -1184,6 +1184,121 @@ TEST(NativeRunOperationLeaseTest, UnpublishedDomainAbortUsesLocalBackendAndHonor
     EXPECT_EQ(g_destroy_context_calls, 0);
 }
 
+TEST(NativeRunOperationLeaseTest, CcuAbortRetainsOwnersWhenFaultedContextRefusesTheSdkCall) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    g_context_rc = -1;
+    EXPECT_THROW(worker.control_ccu_run(1, 0, 4, 1), std::runtime_error);
+    EXPECT_TRUE(worker.comm_cleanup_unconfirmed_);
+    g_context_rc = 0;
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, ActiveCcuBlocksPoisonedLaneResetWithoutParentAbort) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_control_ccu_run_fn_ = [](void *, uint64_t, uint32_t, uint64_t) {
+        return 0;
+    };
+    ASSERT_EQ(worker.control_ccu_run(1, 2, 1, 3), 0);
+    worker.comm_reclamation_unconfirmed_ = true;
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_TRUE(worker.comm_cleanup_unconfirmed_);
+    ASSERT_NE(worker.runtime_module_, nullptr);
+    EXPECT_FALSE(worker.runtime_module_->unload_allowed_);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, CcuStopProofMustCoverEveryDomainAndGeneration) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_control_ccu_run_fn_ = [](void *, uint64_t, uint32_t, uint64_t) {
+        return 0;
+    };
+    ASSERT_EQ(worker.control_ccu_run(1, 2, 1, 3), 0);
+    ASSERT_EQ(worker.control_ccu_run(1, 4, 1, 3), 0);
+    ASSERT_EQ(worker.control_ccu_run(1, 2, 3, 3), 0);
+    ASSERT_EQ(worker.control_ccu_run(1, 4, 3, 2), 0);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, ConfirmedCcuStopAllowsDeviceFinalizeAndReuse) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_control_ccu_run_fn_ = [](void *, uint64_t, uint32_t, uint64_t) {
+        return 0;
+    };
+    for (uint64_t generation : {3u, 4u}) {
+        ASSERT_EQ(worker.control_ccu_run(1, 2, 1, generation), 0);
+        ASSERT_EQ(worker.control_ccu_run(1, 2, 3, generation), 0);
+    }
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_device_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, CcuLaunchFailureAndPendingStopRetainDeviceOwners) {
+    for (bool launch_fails : {false, true}) {
+        ChipWorker worker;
+        prime(worker);
+        worker.finalize_device_fn_ = stub_finalize_device;
+        worker.comm_control_ccu_run_fn_ = [](void *, uint64_t, uint32_t operation, uint64_t) {
+            return operation == 1 ? COMM_RECLAMATION_UNCONFIRMED : 1;
+        };
+        if (launch_fails) {
+            EXPECT_THROW(worker.control_ccu_run(1, 2, 1, 3), std::runtime_error);
+        } else {
+            worker.comm_control_ccu_run_fn_ = [](void *, uint64_t, uint32_t operation, uint64_t) {
+                return operation == 1 ? 0 : 1;
+            };
+            ASSERT_EQ(worker.control_ccu_run(1, 2, 1, 3), 0);
+            ASSERT_EQ(worker.control_ccu_run(1, 2, 3, 3), 1);
+        }
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        EXPECT_EQ(g_device_finalize_calls, 0);
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, RejectedCcuBeginDoesNotPoisonWorkerCleanup) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_control_ccu_run_fn_ = [](void *, uint64_t, uint32_t, uint64_t) {
+        return -1;
+    };
+    EXPECT_THROW(worker.control_ccu_run(1, 2, 1, 3), std::runtime_error);
+    EXPECT_TRUE(worker.unstopped_ccu_runs_.empty());
+    EXPECT_FALSE(worker.ccu_cleanup_unconfirmed_);
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_device_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, OrdinaryCommCleanupFailureStillDrainsLaunchedNativeRun) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_EQ(g_finalize_calls, 1);
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_EQ(g_device_finalize_calls, 0);
+}
+
 TEST(NativeRunOperationLeaseTest, DomainAllocationFailurePublishesCleanupOwnership) {
     const int results[] = {
         -1,

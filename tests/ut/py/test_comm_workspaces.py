@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from simpler import RdmaConfig, SdmaConfig, UrmaConfig
+from simpler import CcuConfig, RdmaConfig, SdmaConfig, UrmaConfig
 from simpler.buffer import AddressSpace
 from simpler.comm_domain import DomainConfig
 
@@ -23,8 +23,15 @@ from simpler_setup.pto_isa import ensure_pto_isa_root
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_ccu_workspace_mapping_uses_same_configuration_as_name_sequence():
+    named = DomainConfig.capture([0, 1], 4096, [], True, (), ("ccu",))
+    mapped = DomainConfig.capture([0, 1], 4096, [], True, (), {"ccu": CcuConfig()})
+    assert named == mapped
+    assert mapped.workspace_mask() == 8
+
+
 @pytest.mark.parametrize(
-    "engines,mask", [((), 0), ([], 0), (["sdma"], 1), (["urma"], 2), (["urma", "sdma"], 3), (["rdma"], 4)]
+    "engines,mask", [((), 0), ([], 0), (["sdma"], 1), (["urma"], 2), (["urma", "sdma"], 3), (["rdma"], 4), (["ccu"], 8)]
 )
 def test_domain_workspace_selection_is_part_of_configuration(engines, mask):
     config = DomainConfig.capture([0, 1], 4096, [], True, (), engines)
@@ -119,6 +126,8 @@ def host_resource_binary(request, tmp_path_factory):
             f"-I{ROOT}/src/a5/platform/onboard/host",
             f"-I{ROOT}/tests/ut/py/support",
             str(ROOT / "tests/ut/py/support/comm_workspaces_host.cpp"),
+            str(ROOT / "src/common/platform_comm/ccu/ccu_domain_owner.cpp"),
+            str(ROOT / "src/common/platform_comm/ccu/ccu_run_lifecycle.cpp"),
             "-ldl",
             "-lrt",
             "-o",

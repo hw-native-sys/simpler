@@ -289,6 +289,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // to AICore. The highest-index thread additionally performs the one-time
     // host-orch boot (attach SM, latch task count) before it starts dispatching.
     int aicpu_thread_num;
+    uint64_t ccu_workspace_addr;
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose

@@ -636,10 +636,60 @@ The legacy `device_ctx` field remains a raw address for synchronous consumers;
 it does not declare or validate an asynchronous engine requirement. No compiled
 capability query or `enable_urma` initialization switch is needed.
 
-The context is simpler's own 1088-byte host/device ABI. Rank metadata starts
+The context is simpler's own 1104-byte host/device ABI. Rank metadata starts
 at offset zero; there is no legacy workspace pair or PTO-compatible prefix.
 PTO session builders receive the chosen workspace address explicitly and do
 not parse this context.
+
+On A5, `workspace_engines=("ccu",)` obtains the local device window's CCU token
+at allocation and exchanges owner addresses, byte ranges and tokens with domain
+peers. `workspaces[CCU]` points to a `SimplerCcuWorkspace` containing a
+rank-ordered `CommCcuWindow` table and the active run's control-table view. These
+owner addresses differ from the imported AIV peer mappings in `windowsIn`.
+The table and credentials share the window lifetime; allocation does not launch
+CCU work. Host windows and RDMA combinations are not supported for CCU.
+
+The typed `submit_ccu_mission(async_ctx, comm_ctx, ccu_id, call_args)` overload
+accepts positional `CcuCallArg` scalars and window references (rank, byte offset,
+byte size). It validates all references before admitting completion or triggering,
+then expands each window to two words: owner address plus offset, and window token.
+Scalars expand to one word. The native kernel declares the resulting byte size in
+its manifest. Runtime publishes those words to P; the user never supplies W
+tokens. P's launch token remains independent. Native kernels consume the ordered
+words and issue their own CCU instructions. Channel selection remains separate
+from window resolution. A peer-rank argument starts with a domain rank and
+resolves it through the window table to the actual L2 rank. The native binding
+supplies channels to every L3 peer, indexed by that L2 rank.
+
+There are no CCU-specific top-level context fields. Domain creation only allocates communication
+resources. A `ChipCallable` carries its CCU modules alongside its AIV children;
+`Worker.register` saves their definitions. `Worker.register_ccu_callable(handle)`
+explicitly registers the callable with HCOMM before any W allocation, using the
+established L3/L2 communication context. `allocate_domain` with
+`workspace_engines=("ccu",)` prepares W and its token descriptors without selecting,
+registering or launching a callable.
+HCOMM registration belongs to the callable and the full L3/L2 communication
+context, without launching work. Changing a window domain's members or releasing
+its storage does not recreate or destroy that registration;
+every allocation must still explicitly enable CCU. An unenabled domain rejects
+CCU submissions before preparation or launch. SDK and ISA build identities are checked internally. Each L2 execution
+launches CCU; its AICPU initializer consumes local READY before admitting AIV work.
+The runtime adds no cross-rank READY barrier.
+Device submission selects `controls[ccu_id]`, where `ccu_id` is the position in
+the L2 callable's kernel list, without an extra instance table or ID scan.
+The AICPU observes and clears each done Event before releasing
+dependent tasks. Finite programs return normally; completed mission streams are
+required before publishing execution completion. After ordinary tasks and their
+async completions retire, runtime sends an explicit EXIT command to unsubmitted
+kernels; the runtime gate skips their business instructions. Submitted kernels
+are never triggered again during stop. Unconfirmed stop
+closes admission and retains domain resources. Borrowing a retained domain alone
+does not launch CCU. The first version permits one selected CCU domain in each
+orchestration run. Prepare B may overlap run A with separate P
+and descriptors; Event reset, domain-root publication and launch B wait for A's
+ordinary work, asynchronous completions and CCU streams to retire. See
+[the native CCU contract](design/ccu-native-abi.md) for the three-Event interface
+and the explicit domain enablement and registration boundaries.
 
 All runtime libraries, bindings, communication-context producers and compiled
 kernels must come from the same simpler build and be updated together. This

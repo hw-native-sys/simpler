@@ -112,7 +112,7 @@ class DomainConfig:
         return UrmaConfig()
 
     def workspace_mask(self) -> int:
-        return sum(1 << ("sdma", "urma", "rdma").index(name) for name in self.workspace_engines)
+        return sum(1 << ("sdma", "urma", "rdma", "ccu").index(name) for name in self.workspace_engines)
 
     def specs(self) -> list[CommBufferSpec]:
         from .task_interface import CommBufferSpec  # noqa: PLC0415

@@ -19,6 +19,13 @@
 
 #include "comm_hccl.cpp"
 
+namespace simpler::ccu {
+bool query_window_token(uint64_t, uint64_t, uint64_t &) {
+    assert(false && "URMA-only fixture must not query CCU tokens");
+    return false;
+}
+}  // namespace simpler::ccu
+
 namespace {
 std::unordered_map<HcclComm, std::vector<CommMem>> registrations;
 struct SubComm {

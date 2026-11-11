@@ -89,6 +89,13 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_ddr_mapping.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ccu_domain_registration_hcomm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ccu_domain_backend_hcomm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ccu_run_lifecycle_hcomm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_domain_registration.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_domain_owner.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_native_module.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_run_lifecycle.cpp"
 )
 # Add common/aicpu_loader/host sources (LoadAicpuOp)
 list(APPEND HOST_RUNTIME_SOURCES
@@ -120,11 +127,16 @@ list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+include("${CMAKE_CURRENT_SOURCE_DIR}/ccu_event_trigger.cmake")
+add_dependencies(host_runtime ccu_event_trigger)
 include("${SIMPLER_CMAKE_DIR}/aicpu_topology_driver.cmake")
 simpler_configure_aicpu_topology_driver(host_runtime)
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 add_custom_command(TARGET host_runtime POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CCU_EVENT_TRIGGER_ELF}"
+        "$<TARGET_FILE_DIR:host_runtime>/ccu_event_trigger.o"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_cpu_topo_fallback.json"
         "$<TARGET_FILE_DIR:host_runtime>/aicpu_cpu_topo_fallback.json"
@@ -203,6 +215,9 @@ target_include_directories(host_runtime
         ${ASCEND_ARCH_HOME}/pkg_inc/profiling
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include
         ${ASCEND_ARCH_HOME}/asc/include
+        ${ASCEND_ARCH_HOME}/include/hccl
+        ${ASCEND_ARCH_HOME}/include/hcomm/ccu
+        ${ASCEND_ARCH_HOME}/pkg_inc/hcomm/ccu
         ${ASCEND_ARCH_HOME}/include/driver
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
@@ -251,6 +266,7 @@ target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
+        asccomm_ccu
         -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
         c_sec
         nnopbase

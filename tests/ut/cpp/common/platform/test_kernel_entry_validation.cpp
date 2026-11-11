@@ -207,4 +207,40 @@ TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
     );
 }
 
+TEST(KernelEntryValidation, CallableImageValidatesCcuPackageBeforeHashing) {
+    auto valid = make_chip_callable(nullptr, 0, "orch", kBinary, sizeof(kBinary), nullptr, nullptr, 0, "", {{1, 2, 3}});
+    ASSERT_EQ(validate_kernel_callable_image(valid.data(), valid.size()), 0);
+    for (int variant = 0; variant < 6; ++variant) {
+        SCOPED_TRACE(variant);
+        auto image = valid;
+        auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+        switch (variant) {
+        case 0:
+            ++callable->wire_version_;
+            break;
+        case 1:
+            callable->ccu_modules_offset_ = UINT32_MAX;
+            break;
+        case 2:
+            callable->ccu_modules_size_ = UINT32_MAX;
+            break;
+        case 3:
+            callable->ccu_modules_size_ = 0;
+            break;
+        case 4:
+            image[offsetof(ChipCallable, storage_) + callable->ccu_modules_offset_] = 0;
+            break;
+        default:
+            image.pop_back();
+            break;
+        }
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    }
+    auto forged = make_chip_callable(nullptr, 0, "orch", nullptr, 0, nullptr, nullptr, 0, "");
+    auto *callable = reinterpret_cast<ChipCallable *>(forged.data());
+    callable->ccu_modules_offset_ = UINT32_MAX;
+    callable->ccu_modules_size_ = UINT32_MAX;
+    EXPECT_EQ(validate_kernel_callable_image(forged.data(), forged.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
 }  // namespace

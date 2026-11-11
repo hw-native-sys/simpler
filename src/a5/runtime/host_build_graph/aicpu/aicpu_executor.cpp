@@ -39,6 +39,7 @@
 
 #include "common/run_terminal_accumulator.h"
 #include "common/unified_log.h"
+#include "platform_comm/ccu/ccu_ready.h"
 
 // Register-based communication
 #include "aicpu/platform_aicpu_affinity.h"
@@ -382,6 +383,20 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     if (is_leader) {
         LOG_INFO("AicpuExecutor: Initializing");
+        const uint64_t ready_start = get_sys_cnt_aicpu();
+        const int ready_rc = simpler::ccu::wait_local_ready(
+            runtime->dev.ccu_workspace_addr,
+            [ready_start] {
+                return get_sys_cnt_aicpu() - ready_start > PLATFORM_PROF_SYS_CNT_FREQ * uint64_t{10};
+            },
+            [] {
+                SPIN_WAIT_HINT();
+            }
+        );
+        if (ready_rc != 0) {
+            LOG_ERROR("Local CCU READY initialization failed: %d", ready_rc);
+            init_failed_.store(true, std::memory_order_release);
+        }
         args_dump_services_allocated_this_init_ = false;
         if (args_dump_services_ != nullptr) init_failed_.store(true, std::memory_order_release);
         // The 0 → 1 fixup already applied above.
@@ -390,7 +405,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         hs_arrived_.store(0, std::memory_order_relaxed);
         hs_release_arrived_.store(0, std::memory_order_relaxed);
         hs_bootstrap_done_.store(false, std::memory_order_relaxed);
-        if (aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) &&
+            aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
         hs_setup_done_.store(true, std::memory_order_release);

@@ -65,6 +65,7 @@ target_sources(_task_interface PRIVATE
 )
 
 target_include_directories(_task_interface PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/common
     ${CMAKE_SOURCE_DIR}/src/common/task_interface
     ${CMAKE_SOURCE_DIR}/src/common/worker
     ${CMAKE_SOURCE_DIR}/src/common/hierarchical

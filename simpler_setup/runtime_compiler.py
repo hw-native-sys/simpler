@@ -302,7 +302,8 @@ class RuntimeCompiler:
                         consumed when target_platform == 'aicore' (the aicore
                         CMakeLists builds the vector-only warmup ELF as a side
                         product). When None, or when the arch does not build the
-                        warmup ELF at all, nothing is exported.
+                        warmup ELF at all, nothing is exported. On A5 this also
+                        stages ccu_event_trigger.o beside the host runtime.
             cmake_defines: Additional CMake cache definitions for this target.
 
         Returns:
@@ -383,6 +384,8 @@ class RuntimeCompiler:
                 dest = od / binary_name
                 place_binary(binary_path, dest)
                 if target_platform == "host" and self.platform == "a5":
+                    trigger = Path(actual_build_dir) / "ccu_event_trigger.o"
+                    place_binary(trigger, od / trigger.name)
                     topo_fallback = Path(cmake_source_dir) / "aicpu_cpu_topo_fallback.json"
                     place_binary(topo_fallback, od / topo_fallback.name)
                 return dest

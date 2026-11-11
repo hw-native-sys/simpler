@@ -21,6 +21,8 @@
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/completion_token.h"
 #include "host_build_graph/runtime_status.h"
+#include "platform_comm/ccu/ccu_device_submission.h"
+#include "platform_comm/comm_context.h"
 
 #ifndef __aicore__
 #define __aicore__
@@ -197,6 +199,35 @@ inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const Comple
     slot->_pad = 0;
     *ctx.completion_count = idx + 1;
     return true;
+}
+
+inline __aicore__ bool submit_ccu_mission(
+    AsyncCtx &ctx, const __gm__ CommContext *domain, uint32_t ccu_id, const void *parameters, uint64_t parameter_size
+) {
+    const auto *workspace = simpler::ccu::ccu_workspace(domain);
+    const auto *mission = simpler::ccu::ccu_control(workspace, ccu_id);
+    auto register_ccu_completion = [&](uint64_t address, uint64_t mask) __aicore__ {
+        const CompletionToken token{address, 0, COMPLETION_ENGINE_CCU, COMPLETION_TYPE_CCU, mask};
+        if (!register_completion_condition(ctx, token)) return false;
+        pto2::detail::defer_flush(ctx);
+        return true;
+    };
+    const bool submitted = simpler::ccu::submit_mission(mission, parameters, parameter_size, register_ccu_completion);
+    if (!submitted) pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    return submitted;
+}
+
+template <size_t N>
+inline __aicore__ bool submit_ccu_mission(
+    AsyncCtx &ctx, const __gm__ CommContext *domain, uint32_t ccu_id, const simpler::ccu::CcuCallArg (&call_args)[N]
+) {
+    uint64_t words[N * 2]{};
+    uint64_t bytes = 0;
+    if (!simpler::ccu::resolve_call_args(domain, call_args, words, bytes)) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
+    return submit_ccu_mission(ctx, domain, ccu_id, words, bytes);
 }
 
 inline __aicore__ void

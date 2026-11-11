@@ -221,6 +221,41 @@ class TestGetDtypeName:
         assert get_dtype_name(dtype) == expected
 
 
+class TestCcuCallableModules:
+    def test_exact_module_bytes_round_trip_through_callable_image(self):
+        modules = [b"\x7fELF\x00native-a", b"\x00\xffnative-b"]
+        callable_obj = ChipCallable.build(
+            signature=[], func_name="orch", binary=b"orchestration", children=[], ccu_modules=modules
+        )
+
+        assert callable_obj.ccu_module_count == 2
+        assert callable_obj.ccu_modules == modules
+
+        raw = ctypes.string_at(callable_obj.buffer_ptr(), callable_obj.buffer_size())
+        restored = ChipCallable.from_bytes(raw)
+        assert restored.ccu_modules == modules
+        assert ctypes.string_at(restored.buffer_ptr(), restored.buffer_size()) == raw
+
+    def test_from_bytes_rejects_unknown_wire_version(self):
+        callable_obj = ChipCallable.build(signature=[], func_name="orch", binary=b"x", children=[])
+        raw = bytearray(ctypes.string_at(callable_obj.buffer_ptr(), callable_obj.buffer_size()))
+        struct.pack_into("<I", raw, 17556, 2)
+
+        with pytest.raises(ValueError, match="wire version"):
+            ChipCallable.from_bytes(bytes(raw))
+
+    def test_from_bytes_rejects_corrupt_module_range(self):
+        callable_obj = ChipCallable.build(
+            signature=[], func_name="orch", binary=b"x", children=[], ccu_modules=[b"module"]
+        )
+        raw = bytearray(ctypes.string_at(callable_obj.buffer_ptr(), callable_obj.buffer_size()))
+        module_offset = struct.unpack_from("<I", raw, 17560)[0]
+        struct.pack_into("<I", raw, 17560, module_offset + 1)
+
+        with pytest.raises(ValueError, match="CCU module range"):
+            ChipCallable.from_bytes(bytes(raw))
+
+
 # ============================================================================
 # torch_interop (canonical torch-aware helpers) + scalar_to_uint64
 # ============================================================================
@@ -1720,7 +1755,7 @@ class TestChipCallable:
         assert clone.scalar_count == 7
 
     @pytest.mark.parametrize("signature_count", [-1, 257])
-    def test_scalar_count_rejects_corrupt_cached_signature_count(self, signature_count):
+    def test_from_bytes_rejects_corrupt_cached_signature_count(self, signature_count):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN, ArgDirection.SCALAR],
             func_name="test_func",
@@ -1730,9 +1765,8 @@ class TestChipCallable:
         raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
         # The wire signature contains 256 int32 ArgDirection entries before sig_count.
         struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
-        clone = ChipCallable.from_bytes(bytes(raw))
         with pytest.raises(ValueError, match=rf"signature count {signature_count}.*256"):
-            _ = clone.scalar_count
+            ChipCallable.from_bytes(bytes(raw))
 
 
 # ============================================================================

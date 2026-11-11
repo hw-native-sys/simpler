@@ -53,6 +53,7 @@ add_library(hierarchical_objs OBJECT
     ${SIMPLER_SRC}/common/task_interface/assert_compat.cpp
 )
 target_include_directories(hierarchical_objs PUBLIC
+    ${SIMPLER_SRC}/common
     ${HIERARCHICAL_SRC_DIR}
     ${SIMPLER_SRC}/common/log/include
     ${SIMPLER_SRC}/common/platform/include
