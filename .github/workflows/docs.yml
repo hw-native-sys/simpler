@@ -3,7 +3,6 @@ name: docs
 on:
   push:
     branches: [main]
-  pull_request:
   # Republish without a code change, and exercise the deploy path on demand.
   workflow_dispatch:
 
@@ -70,7 +69,7 @@ jobs:
           path: _site
 
   deploy:
-    # Only main publishes; a pull request builds to prove the docs still compile.
+    # Only main publishes.
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-24.04

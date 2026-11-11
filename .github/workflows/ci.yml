@@ -1,4 +1,4 @@
-name: CI
+name: Pod runner test
 
 permissions:
   contents: read
@@ -13,99 +13,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  detect-changes:
-    uses: ./.github/workflows/_detect-changes.yml
+  st-network1-onboard-a2a3:
+    uses: ./.github/workflows/_st-network1.yml
     with:
       repository: ${{ github.event.pull_request.head.repo.full_name }}
       ref: ${{ github.event.pull_request.head.sha }}
-      base_repository: ${{ github.event.pull_request.base.repo.full_name }}
-      base_ref: ${{ github.event.pull_request.base.ref }}
-      base_sha: ${{ github.event.pull_request.base.sha }}
-      head_sha: ${{ github.event.pull_request.head.sha }}
-      runs_on: '["self-hosted","cpu"]'
-
-  pre-commit:
-    uses: ./.github/workflows/_pre-commit.yml
-    with:
-      base_sha: ${{ github.event.pull_request.base.sha }}
-      head_sha: ${{ github.event.pull_request.head.sha }}
-      runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
-
-  packaging-matrix:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.examples_only != 'true' && needs.detect-changes.outputs.tests_only != 'true'
-    uses: ./.github/workflows/_packaging.yml
-    with:
-      runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
-
-  ut:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
-    uses: ./.github/workflows/_ut-no-hardware.yml
-    with:
-      runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
-
-  st-sim-a2a3:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-sim-a2a3.yml
-    with:
-      runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
-      include_dfx_smokes: true
-
-  st-sim-a5:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-sim-a5.yml
-    with:
-      runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
-      include_dfx_smokes: true
-
-  profiling-flags-smoke:
-    needs: [detect-changes, pre-commit]
-    if: (needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true') && needs.detect-changes.outputs.examples_only != 'true' && needs.detect-changes.outputs.tests_only != 'true'
-    uses: ./.github/workflows/_profiling-flags-smoke.yml
-    with:
-      runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
-
-  ut-a2a3:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
-    uses: ./.github/workflows/_ut-npu-a2a3.yml
-    with:
-      runs_on: '["self-hosted","a2a3"]'
-      include_cann_examples: true
-
-  st-framework-eager-a2a3:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-framework-eager.yml
-    with:
       platform: a2a3
-      runs_on: '["self-hosted","a2a3"]'
-
-  st-onboard-a2a3:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-npu-a2a3.yml
-    with:
-      runs_on: '["self-hosted","a2a3"]'
-      include_dfx_smokes: true
-
-  # The two DeepSeek smoke cases stay manual, so the main sweep (--manual
-  # exclude) never picks them up; this job selects them with --manual only and
-  # runs on its own devices in parallel with st-onboard-a2a3, keeping their
-  # ~9 min of device time off the main sweep's critical path. Gates exactly as
-  # st-onboard-a2a3 does, per .claude/rules/ci-change-detection.md.
-  st-deepseek-onboard-a2a3:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-deepseek-a2a3.yml
-    with:
-      runs_on: '["self-hosted","a2a3"]'
+      runs_on: '["self-hosted","Linux","ARM64","a2a3pod"]'

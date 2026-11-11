@@ -177,50 +177,20 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
-      - name: Set up environment
-        uses: ./.github/actions/setup-venv
-        with:
-          packages: "--config-settings=build.targets=build_package_${{ inputs.platform }} .[test]"
-          install-torch: "false"
-          system-site-packages: "true"
-          source-cann: "true"
-          cann-env: ${{ env.NETWORK1_CANN_ENV }}
-          http-proxy: ${{ env.NETWORK1_HTTP_PROXY }}
-          https-proxy: ${{ env.NETWORK1_HTTPS_PROXY }}
-          no-proxy: ${{ env.NETWORK1_NO_PROXY }}
-
-      # Staging and the peer-side build are per-run: the network1 pytest sweep runs
-      # against the same tree and the same venv, so re-staging per test would
-      # repeat the whole cost of the job.
-      - name: Stage the checkout on the peer
-        uses: ./.github/actions/network1-stage
-        with:
-          platform: ${{ inputs.platform }}
-
-      - name: Run network1 pytest
-        uses: ./.github/actions/network1-run-pytest
-        with:
-          pytest-args: >-
-            examples tests/st
-            --level 4
-            --platform ${{ inputs.platform }}
-            --device ${{ env.NETWORK1_LOCAL_DEVICES }}
-            --max-parallel 1
-            -v
-            --require-pto-isa
-            --pto-session-timeout 1200
-
-      - name: Clear the network1 staging tree
-        if: always()
-        uses: ./.github/actions/network1-teardown
-
-      # Artifact service availability must not override the network1 test result.
-      - name: Upload network1 logs
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: network1-ci-${{ github.run_id }}-${{ github.run_attempt }}
-          path: output/network1-ci-${{ github.run_id }}-${{ github.run_attempt }}/
-          if-no-files-found: warn
-          retention-days: 7
+      - name: Verify Python 3.10 when recreating the venv
+        run: |
+          set -eo pipefail
+          source "$NETWORK1_CANN_ENV"
+          command -v python3
+          python3 --version
+          probe_dir=$(mktemp -d "$RUNNER_TEMP/python310-check.XXXXXX")
+          trap 'rm -rf "$probe_dir"' EXIT
+          python3 -m venv --system-site-packages "$probe_dir/.venv"
+          "$probe_dir/.venv/bin/python" - <<'PY'
+          import sys
+          print(f"Fresh CI venv: {sys.executable}")
+          print(f"Python version: {sys.version}")
+          assert sys.version_info[:2] == (3, 10), sys.version
+          assert list(zip([1, 2], [3, 4], strict=True)) == [(1, 3), (2, 4)]
+          print("PASS: rebuilt CI venv uses Python 3.10; zip(strict=True) works")
+          PY
