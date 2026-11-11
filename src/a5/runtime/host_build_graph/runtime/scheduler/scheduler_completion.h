@@ -22,7 +22,7 @@ scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLo
     const uint64_t completed = local->pending_completed;
     if (completed == 0) return;
     scheduler_cache_barrier();
-    scheduler_gm_fetch_add(run_control->resolved_task_count, completed);
+    scheduler_gm_fetch_add_discard(run_control->resolved_task_count, completed);
     local->pending_completed = 0;
 }
 

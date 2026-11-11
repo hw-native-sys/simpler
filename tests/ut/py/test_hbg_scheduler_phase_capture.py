@@ -89,6 +89,18 @@ def _capture(inbox_kinds):
         capture.aicore_sched_phase(phase="complete", task_id=task_id, start=start + 6, end=start + 7)
         capture.aicore_sched_phase(phase="resolve", task_id=task_id, start=start + 8, end=start + 9)
     capture.aicore_sched_phase(phase="idle", start=800, end=801)
+    capture.aicore_sched_phase(
+        phase="scalar_window",
+        start=1,
+        end=802,
+        metrics={
+            "scalar_schema": 2,
+            "scalar_depth": 0,
+            "scalar_calls": 1,
+            "function_min_cycles": 50,
+            "iterations_detailed": True,
+        },
+    )
     return capture.build()
 
 
@@ -99,7 +111,17 @@ def test_smoke_accepts_local_stolen_and_mixed_inbox_launches(validate_capture, i
 
 @pytest.mark.parametrize(
     "corruption",
-    ("missing_launch", "duplicate_launch", "unknown_task", "missing_probe", "overflow", "producer", "timing"),
+    (
+        "missing_launch",
+        "duplicate_launch",
+        "unknown_task",
+        "missing_probe",
+        "overflow",
+        "producer",
+        "timing",
+        "missing_scalar_window",
+        "scalar_schema",
+    ),
 )
 def test_smoke_rejects_incomplete_or_inconsistent_launch_evidence(validate_capture, corruption):
     raw = _capture(("dispatch", "worksteal"))
@@ -121,7 +143,13 @@ def test_smoke_rejects_incomplete_or_inconsistent_launch_evidence(validate_captu
         stream["capture"]["dropped"] = 1
     elif corruption == "producer":
         stream["producer"] = "aicpu"
+    elif corruption == "missing_scalar_window":
+        records[:] = [record for record in records if record["kind"] != "scalar_window"]
+        stream["metrics"] = []
+    elif corruption == "scalar_schema":
+        stream["metrics"][0]["scalar_schema"] = 1
     else:
         launch["start_cycles"] -= 2
-    with pytest.raises(AssertionError):
+    error = ValueError if corruption == "scalar_schema" else AssertionError
+    with pytest.raises(error):
         validate_capture(raw)

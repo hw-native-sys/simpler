@@ -27,6 +27,13 @@ a5_hbg_case(test_hbg_args_dump_rendezvous.cpp)
 
 a5_hbg_case(test_hbg_graph_view.cpp)
 
+a5_hbg_case(test_hbg_scalar_trace.cpp NO_OBJS TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_scalar_trace_header.cpp NO_OBJS TIMEOUT 20
+    DEFINES __CPU_SIM)
+
 a5_hbg_case(test_hbg_async_directory.cpp NO_OBJS TIMEOUT 20)
 a5_hbg_case(test_hbg_async_state.cpp NO_OBJS TIMEOUT 20)
 a5_hbg_case(test_hbg_async_pending.cpp NO_OBJS TIMEOUT 20)

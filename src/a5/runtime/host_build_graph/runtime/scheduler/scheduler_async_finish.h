@@ -98,6 +98,9 @@ inline __aicore__ bool scheduler_service_async_slice(
     if (scheduler_read_error(run) != 0) return false;
     const bool finish = async.finish_first;
     async.finish_first = !finish;
+    SchedulerScalarScope scalar_step(
+        local, finish ? SchedPhaseKind::ScalarAsyncFinish : SchedPhaseKind::ScalarAsyncCheck
+    );
     const bool ok =
         finish ?
             scheduler_async_finish_step(

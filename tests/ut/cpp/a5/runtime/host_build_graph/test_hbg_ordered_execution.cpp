@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <memory>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -234,6 +236,189 @@ struct OrderedFixture {
     std::array<std::array<uint64_t, SCHEDULER_READY_QUEUE_COUNT>, 6> cursors{};
     std::array<SchedulerReadyStats, 6> ready_stats{};
 };
+
+std::vector<SchedulerScalarRecord> scalar_rows(const SchedulerScalarTrace &trace) {
+    std::vector<SchedulerScalarRecord> rows;
+    uint32_t cursor = 0;
+    for (uint32_t i = 0; i < trace.committed; ++i) {
+        SchedulerScalarRecord row{};
+        EXPECT_TRUE(scheduler_decode_scalar_storage(trace.records, trace.storage_slots, cursor, row));
+        rows.push_back(row);
+    }
+    EXPECT_EQ(cursor, trace.storage_slots);
+    return rows;
+}
+
+class HbgOrderedScalarDetail : public ::testing::TestWithParam<bool> {};
+
+TEST_P(HbgOrderedScalarDetail, FillPublishesExecutableWorkAndBalancesNestedRecording) {
+    OrderedFixture fixture({{4, LaneMask::aic()}});
+    ASSERT_TRUE(fixture.enqueue(0, 0));
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = fixture.locals[0]->profiling->scalar;
+    trace.buffer = GetParam() ? buffer.get() : nullptr;
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    ASSERT_TRUE(fixture.fill(0));
+    EXPECT_EQ(trace.depth, 0u);
+    EXPECT_EQ(fixture.control(0)->next_block, 1u);
+    EXPECT_NE(fixture.locals[0]->local_ready_mask, 0u);
+    trace.finish(scheduler_cycles());
+    const auto decoded = scalar_rows(trace);
+    if (!GetParam()) {
+        EXPECT_EQ(trace.committed, 0u);
+        EXPECT_EQ(trace.storage_slots, 0u);
+        return;
+    }
+    ASSERT_EQ(buffer->scalar_dropped, 0u);
+    auto find = [&](const std::string &name) -> const SchedulerScalarRecord * {
+        for (uint32_t i = 0; i < trace.committed; ++i)
+            if (name == sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU)))
+                return &decoded[i];
+        return nullptr;
+    };
+    const auto *fill = find("scalar_fill_slots");
+    const auto *ordered = find("scalar_ordered_fill");
+    ASSERT_NE(fill, nullptr);
+    ASSERT_NE(ordered, nullptr);
+    EXPECT_EQ(ordered->kind >> 16, (fill->kind >> 16) + 1);
+    for (const char *name :
+         {"scalar_ordered_poll", "scalar_admission_claim", "scalar_admission_publish", "scalar_admission_prepare",
+          "scalar_admission_commit", "scalar_admission_refresh", "scalar_ordinary_park", "scalar_block_claim",
+          "scalar_admission_close", "scalar_ready_directory", "scalar_dispatch_metadata", "scalar_dispatch_fill",
+          "scalar_dispatch_publish"}) {
+        const auto *child = find(name);
+        ASSERT_NE(child, nullptr) << name;
+        EXPECT_GT(child->kind >> 16, ordered->kind >> 16) << name;
+        EXPECT_GE(child->start_time, ordered->start_time) << name;
+        EXPECT_LE(child->end_time, ordered->end_time) << name;
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(Recording, HbgOrderedScalarDetail, ::testing::Bool());
+
+TEST(HbgOrderedScalarDetail, EmptyPollStillRecordsItsEarlyReturn) {
+    OrderedFixture fixture({{4, LaneMask::aic()}});
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = fixture.locals[0]->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    bool failed = false;
+    EXPECT_FALSE(scheduler_fill_own_slots(
+        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), fixture.cursors[0].data(),
+        &fixture.ready_stats[0], 0, 0, &failed, fixture.storage.ssbuf_region
+    ));
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(trace.depth, 0u);
+    trace.finish(scheduler_cycles());
+    const auto decoded = scalar_rows(trace);
+    uint32_t polls = 0;
+    for (uint32_t i = 0; i < trace.committed; ++i)
+        if (std::string(sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU))) ==
+            "scalar_ordered_poll")
+            ++polls;
+    EXPECT_EQ(polls, 1u);
+    EXPECT_EQ(buffer->scalar_dropped, 0u);
+}
+
+TEST(HbgOrderedScalarDetail, NonAdmissionFillExposesReadyAndDispatchWork) {
+    OrderedFixture fixture({{1, LaneMask::aic()}});
+    ASSERT_TRUE(fixture.enqueue(0, 0));
+    fixture.locals[0]->admission = nullptr;
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = fixture.locals[0]->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    ASSERT_TRUE(fixture.fill(0));
+    EXPECT_NE(fixture.locals[0]->local_ready_mask, 0u);
+    EXPECT_EQ(trace.depth, 0u);
+    trace.finish(scheduler_cycles());
+    const auto decoded = scalar_rows(trace);
+    std::vector<std::string> names;
+    for (uint32_t i = 0; i < trace.committed; ++i)
+        names.emplace_back(sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU)));
+    for (const char *name :
+         {"scalar_fill_slots", "scalar_ready_directory", "scalar_dispatch_metadata", "scalar_dispatch_fill",
+          "scalar_dispatch_publish"})
+        EXPECT_NE(std::find(names.begin(), names.end(), name), names.end()) << name;
+    EXPECT_EQ(std::find(names.begin(), names.end(), "scalar_ordered_fill"), names.end());
+    EXPECT_EQ(buffer->scalar_dropped, 0u);
+}
+
+TEST(HbgOrderedScalarDetail, ClaimCursorDetailPreservesSealAndFallbackPaths) {
+    for (const auto &[seal, next, valid, used_seal] :
+         {std::tuple<uint64_t, uint64_t, bool, bool>{0, 1, true, false}, {2, 2, true, true}, {2, 1, false, false}}) {
+        SCOPED_TRACE(seal);
+        SCOPED_TRACE(next);
+        OrderedFixture fixture({{2, LaneMask::aic()}});
+        ASSERT_TRUE(fixture.admit(0, 0));
+        ASSERT_TRUE(scheduler_refresh_local_obligation(
+            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &fixture.admissions[0]
+        ));
+        fixture.control(0)->claim_seal = seal;
+        fixture.control(0)->next_block = next;
+        auto buffer = std::make_unique<SchedulerActivityBuffer>();
+        auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+        auto &trace = fixture.locals[0]->profiling->scalar;
+        trace.buffer = buffer.get();
+        trace.records = records.get();
+        trace.window_start = scheduler_cycles();
+        uint64_t cursor = UINT64_MAX;
+        bool observed_seal = false;
+        EXPECT_EQ(
+            scheduler_read_claim_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &cursor, &observed_seal
+            ),
+            valid
+        );
+        if (valid) EXPECT_EQ(cursor, next);
+        EXPECT_EQ(observed_seal, used_seal);
+        EXPECT_EQ(fixture.admissions[0].scan_cursor, 0u);
+        EXPECT_EQ(fixture.control(0)->next_block, next);
+        EXPECT_EQ(trace.depth, 0u);
+        trace.finish(scheduler_cycles());
+        const auto decoded = scalar_rows(trace);
+        std::vector<std::string> names;
+        for (uint32_t i = 0; i < trace.committed; ++i)
+            names.emplace_back(sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU)));
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_probe"), 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_confirm"), seal != 0 ? 1 : 0);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_probe"), seal == 2 ? 1 : 0);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_confirm"), used_seal ? 0 : 1);
+        EXPECT_EQ(buffer->scalar_dropped, 0u);
+    }
+}
+
+TEST(HbgOrderedScalarDetail, PollDetailKeepsTheReadyProbeShortCircuit) {
+    for (bool ready : {false, true}) {
+        OrderedFixture fixture({{2, LaneMask::aic()}});
+        if (ready) ASSERT_TRUE(fixture.enqueue(0, 0));
+        auto buffer = std::make_unique<SchedulerActivityBuffer>();
+        auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+        auto &trace = fixture.locals[0]->profiling->scalar;
+        trace.buffer = buffer.get();
+        trace.records = records.get();
+        trace.window_start = scheduler_cycles();
+        EXPECT_EQ(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0]), ready);
+        EXPECT_EQ(trace.depth, 0u);
+        EXPECT_EQ(fixture.control(0)->next_block, 0u);
+        trace.finish(scheduler_cycles());
+        const auto decoded = scalar_rows(trace);
+        std::vector<std::string> names;
+        for (uint32_t i = 0; i < trace.committed; ++i)
+            names.emplace_back(sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU)));
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_poll_local_state"), 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_poll_ready_queue"), 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_poll_own_inbox"), 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_poll_admission_tail"), ready ? 0 : 1);
+        EXPECT_EQ(buffer->scalar_dropped, 0u);
+    }
+}
 
 class HbgOrderedFirstReady : public ::testing::TestWithParam<LaneMask> {};
 

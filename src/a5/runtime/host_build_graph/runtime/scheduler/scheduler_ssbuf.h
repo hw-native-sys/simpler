@@ -14,7 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "scheduler_types.h"
+#include "scheduler_memory.h"
 
 #if defined(__CCE_AICORE__)
 #define SCHEDULER_SSBUF __ssbuf__
@@ -136,7 +136,7 @@ inline __aicore__ void scheduler_ssbuf_store_relaxed(SCHEDULER_SSBUF volatile ui
 inline __aicore__ uint32_t scheduler_ssbuf_load_acquire(const SCHEDULER_SSBUF volatile uint32_t *token) {
 #if defined(__CCE_AICORE__)
     const uint32_t value = *token;
-    dsb((mem_dsb_t)0);
+    scheduler_cache_barrier();
     return value;
 #else
     return __atomic_load_n(token, __ATOMIC_ACQUIRE);
@@ -145,7 +145,7 @@ inline __aicore__ uint32_t scheduler_ssbuf_load_acquire(const SCHEDULER_SSBUF vo
 
 inline __aicore__ void scheduler_ssbuf_store_release(SCHEDULER_SSBUF volatile uint32_t *token, uint32_t value) {
 #if defined(__CCE_AICORE__)
-    dsb((mem_dsb_t)0);
+    scheduler_cache_barrier();
     *token = value;
 #else
     __atomic_store_n(token, value, __ATOMIC_RELEASE);

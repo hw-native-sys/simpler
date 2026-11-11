@@ -33,6 +33,7 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
     SchedulerReadyStats *ready_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr,
     uint64_t profiling_level = 0, SchedulerCompletionDirect *direct = nullptr, bool validate_done_state = true
 ) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarResolve, producer_ref);
     uint32_t used = 0;
     auto fail = [&](SchedulerErrorSite site = SchedulerErrorSite::UNKNOWN,
                     SchedulerGraphResult error = SchedulerGraphResult::INVALID_ARGUMENTS) __aicore__ {

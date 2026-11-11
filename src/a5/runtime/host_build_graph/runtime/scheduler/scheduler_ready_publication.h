@@ -145,7 +145,9 @@ inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
         if (!empty && (!scheduler_task_ref_valid(graph, head) || !scheduler_task_ref_valid(graph, tail))) return fail();
         const uint64_t next =
             scheduler_ready_endpoints_pack(empty ? publication.refs[0] : head, publication.refs[publication.count - 1]);
-        if (scheduler_gm_compare_exchange(inbox->endpoints, packed, next) != packed) {
+        if (scheduler_scalar_atomic_result(local, [&]() __aicore__ {
+                return scheduler_gm_compare_exchange(inbox->endpoints, packed, next);
+            }) != packed) {
             if (stats != nullptr) ++stats->cas_retry_count;
             return SchedulerReadyPublishResult::YIELD;
         }

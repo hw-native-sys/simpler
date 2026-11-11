@@ -336,6 +336,8 @@ def print_aicore_scheduler_phase_breakdown(data):
     for stream_index, records in enumerate(scheduler_records):
         for record in records:
             kind = record.get("phase", "unknown")
+            if kind.startswith("scalar_"):
+                continue
             totals[kind] += max(0.0, record.get("end_time_us", 0.0) - record.get("start_time_us", 0.0))
             counts[kind] += 1
         if stream_index < len(scheduler_streams):
@@ -358,6 +360,19 @@ def print_aicore_scheduler_phase_breakdown(data):
     for kind in sorted(totals):
         print(f"  {kind:<16} records={counts[kind]:>6} total={totals[kind]:>10.3f} us")
     print(f"  dropped={dropped}")
+    profiles = data.get("scalar_profiles") or []
+    if profiles:
+        exclusive = defaultdict(float)
+        for profile in profiles:
+            if not profile["complete"]:
+                continue
+            scale = 1_000_000 / profile["clock_freq_hz"]
+            for phase, cycles in profile["exclusive_cycles"].items():
+                exclusive[phase] += cycles * scale
+        print("  Detailed Scalar: exclusive time summed over cores, including kernel and residual intervals.")
+        print(f"  Complete worker/runs: {sum(p['complete'] for p in profiles)}/{len(profiles)}")
+        for phase, time_us in sorted(exclusive.items()):
+            print(f"    {phase:<28} {time_us:>12.3f} us")
     print("  Queue-pop and AICPU polling-loop metrics are producer-specific and are omitted.")
     print("=" * 90)
 

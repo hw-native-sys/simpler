@@ -764,12 +764,69 @@ struct SchedulerIdleRecord {
 };
 static_assert(sizeof(SchedulerIdleRecord) == 24, "Scheduler idle record layout changed");
 
+inline constexpr uint32_t SCHEDULER_SCALAR_RECORD_CAPACITY = 262144;
+
+struct SchedulerScalarRecord {
+    uint64_t start_time;
+    uint64_t end_time;
+    int64_t task_ref;
+    uint32_t kind;
+    uint32_t count;
+};
+static_assert(sizeof(SchedulerScalarRecord) == 32);
+
+// Compact rows keep an absolute 64-bit start and a 32-bit duration. Rows with
+// a task, a non-unit count or a long duration use a second slot without loss.
+inline constexpr uint32_t SCHEDULER_SCALAR_STORAGE_EXTENDED = UINT32_C(0x8000);
+struct alignas(16) SchedulerScalarStorageSlot {
+    uint64_t time;
+    uint32_t kind;
+    uint32_t value;
+};
+static_assert(sizeof(SchedulerScalarStorageSlot) == 16);
+
+inline __aicore__ bool scheduler_decode_scalar_storage(
+    const SchedulerScalarStorageSlot *slots, uint32_t size, uint32_t &cursor, SchedulerScalarRecord &record
+) {
+    if (cursor >= size) return false;
+    const auto &head = slots[cursor++];
+    record.start_time = head.time;
+    record.kind = head.kind & ~SCHEDULER_SCALAR_STORAGE_EXTENDED;
+    if ((head.kind & SCHEDULER_SCALAR_STORAGE_EXTENDED) != 0) {
+        if (cursor >= size) return false;
+        const auto &tail = slots[cursor++];
+        record.end_time = tail.time;
+        record.task_ref = static_cast<int64_t>(uint64_t{tail.kind} | (uint64_t{tail.value} << 32));
+        record.count = head.value;
+    } else {
+        if (head.time > UINT64_MAX - head.value) return false;
+        record.end_time = head.time + head.value;
+        record.task_ref = -1;
+        record.count = 1;
+    }
+    return record.end_time >= record.start_time;
+}
+
 struct alignas(64) SchedulerActivityBuffer {
     volatile uint32_t committed;
     volatile uint32_t dropped;
     SchedulerIdleRecord records[SCHEDULER_ACTIVITY_CAPACITY];
+    alignas(64) uint32_t scalar_committed;
+    uint32_t scalar_dropped;
+    uint64_t scalar_write_cycles;
+    uint64_t scalar_poll_loops;
+    uint64_t scalar_records_offset;
+    uint64_t scalar_short_intervals;
+    uint64_t scalar_function_min_cycles;
+    uint32_t scalar_storage_format;
+    uint32_t scalar_storage_slots;
 };
 static_assert(sizeof(SchedulerActivityBuffer) % 64 == 0, "scheduler activity buffer must be cache aligned");
+static_assert(
+    offsetof(SchedulerActivityBuffer, scalar_storage_slots) + sizeof(uint32_t) <=
+        offsetof(SchedulerActivityBuffer, scalar_committed) + 64,
+    "Scalar metadata must fit its existing cache line"
+);
 
 enum class SchedulerDispatchSlotState : uint8_t {
     EMPTY = 0,
@@ -1684,17 +1741,39 @@ inline bool scheduler_plan_layout(
     return true;
 }
 
+// Record payload is a write-only device tail. Only its metadata belongs to the
+// initialized/uploaded prefix, including when async storage precedes this tail.
+inline bool scheduler_plan_scalar_storage(AicoreSchedulerLayout *layout) {
+    if (layout == nullptr) return false;
+    if (layout->activity_buffers_offset == 0) return true;
+    return scheduler_layout_reserve(
+        &layout->total_size,
+        uint64_t{SCHEDULER_WORKER_CAPACITY} * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord),
+        SCHEDULER_STATE_ALIGNMENT, &layout->scalar_records_offset
+    );
+}
+
 inline bool scheduler_init_data_from_layout(
     void *base, const AicoreSchedulerLayout &layout, uint64_t device_base_address, uint64_t initialized_bytes = 0
 ) {
-    if (initialized_bytes == 0) initialized_bytes = layout.total_size;
+    const uint64_t prefix_end = layout.scalar_records_offset == 0 ? layout.total_size : layout.scalar_records_offset;
+    if (initialized_bytes == 0) initialized_bytes = prefix_end;
     if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
         device_base_address == 0 || (device_base_address & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-        layout.total_size > UINT64_MAX - device_base_address || initialized_bytes > layout.total_size ||
-        (layout.async_layout_offset == 0 ? initialized_bytes != layout.total_size :
+        layout.total_size > UINT64_MAX - device_base_address || initialized_bytes > prefix_end ||
+        (layout.async_layout_offset == 0 ? initialized_bytes != prefix_end :
                                            initialized_bytes < layout.async_layout_offset))
         return false;
     __builtin_memset(base, 0, static_cast<size_t>(initialized_bytes));
+    if (layout.scalar_records_offset != 0) {
+        auto *buffers = scheduler_state_at<SchedulerActivityBuffer>(base, layout.activity_buffers_offset);
+        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+            buffers[worker].scalar_storage_format = 1;
+            buffers[worker].scalar_records_offset =
+                layout.scalar_records_offset +
+                worker * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord);
+        }
+    }
     if (layout.protocol_layout_offset != 0) {
         *scheduler_state_at<SchedulerProtocolLayout>(base, layout.protocol_layout_offset) = layout.protocol;
         auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, layout.protocol.workers_offset);

@@ -50,6 +50,8 @@ __aicore__ void dispatch_resident_scheduler(
 }  // namespace
 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
+    // Block-local storage can outlive a launch that never unwound its stack.
+    scheduler_scalar_bind(nullptr);
     // The host's selection and its bootstrap address are on their own line, so
     // observing the handshake line does not observe them. One observe covers the
     // whole struct because it is exactly one 64-byte line.
@@ -83,7 +85,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             handshake, get_physical_core_id(), core_type, static_cast<uint32_t>(block_idx) + 1,
             SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
         );
-        OUT_OF_ORDER_STORE_BARRIER();
+        scheduler_store_barrier();
         handshake->report_epoch = report_epoch;
     } else {
         // Kernel/persistent launch: unchanged. `aicore_done` is itself the
@@ -91,7 +93,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         // is written.
         handshake->physical_core_id = get_physical_core_id();
         handshake->core_type = core_type;
-        OUT_OF_ORDER_STORE_BARRIER();
+        scheduler_store_barrier();
         handshake->aicore_done = block_idx + 1;
     }
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
@@ -152,7 +154,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             SchedulerErrorSite::CONTEXT_READY_TIMEOUT
         );
         wait_for_aicpu_exit_signal();
-        OUT_OF_ORDER_STORE_BARRIER();
+        scheduler_store_barrier();
         acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
         return;
     }
