@@ -496,6 +496,10 @@ inline __aicore__ void percounter_mix_release(const LaneConfig &cfg) {
         if ((mask & (uint32_t{1} << lane)) != 0 && signal->finished[lane] != generation) return;
     }
     scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
+    // After the generation, so no lane reads a free line's mask as this
+    // rendezvous': a free line carries a mask only while an arming is staging
+    // one, which is what holds a block back from its kernel.
+    signal->active_mask = 0;
 }
 
 /**
@@ -645,6 +649,29 @@ inline __aicore__ bool percounter_line_precedes_block(const LaneConfig &cfg, con
 }
 
 /**
+ * Whether an arming is staged on the cluster's line and names this lane.
+ *
+ * **A mask under an even generation is an arming in flight.** Both arming sites
+ * stage the payload before they turn the generation odd, and both clear the
+ * mask on every path that gives up, so a free line carries a mask only between
+ * those two points. The lane named there is one the arming has already decided
+ * to name: its holds were read clear, and a block taken since is invisible to
+ * the store that is about to publish.
+ *
+ * Serving a block under that mask is what the order cannot repair afterwards --
+ * the lane enters a kernel it does not leave until its co-holders arrive, and
+ * the line that names it is published a store later, after the last checkpoint
+ * it will reach. Waiting costs the stores between the staging and the
+ * generation, and the line then decides the order as it does for any other.
+ */
+inline __aicore__ bool percounter_line_staging_for(const LaneConfig &cfg) {
+    if (cfg.mix_order_count == 0) return false;
+    SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
+    if (percounter_mix_armed(scheduler_ssbuf_load_acquire(&signal->armed_generation))) return false;
+    return (signal->active_mask & (uint32_t{1} << cfg.cluster_lane)) != 0;
+}
+
+/**
  * Move the next queued cohort into the open slot, if the slot is free.
  *
  * Only an enqueuer and a releaser call this; a general poll would put the
@@ -744,9 +771,12 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
     signal->cohort_block = static_cast<uint32_t>(sync->my_seq + 1);
     // The holds again, with the payload staged and nothing published, for the
     // reason the ordinary draw re-reads them: nothing is a rendezvous until the
-    // generation turns odd, so returning here retracts the arming whole.
-    if (percounter_cohort_older_held_in(cfg, sync->active_mask & ~(uint32_t{1} << cfg.cluster_lane), sync->my_seq))
+    // generation turns odd, so returning here retracts the arming whole, mask
+    // included.
+    if (percounter_cohort_older_held_in(cfg, sync->active_mask & ~(uint32_t{1} << cfg.cluster_lane), sync->my_seq)) {
+        signal->active_mask = 0;
         return true;
+    }
     scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
     sync->my_block = -1;
     // The armed line now carries this block, and is itself what holds the
@@ -760,13 +790,22 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
  * reports whether a block was run or armed. Checked at every checkpoint, ahead
  * of MIX discovery, and costs one load only while a block is held.
  *
- * **This is the only way a held block enters its kernel, and the cohort order
- * is enforced here rather than in the callers.** A lane holding a block of
- * cohort N that is named in cohort N-1's rendezvous yields: entering N would
- * put this lane inside N's kernel while every participant of N-1 waits, and N
- * cannot complete until they are released, because the lanes it is still
- * missing are among them. The yield is to a strictly smaller sequence of one
- * global counter, so the order it imposes is acyclic.
+ * **This is the only way a held block enters its kernel, and the order a lane
+ * owing two gatherings serves them in is enforced here rather than in the
+ * callers.** Entering the block's kernel puts this lane where no checkpoint
+ * reaches it until its co-holders arrive, so it is the step that cannot be
+ * taken back, and every reason to wait is checked before it.
+ *
+ * A rendezvous this lane is named in goes first, and is acyclic for two
+ * separate reasons. **An ordinary draw** was announced while this lane was
+ * clear -- both arming sites read the holds -- so every lane it names is in the
+ * same position and resolves it the same way; the line completes, and the
+ * blocks follow. **A cohort rendezvous** goes first only when its cohort is the
+ * older, which is a strictly smaller sequence of one global counter.
+ *
+ * **A mask staged on a free line also waits**, for the one case the holds
+ * cannot cover: an arming reads them clear, and a lane takes a block and
+ * reaches here before the store that would have told it so.
  *
  * Returns false on an error, including a cohort that has not filled within the
  * watchdog since this lane took its block.
@@ -778,8 +817,10 @@ inline __aicore__ bool percounter_sync_serve_released(
     PercounterSyncState *sync = &state->sync;
     if (sync->my_block < 0) return true;
     // Ahead of the watchdog: the wait is on a rendezvous that carries its own
-    // budget, and this block's is not what bounds it.
+    // budget, or on the stores that finish one, and neither is what this
+    // block's budget bounds.
     if (percounter_line_precedes_block(cfg, state)) return true;
+    if (percounter_line_staging_for(cfg)) return true;
     // Cohorts are promoted in sequence order, so this one is fully claimed
     // exactly when the counter passes it.
     if (scheduler_gm_query(cfg.sync_queue->released) > sync->my_seq) {
@@ -923,8 +964,12 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
     // The holds again, with the payload staged and nothing published: a lane
     // that took a block since the first read is named here, and the generation
     // is what would tell it so. Returning now retracts the whole arming, since
-    // a payload under an even generation is not a rendezvous.
-    if (percounter_cohort_held_in(cfg, mask)) return;
+    // a payload under an even generation is not a rendezvous -- the mask goes
+    // with it, because a staged mask is what holds a named lane's block back.
+    if (percounter_cohort_held_in(cfg, mask)) {
+        signal->active_mask = 0;
+        return;
+    }
     scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
     claim->task_id = -1;
 }
@@ -1138,17 +1183,14 @@ percounter_mix_discover(const LaneConfig &cfg, PercounterLaneState *state, uint6
  * cohort block first, then the cluster's MIX line. `served` reports whether
  * this lane ran or armed anything.
  *
- * **The block goes first, and a holder is never named in an armed line of its
- * own or a later cohort.** Both arming sites refuse a mask naming a holder of a
- * cohort no older than the line's, so a rendezvous served after the block was
- * armed while this lane was clear, and serving the block first strands nobody.
- * Asking the line first would instead run another task's kernel while a
- * co-holder sits at this cohort's barrier waiting for the block this lane still
- * owes.
+ * **The block goes first by default.** Asking the line first would run another
+ * task's kernel while a co-holder sits at this cohort's barrier waiting for the
+ * block this lane still owes.
  *
- * **An older cohort's rendezvous is the exception, and it is decided one level
- * down**: `percounter_sync_serve_released` yields the block to it, so this order
- * holds for the last claimer's direct service too.
+ * **Which cases are exceptions is decided one level down**, in
+ * `percounter_sync_serve_released`: it is the only way a held block enters its
+ * kernel, so the order holds for the last claimer's direct service too, and
+ * this function needs to know nothing about it.
  */
 inline __aicore__ bool
 percounter_checkpoint_serve(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served) {

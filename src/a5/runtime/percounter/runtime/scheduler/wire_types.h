@@ -82,13 +82,17 @@ struct alignas(64) PercounterMixSignal {
     // lane that owes a block of its own needs the sequence to tell which of the
     // two it serves first, so a flag would not carry enough.
     volatile uint32_t cohort_block;
+    // `active_mask` is staged before the generation turns odd and cleared on
+    // every path that frees or abandons the line, so a mask under an even
+    // generation means an arming is in flight for exactly those lanes.
     // Entry `i` carries the sequence plus one of the cohort whose block cluster
     // lane `i` holds and has not finished, and zero while it holds none; lane
     // `i` is its only writer. It is published before that block can be served
     // and cleared only after its kernel returns, so a hold an arming reads as
-    // clear names a lane that is not inside a cohort kernel. It is what an
-    // arming can see of a lane's other commitment, not a lock: the lane's own
-    // service order resolves the case neither arming could exclude.
+    // clear names a lane that was not inside a cohort kernel when it was read.
+    // It is what an arming can see of a lane's other commitment, not a lock:
+    // the reads are not atomic with the fetch_add that takes a block, so the
+    // lane's own service order resolves what they could not exclude.
     volatile uint32_t cohort_hold[PLATFORM_CORES_PER_BLOCKDIM];
 };
 static_assert(sizeof(PercounterMixSignal) == 64, "the MIX signal owns exactly one cache line");
