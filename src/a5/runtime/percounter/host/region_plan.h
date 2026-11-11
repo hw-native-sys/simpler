@@ -267,6 +267,11 @@ inline TaskPlacement task_placement_from_active_mask(uint8_t active_mask, uint8_
     return TaskPlacement::UNSUPPORTED;
 }
 
+/** The same mask as the lane bits upstream's shape checks take. */
+inline LaneMask lane_mask_from_active_mask(uint8_t active_mask) {
+    return LaneMask((active_mask & 1U) != 0, (active_mask & 2U) != 0, (active_mask & 4U) != 0);
+}
+
 /** One task, as the table builder needs to see it. */
 struct TaskInput {
     // 0 for AIC and 1 for AIV. Ignored when `is_mix` is set: a MIX task occupies

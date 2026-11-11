@@ -255,8 +255,10 @@ inline constexpr uint32_t PERCOUNTER_MIX_TICKET_DONE = 1;
  * nothing can resolve is two cohorts each holding part of the pool -- 32
  * clusters, two cohorts of 24 holding 20 each, neither able to fill. With one
  * claimable at a time there is never more than one partially claimed cohort,
- * and the open one always fills, because the orchestrator refuses any cohort
- * wider than its pool.
+ * and the open one always fills, because no cohort is wider than the pool:
+ * every sync-start task passes `scheduler_resident_worker_demand_checked`
+ * against the bind's worker count, a task-table one in upstream's own walk and
+ * a Graph body one in `build_graph_template`.
  *
  * The second rule holds the open slot for the gather alone rather than the whole
  * execution, so the next cohort is already collecting claims while the previous

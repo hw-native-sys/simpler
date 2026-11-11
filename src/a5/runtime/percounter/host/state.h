@@ -72,8 +72,8 @@ struct GraphInputs {
  * not run. `failed_task_id` is then the GRAPH task that named it.
  */
 inline TemplateResult gather_graph_inputs(
-    const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks, std::vector<TaskInput> *inputs,
-    GraphInputs *out, int64_t *failed_task_id
+    const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks, uint64_t worker_count,
+    std::vector<TaskInput> *inputs, GraphInputs *out, int64_t *failed_task_id
 ) {
     // Read on the first GRAPH task: a graph without one has no staging block.
     GraphImageView view{};
@@ -95,7 +95,7 @@ inline TemplateResult gather_graph_inputs(
         auto found = template_of_definition.find(definition_offset);
         if (found == template_of_definition.end()) {
             HostGraphTemplate tmpl{};
-            const TemplateResult built = read_graph_template(view, definition_offset, &tmpl);
+            const TemplateResult built = read_graph_template(view, definition_offset, worker_count, &tmpl);
             if (built.status != TemplateStatus::OK) {
                 *failed_task_id = task_id;
                 return built;
@@ -144,7 +144,9 @@ inline StateSelection select_percounter_state(
     GraphInputs graph{};
     int64_t graph_failed_task = -1;
     const TemplateResult graph_status =
-        gather_graph_inputs(api, host_sm_handle, total_tasks, &inputs, &graph, &graph_failed_task);
+        gather_graph_inputs(
+            api, host_sm_handle, total_tasks, runtime->get_worker_count(), &inputs, &graph, &graph_failed_task
+        );
     if (graph_status.status == TemplateStatus::MALFORMED) {
         LOG_ERROR(
             "A5 percounter: Graph task id=%" PRId64 ": %s (body task %d)", graph_failed_task, graph_status.reason,
@@ -153,7 +155,14 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
     if (graph_status.status == TemplateStatus::UNSUPPORTED) {
-        log_unsupported(total_tasks, graph_status.reason, graph_failed_task);
+        // Named with its body index, as the MALFORMED case above is: the
+        // reason belongs to one task of the body, and the GRAPH task id alone
+        // does not say which.
+        LOG_ERROR(
+            "A5 percounter: graph of %d tasks: Graph task id=%" PRId64 " has %s (body task %d), which percounter does "
+            "not run",
+            total_tasks, graph_failed_task, graph_status.reason, graph_status.body_index
+        );
         return StateSelection::FAILED;
     }
     std::vector<int32_t> edges;

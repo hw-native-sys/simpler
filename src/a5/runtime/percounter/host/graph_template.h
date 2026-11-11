@@ -30,6 +30,7 @@
 
 #include "graph_image_view.h"
 #include "region_plan.h"
+#include "scheduler/scheduler_graph.h"
 #include "scheduler/wire_types.h"
 
 namespace simpler::percounter {
@@ -70,7 +71,7 @@ struct TemplateResult {
  */
 inline TemplateResult build_graph_template(
     const BodyTaskShape *shapes, int32_t task_count, const int32_t *fanin_offsets, const int32_t *fanin_indices,
-    int32_t edge_count, HostGraphTemplate *out
+    int32_t edge_count, uint64_t worker_count, HostGraphTemplate *out
 ) {
     const auto fail = [](TemplateStatus status, const char *reason, int32_t index) {
         return TemplateResult{status, reason, index};
@@ -117,6 +118,18 @@ inline TemplateResult build_graph_template(
         // sentinel must stay a value no real block index takes.
         if (shape.sync_start && (dummy || shape.block_num < 2 || shape.block_num >= PERCOUNTER_ORDER_BLOCK_IDX_ARM))
             return fail(TemplateStatus::MALFORMED, "a sync-start body task with an impossible block count", i);
+        // A cohort wider than the lanes that can serve it never fills: each of
+        // them takes a block and waits for one nobody is left to take. The
+        // cohort queue's freedom from deadlock rests on no such cohort
+        // existing, so a body task is held to the bound upstream's task-table
+        // walk applies to a top-level one -- the same call, so the two agree by
+        // construction rather than by resemblance.
+        SchedulerMinimumWorkerDemand demand{};
+        if (shape.sync_start && !scheduler_resident_worker_demand_checked(
+                                    lane_mask_from_active_mask(shape.active_mask),
+                                    static_cast<uint32_t>(shape.block_num), true, worker_count, &demand
+                                ))
+            return fail(TemplateStatus::UNSUPPORTED, "a sync-start body task wider than the worker pool", i);
         const int32_t subtasks = dummy ? 1 : __builtin_popcount(shape.active_mask);
         if (dummy ? (shape.block_num != 1 || shape.total_required_subtasks != 0 || shape.has_predicate) :
                     (shape.block_num < 1 || shape.block_num > UINT16_MAX / subtasks ||
@@ -189,7 +202,8 @@ inline TemplateResult build_graph_template(
  * Every read goes through upstream's bounded decoders, so a Definition the
  * device would refuse to localize is refused here too, as MALFORMED.
  */
-inline TemplateResult read_graph_template(const GraphImageView &view, uint32_t image_offset, HostGraphTemplate *out) {
+inline TemplateResult
+read_graph_template(const GraphImageView &view, uint32_t image_offset, uint64_t worker_count, HostGraphTemplate *out) {
     GraphDefinitionValue object{};
     if (!graph_definition_decode_framed(view, image_offset, &object))
         return TemplateResult{TemplateStatus::MALFORMED, "the Definition does not decode", -1};
@@ -223,7 +237,7 @@ inline TemplateResult read_graph_template(const GraphImageView &view, uint32_t i
         return TemplateResult{TemplateStatus::MALFORMED, "the fanin rows do not decode", -1};
     const std::vector<int32_t> indices(wire_indices.begin(), wire_indices.end());
     return build_graph_template(
-        shapes.data(), definition.task_count, rows.data(), indices.data(), definition.edge_count, out
+        shapes.data(), definition.task_count, rows.data(), indices.data(), definition.edge_count, worker_count, out
     );
 }
 
