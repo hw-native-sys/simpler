@@ -15,7 +15,8 @@ Design principles:
 
 A5 hardware validation for ordinary PRs is requested by an admin with `/run-a5`.
 A5 simulation, CPU tests and profiling remain automatic under their existing
-change gates. Daily retains its A5 jobs.
+change gates. Daily retains its A5 jobs. A2/A3 multi-machine Network1 validation
+runs only in Daily, including manually dispatched Daily runs.
 
 ## Full Job Matrix
 
@@ -24,7 +25,7 @@ The complete test-type × hardware-tier matrix across automatic CI, the A5 comme
 | Category | CPU (no hardware) | a2a3 runner | a5 runner |
 | -------- | ----------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily only), `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
 
 ## GitHub Actions Jobs
 
@@ -80,7 +81,6 @@ PullRequest
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
-  ├── st-network1-onboard-a2a3    (a2a3pod pair)          — a2a3_changed && st_affected
   └── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
 
 Admin PR comment /run-a5
@@ -101,12 +101,13 @@ Admin PR comment /run-a5
 | `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA, the active URMA regressions and mixed SDMA/URMA cases, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
-| `st-network1-onboard-a2a3` | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
+| `st-network1-onboard-a2a3` (Daily only) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
 
 ### Multi-machine network1 jobs
 
-`st-network1-onboard-a2a3` is the only job spanning two machines. The runner it
+`st-network1-onboard-a2a3` runs only in `daily.yml`, on its schedule or through
+`workflow_dispatch`, and is the only job spanning two machines. The runner it
 lands on becomes the L4 parent and drives its peer entirely over ssh; the peer
 runs no workflow code at all. Everything that identifies either machine —
 addresses, the device split, ports, the staging root, proxies — comes from a
@@ -174,7 +175,7 @@ re-runs through `workflow_dispatch`. It also runs packaging and no-hardware
 unit tests on macOS. Simulation runs on Ubuntu and macOS for both
 architectures; onboard runs on the A2/A3 and A5 self-hosted pools. The
 same DFX smoke steps used by Per-PR run once in each Daily platform job, and
-the A2/A3 `network1` corpus runs through the existing two-machine workflow. The
+the A2/A3 `network1` corpus runs exclusively in Daily through the existing two-machine workflow. The
 main Per-PR scene-test steps keep the default `--manual exclude`, so moving an
 ordinary case to Daily does not require a second workflow exclusion list.
 The dedicated dep-gen, chip-swimlane, PMU, args-dump, and scope-stats steps
