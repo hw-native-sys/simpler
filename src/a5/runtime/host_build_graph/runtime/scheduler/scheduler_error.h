@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "scheduler_compile.h"
+
 #include "scheduler_graph.h"
 #include "scheduler_memory.h"
 #include "scheduler_types.h"
@@ -38,7 +40,7 @@ inline __aicore__ void scheduler_publish_error(__gm__ SchedulerRunControl *run_c
     scheduler_publish_signal(run_control->scheduler_error, status);
 }
 
-inline __aicore__ void scheduler_record_error(
+SCHEDULER_HEAVY_INLINE __aicore__ void scheduler_record_error(
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph = nullptr, __gm__ const SchedulerWorkerContext *context = nullptr,
     SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN, const SchedulerErrorIdentity *identity = nullptr

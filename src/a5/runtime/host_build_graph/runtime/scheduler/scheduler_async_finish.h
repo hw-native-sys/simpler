@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "scheduler_compile.h"
+
 #include "scheduler_async_control.h"
 #include "scheduler_completion_resolver.h"
 #include "scheduler_protocol_execution.h"
@@ -83,7 +85,7 @@ inline __aicore__ bool scheduler_async_finish_step(
     return true;
 }
 
-inline __aicore__ bool scheduler_service_async_slice(
+SCHEDULER_HEAVY_INLINE __aicore__ bool scheduler_service_async_slice(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool &made_progress, SchedulerWakeStats *wake = nullptr,
     SchedulerReadyStats *ready = nullptr, SchedulerCompletionStats *completion = nullptr
