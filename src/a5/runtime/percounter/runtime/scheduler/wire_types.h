@@ -419,6 +419,9 @@ struct alignas(64) PercounterGraphInvocation {
     uint64_t reserved;
 };
 static_assert(sizeof(PercounterGraphInvocation) == 64, "a graph invocation owns exactly one cache line");
+static_assert(
+    std::is_trivially_copyable_v<PercounterGraphInvocation> && std::is_standard_layout_v<PercounterGraphInvocation>
+);
 
 /**
  * The AICPU threads' shared state while they materialize the invocations.
@@ -448,9 +451,6 @@ static_assert(
  * often.
  */
 inline constexpr int32_t PERCOUNTER_GRAPH_SLICE_TASKS = 16;
-static_assert(
-    std::is_trivially_copyable_v<PercounterGraphInvocation> && std::is_standard_layout_v<PercounterGraphInvocation>
-);
 
 /** Where a task's producers live in the flat fanin-address array. */
 struct PercounterFanin {
