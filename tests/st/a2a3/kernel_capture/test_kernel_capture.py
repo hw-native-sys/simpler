@@ -25,9 +25,12 @@ from pathlib import Path
 
 import pytest
 
+from simpler_setup.kernel_compiler import KernelCompiler
+from simpler_setup.runtime_builder import RuntimeBuilder
+
 _ROOT = Path(__file__).resolve().parents[4]
 _SOURCE = Path(__file__).with_name("native")
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"])]
+pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3", "a5"])]
 
 
 def _run(command, **kwargs):
@@ -36,24 +39,22 @@ def _run(command, **kwargs):
     return result
 
 
-@pytest.fixture(scope="module")
-def capture_probe(tmp_path_factory):
+def build_capture_probe(build: Path, device_platform: str):
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
-    ccec = cann / "bin/ccec"
-    cpu_compiler = cann / "tools/hcc/bin/aarch64-target-linux-gnu-g++"
+    compiler = KernelCompiler(device_platform)
+    assert compiler.ccec is not None and compiler.aarch64 is not None
     host_compiler = shutil.which("c++")
-    for tool in (ccec, cpu_compiler):
-        assert tool.is_file(), f"onboard capture probe requires {tool}"
     assert host_compiler, "onboard capture probe requires a host C++ compiler"
-    dispatcher = _ROOT / "build/lib/a2a3/dispatcher/libsimpler_aicpu_dispatcher.so"
-    assert dispatcher.is_file(), f"build the runtime first: missing {dispatcher}"
-    build = tmp_path_factory.mktemp("kernel-capture")
+    runtime = RuntimeBuilder(device_platform).get_binaries("tensormap_and_ringbuffer", build=False)
+    dispatcher = runtime.dispatcher_path
+    assert dispatcher is not None
+    build.mkdir(parents=True, exist_ok=True)
     cpu = build / "cpu.so"
     core = build / "core.o"
     driver = build / "driver"
     _run(
         [
-            str(cpu_compiler),
+            compiler.aarch64.cxx_path,
             "-std=c++17",
             "-O2",
             "-shared",
@@ -65,42 +66,15 @@ def capture_probe(tmp_path_factory):
             str(cpu),
         ]
     )
-    core_includes = [
-        cann / suffix
-        for suffix in (
-            "asc",
-            "asc/include",
-            "asc/include/basic_api",
-            "asc/impl/basic_api",
-            "include",
-            "include/external",
-            "include/c_api",
-            "include/c_api/internal",
-            "include/ascendc/basic_api",
-            "include/ascendc/impl/basic_api",
-        )
-    ]
+    # RTS registers this probe's named raw entry. Use the platform toolchain's
+    # compile flags and keep the ELF intact for rtRegisterAllKernel.
     _run(
         [
-            str(ccec),
-            "-c",
+            compiler.ccec.cxx_path,
+            *compiler.ccec.get_compile_flags(core_type="aic"),
             "-O2",
-            "-x",
-            "cce",
-            "-std=c++17",
-            "--cce-aicore-only",
-            "--cce-aicore-arch=dav-c220-cube",
-            "-mllvm",
-            "-cce-aicore-stack-size=0x8000",
-            "-mllvm",
-            "-cce-aicore-function-stack-size=0x8000",
-            "-mllvm",
-            "-cce-aicore-record-overflow=false",
-            "-mllvm",
-            "-cce-aicore-addr-transform",
-            "-mllvm",
-            "-cce-aicore-dcci-insert-for-scalar=false",
-            *[f"-I{path}" for path in core_includes if path.is_dir()],
+            f"-I{cann / 'asc'}",
+            *[f"-I{path}" for path in compiler.get_ascend_incore_include_dirs()],
             str(_SOURCE / "core.cpp"),
             "-o",
             str(core),
@@ -111,7 +85,7 @@ def capture_probe(tmp_path_factory):
         for suffix in (
             "src/common",
             "src/common/platform/include",
-            "src/a2a3/platform/include",
+            f"src/{device_platform}/platform/include",
             "src/common/task_interface",
             "src/common/worker",
             "src/common/log/include",
@@ -157,6 +131,11 @@ def capture_probe(tmp_path_factory):
         ]
     )
     return driver, dispatcher, cpu, core, build
+
+
+@pytest.fixture(scope="module")
+def capture_probe(tmp_path_factory, request):
+    return build_capture_probe(tmp_path_factory.mktemp("kernel-capture"), request.config.getoption("--platform"))
 
 
 def test_kernel_context_captures_both_internal_streams(capture_probe, request):

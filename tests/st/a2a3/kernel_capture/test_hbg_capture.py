@@ -28,6 +28,7 @@ from simpler.task_interface import ChipCallable, CoreCallable
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
+from simpler_setup.runtime_builder import RuntimeBuilder
 
 _ROOT = Path(__file__).resolve().parents[4]
 _NATIVE = Path(__file__).with_name("native")
@@ -35,10 +36,15 @@ pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), py
 
 
 def build_probe(
-    build: Path, *, retained_models: bool = False, args_dump: bool = False, runtime_name: str = "host_build_graph"
+    build: Path,
+    *,
+    retained_models: bool = False,
+    args_dump: bool = False,
+    runtime_name: str = "host_build_graph",
+    platform: str = "a2a3",
 ):
     build.mkdir(parents=True, exist_ok=True)
-    compiler = KernelCompiler("a2a3")
+    compiler = KernelCompiler(platform)
     kernel = compiler.compile_incore(
         str(_NATIVE / ("hbg_inout_step.cpp" if retained_models else "hbg_step.cpp")),
         core_type="aiv",
@@ -70,7 +76,9 @@ def build_probe(
 
     (build / "callable.bin").write_bytes(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
-    runtime = _ROOT / "build/lib/a2a3/onboard" / runtime_name
+    runtime = RuntimeBuilder(platform).get_binaries(runtime_name, build=False)
+    runtime_dir = runtime.host_path.parent
+    assert runtime.dispatcher_path is not None
     command = [
         "c++",
         "-std=c++17",
@@ -86,8 +94,8 @@ def build_probe(
         f"-I{cann / 'pkg_inc/runtime'}",
         f"-I{cann / 'pkg_inc/profiling'}",
         f"-I{cann / 'pkg_inc/runtime/runtime'}",
-        f"-L{runtime}",
-        f"-Wl,-rpath,{runtime}",
+        f"-L{runtime_dir}",
+        f"-Wl,-rpath,{runtime_dir}",
         "-lhost_runtime",
         f"-L{cann / 'lib64'}",
         f"-Wl,-rpath,{cann / 'lib64'}",
@@ -103,20 +111,21 @@ def build_probe(
     return [
         str(build / "hbg_driver"),
         str(build / "callable.bin"),
-        str(runtime / "libaicpu_kernel.so"),
-        str(runtime / "aicore_kernel.o"),
-        str(_ROOT / "build/lib/a2a3/dispatcher/libsimpler_aicpu_dispatcher.so"),
+        str(runtime.aicpu_path),
+        str(runtime.aicore_path),
+        str(runtime.dispatcher_path),
     ]
 
 
 @pytest.fixture(scope="module")
-def hbg_capture_probe(tmp_path_factory):
+def hbg_capture_probe(tmp_path_factory, request):
     build = tmp_path_factory.mktemp("hbg-capture")
-    return build, build_probe(build)
+    return build, build_probe(build, platform=request.config.getoption("--platform"))
 
 
+@pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
-    binaries = build_probe(tmp_path, retained_models=True)
+    binaries = build_probe(tmp_path, retained_models=True, platform=request.config.getoption("--platform"))
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend-retained-models"
     logs.mkdir()
@@ -169,7 +178,12 @@ def _run_capture_probe(command, run, env):
 
 @pytest.mark.parametrize(
     "scenario",
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    [
+        *(pytest.param(scenario, marks=pytest.mark.platforms(["a2a3", "a5"])) for scenario in range(12)),
+        # These two injections assert the A2/A3 scheduler and boot failure paths.
+        12,
+        13,
+    ],
     ids=[
         "dependency",
         "early-dispatch",
