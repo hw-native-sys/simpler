@@ -3147,7 +3147,10 @@ NB_MODULE(_task_interface, m) {
         .def_static(
             "build",
             [](std::vector<ArgDirection> signature, std::string func_name, nb::bytes binary,
-               std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name) -> PyChipCallable {
+               std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name,
+               std::vector<nb::bytes> ccu_modules) -> PyChipCallable {
+                if (binary.size() > std::numeric_limits<uint32_t>::max())
+                    throw std::invalid_argument("ChipCallable binary exceeds wire size limit");
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto child_count = static_cast<int32_t>(children.size());
@@ -3159,14 +3162,22 @@ NB_MODULE(_task_interface, m) {
                     child_bufs[i] = std::get<1>(children[i]).buffer_;
                 }
 
+                std::vector<std::vector<uint8_t>> module_bytes;
+                module_bytes.reserve(ccu_modules.size());
+                for (const auto &module : ccu_modules) {
+                    const auto *begin = reinterpret_cast<const uint8_t *>(module.c_str());
+                    module_bytes.emplace_back(begin, begin + module.size());
+                }
+
                 auto buf = make_chip_callable(
                     signature.data(), static_cast<int32_t>(signature.size()), func_name.c_str(), bin_ptr, bin_size,
-                    func_ids.data(), child_bufs.data(), child_count, config_name.c_str()
+                    func_ids.data(), child_bufs.data(), child_count, config_name.c_str(), module_bytes
                 );
+                validate_chip_callable_buffer(buf.data(), buf.size());
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("signature"), nb::arg("func_name"), nb::arg("binary"), nb::arg("children"),
-            nb::arg("config_name") = "",
+            nb::arg("config_name") = "", nb::arg("ccu_modules") = std::vector<nb::bytes>{},
             "Build a ChipCallable from signature, func_name, binary, and list of (func_id, CoreCallable) children."
         )
 
@@ -3184,6 +3195,7 @@ NB_MODULE(_task_interface, m) {
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
                 );
+                validate_chip_callable_buffer(buf.data(), buf.size());
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("raw"),
@@ -3191,6 +3203,25 @@ NB_MODULE(_task_interface, m) {
             "buffer_ptr() points to (size buffer_size()). Inverse of the "
             "serialisation used to ship a ChipCallable across the L4 "
             "cascade IPC channel."
+        )
+
+        .def_prop_ro(
+            "ccu_modules",
+            [](const PyChipCallable &self) {
+                nb::list result;
+                for (const auto &module : self.get().ccu_modules())
+                    result.append(nb::bytes(reinterpret_cast<const char *>(module.data()), module.size()));
+                return result;
+            },
+            "Exact native CCU Host module bytes packaged with this callable."
+        )
+
+        .def_prop_ro(
+            "ccu_module_count",
+            [](const PyChipCallable &self) {
+                return self.get().ccu_modules().size();
+            },
+            "Number of native CCU Host modules packaged with this callable."
         )
 
         .def(
