@@ -24,6 +24,27 @@ from simpler_setup.tools.hbg.native_protocol import (
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 
+@pytest.mark.parametrize(
+    "mask,blocks,source,publication",
+    ((1, 1, 0, 0), (2, 1, 0, 0), (1, 1, 2, 0), (1, 1, 2, 1), (1, 2, 3, 0), (7, 1, 3, 0)),
+    ids=("aic_pool", "aiv_pool", "direct", "direct_refill", "spmd_cooperative", "mix_cooperative"),
+)
+def test_current_ready_sources_preserve_ordinary_and_cooperative_causality(mask, blocks, source, publication):
+    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
+    for execution in raw["executions"]:
+        execution.update(ready_source=source, publication_mode=publication)
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
+@pytest.mark.parametrize("mask,blocks", ((1, 1), (2, 1), (1, 2), (7, 1)))
+def test_current_ready_sources_reject_removed_stolen_source(mask, blocks):
+    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    raw["executions"][0]["ready_source"] = 1
+    with pytest.raises(ValueError, match="invalid source/publication mode"):
+        audit_native_protocol(raw, identities)
+
+
 def _claim_seal_capture(mask, blocks, *, sync=False, sealed=True):
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,) if sync else ()).run()
     return _set_claim_seal_observation(raw, identities, sealed=sealed)

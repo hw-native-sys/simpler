@@ -27,15 +27,12 @@ inline __aicore__ bool background_is_ready(__gm__ void *base, uint32_t count) {
     auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
     const auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, summary->ready_pool_offset);
-    if (pool->version != SCHEDULER_READY_POOL_VERSION || pool->group_counts[1] == 0) return false;
-    for (uint32_t group = 0; group < pool->group_counts[1]; ++group) {
-        const auto queue = scheduler_ready_pool_queue(base, *pool, pool->queue_begins[1] + group);
-        const uint64_t head = scheduler_gm_fetch_add(queue.control->head, UINT64_C(0));
-        if (head >= queue.capacity) continue;
-        const int64_t ref = scheduler_gm_query(queue.entries[head]);
-        if (ref >= 1 && ref <= count && scheduler_gm_fetch_add(queue.control->head, UINT64_C(0)) == head) return true;
-    }
-    return false;
+    if (pool->version != SCHEDULER_READY_POOL_VERSION) return false;
+    const auto queue = scheduler_ready_pool_queue(base, *pool, static_cast<uint32_t>(SchedulerReadyClass::AIV));
+    const uint64_t head = scheduler_gm_fetch_add(queue.control->head, UINT64_C(0));
+    if (head >= queue.capacity) return false;
+    const int64_t ref = scheduler_gm_load(queue.entries[head].task_ref);
+    return ref >= 1 && ref <= count && scheduler_gm_fetch_add(queue.control->head, UINT64_C(0)) == head;
 }
 
 // The consumer is the only task absent from the bootstrap queues. Its ticket
@@ -44,10 +41,10 @@ inline __aicore__ bool consumer_was_published(__gm__ void *base, uint32_t count)
     const auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
     const auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, summary->ready_pool_offset);
-    const uint32_t group = scheduler_ready_pool_ref_group(count + 1, pool->group_counts[1]);
-    const auto queue = scheduler_ready_pool_queue(base, *pool, pool->queue_begins[1] + group);
+    if (pool->version != SCHEDULER_READY_POOL_VERSION) return false;
+    const auto queue = scheduler_ready_pool_queue(base, *pool, static_cast<uint32_t>(SchedulerReadyClass::AIV));
     const uint64_t tail = scheduler_gm_fetch_add(queue.control->reserved_tail, UINT64_C(0));
-    return tail != 0 && tail <= queue.capacity && scheduler_gm_query(queue.entries[tail - 1]) == count + 1;
+    return tail != 0 && tail <= queue.capacity && scheduler_gm_load(queue.entries[tail - 1].task_ref) == count + 1;
 }
 
 inline __aicore__ bool wait_was_checked(__gm__ void *base) {

@@ -398,7 +398,6 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
         slot.cooperative = true;
         slot.gm_mix = true;
         slot.subtask_slot = group.subtask_slot;
-        slot.mix_tracker = UINT8_MAX;
         slot.candidate_index = UINT8_MAX;
         slot.state = SchedulerDispatchSlotState::FILLING;
         SchedulerReadyClaim ready{};
@@ -408,14 +407,13 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
         const auto metadata = scheduler_load_dispatch_metadata(base, local, ready.task_ref, profiling_level);
         uint64_t prepare_start = 0;
         if (!scheduler_prepare_dispatch_slot(
-                graph, base, local, run, claim, ready, metadata, profiling_level, nullptr, group.subtask_slot,
-                &prepare_start
+                graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot, &prepare_start
             ))
             return scheduler_admission_fail(
                 graph, local, run, ready.task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
             );
         scheduler_publish_dispatch_slot(
-            base, local, claim, ready, metadata, profiling_level, nullptr, group.subtask_slot, prepare_start
+            base, local, claim, ready, metadata, profiling_level, group.subtask_slot, prepare_start
         );
         group.slot_index = static_cast<uint8_t>(index);
         group.slot_generation = slot.generation;

@@ -55,16 +55,6 @@ TEST(HbgPayloadContext, InitializesEveryOrdinarySlot) {
     );
 }
 
-TEST(HbgPayloadContext, InitializesEveryIndependentMixSlot) {
-    AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 1, &layout));
-    scheduler_test::SchedulerStateBuffer storage(layout);
-    check_payload_range(
-        storage.base(), reinterpret_cast<uint64_t>(storage.base()), layout.mix_payloads_offset,
-        SCHEDULER_MIX_SLOT_CAPACITY
-    );
-}
-
 TEST(HbgPayloadContext, BindsDeviceAddressesInsteadOfHostMirrorAddresses) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(1, 1, 1, &layout));
@@ -76,7 +66,6 @@ TEST(HbgPayloadContext, BindsDeviceAddressesInsteadOfHostMirrorAddresses) {
         storage.base(), device_base, layout.dispatch_payloads_offset,
         SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT
     );
-    check_payload_range(storage.base(), device_base, layout.mix_payloads_offset, SCHEDULER_MIX_SLOT_CAPACITY);
 }
 
 TEST(HbgPayloadContext, RebindClearsDirtyPayloadsAndOldDeviceAddresses) {
@@ -91,14 +80,13 @@ TEST(HbgPayloadContext, RebindClearsDirtyPayloadsAndOldDeviceAddresses) {
         storage.base(), device_base, layout.dispatch_payloads_offset,
         SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT
     );
-    check_payload_range(storage.base(), device_base, layout.mix_payloads_offset, SCHEDULER_MIX_SLOT_CAPACITY);
 }
 
 TEST(HbgPayloadContext, RejectsInvalidDestinationBeforeChangingTheMirror) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(1, 1, 1, &layout));
     scheduler_test::SchedulerStateBuffer storage(layout);
-    auto *payload = scheduler_state_at<DispatchPayload>(storage.base(), layout.mix_payloads_offset);
+    auto *payload = scheduler_state_at<DispatchPayload>(storage.base(), layout.dispatch_payloads_offset);
     payload->function_bin_addr = 123;
     for (uint64_t device_base : {UINT64_C(0), UINT64_C(1), UINT64_C(32), UINT64_MAX - UINT64_C(127)}) {
         SCOPED_TRACE(device_base);

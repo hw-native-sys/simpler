@@ -108,7 +108,7 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     )
     for kind, begin, end, depth in [
         ("scalar_window", 10, 100, 0),
-        ("scalar_ready_refresh", 15, 30, 1),
+        ("scalar_fill_slots", 15, 30, 1),
         ("scalar_atomic_claim", 20, 25, 2),
         ("scalar_seal", 75, 90, 1),
     ]:
@@ -151,7 +151,7 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     assert json.loads(output.read_text())["metadata"]["scalar_detail_display"]["all_events_retained"]
     by_name = {e["name"]: e for e in detail}
     assert "idle" not in by_name
-    parent, child = by_name["scheduler_refresh_ready_inbox"], by_name["scheduler_gm_compare_exchange (return ready)"]
+    parent, child = by_name["scheduler_fill_own_slots"], by_name["scheduler_gm_compare_exchange (return ready)"]
     assert parent["ts"] <= child["ts"] < child["ts"] + child["dur"] <= parent["ts"] + parent["dur"]
     assert "window" not in by_name
     assert data["scalar_profiles"][0]["window_cycles"] == 90
@@ -185,7 +185,6 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_block_cursor_read", "scheduler_read_claim_cursor"),
         ("scalar_admission_close", "scheduler_close_ordered_obligation"),
         ("scalar_ordinary_permit", "scheduler_can_enter_ordinary"),
-        ("scalar_ready_directory", "scheduler_ready_directory_nonempty"),
         ("scalar_dispatch_metadata", "scheduler_load_dispatch_metadata"),
         ("scalar_dispatch_fill", "scheduler_fill_dispatch_slot"),
         ("scalar_dispatch_publish", "scheduler_publish_dispatch_slot"),
@@ -198,7 +197,6 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_poll_local_state", "scheduler_ordered_poll_may_progress: local state"),
         ("scalar_poll_ready_queue", "scheduler_ordered_poll_may_progress: ready queue"),
         ("scalar_poll_ready_pool", "scheduler_ready_pool_may_have_work"),
-        ("scalar_poll_own_inbox", "scheduler_ordered_poll_may_progress: own inbox endpoints"),
         ("scalar_poll_admission_tail", "scheduler_ordered_poll_may_progress: admission commit_tail"),
         ("scalar_poll_mix_state", "scheduler_ordered_poll_may_progress: MIX state"),
         ("scalar_poll_mix_close_seal", "scheduler_ordered_poll_may_progress: MIX close seal"),

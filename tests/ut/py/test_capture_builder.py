@@ -54,6 +54,14 @@ def test_a_phase_no_runtime_records_is_refused():
         capture.sched_phase(phase="ready_claim", start=1, end=2)
 
 
+@pytest.mark.parametrize(
+    "phase", ("worksteal", "scalar_ready_refresh", "scalar_ready_directory", "scalar_poll_own_inbox")
+)
+def test_current_hbg_resident_rejects_removed_inbox_phases(phase):
+    with pytest.raises(ValueError, match=f"aicore producer does not record the phase '{phase}'"):
+        Capture(runtime=HBG_RUNTIME, level=3).aicore_sched_phase(phase=phase, start=1, end=2)
+
+
 def test_a_phase_the_other_runtime_records_is_refused():
     """Naming a runtime and carrying the other's phase is the §5.8 failure."""
     with pytest.raises(ValueError, match="does not record the phase 'graph_prepare'"):

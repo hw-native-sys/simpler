@@ -24,7 +24,7 @@ are covered, because both are this runtime:
 
   AICPU scheduler -- ``graph_prepare`` (bounded Definition expansion) and
       ``resolve_standalone``, which canonicalizes to ``resolve``.
-  AICore scheduler -- ``bootstrap``, ``state_probe``, ``worksteal``, ``refill`` and
+  AICore scheduler -- ``bootstrap``, ``state_probe``, ``refill`` and
       ``idle``, plus ``dispatch`` / ``complete`` / ``resolve``. Written by
       append_scheduler_record() in
       a5/runtime/host_build_graph/host/runtime_maker.cpp. tmr has no AICore
@@ -63,7 +63,6 @@ PHASES_BY_PRODUCER = {
             "resolve",
             "bootstrap",
             "state_probe",
-            "worksteal",
             "refill",
             "idle",
         }
@@ -75,7 +74,6 @@ PHASES_BY_PRODUCER = {
 SCALAR_PHASES = frozenset(
     {
         "scalar_window",
-        "scalar_ready_refresh",
         "scalar_completions",
         "scalar_graph_control",
         "scalar_fill_slots",
@@ -112,7 +110,6 @@ SCALAR_PHASES = frozenset(
         "scalar_block_cursor_read",
         "scalar_admission_close",
         "scalar_ordinary_permit",
-        "scalar_ready_directory",
         "scalar_dispatch_metadata",
         "scalar_dispatch_fill",
         "scalar_dispatch_publish",
@@ -125,7 +122,6 @@ SCALAR_PHASES = frozenset(
         "scalar_poll_local_state",
         "scalar_poll_ready_queue",
         "scalar_poll_ready_pool",
-        "scalar_poll_own_inbox",
         "scalar_poll_admission_tail",
         "scalar_poll_mix_state",
         "scalar_poll_mix_close_seal",
@@ -181,7 +177,6 @@ PHASE_COLORS = {
     # AICore scheduler's own loop.
     "bootstrap": "rail_animation",
     "state_probe": "cq_build_running",
-    "worksteal": "cq_build_attempt_failed",
     "refill": "cq_build_attempt_passed",
     "idle": "grey",  # AICore scheduler spin with no progress
 }
@@ -213,7 +208,6 @@ PHASE_REPORT_LABELS = {
     "early_dispatch": "EarlyDispatch (speculative staging)",
     "drain": "Drain (sync-start staging)",
     "state_probe": "StateProbe (Scheduler-local Dispatch Slot / Ready state)",
-    "worksteal": "Worksteal (remote Inbox claim and dispatch)",
     "refill": "Refill (completed Slot reuse)",
     "graph_prepare": "GraphPrepare (Definition expansion)",
     "resolve": "Resolve (completion/dependency resolution)",
@@ -226,12 +220,11 @@ PHASE_DISPLAY_NAMES = {
     "resolve": "Resolve",
     "state_probe": "StateProbe",
     "dispatch": "Dispatch",
-    "worksteal": "Worksteal",
     "refill": "Refill",
 }
 
 # Every outer phase this runtime can emit, in the order a report lists them. The
-# order carries meaning -- state_probe / dispatch / worksteal / refill is the
+# order carries meaning -- state_probe / dispatch / refill is the
 # AICore scheduler's own loop -- which is one reason this is each runtime's own to
 # state rather than an interleaving of both.
 OUTER_PHASES = (
@@ -239,7 +232,6 @@ OUTER_PHASES = (
     "async_poll",
     "state_probe",
     "dispatch",
-    "worksteal",
     "refill",
     "dummy",
     "early_dispatch",
@@ -256,7 +248,6 @@ WORK_PHASES = frozenset(
         "complete",
         "state_probe",
         "dispatch",
-        "worksteal",
         "refill",
         "early_dispatch",
         "drain",

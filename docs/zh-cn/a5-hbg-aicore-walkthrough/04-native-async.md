@@ -8,7 +8,7 @@
 
 ## 4.1 native graph 接入哪些位置
 
-分支判断在 [aicore_execute](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L161)（第 161 行）：
+分支判断在 [aicore_execute](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L163)（第 163 行）：
 `native_header_offset != 0` 选择 WithNativeGraph 模板。
 
 | 接入位置 | native 行为 |
@@ -16,7 +16,7 @@
 | local config 初始化 | 校验 native image、epoch 和 control inbox |
 | bootstrap 扫描 | 区分 TOP_KERNEL/CHILD_KERNEL/控制节点/HOST_DONE；为 child 绑定描述符参数 |
 | fanin 读取 | 由普通 task_ref 数组切换到 template 的局部 CSR 和 completion 映射 |
-| ready 发布 | kernel 去对应类型 ready 队列；控制节点去 control inbox |
+| ready 发布 | 纯 AIC 和 MIX kernel 去共享 AIC 队列，纯 AIV 去共享 AIV 队列；控制节点去独立 control inbox |
 | 执行循环 | 在 completion 与 fill 之间服务有界数量的控制工作 |
 | 参数 materialize | CHILD_KERNEL 从 instance.args_base 和 child plan 中读取参数 |
 | 总完成 | 控制节点也必须完成依赖传播，计入 logical resolved |
@@ -35,6 +35,8 @@
 在 [scheduler_service_controls](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h#L23)（第 23 行），本核每片最多开始 8 个控制节点、消耗 64 个 work units。
 从 own 或轮转 peer control inbox 领到控制节点后，将其 BLOCKED→DONE，随后沿同一 resolver 的 CSR/remaining 或兼容 wake-list 分支传播完成；解析未结束时保存 `local.control_resolve`，下一轮继续。
 只有 resolver 真正结束才增加 pending_completed。
+
+控制节点不领取业务 slot，也不进入 kernel admission。即使当前 payload slot 或 admission candidate 已占用，主循环仍在 fill 之前给控制服务一个有界切片；两个共享业务队列不会替代这条控制进展路径。
 
 ## 4.2 native 图的数据结构字段
 
@@ -118,7 +120,7 @@ resident 需要先等已注册 completion 条件，再发布 task DONE。
 2. kernel 执行：使用 writer 登记 completion 条件。
 3. [scheduler_async_seal_execution](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_control.h#L330)（第 330 行）：封存条件，发布 group 数据和检查任务；之后释放本次执行资源。
 4. [scheduler_async_close_computation](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_control.h#L394)（第 394 行）：所有 block/subtask 的计算已完成，给逻辑任务关闭 computation。
-5. [scheduler_service_async_slice](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_finish.h#L85)（第 85 行）：交替服务 CHECK 与 FINISH，每次有界预算。
+5. [scheduler_service_async_slice](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_finish.h#L82)（第 82 行）：交替服务 CHECK 与 FINISH，每次有界预算。
 6. CHECK 观察 completion 条件、完成所需 acquire，减少该任务 pending group 数。
 7. computation 已关闭且 pending=0 时，仅有一个 FINISH owner。
 8. [scheduler_async_finish_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_finish.h#L19)（第 19 行） 写任务 DONE，运行可续行 resolver，传播完所有后继后增加 pending_completed。

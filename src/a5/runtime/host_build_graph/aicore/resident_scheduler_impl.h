@@ -310,7 +310,7 @@ __aicore__ bool bootstrap_ready_graph(
         const bool has_fanin = scheduler_task_has_fanin(metadata->flags);
         SchedulerRouteResult route =
             has_fanin ? scheduler_bootstrap_route_task(
-                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref), nullptr
+                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref)
                         ) :
                         SchedulerRouteResult::READY_TO_ENQUEUE;
         if (route == SchedulerRouteResult::ERROR) return false;
@@ -323,9 +323,8 @@ __aicore__ bool bootstrap_ready_graph(
                 continue;
             }
             const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, scheduler_task_lanes(*metadata));
-            if (!scheduler_bootstrap_ready_batch_append(
-                    scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), &batches[core_type], nullptr,
-                    profiling_level
+            if (!scheduler_ready_batch_append(
+                    scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), &batches[core_type]
                 ))
                 return false;
         }
@@ -336,7 +335,7 @@ __aicore__ bool bootstrap_ready_graph(
     // A contended publication remains owned by this scheduler's persistent
     // publisher and is serviced after the scan and in the dispatch loop.
     for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
-        if (!scheduler_ready_batch_push(scheduler_state_base, scheduler, type, &batches[type], nullptr)) return false;
+        if (!scheduler_ready_batch_push(scheduler_state_base, scheduler, type, &batches[type])) return false;
     }
 
     uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
@@ -358,12 +357,6 @@ __aicore__ bool bootstrap_ready_graph(
             if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
         }
     }
-    // What this core published says nothing about its own inboxes now: a push
-    // routes by type and lands on a peer. The mask tracks only the directory
-    // bits this core owns, and the claim path activates a type the first time it
-    // looks at it, so starting empty is correct rather than merely safe.
-    scheduler->owner_ready_queue_mask = 0;
-
     for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index) {
         scheduler_initialize_free_slot(&scheduler->slots[slot_index]);
     }
@@ -371,10 +364,6 @@ __aicore__ bool bootstrap_ready_graph(
 
     // Prepare the first executable wave while the sole DMB launch gate is
     // still closed.
-    uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{
-        (scheduler->config.scheduler_index + 1) % scheduler_count,
-        (scheduler->config.scheduler_index + 1) % scheduler_count,
-    };
     bool fill_failed = false;
     if (graph.native_header_offset != 0) {
         bool progress = false;
@@ -383,9 +372,8 @@ __aicore__ bool bootstrap_ready_graph(
             ))
             return false;
     }
-    (void)scheduler_fill_own_slots<WithProfiling, WithNativeGraph>(
-        graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors, nullptr, profiling_level, 0,
-        &fill_failed, nullptr, nullptr, nullptr
+    (void)scheduler_fill_own_slots<WithProfiling>(
+        graph, scheduler_state_base, scheduler, run_control, profiling_level, 0, &fill_failed
     );
     if (fill_failed) return false;
 
@@ -425,10 +413,6 @@ __aicore__ bool run_ready_dispatch_loop(
     const uint64_t scheduler_count = context->config.scheduler_count;
     if (scheduler_count == 0) return false;
     if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) return false;
-    uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{
-        (context->config.scheduler_index + 1) % scheduler_count,
-        (context->config.scheduler_index + 1) % scheduler_count,
-    };
     uint32_t backoff_iterations = kInitialBackoffIterations;
     uint32_t scheduler_error_poll_count = 0;
     if (phase_timing_enabled) context->profiling->loop_iter = UINT32_MAX;
@@ -441,9 +425,8 @@ __aicore__ bool run_ready_dispatch_loop(
         if (!scheduler_async_service_due(*context->async)) return true;
         SchedulerScalarScope scalar_async(context, SchedPhaseKind::ScalarAsyncService);
         bool advanced = false;
-        const bool ok = scheduler_service_async_slice(
-            graph, scheduler_state_base, context, run_control, profiling_level, advanced, nullptr, nullptr, nullptr
-        );
+        const bool ok =
+            scheduler_service_async_slice(graph, scheduler_state_base, context, run_control, profiling_level, advanced);
         progress = progress || advanced;
         return ok;
     };
@@ -472,21 +455,11 @@ __aicore__ bool run_ready_dispatch_loop(
         SchedulerScalarIteration scalar_iteration(phase_timing_enabled ? &context->profiling->scalar : nullptr);
 
         bool scheduler_progress = false;
-        SchedulerScalarScope scalar_refresh(context, SchedPhaseKind::ScalarReadyRefresh);
-        if (!scheduler_refresh_ready_inbox(scheduler_state_base, context)) {
-            scheduler_record_error(
-                run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                SchedulerErrorSite::READY_INBOX_REFRESH_FAILED
-            );
-            return false;
-        }
         {
-            scalar_refresh.close();
             SchedulerScalarScope scalar_completions(context, SchedPhaseKind::ScalarCompletions);
             uint64_t direct_refilled_slot_mask = 0;
             const bool completion_progress = scheduler_service_cluster_completions<WithProfiling>(
-                graph, scheduler_state_base, context, run_control, nullptr, nullptr, nullptr, profiling_level,
-                &direct_refilled_slot_mask, nullptr
+                graph, scheduler_state_base, context, run_control, profiling_level, &direct_refilled_slot_mask
             );
             scalar_completions.close();
             scheduler_progress = completion_progress;
@@ -508,9 +481,9 @@ __aicore__ bool run_ready_dispatch_loop(
                 }
             }
             bool fill_failed = false;
-            const bool dispatch_progress = scheduler_fill_own_slots<WithProfiling, WithNativeGraph>(
-                graph, scheduler_state_base, context, run_control, ready_victim_cursors, nullptr, profiling_level,
-                direct_refilled_slot_mask, &fill_failed, nullptr, nullptr, nullptr
+            const bool dispatch_progress = scheduler_fill_own_slots<WithProfiling>(
+                graph, scheduler_state_base, context, run_control, profiling_level, direct_refilled_slot_mask,
+                &fill_failed
             );
             scheduler_progress = dispatch_progress || scheduler_progress;
             if (fill_failed) return false;

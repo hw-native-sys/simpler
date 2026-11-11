@@ -76,7 +76,7 @@ inline __aicore__ void scheduler_async_copy_resolver(Destination &destination, c
     destination.route.result = source.route.result;
     destination.publication.inbox_offset = source.publication.inbox_offset;
     destination.publication.count = source.publication.count;
-    destination.publication.type = source.publication.type;
+    destination.publication.destination = source.publication.destination;
     destination.publication.target = source.publication.target;
     destination.publication.phase = source.publication.phase;
     destination.phase = source.phase;

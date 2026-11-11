@@ -131,10 +131,10 @@ struct ErrorFixture {
 };
 
 TEST(HbgErrorIdentity, DedicatedStatusLineSeparatesDiagnosticIdentity) {
-    EXPECT_EQ(sizeof(SchedulerRunControl), 448u);
-    EXPECT_EQ(offsetof(SchedulerRunControl, error_claimed), 256u);
-    EXPECT_EQ(offsetof(SchedulerRunControl, error_site), 312u);
-    EXPECT_EQ(kIdentityOffset, 320u);
+    EXPECT_EQ(sizeof(SchedulerRunControl), 384u);
+    EXPECT_EQ(offsetof(SchedulerRunControl, error_claimed), 192u);
+    EXPECT_EQ(offsetof(SchedulerRunControl, error_site), 248u);
+    EXPECT_EQ(kIdentityOffset, 256u);
     EXPECT_LE(kIdentityOffset + sizeof(Identity), offsetof(SchedulerRunControl, scheduler_error));
 }
 
@@ -144,7 +144,7 @@ TEST(HbgErrorIdentity, PublishedStatusHasNoAtomicWriterOnItsCacheLine) {
     EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_claimed) / 64);
     EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_task_ref) / 64);
     EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_identity_fields) / 64);
-    EXPECT_EQ(status_offset, 384u);
+    EXPECT_EQ(status_offset, 320u);
 }
 
 TEST(HbgErrorIdentity, AicpuFlushesIdentityBeforePublishingAndFlushingStatus) {
@@ -253,7 +253,7 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_FALSE(scheduler_prepare_dispatch_slot(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1, 1, 0, 1}, ready, metadata, 0, nullptr, 1
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1, 1, 0, 1}, ready, metadata, 0, 1
     ));
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
@@ -380,7 +380,7 @@ TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimin
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_FALSE(scheduler_prepare_dispatch_slot(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1, 0, 0, 1}, ready, metadata, 0, nullptr, 1
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1, 0, 0, 1}, ready, metadata, 0, 1
     ));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{UINT64_MAX, UINT64_MAX, 0, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 52u);
@@ -398,8 +398,7 @@ TEST(HbgErrorIdentity, PureGenerationMismatchNamesTheCompletedSlotWithoutGuessin
         local->slots[slot].generation = 3;
     }
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 1, 4, nullptr, nullptr, nullptr, 0, nullptr,
-        nullptr, nullptr
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 1, 4, 0, nullptr, nullptr
     ));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 55u);

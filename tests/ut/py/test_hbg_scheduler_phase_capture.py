@@ -48,7 +48,7 @@ def validate_capture(monkeypatch, tmp_path):
     return validate
 
 
-def _capture(inbox_kinds):
+def _capture():
     capture = Capture(runtime=HBG_RUNTIME, level=3, scheduler_producer="aicore")
     capture.aicore_sched_phase(phase="bootstrap", start=1, end=2)
     capture.aicpu_lifecycle(
@@ -82,7 +82,7 @@ def _capture(inbox_kinds):
         capture.task(task_id=task_id, start=start + 4, end=start + 5)
         if index < 33:
             capture.aicore_sched_phase(phase="state_probe", task_id=task_id, start=start, end=start + 1)
-            kind = inbox_kinds[index % len(inbox_kinds)]
+            kind = "dispatch"
         else:
             kind = "refill"
         capture.aicore_sched_phase(phase=kind, task_id=task_id, start=start + 2, end=start + 3)
@@ -104,9 +104,8 @@ def _capture(inbox_kinds):
     return capture.build()
 
 
-@pytest.mark.parametrize("inbox_kinds", [("dispatch",), ("worksteal",), ("dispatch", "worksteal")])
-def test_smoke_accepts_local_stolen_and_mixed_inbox_launches(validate_capture, inbox_kinds):
-    validate_capture(_capture(inbox_kinds))
+def test_smoke_accepts_pool_dispatch_and_direct_refill_launches(validate_capture):
+    validate_capture(_capture())
 
 
 @pytest.mark.parametrize(
@@ -121,14 +120,15 @@ def test_smoke_accepts_local_stolen_and_mixed_inbox_launches(validate_capture, i
         "timing",
         "missing_scalar_window",
         "scalar_schema",
+        "removed_worksteal",
     ),
 )
 def test_smoke_rejects_incomplete_or_inconsistent_launch_evidence(validate_capture, corruption):
-    raw = _capture(("dispatch", "worksteal"))
+    raw = _capture()
     stream = raw["scheduler_records"]["streams"][0]
     records = stream["records"]
     task_id = hbg_global(11)
-    launch = next(record for record in records if record["task_id"] == task_id and record["kind"] == "worksteal")
+    launch = next(record for record in records if record["task_id"] == task_id and record["kind"] == "dispatch")
     if corruption == "missing_launch":
         records.remove(launch)
     elif corruption == "duplicate_launch":
@@ -148,6 +148,8 @@ def test_smoke_rejects_incomplete_or_inconsistent_launch_evidence(validate_captu
         stream["metrics"] = []
     elif corruption == "scalar_schema":
         stream["metrics"][0]["scalar_schema"] = 1
+    elif corruption == "removed_worksteal":
+        launch["kind"] = "worksteal"
     else:
         launch["start_cycles"] -= 2
     error = ValueError if corruption == "scalar_schema" else AssertionError

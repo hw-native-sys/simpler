@@ -370,7 +370,7 @@ class NativeAudit:
             self.causal.add(published_after, point(execution, "permit"))
             self.payload_points[index] = published_before, published_after
             require(
-                execution["ready_source"] in (0, 1, 2, 3)
+                execution["ready_source"] in (0, 2, 3)
                 and execution["publication_mode"] in (0, 1)
                 and (execution["publication_mode"] == 0 or execution["ready_source"] == 2),
                 "invalid source/publication mode",

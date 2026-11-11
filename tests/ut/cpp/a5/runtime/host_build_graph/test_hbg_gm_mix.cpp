@@ -87,8 +87,7 @@ struct GmMixFixture {
         ),
         graph(shapes.size()),
         admissions(clusters * 3),
-        locals(clusters * 3),
-        cursors(clusters * 3) {
+        locals(clusters * 3) {
         uint32_t trace = 0;
         for (uint64_t task = 0; task < shapes.size(); ++task) {
             const auto shape = shapes[task];
@@ -106,8 +105,9 @@ struct GmMixFixture {
             for (uint8_t subtask = 0; subtask < 3; ++subtask)
                 metadata.kernel_ids[subtask] = shape.mask.has(static_cast<SubtaskSlot>(subtask)) ? 1 : UINT16_MAX;
         }
+        storage.prepare_ready_pool();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 47));
-        storage.ssbuf_region = nullptr;
+
         storage.run_control->active_worker_count = clusters * 3;
         storage.run_control->aic_active_worker_count = clusters;
         storage.run_control->aiv_active_worker_count = clusters * 2;
@@ -122,7 +122,7 @@ struct GmMixFixture {
         }
         for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             locals[worker] = storage.local_context(&storage.contexts[worker]);
-            locals[worker]->has_mix = storage.layout.spmd.mix_task_count != 0;
+
             EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
             locals[worker]->admission = &admissions[worker];
         }
@@ -144,14 +144,13 @@ struct GmMixFixture {
     }
     bool enqueue(uint64_t task, uint32_t worker = 0) {
         auto *local = locals[worker];
-        if (scheduler_route_task(graph.graph(), base(), local, run(), task, nullptr) !=
-            SchedulerRouteResult::READY_TO_ENQUEUE)
+        if (scheduler_route_task(graph.graph(), base(), local, run(), task) != SchedulerRouteResult::READY_TO_ENQUEUE)
             return false;
         SchedulerReadyBatch batch{};
         const auto &metadata = storage.metadata[task];
-        return scheduler_ready_batch_append(base(), local, task, &batch, nullptr) &&
+        return scheduler_ready_batch_append(base(), local, task, &batch) &&
                scheduler_ready_batch_push(
-                   base(), local, scheduler_task_ready_queue(metadata.flags, metadata.active_mask), &batch, nullptr
+                   base(), local, scheduler_task_ready_queue(metadata.flags, metadata.active_mask), &batch
                );
     }
     bool claim_pending(uint64_t task, uint32_t worker = 0) {
@@ -160,9 +159,8 @@ struct GmMixFixture {
         const auto &metadata = storage.metadata[task];
         const uint32_t queue = scheduler_task_ready_queue(metadata.flags, metadata.active_mask);
         SchedulerReadyClaim ready{};
-        ready.inbox_index = scheduler_ready_push_target(local, queue, task);
-        return scheduler_ready_pop_from_inbox(
-                   graph.graph(), base(), local, run(), queue, ready.inbox_index, &ready.task_ref, nullptr
+        return scheduler_claim_ready_for_slot(
+                   graph.graph(), base(), local, run(), local->config.scheduler_count, queue, &ready
                ) &&
                ready.task_ref == static_cast<int64_t>(task) &&
                scheduler_try_claim_admission(graph.graph(), base(), local, run(), &admissions[worker], ready) ==
@@ -217,9 +215,7 @@ struct GmMixFixture {
         return scheduler_gm_mix_retire(graph.graph(), base(), locals[cluster * 3], run());
     }
     bool complete_task(uint64_t task, uint32_t cluster) {
-        return scheduler_complete_ordered_task(
-            graph.graph(), base(), locals[cluster * 3], run(), task, 0, nullptr, nullptr, nullptr
-        );
+        return scheduler_complete_ordered_task(graph.graph(), base(), locals[cluster * 3], run(), task, 0);
     }
     bool close(uint32_t worker, bool *closed) {
         return scheduler_gm_mix_close(graph.graph(), base(), locals[worker], run(), closed);
@@ -227,9 +223,7 @@ struct GmMixFixture {
     template <bool RecordProtocol = true>
     bool fill(uint32_t worker) {
         bool failed = false;
-        scheduler_fill_own_slots<RecordProtocol>(
-            graph.graph(), base(), locals[worker], run(), cursors[worker].data(), nullptr, 0, 0, &failed, nullptr
-        );
+        scheduler_fill_own_slots<RecordProtocol>(graph.graph(), base(), locals[worker], run(), 0, 0, &failed);
         return !failed;
     }
     bool begin(uint32_t worker, GmExecution *execution) {
@@ -262,9 +256,7 @@ struct GmMixFixture {
     bool complete(const GmExecution &execution) {
         auto *local = locals[execution.worker];
         local->local_completed_generations[execution.slot] = execution.generation;
-        return scheduler_service_cluster_completions<RecordProtocol>(
-            graph.graph(), base(), local, run(), nullptr, nullptr, nullptr, 0, nullptr, nullptr
-        );
+        return scheduler_service_cluster_completions<RecordProtocol>(graph.graph(), base(), local, run(), 0, nullptr);
     }
     bool finish_lanes(uint32_t cluster) {
         const auto descriptor = mailbox(cluster)->descriptor;
@@ -285,7 +277,6 @@ struct GmMixFixture {
     scheduler_test::GraphBuffer graph;
     std::vector<SchedulerAdmissionLocalState> admissions;
     std::vector<SchedulerLocalState *> locals;
-    std::vector<std::array<uint64_t, SCHEDULER_READY_QUEUE_COUNT>> cursors;
 };
 
 TEST(HbgGmMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
@@ -294,7 +285,7 @@ TEST(HbgGmMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
     fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     auto *local = fixture.locals[0];
     ASSERT_EQ(
-        scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, nullptr),
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1),
         SchedulerRouteResult::WAITING
     );
     ASSERT_TRUE(fixture.admit(0));
@@ -349,16 +340,17 @@ TEST(HbgGmMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
     EXPECT_EQ(local->pending_completed, 1u);
     const auto &successor = fixture.storage.metadata[1];
     const uint32_t queue = scheduler_task_ready_queue(successor.flags, successor.active_mask);
-    const uint32_t inbox = scheduler_ready_push_target(local, queue, 1);
-    int64_t ready = SCHEDULER_TASK_REF_INVALID;
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), queue, inbox, &ready, nullptr
+    auto *consumer = fixture.locals[1];
+    ASSERT_EQ(consumer->config.self_core_type, queue);
+    SchedulerReadyClaim ready{};
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        fixture.graph.graph(), fixture.base(), consumer, fixture.run(), consumer->config.scheduler_count, queue, &ready
     ));
-    EXPECT_EQ(ready, 1);
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), queue, inbox, &ready, nullptr
+    EXPECT_EQ(ready.task_ref, 1);
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        fixture.graph.graph(), fixture.base(), consumer, fixture.run(), consumer->config.scheduler_count, queue, &ready
     ));
-    EXPECT_EQ(ready, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(ready.task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
 }
 
@@ -638,7 +630,7 @@ TEST_P(HbgGmMixContinuous, DirectSuccessorFromRetirementKeepsItsAdmissionRequire
         fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
         ASSERT_EQ(
-            scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1, nullptr),
+            scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1),
             SchedulerRouteResult::WAITING
         );
         ASSERT_TRUE(fixture.admit(0));
@@ -705,12 +697,11 @@ class HbgGmMixSyncStart : public ::testing::TestWithParam<LaneMask> {};
 
 class HbgGmMixIdlePoll : public ::testing::TestWithParam<std::tuple<LaneMask, uint32_t>> {};
 
-void clear_drained_ready_directories(GmMixFixture &fixture) {
-    for (auto *local : fixture.locals) {
-        for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
-            if (scheduler_ready_queue_holder(type, local->config.self_core_type))
-                ASSERT_TRUE(scheduler_refresh_ready_inbox_type(fixture.base(), local, type));
-        }
+void expect_ready_pool_drained(GmMixFixture &fixture) {
+    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
+        const auto queue = scheduler_ready_pool_queue(fixture.base(), pool, type);
+        EXPECT_EQ(scheduler_gm_query(queue.control->head), scheduler_gm_query(queue.control->reserved_tail));
     }
 }
 
@@ -719,7 +710,7 @@ TEST_P(HbgGmMixIdlePoll, UnpublishedClaimIsIdleButDescriptorAndRetainedSealWakeT
     GmMixFixture fixture({{1, mask}});
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     auto *local = fixture.locals[lane];
     const bool member = fixture.participant(lane);
     EXPECT_FALSE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local));
@@ -748,7 +739,7 @@ TEST_P(HbgGmMixIdlePoll, WaitingForPartnersDoesNotHideAnOrdinaryReadyTask) {
     GmMixFixture fixture({{1, mask}, {1, LaneMask::aiv0()}});
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     auto *local = fixture.locals[lane];
     EXPECT_FALSE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local));
     ASSERT_TRUE(fixture.enqueue(1, lane));
@@ -773,7 +764,7 @@ TEST_P(HbgGmMixSyncStart, IdlePollRequiresAllArrivalAndReleaseAcknowledgements) 
     GmMixFixture fixture({{1, GetParam()}});
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
     ASSERT_TRUE(fixture.publish(0));
     bool progress = false;
@@ -853,8 +844,7 @@ TEST_P(HbgGmMixServiceError, ServiceRejectsPublishedErrorBeforeAnyStateSpecificW
     bool progress = true;
     const auto service = [&](auto record) {
         return scheduler_service_gm_mix<decltype(record)::value>(
-            fixture.graph.graph(), fixture.base(), fixture.locals[scenario.worker], fixture.run(), 0, nullptr, nullptr,
-            nullptr, &progress
+            fixture.graph.graph(), fixture.base(), fixture.locals[scenario.worker], fixture.run(), 0, &progress
         );
     };
     EXPECT_FALSE(scenario.record_protocol ? service(std::true_type{}) : service(std::false_type{}));
@@ -881,7 +871,7 @@ TEST_P(HbgGmMixServiceError, AHealthyServicePassDoesNotCacheTheNextPassEpochOrEr
         bool progress = false;
         const auto service = [&](auto record) {
             return scheduler_service_gm_mix<decltype(record)::value>(
-                fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, nullptr, nullptr, nullptr, &progress
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress
             );
         };
         ASSERT_TRUE(scenario.record_protocol ? service(std::true_type{}) : service(std::false_type{}));
@@ -943,7 +933,7 @@ TEST_P(HbgGmMixServiceError, ServiceValidatesTheWholeContextBeforePhaseSpecificW
         bool progress = true;
         const auto service = [&](auto record) {
             return scheduler_service_gm_mix<decltype(record)::value>(
-                fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, nullptr, nullptr, nullptr, &progress
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress
             );
         };
         EXPECT_FALSE(scenario.record_protocol ? service(std::true_type{}) : service(std::false_type{}));
@@ -1068,8 +1058,7 @@ TEST(HbgGmMix, ServiceCarriesNewPublicationThroughArrivalWithoutAnExtraPoll) {
             if (!fixture.participant(worker)) continue;
             bool progress = false;
             ASSERT_TRUE(scheduler_service_gm_mix(
-                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, nullptr, nullptr,
-                nullptr, &progress
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, &progress
             ));
             EXPECT_TRUE(progress);
             EXPECT_EQ(fixture.mailbox(0)->published_seq, 1u);
@@ -1084,8 +1073,7 @@ TEST(HbgGmMix, ServiceCarriesNewPublicationThroughArrivalWithoutAnExtraPoll) {
                 continue;
             bool progress = false;
             ASSERT_TRUE(scheduler_service_gm_mix(
-                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, nullptr, nullptr,
-                nullptr, &progress
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, &progress
             ));
             EXPECT_TRUE(progress);
             EXPECT_EQ(
@@ -1103,9 +1091,9 @@ TEST(HbgGmMix, ServiceRetiresOnlyAfterAllReleasesAndPublishesTheNextGroupWithout
     GmMixFixture fixture({{2, LaneMask::all()}});
     ASSERT_NO_FATAL_FAILURE(prepare_service_phase(fixture, {0, SchedulerGmMixPhase::RELEASED}));
     bool progress = true;
-    ASSERT_TRUE(scheduler_service_gm_mix(
-        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, nullptr, nullptr, nullptr, &progress
-    ));
+    ASSERT_TRUE(
+        scheduler_service_gm_mix(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &progress)
+    );
     EXPECT_FALSE(progress);
     EXPECT_EQ(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::RELEASED);
     EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
@@ -1114,28 +1102,28 @@ TEST(HbgGmMix, ServiceRetiresOnlyAfterAllReleasesAndPublishesTheNextGroupWithout
         ASSERT_TRUE(fixture.begin(worker, &execution));
         ASSERT_TRUE(fixture.complete(execution));
     }
-    ASSERT_TRUE(scheduler_service_gm_mix(
-        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, nullptr, nullptr, nullptr, &progress
-    ));
+    ASSERT_TRUE(
+        scheduler_service_gm_mix(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &progress)
+    );
     EXPECT_TRUE(progress);
     EXPECT_EQ(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::ARRIVED);
     EXPECT_EQ(fixture.control(0)->next_block, 2u);
     EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
     EXPECT_EQ(fixture.mailbox(0)->published_seq, 2u);
-    ASSERT_TRUE(scheduler_service_gm_mix(
-        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, nullptr, nullptr, nullptr, &progress
-    ));
+    ASSERT_TRUE(
+        scheduler_service_gm_mix(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &progress)
+    );
     EXPECT_FALSE(progress);
     EXPECT_EQ(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::ARRIVED);
     EXPECT_EQ(fixture.control(0)->next_block, 2u);
     EXPECT_EQ(fixture.mailbox(0)->published_seq, 2u);
 }
 
-using GmServiceProfilingCase = std::tuple<LaneMask, uint64_t, bool, bool>;
+using GmServiceProfilingCase = std::tuple<LaneMask, uint64_t, bool>;
 class HbgGmMixServiceProfiling : public ::testing::TestWithParam<GmServiceProfilingCase> {};
 
 TEST_P(HbgGmMixServiceProfiling, ResourceArrivalAndReleaseGuardsHoldAcrossTwoWaves) {
-    const auto [mask, level, with_stats, record_protocol] = GetParam();
+    const auto [mask, level, record_protocol] = GetParam();
     GmMixFixture fixture({{2, mask}}, level == 4, 1);
     if (!record_protocol) {
         ASSERT_EQ(level, 0u);
@@ -1144,15 +1132,11 @@ TEST_P(HbgGmMixServiceProfiling, ResourceArrivalAndReleaseGuardsHoldAcrossTwoWav
     }
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
-    SchedulerWakeStats wake_stats{};
-    SchedulerReadyStats ready_stats{};
-    SchedulerCompletionStats completion_stats{};
+
     const auto service = [&](uint32_t worker, bool *progress) {
         const auto invoke = [&](auto record) {
             return scheduler_service_gm_mix<decltype(record)::value>(
-                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), level,
-                with_stats ? &wake_stats : nullptr, with_stats ? &ready_stats : nullptr,
-                with_stats ? &completion_stats : nullptr, progress
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), level, progress
             );
         };
         return record_protocol ? invoke(std::true_type{}) : invoke(std::false_type{});
@@ -1217,18 +1201,17 @@ TEST_P(HbgGmMixServiceProfiling, ResourceArrivalAndReleaseGuardsHoldAcrossTwoWav
     EXPECT_EQ(identities.size(), static_cast<size_t>(2 * mask.count()));
     EXPECT_EQ(fixture.admissions[0].current_task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(fixture.control(0)->state, static_cast<uint64_t>(SchedulerTaskState::DONE));
-    EXPECT_EQ(completion_stats.resolve_count, with_stats ? 1u : 0u);
+
     EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
 
 std::vector<GmServiceProfilingCase> gm_service_profiling_cases() {
     std::vector<GmServiceProfilingCase> cases;
     for (LaneMask mask : kMixMasks)
-        for (uint64_t level = 0; level <= 4; ++level)
-            for (bool with_stats : {false, true}) {
-                cases.emplace_back(mask, level, with_stats, true);
-                if (level == 0) cases.emplace_back(mask, level, with_stats, false);
-            }
+        for (uint64_t level = 0; level <= 4; ++level) {
+            cases.emplace_back(mask, level, true);
+            if (level == 0) cases.emplace_back(mask, level, false);
+        }
     return cases;
 }
 
@@ -1514,18 +1497,17 @@ TEST(HbgGmMix, MixPrefixSuffixErrorRejectsNewAdmissionAndPreviouslyPermittedKern
     auto *resolver = fixture.locals[3];
     for (uint32_t task : {4u, 3u, 2u})
         ASSERT_EQ(
-            scheduler_route_task(fixture.graph.graph(), fixture.base(), resolver, fixture.run(), task, nullptr),
+            scheduler_route_task(fixture.graph.graph(), fixture.base(), resolver, fixture.run(), task),
             SchedulerRouteResult::WAITING
         );
     fixture.graph.executable(4, 0, {1, 4});
     ASSERT_EQ(fixture.graph.payload(4).fanin_count, 2);
     scheduler_gm_store(fixture.control(1)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-    SchedulerReadyStats ready_stats{};
+
     ASSERT_FALSE(scheduler_resolve_completion(
-        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), 1, nullptr, &ready_stats, nullptr, 0, true,
-        nullptr, UINT32_MAX
+        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), 1, 0, true, nullptr, UINT32_MAX
     ));
-    ASSERT_EQ(ready_stats.batch_count, 1u);
+
     ASSERT_EQ(scheduler_read_error(fixture.run()), static_cast<uint64_t>(SchedulerGraphResult::INVALID_FANIN_ID));
     const uint64_t first_error = scheduler_read_error(fixture.run());
     const uint64_t first_site = fixture.run()->error_site;
@@ -1535,10 +1517,9 @@ TEST(HbgGmMix, MixPrefixSuffixErrorRejectsNewAdmissionAndPreviouslyPermittedKern
     // A published prefix is not rolled back. A consumer that already owns it
     // must still pass the real admission gate after a later suffix failure.
     SchedulerReadyClaim candidate{};
-    candidate.inbox_index = 1;
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), SCHEDULER_MIX_QUEUE, candidate.inbox_index,
-        &candidate.task_ref, nullptr
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), resolver->config.scheduler_count,
+        static_cast<uint32_t>(SchedulerReadyClass::AIC), &candidate
     ));
     ASSERT_EQ(candidate.task_ref, 2);
     EXPECT_EQ(
@@ -1751,7 +1732,7 @@ class HbgGmMixShapes : public ::testing::TestWithParam<std::tuple<LaneMask, uint
 TEST_P(HbgGmMixShapes, RealOwnDispatchAndCompletionKeepEveryLogicalBlockAndSubtaskExactlyOnce) {
     const auto [mask, blocks] = GetParam();
     GmMixFixture fixture({{blocks, mask}});
-    ASSERT_EQ(fixture.storage.ssbuf_region, nullptr);
+
     ASSERT_TRUE(fixture.enqueue(0));
     std::map<std::pair<uint32_t, uint8_t>, uint32_t> visits;
     std::set<uint32_t> single_vector_lanes;
@@ -1907,18 +1888,18 @@ TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsCon
     SchedulerReadyBatch batch{};
     for (uint32_t task : {first_task, 1U - first_task}) {
         ASSERT_EQ(
-            scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), task, nullptr),
+            scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), task),
             SchedulerRouteResult::READY_TO_ENQUEUE
         );
-        ASSERT_TRUE(scheduler_ready_batch_append(fixture.base(), local, task, &batch, nullptr));
+        ASSERT_TRUE(scheduler_ready_batch_append(fixture.base(), local, task, &batch));
     }
-    ASSERT_TRUE(scheduler_ready_batch_push(fixture.base(), local, core_type, &batch, nullptr));
+    ASSERT_TRUE(scheduler_ready_batch_push(fixture.base(), local, core_type, &batch));
     // Direct retention can populate both slots independently of queue prefetch.
     for (uint32_t task : {first_task, 1U - first_task}) {
         SchedulerReadyClaim claim{};
         ASSERT_TRUE(scheduler_claim_ready_for_slot(
             fixture.graph.graph(), fixture.base(), local, fixture.run(), local->config.scheduler_count, core_type,
-            &fixture.cursors[lane][core_type], nullptr, &claim, nullptr, true
+            &claim
         ));
         ASSERT_EQ(claim.task_ref, task);
         ASSERT_TRUE(scheduler_ordered_retain_candidate(&fixture.admissions[lane], claim));
@@ -2220,8 +2201,8 @@ TEST(HbgGmMix, DuplicateGenerationCannotReleaseOrContributeTwice) {
     ASSERT_TRUE(fixture.begin(1, &first));
     ASSERT_TRUE(fixture.complete(first));
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
-        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 1, first.slot, first.generation,
-        nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr
+        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 1, first.slot, first.generation, 0,
+        nullptr, nullptr
     ));
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[1].released_seq, UINT64_C(0)), 1u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
@@ -2530,7 +2511,7 @@ TEST_P(HbgGmMixPollAckHint, ArrivalHintIsClearedOnEarlyReturnAndCannotPermitChan
     GmMixFixture fixture({{1, mask}});
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     ASSERT_EQ(fixture.claim(cluster), SchedulerBlockClaimResult::CLAIMED);
     ASSERT_TRUE(fixture.publish(cluster));
     bool progress = false;
@@ -2577,7 +2558,7 @@ TEST_P(HbgGmMixPollAckHint, ReleaseHintOnlyBelongsToCoordinatorAndStillRejectsLa
     GmMixFixture fixture({{1, mask}});
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     ASSERT_EQ(fixture.claim(cluster), SchedulerBlockClaimResult::CLAIMED);
     ASSERT_TRUE(fixture.publish(cluster));
     ASSERT_TRUE(fixture.rendezvous(cluster));
@@ -2591,9 +2572,9 @@ TEST_P(HbgGmMixPollAckHint, ReleaseHintOnlyBelongsToCoordinatorAndStillRejectsLa
     EXPECT_EQ(phase, worker % 3 == 0 ? SchedulerGmMixPhase::RELEASED : SchedulerGmMixPhase::IDLE);
     fixture.run()->scheduler_error = static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
     bool progress = false;
-    EXPECT_FALSE(scheduler_service_gm_mix(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, nullptr, nullptr, nullptr, &progress, phase
-    ));
+    EXPECT_FALSE(
+        scheduler_service_gm_mix(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress, phase)
+    );
     EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
     EXPECT_EQ(
         fixture.admissions[worker].current_task_ref, fixture.participant(worker) ? 0 : SCHEDULER_TASK_REF_INVALID
@@ -2766,7 +2747,7 @@ TEST(HbgGmMix, MixFaninWaitsForLastGroupAndMaskSixCoordinatorReleasesItOnce) {
     fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
     ASSERT_EQ(
-        scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1, nullptr),
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1),
         SchedulerRouteResult::WAITING
     );
     ASSERT_TRUE(fixture.admit(0));
@@ -2791,8 +2772,12 @@ TEST(HbgGmMix, MixFaninWaitsForLastGroupAndMaskSixCoordinatorReleasesItOnce) {
     ASSERT_TRUE(fixture.complete_task(0, 1));
     EXPECT_EQ(scheduler_gm_load(fixture.control(0)->wake_list_head), SCHEDULER_WAKE_LIST_CLOSED);
     EXPECT_EQ(fixture.locals[3]->pending_completed, 1u);
-    auto *inbox = scheduler_ready_inbox_at(fixture.base(), fixture.locals[3], SCHEDULER_MIX_QUEUE, 1);
-    EXPECT_EQ(scheduler_ready_endpoints_head(scheduler_gm_query(inbox->endpoints)), 1);
+    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+    const auto queue =
+        scheduler_ready_pool_queue(fixture.base(), pool, static_cast<uint32_t>(SchedulerReadyClass::AIC));
+    const uint64_t head = scheduler_gm_query(queue.control->head);
+    ASSERT_LT(head, queue.capacity);
+    EXPECT_EQ(scheduler_gm_query(queue.entries[head].task_ref), 1);
     uint32_t successor_executions = 0;
     for (uint32_t step = 0; step < 100; ++step) {
         for (uint32_t worker = 0; worker < 6; ++worker) {
@@ -2858,13 +2843,13 @@ TEST_P(HbgGmMixOwnPrepare, HasMixDoesNotRequireSsbufForAnOwnPayloadPreparation) 
     for (uint8_t subtask = 0; subtask < 3; ++subtask) {
         if (!mask.has(static_cast<SubtaskSlot>(subtask))) continue;
         auto *local = fixture.locals[subtask];
-        ASSERT_TRUE(local->has_mix);
+
         local->slots[0].state = SchedulerDispatchSlotState::FILLING;
         SchedulerReadyClaim ready{};
         ready.task_ref = 0;
         ASSERT_TRUE(scheduler_prepare_dispatch_slot(
             fixture.graph.graph(), fixture.base(), local, fixture.run(),
-            {subtask, 0, local->slots[0].generation, subtask}, ready, fixture.storage.metadata[0], 0, nullptr, subtask
+            {subtask, 0, local->slots[0].generation, subtask}, ready, fixture.storage.metadata[0], 0, subtask
         ));
         const auto *payload =
             scheduler_state_at<DispatchPayload>(fixture.base(), local->dispatch_payload_offset(subtask, 0));
@@ -3113,7 +3098,7 @@ class HbgGmMixReadyProbe : public ::testing::TestWithParam<LaneMask> {};
 TEST_P(HbgGmMixReadyProbe, EmptyReadySnapshotStillRefreshesAdmissionAndRetiresThenClaims) {
     GmMixFixture fixture({{2, GetParam()}});
     ASSERT_TRUE(fixture.admit(0));
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     ASSERT_EQ(fixture.admissions[0].current_task_ref, SCHEDULER_TASK_REF_INVALID);
     bool empty = false;
     EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty));
@@ -3125,7 +3110,7 @@ TEST_P(HbgGmMixReadyProbe, EmptyReadySnapshotStillRefreshesAdmissionAndRetiresTh
     ASSERT_TRUE(fixture.refresh_all());
     ASSERT_TRUE(fixture.rendezvous(0));
     ASSERT_TRUE(fixture.finish_lanes(0));
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     empty = false;
     EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty));
     EXPECT_TRUE(empty);
@@ -3149,7 +3134,7 @@ TEST_P(HbgGmMixReadyProbe, MissingReleaseDoesNotAdvanceAndTheNextFillSeesNewRead
         ASSERT_TRUE(fixture.begin(lane, &execution));
         ASSERT_TRUE(fixture.complete(execution));
     }
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     bool empty = false;
     EXPECT_FALSE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty));
     EXPECT_TRUE(empty);
@@ -3179,7 +3164,7 @@ struct GmReadyWaitCase {
     LaneMask mask;
     uint32_t worker;
     bool releases;
-    uint32_t ready_location;
+    bool remote_producer;
 };
 
 std::vector<GmReadyWaitCase> gm_ready_wait_cases() {
@@ -3187,9 +3172,9 @@ std::vector<GmReadyWaitCase> gm_ready_wait_cases() {
     for (LaneMask mask : kMixMasks)
         for (uint32_t worker = 0; worker < 6; ++worker) {
             if (!mask.merged_with(LaneMask::aic()).has(static_cast<SubtaskSlot>(worker % 3))) continue;
-            for (uint32_t location = 0; location < 3; ++location) {
-                result.push_back({mask, worker, false, location});
-                result.push_back({mask, worker, true, location});
+            for (bool remote : {false, true}) {
+                result.push_back({mask, worker, false, remote});
+                result.push_back({mask, worker, true, remote});
             }
         }
     return result;
@@ -3218,7 +3203,7 @@ void prepare_ready_wait(GmMixFixture &fixture, const GmReadyWaitCase &scenario, 
         if (scenario.worker % 3 != 0) ASSERT_TRUE(fixture.observe(scenario.worker, &progress));
         ASSERT_TRUE(fixture.arrive(scenario.worker, &progress));
     }
-    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
     ASSERT_EQ(
         fixture.admissions[scenario.worker].gm_mix.phase,
         scenario.releases ? SchedulerGmMixPhase::RELEASED : SchedulerGmMixPhase::ARRIVED
@@ -3229,16 +3214,8 @@ uint32_t ready_wait_task(const GmReadyWaitCase &scenario) { return scenario.work
 
 void enqueue_ready_wait(GmMixFixture &fixture, const GmReadyWaitCase &scenario) {
     const uint32_t task = ready_wait_task(scenario);
-    const uint32_t producer = scenario.ready_location == 2 ? (scenario.worker < 3 ? 3 : 0) : scenario.worker / 3 * 3;
+    const uint32_t producer = scenario.remote_producer ? (scenario.worker < 3 ? 3 : 0) : scenario.worker / 3 * 3;
     ASSERT_TRUE(fixture.enqueue(task, producer));
-    if (scenario.ready_location == 1) {
-        auto *local = fixture.locals[scenario.worker];
-        const auto &metadata = fixture.storage.metadata[task];
-        scheduler_ready_directory_clear(
-            scheduler_ready_directory_at(fixture.base(), local),
-            scheduler_task_ready_queue(metadata.flags, metadata.active_mask), local->self_type_rank()
-        );
-    }
 }
 
 class HbgGmReadyWaitProbe : public ::testing::TestWithParam<GmReadyWaitCase> {};
@@ -3360,9 +3337,9 @@ TEST(HbgGmMixReadyProbeOwnership, CandidatePendingAndLocalReadyNeverReuseAnEmpty
                 ASSERT_TRUE(retained);
             } else {
                 SchedulerReadyClaim candidate{};
-                ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-                    fixture.graph.graph(), fixture.base(), local, fixture.run(), SCHEDULER_MIX_QUEUE, 0,
-                    &candidate.task_ref, nullptr
+                ASSERT_TRUE(scheduler_claim_ready_for_slot(
+                    fixture.graph.graph(), fixture.base(), local, fixture.run(), local->config.scheduler_count,
+                    static_cast<uint32_t>(SchedulerReadyClass::AIC), &candidate
                 ));
                 ASSERT_EQ(candidate.task_ref, 1);
                 ASSERT_EQ(
@@ -3376,7 +3353,7 @@ TEST(HbgGmMixReadyProbeOwnership, CandidatePendingAndLocalReadyNeverReuseAnEmpty
         } else {
             ASSERT_NE(local->local_ready_mask, 0u);
         }
-        ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+        ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
         const uint8_t ready_mask = local->local_ready_mask;
         bool empty = true;
         EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local, &empty));
@@ -3398,35 +3375,27 @@ TEST(HbgGmMixReadyProbeOwnership, CandidatePendingAndLocalReadyNeverReuseAnEmpty
     }
 }
 
-TEST(HbgGmMixReadyProbeOwnership, OwnReadyWithoutDirectoryAndShardReadyBothKeepDiscoveryEnabled) {
+TEST(HbgGmMixReadyProbeOwnership, ReadyFromEitherProducerKeepsDiscoveryEnabled) {
     for (bool remote : {false, true}) {
         SCOPED_TRACE(remote);
         GmMixFixture fixture({{2, LaneMask::all()}, {1, LaneMask::all()}});
         ASSERT_TRUE(fixture.admit(0));
         ASSERT_TRUE(fixture.refresh_all());
-        ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+        ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
         ASSERT_TRUE(fixture.enqueue(1, remote ? 3 : 0));
-        if (!remote) {
-            // Model the legal interval between inbox publication and its directory bit.
-            scheduler_ready_directory_clear(
-                scheduler_ready_directory_at(fixture.base(), fixture.locals[0]), SCHEDULER_MIX_QUEUE, 0
-            );
-        }
         bool empty = true;
         EXPECT_TRUE(
             scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty)
         );
         EXPECT_FALSE(empty);
-        SchedulerReadyStats ready{};
+
         bool failed = false;
         scheduler_fill_own_slots(
-            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), fixture.cursors[0].data(), &ready,
-            0, 0, &failed, nullptr
+            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, 0, &failed
         );
         EXPECT_FALSE(failed);
         EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
-        EXPECT_EQ(ready.pop_count, 1u);
-        EXPECT_EQ(ready.steal_count, remote ? 1u : 0u);
+
         EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
     }
 }
@@ -3437,14 +3406,19 @@ TEST(HbgGmMixReadyProbeOwnership, InvalidDiscoveryConfigurationCannotBeHiddenByA
         GmMixFixture fixture({{2, LaneMask::all()}});
         ASSERT_NO_FATAL_FAILURE(prepare_service_phase(fixture, {0, SchedulerGmMixPhase::RUNNING}));
         ASSERT_TRUE(fixture.finish_lanes(0));
-        ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+        ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
         auto *local = fixture.locals[0];
         if (invalid == 0) local->config.scheduler_count = 0;
         else if (invalid == 1) local->config.scheduler_count = SCHEDULER_WORKER_CAPACITY + 1;
         else if (invalid == 2) local->config.scheduler_index = local->config.scheduler_count;
-        else if (invalid == 3) local->config.cluster_type_ranks[0] = local->config.cluster_count;
-        else if (invalid == 4) local->config.cluster_type_ranks[0] = scheduler_ready_queue_capacity(0);
-        else local->config.self_core_type = SCHEDULER_READY_QUEUE_COUNT;
+        else if (invalid == 3) local->config.ready_pool_offset = 0;
+        else if (invalid == 4) {
+            const auto &pool =
+                *scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+            const auto queue =
+                scheduler_ready_pool_queue(fixture.base(), pool, static_cast<uint32_t>(SchedulerReadyClass::AIC));
+            scheduler_gm_store(queue.control->head, queue.capacity + 1);
+        } else local->config.self_core_type = SCHEDULER_READY_QUEUE_COUNT;
         bool empty = true;
         EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local, &empty));
         EXPECT_FALSE(empty);
@@ -3479,9 +3453,7 @@ TEST_P(HbgGmMixMultiWaveCompletion, EveryReturnPrecedesExactlyOneSuccessorAcross
     ASSERT_TRUE(fixture.admit(0, first * 3));
     ASSERT_TRUE(fixture.refresh_all());
     ASSERT_EQ(
-        scheduler_route_task(
-            fixture.graph.graph(), fixture.base(), fixture.locals[first * 3], fixture.run(), 1, nullptr
-        ),
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[first * 3], fixture.run(), 1),
         SchedulerRouteResult::WAITING
     );
     std::map<std::pair<uint32_t, uint8_t>, uint32_t> visits;

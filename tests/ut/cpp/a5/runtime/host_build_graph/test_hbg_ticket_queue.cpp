@@ -24,11 +24,11 @@
 namespace {
 struct TicketQueueFixture {
     SchedulerTicketQueue control{};
-    std::vector<int64_t> entries;
+    std::vector<SchedulerTicketEntry> entries;
     SchedulerTicketQueueView queue;
 
     explicit TicketQueueFixture(uint64_t capacity) :
-        entries(capacity, SCHEDULER_TASK_REF_INVALID),
+        entries(capacity),
         queue{&control, entries.data(), capacity, capacity} {}
 
     SchedulerTicketResult push(const std::vector<int64_t> &refs) {
@@ -37,7 +37,27 @@ struct TicketQueueFixture {
         if (result != SchedulerTicketResult::SUCCESS) return result;
         return scheduler_ticket_publish(queue, range, refs.data());
     }
+
+    std::vector<int64_t> published_refs() const {
+        std::vector<int64_t> refs;
+        refs.reserve(entries.size());
+        for (const auto &entry : entries)
+            refs.push_back(static_cast<int64_t>(entry.task_ref));
+        return refs;
+    }
 };
+
+TEST(SchedulerTicketQueueTest, PublishedEntriesOccupyDistinctCacheLines) {
+    TicketQueueFixture fixture(4);
+    for (size_t index = 0; index < fixture.entries.size(); ++index) {
+        const auto address = reinterpret_cast<uintptr_t>(&fixture.queue.entries[index]);
+        EXPECT_EQ(address % 64, 0u);
+        if (index != 0) {
+            const auto previous = reinterpret_cast<uintptr_t>(&fixture.queue.entries[index - 1]);
+            EXPECT_GE(address - previous, 64u);
+        }
+    }
+}
 
 TEST(SchedulerTicketQueueTest, PreservesBatchOrderThroughEmptyTransitionsWithoutReusingSlots) {
     TicketQueueFixture fixture(5);
@@ -58,7 +78,7 @@ TEST(SchedulerTicketQueueTest, PreservesBatchOrderThroughEmptyTransitionsWithout
     EXPECT_EQ(scheduler_ticket_try_pop(fixture.queue, &ref), SchedulerTicketResult::NOT_READY);
     EXPECT_EQ(fixture.control.head, 5u);
     EXPECT_EQ(fixture.control.reserved_tail, 5u);
-    EXPECT_EQ(fixture.entries, (std::vector<int64_t>{3, 1, 4, 0, 2}));
+    EXPECT_EQ(fixture.published_refs(), (std::vector<int64_t>{3, 1, 4, 0, 2}));
 }
 
 TEST(SchedulerTicketQueueTest, LaterPublicationCannotConsumeAnEarlierUnpublishedReservation) {
@@ -133,7 +153,7 @@ TEST(SchedulerTicketQueueTest, RejectsInvalidReferencesBeforePublishingAnyPartOf
     ASSERT_EQ(scheduler_ticket_reserve(fixture.queue, 3, &range), SchedulerTicketResult::SUCCESS);
     const int64_t refs[] = {0, 1, 3};
     EXPECT_EQ(scheduler_ticket_publish(fixture.queue, range, refs), SchedulerTicketResult::INVALID);
-    EXPECT_EQ(fixture.entries, (std::vector<int64_t>{-1, -1, -1}));
+    EXPECT_EQ(fixture.published_refs(), (std::vector<int64_t>{-1, -1, -1}));
     int64_t ref = 123;
     EXPECT_EQ(scheduler_ticket_try_pop(fixture.queue, &ref), SchedulerTicketResult::NOT_READY);
     EXPECT_EQ(fixture.control.head, 0u);
@@ -141,7 +161,7 @@ TEST(SchedulerTicketQueueTest, RejectsInvalidReferencesBeforePublishingAnyPartOf
 
 TEST(SchedulerTicketQueueTest, OverflowIsTerminalAndCannotWriteBeyondTheBacking) {
     TicketQueueFixture fixture(3);
-    fixture.entries.push_back(0x12345);
+    fixture.entries.push_back(SchedulerTicketEntry{0x12345});
     fixture.queue.entries = fixture.entries.data();
     SchedulerTicketRange range{};
     ASSERT_EQ(scheduler_ticket_reserve(fixture.queue, 2, &range), SchedulerTicketResult::SUCCESS);
@@ -150,7 +170,7 @@ TEST(SchedulerTicketQueueTest, OverflowIsTerminalAndCannotWriteBeyondTheBacking)
     EXPECT_EQ(fixture.control.reserved_tail, 4u);
     const int64_t refs[] = {0, 1};
     EXPECT_EQ(scheduler_ticket_publish(fixture.queue, {2, 2}, refs), SchedulerTicketResult::INVALID);
-    EXPECT_EQ(fixture.entries, (std::vector<int64_t>{-1, -1, -1, 0x12345}));
+    EXPECT_EQ(fixture.published_refs(), (std::vector<int64_t>{-1, -1, -1, 0x12345}));
 }
 
 TEST(SchedulerTicketQueueTest, ZeroCapacityAndInvalidViewsDoNotAccessEntries) {
@@ -173,7 +193,7 @@ TEST(SchedulerTicketQueueTest, ZeroCapacityAndInvalidViewsDoNotAccessEntries) {
 TEST(SchedulerTicketQueueTest, RejectsCorruptPublishedReferenceWithoutClaimingIt) {
     TicketQueueFixture fixture(1);
     for (int64_t invalid : {-2, 1}) {
-        __atomic_store_n(&fixture.entries[0], invalid, __ATOMIC_RELEASE);
+        __atomic_store_n(&fixture.entries[0].task_ref, invalid, __ATOMIC_RELEASE);
         int64_t ref = 123;
         EXPECT_EQ(scheduler_ticket_try_pop(fixture.queue, &ref), SchedulerTicketResult::INVALID);
         EXPECT_EQ(ref, SCHEDULER_TASK_REF_INVALID);
@@ -286,12 +306,15 @@ TEST(SchedulerTicketQueueTest, ReinitializesTheSameBackingOnlyAfterQuiescence) {
     for (uint32_t run = 0; run < 3; ++run) {
         fixture.control.head = 0;
         fixture.control.reserved_tail = 0;
-        std::fill(fixture.entries.begin(), fixture.entries.end(), SCHEDULER_TASK_REF_INVALID);
+        std::fill(fixture.entries.begin(), fixture.entries.end(), SchedulerTicketEntry{});
         int64_t ref = 123;
         EXPECT_EQ(scheduler_ticket_try_pop(fixture.queue, &ref), SchedulerTicketResult::NOT_READY);
-        ASSERT_EQ(fixture.push({static_cast<int64_t>(run % 2)}), SchedulerTicketResult::SUCCESS);
-        ASSERT_EQ(scheduler_ticket_try_pop(fixture.queue, &ref), SchedulerTicketResult::SUCCESS);
-        EXPECT_EQ(ref, static_cast<int64_t>(run % 2));
+        const std::vector<int64_t> expected{static_cast<int64_t>(run % 2), static_cast<int64_t>((run + 1) % 2)};
+        ASSERT_EQ(fixture.push(expected), SchedulerTicketResult::SUCCESS);
+        for (const auto task_ref : expected) {
+            ASSERT_EQ(scheduler_ticket_try_pop(fixture.queue, &ref), SchedulerTicketResult::SUCCESS);
+            EXPECT_EQ(ref, task_ref);
+        }
         EXPECT_EQ(scheduler_ticket_try_pop(fixture.queue, &ref), SchedulerTicketResult::NOT_READY);
     }
 }

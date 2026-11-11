@@ -187,14 +187,13 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all("runtime" not in stream for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                # Ready Inbox tasks can all be launched through worksteal.
-                required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "refill", "idle"}
+                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )
-                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill"} & emitted_kinds)
+                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill", "worksteal"} & emitted_kinds)
                 records = [record for stream in streams for record in stream["records"]]
-                launch_kinds = {"dispatch", "worksteal", "refill"}
+                launch_kinds = {"dispatch", "refill"}
                 launches_by_task = Counter(
                     int(record["task_id"])
                     for record in records
@@ -209,14 +208,14 @@ class TestSchedulerPhases(SceneTestCase):
                     if record["kind"] == "state_probe" and record["task_id"] is not None
                 }
                 assert state_probe_task_ids <= profiled_task_ids
-                inbox_launch_task_ids = {
+                pool_launch_task_ids = {
                     int(record["task_id"])
                     for record in records
-                    if record["kind"] in {"dispatch", "worksteal"} and record["task_id"] is not None
+                    if record["kind"] == "dispatch" and record["task_id"] is not None
                 }
-                assert inbox_launch_task_ids <= state_probe_task_ids, (
-                    "Ready Inbox launches are missing state_probe records: "
-                    f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
+                assert pool_launch_task_ids <= state_probe_task_ids, (
+                    "Ready pool launches are missing state_probe records: "
+                    f"{sorted(pool_launch_task_ids - state_probe_task_ids)}"
                 )
                 refill_task_ids = {
                     int(record["task_id"])
