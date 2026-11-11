@@ -71,6 +71,30 @@ These workflows retain their own permissions and project requirements. Design
 approval alone does not authorize public messages, merging or unrelated changes.
 Use authorization already present in the conversation rather than asking again.
 
+### A5 device changes
+
+The device compiler has a known stack-realignment defect
+([simpler#2973](https://github.com/hw-native-sys/simpler/issues/2973)): a stack
+object with a large alignment can get inconsistent address fixups once its
+address escapes into an outlined call, so a predicate may read a shifted object
+and report an error that never happened. The source looks correct, the build is
+clean and unit tests pass; only an A5 run shows it.
+
+This is a review-time check, not an authoring rule — write device code naturally.
+When the task's review reaches device code, point the scanner at the build
+directory under review and apply what it reports:
+
+```bash
+./tools/a5-ir-check/a5_ir_check.py <build-dir>
+```
+
+Exit 0 is clean, 1 lists objects whose escaping address reaches an outlined
+call, 2 is a tooling problem or an incomplete scan. A hit is a precondition, not
+a proven defect, so resolve or explicitly justify it; a clean run only covers the
+scanned configuration. Escapes through `phi`/`select` are not traced, and the
+scanner cannot see the miscompile itself, so a device functional claim still
+needs an A5 run. See `tools/a5-ir-check/README.md`.
+
 ## Optional personal coordination
 
 If the user has enabled WudiTask coordination, use its installed `wuditask` skill
