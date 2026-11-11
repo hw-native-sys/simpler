@@ -151,7 +151,6 @@ public:
      * `set_output_prefix`, `output_prefix`, and `launch_aicpu_payload` live on
      * `DeviceRunnerBase`.
      */
-    void arm_host_dep_gen_capture(bool enable) override;
     void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
     bool dep_gen_retains_runs() const override;
     int admit_dep_gen_run(

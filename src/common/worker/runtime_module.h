@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "runtime_host_services.h"
+
 /** Host runtime code ownership; context and native-run storage share this owner. */
 class RuntimeModule {
 public:
@@ -37,6 +39,7 @@ public:
 private:
     void *required_symbol(const char *name) const;
     void *optional_symbol(const char *name) const noexcept;
+    simpler::ReleaseHostServices release_host_services_{nullptr};
     void *handle_{nullptr};
     bool unload_allowed_{true};
 };

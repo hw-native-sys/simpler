@@ -225,11 +225,6 @@ public:
      */
     virtual DrainOutcome drain_execution(ActiveExecution &active) = 0;
     virtual int finalize() = 0;
-    // Arms this thread's host-side dep_gen capture from the run's own config,
-    // before it binds. a2a3 and a5 both override; an arch without dep_gen leaves
-    // the no-op. See the onboard base for why it is not part of
-    // apply_call_config().
-    virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
 
     /**
      * Cross-run retention for the DepGen collector, which lives on the arch
@@ -238,8 +233,7 @@ public:
      * The base owns the latch, the flush and the teardown, so it reaches that
      * collector through these. Defaults are no-ops, so a runner without a
      * DepGen collector inherits today's behaviour and a runtime that captures
-     * its graph on the host is unaffected. Same ownership split as
-     * `arm_host_dep_gen_capture` above.
+     * its graph on the host is unaffected.
      */
     virtual void configure_dep_gen_retention(bool /*enabled*/, std::size_t /*budget_bytes*/) {}
     virtual bool dep_gen_retains_runs() const { return false; }

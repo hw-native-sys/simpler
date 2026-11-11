@@ -28,7 +28,9 @@ namespace simpler {
 template <typename T>
 class __attribute__((visibility("hidden"))) ModuleThreadValue {
     static_assert(std::is_trivially_copyable_v<T>);
-    static constexpr size_t count = (sizeof(T) + sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
+    // Pointer selectors store the pointer representation, never the pointee.
+    static constexpr size_t value_bytes = sizeof(T);  // NOLINT(bugprone-sizeof-expression)
+    static constexpr size_t count = (value_bytes + sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
     using Words = std::array<uintptr_t, count>;
 
 public:
@@ -53,8 +55,8 @@ public:
     bool cache(const T &value) noexcept {
         if (!available()) return false;
         Words words{}, initial{};
-        std::memcpy(words.data(), &value, sizeof(T));
-        std::memcpy(initial.data(), &initial_, sizeof(T));
+        std::memcpy(words.data(), &value, value_bytes);
+        std::memcpy(initial.data(), &initial_, value_bytes);
         for (size_t i = 0; i < count; ++i) {
             if (pthread_setspecific(keys_[i], reinterpret_cast<void *>(words[i] ^ initial[i])) == 0) continue;
             // No borrowed lifetime depends on an optional cache. Disable its
@@ -67,18 +69,18 @@ public:
     T get() const noexcept {
         if (!available()) return initial_;
         Words words{};
-        std::memcpy(words.data(), &initial_, sizeof(T));
+        std::memcpy(words.data(), &initial_, value_bytes);
         for (size_t i = 0; i < count; ++i)
             words[i] ^= reinterpret_cast<uintptr_t>(pthread_getspecific(keys_[i]));
         T value = initial_;
-        std::memcpy(&value, words.data(), sizeof(T));
+        std::memcpy(&value, words.data(), value_bytes);
         return value;
     }
     int try_set(const T &value) noexcept {
         if (error_ != 0) return error_;
         Words words{}, initial{};
-        std::memcpy(words.data(), &value, sizeof(T));
-        std::memcpy(initial.data(), &initial_, sizeof(T));
+        std::memcpy(words.data(), &value, value_bytes);
+        std::memcpy(initial.data(), &initial_, value_bytes);
         std::array<void *, count> previous{};
         for (size_t i = 0; i < count; ++i)
             previous[i] = pthread_getspecific(keys_[i]);

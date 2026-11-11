@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "common/module_thread_value.h"
+#include <stdexcept>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -415,24 +417,35 @@ public:
 
     // ------------------------------------------------------------------ claims
 
-    /**
-     * Record one acquisition of the transaction in flight on this thread.
-     *
-     * Thread-local rather than per slot: a successor prepared on another thread
-     * runs its own transaction, and charging its claims to this one would roll
-     * back a block the other plan is still staging.
-     */
-    static void record_claim(const Claim &claim) { claims().push_back(claim); }
+    // The prepare transaction owns its rollback ledger through exception cleanup.
+    // TLS only selects the live scope; it never owns a vector or its capacity.
+    class ClaimScope {
+    public:
+        ClaimScope() :
+            previous_(active_claims_.get()) {
+            active_claims_.set(&claims_);
+        }
+        ~ClaimScope() { active_claims_.restore(previous_); }
+        ClaimScope(const ClaimScope &) = delete;
+        ClaimScope &operator=(const ClaimScope &) = delete;
 
+    private:
+        std::vector<Claim> claims_;
+        std::vector<Claim> *previous_;
+    };
+    static bool has_claim_scope() noexcept { return active_claims_.get() != nullptr; }
+    static void record_claim(const Claim &claim) { claims().push_back(claim); }
     static std::vector<Claim> &claims() {
-        static thread_local std::vector<Claim> live;
-        return live;
+        if (active_claims_.get() == nullptr) throw std::logic_error("workspace claim without prepare scope");
+        return *active_claims_.get();
+    }
+    // Ownership moves to the run; clearing the ledger does not release its blocks.
+    static void commit_claims() {
+        if (auto *claims = active_claims_.get()) claims->clear();
     }
 
-    /** Adopt this transaction's claims as live references and stop tracking them. */
-    static void commit_claims() { claims().clear(); }
-
 private:
+    inline static __attribute__((visibility("hidden"))) simpler::ModuleThreadValue<std::vector<Claim> *> active_claims_;
     static constexpr uint32_t kNoOwner = 0xFFFFFFFFu;
 
     static bool contains(const std::vector<uint64_t> &values, uint64_t value) {

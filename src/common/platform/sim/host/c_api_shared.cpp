@@ -21,6 +21,8 @@
  * Mirrors the onboard pattern from PR #928.
  */
 
+#include "host/host_dependency_capture_scope.h"
+#include <optional>
 #include "runtime_c_api.h"
 
 #include "callable.h"
@@ -45,6 +47,7 @@
 #include <vector>
 
 #include "common/device_phase.h"
+#include "common/module_thread_value.h"
 #include "common/strace.h"
 #include "host/host_clock_alignment_log.h"
 #include "common/unified_log.h"
@@ -61,6 +64,13 @@ static_assert(__builtin_offsetof(SimNativeRunContext, magic) == 0, "native-run m
 // types belong to that runtime .so. Each platform .so carries weak `false` /
 // `-1` fallbacks for the runtimes that capture on the device instead — see each
 // arch's device_runner.cpp.
+// Runtimes without host graph capture own no capture session.
+extern "C" __attribute__((weak, visibility("hidden"))) void *dep_gen_host_graph_create_capture_session() {
+    return nullptr;
+}
+extern "C" __attribute__((weak, visibility("hidden"))) void
+dep_gen_host_graph_destroy_capture_session(void *) noexcept {}
+
 extern "C" bool dep_gen_host_graph_active();
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
 
@@ -1040,6 +1050,14 @@ int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
+    // The thread owns capture/prepare state even when a recursive call names
+    // another runner or disables capture. Hold admission through all cleanup.
+    static simpler::ModuleThreadValue<bool> preparing;
+    if (preparing.get()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (preparing.try_set(true) != 0) return PTO_RUNTIME_ERR_INTERNAL;
+    const auto prepare_scope = RAIIScopeGuard([&]() {
+        preparing.restore(false);
+    });
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
     if (descriptor->prepare_purpose != SIMPLER_PREPARE_EAGER)
@@ -1084,11 +1102,13 @@ int simpler_prepare_run(
     // preparation whose release result has not been consumed by a raw caller.
     if (magic == kNativeRunPrepareReleasedMagic) std::memset(runtime, 0, kNativeRunPrepareReleaseBytes);
 
+    std::optional<HostDependencyCaptureScope> capture_scope;
     SimNativeRunContext *state = nullptr;
     const uint64_t trace_hid = static_cast<uint64_t>(callable_id);
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
+        capture_scope.emplace(config->enable_dep_gen != 0);
         state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
         if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
             LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
@@ -1122,10 +1142,6 @@ int simpler_prepare_run(
         runner->apply_call_config(state->config);
         // This run's host-phase state, before its bind records into it.
         runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(state->config));
-        // Armed from this run's own config on the thread that is about to bind:
-        // a host-orchestrating runtime keeps the capture in thread-local state
-        // between orchestration and emit. Mirrors the onboard c_api.
-        runner->arm_host_dep_gen_capture(state->config.enable_dep_gen != 0);
 
         {
             STRACE("chip.run.bind");
