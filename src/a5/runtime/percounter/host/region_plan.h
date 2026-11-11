@@ -231,9 +231,12 @@ inline bool plan_layout(
         // After the counters, so the records fall outside `upload_size` below.
         // The entries follow the records for the reason `layout_valid` checks:
         // a record's entry span has to start after the record itself.
-        !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, pto2::resident::AsyncGroupData, async_groups_offset) ||
         !PERCOUNTER_RESERVE(
-            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry, async_entries_offset
+            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS, pto2::resident::AsyncGroupData, async_groups_offset
+        ) ||
+        !PERCOUNTER_RESERVE(
+            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry,
+            async_entries_offset
         ) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef PERCOUNTER_RESERVE

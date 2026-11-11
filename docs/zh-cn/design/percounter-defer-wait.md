@@ -106,8 +106,15 @@ lane 在进入自己的循环前写一次自己那条记录（`percounter_open_a
 个上限要乘 108 付一遍，无论有没有 kernel 登记。4 时每 lane 是 128 B 头部 + 128 B entries，
 全设备 27 KiB；64 时是 235 KiB，比旁边的 payload 数组还大四倍。
 
-每 lane 一条记录即每 lane 一个在途 deferred 任务。代价：一个 lane 连续遇到两个登记条件的
-任务时，第二个要等第一个结算。放宽它是给记录加一维 slot，只改常量不改协议。
+**每 lane 不止一条记录（`PERCOUNTER_ASYNC_SLOTS = 2`），否则这个特性什么也不做。** 一条
+记录从开启它的那次 dispatch 一直活到条件满足，而 lane 在这期间照常跑别的任务 —— 那个间
+隔正是全部意义所在。那些任务需要自己的记录：拿到一条已封口记录的 kernel 根本登记不了，
+而运行时读回一条已结算但未释放的记录，会把一个什么都没登记的任务当成登记了而拒绝。换句
+话说，1 深不是"连续两个登记任务要排队"，是**任何下一个任务都撞车**。
+
+槽位满了的 lane 在下一次 dispatch 前等一个结算，这是槽数唯一被感觉到的地方；那个等待是
+checkpoint 自旋，不是阻塞 —— lane 在那儿照样服务 MIX 和 cohort、照样看得见 EXIT 和别人
+的错误。2 是 COUNTER 用例需要的；加大只多一条记录加它的 entries，不改协议。
 
 ### 3.2 寻址不额外碰任何 cache line
 
@@ -167,12 +174,16 @@ lane 在进入自己的循环前写一次自己那条记录（`percounter_open_a
 插入点只有一个 —— `percounter_checkpoint_serve`：
 
 ```cpp
-if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
+if (!percounter_async_tick(cfg, state, served)) return false;   // 新增，且排在最前
 if (*served) return true;
-if (!percounter_async_tick(cfg, state, served)) return false;   // 新增
+if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
 if (*served) return true;
 return percounter_mix_discover(cfg, state, timeout_cycles, served);
 ```
+
+排在最前且无条件执行：这一项是本 lane 欠下的、别人替不了的债，而后两项是可以由别的 lane
+服务的工作。一个欠着完成的 lane 必须在服务别人之前先看自己那笔。不欠时它只是一次本地
+整数判断（`async_outstanding_hint`），不走记录也不读 entries。
 
 **这一行是死锁正确性的要求，不只是延迟优化。** `percounter_wait_for_fanin` 与
 `percounter_wait_for_entry` 的自旋体每轮都调 `percounter_checkpoint_serve`。一个 lane 延迟
@@ -322,8 +333,8 @@ host 只给本步已经支持的任务形状打"可能登记"标记，其余形�
 
 | 步 | 内容 | 完成判据 |
 | -- | ---- | -------- |
-| S1 | 布局、寻址与**拒绝**：region 预留 group 与 entries、`PercounterControl` 新字段、host 预填、每次 dispatch 开启与封口；kernel 返回后 `count > 0` 或 `error_code != 0` 即报错 | 登记条件的 kernel 得到指名的运行时错误，而非 trap 或错误答案；不登记的图行为一字不变 |
-| S2 | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 普通 AIC/AIV 与 SPMD 的 COUNTER 用例；自环用例；超时报 TIMEOUT |
+| S1 ✅ | 布局、寻址与**拒绝**：region 预留 group 与 entries、`PercounterControl` 新字段、host 预填、每次 dispatch 开启与封口；kernel 返回后 `count > 0` 或 `error_code != 0` 即报错 | 登记条件的 kernel 得到指名的运行时错误，而非 trap 或错误答案；不登记的图行为一字不变 |
+| S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
 | S3 | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | sync-start 用例；`sync_queue->completed` 与 cohort 释放不受影响 |
 | S4 | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | MIX 3/5/6/7 用例；计数器终值与全不延迟时一致 |
 | S5 | Graph body、溢出与非法条件、容量与开销度量 | 第 8 节矩阵补齐 |

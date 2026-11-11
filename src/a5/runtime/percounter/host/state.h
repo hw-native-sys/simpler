@@ -268,18 +268,19 @@ inline StateSelection select_percounter_state(
         payload->local_context.block_num = 1;
         payload->local_context.async_ctx.task_token = TaskId::invalid();
         payload->src_payload = 0;
-        // The resident deferred-completion context, bind-time constants like the
-        // two context arguments above: this lane's record never moves, so a
-        // dispatch rewrites none of these. The legacy slab above stays invalid,
+        // The resident deferred-completion context. The image fields are
+        // bind-time constants like the two context arguments above; the record
+        // the last two name is this lane's first, which a dispatch rewrites
+        // when it takes a different slot. The legacy slab above stays invalid,
         // which is what sends `get_async_ctx` down the resident path.
+        const uint64_t first_record = (slot / PERCOUNTER_PAYLOAD_SLOT_COUNT) * PERCOUNTER_ASYNC_SLOTS;
         payload->global_context.async_present = 1;
         payload->global_context.async_image_address = device_base;
         payload->global_context.async_image_bytes = layout.total_size;
         payload->global_context.async_run_epoch = async_run_epoch;
         payload->global_context.async_group_offset =
-            layout.async_groups_offset +
-            (slot / PERCOUNTER_PAYLOAD_SLOT_COUNT) * sizeof(pto2::resident::AsyncGroupData);
-        payload->global_context.async_group_index = static_cast<uint32_t>(slot / PERCOUNTER_PAYLOAD_SLOT_COUNT);
+            layout.async_groups_offset + first_record * sizeof(pto2::resident::AsyncGroupData);
+        payload->global_context.async_group_index = static_cast<uint32_t>(first_record);
         payload->global_context.async_reserved = 0;
     }
 
