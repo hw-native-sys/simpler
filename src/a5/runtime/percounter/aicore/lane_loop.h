@@ -555,14 +555,37 @@ inline __aicore__ bool percounter_sync_can_serve(const LaneConfig &cfg, uint32_t
 }
 
 /**
+ * Order a store on this line against the loads that follow it.
+ *
+ * Neither SSBUF primitive gives this: the release store puts its barrier
+ * *before* the store and the acquire load puts its after, so a store followed
+ * by a load of another word has nothing between them. Two lanes that each
+ * publish a word and then read the other's are a mutual exclusion that needs
+ * exactly that edge, and without it both can read stale and both proceed.
+ */
+inline __aicore__ void percounter_publish_fence() {
+#if defined(__CCE_AICORE__)
+    dsb((mem_dsb_t)0);
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+/**
  * Publish which cohort this lane owes a block of, as `seq + 1`; 0 is none.
  *
  * The sequence, not a flag: an arming has to tell a lane that owes an older
  * cohort from one that owes a newer, and the two want opposite answers.
+ *
+ * **The fence is half of a mutual exclusion**, not a publication barrier: an
+ * arming stages its mask and then reads these holds, and this lane publishes
+ * its hold and then reads that mask. Both edges have to hold for the pair to
+ * exclude each other.
  */
 inline __aicore__ void percounter_cohort_hold_set(const LaneConfig &cfg, uint64_t seq_plus_one) {
     if (cfg.mix_order_count == 0) return;
     scheduler_ssbuf_store_release(&cfg.mix_signal->cohort_hold[cfg.cluster_lane], static_cast<uint32_t>(seq_plus_one));
+    percounter_publish_fence();
 }
 
 /**
@@ -772,7 +795,9 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
     // The holds again, with the payload staged and nothing published, for the
     // reason the ordinary draw re-reads them: nothing is a rendezvous until the
     // generation turns odd, so returning here retracts the arming whole, mask
-    // included.
+    // included. The fence orders this read after the mask store, as it does
+    // there.
+    percounter_publish_fence();
     if (percounter_cohort_older_held_in(cfg, sync->active_mask & ~(uint32_t{1} << cfg.cluster_lane), sync->my_seq)) {
         signal->active_mask = 0;
         return true;
@@ -966,6 +991,9 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
     // is what would tell it so. Returning now retracts the whole arming, since
     // a payload under an even generation is not a rendezvous -- the mask goes
     // with it, because a staged mask is what holds a named lane's block back.
+    // The fence is the other half of that exclusion: without it this read may
+    // predate the mask store that the lane is meanwhile failing to see.
+    percounter_publish_fence();
     if (percounter_cohort_held_in(cfg, mask)) {
         signal->active_mask = 0;
         return;
