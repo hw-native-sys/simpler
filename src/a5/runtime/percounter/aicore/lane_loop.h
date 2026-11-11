@@ -740,6 +740,13 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     const uint64_t desc = scheduler_gm_query(cfg.sync_pending[seq]);
     // Reserved but not yet written: its own enqueuer will promote it.
     if (desc == 0) return;
+    // **Only one cohort is ever outstanding.** A cohort whose blocks have not
+    // all run can still be waiting for a lane to take one, and a second cohort
+    // in that state takes lanes the first is waiting for while the first holds
+    // lanes the second needs -- each one's kernel is entered a block at a time
+    // and cannot be left, so the two hold each other there. Opening the next
+    // one only once the last has run is what keeps that pair from existing.
+    if (scheduler_gm_query(cfg.sync_queue->completed) != scheduler_gm_query(cfg.sync_queue->claimed_blocks)) return;
     if (scheduler_gm_compare_exchange(q->open_generation, generation, generation + 1) != generation) return;
 
     scheduler_gm_store(q->open_block_num, percounter_sync_desc_blocks(desc));
@@ -947,6 +954,9 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     __gm__ PercounterSyncQueue *q = cfg.sync_queue;
     scheduler_gm_store(q->open_task_id, int64_t{-1});
     scheduler_gm_store(q->released, seq + 1);
+    // Before the slot frees, so a promotion that sees it free also sees what
+    // this cohort still owes: the pair is what says whether one is outstanding.
+    scheduler_gm_fetch_add(q->claimed_blocks, static_cast<uint64_t>(sync->block_num));
     scheduler_gm_store(q->open_generation, generation + 1);
     percounter_sync_promote(cfg);
     return percounter_sync_serve_released(cfg, state, timeout_cycles, served);

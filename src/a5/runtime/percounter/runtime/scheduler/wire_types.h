@@ -302,7 +302,12 @@ struct alignas(64) PercounterSyncQueue {
     // and is free at once -- so without this count the cluster's other lanes
     // could leave before discovering the rendezvous they are needed for.
     alignas(64) uint64_t completed;
-    uint8_t reserved4[56];
+    // Blocks owed by every cohort released so far, which `completed` reaches
+    // exactly when none of them is outstanding. Shares this line with it: the
+    // promotion reads the pair, and a cohort that is still outstanding is one
+    // that can still be waiting for a lane.
+    uint64_t claimed_blocks;
+    uint8_t reserved4[48];
 };
 static_assert(sizeof(PercounterSyncQueue) == 320, "the sync queue owns five isolated cache lines");
 
