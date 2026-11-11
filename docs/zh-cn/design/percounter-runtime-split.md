@@ -146,16 +146,23 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
 ### 实际的冲突面
 
-| 文件 | 冲突块 | 行数 | 成因 |
-| ---- | -----: | ---: | ---- |
-| `aicpu_executor.cpp` | 1 | 108 | 上游改 supervisor body，本分支把它搬进了 `supervise()` |
-| `runtime_maker.cpp` | 4 | 155 | 调用点落在 `create_scheduler_state` 内，和上游新增的 509 行重叠 |
+本分支已向上游合并五次，实际冲突过的文件：
 
-合计 2 文件 5 块 263 行。两个新增头文件永不冲突；`aicore_lifecycle.h` 与
-`scheduler_topology.h` 上游自分叉以来零改动。测试 CMakeLists 那个冲突已永久消失。
+| 文件 | 冲突次数 | 成因 |
+| ---- | -------: | ---- |
+| `mkdocs.yml` | 5 | 两侧都在同一处导航列表里加行 |
+| `host/runtime_maker.cpp` | 4 | 调用点落在 `create_scheduler_state` 内，上游在同一函数里持续增改 |
+| `aicpu/aicpu_executor.cpp` | 3 | 上游改 `run()` 的函数体，本分支把它拆成了七个步骤 |
+| `tests/ut/cpp/a5/runtime/host_build_graph/CMakeLists.txt` | 3 | 两侧都往同一个 target 的 `SOURCES` 里加源文件 |
+| `aicpu/aicpu_executor.h` | 2 | 上游给 `AicpuExecutor` 加成员，本分支把类型搬进了这个新头 |
+| `host/scheduler_extension.h`、`percounter/host/percounter_extension.cpp`、`percounter/aicpu/steps.cpp`、`simpler_setup/kernel_compiler.py` | 各 1 | — |
 
-`aicpu_executor.cpp` 的解法是固定的：把上游的新 supervisor body 搬进
-`AicpuExecutor::supervise()`，保留调用点那一行。
+两类解法是固定的。`aicpu_executor.*`：上游新增的成员随类型一起进头文件，对 `run()`
+函数体的改动落进对应的那个步骤，percounter 的强实现同步跟签名。测试 CMakeLists：
+两侧都是往同一个 target 加源文件，取并集。
+
+`aicore_lifecycle.h` 与 `scheduler_topology.h` 上游自分叉以来零改动，两个新增头文件
+只在上游也改到同名文件时才冲突。
 
 ## 分步计划
 
