@@ -694,6 +694,9 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     if (percounter_sync_armed(generation)) return;
     const uint64_t seq = generation / 2;
     if (seq >= scheduler_gm_query(q->tail)) return;
+    // `tail` counts every attempt, including one the enqueue refused for being
+    // past the ring, so it alone does not bound this read.
+    if (seq >= cfg.sync_cohort_count) return;
     const uint64_t desc = scheduler_gm_query(cfg.sync_pending[seq]);
     // Reserved but not yet written: its own enqueuer will promote it.
     if (desc == 0) return;
@@ -726,6 +729,14 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
 inline __aicore__ void percounter_sync_enqueue(const LaneConfig &cfg, const PercounterTask &task, int32_t block_num) {
     const uint32_t mask = percounter_mix_active_mask(task);
     const uint64_t seq = scheduler_gm_fetch_add(cfg.sync_queue->tail, uint64_t{1});
+    // The ring holds one slot per cohort the planner counted, and the claims it
+    // hands out live in the half past them. A sequence beyond that would write
+    // a descriptor over another cohort's claim count and be found, if at all,
+    // as a cohort that admits one block too many -- so it fails here instead.
+    if (seq >= cfg.sync_cohort_count) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
+        return;
+    }
     scheduler_gm_store(cfg.sync_pending[seq], percounter_sync_desc(task.id, static_cast<uint32_t>(block_num), mask));
     percounter_sync_promote(cfg);
 }
