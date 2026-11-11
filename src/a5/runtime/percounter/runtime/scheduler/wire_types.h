@@ -30,6 +30,7 @@
 // scheduler_protocol_types.h, which scheduler_layout.h pulls in, names LaneMask
 // without including it; host_build_graph's own translation units happen to have
 // it in scope by then, and this runtime's do not.
+#include "async_completion_types.h"
 #include "common/lane_mask.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/ssbuf.h"
@@ -242,6 +243,25 @@ inline __aicore__ bool percounter_counter_published(uint64_t value) { return sta
 inline constexpr uint64_t percounter_counter_preset(int64_t total_subtasks) {
     return static_cast<uint64_t>(static_cast<int64_t>(PERCOUNTER_COUNTER_PUBLISHED) - total_subtasks);
 }
+
+/**
+ * Completion conditions one deferred-completion record holds.
+ *
+ * Four, not `MAX_COMPLETIONS_PER_TASK`: the record is per lane rather than per
+ * task, so the cap is paid 108 times over whether or not a kernel registers
+ * anything. At four, a record's entries are exactly one cache line and the
+ * whole array is 27 KiB; at 64 it would be 235 KiB, four times the payload
+ * array that sits beside it.
+ */
+inline constexpr uint32_t PERCOUNTER_ASYNC_CAPACITY = 4;
+// A record's entries are addressed by multiplying this stride, so it has to be
+// the padded size `layout_valid` checks against, not the raw one.
+static_assert(
+    pto2::resident::async_group_entry_bytes(PERCOUNTER_ASYNC_CAPACITY) ==
+        PERCOUNTER_ASYNC_CAPACITY * sizeof(DeferredCompletionEntry),
+    "the entry stride must already be a multiple of the record alignment"
+);
+static_assert(PERCOUNTER_ASYNC_CAPACITY <= MAX_COMPLETIONS_PER_TASK);
 
 /** A ticket, line-isolated for the same reason the counters are. */
 struct alignas(64) PercounterTicket {
@@ -647,11 +667,19 @@ struct alignas(128) PercounterControl {
     // PERCOUNTER_PAYLOAD_SLOT_COUNT DispatchPayloads per lane: ordinary
     // candidates, a MIX subtask, and a cohort block have separate lifetimes.
     uint64_t dispatch_payloads_offset;
+    // One deferred-completion record per lane and the entry slots behind it,
+    // indexed the way the payloads are and for the same reason. The condition
+    // cap is one record's, and the epoch is what tells a record of this run
+    // from one the retained storage still held.
+    uint64_t async_groups_offset;
+    uint64_t async_entries_offset;
+    uint64_t async_capacity;
+    uint64_t async_run_epoch;
     // Prefilled by the host so a lane can bound its startup wait; the AICPU
     // overwrites it with any override when it publishes the topology.
     uint64_t scheduler_timeout_cycles;
     // Pads the progress counter below onto its own 64 B line.
-    uint8_t reserved[320 - 34 * sizeof(uint64_t)];
+    uint8_t reserved[320 - 38 * sizeof(uint64_t)];
 
     // **Alone on the last line.** Lanes batch their completions into this, and
     // the AICPU supervisor polls it against `executable_block_count`. It is the

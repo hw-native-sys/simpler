@@ -30,6 +30,7 @@
 #include "aicore/aicore.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
+#include "host_build_graph/runtime_status.h"
 #include "runtime.h"
 #include "scheduler/wire_types.h"
 #include "scheduler/scheduler_graph.h"
@@ -119,6 +120,13 @@ struct LaneConfig {
     // Whether any task carries a dispatch predicate; a graph without one never
     // reads the predicate words.
     bool has_predicates;
+
+    // This lane's deferred-completion record, which its payload's GlobalContext
+    // points a kernel at. The record exists so that a kernel registering a
+    // condition leaves a trace: until this runtime honours such conditions, a
+    // non-empty record fails the run rather than letting the task publish with
+    // its data still in flight. One per lane, as the payload is.
+    __gm__ pto2::resident::AsyncGroupData *async_group;
 
     // This lane's place in its cluster: lane 0 is the AIC, 1 and 2 the AIVs,
     // which is also the subtask slot it runs of a MIX task.
@@ -325,6 +333,54 @@ inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const PercounterTask &ta
 }
 
 /**
+ * Lay down this lane's deferred-completion record and hand back its address.
+ *
+ * Written once, before any kernel. The record never moves, and its identity
+ * fields are the same for every task this lane runs: `task_ref`,
+ * `block_index` and `subtask_slot` carry the values `layout_valid` demands
+ * rather than the running task's, because nothing reads them back -- a
+ * registration is refused whatever task made it.
+ *
+ * **The writeback is not optional.** The record sits past the region's uploaded
+ * prefix, so this store is the only thing that has ever put this run's bytes
+ * there, and a kernel that invalidates its data cache on entry would otherwise
+ * find whatever an earlier bind left.
+ */
+inline __aicore__ __gm__ pto2::resident::AsyncGroupData *
+percounter_open_async_record(__gm__ PercounterControl *control, int block_idx) {
+    using pto2::resident::AsyncGroupData;
+    const uint64_t lane = static_cast<uint64_t>(block_idx);
+    const uint32_t capacity = static_cast<uint32_t>(scheduler_gm_query(control->async_capacity));
+    const uint64_t entry_bytes = capacity * sizeof(DeferredCompletionEntry);
+    auto *record = scheduler_state_at<AsyncGroupData>(
+        control, scheduler_gm_query(control->async_groups_offset) + lane * sizeof(AsyncGroupData)
+    );
+    record->run_epoch = scheduler_gm_query(control->async_run_epoch);
+    record->task_ref = 0;
+    record->group_index = static_cast<uint32_t>(lane);
+    record->block_index = 0;
+    record->subtask_slot = 0;
+    record->capacity = static_cast<uint16_t>(capacity);
+    record->reserved = 0;
+    record->entries_bytes = static_cast<uint32_t>(entry_bytes);
+    record->count = 0;
+    record->error_code = SIMPLER_ERROR_NONE;
+    record->reservation_serial = 0;
+    record->reservation_limit = 0;
+    record->reservation_begin = 0;
+    record->reservation_written = 0;
+    record->state = pto2::resident::AsyncPublicationState::OPEN;
+    // SDMA conditions are not served here, and the guard array a submission
+    // would take is what their absence is spelled as.
+    record->sdma_guards_offset = 0;
+    record->sdma_guard_count = 0;
+    record->entries_offset = scheduler_gm_query(control->async_entries_offset) + lane * entry_bytes;
+    for (uint64_t offset = 0; offset < sizeof(AsyncGroupData); offset += 64)
+        dcci((__gm__ uint8_t *)record + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    return record;
+}
+
+/**
  * Prepare one block's subtask from published argument metadata. Tensor values
  * and the dispatch predicate may still be produced elsewhere; neither is read
  * here. The slot remains owned by this candidate until it executes.
@@ -401,6 +457,17 @@ percounter_run_prepared(const LaneConfig &cfg, const PercounterTask &task, __gm_
         if (cfg.profile->slot_within_buf == PLATFORM_AICORE_BUFFER_SIZE) {
             chip_swimlane_aicore_publish_task_count(cfg.profile);
         }
+    }
+    // A kernel that registered a completion condition is asking for its task to
+    // be published only once that condition holds, and this runtime does not
+    // honour that yet. Publishing anyway would release the consumers while the
+    // data is still in flight, so the run fails here instead. Reading the record
+    // is this core reading back its own stores: the registration needs no cache
+    // operation to be visible, which is the same binding the resident scheduler
+    // relies on across a kernel call.
+    if (cfg.async_group->count != 0 || cfg.async_group->error_code != SIMPLER_ERROR_NONE) {
+        percounter_fail(cfg, SchedulerGraphResult::ASYNC_REGISTRATION_FAILED);
+        return false;
     }
     return true;
 }
@@ -1670,6 +1737,7 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     );
     cfg.ticket_group = static_cast<uint32_t>(coordinate.cluster_index) % cfg.ticket_group_count;
     cfg.has_predicates = percounter_gm_read(control->has_predicates) != 0;
+    cfg.async_group = percounter_open_async_record(control, block_idx);
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
 

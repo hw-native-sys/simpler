@@ -19,6 +19,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,13 @@ struct PercounterLayout {
     uint64_t fanin_addr_offset;
     uint64_t counters_offset;
     uint64_t dispatch_payloads_offset;
+    // One deferred-completion record per lane and its entry slots, indexed the
+    // way the payloads are. Reserved for every graph, because whether a kernel
+    // registers a condition is not visible at bind -- the record is what lets
+    // the runtime see that one did. Placed past `upload_size`, so the bytes
+    // cost no DMA and a lane writes its own record's header before its loop.
+    uint64_t async_groups_offset;
+    uint64_t async_entries_offset;
     // The MIX list, its tickets, and the per-cluster word saying the cluster's
     // SSBUF line has been cleared. MIX is not a third core type -- a lane is AIC
     // or AIV, never MIX -- so it keeps its own offsets. All four are zero on a
@@ -220,6 +228,13 @@ inline bool plan_layout(
             dispatch_payloads_offset
         ) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
+        // After the counters, so the records fall outside `upload_size` below.
+        // The entries follow the records for the reason `layout_valid` checks:
+        // a record's entry span has to start after the record itself.
+        !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, pto2::resident::AsyncGroupData, async_groups_offset) ||
+        !PERCOUNTER_RESERVE(
+            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry, async_entries_offset
+        ) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef PERCOUNTER_RESERVE
         return false;
@@ -338,6 +353,19 @@ inline const char *build_status_name(BuildStatus status) {
         return "a fanin edge names no task";
     }
     return "?";
+}
+
+/**
+ * A value no two binds of this process share, and never zero.
+ *
+ * The deferred-completion records sit past `upload_size`, in storage a pipeline
+ * slot retains between runs, so a record can still hold the bytes an earlier
+ * bind left there. The epoch is what a kernel's writer compares before it
+ * treats a record as this run's, and zero is the writer's own "no record".
+ */
+inline uint64_t next_async_run_epoch() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 /** The task a failure is about, for the log line. -1 when it is not about one. */
@@ -670,6 +698,10 @@ inline bool build_tables(
     control->fanin_addr_offset = layout.fanin_addr_offset;
     control->counters_offset = layout.counters_offset;
     control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
+    control->async_groups_offset = layout.async_groups_offset;
+    control->async_entries_offset = layout.async_entries_offset;
+    control->async_capacity = PERCOUNTER_ASYNC_CAPACITY;
+    control->async_run_epoch = next_async_run_epoch();
     // The memset leaves this at 0, which is a real task id. A cohort takes the
     // open slot by flipping its generation and publishes by writing this field
     // last, so a lane gates on a non-negative id to know the shape behind an

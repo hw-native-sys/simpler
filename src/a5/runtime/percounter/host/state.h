@@ -255,6 +255,7 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
 
+    const uint64_t async_run_epoch = region_at<PercounterControl>(host_base, layout.control_offset)->async_run_epoch;
     // Each slot points at its own contexts, so preparing another candidate
     // cannot replace the block identity of a payload already held by the lane.
     for (uint64_t slot = 0; slot < SCHEDULER_WORKER_CAPACITY * PERCOUNTER_PAYLOAD_SLOT_COUNT; ++slot) {
@@ -267,6 +268,19 @@ inline StateSelection select_percounter_state(
         payload->local_context.block_num = 1;
         payload->local_context.async_ctx.task_token = TaskId::invalid();
         payload->src_payload = 0;
+        // The resident deferred-completion context, bind-time constants like the
+        // two context arguments above: this lane's record never moves, so a
+        // dispatch rewrites none of these. The legacy slab above stays invalid,
+        // which is what sends `get_async_ctx` down the resident path.
+        payload->global_context.async_present = 1;
+        payload->global_context.async_image_address = device_base;
+        payload->global_context.async_image_bytes = layout.total_size;
+        payload->global_context.async_run_epoch = async_run_epoch;
+        payload->global_context.async_group_offset =
+            layout.async_groups_offset +
+            (slot / PERCOUNTER_PAYLOAD_SLOT_COUNT) * sizeof(pto2::resident::AsyncGroupData);
+        payload->global_context.async_group_index = static_cast<uint32_t>(slot / PERCOUNTER_PAYLOAD_SLOT_COUNT);
+        payload->global_context.async_reserved = 0;
     }
 
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
