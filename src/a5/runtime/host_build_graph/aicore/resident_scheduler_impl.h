@@ -270,9 +270,6 @@ __aicore__ bool bootstrap_ready_graph(
     __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, SchedulerWorkerStats *stats,
     uint64_t observed_profiling_level
 ) {
-    // Each resident translation unit owns its block-local observer slot. A prior
-    // aborted launch may not have unwound the binding before this invocation.
-    scheduler_scalar_bind(nullptr);
     const uint64_t profiling_level = WithProfiling ? observed_profiling_level : 0;
     // The caller has validated the published format and node count.
     const SchedulerGraphAccess graph =
@@ -409,9 +406,6 @@ __aicore__ bool run_ready_dispatch_loop(
     SchedulerLocalState *__restrict__ context, __gm__ SchedulerRunControl *run_control,
     SchedulerWorkerStats *__restrict__ stats, uint64_t observed_profiling_level
 ) {
-    // Each resident translation unit owns its block-local observer slot. A prior
-    // aborted launch may not have unwound the binding before this invocation.
-    scheduler_scalar_bind(nullptr);
     const uint64_t profiling_level = WithProfiling ? observed_profiling_level : 0;
     // The caller has validated the published format and node count.
     const SchedulerGraphAccess graph =

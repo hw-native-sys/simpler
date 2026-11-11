@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <tuple>
 #include <utility>
 
@@ -376,6 +377,93 @@ TEST(HbgProtocolStartupExit, RealExecutorSealTimeoutPreservesObservedButUnclosed
     EXPECT_EQ(members[4].observed.sequence, 1u);
     EXPECT_EQ(members[4].closed.sequence, 0u);
     EXPECT_EQ(fixture.storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+}
+
+uint32_t scalar_record_count(const SchedulerScalarTrace &trace, SchedPhaseKind kind) {
+    uint32_t cursor = 0;
+    uint32_t count = 0;
+    while (cursor < trace.storage_slots) {
+        SchedulerScalarRecord record{};
+        if (!scheduler_decode_scalar_storage(trace.records, trace.storage_slots, cursor, record)) {
+            ADD_FAILURE() << "Invalid Scalar storage";
+            break;
+        }
+        if ((record.kind & 0xffffU) == static_cast<uint32_t>(kind)) ++count;
+    }
+    return count;
+}
+
+TEST(HbgScalarObserverLifetime, BootstrapPreservesTheResidentBinding) {
+    scheduler_test::FixtureStorage storage(1, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0});
+    scheduler_test::BasicGraphBuffer<1> graph(1);
+    graph.executable(0, 0);
+    auto *base = storage.scheduler_state->base();
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 59));
+    auto *local = storage.local_context(&storage.contexts[0]);
+    local->config.scheduler_count = 1;
+    storage.run_control->expected_task_count = 1;
+    storage.test_graphs[0] = graph.graph();
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        SchedulerWorkerStats stats{};
+        ASSERT_TRUE(
+            (bootstrap_ready_graph<false, true>(graph.graph(), base, local, storage.run_control, 1, &stats, 3))
+        );
+        EXPECT_EQ(scheduler_scalar_current(), &trace);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicFetchAdd), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarBypassLoad), 0u);
+    }
+    EXPECT_EQ(scheduler_scalar_current(), nullptr);
+}
+
+TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
+    scheduler_test::FixtureStorage storage(1, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0});
+    scheduler_test::BasicGraphBuffer<1> graph(1);
+    graph.executable(0, 0);
+    auto *base = storage.scheduler_state->base();
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 59));
+    storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&idle_ready_kernel);
+    storage.test_graphs[0] = graph.graph();
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        storage.contexts[0].cluster_worker_ids[lane] = lane;
+    auto *local = storage.local_context(&storage.contexts[0]);
+    local->config.scheduler_count = 3;
+    auto *run = storage.run_control;
+    run->expected_task_count = 1;
+    SchedulerReadyBatch batch{};
+    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch, nullptr));
+    ASSERT_TRUE(scheduler_ready_batch_push(base, local, 0, &batch, nullptr));
+    std::array<uint8_t, 64> registers{};
+    ScopedStartupRegisterObserver observer([] {});
+    startup_reg_base = registers.data();
+    startup_kernel_calls = 0;
+    write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        SchedulerWorkerStats stats{};
+        ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, 3)));
+        EXPECT_EQ(startup_kernel_calls, 1u);
+        EXPECT_EQ(scheduler_scalar_current(), &trace);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicCas), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarBypassLoad), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDcciOut), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDsbAll), 0u);
+    }
+    EXPECT_EQ(scheduler_scalar_current(), nullptr);
 }
 
 class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uint32_t, uint64_t, bool>> {};
