@@ -21,14 +21,26 @@ int main(int argc, char **argv) {
         const auto records = dsv41::read_records(stream);
         const auto slice = dsv41::select_slice(records, std::stoull(argv[2]), std::stoull(argv[3]));
         size_t tasks = 0, executions = 0;
+        bool uses_comm_context = false;
         for (size_t i = slice.begin; i < slice.end; ++i) {
             const auto &record = records[i];
+            if (records.front().scalars.size() > 1 && records.front().scalars[1] != 0) {
+                for (const auto scalar : record.scalars)
+                    uses_comm_context |= scalar == records.front().scalars[1];
+            }
             if (record.header.operation == dsv41::Operation::SUBMIT ||
                 record.header.operation == dsv41::Operation::DUMMY) {
                 ++tasks;
                 for (int lane = 0; lane < 3; ++lane) {
                     if (record.header.kernels[lane] >= 0) executions += record.header.block_num;
                 }
+            }
+        }
+        bool prefix_uses_comm_context = false;
+        if (records.front().scalars.size() > 1 && records.front().scalars[1] != 0) {
+            for (size_t i = 1; i < slice.begin; ++i) {
+                for (const auto scalar : records[i].scalars)
+                    prefix_uses_comm_context |= scalar == records.front().scalars[1];
             }
         }
         std::cout << "{\"tasks\":" << tasks << ",\"executions\":" << executions << ",\"begin\":" << slice.begin
@@ -39,25 +51,30 @@ int main(int argc, char **argv) {
             comma = true;
             std::cout << "{\"source_address\":" << address << ",\"bytes\":" << bytes << '}';
         }
-        std::cout << "],\"external_bytes\":[";
-        comma = false;
-        for (const auto &entry : records.front().tensors) {
-            uint64_t bytes = 0;
-            for (size_t i = 1; i < slice.end; ++i) {
-                for (const auto &operand : records[i].tensors) {
-                    const auto &tensor = operand.tensor;
-                    if (tensor.buffer.addr == entry.tensor.buffer.addr) {
-                        bytes = std::max(
-                            bytes, (tensor.start_offset + tensor.extent_elem_cache) * get_element_size(tensor.dtype)
-                        );
+        std::cout << "],\"uses_comm_context\":" << (uses_comm_context ? "true" : "false");
+        std::cout << ",\"prefix_uses_comm_context\":" << (prefix_uses_comm_context ? "true" : "false");
+        for (const bool selected_only : {false, true}) {
+            std::cout << (selected_only ? ",\"case_external_bytes\":[" : ",\"external_bytes\":[");
+            comma = false;
+            for (const auto &entry : records.front().tensors) {
+                uint64_t bytes = 0;
+                for (size_t i = selected_only ? slice.begin : 1; i < slice.end; ++i) {
+                    for (const auto &operand : records[i].tensors) {
+                        const auto &tensor = operand.tensor;
+                        if (tensor.buffer.addr == entry.tensor.buffer.addr) {
+                            bytes = std::max(
+                                bytes, (tensor.start_offset + tensor.extent_elem_cache) * get_element_size(tensor.dtype)
+                            );
+                        }
                     }
                 }
+                if (comma) std::cout << ',';
+                comma = true;
+                std::cout << bytes;
             }
-            if (comma) std::cout << ',';
-            comma = true;
-            std::cout << bytes;
+            std::cout << "]";
         }
-        std::cout << "]}\n";
+        std::cout << "}\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

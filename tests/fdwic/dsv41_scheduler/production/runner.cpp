@@ -46,6 +46,7 @@ T read(std::istream &stream) {
 // by the original kernels and production scheduler.
 // A timer sleep here becomes device-side peer wait for the earlier rank.
 void host_barrier(const fs::path &output, const std::string &phase, int rank, int ranks) {
+    if (ranks == 1) return;
     const auto prefix = output.parent_path() / phase;
     std::ofstream(prefix.string() + "." + std::to_string(rank)).put('1');
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
@@ -158,7 +159,8 @@ int run(int argc, char **argv) {
         std::cout << "preserved_original_kernels=" << children.size() << '\n';
         return 0;
     }
-    if (argc != 10) {
+    const bool materialize = argc == 11 && std::string(argv[10]) == "--materialize";
+    if (argc != 10 && !materialize) {
         std::cerr << "usage: native-runner BUNDLE RUNTIME_LIB DEVICE RANK ROOTINFO OUTPUT LEVEL WARMUP ROUNDS\n";
         return 2;
     }
@@ -167,6 +169,9 @@ int run(int argc, char **argv) {
     const bool all_levels = std::string(argv[7]) == "all";
     const int level = all_levels ? 0 : std::stoi(argv[7]), warmup = std::stoi(argv[8]), rounds = std::stoi(argv[9]);
     const bool sliced = fs::exists(bundle / "slice.txt");
+    const bool snapshot = fs::exists(bundle / "snapshot.txt");
+    if ((snapshot && (!sliced || materialize)) || (materialize && !sliced))
+        throw std::runtime_error("Invalid snapshot preparation mode");
     if (sliced) {
         std::ifstream cut(bundle / "slice.txt");
         const auto first = read<std::string>(cut), last = read<std::string>(cut);
@@ -187,6 +192,8 @@ int run(int argc, char **argv) {
     if (read<std::string>(manifest) != "DSV41_NATIVE_V1") throw std::runtime_error("Invalid input manifest");
     const int ranks = read<int>(manifest);
     const size_t window_bytes = read<size_t>(manifest);
+    if (snapshot && (ranks != 1 || window_bytes != 0))
+        throw std::runtime_error("Local snapshot must not initialize communication");
     if (rank < 0 || rank >= ranks) throw std::runtime_error("Rank outside original workload");
     ChipWorker worker;
     CallConfig config;
@@ -290,22 +297,56 @@ int run(int argc, char **argv) {
         }
         if (window_bytes) initialize(worker, window, window_bytes, {0}, true);
     };
-    auto output_hashes = [&] {
-        std::vector<uint64_t> hashes;
-        std::vector<uint8_t> chunk(size_t{8} << 20);
+    // Reference files contain raw bytes or one repeated byte; validation compares data directly.
+    auto read_buffer = [&](const Buffer &buffer) {
+        std::vector<uint8_t> value(buffer.bytes);
+        worker.copy_from(reinterpret_cast<uint64_t>(value.data()), buffer.address, value.size());
+        return value;
+    };
+    auto save_value = [&](const fs::path &path, const std::vector<uint8_t> &value) {
+        const bool repeat = !value.empty() && std::all_of(value.begin(), value.end(), [&](uint8_t byte) {
+            return byte == value.front();
+        });
+        std::ofstream stream(path, std::ios::binary);
+        stream.write(reinterpret_cast<const char *>(value.data()), repeat ? 1 : value.size());
+        if (!stream) throw std::runtime_error("Cannot save boundary data");
+        return repeat;
+    };
+    const auto reference_dir = snapshot ? bundle / "reference" : output / "reference-data";
+    auto save_reference = [&] {
+        fs::create_directories(reference_dir);
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (writable(i) && buffers[i].host.empty())
+                save_value(reference_dir / (std::to_string(i) + ".bin"), read_buffer(buffers[i]));
+        }
+    };
+    auto check_reference = [&] {
         for (size_t i = 0; i < buffers.size(); ++i) {
             if (!writable(i) || !buffers[i].host.empty()) continue;
-            const auto &buffer = buffers[i];
-            uint64_t hash = 14695981039346656037ULL;
-            for (size_t offset = 0; offset < buffer.bytes; offset += chunk.size()) {
-                const size_t count = std::min(chunk.size(), buffer.bytes - offset);
-                worker.copy_from(reinterpret_cast<uint64_t>(chunk.data()), buffer.address + offset, count);
-                for (size_t j = 0; j < count; ++j)
-                    hash = (hash ^ chunk[j]) * 1099511628211ULL;
-            }
-            hashes.push_back(hash);
+            const auto expected = read_binary(reference_dir / (std::to_string(i) + ".bin"));
+            const auto actual = read_buffer(buffers[i]);
+            const bool equal = expected.size() == 1 ? std::all_of(
+                                                          actual.begin(), actual.end(),
+                                                          [&](uint8_t byte) {
+                                                              return byte == expected.front();
+                                                          }
+                                                      ) :
+                                                      actual == expected;
+            if (!equal)
+                throw std::runtime_error(
+                    "Isolated case differs from original prefix + case at buffer " + std::to_string(i)
+                );
         }
-        return hashes;
+    };
+    auto save_inputs = [&] {
+        fs::create_directories(output / "inputs");
+        std::ofstream manifest(output / "inputs.txt");
+        for (size_t i = 0; i < buffers.size(); ++i) {
+            if (!buffers[i].owned || !writable(i)) continue;
+            const bool repeat = save_value(output / "inputs" / (std::to_string(i) + ".bin"), read_buffer(buffers[i]));
+            manifest << i << ' ' << (repeat ? "REPEAT" : "RAW") << '\n';
+        }
+        if (!manifest) throw std::runtime_error("Cannot save boundary manifest");
     };
     auto launch = [&](uint64_t phase, int profiling, const std::string &label) {
         config.enable_chip_swimlane = profiling;
@@ -323,22 +364,21 @@ int run(int argc, char **argv) {
         host_barrier(output, "complete-" + label, rank, ranks);
         return mode;
     };
-    std::vector<uint64_t> reference;
-    if (sliced) {
+    if (sliced && !snapshot) {
         launch(0, 0, "reference");
-        reference = output_hashes();
+        save_reference();
         host_barrier(output, "reference-checked", rank, ranks);
     }
     for (int iteration = 0; iteration < warmup + rounds + (all_levels ? 2 : 0); ++iteration) {
         if (sliced) {
             reset_inputs();
-            launch(1, 0, "prefix" + std::to_string(iteration));
+            if (!snapshot) launch(1, 0, "prefix" + std::to_string(iteration));
+            if (materialize && rank == 0 && iteration == 0) save_inputs();
         }
         int profiling = iteration < warmup ? 0 : level;
         if (all_levels && iteration >= warmup + rounds) profiling = iteration == warmup + rounds ? 1 : 3;
         const auto mode = launch(2, profiling, "run" + std::to_string(iteration));
-        if (sliced && output_hashes() != reference)
-            throw std::runtime_error("Isolated case differs from original prefix + case");
+        if (sliced) check_reference();
         for (auto index : checked) {
             const auto &buffer = buffers[index];
             std::vector<uint8_t> actual(buffer.bytes);
@@ -368,7 +408,8 @@ int run(int argc, char **argv) {
            << ",\"original_kernels\":" << registered->child_count()
            << ",\"isolated_case\":" << (sliced ? "true" : "false")
            << ",\"validated_against_fused_prefix\":" << (sliced ? "true" : "false") << ",\"warmup\":" << warmup
-           << ",\"rounds\":" << rounds << "}\n";
+           << ",\"rounds\":" << rounds << ",\"snapshot_inputs\":" << (snapshot ? "true" : "false")
+           << ",\"ranks\":" << ranks << "}\n";
     return 0;
 }
 }  // namespace

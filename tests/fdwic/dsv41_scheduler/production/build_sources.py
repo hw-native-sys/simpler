@@ -11,7 +11,6 @@
 
 import argparse
 import gzip
-import hashlib
 import json
 import logging
 import os
@@ -31,10 +30,6 @@ ROOT = Path(__file__).resolve().parents[1]
 FLAVORS = ("pypto_lib", "pypto_lib_dsl")
 
 
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
@@ -50,7 +45,7 @@ def build(flavor, output, tools, pto, jobs):
     # Generated DSL C++ includes impl/c_api/... relative to the ASC SDK root.
     asc_roots = [str(path) for path in (sdk / "asc", sdk / "ascendc") if path.is_dir()]
     sdk_versions = {
-        name: digest(sdk / name)
+        name: (sdk / name).read_text()
         for name in ("compiler/version.info", "share/info/asc-devkit/version.info")
         if (sdk / name).is_file()
     }
@@ -111,7 +106,6 @@ def build(flavor, output, tools, pto, jobs):
             "core_type": kernel["core_type"],
             "file": target.name,
             "cache_key": key,
-            "sha256": digest(target),
             "cache_hit": not compiled,
         }
 
@@ -179,16 +173,12 @@ def build(flavor, output, tools, pto, jobs):
         {
             "flavor": flavor,
             "platform": "a5",
-            "manifest_sha256": digest(sources / "manifest.json"),
-            "inputs_sha256": digest(workload / "inputs/inputs.json"),
-            "host_source_sha256": digest(source),
             "pto_isa": str(pto),
             "sdk_include_roots": asc_roots,
             "sdk_versions": sdk_versions,
             "compiler": {"host": host_token, "incore": compiler_tokens},
             "orchestration_cache_key": key,
             "kernels": records,
-            "original_callable_sha256": digest(output / "original-callable.bin"),
         },
     )
 

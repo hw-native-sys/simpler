@@ -10,6 +10,8 @@
 
 """Public-API workloads and independent numerical/causal oracles for resident completion."""
 
+from __future__ import annotations
+
 import json
 import sys
 import warnings
