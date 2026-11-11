@@ -33,6 +33,13 @@ from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 from simpler_setup.torch_interop import make_tensor_arg
 
+pytestmark = [
+    pytest.mark.coverage_runtime("tensormap_and_ringbuffer"),
+    pytest.mark.coverage_skip(
+        reason="rdma_deferred_completion_demo requires SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON", platforms=["a5"]
+    ),
+]
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DTYPE_NBYTES = 4
 STATUS_WORDS = 8

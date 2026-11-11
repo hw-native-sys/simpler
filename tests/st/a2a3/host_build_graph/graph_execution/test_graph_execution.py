@@ -91,6 +91,10 @@ class TestGraphExecutionHostBuildGraph(SceneTestCase):
         for case in matched_cases:
             self._validate_outer_graph_capture(case, prior_mtimes[case["name"]])
 
+    @pytest.mark.coverage_skip(
+        platforms=["a2a3"],
+        reason="AICore shared objects are reloaded only by the simulator",
+    )
     @pytest.mark.skipif(
         "config.getoption('--platform') != 'a2a3sim'",
         reason="AICore shared objects are reloaded only by the simulator",

@@ -41,6 +41,12 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = [
+    pytest.mark.coverage_skip(
+        reason="granted cards [0, 1] map to themselves; no remap to verify", platforms=["a2a3", "a5"]
+    ),
+]
+
 RUNTIME = "tensormap_and_ringbuffer"
 _ST_ROOT = Path(__file__).resolve().parent.parent
 

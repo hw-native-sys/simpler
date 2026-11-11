@@ -19,6 +19,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE = ROOT / "examples/workers/l2/framework_eager/native_submission.py"
 pytestmark = [
+    pytest.mark.runtime_product("kernel"),
+    pytest.mark.execution_mode("eager"),
     pytest.mark.requires_hardware,
     pytest.mark.platforms(["a2a3", "a5"]),
     pytest.mark.test_environment("torch_npu"),
@@ -137,6 +139,7 @@ def test_native_submission_gil(runtime, queue, native_submit_probe, tmp_path, re
 
 
 @pytest.mark.parametrize("queue", ["0", "1"])
+@pytest.mark.coverage_runtime("host_build_graph")
 def test_native_host_value_snapshot(queue, framework_module, tmp_path, request):
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]

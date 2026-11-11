@@ -30,7 +30,13 @@ from simpler_setup.runtime_builder import RuntimeBuilder
 
 _ROOT = Path(__file__).resolve().parents[4]
 _SOURCE = Path(__file__).with_name("native")
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3", "a5"])]
+pytestmark = [
+    pytest.mark.runtime_product("kernel"),
+    pytest.mark.execution_mode("capture_replay"),
+    pytest.mark.coverage_runtime("common"),
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3", "a5"]),
+]
 
 
 def _run(command, **kwargs):

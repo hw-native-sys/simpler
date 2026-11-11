@@ -23,9 +23,16 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+
+# Framework toolchain selection runs this file before the SDK is installed.
+if __package__:
+    from simpler_setup import test_coverage
+else:
+    import test_coverage
 
 
 @dataclass(frozen=True)
@@ -40,7 +47,7 @@ ENVIRONMENTS = {
     "default": TestEnvironment("dispatcher"),
     "torch_npu": TestEnvironment(
         "direct",
-        ".github/actions/setup-framework-eager/constraints.txt",
+        ".github/actions/setup-framework/constraints.txt",
         (9, 0),
         (("torch", "torch"), ("torch_npu", "torch_npu")),
     ),
@@ -85,6 +92,10 @@ def validate_execution(config) -> None:
     import pytest  # noqa: PLC0415
 
     name = config.getoption("--test-environment", default="default")
+    if name == "default" and config.getoption("--environment-receipts", default=False):
+        distributed = bool(config.getoption("numprocesses", default=None)) or hasattr(config, "workerinput")
+        if distributed and not config.getoption("--environment-parent-plan", default=None):
+            raise pytest.UsageError("Distributed default receipts require an immutable parent plan")
     if _environment(name).execution != "direct":
         return
     distributed = bool(config.getoption("numprocesses", default=None)) or (
@@ -221,7 +232,49 @@ def _plan_digest(plan: dict) -> str:
     return hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
 
 
-def prepare_session(session) -> None:
+def child_receipt_argv(config, nodeids=None) -> list[str]:
+    """Allocate an exclusive result path without changing resource scheduling."""
+    plan = getattr(config, "_environment_plan", None)
+    if plan is None:
+        return []
+    directory = Path(tempfile.mkdtemp(prefix="shard-", dir=plan.parent))
+    result = directory / "results.xml"
+    config._environment_results.append(result)
+    feature_args = ["--verify-feature-coverage"] if config.getoption("--verify-feature-coverage", default=False) else []
+    assigned = [arg for nodeid in nodeids or [] for arg in ("--environment-shard-case", nodeid)]
+    return [
+        "--environment-receipts",
+        *feature_args,
+        "--environment-parent-plan",
+        str(plan),
+        *assigned,
+        "--junitxml",
+        str(result),
+    ]
+
+
+def retry_receipt_argv(config, sink: Path, original: str) -> list[str]:
+    """Authorize one bounded retry from the existing poison-skip sink."""
+    records = [json.loads(line) for line in sink.read_text().splitlines() if line.strip()]
+    nodeids = sorted({record["nodeid"] for record in records})
+    plan = json.loads(config._environment_plan.read_text())
+    expected = {case["nodeid"] for case in plan["cases"]}
+    if not nodeids or not set(nodeids) <= expected:
+        raise ValueError("Poison retry contains unplanned nodeids")
+    args = child_receipt_argv(config)
+    retries = getattr(config, "_environment_retries", {})
+    retries[args[-1]] = {"original": original, "nodeids": nodeids}
+    config._environment_retries = retries
+    for nodeid in nodeids:
+        args.extend(["--environment-retry-case", nodeid])
+    return args
+
+
+def execution_mode(item, default=None) -> str:
+    return test_coverage.execution_mode(item, default=default)
+
+
+def prepare_session(session) -> None:  # noqa: PLR0912
     """Freeze the final collection once; default keeps its existing dispatcher."""
     import pytest  # noqa: PLC0415
 
@@ -230,7 +283,8 @@ def prepare_session(session) -> None:
 
     config = session.config
     name = config.getoption("--test-environment", default="default")
-    if _environment(name).execution != "direct" or config.getoption("collectonly", default=False):
+    opted_in = config.getoption("--environment-receipts", default=False)
+    if (_environment(name).execution != "direct" and not opted_in) or config.getoption("collectonly", default=False):
         return
     xmlpath = config.getoption("xmlpath", default=None)
     if not xmlpath:
@@ -242,7 +296,9 @@ def prepare_session(session) -> None:
     for item in session.items:
         if environment_for_item(item) != name:
             raise pytest.UsageError(f"Wrong environment in final collection: {item.nodeid}")
-        if item.get_closest_marker("device_count") or getattr(getattr(item, "cls", None), "_st_level", None):
+        if _environment(name).execution == "direct" and (
+            item.get_closest_marker("device_count") or getattr(getattr(item, "cls", None), "_st_level", None)
+        ):
             raise pytest.UsageError(f"{name} cannot aggregate dispatcher results: {item.nodeid}")
         if any(key.startswith(_PROPERTY_PREFIX) for key, _ in item.user_properties):
             raise pytest.UsageError(f"{item.nodeid}: reserved test receipt property")
@@ -251,6 +307,20 @@ def prepare_session(session) -> None:
         if prefix:
             address.insert(0, prefix)
         cases.append({"nodeid": item.nodeid, "classname": ".".join(address[:-1]), "name": address[-1]})
+        if opted_in:
+            try:
+                if config.getoption("--verify-feature-coverage", default=False):
+                    feature = test_coverage.features(item, config.getoption("--platform"), name)
+                    cases[-1]["feature"] = feature
+                    # Program/auxiliary cases carry no declared mode; receipts still
+                    # record the eager execution they imply.
+                    cases[-1]["execution_mode"] = feature["mode"] or "eager"
+                else:
+                    # Receipts without coverage cannot know the product; an
+                    # undeclared mode is the eager execution such cases imply.
+                    cases[-1]["execution_mode"] = execution_mode(item, default="eager")
+            except ValueError as error:
+                raise pytest.UsageError(str(error)) from error
     if len({case["nodeid"] for case in cases}) != len(cases):
         raise pytest.UsageError("Duplicate nodeids in selected test environment")
     try:
@@ -274,9 +344,32 @@ def prepare_session(session) -> None:
         "identity": identity,
         "cases": cases,
     }
-    destination = Path(xmlpath).with_suffix(".plan.json")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(plan, indent=2) + "\n")
+    parent = config.getoption("--environment-parent-plan", default=None)
+    if config.getoption("--verify-feature-coverage", default=False) and not parent:
+        try:
+            plan["coverage"] = test_coverage.policy(config, cases)
+        except ValueError as error:
+            raise pytest.UsageError(str(error)) from error
+    if opted_in and not parent:
+        required = set(config.getoption("--require-execution-mode", default=[]))
+        missing = required - {case["execution_mode"] for case in cases}
+        if missing:
+            raise pytest.UsageError(f"Required execution modes not selected: {sorted(missing)}")
+    destination = Path(parent) if parent else Path(xmlpath).resolve().with_suffix(".plan.json")
+    if parent:
+        parent_plan = json.loads(destination.read_text())
+        if any(plan[key] != parent_plan[key] for key in ("source", "environment", "platform")):
+            raise pytest.UsageError("Child source, environment or platform differs from parent plan")
+        expected = {case["nodeid"]: case for case in parent_plan["cases"]}
+        if any(expected.get(case["nodeid"]) != case for case in cases):
+            raise pytest.UsageError("Child selected a case outside the parent plan")
+        assigned = config.getoption("--environment-shard-case", default=[])
+        if assigned and set(assigned) != {case["nodeid"] for case in cases}:
+            raise pytest.UsageError("Child selection differs from its assigned plan members")
+        plan = parent_plan
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(plan, indent=2) + "\n")
     digest = _plan_digest(plan)
     for item in session.items:
         item.user_properties.extend(
@@ -287,7 +380,13 @@ def prepare_session(session) -> None:
                 ("simpler_plan", digest),
             ]
         )
-    session._test_environment_receipt = (destination, Path(xmlpath))
+        if "coverage" in plan:
+            item.user_properties.append(("simpler_executed", "false"))
+    if not parent:
+        session._test_environment_receipt = (destination, Path(xmlpath))
+        if opted_in and _environment(name).execution == "dispatcher":
+            config._environment_plan = destination
+            config._environment_results = [Path(xmlpath)]
     print(
         "TEST_ENVIRONMENT_PLAN " + json.dumps({"path": str(destination), "plan": plan, "identity": identity}),
         flush=True,
@@ -295,45 +394,173 @@ def prepare_session(session) -> None:
 
 
 def verify_results(plan_path: Path, xml_path: Path) -> None:
+    verify_result_files(plan_path, [xml_path])
+
+
+def _retry_targets(paths, expected, retries, dispatcher):
+    retry_targets = {}
+    if len(set(paths)) != len(paths):
+        raise ValueError("Duplicate result files")
+    for retry_path, authorization in (retries or {}).items():
+        original = authorization["original"]
+        nodes = authorization["nodeids"]
+        if not dispatcher or original == retry_path or original not in paths or retry_path not in paths or not nodes:
+            raise ValueError("Invalid retry result paths")
+        if len(set(nodes)) != len(nodes):
+            raise ValueError("Duplicate retry authorization")
+        for nodeid in nodes:
+            if nodeid not in expected or nodeid in retry_targets:
+                raise ValueError("Foreign or repeated retry authorization")
+            retry_targets[nodeid] = {(original, "skipped"), (retry_path, "passed")}
+    return retry_targets
+
+
+class ResultVerificationError(ValueError):
+    """Failed verification with source-checked partial execution evidence."""
+
+    def __init__(self, errors, summary):
+        super().__init__("; ".join(errors))
+        self.summary = summary
+
+
+def _result_roots(xml_paths, retries, optional_skips=False):
+    roots = []
+    errors = []
+    for xml_path in xml_paths:
+        try:
+            root = ET.parse(xml_path).getroot()
+        except (OSError, ET.ParseError) as error:
+            errors.append(f"Unreadable result {xml_path}: {error}")
+            continue
+        roots.append((str(xml_path), root))
+        for suite in root.iter("testsuite"):
+            outcomes = ("failures", "errors") if retries or optional_skips else ("failures", "errors", "skipped")
+            if any(int(suite.get(outcome, "0")) for outcome in outcomes):
+                errors.append("Selected test environment reports a failure, error or skip")
+            if (retries or optional_skips) and int(suite.get("skipped", "0")) != len(suite.findall("testcase/skipped")):
+                errors.append("Retry suite skip count disagrees with its receipts")
+    return roots, errors
+
+
+def _verified_case(case, expected, plan):
+    properties = [(p.get("name"), p.get("value")) for p in case.findall("properties/property")]
+    values = dict(properties)
+    nodeid = values.get("simpler_nodeid")
+    if nodeid not in expected:
+        raise ValueError(f"Missing, foreign or duplicate test receipt: {nodeid}")
+    target = expected[nodeid]
+    required = {
+        "simpler_nodeid": nodeid,
+        "simpler_source": plan["source"],
+        "simpler_environment": plan["environment"],
+        "simpler_plan": _plan_digest(plan),
+    }
+    for key, value in required.items():
+        if properties.count((key, value)) != 1 or sum(name == key for name, _ in properties) != 1:
+            raise ValueError(f"Test receipt has wrong source, environment or plan: {nodeid}")
+    if case.get("classname") != target["classname"] or case.get("name") != target["name"]:
+        raise ValueError(f"Test receipt has wrong JUnit identity: {nodeid}")
+    outcome = "skipped" if case.find("skipped") is not None else "passed"
+    if any(child.tag in {"failure", "error"} for child in case):
+        outcome = "failed"
+    executed = outcome == "passed"
+    if "coverage" in plan:
+        flags = [value for key, value in properties if key == "simpler_executed"]
+        if len(flags) != 1 or flags[0] not in ("true", "false"):
+            raise ValueError(f"Missing or invalid execution evidence: {nodeid}")
+        executed = flags[0] == "true"
+        if outcome == "passed" and not executed:
+            raise ValueError(f"Passing receipt without call execution: {nodeid}")
+    return nodeid, outcome, executed
+
+
+def _coverage_summary(plan, expected, observed, recovered, executions, invalid):
+    counts = {}
+    for case in expected.values():
+        mode = case["execution_mode"]
+        counts[mode] = counts.get(mode, 0) + 1
+    summary = {
+        "source": plan["source"],
+        "environment": plan["environment"],
+        "platform": plan["platform"],
+        "identity": plan["identity"],
+        "attempts": sum(len(attempts) for attempts in observed.values()),
+        "recovered": len(recovered),
+        "groups": {mode: {"selected": count, "executed": count, "passed": count} for mode, count in counts.items()},
+    }
+    if "coverage" in plan:
+        summary.update(test_coverage.summary(plan, observed, recovered, executions, invalid))
+    return summary
+
+
+def verify_result_files(  # noqa: PLR0912
+    plan_path: Path, xml_paths: list[Path], *, dispatcher: bool = False, retries: dict | None = None
+) -> None:
+    """Verify the union of explicit result files against one immutable plan."""
+    retries = retries or {}
+    if dispatcher:
+        plan_path.with_suffix(".coverage.json").unlink(missing_ok=True)
     plan = json.loads(plan_path.read_text())
+    if "coverage" in plan:
+        plan_path.with_suffix(".coverage.json").unlink(missing_ok=True)
     profile = _environment(plan["environment"])
     try:
         source = _source()
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError(f"Cannot identify the test source checkout: {error}") from error
-    if profile.execution != "direct" or plan["source"] != source:
+    if profile.execution != ("dispatcher" if dispatcher else "direct") or plan["source"] != source:
         raise ValueError("Test plan source or execution environment does not match this checkout")
     expected = {case["nodeid"]: case for case in plan["cases"]}
     if not expected or len(expected) != len(plan["cases"]):
         raise ValueError("Test plan must contain unique, nonempty nodeids")
-    root = ET.parse(xml_path).getroot()
-    for suite in root.iter("testsuite"):
-        if any(int(suite.get(outcome, "0")) for outcome in ("failures", "errors", "skipped")):
-            raise ValueError("Selected test environment reports a failure, error or skip")
-    observed = set()
-    for case in root.iter("testcase"):
-        properties = [(p.get("name"), p.get("value")) for p in case.findall("properties/property")]
-        values = dict(properties)
-        nodeid = values.get("simpler_nodeid")
-        if nodeid not in expected or nodeid in observed:
-            raise ValueError(f"Missing, foreign or duplicate test receipt: {nodeid}")
-        target = expected[nodeid]
-        required = {
-            "simpler_nodeid": nodeid,
-            "simpler_source": plan["source"],
-            "simpler_environment": plan["environment"],
-            "simpler_plan": _plan_digest(plan),
-        }
-        for key, value in required.items():
-            if properties.count((key, value)) != 1 or sum(name == key for name, _ in properties) != 1:
-                raise ValueError(f"Test receipt has wrong source, environment or plan: {nodeid}")
-        if case.get("classname") != target["classname"] or case.get("name") != target["name"]:
-            raise ValueError(f"Test receipt has wrong JUnit identity: {nodeid}")
-        if any(child.tag in {"failure", "error", "skipped"} for child in case):
-            raise ValueError(f"Selected test did not pass: {nodeid}")
-        observed.add(nodeid)
-    if observed != set(expected):
-        raise ValueError(f"Tests selected but not executed: {sorted(set(expected) - observed)}")
+    retry_targets = _retry_targets([str(path) for path in xml_paths], expected, retries, dispatcher)
+    optional_skips = dispatcher and any(case.get("feature", {}).get("allowed_skip") for case in expected.values())
+    roots, errors = _result_roots(xml_paths, retries, optional_skips)
+    observed = {}
+    executions = {}
+    invalid = set()
+    for path, case in ((path, case) for path, root in roots for case in root.iter("testcase")):
+        try:
+            nodeid, outcome, executed = _verified_case(case, expected, plan)
+            if path in retries and nodeid not in retries[path]["nodeids"]:
+                raise ValueError(f"Unauthorized case in retry result: {nodeid}")
+        except ValueError as error:
+            errors.append(str(error))
+            invalid.update(p.get("value") for p in case.findall("properties/property[@name='simpler_nodeid']"))
+            continue
+        executions[nodeid] = executions.get(nodeid, False) or executed
+        attempts = observed.setdefault(nodeid, [])
+        attempts.append((path, outcome))
+        if outcome == "failed" or (
+            outcome == "skipped"
+            and (path, outcome) not in retry_targets.get(nodeid, set())
+            and not test_coverage.allows_skip(plan, expected[nodeid], case)
+        ):
+            errors.append(f"Selected test did not pass: {nodeid}")
+    if set(observed) != set(expected):
+        errors.append(f"Tests selected but not executed: {sorted(set(expected) - set(observed))}")
+    recovered = set()
+    for nodeid, attempts in observed.items():
+        if nodeid in retry_targets:
+            if len(attempts) != 2 or set(attempts) != retry_targets[nodeid]:
+                errors.append(f"Incomplete or invalid retry: {nodeid}")
+                invalid.add(nodeid)
+            else:
+                recovered.add(nodeid)
+        elif len(attempts) != 1:
+            errors.append(f"Missing, foreign or duplicate test receipt: {nodeid}")
+            invalid.add(nodeid)
+    recovered -= invalid
+    summary = None
+    if dispatcher or "coverage" in plan:
+        summary = _coverage_summary(plan, expected, observed, recovered, executions, invalid)
+        summary["errors"] = list(dict.fromkeys(errors))
+        incomplete = "coverage" in plan and any(group["missing"] for group in summary["groups"].values())
+        summary["verification_status"] = "incomplete" if incomplete else "failed" if errors else "verified"
+    if errors:
+        raise ResultVerificationError(list(dict.fromkeys(errors)), summary if "coverage" in plan else None)
+    if summary is not None:
+        plan_path.with_suffix(".coverage.json").write_text(json.dumps(summary, indent=2) + "\n")
     print("TEST_ENVIRONMENT_VERIFIED " + ", ".join(sorted(observed)), flush=True)
 
 
@@ -341,7 +568,15 @@ def finish_session(session) -> None:
     receipt = getattr(session, "_test_environment_receipt", None)
     if receipt is not None:
         try:
-            verify_results(*receipt)
+            results = getattr(session.config, "_environment_results", None)
+            if results is None:
+                verify_results(*receipt)
+            else:
+                retries = getattr(session.config, "_environment_retries", {})
+                receipt[0].with_suffix(".results.json").write_text(
+                    json.dumps({"files": [str(path) for path in results], "retries": retries}, indent=2) + "\n"
+                )
+                verify_result_files(receipt[0], results, dispatcher=True, retries=retries)
         except (ValueError, OSError, KeyError, ET.ParseError) as error:
             session.exitstatus = 1
             print(f"TEST_ENVIRONMENT_VERIFICATION_FAILED {error}", file=sys.stderr, flush=True)

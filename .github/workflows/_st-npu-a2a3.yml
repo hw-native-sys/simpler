@@ -96,7 +96,7 @@ jobs:
               --platform a2a3 --compile-only --compile-workers 32
           done
 
-      # Framework eager has its own dependency-isolated job. The remaining
+      # The framework environment has its own dependency-isolated job. The remaining
       # three selections are disjoint and exhaustive over this corpus: a test with
       # neither marker lands here, `sdma` alone in the demo task, and
       # `sdma_fault` in the isolated one whether or not it also carries `sdma`.
@@ -106,7 +106,7 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
+            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE' --environment-receipts --verify-feature-coverage --coverage-partition main --junitxml outputs/default-ci/main.xml"
 
       - name: SDMA pytest (a2a3)
         if: inputs.manual_mode != 'only'
@@ -114,14 +114,14 @@ jobs:
           source /usr/local/Ascend/cann/set_env.sh
           SDMA_TESTS="examples tests/st -m 'sdma and not sdma_fault'"
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
-            --run ".venv/bin/python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+            --run ".venv/bin/python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600 --environment-receipts --verify-feature-coverage --coverage-partition sdma --junitxml outputs/default-ci/sdma.xml"
 
       - name: SDMA fault recovery pytest (a2a3)
         if: inputs.manual_mode != 'only'
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
-            --run ".venv/bin/python -m pytest examples tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+            --run ".venv/bin/python -m pytest examples tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600 --environment-receipts --verify-feature-coverage --coverage-partition sdma_fault --junitxml outputs/default-ci/sdma_fault.xml"
 
       - name: DFX smokes (a2a3)
         if: inputs.include_dfx_smokes
@@ -139,3 +139,18 @@ jobs:
           path: outputs/hbg-capture
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Verify and summarize default environment coverage
+        if: always()
+        run: |
+          .venv/bin/python -m simpler_setup.tools.feature_coverage_report \
+            --root outputs/default-ci --environment default --platform a2a3 --manual "$MANUAL_MODE"
+
+      - name: Retain default environment plans and receipts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: default-a2a3-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/default-ci
+          if-no-files-found: warn

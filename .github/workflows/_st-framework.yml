@@ -1,4 +1,4 @@
-name: Framework Eager Scene Tests
+name: Framework Scene Tests
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ on:
 
 jobs:
   run:
-    name: st-framework-eager-${{ inputs.platform }}
+    name: st-framework-${{ inputs.platform }}
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 45
     env:
@@ -43,7 +43,7 @@ jobs:
 
       - name: Set up framework environment
         id: framework
-        uses: ./.github/actions/setup-framework-eager
+        uses: ./.github/actions/setup-framework
         with:
           platform: ${{ inputs.platform }}
 
@@ -62,28 +62,37 @@ jobs:
             *) echo "::error::platform must be a2a3 or a5"; exit 1 ;;
           esac
           source "$CANN_ENV"
-          mkdir -p outputs/framework-eager-ci
-          git rev-parse HEAD | tee outputs/framework-eager-ci/source.txt
+          mkdir -p outputs/framework-ci
+          git rev-parse HEAD | tee outputs/framework-ci/source.txt
           task-submit --list
           task-submit --env CANN_ENV --env MANUAL_MODE --env PLATFORM --env PYTEST_ADDOPTS --env FRAMEWORK_WHEEL_SITE --timeout 2100 --max-time 1200 --device auto --device-num 1 \
             --run "source \"\$CANN_ENV\" && \
               export PYTHONPATH=\"\$FRAMEWORK_WHEEL_SITE\${PYTHONPATH:+:\$PYTHONPATH}\" && \
               .claude/skills/onboard-arch-precheck/check.sh \"\$PLATFORM\" && \
-              npu-smi info > outputs/framework-eager-ci/npu-smi.txt && \
-              .venv-framework/bin/python .github/actions/setup-framework-eager/identity.py --platform \"\$PLATFORM\" && \
-              .venv-framework/bin/python -m pytest examples tests/st --platform \"\$PLATFORM\" --test-environment torch_npu \
+              npu-smi info > outputs/framework-ci/npu-smi.txt && \
+              .venv-framework/bin/python .github/actions/setup-framework/identity.py --platform \"\$PLATFORM\" && \
+              .venv-framework/bin/python -m pytest examples tests/st --platform \"\$PLATFORM\" --test-environment torch_npu --environment-receipts --verify-feature-coverage --coverage-partition all \
               --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s \
-              --basetemp outputs/framework-eager-ci/pytest --junitxml outputs/framework-eager-ci/results.xml"
-          .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-eager-ci/results.plan.json outputs/framework-eager-ci/results.xml
+              --basetemp outputs/framework-ci/pytest --junitxml outputs/framework-ci/results.xml"
+          .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-ci/results.plan.json outputs/framework-ci/results.xml
 
-      - name: Retain framework eager identities and logs
+      - name: Verify and summarize torch_npu environment coverage
+        if: always()
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          MANUAL_MODE: ${{ inputs.manual_mode }}
+        run: |
+          .venv-framework/bin/python -m simpler_setup.tools.feature_coverage_report \
+            --root outputs/framework-ci --environment torch_npu --platform "$PLATFORM" --manual "$MANUAL_MODE"
+
+      - name: Retain framework identities and logs
         if: always()
         # The test result is already checked above; artifact service failures only lose diagnostics.
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: framework-eager-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: framework-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            outputs/framework-eager-ci
-            !outputs/framework-eager-ci/pytest/framework-eager-module*/**
+            outputs/framework-ci
+            !outputs/framework-ci/pytest/framework-eager-module*/**
           if-no-files-found: warn

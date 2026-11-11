@@ -25,7 +25,7 @@ The complete test-type × hardware-tier matrix across automatic CI, the A5 comme
 | Category | CPU (no hardware) | a2a3 runner | a5 runner |
 | -------- | ----------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily only), `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3` (Daily only), `st-deepseek-onboard-a2a3`, `st-framework-a2a3` | `st-onboard-a5`, `st-framework-a5` |
 
 ## GitHub Actions Jobs
 
@@ -36,9 +36,9 @@ shape. The executable job bodies live in reusable workflows:
 `_packaging.yml`, `_profiling-flags-smoke.yml`, `_st-sim-a2a3.yml`,
 `_st-sim-a5.yml`, `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml`,
 `_st-npu-a2a3.yml`, `_st-npu-a5.yml`, `_st-network1.yml`,
-`_st-deepseek-a2a3.yml`, and `_st-framework-eager.yml`. The simulation,
+`_st-deepseek-a2a3.yml`, and `_st-framework.yml`. The simulation,
 ordinary onboard, and NPU unit-test bodies are split by architecture so each
-job renders only its own steps. Framework eager shares `_st-framework-eager.yml`;
+job renders only its own steps. The framework environment shares `_st-framework.yml`;
 callers supply matching `platform` and `runs_on` inputs. Shared step scaffolding
 that is safe to run after checkout lives in composite actions under `.github/actions/`
 (`apt-install`, `cache-pip`, `cache-ccache`, `setup-gcc-15`, `setup-venv`, and the three `network1-*` actions).
@@ -80,14 +80,14 @@ PullRequest
   ├── st-sim-a5              (self-hosted CPU)          — a5_changed && st_affected
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
-  ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
+  ├── st-framework-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
   └── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
 
 Admin PR comment /run-a5
-  └── gate-and-resolve       (ubuntu-24.04)          — open PR to this repo main; pinned head
+  └── gate-and-resolve       (ubuntu-24.04)          — open PR to this repo main; pinned merge
       ├── ut-a5             (a5 self-hosted)        — Python UT and CANN examples
       ├── st-onboard-a5     (a5 self-hosted)        — onboard ST and DFX smokes
-      └── st-framework-eager-a5 (a5 self-hosted)     — framework eager ST
+      └── st-framework-a5 (a5 self-hosted)     — framework eager ST
 ```
 
 | Job | Runner | What it runs |
@@ -97,10 +97,10 @@ Admin PR comment /run-a5
 | `st-sim-a5` | self-hosted CPU | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
-| `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
+| `st-framework-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
 | `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA, the active URMA regressions and mixed SDMA/URMA cases, then adaptive-parallel DFX feature smokes |
-| `st-framework-eager-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
+| `st-framework-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` (Daily only) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
 
@@ -351,13 +351,153 @@ not need `--max-parallel` manually.
 
 - **SDMA tests run in isolated tasks inside `st-onboard-a2a3`.** Within the default test environment, three selections partition the corpus (`examples tests/st`): the ordinary sweep takes `-m "not sdma and not sdma_fault"` with `--exclude-level 4`, one queued task runs `-m "sdma and not sdma_fault"` for the demos, and a separate one-device task runs `-m sdma_fault` for the AICore fault-injection case. The three are disjoint and exhaustive over both markers, and all three name the same paths, so a case cannot land in two tasks or in none. Provisioning the SDMA workspace creates 48 device-only STARS streams that live in the device fault domain, and tearing them down once any AICore task has poisoned that card blocks minutes rather than milliseconds — whether the teardown is a device reset or an explicit stream destroy ([#1425](https://github.com/hw-native-sys/simpler/issues/1425)). The cost therefore falls on whichever process still holds those streams when the fault happens, which is why the fault-injection case gets a task containing nothing else. Separate `task-submit` tasks preserve that on every onboard runner, independent of pytest ordering. Network1 tests are selected by `--level 4` in `st-network1-onboard-a2a3` and explicitly excluded from ordinary onboard ST lanes.
 
-### Framework eager qualification (a2a3 and a5)
+### Feature coverage verification
 
-`st-framework-eager-a2a3` runs automatically on affected PRs. A5 framework
-eager validation for ordinary PRs is part of `/run-a5`. Both also run in
-Daily. Automatic A2/A3 validation uses the `a2a3_changed && st_affected`
-gate; the explicit A5 command runs without a change gate. Each uses its architecture runner pool.
-All callers reuse `_st-framework-eager.yml` with an explicit platform. Setup validates `a2a3|a5`, builds `build_package_<platform>`,
+`--environment-receipts --verify-feature-coverage --junitxml <result.xml>`
+checks feature declarations and execution evidence. The default onboard and
+framework reusable workflows enable these flags; this integration still requires
+validation on real CI runners. The scene
+corpus declares its features, and collect-only inventories can check the actual
+selection without running fixtures. CPU contract tests exercise the real collection hooks,
+dispatcher, xdist workers and JUnit verifier.
+
+Workflow triggers, environment setup, device leases and SDMA isolation use the
+same contracts across the environment suites. Default A2/A3 writes independent `main`, `sdma`
+and `sdma_fault` plans and receipts under `outputs/default-ci`; A5 writes `main`.
+Framework results remain under `outputs/framework-ci`. Each job's final
+verification step runs with `always()`, rechecks the original JUnit files against
+the plan, and writes `coverage-summary.md`, `coverage-summary.json` and the GitHub step summary. It fails
+if any expected partition is missing or its scope differs from the invocation.
+For A2/A3 manual-only runs, the two SDMA steps are outside scope; Daily retains
+their existing default manual exclusion. An empty framework manual-only run is
+not successful qualification.
+
+Artifacts retain plans, parent/child receipts, retry manifests and summaries,
+including partial evidence on failure. Default artifact names include platform,
+host architecture, run ID and attempt. Artifact upload failure does not override
+the test verdict. Sim, Network1, standalone model tests and DFX smokes keep their
+existing validation paths and are not covered by these new summaries.
+
+Program is the default product: a test declares
+`runtime_product("kernel"|"auxiliary")` only when it is not Program. Kernel tests
+also declare `execution_mode("eager"|"capture_replay")`; Program and auxiliary
+groups are mode-free because Program only supports eager. Runtime identity comes
+from the existing runtime marker, scene class or parameter instance; conflicting
+sources are errors. `SceneTestCase` defaults to Program through
+`_st_runtime_product`; its `_st_execution_mode` default applies only when the
+product is Kernel. A marker overrides those class defaults for an exceptional
+method. Plain Program tests need no product or mode marker.
+`coverage_runtime` supplies classification for runtime-independent probes or
+legacy tests without a runtime selection marker, preserving `--runtime` filtering.
+Filenames do not classify graph capture. Borrowed-context parameter instances in
+the stateful eager tests are Kernel; owned-context instances are Program. The
+common stream-capture probe is separate from HBG end-to-end capture qualification.
+Auxiliary probes do not claim delivered Kernel features or satisfy mandatory
+feature groups; they never narrow the corresponding Kernel capture gap.
+
+Coverage groups are `program/<runtime>`, `auxiliary/<runtime>` and
+`kernel/<runtime>/eager|capture_replay`. The policy in
+`simpler_setup/test_coverage.py` requires Program and Kernel eager
+for both runtimes in default onboard sweeps, plus native HBG capture on A2/A3.
+Framework sweeps require Kernel eager for both runtimes and the graph-capture
+groups declared in the applicable corpus, including their mandatory members.
+The stock Torch-NPU native-capture tests declare Kernel capture/replay separately
+from eager argument dumps. A capture group absent from the corpus remains a gap.
+Undelivered capture
+combinations remain explicit gaps. Manual-only, runtime/level and the existing
+SDMA partitions narrow the obligations. Each workflow passes
+`--coverage-partition main|sdma|sdma_fault|all` explicitly; the verifier never
+infers the partition from the `-m` spelling. Ad-hoc `-k`/`-m` filtering cannot remove
+mandatory members from the collected applicable corpus. Deleting a test and its
+declaration entirely cannot be detected unless a required group disappears.
+
+An optional default-environment test may declare
+`coverage_skip(platforms=["a2a3"], reason="exact skip reason")`. This is a
+reviewable exemption for those platforms, not a runtime capability probe.
+The JUnit skip reason must match exactly; xfail is not an allowed skip. Exempt
+members cannot replace a group's required members. Framework skip policy stays
+strict. Summary counts distinguish selected tests, entry into the test body,
+passes, failures, skips and missing results. Setup errors count as failures without
+body entry; teardown errors fail a case even when its body passed. Setup skips do
+not count as executed or passed. Poison-sink retries retain both attempts and count
+each recovered node ID once; a failed attempt cannot become a recovered pass.
+
+Failed verification preserves source-checked partial counts in the job summary and
+its JSON document, with `verification_status` set to `failed` or `incomplete`.
+Missing or invalid case evidence is never a pass. Foreign receipts and unapproved
+duplicates fail verification; an invalid source plan has no attributable counts.
+The JSON includes environment identity, source SHA, partition scope and evidence
+paths; the summary links to the CI run and its artifacts. A diagnostic report
+does not change the nonzero verification exit status or recreate a cached green
+partition summary.
+
+Collect the real corpus with its usual platform, environment and selection flags:
+
+```bash
+python -m pytest examples tests/st --collect-only --platform a2a3 \
+  --exclude-level 4 -m "not sdma and not sdma_fault" \
+  --environment-receipts --verify-feature-coverage --coverage-partition main \
+  -p simpler_setup.tools.collection_inventory --collection-inventory inventory.json
+```
+
+The inventory includes exact selected node IDs, duplicate/classification errors,
+feature declarations and policy obligations. Compare node IDs before and after
+a migration for each existing CI partition. Collection is not execution evidence;
+an empty manual-only framework selection remains empty, not a passing qualification.
+
+The scoped skip audit preserves these existing exceptions:
+
+| Existing condition | Coverage treatment |
+| ------------------ | ------------------ |
+| Early-enqueue classes' unused `test_run` placeholder | Explicit auxiliary test and exact skip reason; actual sequence tests remain required. |
+| HBG unpublished-dlopen validation runs only on sim | Exact skip exception on its onboard architecture. |
+| A2/A3 HBG graph-execution AICore SO-reload probe runs only on sim | Exact reason on A2/A3; reported as skipped, never qualified. |
+| Quarantined A5 chunked URMA fetch | Exact existing quarantine reason on A2/A3 and A5: collection preserves explicit skip markers before platform filtering. It remains skipped and cannot satisfy required execution. |
+| Visible-device remapping receives the identity two-device grant `[0, 1]` | Exact reason allowed on A2/A3 and A5; other skips fail verification. |
+| A5 RDMA workspace build option disabled | Exact exception for that smoke only. |
+| A5 manual CSA frozen fixture absent | Exact exception; reported as skipped, never qualified. |
+| Daily PMU counting-window case without `--enable-pmu 1` | Exact A2/A3 skip; the separate DFX smoke enables PMU and verifies actual counting. |
+| Sim-only branches, unavailable `/proc/self/maps`, missing matching run-completion case | No new onboard exemption; unexpected skips fail. |
+| L4 MPI/Network1 prerequisites missing | Outside these non-L4 sweeps; no blanket exemption for future L4 qualification. |
+
+MXFP cases are generated conditionally from available torch dtypes before pytest
+collection. Their absence cannot be detected by this inventory or by runtime-group
+coverage alone. Compare inventories under the CI dependency versions before enabling
+mandatory verification there. Platform-scoped exemptions permit the specified skip;
+they do not independently establish that the capability is absent.
+
+### Framework environment qualification (a2a3 and a5)
+
+The environment suite is named `st-framework-<arch>` and uses `_st-framework.yml`
+and `setup-framework/`. Execution modes belong to test declarations and coverage
+reports, so future qualified capture cases share this environment and device lease.
+The suite includes Kernel eager and native graph capture/replay declarations;
+actual qualification requires their source-bound passing execution receipts.
+
+Comment-trigger workflows are loaded from the default branch, whereas their local
+actions and identity scripts come from the checked-out PR. The existing
+`setup-framework-eager/action.yml` and `identity.py` paths therefore delegate to
+the canonical setup/identity implementation and preserve the caller's output path.
+They contain no independent dependency pins or execution suite. Remove these entry
+points only after the default-branch callers use the canonical paths and queued
+invocations of the older callers have drained. An older caller's passing result
+qualifies only its own verification contract; candidate coverage summaries require
+a caller that enables feature verification.
+
+When deploying this naming migration, administrators must inspect both branch
+protection and repository/organization rulesets for required check contexts. Replace
+any `st-framework-eager-<arch> / st-framework-eager-<arch>` requirement with the
+observed `st-framework-<arch> / st-framework-<arch>` context from the candidate CI
+run, preserving the required-check app identity and enforcement settings. These
+settings are external to Git and cannot be migrated by a YAML rename. Do not add
+an extra suite merely to emit the retired name. Recheck merge requirements before
+merging the migration; a public ruleset query does not inspect legacy protection.
+
+`st-framework-a2a3` runs automatically on affected PRs. A5 framework
+eager validation for ordinary PRs is part of `/run-a5`. Both run in Daily.
+Automatic callers use the corresponding `a2a3_changed && st_affected` gate;
+the explicit A5 command runs without a change gate. Each uses its architecture runner pool.
+All callers reuse `_st-framework.yml` with an explicit platform. Setup validates `a2a3|a5`, builds `build_package_<platform>`,
 and records the matching onboard runtime roots. The exclusive task checks actual
 silicon before backend import and passes the same platform to identity recording
 and pytest. Artifacts are named separately by platform; a green A3 job does not
@@ -461,7 +601,7 @@ environment retains its existing dispatcher and does not claim this strict
 JUnit aggregation. Logs contain the
 source/native build identities, runtime and framework module hashes, compiled
 bridge identity and consumer results; when artifact upload succeeds,
-`framework-eager-<platform>-*` retains JUnit and per-case logs even on test failure.
+`framework-<platform>-*` retains JUnit and per-case logs even on test failure.
 Artifact upload is best-effort and does not override the verified test result.
 This qualifies the reference
 consumers' same-stream and cross-stream eager ordering, caller-owned lifetimes,
@@ -478,11 +618,18 @@ A repo admin can comment exactly `/run-a5` on an open PR targeting this repo's
 `main` branch. Surrounding whitespace is accepted; extra arguments or text are
 ignored. `ci-a5-comment.yml` checks the commenter's current `admin` permission
 with `getCollaboratorPermissionLevel` before resolving the PR's head repository
-and full commit SHA, including fork PRs. Non-PR comments and unverified or
+and base SHA, then pinning their GitHub-generated merge commit in the upstream
+repository, including fork PRs. The gate verifies that the
+merge commit has exactly the observed base and head as its two parents. A missing,
+conflicting or stale merge snapshot fails the gate before any suite is scheduled;
+issue a new command after GitHub refreshes it. The gate summary records all three
+SHAs. Testing the merge includes current main's CI interfaces even for a PR whose
+head predates their introduction. This qualifies integration with that base,
+not the standalone head. Non-PR comments and unverified or
 non-admin requests cannot schedule hardware work.
 
 Every admitted request runs `ut-a5` with CANN examples, `st-onboard-a5` with DFX
-smokes, and `st-framework-eager-a5` through the existing reusable workflows.
+smokes, and `st-framework-a5` through the existing reusable workflows.
 No change detector filters an explicit request, including a documentation-only
 PR. A new admitted request cancels the previous same-PR job for each suite;
 unmatched and denied comments cannot cancel admitted jobs. Pushes do not
@@ -493,7 +640,7 @@ retests the admitted SHA. The gate and report jobs only call the GitHub API and
 run on GitHub-hosted `ubuntu-24.04`, so a burst of comments never queues on the
 self-hosted pools.
 
-The final PR comment records the exact tested repository/SHA, each suite's
+The final A5 PR comment records the tested merge, original head and base, each suite's
 result and the workflow run link. Skipped and cancelled jobs retain those results
 and are not reported as passing. The issue-comment workflow itself uses the
 default branch's definition, so this new command cannot execute on GitHub until

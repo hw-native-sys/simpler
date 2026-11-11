@@ -16,6 +16,13 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = [
+    pytest.mark.coverage_skip(
+        platforms=["a5"],
+        reason="A5 PCIe CI Host-source URMA ACK timeout; DT validation passes (issue #2922)",
+    ),
+]
+
 
 def _driver():
     name = "_a5_host_comm_domain_driver"
