@@ -13,6 +13,7 @@ no repo checkout required.
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
+- **[scheduler_benchmark](#scheduler_benchmark)** — chip swimlane + `deps.json` → a run's dispatch cost and schedule cost, against a near-optimal schedule and a lower bound
 - **[strace_timing](#strace_timing)** — per-stage `chip.run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[hbg_bind_phases](#hbg_bind_phases)** — `host_build_graph` `bind`-stage segments from the `chip.run.bind.*` spans → per-segment min/median/max plus the control-plane total
 - **[phase_time_split](#phase_time_split)** — the same segment spans split into on-CPU and off-CPU per segment, from per-thread CPU clocks, with cold and warm binds reported separately
@@ -133,6 +134,28 @@ python -m simpler_setup.tools.critical_path <run-dir> \
 
 `--report` accepts a filename, not a path, so the report cannot be redirected
 away from the directory containing its source `chip_swimlane_records.json`.
+
+---
+
+## scheduler_benchmark
+
+Benchmarks one run of any scheduler, on either runtime, from its
+`chip_swimlane_records.json` and the `deps.json` of the same run:
+
+```bash
+python -m simpler_setup.tools.scheduler_benchmark outputs/<case>_<ts>/chip_swimlane_records.json \
+    --deps outputs/<case>_<ts>/deps.json
+```
+
+It prints, per run (`run_epoch`), four numbers and the two steps between
+them: `measured`, then `squeezed` (the same cores and per-core order with every
+gap removed), `best` (a near-optimal schedule) and `bound` (no schedule can be
+shorter); `dispatch cost` is `measured − squeezed` and `schedule cost` is
+`squeezed − best`. `fifo` and `sameOrder` are printed beside them as
+references. Every schedule is validated before it is reported. Pure
+post-processing: no C++ or device is required. See
+[docs/dfx/scheduler-benchmark.md](../../docs/dfx/scheduler-benchmark.md) for
+what each number means and how it is computed.
 
 ---
 

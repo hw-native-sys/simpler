@@ -32,7 +32,8 @@
 bool dep_gen_host_graph_enabled() { return false; }
 
 void dep_gen_host_graph_begin_task(
-    simpler::hbg::TaskId, bool, bool, const int32_t[3], int32_t, int32_t, const TensorRef *, const TensorArgType *
+    simpler::hbg::TaskId, bool, bool, bool, bool, const int32_t[3], int32_t, int32_t, const TensorRef *,
+    const TensorArgType *
 ) {}
 
 void dep_gen_host_graph_end_task() {}
