@@ -81,11 +81,13 @@ struct alignas(64) PercounterMixSignal {
     // is part of the payload and moves under the same release as the task id.
     volatile int32_t block_idx;
     volatile int32_t block_num;
-    // Zero when this arming is a draw from the MIX list; otherwise the cohort's
-    // sequence plus one. The rendezvous is identical either way, but its end is
-    // reported to the cohort record rather than to the MIX done ticket -- and a
-    // lane that owes a block of its own needs the sequence to tell which of the
-    // two it serves first, so a flag would not carry enough.
+    // Zero when this arming is a draw from the MIX list, non-zero when it is a
+    // cohort's own block. The rendezvous is identical either way; what differs
+    // is where its end is reported, to the cohort record rather than to the MIX
+    // done ticket. It carries the cohort's sequence plus one rather than a one
+    // so that the value names the cohort in a dump, but nothing compares it:
+    // the queue keeps one cohort outstanding, so a cohort rendezvous on this
+    // line is always the one whose block the reader holds.
     volatile uint32_t cohort_block;
     // Entry `i` carries the sequence plus one of the cohort whose block cluster
     // lane `i` holds and has not finished, and zero while it holds none; lane
@@ -93,23 +95,14 @@ struct alignas(64) PercounterMixSignal {
     // and for a block one lane runs alone it is cleared only after that kernel
     // returns; a MIX cohort's claimer clears it where it arms the line instead.
     //
-    // **`PERCOUNTER_HOLD_INSIDE` says where that lane is, which the sequence
-    // alone does not.** A lane that only holds a later cohort's block has to
-    // stay nameable -- the arming that refuses it is what the cohort order
-    // releases it for -- while one that has entered that cohort's kernel must
-    // not be named at all, since no checkpoint reaches it again. Both are the
-    // same sequence, so the bit is what tells them apart.
-    //
-    // It is what an arming can see of a lane's other commitment, not a lock:
-    // the reads are not atomic with the fetch_add that takes a block, so the
-    // lane's own service order resolves what they could not exclude.
+    // Only a draw from the MIX list reads it, and only for whether it is zero:
+    // the queue keeps one cohort outstanding, so which cohort a lane owes is
+    // never in question. It is what an arming can see of a lane's other
+    // commitment, not a lock -- the reads are not atomic with the fetch_add
+    // that takes a block, so the lane's own service order resolves what they
+    // could not exclude.
     volatile uint32_t cohort_hold[PLATFORM_CORES_PER_BLOCKDIM];
 };
-/** Set in a `cohort_hold` entry while that lane is inside its block's kernel. */
-inline constexpr uint32_t PERCOUNTER_HOLD_INSIDE = uint32_t{1} << 31;
-/** The sequence plus one a `cohort_hold` entry carries, without that bit. */
-inline constexpr uint32_t PERCOUNTER_HOLD_SEQ_MASK = PERCOUNTER_HOLD_INSIDE - 1;
-
 static_assert(sizeof(PercounterMixSignal) == 64, "the MIX signal owns exactly one cache line");
 static_assert(alignof(PercounterMixSignal) == 64, "two clusters must not share a line");
 // Every member is volatile, so the type is not trivially copyable: the line is

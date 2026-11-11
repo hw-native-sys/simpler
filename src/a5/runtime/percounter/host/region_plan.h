@@ -164,9 +164,6 @@ inline bool plan_layout(
     if (block_total < task_count) return false;
     if (mix_order_count > block_total) return false;
     if (sync_cohort_count > task_count) return false;
-    // A cohort's sequence plus one shares `cohort_hold` with the bit that says
-    // the lane holding it is inside its kernel, so it has to stay below that.
-    if (sync_cohort_count >= PERCOUNTER_HOLD_SEQ_MASK) return false;
     uint64_t placed = mix_order_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t) {
         if (order_count[t] > block_total) return false;
