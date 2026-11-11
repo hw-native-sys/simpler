@@ -211,6 +211,16 @@ tick 在 checkpoint 里，这个自环自动解开，三个阻塞点全部继承
 `local_done`、`sync_queue->completed`、`mix_tickets[DONE]` 三者**全部不动**：它们计的是
 "block 执行完了"，而 block 确实执行完了。
 
+cohort 这条路上，`sync_queue->completed` 原本遵守一条顺序规则 —— 它排在任务计数器之后，
+因为看到它达到总数的 lane 可以退出，而那时不能还有消费者在等。延迟之后任务计数器不在那里
+加了，这条规则改由**退出判据**保证：`async_outstanding` 非零时 lane 不退出，而一个被延迟
+的 cohort block 会一直让它非零。
+
+**槽位等待发生在已经承诺执行之后。** `percounter_async_acquire` 在
+`percounter_launch_kernel` 内部，所以在那里等的 lane 不服务 MIX 和 cohort，服务 cohort
+block 的还握着那个 block。这是停顿不是挂死：等待期间它轮询自己的条件、检查停止信号、到
+看门狗为止，而 MIX 的 arming 读到它的 hold 会正确地不点它的名。
+
 ### 4.5 MIX：延迟的 subtask 先把自己那份减掉
 
 MIX 由掩码最低位的 lane 在 `percounter_mix_wait(finished)` 之后一次性加
@@ -335,7 +345,7 @@ host 只给本步已经支持的任务形状打"可能登记"标记，其余形�
 | -- | ---- | -------- |
 | S1 ✅ | 布局、寻址与**拒绝**：region 预留 group 与 entries、`PercounterControl` 新字段、host 预填、每次 dispatch 开启与封口；kernel 返回后 `count > 0` 或 `error_code != 0` 即报错 | 登记条件的 kernel 得到指名的运行时错误，而非 trap 或错误答案；不登记的图行为一字不变 |
 | S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
-| S3 | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | sync-start 用例；`sync_queue->completed` 与 cohort 释放不受影响 |
+| S3 ✅ | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | 单核 `require_sync_start` 多 block 的登记用例通过，同一用例在 S2 构建上报 error 13（0 of 7 blocks resolved）；回归集 11 passed，失败仍只有那两个 swimlane 用例 |
 | S4 | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | MIX 3/5/6/7 用例；计数器终值与全不延迟时一致 |
 | S5 | Graph body、溢出与非法条件、容量与开销度量 | 第 8 节矩阵补齐 |
 

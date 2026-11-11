@@ -593,6 +593,12 @@ inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLa
  * and still sees EXIT and another lane's error, because `percounter_async_tick`
  * runs beside the services the checkpoint already performs.
  *
+ * **The caller has already committed to this dispatch**, so a lane waiting
+ * here serves no MIX or cohort work, and one serving a cohort block still
+ * holds it. That is a stall, not a hang: the wait polls the lane's own
+ * conditions, tests the stop signals, and ends at the watchdog, while a MIX
+ * arming reading the lane's hold correctly refuses to name it throughout.
+ *
  * Returns false on EXIT, on another lane's error, or when no slot has freed
  * within the watchdog -- which is a condition that never held, and is reported
  * as this lane's TIMEOUT rather than left for the op-execute timeout.
@@ -1201,16 +1207,26 @@ percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state, u
         if (!percounter_resolve(cfg, sync->task_id, &task)) return false;
         bool deferred = false;
         if (!percounter_run_prepared(
-                cfg, state, task, cfg.payloads + PERCOUNTER_SYNC_PAYLOAD_SLOT, timeout_cycles, false, &deferred
+                cfg, state, task, cfg.payloads + PERCOUNTER_SYNC_PAYLOAD_SLOT, timeout_cycles, true, &deferred
             )) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             return false;
         }
-        percounter_publish_completion(cfg, task, uint64_t{1});
+        if (!deferred) percounter_publish_completion(cfg, task, uint64_t{1});
         ++state->local_done;
         sync->my_block = -1;
         percounter_cohort_hold_set(cfg, 0);
-        percounter_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
+        // **Raised whether or not the task published**, and the four lines
+        // above it are why: the block has run, this lane is out of its kernel
+        // and holds nothing, so the cohort protocol is free to proceed. Only
+        // the counter the task's consumers watch waits.
+        //
+        // The rule that count obeys -- a lane seeing it reach the total may
+        // stop, and no consumer may still be waiting then -- now rests on the
+        // exit predicate rather than on this order: a lane does not leave
+        // while `async_outstanding` is non-zero, and a deferred cohort block
+        // keeps it non-zero until its conditions hold.
+        scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
         // The count this block just raised is what the next cohort waits on,
         // and the lane that raises it is the only one that knows it changed.
         percounter_sync_promote(cfg);
