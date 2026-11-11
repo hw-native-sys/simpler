@@ -98,22 +98,6 @@ jobs:
       runs_on: '["self-hosted","a2a3"]'
       include_dfx_smokes: true
 
-  # The only job that spans two machines. It is arch-specific and the most
-  # expensive thing in this file, so it gates exactly as st-onboard-a2a3 does —
-  # never on a weaker signal than a cheaper job, per
-  # .claude/rules/ci-change-detection.md.
-  st-network1-onboard-a2a3:
-    needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
-    uses: ./.github/workflows/_st-network1.yml
-    with:
-      platform: a2a3
-      # a2a3pod is a label on the runner machines, not a value this repo
-      # controls, so it keeps the older word until those machines are
-      # relabelled. A job matches every label in this list, so it cannot accept
-      # either spelling.
-      runs_on: '["self-hosted","Linux","ARM64","a2a3pod"]'
-
   # The two DeepSeek smoke cases stay manual, so the main sweep (--manual
   # exclude) never picks them up; this job selects them with --manual only and
   # runs on its own devices in parallel with st-onboard-a2a3, keeping their
