@@ -105,12 +105,18 @@ inline void percounter_graph_prepare_init(PercounterControl *control) {
 }
 
 inline void percounter_graph_prepare_fail(PercounterGraphPrepare *prepare, uint64_t rank, SchedulerGraphResult why) {
+    // The invocation is claimed first, and carries `rank + 1` so that zero
+    // still means none: readers gate on `error`, so writing it first would let
+    // one report a failure against an invocation number not yet stored.
+    uint64_t unclaimed = 0;
+    if (!__atomic_compare_exchange_n(
+            &prepare->error_invocation, &unclaimed, rank + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+        ))
+        return;
     uint64_t expected = 0;
-    if (__atomic_compare_exchange_n(
-            &prepare->error, &expected, static_cast<uint64_t>(why), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
-        )) {
-        __atomic_store_n(&prepare->error_invocation, rank, __ATOMIC_RELEASE);
-    }
+    __atomic_compare_exchange_n(
+        &prepare->error, &expected, static_cast<uint64_t>(why), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+    );
 }
 
 /** Write back one materialized body task: its storage entry and its argument spans. */
@@ -282,10 +288,20 @@ inline uint64_t percounter_graph_prepare_error(PercounterControl *control, bool 
     auto *prepare = percounter_region<PercounterGraphPrepare>(control, control->graph_prepare_offset);
     const uint64_t error = __atomic_load_n(&prepare->error, __ATOMIC_ACQUIRE);
     if (error != 0 && report) {
-        LOG_ERROR(
-            "A5 percounter: Graph invocation %" PRIu64 " (of %" PRIu64 ") failed to materialize: %" PRIu64,
-            __atomic_load_n(&prepare->error_invocation, __ATOMIC_ACQUIRE), control->graph_invocation_count, error
-        );
+        // Zero where a teardown published the failure rather than an
+        // invocation's own materialization, which names none.
+        const uint64_t claimed = __atomic_load_n(&prepare->error_invocation, __ATOMIC_ACQUIRE);
+        if (claimed == 0) {
+            LOG_ERROR(
+                "A5 percounter: Graph materialization stopped over %" PRIu64 " invocation(s): %" PRIu64,
+                control->graph_invocation_count, error
+            );
+        } else {
+            LOG_ERROR(
+                "A5 percounter: Graph invocation %" PRIu64 " (of %" PRIu64 ") failed to materialize: %" PRIu64,
+                claimed - 1, control->graph_invocation_count, error
+            );
+        }
     }
     return error;
 }
