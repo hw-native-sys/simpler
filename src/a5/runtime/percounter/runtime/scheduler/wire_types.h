@@ -92,11 +92,24 @@ struct alignas(64) PercounterMixSignal {
     // `i` is its only writer. It is published before that block can be served,
     // and for a block one lane runs alone it is cleared only after that kernel
     // returns; a MIX cohort's claimer clears it where it arms the line instead.
+    //
+    // **`PERCOUNTER_HOLD_INSIDE` says where that lane is, which the sequence
+    // alone does not.** A lane that only holds a later cohort's block has to
+    // stay nameable -- the arming that refuses it is what the cohort order
+    // releases it for -- while one that has entered that cohort's kernel must
+    // not be named at all, since no checkpoint reaches it again. Both are the
+    // same sequence, so the bit is what tells them apart.
+    //
     // It is what an arming can see of a lane's other commitment, not a lock:
     // the reads are not atomic with the fetch_add that takes a block, so the
     // lane's own service order resolves what they could not exclude.
     volatile uint32_t cohort_hold[PLATFORM_CORES_PER_BLOCKDIM];
 };
+/** Set in a `cohort_hold` entry while that lane is inside its block's kernel. */
+inline constexpr uint32_t PERCOUNTER_HOLD_INSIDE = uint32_t{1} << 31;
+/** The sequence plus one a `cohort_hold` entry carries, without that bit. */
+inline constexpr uint32_t PERCOUNTER_HOLD_SEQ_MASK = PERCOUNTER_HOLD_INSIDE - 1;
+
 static_assert(sizeof(PercounterMixSignal) == 64, "the MIX signal owns exactly one cache line");
 static_assert(alignof(PercounterMixSignal) == 64, "two clusters must not share a line");
 // Every member is volatile, so the type is not trivially copyable: the line is

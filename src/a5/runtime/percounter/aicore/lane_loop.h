@@ -593,6 +593,19 @@ inline __aicore__ void percounter_cohort_hold_set(const LaneConfig &cfg, uint64_
 }
 
 /**
+ * Say that this lane is entering its block's kernel, where no checkpoint
+ * reaches it again.
+ *
+ * The sequence stays, because a lane inside a kernel still owes that cohort;
+ * what the bit adds is the part the sequence cannot express. It is published
+ * before the lane commits, and the fence inside the store is what lets an
+ * arming that stages its mask afterwards see it.
+ */
+inline __aicore__ void percounter_cohort_hold_enter(const LaneConfig &cfg, uint64_t seq_plus_one) {
+    percounter_cohort_hold_set(cfg, seq_plus_one | PERCOUNTER_HOLD_INSIDE);
+}
+
+/**
  * Whether any lane `mask` names owes a block of a cohort older than `seq`.
  *
  * **Order decides, not the bare fact of a hold.** A lane owing an *older*
@@ -609,7 +622,11 @@ inline __aicore__ bool percounter_cohort_older_held_in(const LaneConfig &cfg, ui
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         if ((mask & (uint32_t{1} << lane)) == 0) continue;
         const uint32_t held = scheduler_ssbuf_load_acquire(&signal->cohort_hold[lane]);
-        if (held != 0 && static_cast<uint64_t>(held - 1) < seq) return true;
+        if (held == 0) continue;
+        // Inside a kernel, the sequence stops deciding: this lane reaches no
+        // further checkpoint, so a line naming it waits on nobody.
+        if ((held & PERCOUNTER_HOLD_INSIDE) != 0) return true;
+        if (static_cast<uint64_t>(held - 1) < seq) return true;
     }
     return false;
 }
@@ -770,6 +787,15 @@ inline __aicore__ int32_t percounter_sync_take_block(const LaneConfig &cfg, uint
 inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state) {
     PercounterSyncState *sync = &state->sync;
     if ((sync->active_mask & (sync->active_mask - 1U)) == 0) {
+        // Entering is the step that cannot be taken back, so it is announced
+        // first and the line read once more: an arming that staged its mask
+        // before this store sees nothing of it and would name a lane already
+        // gone, and one that stages after it reads the bit and refuses.
+        percounter_cohort_hold_enter(cfg, sync->my_seq + 1);
+        if (percounter_line_precedes_block(cfg, state) || percounter_line_staging_for(cfg)) {
+            percounter_cohort_hold_set(cfg, sync->my_seq + 1);
+            return true;
+        }
         PercounterTask task{};
         if (!percounter_resolve(cfg, sync->task_id, &task)) return false;
         uint64_t kernel_start = 0;
