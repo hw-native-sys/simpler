@@ -30,7 +30,6 @@ class ProtocolBuilder:
         self.groups = [0] * clusters
         self.member_rank_offsets = {}
         self.lane_groups = [[0, 0, 0] for _ in range(clusters)]
-        self.generations = {}
         self.identities: list[dict[str, Any]] = []
         self.deferred_tasks = set(deferred_tasks)
         raw = self.raw
@@ -282,8 +281,6 @@ class ProtocolBuilder:
         spec = self.raw["tasks"][task]
         mixed, cooperative = bool(spec["flags"] & 4), bool(spec["flags"] & 12)
         pending = block % 2
-        key = worker, pending
-        self.generations[key] = self.generations.get(key, 0) + 1
         index = (
             spec["trace_base"]
             + block * spec["active_mask"].bit_count()
@@ -293,7 +290,6 @@ class ProtocolBuilder:
             self.common(task, worker),
             index=index,
             block_idx=block,
-            generation=self.generations[key],
             pending_slot=pending,
             subtask_slot=slot,
             ready_source=3 if cooperative else 0,
@@ -340,7 +336,6 @@ class ProtocolBuilder:
                 block_num=spec["block_num"],
                 subtask_slot=slot,
                 pending_slot=pending,
-                dispatch_generation=self.generations[key],
                 order_key=row["order_key"] if cooperative else None,
                 group_seq=group or None,
                 cluster_index=worker // 3,

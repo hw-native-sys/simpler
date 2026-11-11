@@ -13,7 +13,7 @@ from dataclasses import replace
 import pytest
 
 from .helpers import close_task_members, execute_block, make_protocol, run_task
-from .types import MAX_EPOCH, MAX_GENERATION, ContractViolation, Task
+from .types import MAX_EPOCH, ContractViolation, Task
 
 
 def test_ready_b_can_commit_before_unready_a_without_task_ref_order():
@@ -237,7 +237,7 @@ def test_duplicate_lane_block_and_task_completions_are_rejected():
     assert model.state(0).completed == 1 and model.state(0).releases == 1
 
 
-@pytest.mark.parametrize("field,value", [("epoch", 0), ("generation", 999), ("owner", 3)])
+@pytest.mark.parametrize("field,value", [("epoch", 0), ("owner", 3)])
 def test_stale_or_forged_lease_cannot_publish(field, value):
     model = make_protocol(Task(0, 1, 1))
     model.admit(0)
@@ -247,13 +247,14 @@ def test_stale_or_forged_lease_cannot_publish(field, value):
         model.publish(replace(lease, **{field: value}))
 
 
-def test_generation_wrap_is_rejected_without_consuming_a_block():
+def test_exhausted_claim_does_not_mint_another_execution():
     model = make_protocol(Task(0, 1, 1))
     model.admit(0)
-    model.generation = MAX_GENERATION
-    with pytest.raises(ContractViolation, match="GENERATION_OVERFLOW"):
-        model.claim(0, 0)
-    assert model.state(0).next_block == 0
+    lease = model.claim(0, 0)
+    assert lease is not None
+    assert model.claim(0, 0) is None
+    assert model.state(0).next_block == 1
+    assert len(model.state(0).blocks) == 1
 
 
 def test_temporary_empty_admission_log_is_not_end_of_run():

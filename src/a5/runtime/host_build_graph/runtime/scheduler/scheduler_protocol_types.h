@@ -152,7 +152,6 @@ struct alignas(64) SchedulerProtocolExecutionTrace {
     uint64_t permit_tail;
     uint32_t worker_index;
     uint32_t block_idx;
-    uint32_t generation;
     uint16_t pending_slot;
     uint16_t subtask_slot;
     uint32_t flags;

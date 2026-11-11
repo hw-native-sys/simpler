@@ -350,8 +350,8 @@ class NativeAudit:
                 "execution topology mismatch",
             )
             require(
-                execution["pending_slot"] < 2 and 0 < execution["generation"] < 1 << 32,
-                "invalid execution slot/generation",
+                execution["pending_slot"] < 2,
+                "invalid execution slot",
             )
             require(
                 0 < execution["publication_count"] < 1 << 32
@@ -452,7 +452,6 @@ class NativeAudit:
         for executions in slots.values():
             executions.sort(key=lambda row: row["permit"][1])
             for previous, current in zip(executions, executions[1:], strict=False):
-                require(previous["generation"] < current["generation"], "slot generation reused or reversed")
                 require(
                     previous["completion_consumed"][0] <= current["publication_before_cycles"],
                     "payload overwrote an unconsumed slot",
@@ -503,7 +502,6 @@ class NativeAudit:
                 block_num=execution["block_num"],
                 subtask_slot=execution["subtask_slot"],
                 pending_slot=execution["pending_slot"],
-                dispatch_generation=execution["generation"],
                 order_key=execution["order_key"] if execution["flags"] & COOPERATIVE else None,
                 group_seq=execution["group_seq"] if execution["flags"] & GM_GROUP else None,
                 cluster_index=execution["cluster_index"],

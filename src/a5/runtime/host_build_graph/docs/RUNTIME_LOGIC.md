@@ -488,7 +488,10 @@ workers without changing block ownership or completion accounting. MIX and
 `sync_start` retain their full eligible membership. The exporter writes version 10
 (ordinary graph) and version 11 (native Graph). Only these current schemas are accepted. Producers and readers must match;
 historical formats are rejected. Both use the per-resource-type prefix and
-cooperative admission. Execution identities use the strict v1 contract.
+cooperative admission. Execution identities use the strict v1 contract:
+`(run_epoch, task_ref, block_idx, subtask_slot)` identifies an execution;
+worker and pending slot identify its placement. Worker event sequences prove
+that retirement precedes the next payload publication and permit on a reused slot.
 
 Kernel Ready work uses exactly two shared ticket queues: AIC and MIX tasks
 enter the AIC queue; ordinary AIV tasks enter the AIV queue. Each worker probes
@@ -506,15 +509,21 @@ recorded in the [queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-tas
 Business-ready ticket positions are shared GM state; a successful head CAS
 transfers task ownership to one worker. Native control inboxes retain their
 separate atomic endpoints and task links.
-Self-execution notifications contain only a pending-slot mask: the slot stays
-READY with the same generation until the local Executor claims it, so the ready
-token is reconstructed from the slot. Completion generation validation still
-prevents stale notifications from freeing or refilling a pending slot.
+Two own slots use a ready mask and head index to preserve publication order.
+The executor peeks at the head and checks final admission before consuming it
+and changing READY to EXECUTING. A denied permit leaves the order intact;
+parking removes a candidate's slot, and preparing it again appends it at the tail.
+Kernel return, async sealing and enabled argument capture precede the loop's
+EXIT/error gate and a direct `scheduler_complete_own_slot` call. Retirement
+checks EXECUTING and the task/block/subtask/group binding. There is no completion
+notification or periodic completion scan. Direct refill preserves the old
+execution in a local snapshot before rebinding the slot to its successor.
 
 Local configuration, execution slots, control resolution and the optional
 profiling pointer belong to the core-local state. A separate profiling state
-holds timing slots, self-execution traces, worker trace caches, profiling
-offsets, and the loop counter/valid mask. Each worker owns its local execution traces.
+holds two timing slots, self-execution traces, one worker trace cache, profiling
+offsets, and the loop counter/cache-valid flag. Completion trace publication and
+slot release precede cooperative block contribution and GM MIX lane release.
 Sampling is derived from the timing-slot range.
 
 The host records whether any task requests sampled timing in the run control.
@@ -535,8 +544,7 @@ immutable lines.
 
 Each worker owns two GM DispatchPayload slots and their core-local bookkeeping.
 Ordinary, SPMD and GM MIX execution reuse these same slots. The worker prepares
-its own payload, publishes local readiness, executes it, and consumes its local
-completion generation. The scheduler does not reserve or use cluster SSBUF.
+its own payload, publishes local readiness, executes it, and directly retires it after execution. The scheduler does not reserve or use cluster SSBUF.
 
 Each slot's embedded context pointers are initialized in the host-created
 payload image. Dispatch updates `block_idx` and `block_num` for the current

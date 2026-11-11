@@ -176,6 +176,18 @@ native children's public parent/local `TaskId`, rather than their private
 scheduler index. Mix tasks include all active AIC/AIV participants and emit one
 argument set per task, rather than one per block or core.
 
+Each task boundary has one publisher identified by run epoch, task reference,
+stage and worker. Request/Ack records carry that publisher and the existing
+monotonic request tick; they carry no execution-slot generation. The ACK commit
+encodes `(task_ref + 1) << 32 | stage << 8 | status`. The service clears commit,
+publishes the body and echoed tick, then publishes commit. Readers double-check
+commit and tick. Waiting participants track monotonic copy progress for the full
+boundary identity even after the publisher advances to the next request tick.
+Publisher request advancement and sealing require the current request tick.
+Stale epochs, tasks, stages, publishers, chunks and torn ACKs cannot seal a boundary.
+The last returning participant remains EXECUTING until its AFTER seal and return
+gate permit direct slot retirement.
+
 The runtime answers `args_dump_capture_supported_impl = 1`. A dump-enabled bind
 requires an AICore-scheduled graph; an unsupported scheduler shape returns
 `PTO_RUNTIME_ERR_UNSUPPORTED` before publication. Requests with argument dumping

@@ -263,7 +263,6 @@ inline void execution(JsonObject &row, const SchedulerProtocolExecutionTrace &re
     row.number("permit_tail", record.permit_tail);
     row.number("worker_index", record.worker_index);
     row.number("block_idx", record.block_idx);
-    row.number("generation", record.generation);
     row.number("pending_slot", record.pending_slot);
     row.number("subtask_slot", record.subtask_slot);
     row.number("flags", record.flags);

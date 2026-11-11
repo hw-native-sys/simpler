@@ -115,7 +115,7 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         ASSERT_TRUE(scheduler_fill_dispatch_slot(
             graph.graph(), storage.scheduler_state->base(),
             storage.local_context(&storage.contexts[1], &storage.scheduler_local_state), storage.run_control,
-            SchedulerFreeSlotClaim{1, 0, 0, 0}, ready_claim, level
+            SchedulerFreeSlotClaim{0}, ready_claim, level
         ));
         auto *traces =
             scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
@@ -759,7 +759,7 @@ TEST(SchedulerDispatch, RejectsKernelIdBeforeCallableTableAccess) {
     graph.executable(0, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(kFixtureCallableCount);
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
 
@@ -779,7 +779,7 @@ TEST(SchedulerDispatch, RejectsInvalidSingleSubtaskShapeBeforeMetadataIndex) {
     graph.executable(0, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     storage.metadata[0].active_mask = LaneMask::none();
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
 
@@ -798,7 +798,7 @@ TEST(SchedulerDispatch, RejectsCoreTypeMismatch) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIV);
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
 
@@ -818,7 +818,7 @@ TEST(SchedulerDispatch, RejectsUnknownTargetCoreType) {
     storage.contexts[0].core_type = 2;
     storage.metadata[0].kernel_ids[1] = 1;
     storage.metadata[0].active_mask = LaneMask::aiv0();
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
 
@@ -831,14 +831,14 @@ TEST(SchedulerDispatch, RejectsUnknownTargetCoreType) {
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
 }
 
-TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZeroCallable) {
+TEST(SchedulerDispatch, ReadySlotRemainsBoundWhenAnotherSlotRejectsZeroCallable) {
     FixtureStorage storage(2, 1);
     storage.prepare_ready_pool();
     GraphBuffer graph(2);
     graph.executable(0, 0);
     graph.executable(1, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
 
@@ -847,12 +847,10 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
         ready_claim, 0
     ));
-    EXPECT_EQ(storage.scheduler_local_state.slots[0].generation, 1u);
+    EXPECT_EQ(storage.scheduler_local_state.slots[0].state, SchedulerDispatchSlotState::READY);
     uint32_t pending_slot = UINT32_MAX;
-    uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&storage.scheduler_local_state, &pending_slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_peek(&storage.scheduler_local_state, &pending_slot));
     EXPECT_EQ(pending_slot, 0u);
-    EXPECT_EQ(publication, scheduler_dispatch_publication(1, SchedulerDispatchSlotState::READY));
 
     storage.callable_addresses[1] = 0;
     storage.run_control->error_claimed = 0;
@@ -886,7 +884,7 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
     storage.metadata[0].kernel_ids[0] = 1;
     storage.metadata[1].kernel_ids[0] = 2;
 
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
@@ -919,7 +917,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(kFixtureCallableCount - 1);
     storage.callable_addresses[kFixtureCallableCount - 1] = UINT64_C(0x2000);
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
@@ -1002,7 +1000,7 @@ TEST(SchedulerPredicate, MalformedPredicateStopsDispatchWithoutPublishingSlot) {
     graph.predicate(0, 0, 4, static_cast<uint8_t>(PredicateOp::GT));
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     storage.metadata[0].flags |= SCHEDULER_TASK_HAS_PREDICATE;
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
 
@@ -1025,7 +1023,7 @@ TEST(SchedulerPredicate, FailedPredicatePublishesDependencyOnlyDispatch) {
     graph.predicate(0, reinterpret_cast<uint64_t>(&value), 4, static_cast<uint8_t>(PredicateOp::GT));
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     storage.metadata[0].flags |= SCHEDULER_TASK_HAS_PREDICATE;
-    SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim slot_claim{0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_ref = 0;
 

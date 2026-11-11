@@ -77,7 +77,7 @@ MPMC pop 的成功 CAS 是唯一 owner 的获取点，不再增加 Graph 级 own
 
 ### 控制完成切片
 
-每轮先处理已有 kernel completion，再运行一个控制切片，然后继续 ordered obligations、slot fill 和 kernel。
+kernel 返回收尾与 EXIT/错误门禁之后直接处理当前 slot completion，再运行控制切片、ordered obligations、slot fill 和下一次 kernel。
 即使所有 payload slot 占满或 admission candidate 被暂存，也必须运行控制切片。
 已有 kernel completion 的控制后继只入队；下一切片处理，避免 completion→control 的递归。
 
@@ -136,7 +136,7 @@ Host 按 task_ref 顺序分别累计 AIC/AIV 普通 SPMD 的 block 数；MIX、s
 `SchedulerLocalSlotState` 用三态 predicate（未求值、通过、不通过）保存一次求值的结果，
 park/restore 与 `args_observed` 一起迁移，不因重试而读取更新后的 predicate operand。
 `SchedulerWorkerContext` 为 320 bytes，`SchedulerLocalConfig` 为 104 bytes，
-slot 保持 24 bytes，`SchedulerLocalState` 为 384 bytes（含可选异步服务状态的 8-byte 引用），其中控制解析游标占 160 bytes，均有 64-bit 构建的静态断言。
+slot 保持 24 bytes，`SchedulerLocalState` 为 368 bytes（含可选异步服务状态的 8-byte 引用），其中控制解析游标占 160 bytes，均有 64-bit 构建的静态断言。
 最初 I4 测试快照使用两个 predicate 布尔值，slot 为 32 bytes、总状态为 616 bytes；
 后续性能证据必须明确区分该快照与三态布局。
 这些局部状态也用于无 Graph 路径，P1 必须实测其开销，不能仅凭 native 分支未执行就断言零影响。

@@ -51,15 +51,12 @@ public:
     }
 };
 
-void protocol_chain_kernel(__gm__ int64_t *) {
-    if (++startup_kernel_calls == 2) write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
-}
+void protocol_chain_kernel(__gm__ int64_t *) { ++startup_kernel_calls; }
 
 void identity_test_kernel(__gm__ int64_t *) {
     ++startup_kernel_calls;
     identity_test_payload->local_context.block_idx = 77;
     identity_test_payload->local_context.block_num = 99;
-    write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 }
 
 struct StartupFixture {
@@ -179,20 +176,19 @@ struct StartupFixture {
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 auto &local = locals[lane];
                 uint32_t slot = UINT32_MAX;
-                uint64_t publication = 0;
                 const bool active = storage.metadata[task].active_mask.has(static_cast<SubtaskSlot>(lane));
-                if (!scheduler_local_ready_pop(&local, &slot, &publication)) {
+                if (!scheduler_local_ready_peek(&local, &slot)) {
                     EXPECT_FALSE(active);
                     continue;
                 }
                 bool permit = false;
                 ASSERT_TRUE(scheduler_ordered_can_enter_slot(graph_view, base(), &local, run, slot, &permit));
                 ASSERT_TRUE(permit);
+                ASSERT_TRUE(scheduler_local_ready_execute(&local, slot));
                 auto *payload = scheduler_state_at<DispatchPayload>(base(), local.dispatch_payload_offset(lane, slot));
                 if (scheduler_protocol_enabled(&local)) scheduler_execute_protocol_task(base(), &local, slot, payload);
                 else execute_task(payload);
-                local.local_completed_generations[slot] = scheduler_dispatch_generation(publication);
-                ASSERT_TRUE(scheduler_service_cluster_completions(graph_view, base(), &local, run, 0, nullptr));
+                ASSERT_TRUE(scheduler_complete_own_slot(graph_view, base(), &local, run, slot, 0));
             }
             ASSERT_EQ(scheduler_gm_mix_retire(graph_view, base(), &locals[0], run), SchedulerGmMixResult::TASK_LAST);
             ASSERT_TRUE(scheduler_complete_ordered_task(graph_view, base(), &locals[0], run, task, 0));
@@ -493,6 +489,10 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     identity_test_payload =
         scheduler_state_at<DispatchPayload>(base, local->dispatch_payload_offset(local->config.self_lane, 0));
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    ScopedStartupRegisterObserver stop_after_completion([&] {
+        if (local->pending_completed + run->resolved_task_count == run->expected_task_count)
+            write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+    });
     SchedulerWorkerStats stats{};
     if (with_profiling) {
         ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, level)));
@@ -501,8 +501,7 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     }
     ASSERT_EQ(startup_kernel_calls, 1u);
     ASSERT_EQ(identity_test_payload->local_context.block_idx, 77);
-    uint64_t refilled = 0;
-    ASSERT_TRUE(scheduler_service_cluster_completions(graph.graph(), base, local, run, level, &refilled));
+    EXPECT_EQ(local->slots[0].state, SchedulerDispatchSlotState::FREE);
     const auto *trace = scheduler_state_at<SchedulerTaskTrace>(base, storage.layout.trace_cells_offset);
     if (level == 0) {
         EXPECT_EQ(trace->execution_identity_flags, 0u);
@@ -523,7 +522,6 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
         EXPECT_EQ(trace->execution_block_num, 1u);
         EXPECT_EQ(trace->execution_subtask_slot, worker == 0 ? 0u : 1u);
         EXPECT_EQ(trace->execution_pending_slot, 0u);
-        EXPECT_EQ(trace->execution_generation, 1u);
         EXPECT_EQ(trace->execution_cluster_index, 0u);
         EXPECT_EQ(trace->execution_cluster_lane, worker);
         EXPECT_EQ(trace->execution_identity_flags, SCHEDULER_TRACE_IDENTITY_CAPTURED | SCHEDULER_TRACE_EXECUTED);
@@ -555,7 +553,6 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
         EXPECT_EQ(event->block_idx, 0u);
         EXPECT_EQ(event->logical_block_num, 1u);
         EXPECT_EQ(event->pending_slot, 0u);
-        EXPECT_EQ(event->generation, 1u);
         EXPECT_EQ(event->cluster_lane, worker);
         EXPECT_EQ(
             event->flags, SCHEDULER_PROTOCOL_ENTRY | SCHEDULER_PROTOCOL_EXECUTED | SCHEDULER_PROTOCOL_PERMIT_NO_LOG |
@@ -698,16 +695,20 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    ScopedStartupRegisterObserver stop_after_completion([&] {
+        if (local->pending_completed + run->resolved_task_count == run->expected_task_count)
+            write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+    });
     SchedulerWorkerStats stats{};
     ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, 4)));
     ASSERT_EQ(startup_kernel_calls, 2u);
-    ASSERT_TRUE(scheduler_service_cluster_completions(graph.graph(), base, local, run, 4, nullptr));
+    EXPECT_EQ(local->slots[0].state, SchedulerDispatchSlotState::FREE);
     const auto *events =
         scheduler_state_at<SchedulerProtocolExecutionTrace>(base, storage.layout.protocol.executions_offset);
     EXPECT_EQ(events[0].task_ref, 0);
     EXPECT_EQ(events[1].task_ref, 1);
     EXPECT_EQ(events[0].pending_slot, events[1].pending_slot);
-    EXPECT_GT(events[1].generation, events[0].generation);
+    EXPECT_GE(events[1].publication_before_cycles, events[0].completion_consumed.cycles);
     EXPECT_NE(events[0].trace_published.sequence, 0u);
     EXPECT_GT(events[1].entry.sequence, events[0].trace_published.sequence);
     EXPECT_GT(events[1].trace_published.sequence, events[1].completion_consumed.sequence);

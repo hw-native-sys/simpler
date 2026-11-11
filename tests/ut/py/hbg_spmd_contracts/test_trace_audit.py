@@ -112,15 +112,15 @@ def test_duplicate_event_is_rejected_for_its_protocol_reason_not_timestamp(kind,
 @pytest.mark.parametrize(
     "kind,field,value,code",
     [
-        ("claim", "generation", 0, "TRACE_GENERATION"),
-        ("claim", "generation", 1 << 32, "TRACE_GENERATION"),
+        ("claim", "epoch", 0, "TRACE_EPOCH"),
+        ("claim", "task", 999, "TRACE_TASK"),
         ("claim", "owner", 999, "TRACE_MEMBER"),
         ("claim", "block", -1, "TRACE_BLOCK"),
         ("claim", "block", 2, "TRACE_BLOCK"),
         ("admit", "order", 1, "TRACE_ADMISSION_GAP"),
         ("admit", "members", [999], "MEMBERS"),
         ("publish", "order", 99, "TRACE_ORDER"),
-        ("start", "generation", 999, "TRACE_GENERATION"),
+        ("start", "block_num", 999, "TRACE_CONTEXT"),
         ("start", "slot", 2, "TRACE_CONTEXT"),
         ("start", "block_num", 1, "TRACE_CONTEXT"),
         ("start", "worker", 999, "TRACE_EXECUTION_MEMBER"),
@@ -185,7 +185,7 @@ def test_missing_header_fields_are_not_inferred(field):
         audit(model, payload)
 
 
-@pytest.mark.parametrize("field", ["generation", "block_num", "slot", "order", "worker", "source"])
+@pytest.mark.parametrize("field", ["block_num", "slot", "order", "worker", "source"])
 def test_missing_execution_fields_are_not_inferred(field):
     model, payload = sample()
     del first_event(payload, "start")[field]
@@ -244,7 +244,6 @@ def test_unknown_event_and_backward_clock_are_rejected():
         ("claim", "mapping", [[False, 0], [1, 1], [2, 2]]),
         ("start", "worker", False),
         ("start", "slot", False),
-        ("start", "generation", True),
         ("start", "block_num", 2.0),
         ("cluster_close", "cluster", False),
     ],

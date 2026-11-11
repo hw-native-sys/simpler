@@ -10,7 +10,7 @@
 | ------ | -------------- |
 | 既有登记接口、容量 0/64/65 | 无新注册声明也能登记；合法零登记完成；条件溢出锁存首错且不提前发布完成 |
 | 记录身份与格式 | 旧 run、错误 group/task/block/lane、未知 kind、记录越界或未对齐均明确失败；不将内部身份检查等同于外部资源持有 |
-| 本次执行绑定复用 | 返回复用同次准入的映射；错误 base/bytes/run/group/offset、task/block/lane 或 slot generation 均不得公开 CHECK/FINISH；开放预留及重复封口仍拒绝 |
+| 本次执行绑定复用 | 返回复用同次准入的映射；错误 base/bytes/run/group/offset、task/block/lane 或非 EXECUTING slot 均不得公开 CHECK/FINISH；开放预留及重复封口仍拒绝 |
 | 既有 owner | heap、输入引用和 domain 保留到实际访问结束；scalar context 沿用既有使用登记；同地址复用必须等待旧使用结束 |
 | 消费者读取 | 同步消费者、alias、多 fanin、Graph PARAM/SUB_TASK 均读取完整新 payload；signal 满足不能替代数据验证 |
 | 必要获取 | 验证现有读取路径；仅在确需缓存操作时解析范围并检查 cache line 共享，不能用未经验证的空操作掩盖缺口 |

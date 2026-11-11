@@ -28,256 +28,11 @@
 #include "scheduler/scheduler_protocol_execute.h"
 #include "scheduler/scheduler_args_dump.h"
 
+#include "hbg_gm_mix_test_support.h"
+
 namespace {
 
-struct GmShape {
-    uint16_t blocks;
-    LaneMask mask;
-    bool sync_start{false};
-};
-
-// Every lane set that makes a task a Mix: the two AIC+single-AIV pairs, both
-// AIVs, and all three.
-constexpr LaneMask kAicAiv0{/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false};
-constexpr LaneMask kAicAiv1{/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true};
-constexpr std::array<LaneMask, 4> kMixMasks{kAicAiv0, kAicAiv1, LaneMask::both_aiv(), LaneMask::all()};
-
-// gtest cannot stream a LaneMask, so SCOPED_TRACE names the lanes instead.
-std::string lane_names(LaneMask lanes) {
-    std::string name;
-    if (lanes.has_aic()) name += "aic";
-    if (lanes.has_aiv0()) name += name.empty() ? "aiv0" : "+aiv0";
-    if (lanes.has_aiv1()) name += name.empty() ? "aiv1" : "+aiv1";
-    return name.empty() ? "none" : name;
-}
-
-uint64_t gm_trace_capacity(const std::vector<GmShape> &shapes) {
-    uint64_t maximum = 1;
-    for (const auto &shape : shapes)
-        maximum = std::max<uint64_t>(maximum, static_cast<uint64_t>(shape.blocks) * 3);
-    return maximum;
-}
-
-SchedulerSpmdRequirements gm_requirements(const std::vector<GmShape> &shapes, uint32_t clusters) {
-    SchedulerSpmdRequirements result{clusters * 3, clusters, 0, 0};
-    for (const auto &shape : shapes) {
-        const bool mix = shape.mask.is_mix();
-        if (mix || shape.blocks > 1) ++result.cooperative_task_count;
-        if (mix) ++result.mix_task_count;
-    }
-    return result;
-}
-
-struct GmExecution {
-    int64_t task{SCHEDULER_TASK_REF_INVALID};
-    uint32_t block{0};
-    uint32_t blocks{0};
-    uint32_t worker{0};
-    uint32_t slot{0};
-    uint32_t generation{0};
-    uint8_t subtask{UINT8_MAX};
-    uint32_t physical_subblock{0};
-};
-
-struct GmMixFixture {
-    explicit GmMixFixture(const std::vector<GmShape> &shapes, bool protocol_profiling = false, uint32_t clusters = 2) :
-        storage(
-            shapes.size(), clusters * 3, gm_trace_capacity(shapes), gm_requirements(shapes, clusters),
-            protocol_profiling
-        ),
-        graph(shapes.size()),
-        admissions(clusters * 3),
-        locals(clusters * 3) {
-        uint32_t trace = 0;
-        for (uint64_t task = 0; task < shapes.size(); ++task) {
-            const auto shape = shapes[task];
-            graph.mixed(task, shape.mask);
-            auto &metadata = storage.metadata[task];
-            metadata.active_mask = shape.mask;
-            metadata.logical_block_num = shape.blocks;
-            metadata.flags = SCHEDULER_TASK_EXECUTABLE;
-            if (shape.blocks > 1) metadata.flags |= SCHEDULER_TASK_SPMD;
-            if (shape.sync_start) metadata.flags |= SCHEDULER_TASK_SYNC_START;
-            if (shape.mask.is_mix()) metadata.flags |= SCHEDULER_TASK_MIX;
-            metadata.trace_index_base = trace;
-            trace += shape.blocks * static_cast<uint32_t>(shape.mask.count());
-            metadata.timing_slot = -1;
-            for (uint8_t subtask = 0; subtask < 3; ++subtask)
-                metadata.kernel_ids[subtask] = shape.mask.has(static_cast<SubtaskSlot>(subtask)) ? 1 : UINT16_MAX;
-        }
-        storage.prepare_ready_pool();
-        EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 47));
-
-        storage.run_control->active_worker_count = clusters * 3;
-        storage.run_control->aic_active_worker_count = clusters;
-        storage.run_control->aiv_active_worker_count = clusters * 2;
-        storage.run_control->expected_task_count = shapes.size();
-        for (uint32_t worker = 0; worker < locals.size(); ++worker) {
-            auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = clusters * 3;
-            for (uint32_t lane = 0; lane < 3; ++lane)
-                context.cluster_worker_ids[lane] = (worker / 3) * 3 + lane;
-            storage.test_graphs[worker] = graph.graph();
-        }
-        for (uint32_t worker = 0; worker < locals.size(); ++worker) {
-            locals[worker] = storage.local_context(&storage.contexts[worker]);
-
-            EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
-            locals[worker]->admission = &admissions[worker];
-        }
-    }
-
-    void *base() const { return storage.scheduler_state->base(); }
-    SchedulerRunControl *run() const { return storage.run_control; }
-    SchedulerTaskControl *control(uint64_t task) const {
-        return scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset) + task;
-    }
-    SchedulerGroupMailbox *mailbox(uint32_t cluster) const {
-        return scheduler_state_at<SchedulerGroupMailbox>(base(), storage.layout.group_mailboxes_offset) + cluster;
-    }
-    volatile uint64_t &seal(uint64_t task, uint32_t cluster) const {
-        const auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
-            base(), storage.layout.admission_records_offset + task * storage.layout.admission_record_stride
-        );
-        return scheduler_state_at<SchedulerMixCloseSeal>(base(), record->mix_close_seals_offset)[cluster].value;
-    }
-    bool enqueue(uint64_t task, uint32_t worker = 0) {
-        auto *local = locals[worker];
-        if (scheduler_route_task(graph.graph(), base(), local, run(), task) != SchedulerRouteResult::READY_TO_ENQUEUE)
-            return false;
-        SchedulerReadyBatch batch{};
-        const auto &metadata = storage.metadata[task];
-        return scheduler_ready_batch_append(base(), local, task, &batch) &&
-               scheduler_ready_batch_push(
-                   base(), local, scheduler_task_ready_queue(metadata.flags, metadata.active_mask), &batch
-               );
-    }
-    bool claim_pending(uint64_t task, uint32_t worker = 0) {
-        if (!enqueue(task, worker)) return false;
-        auto *local = locals[worker];
-        const auto &metadata = storage.metadata[task];
-        const uint32_t queue = scheduler_task_ready_queue(metadata.flags, metadata.active_mask);
-        SchedulerReadyClaim ready{};
-        return scheduler_claim_ready_for_slot(
-                   graph.graph(), base(), local, run(), local->config.scheduler_count, queue, &ready
-               ) &&
-               ready.task_ref == static_cast<int64_t>(task) &&
-               scheduler_try_claim_admission(graph.graph(), base(), local, run(), &admissions[worker], ready) ==
-                   SchedulerAdmissionResult::PROGRESS;
-    }
-    bool admit(uint64_t task, uint32_t worker = 0) {
-        return claim_pending(task, worker) &&
-               scheduler_prepare_admission_record(graph.graph(), base(), locals[worker], run(), &admissions[worker]) &&
-               scheduler_try_commit_admission(graph.graph(), base(), locals[worker], run(), &admissions[worker]) ==
-                   SchedulerAdmissionResult::PROGRESS;
-    }
-    bool refresh(uint32_t worker) {
-        return scheduler_refresh_local_obligation(graph.graph(), base(), locals[worker], run(), &admissions[worker]);
-    }
-    bool refresh_all() {
-        for (uint32_t worker = 0; worker < locals.size(); ++worker)
-            if (!refresh(worker)) return false;
-        return true;
-    }
-    bool participant(uint32_t worker, uint32_t task = 0) const {
-        return storage.metadata[task]
-            .active_mask.merged_with(LaneMask::aic())
-            .has(static_cast<SubtaskSlot>(worker % 3));
-    }
-    SchedulerBlockClaimResult claim(uint32_t cluster) {
-        return scheduler_gm_mix_claim(graph.graph(), base(), locals[cluster * 3], run());
-    }
-    bool publish(uint32_t cluster) {
-        return scheduler_gm_mix_publish(graph.graph(), base(), locals[cluster * 3], run());
-    }
-    bool observe(uint32_t worker, bool *progress) {
-        return scheduler_gm_mix_observe(graph.graph(), base(), locals[worker], run(), progress);
-    }
-    bool arrive(uint32_t worker, bool *progress) {
-        return scheduler_gm_mix_arrive(graph.graph(), base(), locals[worker], run(), progress);
-    }
-    bool prepare(uint32_t worker, bool *progress) {
-        return scheduler_gm_mix_prepare_lane(graph.graph(), base(), locals[worker], run(), 0, progress);
-    }
-    bool rendezvous(uint32_t cluster) {
-        bool progress = false;
-        const LaneMask resources = mailbox(cluster)->descriptor.resource_mask;
-        for (uint32_t lane = 1; lane < 3; ++lane)
-            if (resources.has(static_cast<SubtaskSlot>(lane)) && !observe(cluster * 3 + lane, &progress)) return false;
-        for (uint32_t lane = 0; lane < 3; ++lane)
-            if (resources.has(static_cast<SubtaskSlot>(lane)) && !arrive(cluster * 3 + lane, &progress)) return false;
-        for (uint32_t lane = 0; lane < 3; ++lane)
-            if (resources.has(static_cast<SubtaskSlot>(lane)) && !prepare(cluster * 3 + lane, &progress)) return false;
-        return true;
-    }
-    SchedulerGmMixResult retire(uint32_t cluster) {
-        return scheduler_gm_mix_retire(graph.graph(), base(), locals[cluster * 3], run());
-    }
-    bool complete_task(uint64_t task, uint32_t cluster) {
-        return scheduler_complete_ordered_task(graph.graph(), base(), locals[cluster * 3], run(), task, 0);
-    }
-    bool close(uint32_t worker, bool *closed) {
-        return scheduler_gm_mix_close(graph.graph(), base(), locals[worker], run(), closed);
-    }
-    template <bool RecordProtocol = true>
-    bool fill(uint32_t worker) {
-        bool failed = false;
-        scheduler_fill_own_slots<RecordProtocol>(graph.graph(), base(), locals[worker], run(), 0, 0, &failed);
-        return !failed;
-    }
-    bool begin(uint32_t worker, GmExecution *execution) {
-        auto *local = locals[worker];
-        uint32_t slot = UINT32_MAX;
-        uint64_t publication = 0;
-        if (!scheduler_local_ready_pop(local, &slot, &publication)) return false;
-        bool permit = false;
-        if (!scheduler_ordered_can_enter_slot(graph.graph(), base(), local, run(), slot, &permit)) return false;
-        if (!permit) {
-            local->local_ready_mask |= static_cast<uint8_t>(1U << slot);
-            return false;
-        }
-        auto *payload =
-            scheduler_state_at<DispatchPayload>(base(), local->dispatch_payload_offset(local->config.self_lane, slot));
-        if (scheduler_protocol_enabled(local)) scheduler_execute_protocol_task(base(), local, slot, payload);
-        *execution = {
-            local->slots[slot].task_ref,
-            static_cast<uint32_t>(payload->local_context.block_idx),
-            static_cast<uint32_t>(payload->local_context.block_num),
-            worker,
-            slot,
-            scheduler_dispatch_generation(publication),
-            local->slots[slot].subtask_slot,
-            static_cast<uint32_t>(payload->global_context.sub_block_id)
-        };
-        return true;
-    }
-    template <bool RecordProtocol = true>
-    bool complete(const GmExecution &execution) {
-        auto *local = locals[execution.worker];
-        local->local_completed_generations[execution.slot] = execution.generation;
-        return scheduler_service_cluster_completions<RecordProtocol>(graph.graph(), base(), local, run(), 0, nullptr);
-    }
-    bool finish_lanes(uint32_t cluster) {
-        const auto descriptor = mailbox(cluster)->descriptor;
-        for (uint32_t lane = 0; lane < 3; ++lane) {
-            if (!descriptor.resource_mask.has(static_cast<SubtaskSlot>(lane))) continue;
-            GmExecution execution{};
-            const bool active = descriptor.lane_subtasks[lane] != UINT8_MAX;
-            const bool entered = begin(cluster * 3 + lane, &execution);
-            if (active != entered || (entered && !complete(execution))) return false;
-        }
-        return true;
-    }
-    bool drain(uint32_t worker, bool *done) {
-        return scheduler_drain_ordered_exit(graph.graph(), base(), locals[worker], run(), done);
-    }
-
-    scheduler_test::FixtureStorage storage;
-    scheduler_test::GraphBuffer graph;
-    std::vector<SchedulerAdmissionLocalState> admissions;
-    std::vector<SchedulerLocalState *> locals;
-};
+using namespace scheduler_test::gm_mix;
 
 TEST(HbgGmMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
     GmMixFixture fixture({{3, LaneMask::all()}, {1, LaneMask::aiv0()}}, false, 1);
@@ -295,10 +50,10 @@ TEST(HbgGmMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
     dump.active_mask = 7;
     dump.expected_participants = 9;
     ASSERT_EQ(scheduler_args_dump_enter(&dump), SchedulerArgsDumpArrival::Publisher);
-    dump.publisher_before = scheduler_args_dump_publisher(0, 1);
+    dump.publisher_before = scheduler_args_dump_publisher(0);
     SchedulerArgsDumpAck before{11, 0, 0, 1, 1, 0, 0, 0};
-    before.status = scheduler_args_dump_ack_commit(1, 0, SchedulerArgsDumpStatus::Sealed);
-    ASSERT_TRUE(scheduler_args_dump_seal(&dump, ArgsDumpStage::BEFORE_DISPATCH, before, 11));
+    before.status = scheduler_args_dump_ack_commit(0, 0, SchedulerArgsDumpStatus::Sealed);
+    ASSERT_TRUE(scheduler_args_dump_seal(&dump, ArgsDumpStage::BEFORE_DISPATCH, before, 11, 1));
     std::array<uint32_t, 9> visible{};
     GmExecution held{};
     for (uint32_t block = 0; block < 3; ++block) {
@@ -329,10 +84,10 @@ TEST(HbgGmMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
     }
     EXPECT_EQ(visible, (std::array<uint32_t, 9>{1, 2, 3, 4, 5, 6, 7, 8, 9}));
     EXPECT_EQ(fixture.control(0)->completed_blocks, 2u);
-    dump.publisher_after = scheduler_args_dump_publisher(held.worker, held.generation);
-    SchedulerArgsDumpAck after{11, 0, 1, held.generation, 1, 0, 0, 0};
-    after.status = scheduler_args_dump_ack_commit(held.generation, 1, SchedulerArgsDumpStatus::Sealed);
-    ASSERT_TRUE(scheduler_args_dump_seal(&dump, ArgsDumpStage::AFTER_COMPLETION, after, 11));
+    dump.publisher_after = scheduler_args_dump_publisher(held.worker);
+    SchedulerArgsDumpAck after{11, 0, 1, scheduler_args_dump_publisher(held.worker), 1, 0, 0, 0};
+    after.status = scheduler_args_dump_ack_commit(0, 1, SchedulerArgsDumpStatus::Sealed);
+    ASSERT_TRUE(scheduler_args_dump_seal(&dump, ArgsDumpStage::AFTER_COMPLETION, after, 11, 1));
     ASSERT_TRUE(fixture.complete(held));
     ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
     ASSERT_TRUE(fixture.complete_task(0, 0));
@@ -1379,7 +1134,7 @@ TEST_P(HbgGmPendingEntryGuard, PendingCandidateDoesNotBypassErrorEpochOrGroupIde
     } else if (scenario.failure == 1) {
         ++admission.epoch;
     } else if (scenario.failure == 2) {
-        ++admission.gm_mix.slot_generation;
+        admission.gm_mix.subtask_slot ^= 1U;
     } else {
         ++admission.gm_mix.block_idx;
     }
@@ -1881,7 +1636,7 @@ class HbgGmMixOrdinaryResource : public ::testing::TestWithParam<std::tuple<Lane
 TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsConsumed) {
     const auto [mask, lane, pending_slot] = GetParam();
     const LaneMask ordinary_mask = lane == 0 ? LaneMask::aic() : LaneMask::aiv0();
-    GmMixFixture fixture({{1, ordinary_mask}, {1, ordinary_mask}, {1, mask}});
+    GmMixFixture fixture({{1, ordinary_mask}, {1, ordinary_mask}, {1, mask}}, true);
     auto *local = fixture.locals[lane];
     const uint32_t core_type = lane == 0 ? 0 : 1;
     const uint32_t first_task = lane == 2 ? 1 : 0;
@@ -1915,9 +1670,13 @@ TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsCon
     }
     ASSERT_EQ(ordinary.slot, pending_slot);
     ASSERT_FALSE(local->slots[pending_slot].cooperative);
-    ASSERT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::READY);
-    const uint32_t consumed = scheduler_consumed_completion_generation(local, lane, pending_slot);
-    ASSERT_LT(consumed, ordinary.generation);
+    ASSERT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::EXECUTING);
+    const auto *ordinary_trace = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+                                     fixture.base(), fixture.storage.layout.protocol.executions_offset
+                                 ) +
+                                 ordinary.task;
+    ASSERT_NE(ordinary_trace->returned.sequence, 0u);
+    ASSERT_EQ(ordinary_trace->completion_consumed.sequence, 0u);
 
     ASSERT_TRUE(fixture.admit(2, 3));
     ASSERT_TRUE(fixture.refresh_all());
@@ -1929,7 +1688,7 @@ TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsCon
         ASSERT_TRUE(fixture.finish_lanes(0));
         ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
         ASSERT_TRUE(fixture.complete_task(2, 0));
-        EXPECT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::READY);
+        EXPECT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::EXECUTING);
         EXPECT_EQ(fixture.mailbox(0)->lanes[lane].arrived_seq, 0u);
         EXPECT_EQ(fixture.mailbox(0)->lanes[lane].released_seq, 0u);
         ASSERT_TRUE(fixture.complete(ordinary));
@@ -1956,19 +1715,16 @@ TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsCon
         EXPECT_TRUE(progress);
     }
 
-    for (bool returned : {false, true}) {
-        SCOPED_TRACE(returned);
-        if (returned) local->local_completed_generations[pending_slot] = ordinary.generation;
-        EXPECT_EQ(local->local_completed_generations[pending_slot] == ordinary.generation, returned);
-        EXPECT_EQ(scheduler_consumed_completion_generation(local, lane, pending_slot), consumed);
+    {
+        EXPECT_EQ(ordinary_trace->completion_consumed.sequence, 0u);
         progress = true;
         ASSERT_TRUE(fixture.arrive(lane, &progress));
         EXPECT_FALSE(progress);
         EXPECT_EQ(fixture.admissions[lane].gm_mix.phase, SchedulerGmMixPhase::PUBLISHED);
         EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[lane].arrived_seq, UINT64_C(0)), 0u);
         EXPECT_EQ(local->slots[pending_slot].task_ref, ordinary.task);
-        EXPECT_EQ(local->slots[pending_slot].generation, ordinary.generation);
-        EXPECT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::READY);
+        EXPECT_EQ(local->slots[pending_slot].block_idx, ordinary.block);
+        EXPECT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::EXECUTING);
         for (uint32_t member : {0U, 1U, 2U}) {
             if (!fixture.participant(member, 2)) continue;
             progress = true;
@@ -1981,7 +1737,7 @@ TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsCon
 
     ASSERT_TRUE(fixture.complete(ordinary));
     ASSERT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::FREE);
-    EXPECT_EQ(scheduler_consumed_completion_generation(local, lane, pending_slot), ordinary.generation);
+    EXPECT_NE(ordinary_trace->completion_consumed.sequence, 0u);
     ASSERT_TRUE(fixture.arrive(lane, &progress));
     EXPECT_TRUE(progress);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[lane].arrived_seq, UINT64_C(0)), 1u);
@@ -2040,7 +1796,7 @@ TEST(HbgGmMix, KernelReturnWithoutCompletionReleaseDoesNotRetireTheGroup) {
     ASSERT_TRUE(fixture.complete(executions[0]));
     ASSERT_TRUE(fixture.complete(executions[1]));
     const auto &late = executions[2];
-    fixture.locals[2]->local_completed_generations[late.slot] = late.generation;
+    EXPECT_EQ(fixture.locals[2]->slots[late.slot].state, SchedulerDispatchSlotState::EXECUTING);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[2].released_seq, UINT64_C(0)), 0u);
     EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
@@ -2190,7 +1946,7 @@ TEST(HbgGmMix, ReleasedAcknowledgementsFromThePreviousGroupCannotRetireTheNextGr
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 2u);
 }
 
-TEST(HbgGmMix, DuplicateGenerationCannotReleaseOrContributeTwice) {
+TEST(HbgGmMix, RetiredSlotCannotReleaseOrContributeTwice) {
     GmMixFixture fixture({{1, LaneMask::all()}});
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
@@ -2200,10 +1956,6 @@ TEST(HbgGmMix, DuplicateGenerationCannotReleaseOrContributeTwice) {
     GmExecution first{};
     ASSERT_TRUE(fixture.begin(1, &first));
     ASSERT_TRUE(fixture.complete(first));
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
-        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 1, first.slot, first.generation, 0,
-        nullptr, nullptr
-    ));
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[1].released_seq, UINT64_C(0)), 1u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
     for (uint32_t worker : {0u, 2u}) {
@@ -2215,6 +1967,11 @@ TEST(HbgGmMix, DuplicateGenerationCannotReleaseOrContributeTwice) {
     EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 1u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+    EXPECT_FALSE(scheduler_complete_own_slot(
+        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), first.slot, 0
+    ));
+    EXPECT_EQ(fixture.mailbox(0)->lanes[1].released_seq, 1u);
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
 }
 
 TEST(HbgGmMix, ReleaseBeforeRealSlotRetirementFailsWithoutPublishingAnAcknowledgement) {
@@ -2227,10 +1984,10 @@ TEST(HbgGmMix, ReleaseBeforeRealSlotRetirementFailsWithoutPublishingAnAcknowledg
     GmExecution execution{};
     ASSERT_TRUE(fixture.begin(1, &execution));
     EXPECT_FALSE(scheduler_gm_mix_release_lane(
-        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), execution.task, execution.slot,
-        execution.generation
+        fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(),
+        fixture.locals[1]->slots[execution.slot], execution.slot
     ));
-    EXPECT_EQ(fixture.locals[1]->slots[execution.slot].state, SchedulerDispatchSlotState::READY);
+    EXPECT_EQ(fixture.locals[1]->slots[execution.slot].state, SchedulerDispatchSlotState::EXECUTING);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[1].released_seq, UINT64_C(0)), 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
 }
@@ -2283,7 +2040,7 @@ TEST_P(HbgGmMixHighSequence, GroupSequenceIsIndependentOfTheNarrowOwnSlotGenerat
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->published_seq, UINT64_C(0)), previous + 1);
     for (uint32_t worker = 0; worker < 3; ++worker) {
         EXPECT_EQ(fixture.admissions[worker].gm_mix.group_seq, previous + 1);
-        EXPECT_EQ(fixture.admissions[worker].gm_mix.slot_generation, 1u);
+        EXPECT_LT(fixture.admissions[worker].gm_mix.slot_index, SCHEDULER_PENDING_SLOT_COUNT);
     }
     ASSERT_TRUE(fixture.finish_lanes(0));
     ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
@@ -2848,8 +2605,8 @@ TEST_P(HbgGmMixOwnPrepare, HasMixDoesNotRequireSsbufForAnOwnPayloadPreparation) 
         SchedulerReadyClaim ready{};
         ready.task_ref = 0;
         ASSERT_TRUE(scheduler_prepare_dispatch_slot(
-            fixture.graph.graph(), fixture.base(), local, fixture.run(),
-            {subtask, 0, local->slots[0].generation, subtask}, ready, fixture.storage.metadata[0], 0, subtask
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, fixture.storage.metadata[0], 0,
+            subtask
         ));
         const auto *payload =
             scheduler_state_at<DispatchPayload>(fixture.base(), local->dispatch_payload_offset(subtask, 0));
@@ -3390,9 +3147,7 @@ TEST(HbgGmMixReadyProbeOwnership, ReadyFromEitherProducerKeepsDiscoveryEnabled) 
         EXPECT_FALSE(empty);
 
         bool failed = false;
-        scheduler_fill_own_slots(
-            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, 0, &failed
-        );
+        scheduler_fill_own_slots(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &failed);
         EXPECT_FALSE(failed);
         EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
 

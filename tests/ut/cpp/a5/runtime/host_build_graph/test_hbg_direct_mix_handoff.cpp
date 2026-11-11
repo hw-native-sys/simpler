@@ -9,144 +9,130 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include <tuple>
-
-#include "hbg_scheduler_test_support.h"
-#include "scheduler/scheduler_dispatch.h"
+#include "hbg_gm_mix_test_support.h"
 
 namespace {
+using namespace scheduler_test::gm_mix;
 
-enum class HandoffScenario { EMPTY_QUEUE, QUEUED_MIX, TWO_SUCCESSORS, BUSY_MIX_LANES };
+enum class HandoffScenario { EMPTY_QUEUE, QUEUED_MIX, TWO_SUCCESSORS, BUSY_LANE };
 
-uint8_t first_subtask(LaneMask lanes) { return lanes.has_aic() ? 0 : (lanes.has_aiv0() ? 1 : 2); }
-
-class HbgMixQueueHandoff : public ::testing::TestWithParam<std::tuple<uint32_t, LaneMask>> {
+class HbgDirectMixHandoff : public ::testing::TestWithParam<std::tuple<uint32_t, LaneMask>> {
 protected:
-    void expect_successor_reachable(HandoffScenario scenario) {
-        const auto [producer_lane, mix_mask] = GetParam();
+    void run_handoff(bool protocol, HandoffScenario scenario = HandoffScenario::EMPTY_QUEUE) {
+        const auto [producer_lane, mask] = GetParam();
         SCOPED_TRACE(producer_lane);
-        SCOPED_TRACE(mix_mask.count());
-        const bool second = scenario == HandoffScenario::QUEUED_MIX || scenario == HandoffScenario::TWO_SUCCESSORS;
-        const uint32_t count = second ? 3 : 2;
-        scheduler_test::FixtureStorage storage(count, 3, 3);
-        scheduler_test::GraphBuffer graph(count);
-        const uint8_t producer_subtask = producer_lane == 0 ? 0 : 1;
-        graph.executable(0, producer_subtask);
-        for (uint32_t task = 1; task < count; ++task) {
-            graph.mixed(task, mix_mask);
-            if (task == 1 || scenario == HandoffScenario::TWO_SUCCESSORS)
-                graph.executable(task, first_subtask(mix_mask), {0});
-        }
-        for (uint32_t task = 0; task < count; ++task) {
-            auto &metadata = storage.metadata[task];
-            metadata.active_mask = task == 0 ? LaneMask::of(static_cast<SubtaskSlot>(producer_subtask)) : mix_mask;
-            metadata.flags = SCHEDULER_TASK_EXECUTABLE;
-            if (task != 0) metadata.flags |= SCHEDULER_TASK_MIX;
-            if (task == 1 || (task == 2 && scenario == HandoffScenario::TWO_SUCCESSORS))
-                metadata.flags |= SCHEDULER_TASK_HAS_FANIN;
-            metadata.trace_index_base = task * 3;
-            metadata.timing_slot = -1;
-            for (uint32_t lane = 0; lane < 3; ++lane)
-                metadata.kernel_ids[lane] = metadata.active_mask.has(static_cast<SubtaskSlot>(lane)) ? 1 : UINT16_MAX;
-        }
-        storage.prepare_ready_pool();
-        for (uint32_t lane = 0; lane < 3; ++lane) {
-            auto &context = storage.contexts[lane];
-            context.is_scheduler = 1;
-            context.scheduler_count = 3;
-            for (uint32_t peer = 0; peer < 3; ++peer)
-                context.cluster_worker_ids[peer] = peer;
-        }
-        auto *producer = storage.local_context(&storage.contexts[producer_lane]);
-        auto *coordinator = storage.local_context(&storage.contexts[0]);
-        void *base = storage.scheduler_state->base();
+        SCOPED_TRACE(lane_names(mask));
+        const bool second_mix = scenario == HandoffScenario::QUEUED_MIX || scenario == HandoffScenario::TWO_SUCCESSORS;
+        const bool busy = scenario == HandoffScenario::BUSY_LANE;
+        const LaneMask ordinary = producer_lane == 0 ? LaneMask::aic() : LaneMask::aiv0();
+        std::vector<GmShape> shapes{{1, ordinary}, {1, mask}};
+        if (second_mix) shapes.push_back({1, mask});
+        const uint32_t held_worker = producer_lane != 0 ? 0 : (mask.has_aiv0() ? 1 : 2);
+        if (busy) shapes.push_back({1, held_worker == 0 ? LaneMask::aic() : LaneMask::aiv0()});
+        GmMixFixture fixture(shapes, protocol, 1);
+        const uint8_t first = mask.has_aic() ? 0 : 1;
+        fixture.graph.executable(1, first, {0});
+        fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
         ASSERT_EQ(
-            scheduler_route_task(graph.graph(), base, producer, storage.run_control, 1), SchedulerRouteResult::WAITING
+            scheduler_route_task(
+                fixture.graph.graph(), fixture.base(), fixture.locals[producer_lane], fixture.run(), 1
+            ),
+            SchedulerRouteResult::WAITING
         );
         if (scenario == HandoffScenario::TWO_SUCCESSORS) {
+            fixture.graph.executable(2, first, {0});
+            fixture.storage.metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
             ASSERT_EQ(
-                scheduler_route_task(graph.graph(), base, producer, storage.run_control, 2),
+                scheduler_route_task(
+                    fixture.graph.graph(), fixture.base(), fixture.locals[producer_lane], fixture.run(), 2
+                ),
                 SchedulerRouteResult::WAITING
             );
-        } else if (scenario == HandoffScenario::QUEUED_MIX) {
-            ASSERT_EQ(
-                scheduler_route_task(graph.graph(), base, coordinator, storage.run_control, 2),
-                SchedulerRouteResult::READY_TO_ENQUEUE
-            );
-            SchedulerReadyBatch batch{};
-            ASSERT_TRUE(scheduler_ready_batch_append(base, coordinator, 2, &batch));
-            ASSERT_TRUE(scheduler_ready_batch_push(base, coordinator, 0, &batch));
         }
-        SchedulerReadyClaim initial{};
-        initial.task_ref = 0;
-        SchedulerFreeSlotClaim slot{producer_lane, 0, producer->slots[0].generation, producer_lane};
-        ASSERT_TRUE(scheduler_fill_dispatch_slot(graph.graph(), base, producer, storage.run_control, slot, initial, 0));
-        uint32_t executed_slot = UINT32_MAX;
-        uint64_t publication = 0;
-        ASSERT_TRUE(scheduler_local_ready_pop(producer, &executed_slot, &publication));
-        producer->local_completed_generations[executed_slot] = scheduler_dispatch_generation(publication);
-        uint64_t refilled = 0;
-        ASSERT_TRUE(
-            scheduler_service_cluster_completions(graph.graph(), base, producer, storage.run_control, 0, &refilled)
-        );
-        EXPECT_EQ(refilled, 0u);
-        EXPECT_EQ(producer->slots[executed_slot].state, SchedulerDispatchSlotState::FREE);
-        EXPECT_EQ(scheduler_task_control_at(base, producer, 0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-        EXPECT_EQ(storage.run_control->scheduler_error, 0u);
-
-        // AIV workers do not claim MIX, including a task containing only two AIV lanes.
-        for (uint32_t lane : {1u, 2u}) {
+        ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
+        ASSERT_TRUE(fixture.enqueue(0, producer_lane));
+        ASSERT_TRUE(fixture.fill(producer_lane));
+        GmExecution producer{};
+        ASSERT_TRUE(fixture.begin(producer_lane, &producer));
+        ASSERT_EQ(producer.task, 0);
+        GmExecution held{};
+        if (busy) {
+            ASSERT_TRUE(fixture.enqueue(2, held_worker));
+            ASSERT_TRUE(fixture.fill(held_worker));
+            ASSERT_TRUE(fixture.begin(held_worker, &held));
+            ASSERT_EQ(held.task, 2);
+        }
+        if (scenario == HandoffScenario::QUEUED_MIX) ASSERT_TRUE(fixture.enqueue(2));
+        ASSERT_TRUE(fixture.complete(producer));
+        EXPECT_EQ(fixture.control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+        const auto *pool =
+            scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+        const auto queue = scheduler_ready_pool_queue(fixture.base(), *pool, 0);
+        ASSERT_EQ(queue.control->reserved_tail - queue.control->head, second_mix ? 2u : 1u);
+        EXPECT_EQ(queue.entries[queue.control->head].task_ref, second_mix ? 2 : 1);
+        EXPECT_EQ(queue.entries[queue.control->reserved_tail - 1].task_ref, 1);
+        for (uint32_t worker : {1u, 2u}) {
             SchedulerReadyClaim aiv{};
             ASSERT_TRUE(scheduler_claim_ready_for_slot(
-                graph.graph(), base, storage.local_context(&storage.contexts[lane]), storage.run_control, 3, 1, &aiv
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 3, 1, &aiv
             ));
             EXPECT_EQ(aiv.task_ref, SCHEDULER_TASK_REF_INVALID);
         }
-        if (scenario == HandoffScenario::BUSY_MIX_LANES) {
-            for (uint32_t lane : {1u, 2u})
-                for (auto &pending : storage.local_context(&storage.contexts[lane])->slots)
-                    pending.state = SchedulerDispatchSlotState::FILLING;
+        if (busy) {
+            for (uint32_t worker = 0; worker < 3; ++worker)
+                ASSERT_TRUE(fixture.fill(worker)) << "worker=" << worker << " site=" << fixture.run()->error_site
+                                                  << " task=" << fixture.run()->error_task_ref;
+            for (uint32_t worker = 0; worker < 3; ++worker) {
+                GmExecution premature{};
+                EXPECT_FALSE(fixture.begin(worker, &premature));
+            }
+            EXPECT_EQ(fixture.locals[held_worker]->slots[held.slot].state, SchedulerDispatchSlotState::EXECUTING);
+            EXPECT_EQ(fixture.control(1)->completed_blocks, 0u);
+            ASSERT_TRUE(fixture.complete(held));
         }
-        // Ready ownership precedes bounded admission. Busy physical lanes must
-        // not pin discovery to a shared queue head or lose an unlocked successor.
-        for (int64_t expected : second ? std::vector<int64_t>{2, 1} : std::vector<int64_t>{1}) {
-            SchedulerReadyClaim ready{};
-            ASSERT_TRUE(
-                scheduler_claim_ready_for_slot(graph.graph(), base, coordinator, storage.run_control, 3, 0, &ready)
-            );
-            EXPECT_EQ(ready.task_ref, expected);
-            EXPECT_EQ(ready.source, SchedulerReadySource::POOL);
+        std::set<std::tuple<int64_t, uint32_t, uint8_t>> executions;
+        std::vector<int64_t> first_entries;
+        bool finished = false;
+        for (uint32_t step = 0; step < 128 && !finished; ++step) {
+            for (uint32_t worker = 0; worker < 3; ++worker) {
+                ASSERT_TRUE(fixture.fill(worker)) << "worker=" << worker << " site=" << fixture.run()->error_site
+                                                  << " task=" << fixture.run()->error_task_ref;
+                GmExecution execution{};
+                if (!fixture.begin(worker, &execution)) continue;
+                EXPECT_GE(execution.task, 1);
+                EXPECT_TRUE(executions.emplace(execution.task, execution.block, execution.subtask).second);
+                if (std::find(first_entries.begin(), first_entries.end(), execution.task) == first_entries.end())
+                    first_entries.push_back(execution.task);
+                ASSERT_TRUE(fixture.complete(execution));
+            }
+            uint64_t completed = 0;
+            for (const auto *local : fixture.locals)
+                completed += local->pending_completed;
+            finished = completed == shapes.size();
         }
-        SchedulerReadyClaim empty{};
-        ASSERT_TRUE(
-            scheduler_claim_ready_for_slot(graph.graph(), base, coordinator, storage.run_control, 3, 0, &empty)
-        );
-        EXPECT_EQ(empty.task_ref, SCHEDULER_TASK_REF_INVALID);
-        EXPECT_EQ(storage.run_control->scheduler_error, 0u);
+        ASSERT_TRUE(finished);
+        EXPECT_EQ(executions.size(), static_cast<size_t>(mask.count()) * (second_mix ? 2 : 1));
+        EXPECT_EQ(first_entries, second_mix ? (std::vector<int64_t>{2, 1}) : (std::vector<int64_t>{1}));
+        for (uint32_t task = 0; task < shapes.size(); ++task)
+            EXPECT_EQ(fixture.control(task)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+        EXPECT_EQ(queue.control->head, queue.control->reserved_tail);
+        EXPECT_EQ(fixture.run()->scheduler_error, 0u);
     }
 };
 
-TEST_P(HbgMixQueueHandoff, CompletionQueuesMixInsteadOfUsingOrdinaryDirectRefill) {
-    expect_successor_reachable(HandoffScenario::EMPTY_QUEUE);
+TEST_P(HbgDirectMixHandoff, RetirementKeepsUnlockedMixReachable) { run_handoff(true); }
+TEST_P(HbgDirectMixHandoff, UnprofiledRetirementKeepsUnlockedMixReachable) { run_handoff(false); }
+TEST_P(HbgDirectMixHandoff, UnlockedMixDoesNotDisplaceAnExistingQueueHead) {
+    run_handoff(true, HandoffScenario::QUEUED_MIX);
 }
-TEST_P(HbgMixQueueHandoff, ExistingQueueHeadPrecedesUnlockedMix) {
-    expect_successor_reachable(HandoffScenario::QUEUED_MIX);
+TEST_P(HbgDirectMixHandoff, TwoMixSuccessorsUnlockedTogetherExecuteExactlyOnce) {
+    run_handoff(true, HandoffScenario::TWO_SUCCESSORS);
 }
-TEST_P(HbgMixQueueHandoff, TwoUnlockedSuccessorsAreClaimedExactlyOnce) {
-    expect_successor_reachable(HandoffScenario::TWO_SUCCESSORS);
+TEST_P(HbgDirectMixHandoff, BusyOrdinaryLaneRetainsItsSlotUntilRetirement) {
+    run_handoff(true, HandoffScenario::BUSY_LANE);
 }
-TEST_P(HbgMixQueueHandoff, BusyPhysicalLanesDoNotHideReadyOwnership) {
-    expect_successor_reachable(HandoffScenario::BUSY_MIX_LANES);
-}
-
 INSTANTIATE_TEST_SUITE_P(
-    ProducerLanesAndMixMasks, HbgMixQueueHandoff,
-    ::testing::Combine(
-        ::testing::Values(0u, 1u, 2u),
-        ::testing::Values(
-            LaneMask(true, true, false), LaneMask(true, false, true), LaneMask::both_aiv(), LaneMask::all()
-        )
-    )
+    ProducerLanesAndMixMasks, HbgDirectMixHandoff,
+    ::testing::Combine(::testing::Values(0u, 1u, 2u), ::testing::ValuesIn(kMixMasks))
 );
-
 }  // namespace

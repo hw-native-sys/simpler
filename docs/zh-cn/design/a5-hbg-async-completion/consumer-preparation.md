@@ -22,7 +22,7 @@ run 入口保留既有全 DCache 获取。首次非零 group 发布前置位单�
 
 只对确实缺少获取保证的读取路径增加准备：依赖满足、参数地址物化后，在读取 predicate 或进入业务 kernel 前，在实际核完成缓存操作。predicate=false 仍需先保证 predicate operand 可见，但不执行业务 kernel。
 
-长范围按实际缓存维护工作量分段。进度绑定当前核、slot generation 和数据发布，不能把别核的准备结果当成可移交 lease。准备期间不等待外部条件、不占 async CHECK lease，并继续遵守调度预算。
+长范围按实际缓存维护工作量分段。进度绑定当前核、task/block/subtask 与数据发布，不能把别核的准备结果当成可移交 lease。准备期间不等待外部条件、不占 async CHECK lease，并继续遵守调度预算。
 
 MIX/sync-start 若需要额外本核准备，必须覆盖全部实际参与成员；mask 6 中 inactive AIC coordinator 仍履行现有协调职责。最终 start 许可之后直接执行业务，不再插入会改变准备状态的工作。
 

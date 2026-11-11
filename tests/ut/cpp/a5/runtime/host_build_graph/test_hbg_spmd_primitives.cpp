@@ -88,4 +88,31 @@ TEST(HbgSpmdPrimitiveBoundary, AnEmptyHintDoesNotProveFutureQueueQuiescence) {
     EXPECT_EQ(claim.task_ref, 0);
 }
 
+TEST(HbgSpmdPrimitiveBoundary, PeekPreservesFifoAndParkedSlotRejoinsAtTheTail) {
+    SchedulerLocalState local{};
+    for (auto &slot : local.slots)
+        slot.state = SchedulerDispatchSlotState::READY;
+    scheduler_local_ready_publish(&local, 1);
+    scheduler_local_ready_publish(&local, 0);
+    uint32_t head = UINT32_MAX;
+    ASSERT_TRUE(scheduler_local_ready_peek(&local, &head));
+    EXPECT_EQ(head, 1u);
+    ASSERT_TRUE(scheduler_local_ready_peek(&local, &head));
+    EXPECT_EQ(head, 1u);
+    EXPECT_FALSE(scheduler_local_ready_execute(&local, 0));
+    EXPECT_EQ(local.local_ready_mask, 3u);
+    scheduler_local_ready_remove(&local, 1);
+    scheduler_local_ready_publish(&local, 1);
+    ASSERT_TRUE(scheduler_local_ready_peek(&local, &head));
+    EXPECT_EQ(head, 0u);
+    ASSERT_TRUE(scheduler_local_ready_execute(&local, 0));
+    EXPECT_EQ(local.slots[0].state, SchedulerDispatchSlotState::EXECUTING);
+    EXPECT_FALSE(scheduler_local_ready_execute(&local, 0));
+    ASSERT_TRUE(scheduler_local_ready_peek(&local, &head));
+    EXPECT_EQ(head, 1u);
+    ASSERT_TRUE(scheduler_local_ready_execute(&local, 1));
+    EXPECT_EQ(local.local_ready_mask, 0u);
+    EXPECT_FALSE(scheduler_local_ready_peek(&local, &head));
+}
+
 }  // namespace

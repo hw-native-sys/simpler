@@ -16,9 +16,10 @@
 #include "scheduler/scheduler_args_dump.h"
 
 namespace {
-SchedulerArgsDumpAck sealed(const SchedulerArgsDumpTask &task, ArgsDumpStage stage, uint32_t generation) {
-    SchedulerArgsDumpAck ack{11, task.task_ref, static_cast<uint64_t>(stage), generation, 1, 0, 0, 0};
-    ack.status = scheduler_args_dump_ack_commit(generation, ack.stage, SchedulerArgsDumpStatus::Sealed);
+SchedulerArgsDumpAck sealed(const SchedulerArgsDumpTask &task, ArgsDumpStage stage) {
+    const uint64_t publisher = stage == ArgsDumpStage::BEFORE_DISPATCH ? task.publisher_before : task.publisher_after;
+    SchedulerArgsDumpAck ack{11, task.task_ref, static_cast<uint64_t>(stage), publisher, 1, 0, 0, 0};
+    ack.status = scheduler_args_dump_ack_commit(task.task_ref, ack.stage, SchedulerArgsDumpStatus::Sealed);
     return ack;
 }
 
@@ -30,12 +31,12 @@ TEST(ResidentArgsDumpBoundary, TaskLatchesRemainValidAcrossBlockWavesAndReusedWo
     EXPECT_EQ(scheduler_args_dump_enter(&task), SchedulerArgsDumpArrival::Publisher);
     EXPECT_EQ(scheduler_args_dump_enter(&task), SchedulerArgsDumpArrival::Waiting);
     EXPECT_FALSE(scheduler_args_dump_can_execute(&task));
-    task.publisher_before = scheduler_args_dump_publisher(0, 7);
-    auto ack = sealed(task, ArgsDumpStage::BEFORE_DISPATCH, 7);
+    task.publisher_before = scheduler_args_dump_publisher(0);
+    auto ack = sealed(task, ArgsDumpStage::BEFORE_DISPATCH);
     auto wrong = ack;
     wrong.run_epoch = 12;
-    EXPECT_FALSE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, wrong, 11));
-    ASSERT_TRUE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, ack, 11));
+    EXPECT_FALSE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, wrong, 11, 1));
+    ASSERT_TRUE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, ack, 11, 1));
     // The publisher can finish and reuse its worker before later blocks enter.
     ack = {};
     EXPECT_EQ(
@@ -69,9 +70,9 @@ TEST(ResidentArgsDumpBoundary, TaskLatchesRemainValidAcrossBlockWavesAndReusedWo
         SchedulerArgsDumpArrival::Publisher
     );
     EXPECT_FALSE(scheduler_args_dump_can_complete(&task));
-    task.publisher_after = scheduler_args_dump_publisher(1, 9);
+    task.publisher_after = scheduler_args_dump_publisher(1);
     ASSERT_TRUE(scheduler_args_dump_seal(
-        &task, ArgsDumpStage::AFTER_COMPLETION, sealed(task, ArgsDumpStage::AFTER_COMPLETION, 9), 11
+        &task, ArgsDumpStage::AFTER_COMPLETION, sealed(task, ArgsDumpStage::AFTER_COMPLETION), 11, 1
     ));
     EXPECT_TRUE(scheduler_args_dump_can_complete(&task));
 }
@@ -82,9 +83,9 @@ TEST(ResidentArgsDumpBoundary, MixFinalWriterCannotSealBeforeAllBlocksAndSubtask
     task.active_mask = 7;
     task.expected_participants = 9;
     ASSERT_EQ(scheduler_args_dump_enter(&task), SchedulerArgsDumpArrival::Publisher);
-    task.publisher_before = scheduler_args_dump_publisher(0, 1);
+    task.publisher_before = scheduler_args_dump_publisher(0);
     ASSERT_TRUE(scheduler_args_dump_seal(
-        &task, ArgsDumpStage::BEFORE_DISPATCH, sealed(task, ArgsDumpStage::BEFORE_DISPATCH, 1), 11
+        &task, ArgsDumpStage::BEFORE_DISPATCH, sealed(task, ArgsDumpStage::BEFORE_DISPATCH), 11, 1
     ));
     std::array<int, 9> writes{};
     for (size_t i = 0; i < writes.size(); ++i) {
@@ -102,9 +103,9 @@ TEST(ResidentArgsDumpBoundary, MixFinalWriterCannotSealBeforeAllBlocksAndSubtask
             EXPECT_EQ(writes, (std::array<int, 9>{1, 2, 3, 4, 5, 6, 7, 8, 9}));
         }
     }
-    task.publisher_after = scheduler_args_dump_publisher(2, 3);
+    task.publisher_after = scheduler_args_dump_publisher(2);
     ASSERT_TRUE(scheduler_args_dump_seal(
-        &task, ArgsDumpStage::AFTER_COMPLETION, sealed(task, ArgsDumpStage::AFTER_COMPLETION, 3), 11
+        &task, ArgsDumpStage::AFTER_COMPLETION, sealed(task, ArgsDumpStage::AFTER_COMPLETION), 11, 1
     ));
     EXPECT_TRUE(scheduler_args_dump_can_complete(&task));
     EXPECT_EQ(
@@ -124,9 +125,9 @@ TEST(ResidentArgsDumpBoundary, FailedVisibilityPublicationCannotCountAWriterOrSe
     task.task_ref = 7;
     task.active_mask = task.expected_participants = 1;
     ASSERT_EQ(scheduler_args_dump_enter(&task), SchedulerArgsDumpArrival::Publisher);
-    task.publisher_before = scheduler_args_dump_publisher(0, 1);
+    task.publisher_before = scheduler_args_dump_publisher(0);
     ASSERT_TRUE(scheduler_args_dump_seal(
-        &task, ArgsDumpStage::BEFORE_DISPATCH, sealed(task, ArgsDumpStage::BEFORE_DISPATCH, 1), 11
+        &task, ArgsDumpStage::BEFORE_DISPATCH, sealed(task, ArgsDumpStage::BEFORE_DISPATCH), 11, 1
     ));
     EXPECT_EQ(
         scheduler_args_dump_return(
@@ -160,14 +161,45 @@ TEST(ResidentArgsDumpBoundary, AbortedOrEmptyTaskCannotAcquireOrPublishSuccess) 
     );
     EXPECT_FALSE(scheduler_args_dump_can_complete(&task));
 }
-enum class AckMutation { None, TickAfterBody, ClearCommitAfterBody };
+
+TEST(ResidentArgsDumpBoundary, SealRequiresCurrentTaskStagePublisherEpochAndRequestTick) {
+    for (int mutation = 0; mutation < 6; ++mutation) {
+        SCOPED_TRACE(mutation);
+        SchedulerArgsDumpTask task{};
+        task.task_ref = 0;
+        task.active_mask = task.expected_participants = 1;
+        task.publisher_before = scheduler_args_dump_publisher(0);
+        ASSERT_EQ(scheduler_args_dump_enter(&task), SchedulerArgsDumpArrival::Publisher);
+        auto ack = sealed(task, ArgsDumpStage::BEFORE_DISPATCH);
+        if (mutation == 0) ++ack.task_id;
+        if (mutation == 1) ack.stage = static_cast<uint64_t>(ArgsDumpStage::AFTER_COMPLETION);
+        if (mutation == 2) ++ack.publisher;
+        if (mutation == 3) ack.run_epoch ^= UINT64_C(1) << 40;
+        if (mutation == 4) ++ack.tick;
+        if (mutation == 5) ack.tick = 0;
+        ack.status = scheduler_args_dump_ack_commit(ack.task_id, ack.stage, SchedulerArgsDumpStatus::Sealed);
+        EXPECT_FALSE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, ack, 11, 1));
+        EXPECT_FALSE(scheduler_args_dump_can_execute(&task));
+        ack = sealed(task, ArgsDumpStage::BEFORE_DISPATCH);
+        ASSERT_TRUE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, ack, 11, 1));
+        EXPECT_FALSE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, ack, 11, 1));
+    }
+}
+
+enum class AckMutation { None, TickAfterBody, ClearCommitAfterBody, AdvanceRequestAfterBody };
 struct ChangingAckReader {
     SchedulerArgsDumpAck *ack;
     AckMutation mutation;
+    SchedulerArgsDumpRequest *request{nullptr};
     uint64_t load(uint64_t &word) const {
         if (&word == &ack->byte_cursor) {
             if (mutation == AckMutation::TickAfterBody) ++ack->tick;
             if (mutation == AckMutation::ClearCommitAfterBody) ack->status = 0;
+            if (mutation == AckMutation::AdvanceRequestAfterBody) {
+                request->arg_index = ack->arg_index;
+                request->byte_cursor = ack->byte_cursor;
+                ++request->tick;
+            }
         }
         return word;
     }
@@ -178,7 +210,7 @@ TEST(ResidentArgsDumpBoundary, AckObservationRejectsSameCommitWithANewTickAndInc
     for (AckMutation mutation : {AckMutation::None, AckMutation::TickAfterBody, AckMutation::ClearCommitAfterBody}) {
         SCOPED_TRACE(static_cast<int>(mutation));
         SchedulerArgsDumpAck ack{11, 3, 0, 7, 1, 2, 65536, 0};
-        ack.status = scheduler_args_dump_ack_commit(7, 0, SchedulerArgsDumpStatus::InProgress);
+        ack.status = scheduler_args_dump_ack_commit(3, 0, SchedulerArgsDumpStatus::InProgress);
         SchedulerArgsDumpAck observed{};
         const bool accepted = scheduler_args_dump_observe_ack(&ack, &observed, ChangingAckReader{&ack, mutation});
         EXPECT_EQ(accepted, mutation == AckMutation::None);
@@ -191,6 +223,48 @@ TEST(ResidentArgsDumpBoundary, AckObservationRejectsSameCommitWithANewTickAndInc
             EXPECT_EQ(observed.tick, 0u);
             EXPECT_EQ(observed.status, 0u);
         }
+    }
+}
+TEST(ResidentArgsDumpBoundary, RequestAdvancePreservesWaitingParticipantsPhaseProgress) {
+    SchedulerArgsDumpRequest request{11, 3, 0, 7, 1, 2, 0, 0};
+    const uint64_t previous_bytes = request.byte_cursor;
+    SchedulerArgsDumpAck ack{11, 3, 0, 7, 1, 2, 65536, 0};
+    ack.status = scheduler_args_dump_ack_commit(3, 0, SchedulerArgsDumpStatus::InProgress);
+    SchedulerArgsDumpAck observed{};
+    ASSERT_TRUE(scheduler_args_dump_observe_ack(
+        &ack, &observed, ChangingAckReader{&ack, AckMutation::AdvanceRequestAfterBody, &request}
+    ));
+    ASSERT_EQ(request.tick, 2u);
+    ASSERT_EQ(observed.tick, 1u);
+    EXPECT_TRUE(scheduler_args_dump_ack_matches_phase(observed, 11, 3, ArgsDumpStage::BEFORE_DISPATCH, 7));
+    EXPECT_EQ(scheduler_args_dump_ack_status(observed), SchedulerArgsDumpStatus::InProgress);
+    EXPECT_EQ(request.byte_cursor, observed.byte_cursor);
+    EXPECT_GT(observed.byte_cursor, previous_bytes);
+
+    SchedulerArgsDumpTask task{};
+    task.task_ref = 3;
+    task.active_mask = task.expected_participants = 1;
+    task.publisher_before = 7;
+    ASSERT_EQ(scheduler_args_dump_enter(&task), SchedulerArgsDumpArrival::Publisher);
+    observed.status = scheduler_args_dump_ack_commit(3, 0, SchedulerArgsDumpStatus::Sealed);
+    EXPECT_FALSE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, observed, 11, request.tick));
+    EXPECT_FALSE(scheduler_args_dump_can_execute(&task));
+    observed.tick = request.tick;
+    EXPECT_TRUE(scheduler_args_dump_seal(&task, ArgsDumpStage::BEFORE_DISPATCH, observed, 11, request.tick));
+}
+
+TEST(ResidentArgsDumpBoundary, WaitingParticipantRejectsProgressFromAnotherPhase) {
+    for (int mutation = 0; mutation < 4; ++mutation) {
+        SCOPED_TRACE(mutation);
+        SchedulerArgsDumpAck ack{11, 3, 0, 7, 1, 2, 65536, 0};
+        if (mutation == 0) ++ack.run_epoch;
+        if (mutation == 1) ++ack.task_id;
+        if (mutation == 2) ++ack.stage;
+        if (mutation == 3) ++ack.publisher;
+        ack.status = scheduler_args_dump_ack_commit(ack.task_id, ack.stage, SchedulerArgsDumpStatus::InProgress);
+        SchedulerArgsDumpAck observed{};
+        ASSERT_TRUE(scheduler_args_dump_observe_ack(&ack, &observed));
+        EXPECT_FALSE(scheduler_args_dump_ack_matches_phase(observed, 11, 3, ArgsDumpStage::BEFORE_DISPATCH, 7));
     }
 }
 }  // namespace

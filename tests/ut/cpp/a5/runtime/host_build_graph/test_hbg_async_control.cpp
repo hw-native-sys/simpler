@@ -218,11 +218,8 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     slot.task_ref = 0;
     slot.block_idx = 0;
     slot.subtask_slot = 0;
-    slot.state = SchedulerDispatchSlotState::READY;
-    slot.generation = 1;
-    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, 1, 0, nullptr, nullptr
-    ));
+    slot.state = SchedulerDispatchSlotState::EXECUTING;
+    ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0));
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
     EXPECT_TRUE(scheduler_async_pending::closed(f.join().word));
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
@@ -282,13 +279,9 @@ TEST(HbgAsyncControl, ZeroConditionSingleExecutionKeepsItsSuccessorOnTheCompleti
     slot.task_ref = 0;
     slot.block_idx = 0;
     slot.subtask_slot = 0;
-    slot.state = SchedulerDispatchSlotState::READY;
-    slot.generation = 1;
-    bool refilled = false;
-    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0, 1, 0, nullptr, &refilled
-    ));
-    EXPECT_TRUE(refilled);
+    slot.state = SchedulerDispatchSlotState::EXECUTING;
+    ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0));
+    EXPECT_NE(f.local()->local_ready_mask & 1U, 0u);
     EXPECT_EQ(slot.task_ref, 1);
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::READY);
     EXPECT_EQ(f.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));

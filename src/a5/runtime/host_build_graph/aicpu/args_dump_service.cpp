@@ -23,7 +23,7 @@ T *image_array(SchedulerArgsDumpHeader *image, uint64_t offset) {
 }
 
 bool same_phase(const SchedulerArgsDumpRequest &a, const SchedulerArgsDumpRequest &b) {
-    return a.run_epoch == b.run_epoch && a.task_id == b.task_id && a.stage == b.stage && a.generation == b.generation &&
+    return a.run_epoch == b.run_epoch && a.task_id == b.task_id && a.stage == b.stage && a.publisher == b.publisher &&
            a.arg_index == b.arg_index;
 }
 
@@ -166,14 +166,14 @@ void ResidentArgsDumpService::acknowledge(
     __atomic_store_n(&ack->run_epoch, request.run_epoch, __ATOMIC_RELAXED);
     __atomic_store_n(&ack->task_id, request.task_id, __ATOMIC_RELAXED);
     __atomic_store_n(&ack->stage, request.stage, __ATOMIC_RELAXED);
-    __atomic_store_n(&ack->generation, request.generation, __ATOMIC_RELAXED);
+    __atomic_store_n(&ack->publisher, request.publisher, __ATOMIC_RELAXED);
     __atomic_store_n(&ack->arg_index, cursor, __ATOMIC_RELAXED);
     __atomic_store_n(&ack->byte_cursor, bytes, __ATOMIC_RELAXED);
     __atomic_store_n(&ack->tick, request.tick, __ATOMIC_RELEASE);
     cache_flush_range(ack, sizeof(*ack));
     wmb();
     __atomic_store_n(
-        &ack->status, scheduler_args_dump_ack_commit(request.generation, request.stage, status), __ATOMIC_RELEASE
+        &ack->status, scheduler_args_dump_ack_commit(request.task_id, request.stage, status), __ATOMIC_RELEASE
     );
     cache_flush_range(ack, sizeof(*ack));
     wmb();
@@ -183,8 +183,9 @@ bool ResidentArgsDumpService::service(uint32_t worker, const SchedulerArgsDumpRe
     auto *task = scheduler_args_dump_task(image_, request.task_id);
     const auto stage = static_cast<ArgsDumpStage>(request.stage);
     bool valid = task != nullptr && request.run_epoch == image_->run_epoch &&
-                 request.stage <= static_cast<uint64_t>(ArgsDumpStage::AFTER_COMPLETION) && request.generation != 0 &&
-                 request.generation <= UINT32_MAX && request.arg_index <= CORE_MAX_TENSOR_ARGS + CORE_MAX_SCALAR_ARGS;
+                 request.stage <= static_cast<uint64_t>(ArgsDumpStage::AFTER_COMPLETION) &&
+                 request.publisher == scheduler_args_dump_publisher(worker) &&
+                 request.arg_index <= CORE_MAX_TENSOR_ARGS + CORE_MAX_SCALAR_ARGS;
     if (task != nullptr) {
         // Observation only: AICPU never writes a cache line containing the
         // concurrently updated GM arrival/departure/abort words.
@@ -193,7 +194,7 @@ bool ResidentArgsDumpService::service(uint32_t worker, const SchedulerArgsDumpRe
         if (valid) {
             const uint64_t publisher =
                 stage == ArgsDumpStage::BEFORE_DISPATCH ? task->publisher_before : task->publisher_after;
-            valid = publisher == scheduler_args_dump_publisher(worker, request.generation) &&
+            valid = publisher == request.publisher &&
                     (stage == ArgsDumpStage::BEFORE_DISPATCH ?
                          task->before_state == 1 :
                          task->returned_participants == task->expected_participants) &&

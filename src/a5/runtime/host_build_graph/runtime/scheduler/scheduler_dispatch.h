@@ -300,7 +300,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             SchedulerReadyClaim ready{};
             ready.task_ref = slot.task_ref;
             ready.source = SchedulerReadySource::COOPERATIVE;
-            const SchedulerFreeSlotClaim claim{local->worker_id(), index, slot.generation, local->config.self_lane};
+            const SchedulerFreeSlotClaim claim{index};
             if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, ready, profiling_level)) {
                 *failed = true;
                 return progress;
@@ -340,7 +340,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             slot.predicate = candidate.predicate;
             slot.state = SchedulerDispatchSlotState::FILLING;
             candidate.ready.publication_mode = SchedulerPublicationMode::DISPATCH;
-            const SchedulerFreeSlotClaim claim{local->worker_id(), index, slot.generation, local->config.self_lane};
+            const SchedulerFreeSlotClaim claim{index};
             if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, candidate.ready, profiling_level)) {
                 *failed = true;
                 return progress;
@@ -417,13 +417,10 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
 // A ready probe is useful only when the corresponding work can be claimed,
 // so this must admit every slot scheduler_fill_own_slots would fill: rejecting
 // a fillable slot suppresses discovery and starves its work.
-inline __aicore__ bool
-scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type, uint64_t skip_slot_mask) {
+inline __aicore__ bool scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type) {
     if (local->config.self_core_type != core_type) return false;
     for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        if ((skip_slot_mask & (UINT64_C(1) << slot)) == 0 &&
-            local->own_slots()[slot].state == SchedulerDispatchSlotState::FREE)
-            return true;
+        if (local->own_slots()[slot].state == SchedulerDispatchSlotState::FREE) return true;
     }
     return false;
 }
@@ -431,14 +428,13 @@ scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type, 
 // Claim only the next ordinary execution. Reserving another ready task behind
 // a running kernel can hide work needed by that kernel from every idle core.
 // Cooperative admission retains its separate slot/participant protocol.
-// `skip_slot_mask` names slots a completion pass already refilled.
 //
 // The return value reports whether this pass made progress; `failed` separately
 // reports an aborted pass.
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_fill_own_slots(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, uint64_t profiling_level, uint64_t skip_slot_mask, bool *failed
+    __gm__ SchedulerRunControl *run_control, uint64_t profiling_level, bool *failed
 ) {
     SchedulerScalarScope scalar_scope(scheduler, SchedPhaseKind::ScalarFillSlots, -1);
     if (failed != nullptr) *failed = false;
@@ -449,14 +445,11 @@ static inline __aicore__ bool scheduler_fill_own_slots(
         );
     if (scheduler->local_ready_mask != 0) return false;
     const uint32_t core_type = scheduler->config.self_core_type;
-    if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask)) return false;
-    const uint64_t worker_id = scheduler->worker_id();
-    const uint32_t self_lane = scheduler->config.self_lane;
+    if (!scheduler_has_usable_slot(scheduler, core_type)) return false;
     uint64_t state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     bool progress = false;
 
     for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        if ((skip_slot_mask & (UINT64_C(1) << slot)) != 0) continue;
         SchedulerLocalSlotState *local_slot = &scheduler->own_slots()[slot];
         if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
 
@@ -473,7 +466,7 @@ static inline __aicore__ bool scheduler_fill_own_slots(
 
         ready.state_probe_start_cycles = state_probe_start_cycles;
         ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-        const SchedulerFreeSlotClaim claim{worker_id, slot, local_slot->generation, self_lane};
+        const SchedulerFreeSlotClaim claim{slot};
         local_slot->state = SchedulerDispatchSlotState::FILLING;
         if (!scheduler_fill_dispatch_slot(
                 graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level

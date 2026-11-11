@@ -145,10 +145,10 @@ kernel execution 的唯一身份为 `(run_epoch, node_ref, block_idx, subtask_id
 ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的两种控制事件靠 kind 区分。
 不把内部 ref 写成公共 TaskId，也不让不同实例的 local_child_id 覆盖对方采样记录。
 
-主线 native protocol JSON 的 v5 reader 不能猜测新映射语义；新增 schema 版本与明确 node map。
-同步修改 `simpler_setup/tools/hbg/native_protocol.py`、export UT 和 Python oracle UT，保留旧版本读取能力。
+native protocol JSON 的 schema 与明确的 node map 共同定义映射语义。
+`simpler_setup/tools/hbg/native_protocol.py`、export UT 和 Python oracle UT 与生产者使用同一当前格式。
 当前实现导出 `hbg-native-protocol-v11`，保留领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
-以及 v10 起按资源类型累计 block 前缀的 ordinary 有界循环成员规则，
+以及按资源类型累计 block 前缀的 ordinary 有界循环成员规则，
 并包含两部分原生 Graph 来源：
 
 - `node_map`：每个 internal ref 的 kind、public TaskId、original task/shell id 与 local child id；
@@ -160,7 +160,8 @@ ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的�
 再与运行视图导出的 `tasks`/`node_map` 比较；`native_causality.py` 继续验证发布、成员、block 和完成顺序。
 control 节点使用 protocol TaskDone actor，不伪造 kernel execution 或 legacy GraphPrepare。
 无 Graph capture 输出 v10，native Graph 输出 v11；读端仅接受这两个当前格式，生产者与工具必须配套。
-不维护历史或内部实验格式的兼容分支。execution identity 保持严格 v1，多 block 记录不得缺失 order_key。
+不维护历史或内部实验格式的兼容分支。execution identity 使用严格 v1，多 block 记录不得缺失 order_key。
+执行身份是 run/task/block/subtask；slot 复用由本核事件序列与退休先于下一次 publication/permit 的关系审计，不导出 slot generation。
 当前 native audit 从冻结任务形状独立重建 member_rank_offset 并核对成员集合，不以导出的偏移值作为 oracle。
 所有受支持任务均遵守 cooperative admission。
 

@@ -1269,7 +1269,7 @@ def test_current_kernel_timeout_does_not_hide_invalid_claim_seal(native, task, v
 def test_timeout_requires_exact_stride_without_relaxing_failed_run_checks(native, mask, lane, version, stride):
     raw = _large_ticket_capture(mask, lane)
     protocol = raw["aicore_protocol"]
-    protocol.update(schema=f"hbg-native-protocol-v{version}", close_seal_stride=64 if version >= 10 else 128)
+    protocol.update(schema=f"hbg-native-protocol-v{version}", close_seal_stride=64)
     for control in protocol["task_controls"]:
         control.update(admission_claim_lock=0, claim_seal=0)
     native._check_failed_capture(raw, 257, mask, lane)

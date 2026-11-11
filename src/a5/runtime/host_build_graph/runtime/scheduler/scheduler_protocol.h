@@ -224,7 +224,7 @@ inline __aicore__ void scheduler_protocol_payload_publication(
     __gm__ void *base, Local *local, const Claim &claim, const Ready &ready, bool before
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr || claim.worker_id != local->worker_id()) return;
+    if (layout == nullptr) return;
     if (claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
@@ -239,13 +239,13 @@ inline __aicore__ void scheduler_protocol_payload_publication(
     if (record == nullptr) return;
     if (before) {
         scheduler_protocol_observe_record(record);
-        if (record->permit.sequence != 0 || record->entry.sequence != 0 ||
+        if ((local->local_ready_mask & (1U << claim.slot_index)) != 0 || record->permit.sequence != 0 ||
+            record->entry.sequence != 0 ||
             (record->publication_count != 0 &&
              (slot.cooperative || (record->flags & SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED) == 0 ||
               record->worker_index != local->worker_id() || record->run_epoch != layout->run_epoch ||
               record->task_ref != slot.task_ref || record->block_idx != slot.block_idx ||
-              record->subtask_slot != slot.subtask_slot ||
-              (record->pending_slot == claim.slot_index && record->generation >= slot.generation)))) {
+              record->subtask_slot != slot.subtask_slot))) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_DUPLICATE);
             return;
         }
@@ -263,14 +263,13 @@ inline __aicore__ void scheduler_protocol_payload_publication(
         record->worker_index = static_cast<uint32_t>(local->worker_id());
         record->pending_slot = static_cast<uint16_t>(claim.slot_index);
         record->subtask_slot = slot.subtask_slot;
-        record->generation = slot.generation;
         record->ready_source = static_cast<uint32_t>(ready.source);
         record->publication_mode = static_cast<uint32_t>(ready.publication_mode);
     } else {
         if (record->publication_count == 0 || record->worker_index != local->worker_id() ||
-            record->task_ref != slot.task_ref || record->generation != slot.generation ||
-            record->pending_slot != claim.slot_index || record->subtask_slot != slot.subtask_slot ||
-            record->block_idx != slot.block_idx || record->run_epoch != layout->run_epoch) {
+            record->task_ref != slot.task_ref || record->pending_slot != claim.slot_index ||
+            record->subtask_slot != slot.subtask_slot || record->block_idx != slot.block_idx ||
+            record->run_epoch != layout->run_epoch) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
             return;
         }
