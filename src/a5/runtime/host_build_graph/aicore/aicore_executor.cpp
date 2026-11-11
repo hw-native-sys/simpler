@@ -34,7 +34,7 @@ namespace {
 
 constexpr uint32_t kInitialBackoffIterations = 8;
 constexpr uint32_t kMaximumBackoffIterations = 256;
-constexpr uint32_t kMaximumIdleBackoffIterations = 1024;
+constexpr uint32_t kMaximumIdleBackoffIterations = 128;
 constexpr uint32_t kSchedulerErrorPollInterval = 64;
 
 struct SchedulerWorkerStats {
