@@ -923,6 +923,14 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     // look may be named in it, and a block taken now would leave this lane
     // owing a cohort and a rendezvous at once.
     if (percounter_mix_unseen(cfg, state)) return true;
+    // The seqlock's opening edge. A stale task id was measured to reach back
+    // exactly one publication and never two, which lands on the `-1` the last
+    // claimer leaves and is refused below -- but 26 observed cases bound no
+    // tail, and two steps back would be the previous cohort's id under this
+    // cohort's generation, which the closing check cannot see. The mix look
+    // above happens to carry this edge when there is a MIX list, and nothing
+    // carries it when there is not.
+    percounter_observe_fence();
     const int64_t task_id = scheduler_gm_query(cfg.sync_queue->open_task_id);
     // Slot taken, payload not yet published: deciding now would read the
     // previous cohort's shape, and a decision is final.
