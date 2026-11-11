@@ -746,7 +746,13 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     // lanes the second needs -- each one's kernel is entered a block at a time
     // and cannot be left, so the two hold each other there. Opening the next
     // one only once the last has run is what keeps that pair from existing.
-    if (scheduler_gm_query(cfg.sync_queue->completed) != scheduler_gm_query(cfg.sync_queue->claimed_blocks)) return;
+    // Read as atomics -- adding zero returns the value and leaves it -- because
+    // both words are published by `fetch_add`, and a device load does not
+    // observe one of those until it has drained. A spin can afford to be
+    // behind; this decides once, and a stale read abandons the cohort for good.
+    const uint64_t done = scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{0});
+    const uint64_t owed = scheduler_gm_fetch_add(cfg.sync_queue->claimed_blocks, uint64_t{0});
+    if (done != owed) return;
     if (scheduler_gm_compare_exchange(q->open_generation, generation, generation + 1) != generation) return;
 
     scheduler_gm_store(q->open_block_num, percounter_sync_desc_blocks(desc));
@@ -815,6 +821,9 @@ inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, Percou
         sync->my_block = -1;
         percounter_cohort_hold_set(cfg, 0);
         scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
+        // The count this block just raised is what the next cohort waits on,
+        // and the lane that raises it is the only one that knows it changed.
+        percounter_sync_promote(cfg);
         return true;
     }
 
@@ -1211,8 +1220,14 @@ inline __aicore__ bool percounter_serve_mix(
         percounter_publish_completion(cfg, task, static_cast<uint64_t>(__builtin_popcount(mask)));
         // After the task counter: a lane that sees either count reach its total
         // may stop, and no consumer of the task may still be waiting then.
-        if (cohort_block) scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
-        else scheduler_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next, uint64_t{1});
+        if (cohort_block) {
+            scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
+            // As in the single-lane block: whoever raises the count is who can
+            // tell the queue that what it was waiting for has happened.
+            percounter_sync_promote(cfg);
+        } else {
+            scheduler_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next, uint64_t{1});
+        }
         ++state->local_done;
     }
     return true;
