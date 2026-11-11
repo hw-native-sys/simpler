@@ -576,15 +576,13 @@ inline __aicore__ void percounter_publish_fence() {
 }
 
 /**
- * Order a bypass load of GM against the bypass loads that follow it.
+ * Order a read of GM against the reads that follow it.
  *
- * Two of them can observe two atomic writes out of order, so a word that was
- * published before the one this lane just read can still come back stale --
- * measured on a5 at roughly one in 70,000 sampled pairs, with the two words
- * in one cache line or in two. Separating the writer's two stores with a
- * barrier did not stop it; separating the reader's two loads did. A reader
- * that gates on one word and then reads what that word vouches for therefore
- * needs this between the two.
+ * **Two GM reads are two samples, not one snapshot.** A lane that gates on
+ * one word and then reads what that word vouches for needs this between them,
+ * or the second read can return a value older than the first implies. Reading
+ * both atomically is not a substitute: it orders a pair that shares a cache
+ * line and not a pair that does not.
  *
  * SSBUF needs no equivalent: `scheduler_ssbuf_load_acquire` is a load
  * *followed* by the barrier, so consecutive acquire loads already carry it.
@@ -595,6 +593,19 @@ inline __aicore__ void percounter_observe_fence() {
 #else
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
+}
+
+/**
+ * Read a word a decision gates on, and order it against what follows.
+ *
+ * The atomic read keeps this one word from being stale; the fence keeps the
+ * words read after it from being older. A gate needs both, so they are
+ * bundled rather than left for each caller to remember.
+ */
+inline __aicore__ uint64_t percounter_gate_read(__gm__ volatile uint64_t &word) {
+    const uint64_t value = scheduler_gm_fetch_add(word, uint64_t{0});
+    percounter_observe_fence();
+    return value;
 }
 
 /**
@@ -712,20 +723,12 @@ inline __aicore__ bool percounter_line_staging_for(const LaneConfig &cfg) {
  */
 inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     __gm__ PercounterSyncQueue *q = cfg.sync_queue;
-    // Every word this decision rests on is read as an atomic -- adding zero
-    // returns the value and leaves it -- because each is published by an
-    // atomic from a lane that is often not this one, and across cores a bypass
-    // load of such a word can lag. A bypass load does observe the writing
-    // core's *own* atomic write, measured on a5 over 440k back-to-back
-    // write-then-read trials, but an enqueuer whose call finds the slot busy
-    // leaves this cohort to whichever lane finishes the outstanding one, and
-    // that lane wrote none of them.
-    //
-    // The generation included, and the compare-exchange below is no substitute
-    // for it: a lane that reads the previous generation still sees the slot
-    // armed and returns above, never reaching the exchange that would have
-    // caught it.
-    const uint64_t generation = scheduler_gm_fetch_add(q->open_generation, uint64_t{0});
+    // The gate for everything below, and the one read nothing downstream can
+    // recover from: a lane that reads the previous generation sees the slot
+    // still armed and returns here, never reaching the exchange that would
+    // have caught it. The fence is what puts `claimed_blocks`, which sits in
+    // a cache line of its own, no earlier than this.
+    const uint64_t generation = percounter_gate_read(q->open_generation);
     if (percounter_sync_armed(generation)) return;
     const uint64_t seq = generation / 2;
     if (seq >= scheduler_gm_fetch_add(q->tail, uint64_t{0})) return;
@@ -741,9 +744,10 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
     // lanes the second needs -- each one's kernel is entered a block at a time
     // and cannot be left, so the two hold each other there. Opening the next
     // one only once the last has run is what keeps that pair from existing.
-    // Atomic reads for the same reason as the two above. A spin can afford to
-    // be behind; this decides once, and a stale read abandons the cohort for
-    // good.
+    // Atomic, like every read here, because a spin can afford to be behind
+    // and this decides once -- a stale read abandons the cohort for good. The
+    // two need no fence between them: they share a cache line, which is what
+    // the layout puts them in, and that is enough to order them.
     const uint64_t done = scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{0});
     const uint64_t owed = scheduler_gm_fetch_add(cfg.sync_queue->claimed_blocks, uint64_t{0});
     if (done != owed) return;
@@ -923,13 +927,10 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     // look may be named in it, and a block taken now would leave this lane
     // owing a cohort and a rendezvous at once.
     if (percounter_mix_unseen(cfg, state)) return true;
-    // The seqlock's opening edge. A stale task id was measured to reach back
-    // exactly one publication and never two, which lands on the `-1` the last
-    // claimer leaves and is refused below -- but 26 observed cases bound no
-    // tail, and two steps back would be the previous cohort's id under this
-    // cohort's generation, which the closing check cannot see. The mix look
-    // above happens to carry this edge when there is a MIX list, and nothing
-    // carries it when there is not.
+    // The seqlock's opening edge: a task id older than this generation would
+    // be the previous cohort's, and the closing check compares generations,
+    // not ids, so it cannot see that. A graph with no MIX list reaches here
+    // without the acquire load above, so nothing else carries this edge.
     percounter_observe_fence();
     const int64_t task_id = scheduler_gm_query(cfg.sync_queue->open_task_id);
     // Slot taken, payload not yet published: deciding now would read the
@@ -971,13 +972,10 @@ percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     scheduler_gm_store(q->released, seq + 1);
     // Before the slot frees, so a promotion that sees it free also sees what
     // this cohort still owes: the pair is what says whether one is
-    // outstanding. Program order alone does not carry that -- two atomic
-    // writes to different words are not ordered for a reader by the order
-    // this lane issued them -- and a promotion that saw the free slot over the
-    // old count would read `completed == claimed_blocks` while none of this
-    // cohort's blocks had run, and open the next one on top of it.
+    // outstanding. The order these two go out in is not what carries that --
+    // the promotion fences its own reads instead -- so this lane only has to
+    // issue the count before it hands the slot on.
     scheduler_gm_fetch_add(q->claimed_blocks, static_cast<uint64_t>(sync->block_num));
-    percounter_publish_fence();
     scheduler_gm_store(q->open_generation, generation + 1);
     percounter_sync_promote(cfg);
     return percounter_sync_serve_released(cfg, state, timeout_cycles, served);

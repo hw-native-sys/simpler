@@ -268,11 +268,16 @@ inline constexpr uint32_t PERCOUNTER_MIX_TICKET_DONE = 1;
  * reported count is never compared against the admitted width; upstream's
  * resident path is bounded the same way and has the same gap.
  *
- * The second rule holds the open slot for the gather alone rather than the whole
- * execution, so the next cohort is already collecting claims while the previous
- * one runs. A lane holding a block therefore cannot read the record to learn its
- * cohort filled; `released` answers that. Cohorts are promoted in sequence
- * order, so a holder of sequence `s` runs once `released > s`.
+ * The second rule frees the slot at the gather rather than at the end of
+ * execution, so a lane holding a block cannot read the record to learn that
+ * its cohort filled; `released` answers that, and a holder of sequence `s`
+ * runs once `released > s`.
+ *
+ * It does **not** mean the next cohort collects claims while this one runs.
+ * `percounter_sync_promote` opens one only once `completed` has reached
+ * `claimed_blocks`, so at most one cohort is outstanding at a time. That is
+ * what the freedom from deadlock rests on, and its cost is that a cohort's
+ * gather cannot overlap its predecessor's execution.
  */
 struct alignas(64) PercounterSyncQueue {
     // The open cohort. A graph with no cohort currently open pays one load on
