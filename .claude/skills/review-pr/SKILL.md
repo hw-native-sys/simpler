@@ -800,6 +800,57 @@ Note: this detects *include-path* changes, **not** edits to files that merely ha
 
 **What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_BUILD_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Appendix B blockquotes in Step 9.
 
+## Step 7.6: Feature Coverage Declarations (repo-specific)
+
+The onboard ST lanes (`_st-npu-a2a3.yml`, `_st-npu-a5.yml`) and the framework
+lanes (`_st-framework*.yml`) run pytest with `--environment-receipts
+--verify-feature-coverage --coverage-partition <partition>`. A selected case
+with a missing or conflicting declaration fails **collection**, turning the
+whole lane red before any test runs. Trigger this step when the diff adds or
+edits a case under `examples/` or `tests/st/`, or touches
+`simpler_setup/scene_test.py`, `simpler_setup/test_coverage.py`, or those
+workflows.
+
+For every added or modified case, check:
+
+1. **Declarations present.** Program is the default: a case declares
+   `runtime_product("kernel"|"auxiliary")` only when it is not Program. Kernel
+   cases also declare `execution_mode("eager"|"capture_replay")`; Program and
+   auxiliary cases are mode-free and an explicit mode on them is an error.
+   `SceneTestCase` defaults to Program; its `_st_execution_mode` default applies
+   only to Kernel. Plain Program tests need no product or mode marker.
+2. **Exactly one runtime identity.** From the `runtime` marker, the scene class
+   `_st_runtime`, or the parametrized `runtime` parameter. `coverage_runtime`
+   is for runtime-independent probes / legacy tests and must not carry a
+   feature claim.
+3. **Honest product.** Program = borrowed-context / limited-resource; Kernel =
+   worker-owned; Auxiliary probes must not claim delivered Kernel features or
+   satisfy mandatory groups. Framework (`torch_npu`) consumers must be Kernel.
+4. **Skip exceptions.** Only `coverage_skip(platforms=[...], reason="<exact>")`
+   on the default environment; the JUnit skip reason must match exactly; no
+   xfail; no framework skip exceptions; an exemption cannot replace a required
+   group member. New exceptions must be justified against the scoped-skip table
+   in `docs/ci.md`.
+5. **Obligations stay satisfiable.** Coverage groups are `program/<runtime>`,
+   `auxiliary/<runtime>` and `kernel/<runtime>/<mode>`. Default onboard sweeps
+   require Program and Kernel eager for both runtimes (plus native HBG capture
+   on A2/A3); framework sweeps require Kernel eager and their declared capture
+   groups. Flag removal or rename of the only case satisfying a mandatory
+   group, or a partition narrowed without CI-visible justification.
+6. **Receipt invariants** (only when the PR edits the coverage machinery): an
+   unexecuted case is never a pass; failure/incomplete summaries preserve
+   source-checked partial counts; a retry counts a node ID once and a failed
+   attempt cannot become a recovered pass.
+
+Authoritative detail: `docs/ci.md` → "Feature coverage verification",
+`simpler_setup/test_coverage.py` and `simpler_setup/test_environments.py`. To
+verify the actual selection before flagging a collection gap, use the
+`collection_inventory` collect-only command with the lane's explicit
+`--coverage-partition`.
+
+A missing declaration is a **blocking finding**, not an optional improvement:
+the lane cannot collect until it is fixed.
+
 ## Step 8: Optional Cross-Check with External CLI Reviewers
 
 **Opt-in only.** Skip this entire step unless the user's `/review-pr`

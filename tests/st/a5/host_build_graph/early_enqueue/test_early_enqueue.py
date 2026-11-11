@@ -766,6 +766,11 @@ class _A5EarlyEnqueueBase(SceneTestCase):
 
     CALLABLE = _CALLABLES
 
+    @pytest.mark.runtime_product("auxiliary")
+    @pytest.mark.coverage_skip(
+        reason="early enqueue drives its own multi-run sequences; see the cases below",
+        platforms=["a2a3", "a5"],
+    )
     def test_run(self):
         """Not the standard single-case golden path.
 

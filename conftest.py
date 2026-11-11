@@ -55,6 +55,7 @@ if sys.platform == "darwin":
 import pytest  # noqa: E402
 
 from simpler_setup import parallel_scheduler as _ps  # noqa: E402
+from simpler_setup import test_coverage as _test_coverage  # noqa: E402
 from simpler_setup import test_environments as _test_environments  # noqa: E402
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
@@ -229,6 +230,20 @@ def drain_host_log(tmp_path_factory):
 
 def pytest_addoption(parser):
     """Register CLI options."""
+    parser.addoption(
+        "--environment-receipts", action="store_true", help="Verify default-environment execution receipts"
+    )
+    parser.addoption("--environment-parent-plan", default=None, help=argparse.SUPPRESS)
+    parser.addoption("--environment-retry-case", action="append", default=[], help=argparse.SUPPRESS)
+    parser.addoption("--environment-shard-case", action="append", default=[], help=argparse.SUPPRESS)
+    parser.addoption("--require-execution-mode", action="append", default=[])
+    parser.addoption("--verify-feature-coverage", action="store_true", help="Check declared feature obligations")
+    parser.addoption(
+        "--coverage-partition",
+        choices=("main", "sdma", "sdma_fault", "all"),
+        default="all",
+        help="Coverage partition selected by this invocation; CI passes it explicitly",
+    )
     parser.addoption("--platform", action="store", default=None, help="Target platform (e.g., a2a3sim, a2a3)")
     parser.addoption("--device", action="store", default="0", help="Device ID or range (e.g., 0, 4-7)")
     parser.addoption(
@@ -646,6 +661,12 @@ def pytest_configure(config):
     )
 
     config.addinivalue_line("markers", "test_environment(name): required registered test environment")
+    config.addinivalue_line("markers", "execution_mode(name): Kernel eager or capture_replay")
+    config.addinivalue_line("markers", "runtime_product(name): Kernel or auxiliary product; Program is the default")
+    config.addinivalue_line("markers", "coverage_runtime(name): feature runtime without changing runtime selection")
+    config.addinivalue_line("markers", "coverage_skip(reason, platforms): scoped optional skip exception")
+    if config.getoption("--verify-feature-coverage") and not config.getoption("--environment-receipts"):
+        raise pytest.UsageError("Feature verification requires --environment-receipts")
     try:
         _test_environments.select_environment([], config.getoption("--test-environment"))
         _test_environments.validate_execution(config)
@@ -778,6 +799,11 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         environment_items, environment_deselected = _test_environments.select_environment(
             items, config.getoption("--test-environment", default="default")
         )
+        for option in ("--environment-shard-case", "--environment-retry-case"):
+            assigned = config.getoption(option, default=[])
+            if assigned:
+                environment_deselected.extend(item for item in environment_items if item.nodeid not in assigned)
+                environment_items = [item for item in environment_items if item.nodeid in assigned]
     except ValueError as error:
         raise pytest.UsageError(str(error)) from error
     keep: list = []
@@ -872,6 +898,10 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         return (sdma_last, 0 if level >= 3 else 1, item.nodeid)
 
     items.sort(key=sort_key)
+    try:
+        _test_coverage.remember_candidates(config, items)
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from error
 
     # The automatic rankN/dN layout is scoped to one same-host L3 Worker. Every
     # level above NODE owns several L3 Workers, each of which numbers its local
@@ -1114,6 +1144,7 @@ def _resource_child_command(spec, device_ids, platform, manual_mode, cfg):
     for selector in cfg.getoption("--case", default=None) or []:
         command.extend(["--case", str(selector)])
     command.extend(_resource_child_diagnostic_argv(cfg))
+    command.extend(_test_environments.child_receipt_argv(cfg, [spec.nodeid]))
     return command
 
 
@@ -1321,7 +1352,7 @@ def _emit_resource_failure_summary(
         print("  full output is in the Resource child group above", flush=True)
 
 
-def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
+def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912, PLR0915
     """Run Resource → L2 → leftover phases.
 
     The Resource phase dispatches every item that needs a dedicated
@@ -1345,7 +1376,10 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     manual_mode = cfg.getoption("--manual", default="exclude")
     max_parallel = _resolve_max_parallel(cfg, platform or "", device_ids)
 
-    base_args = _base_pytest_argv(session, strip_options=("--exclude-level", "--runtime", "--level"))
+    strip_options = ["--exclude-level", "--runtime", "--level"]
+    if getattr(cfg, "_environment_plan", None):
+        strip_options.extend(["--junitxml", "--junit-xml", "--environment-parent-plan"])
+    base_args = _base_pytest_argv(session, strip_options=strip_options)
     cwd = session.config.invocation_params.dir
 
     # ----- Phase 1: Resource (L3 classes + standalone resource functions) -----
@@ -1435,6 +1469,18 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         )
     for rt in l2_runtimes:
         cmd = base_args + ["--resource-child", "--runtime", rt, "--level", "2"]
+        members = (
+            [
+                item.nodeid
+                for item in session.items
+                if getattr(getattr(item, "cls", None), "_st_runtime", None) == rt
+                and _item_scene_level(item) == SceneTestLevel.CHIP
+            ]
+            if getattr(cfg, "_environment_plan", None)
+            else []
+        )
+        receipt_args = _test_environments.child_receipt_argv(cfg, members)
+        cmd += receipt_args
         if xdist_active:
             cmd += xdist_options
         # Per-runtime sink for the in-process poison guards (issue #1110). Each
@@ -1468,11 +1514,14 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         # guards registered, never from "outcome == skipped", so legitimate
         # skips are untouched.
         deferred = _read_l2_poison_sink(sink_path)
+        retry_base = base_args
+        if deferred and receipt_args:
+            retry_base = base_args + _test_environments.retry_receipt_argv(cfg, Path(sink_path), receipt_args[-1])
         try:
             os.unlink(sink_path)
         except FileNotFoundError:
             pass
-        if deferred and _l2_poison_retry(base_args, rt, deferred, cwd) != 0:
+        if deferred and _l2_poison_retry(retry_base, rt, deferred, cwd) != 0:
             l2_failed = True
             print(f"*** FAIL: L2 {rt} poison-retry — expand group above ***", flush=True)
             if fail_fast:
@@ -1627,6 +1676,10 @@ _ST_CALL_EXCINFO = "_st_call_excinfo"
 # call.excinfo for the side effect and don't touch the result.
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
+    if call.when == "call":
+        for index, (key, _) in enumerate(item.user_properties):
+            if key == "simpler_executed":
+                item.user_properties[index] = (key, "true")
     yield
     # A fixture that depends on st_worker may dispatch during setup. Preserve
     # that error before st_worker's teardown finalizer decides whether its
