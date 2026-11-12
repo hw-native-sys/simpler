@@ -281,7 +281,7 @@ inline StateSelection select_percounter_state(
         payload->global_context.async_group_offset =
             layout.async_groups_offset + first_record * sizeof(pto2::resident::AsyncGroupData);
         payload->global_context.async_group_index = static_cast<uint32_t>(first_record);
-        payload->global_context.async_reserved = 0;
+        payload->global_context.async_output_capture_refused = 0;
     }
 
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);

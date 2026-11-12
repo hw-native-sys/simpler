@@ -380,12 +380,17 @@ percounter_publish_completion(const LaneConfig &cfg, const PercounterTask &task,
 }
 
 /**
- * The mutable fields of a deferred-completion record all sit in its first
- * cache line -- `state` ends it at offset 60, and the identity and entry
- * bounds behind it never change -- so the seal and the settle each publish
- * one line, not two. The resident scheduler writes back the same prefix.
+ * The fields a dispatch mutates are the record's leading run -- `count` opens
+ * it and `state` closes it -- and the identity and entry bounds behind them
+ * never change after initialization. That run fits inside the alignment the
+ * record is laid out on, so it has the record's first cache line to itself and
+ * the seal and the settle each publish one line, not two. The resident
+ * scheduler writes back the same prefix.
  */
-static_assert(offsetof(pto2::resident::AsyncGroupData, sdma_guards_offset) == 64);
+static_assert(
+    offsetof(pto2::resident::AsyncGroupData, state) + sizeof(pto2::resident::AsyncPublicationState) <=
+    pto2::resident::ASYNC_RECORD_ALIGNMENT
+);
 
 /**
  * Lay down this lane's deferred-completion records and hand back the first.
@@ -419,7 +424,6 @@ percounter_init_async_records(__gm__ PercounterControl *control, int block_idx) 
         record->block_index = 0;
         record->subtask_slot = 0;
         record->capacity = static_cast<uint16_t>(capacity);
-        record->reserved = 0;
         record->entries_bytes = static_cast<uint32_t>(entry_bytes);
         record->count = 0;
         record->error_code = SIMPLER_ERROR_NONE;
