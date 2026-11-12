@@ -101,6 +101,9 @@ void fork_hygiene_once() { std::call_once(g_fork_hygiene_once, apply_env_default
 // ---------------------------------------------------------------------------
 
 Worker::Worker(int32_t level, uint64_t heap_ring_size) :
+    Worker(level, heap_ring_size, {}) {}
+
+Worker::Worker(int32_t level, uint64_t heap_ring_size, const std::vector<int> &heap_fds) :
     level_(level) {
     // Fork hygiene runs before the HeapRing mmap so the env-var defaults
     // apply to any thread-pool library that observes them at library init.
@@ -109,7 +112,7 @@ Worker::Worker(int32_t level, uint64_t heap_ring_size) :
     // mmap the HeapRing region here, in the ctor, so Python callers can
     // construct the Worker before fork()-ing children. The children
     // inherit the MAP_SHARED region at the same virtual address.
-    allocator_.init(heap_ring_size, ALLOC_TIMEOUT_MS);
+    allocator_.init_shared(heap_ring_size, heap_fds, ALLOC_TIMEOUT_MS);
 }
 
 Worker::~Worker() {

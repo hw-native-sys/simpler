@@ -2278,7 +2278,8 @@ NB_MODULE(_task_interface, m) {
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
         .value("FORK_COW", BackendKind::FORK_COW)
-        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE)
+        .value("SHARED_FD_SLICE", BackendKind::SHARED_FD_SLICE);
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire

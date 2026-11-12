@@ -289,8 +289,11 @@ d  = orch.alloc_child_tensor(worker, (M, N), dtype)  # kind4: DEVICE_MALLOC on t
 
 `create_buffer` returns a `Buffer` backed by a POSIX shm the consumer maps
 lazily on first receipt of a tensor over it (map-once, by identity);
-`alloc_shared_tensor` returns a runtime-managed intermediate over a FORK_SHM ring
-VA. `alloc_child_tensor` allocates device memory on a specific next-level worker
+`alloc_shared_tensor` returns a runtime-managed intermediate. After direct A5 L2 initialization, a top-level A5 `tensormap_and_ringbuffer` L3 Worker starts
+its chip children in new interpreters. These children require explicit shared inputs from
+`create_buffer`. Managed intermediates use `SHARED_FD_SLICE` to locate the backing and offset
+independently of the consumer address. Forked chip children retain `FORK_SHM` for managed intermediates.
+`alloc_child_tensor` allocates device memory on a specific next-level worker
 and wraps the pointer; its `.base` is the device pointer (the `orch.copy_to`
 destination), and a tensor over it must be dispatched only to that worker.
 
@@ -437,7 +440,8 @@ gates, or keys on it.
 
 | Backend | Materializes to | `body` must be | Used for |
 | ------- | --------------- | -------------- | -------- |
-| `POSIX_SHM` | a named shm mapped into the consumer | the shm name: 1–32 bytes of printable ASCII, no `/` | `create_buffer` / `alloc_shared_tensor` |
+| `POSIX_SHM` | a named shm mapped into the consumer | the shm name: 1–32 bytes of printable ASCII, no `/` | `create_buffer` |
+| `SHARED_FD_SLICE` | an allocation-bounded view of a shared heap mapping | producer PID (u32), inherited fd (u32), slab offset (u64), all LE | `Orchestrator.alloc` / `alloc_shared_tensor` in an L3 Worker with exec chip children |
 | `FORK_SHM` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork `MAP_SHARED` host buffer (e.g. `share_memory_()`), writable from the child |
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |

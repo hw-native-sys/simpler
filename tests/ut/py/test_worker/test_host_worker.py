@@ -851,11 +851,11 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
             assert shm.buf is not None
             worker_mod._PIPELINE_LEASE_FMT.pack_into(shm.buf, worker_mod._OFF_PIPELINE_LEASE, depth, granted_sets, 0)
 
-    def fake_fork() -> int:
-        startup_events.append(("fork",))
+    def fake_launch(*_args) -> int:
+        startup_events.append(("launch",))
         return next(fork_pids)
 
-    monkeypatch.setattr(worker_mod.os, "fork", fake_fork)
+    monkeypatch.setattr(worker, "_launch_chip_process", fake_launch)
     monkeypatch.setattr(worker_mod._simpler_log, "get_current_config", lambda: 60)
     monkeypatch.setattr(
         worker_mod,
@@ -898,7 +898,7 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
     )
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
-    assert startup_events[1:] == [("fork",), ("fork",), ("writer",)]
+    assert startup_events[1:] == [("launch",), ("launch",), ("writer",)]
 
 
 def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monkeypatch):
@@ -8243,6 +8243,23 @@ class TestScope:
 
 
 class TestOrchAlloc:
+    def test_only_zero_byte_alloc_returns_empty_buffer(self):
+        worker = Worker(level=3, num_sub_workers=1)
+        try:
+            worker.init()
+
+            def graph(orch, _args, _config):
+                for allocate in (orch.alloc, worker.alloc_shared_tensor):
+                    empty = allocate((0,), DataType.FLOAT32)
+                    assert empty.base == empty.nbytes == 0
+                    # This positive size fits uint64 before alignment but cannot back a buffer.
+                    with pytest.raises(ValueError):
+                        allocate((1073741823, 1073741825, 16), DataType.UINT8)
+
+            worker.run(graph)
+        finally:
+            worker.close()
+
     def test_alloc_returns_valid_tensor(self):
         """alloc returns a Tensor whose data ptr is non-zero and writeable."""
         captured = []

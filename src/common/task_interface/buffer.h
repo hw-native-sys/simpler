@@ -86,7 +86,7 @@ enum class AccessMode : uint8_t {
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
 // import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
-// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; 7.. reserved
+// P2 and rejected on decode in P1. Values 0–7 are assigned; 8.. reserved
 // (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
@@ -106,6 +106,7 @@ enum class BackendKind : uint8_t {
     DEVICE_MALLOC = 4,
     FORK_COW = 5,
     VMM_SHAREABLE = 6,
+    SHARED_FD_SLICE = 7,
 };
 
 /**
@@ -259,7 +260,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");
-    if (h.backend_kind > static_cast<uint8_t>(BackendKind::VMM_SHAREABLE))
+    if (h.backend_kind > static_cast<uint8_t>(BackendKind::SHARED_FD_SLICE))
         reject("invalid BufferDescriptor: backend_kind out of range");
     if (h.body_len > DESC_MAX_BYTES) reject("invalid BufferDescriptor: body_len exceeds DESC_MAX_BYTES");
     if (h.identity.generation == 0) reject("invalid BufferDescriptor: generation 0 is reserved (uninitialized)");
@@ -309,6 +310,19 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
                 reject("invalid BufferDescriptor: POSIX_SHM shm name must be printable ASCII without '/'");
             }
         }
+        break;
+    }
+    case BackendKind::SHARED_FD_SLICE: {
+        if (h.body_len != 16) reject("invalid BufferDescriptor: SHARED_FD_SLICE body must be 16 bytes");
+        uint32_t pid = 0;
+        uint32_t fd = 0;
+        uint64_t offset = 0;
+        std::memcpy(&pid, h.body, sizeof(pid));
+        std::memcpy(&fd, h.body + 4, sizeof(fd));
+        std::memcpy(&offset, h.body + 8, sizeof(offset));
+        if (pid == 0 || fd < 3 || fd > INT32_MAX)
+            reject("invalid BufferDescriptor: SHARED_FD_SLICE process or fd is invalid");
+        if (offset > UINT64_MAX - h.nbytes) reject("invalid BufferDescriptor: SHARED_FD_SLICE span overflows uint64");
         break;
     }
     case BackendKind::VMM_SHAREABLE: {
