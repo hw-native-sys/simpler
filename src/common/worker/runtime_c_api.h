@@ -189,7 +189,7 @@ typedef enum PipelineResourceClass {
     /* The device writes it and the host must read it back at an address it
        knows. Keyed by run epoch rather than pipeline slot, so an unobserved
        result is not overwritten by a successor. Declared here to reserve the
-       value; no runtime declares it before the Reported pool exists. */
+       value; no runtime declares it yet. */
     PTO_PIPELINE_REPORTED = 3,
     /* Shared scratch owned by the platform's ScratchPool rather than by an
        arena bank. Only the GM heap may use it: the pool serves the region
@@ -796,9 +796,11 @@ int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceRe
 /**
  * Let this context size its own run concurrency from the resources it proves.
  *
- * Asked once, before anything is prepared, by a caller that was given no
- * explicit depth and no explicit byte budget. A context that is never asked
- * admits exactly what it was granted, as it did before.
+ * Asked once, before anything is prepared. A caller that configured no explicit
+ * depth leaves the size to the context; a configured workspace byte budget, when
+ * one is in force, becomes the budget the exploratory set is measured against.
+ * A context that is never asked admits exactly what it was granted, as it did
+ * before.
  *
  * @return 0 when the context will size itself, PTO_RUNTIME_ERR_UNSUPPORTED on a
  *         context that cannot (no managed workspace, or already prepared work)
@@ -810,8 +812,10 @@ int simpler_enable_automatic_admission_ctx(DeviceContextHandle ctx);
  *
  * A count of identities, never a byte figure. One until a run has completed its
  * resource commit; it then grows with what the context has proved and shrinks
- * when those resources are reclaimed or become unprovable. Equal to the grant
- * on a context that does not size itself.
+ * when those resources are reclaimed or become unprovable. A workspace byte
+ * budget withholds only the exploratory set while one more set of the largest
+ * proven size would not fit; a proven slot is never withdrawn. Equal to the
+ * grant on a context that does not size itself.
  */
 uint32_t simpler_admissible_run_resource_sets_ctx(DeviceContextHandle ctx);
 

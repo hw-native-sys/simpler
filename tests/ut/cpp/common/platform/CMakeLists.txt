@@ -213,6 +213,10 @@ simpler_ut_platform_case(test_ccu_completion.cpp SINGLE BARE
 
 simpler_ut_platform_case(test_ccu_device_submission.cpp SINGLE BARE
     INCLUDES ${SIMPLER_SRC}/common)
+# ReportedPool lifecycle: host-only, with the sim allocator as its byte source.
+platform_single_case(test_reported_pool.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/memory_allocator.cpp ${HOST_LOG_TEST_SOURCES}
+    INCLUDES ${SIMPLER_LOG_DIR})
 
 # Each of these covers a header-only piece of the arch's platform surface and
 # needs nothing compiled in but the CANN platform stand-in.

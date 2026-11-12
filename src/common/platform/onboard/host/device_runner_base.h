@@ -87,7 +87,9 @@
 #include "host/kernel_entry_validation.h"
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
+#include "host/reported_pool.h"
 #include "host/auto_admission.h"
+#include "host/run_resource_cost.h"
 #include "host/run_resource_growth.h"
 #include "host/workspace_manager.h"
 #include "host/pmu_collector.h"
@@ -120,14 +122,6 @@ struct PreparedSubmissionStorage {
     std::unique_ptr<RunCompletionFence> fence;
     std::unique_ptr<RunCallerOrder> caller_order;
     void *device_wall{nullptr};
-    void *device_result{nullptr};
-    // A failed allocation's nonnull output is owned, but cannot be initialized
-    // until checked release succeeds. Copy failures keep a valid allocation.
-    int result_allocation_rc{0};
-    bool result_initialized{false};
-    bool retain_replay_evidence{false};
-    bool evidence_observed{false};
-    NativeInvocationEvidence::Snapshot observed_evidence{};
 };
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
@@ -708,7 +702,9 @@ public:
      * borrowed one and a simulated one never ask, and every admission figure
      * below then reports what it reported before.
      */
-    void enable_automatic_admission() { auto_admission_.configure(granted_run_resource_sets_); }
+    void enable_automatic_admission() {
+        auto_admission_.configure(granted_run_resource_sets_, workspace_.limit_bytes());
+    }
 
     bool automatic_admission_enabled() const { return auto_admission_.enabled(); }
 
@@ -722,8 +718,35 @@ public:
      */
     uint32_t admissible_run_resource_sets() const {
         if (!auto_admission_.enabled()) return static_cast<uint32_t>(granted_run_resource_sets_);
-        return auto_admission_.affordable_sets(static_cast<uint32_t>(granted_run_resource_sets_));
+        // The ledger's own charge is read only where a budget makes it decide
+        // something. The proof-only path stays a lock-free read of this
+        // state, which is what it was before any byte figure existed; the
+        // ledger can be held across a device allocation, and this report is
+        // published on the run-completion path.
+        if (!auto_admission_.budget_enforced())
+            return auto_admission_.affordable_sets(static_cast<uint32_t>(granted_run_resource_sets_));
+        return auto_admission_.affordable_sets(
+            static_cast<uint32_t>(granted_run_resource_sets_), workspace_.reserved_bytes()
+        );
     }
+
+    /**
+     * What the last preparation retained on `pipeline_slot` committed.
+     *
+     * Zero until a preparation has retained its resources on the slot since the
+     * grant was installed, and after an explicit proof withdrawal. This is the
+     * figure `note_run_resources_proven` hands to admission, not a live
+     * footprint.
+     */
+    RunResourceCost run_resource_cost(uint32_t pipeline_slot) const {
+        const RunResourceCost *cost = run_resource_costs_.find(pipeline_slot);
+        return cost != nullptr ? *cost : RunResourceCost{};
+    }
+
+    /** The byte policy automatic admission measures the exploratory set against. */
+    uint64_t admission_budget_bytes() const { return auto_admission_.budget_bytes(); }
+
+    bool admission_budget_enforced() const { return auto_admission_.budget_enforced(); }
 
     /**
      * Give up every resource a saved plan still holds, at whatever stage it
@@ -759,7 +782,10 @@ public:
     void release_plan_epoch_refs(uint32_t pipeline_slot, std::uint64_t run_epoch);
 
     /** Withdraw a slot's resource proof. */
-    void clear_run_resource_proof(uint32_t pipeline_slot) { auto_admission_.clear_proven(pipeline_slot); }
+    void clear_run_resource_proof(uint32_t pipeline_slot) {
+        auto_admission_.clear_proven(pipeline_slot);
+        if (RunResourceCost *cost = run_resource_costs_.find(pipeline_slot); cost != nullptr) *cost = RunResourceCost{};
+    }
 
     /**
      * Return the storage of every run-resource set nothing can reach, so a
@@ -1246,7 +1272,7 @@ public:
      * transfer happened.
      */
     int read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
-    void release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved);
+    int release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved);
 
     /**
      * What this slot's cached region says about the run whose epoch is
@@ -3106,6 +3132,9 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
+    // Run-result regions keyed by run epoch, so a successor reusing the slot
+    // cannot inherit or overwrite an unobserved predecessor result.
+    ReportedPool reported_pool_{mem_alloc_};
 
     // The device allocations a caller minted through this context, and which
     // runs still hold them — see host/caller_device_buffers.h. Only the
@@ -3270,6 +3299,7 @@ protected:
         RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
         RunResourceSlots<bool>::Storage device_timing_armed;
         RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
+        RunResourceSlots<RunResourceCost>::Storage run_resource_costs;
         RunBoundaryLedger::Storage run_boundaries_observed;
         QueuedStreamWaits::Storage queued_waits;
         RunBoundaryMarks::Storage boundary_marks;
@@ -3420,16 +3450,23 @@ protected:
     // Preparation cannot overwrite an armed slot. Failed publication leaves it
     // unarmed, so readback cannot misattribute a predecessor's timing.
     RunResourceSlots<bool> device_timing_armed_;
-    // Each live call owns its original result address and optional host read.
-    // An idle current-slot allocation is retained for sequential reuse.
+    // Each live call owns its epoch's result lease and optional host read. The
+    // pool keeps one idle region for a sequential successor.
     struct RunResultStorage {
         uint32_t pipeline_slot{UINT32_MAX};
-        void *device_ptr{nullptr};
-        std::shared_ptr<PreparedSubmissionStorage> backing;
+        ReportedPool::Lease lease;
         DeviceRunResultRegion region{};
         RunRecordRead read{RunRecordRead::NotAttempted};
         int transfer_rc{0};
         bool initialized{false};
+        bool retain_evidence{false};
+        bool evidence_observed{false};
+        // The run's own lease ends at finalize; each external retain adds one.
+        // The pool region stays owned until both are gone.
+        size_t external_leases{0};
+        bool internal_released{false};
+        bool externally_retained{false};
+        NativeInvocationEvidence::Snapshot observed_evidence{};
     };
     // Owned by the live call, independently of its reusable execution slot.
     std::unordered_map<uint64_t, RunResultStorage> run_result_storage_;
@@ -3474,6 +3511,10 @@ protected:
     // bind is preparation and a prepared successor prepares while its
     // predecessor still owns the collectors — see host_phase_run_state.h.
     RunResourceSlots<HostPhaseRunState> host_phase_runs_;
+    // What each set committed when its run proved the slot, measured at the
+    // one point the preparation's resources are all committed and before the
+    // heap lease moves into the published resources.
+    RunResourceSlots<RunResourceCost> run_resource_costs_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     // Reference-counted for the whole of PMU collection, which spans every
@@ -3489,8 +3530,36 @@ protected:
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
     bool pmu_enabled_{false};                                             // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                         // diagnostic artifact root directory
+protected:
+    // Test-visible snapshot of one epoch's result region. Production callers
+    // reach the same state through the run-result API.
+    struct ResultRegionSnapshot {
+        bool found{false};
+        void *device_ptr{nullptr};
+        bool initialized{false};
+        bool retain_evidence{false};
+        bool evidence_observed{false};
+        NativeInvocationEvidence::Snapshot observed_evidence{};
+    };
+    ResultRegionSnapshot result_region_snapshot(uint64_t run_epoch, uint32_t pipeline_slot) const;
+    // The most recent evidence read, kept after its epoch is released so the
+    // observation remains inspectable. Test-visible; production reads the log.
+    const ResultRegionSnapshot &last_observed_result_region() const { return last_observed_result_region_; }
+    void *idle_result_device_ptr() const { return reported_pool_.idle_device_ptr(); }
+    bool idle_result_initialized() const { return reported_pool_.idle_region_initialized(); }
+    void *pending_failed_result_device_ptr() const { return reported_pool_.pending_failed_device_ptr(); }
+    // Called under run_result_mu_; records that this epoch's evidence tail is
+    // worth reading even when the run is not a diagnostic recording.
+    void set_result_retain_evidence(uint64_t run_epoch, uint32_t pipeline_slot);
+
 private:
     int prepare_submission_slot_resources(uint32_t pipeline_slot);
-    // Called under run_result_mu_; initialization creates no epoch observation.
-    int initialize_result_storage(PreparedSubmissionStorage &backing);
+    // Called under run_result_mu_; no-op when the epoch has no unread evidence.
+    int read_result_evidence(RunResultStorage &storage);
+    // Called under run_result_mu_; releases the pool region once every lease
+    // has ended and the evidence has been read.
+    int finish_result_release(RunResultStorage &storage);
+    void note_result_external_lease_started(const NativeRunIdentity &identity);
+    int note_result_external_lease_ended(const NativeRunIdentity &identity);
+    ResultRegionSnapshot last_observed_result_region_;
 };

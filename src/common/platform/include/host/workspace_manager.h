@@ -319,6 +319,12 @@ public:
         return has_limit_;
     }
 
+    /** The finite limit in force, or zero when management carries none. */
+    uint64_t limit_bytes() const {
+        std::scoped_lock lk(mu_);
+        return has_limit_ ? limit_bytes_ : 0;
+    }
+
     /**
      * Acquire a block for one consumer region, reusing an existing generation
      * when it both fits and has no consumer left.

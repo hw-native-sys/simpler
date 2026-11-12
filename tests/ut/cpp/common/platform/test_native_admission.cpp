@@ -717,7 +717,7 @@ TEST_F(NativeAdmissionTest, OptionalResultNativeKernelPreparationsDoNotBindAPriv
         const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
         EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_data_base, 0u);
         EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_epoch, attempt.descriptor.run_epoch);
-        EXPECT_FALSE(runner.result_storage().retain_replay_evidence);
+        EXPECT_FALSE(runner.result_region().retain_evidence);
         const size_t downloads = control().d2h_calls;
         ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
         EXPECT_EQ(control().d2h_calls, downloads);
@@ -2345,6 +2345,80 @@ TEST_F(NativeAdmissionTest, PerRegionBanksCommitEachRegionToItsOwnBank) {
     EXPECT_EQ(runner.finalize(), 0);
 }
 
+// A proven set reports what its commit committed, from the three bank regions
+// the set selected and the run-result region of its epoch. The sizes come from
+// the runtime's own arena request, so the case names them by source rather
+// than by a fixed number.
+TEST_F(NativeAdmissionTest, AProvenSetReportsTheBytesItsCommitCommitted) {
+    Runner runner;
+    ASSERT_EQ(runner.prepare_result(0, 10), 0);
+    Attempt attempt(runner, 0, 10);
+    ASSERT_EQ(attempt.prepare(), 0);
+    const RunResourceCost cost = runner.run_resource_cost(0);
+    EXPECT_EQ(cost.image_bytes, runner.bank_region_size(0, 2));
+    EXPECT_EQ(cost.shared_memory_bytes, runner.bank_region_size(0, 1));
+    EXPECT_GT(cost.heap_bytes, 0u);
+    EXPECT_EQ(cost.reported_bytes, sizeof(NativeInvocationResultStorage));
+    EXPECT_EQ(cost.budgeted_bytes(), cost.heap_bytes + cost.image_bytes + cost.shared_memory_bytes);
+    EXPECT_GT(cost.total_bytes(), 0u);
+    // The proof carries the same figure into the admission state.
+    EXPECT_EQ(runner.admission_proven_cost(0).total_bytes(), cost.total_bytes());
+    // No budget was configured, so the proof still offers the exploratory set.
+    EXPECT_EQ(runner.admissible_run_resource_sets(), 2u);
+}
+
+// The workspace limit is the byte policy admission measures against; a limit
+// installed before automatic admission is enabled is the one it reports.
+TEST_F(NativeAdmissionTest, AWorkspaceLimitBecomesTheAdmissionBudget) {
+    Runner runner(true, 12 * kUnit);
+    ASSERT_TRUE(runner.admission_budget_enforced());
+    EXPECT_EQ(runner.admission_budget_bytes(), 12 * kUnit);
+    EXPECT_EQ(runner.admissible_run_resource_sets(), 1u);
+}
+
+// A set proven under a budget larger than its commit but smaller than two of
+// them keeps its proof and withholds only the exploratory set: one more set of
+// the proven size cannot fit beside what the ledger already charges.
+TEST_F(NativeAdmissionTest, AWorkspaceBudgetWithholdsTheExploratorySetThatCannotFit) {
+    // The first run is prepared with admission off, so the arena it sizes is a
+    // measured budget rather than a guessed one. The second run is the one that
+    // proves the slot under that budget.
+    Runner runner(true, 0, /*automatic_admission=*/false);
+    {
+        Attempt warm(runner, 0, 9);
+        ASSERT_EQ(warm.prepare(), 0);
+    }
+    const RunResourceCost warm_cost = runner.run_resource_cost(0);
+    ASSERT_GT(warm_cost.budgeted_bytes(), 0u);
+    const uint64_t charged = runner.charged();
+    ASSERT_TRUE(runner.set_workspace_limit(charged + warm_cost.budgeted_bytes() - 1));
+    runner.enable_automatic_admission();
+    ASSERT_TRUE(runner.automatic_admission_enabled());
+    ASSERT_TRUE(runner.admission_budget_enforced());
+    Attempt admitted(runner, 0, 10);
+    ASSERT_EQ(admitted.prepare(), 0);
+    EXPECT_EQ(runner.admissible_run_resource_sets(), 1u);
+}
+
+// The same measured budget with room for another proven set keeps the
+// exploratory set offered, so the rule withholds only what cannot fit.
+TEST_F(NativeAdmissionTest, AWorkspaceBudgetThatCanHoldAnotherProvenSetKeepsTheExploratorySet) {
+    Runner runner(true, 0, /*automatic_admission=*/false);
+    {
+        Attempt warm(runner, 0, 9);
+        ASSERT_EQ(warm.prepare(), 0);
+    }
+    const RunResourceCost warm_cost = runner.run_resource_cost(0);
+    ASSERT_GT(warm_cost.budgeted_bytes(), 0u);
+    const uint64_t charged = runner.charged();
+    ASSERT_TRUE(runner.set_workspace_limit(charged + warm_cost.budgeted_bytes() + 1));
+    runner.enable_automatic_admission();
+    ASSERT_TRUE(runner.automatic_admission_enabled());
+    Attempt admitted(runner, 0, 10);
+    ASSERT_EQ(admitted.prepare(), 0);
+    EXPECT_EQ(runner.admissible_run_resource_sets(), 2u);
+}
+
 TEST_F(NativeAdmissionTest, NativePrepareParksAndDestroysTheAttemptBeforeAnEarlyRetryAttachFailure) {
     Runner runner;
     ASSERT_EQ(staging(runner, 0, 10, 20 * kUnit), 0);
@@ -2869,17 +2943,17 @@ TEST_F(NativeAdmissionTest, ColdResultCopyFailureRetainsAllocationForInitializat
     Runner runner;
     control().copy_rc = -73;
     EXPECT_EQ(runner.prepare_result(), -73);
-    auto &owner = runner.result_storage();
-    void *allocation = owner.device_result;
+    auto &owner = runner;
+    void *allocation = owner.result_region().device_ptr;
     EXPECT_NE(allocation, nullptr);
-    EXPECT_FALSE(owner.result_initialized);
+    EXPECT_FALSE(owner.result_region().initialized);
     const auto allocations = control().allocations;
     control().copy_rc = 0;
     ASSERT_EQ(runner.prepare_result(), 0);
-    EXPECT_EQ(owner.device_result, allocation);
+    EXPECT_EQ(owner.result_region().device_ptr, allocation);
     EXPECT_EQ(control().allocations, allocations);
-    EXPECT_TRUE(owner.result_initialized);
-    auto *storage = static_cast<NativeInvocationResultStorage *>(owner.device_result);
+    EXPECT_TRUE(owner.result_region().initialized);
+    auto *storage = static_cast<NativeInvocationResultStorage *>(owner.result_region().device_ptr);
     EXPECT_EQ(storage->result.published, 0);
     EXPECT_EQ(storage->evidence.read_after_exit().kind, NativeInvocationEvidence::Kind::None);
     EXPECT_EQ(runner.close_result(), 0);
@@ -2888,27 +2962,27 @@ TEST_F(NativeAdmissionTest, ColdResultCopyFailureRetainsAllocationForInitializat
 TEST_F(NativeAdmissionTest, FailedEvidenceReadKeepsBackingThenRetryObservesAndReleasesOnce) {
     Runner runner;
     ASSERT_EQ(runner.prepare_result(), 0);
-    auto &owner = runner.result_storage();
-    auto *storage = static_cast<NativeInvocationResultStorage *>(owner.device_result);
+    auto &owner = runner;
+    auto *storage = static_cast<NativeInvocationResultStorage *>(owner.result_region().device_ptr);
     const uint8_t payload[] = {9, 7};
     // No device tasks exist in this transport fixture: the owner has exclusive
     // access and no pending device use, independently of the stored verdict.
     storage->evidence.begin_after_exit();
     storage->evidence.complete({DeviceRunVerdict::Error, -51, DeviceRunCodeSource::Header}, payload, 2, true);
-    void *allocation = owner.device_result;
+    void *allocation = owner.result_region().device_ptr;
     const auto bytes = control().bytes;
     control().copy_rc = -77;
     EXPECT_EQ(runner.close_result(), -77);
-    EXPECT_EQ(owner.device_result, allocation);
+    EXPECT_EQ(owner.result_region().device_ptr, allocation);
     EXPECT_EQ(control().bytes, bytes);
-    EXPECT_FALSE(owner.evidence_observed);
+    EXPECT_FALSE(owner.result_region().evidence_observed);
     control().copy_rc = 0;
     ASSERT_EQ(runner.close_result(), 0);
-    EXPECT_EQ(owner.device_result, nullptr);
-    EXPECT_TRUE(owner.evidence_observed);
-    EXPECT_EQ(owner.observed_evidence.terminal.code, -51);
-    EXPECT_EQ(owner.observed_evidence.payload[0], 9);
-    EXPECT_EQ(owner.observed_evidence.payload_bytes, 2);
+    EXPECT_EQ(owner.result_region().device_ptr, nullptr);
+    EXPECT_TRUE(owner.last_observed_result_region().evidence_observed);
+    EXPECT_EQ(owner.last_observed_result_region().observed_evidence.terminal.code, -51);
+    EXPECT_EQ(owner.last_observed_result_region().observed_evidence.payload[0], 9);
+    EXPECT_EQ(owner.last_observed_result_region().observed_evidence.payload_bytes, 2);
     const auto remaining = control().bytes;
     control().copy_rc = -88;
     EXPECT_EQ(runner.close_result(), 0);
@@ -2919,26 +2993,20 @@ TEST_F(NativeAdmissionTest, FailedEvidenceReadKeepsBackingThenRetryObservesAndRe
 TEST_F(NativeAdmissionTest, FailedResultFreeRetainsObservedEvidenceWithoutRepeatingReadback) {
     Runner runner;
     ASSERT_EQ(runner.prepare_result(), 0);
-    auto &owner = runner.result_storage();
-    auto *storage = static_cast<NativeInvocationResultStorage *>(owner.device_result);
+    auto *storage = static_cast<NativeInvocationResultStorage *>(runner.result_region().device_ptr);
     storage->evidence.begin_after_exit();
     storage->evidence.complete({DeviceRunVerdict::Error, -61, DeviceRunCodeSource::ThreadRc}, nullptr, 0, true);
-    void *allocation = owner.device_result;
     const auto bytes = control().bytes;
     control().free_rc = -91;
-    EXPECT_EQ(runner.close_result(), -91);
-    EXPECT_EQ(owner.device_result, allocation);
+    // The pool frees the region at finalize, which is now the failed-free path.
+    EXPECT_EQ(runner.finalize(), -91);
     EXPECT_EQ(control().bytes, bytes);
-    EXPECT_TRUE(owner.evidence_observed);
-    EXPECT_EQ(owner.observed_evidence.terminal.code, -61);
+    EXPECT_TRUE(runner.last_observed_result_region().evidence_observed);
+    EXPECT_EQ(runner.last_observed_result_region().observed_evidence.terminal.code, -61);
     control().free_rc = 0;
     control().copy_rc = -77;
-    EXPECT_EQ(runner.close_result(), 0);
-    EXPECT_EQ(owner.device_result, nullptr);
-    EXPECT_EQ(owner.observed_evidence.terminal.code, -61);
-    const auto remaining = control().bytes;
-    EXPECT_EQ(runner.close_result(), 0);
-    EXPECT_EQ(control().bytes, remaining);
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_EQ(control().bytes, 0u);
     control().copy_rc = 0;
 }
 
@@ -2946,12 +3014,10 @@ TEST_F(NativeAdmissionTest, ContextFinalizeCannotSweepResultBackingAfterReadOrFr
     for (bool fail_free : {false, true}) {
         Runner runner;
         ASSERT_EQ(runner.prepare_result(), 0);
-        void *allocation = runner.result_storage().device_result;
         const auto bytes = control().bytes;
         control().copy_rc = fail_free ? 0 : -77;
         control().free_rc = fail_free ? -91 : 0;
         EXPECT_EQ(runner.finalize(), fail_free ? -91 : -77);
-        EXPECT_EQ(runner.result_storage().device_result, allocation);
         EXPECT_EQ(control().bytes, bytes);
         control().copy_rc = 0;
         control().free_rc = 0;
@@ -3415,9 +3481,7 @@ TEST_F(NativeAdmissionTest, OptionalResultNativeRecordingKeepsFiveModelsWithoutP
         );
     };
     const auto initial_records = record_allocations();
-    const std::array<void *, 2> warm_records{
-        runner.result_storage(0).device_result, runner.result_storage(1).device_result
-    };
+    const std::array<void *, 2> warm_records{runner.result_region(0).device_ptr, runner.result_region(1).device_ptr};
     const auto result_uploads = [&] {
         return std::count_if(control().uploads.begin(), control().uploads.end(), [&](const auto &entry) {
             return entry.first != nullptr &&
@@ -3445,7 +3509,7 @@ TEST_F(NativeAdmissionTest, OptionalResultNativeRecordingKeepsFiveModelsWithoutP
         references.push_back(reference);
         control().recording_active = true;
         ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
-        EXPECT_FALSE(runner.result_storage(index % 2).retain_replay_evidence);
+        EXPECT_FALSE(runner.result_region(index % 2).retain_evidence);
         EXPECT_EQ(record_allocations(), initial_records);
         EXPECT_EQ(result_uploads(), initial_uploads);
         EXPECT_EQ(control().d2h_calls, downloads);
@@ -4035,8 +4099,8 @@ TEST_F(NativeAdmissionTest, KernelRuntimeAllocationFailureRetainsEarlierGrantedB
     EXPECT_EQ(initialize_cold_kernel_runner(runner, grant), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(runner.kernel_execution_state().phase(), KernelContextPhase::Poisoned);
     for (uint32_t slot = 0; slot < grant; ++slot) {
-        EXPECT_EQ(runner.result_storage(slot).device_result, nullptr);
-        EXPECT_FALSE(runner.result_storage(slot).result_initialized);
+        EXPECT_EQ(runner.result_region(slot).device_ptr, nullptr);
+        EXPECT_FALSE(runner.result_region(slot).initialized);
     }
     auto &owner = runner.result_storage(0).args;
     ASSERT_NE(owner.runtime_args, nullptr);
@@ -4290,7 +4354,7 @@ TEST_F(NativeAdmissionTest, KernelInitConsumesOnlyMandatoryDeviceDescriptorBytes
     EXPECT_EQ(initialize_cold_kernel_runner(runner, 2), 0);
     for (uint32_t slot = 0; slot < 2; ++slot) {
         EXPECT_NE(runner.result_storage(slot).args.runtime_args, nullptr);
-        EXPECT_EQ(runner.result_storage(slot).device_result, nullptr);
+        EXPECT_EQ(runner.result_region(slot).device_ptr, nullptr);
     }
     EXPECT_EQ(control().bytes, mandatory_bytes);
     EXPECT_EQ(runner.finalize(), 0);
@@ -4375,29 +4439,25 @@ TEST_F(NativeAdmissionTest, FailedEagerResultAllocationCannotBecomeUsableBeforeC
         failed.config.enable_pmu = 1;
         std::strcpy(failed.config.output_prefix, "requested-eager-result");
         ASSERT_EQ(failed.prepare(), -747);
-        ASSERT_TRUE(failed.consume_release());
+        void *failed_address = runner.pending_failed_result_ptr();
+        ASSERT_NE(failed_address, nullptr);
+        EXPECT_EQ(uploads_to(failed_address), 0u);
+        control().failed_allocation_bytes = 0;
+        // The failed allocation is not a result; the next acquire performs the
+        // checked free. The selected failure keeps it pending for that retry.
+        control().selected_free = failed_address;
+        control().selected_free_rc = -751;
+        EXPECT_TRUE(failed.consume_release());
     }
-    auto &owner = runner.result_storage();
-    void *failed_address = owner.device_result;
-    ASSERT_NE(failed_address, nullptr);
-    EXPECT_FALSE(owner.result_initialized);
-    EXPECT_EQ(uploads_to(failed_address), 0u);
-    control().failed_allocation_bytes = 0;
-    control().selected_free = failed_address;
-    control().selected_free_rc = -751;
+    EXPECT_EQ(control().selected_free_attempts, 0u);
     {
         Attempt retry(runner, 0, 10312);
         retry.args.tensor(0).address_space = AddressSpace::DEVICE;
         retry.args.tensor(0).transfer = TensorTransfer::NONE;
         retry.config.enable_pmu = 1;
         std::strcpy(retry.config.output_prefix, "requested-eager-result");
-        const int rc = retry.prepare();
-        EXPECT_EQ(rc, -751);
-        EXPECT_EQ(owner.device_result, failed_address);
-        EXPECT_FALSE(owner.result_initialized);
-        EXPECT_EQ(uploads_to(failed_address), 0u);
+        EXPECT_EQ(retry.prepare(), -751);
         EXPECT_EQ(control().selected_free_attempts, 1u);
-        if (rc == 0) EXPECT_EQ(simpler_finalize_run(&runner, retry.storage), 0);
         EXPECT_TRUE(retry.consume_release());
     }
     control().selected_free_rc = 0;
@@ -4408,7 +4468,7 @@ TEST_F(NativeAdmissionTest, FailedEagerResultAllocationCannotBecomeUsableBeforeC
         retry.config.enable_pmu = 1;
         std::strcpy(retry.config.output_prefix, "requested-eager-result");
         ASSERT_EQ(retry.prepare(), 0);
-        EXPECT_TRUE(owner.result_initialized);
+        EXPECT_TRUE(runner.result_region().initialized);
         EXPECT_EQ(control().selected_free_attempts, 2u);
         ASSERT_EQ(simpler_finalize_run(&runner, retry.storage), 0);
     }
@@ -4418,6 +4478,34 @@ TEST_F(NativeAdmissionTest, FailedEagerResultAllocationCannotBecomeUsableBeforeC
     cleanup.dismiss();
 }
 
+TEST_F(NativeAdmissionTest, AFailedResultFreeOnOneSlotDoesNotBlockAnotherSlot) {
+    Runner runner;
+    control().failed_allocation_bytes = sizeof(NativeInvocationResultStorage);
+    control().allocation_failure_with_storage = true;
+    control().allocation_failure_rc = -747;
+    EXPECT_NE(runner.prepare_result(0, 20001), 0);
+    void *failed = runner.result_region(0, 20001).device_ptr;
+    ASSERT_NE(failed, nullptr);
+    control().failed_allocation_bytes = 0;
+    // Releasing the failed preparation moves its allocation to the pool's
+    // checked-free list for slot 0.
+    EXPECT_EQ(runner.close_result(0), 0);
+    EXPECT_EQ(runner.pending_failed_result_ptr(), failed);
+    control().selected_free = failed;
+    control().selected_free_rc = -751;
+    // A different slot must not inherit slot 0's failed free.
+    ASSERT_EQ(runner.prepare_result(1, 20002), 0);
+    EXPECT_EQ(control().selected_free_attempts, 0u);
+    EXPECT_TRUE(runner.result_region(1, 20002).initialized);
+    // Slot 0 retries its pending free and fails.
+    EXPECT_EQ(runner.prepare_result(0, 20003), -751);
+    EXPECT_EQ(control().selected_free_attempts, 1u);
+    control().selected_free_rc = 0;
+    ASSERT_EQ(runner.prepare_result(0, 20004), 0);
+    EXPECT_EQ(control().selected_free_attempts, 2u);
+    EXPECT_EQ(runner.finalize(), 0);
+}
+
 TEST_F(NativeAdmissionTest, KernelInitWithoutDiagnosticsDoesNotAllocateResultStorage) {
     ColdKernelRunner runner;
     control().failed_allocation_bytes = sizeof(NativeInvocationResultStorage);
@@ -4425,7 +4513,7 @@ TEST_F(NativeAdmissionTest, KernelInitWithoutDiagnosticsDoesNotAllocateResultSto
     ASSERT_EQ(initialize_cold_kernel_runner(runner, 2), 0);
     for (uint32_t slot = 0; slot < 2; ++slot) {
         EXPECT_NE(runner.result_storage(slot).args.runtime_args, nullptr);
-        EXPECT_EQ(runner.result_storage(slot).device_result, nullptr);
+        EXPECT_EQ(runner.result_region(slot).device_ptr, nullptr);
     }
     EXPECT_NE(runner.kernel_execution_state().phase(), KernelContextPhase::Poisoned);
     control().failed_allocation_bytes = 0;
@@ -4441,7 +4529,7 @@ TEST_F(NativeAdmissionTest, ProgramKeepsItsRecordAndPreservesAllocationFailureCo
         Attempt failed(runner, 0, 10320);
         EXPECT_EQ(failed.prepare(), PTO_RUNTIME_ERR_INTERNAL);
         EXPECT_TRUE(failed.consume_release());
-        EXPECT_EQ(runner.result_storage().device_result, nullptr);
+        EXPECT_EQ(runner.result_region().device_ptr, nullptr);
     }
     control().failed_allocation_bytes = 0;
     {
@@ -4475,14 +4563,14 @@ TEST_F(NativeAdmissionTest, ProgramResultCopyFailureKeepsItsRawCodeAndValidBacki
     {
         Attempt failed(runner, 0, 10322);
         EXPECT_EQ(failed.prepare(), -753);
-        EXPECT_TRUE(failed.consume_release());
-        backing = runner.result_storage().device_result;
+        backing = runner.idle_result_ptr();
         ASSERT_NE(backing, nullptr);
-        EXPECT_EQ(runner.result_storage().result_allocation_rc, 0);
-        EXPECT_FALSE(runner.result_storage().result_initialized);
+        EXPECT_FALSE(runner.idle_result_initialized());
         ASSERT_FALSE(control().uploads.empty());
         EXPECT_EQ(control().uploads.back().first, backing);
+        EXPECT_TRUE(failed.consume_release());
     }
+    EXPECT_EQ(runner.idle_result_ptr(), backing);
     {
         Attempt succeeding(runner, 0, 10323);
         ASSERT_EQ(succeeding.prepare(), 0);
@@ -4490,7 +4578,8 @@ TEST_F(NativeAdmissionTest, ProgramResultCopyFailureKeepsItsRawCodeAndValidBacki
         EXPECT_EQ(
             state->prepared_execution->kernel_args.args.run_result_data_base, reinterpret_cast<uint64_t>(backing)
         );
-        EXPECT_TRUE(runner.result_storage().result_initialized);
+        EXPECT_EQ(runner.result_region().device_ptr, backing);
+        EXPECT_TRUE(runner.result_region().initialized);
         EXPECT_EQ(simpler_finalize_run(&runner, succeeding.storage), 0);
     }
     EXPECT_EQ(runner.finalize(), 0);
@@ -4537,16 +4626,16 @@ TEST_F(NativeAdmissionTest, DiagnosticResultCopyFailureIsReportedOnlyWhenRequest
     control().copy_error_bytes = sizeof(NativeInvocationResultStorage);
     ASSERT_EQ(initialize_cold_kernel_runner(runner, 2), 0);
     ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
-    EXPECT_EQ(runner.result_storage().device_result, nullptr);
+    EXPECT_EQ(runner.result_region().device_ptr, nullptr);
 
     Attempt attempt(runner, 0, 10323);
     use_capture_preparation(attempt);
     attempt.config.enable_pmu = 1;
     std::strcpy(attempt.config.output_prefix, "requested-result-copy");
     EXPECT_EQ(attempt.prepare(), 207001);
+    EXPECT_NE(runner.idle_result_ptr(), nullptr);
+    EXPECT_FALSE(runner.idle_result_initialized());
     EXPECT_TRUE(attempt.consume_release());
-    EXPECT_NE(runner.result_storage().device_result, nullptr);
-    EXPECT_FALSE(runner.result_storage().result_initialized);
     control().copy_rc = 0;
     control().copy_error_bytes = 0;
     EXPECT_EQ(runner.finalize(), 0);
@@ -4871,7 +4960,7 @@ TEST_F(NativeAdmissionTest, NativeDiagnosticPrepareReusesResultBackingAndKeepsRe
     ASSERT_EQ(initialize_cold_kernel_runner(runner, 3), 0);
     EXPECT_EQ(runner.result_epoch_count(), 0u);
     for (uint32_t slot = 0; slot < 3; ++slot)
-        EXPECT_EQ(runner.result_storage(slot).device_result, nullptr);
+        EXPECT_EQ(runner.result_region(slot).device_ptr, nullptr);
     ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
     diagnostic_path = "kernel-initial-result-history";
     ASSERT_TRUE(std::filesystem::create_directory(diagnostic_path));
@@ -4881,9 +4970,10 @@ TEST_F(NativeAdmissionTest, NativeDiagnosticPrepareReusesResultBackingAndKeepsRe
         setup.config.enable_pmu = 1;
         std::strcpy(setup.config.output_prefix, diagnostic_path.c_str());
         ASSERT_EQ(setup.prepare(), 0);
+        ASSERT_NE(runner.result_region().device_ptr, nullptr);
         ASSERT_EQ(simpler_finalize_run(&runner, setup.storage), 0);
     }
-    void *initial_result = runner.result_storage().device_result;
+    void *initial_result = runner.idle_result_ptr();
     ASSERT_NE(initial_result, nullptr);
     const size_t uploads_before = uploads_to(initial_result);
     if (initial_result != nullptr) {
@@ -4912,7 +5002,7 @@ TEST_F(NativeAdmissionTest, NativeDiagnosticPrepareReusesResultBackingAndKeepsRe
         state->prepared_execution->kernel_args.args.run_result_data_base, reinterpret_cast<uint64_t>(initial_result)
     );
     EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_epoch, attempt.descriptor.run_epoch);
-    EXPECT_EQ(uploads_to(runner.result_storage().device_result), uploads_before);
+    EXPECT_EQ(uploads_to(runner.result_region().device_ptr), uploads_before);
     EXPECT_EQ(control().event_create_calls, initial_events);
     EXPECT_EQ(control().binary_register_calls, initial_binaries);
     if (initial_result != nullptr) {
@@ -4929,7 +5019,9 @@ TEST_F(NativeAdmissionTest, NativeDiagnosticPrepareReusesResultBackingAndKeepsRe
     control().recording_active = false;
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     EXPECT_FALSE(backing.expired());
-    EXPECT_EQ(runner.result_storage().device_result, initial_result);
+    // The external reference keeps this epoch's result lease, so the region is
+    // still owned by the epoch rather than parked in the idle cache.
+    EXPECT_EQ(runner.result_region(0, attempt.descriptor.run_epoch).device_ptr, initial_result);
     ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
     reference = nullptr;
     EXPECT_TRUE(backing.expired());

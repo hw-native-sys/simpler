@@ -118,6 +118,107 @@ TEST(AutoAdmissionCapacity, TheExploratorySetIsWithheldWhileAGrowerHoldsTheToken
     EXPECT_EQ(state->affordable_sets(kDirectory), 2u);
 }
 
+// The recorded cost is what the set's commit reported, and withdrawing the
+// proof withdraws the figure with it: a slot that cannot carry a run has no
+// footprint to estimate the next one from.
+TEST(AutoAdmissionCost, AProvenSetKeepsTheCostItsCommitReported) {
+    AutoAdmissionState state;
+    state.configure(kDirectory);
+    RunResourceCost cost;
+    cost.heap_bytes = 100;
+    cost.image_bytes = 40;
+    cost.shared_memory_bytes = 10;
+    cost.scheduler_bytes = 5;
+    cost.reported_bytes = 7;
+    state.note_proven(0, cost);
+    const RunResourceCost recorded = state.proven_cost(0);
+    EXPECT_EQ(recorded.heap_bytes, 100u);
+    EXPECT_EQ(recorded.image_bytes, 40u);
+    EXPECT_EQ(recorded.shared_memory_bytes, 10u);
+    EXPECT_EQ(recorded.scheduler_bytes, 5u);
+    EXPECT_EQ(recorded.reported_bytes, 7u);
+    EXPECT_EQ(recorded.budgeted_bytes(), 150u);
+    EXPECT_EQ(recorded.total_bytes(), 162u);
+    state.clear_proven(0);
+    EXPECT_FALSE(state.proven_cost(0).any());
+}
+
+// A context with no byte policy keeps the proof-only rule: there is no budget
+// a cost could be compared against.
+TEST(AutoAdmissionCost, WithoutABudgetCostNeverWithholdsTheExploratorySet) {
+    AutoAdmissionState state;
+    state.configure(kDirectory);
+    RunResourceCost huge;
+    huge.heap_bytes = 1ull << 40;
+    state.note_proven(0, huge);
+    EXPECT_FALSE(state.budget_enforced());
+    EXPECT_EQ(state.affordable_sets(kDirectory, 1ull << 41), 2u);
+}
+
+// Cold start has no proven set to estimate from; the first exploratory set is
+// the allocator's to answer, exactly as it was before any budget existed.
+TEST(AutoAdmissionCost, ColdStartIsOfferedEvenWhenTheBudgetIsAlreadyCharged) {
+    AutoAdmissionState state;
+    state.configure(kDirectory, 1000);
+    EXPECT_TRUE(state.budget_enforced());
+    EXPECT_EQ(state.affordable_sets(kDirectory, 900), 1u);
+}
+
+// The probe is withheld when one more set of the largest proven size cannot
+// fit beside what the ledger already charges.
+TEST(AutoAdmissionCost, TheProbeIsWithheldWhenOneMoreProvenSizeSetCannotFit) {
+    AutoAdmissionState state;
+    state.configure(kDirectory, 1000);
+    RunResourceCost cost;
+    cost.heap_bytes = 400;
+    state.note_proven(0, cost);
+    EXPECT_EQ(state.affordable_sets(kDirectory, 400), 2u);
+    EXPECT_EQ(state.affordable_sets(kDirectory, 700), 1u);
+}
+
+// The reserve is the largest proven set, not the first one: a cheap set that
+// happened to commit early is not what a new set is estimated at.
+TEST(AutoAdmissionCost, TheProbeReserveIsTheLargestProvenSet) {
+    AutoAdmissionState state;
+    state.configure(kDirectory, 1000);
+    RunResourceCost small;
+    small.heap_bytes = 100;
+    RunResourceCost large;
+    large.heap_bytes = 400;
+    state.note_proven(0, small);
+    state.note_proven(1, large);
+    EXPECT_EQ(state.max_proven_cost().budgeted_bytes(), 400u);
+    EXPECT_EQ(state.affordable_sets(kDirectory, 700), 2u);
+    EXPECT_EQ(state.affordable_sets(kDirectory, 500), 3u);
+}
+
+// A budget never withdraws a proven slot: those sets are already committed,
+// and reporting fewer would not return a byte.
+TEST(AutoAdmissionCost, AProvenPrefixSurvivesABudgetItAlreadyExceeds) {
+    AutoAdmissionState state;
+    state.configure(kDirectory, 1000);
+    RunResourceCost cost;
+    cost.heap_bytes = 400;
+    for (uint32_t slot = 0; slot < 3; ++slot)
+        state.note_proven(slot, cost);
+    EXPECT_EQ(state.affordable_sets(kDirectory, 5000), 3u);
+}
+
+// The scheduler state and the run-result region are outside the ledger's
+// budget: they stay part of the set's reported footprint without deciding the
+// exploratory set.
+TEST(AutoAdmissionCost, OnlyBudgetedBytesGateTheExploratorySet) {
+    AutoAdmissionState state;
+    state.configure(kDirectory, 1000);
+    RunResourceCost cost;
+    cost.heap_bytes = 300;
+    cost.reported_bytes = 10000;
+    cost.scheduler_bytes = 10000;
+    state.note_proven(0, cost);
+    EXPECT_EQ(state.proven_cost(0).total_bytes(), 20300u);
+    EXPECT_EQ(state.affordable_sets(kDirectory, 600), 2u);
+}
+
 // One grower per context, and the holder keeps it across its own stages: a plan
 // that grows its inputs and then its regions is one growth attempt.
 TEST(AutoAdmissionToken, OneGrowerAtATimeAndTheHolderIsIdempotent) {

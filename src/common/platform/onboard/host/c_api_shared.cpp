@@ -2937,7 +2937,7 @@ static int finalize_native_run(
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
-    state->runner->release_device_run_result(
+    const int result_release_rc = state->runner->release_device_run_result(
         state->descriptor.pipeline_slot, state->descriptor.run_epoch, !launched || state->physical_complete
     );
     if (state->retired_host_staging != nullptr && state->runner->accepts_new_run()) {
@@ -2953,9 +2953,11 @@ static int finalize_native_run(
     if (validation_rc != 0) return validation_rc;
     if (resources_rc != 0) return resources_rc;
     if ((launched || recorded) && execution_rc != 0) return execution_rc;
-    // Last: a standalone workspace-reclamation failure is still a failure, and
-    // with nothing above it to report this is where the caller learns of it.
+    // Last: a standalone workspace-reclamation or result-release failure is
+    // still a failure, and with nothing above it to report this is where the
+    // caller learns of it.
     if (reclaim_rc != 0) return reclaim_rc;
+    if (result_release_rc != 0) return result_release_rc;
     if (no_submission && !launched) publish_released_preparation(state, run_epoch);
     return (launched || recorded) ? execution_rc : 0;
 } catch (...) {
