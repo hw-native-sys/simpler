@@ -143,10 +143,9 @@ inline StateSelection select_percounter_state(
     std::vector<TaskInput> inputs(task_count);
     GraphInputs graph{};
     int64_t graph_failed_task = -1;
-    const TemplateResult graph_status =
-        gather_graph_inputs(
-            api, host_sm_handle, total_tasks, runtime->get_worker_count(), &inputs, &graph, &graph_failed_task
-        );
+    const TemplateResult graph_status = gather_graph_inputs(
+        api, host_sm_handle, total_tasks, runtime->get_worker_count(), &inputs, &graph, &graph_failed_task
+    );
     if (graph_status.status == TemplateStatus::MALFORMED) {
         LOG_ERROR(
             "A5 percounter: Graph task id=%" PRId64 ": %s (body task %d)", graph_failed_task, graph_status.reason,

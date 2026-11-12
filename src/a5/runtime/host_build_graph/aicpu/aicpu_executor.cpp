@@ -600,8 +600,7 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
                     const uint64_t copy_progress = ready_watchdog_.last_progress();
                     if (copy_progress > last_progress_cycles) last_progress_cycles = copy_progress;
                 }
-                if (resolved_task_count != last_resolved_task_count ||
-                    bootstrap_complete != bootstrap_was_complete) {
+                if (resolved_task_count != last_resolved_task_count || bootstrap_complete != bootstrap_was_complete) {
                     last_resolved_task_count = resolved_task_count;
                     bootstrap_was_complete = bootstrap_complete;
                     last_progress_cycles = now;
@@ -642,8 +641,7 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
             if (supervisor_rc == 0 &&
                 resolved_task_count + run_control->inline_completed_count != run_control->expected_task_count) {
                 LOG_ERROR(
-                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64
-                    " inline=%" PRIu64,
+                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64 " inline=%" PRIu64,
                     run_control->expected_task_count, resolved_task_count, run_control->inline_completed_count
                 );
                 supervisor_rc = -1;

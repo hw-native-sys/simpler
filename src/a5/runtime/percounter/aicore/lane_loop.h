@@ -1009,7 +1009,8 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
     if (claim->task_id < 0) {
         if (claim->position < 0) {
             if (claim->list_spent) return;
-            const uint64_t draw = percounter_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DRAW].next, uint64_t{1});
+            const uint64_t draw =
+                percounter_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DRAW].next, uint64_t{1});
             if (draw >= cfg.mix_order_count) {
                 claim->list_spent = true;
                 return;
