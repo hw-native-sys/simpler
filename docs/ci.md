@@ -41,7 +41,15 @@ ordinary onboard, and NPU unit-test bodies are split by architecture so each
 job renders only its own steps. The framework environment shares `_st-framework.yml`;
 callers supply matching `platform` and `runs_on` inputs. Shared step scaffolding
 that is safe to run after checkout lives in composite actions under `.github/actions/`
-(`apt-install`, `cache-pip`, `cache-ccache`, `setup-gcc-15`, `setup-venv`, and the three `network1-*` actions).
+(`apt-install`, `cache-pip`, `cache-ccache`, `setup-gcc-15`, `setup-python`, `setup-venv`, `upload-diagnostics`, and the three `network1-*` actions).
+Optional onboard, Network1, and framework diagnostic uploads use the local
+`upload-diagnostics` composite action. Its definition is fetched from the
+workflow's `github.workflow_sha` into `.ci-support` at retention time, so an
+older tested PR head need not contain the action. The tested checkout stays
+at its admitted revision. Both helper checkout and upload retain
+`continue-on-error: true`; upload runs only when helper checkout succeeds.
+The runner loads the remote uploader when the final retention step runs,
+rather than during job initialization.
 `setup-gcc-15` accepts a complete, pre-provisioned GCC 15 toolchain on any
 Linux runner; automatic installation of missing Linux tools is Ubuntu-only,
 while macOS installation uses Homebrew. `_packaging.yml` deliberately retains
@@ -72,9 +80,9 @@ timeouts remain a per-connection safeguard, not a wall-clock guarantee.
 ```text
 PullRequest
   ├── pre-commit             (self-hosted CPU)
-  ├── packaging-matrix       (self-hosted CPU, Python 3.10)          — [needs !examples_only && !tests_only]
+  ├── packaging-matrix       (self-hosted CPU, Python ≥3.10)          — [needs !examples_only && !tests_only]
   ├── profiling-flags-smoke  (self-hosted CPU)         — (a2a3_changed || a5_changed) && !examples_only && !tests_only
-  ├── ut                     (self-hosted CPU, Python 3.10)          — Python + C++ UT, no hardware [needs ut_affected]
+  ├── ut                     (self-hosted CPU, Python ≥3.10)          — Python + C++ UT, no hardware [needs ut_affected]
   ├── detect-changes         (reusable; self-hosted CPU in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
   ├── st-sim-a2a3            (self-hosted CPU)          — a2a3_changed && st_affected
   ├── st-sim-a5              (self-hosted CPU)          — a5_changed && st_affected
@@ -92,7 +100,7 @@ Admin PR comment /run-a5
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut` | self-hosted CPU, Python 3.10 | `pytest tests/ut` + `ctest -LE requires_hardware` |
+| `ut` | self-hosted CPU, Python ≥3.10 | `pytest tests/ut` + `ctest -LE requires_hardware` |
 | `st-sim-a2a3` | self-hosted CPU | `pytest examples tests/st --platform a2a3sim` |
 | `st-sim-a5` | self-hosted CPU | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
@@ -303,11 +311,10 @@ compile databases. Files excluded by the clang-tidy hook — vendored
 `3rdparty/`, Python bindings, kernels, and AICore sources — do not trigger that
 build. Python, documentation, and other recognized non-C++ changes also skip
 it. Changes to `.pre-commit-config.yaml`, and all unrecognized paths, remain
-conservative and build the combined target. Self-hosted CPU runs still
-create a lightweight venv so the pre-commit action never installs into the
-runner's system Python; only diffs selected for clang-tidy preparation install
-the package and prepare its compiler stand-ins. Each sanitizer matrix cell
-selects its own platform. The profiling-flags smoke installs only the
+conservative and build the combined target. Self-hosted CPU runs install and
+run pre-commit directly in a lightweight venv; only diffs selected for clang-tidy
+preparation install the package and prepare its compiler stand-ins. Each
+sanitizer matrix cell selects its own platform. The profiling-flags smoke installs only the
 `_task_interface` binding because its matrix builds every runtime configuration
 itself.
 
@@ -340,6 +347,7 @@ not need `--max-parallel` manually.
 ### Scheduling constraints
 
 - PR simulation and no-hardware unit tests run on the self-hosted CPU pool; Daily retains GitHub-hosted coverage.
+- Change detection and pre-commit start with 100 commits of checkout history. They use the admitted PR base SHA when available, fetching only a missing base commit. If the merge-base is outside the shallow history, they deepen the head and base histories in two bounded rounds of 100 and 400 commits, without fetching every branch or tag. Unresolved history makes the detector run the full matrix; pre-commit fails with an explicit error rather than emitting an empty base SHA.
 - `detect-changes` is implemented once in [`.github/workflows/_detect-changes.yml`](../.github/workflows/_detect-changes.yml) and computes four axes from the PR diff — non-code (`non_code_only`), architecture (`a2a3_changed` / `a5_changed`), test category (`st_affected` / `ut_affected`), and corpus (`examples_only` / `tests_only`) — **all of them derived from one `NON_CODE` set**: `docs/`, `.docs/`, `.claude/`, `mkdocs.yml`, `.github/workflows/docs.yml`, `.gitignore`, `.pre-commit-config.yaml`, and any `*.md` file anywhere. Membership follows a file's *effect*, not its path — `mkdocs.yml` and `docs.yml` are docs tooling that happens to live outside `docs/`. An arch flag is `false` only when every changed file is in the opposite platform's tree (`src/{arch}/`, `examples/{arch}/`, `tests/{st,ut/cpp}/{arch}/`) or in `NON_CODE`. Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), shared test infra (`tests/ut/py/`, `tests/lint/`), tooling (`tools/`), or any CI implementation workflow (`.github/workflows/ci.yml`, `.github/workflows/_*.yml`) — flips both flags to `true`. CI implementation workflows are deliberately excluded from `NON_CODE`: a change to the gates or reusable job bodies must run the complete automatic matrix. Explicit `/run-a5` hardware suites remain manual.
 - **Test-category axis:** `ST_ONLY='^(tests/st/|examples/)'` and `UT_ONLY='^tests/ut/'`, applied in the same shape as the arch patterns — a category is unaffected only when *every* changed file is exclusively the other's. `st_affected` gates automatic scene-test jobs; `ut_affected` gates automatic `ut` and `ut-a2a3`. Explicit `/run-a5` requests run all three A5 hardware suites without change detection. Anything belonging to neither (root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/`) flips both, so shared infrastructure always runs both suites.
 - **Corpus axis:** `EXAMPLES_ONLY='^examples/'` and `TESTS_ONLY='^(tests/)'`, same shape again, one per side of the product jobs' payload. `packaging-matrix` and `profiling-flags-smoke` build and install the product and then exercise it with a fixed, tiny payload — one entry-point script (a `tests/st/` file) and one `vector_example` — so neither reads either suite as a corpus, and a diff confined to `examples/` or to `tests/` cannot reach them: `wheel.packages` is `["simpler_setup", "python/simpler"]`, so both partitions are provably absent from the product. A payload file changed under either is still exercised by the scene-test job that reads the same corpus.
@@ -652,12 +660,17 @@ validate its scripts and topology before that deployment.
 All seven no-hardware PR jobs (`detect-changes`, `pre-commit`, `ut`,
 `packaging-matrix`, `profiling-flags-smoke`, `st-sim-a2a3`, `st-sim-a5`) use
 `[self-hosted, cpu]`. The runner label accepts either ARM64 or X64 hosts.
-`ut` and `packaging-matrix` verify that the provisioned `python3` matches
-Python 3.10 before creating their project-local venvs. Daily retains separate
-GitHub-hosted Ubuntu/macOS coverage. The A5 comment gate/report and docs jobs
-also use GitHub-hosted runners.
+The Python-consuming CPU jobs verify that the provisioned `python3` is at
+least Python 3.10 before installing dependencies or running Python tools;
+newer interpreters are accepted. GitHub-hosted variants retain Python setup
+with the requested version, defaulting to 3.10. Only hosted jobs fetch and
+run the local `setup-python` wrapper from the workflow's fixed SHA in
+`.ci-support`, so CPU jobs do not prepare its remote setup action and old
+tested PR heads need not contain the wrapper. CI static analysis also targets
+Python 3.10. Daily retains separate GitHub-hosted Ubuntu/macOS coverage. The
+A5 comment gate/report and docs jobs also use GitHub-hosted runners.
 
-Provision Python 3.10, GCC 15, CMake, Ninja, GoogleTest, Graphviz, clang-tidy 18 and a matching CPU Torch wheel on each CPU runner. The distribution package names depend on the host OS. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on CPU and GitHub-hosted runners. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim. On APT-based self-hosted CPU runners, the same bounded APT action used by the GitHub-hosted lane installs missing build/lint tools before verification; an existing `clang-tidy-18` satisfies the lint-tool requirement. Non-APT runners must provide the tools in advance, and verification still fails if any required tool is unavailable.
+Provision Python 3.10 or newer, GCC 15, CMake, Ninja, GoogleTest, Graphviz, clang-tidy 18 and a matching CPU Torch wheel on each CPU runner. The distribution package names depend on the host OS. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on CPU and GitHub-hosted runners. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim. On APT-based self-hosted CPU runners, the same bounded APT action used by the GitHub-hosted lane installs missing build/lint tools before verification; an existing `clang-tidy-18` satisfies the lint-tool requirement. Non-APT runners must provide the tools in advance, and verification still fails if any required tool is unavailable.
 
 Pip and compiler caches persist on these hosts; CPU jobs use their on-disk
 caches without uploading or downloading them through `actions/cache`.
@@ -752,10 +765,15 @@ the directory grows by one entry per kernel change forever and the saved
 crowd the repository's 10 GB cache budget and evict the pip and other caches
 the other jobs depend on.
 
-The pip download cache is keyed by runner OS, runner architecture, and
+GitHub-hosted jobs restore and save the pip download cache, keyed by runner OS, runner architecture, and
 `pyproject.toml`. Source-only changes therefore reuse the same dependency cache
 instead of creating another roughly 200 MB archive; pip still resolves and
 validates requested versions on every install.
+
+Self-hosted CPU jobs use persistent pip and ccache directories without remote
+cache restore or upload. Pre-commit runs directly in the selected Python
+environment and reuses its local hook cache; it does not download the
+`pre-commit/action` wrapper or that wrapper's remote cache action.
 
 ## Test Sources
 

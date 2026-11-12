@@ -77,7 +77,7 @@ jobs:
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || inputs.head_sha || github.sha }}
-          fetch-depth: 0
+          fetch-depth: 100
           persist-credentials: false
 
       - name: Check file changes
@@ -88,7 +88,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
-          HEAD_REV=HEAD
+          HEAD_REV=$(git rev-parse HEAD)
           if [ -n "$HEAD_SHA" ]; then
             if git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
               HEAD_REV="$HEAD_SHA"
@@ -98,25 +98,28 @@ jobs:
           fi
 
           BASE_URL="https://github.com/${BASE_REPOSITORY}.git"
-          BASE_REMOTE="refs/remotes/base/${BASE_REF}"
-          BASE_FETCHED=false
-          if git fetch --no-tags "$BASE_URL" "+refs/heads/${BASE_REF}:${BASE_REMOTE}"; then
-            BASE_FETCHED=true
-          else
-            echo "base fetch failed for ${BASE_REPOSITORY}/${BASE_REF}; treating diff as unattributable"
+          BASE="$BASE_SHA"
+          if [ -z "$BASE" ]; then
+            if git fetch --no-tags --depth=100 "$BASE_URL" "refs/heads/${BASE_REF}"; then
+              BASE=$(git rev-parse FETCH_HEAD)
+            else
+              echo "base fetch failed for ${BASE_REPOSITORY}/${BASE_REF}; treating diff as unattributable"
+            fi
+          elif ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=100 "$BASE_URL" "$BASE" || BASE=""
           fi
 
-          BASE=""
-          if [ -n "$BASE_SHA" ]; then
-            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-              git fetch --no-tags "$BASE_URL" "$BASE_SHA" || true
-            fi
-            BASE="$BASE_SHA"
-          elif [ "$BASE_FETCHED" = "true" ]; then
-            if ! BASE=$(git merge-base "$BASE_REMOTE" "$HEAD_REV"); then
-              echo "merge-base failed for $BASE_REMOTE...$HEAD_REV; treating diff as unattributable"
-              BASE=""
-            fi
+          if [ -n "$BASE" ]; then
+            for deepen in 100 400; do
+              if git merge-base "$BASE" "$HEAD_REV" >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$(git rev-parse --is-shallow-repository)" != true ]; then
+                break
+              fi
+              git fetch --no-tags --deepen="$deepen" origin "$HEAD_REV" || break
+              git fetch --no-tags --deepen="$deepen" "$BASE_URL" "$BASE" || break
+            done
           fi
 
           # `run:` is `bash -e`, so a failing git diff would abort the step

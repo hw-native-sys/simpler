@@ -85,11 +85,24 @@ jobs:
           .venv-framework/bin/python -m simpler_setup.tools.feature_coverage_report \
             --root outputs/framework-ci --environment torch_npu --platform "$PLATFORM" --manual "$MANUAL_MODE"
 
-      - name: Retain framework identities and logs
+      - name: Checkout diagnostic upload action
+        id: diagnostics
         if: always()
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/upload-diagnostics
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Retain framework identities and logs
+        if: always() && steps.diagnostics.outcome == 'success'
         # The test result is already checked above; artifact service failures only lose diagnostics.
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: ./.ci-support/.github/actions/upload-diagnostics
         with:
           name: framework-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

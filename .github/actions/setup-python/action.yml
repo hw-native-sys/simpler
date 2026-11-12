@@ -1,0 +1,15 @@
+name: Set up hosted Python
+description: Load Python setup only when a GitHub-hosted job executes this action.
+
+inputs:
+  python-version:
+    description: Python version selected for the GitHub-hosted job.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}

@@ -215,10 +215,23 @@ jobs:
         uses: ./.github/actions/network1-teardown
 
       # Artifact service availability must not override the network1 test result.
-      - name: Upload network1 logs
+      - name: Checkout diagnostic upload action
+        id: diagnostics
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/upload-diagnostics
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Upload network1 logs
+        if: always() && steps.diagnostics.outcome == 'success'
+        continue-on-error: true
+        uses: ./.ci-support/.github/actions/upload-diagnostics
         with:
           name: network1-ci-${{ github.run_id }}-${{ github.run_attempt }}
           path: output/network1-ci-${{ github.run_id }}-${{ github.run_attempt }}/
