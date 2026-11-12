@@ -12,6 +12,9 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
+The current L0 measurements, raw samples, runtime build times and refresh
+procedure are maintained in [RESULTS.md](RESULTS.md).
+
 ## Cases
 
 Layer indices are zero-based. The two task organizations are captured separately.

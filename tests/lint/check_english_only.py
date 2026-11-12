@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Optional
 
 # Default excluded directories (can be overridden via --exclude)
-DEFAULT_EXCLUDED_PATTERNS = ["3rdparty", "reference", "docs/zh-cn", "README.zh-CN.md"]
+DEFAULT_EXCLUDED_PATTERNS = [
+    "3rdparty",
+    "reference",
+    "docs/zh-cn",
+    "README.zh-CN.md",
+    "tests/fdwic/dsv41_scheduler/RESULTS.md",
+]
 
 
 def get_git_tracked_files(root_dir: Path) -> list[Path]:
