@@ -380,15 +380,12 @@ percounter_publish_completion(const LaneConfig &cfg, const PercounterTask &task,
 }
 
 /**
- * The fields of a deferred-completion record a dispatch rewrites.
- *
- * They all sit in the record's first cache line -- `state` ends it at offset
- * 60, the identity and entry bounds behind it never change -- so opening a
- * record publishes one line, not two. The resident scheduler's seal writes
- * back exactly this prefix for the same reason.
+ * The mutable fields of a deferred-completion record all sit in its first
+ * cache line -- `state` ends it at offset 60, and the identity and entry
+ * bounds behind it never change -- so the seal and the settle each publish
+ * one line, not two. The resident scheduler writes back the same prefix.
  */
-inline constexpr uint64_t PERCOUNTER_ASYNC_MUTABLE_BYTES = offsetof(pto2::resident::AsyncGroupData, sdma_guards_offset);
-static_assert(PERCOUNTER_ASYNC_MUTABLE_BYTES == 64);
+static_assert(offsetof(pto2::resident::AsyncGroupData, sdma_guards_offset) == 64);
 
 /**
  * Lay down this lane's deferred-completion records and hand back the first.
@@ -443,29 +440,25 @@ percounter_init_async_records(__gm__ PercounterControl *control, int block_idx) 
 }
 
 /**
- * Hand `slot`'s record to the kernel about to run: reset what a registration
- * writes, name the task it belongs to, and point the payload's context at it.
+ * Point the payload's context at `slot`'s record, for the kernel about to run.
  *
- * The context fields live in the payload's `global_context`, which the caller
+ * **Two stores and nothing else, which is what keeps a graph that registers
+ * nothing paying nothing.** Both land in `global_context`, a line the caller
  * writes and publishes for every dispatch anyway, so naming a different record
- * each time costs no line this dispatch was not already paying for.
+ * costs no line and no cache operation this dispatch was not already paying.
+ *
+ * It resets no field because a free record is already reset: the lane's own
+ * initialization leaves one that way, a dispatch that registers nothing leaves
+ * it that way, and `percounter_async_settle` puts it back that way. The only
+ * writer of a record between those points is the kernel holding the slot, and
+ * no dispatch takes a slot while it is held.
+ *
+ * The identity fields keep the zeroes that initialization gave them. They are
+ * what `layout_valid` bounds-checks and what a dump would read; nothing the
+ * runtime does with a registration comes from them, because the lane publishes
+ * from the task it resolved, not from the record.
  */
-inline __aicore__ void percounter_async_open(
-    const LaneConfig &cfg, __gm__ DispatchPayload *payload, uint32_t slot, int64_t task_id, int32_t block_idx,
-    int32_t subtask_slot
-) {
-    __gm__ pto2::resident::AsyncGroupData *record = &cfg.async_group[slot];
-    record->task_ref = task_id;
-    record->block_index = static_cast<uint32_t>(block_idx);
-    record->subtask_slot = static_cast<uint32_t>(subtask_slot);
-    record->count = 0;
-    record->error_code = SIMPLER_ERROR_NONE;
-    record->reservation_serial = 0;
-    record->reservation_limit = 0;
-    record->reservation_begin = 0;
-    record->reservation_written = 0;
-    record->state = pto2::resident::AsyncPublicationState::OPEN;
-    dcci((__gm__ uint8_t *)record, SINGLE_CACHE_LINE, CACHELINE_OUT);
+inline __aicore__ void percounter_async_open(const LaneConfig &cfg, __gm__ DispatchPayload *payload, uint32_t slot) {
     payload->global_context.async_group_offset = cfg.async_group_offset + slot * sizeof(pto2::resident::AsyncGroupData);
     payload->global_context.async_group_index = cfg.async_group_base_index + slot;
 }
@@ -523,16 +516,30 @@ inline __aicore__ bool percounter_async_seal(
  * Settle `slot`: publish the completion its dispatch withheld and free it.
  *
  * The publication is the one its dispatch did not make, so the task's counter
- * ends up where a synchronous run would have left it. `async_settled` rises
- * with it and never falls, which is what lets a waiting lane's watchdog tell
- * a device still finishing deferred work from one that has stopped.
+ * ends up where a synchronous run would have left it -- on a MIX subtask, the
+ * share the lane took back out before reporting finished. `async_settled`
+ * rises with it and never falls, which is what lets a waiting lane's watchdog
+ * tell a device still finishing deferred work from one that has stopped.
+ *
+ * **The record is returned reset, not merely unlocked.** `percounter_async_open`
+ * writes no field, so this is the only place a used record is made fit for the
+ * next dispatch; the writeback is the one cache operation a deferral adds over
+ * a synchronous completion, and it is paid once per deferral rather than once
+ * per dispatch.
  */
 inline __aicore__ void percounter_async_settle(const LaneConfig &cfg, PercounterLaneState *state, uint32_t slot) {
     PercounterAsyncSlot &held = state->async_slots[slot];
     scheduler_gm_fetch_add(cfg.counters[held.task_id].value, uint64_t{1});
     if (held.sink) scheduler_gm_fetch_add(cfg.counters[held.shell].value, uint64_t{1});
     held.pending_mask = 0;
-    cfg.async_group[slot].state = pto2::resident::AsyncPublicationState::OPEN;
+    __gm__ pto2::resident::AsyncGroupData *record = &cfg.async_group[slot];
+    record->count = 0;
+    record->error_code = SIMPLER_ERROR_NONE;
+    record->reservation_limit = 0;
+    record->reservation_begin = 0;
+    record->reservation_written = 0;
+    record->state = pto2::resident::AsyncPublicationState::OPEN;
+    dcci((__gm__ uint8_t *)record, SINGLE_CACHE_LINE, CACHELINE_OUT);
     scheduler_gm_fetch_add(cfg.control->async_settled, uint64_t{1});
     scheduler_gm_fetch_add(cfg.control->async_outstanding, ~uint64_t{0});
 }
@@ -697,9 +704,7 @@ inline __aicore__ bool percounter_run_prepared(
 
     uint32_t slot = 0;
     if (!percounter_async_acquire(cfg, state, timeout_cycles, &slot)) return false;
-    percounter_async_open(
-        cfg, payload, slot, task.id, payload->local_context.block_idx, payload->global_context.sub_block_id + 1
-    );
+    percounter_async_open(cfg, payload, slot);
     percounter_writeback_dispatch_payload(payload);
 
     // The barrier is the publication fence a consumer's spin depends on: the

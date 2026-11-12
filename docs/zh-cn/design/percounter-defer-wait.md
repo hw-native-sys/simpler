@@ -150,16 +150,21 @@ checkpoint 自旋，不是阻塞 —— lane 在那儿照样服务 MIX 和 cohor
 
 ### 4.1 登记
 
-`percounter_launch_kernel` 增加出参 `bool *deferred`。
+`percounter_launch_kernel` 增加入参 `bool may_defer` 和出参 `bool *deferred`。
 
-**kernel 之前**：该任务带"可能登记"标记时，重置 group 头部（`run_epoch`、
-`task_ref = task.id`、`group_index`、`block_index`、`subtask_slot`、`capacity`、
-`entries_offset`、`count = 0`、`error_code = 0`、`state = OPEN`、
-`sdma_guards_offset = 0`、`sdma_guard_count = 0`）并写回，置 `async_present = 1`；
-否则置 `async_present = 0` 且**完全不碰 group**。
+**kernel 之前**：取一个空闲槽位，把 `global_context.async_group_offset` /
+`async_group_index` 指向它。**就这两条存储，不碰记录本身。**
 
-标记来自任务描述符中的一个位，lane 本就要读该描述符。因此不登记的任务只多一次
-`async_present = 0` 的存储，落在已脏的第 7 行上。
+原本设计的是"按任务上的一个位决定要不要开记录，开就重置头部并写回"。实现下来发现那个位
+拿不到 —— kernel 会不会登记在 bind 时不可见 —— 而**重置也不需要**：空闲记录本来就是重置
+过的。lane 启动时的初始化让它是，不登记的 dispatch 让它保持是，
+`percounter_async_settle` 把它放回去。两个端点之间唯一的写者是持有该槽位的 kernel，而没有
+dispatch 会去拿一个被持有的槽位。
+
+于是**不登记的任务多付的就是那两条存储，落在 `global_context` 这条本来每次 dispatch 就要
+写、要刷的线上 —— 不多一条脏行，不多一次 dcci**。记录的 `task_ref` / `block_index` /
+`subtask_slot` 一直保持初始化时的零：它们是 `layout_valid` 的边界检查和 dump 的读物，运行时
+对一次登记做的任何事都不从它们取值，因为 lane 发布用的是自己解析出来的 task。
 
 **kernel 返回后**：调用 `seal_conditions()`。
 
@@ -347,7 +352,7 @@ host 只给本步已经支持的任务形状打"可能登记"标记，其余形�
 | S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
 | S3 ✅ | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | 单核 `require_sync_start` 多 block 的登记用例通过，同一用例在 S2 构建上报 error 13（0 of 7 blocks resolved）；回归集 11 passed，失败仍只有那两个 swimlane 用例 |
 | S4 ✅ | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | 两 AIV MIX 的登记用例通过，同一用例在 S3 构建上报 error 13（0 of 4 blocks resolved）；回归集 12 passed，连跑三遍一致 |
-| S5 | Graph body、溢出与非法条件、容量与开销度量 | 第 8 节矩阵补齐 |
+| S5 部分 | Graph body ✅；溢出与非法条件、容量与开销实测 ⬜ | body sink 延迟的用例通过（sink 的 shell 计数器若漏加，Graph 的 EXIT 会挂死）；开启/结算的代价重新分配后回归集 13 passed，两遍一致 |
 
 **S1 既是布局也是 1.1 的修复**，两者不可分：登记失败的 kernel 在设备上不留痕迹，所以只有
 先给它一个真正能写进去的 group，percounter 才看得见"这个任务登记了条件"。S1 之后登记机械
