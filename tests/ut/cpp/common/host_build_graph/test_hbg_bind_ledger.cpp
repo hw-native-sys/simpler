@@ -1976,6 +1976,26 @@ protected:
         ASSERT_GT(first.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
         const size_t predecessor_bytes = slot(0).capacity;
         const auto predecessor_host = slot(0).host;
+#if __has_include("scheduler/scheduler_args_dump.h")
+        const auto check_diagnostics = [](const Runtime &rt, int pmu, int level) {
+            const auto &prerequisites = rt.pending_publication().prerequisites;
+            ASSERT_EQ(prerequisites.size(), 1u);
+            const auto &region = prerequisites.front();
+            const uint64_t device_base = reinterpret_cast<uint64_t>(region.device_target);
+            const uint64_t context_address = rt.dev.scheduler_bootstrap.worker_context_base;
+            ASSERT_GE(context_address, device_base);
+            const uint64_t context_offset = context_address - device_base;
+            ASSERT_LE(context_offset + sizeof(SchedulerWorkerContext), region.bytes);
+            const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+                static_cast<const uint8_t *>(region.source) + context_offset
+            );
+            EXPECT_EQ(context->pmu_cells_offset != 0, pmu != 0);
+            EXPECT_EQ(context->activity_buffers_offset != 0, level >= 3);
+            if (pmu != 0) EXPECT_LE(context->pmu_cells_offset + sizeof(SchedulerTaskPmuCell), region.bytes);
+            if (level >= 3) EXPECT_LE(context->activity_buffers_offset + sizeof(SchedulerActivityBuffer), region.bytes);
+        };
+        check_diagnostics(*first.runtime, before_pmu, before_level);
+#endif
         ASSERT_EQ(
             bind_callable_to_runtime_impl(
                 second.runtime.get(), &second.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
@@ -1983,13 +2003,11 @@ protected:
             0
         );
         ASSERT_GT(second.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
-        // Identical task shape, distinct fresh slots: only the current run's
-        // optional PMU cells or activity buffers can change the requested size.
-        if (after_pmu > before_pmu || after_level > before_level) {
-            EXPECT_GT(slot(1).capacity, predecessor_bytes);
-        } else {
-            EXPECT_LT(slot(1).capacity, predecessor_bytes);
-        }
+        // Optional cells can occupy alignment padding without changing total capacity.
+#if __has_include("scheduler/scheduler_args_dump.h")
+        check_diagnostics(*second.runtime, after_pmu, after_level);
+        check_diagnostics(*first.runtime, before_pmu, before_level);
+#endif
         EXPECT_EQ(slot(0).capacity, predecessor_bytes);
         EXPECT_EQ(slot(0).host, predecessor_host);
         EXPECT_EQ(runner.pmu, before_pmu);

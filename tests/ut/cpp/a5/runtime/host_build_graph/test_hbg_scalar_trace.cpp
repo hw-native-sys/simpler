@@ -123,10 +123,10 @@ TEST(HbgScalarTrace, InitializationPublishesHeadersWithoutTouchingRecordPayload)
     ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &layout, true));
     const uint64_t initialized_bytes = layout.total_size;
     ASSERT_TRUE(scheduler_plan_scalar_storage(&layout));
-    std::vector<uint8_t> storage(layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1, 0xa5);
+    std::vector<uint8_t> storage(layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1, 0xa5);
     auto *base = reinterpret_cast<uint8_t *>(
-        (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_ALIGNMENT - 1) &
-        ~(uintptr_t{SCHEDULER_STATE_ALIGNMENT} - 1)
+        (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_BASE_ALIGNMENT - 1) &
+        ~(uintptr_t{SCHEDULER_STATE_BASE_ALIGNMENT} - 1)
     );
     ASSERT_TRUE(scheduler_init_data_from_layout(base, layout, UINT64_C(0x100000), initialized_bytes));
     auto *headers = scheduler_state_at<SchedulerActivityBuffer>(base, layout.activity_buffers_offset);

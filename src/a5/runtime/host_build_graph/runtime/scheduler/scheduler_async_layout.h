@@ -25,7 +25,6 @@ struct alignas(64) SchedulerAsyncLayout {
     uint64_t group_progress_offset;
     uint64_t joins_offset;
     uint64_t finish_leases_offset;
-    uint64_t finish_progress_offset;
     uint64_t check_directory_offset;
     uint64_t finish_directory_offset;
     uint32_t task_count;
@@ -49,10 +48,6 @@ struct alignas(64) SchedulerAsyncGroupProgress {
     uint32_t acquire_cursor;
 };
 
-struct alignas(64) SchedulerAsyncFinishProgress {
-    SchedulerResolveCursor resolver;
-};
-
 struct alignas(64) SchedulerAsyncDirectoryWord {
     volatile uint64_t bits;
 };
@@ -61,33 +56,9 @@ struct alignas(64) SchedulerAsyncActivity {
     volatile uint64_t activated;
 };
 
-// Explicit field copies work for private/GM address spaces and preserve the
-// complete continuation, including a batch not yet published by its owner.
-template <typename Destination, typename Source>
-inline __aicore__ void scheduler_async_copy_resolver(Destination &destination, const Source &source) {
-    destination.producer_ref = source.producer_ref;
-    destination.next_waiter = source.next_waiter;
-    destination.waiter_ref = source.waiter_ref;
-    destination.saved_next = source.saved_next;
-    destination.route.task_ref = source.route.task_ref;
-    destination.route.producer_ref = source.route.producer_ref;
-    destination.route.next_fanin = source.route.next_fanin;
-    destination.route.fanin_count = source.route.fanin_count;
-    destination.route.result = source.route.result;
-    destination.publication.inbox_offset = source.publication.inbox_offset;
-    destination.publication.count = source.publication.count;
-    destination.publication.destination = source.publication.destination;
-    destination.publication.target = source.publication.target;
-    destination.publication.phase = source.publication.phase;
-    destination.phase = source.phase;
-    destination.visited_count = source.visited_count;
-    for (uint32_t i = 0; i < SCHEDULER_READY_PUBLICATION_CAPACITY; ++i)
-        destination.publication.refs[i] = source.publication.refs[i];
-}
-
 static_assert(sizeof(SchedulerAsyncLayout) == 128 && alignof(SchedulerAsyncLayout) == 64);
-static_assert(offsetof(SchedulerAsyncLayout, task_count) == 96);
-static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 120);
+static_assert(offsetof(SchedulerAsyncLayout, task_count) == 88);
+static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 112);
 static_assert(sizeof(SchedulerAsyncActivity) == 64 && alignof(SchedulerAsyncActivity) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncActivity> && std::is_trivially_copyable_v<SchedulerAsyncActivity>
@@ -100,11 +71,6 @@ static_assert(
 static_assert(sizeof(SchedulerAsyncGroupProgress) == 64 && alignof(SchedulerAsyncGroupProgress) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncGroupProgress> && std::is_trivially_copyable_v<SchedulerAsyncGroupProgress>
-);
-static_assert(sizeof(SchedulerAsyncFinishProgress) == 192 && alignof(SchedulerAsyncFinishProgress) == 64);
-static_assert(
-    std::is_standard_layout_v<SchedulerAsyncFinishProgress> &&
-    std::is_trivially_copyable_v<SchedulerAsyncFinishProgress>
 );
 static_assert(sizeof(SchedulerAsyncDirectoryWord) == 64 && alignof(SchedulerAsyncDirectoryWord) == 64);
 

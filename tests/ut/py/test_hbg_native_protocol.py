@@ -76,7 +76,6 @@ def capture(epoch=0):
                 completed_subtasks=0,
                 admission_state=0,
                 claim_tickets=0,
-                admission_claim_lock=0,
                 claim_seal=0,
             )
         ],
@@ -116,7 +115,7 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
 def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
     raw = capture()
     raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
-    raw["task_controls"][0].update(claim_tickets=0, admission_claim_lock=0, claim_seal=0)
+    raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
     raw["executed_task_count"] = 0
     with pytest.raises(ValueError, match="unknown fields"):
@@ -239,7 +238,7 @@ def test_noncurrent_protocol_versions_are_rejected(version):
         read_native_protocol(raw)
 
 
-@pytest.mark.parametrize("field", ("claim_tickets", "admission_claim_lock", "claim_seal"))
+@pytest.mark.parametrize("field", ("claim_tickets", "claim_seal"))
 @pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
 def test_current_control_words_are_mandatory_uint64(field, value):
     raw = capture()

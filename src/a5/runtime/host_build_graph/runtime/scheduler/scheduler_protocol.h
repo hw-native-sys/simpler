@@ -301,11 +301,9 @@ scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task
         return;
     }
     const auto *source = scheduler_state_at<SchedulerTaskMetadata>(base, local->config.task_metadata_offset) + task;
-    SchedulerTaskMetadata metadata{};
-    metadata.flags = source->flags;
-    metadata.logical_block_num = source->logical_block_num;
+    const uint8_t task_flags = source->flags;
     uint64_t order = UINT64_MAX;
-    if (scheduler_task_requires_admission(metadata)) {
+    if (scheduler_task_requires_admission(task_flags)) {
         if (deferred) {
             // FINISH may run on a different core after the execution cohort
             // closed. The admission publication retains the original order.
@@ -327,7 +325,7 @@ scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task
             order = admission->scan_cursor;
         }
     }
-    const uint32_t flags = metadata.flags | (deferred ? SCHEDULER_PROTOCOL_DEFERRED_FINISH : 0);
+    const uint32_t flags = task_flags | (deferred ? SCHEDULER_PROTOCOL_DEFERRED_FINISH : 0);
     scheduler_protocol_task_actor(base, local, task, order, flags, true, before);
 }
 

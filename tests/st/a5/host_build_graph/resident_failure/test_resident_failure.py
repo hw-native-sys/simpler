@@ -231,10 +231,6 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     version = protocol_version(protocol)
     assert version in (10, 11)
     assert type(protocol.get("close_seal_stride")) is int and protocol["close_seal_stride"] == 64
-    assert all(
-        type(control.get("admission_claim_lock")) is int and control["admission_claim_lock"] == 0
-        for control in control_rows
-    )
     for task in protocol["tasks"]:
         control = controls[task["task_ref"]]
         seal = control.get("claim_seal")

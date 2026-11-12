@@ -301,7 +301,12 @@ struct NativeViewFixture {
             header.image_bytes = layout.total_size;
             header.control_inboxes_offset = layout.control_inboxes_offset;
         }
-        backing.reset(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, header.image_bytes));
+        backing.reset(
+            std::aligned_alloc(
+                SCHEDULER_STATE_BASE_ALIGNMENT, (header.image_bytes + SCHEDULER_STATE_BASE_ALIGNMENT - 1) /
+                                                    SCHEDULER_STATE_BASE_ALIGNMENT * SCHEDULER_STATE_BASE_ALIGNMENT
+            )
+        );
         if (!backing) throw std::bad_alloc();
         std::memset(backing.get(), 0, header.image_bytes);
         if (runtime_state &&
@@ -625,7 +630,7 @@ TEST(HbgNativeGraphPlan, AnyEligibleWorkerClaimsTheSharedQueue) {
             auto *run = static_cast<SchedulerRunControl *>(view.backing.get());
             seed_native_ready(view, local, 1);
             SchedulerReadyClaim claim{};
-            ASSERT_TRUE(scheduler_claim_ready_for_slot(view.graph, view.backing.get(), &local, run, 30, type, &claim));
+            ASSERT_TRUE(scheduler_claim_ready_for_slot(view.graph, view.backing.get(), &local, run, type, &claim));
             EXPECT_EQ(claim.task_ref, 1);
             EXPECT_EQ(claim.source, SchedulerReadySource::POOL);
             EXPECT_EQ(scheduler_read_error(run), 0u);
@@ -642,7 +647,7 @@ TEST(HbgNativeGraphPlan, NativeReadyClaimPreservesPublicationOrder) {
         seed_native_ready(view, producer, ref);
     for (int64_t expected : {1, 2, 3}) {
         SchedulerReadyClaim claim{};
-        ASSERT_TRUE(scheduler_claim_ready_for_slot(view.graph, view.backing.get(), &consumer, run, 30, 0, &claim));
+        ASSERT_TRUE(scheduler_claim_ready_for_slot(view.graph, view.backing.get(), &consumer, run, 0, &claim));
         EXPECT_EQ(claim.task_ref, expected);
     }
 }
@@ -667,7 +672,7 @@ TEST(HbgNativeGraphPlan, ConcurrentConsumersClaimEachNativeTaskOnce) {
             while (!start.load(std::memory_order_acquire)) {}
             for (uint32_t attempt = 0; attempt < tasks * 2; ++attempt) {
                 SchedulerReadyClaim claim{};
-                if (!scheduler_claim_ready_for_slot(view.graph, base, &local, run, 30, 0, &claim)) {
+                if (!scheduler_claim_ready_for_slot(view.graph, base, &local, run, 0, &claim)) {
                     ++failures;
                     break;
                 }
@@ -787,27 +792,21 @@ TEST(HbgNativeGraphPlan, DummyChainProgressesWithFullKernelSlotsAfterBootstrapBa
     }
 }
 
-TEST(HbgNativeGraphPlan, SlicedFanoutCountsProducerOnlyAfterAllWaitersArePublished) {
+TEST(HbgNativeGraphPlan, SynchronousFanoutFinishesWithinOneNodeService) {
     DefinitionFixture body(std::vector<std::vector<uint16_t>>(130), true);
     ControlFixture view(body);
     scheduler_gm_store(view.run->bootstrap_scan_complete, uint64_t{1});
     bool progress = false;
     ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress));
     EXPECT_TRUE(progress);
-    EXPECT_EQ(view.locals[0].control_resolve.producer_ref, 0);
-    EXPECT_GE(view.locals[0].control_resolve.next_waiter, 0);
-    EXPECT_EQ(view.completed(), 0);
-    // Another worker can consume the published prefix while its producer's
-    // continuation still owns the remaining wake chain.
-    ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &view.locals[2], view.run, 0, &progress));
-    EXPECT_GT(view.locals[2].pending_completed, 0);
-    EXPECT_EQ(view.locals[0].pending_completed, 0);
+    EXPECT_GT(view.locals[0].pending_completed, 0);
+    EXPECT_LE(view.locals[0].pending_completed, SCHEDULER_CONTROL_NODE_BUDGET);
+    auto *root = scheduler_task_control_at(view.backing.get(), &view.locals[0], 0);
+    EXPECT_EQ(root->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
     for (uint32_t step = 0; step < 128 && view.completed() < view.graph.task_count; ++step)
         for (auto &local : view.locals)
             ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &local, view.run, 0, &progress));
     EXPECT_EQ(view.completed(), view.graph.task_count);
-    for (auto &local : view.locals)
-        EXPECT_LT(local.control_resolve.producer_ref, 0);
 }
 
 namespace {
@@ -1101,7 +1100,7 @@ TEST(HbgNativeGraphPlan, BootstrapArgumentsSurviveAdmissionRetriesForSpmdAndMix)
             SchedulerAdmissionResult::PROGRESS
         );
         view.control()->commit_lock = 3;
-        ASSERT_TRUE(scheduler_prepare_admission_record(view.graph, base, local, view.run, admission));
+
         const auto &plan = view.plan.definitions[0].children[0];
         auto *scalars = reinterpret_cast<uint64_t *>(view.bound.instance->args_base + plan.scalars_offset);
         EXPECT_EQ(scalars[0], 71);
@@ -1109,7 +1108,7 @@ TEST(HbgNativeGraphPlan, BootstrapArgumentsSurviveAdmissionRetriesForSpmdAndMix)
             scheduler_try_commit_admission(view.graph, base, local, view.run, admission),
             SchedulerAdmissionResult::RETRY
         );
-        ASSERT_TRUE(scheduler_prepare_admission_record(view.graph, base, local, view.run, admission));
+
         EXPECT_EQ(scalars[0], 71) << "admission does not rewrite bootstrap's immutable argument publication";
         view.control()->commit_lock = 0;
         ASSERT_EQ(
@@ -1142,7 +1141,10 @@ TEST(HbgNativeGraphPlan, BootstrapBindingFailureCannotClaimOrPublishAdmission) {
         scheduler_try_claim_admission(view.graph, base, &view.locals[0], view.run, &view.admissions[0], candidate),
         SchedulerAdmissionResult::ERROR
     );
-    EXPECT_FALSE(scheduler_prepare_admission_record(view.graph, base, &view.locals[0], view.run, &view.admissions[0]));
+    EXPECT_EQ(
+        scheduler_try_commit_admission(view.graph, base, &view.locals[0], view.run, &view.admissions[0]),
+        SchedulerAdmissionResult::ERROR
+    );
     EXPECT_NE(scheduler_read_error(view.run), 0);
     EXPECT_EQ(view.run->error_site, static_cast<uint64_t>(SchedulerErrorSite::GRAPH_BIND_SCALAR));
     auto *control = scheduler_task_control_at(base, &view.locals[0], view.child());
@@ -1166,7 +1168,7 @@ TEST(HbgNativeGraphPlan, NativeMixAdmissionIncludesOnlyActiveLanesAndCoordinator
             scheduler_try_claim_admission(view.graph, base, local, view.run, admission, candidate),
             SchedulerAdmissionResult::PROGRESS
         );
-        ASSERT_TRUE(scheduler_prepare_admission_record(view.graph, base, local, view.run, admission));
+
         ASSERT_EQ(
             scheduler_try_commit_admission(view.graph, base, local, view.run, admission),
             SchedulerAdmissionResult::PROGRESS

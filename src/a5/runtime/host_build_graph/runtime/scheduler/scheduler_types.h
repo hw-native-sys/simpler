@@ -635,7 +635,14 @@ inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
 //
 // These types are shared by Host, AICPU lifecycle, and AICore workers.
 // =============================================================================
+// Wire subregions use 64B alignment; the allocation base must also satisfy
+// the shared GM types' alignment, computed below.
 inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 64;
+inline constexpr uint64_t SCHEDULER_SCALAR_DCACHE_LINE_BYTES = 64;
+// CANN's SIMT GM-atomic model uses 128B sectors within a 512B L2 line.
+// AIC/AIV scalar atomicAdd/ld_dev probes support this separation for layout;
+// it is not a scalar ordering guarantee. See the data-layout contract.
+inline constexpr uint64_t SCHEDULER_GM_ATOMIC_SECTOR_BYTES = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
@@ -916,15 +923,20 @@ inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
     return (flags & SCHEDULER_TASK_HAS_PREDICATE) != 0;
 }
 
+// Host metadata construction and spmd-record validation establish that SPMD
+// means logical_block_num > 1. Classification needs only these immutable flags;
+// payload preparation and shape validation still read the full metadata.
+inline __aicore__ bool scheduler_task_requires_admission(uint8_t flags) {
+    return (flags & (SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE)) == SCHEDULER_TASK_EXECUTABLE &&
+           (flags & (SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SYNC_START)) != 0;
+}
+
 inline __aicore__ bool scheduler_task_requires_admission(const SchedulerTaskMetadata &metadata) {
-    return scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags) &&
-           (metadata.logical_block_num > 1 || scheduler_task_is_mix(metadata.flags) ||
-            scheduler_task_requires_sync_start(metadata.flags));
+    return scheduler_task_requires_admission(metadata.flags);
 }
 
 enum class SchedulerAdmissionState : uint64_t {
     UNCLAIMED = 0,
-    PREPARED = 2,
     ADMITTED = 3,
     INITIALIZED = 4,
 };
@@ -945,36 +957,45 @@ inline __aicore__ constexpr uint64_t scheduler_completion_initial_state(uint32_t
     return static_cast<uint64_t>(total) << 16;
 }
 
-struct alignas(64) SchedulerTaskControl {
-    // Only atomic wrappers write this line. The link belongs to at most one
-    // dependency list, Ready inbox or unpublished Ready batch at a time.
+// One atomic word transfers a waiter's chain link and next unexamined fanin.
+// Task refs fit int32; -1 terminates the chain. Fanin positions fit uint32.
+inline __aicore__ constexpr uint64_t scheduler_wake_cursor_pack(int64_t next, uint32_t fanin) {
+    return (static_cast<uint64_t>(fanin) << 32) | static_cast<uint32_t>(next);
+}
+inline __aicore__ constexpr int64_t scheduler_wake_cursor_next(uint64_t cursor) { return static_cast<int32_t>(cursor); }
+inline __aicore__ constexpr uint32_t scheduler_wake_cursor_fanin(uint64_t cursor) {
+    return static_cast<uint32_t>(cursor >> 32);
+}
+
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
+    // Only atomic wrappers write this line. wake_cursor owns dependency links;
+    // next_waiter owns control-inbox or unpublished Ready-batch links.
     volatile int64_t state;
     volatile int64_t wake_list_head;
     volatile int64_t next_waiter;
     volatile uint64_t claim_tickets;
-    volatile uint64_t admission_claim_lock;
+    volatile uint64_t wake_cursor;
 
-    // The resolver owns cached metadata; its writeback cannot touch atomics.
-    alignas(64) int32_t next_fanin_index;
-    int32_t waiting_producer;
-    uint64_t completion_resolve_start_cycles;
+    // Block claimers and retiring workers update these counters concurrently.
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t next_block;
+    // Bits [0,16) count retired subtasks; [16,32) hold the Host-validated total.
+    // Each high-half vote requires the last return to check async completion.
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t completion_state;
+
+    // Resolve timing starts only after all computation contributions finish.
+    // It shares the quiescent counter's L2 region, but occupies another 64B
+    // scalar DCache line so its writeback cannot restore an atomic word.
+    alignas(SCHEDULER_SCALAR_DCACHE_LINE_BYTES) uint64_t completion_resolve_start_cycles;
     uint64_t completion_resolve_end_cycles;
     uint64_t scheduler_worker_id;
     uint64_t completion_resolve_loop_iter;
 
-    // Block claimers and retiring workers update these counters concurrently.
-    alignas(64) volatile uint64_t next_block;
-    // Bits [0,16) count retired subtasks; [16,32) hold the Host-validated total.
-    // Each high-half vote requires the last return to check async completion.
-    // Valid counts are at most INT16_MAX, so the same RMW cannot change the total.
-    alignas(64) volatile uint64_t completion_state;
-
     // Only the admission owner bypass-publishes this signal. No cached store
     // or atomic RMW may target its line.
-    alignas(64) volatile uint64_t admission_state;
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t admission_state;
 
     // The final block claimer publishes this immutable claim certificate.
-    alignas(64) volatile uint64_t claim_seal;
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
 };
 
 // Each record's bitmap follows its header within an independently aligned
@@ -998,11 +1019,11 @@ struct alignas(64) SchedulerMixCloseSeal {
     volatile uint64_t value;
 };
 
-struct alignas(64) SchedulerAdmissionControl {
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerAdmissionControl {
     // Only the lock uses atomics. Tail publishers are serialized by the lock
     // and complete their bypass store before releasing it.
     volatile uint64_t commit_lock;
-    alignas(64) volatile uint64_t commit_tail;
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t commit_tail;
 };
 
 struct alignas(64) SchedulerGroupDescriptor {
@@ -1357,29 +1378,33 @@ static_assert(std::is_trivially_copyable_v<SchedulerTaskMetadata> && std::is_sta
 static_assert(alignof(SchedulerTaskMetadata) == 8, "metadata copies require scalar-aligned call frames");
 static_assert(offsetof(SchedulerTaskMetadata, timing_slot) == 12, "timing tag offset changed");
 static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block count must occupy the metadata tail");
-static_assert(sizeof(SchedulerTaskControl) == 384, "task control layout changed");
-static_assert(alignof(SchedulerTaskControl) == 64, "task control alignment changed");
+// Allocation alignment follows the shared GM types, not DCache maintenance.
+inline constexpr uint64_t SCHEDULER_STATE_BASE_ALIGNMENT = alignof(SchedulerTaskControl);
+static_assert(alignof(SchedulerAdmissionControl) <= SCHEDULER_STATE_BASE_ALIGNMENT);
+
+static_assert(sizeof(SchedulerTaskControl) == 640, "task control layout changed");
+static_assert(alignof(SchedulerTaskControl) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES, "task control alignment changed");
 static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 24, "ticket cursor must use the atomic region");
 static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor requires an isolated atomic line");
 static_assert(
-    offsetof(SchedulerTaskControl, completion_state) == 192, "completion counter requires an isolated atomic line"
+    offsetof(SchedulerTaskControl, completion_state) == 256, "completion counter requires an isolated atomic line"
 );
 static_assert(
-    offsetof(SchedulerTaskControl, admission_claim_lock) == 32, "admission claim lock must use the atomic line"
+    offsetof(SchedulerTaskControl, admission_state) == 384, "admission state requires an isolated signal region"
 );
-static_assert(
-    offsetof(SchedulerTaskControl, admission_state) == 256, "admission state requires an isolated signal region"
-);
-static_assert(offsetof(SchedulerTaskControl, claim_seal) == 320, "claim seal requires an isolated atomic line");
+static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated atomic line");
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
 static_assert(offsetof(SchedulerAdmissionRecord, member_rank_offset) == 40, "membership prefix offset changed");
 static_assert(sizeof(SchedulerMixCloseSeal) == 64, "close seals require independent atomic regions");
 static_assert(alignof(SchedulerMixCloseSeal) == 64, "close seals require isolated alignment");
 static_assert(offsetof(SchedulerMixCloseSeal, value) == 0, "close seal value must lead its region");
 static_assert(std::is_standard_layout_v<SchedulerMixCloseSeal> && std::is_trivially_copyable_v<SchedulerMixCloseSeal>);
-static_assert(sizeof(SchedulerAdmissionControl) == 128, "admission control layout changed");
-static_assert(alignof(SchedulerAdmissionControl) == 64, "admission control requires isolated atomic regions");
-static_assert(offsetof(SchedulerAdmissionControl, commit_tail) == 64, "tail must not share the lock's atomic region");
+static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
+static_assert(
+    alignof(SchedulerAdmissionControl) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES,
+    "admission control requires isolated atomic regions"
+);
+static_assert(offsetof(SchedulerAdmissionControl, commit_tail) == 128, "tail must not share the lock's atomic region");
 static_assert(sizeof(SchedulerGroupDescriptor) == 128, "group descriptor layout changed");
 static_assert(sizeof(SchedulerGroupLaneAck) == 64, "lane acknowledgements require separate atomic regions");
 static_assert(sizeof(SchedulerGroupMailbox) == 384, "group mailbox layout changed");
@@ -1388,9 +1413,12 @@ static_assert(offsetof(SchedulerGroupMailbox, lanes) == 192, "each lane must own
 // Both chain links share the atomic line. A link has several producers, so it is
 // written as a single device word; keeping it off the line-published half is what
 // stops one producer's writeback from restoring its stale copy of the link.
-static_assert(offsetof(SchedulerTaskControl, next_waiter) < 64, "wake link must sit on the atomic line");
 static_assert(
-    offsetof(SchedulerTaskControl, next_fanin_index) == 64, "line-published waiter metadata needs its own line"
+    offsetof(SchedulerTaskControl, next_waiter) < 64 && offsetof(SchedulerTaskControl, wake_cursor) < 64,
+    "control and dependency links must sit on the atomic line"
+);
+static_assert(
+    offsetof(SchedulerTaskControl, completion_resolve_start_cycles) == 320, "resolver timing needs its own line"
 );
 static_assert(sizeof(SchedulerReadyInbox) == 64, "control inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 64, "control inbox alignment changed");
@@ -1672,8 +1700,8 @@ inline bool scheduler_init_data_from_layout(
 ) {
     const uint64_t prefix_end = layout.scalar_records_offset == 0 ? layout.total_size : layout.scalar_records_offset;
     if (initialized_bytes == 0) initialized_bytes = prefix_end;
-    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-        device_base_address == 0 || (device_base_address & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0 ||
+        device_base_address == 0 || (device_base_address & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0 ||
         layout.total_size > UINT64_MAX - device_base_address || initialized_bytes > prefix_end ||
         (layout.async_layout_offset == 0 ? initialized_bytes != prefix_end :
                                            initialized_bytes < layout.async_layout_offset))
@@ -1706,7 +1734,7 @@ inline bool scheduler_init_data_from_layout(
         controls[i].state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
         controls[i].wake_list_head = SCHEDULER_WAKE_LIST_OPEN;
         controls[i].next_waiter = SCHEDULER_TASK_REF_INVALID;
-        controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_REF_INVALID);
+        controls[i].wake_cursor = scheduler_wake_cursor_pack(SCHEDULER_TASK_REF_INVALID, 0);
     }
     if (layout.control_inboxes_offset != 0) {
         auto *control_ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.control_inboxes_offset);
@@ -1779,7 +1807,8 @@ inline bool scheduler_init_data_from_layout(
 }
 
 inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLayout &layout, uint64_t run_epoch) {
-    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0) return false;
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0)
+        return false;
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset);
     auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
     uint64_t cooperative_count = 0;

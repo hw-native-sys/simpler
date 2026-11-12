@@ -95,7 +95,9 @@ static inline __aicore__ bool scheduler_complete_task(
     if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
-    auto *direct = direct_ready != nullptr ? direct_ready : scheduler_ordered_direct_sink(scheduler->admission);
+    auto *direct = direct_ready;
+    if (direct == nullptr && scheduler->admission != nullptr)
+        direct = scheduler_ordered_direct_sink(scheduler->admission);
     const bool resolved = scheduler_resolve_completion(
         graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, false, direct,
         scheduler->config.self_core_type, true
@@ -111,7 +113,7 @@ static inline __aicore__ bool scheduler_complete_task(
     }
     if (direct != nullptr && !scheduler_task_ref_is_null(direct->task_ref) &&
         scheduler_task_requires_admission(
-            scheduler_load_dispatch_metadata(scheduler_state_base, scheduler, direct->task_ref, profiling_level)
+            scheduler_task_metadata_at(scheduler_state_base, scheduler, direct->task_ref)->flags
         )) {
         const auto claimed = scheduler_try_claim_admission(
             graph, scheduler_state_base, scheduler, run_control, scheduler->admission, *direct
@@ -130,7 +132,8 @@ static inline __aicore__ bool scheduler_complete_task(
     return true;
 }
 
-// FromExecutor is the resident's return path after execution identity validation.
+// FromExecutor retains the resident's exclusive ownership of a dispatched slot:
+// kernels receive only GM payload/argument contexts, never its private binding.
 // The checked entry also serves tests and callers that do not hold that proof.
 template <bool RecordProtocol = true, bool FromExecutor = false>
 static inline __aicore__ bool scheduler_complete_own_slot(
@@ -210,9 +213,11 @@ static inline __aicore__ bool scheduler_complete_own_slot(
             contribution == SchedulerSubtaskFinishResult::TASK_LAST_CHECK_ASYNC, profiling_level, direct
         );
     }
-    SchedulerExecutorTaskTrace executor_trace{};
-    if (chip_task_timing_enabled || sampled_task_timing_enabled)
-        executor_trace = scheduler->profiling->executor_traces[pending_slot];
+    // This core is the sole writer. Rebinding the slot happens after all trace
+    // reads below, so retirement can read the executor's record in place.
+    const SchedulerExecutorTaskTrace *executor_trace = chip_task_timing_enabled || sampled_task_timing_enabled ?
+                                                           &scheduler->profiling->executor_traces[pending_slot] :
+                                                           nullptr;
     __gm__ SchedulerTaskTrace *completed_trace = nullptr;
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
@@ -228,14 +233,14 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         if (phase_timing_enabled && !scheduler->profiling->worker_trace_valid) {
             scheduler_observe_cache_line(&target->trace_aicore_entry_cycles);
         }
-        completed_trace->kernel_start_cycles = executor_trace.kernel_start_cycles;
-        completed_trace->kernel_end_cycles = executor_trace.kernel_end_cycles;
-        completed_trace->ready_observe_cycles = executor_trace.ready_observe_cycles;
+        completed_trace->kernel_start_cycles = executor_trace->kernel_start_cycles;
+        completed_trace->kernel_end_cycles = executor_trace->kernel_end_cycles;
+        completed_trace->ready_observe_cycles = executor_trace->ready_observe_cycles;
         if (schedule_timing_enabled) completed_trace->complete_start_cycles = completion_observe;
         if (phase_timing_enabled) {
-            completed_trace->ready_scan_start_cycles = executor_trace.ready_scan_start_cycles;
-            completed_trace->completion_id = executor_trace.completion_id;
-            completed_trace->completion_inbox_index = executor_trace.completion_inbox_index;
+            completed_trace->ready_scan_start_cycles = executor_trace->ready_scan_start_cycles;
+            completed_trace->completion_id = executor_trace->completion_id;
+            completed_trace->completion_inbox_index = executor_trace->completion_inbox_index;
             SchedulerWorkerTraceCache *worker_trace = &scheduler->profiling->worker_trace;
             if (!scheduler->profiling->worker_trace_valid) {
                 worker_trace->descriptor_cache_observed_cycles = target->trace_descriptor_cache_observed_cycles;
@@ -252,8 +257,8 @@ static inline __aicore__ bool scheduler_complete_own_slot(
             completed_trace->complete_loop_iter = scheduler->profiling->loop_iter;
         }
     } else if (completed_trace != nullptr) {
-        completed_trace->kernel_start_cycles = executor_trace.kernel_start_cycles;
-        completed_trace->kernel_end_cycles = executor_trace.kernel_end_cycles;
+        completed_trace->kernel_start_cycles = executor_trace->kernel_start_cycles;
+        completed_trace->kernel_end_cycles = executor_trace->kernel_end_cycles;
     }
     if (chip_task_timing_enabled) {
         if (phase_timing_enabled) {

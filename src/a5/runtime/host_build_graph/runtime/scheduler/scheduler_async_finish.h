@@ -17,12 +17,11 @@
 
 static inline __aicore__ bool scheduler_async_finish_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerAsyncLocalState &async, uint32_t budget, bool &made_progress, uint64_t profiling_level = 0
+    SchedulerAsyncLocalState &async, bool &made_progress, uint64_t profiling_level = 0
 ) {
     using namespace scheduler_async_detail;
     made_progress = false;
-    if (async.error_code != 0 || async.layout == nullptr || local == nullptr || run == nullptr || base != async.base ||
-        budget == 0)
+    if (async.error_code != 0 || async.layout == nullptr || local == nullptr || run == nullptr || base != async.base)
         return fail(async, -1);
     uint32_t index = ASYNC_INVALID_INDEX;
     uint64_t owned = 0;
@@ -44,31 +43,13 @@ static inline __aicore__ bool scheduler_async_finish_step(
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(base, async.layout->joins_offset);
     if (!scheduler_async_pending::ready_to_finish(scheduler_gm_fetch_add(joins[index].word, UINT64_C(0))))
         return failed();
-    auto *progress = scheduler_state_at<SchedulerAsyncFinishProgress>(base, async.layout->finish_progress_offset);
-    observe(&progress[index], sizeof(SchedulerAsyncFinishProgress));
-    SchedulerResolveCursor cursor{};
-    scheduler_async_copy_resolver(cursor, progress[index].resolver);
-    if (cursor.phase == SchedulerResolvePhase::START) {
-        auto *control = scheduler_task_control_at(base, local, task_ref);
-        scheduler_protocol_task_done(base, local, task_ref, true, true);
-        scheduler_cache_barrier();
-        scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-        scheduler_protocol_task_done(base, local, task_ref, false, true);
-    }
-    const SchedulerResolveCursor before = cursor;
-    const auto result =
-        scheduler_resolve_completion_step(graph, base, local, run, task_ref, cursor, budget, profiling_level);
-    scheduler_async_copy_resolver(progress[index].resolver, cursor);
-    publish(&progress[index], sizeof(SchedulerAsyncFinishProgress));
-    if (result.result == SchedulerResolveResult::ERROR) return failed();
-    made_progress = cursor.phase != before.phase || cursor.visited_count != before.visited_count ||
-                    cursor.route.next_fanin != before.route.next_fanin ||
-                    cursor.publication.phase != before.publication.phase ||
-                    cursor.publication.count != before.publication.count;
-    if (result.result == SchedulerResolveResult::YIELD)
-        return scheduler_async_lease_release(leases[index], owned).result == SchedulerAsyncLeaseResult::SUCCESS ||
-               failed();
-    if (result.result != SchedulerResolveResult::DONE) return failed();
+    auto *control = scheduler_task_control_at(base, local, task_ref);
+    scheduler_protocol_task_done(base, local, task_ref, true, true);
+    scheduler_cache_barrier();
+    scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    scheduler_protocol_task_done(base, local, task_ref, false, true);
+    if (!scheduler_resolve_completion(graph, base, local, run, task_ref, profiling_level, false, nullptr, UINT32_MAX))
+        return failed();
     auto *directory = scheduler_state_at<SchedulerAsyncDirectoryWord>(base, async.layout->finish_directory_offset);
     if (scheduler_async_lease_finish(leases[index], owned).result != SchedulerAsyncLeaseResult::SUCCESS ||
         scheduler_async_directory_clear(directory[index / 64].bits, index % 64) !=
@@ -99,7 +80,7 @@ static inline __aicore__ bool scheduler_service_async_slice(
     );
     const bool ok =
         finish ?
-            scheduler_async_finish_step(graph, base, local, run, async, 8, made_progress, profiling_level) :
+            scheduler_async_finish_step(graph, base, local, run, async, made_progress, profiling_level) :
             scheduler_async_check_step(
                 async, UINT32_C(1) << local->config.self_core_type, 8, SchedulerAsyncCompletionObserver{}, made_progress
             );

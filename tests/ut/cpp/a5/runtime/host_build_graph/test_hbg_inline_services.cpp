@@ -238,7 +238,7 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     ASSERT_TRUE(fixture.complete(1, 0));
     EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
     EXPECT_NE(scheduler_gm_load(fixture.control(1).state), static_cast<int64_t>(SchedulerTaskState::DONE));
-    EXPECT_EQ(fixture.control(2).waiting_producer, 1);
+    EXPECT_EQ(fixture.control(1).wake_list_head, 2);
     ASSERT_TRUE(fixture.fill());
     ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
     ASSERT_EQ(fixture.locals[1]->slots[0].block_idx, 1u);

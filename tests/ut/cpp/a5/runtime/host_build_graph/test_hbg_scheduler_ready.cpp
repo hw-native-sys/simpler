@@ -40,8 +40,7 @@ bool pop_ready(
     int64_t *task
 ) {
     SchedulerReadyClaim claim{};
-    const bool ok =
-        scheduler_claim_ready_for_slot(graph, base, local, run, local->config.runtime_worker_count, queue, &claim);
+    const bool ok = scheduler_claim_ready_for_slot(graph, base, local, run, queue, &claim);
     *task = claim.task_ref;
     return ok;
 }
@@ -340,8 +339,8 @@ TEST(SchedulerBootstrap, RegistersOnlyOnFirstExecutableProducer) {
         SchedulerRouteResult::WAITING
     );
     EXPECT_EQ(controls[0].wake_list_head, 1);
-    EXPECT_EQ(controls[1].next_waiter, SCHEDULER_WAKE_LIST_OPEN);
-    EXPECT_EQ(controls[1].waiting_producer, 0);
+    EXPECT_EQ(scheduler_wake_cursor_next(controls[1].wake_cursor), SCHEDULER_WAKE_LIST_OPEN);
+    EXPECT_EQ(scheduler_wake_cursor_fanin(controls[1].wake_cursor), 1u);
 
     EXPECT_EQ(
         scheduler_bootstrap_route_task(
@@ -351,11 +350,103 @@ TEST(SchedulerBootstrap, RegistersOnlyOnFirstExecutableProducer) {
         SchedulerRouteResult::WAITING
     );
     EXPECT_EQ(controls[1].wake_list_head, 3);
-    EXPECT_EQ(controls[3].next_fanin_index, 1);
-    EXPECT_EQ(controls[3].waiting_producer, 1);
+    EXPECT_EQ(scheduler_wake_cursor_fanin(controls[3].wake_cursor), 2);
 }
 
-TEST(SchedulerRouteContinuation, BoundsFaninWorkAndResumesFromAnotherWorker) {
+TEST(SchedulerBootstrap, ResumeSkipsHostDoneAndDuplicatesButRetainsTheNextDeviceDependency) {
+    for (bool another_device_predecessor : {false, true}) {
+        FixtureStorage storage(5, 3);
+        storage.prepare_ready_pool();
+        GraphBuffer graph(5);
+        for (uint32_t ref = 0; ref < 4; ++ref)
+            graph.executable(ref, 0);
+        graph.executable(4, 0, {0, 1, 0, 2, 3});
+        auto *base = storage.scheduler_state->base();
+        auto *local = storage.local_context(&storage.contexts[0]);
+        for (uint32_t ref : {1u, 2u, 3u}) {
+            if (ref == 2 && another_device_predecessor) continue;
+            storage.metadata[ref].flags = 0;
+            auto *control = scheduler_task_control_at(base, local, ref);
+            control->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+            control->wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
+        }
+        ASSERT_EQ(
+            scheduler_bootstrap_route_task(graph.graph(), base, local, storage.run_control, 4),
+            SchedulerRouteResult::WAITING
+        );
+        const auto *waiter = scheduler_task_control_at(base, local, 4);
+        EXPECT_EQ(scheduler_wake_cursor_fanin(waiter->wake_cursor), another_device_predecessor ? 3u : 5u);
+        scheduler_task_control_at(base, local, 0)->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+        ASSERT_TRUE(scheduler_resolve_completion(
+            graph.graph(), base, local, storage.run_control, 0, 0, true, nullptr, UINT32_MAX
+        ));
+        int64_t ref = -1;
+        ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+        EXPECT_EQ(ref, another_device_predecessor ? SCHEDULER_TASK_REF_INVALID : 4);
+        if (another_device_predecessor) {
+            auto *second = scheduler_task_control_at(base, local, 2);
+            EXPECT_EQ(second->wake_list_head, 4);
+            second->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+            ASSERT_TRUE(scheduler_resolve_completion(
+                graph.graph(), base, local, storage.run_control, 2, 0, true, nullptr, UINT32_MAX
+            ));
+            ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+            EXPECT_EQ(ref, 4);
+        }
+        ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+        EXPECT_EQ(ref, SCHEDULER_TASK_REF_INVALID);
+    }
+}
+
+TEST(SchedulerReadyWake, ValidatedAndImmediateOwnersPublishPrefixAndRetainAnUnfinishedDependency) {
+    for (bool validate_done_state : {false, true}) {
+        SCOPED_TRACE(validate_done_state);
+        constexpr int64_t last = SCHEDULER_READY_PUBLICATION_CAPACITY + 4;
+        FixtureStorage storage(last + 1, 1);
+        storage.prepare_ready_pool();
+        GraphBuffer graph(last + 1);
+        graph.executable(0, 0);
+        graph.executable(1, 0);
+        for (int64_t ref = 2; ref <= last; ++ref) {
+            graph.executable(ref, 0, ref == last ? std::vector<int32_t>{0, 1} : std::vector<int32_t>{0});
+            storage.metadata[ref].flags |= SCHEDULER_TASK_HAS_FANIN;
+        }
+        auto *base = storage.scheduler_state->base();
+        auto *local = storage.local_context(&storage.contexts[0]);
+        for (int64_t ref = last; ref >= 2; --ref)
+            ASSERT_EQ(
+                scheduler_route_task(graph.graph(), base, local, storage.run_control, ref),
+                SchedulerRouteResult::WAITING
+            );
+        auto *first = scheduler_task_control_at(base, local, 0);
+        first->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+        ASSERT_TRUE(scheduler_resolve_completion(
+            graph.graph(), base, local, storage.run_control, 0, 0, validate_done_state, nullptr, UINT32_MAX
+        ));
+        auto *second = scheduler_task_control_at(base, local, 1);
+        EXPECT_EQ(second->wake_list_head, last);
+        EXPECT_EQ(scheduler_wake_cursor_fanin(scheduler_task_control_at(base, local, last)->wake_cursor), 2u);
+        for (int64_t expected = 2; expected < last; ++expected) {
+            int64_t ref = -1;
+            ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+            EXPECT_EQ(ref, expected);
+        }
+        int64_t ref = -1;
+        ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+        EXPECT_EQ(ref, SCHEDULER_TASK_REF_INVALID);
+        second->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+        ASSERT_TRUE(scheduler_resolve_completion(
+            graph.graph(), base, local, storage.run_control, 1, 0, validate_done_state, nullptr, UINT32_MAX
+        ));
+        ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+        EXPECT_EQ(ref, last);
+        ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+        EXPECT_EQ(ref, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(storage.run_control->scheduler_error, 0u);
+    }
+}
+
+TEST(SchedulerSynchronousRoute, ScansAllCompletedFaninsInOneCall) {
     constexpr uint32_t fanin_count = SCHEDULER_GRAPH_MAX_FANIN;
     FixtureStorage storage(fanin_count + 1, 3);
     storage.prepare_ready_pool();
@@ -367,33 +458,17 @@ TEST(SchedulerRouteContinuation, BoundsFaninWorkAndResumesFromAnotherWorker) {
         graph.executable(i, 0);
         fanins.push_back(i);
         scheduler_task_control_at(base, first, i)->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+        scheduler_task_control_at(base, first, i)->wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
     }
     graph.executable(fanin_count, 0, fanins);
-    SchedulerRouteCursor cursor;
-
     EXPECT_EQ(
-        scheduler_route_task_step(graph.graph(), base, first, storage.run_control, fanin_count, cursor, 0).result,
-        SchedulerRouteResult::YIELD
+        scheduler_route_task(graph.graph(), base, first, storage.run_control, fanin_count),
+        SchedulerRouteResult::READY_TO_ENQUEUE
     );
-    EXPECT_EQ(cursor.task_ref, SCHEDULER_TASK_REF_INVALID);
-    uint32_t total_units = 0;
-    for (uint32_t call = 0; cursor.result == SchedulerRouteResult::YIELD && call < fanin_count + 2; ++call) {
-        auto *local = storage.local_context(&storage.contexts[call % 3]);
-        SchedulerRouteCursor restored;
-        std::memcpy(&restored, &cursor, sizeof(cursor));
-        const auto progress =
-            scheduler_route_task_step(graph.graph(), base, local, storage.run_control, fanin_count, restored, 8);
-        EXPECT_LE(progress.work_units, 8u);
-        total_units += progress.work_units;
-        cursor = restored;
-    }
-    EXPECT_EQ(cursor.result, SchedulerRouteResult::READY_TO_ENQUEUE);
-    EXPECT_EQ(total_units, fanin_count + 1);
-
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
 }
 
-TEST(SchedulerRouteContinuation, ProducerClosingBetweenStepsAdvancesWithoutLostRegistration) {
+TEST(SchedulerSynchronousRoute, ClosedPredecessorRoutesToNextUnfinishedProducer) {
     FixtureStorage storage(3, 3);
     storage.prepare_ready_pool();
     GraphBuffer graph(3);
@@ -402,36 +477,70 @@ TEST(SchedulerRouteContinuation, ProducerClosingBetweenStepsAdvancesWithoutLostR
     graph.executable(2, 1, {0, 1});
     auto *base = storage.scheduler_state->base();
     auto *local = storage.local_context(&storage.contexts[0]);
-    SchedulerRouteCursor cursor;
-
-    auto progress = scheduler_route_task_step(graph.graph(), base, local, storage.run_control, 2, cursor, 2);
-    ASSERT_EQ(progress.result, SchedulerRouteResult::YIELD);
-    ASSERT_EQ(cursor.producer_ref, 0);
     auto *producer = scheduler_task_control_at(base, local, 0);
     scheduler_gm_store(producer->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     scheduler_gm_exchange(producer->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
-    local = storage.local_context(&storage.contexts[1]);
-    progress = scheduler_route_task_step(graph.graph(), base, local, storage.run_control, 2, cursor, 1);
-    ASSERT_EQ(progress.result, SchedulerRouteResult::YIELD);
-
-    progress = scheduler_route_task_step(graph.graph(), base, local, storage.run_control, 2, cursor, 2);
-    ASSERT_EQ(progress.result, SchedulerRouteResult::WAITING);
+    ASSERT_EQ(scheduler_route_task(graph.graph(), base, local, storage.run_control, 2), SchedulerRouteResult::WAITING);
     EXPECT_EQ(scheduler_task_control_at(base, local, 1)->wake_list_head, 2);
-
     auto *waiter = scheduler_task_control_at(base, local, 2);
-    waiter->next_fanin_index = INT32_MIN;
-    waiter->next_waiter = 71;
-    waiter->state = static_cast<int64_t>(SchedulerTaskState::DONE);
-    const auto retry = scheduler_route_task_step(graph.graph(), base, local, storage.run_control, 2, cursor, 8);
-    EXPECT_EQ(retry.result, SchedulerRouteResult::WAITING);
-    EXPECT_EQ(retry.work_units, 0u);
-    EXPECT_EQ(waiter->next_fanin_index, INT32_MIN);
-    EXPECT_EQ(waiter->next_waiter, 71);
-
+    EXPECT_EQ(scheduler_wake_cursor_fanin(waiter->wake_cursor), 2u);
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
 }
 
-TEST(SchedulerRouteContinuation, ConcurrentPublishersRetainEveryWaiterWithinPerCallBudgets) {
+TEST(SchedulerSynchronousRoute, TaskDoneBeforeDetachStillAcceptsAndReleasesTheWaiter) {
+    FixtureStorage storage(2, 3);
+    storage.prepare_ready_pool();
+    GraphBuffer graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0, {0});
+    auto *base = storage.scheduler_state->base();
+    auto *local = storage.local_context(&storage.contexts[0]);
+    auto *producer = scheduler_task_control_at(base, local, 0);
+    scheduler_gm_store(producer->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    ASSERT_EQ(scheduler_gm_load(producer->wake_list_head), SCHEDULER_WAKE_LIST_OPEN);
+    ASSERT_EQ(scheduler_route_task(graph.graph(), base, local, storage.run_control, 1), SchedulerRouteResult::WAITING);
+    ASSERT_EQ(scheduler_gm_load(producer->wake_list_head), 1);
+    ASSERT_TRUE(
+        scheduler_resolve_completion(graph.graph(), base, local, storage.run_control, 0, 0, true, nullptr, UINT32_MAX)
+    );
+    int64_t ref = -1;
+    ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+    EXPECT_EQ(ref, 1);
+    ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+    EXPECT_EQ(ref, SCHEDULER_TASK_REF_INVALID);
+}
+
+TEST(SchedulerSynchronousCompletion, InvalidPackedFaninCannotMakeAnUnreadyWaiterRunnable) {
+    for (uint32_t index : {0u, 3u, UINT32_MAX}) {
+        FixtureStorage storage(3, 3);
+        storage.prepare_ready_pool();
+        GraphBuffer graph(3);
+        graph.executable(0, 0);
+        graph.executable(1, 0);
+        graph.executable(2, 0, {0, 1});
+        auto *base = storage.scheduler_state->base();
+        auto *local = storage.local_context(&storage.contexts[0]);
+        ASSERT_EQ(
+            scheduler_bootstrap_route_task(graph.graph(), base, local, storage.run_control, 2),
+            SchedulerRouteResult::WAITING
+        );
+        auto *waiter = scheduler_task_control_at(base, local, 2);
+        scheduler_gm_store(waiter->wake_cursor, scheduler_wake_cursor_pack(SCHEDULER_WAKE_LIST_OPEN, index));
+        scheduler_gm_store(
+            scheduler_task_control_at(base, local, 0)->state, static_cast<int64_t>(SchedulerTaskState::DONE)
+        );
+        EXPECT_FALSE(scheduler_resolve_completion(
+            graph.graph(), base, local, storage.run_control, 0, 0, true, nullptr, UINT32_MAX
+        ));
+        EXPECT_EQ(
+            storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_INVALID_WAITER)
+        );
+        EXPECT_FALSE(scheduler_ready_pool_may_have_work(base, local, 0));
+        EXPECT_EQ(scheduler_gm_load(waiter->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+    }
+}
+
+TEST(SchedulerSynchronousRoute, ConcurrentPublishersRetainEveryWaiter) {
     constexpr uint32_t publishers = 16;
     FixtureStorage storage(publishers + 1, 3);
     storage.prepare_ready_pool();
@@ -441,7 +550,6 @@ TEST(SchedulerRouteContinuation, ConcurrentPublishersRetainEveryWaiterWithinPerC
         graph.executable(i, 1, {0});
     auto *base = storage.scheduler_state->base();
     auto *local = storage.local_context(&storage.contexts[0]);
-    std::vector<SchedulerRouteCursor> cursors(publishers);
     std::atomic<bool> start{false};
     std::vector<std::thread> threads;
     for (uint32_t index = 0; index < publishers; ++index) {
@@ -449,14 +557,10 @@ TEST(SchedulerRouteContinuation, ConcurrentPublishersRetainEveryWaiterWithinPerC
             SchedulerLocalState own = *local;
 
             while (!start.load(std::memory_order_acquire)) {}
-            for (uint32_t attempts = 0; attempts < 10000 && cursors[index].result == SchedulerRouteResult::YIELD;
-                 ++attempts) {
-                auto progress = scheduler_route_task_step(
-                    graph.graph(), base, &own, storage.run_control, index + 1, cursors[index], 1
-                );
-                EXPECT_LE(progress.work_units, 1u);
-            }
-            EXPECT_EQ(cursors[index].result, SchedulerRouteResult::WAITING);
+            EXPECT_EQ(
+                scheduler_route_task(graph.graph(), base, &own, storage.run_control, index + 1),
+                SchedulerRouteResult::WAITING
+            );
         });
     }
     start.store(true, std::memory_order_release);
@@ -471,7 +575,9 @@ TEST(SchedulerRouteContinuation, ConcurrentPublishersRetainEveryWaiterWithinPerC
         ASSERT_LE(waiter, publishers);
         EXPECT_FALSE(found[waiter]);
         found[waiter] = true;
-        waiter = scheduler_observe_next_waiter(scheduler_task_control_at(base, local, waiter));
+        waiter = scheduler_wake_cursor_next(
+            scheduler_gm_fetch_add(scheduler_task_control_at(base, local, waiter)->wake_cursor, UINT64_C(0))
+        );
         ++count;
     }
     EXPECT_EQ(waiter, SCHEDULER_WAKE_LIST_OPEN);
@@ -532,7 +638,7 @@ TEST(SchedulerReadyPublicationTest, CorruptContinuationCannotRedirectBusinessPub
     EXPECT_FALSE(scheduler_ready_pool_may_have_work(base, local, 0));
 }
 
-TEST(SchedulerCompletionContinuation, PublishesReadyPrefixBeforeLongFaninCanYield) {
+TEST(SchedulerSynchronousCompletion, ReadyPrefixPrecedesLongFaninSuccessor) {
     FixtureStorage storage(11, 3);
     storage.prepare_ready_pool();
     GraphBuffer graph(11);
@@ -552,30 +658,14 @@ TEST(SchedulerCompletionContinuation, PublishesReadyPrefixBeforeLongFaninCanYiel
         scheduler_gm_store(
             scheduler_task_control_at(base, local, ref)->state, static_cast<int64_t>(SchedulerTaskState::DONE)
         );
+        if (ref != 0) scheduler_task_control_at(base, local, ref)->wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
     }
-    SchedulerResolveCursor cursor;
-    bool reached_long_fanin = false;
-    for (uint32_t call = 0; call < 32; ++call) {
-        const auto progress =
-            scheduler_resolve_completion_step(graph.graph(), base, local, storage.run_control, 0, cursor, 1);
-        ASSERT_NE(progress.result, SchedulerResolveResult::ERROR);
-        EXPECT_LE(progress.work_units, 1u);
-        if (cursor.waiter_ref == 10 && cursor.phase == SchedulerResolvePhase::ROUTE) {
-            reached_long_fanin = true;
-            break;
-        }
-    }
-    ASSERT_TRUE(reached_long_fanin);
+    ASSERT_TRUE(
+        scheduler_resolve_completion(graph.graph(), base, local, storage.run_control, 0, 0, true, nullptr, UINT32_MAX)
+    );
     int64_t ref = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
     EXPECT_EQ(ref, 1);
-    for (uint32_t call = 0; call < 64 && cursor.phase != SchedulerResolvePhase::DONE; ++call) {
-        const auto progress =
-            scheduler_resolve_completion_step(graph.graph(), base, local, storage.run_control, 0, cursor, 1);
-        ASSERT_NE(progress.result, SchedulerResolveResult::ERROR);
-        EXPECT_LE(progress.work_units, 1u);
-    }
-    ASSERT_EQ(cursor.phase, SchedulerResolvePhase::DONE);
     ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
     EXPECT_EQ(ref, 10);
     ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
@@ -583,7 +673,7 @@ TEST(SchedulerCompletionContinuation, PublishesReadyPrefixBeforeLongFaninCanYiel
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
 }
 
-TEST(SchedulerCompletionContinuation, SavesTheDetachedNextBeforeAnotherResolverReusesTheWaiter) {
+TEST(SchedulerSynchronousCompletion, RehangsEveryDetachedWaiterAndPublishesItOnce) {
     FixtureStorage storage(11, 3);
     storage.prepare_ready_pool();
     for (uint32_t worker = 0; worker < 3; ++worker)
@@ -603,67 +693,28 @@ TEST(SchedulerCompletionContinuation, SavesTheDetachedNextBeforeAnotherResolverR
     scheduler_gm_store(
         scheduler_task_control_at(base, local, 0)->state, static_cast<int64_t>(SchedulerTaskState::DONE)
     );
-    SchedulerResolveCursor cursor;
-
-    bool migrated = false;
+    ASSERT_TRUE(
+        scheduler_resolve_completion(graph.graph(), base, local, storage.run_control, 0, 0, true, nullptr, UINT32_MAX)
+    );
+    EXPECT_FALSE(scheduler_ready_pool_may_have_work(base, local, 0));
+    auto *second = scheduler_task_control_at(base, local, 1);
+    second->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+    ASSERT_TRUE(
+        scheduler_resolve_completion(graph.graph(), base, local, storage.run_control, 1, 0, true, nullptr, UINT32_MAX)
+    );
     std::vector<bool> seen(11, false);
-    for (uint32_t attempt = 0; attempt < 1000 && cursor.phase != SchedulerResolvePhase::DONE; ++attempt) {
-        SchedulerResolveCursor transferred;
-        std::memcpy(&transferred, &cursor, sizeof(cursor));
-        local = storage.local_context(&storage.contexts[attempt % 3]);
-        const auto progress =
-            scheduler_resolve_completion_step(graph.graph(), base, local, storage.run_control, 0, transferred, 1);
-        ASSERT_NE(progress.result, SchedulerResolveResult::ERROR);
-        EXPECT_LE(progress.work_units, 1u);
-        cursor = transferred;
-        if (scheduler_gm_load(scheduler_task_control_at(base, local, 1)->wake_list_head) >= 0 && !migrated) {
-            migrated = true;
-            scheduler_gm_store(
-                scheduler_task_control_at(base, local, 1)->state, static_cast<int64_t>(SchedulerTaskState::DONE)
-            );
-            SchedulerResolveCursor peer;
-            for (uint32_t call = 0; call < 32 && peer.phase != SchedulerResolvePhase::DONE; ++call) {
-                const auto outcome =
-                    scheduler_resolve_completion_step(graph.graph(), base, local, storage.run_control, 1, peer, 8);
-                ASSERT_NE(outcome.result, SchedulerResolveResult::ERROR)
-                    << "site=" << storage.run_control->error_site << " task=" << storage.run_control->error_task_ref
-                    << " waiter=" << peer.waiter_ref << " next=" << peer.next_waiter
-                    << " publish=" << static_cast<uint32_t>(peer.publication.phase)
-                    << " target=" << peer.publication.target;
-                EXPECT_LE(outcome.work_units, 8u);
-            }
-            ASSERT_EQ(peer.phase, SchedulerResolvePhase::DONE);
-            int64_t ref = SCHEDULER_TASK_REF_INVALID;
-            ASSERT_TRUE(pop_ready(
-                graph.graph(), base, storage.local_context(&storage.contexts[0]), storage.run_control, 0, &ref
-            ));
-            ASSERT_GE(ref, 2);
-            ASSERT_LT(ref, 11);
-            seen[ref] = true;
-            scheduler_task_control_at(base, local, ref)->next_waiter = INT64_MAX;
-        }
-    }
-    EXPECT_TRUE(migrated);
-    ASSERT_EQ(cursor.phase, SchedulerResolvePhase::DONE);
-    EXPECT_EQ(cursor.visited_count, 9u);
-
-    for (uint32_t count = 0; count < 8; ++count) {
-        int64_t ref = SCHEDULER_TASK_REF_INVALID;
-        ASSERT_TRUE(
-            pop_ready(graph.graph(), base, storage.local_context(&storage.contexts[0]), storage.run_control, 0, &ref)
-        );
+    for (uint32_t count = 0; count < 9; ++count) {
+        int64_t ref = -1;
+        ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
         ASSERT_GE(ref, 2);
         ASSERT_LT(ref, 11);
         EXPECT_FALSE(seen[ref]);
         seen[ref] = true;
+        scheduler_task_control_at(base, local, ref)->wake_cursor = UINT64_MAX;
     }
-    for (uint32_t ref = 2; ref < 11; ++ref)
-        EXPECT_TRUE(seen[ref]);
-    const auto repeated =
-        scheduler_resolve_completion_step(graph.graph(), base, local, storage.run_control, 0, cursor, 8);
-    EXPECT_EQ(repeated.result, SchedulerResolveResult::DONE);
-    EXPECT_EQ(repeated.work_units, 0u);
-
+    int64_t ref = -1;
+    ASSERT_TRUE(pop_ready(graph.graph(), base, local, storage.run_control, 0, &ref));
+    EXPECT_EQ(ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
 }
 
@@ -707,25 +758,15 @@ TEST(SchedulerReadyPool, RejectsReadyQueueBoundary) {
     EXPECT_FALSE(scheduler_ready_queue_holder(2, 0));
 }
 
-TEST(SchedulerReadyPool, RequiresOwnerStateForPublishAndClaim) {
+TEST(SchedulerReadyPool, BatchPublicationRequiresOwnerState) {
     FixtureStorage storage(1, 1);
     storage.prepare_ready_pool();
-    GraphBuffer graph(1);
-    graph.executable(0, 0);
-
     SchedulerReadyBatch batch{};
     ASSERT_TRUE(scheduler_ready_batch_append(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 0, &batch
     ));
 
     EXPECT_FALSE(scheduler_ready_batch_push(storage.scheduler_state->base(), nullptr, 0, &batch));
-    SchedulerReadyClaim claim{};
-    EXPECT_FALSE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(), nullptr, storage.run_control, 1, 0, &claim
-    ));
-    EXPECT_FALSE(scheduler_resolve_completion(
-        graph.graph(), storage.scheduler_state->base(), nullptr, storage.run_control, 0, 0, true, nullptr, UINT32_MAX
-    ));
 }
 
 TEST(SchedulerReadyPool, BatchPushPreservesFifoAndDrainsTheSharedQueue) {
@@ -1205,7 +1246,10 @@ TEST(SchedulerReadyWake, ConcurrentRegistrationAndCloseResolveEveryConsumerExact
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
     for (uint64_t task = 1; task <= kConsumers; ++task) {
         EXPECT_EQ(seen[task].load(), 1u) << "consumer=" << task;
-        EXPECT_EQ(controls[task].next_fanin_index, 0) << "consumer=" << task;
+        // A consumer that observes CLOSED before registering has no metadata
+        // publication; its initial zero index is still valid.
+        EXPECT_GE(scheduler_wake_cursor_fanin(controls[task].wake_cursor), 0) << "consumer=" << task;
+        EXPECT_LE(scheduler_wake_cursor_fanin(controls[task].wake_cursor), 1) << "consumer=" << task;
         EXPECT_EQ(controls[task].state, static_cast<int64_t>(SchedulerTaskState::BLOCKED)) << "consumer=" << task;
     }
 }
@@ -1424,7 +1468,8 @@ TEST(SchedulerReadyWake, InvalidSuffixLeavesOnlyTheAlreadyPublishedMixPrefixReac
         SCOPED_TRACE(corruption);
         MixPrefixFixture fixture(10);
         fixture.register_successors();
-        if (corruption == 1) fixture.controls[9].next_waiter = fixture.graph.graph().task_count;
+        if (corruption == 1)
+            fixture.controls[9].wake_cursor = scheduler_wake_cursor_pack(fixture.graph.graph().task_count, 1);
         else if (corruption == 2) {
             fixture.graph.executable(10, 0, {0, 10});
             ASSERT_EQ(fixture.graph.payload(10).fanin_count, 2);
@@ -1467,7 +1512,7 @@ TEST(SchedulerReadyWake, ErrorsExposeOnlyThePrefixPublishedBeforeFaninTraversal)
             fixture.register_successors();
             if (corruption == 1) {
                 if (bad_position == 0) fixture.controls[0].wake_list_head = fixture.graph.graph().task_count;
-                else fixture.controls[2].next_waiter = fixture.graph.graph().task_count;
+                else fixture.controls[2].wake_cursor = scheduler_wake_cursor_pack(fixture.graph.graph().task_count, 1);
             } else if (corruption == 2) {
                 const uint32_t task = 2 + bad_position;
                 fixture.graph.executable(task, 0, {0, static_cast<int32_t>(task)});
@@ -1508,8 +1553,7 @@ TEST(SchedulerReadyWake, MixPrefixMigrationKeepsTheRemainingWakeChainAndPublishe
 
         EXPECT_EQ(direct.task_ref, SCHEDULER_TASK_REF_INVALID);
         EXPECT_EQ(fixture.controls[1].wake_list_head, migrating);
-        EXPECT_EQ(fixture.controls[migrating].waiting_producer, 1);
-        EXPECT_EQ(fixture.controls[migrating].next_fanin_index, 1);
+        EXPECT_EQ(scheduler_wake_cursor_fanin(fixture.controls[migrating].wake_cursor), 2);
         int64_t popped = SCHEDULER_TASK_REF_INVALID;
         for (uint32_t task = 2; task < 6; ++task) {
             if (task == migrating) continue;

@@ -84,6 +84,10 @@ that ...".
 
 Newest first.
 
+- [2026-11 — A5 HBG synchronous completion](2026-11-a5-hbg-synchronous-completion.md) — select synchronous CSR by default; remove resumable completion and redundant per-task admission ownership, while retaining global commit ordering and recording the unmet full-completion target.
+
+- [2026-11 — A5 HBG execution snapshot reuse](2026-11-a5-hbg-execution-snapshot-reuse.md) — reverted: reusing the executor snapshot did not shorten SWA completion; same-device L0 remained flat despite one fewer source-level copy.
+- [2026-11 — A5 HBG cursor phase fallthrough](2026-11-a5-hbg-cursor-phase-fusion.md) — reverted: adjacent-phase fallthrough increased generated code and did not improve SWA resolver or L0 Device time.
 - [2026-11 — A5 HBG direct execution records](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#direct-executor-record) — reverted: direct slot trace writes combined with earlier successor retention did not establish a SWA L3 benefit; different devices limit the comparison.
 
 - [2026-11 — A5 HBG primitive record constant specialization](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#scalar-primitive-constants) — reverted: fewer instructions per wrapper did not establish a SWA L3 completion benefit; additional template instances increased total static code size. Cold build time was 337.925→402.551 s without controlling shared-host load.

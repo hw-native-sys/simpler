@@ -489,7 +489,7 @@ TEST(SchedulerClusterCompletion, ReleasesCompletedSlotAndLeavesReadyTaskQueued) 
     SchedulerReadyClaim queued{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 1, 0, &queued
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, &queued
     ));
     EXPECT_EQ(queued.task_ref, 1);
 }
@@ -719,7 +719,7 @@ TEST(SchedulerNormalDispatch, LeavesLaterWorkSharedWhileOneExecutionIsQueued) {
     // The later task remains in the shared pool for another execution core.
     SchedulerReadyClaim remaining{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 1, 0, &remaining
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, &remaining
     ));
     EXPECT_EQ(remaining.task_ref, 1);
 }
@@ -810,6 +810,26 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) 
     auto &context = storage.contexts[2];
     SchedulerLocalState local{};
     EXPECT_EQ(local.worker_id(), UINT64_MAX);
+    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, nullptr));
+    auto invalid_graph = graph;
+    ++invalid_graph.task_count;
+    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &invalid_graph, &local));
+    auto *summary =
+        scheduler_state_at<SchedulerGraphSummary>(storage.scheduler_state->base(), context.graph_summary_offset);
+    const uint64_t ready_pool_offset = summary->ready_pool_offset;
+    summary->ready_pool_offset = 0;
+    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
+    summary->ready_pool_offset = ready_pool_offset;
+    const uint64_t scheduler_count = context.scheduler_count;
+    for (uint64_t invalid_count : {UINT64_C(0), uint64_t{SCHEDULER_WORKER_CAPACITY + 1}}) {
+        context.scheduler_count = invalid_count;
+        EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
+    }
+    context.scheduler_count = scheduler_count;
+    const uint64_t scheduler_index = context.scheduler_index;
+    context.scheduler_index = scheduler_count;
+    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
+    context.scheduler_index = scheduler_index;
     for (auto field :
          {&SchedulerWorkerContext::worker_contexts_offset, &SchedulerWorkerContext::callable_addresses_count,
           &SchedulerWorkerContext::task_metadata_offset}) {

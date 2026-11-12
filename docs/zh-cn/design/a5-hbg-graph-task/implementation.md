@@ -11,7 +11,7 @@
 
 **历史决策（2026-11-03）：独立 block 原型因编译成本撤回，当时恢复到测得 38.454 ms 的 `queue-ordinary-credit-v1`。该数值只属于当时的版本。**
 
-当前继续使用全任务 cooperative admission，并包含 64B 共享布局、Host CSR/remaining、ordinary 小 grid 的循环成员集合及 resident 编译单元拆分。当前代码合同见[数据布局](data-layout.md)、[依赖计数](dependency-counters.md)与[调度协议](protocol.md)；历史阶段的验证不自动覆盖后续改动。
+当前使用全任务cooperative admission、按128B Sector隔离的共享热点、默认Host CSR/remaining、同步completion、ordinary小grid的循环成员集合及resident编译单元拆分。Scalar DCache仍按64B行处理。当前代码合同见[数据布局](data-layout.md)、[依赖计数](dependency-counters.md)与[调度协议](protocol.md)；历史阶段的验证不自动覆盖后续改动。
 
 **用户约定：方案确定后按阶段自主实现，遇到问题自行分析、修复、验证和迭代，不因常规实现选择反复询问用户。**
 每阶段保留代码差异、验证结果、未解决问题和下一步，不把上下文切换当作停止任务或重新确认的理由。
@@ -80,10 +80,10 @@ Qwen 性能接近目标后再执行完整性能回归；已有局部退化如实
 | A5 `host/runtime_maker.cpp` 的 HostPreparePlan | 自有 plan、park/resume、retry、pipeline slot publication/lease 生命周期 |
 | A5 `runtime/scheduler/scheduler_graph.h` | versioned view、统一 kind/fanin/args/identity 访问器，旧路径仍直接寻址 |
 | A5 `runtime/scheduler/scheduler_graph_binding.h`，新增 | AICore POD Tensor/scalar/predicate 重定位及精确范围发布 |
-| A5 `runtime/scheduler/scheduler_graph_control.h`，新增 | 无资源 control inbox、可继续的 wake resolve、DONE 与汇总 |
+| A5 `runtime/scheduler/scheduler_graph_control.h`，新增 | 无资源 control inbox、完整同步后继传播、DONE 与汇总 |
 | A5 `runtime/scheduler/scheduler_ready.h` | bootstrap/route/resolve 的 fanin 读取统一，控制与 kernel 分流，direct refill 保持 kernel 专用 |
-| A5 `runtime/scheduler/scheduler_admission.h` | PREPARED publication，成员首次观察 bootstrap 已发布的参数 |
-| A5 `runtime/scheduler/scheduler_types.h`、layout 创建处 | node/instance/template/header wire、counts、inbox/continuation 与 checked size |
+| A5 `runtime/scheduler/scheduler_admission.h` | Ready唯一owner保留本地pending，提交时发布ADMITTED；成员首次观察bootstrap已发布的参数 |
+| A5 `runtime/scheduler/scheduler_types.h`、layout 创建处 | node/instance/template/header wire、counts、inbox、CHECK 进度与 checked size |
 | A5 `aicore/aicore_executor.cpp`、`resident_scheduler.h` | 启动握手、变体选择与窄入口声明 |
 | A5 `aicore/resident_scheduler_impl.h` 及四个 `resident_*.cpp` | bootstrap、每轮调度/控制服务、完成 flush 与退出；普通/native × profile 开关显式实例化 |
 | A5 `aicpu/aicpu_executor.cpp` | N-node supervision、mapped error identity、保持原 run fence |
@@ -124,7 +124,7 @@ I2/I3 的中间版本可按已完成 capability 选择整 run legacy，不能用
 | fanin | 1、128、129、1023，EXIT 1024 sinks；重复/前向/自环边 | 合法图完整路由，非法图在发布前失败，无截断 |
 | 多实例 | 相同 Definition、多 key、不同 boundary 地址/origin/scalar、并发 recording | 元数据共享，参数和控制互不覆盖；不跨 run 复用旧地址 |
 | 参数 | 非连续 view、非零 start_offset、heap output、零 scalar、最大参数数 | 与公共 AICPU binder 的合法输入结果一致；checked arithmetic 拒绝溢出 |
-| 控制服务 | 所有 slots 满、admission 暂存、长 DUMMY 链、fanout 超过切片预算 | control 仍前进，continuation 无丢失/重复；无递归栈增长 |
+| 控制服务 | 所有 slots 满、admission 暂存、长 DUMMY 链、大 fanout | 处理下一个 control 节点前完整传播当前节点后继；每次服务有界处理完整节点，无丢失/重复或递归栈增长 |
 | SPMD/MIX | 单/多 block、波次、满宽、inactive lane、slow last block/lane、sync_start | identity/membership/order 正确，最后真实完成前不释放依赖 |
 | predicate | true/false、PARAM/内部 operand、多个实例取不同值 | 跳过恰好一次；无多成员部分跳过；非法组合先选择明确结果 |
 | 缓存 | 两 writer 相邻 scalar、两个 worker 消费同一参数、同地址新 epoch | 参数完整、无旧 cache line 覆盖，无每 block 重复绑定 |

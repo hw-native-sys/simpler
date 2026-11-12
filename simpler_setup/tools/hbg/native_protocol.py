@@ -178,7 +178,7 @@ def read_native_protocol(section):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
             extra = {
-                "control": ("claim_tickets", "admission_claim_lock", "claim_seal"),
+                "control": ("claim_tickets", "claim_seal"),
                 "admission": ("member_rank_offset",),
             }.get(kind, ())
             _record(row, kind, f"{table}[{row[key]}]", extra)

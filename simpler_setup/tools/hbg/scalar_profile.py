@@ -42,7 +42,6 @@ SCALAR_FUNCTIONS = {
     "scalar_ordered_poll": "scheduler_ordered_poll_may_progress",
     "scalar_admission_claim": "scheduler_try_claim_admission",
     "scalar_admission_publish": "scheduler_ordered_publish_pending",
-    "scalar_admission_prepare": "scheduler_prepare_admission_record",
     "scalar_admission_commit": "scheduler_admission_detail::commit_validated_record",
     "scalar_admission_refresh": "scheduler_refresh_local_obligation",
     "scalar_ordinary_park": "scheduler_ordered_park_ordinary",

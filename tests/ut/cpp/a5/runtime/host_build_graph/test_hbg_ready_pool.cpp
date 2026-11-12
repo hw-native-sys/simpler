@@ -129,7 +129,7 @@ struct PoolFixture {
         return false;
     }
     bool pop(uint32_t worker, uint32_t type, SchedulerReadyClaim *claim) {
-        return scheduler_claim_ready_for_slot(graph, base(), &locals[worker], run, locals.size(), type, claim);
+        return scheduler_claim_ready_for_slot(graph, base(), &locals[worker], run, type, claim);
     }
 };
 
@@ -292,6 +292,20 @@ TEST(SchedulerReadyPoolTest, InvalidReadyClassAndWorkerTypeCannotClaimTask) {
     EXPECT_EQ(claim.task_ref, 0);
 }
 
+TEST(SchedulerReadyPoolTest, InvalidSharedReferenceCannotAcquireATicket) {
+    for (int64_t ref : {INT64_C(-2), INT64_C(1), INT64_MAX}) {
+        SCOPED_TRACE(ref);
+        PoolFixture fixture(tasks(1, 0), 1);
+        ASSERT_TRUE(fixture.push(0, 0, {0}));
+        const auto queue = scheduler_ready_pool_queue(fixture.base(), fixture.plan.header, 0);
+        scheduler_gm_store(queue.entries[0].task_ref, ref);
+        SchedulerReadyClaim claim;
+        EXPECT_FALSE(fixture.pop(0, 0, &claim));
+        EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(scheduler_gm_fetch_add(queue.control->head, UINT64_C(0)), 0u);
+    }
+}
+
 TEST(SchedulerReadyPoolTest, SpmdTasksEnterAdmissionOncePerLogicalTask) {
     for (uint32_t type : {0U, 1U}) {
         auto metadata = tasks(2, type);
@@ -314,6 +328,18 @@ TEST(SchedulerReadyPoolTest, SpmdTasksEnterAdmissionOncePerLogicalTask) {
         EXPECT_EQ(counts[1], 1u);
         EXPECT_FALSE(scheduler_ready_pool_may_have_work(fixture.base(), &fixture.locals[type], type));
     }
+}
+
+TEST(SchedulerReadyPool, PlanSeparatesQueueCursorsEvenAfterA64BytePrefix) {
+    SchedulerReadyPoolPlan plan;
+    ASSERT_TRUE(scheduler_plan_ready_pool(tasks(2, 0), 1, 64, &plan));
+    EXPECT_EQ(plan.header.controls_offset % alignof(SchedulerTicketQueue), 0u);
+    for (const auto &descriptor : plan.descriptors)
+        EXPECT_EQ(descriptor.entries_offset % alignof(SchedulerTicketEntry), 0u);
+    EXPECT_NE(
+        offsetof(SchedulerTicketQueue, head) / SCHEDULER_GM_ATOMIC_SECTOR_BYTES,
+        offsetof(SchedulerTicketQueue, reserved_tail) / SCHEDULER_GM_ATOMIC_SECTOR_BYTES
+    );
 }
 
 TEST(SchedulerDependencyTest, DeduplicatesEdgesAndExcludesHostCompletedNodes) {
@@ -344,78 +370,75 @@ TEST(SchedulerDependencyTest, DeduplicatesEdgesAndExcludesHostCompletedNodes) {
     EXPECT_FALSE(scheduler_dependency_successor(fixture.base(), *header, 2, 3, &successor));
 }
 
-TEST(SchedulerDependencyTest, ConcurrentProducerResolversPublishJoinExactlyOnce) {
-    constexpr uint32_t producers = 32;
-    std::vector<std::vector<int32_t>> edges(producers + 1);
-    edges.back().resize(producers);
-    std::iota(edges.back().begin(), edges.back().end(), 0);
-    PoolFixture fixture(tasks(producers + 1, 0), 11, edges);
-    std::atomic<bool> start{false};
-    std::atomic<uint32_t> failures{0};
-    std::vector<std::thread> threads;
-    for (uint32_t producer = 0; producer < producers; ++producer) {
-        auto *control = scheduler_task_control_at(fixture.base(), &fixture.locals[producer], producer);
-        control->state = static_cast<int64_t>(SchedulerTaskState::DONE);
-        threads.emplace_back([&, producer] {
-            while (!start.load(std::memory_order_acquire)) {}
-            SchedulerResolveCursor cursor;
-            for (uint32_t step = 0; step < 1000; ++step) {
-                auto result = scheduler_resolve_completion_step(
-                    fixture.graph, fixture.base(), &fixture.locals[producer], fixture.run, producer, cursor, 1
-                );
-                if (result.result == SchedulerResolveResult::DONE) return;
-                if (result.result == SchedulerResolveResult::ERROR) break;
-            }
-            ++failures;
-        });
+TEST(SchedulerDependencyTest, HostConstructionRejectsInvalidFaninReferences) {
+    for (int32_t producer : {-1, 1, 2, INT32_MAX}) {
+        SCOPED_TRACE(producer);
+        PoolFixture fixture(tasks(2, 0), 1, {{}, {0}});
+        fixture.graph_storage.executable(1, 0, {producer});
+        EXPECT_FALSE(scheduler_init_dependencies(fixture.base(), fixture.dependency_plan, fixture.graph, {}));
     }
-    start.store(true, std::memory_order_release);
-    for (auto &thread : threads)
-        thread.join();
-    ASSERT_EQ(failures.load(), 0);
-    SchedulerReadyClaim claim;
-    ASSERT_TRUE(fixture.pop(0, 0, &claim));
-    EXPECT_EQ(claim.task_ref, producers);
-    ASSERT_TRUE(fixture.pop(0, 0, &claim));
-    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
-    const auto *header = scheduler_dependencies(fixture.base(), fixture.plan.header_offset);
-    EXPECT_EQ(scheduler_state_at<uint64_t>(fixture.base(), header->remaining_offset)[producers], 0);
-    SchedulerResolveCursor duplicate;
-    EXPECT_EQ(
-        scheduler_resolve_completion_step(
-            fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, duplicate, 1
-        )
-            .result,
-        SchedulerResolveResult::ERROR
-    );
-    EXPECT_EQ(scheduler_state_at<uint64_t>(fixture.base(), header->remaining_offset)[producers], 0);
 }
 
-TEST(SchedulerDependencyTest, FanoutSurvivesEveryBudgetBoundaryAndOwnerTransfer) {
+TEST(SchedulerDependencyTest, ConcurrentProducerResolversPublishJoinExactlyOnce) {
+    constexpr uint32_t producers = 32;
+    for (uint32_t direct_mode : {0u, 1u, 2u}) {
+        SCOPED_TRACE(direct_mode);
+        std::vector<std::vector<int32_t>> edges(2 * producers + 1);
+        edges[producers].resize(producers);
+        std::iota(edges[producers].begin(), edges[producers].end(), 0);
+        PoolFixture fixture(tasks(2 * producers + 1, 0), producers, edges);
+        std::array<SchedulerReadyClaim, producers> direct{};
+        std::atomic<bool> start{false};
+        std::atomic<uint32_t> failures{0};
+        std::vector<std::thread> threads;
+        for (uint32_t producer = 0; producer < producers; ++producer) {
+            auto *local = &fixture.locals[producer * 3];
+            auto *control = scheduler_task_control_at(fixture.base(), local, producer);
+            control->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+            if (direct_mode == 2) direct[producer].task_ref = producers + 1 + producer;
+            threads.emplace_back([&, producer, local] {
+                while (!start.load(std::memory_order_acquire)) {}
+                if (!scheduler_resolve_completion(
+                        fixture.graph, fixture.base(), local, fixture.run, producer, 0, false,
+                        direct_mode == 0 ? nullptr : &direct[producer], 0
+                    ))
+                    ++failures;
+            });
+        }
+        start.store(true, std::memory_order_release);
+        for (auto &thread : threads)
+            thread.join();
+        ASSERT_EQ(failures.load(), 0);
+        uint32_t owners = 0;
+        for (uint32_t producer = 0; producer < producers; ++producer) {
+            owners += direct[producer].task_ref == producers;
+            if (direct_mode == 2) EXPECT_EQ(direct[producer].task_ref, producers + 1 + producer);
+        }
+        SchedulerReadyClaim claim;
+        ASSERT_TRUE(fixture.pop(0, 0, &claim));
+        if (claim.task_ref != SCHEDULER_TASK_REF_INVALID) {
+            EXPECT_EQ(claim.task_ref, producers);
+            ++owners;
+        }
+        EXPECT_EQ(owners, 1u);
+        EXPECT_EQ(direct_mode == 1, claim.task_ref == SCHEDULER_TASK_REF_INVALID);
+        ASSERT_TRUE(fixture.pop(0, 0, &claim));
+        EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+        const auto *header = scheduler_dependencies(fixture.base(), fixture.plan.header_offset);
+        EXPECT_EQ(scheduler_state_at<uint64_t>(fixture.base(), header->remaining_offset)[producers], 0);
+    }
+}
+
+TEST(SchedulerDependencyTest, SynchronousFanoutPublishesEveryDeduplicatedSuccessor) {
     constexpr uint32_t successors = 22;
     std::vector<std::vector<int32_t>> edges(successors + 1, {0, 0});
     edges.front().clear();
     PoolFixture fixture(tasks(successors + 1, 0), 3, edges);
     scheduler_task_control_at(fixture.base(), &fixture.locals[0], 0)->state =
         static_cast<int64_t>(SchedulerTaskState::DONE);
-    SchedulerResolveCursor cursor;
-    bool done = false;
-    for (uint32_t step = 0; step < 1000; ++step) {
-        SchedulerResolveCursor restored;
-        std::memcpy(&restored, &cursor, sizeof(cursor));
-        const auto result = scheduler_resolve_completion_step(
-            fixture.graph, fixture.base(), &fixture.locals[step % fixture.locals.size()], fixture.run, 0, restored, 1
-        );
-        cursor = restored;
-        ASSERT_NE(result.result, SchedulerResolveResult::ERROR);
-        ASSERT_LE(result.work_units, 1);
-        if (result.result == SchedulerResolveResult::DONE) {
-            done = true;
-            break;
-        }
-    }
-    ASSERT_TRUE(done);
-    EXPECT_EQ(cursor.visited_count, successors);
+    ASSERT_TRUE(scheduler_resolve_completion(
+        fixture.graph, fixture.base(), &fixture.locals[0], fixture.run, 0, 0, true, nullptr, UINT32_MAX
+    ));
     std::vector<bool> seen(successors + 1, false);
     for (uint32_t i = 0; i < successors; ++i) {
         SchedulerReadyClaim claim;
@@ -475,18 +498,11 @@ TEST(SchedulerReadyPoolTest, DirectOwnershipLeavesNoQueuedCopyAndPreservesTheExi
     EXPECT_EQ(queued.task_ref, SCHEDULER_TASK_REF_INVALID);
 }
 
-TEST(SchedulerReadyPoolTest, DirectOwnershipRequiresTheSameValidatedRouteAsQueuedPublication) {
+TEST(SchedulerReadyPoolTest, DirectOwnershipRejectsNonExecutableMetadata) {
     PoolFixture fixture(tasks(1, 0), 1);
     auto *local = &fixture.locals[0];
     SchedulerReadyPublication publication{};
     SchedulerReadyClaim direct;
-    local->config.ready_pool_offset = 0;
-    EXPECT_EQ(
-        scheduler_ready_publication_append(fixture.graph, fixture.base(), local, 0, publication, &direct, 0),
-        SchedulerReadyAppendResult::ERROR
-    );
-    EXPECT_EQ(direct.task_ref, SCHEDULER_TASK_REF_INVALID);
-    local->config.ready_pool_offset = fixture.plan.header_offset;
     auto *metadata = scheduler_task_metadata_at(fixture.base(), local, 0);
     metadata->flags = 0;
     EXPECT_EQ(

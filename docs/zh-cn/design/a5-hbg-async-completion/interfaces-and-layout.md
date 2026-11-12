@@ -38,7 +38,7 @@ Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block
 
 基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行封口后直接释放资源，不创建 CHECK 责任。预留容量与每轮初始化、上传范围分开：Host/Device backing 保留完整容量，但 `initialized_bytes` 只覆盖原调度状态及异步元数据、join、目录、SDMA guard、连续 header。token、CHECK/FINISH lease 与进度位于后缀，首次实际发布前由唯一写者初始化。Host 使用既有 pending metadata 路径上传此前缀，不清零或上传未使用后缀。空间、bind 和 H2D 成本分别计量，不将减少上传宣称为省掉全部预留内存。
 
-`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、连续 header 基址 `groups_offset`、lease、CHECK 进度、task join、FINISH 游标、活动位图及 run 活动标记的位置。offset 120 使用原布局余量保存 activity_offset；标记独占 64 B 行，禁止与 cached 数据共用回写行。FINISH 的完整 resolver 游标为 160 B，放在独立 192 B 进度记录内。lease、发布数据和 cached 进度分别隔离到 64 B cache line。
+`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、连续 header 基址 `groups_offset`、lease、CHECK 进度、task join、FINISH 目录、活动位图及 run 活动标记的位置。offset 112 保存 activity_offset；标记独占 64 B 行，禁止与 cached 数据共用回写行。FINISH owner 持有 lease 直到全部后继同步传播完成；目录扫描游标位于 control state。lease、发布数据和 CHECK 进度分别隔离到 64 B cache line。
 
 SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。32 个实际 cluster 对应 2048 B 互斥存储，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
 
