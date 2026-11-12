@@ -486,8 +486,18 @@ inline __aicore__ bool percounter_async_seal(
     *deferred = false;
     __gm__ pto2::resident::AsyncGroupData *record = &cfg.async_group[slot];
     const uint32_t count = record->count;
-    if (record->error_code != SIMPLER_ERROR_NONE || count > record->capacity) {
-        percounter_fail(cfg, SchedulerGraphResult::ASYNC_REGISTRATION_FAILED);
+    const int32_t error = record->error_code;
+    if (error != SIMPLER_ERROR_NONE || count > record->capacity) {
+        // The record carries why, and the kernel writes it there because no
+        // public entry point can publish an arbitrary code. Carrying it across
+        // is what tells a reader of the device log that five conditions went
+        // into a record that holds four, rather than only that something
+        // about the registration was wrong.
+        percounter_fail(
+            cfg, error == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW      ? SchedulerGraphResult::ASYNC_WAIT_OVERFLOW
+                 : error == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ? SchedulerGraphResult::ASYNC_COMPLETION_INVALID
+                                                                   : SchedulerGraphResult::ASYNC_REGISTRATION_FAILED
+        );
         return false;
     }
     if (count == 0) return true;

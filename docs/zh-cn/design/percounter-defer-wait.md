@@ -335,7 +335,7 @@ kernel。若实测需要，加回 HBG 的 `check_directory` 位图与 `Scheduler
 | MIX 3/5/6/7 | 部分 subtask 延迟；计数器终值与全不延迟时一致，中间值可为负 |
 | sync-start cohort | 延迟不影响 `sync_queue->completed` 与 cohort 释放 |
 | Graph body | body sink 延迟时 shell 计数器同样推迟 |
-| 溢出与非法 | 超过 capacity、非法 expected、非法对齐各自锁存对应错误码 |
+| 溢出与非法 ✅ | 超过 capacity 的登记以 error 12 (`ASYNC_WAIT_OVERFLOW`) 结束整个 run，0 blocks resolved；记录里的具体码映射到对应的 `SchedulerGraphResult`，不再统一压成 13 |
 | 超时 | 条件永不满足时报 TIMEOUT，而非由 45 秒 op 超时收场 |
 
 容量、区域字节数与同步路径开销分别度量；优化不得引入强制的额外用户声明。
@@ -352,7 +352,7 @@ host 只给本步已经支持的任务形状打"可能登记"标记，其余形�
 | S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
 | S3 ✅ | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | 单核 `require_sync_start` 多 block 的登记用例通过，同一用例在 S2 构建上报 error 13（0 of 7 blocks resolved）；回归集 11 passed，失败仍只有那两个 swimlane 用例 |
 | S4 ✅ | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | 两 AIV MIX 的登记用例通过，同一用例在 S3 构建上报 error 13（0 of 4 blocks resolved）；回归集 12 passed，连跑三遍一致 |
-| S5 部分 | Graph body ✅；溢出与非法条件、容量与开销实测 ⬜ | body sink 延迟的用例通过（sink 的 shell 计数器若漏加，Graph 的 EXIT 会挂死）；开启/结算的代价重新分配后回归集 13 passed，两遍一致 |
+| S5 部分 | Graph body ✅、溢出 ✅、上游用例对比 ✅；非法 expected / 非法对齐、容量与开销实测 ⬜ | 见第 8 节；上游 `defer_wait_progress` 五个 case 在 percounter 上通过（含 `c_plus_one`），`ReadyFairness` 不通过且 resident 通过，已记入 KNOWN_ISSUES |
 
 **S1 既是布局也是 1.1 的修复**，两者不可分：登记失败的 kernel 在设备上不留痕迹，所以只有
 先给它一个真正能写进去的 group，percounter 才看得见"这个任务登记了条件"。S1 之后登记机械
