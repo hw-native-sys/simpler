@@ -1409,7 +1409,7 @@ static inline __aicore__ bool scheduler_fill_dispatch_slot(
 inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, int64_t ref,
     SchedulerReadyPublication &publication, SchedulerReadyClaim *direct_ready = nullptr,
-    uint32_t direct_core_type = UINT32_MAX
+    uint32_t direct_core_type = UINT32_MAX, bool admission_owner = false
 );
 static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local,
@@ -1420,6 +1420,7 @@ static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication
 struct SchedulerCompletionDirect {
     SchedulerReadyClaim *ready{nullptr};
     uint32_t core_type{0};
+    bool admission_owner{false};
 };
 
 static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_resolve_completion_step(
@@ -1431,13 +1432,13 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
 static __aicore__ __attribute__((noinline)) bool scheduler_resolve_completion_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t producer_ref, const __gm__ SchedulerDependencyHeader &dependencies, uint64_t profiling_level,
-    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type
+    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type, bool admission_owner
 );
 
 static inline __aicore__ bool scheduler_resolve_completion(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level, bool validate_done_state,
-    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type
+    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type, bool admission_owner = false
 ) {
     // Immediate completion owners hold a validated graph/local/run binding.
     // CSR notification has no suspended waiter or dynamic wake-list ownership.
@@ -1446,11 +1447,11 @@ static inline __aicore__ bool scheduler_resolve_completion(
         if (dependencies != nullptr)
             return scheduler_resolve_completion_step(
                 graph, scheduler_state_base, context, run_control, task_ref, *dependencies, profiling_level,
-                direct_ready, direct_core_type
+                direct_ready, direct_core_type, admission_owner
             );
     }
     SchedulerResolveCursor cursor{};
-    SchedulerCompletionDirect direct{direct_ready, direct_core_type};
+    SchedulerCompletionDirect direct{direct_ready, direct_core_type, admission_owner};
     for (;;) {
         const auto progress = scheduler_resolve_completion_step(
             graph, scheduler_state_base, context, run_control, task_ref, cursor, UINT32_MAX, profiling_level, &direct,

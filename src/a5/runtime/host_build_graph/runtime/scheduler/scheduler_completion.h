@@ -70,6 +70,8 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
 // The unique last computation contributor owns logical completion. Trace
 // publication and Mix resource release finish before the owning core can
 // acknowledge EXIT; successors may run independently of those records.
+// One dependency-ready cooperative successor may be admitted by this core
+// regardless of its execution type; excess successors retain queue ownership.
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_complete_task(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
@@ -93,12 +95,12 @@ static inline __aicore__ bool scheduler_complete_task(
     if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     if constexpr (RecordProtocol) scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
+    auto *direct = direct_ready != nullptr ? direct_ready : scheduler_ordered_direct_sink(scheduler->admission);
     const bool resolved = scheduler_resolve_completion(
-        graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, false, direct_ready,
-        scheduler->config.self_core_type
+        graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, false, direct,
+        scheduler->config.self_core_type, true
     );
-    // This task has reached DONE even if successor resolution reports an
-    // error. The run's terminal accounting includes it exactly once.
+    // DONE contributes once even when successor resolution reports an error.
     ++scheduler->pending_completed;
     if (!resolved) {
         scheduler_record_error(
@@ -106,6 +108,24 @@ static inline __aicore__ bool scheduler_complete_task(
             SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
         );
         return false;
+    }
+    if (direct != nullptr && !scheduler_task_ref_is_null(direct->task_ref) &&
+        scheduler_task_requires_admission(
+            scheduler_load_dispatch_metadata(scheduler_state_base, scheduler, direct->task_ref, profiling_level)
+        )) {
+        const auto claimed = scheduler_try_claim_admission(
+            graph, scheduler_state_base, scheduler, run_control, scheduler->admission, *direct
+        );
+        if (claimed == SchedulerAdmissionResult::ERROR) return false;
+        if (claimed == SchedulerAdmissionResult::PROGRESS) {
+            // Pending admission owns the task even if the commit lock is busy.
+            // Clear the candidate only after that ownership transfer succeeds.
+            *direct = {};
+            if (scheduler_ordered_publish_pending<RecordProtocol>(
+                    graph, scheduler_state_base, scheduler, run_control
+                ) == SchedulerAdmissionResult::ERROR)
+                return false;
+        }
     }
     return true;
 }

@@ -307,6 +307,15 @@ __aicore__ bool bootstrap_ready_graph(
                 return false;
         }
         if (!control_node && !scheduler_task_is_executable(metadata->flags)) continue;
+        if (!control_node &&
+            scheduler_task_requires_admission(
+                scheduler_load_dispatch_metadata(scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), 0)
+            ) &&
+            !scheduler_bootstrap_prepare_admission(
+                graph, scheduler_state_base, scheduler, run_control, scheduler->admission,
+                static_cast<int64_t>(task_ref)
+            ))
+            return false;
         const bool has_fanin = scheduler_task_has_fanin(metadata->flags);
         SchedulerRouteResult route =
             has_fanin ? scheduler_bootstrap_route_task(
@@ -541,13 +550,13 @@ __aicore__ bool run_ready_dispatch_loop(
                 WithProfiling && timing_slot >= 0 && timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT;
             const bool commit_executor_trace = commit_scheduler_trace || commit_task_timing;
             uint64_t ready_observe = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            // This core prepares every payload it executes, including Mix lanes.
+            const int64_t task_ref = local_slot->task_ref;
+            SchedulerScalarScope scalar_prepare(context, SchedPhaseKind::ScalarPrepare, task_ref, ready_observe);
             if (phase_timing_enabled && idle_active) {
                 scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, ready_observe);
                 idle_active = false;
             }
-            // This core prepares every payload it executes, including Mix lanes.
-            const int64_t task_ref = local_slot->task_ref;
-            SchedulerScalarScope scalar_prepare(context, SchedPhaseKind::ScalarPrepare, task_ref, ready_observe);
             if (!scheduler_task_ref_valid(graph, task_ref)) {
                 scheduler_record_error(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,

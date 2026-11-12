@@ -1091,6 +1091,7 @@ TEST(HbgNativeGraphPlan, BootstrapArgumentsSurviveAdmissionRetriesForSpmdAndMix)
         auto *local = &view.locals[0];
         auto *admission = &view.admissions[0];
         ASSERT_TRUE(scheduler_bootstrap_bind_arguments(view.graph, view.child(), local, view.run));
+        ASSERT_TRUE(scheduler_bootstrap_prepare_admission(view.graph, base, local, view.run, admission, view.child()));
         view.run->bootstrap_scan_complete = 1;
         view.bound.scalar = 999;
         SchedulerReadyClaim candidate{};
@@ -1157,6 +1158,7 @@ TEST(HbgNativeGraphPlan, NativeMixAdmissionIncludesOnlyActiveLanesAndCoordinator
         auto *local = &view.locals[0];
         auto *admission = &view.admissions[0];
         ASSERT_TRUE(scheduler_bootstrap_bind_arguments(view.graph, view.child(), local, view.run));
+        ASSERT_TRUE(scheduler_bootstrap_prepare_admission(view.graph, base, local, view.run, admission, view.child()));
         view.run->bootstrap_scan_complete = 1;
         SchedulerReadyClaim candidate{};
         candidate.task_ref = view.child();

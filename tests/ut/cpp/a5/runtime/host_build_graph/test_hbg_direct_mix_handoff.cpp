@@ -10,6 +10,7 @@
  */
 
 #include "hbg_gm_mix_test_support.h"
+#include "dependency_plan.h"
 
 namespace {
 using namespace scheduler_test::gm_mix;
@@ -50,6 +51,7 @@ protected:
             );
         }
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
+        ASSERT_TRUE(fixture.bootstrap_admission());
         ASSERT_TRUE(fixture.enqueue(0, producer_lane));
         ASSERT_TRUE(fixture.fill(producer_lane));
         GmExecution producer{};
@@ -68,25 +70,27 @@ protected:
         const auto *pool =
             scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
         const auto queue = scheduler_ready_pool_queue(fixture.base(), *pool, 0);
-        // One successor belongs to ordered admission, never an ordinary slot.
-        // Existing queued tickets retain their head and FIFO order.
+        // Completion owns one unlocked successor through admission. An existing
+        // queue entry, or excess fanout, remains queued without a second owner.
         const int64_t direct_task = scenario == HandoffScenario::TWO_SUCCESSORS ? 2 : 1;
-        std::set<int64_t> reachable;
-        for (const auto &candidate : fixture.admissions[producer_lane].candidates) {
-            if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
-            EXPECT_EQ(candidate.ready.task_ref, direct_task);
-            EXPECT_EQ(candidate.ready.source, SchedulerReadySource::DIRECT_RESOLVE);
-            EXPECT_TRUE(reachable.insert(candidate.ready.task_ref).second);
-        }
-        EXPECT_EQ(reachable.size(), 1u);
-        EXPECT_EQ(fixture.locals[producer_lane]->slots[producer.slot].state, SchedulerDispatchSlotState::FREE);
+        const int64_t queued_task = scenario == HandoffScenario::TWO_SUCCESSORS ? 1 : 2;
+        const auto &admission = fixture.admissions[producer_lane];
+        const auto *shared = scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), admission.control_offset);
+        const auto *log = scheduler_state_at<int64_t>(fixture.base(), admission.log_offset);
+        ASSERT_EQ(shared->commit_tail, 1u);
+        EXPECT_EQ(log[0], direct_task);
+        EXPECT_EQ(
+            fixture.control(direct_task)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)
+        );
+        EXPECT_EQ(admission.pending_task_ref, SCHEDULER_TASK_REF_INVALID);
         ASSERT_EQ(queue.control->reserved_tail - queue.control->head, second_mix ? 1u : 0u);
         if (second_mix) {
-            const int64_t queued = scenario == HandoffScenario::QUEUED_MIX ? 2 : 1;
-            EXPECT_EQ(queue.entries[queue.control->head].task_ref, queued);
-            EXPECT_TRUE(reachable.insert(queued).second);
+            EXPECT_EQ(queue.entries[queue.control->head].task_ref, queued_task);
+            EXPECT_EQ(
+                fixture.control(queued_task)->admission_state,
+                static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
+            );
         }
-        EXPECT_EQ(reachable, second_mix ? (std::set<int64_t>{1, 2}) : (std::set<int64_t>{1}));
         for (uint32_t worker : {1u, 2u}) {
             SchedulerReadyClaim aiv{};
             ASSERT_TRUE(scheduler_claim_ready_for_slot(
@@ -128,11 +132,12 @@ protected:
         }
         ASSERT_TRUE(finished);
         EXPECT_EQ(executions.size(), static_cast<size_t>(mask.count()) * (second_mix ? 2 : 1));
-        EXPECT_EQ(first_entries.size(), second_mix ? 2u : 1u);
-        EXPECT_EQ(
-            (std::set<int64_t>(first_entries.begin(), first_entries.end())),
-            second_mix ? (std::set<int64_t>{1, 2}) : (std::set<int64_t>{1})
-        );
+        const std::vector<int64_t> expected_entries =
+            second_mix ? std::vector<int64_t>{direct_task, queued_task} : std::vector<int64_t>{direct_task};
+        EXPECT_EQ(first_entries, expected_entries);
+        ASSERT_EQ(shared->commit_tail, expected_entries.size());
+        for (size_t index = 0; index < expected_entries.size(); ++index)
+            EXPECT_EQ(log[index], expected_entries[index]);
         for (uint32_t task = 0; task < shapes.size(); ++task)
             EXPECT_EQ(fixture.control(task)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
         EXPECT_EQ(queue.control->head, queue.control->reserved_tail);
@@ -142,7 +147,7 @@ protected:
 
 TEST_P(HbgDirectMixHandoff, RetirementKeepsUnlockedMixReachable) { run_handoff(true); }
 TEST_P(HbgDirectMixHandoff, UnprofiledRetirementKeepsUnlockedMixReachable) { run_handoff(false); }
-TEST_P(HbgDirectMixHandoff, UnlockedMixDoesNotDisplaceAnExistingQueueHead) {
+TEST_P(HbgDirectMixHandoff, DirectAdmissionPreservesAnExistingQueuedMix) {
     run_handoff(true, HandoffScenario::QUEUED_MIX);
 }
 TEST_P(HbgDirectMixHandoff, TwoMixSuccessorsUnlockedTogetherExecuteExactlyOnce) {
@@ -155,4 +160,73 @@ INSTANTIATE_TEST_SUITE_P(
     ProducerLanesAndMixMasks, HbgDirectMixHandoff,
     ::testing::Combine(::testing::Values(0u, 1u, 2u), ::testing::ValuesIn(kMixMasks))
 );
+
+TEST(HbgDirectAdmissionRetry, CsrAndWakeListRetainCrossTypeSuccessorsBehindAnExistingPendingOwner) {
+    for (bool csr : {false, true}) {
+        for (const auto child_mask : {LaneMask::aiv0(), LaneMask::both_aiv(), LaneMask::all()}) {
+            SCOPED_TRACE(csr);
+            SCOPED_TRACE(lane_names(child_mask));
+            SchedulerDependencyPlan dependencies{};
+            GmMixFixture fixture(
+                {{2, LaneMask::aic()}, {2, child_mask}, {2, LaneMask::aic()}}, false, 2,
+                [&](AicoreSchedulerLayout &layout) {
+                    if (!csr) return;
+                    EXPECT_TRUE(scheduler_plan_dependencies(3, 1, layout.total_size, &dependencies));
+                    layout.total_size = dependencies.total_size;
+                }
+            );
+            fixture.graph.executable(1, 1, {0});
+            fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+            ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
+            if (csr) {
+                auto *pool =
+                    scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+                pool->dependencies_offset = dependencies.header_offset;
+                pool->storage_end_offset = dependencies.total_size;
+                ASSERT_TRUE(scheduler_init_dependencies(fixture.base(), dependencies, fixture.graph.graph(), {}));
+            }
+            ASSERT_TRUE(fixture.bootstrap_admission());
+            ASSERT_EQ(
+                scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1),
+                SchedulerRouteResult::WAITING
+            );
+            ASSERT_TRUE(fixture.admit(0));
+            ASSERT_TRUE(fixture.claim_pending(2));
+            fixture.control(0)->next_block = 2;
+            fixture.control(0)->claim_seal = 2;
+            fixture.control(0)->completion_state |= 2;
+            ASSERT_TRUE(scheduler_complete_task(
+                fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, false, 0, nullptr
+            ));
+            EXPECT_EQ(fixture.admissions[0].pending_task_ref, 2);
+            EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
+            unsigned retained = 0;
+            for (const auto &candidate : fixture.admissions[0].candidates) {
+                if (candidate.ready.task_ref != 1) continue;
+                ++retained;
+                EXPECT_EQ(candidate.slot_index, UINT8_MAX);
+            }
+            ASSERT_EQ(retained, 1u);
+            ASSERT_EQ(
+                scheduler_ordered_publish_pending(
+                    fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()
+                ),
+                SchedulerAdmissionResult::PROGRESS
+            );
+            ASSERT_TRUE(fixture.fill(0));
+            EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
+            auto *shared = scheduler_state_at<SchedulerAdmissionControl>(
+                fixture.base(), fixture.storage.layout.admission_control_offset
+            );
+            ASSERT_EQ(shared->commit_tail, 3u);
+            auto *log = scheduler_state_at<int64_t>(fixture.base(), fixture.storage.layout.admission_log_offset);
+            EXPECT_EQ(log[0], 0);
+            EXPECT_EQ(log[1], 2);
+            EXPECT_EQ(log[2], 1);
+            for (const auto &slot : fixture.locals[0]->slots)
+                EXPECT_NE(slot.task_ref, 1);
+            EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+        }
+    }
+}
 }  // namespace
