@@ -545,20 +545,22 @@ or zero size before publishing the context, and propagates initialization failur
 as host errors. Callers must treat handle/context metadata as read-only and obtain
 the checked context in every orchestration run rather than caching its raw address.
 
-URMA requests require A5 TMR L3 domains. Device domains take an ordered subset of
-the Worker's chips. For example, chip 1 has domain rank 0 in `[1, 2]` and domain
-rank 1 in `[2, 1]`. The HCCL child communicator and the window and peer MR tables
-use that same domain-rank order. Overlapping Device domains can stay live and be
-used in successive runs, with each domain owning its communicator and URMA
-workspace. Host-source URMA domains require ranks in dense prefix order.
+URMA requests require A5 L3 domains. TMR Device domains take an ordered subset of
+Worker chips. For example, chip 1 has domain rank 0 in `[1, 2]` and domain rank 1
+in `[2, 1]`. The HCCL child communicator and the window and peer MR tables use
+that same domain-rank order. Overlapping TMR Device domains can stay live and be
+used in successive runs, each owning its communicator and URMA workspace.
+Host-source URMA domains require ranks in dense prefix order.
 
-Single-rank requests reach the provider, and initialization failures are
+HBG supports two Device-source ranks in dense prefix order, one jetty per AIV,
+and single-AIV single-block tasks; see
+[resident completion](#hbg-resident-urma-registration) for the request limits.
+TMR single-rank requests reach the provider, and initialization failures are
 reported on the host. The currently pinned PTO URMA manager rejects single-rank
 initialization. The successful
 [single-device CANN Hcomm loopback probe](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)
 uses two endpoints and has not been integrated into that provider; the provider
-restriction is not a hardware limitation. HBG URMA completion and L4 async
-domains are unsupported.
+restriction is not a hardware limitation. L4 async domains are unsupported.
 
 URMA domains use `PER_PEER`: each resident AIV owns a separate queue group
 for each remote peer. `UrmaConfig(jetties_per_aiv=1, sq_depth=0)` preserves one
@@ -738,7 +740,8 @@ The workspace coverage is split by platform and execution layer:
 | ---------------- | ------------------ | -------- |
 | A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
 | A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
-| A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
+| A5 HBG | Two-rank Device URMA with one jetty and one AIV per task | GET/PUT, post-return pending, consumer visibility, domain reuse and CQ protocol in `host_build_graph/async_completion/test_urma_completion.py` |
+| A5 TMR completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
 | A2/A3 | Worker-owned SDMA and optional peer mappings for L3 TMR Host domains | SDMA and prefetch examples, and `test_a3_host_source_domain.py` for Host MTE and peer SDMA |
 | Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |
 
@@ -912,7 +915,22 @@ the reservation and poisons publication. Stale writer or reservation identities
 fail without erasing accepted entries. Run failure handling retains resources
 that may still be referenced by submitted work.
 
-HBG URMA domains remain disabled at the public Worker entry. The resident
-completion observer rejects URMA records until CQ observation and queue-tail
-ownership are implemented; registration alone does not provide a usable
-communication path.
+A5 HBG supports Device-source URMA domains with two dense-prefix ranks and
+one jetty per AIV. Each submitting task must have one block and one AIV lane;
+MIX and multi-block submissions are rejected before posting. Each request is
+limited to one WQE. Host-source domains retain their TMR requirement.
+
+The sender AIV exclusively observes and retires its queues across condition
+groups. Other workers leave those conditions pending. The sender executes
+submission kernels and CHECK steps serially, so a queue has one tail publisher
+without using a condition-group lease as a queue lock. CHECK uses the pinned
+ISA nonblocking CQ poll, including its CQ cache/owner protocol and tail/doorbell
+publication. Cumulative CQ and SQ targets prevent late checks of older groups
+from moving a completed tail backwards. FINISH releases dependencies only after
+all execution and completion conditions have joined.
+
+Normal close reuses the existing domain fence and SQ/CQ drain checks. A CQ
+error or failed registration fails the run; unconfirmed queue drain retains
+the domain's workspace and memory registrations. An unsuccessful run does not
+prove external accesses stopped. Multi-AIV task shapes, multi-jetty and chunked
+requests are tracked separately in issue #2997.

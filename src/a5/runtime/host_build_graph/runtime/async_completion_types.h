@@ -45,6 +45,7 @@ struct alignas(ASYNC_RECORD_ALIGNMENT) AsyncGroupData {
     uint32_t entries_bytes;
     uint32_t sdma_guard_count;
     uint16_t capacity;
+    uint16_t urma_single_aiv;
 };
 
 // SDK session creation and SQ/post-id updates share one writer per physical

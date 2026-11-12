@@ -79,11 +79,15 @@ static inline __aicore__ bool scheduler_service_async_slice(
         local, finish ? SchedPhaseKind::ScalarAsyncFinish : SchedPhaseKind::ScalarAsyncCheck
     );
     const bool ok =
-        finish ?
-            scheduler_async_finish_step(graph, base, local, run, async, made_progress, profiling_level) :
-            scheduler_async_check_step(
-                async, UINT32_C(1) << local->config.self_core_type, 8, SchedulerAsyncCompletionObserver{}, made_progress
-            );
+        finish ? scheduler_async_finish_step(graph, base, local, run, async, made_progress, profiling_level) :
+                 scheduler_async_check_step(
+                     async, UINT32_C(1) << local->config.self_core_type, 8,
+                     SchedulerAsyncCompletionObserver{
+                         scheduler_async_urma_sender(local->config.self_lane, local->config.shared_context->type_rank)
+                     },
+                     made_progress
+                 );
+
     if (!ok)
         scheduler_record_error(
             run, async.failed_task_ref, scheduler_async_error_result(&async), &graph, local,

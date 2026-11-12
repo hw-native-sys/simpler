@@ -12,6 +12,7 @@
 #pragma once
 
 #include "async_condition_writer.h"
+#include "backend/urma/urma_completion_scheduler.h"
 #include "scheduler_async_directory.h"
 #include "scheduler_async_layout.h"
 #include "scheduler_graph.h"
@@ -429,9 +430,9 @@ scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_
 namespace {
 
 struct SchedulerAsyncCompletionObserver {
+    uint32_t urma_sender{UINT32_MAX};
     inline __aicore__ CompletionPollResult operator()(const CompletionToken &token, uint32_t observer_mask) const {
-        if (observer_mask == 0 || (observer_mask & ~3U) != 0 || token.engine == COMPLETION_ENGINE_URMA ||
-            !pto2::resident::detail::token_valid(token))
+        if (observer_mask == 0 || (observer_mask & ~3U) != 0 || !pto2::resident::detail::token_valid(token))
             return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
         if (token.completion_type == COMPLETION_TYPE_CCU) {
             auto *event = reinterpret_cast<__gm__ uint64_t *>(token.addr);
@@ -457,6 +458,8 @@ struct SchedulerAsyncCompletionObserver {
                        CompletionPollResult{CompletionPollState::READY, 0} :
                        CompletionPollResult{CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
         }
+        if (token.engine == COMPLETION_ENGINE_URMA)
+            return pto2::urma_backend::poll_owned_queue(token, urma_sender, pto2::urma_backend::AicoreCqPoll{});
         if (token.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
             auto *record = reinterpret_cast<__gm__ uint64_t *>(token.addr);
             const uint64_t completed =

@@ -391,4 +391,21 @@ TEST(HbgAsyncPlan, InitializationChecksDestinationBeforeWritingAndResetsRetiredS
     EXPECT_EQ(static_cast<AsyncPublicationState>(data->state), AsyncPublicationState::OPEN);
 }
 
+TEST(HbgAsyncPlan, UrmaAdmissionRequiresSingleAivExecution) {
+    for (uint32_t blocks : {1u, 2u}) {
+        for (auto mask : {LaneMask::all(), LaneMask::both_aiv(), LaneMask::aic(), LaneMask::aiv0(), LaneMask::aiv1()}) {
+            AsyncCompletionHostPlan plan;
+            std::string error;
+            ASSERT_TRUE(plan_async_completion(kPrefix, 1, 1, {task(0, blocks, mask)}, &plan, &error));
+            Image image(plan.total_bytes);
+            ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
+            for (uint32_t i = 0; i < plan.layout.group_count; ++i)
+                EXPECT_EQ(
+                    group_at(image, plan, i).urma_single_aiv,
+                    blocks == 1 && (mask == LaneMask::aiv0() || mask == LaneMask::aiv1()) ? 1u : 0u
+                );
+        }
+    }
+}
+
 }  // namespace

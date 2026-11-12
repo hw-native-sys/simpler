@@ -900,8 +900,31 @@ TEST(HbgAsyncControl, UrmaRecordCannotFallThroughToCounterObservation) {
     const CompletionToken token{0, 0, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE, 0x10000};
     ASSERT_TRUE(pto2::resident::detail::token_valid(token));
     const auto result = SchedulerAsyncCompletionObserver{}(token, 1);
-    EXPECT_EQ(result.state, CompletionPollState::FAILED);
-    EXPECT_EQ(result.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(result.state, CompletionPollState::PENDING);
+    EXPECT_EQ(result.error_code, SIMPLER_ERROR_NONE);
+}
+
+TEST(HbgAsyncControl, UrmaObserverFailureRetainsAcceptedGroupAndBlocksFinish) {
+    AsyncFixture f(1);
+    const auto writer = f.start();
+    pto::comm::urma::UrmaInfo malformed{};
+    const CompletionToken token{
+        0, 1, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE, reinterpret_cast<uint64_t>(&malformed)
+    };
+    ASSERT_TRUE(register_completion_condition(writer, token));
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    ASSERT_TRUE(f.close());
+    f.local(1)->config.self_lane = 1;
+    f.storage.contexts[1].type_rank = 0;
+    bool progress = false;
+    EXPECT_FALSE(
+        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)
+    );
+    EXPECT_NE(scheduler_read_error(f.storage.run_control), 0u);
+    EXPECT_EQ(pto2::resident::detail::group(writer)->count, 1u);
+    EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+    EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::FAILED);
 }
 
 }  // namespace

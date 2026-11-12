@@ -297,7 +297,7 @@ class RuntimeBuilder:
         cfg = build_config[target]
         include_dirs = [str((config_dir / p).resolve()) for p in cfg["include_dirs"]]
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
-        if self._arch == "a5" and config_dir.name == "tensormap_and_ringbuffer":
+        if self._arch == "a5":
             from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
             include_dirs.append(str(Path(ensure_pto_isa_root()) / "include"))

@@ -990,7 +990,8 @@ class TestRuntimeBuilderIntegration:
 
 @pytest.mark.parametrize("platform", ["a5", "a5sim"])
 @pytest.mark.parametrize("target", ["host", "aicpu", "aicore"])
-def test_a5_tmr_targets_use_pinned_isa_headers(tmp_path, monkeypatch, platform, target):
+@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+def test_a5_targets_use_pinned_isa_headers(tmp_path, monkeypatch, platform, target, runtime):
     from simpler_setup import pto_isa  # noqa: PLC0415
     from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -999,7 +1000,7 @@ def test_a5_tmr_targets_use_pinned_isa_headers(tmp_path, monkeypatch, platform, 
     builder = RuntimeBuilder.__new__(RuntimeBuilder)
     builder._arch = "a5"
     builder.platform = platform
-    config_dir = tmp_path / "tensormap_and_ringbuffer"
+    config_dir = tmp_path / runtime
     config = {target: {"include_dirs": ["runtime"], "source_dirs": [target]}}
     includes, sources = builder._resolve_target_dirs(config_dir, config, target)
     assert includes == [str(config_dir / "runtime"), str(pto_root / "include")]

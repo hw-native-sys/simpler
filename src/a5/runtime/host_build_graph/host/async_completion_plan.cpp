@@ -78,6 +78,8 @@ bool plan_async_completion(
         AsyncTaskHostPlan task;
         task.data = {input.task_ref, layout.group_count, static_cast<uint16_t>(input.block_count), mask};
         task.capacities = input.capacities;
+        task.urma_single_aiv = input.block_count == 1 && input.active_mask.count() == 1 &&
+                               !input.active_mask.has(static_cast<SubtaskSlot>(0));
         next.tasks.push_back(task);
         layout.group_count += groups;
     }
@@ -179,6 +181,7 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
     for (const auto &planned : plan.tasks) {
         const auto &task = planned.data;
         header.task_ref = task.task_ref;
+        header.urma_single_aiv = planned.urma_single_aiv ? 1 : 0;
         uint64_t entries_offset = planned.entries_offset;
         for (uint32_t block = 0; block < task.block_count; ++block) {
             header.block_index = block;

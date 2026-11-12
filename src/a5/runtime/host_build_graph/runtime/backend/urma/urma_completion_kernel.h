@@ -20,6 +20,19 @@ inline __aicore__ bool send_request_entry(AsyncCtx &ctx, UrmaRequestDescriptor<D
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         return false;
     }
+    auto *group = pto2::resident::detail::group(ctx.resident);
+    if (group == nullptr || group->urma_single_aiv != 1 || desc.workspace == nullptr ||
+        reinterpret_cast<uintptr_t>(desc.workspace) % alignof(pto::comm::urma::UrmaInfo) != 0 ||
+        simpler::urma::tensor_element_count(desc.dst) >
+            pto::comm::urma::kUrmaMaxWqeTransferBytes / sizeof(typename DstTensor::RawDType)) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
+    auto *info = reinterpret_cast<__gm__ pto::comm::urma::UrmaInfo *>(desc.workspace);
+    if (info->layout != pto::comm::urma::UrmaLayout::PER_PEER || info->rankCount != 2 || info->jettiesPerCore != 1) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
     simpler::urma::HbgRequestAdapter runtime(ctx.resident, ctx.urma_sender_id);
     return simpler::urma::submit_chunked_urma_request(runtime, desc);
 }

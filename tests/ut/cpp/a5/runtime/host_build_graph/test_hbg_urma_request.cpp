@@ -11,6 +11,7 @@
 
 #include "helpers/urma_request_test.h"
 #include "backend/urma/urma_request_adapter.h"
+#include "backend/urma/urma_completion_scheduler.h"
 
 namespace {
 struct HbgUrmaFixture {
@@ -192,4 +193,75 @@ TEST(HbgUrmaRequest, StaleWriterRejectsBeforePosting) {
         EXPECT_TRUE(f.script.submissions.empty());
         EXPECT_EQ(f.group().count, 0u);
     }
+}
+
+TEST(HbgUrmaRequest, OnlyQueueSenderCanObserveAcrossGroups) {
+    HbgUrmaFixture f;
+    f.info.jettiesPerCore = 1;
+    CompletionToken token{
+        uint64_t{6} << 32 | 3, 2, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE,
+        reinterpret_cast<uint64_t>(f.workspace())
+    };
+    uint32_t calls = 0;
+    auto poll = [&](auto *info, uint32_t peer, uint32_t jetty, uint32_t bb, uint32_t cqe) {
+        EXPECT_EQ(info, &f.info);
+        EXPECT_EQ(peer, 1u);
+        EXPECT_EQ(jetty, 2u);
+        EXPECT_EQ(bb, 3u);
+        EXPECT_EQ(cqe, 2u);
+        ++calls;
+        return CompletionPollResult{CompletionPollState::READY, 0};
+    };
+    for (uint32_t sender : {0u, 1u, 3u, UINT32_MAX})
+        EXPECT_EQ(pto2::urma_backend::poll_owned_queue(token, sender, poll).state, CompletionPollState::PENDING);
+    EXPECT_EQ(calls, 0u);
+    EXPECT_EQ(pto2::urma_backend::poll_owned_queue(token, 2, poll).state, CompletionPollState::READY);
+    EXPECT_EQ(calls, 1u);
+}
+TEST(HbgUrmaRequest, MalformedQueueNeverReachesDevicePoll) {
+    for (int defect = 0; defect < 5; ++defect) {
+        HbgUrmaFixture f;
+        f.info.jettiesPerCore = 1;
+        CompletionToken token{
+            uint64_t{6} << 32 | 3, 2, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE,
+            reinterpret_cast<uint64_t>(f.workspace())
+        };
+        if (defect == 0) f.cq[6].depth = 3;
+        if (defect == 1) f.cq[6].cqeShiftSize = 5;
+        if (defect == 2) f.sq[6].tailAddr = 0;
+        if (defect == 3) f.info.jettiesPerCore = 2;
+        if (defect == 4) f.info.jettyCount = 7;
+        auto poll = [](auto *, uint32_t, uint32_t, uint32_t, uint32_t) {
+            ADD_FAILURE();
+            return CompletionPollResult{CompletionPollState::READY, 0};
+        };
+        EXPECT_EQ(pto2::urma_backend::poll_owned_queue(token, 2, poll).state, CompletionPollState::FAILED);
+    }
+}
+TEST(HbgUrmaRequest, CompletionPendingAndErrorPropagateWithoutRetiring) {
+    HbgUrmaFixture f;
+    f.info.jettiesPerCore = 1;
+    CompletionToken token{
+        uint64_t{6} << 32 | 3, 2, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE,
+        reinterpret_cast<uint64_t>(f.workspace())
+    };
+    for (auto state : {CompletionPollState::PENDING, CompletionPollState::FAILED}) {
+        auto poll = [state](auto *, uint32_t, uint32_t, uint32_t, uint32_t) {
+            return CompletionPollResult{
+                state, state == CompletionPollState::FAILED ? SIMPLER_ERROR_ASYNC_COMPLETION_INVALID : 0
+            };
+        };
+        EXPECT_EQ(pto2::urma_backend::poll_owned_queue(token, 2, poll).state, state);
+        EXPECT_EQ(f.cq_tail[6], 0u);
+        EXPECT_EQ(f.sq_tail[6], 0u);
+    }
+}
+TEST(HbgUrmaRequest, FreshAdaptersAppendToSameLiveGroup) {
+    HbgUrmaFixture f;
+    ASSERT_TRUE(f.submit(UrmaOp::TGET, 1));
+    f.runtime = simpler::urma::HbgRequestAdapter(f.writer, 1);
+    ASSERT_TRUE(f.submit(UrmaOp::TPUT, 1));
+    EXPECT_EQ(f.group().count, 2u);
+    EXPECT_EQ(f.entry(1).expected_value, 2u);
+    EXPECT_TRUE(pto2::resident::seal_conditions(f.writer));
 }

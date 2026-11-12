@@ -22,6 +22,7 @@ from simpler.buffer import AddressSpace, wrap_vmm_window
 from simpler.comm_domain import DomainConfig, HostBufferMapping
 from simpler.task_interface import CommDomainHandle
 from simpler.worker import Worker
+from simpler.workspace_config import UrmaConfig
 
 
 def test_memory_source_is_part_of_reuse_identity():
@@ -254,3 +255,27 @@ def test_borrower_process_exit_keeps_native_backing(native_host_memory, close_ma
 def test_device_buffer_has_no_cpu_shared_memory():
     buf = wrap_vmm_window(0x100000, 64, b"hosttest", 1, "L3", owner_worker_id=0)
     assert buf.shm is None
+
+
+@pytest.mark.parametrize(
+    "members,jetties,accepted", [([0, 1], 1, True), ([0], 1, False), ([0, 1], 2, False), ([1, 0], 1, False)]
+)
+def test_hbg_device_urma_admission_before_backend(members, jetties, accepted):
+    owner = SimpleNamespace(level=3, _config={"device_ids": [0, 1], "platform": "a5", "runtime": "host_build_graph"})
+
+    def call():
+        return Worker._domain_config(
+            cast(Any, owner),
+            members,
+            4096,
+            [],
+            True,
+            {"urma": UrmaConfig(jetties_per_aiv=jetties)},
+            AddressSpace.DEVICE,
+        )
+
+    if accepted:
+        assert call().workspace_engines == ("urma",)
+    else:
+        with pytest.raises(ValueError, match="HBG URMA|dense prefix"):
+            call()
