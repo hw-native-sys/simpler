@@ -104,17 +104,20 @@ capacity.
 
 **`add_dep` is a task-to-task edge only — it is invisible to the host-side
 `set_tensor_data`.** `set_tensor_data(X)` is a host write, not a task in the
-graph, so a "writer depends on reader" edge places no constraint on it. Its
-only channel for discovering in-flight readers is buffer-keyed: it looks up
-`X`'s producer in the TensorMap and waits for that producer *and its
+graph, so a "writer depends on reader" edge places no constraint on it. Left to
+itself, its only channel for discovering in-flight readers is buffer-keyed: it
+looks up `X`'s producer in the TensorMap and waits for that producer *and its
 consumers* (`wait_for_tensor_ready` with `wait_for_consumers=true`, see
 [`runtime_core.cpp`](../src/a5/runtime/tensormap_and_ringbuffer/runtime/runtime_core.cpp)).
 `add_dep` writes no TensorMap entry for `X` and does not touch that producer's
-fanout, so a reader wired only through `add_dep` is not in the set
-`set_tensor_data` waits on. If a buffer that a reader touches may later be
-written from the host via `set_tensor_data`, that reader must use `add_inout`
-(Option A) to register itself in the TensorMap — `add_dep` cannot substitute
-here.
+fanout, so a reader wired only through `add_dep` is not discovered by
+`set_tensor_data` on its own. A host-side write that must wait for such a
+reader names it in `set_tensor_data`'s `deps` argument: the accessor waits for
+every declared task and its retained consumers. That is the same task id `add_dep`
+already captured, so no extra bookkeeping is needed — see
+[`SCALAR_DATA_ACCESS.md`](../src/a5/runtime/tensormap_and_ringbuffer/docs/SCALAR_DATA_ACCESS.md)
+§3.3. Ordering-only (`DEP_WAIT`) consumers must be named directly: their
+producer releases the fanout reference at wiring, before the reader completes.
 
 That guard is a `tensormap_and_ringbuffer` property. `host_build_graph` has no
 host-side WAR guard to be visible to: its orchestration runs to completion before
@@ -127,15 +130,15 @@ outright (see
 Prefer **Option B (`add_dep`)**. It is precise (one edge, no side effects on
 the tensormap), and it preserves read parallelism. Use **Option A (`INOUT`)**
 only when the tensor is semantically read-modify-write anyway, or when the
-reader must be visible to the host-side `set_tensor_data` WAR guard (see the
-`set_tensor_data` note in
+reader must also be visible to every accessor in the graph without threading
+its id through each `set_tensor_data` call (see the `set_tensor_data` note in
 [`orchestration_api.h`](../src/a5/runtime/tensormap_and_ringbuffer/orchestration/orchestration_api.h)).
 
 | Concern | Option A: `INOUT` | Option B: `add_dep` |
 | ------- | ----------------- | ------------------- |
 | Creates the WAR edge | ✓ | ✓ |
 | Keeps readers concurrent | ✗ (readers serialize as WAW) | ✓ |
-| Visible to host `set_tensor_data` | ✓ | ✗ |
+| Visible to host `set_tensor_data` | ✓ | ✓ when the id is passed in `deps` |
 | Extra tensormap entry per read | ✓ | ✗ |
 | Effort | change one arg tag | capture id + one `add_dep` |
 

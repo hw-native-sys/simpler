@@ -86,19 +86,48 @@ void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, c
 }
 
 // Wait for all producers of this tensor to be safe for data access.
-// Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
+// Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers),
+// then every task the caller declared in `deps`.
 // For reads: wait until each producer COMPLETED (done writing).
-// For writes: also wait until all consumers done reading
+// For writes: also wait until retained consumers done reading
 //   (consumer low bits of fanout_refcount >= consumer count, excluding the
 //    bit31 scope reference).
 // Uses cycle-based timeout (checked every 1024 spins).
-// Returns false on timeout (sets orch.fatal).
+// Returns false on timeout or invalid declared dependency (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
 static bool wait_for_tensor_ready(
-    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, bool wait_for_consumers, const char *caller
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, bool wait_for_consumers, const TaskId *deps,
+    uint32_t dep_count, const char *caller
 ) {
     TaskId owner = tensor.owner_task_id;
     OrchestratorState &orch = rt->orchestrator;
+
+    // A declared dependency names a task that already exists in this run, so
+    // check the whole list before any wait: an invalid entry must be reported
+    // without blocking on the valid ones.
+    if (dep_count > 0 && deps == nullptr) {
+        orch.report_fatal(SIMPLER_ERROR_INVALID_ARGS, caller, "deps is null with dep_count=%u", dep_count);
+        return false;
+    }
+    for (uint32_t i = 0; i < dep_count; i++) {
+        TaskId dep = deps[i];
+        if (!dep.is_valid() || dep.ring() >= CHIP_MAX_RING_DEPTH || dep.local_id() < 0) {
+            orch.report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, caller, "deps[%u]=0x%llx is not a valid task id", i,
+                (unsigned long long)TaskId::to_uint64(dep)
+            );
+            return false;
+        }
+        int32_t task_head = orch.rings[dep.ring()].task_allocator.task_head();
+        if (dep.local_id() >= task_head) {
+            orch.report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, caller,
+                "deps[%u] names task (ring=%u, local=%d), but only %d tasks were submitted on that ring", i,
+                static_cast<unsigned>(dep.ring()), dep.local_id(), task_head
+            );
+            return false;
+        }
+    }
 
     // Segmented wait: collect up to kSegmentCap producer slots, then flush by
     // spinning on each. When the segment fills, we wait for the accumulated
@@ -219,12 +248,33 @@ static bool wait_for_tensor_ready(
     };
 
     do_wait();
-    return !failed;
+    if (failed) return false;
+
+    // A declared task whose slot no longer carries it has been consumed and
+    // rebound to a newer submission; consumption implies completion, so there
+    // is nothing left to wait for.
+    for (uint32_t i = 0; i < dep_count; i++) {
+        TaskId dep = deps[i];
+        SharedMemoryRingHeader &ring = orch.sm_header->rings[dep.ring()];
+        int32_t local_id = dep.local_id();
+        if (ring.fc.last_task_alive.load(std::memory_order_acquire) > local_id) continue;
+        ChipTaskSlotState &slot = ring.get_slot_state_by_task_id(local_id);
+        if (slot.task == nullptr || slot.task->task_id.local_id() != local_id) continue;
+        wait_one_producer(slot);
+        if (failed) return false;
+        if (!wait_for_consumers) continue;
+        wait_one_consumers(slot);
+        if (failed) return false;
+    }
+
+    return true;
 }
 MAYBE_UNINITIALIZED_END
 
-uint64_t
-get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+uint64_t get_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[],
+    const simpler::tmr::TaskId *deps, uint32_t dep_count
+) {
     if (tensor.address_space != AddressSpace::DEVICE) {
         rt->orchestrator.report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "device orchestration cannot access HOST tensors"
@@ -239,7 +289,7 @@ get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t
         return 0;
     }
 
-    if (!wait_for_tensor_ready(rt, tensor, false, __FUNCTION__)) {
+    if (!wait_for_tensor_ready(rt, tensor, false, deps, dep_count, __FUNCTION__)) {
         return 0;
     }
 
@@ -252,7 +302,8 @@ get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t
 }
 
 void set_tensor_data(
-    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value,
+    const simpler::tmr::TaskId *deps, uint32_t dep_count
 ) {
     if (tensor.address_space != AddressSpace::DEVICE) {
         rt->orchestrator.report_fatal(
@@ -268,8 +319,8 @@ void set_tensor_data(
         return;
     }
 
-    // Wait for producer + all consumers before writing (WAW + WAR safety)
-    if (!wait_for_tensor_ready(rt, tensor, true, __FUNCTION__)) {
+    // Wait for producer + retained consumers before writing (WAW + WAR safety)
+    if (!wait_for_tensor_ready(rt, tensor, true, deps, dep_count, __FUNCTION__)) {
         return;
     }
 
