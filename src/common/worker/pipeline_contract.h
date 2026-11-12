@@ -127,8 +127,8 @@ inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
     return true;
 }
 
-// Each execution role is supplied exactly once.
-inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
+// Each required execution role is supplied exactly once; an absent AICPU has no handle.
+inline bool has_serviceable_stream_topology(const PipelineContract &contract, bool requires_aicpu = true) {
     if (contract.resource_count > PTO_PIPELINE_MAX_RESOURCES) return false;
     constexpr uint32_t STREAM_KINDS[] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_AICORE_STREAM};
     for (uint32_t kind : STREAM_KINDS) {
@@ -139,7 +139,8 @@ inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
             if (resource.resource_class != PTO_PIPELINE_EXEC_HANDLE) return false;
             ++count;
         }
-        if (count != 1) return false;
+        const uint32_t required_count = kind == PTO_PIPELINE_AICPU_STREAM && !requires_aicpu ? 0 : 1;
+        if (count != required_count) return false;
     }
     return true;
 }

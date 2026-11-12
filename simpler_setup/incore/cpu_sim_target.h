@@ -20,5 +20,10 @@ static_assert(
 
 // Every translation unit has the same fixed target; inline permits one export per linked image.
 extern "C" __attribute__((used, visibility("default"))) inline const char *simpler_cpu_sim_target() {
+#if defined(SIMPLER_CPU_SIM_TARGET_WSE)
+    static_assert(pto::CPU_SIM_TARGET == pto::CpuSimTarget::A5, "WSE compatibility kernels require A5 CPU semantics");
+    return "wsesim";
+#else
     return pto::CPU_SIM_TARGET == pto::CpuSimTarget::A5 ? "a5sim" : "a2a3sim";
+#endif
 }

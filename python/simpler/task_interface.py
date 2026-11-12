@@ -1582,7 +1582,7 @@ def _initialize_chip_runtime(  # noqa: PLR0913 -- explicit binary, workspace and
     # no dispatcher; onboard bootstrap consumes its actual binary path.
     impl.init(
         str(bins.host_path),
-        str(bins.aicpu_path),
+        "" if bins.aicpu_path is None else str(bins.aicpu_path),
         str(bins.aicore_path),
         "" if dispatcher_path is None else str(dispatcher_path),
         int(device_id),

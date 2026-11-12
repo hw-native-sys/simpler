@@ -23,11 +23,12 @@ PLATFORM_MAP: dict[str, tuple[str, str]] = {
     "a2a3sim": ("a2a3", "sim"),
     "a5": ("a5", "onboard"),
     "a5sim": ("a5", "sim"),
+    "wsesim": ("wse", "sim"),
 }
 
 _REVERSE_MAP: dict[tuple[str, str], str] = {v: k for k, v in PLATFORM_MAP.items()}
 
-ARCHS = ("a2a3", "a5")
+ARCHS = ("a2a3", "a5", "wse")
 TARGETS = ("host", "aicpu", "aicore")
 
 

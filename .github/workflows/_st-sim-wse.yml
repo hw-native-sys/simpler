@@ -1,0 +1,139 @@
+name: Simulation Scene Tests (wsesim)
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+      ref:
+        required: false
+        type: string
+      runs_on:
+        required: true
+        type: string
+      setup_variant:
+        description: github or self-cpu.
+        required: true
+        type: string
+      include_dfx_smokes:
+        required: false
+        default: false
+        type: boolean
+      manual_mode:
+        description: exclude for Per-PR, include for the Daily full sweep.
+        required: false
+        default: exclude
+        type: string
+      python_version:
+        description: Hosted Python version; CI requires Python 3.10 or newer.
+        required: false
+        default: "3.10"
+        type: string
+      scheduler_timeout_ms:
+        description: Scheduler timeout budget in milliseconds.
+        required: false
+        default: "10000"
+        type: string
+      session_timeout_seconds:
+        description: Pytest session timeout in seconds.
+        required: false
+        default: 1200
+        type: number
+      job_timeout_minutes:
+        description: Job timeout in minutes.
+        required: false
+        default: 30
+        type: number
+
+jobs:
+  run:
+    name: st-sim-wsesim
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
+    env:
+      MANUAL_MODE: ${{ inputs.manual_mode }}
+      SIMPLER_SCHEDULER_TIMEOUT_MS: ${{ inputs.scheduler_timeout_ms }}
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Checkout Python setup action
+        if: inputs.setup_variant == 'github'
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/setup-python
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        if: inputs.setup_variant == 'github'
+        uses: ./.ci-support/.github/actions/setup-python
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Verify Python >= 3.10
+        run: |
+          python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
+
+      - name: Validate manual mode
+        run: |
+          case "$MANUAL_MODE" in
+            exclude|include|only) ;;
+            *)
+              echo "::error::manual_mode must be exclude, include, or only"
+              exit 2
+              ;;
+          esac
+
+      - name: Set up C++ compiler
+        if: inputs.setup_variant == 'github'
+        uses: ./.github/actions/setup-gcc-15
+        with:
+          install-graphviz: "true"
+
+      - name: Verify provisioned toolchain
+        if: inputs.setup_variant == 'self-cpu'
+        run: |
+          command -v ninja
+          command -v g++
+          command -v dot
+          if ! command -v g++-15 >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/bin"
+            ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
+        uses: ./.github/actions/cache-pip
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-venv
+        with:
+          build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_wsesim .[test]"
+
+      - name: Run pytest scene tests
+        run: |
+          .venv/bin/python -m pytest examples tests/st --platform wsesim --device 0 --max-parallel 1 -v \
+            --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
+            --manual "$MANUAL_MODE"
+
+      - name: Dependency capture smoke
+        if: inputs.include_dfx_smokes
+        run: |
+          .venv/bin/python -m pytest tests/st/wse/host_build_graph/vector_example \
+            --platform wsesim --device 0 --max-parallel 1 --enable-dep-gen \
+            --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
+            --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}"

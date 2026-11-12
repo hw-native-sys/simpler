@@ -159,8 +159,10 @@ class RuntimeCompiler:
             self.platform_dir = self.project_root / "src" / "a5" / "platform" / "onboard"
         elif platform == "a5sim":
             self.platform_dir = self.project_root / "src" / "a5" / "platform" / "sim"
+        elif platform == "wsesim":
+            self.platform_dir = self.project_root / "src" / "wse" / "platform" / "sim"
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim, wsesim")
 
         if not self.platform_dir.is_dir():
             raise ValueError(f"Platform '{platform}' not found at {self.platform_dir}")
@@ -173,8 +175,10 @@ class RuntimeCompiler:
             self._init_a5()
         elif platform == "a5sim":
             self._init_a5sim()
+        elif platform == "wsesim":
+            self._init_wsesim()
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim, wsesim")
 
     def _init_a2a3(self):
         """Initialize toolchains for real a2a3 hardware."""
@@ -253,6 +257,14 @@ class RuntimeCompiler:
         self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
         self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
+    def _init_wsesim(self):
+        """Initialize the WSE Host and PE simulator components."""
+        self._ensure_host_compilers()
+        gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
+        self.aicpu_target = None
+        self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
+        self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
+
     def _ensure_host_compilers(self):
         if not self._find_executable("gcc"):
             raise FileNotFoundError("Host C compiler not found: gcc. Please install gcc.")
@@ -318,6 +330,8 @@ class RuntimeCompiler:
         if target_platform == "aicore":
             target = self.aicore_target
         elif target_platform == "aicpu":
+            if self.aicpu_target is None:
+                raise ValueError(f"{self.platform} has no AICPU runtime component")
             target = self.aicpu_target
         elif target_platform == "host":
             target = self.host_target

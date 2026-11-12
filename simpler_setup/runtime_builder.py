@@ -227,7 +227,7 @@ class RuntimeBinaries:
     """
 
     host_path: Path
-    aicpu_path: Path
+    aicpu_path: Optional[Path]
     aicore_path: Path
     sim_context_path: Optional[Path] = None
     dispatcher_path: Optional[Path] = None
@@ -327,7 +327,7 @@ class RuntimeBuilder:
         invalid, let ``read_pto_isa_pin`` raise so an embedding onboard build
         cannot silently proceed with unknown PTO-ISA headers.
         """
-        if not self._requires_pto_isa_metadata_validation() and self.platform != "a5sim":
+        if not self._requires_pto_isa_metadata_validation() and self.platform not in {"a5sim", "wsesim"}:
             return ""
         from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
@@ -364,6 +364,8 @@ class RuntimeBuilder:
         missing = []
         for target in TARGETS:
             target_obj = getattr(compiler, f"{target}_target")
+            if target == "aicpu" and target_obj is None:
+                continue
             binary = output_dir / target_obj.get_binary_name()
             paths[target] = binary
             if not binary.is_file():
@@ -398,7 +400,7 @@ class RuntimeBuilder:
 
         return RuntimeBinaries(
             host_path=paths["host"],
-            aicpu_path=paths["aicpu"],
+            aicpu_path=paths.get("aicpu"),
             aicore_path=paths["aicore"],
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
@@ -525,12 +527,12 @@ class RuntimeBuilder:
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             fut_host = executor.submit(_compile_target, "host")
-            fut_aicpu = executor.submit(_compile_target, "aicpu")
+            fut_aicpu = executor.submit(_compile_target, "aicpu") if compiler.aicpu_target is not None else None
             fut_aicore = executor.submit(_compile_target, "aicore")
             fut_sim_ctx = executor.submit(self.ensure_sim_context, build=build_shared) if variant == "sim" else None
 
             host_path = fut_host.result()
-            aicpu_path = fut_aicpu.result()
+            aicpu_path = fut_aicpu.result() if fut_aicpu is not None else None
             aicore_path = fut_aicore.result()
             sim_context_path = fut_sim_ctx.result() if fut_sim_ctx else None
 
@@ -656,6 +658,8 @@ class RuntimeBuilder:
         arch, variant = self._arch, self._variant
         entries = []
         for target in TARGETS:
+            if target == "aicpu" and self._runtime_compiler.aicpu_target is None:
+                continue
             cc = self._CACHE_DIR / arch / variant / runtime_name / target / "compile_commands.json"
             if cc.exists():
                 try:
