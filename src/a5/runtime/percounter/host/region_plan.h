@@ -290,7 +290,7 @@ inline TaskPlacement task_placement_from_active_mask(uint8_t active_mask, uint8_
 
 /** The same mask as the lane bits upstream's shape checks take. */
 inline LaneMask lane_mask_from_active_mask(uint8_t active_mask) {
-    return LaneMask((active_mask & 1U) != 0, (active_mask & 2U) != 0, (active_mask & 4U) != 0);
+    return {(active_mask & 1U) != 0, (active_mask & 2U) != 0, (active_mask & 4U) != 0};
 }
 
 /** One task, as the table builder needs to see it. */

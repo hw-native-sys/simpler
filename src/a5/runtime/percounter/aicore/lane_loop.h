@@ -494,9 +494,9 @@ inline __aicore__ bool percounter_async_seal(
         // into a record that holds four, rather than only that something
         // about the registration was wrong.
         percounter_fail(
-            cfg, error == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW      ? SchedulerGraphResult::ASYNC_WAIT_OVERFLOW
-                 : error == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ? SchedulerGraphResult::ASYNC_COMPLETION_INVALID
-                                                                   : SchedulerGraphResult::ASYNC_REGISTRATION_FAILED
+            cfg, error == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW      ? SchedulerGraphResult::ASYNC_WAIT_OVERFLOW :
+                 error == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ? SchedulerGraphResult::ASYNC_COMPLETION_INVALID :
+                                                                   SchedulerGraphResult::ASYNC_REGISTRATION_FAILED
         );
         return false;
     }
@@ -771,23 +771,6 @@ inline __aicore__ bool percounter_prepare_pending(
     }
     pending->prepared = true;
     return true;
-}
-
-/**
- * Record `count` finished subtasks of `task`; called after their store
- * barriers. A body sink's subtasks also count toward its shell, whose counter
- * is preset against every sink subtask of the body.
- */
-inline __aicore__ void
-percounter_publish_completion(const LaneConfig &cfg, const PercounterTask &task, uint64_t count) {
-    percounter_gm_fetch_add(cfg.counters[task.id].value, count);
-    if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, count);
-}
-
-/** True when the lane should stop: EXIT is signalled or some lane has failed. */
-inline __aicore__ bool percounter_should_stop(const LaneConfig &cfg) {
-    return static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL ||
-           percounter_gm_read(cfg.control->lane_error) != 0;
 }
 
 /**
