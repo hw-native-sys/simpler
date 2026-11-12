@@ -117,8 +117,9 @@ scheduler_scalar_result_runtime(const Local *local, SchedPhaseKind kind, Operati
 }
 
 template <typename Local, typename Operation>
-static inline __aicore__ __attribute__((always_inline)) auto
-scheduler_scalar_result(const Local *local, SchedPhaseKind kind, Operation operation) {
+static inline __aicore__ __attribute__((always_inline)) auto scheduler_scalar_result(
+    [[maybe_unused]] const Local *local, [[maybe_unused]] SchedPhaseKind kind, Operation operation
+) {
     if constexpr (kSchedulerScalarInstrumentation) return scheduler_scalar_result_runtime(local, kind, operation);
     else return operation();
 }

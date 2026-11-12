@@ -292,15 +292,16 @@ scheduler_scalar_memory_result_runtime(SchedPhaseKind kind, Operation operation)
 }
 
 template <typename Operation>
-static inline __aicore__ __attribute__((always_inline)) void
-scheduler_scalar_memory_issue(SchedPhaseKind kind, uint32_t calls, Operation operation) {
+static inline __aicore__ __attribute__((always_inline)) void scheduler_scalar_memory_issue(
+    [[maybe_unused]] SchedPhaseKind kind, [[maybe_unused]] uint32_t calls, Operation operation
+) {
     if constexpr (kSchedulerScalarInstrumentation) scheduler_scalar_memory_issue_runtime(kind, calls, operation);
     else operation();
 }
 
 template <typename Operation>
 static inline __aicore__ __attribute__((always_inline)) auto
-scheduler_scalar_memory_result(SchedPhaseKind kind, Operation operation) {
+scheduler_scalar_memory_result([[maybe_unused]] SchedPhaseKind kind, Operation operation) {
     if constexpr (kSchedulerScalarInstrumentation) return scheduler_scalar_memory_result_runtime(kind, operation);
     else return operation();
 }

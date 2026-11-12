@@ -9,6 +9,15 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "scheduler/scheduler_scalar_policy.h"
+
+namespace {
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = true;
+};
+}  // namespace
+
 #include "scalar_policy_test_body.h"
 
 ScalarPolicyObservation scalar_policy_profiled() { return observe_scalar_policy(); }

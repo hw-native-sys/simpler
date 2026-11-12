@@ -13,12 +13,12 @@
 
 namespace {
 
-// Each translation unit owns its policy. Residents with WithProfiling=false
-// specialize it before including the scheduler implementation.
+// Text-only callables do not own block-local trace storage. Only profiling
+// resident translation units opt in before including the scheduler implementation.
 // Policy-dependent helpers, callers and observer adapters have internal linkage.
 template <typename = void>
 struct SchedulerScalarCompilation {
-    static constexpr bool enabled = true;
+    static constexpr bool enabled = false;
 };
 
 }  // namespace

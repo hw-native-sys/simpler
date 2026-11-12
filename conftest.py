@@ -619,6 +619,20 @@ def _validate_level_filters(config) -> None:
         raise pytest.UsageError("--level and --exclude-level cannot be used together")
 
 
+def _configure_ascend_logs(config) -> None:
+    """Keep A5 process/device logs with the JUnit artifacts, including child processes."""
+    report = config.getoption("xmlpath", default=None)
+    if config.getoption("--platform", default=None) != "a5" or not report:
+        return
+    if os.environ.get("ASCEND_PROCESS_LOG_PATH"):
+        return
+    log_dir = Path(report).resolve().parent / "ascend"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    patch = pytest.MonkeyPatch()
+    patch.setenv("ASCEND_PROCESS_LOG_PATH", str(log_dir))
+    config.add_cleanup(patch.undo)
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -676,6 +690,7 @@ def pytest_configure(config):
     _validate_level_filters(config)
     _validate_diagnostic_flags(config)
     _configure_sanitizer(config)
+    _configure_ascend_logs(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
     # simpler's own WARNINGs — e.g. the device-log-timing "no device log written"
