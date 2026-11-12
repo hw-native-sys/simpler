@@ -28,6 +28,10 @@ a5 hbg 除文档外约 22,300 行，其中 percounter 专属 3,877 行（17%）�
 
 **这八个文件全是头文件，没有一个 `.cpp`。** 这是整个方案成立的前提。
 
+> 当前的 percounter 已经是 15 个文件：上面这八个之外，`aicore/entry.cpp`、
+> `aicpu/steps.cpp`、`host/extension.cpp` 三个入口 `.cpp`，以及后来从 hbg 接管过来的
+> `runtime/scheduler/{ssbuf,gm,image_read}.h`（见本文末节）。
+
 ### percounter 改过的 hbg 文件
 
 从分叉点算起共 7 个代码文件、约 93 行：
@@ -194,7 +198,7 @@ percounter 自己的头，并**在同一步删掉 hbg 对它们的全部引用**
 `tests/ut/cpp/a5/runtime/host_build_graph/` 里。percounter 的测试与 CI 接入一并放到
 后续 PR，所以本 PR 之后它没有任何用例——这是"CI 开销：零"那一节的代价。
 
-做完这一步，**hbg 干净了，而 percounter 还没接上**——它的八个头躺在新树里没人 include，
+做完这一步，**hbg 干净了，而 percounter 还没接上**——它那几个头躺在新树里没人 include，
 percounter runtime 编出来和 hbg 等价。这是一个可验证的中间态。
 
 验收：
@@ -265,3 +269,24 @@ codegen 就真的不同了，独立的 `RuntimeKind` 给这件事留了口子。
 
 一个明确的信号：**当第 3 步之后仍需 fork 的文件超过 hbg 的一半时**，复用已经不划算，
 那时再整树复制，而且那时已经知道哪些可以删。
+
+### 已经出现过的一次信号
+
+2026-11-12 合并 upstream 时，#2991 把 `scheduler_memory.h` 的每个原语包进了一个
+`noinline` 的 tracing 包装器，并让 `scheduler_ssbuf.h` 的 acquire/release 改走它。
+那两个访问器是 percounter MIX rendezvous **唯一**的内存序来源，`percounter_mix_wait`
+每个 peer 每次自旋都要走一遍；hbg 自己的 AICore 侧很少轮询，吃得下这个开销。合并后
+每一次设备运行都在固定 21 秒故障，a5sim 完全不复现，二分十六个上游提交才定位到它。
+
+这一次的处置不是整树复制，而是**把 lane 真正跑在上面的那一层接管过来**——`ssbuf.h`、
+`gm.h`、`image_read.h` 三个头。判据不是"改了多少文件"，而是：
+
+> **两个 runtime 对同一个访问的代价不同时，那个访问就不该再共享。**
+
+图像格式、布局、拓扑、看门狗对双方代价相同，仍然共享；而 AICPU 驱动的调度器和
+lane 自驱的调度器，对"一次 GM 访问值多少"的答案不一样，这半边就该各管各的。
+
+按这条判据，下一次会落在 AICPU 和 host 镜像上——它们至今仍整体编译 hbg 的源码目录。
+
+完整经过见
+[`docs/investigations/2026-11-percounter-shared-primitive-coupling.md`](../../investigations/2026-11-percounter-shared-primitive-coupling.md)。
