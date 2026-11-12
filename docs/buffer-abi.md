@@ -115,7 +115,7 @@ and output copy-back; H2D does not mean every argument is copied in. Buffer iden
 import grants and `TensorArgType` access checks are unchanged.
 
 `Worker.create_buffer(nbytes)` retains ordinary shared Host backing and its native
-grant. A direct A5 L2 Worker accepts an explicit per-call mapping request:
+grant. A direct A3 or A5 L2 Worker accepts an explicit per-call mapping request:
 
 ```python
 buffer = l2.create_buffer(nbytes)
@@ -127,10 +127,11 @@ l2.release_buffer(buffer)
 
 `add_tensor` records MAP without registering memory or changing the Tensor. During
 submission the owning L2 Worker validates the source grant, retains the Buffer,
-and registers its whole POSIX_SHM backing in the current A5 context. Registration
-uses ACL HostRegister/GetDevicePointer and is cached until Buffer release. No
-table-sized Device replica is allocated. Subsequent calls and views reuse the
-registration while preserving their own offsets and geometry.
+and registers its whole POSIX_SHM backing in the current device context. The A3
+backend obtains the mapped address from `aclrtHostRegister`; the A5 backend uses
+`aclrtHostRegisterV2` and `aclrtHostGetDevicePointer`. Registration is cached
+until Buffer release. Subsequent calls and views reuse the registration while
+preserving their own offsets and geometry. MAP uses the Host backing directly.
 
 The ImportRegistry resolves each argument separately as `(base, address_space,
 execution_transfer)`. MAP lowers to the mapped Device base with DEVICE/NONE;
