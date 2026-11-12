@@ -10887,8 +10887,8 @@ class Worker:
                 if self._config.get("runtime") not in ("tensormap_and_ringbuffer", "host_build_graph"):
                     raise ValueError("URMA domain workspaces require A5 TMR or HBG")
                 if self._config.get("runtime") == "host_build_graph":
-                    if len(config.members) != 2 or config.urma_config().jetties_per_aiv != 1:
-                        raise ValueError("HBG URMA requires two Device ranks and one jetty per AIV")
+                    if len(config.members) < 2 or config.urma_config().jetties_per_aiv != 1:
+                        raise ValueError("HBG URMA requires at least two Device ranks and one jetty per AIV")
                     if config.members != tuple(range(len(config.members))):
                         raise ValueError("HBG URMA requires ranks in dense prefix order")
                 if config.memory_source == AddressSpace.HOST and config.members != tuple(range(len(config.members))):

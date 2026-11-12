@@ -1,6 +1,6 @@
 # URMA concurrent sender validation
 
-These A5 `tensormap_and_ringbuffer` tests use one communication domain and the
+These shared A5 workloads use one communication domain and the
 public deferred URMA request adapter. Rank 0 sends into disjoint remote slots,
 then reads them back after PUT completion. An add-one consumer depends on the
 GET output. Peer-specific payloads distinguish target ranks even when the
@@ -85,3 +85,12 @@ Select an individual case with `--case same_peer` or another name from the table
 Preserve the exact simpler/ISA/CANN revisions, runtime artifacts, device IDs,
 resource-child results, and device logs with the acceptance report. A skipped or
 unexecuted case is not hardware acceptance.
+
+The HBG entry at `../../host_build_graph/urma_concurrent_senders/` reuses the
+same kernels, data and numerical oracles for same-peer SPMD, independent tasks,
+MIX siblings and two-peer transfers. It also checks per-sender submitted counts
+across tasks and prints the complete device records. Queue-wrap and pending
+reuse scenarios remain TMR-specific here. Manual HBG latency cases compare
+synchronous and deferred requests with two senders, two peers and 1 MiB per
+request; the first of eleven PUT waves is the rendezvous/warmup wave. The
+synchronous option is a test comparison and does not alter runtime admission.

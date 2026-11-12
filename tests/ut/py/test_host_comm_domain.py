@@ -258,10 +258,11 @@ def test_device_buffer_has_no_cpu_shared_memory():
 
 
 @pytest.mark.parametrize(
-    "members,jetties,accepted", [([0, 1], 1, True), ([0], 1, False), ([0, 1], 2, False), ([1, 0], 1, False)]
+    "members,jetties,accepted",
+    [([0, 1], 1, True), ([0, 1, 2], 1, True), ([0], 1, False), ([0, 1], 2, False), ([1, 0], 1, False)],
 )
 def test_hbg_device_urma_admission_before_backend(members, jetties, accepted):
-    owner = SimpleNamespace(level=3, _config={"device_ids": [0, 1], "platform": "a5", "runtime": "host_build_graph"})
+    owner = SimpleNamespace(level=3, _config={"device_ids": [0, 1, 2], "platform": "a5", "runtime": "host_build_graph"})
 
     def call():
         return Worker._domain_config(

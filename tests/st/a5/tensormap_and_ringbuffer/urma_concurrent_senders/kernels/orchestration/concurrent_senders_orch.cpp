@@ -17,7 +17,8 @@
 namespace {
 constexpr uint32_t kRecordWords = 32;
 
-simpler::tmr::Tensor view(const simpler::tmr::Tensor &tensor, uint32_t count, uint32_t offset) {
+template <typename Tensor>
+Tensor view(const Tensor &tensor, uint32_t count, uint32_t offset) {
     uint32_t shape[] = {count};
     uint32_t start[] = {offset};
     return tensor.view(shape, start);
@@ -34,7 +35,6 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     const auto &out = orch_args.tensor(2).ref();
     const auto &result = orch_args.tensor(3).ref();
     const auto &records = orch_args.tensor(4).ref();
-    const auto &layout = orch_args.tensor(5).ref();
     const uint64_t comm_ctx = orch_args.scalar<uint64_t>(0);
     const uint32_t elems = orch_args.scalar<uint32_t>(1);
     const uint32_t slots = orch_args.scalar<uint32_t>(2);
@@ -42,12 +42,11 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     const uint32_t waves = orch_args.scalar<uint32_t>(4);
     const uint32_t repeats = orch_args.scalar<uint32_t>(5);
     const uint32_t mode = orch_args.scalar<uint32_t>(6);
+    const uint32_t synchronous = orch_args.scalar<uint32_t>(7);
     const bool pending_reuse = mode == 3;
     const bool independent = mode == 1 || pending_reuse;
     const bool mixed = mode == 2;
     const uint32_t width = slots;
-    uint32_t zero[] = {0};
-    set_tensor_data<int64_t>(layout, 1, zero, width);
     if (width == 0 || width > slots || (independent && width != 2)) return;
 
     TaskId previous[2] = {TaskId::invalid(), TaskId::invalid()};
@@ -86,6 +85,7 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
             );
             args.add_scalar(wave);
             args.add_scalar(put ? mode : 0);
+            args.add_scalar(synchronous);
             for (uint32_t dep = 0; dep < tasks; ++dep) {
                 if ((!pending_reuse || !put) && previous[dep].is_valid()) args.add_dep(previous[dep]);
                 if (pending_reuse && !put && first_wave[dep].is_valid()) args.add_dep(first_wave[dep]);

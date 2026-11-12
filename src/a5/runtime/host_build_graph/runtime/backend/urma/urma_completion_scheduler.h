@@ -31,7 +31,7 @@ poll_owned_queue(const CompletionToken &token, uint32_t observer_sender, const P
     using namespace pto::comm::urma;
     auto *info = reinterpret_cast<__gm__ UrmaInfo *>(token.backend_cookie);
     const uint32_t row = static_cast<uint32_t>(token.addr >> 32);
-    if (info->layout != UrmaLayout::PER_PEER || info->rankCount != 2 || info->rowsPerPeer == 0 ||
+    if (info->layout != UrmaLayout::PER_PEER || info->rankCount < 2 || info->rowsPerPeer == 0 ||
         info->jettiesPerCore != 1 || static_cast<uint64_t>(info->rowsPerPeer) * info->rankCount != info->jettyCount ||
         row >= info->jettyCount || info->sqPtr == 0 || info->scqPtr == 0 || info->sqPtr % alignof(UrmaWQCtx) != 0 ||
         info->scqPtr % alignof(UrmaCqCtx) != 0)

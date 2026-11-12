@@ -29,7 +29,6 @@ struct AsyncTaskHostPlan {
     SchedulerAsyncTaskData data;
     uint64_t entries_offset{0};
     uint32_t block_entry_bytes{0};
-    bool urma_single_aiv{false};
     std::array<uint16_t, 3> capacities{};
 };
 

@@ -60,7 +60,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         logical >= slots) {
         record[0] = -1;
         flush(record);
-        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(ctx);
         return;
     }
@@ -73,7 +73,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         static_cast<uint64_t>(info->rankCount) * info->rowsPerPeer != info->jettyCount) {
         record[0] = -2;
         flush(record);
-        pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(ctx);
         return;
     }
@@ -114,7 +114,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         if (!arrived) {
             record[0] = -3;
             flush(record);
-            pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             pto2::detail::defer_flush(ctx);
             return;
         }
@@ -127,9 +127,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     const uint32_t before = *ctx.completion_count;
     for (uint32_t rep = 0; rep < repeats; ++rep) {
         for (uint32_t peer = 1; peer <= peers; ++peer) {
-            auto *remote = pto2::urma_backend::peer_mr_ptr<float>(workspace, peer, receive_offset);
+            auto *remote = simpler::urma::peer_mr_ptr<float>(workspace, peer, receive_offset);
             record[25 + peer] = reinterpret_cast<uint64_t>(remote);
-            record[28 + peer] = reinterpret_cast<uint64_t>(pto2::urma_backend::peer_mr_ptr<float>(workspace, peer, 0));
+            record[28 + peer] = reinterpret_cast<uint64_t>(simpler::urma::peer_mr_ptr<float>(workspace, peer, 0));
             auto *peer_source = local + (static_cast<uint64_t>(peer - 1) * slots + logical) * elems;
             auto source = data(put ? peer_source : remote, elems);
             auto dest = data(put ? remote : out + (static_cast<uint64_t>(peer - 1) * slots + logical) * elems, elems);
@@ -148,11 +148,27 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                     ctx.completion_entries[i].backend_cookie != reinterpret_cast<uint64_t>(workspace)) {
                     record[0] = -5;
                     flush(record);
-                    pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+                    pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
                     pto2::detail::defer_flush(ctx);
                     return;
                 }
                 if (i == request_begin) record[23 + peer] = actual_row;
+                if (args[15] != 0) {
+                    pto::comm::AsyncSession session;
+                    bool completed = false;
+                    const auto &entry = ctx.completion_entries[i];
+                    if (!simpler::urma::build_urma_session(ctx.urma_sender_id, workspace, peer, session) ||
+                        !pto::comm::urma::detail::UrmaPollCqAt(
+                            session, peer, actual_row % info->rowsPerPeer, static_cast<uint32_t>(entry.addr),
+                            entry.expected_value, true, completed
+                        ) ||
+                        !completed) {
+                        record[0] = -6;
+                        flush(record);
+                        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+                        return;
+                    }
+                }
             }
         }
     }

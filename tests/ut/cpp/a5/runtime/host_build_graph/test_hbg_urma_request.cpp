@@ -10,7 +10,7 @@
  */
 
 #include "helpers/urma_request_test.h"
-#include "backend/urma/urma_request_adapter.h"
+#include "backend/urma/urma_completion_kernel.h"
 #include "backend/urma/urma_completion_scheduler.h"
 
 namespace {
@@ -264,4 +264,70 @@ TEST(HbgUrmaRequest, FreshAdaptersAppendToSameLiveGroup) {
     EXPECT_EQ(f.group().count, 2u);
     EXPECT_EQ(f.entry(1).expected_value, 2u);
     EXPECT_TRUE(pto2::resident::seal_conditions(f.writer));
+}
+
+TEST(HbgUrmaRequest, PublicEntryAcceptsEachAivExecutionAndRejectsBeforePosting) {
+    using S = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
+    using T = pto::GlobalTensor<float, S, S>;
+    for (uint32_t lane : {1u, 2u}) {
+        for (uint32_t block : {0u, 7u}) {
+            for (uint32_t defect : {0u, 1u, 2u, 3u}) {
+                HbgUrmaFixture f;
+                f.info.jettiesPerCore = 1;
+                f.group().subtask_slot = lane;
+                f.group().block_index = block;
+                AsyncCtx ctx{};
+                ctx.resident_enabled = 1;
+                ctx.resident = f.writer;
+                ctx.urma_sender_id = lane;
+                const uint64_t n = defect == 2 ? pto::comm::urma::kUrmaMaxWqeTransferBytes / sizeof(float) + 1 : 8;
+                T dst({0x100000}, S(1, 1, 1, 1, n), S(n, n, n, n, 1));
+                T src({0x200000}, S(1, 1, 1, 1, n), S(n, n, n, n, 1));
+                ASSERT_TRUE(
+                    pto2::resident::register_completion_condition(
+                        f.writer, CompletionToken{0x10000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0}
+                    )
+                );
+                if (defect == 1) ctx.urma_sender_id = UINT32_MAX;
+                if (defect == 3) ctx.urma_sender_id = f.info.rowsPerPeer;
+                const bool accepted =
+                    send_request_entry(ctx, UrmaRequestDescriptor<T, T>{UrmaOp::TGET, dst, src, f.workspace(), 1});
+                EXPECT_EQ(accepted, defect == 0);
+                EXPECT_EQ(f.script.submissions.size(), defect == 0 ? 1u : 0u);
+                EXPECT_EQ(f.group().count, defect == 0 ? 2u : 1u);
+                EXPECT_EQ(f.entry(0).addr, 0x10000u);
+                if (defect == 0) EXPECT_EQ(f.entry(1).addr >> 32, f.info.rowsPerPeer + lane);
+                else EXPECT_NE(f.group().error_code, 0);
+            }
+        }
+    }
+}
+
+TEST(HbgUrmaRequest, SameSenderOwnsSeparateQueuesForEveryPeer) {
+    HbgUrmaFixture f;
+    f.info.jettiesPerCore = 1;
+    f.info.rankCount = 4;
+    f.info.rowsPerPeer = 2;
+    for (uint32_t peer = 1; peer < 4; ++peer) {
+        for (uint32_t sender = 0; sender < 2; ++sender) {
+            const uint32_t row = peer * 2 + sender;
+            const CompletionToken token{
+                uint64_t{row} << 32 | 1, 1, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE,
+                reinterpret_cast<uint64_t>(f.workspace())
+            };
+            uint32_t calls = 0;
+            auto poll = [&](auto *, uint32_t actual_peer, uint32_t actual_sender, uint32_t, uint32_t) {
+                EXPECT_EQ(actual_peer, peer);
+                EXPECT_EQ(actual_sender, sender);
+                ++calls;
+                return CompletionPollResult{CompletionPollState::READY, 0};
+            };
+            EXPECT_EQ(
+                pto2::urma_backend::poll_owned_queue(token, 1 - sender, poll).state, CompletionPollState::PENDING
+            );
+            EXPECT_EQ(calls, 0u);
+            EXPECT_EQ(pto2::urma_backend::poll_owned_queue(token, sender, poll).state, CompletionPollState::READY);
+            EXPECT_EQ(calls, 1u);
+        }
+    }
 }

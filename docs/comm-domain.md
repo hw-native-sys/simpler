@@ -552,8 +552,8 @@ that same domain-rank order. Overlapping TMR Device domains can stay live and be
 used in successive runs, each owning its communicator and URMA workspace.
 Host-source URMA domains require ranks in dense prefix order.
 
-HBG supports two Device-source ranks in dense prefix order, one jetty per AIV,
-and single-AIV single-block tasks; see
+HBG supports Device-source domains with at least two ranks in dense prefix order,
+one jetty per AIV, and multi-block AIV and MIX tasks; see
 [resident completion](#hbg-resident-urma-registration) for the request limits.
 TMR single-rank requests reach the provider, and initialization failures are
 reported on the host. The currently pinned PTO URMA manager rejects single-rank
@@ -740,7 +740,7 @@ The workspace coverage is split by platform and execution layer:
 | ---------------- | ------------------ | -------- |
 | A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
 | A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
-| A5 HBG | Two-rank Device URMA with one jetty and one AIV per task | GET/PUT, post-return pending, consumer visibility, domain reuse and CQ protocol in `host_build_graph/async_completion/test_urma_completion.py` |
+| A5 HBG | Device URMA with one jetty per physical AIV, including multi-block and MIX tasks | GET/PUT, post-return pending, consumer visibility, domain reuse and CQ protocol in `host_build_graph/async_completion/test_urma_completion.py` |
 | A5 TMR completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
 | A2/A3 | Worker-owned SDMA and optional peer mappings for L3 TMR Host domains | SDMA and prefetch examples, and `test_a3_host_source_domain.py` for Host MTE and peer SDMA |
 | Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |
@@ -915,10 +915,17 @@ the reservation and poisons publication. Stale writer or reservation identities
 fail without erasing accepted entries. Run failure handling retains resources
 that may still be referenced by submitted work.
 
-A5 HBG supports Device-source URMA domains with two dense-prefix ranks and
-one jetty per AIV. Each submitting task must have one block and one AIV lane;
-MIX and multi-block submissions are rejected before posting. Each request is
-limited to one WQE. Host-source domains retain their TMR requirement.
+A5 HBG supports Device-source URMA domains with at least two dense-prefix ranks
+and one jetty per AIV. AIV blocks and MIX sibling AIVs use their physical sender
+identities, with a separate completion group per block and lane. Independent tasks
+and requests to different peers retain the same queue ownership rule. AIC lanes
+cannot submit URMA requests. Each request is limited to one WQE; multi-jetty
+requests are rejected before posting. Host-source domains retain their TMR requirement.
+
+The shared concurrent-sender workloads also run through
+`host_build_graph/urma_concurrent_senders/test_urma_concurrent_senders.py`.
+They check same-peer SPMD, independent tasks, MIX siblings and two-peer queues
+against physical sender IDs, cumulative queue counters and full consumer outputs.
 
 The sender AIV exclusively observes and retires its queues across condition
 groups. Other workers leave those conditions pending. The sender executes
@@ -932,5 +939,5 @@ all execution and completion conditions have joined.
 Normal close reuses the existing domain fence and SQ/CQ drain checks. A CQ
 error or failed registration fails the run; unconfirmed queue drain retains
 the domain's workspace and memory registrations. An unsuccessful run does not
-prove external accesses stopped. Multi-AIV task shapes, multi-jetty and chunked
-requests are tracked separately in issue #2997.
+prove external accesses stopped. Multi-jetty and chunked requests
+are tracked separately in issue #2997.

@@ -44,10 +44,10 @@ def concurrent_senders_orch(orch, callables, task_args, config):
                 domain[0].buffers[name].tensor((peers * count if name == "source" else count,), DataType.FLOAT32),
                 TensorArgType.INPUT,
             )
-        for name in ("out", "result", "records", "layout"):
+        for name in ("out", "result", "records"):
             args.add_tensor(_rehosted_ref_for(task_args, getattr(task_args, name)), TensorArgType.OUTPUT_EXISTING)
         args.add_scalar(domain.device_context(0, workspace_engines=("urma",)))
-        for name in ("elems", "slots", "peers", "waves", "repeats", "independent"):
+        for name in ("elems", "slots", "peers", "waves", "repeats", "independent", "synchronous"):
             args.add_scalar(getattr(task_args, name))
         orch.submit_next_level(callables.concurrent_senders, args, config, worker=0)
 
@@ -62,14 +62,14 @@ class _UrmaConcurrentSenders(SceneTestCase):
                 "orchestration": {
                     "source": "kernels/orchestration/concurrent_senders_orch.cpp",
                     "function_name": "aicpu_orchestration_entry",
-                    "signature": [D.IN, D.IN, D.OUT, D.OUT, D.OUT, D.OUT] + [D.IN] * 7,
+                    "signature": [D.IN, D.IN, D.OUT, D.OUT, D.OUT] + [D.IN] * 8,
                 },
                 "incores": [
                     {
                         "func_id": 0,
                         "source": "kernels/aiv/kernel_transfer.cpp",
                         "core_type": "aiv",
-                        "signature": [D.IN, D.IN, D.OUT, D.OUT] + [D.IN] * 11,
+                        "signature": [D.IN, D.IN, D.OUT, D.OUT] + [D.IN] * 12,
                     },
                     {
                         "func_id": 1,
@@ -81,7 +81,7 @@ class _UrmaConcurrentSenders(SceneTestCase):
                         "func_id": 2,
                         "source": "kernels/aic/kernel_idle.cpp",
                         "core_type": "aic",
-                        "signature": [D.IN, D.IN, D.OUT, D.OUT] + [D.IN] * 11,
+                        "signature": [D.IN, D.IN, D.OUT, D.OUT] + [D.IN] * 12,
                     },
                 ],
             }
@@ -101,20 +101,20 @@ class _UrmaConcurrentSenders(SceneTestCase):
             TensorArg("out", torch.zeros(peers * slots * elems)),
             TensorArg("result", torch.zeros(peers * slots * elems)),
             TensorArg("records", torch.zeros((waves + 1) * slots * RECORD_WORDS + marker_words, dtype=torch.int64)),
-            TensorArg("layout", torch.zeros(16, dtype=torch.int64)),
             Scalar("elems", elems),
             Scalar("slots", slots),
             Scalar("peers", peers),
             Scalar("waves", waves),
             Scalar("repeats", params["repeats"]),
             Scalar("independent", params.get("independent", 0)),
+            Scalar("synchronous", int(params.get("synchronous", False))),
         )
 
     def compute_golden(self, args, params):
         pass
 
     def compare_outputs(self, test_args, golden_args, output_names, params):
-        width = int(test_args.layout[0])
+        width = params["slots"]
         slots, peers, waves = (params[key] for key in ("slots", "peers", "waves"))
         elems = params.get("elems", TILE_ELEMS)
         assert 0 < width <= slots
