@@ -924,9 +924,9 @@ inline __aicore__ bool scheduler_task_requires_admission(const SchedulerTaskMeta
 
 enum class SchedulerAdmissionState : uint64_t {
     UNCLAIMED = 0,
-    CLAIMED = 1,
     PREPARED = 2,
     ADMITTED = 3,
+    INITIALIZED = 4,
 };
 
 inline constexpr uint64_t SCHEDULER_COMPLETION_ASYNC_UNIT = UINT64_C(1) << 32;

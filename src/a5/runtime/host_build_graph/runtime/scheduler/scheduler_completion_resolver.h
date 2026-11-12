@@ -30,7 +30,7 @@ static_assert(
 static __aicore__ __attribute__((noinline)) bool scheduler_resolve_completion_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t producer_ref, const __gm__ SchedulerDependencyHeader &dependencies, uint64_t profiling_level,
-    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type
+    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type, bool admission_owner
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarResolve, producer_ref);
     const bool timing = scheduler_phase_timing_enabled(profiling_level);
@@ -74,12 +74,13 @@ static __aicore__ __attribute__((noinline)) bool scheduler_resolve_completion_st
         if (previous == 0 || previous > static_cast<uint64_t>(ref))
             return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
         if (previous != 1) continue;
-        auto appended =
-            scheduler_ready_publication_append(graph, base, local, ref, publication, direct_ready, direct_core_type);
+        auto appended = scheduler_ready_publication_append(
+            graph, base, local, ref, publication, direct_ready, direct_core_type, admission_owner
+        );
         if (appended == SchedulerReadyAppendResult::FULL) {
             if (!flush()) return false;
             appended = scheduler_ready_publication_append(
-                graph, base, local, ref, publication, direct_ready, direct_core_type
+                graph, base, local, ref, publication, direct_ready, direct_core_type, admission_owner
             );
         }
         if (appended == SchedulerReadyAppendResult::DIRECT) continue;
@@ -268,10 +269,14 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
                             SchedulerErrorSite::COMPLETION_INVALID_SHAPE, SchedulerGraphResult::UNSUPPORTED_SHAPE
                         );
                     const uint32_t type = scheduler_task_ready_queue(metadata.flags, lanes);
-                    const bool direct_type =
-                        scheduler_task_is_mix(metadata.flags) ? local->admission != nullptr : type == direct->core_type;
-                    if (direct_type && direct->ready != nullptr &&
-                        scheduler_task_ref_is_null(direct->ready->task_ref)) {
+                    const bool cooperative = !scheduler_task_is_inline(metadata.flags) &&
+                                             (metadata.logical_block_num > 1 || scheduler_task_is_mix(metadata.flags) ||
+                                              scheduler_task_requires_sync_start(metadata.flags));
+                    const bool admission_direct = direct->admission_owner && local->admission != nullptr &&
+                                                  local->admission->initialized && cooperative;
+                    if ((admission_direct || (scheduler_task_is_mix(metadata.flags) ? local->admission != nullptr :
+                                                                                      type == direct->core_type)) &&
+                        direct->ready != nullptr && scheduler_task_ref_is_null(direct->ready->task_ref)) {
                         direct->ready->task_ref = candidate;
                         direct->ready->source = SchedulerReadySource::DIRECT_RESOLVE;
                         direct->ready->publication_mode = SchedulerPublicationMode::REFILL;

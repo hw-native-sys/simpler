@@ -84,7 +84,7 @@
 | `completion_resolve_loop_iter` | 对应 scheduler 循环序号 |
 | `next_block` | 已确认成功领取的 block 数/领取游标；ticket 分支中不是 next ticket 值 |
 | `completion_state` | 低16位累计已退休的实际子任务，16–31位为Host初始化的总数，高32位累计需要检查异步完成的保守票数 |
-| `admission_state` | UNCLAIMED → CLAIMED → PREPARED → ADMITTED |
+| `admission_state` | UNCLAIMED → INITIALIZED → PREPARED → ADMITTED |
 | `claim_seal` | 全部有效 block 已确认领取的不可变凭据，值为逻辑 block 总数 |
 
 TaskControl 共六行：首行是原子 state/链指针/claim tickets；第二行是 resolver 的 cached metadata；

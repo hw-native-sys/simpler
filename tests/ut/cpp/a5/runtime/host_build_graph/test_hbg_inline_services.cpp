@@ -79,6 +79,16 @@ struct InlineFixture {
         graph.payload(consumer).fanin_data()[0] = static_cast<int32_t>(producer);
         storage.metadata[consumer].flags |= SCHEDULER_TASK_HAS_FANIN;
     }
+    bool bootstrap_admission() {
+        if (run()->bootstrap_scan_complete != 0) return false;
+        for (int64_t task = 0; task < 3; ++task) {
+            if (!scheduler_task_requires_admission(storage.metadata[task])) continue;
+            if (!scheduler_bootstrap_prepare_admission(graph.graph(), base(), locals[0], run(), &admissions[0], task))
+                return false;
+        }
+        run()->bootstrap_scan_complete = 1;
+        return true;
+    }
     SchedulerRouteResult route(uint32_t task, uint32_t worker = 1) {
         return scheduler_route_task(graph.graph(), base(), locals[worker], run(), task);
     }
@@ -159,6 +169,7 @@ TEST(HbgInlineService, CancellationIsObservedBeforePublishingTaskDone) {
 
 TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
     InlineFixture fixture(true, true, false, LaneMask::all());
+    ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.enqueue(0, 0));
     ASSERT_TRUE(fixture.fill(0));
     ASSERT_TRUE(fixture.enqueue(1));
@@ -216,6 +227,7 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     InlineFixture fixture;
     fixture.dependency(1, 0);
     fixture.dependency(2, 1);
+    ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_EQ(fixture.route(1), SchedulerRouteResult::WAITING);
     ASSERT_EQ(fixture.route(2), SchedulerRouteResult::WAITING);
     ASSERT_TRUE(fixture.enqueue(0));

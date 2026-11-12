@@ -134,6 +134,11 @@ struct StartupFixture {
                 scheduler_initialize_free_slot(&slot);
         }
         auto *run = storage.run_control;
+        for (int64_t task = 0; task < 2; ++task)
+            ASSERT_TRUE(
+                scheduler_bootstrap_prepare_admission(graph_view, base(), &locals[0], run, &admissions[0], task)
+            );
+        run->bootstrap_scan_complete = 1;
         for (int64_t task = 0; task < 2; ++task) {
             const LaneMask resources = scheduler_mix_resource_mask(storage.metadata[task].active_mask);
             ASSERT_EQ(

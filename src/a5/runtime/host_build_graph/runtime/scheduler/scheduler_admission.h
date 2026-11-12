@@ -301,24 +301,8 @@ static inline __aicore__ bool scheduler_admission_expected_members(
            (!scheduler_task_requires_sync_start(record->flags) || record->logical_block_num <= positions);
 }
 
-static inline __aicore__ bool scheduler_admission_published_record_valid(
-    __gm__ void *base, SchedulerLocalState *local, SchedulerAdmissionLocalState *admission, int64_t task_ref,
-    __gm__ const SchedulerAdmissionRecord *record
-) {
-    if (!scheduler_admission_static_record_valid(base, local, admission, task_ref, record)) return false;
-    uint64_t expected[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
-    uint32_t members = 0;
-    if (!scheduler_admission_expected_members(base, local, admission, record, expected, &members) ||
-        record->member_count != members)
-        return false;
-    const auto *words = scheduler_state_at<uint64_t>(base, record->member_words_offset);
-    for (uint64_t word = 0; word < admission->member_word_count; ++word)
-        if (words[word] != expected[word]) return false;
-    return true;
-}
-
 // The caller uniquely owns the candidate through ready pop or direct resolve.
-// Only PROGRESS transfers it into pending; RETRY leaves that ownership with the caller.
+// Only PROGRESS transfers it into pending; RETRY leaves ownership with the caller.
 static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission, const SchedulerReadyClaim &candidate
@@ -340,34 +324,35 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
         scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
         return SchedulerAdmissionResult::ERROR;
     }
-    // The lock protects the single UNCLAIMED transition, not the pending
+    // The lock protects the single ready-owner transition, not the pending
     // candidate's lifetime. A late acquirer must recheck the published phase.
     bool valid = scheduler_read_worker_error(run, local->worker_id()) == 0;
-    if (valid &&
-        scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED))
+    const auto expected = SchedulerAdmissionState::INITIALIZED;
+    if (valid && (scheduler_gm_query(run->bootstrap_scan_complete) == 0 ||
+                  scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(expected)))
         valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
     if (valid)
-        scheduler_publish_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::CLAIMED));
+        scheduler_publish_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
     scheduler_gm_store(control->admission_claim_lock, UINT64_C(0));
     if (!valid) return SchedulerAdmissionResult::ERROR;
     admission->pending_task_ref = task;
     return SchedulerAdmissionResult::PROGRESS;
 }
 
-static inline __aicore__ bool scheduler_prepare_admission_record(
+// Bootstrap is the sole immutable-record writer before the scan gate.
+static inline __aicore__ bool scheduler_bootstrap_prepare_admission(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerAdmissionLocalState *admission, bool *prepared_now = nullptr
+    SchedulerAdmissionLocalState *admission, int64_t task
 ) {
-    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionPrepare, -1);
-    if (prepared_now != nullptr) *prepared_now = false;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
-    const int64_t task = admission->pending_task_ref;
+    if (admission->pending_task_ref != SCHEDULER_TASK_REF_INVALID ||
+        scheduler_gm_query(run->bootstrap_scan_complete) != 0)
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
     if (admission->capacity == 0 || !scheduler_task_ref_valid(graph, task))
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
     auto *control = scheduler_task_control_at(base, local, task);
     const uint64_t state = scheduler_gm_query(control->admission_state);
-    if (state == static_cast<uint64_t>(SchedulerAdmissionState::PREPARED)) return true;
-    if (state != static_cast<uint64_t>(SchedulerAdmissionState::CLAIMED) ||
+    if (state != static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED) ||
         scheduler_gm_query(control->claim_seal) != 0 ||
         scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) != 0 ||
         scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) != 0 ||
@@ -396,16 +381,37 @@ static inline __aicore__ bool scheduler_prepare_admission_record(
     scheduler_writeback_cache_line(record);
     scheduler_writeback_cache_line(words);
     scheduler_cache_barrier();
-    scheduler_publish_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
-    if (prepared_now != nullptr) *prepared_now = true;
+    scheduler_publish_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
+    return true;
+}
+
+// Readiness transfers a bootstrap-validated record to one pending owner.
+// Only epoch, order and publication state can change before commit.
+static inline __aicore__ bool scheduler_prepare_admission_record(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    SchedulerAdmissionLocalState *admission
+) {
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionPrepare, -1);
+    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
+    const int64_t task = admission->pending_task_ref;
+    if (admission->capacity == 0 || !scheduler_task_ref_valid(graph, task))
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
+    auto *control = scheduler_task_control_at(base, local, task);
+    if (scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::PREPARED))
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
+    auto *record = scheduler_admission_record_at(base, admission, task);
+    scheduler_observe_cache_line(record);
+    if (record->run_epoch != admission->epoch)
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
+    if (record->order_key != UINT64_MAX)
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
     return true;
 }
 
 namespace scheduler_admission_detail {
 
-// The pending owner reaches this only after complete validation or fresh
-// construction in the same bounded call. Before ADMITTED, no legitimate block
-// claimant can modify its counters. A returned RETRY discards that proof.
+// The pending owner holds an immutable record validated by the closed bootstrap
+// scan. Before ADMITTED, no legitimate block claimant can modify its counters.
 template <bool RecordProtocol = true>
 static inline __aicore__ SchedulerAdmissionResult commit_validated_record(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
@@ -454,31 +460,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission
 ) {
-    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
-    const int64_t task = admission->pending_task_ref;
-    if (admission->capacity == 0 || !scheduler_task_ref_valid(graph, task)) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-        return SchedulerAdmissionResult::ERROR;
-    }
-    auto *control = scheduler_task_control_at(base, local, task);
-    auto *record = scheduler_admission_record_at(base, admission, task);
-    if (scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::PREPARED) ||
-        scheduler_gm_query(control->claim_seal) != 0 ||
-        scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) != 0 ||
-        scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) != 0 ||
-        scheduler_completion_progress(scheduler_gm_fetch_add(control->completion_state, UINT64_C(0))) != 0) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-        return SchedulerAdmissionResult::ERROR;
-    }
-    if (record->run_epoch != admission->epoch) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
-        return SchedulerAdmissionResult::ERROR;
-    }
-    if (record->order_key != UINT64_MAX ||
-        !scheduler_admission_published_record_valid(base, local, admission, task, record)) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-        return SchedulerAdmissionResult::ERROR;
-    }
+    if (!scheduler_prepare_admission_record(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
     return scheduler_admission_detail::commit_validated_record<RecordProtocol>(graph, base, local, run, admission);
 }
 
@@ -544,9 +526,10 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
         if (record->run_epoch != admission->epoch)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
         auto *control = scheduler_task_control_at(base, local, task);
+        // The closed bootstrap scan validates immutable record fields and the
+        // member bitmap once. Epoch, order and publication remain dynamic gates.
         if (record->order_key != admission->scan_cursor ||
-            scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED) ||
-            !scheduler_admission_published_record_valid(base, local, admission, task, record))
+            scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
         const uint64_t worker = local->worker_id();
         if ((words[worker / 64] & (UINT64_C(1) << (worker % 64))) != 0) {
@@ -939,14 +922,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_ordered_publish_pend
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionPublish, -1);
     auto *admission = local->admission;
     if (scheduler_task_ref_is_null(admission->pending_task_ref)) return SchedulerAdmissionResult::PROGRESS;
-    bool prepared_now = false;
-    if (!scheduler_prepare_admission_record(graph, base, local, run, admission, &prepared_now))
-        return SchedulerAdmissionResult::ERROR;
-    if (!prepared_now) return scheduler_try_commit_admission<RecordProtocol>(graph, base, local, run, admission);
-    // Only the constructing owner may use this path, without returning to the
-    // scheduler between preparation and this attempt. Retries revalidate fully.
-    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
-    return scheduler_admission_detail::commit_validated_record<RecordProtocol>(graph, base, local, run, admission);
+    return scheduler_try_commit_admission<RecordProtocol>(graph, base, local, run, admission);
 }
 
 template <bool RecordProtocol = true>

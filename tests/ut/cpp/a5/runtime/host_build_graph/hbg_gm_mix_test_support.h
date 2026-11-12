@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -81,10 +82,13 @@ struct GmExecution {
 };
 
 struct GmMixFixture {
-    explicit GmMixFixture(const std::vector<GmShape> &shapes, bool protocol_profiling = false, uint32_t clusters = 2) :
+    explicit GmMixFixture(
+        const std::vector<GmShape> &shapes, bool protocol_profiling = false, uint32_t clusters = 2,
+        const std::function<void(AicoreSchedulerLayout &)> &extend_layout = {}
+    ) :
         storage(
             shapes.size(), clusters * 3, gm_trace_capacity(shapes), gm_requirements(shapes, clusters),
-            protocol_profiling
+            protocol_profiling, extend_layout
         ),
         graph(shapes.size()),
         admissions(clusters * 3),
@@ -140,6 +144,19 @@ struct GmMixFixture {
             base(), storage.layout.admission_records_offset + task * storage.layout.admission_record_stride
         );
         return scheduler_state_at<SchedulerMixCloseSeal>(base(), record->mix_close_seals_offset)[cluster].value;
+    }
+    bool bootstrap_admission() {
+        if (run()->bootstrap_scan_complete != 0) return false;
+        for (uint64_t task = 0; task < graph.graph().task_count; ++task) {
+            if (!scheduler_task_requires_admission(scheduler_load_dispatch_metadata(base(), locals[0], task, 0)))
+                continue;
+            if (!scheduler_bootstrap_prepare_admission(
+                    graph.graph(), base(), locals[0], run(), &admissions[0], static_cast<int64_t>(task)
+                ))
+                return false;
+        }
+        scheduler_gm_store(run()->bootstrap_scan_complete, UINT64_C(1));
+        return true;
     }
     bool enqueue(uint64_t task, uint32_t worker = 0) {
         auto *local = locals[worker];

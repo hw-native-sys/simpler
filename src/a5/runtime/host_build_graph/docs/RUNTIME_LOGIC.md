@@ -471,6 +471,36 @@ separate participation policy to bootstrap, dispatch and shutdown. All discovere
 lanes therefore participate, and bootstrap partitions the task scan across their
 Schedulers. This scan parallelism is not an isolated performance measurement.
 
+The scan also validates and constructs each cooperative task's immutable
+admission record and member bitmap. INITIALIZED grants no Ready ownership,
+order key or block. The completed scan gate gives every Scheduler proof
+that these records belong to the current run. Dependency routing remains dynamic:
+only the unique Ready owner changes INITIALIZED to PREPARED and publishes the
+record through the existing commit lock. Members still check the run epoch,
+committed order and ADMITTED signal; they reuse the scan's static membership
+validation. No block counter can change before admission, and commit retries
+retain the same pending owner. Task and completion counts are unchanged.
+
+The validation contract distinguishes initialization from publication:
+
+| Boundary | Checks |
+| -------- | ------ |
+| Bootstrap, before publishing INITIALIZED | Initial claim/next counters, completion progress and seal are zero; the packed completion total remains intact; record shape, flags and storage offsets match task metadata; member storage is empty; topology determines the frozen bitmap. |
+| Each ready claim and pending publication, including retries | A unique ready owner transfers INITIALIZED to PREPARED; the run/error and epoch gates remain live; PREPARED, record epoch and the unassigned order key are checked before commit. |
+| Under the commit lock | Owner identity, active run/error, epoch and remaining log capacity are checked before the record, ADMITTED signal and tail are published. |
+| Member adoption | The log task, run epoch, order key and ADMITTED publication are checked before the frozen bitmap is consumed. |
+
+No legitimate writer changes a task's initial block counters before ADMITTED, or
+its immutable record fields after the bootstrap scan. The fast path relies on
+that protocol; it does not repeat a general corruption scan of those fields at
+every commit or member adoption. Tests that inject invalid static data or initial
+counters exercise rejection at bootstrap. Tests of retry-time epoch, order,
+state, error and capacity violations exercise the production publication path.
+Both ordinary and native resident entry points and low-level scheduler fixtures
+bootstrap their complete task configuration before dispatch. There is one
+preparation lifecycle: UNCLAIMED to INITIALIZED at bootstrap, then PREPARED
+and ADMITTED after readiness. No construct-on-claim fallback is retained.
+
 Task-level Mix membership is the active lane mask plus the AIC coordinator.
 A 1C1V task therefore coordinates two lanes per cluster; 1C2V and 2V coordinate
 all three. The inactive AIV has no obligation for a two-lane group. Per-lane
@@ -494,6 +524,16 @@ contribute again. Execution identities use the strict v1 contract:
 `(run_epoch, task_ref, block_idx, subtask_slot)` identifies an execution;
 worker and pending slot identify its placement. Worker event sequences prove
 that retirement precedes the next payload publication and permit on a reused slot.
+
+A completion resolver may retain one dependency-ready cooperative successor in a
+persistent admission candidate, independent of the completing core's type. It
+attempts the ordinary claim/prepare/commit sequence before returning; a busy
+commit lock retains pending ownership for the next finite scheduler pass.
+A full candidate set sends successors through the shared queues. This does not
+reserve an execution slot, bypass any fanin, or grant a kernel entry permit.
+Ordinary direct refill remains limited to the executing core type and excludes
+MIX. Queued tasks preserve their queue's FIFO order; already-ready independent
+tasks do not impose an ordering on this direct admission.
 
 Kernel Ready work uses exactly two shared ticket queues: AIC and MIX tasks
 enter the AIC queue; ordinary AIV tasks enter the AIV queue. Each worker probes
@@ -603,6 +643,20 @@ and admit a cooperative task while all execution slots are occupied.
 Idle polling backs off from 8 to at most 128 iterations. Dispatch trace GM
 writes follow ready publication; Host tooling computes ready-to-kernel latency
 from the recorded timestamps.
+
+### Preparation does not reserve future execution
+
+Bootstrap preparation initializes immutable membership and validation data only.
+It does not claim ready ownership, append an admission order key, or reserve a
+worker obligation or execution slot. A successor becomes eligible for admission
+only after dependency resolution observes its predecessor's logical completion,
+including all registered asynchronous completion conditions.
+
+A sole DAG predecessor is not a proof of progress independence: that predecessor
+may wait on a COUNTER published by an otherwise independent task. Admitting its
+successor before logical completion can occupy the workers required by that
+publisher and create a resource cycle. Completion-time direct handoff avoids a
+ready-queue round trip only after the normal completion and fanin checks pass.
 
 ## 8. Scalar Access During Construction
 

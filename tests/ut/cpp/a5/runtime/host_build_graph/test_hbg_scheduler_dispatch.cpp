@@ -917,6 +917,7 @@ class SchedulerMix : public ::testing::TestWithParam<LaneMask> {};
 TEST_P(SchedulerMix, PayloadAndCompletionTraceFollowEachLogicalSubtask) {
     const auto mask = GetParam();
     GmMixFixture fixture({{1, mask}}, true, 1);
+    ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
     ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
@@ -965,6 +966,7 @@ TEST_P(SchedulerMix, LastLaneAloneResolvesDependency) {
         scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1),
         SchedulerRouteResult::WAITING
     );
+    ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
     ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
@@ -993,6 +995,7 @@ TEST_P(SchedulerMix, LastLaneAloneResolvesDependency) {
 TEST_P(SchedulerMix, FourQueuedTasksReuseSlotsWithoutLosingFifoOrExecutions) {
     const auto mask = GetParam();
     GmMixFixture fixture({{1, mask}, {1, mask}, {1, mask}, {1, mask}}, true, 1);
+    ASSERT_TRUE(fixture.bootstrap_admission());
     for (uint32_t task = 0; task < 4; ++task)
         ASSERT_TRUE(fixture.enqueue(task));
     std::map<int64_t, std::set<uint8_t>> seen;
@@ -1021,6 +1024,7 @@ TEST_P(SchedulerMix, FourQueuedTasksReuseSlotsWithoutLosingFifoOrExecutions) {
 
 TEST_P(SchedulerMix, FailedPreparationPublishesNoPayloadOrCompletion) {
     GmMixFixture fixture({{1, GetParam()}}, true, 1);
+    ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
     ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);

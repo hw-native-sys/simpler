@@ -15,7 +15,8 @@
 
 inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, int64_t ref,
-    SchedulerReadyPublication &publication, SchedulerReadyClaim *direct_ready, uint32_t direct_core_type
+    SchedulerReadyPublication &publication, SchedulerReadyClaim *direct_ready, uint32_t direct_core_type,
+    bool admission_owner
 ) {
     if (local == nullptr || !scheduler_task_ref_valid(graph, ref) ||
         publication.phase != SchedulerReadyPublishPhase::COLLECTING ||
@@ -31,10 +32,13 @@ inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
     }
     uint32_t type = SCHEDULER_READY_QUEUE_COUNT;
     bool mix = false;
+    bool cooperative = false;
     if (!control) {
         const auto &metadata = *scheduler_task_metadata_at(base, local, ref);
         const LaneMask lanes = scheduler_task_lanes(metadata);
         mix = scheduler_task_is_mix(metadata.flags);
+        cooperative = !scheduler_task_is_inline(metadata.flags) &&
+                      (metadata.logical_block_num > 1 || mix || scheduler_task_requires_sync_start(metadata.flags));
         type = scheduler_task_ready_queue(metadata.flags, lanes);
         if (!scheduler_task_is_executable(metadata.flags) || type >= SCHEDULER_READY_QUEUE_COUNT ||
             (scheduler_metadata_single_subtask_slot(lanes) == UINT8_MAX && !mix))
@@ -59,7 +63,8 @@ inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
         // Direct ownership uses the same validated route as a queued ticket.
         // Ordered MIX admission can be owned by either core architecture.
         if (!control && direct_ready != nullptr && scheduler_task_ref_is_null(direct_ready->task_ref) &&
-            (mix ? local->admission != nullptr : type == direct_core_type)) {
+            ((admission_owner && cooperative && local->admission != nullptr && local->admission->initialized) ||
+             (mix ? local->admission != nullptr : type == direct_core_type))) {
             direct_ready->task_ref = ref;
             direct_ready->source = SchedulerReadySource::DIRECT_RESOLVE;
             direct_ready->publication_mode = SchedulerPublicationMode::REFILL;
