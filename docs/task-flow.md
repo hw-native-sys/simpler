@@ -250,6 +250,8 @@ memcpy from the mailbox tensor array into `ChipTensor[]`. Host-backed arguments
 may need a device copy-in and output copy-back; device-backed arguments must
 resolve to allocations owned by the target chip. The native `ChipWorker`
 consumes the resulting POD and invokes the runtime's execution lifecycle.
+The stream/pipeline boundary behind that lifecycle — what the CANN stream does
+and does not provide — is explained in [run-pipeline.md](run-pipeline.md).
 
 #### Pipeline resource leases
 
