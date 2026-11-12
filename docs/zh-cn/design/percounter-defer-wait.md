@@ -125,6 +125,13 @@ checkpoint 自旋，不是阻塞 —— lane 在那儿照样服务 MIX 和 cohor
 `scheduler_writeback_dispatch_payload` 里刷。**带 slot 维度、每次 dispatch 重写 group 地址，
 不增加任何脏行，也不增加任何 dcci。**
 
+**这一条成立，但它不等于零成本。** 实测在一张 4096 任务、无人登记的图上，这套机制让
+device wall 从 256.5 µs 涨到 269.3 µs（+5.0%，两组分布不重叠，同构建漂移 1.7%）。其中约
+三分之一来自 `percounter_async_seal` 读 `record->count` —— 每次 dispatch 开头的
+`scheduler_observe_data_cache` 是整缓存失效，所以那条线必然是冷的；去掉这次读只收回
+269.3 → 265.6 µs。**剩下约 9 µs 尚未归因**，aicore 目标文件增大 2.1% 是候选而非证据。
+完整数据与方法见 `KNOWN_ISSUES.md`。
+
 ### 3.3 `PercounterControl` 的新字段
 
 只读字段放进现有 `reserved` 区（48 B 可用，需 32 B）：
@@ -352,7 +359,7 @@ host 只给本步已经支持的任务形状打"可能登记"标记，其余形�
 | S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
 | S3 ✅ | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | 单核 `require_sync_start` 多 block 的登记用例通过，同一用例在 S2 构建上报 error 13（0 of 7 blocks resolved）；回归集 11 passed，失败仍只有那两个 swimlane 用例 |
 | S4 ✅ | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | 两 AIV MIX 的登记用例通过，同一用例在 S3 构建上报 error 13（0 of 4 blocks resolved）；回归集 12 passed，连跑三遍一致 |
-| S5 部分 | Graph body ✅、溢出 ✅、上游用例对比 ✅；非法 expected / 非法对齐、容量与开销实测 ⬜ | 见第 8 节；上游 `defer_wait_progress` 五个 case 在 percounter 上通过（含 `c_plus_one`），`ReadyFairness` 不通过且 resident 通过，已记入 KNOWN_ISSUES |
+| S5 ✅ | Graph body、溢出、非法对齐、上游用例对比、开销实测 | 见第 8 节与 `KNOWN_ISSUES.md`：溢出报 error 12、非法对齐报 error 11；上游 `defer_wait_progress` 五个 case 通过（含 `c_plus_one`）；开销在 4096 任务图上实测为 +5.0~6.7%，未全部归因 |
 
 **S1 既是布局也是 1.1 的修复**，两者不可分：登记失败的 kernel 在设备上不留痕迹，所以只有
 先给它一个真正能写进去的 group，percounter 才看得见"这个任务登记了条件"。S1 之后登记机械
