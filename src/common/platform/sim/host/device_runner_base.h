@@ -440,6 +440,12 @@ public:
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
     );
+    // Simulation publishes launch metadata synchronously at prepare, so two
+    // prepared slots would overwrite one shared ready-pool buffer before either
+    // launches. This pair is therefore per slot, not shared.
+    int acquire_scheduler_scratch(
+        uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+    );
     std::shared_ptr<void> get_orchestration_scratch(uint32_t slot) const {
         return slot < orchestration_scratch_.size() ? orchestration_scratch_[slot] : std::shared_ptr<void>{};
     }
@@ -944,6 +950,7 @@ protected:
      * records each outcome before the slot's entry is cleared.
      */
     int release_scheduler_state_storage();
+    int release_scheduler_scratch_storage();
 
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
@@ -998,6 +1005,7 @@ protected:
     // utils/retained_scheduler_storage.h, which holds the grow, alignment and
     // failure rules.
     RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
+    RunResourceSlots<RetainedSchedulerStorage> scheduler_scratch_storage_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -1072,6 +1080,7 @@ protected:
         RunResourceSlots<size_t>::Storage retained_temp_sizes;
         RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
         RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_scratch_storage;
         RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
         RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
         RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;

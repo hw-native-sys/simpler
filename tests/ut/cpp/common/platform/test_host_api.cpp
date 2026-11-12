@@ -301,6 +301,27 @@ TEST(HostApi, OrchestrationScratchIsIsolatedByRunnerAndPipelineSlot) {
     fallback.set_orchestration_scratch({});
 }
 
+TEST(HostApiTest, SchedulerScratchAndKernelQueriesDefaultOffWhenAbsent) {
+    HostApiOps ops{};
+    const HostApi absent(nullptr, 0, 0, 0, &ops);
+    EXPECT_FALSE(absent.execution_is_kernel_mode());
+    void *device = reinterpret_cast<void *>(0x1);
+    void *host = reinterpret_cast<void *>(0x2);
+    EXPECT_EQ(absent.acquire_scheduler_scratch(64, 64, &device, &host), -1);
+    EXPECT_EQ(device, nullptr);
+    EXPECT_EQ(host, nullptr);
+    struct Mode {
+        int kernel;
+    } mode{0};
+    ops.execution_is_kernel_mode = [](void *ctx) {
+        return static_cast<Mode *>(ctx)->kernel;
+    };
+    const HostApi bound(&mode, 0, 0, 0, &ops);
+    EXPECT_FALSE(bound.execution_is_kernel_mode());
+    mode.kernel = 1;
+    EXPECT_TRUE(bound.execution_is_kernel_mode());
+}
+
 TEST(HostApiTest, LegacyDiagnosticQueriesKeepRunnerFallbackAndAbsentDefaults) {
     HostApiOps ops{};
     HostApi absent(nullptr, 0, 0, 0, &ops);

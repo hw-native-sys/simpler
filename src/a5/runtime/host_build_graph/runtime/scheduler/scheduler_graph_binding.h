@@ -164,7 +164,7 @@ scheduler_bind_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
     auto *child = scheduler_native_child_plan_checked(graph, node);
     if (child == nullptr) return SchedulerGraphBindingError::DEFINITION;
     const auto &instance = *node.instance;
-    const uint64_t definition_base = graph.scheduler_state_address + node.definition->definition_offset;
+    const uint64_t definition_base = graph.native_image_address + node.definition->definition_offset;
     auto *definition = reinterpret_cast<__gm__ const GraphDefinition *>(definition_base);
     if (instance.boundary_tensor_count != static_cast<uint32_t>(definition->boundary_tensor_count) ||
         instance.boundary_scalar_count != static_cast<uint32_t>(definition->boundary_scalar_count) ||

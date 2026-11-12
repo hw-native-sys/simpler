@@ -19,7 +19,7 @@
 #include "scheduler_types.h"
 
 inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_MAGIC = 0x35474248;
-inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 2;
+inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 3;
 inline constexpr uint32_t SCHEDULER_NATIVE_NO_INSTANCE = UINT32_MAX;
 inline constexpr uint64_t SCHEDULER_NATIVE_NO_PREDICATE = UINT64_MAX;
 
@@ -38,8 +38,10 @@ struct SchedulerNodeBinding {
     SchedulerNodeKind kind;
 };
 
-// All offsets name regions of the scheduler backing, including the existing
-// run control prefix. Absolute addresses are confined to per-run instances.
+// Offsets name regions of the image allocation, including the reserved run
+// control prefix. `control_inboxes_offset` is the exception: it names the
+// control state, which is a separate allocation in a program context. Absolute
+// addresses are confined to per-run instances.
 struct alignas(64) SchedulerNativeGraphHeader {
     uint32_t magic;
     uint32_t version;

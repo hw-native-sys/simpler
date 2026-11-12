@@ -221,6 +221,13 @@ public:
         heap_pool_ = std::move(pool);
         heap_lease_ = lease;
     }
+    // The ready-pool scratch generation this preparation's runs may still
+    // reach. Held until the last host reference to this preparation drops, so
+    // a successor's growth cannot retire a generation an unfinished run names.
+    void take_scheduler_scratch_lease(std::shared_ptr<ScratchPool> pool, ScratchPool::Lease lease) {
+        scheduler_scratch_pool_ = std::move(pool);
+        scheduler_scratch_lease_ = lease;
+    }
 
     ~PreparedRunResources() {
         // The object is the lease holder; its destruction ends the last host
@@ -228,6 +235,8 @@ public:
         // retired or freed by the runner's explicit reclaim paths.
         release_temporary_lease();
         if (heap_pool_ != nullptr && heap_lease_.valid()) heap_pool_->release(heap_lease_);
+        if (scheduler_scratch_pool_ != nullptr && scheduler_scratch_lease_.valid())
+            scheduler_scratch_pool_->release(scheduler_scratch_lease_);
     }
 
 private:
@@ -245,6 +254,8 @@ private:
     // A pooled heap generation, when the contract selected one.
     std::shared_ptr<ScratchPool> heap_pool_;
     ScratchPool::Lease heap_lease_{};
+    std::shared_ptr<ScratchPool> scheduler_scratch_pool_;
+    ScratchPool::Lease scheduler_scratch_lease_{};
     std::vector<WorkspaceManager::BackingLease> backing_;
 };
 

@@ -212,6 +212,8 @@ struct FakeHostApi {
     int staging_status{0};
     int arena_status{0};
     bool retain_plan{false};
+    // Stands in for a capture/kernel context's execution latch.
+    bool kernel_mode{false};
     std::shared_ptr<void> prepare_plan;
 
     void *retained_addr = nullptr;
@@ -246,6 +248,17 @@ struct FakeHostApi {
     // to the grant and this is only the stand-in it writes through.
     std::array<SchedulerStateSlot, 4> scheduler_slots{};
     int scheduler_acquires{0};
+    // The ready-pool scratch, as the runner would hold it: one grow-only
+    // device+host pair per pipeline slot.
+    struct SchedulerScratchSlot {
+        void *device{nullptr};
+        void *device_published{nullptr};
+        std::vector<uint8_t> host;
+        size_t capacity{0};
+    };
+    std::array<SchedulerScratchSlot, 4> scheduler_scratch_slots{};
+    int scheduler_scratch_acquires{0};
+    bool refuse_scheduler_scratch{false};
     size_t definition_offset{0};
     int device_malloc_count{0};
     int copy_count{0};
@@ -291,7 +304,13 @@ struct FakeHostApi {
         for (SchedulerStateSlot &slot : scheduler_slots) {
             slot = SchedulerStateSlot{};
         }
+        // Their device blocks are in `live`, freed above with every other fake
+        // device allocation; a bind never releases the runner's scratch.
+        for (SchedulerScratchSlot &slot : scheduler_scratch_slots) {
+            slot = SchedulerScratchSlot{};
+        }
         scheduler_acquires = 0;
+        scheduler_scratch_acquires = 0;
     }
 };
 
@@ -661,6 +680,35 @@ int fake_acquire_scheduler_state_storage(
     return 0;
 }
 
+// One slot's scratch pair: grow-only, aligned, handed over uninitialized, the
+// same shape the runner's per-slot staging and shared pool lease present.
+int fake_acquire_scheduler_scratch(
+    void *runner_ctx, uint32_t slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    *device_out = nullptr;
+    *host_out = nullptr;
+    if (g_fake->refuse_scheduler_scratch) return -1;
+    if (slot >= g_fake->scheduler_scratch_slots.size() || bytes == 0 || alignment == 0) return -1;
+    auto &entry = g_fake->scheduler_scratch_slots[slot];
+    ++g_fake->scheduler_scratch_acquires;
+    if (entry.device == nullptr || entry.capacity < bytes) {
+        void *grown = fake_device_malloc(runner_ctx, bytes + alignment - 1);
+        if (grown == nullptr) return -1;
+        if (entry.device != nullptr) fake_device_free(runner_ctx, entry.device);
+        entry.device = grown;
+        entry.host.assign(bytes + alignment - 1, 0);
+        entry.capacity = bytes;
+    }
+    const auto align = [alignment](void *p) {
+        const auto raw = reinterpret_cast<uintptr_t>(p);
+        return reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    };
+    entry.device_published = align(entry.device);
+    *device_out = entry.device_published;
+    *host_out = align(entry.host.data());
+    return 0;
+}
+
 void fake_get_graph_definition_staging(void *, uint32_t, void **addr, size_t *size) {
     if (addr != nullptr) {
         *addr = g_fake->definition_bytes == 0 ? nullptr : g_fake->definition_staging.data() + g_fake->definition_offset;
@@ -753,6 +801,10 @@ const HostApiOps &fake_ops() {
         r.publish_graph_section = fake_publish_graph_section;
         r.get_graph_definition_staging = fake_get_graph_definition_staging;
         r.acquire_scheduler_state_storage = fake_acquire_scheduler_state_storage;
+        r.acquire_scheduler_scratch = fake_acquire_scheduler_scratch;
+        r.execution_is_kernel_mode = [](void *) -> int {
+            return g_fake->kernel_mode ? 1 : 0;
+        };
         r.declare_caller_device_writes = fake_declare_caller_device_writes;
         r.caller_device_span_written_by_other_run = fake_caller_device_span_written_by_other_run;
         r.get_prepare_plan = [](void *, uint32_t) {
@@ -842,6 +894,9 @@ protected:
     void expect_only_slot_scheduler_storage_live() const {
         std::unordered_set<void *> retained;
         for (const FakeHostApi::SchedulerStateSlot &slot : fake_.scheduler_slots) {
+            if (slot.device != nullptr) retained.insert(slot.device);
+        }
+        for (const FakeHostApi::SchedulerScratchSlot &slot : fake_.scheduler_scratch_slots) {
             if (slot.device != nullptr) retained.insert(slot.device);
         }
         EXPECT_EQ(fake_.live, retained);
@@ -1230,7 +1285,9 @@ TEST_F(HbgBindLedgerTest, AllMetadataSourcesSurviveBindAndPublishInOrder) {
     EXPECT_EQ(fake_.orchestration_count, 1);
     const bool native = std::strcmp(get_platform(), "a5sim") == 0;
     const auto &pending = runtime.pending_publication();
-    ASSERT_EQ(pending.prerequisites.size(), static_cast<size_t>(native));
+    ASSERT_EQ(pending.prerequisites.size(), native ? 2u : 0u);
+    // The native image rides the run image as its scheduler tail.
+    EXPECT_EQ(pending.scheduler_image_bytes != 0u, native);
     EXPECT_EQ(fake_.section_publications, native ? 0u : 1u);
     EXPECT_EQ(
         runtime.get_graph_section_source(), native ? GraphSectionSource::None : GraphSectionSource::LaunchEnvelope
@@ -1250,14 +1307,119 @@ TEST_F(HbgBindLedgerTest, AllMetadataSourcesSurviveBindAndPublishInOrder) {
         scheduler_snapshot.assign(source, source + region.bytes);
     }
     ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
-    ASSERT_EQ(fake_.copies.size(), 1u + static_cast<size_t>(native));
+    ASSERT_EQ(fake_.copies.size(), native ? 3u : 1u);
     EXPECT_EQ(fake_.copies.back().dst, image_target);
     EXPECT_EQ(fake_.copies.back().bytes, image_bytes);
     if (native)
         EXPECT_EQ(std::memcmp(fake_.copies.front().dst, scheduler_snapshot.data(), scheduler_snapshot.size()), 0);
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
-    EXPECT_EQ(fake_.copies.size(), 1u + static_cast<size_t>(native));
+    EXPECT_EQ(fake_.copies.size(), native ? 3u : 1u);
     EXPECT_EQ(fake_.section_publications, native ? 0u : 1u);
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+#if __has_include("scheduler/scheduler_args_dump.h")
+TEST_F(HbgBindLedgerTest, KernelContextKeepsTheNativeImageInTheSchedulerState) {
+    if (std::strcmp(get_platform(), "a5sim") != 0) GTEST_SKIP() << "a5 scheduler state is the subject";
+    ChipStorageTaskArgs args;
+    const auto staged_context = [](uint64_t worker_context_base, const auto &region) {
+        return reinterpret_cast<const SchedulerWorkerContext *>(
+            static_cast<const uint8_t *>(region.source) +
+            (worker_context_base - reinterpret_cast<uint64_t>(region.device_target))
+        );
+    };
+
+    Runtime program_runtime;
+    init_runtime(program_runtime);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(program_runtime, args, nullptr, 0), 0);
+    const auto &program_pending = program_runtime.pending_publication();
+    ASSERT_EQ(program_pending.prerequisites.size(), 2u);
+    EXPECT_GT(program_pending.scheduler_image_bytes, 0u);
+    const auto &program_state = program_pending.prerequisites.front();
+    const uint64_t program_state_bytes = program_state.bytes;
+    // A program context names the delivered image and the acquired scratch,
+    // neither of which is the state allocation.
+    const auto *program_context =
+        staged_context(program_runtime.dev.scheduler_bootstrap.worker_context_base, program_state);
+    EXPECT_EQ(program_context->native_image_bytes, program_pending.scheduler_image_bytes);
+    EXPECT_NE(program_context->native_image_address, reinterpret_cast<uint64_t>(program_state.device_target));
+    EXPECT_EQ(
+        program_context->ready_scratch_address,
+        reinterpret_cast<uint64_t>(program_pending.prerequisites[1].device_target)
+    );
+    EXPECT_EQ(program_context->ready_scratch_bytes, program_pending.prerequisites[1].bytes);
+    EXPECT_EQ(release_run_bindings_impl(&program_runtime, &api_), 0);
+
+    // A capture/kernel context keeps the image inside the single scheduler
+    // allocation, so the state publication carries it and the run image does not.
+    fake_.kernel_mode = true;
+    Runtime kernel_runtime;
+    init_runtime(kernel_runtime);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(kernel_runtime, args, nullptr, 0), 0);
+    const auto &kernel_pending = kernel_runtime.pending_publication();
+    ASSERT_EQ(kernel_pending.prerequisites.size(), 1u);
+    EXPECT_EQ(kernel_pending.scheduler_image_bytes, 0u);
+    const auto &kernel_state = kernel_pending.prerequisites.front();
+    EXPECT_GT(kernel_state.bytes, program_state_bytes);
+    const auto *kernel_context =
+        staged_context(kernel_runtime.dev.scheduler_bootstrap.worker_context_base, kernel_state);
+    EXPECT_EQ(kernel_context->native_image_address, reinterpret_cast<uint64_t>(kernel_state.device_target));
+    EXPECT_EQ(kernel_context->native_image_bytes, kernel_context->scheduler_state_bytes);
+    EXPECT_EQ(kernel_context->ready_scratch_address, reinterpret_cast<uint64_t>(kernel_state.device_target));
+    EXPECT_EQ(kernel_context->ready_scratch_bytes, kernel_context->scheduler_state_bytes);
+    EXPECT_EQ(release_run_bindings_impl(&kernel_runtime, &api_), 0);
+}
+
+TEST_F(HbgBindLedgerTest, ScratchRefusalFailsTheProgramBindButNotAKernelContext) {
+    if (std::strcmp(get_platform(), "a5sim") != 0) GTEST_SKIP() << "a5 scheduler state is the subject";
+    ChipStorageTaskArgs args;
+    fake_.refuse_scheduler_scratch = true;
+
+    Runtime program_runtime;
+    init_runtime(program_runtime);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    EXPECT_EQ(bind(program_runtime, args, nullptr, 0), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(program_runtime.pending_publication().prerequisites.empty());
+    EXPECT_EQ(program_runtime.pending_publication().bytes, 0u);
+
+    // The kernel path never asks for the scratch, so the same refusal is not
+    // its failure.
+    fake_.kernel_mode = true;
+    Runtime kernel_runtime;
+    init_runtime(kernel_runtime);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(kernel_runtime, args, nullptr, 0), 0);
+    ASSERT_EQ(kernel_runtime.pending_publication().prerequisites.size(), 1u);
+    EXPECT_EQ(release_run_bindings_impl(&kernel_runtime, &api_), 0);
+}
+#endif
+
+TEST_F(HbgBindLedgerTest, ProgramBindStagesTheScratchAfterTheStateAndReusesTheSlot) {
+    if (std::strcmp(get_platform(), "a5sim") != 0) GTEST_SKIP() << "a5 scheduler state is the subject";
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    const auto &first = runtime.pending_publication();
+    ASSERT_EQ(first.prerequisites.size(), 2u);
+    EXPECT_EQ(first.prerequisites[1].phase, HostPhaseKind::Count);
+    EXPECT_GT(first.prerequisites[1].bytes, 0u);
+    void *const scratch_target = first.prerequisites[1].device_target;
+    EXPECT_NE(scratch_target, first.prerequisites[0].device_target);
+    EXPECT_EQ(fake_.scheduler_scratch_acquires, 1);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    // The scratch is the slot's retained pair: a second bind reuses the same
+    // generation instead of asking the pool for another.
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    const auto &second = runtime.pending_publication();
+    ASSERT_EQ(second.prerequisites.size(), 2u);
+    EXPECT_EQ(second.prerequisites[1].device_target, scratch_target);
+    EXPECT_EQ(fake_.scheduler_scratch_acquires, 2);
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
@@ -1374,8 +1536,10 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
         EXPECT_EQ(fake_.copy_count, 0);
         const auto &pending = runtime.pending_publication();
-        // Native Definitions share the scheduler-state publication.
-        ASSERT_EQ(pending.prerequisites.size(), static_cast<size_t>(resident));
+        // Native Definitions share the scheduler-state publication; only a
+        // Graph's native image joins the run image.
+        ASSERT_EQ(pending.prerequisites.size(), resident ? 2u : 0u);
+        EXPECT_EQ(pending.scheduler_image_bytes != 0u, definitions && a5);
         EXPECT_EQ(fake_.section_publications, definitions && !a5 ? 1u : 0u);
         std::vector<void *> destinations;
         std::vector<std::vector<uint8_t>> snapshots;
@@ -1454,8 +1618,9 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry}) {
         SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
-        // The run image, plus a resident scheduler state where one is selected.
-        const size_t regions = 1 + static_cast<size_t>(a5);
+        // The run image, plus a resident scheduler's state and scratch and,
+        // for a native Graph, its delivered image.
+        const size_t regions = 1 + (a5 ? 2u : 0u);
         for (size_t failure = 1; failure <= regions; ++failure) {
             SCOPED_TRACE(failure);
             fake_.copy_count = 0;
@@ -1487,7 +1652,7 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
             eps_ = {definitions ? recording_orch_entry : ordinary_orch_entry, capture_orch_bind};
             ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
             const auto &replacement = runtime.pending_publication();
-            ASSERT_EQ(replacement.prerequisites.size(), static_cast<size_t>(resident));
+            ASSERT_EQ(replacement.prerequisites.size(), resident ? 2u : 0u);
             for (const auto &region : replacement.prerequisites) {
                 EXPECT_EQ(region.phase, HostPhaseKind::Count);
             }
@@ -1979,7 +2144,7 @@ protected:
 #if __has_include("scheduler/scheduler_args_dump.h")
         const auto check_diagnostics = [](const Runtime &rt, int pmu, int level) {
             const auto &prerequisites = rt.pending_publication().prerequisites;
-            ASSERT_EQ(prerequisites.size(), 1u);
+            ASSERT_EQ(prerequisites.size(), 2u);
             const auto &region = prerequisites.front();
             const uint64_t device_base = reinterpret_cast<uint64_t>(region.device_target);
             const uint64_t context_address = rt.dev.scheduler_bootstrap.worker_context_base;
@@ -1989,6 +2154,8 @@ protected:
             const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
                 static_cast<const uint8_t *>(region.source) + context_offset
             );
+            EXPECT_EQ(context->ready_scratch_address, reinterpret_cast<uint64_t>(prerequisites[1].device_target));
+            EXPECT_EQ(context->ready_scratch_bytes, prerequisites[1].bytes);
             EXPECT_EQ(context->pmu_cells_offset != 0, pmu != 0);
             EXPECT_EQ(context->activity_buffers_offset != 0, level >= 3);
             if (pmu != 0) EXPECT_LE(context->pmu_cells_offset + sizeof(SchedulerTaskPmuCell), region.bytes);
@@ -2187,7 +2354,7 @@ TEST_F(HbgResidentSchedulerStorageTest, AGraphRunPublishesItsOwnResidentStorage)
     eps_ = {recording_orch_entry, capture_orch_bind};
     ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
     const auto &pending = runtime.pending_publication();
-    ASSERT_EQ(pending.prerequisites.size(), 1u);
+    ASSERT_EQ(pending.prerequisites.size(), 2u);
     EXPECT_EQ(fake_.section_publications, 0u);
     EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, resident_mode);
@@ -2377,7 +2544,7 @@ TEST_F(HbgBindLedgerTest, CarrierRefusalAffectsOnlyRunsThatUseTheCarrier) {
     else EXPECT_NE(rc, 0);
     EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
     EXPECT_EQ(runtime.get_graph_section_bytes(), 0u);
-    EXPECT_EQ(runtime.pending_publication().prerequisites.size(), static_cast<size_t>(native));
+    EXPECT_EQ(runtime.pending_publication().prerequisites.size(), native ? 2u : 0u);
 }
 
 // A run with no Graph task names no section, so a reader cannot be handed a
@@ -2850,7 +3017,7 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
         const auto &pending = runtime.pending_publication();
         const size_t count = pending.prerequisites.size();
-        ASSERT_EQ(count, static_cast<size_t>(a5));
+        ASSERT_EQ(count, a5 ? 2u : 0u);
         std::vector<Captured> expected;
         for (const auto &region : pending.prerequisites) {
             const auto *source = static_cast<const uint8_t *>(region.source);
@@ -2903,7 +3070,7 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
         runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 2u);
         const auto &region = runtime.pending_publication().prerequisites.front();
         const auto context_offset =
             runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
@@ -2971,7 +3138,9 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
             device_context->scheduler_state_bytes,
             static_cast<uint32_t>(device_context->original_task_count),
             static_cast<uint16_t>(device_context->graph_view_version),
-            static_cast<uint16_t>(device_context->graph_view_bytes)
+            static_cast<uint16_t>(device_context->graph_view_bytes),
+            device_context->native_image_address,
+            device_context->native_image_bytes
         };
         SchedulerGraphAccess graph(view);
         if (entry != scalar_dump_orch_entry)
@@ -3001,7 +3170,7 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpExcludesPendingInlineControlOper
         runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 2u);
         const auto &region = runtime.pending_publication().prerequisites.front();
         const auto context_offset =
             runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);

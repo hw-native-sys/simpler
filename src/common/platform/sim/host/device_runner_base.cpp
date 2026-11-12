@@ -156,6 +156,7 @@ SimDeviceRunnerBase::RunResourceStaging SimDeviceRunnerBase::build_run_resources
     staged.retained_temp_sizes = RunResourceSlots<size_t>::build(granted);
     staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
     staged.scheduler_state_storage = RunResourceSlots<RetainedSchedulerStorage>::build(granted);
+    staged.scheduler_scratch_storage = RunResourceSlots<RetainedSchedulerStorage>::build(granted);
     staged.orchestration_scratch = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.run_image_stagings = RunResourceSlots<RetainedSmMirror>::build(granted);
@@ -176,6 +177,7 @@ void SimDeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStagin
     retained_temp_sizes_.commit(std::move(staged.retained_temp_sizes));
     graph_definition_staging_.commit(std::move(staged.graph_definition_staging));
     scheduler_state_storage_.commit(std::move(staged.scheduler_state_storage));
+    scheduler_scratch_storage_.commit(std::move(staged.scheduler_scratch_storage));
     orchestration_scratch_.commit(std::move(staged.orchestration_scratch));
     sm_mirrors_.commit(std::move(staged.sm_mirrors));
     run_image_stagings_.commit(std::move(staged.run_image_stagings));
@@ -776,6 +778,37 @@ int SimDeviceRunnerBase::acquire_scheduler_state_storage(
         alignment, static_cast<uint32_t>(status)
     );
     return -1;
+}
+
+int SimDeviceRunnerBase::acquire_scheduler_scratch(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    if (device_out != nullptr) *device_out = nullptr;
+    if (host_out != nullptr) *host_out = nullptr;
+    if (pipeline_slot >= scheduler_scratch_storage_.size()) return -1;
+    if (execution_mode_latch().is_kernel() || !can_accept_run()) return -1;
+    const RetainedSchedulerStorage::Status status = scheduler_scratch_storage_[pipeline_slot].acquire(
+        bytes, alignment,
+        [this](size_t raw_bytes) {
+            return mem_alloc_.alloc(raw_bytes);
+        },
+        [this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        },
+        device_out, host_out
+    );
+    return status == RetainedSchedulerStorage::Status::Ok ? 0 : -1;
+}
+
+int SimDeviceRunnerBase::release_scheduler_scratch_storage() {
+    int first_error = 0;
+    for (RetainedSchedulerStorage &entry : scheduler_scratch_storage_) {
+        const int rc = entry.release([this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        });
+        if (rc != 0 && first_error == 0) first_error = rc;
+    }
+    return first_error;
 }
 
 int SimDeviceRunnerBase::release_scheduler_state_storage() {

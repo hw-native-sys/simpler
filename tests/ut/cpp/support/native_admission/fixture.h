@@ -70,6 +70,17 @@ public:
     size_t scheduler_capacity(uint32_t slot) const {
         return scheduler_state_storage_[slot] ? scheduler_state_storage_[slot]->device_capacity() : 0;
     }
+    int acquire_scheduler_scratch(uint32_t slot, size_t bytes, void **device, void **host) {
+        return DeviceRunnerBase::acquire_scheduler_scratch(slot, bytes, 64, device, host);
+    }
+    void release_scheduler_scratch(uint32_t slot) { DeviceRunnerBase::release_scheduler_scratch(slot); }
+    size_t scheduler_scratch_generations() const {
+        return scheduler_scratch_pool_ ? scheduler_scratch_pool_->live_generations() : 0;
+    }
+    size_t scheduler_scratch_leases() const {
+        return scheduler_scratch_pool_ ? scheduler_scratch_pool_->live_leases() : 0;
+    }
+    int latch_kernel_mode() { return execution_mode_latch().latch(SIMPLER_MODE_KERNEL); }
     int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
         KernelArgsHelper args;
         // This low-level evidence fixture explicitly requests the native record.

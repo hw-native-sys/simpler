@@ -708,6 +708,9 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     // READY publishes this run's timeout; no writer changes it during execution.
     const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
     scheduler_observe_cache_line(&context->graph_task_count);
+    // The image and scratch references sit past the first observed line; a
+    // stale zero image address would fail the native extent check below.
+    scheduler_observe_cache_line(&context->native_image_address);
     const SchedulerGraphView graph{
         context->graph_storage_address,
         context->graph_task_count,
@@ -718,6 +721,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         static_cast<uint32_t>(context->original_task_count),
         static_cast<uint16_t>(context->graph_view_version),
         static_cast<uint16_t>(context->graph_view_bytes),
+        WithNativeGraph ? context->native_image_address : 0,
+        WithNativeGraph ? context->native_image_bytes : 0,
     };
     SchedulerWorkerStats stats{};
     std::conditional_t<WithProfiling, SchedulerLocalProfilingState, SchedulerNoProfilingState> profile{};
@@ -731,10 +736,10 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     const bool native_extent_valid =
         graph.native_header_offset == 0 ||
         scheduler_native_header_extent_valid(
-            graph.scheduler_state_address, graph.scheduler_state_bytes, graph.native_header_offset
+            graph.native_image_address, graph.native_image_bytes, graph.native_header_offset
         );
     if (graph.native_header_offset != 0 && native_extent_valid)
-        scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.scheduler_state_address));
+        scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.native_image_address));
     bool config_valid =
         native_extent_valid &&
         scheduler_initialize_local_config(scheduler_state_base, context, &graph, &scheduler_local_state);

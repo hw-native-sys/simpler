@@ -110,14 +110,16 @@ static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication
             return fail();
     } else {
         if (publication.target != 0 || publication.inbox_offset != 0) return fail();
-        pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
+        pool = scheduler_state_at<SchedulerReadyPoolHeader>(
+            scheduler_ready_storage_base(local), local->config.ready_pool_offset
+        );
     }
 
     if (publication.phase == SchedulerReadyPublishPhase::COLLECTING) {
         for (uint32_t index = 0; index < publication.count; ++index)
             if (!scheduler_task_ref_valid(graph, publication.refs[index])) return fail();
         if (!control) {
-            const auto queue = scheduler_ready_pool_queue(base, *pool, type);
+            const auto queue = scheduler_ready_pool_queue(scheduler_ready_storage_base(local), *pool, type);
             SchedulerTicketRange range{};
             if (scheduler_ticket_reserve(queue, publication.count, &range) != SchedulerTicketResult::SUCCESS ||
                 scheduler_ticket_publish(queue, range, publication.refs) != SchedulerTicketResult::SUCCESS)

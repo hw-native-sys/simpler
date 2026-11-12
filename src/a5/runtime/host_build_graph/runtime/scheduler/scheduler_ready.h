@@ -178,6 +178,8 @@ struct SchedulerLocalConfig {
     const SchedulerGraphView *graph{nullptr};
     uint64_t task_controls_offset{0};
     uint64_t control_inboxes_offset{0};
+    uint64_t ready_scratch_address{0};
+    uint64_t ready_scratch_bytes{0};
     uint64_t ready_pool_offset{0};
     uint64_t graph_summary_offset{0};
     // The callable's registration-owned entry table, named by absolute address
@@ -280,14 +282,18 @@ scheduler_slot_uses_admission(const SchedulerLocalState *local, const SchedulerL
     return local->admission != nullptr && slot.candidate_index == UINT8_MAX;
 }
 
+inline __aicore__ __gm__ void *scheduler_ready_storage_base(const SchedulerLocalState *local) {
+    return reinterpret_cast<__gm__ void *>(local->config.ready_scratch_address);
+}
+
 static_assert(SCHEDULER_WORKER_CAPACITY < UINT16_MAX, "worker IDs must fit the local config");
 static_assert(PLATFORM_CORES_PER_BLOCKDIM <= 8, "worker trace mask must fit one byte");
 static_assert(SCHEDULER_PENDING_SLOT_COUNT == 2, "local ready head requires two slots");
 static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 104, "64-bit local config size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 120, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 208, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 224, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 168 + sizeof(SchedulerScalarTrace),
     "64-bit local profiling size changed"
@@ -305,7 +311,9 @@ static inline __aicore__ bool scheduler_initialize_local_config(
         scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(context) + offset);
     if (!scheduler_graph_view_valid(*graph) || context->original_task_count != graph->original_task_count ||
         context->graph_view_version != graph->view_version || context->graph_view_bytes != graph->view_bytes ||
-        context->native_header_offset != graph->native_header_offset)
+        context->native_header_offset != graph->native_header_offset ||
+        context->native_image_address != graph->native_image_address ||
+        context->native_image_bytes != graph->native_image_bytes)
         return false;
     SchedulerLocalConfig &config = local->config;
     const uint64_t payload_stride = SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
@@ -331,26 +339,33 @@ static inline __aicore__ bool scheduler_initialize_local_config(
     config.callable_addresses_address = context->callable_addresses_address;
     config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
     config.graph_summary_offset = context->graph_summary_offset;
+    config.ready_scratch_address = context->ready_scratch_address;
+    config.ready_scratch_bytes = context->ready_scratch_bytes;
     auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, config.graph_summary_offset);
     for (uint64_t offset = 0; offset < sizeof(*summary); offset += 64)
         scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(summary) + offset);
     if (graph->native_header_offset != 0) {
         const auto *header = scheduler_native_header_checked(
-            graph->scheduler_state_address, graph->scheduler_state_bytes, graph->native_header_offset,
-            graph->task_count, graph->original_task_count
+            graph->native_image_address, graph->native_image_bytes, graph->native_header_offset, graph->task_count,
+            graph->original_task_count
         );
         if (header == nullptr || header->control_inbox_count != context->runtime_worker_count ||
             header->run_epoch != summary->run_epoch ||
-            graph->scheduler_state_address != reinterpret_cast<uint64_t>(base))
+            graph->scheduler_state_address != reinterpret_cast<uint64_t>(base) ||
+            !scheduler_control_inboxes_valid(
+                graph->scheduler_state_address, graph->scheduler_state_bytes, header->control_inboxes_offset,
+                header->control_inbox_count
+            ))
             return false;
         config.control_inboxes_offset = header->control_inboxes_offset;
         local->control_peer_cursor = static_cast<uint32_t>(context->worker_index + 1);
     }
     config.ready_pool_offset = summary->ready_pool_offset;
-    if (config.ready_pool_offset == 0 || !scheduler_ready_pool_validate(
-                                             base, context->scheduler_state_bytes, config.ready_pool_offset,
-                                             graph->task_count, static_cast<uint32_t>(context->cluster_count)
-                                         ))
+    if (config.ready_pool_offset == 0 ||
+        !scheduler_ready_pool_validate(
+            scheduler_ready_storage_base(local), config.ready_scratch_bytes, config.ready_pool_offset,
+            graph->task_count, static_cast<uint32_t>(context->cluster_count)
+        ))
         return false;
     const uint64_t runtime_worker_count = context->runtime_worker_count;
     const uint64_t scheduler_count = context->scheduler_count;
@@ -749,10 +764,14 @@ static inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
         scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, context);
         return SchedulerRouteResult::ERROR;
     }
-    const auto *dependencies = scheduler_dependencies(scheduler_state_base, context->config.ready_pool_offset);
+    const auto *dependencies =
+        scheduler_dependencies(scheduler_ready_storage_base(context), context->config.ready_pool_offset);
     if (dependencies != nullptr) {
         const uint64_t remaining = scheduler_gm_fetch_add(
-            scheduler_state_at<uint64_t>(scheduler_state_base, dependencies->remaining_offset)[task_ref], UINT64_C(0)
+            scheduler_state_at<uint64_t>(
+                scheduler_ready_storage_base(context), dependencies->remaining_offset
+            )[task_ref],
+            UINT64_C(0)
         );
         if (remaining > static_cast<uint64_t>(task_ref)) {
             scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_COUNT, &graph, context);
@@ -913,7 +932,8 @@ static inline __aicore__ bool scheduler_ready_batch_push_queue(
 static inline __aicore__ bool scheduler_ready_pool_push_batch(
     __gm__ void *base, SchedulerLocalState *local, uint32_t type, SchedulerReadyBatch *batch
 ) {
-    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
+    __gm__ void *const ready_storage = scheduler_ready_storage_base(local);
+    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(ready_storage, local->config.ready_pool_offset);
     if (batch->count == 0 || batch->count > pool.task_count) return false;
     int64_t current = batch->head;
     uint64_t remaining = batch->count;
@@ -934,7 +954,7 @@ static inline __aicore__ bool scheduler_ready_pool_push_batch(
             if (remaining == 0 && (current != batch->tail || next != SCHEDULER_INBOX_EMPTY)) return false;
             current = next;
         } while (remaining != 0 && count < 8 && current >= 0);
-        const auto queue = scheduler_ready_pool_queue(base, pool, type);
+        const auto queue = scheduler_ready_pool_queue(ready_storage, pool, type);
         SchedulerTicketRange range{};
         if (scheduler_ticket_reserve(queue, count, &range) != SchedulerTicketResult::SUCCESS ||
             scheduler_ticket_publish(queue, range, refs) != SchedulerTicketResult::SUCCESS)
@@ -1046,8 +1066,10 @@ static inline __aicore__ bool scheduler_ready_pool_claim(
 ) {
     *claim = {};
     if (!scheduler_ready_queue_holder(queue_class, local->config.self_core_type)) return false;
-    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
-    const auto queue = scheduler_ready_pool_queue(base, pool, queue_class);
+    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(
+        scheduler_ready_storage_base(local), local->config.ready_pool_offset
+    );
+    const auto queue = scheduler_ready_pool_queue(scheduler_ready_storage_base(local), pool, queue_class);
     auto fail = [&](int64_t ref) __aicore__ {
         scheduler_record_error(
             run, ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local, SchedulerErrorSite::READY_POP_INVALID_HEAD
@@ -1088,8 +1110,10 @@ scheduler_ready_pool_may_have_work(__gm__ void *base, const SchedulerLocalState 
     // This hint shares claim's initialized-binding/pool-layout precondition.
     // Invalid routing or dynamic head state must reach claim instead of hiding work.
     if (!scheduler_ready_queue_holder(queue_class, local->config.self_core_type)) return true;
-    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
-    const auto queue = scheduler_ready_pool_queue(base, pool, queue_class);
+    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(
+        scheduler_ready_storage_base(local), local->config.ready_pool_offset
+    );
+    const auto queue = scheduler_ready_pool_queue(scheduler_ready_storage_base(local), pool, queue_class);
     if (queue.capacity == 0) return false;
     const uint64_t head = scheduler_gm_query(queue.control->head);
     if (head > queue.capacity) return true;
@@ -1398,7 +1422,8 @@ static inline __aicore__ bool scheduler_resolve_completion(
             return false;
         }
     }
-    const auto *dependencies = scheduler_dependencies(scheduler_state_base, context->config.ready_pool_offset);
+    const auto *dependencies =
+        scheduler_dependencies(scheduler_ready_storage_base(context), context->config.ready_pool_offset);
     if (dependencies != nullptr)
         return scheduler_resolve_csr_completion(
             graph, scheduler_state_base, context, run_control, task_ref, *dependencies, profiling_level, direct_ready,

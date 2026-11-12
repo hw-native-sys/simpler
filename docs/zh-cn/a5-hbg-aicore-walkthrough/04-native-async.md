@@ -50,7 +50,7 @@
 | `instance_index` | 所属 graph instance；不属于 instance 时为无效标记 |
 | `kind` | 节点类别 |
 
-**范围与用途：** native 图每轮一份 128B、64B 对齐的 GM image 头，version=2，为所有核提供布局入口；它本身不记录每个核的调度进度。
+**范围与用途：** native 图每轮一份 128B、64B 对齐的 GM image 头，version=3，为所有核提供布局入口；它本身不记录每个核的调度进度。
 
 | SchedulerNativeGraphHeader 字段 | 作用 |
 | ------------------------------- | ---- |

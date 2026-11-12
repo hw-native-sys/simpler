@@ -59,7 +59,8 @@ static inline __aicore__ bool scheduler_ready_pool_validate(
     __gm__ void *base, uint64_t state_bytes, uint64_t pool_offset, uint64_t task_count, uint32_t clusters
 ) {
     if (base == nullptr || reinterpret_cast<uintptr_t>(base) % SCHEDULER_STATE_BASE_ALIGNMENT != 0 ||
-        pool_offset == 0 || pool_offset % SCHEDULER_STATE_ALIGNMENT != 0 || pool_offset > state_bytes ||
+        state_bytes > UINT64_MAX - reinterpret_cast<uintptr_t>(base) || pool_offset == 0 ||
+        pool_offset % SCHEDULER_STATE_ALIGNMENT != 0 || pool_offset > state_bytes ||
         sizeof(SchedulerReadyPoolHeader) > state_bytes - pool_offset || clusters == 0 ||
         clusters > SCHEDULER_CLUSTER_CAPACITY || task_count > INT32_MAX)
         return false;

@@ -104,6 +104,8 @@ inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerConte
         static_cast<uint32_t>(context.original_task_count),
         static_cast<uint16_t>(context.graph_view_version),
         static_cast<uint16_t>(context.graph_view_bytes),
+        context.native_image_address,
+        context.native_image_bytes,
     };
 }
 

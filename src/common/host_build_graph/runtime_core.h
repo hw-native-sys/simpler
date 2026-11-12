@@ -89,11 +89,14 @@ struct RuntimeArenaLayout {
     // Past off_copied_end the device carries one further tail the host arena does
     // not: the shared-memory image, whose size is the submitted task count and
     // therefore not known when this layout is built. bind grows the device region
-    // to cover it once orchestration ends.
+    // to cover it once orchestration ends. A resident scheduler that ships its
+    // native image with the run (a5 program context) appends that image after the
+    // shared-memory tail in the same grown region.
     //
-    // The copied zone is padded to a CHIP_ALIGN_SIZE boundary, so that tail begins
-    // exactly at off_copied_end: the copied zone and the shared-memory image are
-    // adjacent on the device and travel as one copy.
+    // Both ends of the copied zone sit on CHIP_ALIGN_SIZE boundaries, so that tail
+    // begins exactly at off_copied_end: the copied zone and the shared-memory image
+    // are adjacent on the device and travel as one copy, and any aligned region
+    // appended after it keeps its alignment relative to the copy's base.
     //
     // The orchestrator is NOT here. It runs on the host, owns its own scratch, and
     // no device code reads any of it — see OrchestratorState.
@@ -173,9 +176,8 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
  * the graph; the task-capacity form above reserves the capacity limits and is
  * for callers without a graph.
  */
-RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, uint64_t task_capacity, const ReadyQueueCapacities &ready_queue_capacities
-);
+RuntimeArenaLayout
+runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity, const ReadyQueueCapacities &ready_queue_capacities);
 
 /**
  * Phase 2 — write the data half of the runtime arena: standalone fields,

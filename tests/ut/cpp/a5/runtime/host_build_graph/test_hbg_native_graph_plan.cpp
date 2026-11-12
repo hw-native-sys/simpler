@@ -240,21 +240,22 @@ struct NativeViewFixture {
     NativeGraphHostPlan plan;
     NativeGraphReadonlyImage readonly_image;
     std::unique_ptr<void, decltype(&std::free)> backing{nullptr, &std::free};
+    std::unique_ptr<void, decltype(&std::free)> image_backing{nullptr, &std::free};
     SchedulerGraphView graph{};
     AicoreSchedulerLayout layout{};
     SchedulerReadyPoolPlan ready_pool{};
 
     NativeViewFixture(
         const DefinitionFixture &definition, std::vector<uint32_t> indices, bool runtime_state = false,
-        uint64_t workers = 3
+        uint64_t workers = 3, bool split_image = false
     ) :
         NativeViewFixture(
-            std::vector<const DefinitionFixture *>{&definition}, std::move(indices), runtime_state, workers
+            std::vector<const DefinitionFixture *>{&definition}, std::move(indices), runtime_state, workers, split_image
         ) {}
 
     NativeViewFixture(
         const std::vector<const DefinitionFixture *> &definitions, std::vector<uint32_t> indices,
-        bool runtime_state = false, uint64_t workers = 3
+        bool runtime_state = false, uint64_t workers = 3, bool split_image = false
     ) :
         original(indices.size()) {
         std::string error;
@@ -270,8 +271,9 @@ struct NativeViewFixture {
         header.control_inboxes_offset = readonly_image.bytes.size();
         header.image_bytes = readonly_image.bytes.size() + workers * sizeof(SchedulerReadyInbox);
         header.run_epoch = 1;
+        uint64_t state_bytes = header.image_bytes;
         std::vector<SchedulerTaskMetadata> task_metadata(plan.bindings.size());
-        if (runtime_state) {
+        if (runtime_state || split_image) {
             for (size_t ref = 0; ref < plan.bindings.size(); ++ref) {
                 const auto &binding = plan.bindings[ref];
                 if (binding.kind == SchedulerNodeKind::CHILD_KERNEL) {
@@ -290,40 +292,54 @@ struct NativeViewFixture {
                     if (scheduler_task_is_mix(child.metadata.flags)) ++requirements.mix_task_count;
                 }
             }
+            // A program context plans no image prefix and reserves the control
+            // inboxes right after the run control; the image is its own region.
             if (!scheduler_plan_layout(
                     plan.bindings.size(), 0, 0, &layout, false, trace_count, requirements, false, false,
-                    readonly_image.bytes.size()
+                    split_image ? 0 : readonly_image.bytes.size(), split_image
                 ))
                 throw std::runtime_error("scheduler layout");
             if (!scheduler_plan_ready_pool(task_metadata, workers / 3, layout.total_size, &ready_pool))
                 throw std::runtime_error("ready pool plan");
             layout.total_size = ready_pool.total_size;
-            header.image_bytes = layout.total_size;
+            state_bytes = layout.total_size;
             header.control_inboxes_offset = layout.control_inboxes_offset;
+            header.image_bytes = split_image ? readonly_image.bytes.size() : layout.total_size;
         }
         backing.reset(
             std::aligned_alloc(
-                SCHEDULER_STATE_BASE_ALIGNMENT, (header.image_bytes + SCHEDULER_STATE_BASE_ALIGNMENT - 1) /
+                SCHEDULER_STATE_BASE_ALIGNMENT, (state_bytes + SCHEDULER_STATE_BASE_ALIGNMENT - 1) /
                                                     SCHEDULER_STATE_BASE_ALIGNMENT * SCHEDULER_STATE_BASE_ALIGNMENT
             )
         );
         if (!backing) throw std::bad_alloc();
-        std::memset(backing.get(), 0, header.image_bytes);
-        if (runtime_state &&
+        std::memset(backing.get(), 0, state_bytes);
+        if ((runtime_state || split_image) &&
             !scheduler_init_data_from_layout(backing.get(), layout, reinterpret_cast<uint64_t>(backing.get())))
             throw std::runtime_error("scheduler init");
-        std::memcpy(
-            static_cast<std::byte *>(backing.get()) + sizeof(SchedulerRunControl),
-            readonly_image.bytes.data() + sizeof(SchedulerRunControl),
-            readonly_image.bytes.size() - sizeof(SchedulerRunControl)
-        );
-        std::memcpy(static_cast<std::byte *>(backing.get()) + readonly_image.header_offset, &header, sizeof(header));
+        void *image_base = backing.get();
+        if (split_image) {
+            image_backing.reset(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, readonly_image.bytes.size()));
+            if (!image_backing) throw std::bad_alloc();
+            std::memset(image_backing.get(), 0, readonly_image.bytes.size());
+            image_base = image_backing.get();
+            std::memcpy(image_base, readonly_image.bytes.data(), readonly_image.bytes.size());
+        } else {
+            std::memcpy(
+                static_cast<std::byte *>(backing.get()) + sizeof(SchedulerRunControl),
+                readonly_image.bytes.data() + sizeof(SchedulerRunControl),
+                readonly_image.bytes.size() - sizeof(SchedulerRunControl)
+            );
+        }
+        std::memcpy(static_cast<std::byte *>(image_base) + readonly_image.header_offset, &header, sizeof(header));
         graph = original.graph();
         graph.task_count = plan.bindings.size();
         graph.scheduler_state_address = reinterpret_cast<uint64_t>(backing.get());
-        graph.scheduler_state_bytes = header.image_bytes;
+        graph.scheduler_state_bytes = state_bytes;
         graph.native_header_offset = readonly_image.header_offset;
-        if (runtime_state) {
+        graph.native_image_address = reinterpret_cast<uint64_t>(image_base);
+        graph.native_image_bytes = header.image_bytes;
+        if (runtime_state || split_image) {
             std::copy(
                 task_metadata.begin(), task_metadata.end(),
                 scheduler_state_at<SchedulerTaskMetadata>(backing.get(), layout.task_metadata_offset)
@@ -334,14 +350,15 @@ struct NativeViewFixture {
             if (!scheduler_init_spmd_task_records(backing.get(), layout, 1)) throw std::runtime_error("SPMD init");
         }
     }
+    void *image_base() { return image_backing ? image_backing.get() : backing.get(); }
     SchedulerNativeGraphHeader &header() {
         return *reinterpret_cast<SchedulerNativeGraphHeader *>(
-            static_cast<std::byte *>(backing.get()) + readonly_image.header_offset
+            static_cast<std::byte *>(image_base()) + readonly_image.header_offset
         );
     }
     SchedulerGraphTemplate &definition() {
         return *reinterpret_cast<SchedulerGraphTemplate *>(
-            static_cast<std::byte *>(backing.get()) + header().templates_offset
+            static_cast<std::byte *>(image_base()) + header().templates_offset
         );
     }
 };
@@ -391,8 +408,10 @@ TEST(HbgNativeGraphPlan, AccessConstructionDoesNotObserveNativeBacking) {
     wire.scheduler_state_address = SCHEDULER_STATE_ALIGNMENT;
     wire.scheduler_state_bytes = 1024 * 1024;
     wire.native_header_offset = sizeof(SchedulerRunControl);
+    wire.native_image_address = SCHEDULER_STATE_ALIGNMENT;
+    wire.native_image_bytes = 1024 * 1024;
     ASSERT_TRUE(scheduler_native_header_extent_valid(
-        wire.scheduler_state_address, wire.scheduler_state_bytes, wire.native_header_offset
+        wire.native_image_address, wire.native_image_bytes, wire.native_header_offset
     ));
     const SchedulerGraphAccess access(wire);
     EXPECT_EQ(access.scheduler_state_address, wire.scheduler_state_address);
@@ -550,7 +569,10 @@ TEST(HbgNativeGraphPlan, ReadersRejectForgedHeaderRegionsAndInstanceBindings) {
     NativeViewFixture view(body, {0});
     ASSERT_TRUE(scheduler_graph_view_valid(view.graph));
     auto graph = view.graph;
-    graph.scheduler_state_bytes = view.readonly_image.header_offset;
+    graph.native_image_bytes = view.readonly_image.header_offset;
+    EXPECT_FALSE(scheduler_graph_view_valid(graph));
+    graph = view.graph;
+    graph.native_image_address = 0;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
     graph = view.graph;
     graph.native_header_offset = UINT64_MAX - 127;
@@ -572,6 +594,63 @@ TEST(HbgNativeGraphPlan, ReadersRejectForgedHeaderRegionsAndInstanceBindings) {
         reinterpret_cast<SchedulerNodeBinding *>(static_cast<std::byte *>(view.backing.get()) + header.bindings_offset);
     bindings[1].instance_index = 99;
     EXPECT_NE(scheduler_node_fanin_count(view.graph, 1, &count), SchedulerGraphResult::OK);
+}
+
+TEST(HbgNativeGraphPlan, ReadonlyImageExtentMatchesTheMaterializedImage) {
+    DefinitionFixture body(std::vector<std::vector<uint16_t>>{{}, {0}, {1}});
+    NativeGraphHostPlan plan;
+    plan.definitions.resize(1);
+    std::string error;
+    ASSERT_TRUE(body.build(plan.definitions[0], error)) << error;
+    ASSERT_TRUE(native_graph_plan_nodes({0}, &plan, &error)) << error;
+    uint64_t extent = 0;
+    ASSERT_TRUE(native_graph_plan_readonly_image_extent(plan, &extent, &error)) << error;
+    NativeGraphReadonlyImage image;
+    ASSERT_TRUE(native_graph_plan_readonly_image(plan, &image, &error)) << error;
+    EXPECT_EQ(extent, image.bytes.size());
+    EXPECT_EQ(image.header_offset, sizeof(SchedulerRunControl));
+}
+
+TEST(HbgNativeGraphPlan, ProgramLayoutDeliversTheImageOutsideTheSchedulerState) {
+    DefinitionFixture body(std::vector<std::vector<uint16_t>>{{}, {0}});
+    NativeViewFixture legacy(body, {0});
+    NativeViewFixture split(body, {0}, false, 3, /*split_image=*/true);
+    ASSERT_TRUE(scheduler_graph_view_valid(legacy.graph));
+    ASSERT_TRUE(scheduler_graph_view_valid(split.graph));
+    // No image prefix: the state's arrays begin right after the run control.
+    EXPECT_EQ(split.layout.native_readonly_end_offset, 0u);
+    EXPECT_EQ(split.layout.control_inboxes_offset, sizeof(SchedulerRunControl));
+    EXPECT_NE(split.graph.native_image_address, split.graph.scheduler_state_address);
+    EXPECT_EQ(split.graph.native_image_address, reinterpret_cast<uint64_t>(split.image_base()));
+    EXPECT_EQ(split.graph.native_image_bytes, split.readonly_image.bytes.size());
+    // Every node reads the same through the delivered image as through the
+    // single-allocation layout.
+    ASSERT_EQ(legacy.graph.task_count, split.graph.task_count);
+    for (int64_t ref = 0; ref < static_cast<int64_t>(split.graph.task_count); ++ref) {
+        uint64_t legacy_identity = 0;
+        uint64_t split_identity = 0;
+        ASSERT_EQ(scheduler_node_identity(legacy.graph, ref, &legacy_identity), SchedulerGraphResult::OK);
+        ASSERT_EQ(scheduler_node_identity(split.graph, ref, &split_identity), SchedulerGraphResult::OK);
+        EXPECT_EQ(split_identity, legacy_identity);
+        uint32_t legacy_fanin = 0;
+        uint32_t split_fanin = 0;
+        ASSERT_EQ(scheduler_node_fanin_count(legacy.graph, ref, &legacy_fanin), SchedulerGraphResult::OK);
+        ASSERT_EQ(scheduler_node_fanin_count(split.graph, ref, &split_fanin), SchedulerGraphResult::OK);
+        EXPECT_EQ(split_fanin, legacy_fanin);
+    }
+    // The control inboxes are a span of the state, not of the image.
+    const auto inboxes = [](const SchedulerGraphView &graph, uint64_t offset, uint64_t count) {
+        return scheduler_control_inboxes_valid(
+            graph.scheduler_state_address, graph.scheduler_state_bytes, offset, count
+        );
+    };
+    EXPECT_TRUE(inboxes(split.graph, split.header().control_inboxes_offset, split.header().control_inbox_count));
+    EXPECT_FALSE(inboxes(split.graph, split.layout.total_size, split.header().control_inbox_count));
+    // The state allocation cannot stand in for the delivered image.
+    auto state_as_image = split.graph;
+    state_as_image.native_image_address = state_as_image.scheduler_state_address;
+    state_as_image.native_image_bytes = state_as_image.scheduler_state_bytes;
+    EXPECT_FALSE(scheduler_graph_view_valid(state_as_image));
 }
 
 namespace {
@@ -596,6 +675,8 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
     config.graph = &view.graph;
     config.task_controls_offset = view.layout.task_controls_offset;
     config.task_metadata_offset = view.layout.task_metadata_offset;
+    config.ready_scratch_address = reinterpret_cast<uint64_t>(view.backing.get());
+    config.ready_scratch_bytes = view.layout.total_size;
     config.ready_pool_offset = view.ready_pool.header_offset;
     config.runtime_worker_count = config.scheduler_count = 30;
     config.cluster_count = 10;
@@ -732,6 +813,8 @@ struct ControlFixture : NativeViewFixture {
             config.task_controls_offset = layout.task_controls_offset;
             config.task_metadata_offset = static_cast<uint32_t>(layout.task_metadata_offset);
             config.control_inboxes_offset = layout.control_inboxes_offset;
+            config.ready_scratch_address = reinterpret_cast<uint64_t>(backing.get());
+            config.ready_scratch_bytes = layout.total_size;
             config.ready_pool_offset = ready_pool.header_offset;
             config.runtime_worker_count = 3;
             config.scheduler_count = 3;
@@ -1062,6 +1145,8 @@ struct NativeAdmissionFixture : NativeViewFixture {
             config.worker_contexts_offset = layout.worker_contexts_offset;
             config.task_controls_offset = layout.task_controls_offset;
             config.task_metadata_offset = layout.task_metadata_offset;
+            config.ready_scratch_address = reinterpret_cast<uint64_t>(backing.get());
+            config.ready_scratch_bytes = layout.total_size;
             config.ready_pool_offset = ready_pool.header_offset;
             config.runtime_worker_count = 3;
             config.cluster_count = 1;
