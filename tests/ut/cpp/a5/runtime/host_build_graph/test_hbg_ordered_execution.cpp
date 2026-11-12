@@ -2014,7 +2014,7 @@ TEST_P(HbgOrderedTicketCursor, StaleTicketsRejectBootstrapBeforeReadyOwnership) 
     EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
 }
 
-TEST_P(HbgOrderedTicketCursor, SyncStartTasksKeepTheBoundedCasPath) {
+TEST_P(HbgOrderedTicketCursor, ExactFullResidencySyncClaimsThroughTheFetchAdd) {
     const LaneMask mask = GetParam();
     const uint16_t positions = mask == LaneMask::aic() ? 2 : 4;
     OrderedFixture fixture({{positions, mask, true}});
