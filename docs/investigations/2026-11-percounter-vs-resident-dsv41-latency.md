@@ -17,8 +17,9 @@ to be an artifact of the probe itself.
 Device wall `chip.run.runner_run.device_wall` at profiling level 0, one warmup and five
 measured rounds, on both case flavours. The runner executes three callables per
 iteration — a reference, the *prefix* that produces the slice's real inputs, then the
-case — so a median over a run's spans mixes populations that differ by one to two orders
-of magnitude. Split them by magnitude before reading anything.
+case — so a median over a run's spans mixes three populations. Separate them by phase
+position before reading anything; the method note at the end says why magnitude will not
+do it.
 
 `aicore_kernel.o` was rebuilt from a dropped cache for every arm and its md5 recorded
 with the measurement; see the method note at the end for why that is not optional.
@@ -31,33 +32,33 @@ draw; `3 us -> 1 us` lowers that switch's threshold instead. Microseconds, p50.
 | case | base | one | `3 us -> 1 us` | resident |
 | ---- | ---- | --- | -------------- | -------- |
 | **pypto_lib** | | | | |
-| `swa` | 100.0 | 103.7 | 103.2 | 202.7 |
+| `swa` | 925.2 | **617.9** | 925.1 | 1095.1 |
 | `c2a_full` | 2170.8 | **1287.2** | 1968.6 | 1829.4 |
 | `c2a_reuse` | 1818.2 | 1024.9 | **992.7** | 1434.8 |
 | `c1a_full` | 1991.4 | **1182.0** | 1198.2 | 1754.5 |
 | `c1a_reindex` | 1923.4 | **1168.3** | 1169.3 | 1744.7 |
 | `c1a_reuse` | 1747.0 | 1005.5 | **999.2** | 1451.6 |
-| `moe` | 937.4 | **620.6** | 881.9 | 1144.6 |
-| `engram` | 1233.9 | **1136.1** | 1189.2 | 1487.6 |
+| `moe` | 9766.9 | **2113.4** | 7344.6 | 3961.0 |
+| `engram` | 1233.9 | **1122.8** | 1189.2 | 1477.5 |
 | `layers_19_21` | 19042.3 | **9821.0** | 17187.3 | 19465.3 |
 | **pypto_lib_dsl** | | | | |
-| `swa` | 98.7 | 100.9 | 103.6 | 200.3 |
-| `c2a_full` | 2522.5 | 1591.6 | **1567.4** | 2075.6 |
+| `swa` | 1357.8 | **1048.8** | 1050.6 | 1498.0 |
+| `c2a_full` | 2514.6 | 1573.4 | **1567.4** | 2069.7 |
 | `c2a_reuse` | 1748.1 | 1448.3 | **1436.1** | 1841.0 |
 | `c1a_full` | 2219.2 | 1625.0 | **1571.2** | 1980.9 |
 | `c1a_reindex` | 1835.8 | **1576.5** | 1581.4 | 1986.4 |
 | `c1a_reuse` | 1706.7 | 1502.0 | **1463.8** | 1865.6 |
-| `moe` | 2109.8 | **1131.2** | 1435.1 | 1602.0 |
-| `engram` | 1230.2 | **1146.8** | 1244.7 | 1487.9 |
+| `moe` | 3930.3 | 1593.2 | **1450.7** | 2090.0 |
+| `engram` | 1224.8 | **1099.6** | 1201.1 | 1460.6 |
 | `layers_19_21` | 11635.6 | 8869.3 | **8744.5** | 12223.2 |
 
-Sixteen of eighteen improve, by 6.8% to 48.4%. The two that do not are both `swa`, at
-+3.7% and +2.2% with overlapping ranges — and `swa`'s order list was short enough that
-its lanes already drew one position at a time, so nothing about it changed.
+All eighteen improve, by 9.0% to 78.4%, with the largest gains where a lane had the
+most to withhold: `moe` 9766.9 -> 2113.4 us and `layers_19_21` 19042.3 -> 9821.0 on
+`pypto_lib`.
 
 Against the resident scheduler the change moves the verdict, not the margin: `base` won
-four of nine on `pypto_lib` and six of nine on the DSL flavour; `one` wins **eighteen of
-eighteen**, by 1.22x to 1.99x. All seventy-two runs passed on both ranks.
+three of nine on `pypto_lib` and six of nine on the DSL flavour; `one` wins **eighteen
+of eighteen**, by 1.22x to 1.98x. All seventy-two runs passed on both ranks.
 
 What a range costs is availability. A lane that draws four positions is committed to
 them: if none is ready it waits on one while the other three go unrun, and no idle lane
@@ -69,9 +70,9 @@ and the ticket atomics the range saves do not come close to paying for it.
 The rule being removed read "a lane whose last kernel ran at least 3 us draws one
 position at a time". Lowering it to 1 us is the `3 us -> 1 us` column, and it is
 **flavour-dependent**: on the DSL cases it lands within a few percent of one-per-draw,
-while on `pypto_lib` it leaves most of the win behind — `c2a_full` +53%,
-`layers_19_21` +75%, `moe` +42% against the one-per-draw arm. `c2a_full` under that
-threshold is visibly bimodal, `[1271.5 .. 2017.9]`, which is what a threshold sitting
+and 9% ahead of it on `moe`, while on `pypto_lib` it leaves most of the win behind —
+`swa` +50%, `c2a_full` +53%, `layers_19_21` +75% and `moe` +248% against the
+one-per-draw arm. `c2a_full` under that threshold is visibly bimodal, `[1271.5 .. 2017.9]`, which is what a threshold sitting
 inside the distribution looks like.
 
 The same operators built two ways want different thresholds, so no constant works. The
@@ -218,3 +219,16 @@ of every sweep.
 A `comm_init failed` / `507033` at `ChipWorker` init aborts a run before any kernel
 executes. It occurred once in seventy-two runs on a shared box and passed on re-run; it
 is not a scheduler signal.
+
+Separate a run's device-wall spans **by phase position, never by magnitude**. They come
+out as one reference followed by a (prefix, case) pair per round, and on `swa`, `moe`,
+`engram` and the DSL `c2a_full` the two phases are the same size, so a magnitude split
+mixes them without saying so. An earlier draft of this entry did exactly that and
+reported `swa` at 100 us and `moe` at 937 us; both were prefix spans, and the error
+turned `swa`'s 33% gain into an apparent 4% loss, which then read as the one case the
+change did not help. `layers_19_21`, whose phases differ by 6x, comes out the same
+either way and is the control that shows the positional split is right.
+
+The entry it replaced already carried "a device-wall median mixes the prefix and the
+case" as its own method note, so the warning was present and still not enough: a note
+that says *separate them* does not stop you reaching for the separator that is wrong.
