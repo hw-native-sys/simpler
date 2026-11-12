@@ -1217,10 +1217,9 @@ class ImportRegistry:
         is computed against that number, so an unverified one makes them all vacuous.
 
         Selection is the capability judgment: ``select_adapter`` either names the mechanism that
-        reaches this backing from this endpoint or refuses, and the resolver below only carries the
-        named mechanism out. Nothing after selection looks at ``backend_kind`` again. A mechanism
-        that reaches the backing without producing an address is refused *here* rather than there --
-        this returns a mapping, and that is the only narrowing it applies to the judgment.
+        reaches this backing from this endpoint or refuses. A shared-file slice uses a cached
+        mapping of the whole backing and adds its offset. Other descriptors use the selected
+        resolver. Materialization requires a local address, so it refuses addressless mechanisms.
         """
         key = desc.identity
         cached = self._by_identity.get(key)

@@ -83,12 +83,11 @@ class DeviceRunner : public DeviceRunnerBase {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
-    int bind_current_thread(int device_id) override;
     std::thread create_thread(std::function<void()> fn) override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
     // `copy_to_device`, `copy_from_device`,
-    // `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`, `create_thread`,
+    // `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`,
     // `attach_current_thread`, `ensure_device_initialized`,
     // `print_handshake_results`, `set_executors`, `set_dispatcher_binary`,
     // `device_id`, `last_device_wall_ns`, `launch_aicpu_payload`, and
@@ -190,6 +189,7 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    int bind_current_thread(int device_id) override;
     int prepare_kernel_arch_context(rtStream_t control_stream) override;
     int release_arch_context_resources(bool abandon_device_resources) override;
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;

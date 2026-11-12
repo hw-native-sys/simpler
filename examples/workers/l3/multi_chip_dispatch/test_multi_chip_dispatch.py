@@ -11,13 +11,15 @@
 import ctypes
 import os
 import struct
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType, _bind_host_log_session_directory
 from simpler.worker import Worker
 
-from .main import N_COLS, N_ROWS, build_chip_callable, run
+from .main import N_COLS, N_ROWS, build_chip_callable
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
@@ -25,8 +27,16 @@ from .main import N_COLS, N_ROWS, build_chip_callable, run
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_multi_chip_dispatch(st_platform, st_device_ids):
-    rc = run(st_platform, [int(d) for d in st_device_ids])
-    assert rc == 0
+    # This example exercises fork-inherited tensors, so it needs a fresh process.
+    script = (
+        "import runpy, sys\n"
+        "run = runpy.run_path(sys.argv[1])['run']\n"
+        "sys.exit(run(sys.argv[2], [int(device) for device in sys.argv[3:]]))"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script, str(Path(__file__).with_name("main.py")), st_platform, *map(str, st_device_ids)],
+        check=True,
+    )
 
 
 @pytest.mark.platforms(["a2a3sim", "a5sim", "a5"])

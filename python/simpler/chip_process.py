@@ -126,7 +126,19 @@ def launch_chip(worker, index, device_id, snapshots, log_level, requested_depth,
             pickle.dump(data, bootstrap, protocol=pickle.HIGHEST_PROTOCOL)
             bootstrap.seek(0)
             fds = bootstrap.fileno(), tracker_fd, child.fileno()
-            command = [sys.executable, "-m", "simpler.chip_process", *(str(fd) for fd in fds)]
+            # Restore import order before importing Simpler. In particular, an
+            # editable checkout may be available only through the parent's sys.path.
+            command = [
+                sys.executable,
+                "-c",
+                "import sys\n"
+                "sys.path[:] = sys.argv[4:]\n"
+                "del sys.argv[4:]\n"
+                "from simpler.chip_process import _main\n"
+                "_main(*(int(fd) for fd in sys.argv[1:4]))",
+                *(str(fd) for fd in fds),
+                *(entry for entry in sys.path if isinstance(entry, str)),
+            ]
             actions = _spawn_file_actions(heap_fds | set(fds), cleanup)
             pid = os.posix_spawn(sys.executable, command, os.environ, file_actions=actions)
             worker._record_chip_pid(pid)
@@ -211,7 +223,3 @@ def _main(bootstrap_fd: int, tracker_fd: int, startup_fd: int) -> None:
     finally:
         mailbox.close()
     module._exit_after_host_log_flush(0)
-
-
-if __name__ == "__main__":
-    _main(int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]))

@@ -13,7 +13,9 @@ import os
 import signal
 import sys
 from contextlib import ExitStack, contextmanager, suppress
+from pathlib import Path
 from time import monotonic
+from unittest.mock import Mock
 
 import pytest
 from simpler import chip_process
@@ -21,7 +23,7 @@ from simpler.chip_process import _pack_config, _unpack_config, launch_chip
 from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
-from ._harness import chip_callable
+from ._harness import TEST_WALL_BUDGET_S, chip_callable, hard_timeout
 
 
 def test_bootstrap_config_keeps_per_ring_sizes_and_diagnostics():
@@ -50,6 +52,41 @@ def test_spawn_preserves_only_the_requested_descriptors(tmp_path):
             )
             pid = os.posix_spawn(sys.executable, [sys.executable, "-c", script], os.environ, file_actions=actions)
         assert os.waitpid(pid, 0) == (pid, 0)
+
+
+def test_exec_child_uses_parent_import_order(monkeypatch, tmp_path):
+    real_spawn = os.posix_spawn
+
+    def launch_without_site(*args):
+        def spawn(path, command, env, **kwargs):
+            # Disable the editable-install finder in the child.
+            return real_spawn(path, [command[0], "-S", *command[1:]], env, **kwargs)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(chip_process.os, "posix_spawn", spawn)
+            return launch_chip(*args)
+
+    shadow = tmp_path / "simpler"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text('raise RuntimeError("wrong simpler package")\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.syspath_prepend(str(Path(chip_process.__file__).resolve().parents[1]))
+    monkeypatch.setattr(Worker, "_uses_exec_chip", lambda _worker: True)
+    monkeypatch.setattr(Worker, "_launch_chip_process", launch_without_site)
+    worker = Worker(
+        level=3,
+        platform="a5sim",
+        runtime="tensormap_and_ringbuffer",
+        device_ids=[0],
+        num_sub_workers=0,
+        heap_ring_size=0,
+        startup_timeout_s=30,
+    )
+    try:
+        worker.init()
+    finally:
+        worker.close()
 
 
 @pytest.mark.parametrize("child_bootstrap", [True, False])
@@ -172,21 +209,36 @@ def test_chip_killed_after_ready_is_reaped_by_existing_close(monkeypatch):
         os.waitpid(pid, os.WNOHANG)
 
 
-def test_mailbox_loop_keeps_bootstrap_parent_identity():
+@hard_timeout(TEST_WALL_BUDGET_S)
+def test_exec_chip_loop_keeps_bootstrap_parent_identity(monkeypatch):
     from simpler import worker as module  # noqa: PLC0415
 
-    storage = bytearray(module.mailbox_size(1))
-    view = memoryview(storage)
-    try:
-        module._run_mailbox_loop(
+    actual_parent = os.getppid()
+    get_parent = Mock(side_effect=[actual_parent])
+    monkeypatch.setattr(module.os, "getppid", get_parent)
+    monkeypatch.setattr(module, "_PARENT_LIVENESS_POLL_INTERVAL", 1)
+    chip = Mock(spec_set=["_close_chip_run_lane"])
+    regions = Mock()
+    regions.sweep.return_value = ()
+    with memoryview(bytearray(module.mailbox_size(1))) as view:
+        module._run_chip_main_loop(
+            chip,
             view,
+            module._buffer_field_addr(view, 0),
             module._buffer_field_addr(view, module._OFF_STATE),
-            handle_task=lambda *_args: pytest.fail("unexpected task"),
-            handle_control=lambda *_args: pytest.fail("unexpected control"),
-            expected_parent_pid=os.getppid() + 1,
+            0,
+            {},
+            {},
+            {},
+            module.mint_owner_instance_id(),
+            chip_platform="a5sim",
+            provider_region_store=regions,
+            fork_inherited=False,
+            expected_parent_pid=actual_parent + 1,
         )
-    finally:
-        view.release()
+    get_parent.assert_called_once_with()
+    chip._close_chip_run_lane.assert_called_once_with()
+    regions.sweep.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

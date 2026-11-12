@@ -282,9 +282,10 @@ type change rather than a silently wrong address.
 
 ```python
 h  = worker.create_buffer(nbytes)                 # kind3: explicit shared host buffer (POSIX shm)
-h  = worker.alloc_shared_tensor((M, N), dtype)    # kind3: shape-sized create_buffer
-# inside an orch fn, for device (chip-private) memory:
-d  = orch.alloc_child_tensor(worker, (M, N), dtype)  # kind4: DEVICE_MALLOC on that chip
+
+def orch_fn(orch, args, config):
+    intermediate = worker.alloc_shared_tensor((M, N), dtype)  # managed HeapRing allocation
+    d = orch.alloc_child_tensor(worker_id, (M, N), dtype)      # kind4: DEVICE_MALLOC on that chip
 ```
 
 `create_buffer` returns a `Buffer` backed by a POSIX shm the consumer maps
@@ -492,11 +493,9 @@ completion token for a downstream task to depend on.
 
 This page describes the memory model end to end. **The dispatch wire is
 connected**: `TaskArgs` carries the `Tensor`, `Tensor(buffer, ...)` reaches a
-consumer, and the submit-time checks above run on every submit. Still absent are
-the other allocators (`alloc_shared_tensor`, `alloc_child_tensor`), and the
-endpoint x `address_space` check inside `materialize` — a device backing resolved
-there yields a pointer meaningful only on its owner chip, and today that is
-enforced where a task is submitted rather than where it is materialized.
+consumer, and the submit-time checks above run on every submit. A device backing
+resolved by `materialize` yields a pointer meaningful only on its owner chip.
+The submit path enforces this endpoint and `address_space` check.
 
 **There is no second blob format.** A `Tensor` travels in the TaskArgs mailbox
 blob that `write_blob` / `read_blob` implement in

@@ -2676,7 +2676,6 @@ def _run_mailbox_loop(
     handle_task,
     handle_control,
     on_shutdown=None,
-    expected_parent_pid: int | None = None,
 ) -> None:
     """The mailbox state machine every forked child runs.
 
@@ -2711,7 +2710,7 @@ def _run_mailbox_loop(
     control command overwrites a concurrent ``_SHUTDOWN`` store, and only the
     sticky word survives that.
     """
-    parent_pid = os.getppid() if expected_parent_pid is None else expected_parent_pid
+    parent_pid = os.getppid()
     liveness_countdown = _PARENT_LIVENESS_POLL_INTERVAL
     shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
     mailbox_addr = _buffer_field_addr(buf, 0)
@@ -9283,9 +9282,9 @@ class Worker:
         subtree — recursively, for L4+ — to publish INIT_READY, activates any
         remote L3 sessions, starts the C++ scheduler, and only then publishes
         READY in one atomic commit. It returns with the tree ready to run, or
-        raises after a bounded rollback that reaps the children it forked
-        best-effort (a child wedged in native code past the deadline may be left
-        behind — see the deferred un-reaped-child / nested-shm items).
+        raises after a bounded rollback that reaps local children, including
+        exec-mode chips, best-effort. A child wedged in native code past the
+        deadline may be left behind (see the deferred un-reaped-child / nested-shm items).
         ``run`` / ``create_buffer`` / the remote register/memory APIs never
         trigger startup.
 
@@ -10008,9 +10007,9 @@ class Worker:
         self._activate_mpi_direct_workers(deadline)
         self._activate_remote_sessions(deadline)
 
-        # _Worker was constructed in _init_hierarchical (pre-fork) so children
-        # inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode workers via
-        # the unified mailbox.
+        # _init_hierarchical constructs _Worker before child startup. Forked
+        # children inherit the HeapRing mapping. Exec chips map its shared file
+        # descriptors. Register PROCESS-mode workers via the unified mailbox.
         dw = self._worker
         assert dw is not None
         # `direct_chip_pipeline_depth` is the native pipeline-slot capability; `_pending_run_depth`
