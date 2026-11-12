@@ -24,7 +24,7 @@ static inline __aicore__ bool scheduler_service_controls(
 ) {
     *progress = false;
     if (local->config.control_inboxes_offset == 0) return true;
-    if (scheduler_read_error(run) != 0) return false;
+    if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     if (scheduler_gm_query(run->bootstrap_scan_complete) == 0) return true;
     uint32_t started = 0, work = 0, completed = 0;
     auto &continuation = local->control_resolve;

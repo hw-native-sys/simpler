@@ -99,11 +99,11 @@ MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 
 另一分支用 CAS 推进 `next_block`，SYNC_START 成员成功一次后设置 `sync_claimed`，不继续包办多个 block。
 这里的 SYNC_START 资源/领取约束不能直接理解为所有核在同一个时钟周期进入 kernel。
 
-[claim_ordered_block](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h) 把 task、block、cooperative 标记放入本核 slot。
+[claim_ordered_block](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h) 把 task、block 和候选来源写入本核 slot；不再维护独立的 cooperative 字段。
 同一逻辑任务可以分多波执行，payload.block_num 始终是总 block 数。
 
-每个 block 返回后，[finish_ordered_block](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_admission.h) 先释放本地 slot，再原子增加 `completed_blocks`。
-只有使其达到 logical_block_num 的最后一个 block，才能进入整个任务的完成处理。
+每次子任务返回后，[scheduler_contribute_subtask](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h) 贡献一次实际执行完成。
+累计达到 `logical_block_num × active_mask.count()` 的最后一个贡献者处理逻辑完成；普通、SPMD 和 MIX 使用同一计数。
 
 ## 3.3 MIX：一个 cluster 内各核自己准备和执行
 
@@ -117,14 +117,14 @@ MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 
 4. 各参与核观察分配、校验 epoch/order/group；等本核 own slots 都 free 后写 `arrived_seq`。
 5. 确认本 group 的所有资源成员都 arrived，才各自准备自己的 own slot。
 6. 每个核调用自己的 subtask kernel；没有业务 subtask 的资源成员直接释放。
-7. 本核完成消费和 trace 收尾后写 `released_seq`。
-8. AIC 确认所有资源成员 release，给 completed_blocks 贡献一个逻辑 block。
-9. 全部 block 完成后，整个任务才进入 DONE/依赖传播。
+7. 实际执行 lane 贡献一次子任务完成，再完成 trace 收尾并写 `released_seq`。
+8. AIC 确认所有资源成员 release，退休该 group 的资源；不重复贡献完成计数。
+9. 最后一个实际子任务触发逻辑完成或异步 FINISH；这可以早于 group 资源退役。
 
 即使是纯双 AIV MIX，AIC 仍作为 coordinator 进入 resource_mask；它可能没有业务 kernel。
 当前主线 descriptor 的逻辑 subtask 与物理通信 lane 保持对应。
 
-ready 领取、组协调与 slot 管理是三个不同职责：AIC 从共享队列认领 MIX task 并发布 admission；各 cluster 的 AIC 领取该 task 的 block、协调 mailbox；每个执行成员通过 [scheduler_gm_mix_prepare_lane](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_gm_mix.h) 选择并填写自己的 `local->slots[index]`。
+ready 领取、组协调与 slot 管理是三个不同职责：AIC 从共享队列认领 MIX task 并发布 admission；完成路径也可由 AIV 直接持有 MIX 候选并推进 admission；各 cluster 的 AIC 领取该 task 的 block、协调 mailbox；每个执行成员通过 [scheduler_gm_mix_prepare_lane](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_gm_mix.h) 选择并填写自己的 `local->slots[index]`。
 每个 worker 只有两个 own slot，普通任务与 MIX 共用 payload 和本核直接退休流程。coordinator 汇总成员 release，不替其他成员填写或回收 slot。
 
 [SchedulerGroupMailbox](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：
@@ -172,22 +172,22 @@ descriptor 占 128B，published_seq 位于单独的 64B 行；`lanes[3]` 各占 
 ## 3.4 kernel 返回怎样变成逻辑任务完成
 
 读 [executor 的返回路径](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h)：
-核对保存的 task/block/subtask/group 绑定，seal async，完成启用的 DFX 与 AFTER_COMPLETION 抓取，然后进入 EXIT/共享错误门禁。
+核对保存的 task/block/subtask/group 绑定，seal async，完成启用的 DFX 与 AFTER_COMPLETION 抓取，然后进入 EXIT/本worker错误门禁。
 门禁允许继续时，同一调用链直接调用 [scheduler_complete_own_slot](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h)：
 
-1. 检查 EXECUTING、任务/逻辑执行与 group 绑定，保存本次完成快照。
-2. 普通任务释放 slot；无延迟条件时写 DONE 并解析依赖，可以直接为同类型后继 refill。
-3. 非 MIX 协作 block 先发布执行记录并释放 slot，再贡献 completed_blocks；仅最后一个 block 完成逻辑任务。
-4. GM MIX 先发布执行记录并释放 slot，再发布本 lane release；coordinator 汇总整个 group。
-5. 有 async 条件时关闭 computation，由正确的 FINISH 推进逻辑 DONE/resolve。
+1. 保留本次 EXECUTING 身份，释放本地 slot 的业务绑定。
+2. 一次原子操作累计实际子任务完成数及 async-check 票数。
+3. 最后一个贡献者若看到累计零票，可直接完成；否则关闭 async computation，必要时等待 FINISH。
+4. 逻辑完成发布 DONE 并解析后继，可以直接保留一个有权推进的候选。
+5. 整理和发布 trace，再释放 MIX lane；所有诊断写入在槽复用、成员关闭和 EXIT ACK 前完成。
 
 重复退休 FREE/READY slot 会报绑定错误。失败沿首错与退出路径处理，不重试已经部分推进的 completion。
 predicate 跳过业务调用仍走一次相同退休路径；INLINE/native 控制节点保留各自的直接完成入口。
 
 ## 3.5 完成传播：CSR 计数与 wake-list 共用 resolver
 
-入口 [scheduler_resolve_completion_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h) 是 `static noinline` 函数，普通完成、native 控制节点与 async FINISH 都使用它。
-外联不改变每片预算和唯一 owner 的规则。
+[scheduler_resolve_completion_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h) 有两个 `static noinline` 入口：同步 CSR 完成直接遍历已验证的 fanout，不关闭动态 wake list；控制节点、async FINISH 及其他续行路径使用有界游标。
+以下状态机描述有界入口，外联不改变每片预算和唯一 owner 的规则。
 
 ```text
 START   确认 producer DONE，关闭 wake_list_head；计数路径要求没有动态 waiter
@@ -202,11 +202,11 @@ DONE    该 producer 的全部后继已经处理或责任已交接
 
 wake-list 路径必须先保存旧 next，因为 route 可能改写 waiter 的 next_waiter。
 计数路径按 immutable CSR 前进，visited_count 同时定位当前行中的边，不重复通知已经消费的边。
-计数从 1→0 的后继同样可以 direct refill：调用方提供直接交接位置、后继为同核类型的非 MIX kernel 时，resolver 可保留一个 ready claim；实际准备和执行仍受普通/有序派发入口的约束。其他 kernel 按 AIC（含 MIX）/AIV 发布到两个共享队列，控制节点进入 control inbox。
+计数从 1→0 的后继可以直接保留：同核类型的非 MIX kernel 可交给原派发入口；有 ordered admission 时，完成核也可直接持有 MIX 候选（包括 AIV）。后者只获得准入发布权，MIX 的执行仍由 AIC 协调与各 lane 的许可决定。其他 kernel 按 AIC（含 MIX）/AIV 发布到两个共享队列，控制节点进入 control inbox。
 
 [解析游标](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_resolve_state.h) 的所有字段：
 
-**范围与用途：** 完整 SchedulerResolveCursor 为 160B、自然 8B 对齐；这些结构表示一个正在推进的解析过程。普通同步解析的 cursor 是调用内局部值；native 控制解析放在本核 LocalState 中跨循环保存；async FINISH 的 cursor 则保存到 GM，持有 lease 的服务核可接续。它们的归属取决于谁拥有当前解析责任，不能仅凭结构名判断都在本核或都在 GM。
+**范围与用途：** 完整 SchedulerResolveCursor 为 160B、自然 8B 对齐；这些结构表示一个正在推进的解析过程。需要游标的普通同步解析使用调用内局部值；直接 CSR 入口不保存续行游标；native 控制解析放在本核 LocalState 中跨循环保存；async FINISH 的 cursor 则保存到 GM，持有 lease 的服务核可接续。它们的归属取决于谁拥有当前解析责任，不能仅凭结构名判断都在本核或都在 GM。
 
 | 结构 | 字段及作用 |
 | ---- | ---------- |
@@ -218,8 +218,8 @@ wake-list 路径必须先保存旧 next，因为 route 可能改写 waiter 的 n
 
 一个发布批次最多容纳 8 个同 destination 的 ref；AIC 与 MIX 可以共用一个批次。业务队列在一次有界调用内完成预留和原子发布；control inbox 则先准备链，再 CAS 追加，争用时保留 PREPARED 状态续行。续行保存整个 publication，不能只保存下一个后继索引。
 
-解析完成后才增加本地 `pending_completed`。在空闲、收尾，以及 native 的有界批次条件下，
-[flush_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h) 先屏障，再原子相加到 `run_control.resolved_task_count`。
+同步任务发布 DONE 后，由唯一完成者在解析返回时增加本地 `pending_completed`；解析报错也只计一次。在空闲、收尾，以及 native 的有界批次条件下，
+[flush_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h#L21)（第 21 行） 先屏障，再原子相加到 `run_control.resolved_task_count`。
 
 这解释了为什么全局 resolved 计数可能暂时落后于实际 kernel 返回数：它统计的是逻辑节点，而且是批量发布。
 

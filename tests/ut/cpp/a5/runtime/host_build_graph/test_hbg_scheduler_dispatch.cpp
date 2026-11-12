@@ -951,9 +951,9 @@ TEST_P(SchedulerMix, PayloadAndCompletionTraceFollowEachLogicalSubtask) {
         EXPECT_EQ(local->slots[execution.slot].state, SchedulerDispatchSlotState::FREE);
     }
     EXPECT_EQ(subtasks.size(), mask.count());
-    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
-    ASSERT_TRUE(fixture.complete_task(0, 0));
-    EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::PROGRESS);
+    ASSERT_TRUE(fixture.task_done(0));
+    EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), mask.count());
 }
 
 TEST_P(SchedulerMix, LastLaneAloneResolvesDependency) {
@@ -979,15 +979,15 @@ TEST_P(SchedulerMix, LastLaneAloneResolvesDependency) {
     for (size_t index = 0; index + 1 < active.size(); ++index) {
         ASSERT_TRUE(fixture.complete(active[index]));
         EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
-        EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+        EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), index + 1);
         EXPECT_EQ(fixture.control(0)->wake_list_head, 1);
     }
     ASSERT_TRUE(fixture.complete(active.back()));
-    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
-    ASSERT_TRUE(fixture.complete_task(0, 0));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::PROGRESS);
+    ASSERT_TRUE(fixture.task_done(0));
     EXPECT_EQ(fixture.control(0)->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
     EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
-    EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
+    EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), mask.count());
 }
 
 TEST_P(SchedulerMix, FourQueuedTasksReuseSlotsWithoutLosingFifoOrExecutions) {
@@ -1015,7 +1015,7 @@ TEST_P(SchedulerMix, FourQueuedTasksReuseSlotsWithoutLosingFifoOrExecutions) {
     EXPECT_EQ(order, (std::vector<int64_t>{0, 1, 2, 3}));
     for (uint32_t task = 0; task < 4; ++task) {
         EXPECT_EQ(seen[task].size(), mask.count());
-        EXPECT_EQ(fixture.control(task)->completed_blocks, 1u);
+        EXPECT_EQ(scheduler_completion_count(fixture.control(task)->completion_state), mask.count());
     }
 }
 
@@ -1032,7 +1032,7 @@ TEST_P(SchedulerMix, FailedPreparationPublishesNoPayloadOrCompletion) {
         EXPECT_EQ(local->pending_completed, 0u);
     }
     EXPECT_NE(fixture.run()->scheduler_error, 0u);
-    EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+    EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 0u);
 }
 
 INSTANTIATE_TEST_SUITE_P(CurrentGmMasks, SchedulerMix, ::testing::ValuesIn(kMixMasks));

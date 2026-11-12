@@ -190,8 +190,11 @@ struct StartupFixture {
                 else execute_task(payload);
                 ASSERT_TRUE(scheduler_complete_own_slot(graph_view, base(), &local, run, slot, 0));
             }
-            ASSERT_EQ(scheduler_gm_mix_retire(graph_view, base(), &locals[0], run), SchedulerGmMixResult::TASK_LAST);
-            ASSERT_TRUE(scheduler_complete_ordered_task(graph_view, base(), &locals[0], run, task, 0));
+            ASSERT_EQ(scheduler_gm_mix_retire(graph_view, base(), &locals[0], run), SchedulerGmMixResult::PROGRESS);
+            EXPECT_EQ(
+                scheduler_task_control_at(base(), &locals[0], task)->state,
+                static_cast<int64_t>(SchedulerTaskState::DONE)
+            );
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
                 bool closed = false;
@@ -199,7 +202,8 @@ struct StartupFixture {
                 ASSERT_TRUE(closed);
             }
         }
-        scheduler_flush_completions(run, &locals[0]);
+        for (uint32_t lane = 0; lane < 3; ++lane)
+            scheduler_flush_completions(run, &locals[lane]);
     }
 
     void run_late_worker(uint32_t worker = 3) {
@@ -245,7 +249,10 @@ TEST_P(HbgGmMixStartupExit, LateZeroWorkCoordinatorClosesEveryAdmittedMixBeforeE
     ASSERT_EQ(scheduler_gm_fetch_add(fixture.storage.run_control->scheduler_error, UINT64_C(0)), 0u);
     for (uint64_t task = 0; task < 2; ++task) {
         ASSERT_EQ(scheduler_gm_fetch_add(fixture.control(task)->next_block, UINT64_C(0)), 1u);
-        ASSERT_EQ(scheduler_gm_fetch_add(fixture.control(task)->completed_blocks, UINT64_C(0)), 1u);
+        ASSERT_EQ(
+            scheduler_completion_progress(scheduler_gm_fetch_add(fixture.control(task)->completion_state, UINT64_C(0))),
+            fixture.storage.metadata[task].active_mask.count()
+        );
         ASSERT_EQ(scheduler_gm_load(fixture.control(task)->state), static_cast<int64_t>(SchedulerTaskState::DONE));
         ASSERT_EQ(scheduler_gm_fetch_add(fixture.seal(task, 1), UINT64_C(0)), 0u);
     }
@@ -428,7 +435,7 @@ TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
     SchedulerReadyBatch batch{};
     ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch));
     ASSERT_TRUE(scheduler_ready_batch_push(base, local, 0, &batch));
-    std::array<uint8_t, 64> registers{};
+    alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     ScopedStartupRegisterObserver observer([] {});
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
@@ -483,7 +490,7 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     SchedulerReadyBatch batch{};
     ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch));
     ASSERT_TRUE(scheduler_ready_batch_push(base, local, worker == 0 ? 0 : 1, &batch));
-    std::array<uint8_t, 64> registers{};
+    alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
     identity_test_payload =
@@ -502,6 +509,8 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     ASSERT_EQ(startup_kernel_calls, 1u);
     ASSERT_EQ(identity_test_payload->local_context.block_idx, 77);
     EXPECT_EQ(local->slots[0].state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(scheduler_read_error(run), 0u);
+    EXPECT_EQ(scheduler_completion_count(scheduler_task_control_at(base, local, 0)->completion_state), 1u);
     const auto *trace = scheduler_state_at<SchedulerTaskTrace>(base, storage.layout.trace_cells_offset);
     if (level == 0) {
         EXPECT_EQ(trace->execution_identity_flags, 0u);
@@ -612,7 +621,7 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
     }
     auto *run = storage.run_control;
     run->expected_task_count = 2;
-    std::array<uint8_t, 64> registers{};
+    alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
@@ -651,7 +660,7 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
         EXPECT_EQ(admission.current_task_ref, SCHEDULER_TASK_REF_INVALID);
         auto *control = scheduler_task_control_at(base, local, 1);
         EXPECT_EQ(control->next_block, 0u);
-        EXPECT_EQ(control->completed_blocks, 0u);
+        EXPECT_EQ(scheduler_completion_progress(control->completion_state), 0u);
         EXPECT_EQ(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED));
     }
     if (arrival == IdleDispatchArrival::ERROR) {
@@ -691,7 +700,7 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     SchedulerReadyBatch batch{};
     ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch));
     ASSERT_TRUE(scheduler_ready_batch_push(base, local, 0, &batch));
-    std::array<uint8_t, 64> registers{};
+    alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
@@ -703,6 +712,9 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, 4)));
     ASSERT_EQ(startup_kernel_calls, 2u);
     EXPECT_EQ(local->slots[0].state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(scheduler_read_error(run), 0u);
+    EXPECT_EQ(scheduler_completion_count(scheduler_task_control_at(base, local, 0)->completion_state), 1u);
+    EXPECT_EQ(scheduler_completion_count(scheduler_task_control_at(base, local, 1)->completion_state), 1u);
     const auto *events =
         scheduler_state_at<SchedulerProtocolExecutionTrace>(base, storage.layout.protocol.executions_offset);
     EXPECT_EQ(events[0].task_ref, 0);

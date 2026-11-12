@@ -79,6 +79,14 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }
 
+TEST_F(ProtocolExportFixture, ExportsPhysicalCountWithoutAsyncVotes) {
+    at<SchedulerTaskControl>(layout.task_controls_offset)[0].completion_state =
+        scheduler_completion_initial_state(6) + 2 * SCHEDULER_COMPLETION_ASYNC_UNIT + 6;
+    const auto json = dump();
+    EXPECT_NE(json.find("\"completed_subtasks\":6"), std::string::npos);
+    EXPECT_EQ(json.find("\"completed_subtasks\":8589934598"), std::string::npos);
+}
+
 TEST(ProtocolGraphSourceTest, CopiesOriginalCsrAndDeduplicatesDefinitionsByKey) {
     scheduler_test::BasicGraphBuffer<2> original(2);
     original.payload(1).fanin_count = 1;

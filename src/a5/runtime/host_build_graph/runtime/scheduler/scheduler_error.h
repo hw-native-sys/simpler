@@ -35,10 +35,14 @@ static inline __aicore__ uint64_t scheduler_read_error(__gm__ SchedulerRunContro
 }
 
 static inline __aicore__ void scheduler_publish_error(__gm__ SchedulerRunControl *run_control, uint64_t status) {
+    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker)
+        scheduler_publish_signal(run_control->worker_errors[worker].status, status);
     scheduler_publish_signal(run_control->scheduler_error, status);
 }
 
-static inline __aicore__ void scheduler_record_error(
+static_assert(alignof(SchedulerGraphView) <= 8 && alignof(SchedulerErrorIdentity) <= 8);
+
+static __aicore__ __attribute__((noinline)) void scheduler_record_error(
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph = nullptr, __gm__ const SchedulerWorkerContext *context = nullptr,
     SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN, const SchedulerErrorIdentity *identity = nullptr
@@ -81,4 +85,12 @@ static inline __aicore__ void scheduler_record_error(
     scheduler_gm_store(run_control->error_site, static_cast<uint64_t>(error_site));
     scheduler_cache_barrier();
     scheduler_publish_error(run_control, static_cast<uint64_t>(status));
+}
+
+static inline __aicore__ uint64_t
+scheduler_read_worker_error(__gm__ SchedulerRunControl *run_control, uint64_t worker) {
+    // A malformed local lane has no reader line. The enclosing context check
+    // reports it; canonical status remains readable before that validation.
+    if (worker >= SCHEDULER_WORKER_CAPACITY) return scheduler_read_error(run_control);
+    return scheduler_gm_query(run_control->worker_errors[worker].status);
 }

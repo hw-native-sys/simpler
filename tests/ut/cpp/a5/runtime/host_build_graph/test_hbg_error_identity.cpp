@@ -30,6 +30,7 @@ struct ErrorCacheEvent {
     size_t bytes;
     bool flush;
     uint64_t status;
+    uint32_t published_workers;
 };
 
 struct ErrorCacheTrace;
@@ -47,8 +48,12 @@ struct ErrorCacheTrace {
 
 void record_cache_access(const void *address, size_t bytes, bool flush) {
     if (active_cache_trace == nullptr) return;
+    uint32_t published_workers = 0;
+    for (const auto &signal : active_cache_trace->run->worker_errors)
+        published_workers += __atomic_load_n(&signal.status, __ATOMIC_ACQUIRE) != 0;
     active_cache_trace->events.push_back(
-        {address, bytes, flush, __atomic_load_n(&active_cache_trace->run->scheduler_error, __ATOMIC_ACQUIRE)}
+        {address, bytes, flush, __atomic_load_n(&active_cache_trace->run->scheduler_error, __ATOMIC_ACQUIRE),
+         published_workers}
     );
 }
 
@@ -131,7 +136,7 @@ struct ErrorFixture {
 };
 
 TEST(HbgErrorIdentity, DedicatedStatusLineSeparatesDiagnosticIdentity) {
-    EXPECT_EQ(sizeof(SchedulerRunControl), 384u);
+    EXPECT_EQ(sizeof(SchedulerRunControl), 384u + SCHEDULER_WORKER_CAPACITY * 64);
     EXPECT_EQ(offsetof(SchedulerRunControl, error_claimed), 192u);
     EXPECT_EQ(offsetof(SchedulerRunControl, error_site), 248u);
     EXPECT_EQ(kIdentityOffset, 256u);
@@ -153,20 +158,26 @@ TEST(HbgErrorIdentity, AicpuFlushesIdentityBeforePublishingAndFlushingStatus) {
     ASSERT_TRUE(record_aicore_scheduler_runtime_error(
         fixture.run(), SchedulerGraphResult::TIMEOUT, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT
     ));
-    ASSERT_EQ(trace.events.size(), 2u);
+    ASSERT_EQ(trace.events.size(), 3u);
     const auto *base = reinterpret_cast<const uint8_t *>(fixture.run());
     EXPECT_EQ(trace.events[0].address, base + offsetof(SchedulerRunControl, error_claimed));
     EXPECT_EQ(trace.events[0].bytes, 128u);
     EXPECT_TRUE(trace.events[0].flush);
     EXPECT_EQ(trace.events[0].status, 0u);
-    EXPECT_EQ(trace.events[1].address, base + offsetof(SchedulerRunControl, scheduler_error));
-    EXPECT_EQ(trace.events[1].bytes, 64u);
+    EXPECT_EQ(trace.events[0].published_workers, 0u);
+    EXPECT_EQ(trace.events[1].address, fixture.run()->worker_errors);
+    EXPECT_EQ(trace.events[1].bytes, sizeof(fixture.run()->worker_errors));
     EXPECT_TRUE(trace.events[1].flush);
-    EXPECT_EQ(trace.events[1].status, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    EXPECT_EQ(trace.events[1].status, 0u);
+    EXPECT_EQ(trace.events[1].published_workers, SCHEDULER_WORKER_CAPACITY);
+    EXPECT_EQ(trace.events[2].address, base + offsetof(SchedulerRunControl, scheduler_error));
+    EXPECT_EQ(trace.events[2].bytes, sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, scheduler_error));
+    EXPECT_TRUE(trace.events[2].flush);
+    EXPECT_EQ(trace.events[2].status, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
     EXPECT_FALSE(record_aicore_scheduler_runtime_error(
         fixture.run(), SchedulerGraphResult::INVALID_ARGUMENTS, SchedulerErrorSite::GROUP_INVALID_STATE
     ));
-    EXPECT_EQ(trace.events.size(), 2u);
+    EXPECT_EQ(trace.events.size(), 3u);
 }
 
 TEST(HbgErrorIdentity, ColdLogObservesTheSeparateStatusLineBeforeReloadingIdentity) {
@@ -180,7 +191,7 @@ TEST(HbgErrorIdentity, ColdLogObservesTheSeparateStatusLineBeforeReloadingIdenti
     ASSERT_EQ(trace.events.size(), 2u);
     const auto *base = reinterpret_cast<const uint8_t *>(fixture.run());
     EXPECT_EQ(trace.events[0].address, base + offsetof(SchedulerRunControl, error_claimed));
-    EXPECT_EQ(trace.events[0].bytes, 192u);
+    EXPECT_EQ(trace.events[0].bytes, sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed));
     EXPECT_FALSE(trace.events[0].flush);
     EXPECT_EQ(trace.events[1].address, base + offsetof(SchedulerRunControl, error_claimed));
     EXPECT_EQ(trace.events[1].bytes, 128u);
@@ -196,6 +207,8 @@ TEST(HbgErrorIdentity, InitializationAndRetainedResetUseUnknownInsteadOfValidZer
     ));
     EXPECT_EQ(read_identity(*fixture.run()), kUnknown);
     EXPECT_EQ(fixture.run()->error_claimed, 0u);
+    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker)
+        EXPECT_EQ(scheduler_read_worker_error(fixture.run(), worker), 0u);
     EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
 
@@ -245,7 +258,7 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
     admission.current_flags = metadata.flags;
     for (uint32_t slot = 0; slot < 2; ++slot) {
         local->slots[slot].task_ref = 0;
-        local->slots[slot].cooperative = true;
+
         local->slots[slot].block_idx = slot + 1;
         local->slots[slot].state = slot == 0 ? SchedulerDispatchSlotState::READY : SchedulerDispatchSlotState::FILLING;
     }
@@ -343,6 +356,8 @@ TEST(HbgErrorIdentity, AicoreFirstWriterSurvivesALaterAicpuTimeoutAndAnotherWork
     EXPECT_EQ(read_identity(*fixture.run()), first);
     EXPECT_EQ(first, (Identity{61, 0, 2, 7, 1, 1}));
     EXPECT_EQ(fixture.run()->error_task_ref, 0u);
+    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker)
+        EXPECT_EQ(scheduler_read_worker_error(fixture.run(), worker), scheduler_read_error(fixture.run()));
 }
 
 TEST(HbgErrorIdentity, AicpuFirstWriterPublishesUnknownRatherThanStaleAicoreIdentity) {
@@ -364,6 +379,10 @@ TEST(HbgErrorIdentity, AicpuFirstWriterPublishesUnknownRatherThanStaleAicoreIden
     EXPECT_EQ(read_valid_fields(*fixture.run()), 0u);
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT));
     EXPECT_EQ(scheduler_read_error(fixture.run()), static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker)
+        EXPECT_EQ(
+            scheduler_read_worker_error(fixture.run(), worker), static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
+        );
 }
 
 TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimingAnAdmissionOrder) {
@@ -393,7 +412,7 @@ TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheO
     for (uint32_t slot = 0; slot < 2; ++slot) {
         local->slots[slot].task_ref = 0;
         local->slots[slot].block_idx = slot + 1;
-        local->slots[slot].cooperative = true;
+
         local->slots[slot].state = SchedulerDispatchSlotState::READY;
     }
     EXPECT_FALSE(scheduler_complete_own_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 0));
@@ -406,21 +425,22 @@ TEST(HbgErrorIdentity, PureCompletionOverflowRetainsItsBlockAndDoesNotCountSucce
     ErrorFixture fixture;
     auto *local = fixture.locals[1];
     fixture.admissions[1].current_flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
+    fixture.storage.metadata[0].flags = fixture.admissions[1].current_flags;
+    fixture.storage.metadata[0].active_mask = LaneMask::aiv0();
     auto &slot = local->slots[1];
     slot.task_ref = 0;
     slot.block_idx = 3;
-    slot.cooperative = true;
     slot.state = SchedulerDispatchSlotState::EXECUTING;
     auto *controls =
         scheduler_state_at<SchedulerTaskControl>(fixture.base(), fixture.storage.layout.task_controls_offset);
-    scheduler_gm_store(controls[0].completed_blocks, UINT64_C(4));
+    scheduler_gm_store(controls[0].completion_state, scheduler_completion_initial_state(4) | UINT64_C(4));
     EXPECT_EQ(
-        scheduler_finish_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1),
-        SchedulerBlockFinishResult::ERROR
+        scheduler_contribute_subtask<false>(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, 1),
+        SchedulerSubtaskFinishResult::ERROR
     );
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 3, UINT64_MAX, 1, 1}));
     EXPECT_EQ(local->pending_completed, 0u);
-    EXPECT_EQ(scheduler_gm_fetch_add(controls[0].completed_blocks, UINT64_C(0)), 5u);
+    EXPECT_EQ(scheduler_completion_count(scheduler_gm_fetch_add(controls[0].completion_state, UINT64_C(0))), 5u);
 }
 
 TEST(HbgErrorIdentity, RetiredGroupKeepsItsLastIdentityOnlyWhileItBelongsToTheCurrentTask) {
@@ -477,6 +497,9 @@ TEST(HbgErrorIdentity, PublishedStatusAlwaysCarriesOneCoherentWinningIdentity) {
         while (ready.load(std::memory_order_acquire) != 2) {}
         go.store(true, std::memory_order_release);
         while (scheduler_read_error(fixture.run()) == 0) {}
+        const uint64_t status = scheduler_read_error(fixture.run());
+        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker)
+            EXPECT_EQ(scheduler_read_worker_error(fixture.run(), worker), status);
         const uint64_t task = __atomic_load_n(&fixture.run()->error_task_ref, __ATOMIC_RELAXED);
         const auto identity = read_identity(*fixture.run());
         a.join();

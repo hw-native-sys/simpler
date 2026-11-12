@@ -22,6 +22,85 @@ static_assert(
     "outlined resolver local arguments must not require over-aligned stack storage"
 );
 
+// The caller is the unique TaskDone owner. CSR storage is Host-validated and
+// immutable until the run fence; it contains no dynamically registered waiter.
+// This overload finishes synchronously and never exports a continuation.
+// Contribution or inline completion checks cancellation before TaskDone. This
+// same-call continuation shares that observation; long fanout refreshes it.
+static __aicore__ __attribute__((noinline)) bool scheduler_resolve_completion_step(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    int64_t producer_ref, const __gm__ SchedulerDependencyHeader &dependencies, uint64_t profiling_level,
+    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type
+) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarResolve, producer_ref);
+    const bool timing = scheduler_phase_timing_enabled(profiling_level);
+    const uint64_t start = timing ? scheduler_cycles() : 0;
+    auto fail = [&](SchedulerErrorSite site) __aicore__ {
+        scheduler_record_error(run, producer_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local, site);
+        return false;
+    };
+    const auto *offsets = scheduler_state_at<uint64_t>(base, dependencies.fanout_offsets_offset);
+    const uint64_t begin = offsets[producer_ref], end = offsets[producer_ref + 1];
+    if (begin > end || end > dependencies.edge_count || end - begin > dependencies.task_count)
+        return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+    const auto *refs = scheduler_state_at<int32_t>(base, dependencies.fanout_refs_offset);
+    auto *remaining = scheduler_state_at<uint64_t>(base, dependencies.remaining_offset);
+    // TaskDone and successor counters occupy different atomic lines. A credit
+    // may make the successor runnable on another core immediately.
+    if (begin != end) scheduler_cache_barrier();
+    SchedulerReadyPublication publication{};
+    auto flush = [&]() __aicore__ {
+        if (publication.count == 0) return true;
+        uint32_t retries = 0;
+        for (;;) {
+            const auto result = scheduler_ready_publication_step(graph, base, local, publication);
+            if (result == SchedulerReadyPublishResult::ERROR)
+                return fail(SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED);
+            if (result == SchedulerReadyPublishResult::DONE) break;
+            if (++retries % 32 == 0 && scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+        }
+        // Only refs[0, count) are live. The first append initializes routing.
+        publication.count = 0;
+        publication.phase = SchedulerReadyPublishPhase::COLLECTING;
+        return true;
+    };
+    for (uint64_t edge = begin; edge < end; ++edge) {
+        if (edge != begin && (edge - begin) % 32 == 0 && scheduler_read_worker_error(run, local->worker_id()) != 0)
+            return false;
+        const int64_t ref = refs[edge];
+        if (ref <= producer_ref || static_cast<uint64_t>(ref) >= dependencies.task_count)
+            return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+        const uint64_t previous = scheduler_gm_fetch_add(remaining[ref], UINT64_MAX);
+        if (previous == 0 || previous > static_cast<uint64_t>(ref))
+            return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+        if (previous != 1) continue;
+        auto appended =
+            scheduler_ready_publication_append(graph, base, local, ref, publication, direct_ready, direct_core_type);
+        if (appended == SchedulerReadyAppendResult::FULL) {
+            if (!flush()) return false;
+            appended = scheduler_ready_publication_append(
+                graph, base, local, ref, publication, direct_ready, direct_core_type
+            );
+        }
+        if (appended == SchedulerReadyAppendResult::DIRECT) continue;
+        if (appended != SchedulerReadyAppendResult::ADDED)
+            return fail(SchedulerErrorSite::COMPLETION_READY_APPEND_FAILED);
+        if (publication.count == SCHEDULER_READY_PUBLICATION_CAPACITY && !flush()) return false;
+    }
+    if (!flush()) return false;
+    if (timing) {
+        auto *control = scheduler_task_control_at(base, local, producer_ref);
+        // A synchronous CSR owner is the sole writer of this timing line.
+        // Host consumes it after all cores have acknowledged retirement.
+        control->completion_resolve_start_cycles = start;
+        control->completion_resolve_end_cycles = scheduler_cycles();
+        control->scheduler_worker_id = local->worker_id();
+        control->completion_resolve_loop_iter = local->profiling->loop_iter;
+        scheduler_publish_cache_line(&control->next_fanin_index);
+    }
+    return true;
+}
+
 // The producer is already DONE. This cursor owns its successor traversal until
 // every ready publication and direct handoff has finished. Returning
 // DONE does not itself contribute to the run's completion counter.
@@ -44,20 +123,24 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
     if (cursor.phase != SchedulerResolvePhase::START && cursor.producer_ref != producer_ref) return fail();
     if (cursor.phase == SchedulerResolvePhase::FAILED) return {SchedulerResolveResult::ERROR, 0};
     if (cursor.phase == SchedulerResolvePhase::DONE) return {SchedulerResolveResult::DONE, 0};
-    if (scheduler_read_error(run) != 0) {
+    if (scheduler_read_worker_error(run, local->worker_id()) != 0) {
         cursor.phase = SchedulerResolvePhase::FAILED;
         return {SchedulerResolveResult::ERROR, 0};
     }
     const auto *dependencies = scheduler_dependencies(base, local->config.ready_pool_offset);
     const bool timing = scheduler_phase_timing_enabled(profiling_level);
     if (timing && local->profiling == nullptr) return fail();
+    bool timing_line_acquired = false;
+    uint32_t next_error_check = 32;
     while (used < budget) {
-        // Check at successor and publication boundaries; local cursor-only
-        // transitions retain the error observation made at this slice's entry.
-        if ((cursor.phase == SchedulerResolvePhase::SELECT || cursor.phase == SchedulerResolvePhase::PUBLISH) &&
-            scheduler_read_error(run) != 0) {
-            cursor.phase = SchedulerResolvePhase::FAILED;
-            return {SchedulerResolveResult::ERROR, used};
+        // Entry observes cancellation. Long slices refresh it every bounded
+        // group of work units; local state transitions need no GM observation.
+        if (used >= next_error_check) {
+            if (scheduler_read_worker_error(run, local->worker_id()) != 0) {
+                cursor.phase = SchedulerResolvePhase::FAILED;
+                return {SchedulerResolveResult::ERROR, used};
+            }
+            next_error_check = used > UINT32_MAX - 32 ? UINT32_MAX : used + 32;
         }
         switch (cursor.phase) {
         case SchedulerResolvePhase::START: {
@@ -68,6 +151,7 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
                 return fail(SchedulerErrorSite::COMPLETION_TASK_NOT_DONE);
             if (timing) {
                 scheduler_observe_cache_line(&control->next_fanin_index);
+                timing_line_acquired = true;
                 control->completion_resolve_start_cycles = scheduler_cycles();
                 control->scheduler_worker_id = local->worker_id();
                 control->completion_resolve_loop_iter = local->profiling->loop_iter;
@@ -94,7 +178,9 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
                 }
                 if (timing) {
                     auto *control = scheduler_task_control_at(base, local, producer_ref);
-                    scheduler_observe_cache_line(&control->next_fanin_index);
+                    // Ownership cannot transfer within this invocation. A
+                    // resumed cursor acquires the preceding owner's line.
+                    if (!timing_line_acquired) scheduler_observe_cache_line(&control->next_fanin_index);
                     control->completion_resolve_end_cycles = scheduler_cycles();
                     scheduler_publish_cache_line(&control->next_fanin_index);
                 }
@@ -182,8 +268,10 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
                             SchedulerErrorSite::COMPLETION_INVALID_SHAPE, SchedulerGraphResult::UNSUPPORTED_SHAPE
                         );
                     const uint32_t type = scheduler_task_ready_queue(metadata.flags, lanes);
-                    if (!scheduler_task_is_mix(metadata.flags) && type == direct->core_type &&
-                        direct->ready != nullptr && scheduler_task_ref_is_null(direct->ready->task_ref)) {
+                    const bool direct_type =
+                        scheduler_task_is_mix(metadata.flags) ? local->admission != nullptr : type == direct->core_type;
+                    if (direct_type && direct->ready != nullptr &&
+                        scheduler_task_ref_is_null(direct->ready->task_ref)) {
                         direct->ready->task_ref = candidate;
                         direct->ready->source = SchedulerReadySource::DIRECT_RESOLVE;
                         direct->ready->publication_mode = SchedulerPublicationMode::REFILL;

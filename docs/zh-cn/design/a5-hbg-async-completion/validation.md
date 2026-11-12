@@ -18,15 +18,15 @@
 | lease 交接 | 旧版本 CAS 失败；同一记录同时至多一个 owner；交权前进度可见 |
 | 活动目录 | bit 0/63、重复置/清、同字并发不改邻位；合法 126 次邻位变化后仍可完成 |
 | 目录超界 | 超出一次性生命周期合同明确失败，不能跳过未完成发布后继续业务 |
-| P/R/closed 汇合 | 晚到登记、最后计算释放/最后 CHECK 任意次序；所有非零比例、零登记、skip、MIX 均不提前完成且只授予一次完成权 |
-| 计算释放顺序 | SPMD 每 block 的 trace 发布与 slot 释放先于 completed_blocks；MIX 收齐 release 后贡献，不能提前关闭计算 |
+| P/R/closed 汇合 | 晚到登记、最后物理子任务贡献/最后 CHECK 任意次序；所有非零比例、零登记、skip、MIX 均不提前完成且只授予一次完成权 |
+| 计算与资源收尾顺序 | 全部物理子任务返回并封口后才可关闭 computation；trace 先于 slot 复用、MIX release 和 EXIT ACK；双 AIV 的 inactive AIC 停在 ARRIVED 时仍能通过 EXIT drain 收尾，不能误执行业务 kernel |
 | 初始化前缀与预留后缀 | 保持 64 条容量；脏值填充后缀、只拷贝前缀、跨 run 复用仍正确；零登记不写后缀，首次 CHECK/FINISH 初始化完整，重复封口不能覆盖 OWNED |
 | 分离 header/token | 连续 header、token 对齐/范围/不重叠；旧合并长度被拒绝；真实 AsyncCtx 指针指向 token 区，登记和观察一致 |
 | run 活动门控 | 零登记跳过空扫描；异核首次发布在最多 16 个冷空闲服务机会内可见，业务返回和本核错误绕过延迟，实际消费者获取不抽样；未激活时仍传播错误，跨 run 重置 |
 | 长 fanin/fanout | 每一步受预算约束；长 fanin 扫描让出前已就绪前缀可被消费；跨核续接不丢失、不重复 waiter 或 ready 发布 |
 | 共用完成主体 | 普通完成直接处理到底并保留 direct refill/MIX 前缀；FINISH/Graph 以小预算续接；并发消费者恰好收到每个后继一次，错误前已发布前缀与未公开后缀边界明确 |
 | 责任移交 | waiter 挂到下一 producer 后立即被其改写，旧 FINISH 仍沿自己保存的旧链继续 |
-| resolve/退休 | TaskDone 可以早于 drain，run 完成及 backing 回收不能早于最后尾部 |
+| resolve/退休 | TaskDone 可以早于 drain，run 返回及 backing 回收不能早于全部资源与 trace 尾部 |
 | 服务点 | publication 持续 RETRY、cohort 汇合未完成、admission 失败、持续业务 ready 时各类服务仍可达 |
 
 CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于构造最坏合法交错，真实线程测试用于发现并发访问问题；不能只测试与实现同构的另一套计数器。
@@ -91,7 +91,7 @@ CPU 测试必须调用生产算法或生产 helper。可控原子适配器用于
 | -------- | ---- |
 | 普通单 lane | 非零、零登记、已经满足、实际延迟、1/64 条条件、多类型/多资源混合 |
 | SPMD | 超过并发容量的分波、不同 block 不同条件数、零登记与非零混合 |
-| MIX 3/5/6/7 | 同步 lane、零登记 lane 和 pending lane 混合；coordinator 每 block 只贡献一次计算释放 |
+| MIX 3/5/6/7 | 同步 lane、零登记 lane 和 pending lane 混合；每个 active lane 贡献一次物理完成，coordinator 资源退役不重复贡献 |
 | sync-start | 容量边界，取得许可后不插入检查；释放后的等待不扣住下一 cohort |
 | 单 lane predicate | skip 不发 DMA，预分配 group 仍结算；非法组合拒绝 |
 | Graph | 多实例、内外 fanin、多个 sink、不同实例相同 local id、普通任务交错 |

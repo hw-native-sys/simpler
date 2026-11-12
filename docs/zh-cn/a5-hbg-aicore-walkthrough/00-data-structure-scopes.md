@@ -141,7 +141,7 @@ flowchart TD
 | `SchedulerResolveProgress` | 一次resolve_step返回值 | 调用者私有 | DONE/YIELD/ERROR及本片work units | 当前调用返回值使用期间 |
 
 关闭一个 worker 的当前 admission 义务，不等于整个任务已经完成。
-该核可能已完成自己承担的部分并确认不再领取，而别的核还在运行；逻辑完成还需要全体 block 的 completed_blocks join。
+该核可能已完成自己承担的部分并确认不再领取，而别的核还在运行；逻辑完成需要全部实际子任务汇合；存在异步条件时还需等待 FINISH，MIX 资源退役不重复计数。
 
 ## native 图与异步完成
 

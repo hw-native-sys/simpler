@@ -59,15 +59,20 @@ task_window_last_index、scheduler_state_address、native_header_offset、schedu
 | 类型 | 大小 | cacheline 所有权 |
 | ---- | ---- | ---------------- |
 | SchedulerTaskControl | 384 B | state/claim tickets、resolver metadata、block cursor、completion、admission signal、claim seal 各一行 |
-| SchedulerWorkerContext | 384 B | 5 行 READY 发布的配置，1 行本核写回诊断 |
+| SchedulerWorkerContext | 320 B | 4 行 READY 发布的配置，1 行本核写回诊断 |
 | SchedulerTaskTrace | 320 B | publication header；kernel timing；dispatch/completion；refill/startup；execution identity，各一行 |
-| SchedulerRunControl | 448 B | 配置、生命周期原子、错误身份和独立错误 signal |
+| SchedulerRunControl | 7296 B | 384 B配置、生命周期原子及错误身份前缀，加108个独占cacheline的worker错误signal |
 | SchedulerTicketQueue | 128 B | head 和 reserved_tail 各一行；reserved_tail 是有效预留游标 |
+| SchedulerTicketEntry | 64 B | 每个 entry 的 task_ref 独占原子行，发布后本轮不覆盖 |
 | SchedulerGroupMailbox | 384 B | descriptor 128 B、publication 64 B、三个 lane ack 各 64 B |
 | SchedulerMixCloseSeal / SchedulerReadyInbox | 64 B | 每项独立原子行 |
 
 TaskControl 的 state、wake_list_head、next_waiter、claim_tickets、admission_claim_lock 共用原子行。
-next_block、completed_blocks 与 claim_seal 分别占用独立的 64 B 行，隔离并发领取、退休与领取结束观察。
+next_block、completion_state 与 claim_seal 分别占用独立的 64 B 行，隔离并发领取、退休与领取结束观察。
+completion_state 的低 16 位是实际子任务完成数，16–31 位是 Host 初始化的总子任务数，
+高 32 位是需要检查异步完成的保守票数。每次子任务完成通过同一次 RMW 更新完成数和票数，
+并从返回值取得总数；总子任务数不超过 INT16_MAX，合法贡献不会进位到总数字段。
+导出的 completed_subtasks 只取低 16 位。
 所有原子行禁止 cached 整行写回；resolver metadata 与 admission bypass signal 保持各自独立的写入区域。
 next_fanin_index、waiting_producer 和 resolver timing 在第二行；admission_state 单独 bypass 发布。
 等待链、MIX admission、sync_start、defer_wait 和可恢复 resolver 的状态均保留。
@@ -79,8 +84,9 @@ AdmissionRecord 为 64B，offset 40 的 `uint64_t member_rank_offset` 保存同�
 WorkerContext 的首行保存 core_type/physical_core_id/type_rank/is_scheduler，以及 run_control_offset、
 task_controls_offset、scheduler_state_base_address、dispatch_payload_offset、worker_index、worker_contexts_offset。
 启动 watchdog 与 peer route 校验只需观察这一行。第二行保存 graph view 与 graph_summary_offset；
-第三行是 dispatch/queue/kernel-entry offsets；第四行是 topology 与 AICPU lifecycle offset；
-第五行是 trace/activity/PMU offsets 与 args_dump_address。offset 320 开始的本核诊断行保存 bootstrap_task_count、
+第三行从 offset 128 开始，保存 metadata、kernel-entry table、worker 数量，以及 offset 160 开始的 scheduler/cluster 计数和索引；
+第四行从 offset 192 开始，保存 cluster_worker_ids、AICPU lifecycle offset、offset 224 开始的 trace/activity/PMU offsets 和 offset 248 的 args_dump_address。
+前四行是配置；offset 256 开始的第五行是本核诊断行，保存 bootstrap_task_count、
 bootstrap_start_cycles、target_bootstrap_end_cycles 和四个 trace 启动时间戳。
 未被读取的聚合统计不写入 GM；本地 completion ID 计数和退出时间戳仍参与调度控制。
 

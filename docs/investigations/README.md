@@ -84,6 +84,12 @@ that ...".
 
 Newest first.
 
+- [2026-11 — A5 HBG direct execution records](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#direct-executor-record) — reverted: direct slot trace writes combined with earlier successor retention did not establish a SWA L3 benefit; different devices limit the comparison.
+
+- [2026-11 — A5 HBG primitive record constant specialization](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#scalar-primitive-constants) — reverted: fewer instructions per wrapper did not establish a SWA L3 completion benefit; additional template instances increased total static code size. Cold build time was 337.925→402.551 s without controlling shared-host load.
+
+- [2026-11 — A5 HBG Scalar observer inlining](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#scalar-observer-inlining) — reverted: cold build grew from 257.749 s to 1031.377 s; three-round SWA L3 measurements did not establish a completion benefit, with different devices limiting the comparison.
+
 - [2026-11 — A5 HBG admission shortcuts](../zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md) — withdrawn: batched publication showed no established benefit; replacing claim-seal atomics with bypass stores lacks the required A5 hardware evidence despite passing selected functional tests.
 
 - [2026-11 — A5 HBG DSV4.1 scheduler review](../zh-cn/investigations/2026-11-a5-hbg-dsv-scheduler-review.md) — same-allocation commit comparisons isolate independent block dispatch as an Engram/SWA regression. Reviews the retained layout/build changes and restores cooperative SPMD scheduling.

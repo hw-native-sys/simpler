@@ -59,21 +59,21 @@ AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；�
 | ---- | ---------- | -------------- |
 | P、R 各加一 | 非零组封口者 | 必须先于 CHECK 发布及本次执行资源释放；closed 后禁止新增 |
 | P 减一 | 最终 CHECK owner | 条件全部满足、group 终态及目录清位后；旧值 P=1 且 closed 时获得 FINISH 激活权 |
-| 设置 closed | 真实计算汇合的最后贡献者 | 全部 block/lane 已封口、trace 已发布且执行资源已释放；旧值 P=0、R>0 时获得 FINISH 激活权 |
+| 设置 closed | 真实计算汇合的最后贡献者 | 全部物理子任务已返回并封口登记；trace 和 MIX 资源按各自收尾顺序完成；旧值 P=0、R>0 时获得 FINISH 激活权 |
 
 每次转换只使用一次 unsigned GM fetch-add，并根据它返回的旧值判断结果。错误状态使用既有 run 首错 latch；非法位、溢出、下溢或重复 close 不作算术补偿，也不能获得完成权。唯一执行及 lease 身份防止重复贡献，计数校验不能替代身份验证。
 
-计算释放复用原有调度汇合：单 lane SPMD 的 `completed_blocks` 贡献必须在该 block 的 trace 发布及 slot 释放之后；MIX coordinator 收齐各 lane release 后，每 block 只贡献一次。最后贡献者关闭计算。异步路径不再为每个 block 重复维护第二份释放计数。释放 slot 前保存稳定身份，不能从已清空的 slot 反查。
+计算汇合使用统一的物理子任务计数：每个实际执行 lane 在返回并封口登记后贡献一次 `completed_subtasks`，总数为 block 数乘 active lane 数。最后贡献者依据同次 RMW 中累计的保守异步票决定是否关闭 computation。贡献和后继解析可以先于执行 trace 发布；MIX coordinator 收齐资源 release 后只负责资源退役，不重复贡献逻辑完成。释放 slot 的业务绑定前保存稳定身份，不能从已清空的 slot 反查。
 
 P 暂时为零不证明计算结束，其他尚未返回的成员仍可能登记。只有设置 closed 或递减最后 P 的原子返回值授予 FINISH 激活权；普通读取只可验证已有 FINISH 的就绪条件，不能再激活。获权者先初始化完整 resolver 游标和 lease，再发布预分配 FINISH 的 RUNNABLE 和目录位后返回，FINISH 继续受预算约束。
 
-所有成员均零登记的普通、SPMD、MIX 或合法 skip task 沿用同步完成及本核后继路径，不创建 CHECK/FINISH 工作。非 ordered 路径只在真实最后计算返回后读取 R；R=0 时无需写 closed，保持原同步 resolve/refill 顺序。ordered 路径在 close 返回 P=R=0 时同步完成。不得在计算汇合前缓存 R=0；曾登记但条件已经满足的 task 仍进入 FINISH。全局完成数始终晚于最终 trace 和后继发布。
+所有成员均零登记的普通、SPMD、MIX 或合法 skip task 沿用同步完成及本核后继路径，不创建 CHECK/FINISH 工作。最后物理贡献的保守异步票为零时可跳过 join；票非零时检查实际 P/R 并按 close 结果完成或激活 FINISH。不得根据先返回成员的零登记或暂时 P=0 推断整个任务同步；曾登记但条件已经满足的 task 仍进入 FINISH。全局逻辑完成计数可以早于最终 trace 和 MIX 资源收尾，但存储回收必须等待全部 trace、资源义务和 EXIT 握手完成。
 
 ### 不同任务形状
 
-- **普通/SPMD：** 非零物理执行登记并结算自己的 P，每个 block 通过原有计算汇合释放；分波执行不要求同时驻留。
-- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。group 完成不代替 coordinator 的 block 释放贡献，也不长期占用 MIX mailbox 或 cohort。保留既有 active lane 汇合，不因延迟完成新增消费准备 ack。
-- **sync-start：** 启动许可继续约束原计算 cohort。条件等待发生在执行资源释放后；已取得执行许可的核不得夹入 CHECK/FINISH。若特定读取路径确需额外本核获取，按[消费者可见性](consumer-preparation.md)在最终许可前完成，不将其作为所有任务的固定阶段。
+- **普通/SPMD：** 非零物理执行登记并结算自己的 P，每个实际执行通过统一计数参与计算汇合；分波执行不要求同时驻留。
+- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。条件 group 完成不代替物理子任务完成或 coordinator 的资源退役，也不长期占用 MIX mailbox 或 cohort。inactive AIC 仍须发布资源 release；正常 EXIT drain 可补齐已到达的 inactive coordinator，不能执行尚未返回的业务 kernel。
+- **sync-start：** 启动许可继续约束原计算 cohort。条件未满足不会长期占用已返回执行的资源；已取得执行许可的核不得夹入 CHECK/FINISH。若特定读取路径确需额外本核获取，按[消费者可见性](consumer-preparation.md)在最终许可前完成，不将其作为所有任务的固定阶段。
 - **predicate skip：** 合法 skip 走 runtime 封口和执行资源释放尾部；业务 kernel 未调用时不创建 pending 责任。
 - **Graph：** 每个实例的 child 使用独立 group/join。child 的 TaskDone 通过原 body→EXIT 依赖推进，ENTER/EXIT 本身不分配执行 group。未激活 child 仍保留责任；不能把未执行当成取消。
 
@@ -138,7 +138,7 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 
 每核用独立 CHECK/FINISH 游标轮换选择一种服务；一个循环最多领取一条记录，普通工作总额度为 8。有业务可执行时，累计最多 4 次执行返回后在最终 admission 之前服务；没有可执行 slot 或仍有 ready 发布积压时，每轮经过一次服务门。最后一个不满 64 位的目录字扫描结束后，游标回到 bit 0；不能对总记录数取模后跳过前面的低位。
 
-返回核封口时保留自己的 dirty 发布区，直接检查并写回 count/token；失效该区会丢弃刚登记的条件。其他核取得 lease 后再观察已发布的区和进度。MIX 的 B 贡献晚于所有 lane release ACK 和本地 cohort 重置，普通/SPMD 的 B 贡献晚于 slot 释放及最终 trace 发布。
+返回核封口时保留自己的 dirty 发布区，直接检查并写回 count/token；失效该区会丢弃刚登记的条件。其他核取得 lease 后再观察已发布的区和进度。物理完成贡献晚于本次执行封口登记，不要求其他 lane 的资源 release 或最终 trace 已发布。每核的 trace 发布仍先于自己的 slot 复用、MIX release 和 EXIT ACK；coordinator 收齐 release 后退役资源。
 
 CAS 失败立即返回正常服务，不等待某个 owner，不 sleep，也不给某记录设置固定重试时间。持续 PENDING、扫描与碰撞不刷新进展 watchdog；真实登记完成、条件推进、执行释放和后继发布才属于协议进展。
 

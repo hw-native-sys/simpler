@@ -854,7 +854,7 @@ TEST(SchedulerDispatch, ReadySlotRemainsBoundWhenAnotherSlotRejectsZeroCallable)
 
     storage.callable_addresses[1] = 0;
     storage.run_control->error_claimed = 0;
-    storage.run_control->scheduler_error = 0;
+    scheduler_publish_error(storage.run_control, 0);
     slot_claim.slot_index = 1;
     ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(

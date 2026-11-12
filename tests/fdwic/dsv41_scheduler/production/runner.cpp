@@ -179,7 +179,7 @@ int run(int argc, char **argv) {
         setenv("DSV41_LAST_TASK", last.c_str(), 1);
         setenv("DSV41_PLAN_PATH", (bundle / ("plan-rank" + std::to_string(rank) + ".bin")).c_str(), 1);
     }
-    if ((level != 0 && level != 1 && level != 3) || warmup < 0 || rounds < 1) {
+    if (level < 0 || level > 4 || warmup < 0 || rounds < 1) {
         throw std::runtime_error("Invalid profiling level or iteration count");
     }
     fs::create_directories(output / "host");
@@ -375,7 +375,8 @@ int run(int argc, char **argv) {
             if (!snapshot) launch(1, 0, "prefix" + std::to_string(iteration));
             if (materialize && rank == 0 && iteration == 0) save_inputs();
         }
-        int profiling = iteration < warmup ? 0 : level;
+        // A single-level run warms the same collection path that it measures.
+        int profiling = level;
         if (all_levels && iteration >= warmup + rounds) profiling = iteration == warmup + rounds ? 1 : 3;
         const auto mode = launch(2, profiling, "run" + std::to_string(iteration));
         if (sliced) check_reference();

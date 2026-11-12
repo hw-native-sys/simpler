@@ -224,8 +224,9 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     controls = {control["task_ref"]: control for control in control_rows}
     assert len(controls) == len(control_rows) == len(protocol["tasks"])
     assert set(controls) == {task["task_ref"] for task in protocol["tasks"]}
-    assert controls[root["task_ref"]]["completed_blocks"] < blocks
-    assert controls[consumer["task_ref"]]["completed_blocks"] == 0
+    total_subtasks = blocks * root["active_mask"].bit_count()
+    assert controls[root["task_ref"]]["completed_subtasks"] < total_subtasks
+    assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
     positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
     version = protocol_version(protocol)
     assert version in (10, 11)
