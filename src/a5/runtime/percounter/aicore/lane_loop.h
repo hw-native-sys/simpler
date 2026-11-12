@@ -1796,7 +1796,13 @@ inline __aicore__ void percounter_flush_done(const LaneConfig &cfg, PercounterLa
  */
 inline __aicore__ void
 percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles) {
-    if (cfg.mix_order_count == 0 && cfg.sync_cohort_count == 0) return;
+    // **A deferred group keeps its lane here too**, and not only on a graph
+    // with MIX or cohort work. The lane that owes a completion is the only one
+    // that can make it, so leaving with one outstanding strands the task's
+    // consumers on a counter nobody will ever raise. This is the loop that
+    // consults `percounter_lane_may_exit`, which is where the device-wide
+    // outstanding count gates the exit.
+    if (cfg.mix_order_count == 0 && cfg.sync_cohort_count == 0 && state->async_outstanding_hint == 0) return;
     // Restarted whenever this lane serves, and whenever the device completes a
     // rendezvous or a cohort block. What this lane waits for is device-wide, so
     // its own idleness is not evidence of a stall: a long task on another
