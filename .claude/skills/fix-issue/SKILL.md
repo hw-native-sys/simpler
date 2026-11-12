@@ -57,6 +57,10 @@ Follow `CLAUDE.md` and applicable rules. Use an isolated branch/worktree based o
 current `$BASE_REF`, or resume the established task branch. Inspect worktrees before
 creating or switching branches; never reset a branch another writer holds.
 
+For a defect whose cause is not already established, work through the
+[diagnosis loop](references/diagnosis.md) before changing code; it produces the
+failing repro, the cause and the regression test at the correct seam.
+
 Reproduce defects where practical, make the bounded change and use
 [testing](../testing/SKILL.md) for appropriate checks. Keep one meaningful delivery
 per PR; do not split one owner's work into trivial child Issues or PRs to populate

@@ -207,6 +207,9 @@ git fetch upstream                        # $BASE_REF is a remote-tracking ref โ
 git rebase "$BASE_REF"                    # see [commit-and-push](../../lib/github/commit-and-push.md) ยง1
 ```
 
+If the rebase stops with conflicts, resolve them with the
+[merge-conflict procedure](references/merge-conflicts.md) before continuing.
+
 **Fix:**
 
 1. Read affected files, make changes with Edit tool
