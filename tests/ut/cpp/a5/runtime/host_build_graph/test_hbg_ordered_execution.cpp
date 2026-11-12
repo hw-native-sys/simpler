@@ -61,7 +61,6 @@ struct OrderedExecution {
     uint32_t blocks{0};
     uint32_t worker{0};
     uint32_t slot{0};
-    uint32_t generation{0};
     uint64_t function{0};
 };
 
@@ -149,7 +148,7 @@ struct OrderedFixture {
     }
     bool fill(uint32_t worker, uint64_t profiling = 0) {
         bool failed = false;
-        scheduler_fill_own_slots(graph.graph(), base(), locals[worker], run(), profiling, 0, &failed);
+        scheduler_fill_own_slots(graph.graph(), base(), locals[worker], run(), profiling, &failed);
         return !failed;
     }
     std::vector<uint32_t> members(uint64_t task) {
@@ -180,22 +179,16 @@ struct OrderedFixture {
         SchedulerReadyClaim ready{};
         ready.task_ref = local->slots[slot].task_ref;
         ready.source = SchedulerReadySource::COOPERATIVE;
-        return scheduler_fill_dispatch_slot(
-            graph.graph(), base(), local, run(), {worker, slot, local->slots[slot].generation, local->config.self_lane},
-            ready, 0
-        );
+        return scheduler_fill_dispatch_slot(graph.graph(), base(), local, run(), {slot}, ready, 0);
     }
     bool begin(uint32_t worker, OrderedExecution *execution) {
         auto *local = locals[worker];
         uint32_t slot = UINT32_MAX;
-        uint64_t publication = 0;
-        if (!scheduler_local_ready_pop(local, &slot, &publication)) return false;
+        if (!scheduler_local_ready_peek(local, &slot)) return false;
         bool permit = false;
         if (!scheduler_ordered_can_enter_slot(graph.graph(), base(), local, run(), slot, &permit)) return false;
-        if (!permit) {
-            local->local_ready_mask |= static_cast<uint8_t>(1U << slot);
-            return false;
-        }
+        if (!permit) return false;
+        if (!scheduler_local_ready_execute(local, slot)) return false;
         auto *payload =
             scheduler_state_at<DispatchPayload>(base(), local->dispatch_payload_offset(local->config.self_lane, slot));
         if (scheduler_protocol_enabled(local)) scheduler_execute_protocol_task(base(), local, slot, payload);
@@ -205,16 +198,13 @@ struct OrderedFixture {
             static_cast<uint32_t>(payload->local_context.block_num),
             worker,
             slot,
-            scheduler_dispatch_generation(publication),
             payload->function_bin_addr
         };
         return true;
     }
     bool complete(const OrderedExecution &execution) {
         auto *local = locals[execution.worker];
-        local->local_completed_generations[execution.slot] = execution.generation;
-        uint64_t refilled = 0;
-        return scheduler_service_cluster_completions(graph.graph(), base(), local, run(), 0, &refilled);
+        return scheduler_complete_own_slot(graph.graph(), base(), local, run(), execution.slot, 0);
     }
     bool close(uint32_t worker, bool *closed) {
         return scheduler_close_ordered_obligation(graph.graph(), base(), locals[worker], run(), closed);
@@ -297,7 +287,7 @@ TEST(HbgOrderedScalarDetail, EmptyPollStillRecordsItsEarlyReturn) {
     trace.window_start = scheduler_cycles();
     bool failed = false;
     EXPECT_FALSE(
-        scheduler_fill_own_slots(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, 0, &failed)
+        scheduler_fill_own_slots(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &failed)
     );
     EXPECT_FALSE(failed);
     EXPECT_EQ(trace.depth, 0u);
@@ -441,14 +431,16 @@ TEST_P(HbgOrderedFirstReady, ReadySecondSlotRunsBeforeTheFreeFirstSlotIsRefilled
     auto *local = fixture.locals[worker];
     ASSERT_TRUE(fixture.admit(0, worker));
     ASSERT_TRUE(fixture.stage_one(worker, 1));
-    const uint32_t generation = local->slots[1].generation;
+    const auto staged = local->slots[1];
     for (uint32_t poll = 0; poll < 8; ++poll) {
         ASSERT_TRUE(fixture.fill(worker));
         EXPECT_EQ(fixture.control(0)->claim_tickets, 1u);
         EXPECT_EQ(fixture.control(0)->next_block, 1u);
         EXPECT_EQ(local->local_ready_mask, 2u);
         EXPECT_EQ(local->slots[0].state, SchedulerDispatchSlotState::FREE);
-        EXPECT_EQ(local->slots[1].generation, generation);
+        EXPECT_EQ(local->slots[1].task_ref, staged.task_ref);
+        EXPECT_EQ(local->slots[1].block_idx, staged.block_idx);
+        EXPECT_EQ(local->ready_head, 1u);
     }
     OrderedExecution execution{};
     ASSERT_TRUE(fixture.begin(worker, &execution));
@@ -594,7 +586,7 @@ TEST_P(HbgOrderedExhaustionSafety, ExhaustionCannotCloseAnActiveSlotWithItsReady
     OrderedExecution execution{};
     ASSERT_TRUE(fixture.begin(worker, &execution));
     ASSERT_EQ(fixture.locals[worker]->local_ready_mask, 0u);
-    ASSERT_EQ(fixture.locals[worker]->slots[1].state, SchedulerDispatchSlotState::READY);
+    ASSERT_EQ(fixture.locals[worker]->slots[1].state, SchedulerDispatchSlotState::EXECUTING);
     ASSERT_TRUE(fixture.fill(worker));
     EXPECT_EQ(fixture.admissions[worker].current_task_ref, 0);
     EXPECT_EQ(fixture.admissions[worker].scan_cursor, 0u);
@@ -890,10 +882,6 @@ TEST(HbgOrderedExecution, PartialCompletionDoesNotReleaseFaninAndLastGenerationR
     EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(scheduler_gm_load(fixture.control(0)->wake_list_head), SCHEDULER_WAKE_LIST_CLOSED);
     EXPECT_EQ(fixture.locals[0]->pending_completed, 1u);
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
-        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, slow.slot, slow.generation, 0,
-        nullptr, nullptr
-    ));
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 3u);
     EXPECT_EQ(fixture.locals[0]->pending_completed, 1u);
     uint32_t retained = 0;
@@ -906,6 +894,10 @@ TEST(HbgOrderedExecution, PartialCompletionDoesNotReleaseFaninAndLastGenerationR
     ASSERT_TRUE(fixture.begin(0, &successor));
     EXPECT_EQ(successor.task, 1);
     ASSERT_TRUE(fixture.complete(successor));
+    EXPECT_EQ(fixture.locals[0]->pending_completed, 2u);
+    EXPECT_FALSE(scheduler_complete_own_slot(
+        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), successor.slot, 0
+    ));
     EXPECT_EQ(fixture.locals[0]->pending_completed, 2u);
 }
 
@@ -1000,9 +992,7 @@ TEST_P(HbgOrderedAdmissionProgress, BoundedRetirementReportsProgressAndCaughtUpP
     ASSERT_EQ(fixture.admissions[late_worker].scan_cursor, 0u);
     const auto fill_slots = record_protocol ? scheduler_fill_own_slots<true> : scheduler_fill_own_slots<false>;
     auto fill = [&](bool *failed) {
-        return fill_slots(
-            fixture.graph.graph(), fixture.base(), fixture.locals[late_worker], fixture.run(), 0, 0, failed
-        );
+        return fill_slots(fixture.graph.graph(), fixture.base(), fixture.locals[late_worker], fixture.run(), 0, failed);
     };
     bool failed = false;
     EXPECT_TRUE(fill(&failed));
@@ -1177,12 +1167,10 @@ TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePre
     }
     ASSERT_TRUE(fixture.fill(0));
     ASSERT_EQ(fixture.locals[0]->local_ready_mask, 3u);
-
-    std::array<uint32_t, 2> old_generations{};
     for (uint32_t slot = 0; slot < 2; ++slot) {
         EXPECT_FALSE(fixture.locals[0]->slots[slot].cooperative);
         EXPECT_NE(fixture.locals[0]->slots[slot].predicate, SchedulerPredicateState::UNEVALUATED);
-        old_generations[slot] = fixture.locals[0]->slots[slot].generation;
+        EXPECT_EQ(events[slot].publication_count, 1u);
     }
     ASSERT_TRUE(fixture.admit(2, 3));
     OrderedExecution denied{};
@@ -1229,7 +1217,7 @@ TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePre
         ASSERT_LT(ordinary.task, 2);
         ++resumed[ordinary.task];
         EXPECT_EQ(ordinary.function != 0, ordinary.task == 0);
-        EXPECT_GT(ordinary.generation, old_generations[ordinary.slot]);
+        EXPECT_EQ(events[ordinary.task].publication_count, 2u);
         ASSERT_TRUE(fixture.complete(ordinary));
     }
     EXPECT_EQ(resumed, (std::array<uint32_t, 2>{1, 1}));
@@ -2018,10 +2006,9 @@ TEST(HbgOrderedProtocol, EachBlockPublishesItsTraceBeforeContributingCompletion)
         OrderedExecution execution;
         ASSERT_TRUE(fixture.begin(worker, &execution));
         auto *local = fixture.locals[worker];
-        ASSERT_TRUE(scheduler_service_cluster_completion_slot(
-            fixture.graph.graph(), fixture.base(), local, fixture.run(), local->config.self_lane, execution.slot,
-            execution.generation, 4, nullptr, nullptr
-        ));
+        ASSERT_TRUE(
+            scheduler_complete_own_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), execution.slot, 4)
+        );
         const auto *blocks = scheduler_state_at<SchedulerProtocolBlockTrace>(
             fixture.base(), fixture.storage.layout.protocol.blocks_offset
         );
@@ -2165,13 +2152,13 @@ TEST(HbgOrderedProtocol, AdmissionAfterAnOrdinaryPermitCannotRewriteItsObservedT
     ASSERT_TRUE(fixture.fill(0));
     auto *local = fixture.locals[0];
     uint32_t slot = UINT32_MAX;
-    uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(local, &slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_peek(local, &slot));
     bool permit = false;
     ASSERT_TRUE(
         scheduler_ordered_can_enter_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, &permit)
     );
     ASSERT_TRUE(permit);
+    ASSERT_TRUE(scheduler_local_ready_execute(local, slot));
     ASSERT_TRUE(fixture.admit(1, 3));
     const auto *shared =
         scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), fixture.storage.layout.admission_control_offset);
@@ -2185,9 +2172,7 @@ TEST(HbgOrderedProtocol, AdmissionAfterAnOrdinaryPermitCannotRewriteItsObservedT
     EXPECT_NE(events[0].flags & SCHEDULER_PROTOCOL_PERMIT_TAIL, 0u);
     EXPECT_GT(events[0].entry.sequence, events[0].permit.sequence);
     EXPECT_GT(events[0].returned.sequence, events[0].entry.sequence);
-    OrderedExecution execution{
-        0, 0, 1, 0, slot, scheduler_dispatch_generation(publication), payload->function_bin_addr
-    };
+    OrderedExecution execution{0, 0, 1, 0, slot, payload->function_bin_addr};
     ASSERT_TRUE(fixture.complete(execution));
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(1)->completed_blocks, UINT64_C(0)), 0u);
     const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
@@ -2245,7 +2230,7 @@ TEST(HbgOrderedProtocol, ConsumedPermitPreventsPayloadSnapshotFromBeingReplaced)
     const auto first = events[0];
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{0, execution.slot, execution.generation, 0};
+    SchedulerFreeSlotClaim claim{execution.slot};
     scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
     EXPECT_EQ(events[0].publication_count, first.publication_count);
     EXPECT_EQ(events[0].publication_before_cycles, first.publication_before_cycles);
@@ -2263,7 +2248,7 @@ TEST(HbgOrderedProtocol, FinishedWorkerCannotPublishEvenAnUnsequencedPayloadSnap
     scheduler_protocol_finish(fixture.base(), local, true);
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{0, 0, 0, 0};
+    SchedulerFreeSlotClaim claim{0};
     scheduler_protocol_payload_publication(fixture.base(), local, claim, ready, true);
     const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
         fixture.base(), fixture.storage.layout.protocol.executions_offset
@@ -2285,13 +2270,12 @@ TEST(HbgOrderedProtocol, CooperativePayloadCannotBeRepublishedBeforeItsFirstPerm
     );
     ASSERT_EQ(events[0].permit.sequence, 0u);
     const auto first = events[0];
-    ++fixture.locals[0]->slots[0].generation;
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{0, 0, fixture.locals[0]->slots[0].generation, 0};
+    SchedulerFreeSlotClaim claim{0};
     scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
     EXPECT_EQ(events[0].publication_count, first.publication_count);
-    EXPECT_EQ(events[0].generation, first.generation);
+    EXPECT_EQ(events[0].pending_slot, first.pending_slot);
     const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
         fixture.base(), fixture.storage.layout.protocol.workers_offset
     );

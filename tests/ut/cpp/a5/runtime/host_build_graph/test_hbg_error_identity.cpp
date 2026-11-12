@@ -253,7 +253,7 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_FALSE(scheduler_prepare_dispatch_slot(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1, 1, 0, 1}, ready, metadata, 0, 1
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1}, ready, metadata, 0, 1
     ));
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
@@ -380,13 +380,13 @@ TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimin
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_FALSE(scheduler_prepare_dispatch_slot(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1, 0, 0, 1}, ready, metadata, 0, 1
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, metadata, 0, 1
     ));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{UINT64_MAX, UINT64_MAX, 0, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 52u);
 }
 
-TEST(HbgErrorIdentity, PureGenerationMismatchNamesTheCompletedSlotWithoutGuessingFromTheOtherSlot) {
+TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheOtherSlot) {
     ErrorFixture fixture;
     auto *local = fixture.locals[1];
     fixture.admissions[1].current_flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
@@ -395,11 +395,8 @@ TEST(HbgErrorIdentity, PureGenerationMismatchNamesTheCompletedSlotWithoutGuessin
         local->slots[slot].block_idx = slot + 1;
         local->slots[slot].cooperative = true;
         local->slots[slot].state = SchedulerDispatchSlotState::READY;
-        local->slots[slot].generation = 3;
     }
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 1, 4, 0, nullptr, nullptr
-    ));
+    EXPECT_FALSE(scheduler_complete_own_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 0));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 55u);
     EXPECT_EQ(local->pending_completed, 0u);
@@ -413,7 +410,7 @@ TEST(HbgErrorIdentity, PureCompletionOverflowRetainsItsBlockAndDoesNotCountSucce
     slot.task_ref = 0;
     slot.block_idx = 3;
     slot.cooperative = true;
-    slot.state = SchedulerDispatchSlotState::READY;
+    slot.state = SchedulerDispatchSlotState::EXECUTING;
     auto *controls =
         scheduler_state_at<SchedulerTaskControl>(fixture.base(), fixture.storage.layout.task_controls_offset);
     scheduler_gm_store(controls[0].completed_blocks, UINT64_C(4));
@@ -423,6 +420,7 @@ TEST(HbgErrorIdentity, PureCompletionOverflowRetainsItsBlockAndDoesNotCountSucce
     );
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 3, UINT64_MAX, 1, 1}));
     EXPECT_EQ(local->pending_completed, 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(controls[0].completed_blocks, UINT64_C(0)), 5u);
 }
 
 TEST(HbgErrorIdentity, RetiredGroupKeepsItsLastIdentityOnlyWhileItBelongsToTheCurrentTask) {

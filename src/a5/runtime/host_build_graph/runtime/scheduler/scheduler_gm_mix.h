@@ -151,7 +151,6 @@ static inline __aicore__ bool scheduler_gm_mix_close(
     group.task_last_seq = 0;
     group.slot_index = UINT8_MAX;
     group.subtask_slot = UINT8_MAX;
-    group.slot_generation = 0;
     *closed = true;
     return true;
 }
@@ -190,7 +189,6 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
     ++group.group_seq;
     group.phase = SchedulerGmMixPhase::CLAIMED;
     group.slot_index = UINT8_MAX;
-    group.slot_generation = 0;
     group.subtask_slot = UINT8_MAX;
     return SchedulerBlockClaimResult::CLAIMED;
 }
@@ -299,7 +297,6 @@ static inline __aicore__ bool scheduler_gm_mix_observe(
     group.block_idx = descriptor->block_idx;
     group.subtask_slot = descriptor->lane_subtasks[local->config.self_lane];
     group.slot_index = UINT8_MAX;
-    group.slot_generation = 0;
     group.phase = SchedulerGmMixPhase::PUBLISHED;
     if constexpr (RecordProtocol) scheduler_protocol_group_descriptor(base, local, descriptor);
     *progress = true;
@@ -403,7 +400,7 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
         SchedulerReadyClaim ready{};
         ready.task_ref = admission.current_task_ref;
         ready.source = SchedulerReadySource::COOPERATIVE;
-        const SchedulerFreeSlotClaim claim{local->worker_id(), index, slot.generation, local->config.self_lane};
+        const SchedulerFreeSlotClaim claim{index};
         const auto metadata = scheduler_load_dispatch_metadata(base, local, ready.task_ref, profiling_level);
         uint64_t prepare_start = 0;
         if (!scheduler_prepare_dispatch_slot(
@@ -416,7 +413,6 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
             base, local, claim, ready, metadata, profiling_level, group.subtask_slot, prepare_start
         );
         group.slot_index = static_cast<uint8_t>(index);
-        group.slot_generation = slot.generation;
         group.phase = SchedulerGmMixPhase::RUNNING;
         *progress = true;
         return true;
@@ -424,20 +420,22 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     return true;
 }
 
-// Completion owns the generation check. Both slot retirement and trace
-// publication precede this release operation.
+// The completion snapshot names the released execution. Slot retirement and
+// trace publication precede this release operation.
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_gm_mix_release_lane(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t task_ref, uint32_t slot_index, uint32_t generation
+    const SchedulerLocalSlotState &completed, uint32_t slot_index
 ) {
     if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return false;
     auto &admission = *local->admission;
     auto &group = admission.gm_mix;
+    const int64_t task_ref = completed.task_ref;
     if (group.phase != SchedulerGmMixPhase::RUNNING || task_ref != admission.current_task_ref ||
         slot_index >= SCHEDULER_PENDING_SLOT_COUNT || group.slot_index != slot_index ||
-        group.slot_generation != generation || generation == 0 ||
-        local->slots[slot_index].state != SchedulerDispatchSlotState::FREE)
+        completed.state != SchedulerDispatchSlotState::EXECUTING || !completed.cooperative || !completed.gm_mix ||
+        group.block_idx != completed.block_idx || group.subtask_slot != completed.subtask_slot ||
+        group.group_seq == 0 || local->slots[slot_index].state != SchedulerDispatchSlotState::FREE)
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
     return true;
@@ -463,7 +461,6 @@ static inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
     if (finished == SchedulerBlockFinishResult::ERROR) return SchedulerGmMixResult::ERROR;
     group.phase = SchedulerGmMixPhase::IDLE;
     group.slot_index = UINT8_MAX;
-    group.slot_generation = 0;
     group.subtask_slot = UINT8_MAX;
     return finished == SchedulerBlockFinishResult::TASK_LAST ? SchedulerGmMixResult::TASK_LAST :
                                                                SchedulerGmMixResult::PROGRESS;

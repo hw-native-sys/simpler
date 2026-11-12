@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "inner_kernel.h"
+
 #include <gtest/gtest.h>
 
 #include <iterator>
@@ -24,6 +26,7 @@
 #include "scheduler/scheduler_dispatch.h"
 #include "runtime_types.h"
 #include "hbg_scheduler_test_support.h"
+#include "hbg_gm_mix_test_support.h"
 
 namespace {
 
@@ -95,7 +98,6 @@ void occupy_normal_slot(
     local_slot.task_ref = task_ref;
     local_slot.subtask_slot = 1;
     local_slot.state = SchedulerDispatchSlotState::READY;
-    local_slot.generation = ++storage.scheduler_local_state.dispatch_sequence;
     scheduler_local_ready_publish(&storage.scheduler_local_state, pending_slot);
 }
 
@@ -113,24 +115,22 @@ SchedulerLocalSlotState *prepare_completed_normal_slot(FixtureStorage &storage, 
     scheduler_initialize_free_slot(&local_slot);
     local_slot.task_ref = 0;
     local_slot.subtask_slot = 0;
-    local_slot.state = SchedulerDispatchSlotState::READY;
-    local_slot.generation = ++storage.scheduler_local_state.dispatch_sequence;
-    storage.scheduler_local_state.local_completed_generations[0] = local_slot.generation;
+    local_slot.state = SchedulerDispatchSlotState::EXECUTING;
     auto *control = scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0);
     control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
     return &local_slot;
 }
 
-TEST(SchedulerLocalCompletion, TracksConsumedGenerationsPerSlot) {
-    SchedulerLocalState scheduler_local_state{};
-    EXPECT_FALSE(scheduler_completion_generation_is_new(&scheduler_local_state, 0, 0, 0));
-    EXPECT_TRUE(scheduler_completion_generation_is_new(&scheduler_local_state, 0, 0, 1));
-    scheduler_mark_completion_consumed(&scheduler_local_state, 0, 0, 1);
-    EXPECT_FALSE(scheduler_completion_generation_is_new(&scheduler_local_state, 0, 0, 1));
-    EXPECT_TRUE(scheduler_completion_generation_is_new(&scheduler_local_state, 0, 0, 2));
-    EXPECT_TRUE(scheduler_completion_generation_is_new(&scheduler_local_state, 0, 1, 1));
-    scheduler_mark_completion_consumed(&scheduler_local_state, 0, 1, UINT32_MAX);
-    EXPECT_TRUE(scheduler_completion_generation_is_new(&scheduler_local_state, 0, 1, 1));
+TEST(SchedulerSlotCompletion, InitializationDoesNotPublishAnExecutableSlot) {
+    SchedulerLocalState local{};
+    EXPECT_EQ(local.slots[0].state, SchedulerDispatchSlotState::EMPTY);
+    for (auto &slot : local.slots)
+        scheduler_initialize_free_slot(&slot);
+    uint32_t slot = UINT32_MAX;
+    EXPECT_FALSE(scheduler_local_ready_peek(&local, &slot));
+    EXPECT_FALSE(scheduler_local_ready_execute(&local, 0));
+    EXPECT_EQ(local.slots[0].state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(local.slots[1].state, SchedulerDispatchSlotState::FREE);
 }
 
 TEST(SchedulerClusterCompletion, AccumulatesBatchOnSuccessAndBothKindsOfErrorExit) {
@@ -145,26 +145,27 @@ TEST(SchedulerClusterCompletion, AccumulatesBatchOnSuccessAndBothKindsOfErrorExi
         scheduler_initialize_free_slot(&second);
         second.task_ref = 1;
         second.subtask_slot = 0;
-        second.state = SchedulerDispatchSlotState::READY;
-        second.generation = ++storage.scheduler_local_state.dispatch_sequence;
+        second.state = failure == 2 ? SchedulerDispatchSlotState::READY : SchedulerDispatchSlotState::EXECUTING;
         auto *control =
             scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 1);
         if (failure == 1) control->wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
-        storage.scheduler_local_state.local_completed_generations[1] = second.generation + (failure == 2 ? 1 : 0);
+        ASSERT_TRUE(scheduler_complete_own_slot(
+            graph.graph(), storage.scheduler_state->base(),
+            storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0
+        ));
         EXPECT_EQ(
-            scheduler_service_cluster_completions(
+            scheduler_complete_own_slot(
                 graph.graph(), storage.scheduler_state->base(),
-                storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, nullptr
+                storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 1, 0
             ),
             failure == 0
         );
         EXPECT_EQ(storage.scheduler_local_state.pending_completed, failure == 2 ? 1u : 2u);
         EXPECT_EQ(storage.run_control->scheduler_error == 0, failure == 0);
-        EXPECT_EQ(scheduler_consumed_completion_generation(&storage.scheduler_local_state, 0, 0), 1u);
     }
 }
 
-TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
+TEST(SchedulerClusterCompletion, ExecutingSlotCompletesNormalTask) {
     FixtureStorage storage(1, 3);
     GraphBuffer graph(1);
     graph.executable(0, 0);
@@ -181,30 +182,27 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     slot->task_ref = 0;
     local_slot->task_ref = 0;
     local_slot->subtask_slot = 0;
-    storage.scheduler_local_state.set_timing_slot(0, 0, 0);
-    local_slot->state = SchedulerDispatchSlotState::READY;
-    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequence;
+    storage.scheduler_local_state.set_timing_slot(0, 0);
+    local_slot->state = SchedulerDispatchSlotState::EXECUTING;
+    // A core's own slot keeps its executor trace and its completion in local
+    // state; neither crosses the cluster's SSBUF.
     auto *executor_trace = &storage.scheduler_local_state.profiling->executor_traces[0];
     executor_trace->kernel_start_cycles = 100;
     executor_trace->kernel_end_cycles = 200;
     storage.metadata[0].timing_slot = 0;
-    storage.scheduler_local_state.local_completed_generations[0] = local_slot->generation;
     auto *control = scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0);
     control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
-
-    ASSERT_TRUE(scheduler_service_cluster_completions(
+    ASSERT_TRUE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, nullptr
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0
     ));
-    // The generation is consumed from local state, and the slot is released.
-    EXPECT_EQ(scheduler_consumed_completion_generation(&storage.scheduler_local_state, 0, 0), slot->generation);
     EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::FREE);
     EXPECT_EQ(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
-    EXPECT_FALSE(scheduler_service_cluster_completions(
+    EXPECT_FALSE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, nullptr
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0
     ));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     auto *traces =
@@ -227,18 +225,16 @@ TEST(SchedulerClusterCompletion, UnprofiledSelfHandoffNeedsNoProfilingStorage) {
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control,
-        SchedulerFreeSlotClaim{1, 0, slot.generation, 1}, ready, 0
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, SchedulerFreeSlotClaim{0}, ready, 0
     ));
     uint32_t selected = UINT32_MAX;
-    uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(local, &selected, &publication));
+    ASSERT_TRUE(scheduler_local_ready_peek(local, &selected));
     ASSERT_EQ(selected, 0u);
-    EXPECT_EQ(local->timing_slot(1, selected), -1);
-    local->local_completed_generations[selected] = scheduler_dispatch_generation(publication);
-    ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, nullptr
-    ));
+    ASSERT_TRUE(scheduler_local_ready_execute(local, selected));
+    EXPECT_EQ(local->timing_slot(selected), -1);
+    ASSERT_TRUE(
+        scheduler_complete_own_slot(graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0)
+    );
     EXPECT_EQ(local->profiling, nullptr);
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
     scheduler_flush_completions(storage.run_control, local);
@@ -261,30 +257,31 @@ TEST(SchedulerClusterCompletion, SelfSlotsKeepDistinctSampledTraces) {
         scheduler_initialize_free_slot(&slot);
         slot.task_ref = index;
         slot.subtask_slot = 1;
-        local->set_timing_slot(1, index, index);
-        slot.state = SchedulerDispatchSlotState::READY;
-        slot.generation = ++local->dispatch_sequence;
+        local->set_timing_slot(index, index);
+        slot.state = SchedulerDispatchSlotState::EXECUTING;
         storage.metadata[index].active_mask = LaneMask::aiv0();
         local->profiling->executor_traces[index].kernel_start_cycles = 100 + index;
         local->profiling->executor_traces[index].kernel_end_cycles = 200 + index;
-        local->local_completed_generations[index] = slot.generation;
         auto *control = scheduler_task_control_at(storage.scheduler_state->base(), local, index);
         control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
         storage.metadata[index].timing_slot = index;
     }
-    ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, nullptr
-    ));
+    ASSERT_TRUE(
+        scheduler_complete_own_slot(graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0)
+    );
+    ASSERT_TRUE(
+        scheduler_complete_own_slot(graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 1, 0)
+    );
     auto *traces =
         scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
     for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
         EXPECT_EQ(traces[index].kernel_start_cycles, 100 + index);
         EXPECT_EQ(traces[index].kernel_end_cycles, 200 + index);
-        EXPECT_FALSE(local->sampled_task_timing(1, index));
+        EXPECT_FALSE(local->sampled_task_timing(index));
     }
 }
 
-TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
+TEST(SchedulerClusterCompletion, RejectsNonExecutingCompletionAtNamedSite) {
     FixtureStorage storage(1, 3);
     GraphBuffer graph(1);
     graph.executable(0, 0);
@@ -297,15 +294,13 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     slot->task_ref = 0;
     local_slot->task_ref = 0;
     local_slot->state = SchedulerDispatchSlotState::READY;
-    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequence;
 
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
+    EXPECT_FALSE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0,
-        slot->generation + 1, false, nullptr, nullptr
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, false
     ));
     EXPECT_EQ(
-        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH)
+        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID)
     );
 }
 
@@ -318,10 +313,9 @@ TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenResolveFails) {
     auto *control = scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0);
     control->wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
 
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
+    EXPECT_FALSE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, slot->generation,
-        0, nullptr, nullptr
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0
     ));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
@@ -346,34 +340,37 @@ TEST(SchedulerClusterCompletion, CompletionWithoutSuccessorsIgnoresQueueStorage)
     pool->descriptors_offset = UINT64_MAX;
     pool->controls_offset = UINT64_MAX;
 
-    EXPECT_TRUE(scheduler_service_cluster_completion_slot(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, slot->generation, 0, nullptr,
-        nullptr
-    ));
+    EXPECT_TRUE(
+        scheduler_complete_own_slot(graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0)
+    );
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     EXPECT_EQ(slot->state, SchedulerDispatchSlotState::FREE);
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
 }
 
 TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenRefillDispatchFails) {
-    FixtureStorage storage(1, 2);
-    GraphBuffer graph(1);
+    FixtureStorage storage(2, 2);
+    GraphBuffer graph(2);
     graph.executable(0, 0);
     SchedulerWorkerContext &scheduler = storage.contexts[0];
     SchedulerLocalSlotState *slot = prepare_completed_normal_slot(storage, scheduler);
-    SchedulerReadyClaim replacement{};
-    replacement.task_ref = 1;
+    graph.executable(1, 0, {0});
+    storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    storage.callable_addresses[1] = 0;
+    ASSERT_EQ(
+        scheduler_route_task(
+            graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler), storage.run_control, 1
+        ),
+        SchedulerRouteResult::WAITING
+    );
 
-    EXPECT_FALSE(scheduler_service_cluster_completion_slot(
+    EXPECT_FALSE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, slot->generation,
-        0, &replacement, nullptr
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0
     ));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
-    EXPECT_EQ(
-        storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_REFILL_DISPATCH_FAILED)
-    );
+    EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
 }
 
 TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
@@ -406,12 +403,10 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     slot->task_ref = 0;
     local_slot->task_ref = 0;
     local_slot->subtask_slot = 0;
-    local_slot->state = SchedulerDispatchSlotState::READY;
-    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequence;
+    local_slot->state = SchedulerDispatchSlotState::EXECUTING;
     auto *executor_trace = &storage.scheduler_local_state.profiling->executor_traces[0];
     executor_trace->kernel_start_cycles = 100;
     executor_trace->kernel_end_cycles = 200;
-    storage.scheduler_local_state.local_completed_generations[0] = local_slot->generation;
     auto *traces =
         scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
     producer->completion_resolve_start_cycles = 1;
@@ -419,13 +414,13 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     producer->scheduler_worker_id = UINT64_MAX;
     traces[1].kernel_start_cycles = 1;
 
-    ASSERT_TRUE(scheduler_service_cluster_completions(
+    ASSERT_TRUE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control,
-        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0,
+        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
     ));
-    EXPECT_EQ(producer->completion_resolve_start_cycles, 0u);
-    EXPECT_EQ(producer->completion_resolve_end_cycles, 0u);
+    EXPECT_GT(producer->completion_resolve_start_cycles, 1u);
+    EXPECT_GE(producer->completion_resolve_end_cycles, producer->completion_resolve_start_cycles);
     EXPECT_EQ(producer->scheduler_worker_id, scheduler.worker_index);
     EXPECT_EQ(traces[1].kernel_start_cycles, 1u);
     EXPECT_EQ(traces[0].valid, 1u);
@@ -462,12 +457,9 @@ TEST(SchedulerClusterCompletion, ReleasesCompletedSlotAndLeavesReadyTaskQueued) 
     storage.prepare_ready_pool();
     SchedulerLocalSlotState *local_slot = &storage.scheduler_local_state.slots[0];
     scheduler_initialize_free_slot(local_slot);
-    local_slot->generation = ++storage.scheduler_local_state.dispatch_sequence;
-    const uint32_t completed_generation = local_slot->generation;
     local_slot->task_ref = 0;
     local_slot->subtask_slot = 0;
-    local_slot->state = SchedulerDispatchSlotState::READY;
-    storage.scheduler_local_state.local_completed_generations[0] = completed_generation;
+    local_slot->state = SchedulerDispatchSlotState::EXECUTING;
     auto *completed_control =
         scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0);
     completed_control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
@@ -483,19 +475,16 @@ TEST(SchedulerClusterCompletion, ReleasesCompletedSlotAndLeavesReadyTaskQueued) 
         storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state), 0, &batch
     ));
 
-    uint64_t direct_refilled_slot_mask = 0;
-    ASSERT_TRUE(scheduler_service_cluster_completions(
+    ASSERT_TRUE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control,
-        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, &direct_refilled_slot_mask
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0,
+        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
     ));
 
     EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::FREE);
     EXPECT_EQ(local_slot->task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(local_slot->generation, completed_generation);
     EXPECT_EQ(completed_control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
-    EXPECT_EQ(direct_refilled_slot_mask, 0u);
     // Task 1 is still where it was pushed, claimable by the next fill pass.
     SchedulerReadyClaim queued{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
@@ -505,7 +494,7 @@ TEST(SchedulerClusterCompletion, ReleasesCompletedSlotAndLeavesReadyTaskQueued) 
     EXPECT_EQ(queued.task_ref, 1);
 }
 
-TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDispatchMetadata) {
+TEST(SchedulerClusterCompletion, DirectRefillKeepsTheCompletedTaskTraceBoundToTheOldExecution) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
     graph.executable(0, 0);
@@ -529,8 +518,7 @@ TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDisp
     producer_ready.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, SchedulerFreeSlotClaim{0, 0, local_slot->generation, 0}, producer_ready,
-        SCHEDULER_PROFILING_TASK_TIMING_LEVEL
+        storage.run_control, SchedulerFreeSlotClaim{0}, producer_ready, SCHEDULER_PROFILING_TASK_TIMING_LEVEL
     ));
     ASSERT_EQ(
         scheduler_bootstrap_route_task(
@@ -539,19 +527,17 @@ TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDisp
         SchedulerRouteResult::WAITING
     );
 
-    const uint32_t completed_generation = local_slot->generation;
     auto *executor_trace = &scheduler_local_state.profiling->executor_traces[0];
     executor_trace->kernel_start_cycles = 100;
     executor_trace->kernel_end_cycles = 200;
-    scheduler_local_state.local_completed_generations[0] = completed_generation;
 
-    ASSERT_TRUE(scheduler_service_cluster_completions(
+    ASSERT_TRUE(scheduler_local_ready_execute(&scheduler_local_state, 0));
+    ASSERT_TRUE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, SCHEDULER_PROFILING_TASK_TIMING_LEVEL, nullptr
+        storage.run_control, 0, SCHEDULER_PROFILING_TASK_TIMING_LEVEL
     ));
 
     EXPECT_EQ(local_slot->task_ref, 1);
-    EXPECT_EQ(local_slot->generation, completed_generation + 1);
     EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::READY);
 
     auto *traces =
@@ -566,7 +552,7 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
     graph.executable(0, 0);
     graph.executable(1, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    SchedulerWorkerContext &scheduler = storage.contexts[1];
+    SchedulerWorkerContext &scheduler = storage.contexts[0];
     SchedulerWorkerContext &target = storage.contexts[0];
     scheduler.is_scheduler = 1;
     scheduler.scheduler_index = 0;
@@ -589,29 +575,28 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
         ready.task_ref = pending_slot;
         ASSERT_TRUE(scheduler_fill_dispatch_slot(
             graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-            storage.run_control, SchedulerFreeSlotClaim{0, pending_slot, local_slot->generation, 0}, ready,
-            SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
+            storage.run_control, SchedulerFreeSlotClaim{pending_slot}, ready, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
         ));
         auto *executor_trace = &scheduler_local_state.profiling->executor_traces[pending_slot];
         executor_trace->kernel_start_cycles = 100 + pending_slot;
         executor_trace->kernel_end_cycles = 200 + pending_slot;
     }
 
-    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+    ASSERT_TRUE(scheduler_local_ready_execute(&scheduler_local_state, 0));
+    ASSERT_TRUE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, 0, 0, scheduler_local_state.slots[0].generation, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL,
-        nullptr, nullptr
+        storage.run_control, 0, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
     ));
-    ASSERT_TRUE((scheduler_local_state.profiling->worker_trace_valid_mask & 1U) != 0);
+    ASSERT_TRUE(scheduler_local_state.profiling->worker_trace_valid);
 
     target.trace_aicore_entry_cycles = 21;
     target.trace_handshake_publish_cycles = 22;
     target.trace_register_release_cycles = 23;
     target.trace_descriptor_cache_observed_cycles = 24;
-    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+    ASSERT_TRUE(scheduler_local_ready_execute(&scheduler_local_state, 1));
+    ASSERT_TRUE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, 0, 1, scheduler_local_state.slots[1].generation, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL,
-        nullptr, nullptr
+        storage.run_control, 1, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
     ));
 
     auto *traces =
@@ -622,37 +607,39 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
     EXPECT_EQ(traces[1].descriptor_cache_observed_cycles, 14u);
 }
 
-TEST(SchedulerClusterCompletion, RefillWithSuppliedClaimPreservesStateProbeAndReadySource) {
+TEST(SchedulerClusterCompletion, DirectSuccessorRefillPublishesItsOwnSourceAndTiming) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
     graph.executable(0, 0);
-    graph.executable(1, 0);
+    graph.executable(1, 0, {0});
+    storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     SchedulerWorkerContext &scheduler = storage.contexts[0];
     SchedulerLocalSlotState *slot = prepare_completed_normal_slot(storage, scheduler);
     uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
 
-    SchedulerReadyClaim replacement{};
-    replacement.task_ref = 1;
-    replacement.source = SchedulerReadySource::POOL;
-    replacement.state_probe_start_cycles = 123;
-    replacement.state_probe_end_cycles = 456;
-    bool refilled = false;
+    ASSERT_EQ(
+        scheduler_route_task(
+            graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler), storage.run_control, 1
+        ),
+        SchedulerRouteResult::WAITING
+    );
 
-    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+    ASSERT_TRUE(scheduler_complete_own_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, slot->generation,
-        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, &replacement, &refilled
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0,
+        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL
     ));
 
-    EXPECT_TRUE(refilled);
+    EXPECT_EQ(slot->task_ref, 1);
+    EXPECT_EQ(slot->state, SchedulerDispatchSlotState::READY);
     auto *traces =
         scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
-    EXPECT_EQ(traces[1].ready_source, static_cast<uint64_t>(SchedulerReadySource::POOL));
+    EXPECT_EQ(traces[1].ready_source, static_cast<uint64_t>(SchedulerReadySource::DIRECT_RESOLVE));
     EXPECT_EQ(traces[1].publication_mode, static_cast<uint64_t>(SchedulerPublicationMode::REFILL));
-    EXPECT_EQ(traces[1].state_probe_start_cycles, 123u);
-    EXPECT_EQ(traces[1].state_probe_end_cycles, 456u);
+    EXPECT_EQ(traces[1].state_probe_start_cycles, 0u);
+    EXPECT_EQ(traces[1].state_probe_end_cycles, 0u);
 }
 
 TEST(SchedulerNormalDispatch, FillsItsOwnFreshAicSlot) {
@@ -679,9 +666,9 @@ TEST(SchedulerNormalDispatch, FillsItsOwnFreshAicSlot) {
     ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch));
 
     bool failed = true;
-    ASSERT_TRUE(scheduler_fill_own_slots(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &failed
-    ));
+    ASSERT_TRUE(
+        scheduler_fill_own_slots(graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, &failed)
+    );
     EXPECT_FALSE(failed);
     EXPECT_EQ(local->own_slots()[0].task_ref, 0);
     EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
@@ -715,9 +702,9 @@ TEST(SchedulerNormalDispatch, LeavesLaterWorkSharedWhileOneExecutionIsQueued) {
     ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch));
 
     bool failed = false;
-    EXPECT_TRUE(scheduler_fill_own_slots(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &failed
-    ));
+    EXPECT_TRUE(
+        scheduler_fill_own_slots(graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, &failed)
+    );
     EXPECT_FALSE(failed);
     EXPECT_EQ(local->own_slots()[0].task_ref, 0);
     EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
@@ -725,9 +712,9 @@ TEST(SchedulerNormalDispatch, LeavesLaterWorkSharedWhileOneExecutionIsQueued) {
     EXPECT_EQ(local->own_slots()[1].state, SchedulerDispatchSlotState::FREE);
     EXPECT_EQ(local->local_ready_mask, 1u);
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);
-    EXPECT_FALSE(scheduler_fill_own_slots(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &failed
-    ));
+    EXPECT_FALSE(
+        scheduler_fill_own_slots(graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, &failed)
+    );
     EXPECT_FALSE(failed);
     // The later task remains in the shared pool for another execution core.
     SchedulerReadyClaim remaining{};
@@ -738,46 +725,35 @@ TEST(SchedulerNormalDispatch, LeavesLaterWorkSharedWhileOneExecutionIsQueued) {
 }
 
 TEST(SchedulerLocalReady, OlderDispatchPrecedesReusedLowerSlot) {
-    SchedulerLocalState scheduler_local_state{};
-    scheduler_local_state.config.self_lane = 1;
-    scheduler_local_state.slots[0].generation = 1;
-    scheduler_local_state.slots[1].generation = 2;
-    scheduler_local_state.slots[0].state = SchedulerDispatchSlotState::READY;
-    scheduler_local_state.slots[1].state = SchedulerDispatchSlotState::READY;
-    const uint64_t slot_0_publication = scheduler_dispatch_publication(1, SchedulerDispatchSlotState::READY);
-    const uint64_t slot_1_publication = scheduler_dispatch_publication(2, SchedulerDispatchSlotState::READY);
-    scheduler_local_ready_publish(&scheduler_local_state, 0);
-    scheduler_local_ready_publish(&scheduler_local_state, 1);
-
-    uint32_t pending_slot = UINT32_MAX;
-    uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
-    EXPECT_EQ(pending_slot, 0u);
-    EXPECT_EQ(publication, slot_0_publication);
-
-    scheduler_local_state.slots[0].generation = 3;
-    scheduler_local_ready_publish(&scheduler_local_state, 0);
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
-    EXPECT_EQ(pending_slot, 1u);
-    EXPECT_EQ(publication, slot_1_publication);
-
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
-    EXPECT_EQ(pending_slot, 0u);
-    EXPECT_EQ(publication, scheduler_dispatch_publication(3, SchedulerDispatchSlotState::READY));
-    EXPECT_EQ(scheduler_local_state.local_ready_mask, 0u);
+    SchedulerLocalState local{};
+    for (auto &slot : local.slots)
+        slot.state = SchedulerDispatchSlotState::READY;
+    scheduler_local_ready_publish(&local, 0);
+    scheduler_local_ready_publish(&local, 1);
+    ASSERT_TRUE(scheduler_local_ready_execute(&local, 0));
+    scheduler_initialize_free_slot(&local.slots[0]);
+    local.slots[0].state = SchedulerDispatchSlotState::READY;
+    scheduler_local_ready_publish(&local, 0);
+    uint32_t head = UINT32_MAX;
+    ASSERT_TRUE(scheduler_local_ready_peek(&local, &head));
+    EXPECT_EQ(head, 1u);
+    ASSERT_TRUE(scheduler_local_ready_execute(&local, 1));
+    ASSERT_TRUE(scheduler_local_ready_peek(&local, &head));
+    EXPECT_EQ(head, 0u);
+    ASSERT_TRUE(scheduler_local_ready_execute(&local, 0));
+    EXPECT_EQ(local.local_ready_mask, 0u);
 }
 
 TEST(SchedulerLocalReady, InvalidSlotStateIsNotReconstructedAsReady) {
     SchedulerLocalState local{};
-    local.config.self_lane = 1;
-    local.slots[0].generation = 7;
     local.slots[0].state = SchedulerDispatchSlotState::FREE;
     scheduler_local_ready_publish(&local, 0);
     uint32_t slot = UINT32_MAX;
-    uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&local, &slot, &publication));
-    EXPECT_NE(scheduler_dispatch_state(publication), SchedulerDispatchSlotState::READY);
-    EXPECT_FALSE(scheduler_local_ready_pop(&local, &slot, &publication));
+    ASSERT_TRUE(scheduler_local_ready_peek(&local, &slot));
+    EXPECT_EQ(slot, 0u);
+    EXPECT_FALSE(scheduler_local_ready_execute(&local, slot));
+    EXPECT_EQ(local.slots[0].state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(local.local_ready_mask, 1u);
 }
 
 // Model READY's fully published physical cluster, including all peers. Every
@@ -886,17 +862,16 @@ TEST(SchedulerClusterCompletion, DefersGlobalCountUntilFlushAndNeverPublishesTwi
     FixtureStorage storage(1, 3);
     GraphBuffer graph_buffer(1);
     graph_buffer.executable(0, 0);
-    configure_normal_aiv_cluster(storage, 1);
     auto &context = storage.contexts[0];
     prepare_completed_normal_slot(storage, context);
     SchedulerLocalState *local = storage.local_context(&context, &storage.scheduler_local_state);
-    ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, nullptr
+    ASSERT_TRUE(scheduler_complete_own_slot(
+        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0
     ));
     EXPECT_EQ(local->pending_completed, 1u);
     EXPECT_EQ(storage.run_control->resolved_task_count, 0u);
-    EXPECT_FALSE(scheduler_service_cluster_completions(
-        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, nullptr
+    EXPECT_FALSE(scheduler_complete_own_slot(
+        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0
     ));
     EXPECT_EQ(local->pending_completed, 1u);
     scheduler_flush_completions(storage.run_control, local);
@@ -917,35 +892,148 @@ TEST(SchedulerNormalDispatch, NoUsableCapacityDoesNotAccessPool) {
         local->own_slots()[slot].state = SchedulerDispatchSlotState::FILLING;
     bool failed = true;
     EXPECT_FALSE(scheduler_fill_own_slots(
-        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &failed
+        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, &failed
     ));
     EXPECT_FALSE(failed);
     const uint32_t own_type = local->config.self_core_type;
-    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type, 0));
+    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type));
 
-    // A free slot is capacity unless a completion pass already refilled it.
+    // READY slots retain their payload until entry or explicit parking.
     local->own_slots()[1].state = SchedulerDispatchSlotState::FREE;
-    EXPECT_TRUE(scheduler_has_usable_slot(local, own_type, 0));
-    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type, UINT64_C(1) << 1));
+    EXPECT_TRUE(scheduler_has_usable_slot(local, own_type));
+    local->own_slots()[1].state = SchedulerDispatchSlotState::READY;
+    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type));
     // Work of another type is never this core's capacity.
-    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type == 0 ? 1 : 0, 0));
+    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type == 0 ? 1 : 0));
 }
 
-TEST(SchedulerDispatch, SequenceExhaustionDoesNotPublishOrWrap) {
-    FixtureStorage storage(1, 3);
-    GraphBuffer graph(1);
-    graph.executable(0, 0);
-    auto *local = storage.local_context(&storage.contexts[0]);
-    local->dispatch_sequence = UINT32_MAX;
-    local->slots[0].state = SchedulerDispatchSlotState::FILLING;
-    SchedulerReadyClaim ready{};
-    ready.task_ref = 0;
-    const auto metadata = scheduler_load_dispatch_metadata(storage.scheduler_state->base(), local, 0, 0);
-    EXPECT_FALSE(scheduler_prepare_dispatch_slot(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, {0, 0, 0, 0}, ready, metadata, 0, 0
-    ));
-    EXPECT_EQ(local->dispatch_sequence, UINT32_MAX);
-    EXPECT_EQ(local->local_ready_mask, 0u);
+}  // namespace
+
+namespace {
+using namespace scheduler_test::gm_mix;
+
+class SchedulerMix : public ::testing::TestWithParam<LaneMask> {};
+
+TEST_P(SchedulerMix, PayloadAndCompletionTraceFollowEachLogicalSubtask) {
+    const auto mask = GetParam();
+    GmMixFixture fixture({{1, mask}}, true, 1);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.rendezvous(0, 3));
+    const auto descriptor = fixture.mailbox(0)->descriptor;
+    std::set<uint64_t> payloads;
+    std::set<uint32_t> subtasks;
+    for (uint32_t worker = 0; worker < 3; ++worker) {
+        const auto subtask = descriptor.lane_subtasks[worker];
+        if (subtask == UINT8_MAX) continue;
+        auto *local = fixture.locals[worker];
+        GmExecution execution{};
+        ASSERT_TRUE(fixture.begin(worker, &execution));
+        EXPECT_EQ(execution.subtask, subtask);
+        EXPECT_TRUE(subtasks.insert(subtask).second);
+        EXPECT_TRUE(payloads.insert(local->dispatch_payload_offset(worker, execution.slot)).second);
+        EXPECT_EQ(execution.physical_subblock, worker == 2 ? 1u : 0u);
+        auto &staged = local->profiling->executor_traces[execution.slot];
+        staged.kernel_start_cycles = 100 + worker;
+        staged.kernel_end_cycles = 200 + worker;
+        ASSERT_TRUE(
+            scheduler_complete_own_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), execution.slot, 3)
+        );
+        auto *traces =
+            scheduler_state_at<SchedulerTaskTrace>(fixture.base(), fixture.storage.layout.trace_cells_offset);
+        const auto &trace =
+            traces[scheduler_trace_index_at(fixture.base(), local, 0, static_cast<SubtaskSlot>(subtask), 0)];
+        EXPECT_EQ(trace.worker_id, worker);
+        EXPECT_EQ(trace.kernel_start_cycles, 100 + worker);
+        EXPECT_EQ(trace.valid, 1u);
+        EXPECT_EQ(local->slots[execution.slot].state, SchedulerDispatchSlotState::FREE);
+    }
+    EXPECT_EQ(subtasks.size(), mask.count());
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
+    ASSERT_TRUE(fixture.complete_task(0, 0));
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
 }
 
+TEST_P(SchedulerMix, LastLaneAloneResolvesDependency) {
+    const auto mask = GetParam();
+    GmMixFixture fixture({{1, mask}, {1, LaneMask::aic()}}, true, 1);
+    fixture.graph.executable(1, 0, {0});
+    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    ASSERT_EQ(
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1),
+        SchedulerRouteResult::WAITING
+    );
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.rendezvous(0));
+    std::vector<GmExecution> active;
+    for (uint32_t worker = 0; worker < 3; ++worker) {
+        GmExecution execution{};
+        if (fixture.begin(worker, &execution)) active.push_back(execution);
+    }
+    ASSERT_EQ(active.size(), mask.count());
+    for (size_t index = 0; index + 1 < active.size(); ++index) {
+        ASSERT_TRUE(fixture.complete(active[index]));
+        EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
+        EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+        EXPECT_EQ(fixture.control(0)->wake_list_head, 1);
+    }
+    ASSERT_TRUE(fixture.complete(active.back()));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
+    ASSERT_TRUE(fixture.complete_task(0, 0));
+    EXPECT_EQ(fixture.control(0)->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
+    EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
+}
+
+TEST_P(SchedulerMix, FourQueuedTasksReuseSlotsWithoutLosingFifoOrExecutions) {
+    const auto mask = GetParam();
+    GmMixFixture fixture({{1, mask}, {1, mask}, {1, mask}, {1, mask}}, true, 1);
+    for (uint32_t task = 0; task < 4; ++task)
+        ASSERT_TRUE(fixture.enqueue(task));
+    std::map<int64_t, std::set<uint8_t>> seen;
+    std::vector<int64_t> order;
+    uint64_t completed = 0;
+    for (uint32_t step = 0; step < 128 && completed < 4; ++step) {
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            ASSERT_TRUE(fixture.fill(worker));
+            GmExecution execution{};
+            if (!fixture.begin(worker, &execution)) continue;
+            if (seen[execution.task].empty()) order.push_back(execution.task);
+            EXPECT_TRUE(seen[execution.task].insert(execution.subtask).second);
+            ASSERT_TRUE(fixture.complete(execution));
+        }
+        completed = 0;
+        for (const auto *local : fixture.locals)
+            completed += local->pending_completed;
+    }
+    ASSERT_EQ(completed, 4u);
+    EXPECT_EQ(order, (std::vector<int64_t>{0, 1, 2, 3}));
+    for (uint32_t task = 0; task < 4; ++task) {
+        EXPECT_EQ(seen[task].size(), mask.count());
+        EXPECT_EQ(fixture.control(task)->completed_blocks, 1u);
+    }
+}
+
+TEST_P(SchedulerMix, FailedPreparationPublishesNoPayloadOrCompletion) {
+    GmMixFixture fixture({{1, GetParam()}}, true, 1);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    fixture.storage.callable_addresses[1] = 0;
+    EXPECT_FALSE(fixture.rendezvous(0));
+    for (const auto *local : fixture.locals) {
+        EXPECT_EQ(local->local_ready_mask, 0u);
+        EXPECT_EQ(local->pending_completed, 0u);
+    }
+    EXPECT_NE(fixture.run()->scheduler_error, 0u);
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(CurrentGmMasks, SchedulerMix, ::testing::ValuesIn(kMixMasks));
 }  // namespace

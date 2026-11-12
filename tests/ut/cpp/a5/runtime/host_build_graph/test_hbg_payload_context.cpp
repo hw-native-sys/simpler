@@ -55,6 +55,15 @@ TEST(HbgPayloadContext, InitializesEveryOrdinarySlot) {
     );
 }
 
+TEST(HbgPayloadContext, InitializesEveryOwnSlotInAMixGraph) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, 1, 1, &layout));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    check_payload_range(
+        storage.base(), reinterpret_cast<uint64_t>(storage.base()), layout.dispatch_payloads_offset,
+        SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT
+    );
+}
 TEST(HbgPayloadContext, BindsDeviceAddressesInsteadOfHostMirrorAddresses) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(1, 1, 1, &layout));

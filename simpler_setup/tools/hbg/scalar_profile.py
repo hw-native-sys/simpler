@@ -14,12 +14,12 @@ from collections import defaultdict
 from pathlib import Path
 
 SCALAR_FUNCTIONS = {
-    "scalar_completions": "scheduler_service_cluster_completions",
+    "scalar_completions": "scheduler_complete_own_slot",
     "scalar_graph_control": "scheduler_service_controls",
     "scalar_fill_slots": "scheduler_fill_own_slots",
     "scalar_ordered_fill": "scheduler_fill_ordered_slots",
     "scalar_admission": "scheduler_ordered_can_enter_slot",
-    "scalar_executor_scan": "run_ready_dispatch_loop: scan slots",
+    "scalar_executor_scan": "run_ready_dispatch_loop: peek ready head",
     "scalar_prepare": "run_ready_dispatch_loop: prepare execution",
     "scalar_seal": "run_ready_dispatch_loop: seal execution",
     "scalar_publish_completion": "run_ready_dispatch_loop: publish completion",

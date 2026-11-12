@@ -8,11 +8,11 @@
 
 跳过 host 的分配、建图和上传，只接受这些输入：Runtime 启动描述、只读图/参数、scheduler state，以及每个核的 context 和 payload 存储。
 
-初值契约可核对 [scheduler_types.h](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L1674)（第 1674 行）：尚未完成任务的 `state=BLOCKED`，`wake_list_head=-1`，`next_waiter=-1`，`waiting_producer=-1`；领取/完成游标为 0；依赖 remaining 由 Host 填入未完成且去重的前驱数；payload 的 `args[48]`、`args[49]` 已指向自身两个 context。已经 inline 完成的节点另作 DONE 处理。
-两个业务 ready 队列的 `head/reserved_tail` 初始为 0，所有 `SchedulerTicketEntry.task_ref` 初始为 -1，见 [ready pool 初始化](../../../src/a5/runtime/host_build_graph/host/ready_pool_plan.h#L71)。native control inbox 的 head/tail 初始均为 -1。
+初值契约可核对 [scheduler_types.h](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：尚未完成任务的 `state=BLOCKED`，`wake_list_head=-1`，`next_waiter=-1`，`waiting_producer=-1`；领取/完成游标为 0；依赖 remaining 由 Host 填入未完成且去重的前驱数；payload 的 `args[48]`、`args[49]` 已指向自身两个 context。已经 inline 完成的节点另作 DONE 处理。
+两个业务 ready 队列的 `head/reserved_tail` 初始为 0，所有 `SchedulerTicketEntry.task_ref` 初始为 -1，见 [ready pool 初始化](../../../src/a5/runtime/host_build_graph/host/ready_pool_plan.h)。native control inbox 的 head/tail 初始均为 -1。
 静态依赖路径通过 ready-pool header 的 `dependencies_offset` 定位 CSR/remaining；为 0 时保留 wake-list 路由。这只是输入契约，不沿 Host 构造流程展开。
 
-从 [AicpuExecutor::init](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp#L433)（第 433 行） 开始，leader 先调用 `pre_handshake_init`：
+从 [AicpuExecutor::init](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp) 开始，leader 先调用 `pre_handshake_init`：
 
 - 校验 worker 数在 1..108。
 - 清 `cores_`、物理核列表、握手计时。
@@ -20,7 +20,7 @@
 - 保存核数、AICPU 线程数、寄存器地址表。
 - 清握手失败标志、已退休核计数；按配置初始化诊断采集。
 
-[AicoreLifecycle](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.h#L68)（第 68 行） 的成员：
+[AicoreLifecycle](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.h) 的成员：
 
 **范围与用途：** `AicoreLifecycle` 是 AICPU executor 内的一份共享生命周期管理对象；其中 `CoreState` 按 worker 各一条，`ThreadHandshakeTiming` 按 AICPU 线程各一条。它保存发现结果和启动/退出进度，不保存每个业务任务的执行参数。
 
@@ -42,7 +42,7 @@
 
 ## 1.2 AICore 报到，AICPU 发现拓扑
 
-读 [平台 kernel 入口](../../../src/a5/platform/onboard/aicore/kernel.cpp#L118)（第 118 行）。设启动 cluster 数为 C：
+读 [平台 kernel 入口](../../../src/a5/platform/onboard/aicore/kernel.cpp)。设启动 cluster 数为 C：
 
 - AIC 的 worker_index 为硬件 block_idx，范围 [0,C)。
 - AIV 的 worker_index 为 `C + block_idx * subblockdim + subblockid`；此处一个 cluster 两个 AIV。
@@ -50,7 +50,7 @@
 
 入口参数字段含义：`runtime_args` 是 Runtime GM 地址；`enable_profiling_flag` 是诊断位图；`force_simt_anchor` 为编译分类用入口参数，正常为 0；`chip_swimlane_aicore_rotation_table` 是每核采集 head 的槽地址表；`aicore_pmu_ring_addrs` 是每核 PMU ring 地址表；`pmu_reg_addrs` 是按物理核索引的 PMU 寄存器表；`report_epoch` 是本轮报告身份。诊断地址未启用时清空本地缓存，避免继承上次 launch。
 
-[SchedulerBootstrapInputs](../../../src/common/host_build_graph/runtime.h#L219)（第 219 行），独占 64 字节：
+[SchedulerBootstrapInputs](../../../src/common/host_build_graph/runtime.h)，独占 64 字节：
 
 **范围与用途：** 每轮启动描述中一份，放在 GM。所有 AICPU/AICore 从这里获知本轮模式和 context 数组入口；执行期间只读。它不是每核一份，也不是完整调度状态。
 
@@ -60,7 +60,7 @@
 | `reserved_` | 对齐保留字段 |
 | `worker_context_base` | worker 0 的 SchedulerWorkerContext 完整 GM 地址 |
 
-[AICore 报告](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp#L72)（第 72 行） 写入 [Handshake](../../../src/common/host_build_graph/runtime.h#L119)（第 119 行），每核一条 64B cache line：
+[AICore 报告](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp) 写入 [Handshake](../../../src/common/host_build_graph/runtime.h)，每核一条 64B cache line：
 
 **范围与用途：** `Handshake` 按 worker 每核一份，位于 GM；核只向自己的条目报到，负责它的 AICPU 线程应答。它覆盖启动和退休握手，不随每个 task 更新。
 
@@ -76,10 +76,10 @@
 report_epoch 非零时，AICore 先清旧的反向应答字段、写身份和 done，经 store barrier 再写 epoch，最后 DCCI 写回并 DSB。
 epoch 为 0 时，沿无 stamp 的报告协议写身份，屏障后写 done。AICPU 接受条件始终要求 done 非零；非零 expected_epoch 还必须匹配 epoch。
 
-[handshake_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L99)（第 99 行） 中线程 t 负责
+[handshake_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp) 中线程 t 负责
 `[t*N/T, (t+1)*N/T)`。每轮扫描自己分区，接受报告后执行 `rmb()`，再读报告 payload 并建立 `cores_[i]`。
 
-所有分区完成后，leader 进入 [post_handshake_init](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L154)（第 154 行）：
+所有分区完成后，leader 进入 [post_handshake_init](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp)：
 
 1. 分别为 AIC、AIV 编排 `type_rank`。
 2. 校验 AIV 数恰好为 AIC 数的两倍，与图中预期 worker/cluster 数一致。
@@ -90,7 +90,7 @@ epoch 为 0 时，沿无 stamp 的报告协议写身份，屏障后写 done。AI
 
 ## 1.3 每核 context 的字段
 
-[SchedulerWorkerContext 定义](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L1192)（第 1192 行）。当前结构为 320B、64B 对齐：前四行配置 READY 后不变，最后一行保存本核诊断时间。
+[SchedulerWorkerContext 定义](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)。当前结构为 320B、64B 对齐：前四行配置 READY 后不变，最后一行保存本核诊断时间。
 
 **范围与用途：** 这是 GM 中每个 worker 的一份配置入口，按 `worker_index` 寻址。它既包含本核身份和本核 payload 起点，也包含指向本轮共享任务表、队列和 RunControl 的偏移。不同 worker 的 context 可以指向同一个共享对象；并不是每核复制整张图。启动前输入和 AICPU 拓扑发现共同填好配置；READY 后配置只读，末尾统计区由本核更新。
 
@@ -160,13 +160,13 @@ WorkerContext 的物理分组与访问范围如下。这里的间距由 `alignas
 
 ## 1.4 READY、bootstrap 与 DMB
 
-[publish_context_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp#L300)（第 300 行） 先写 `Handshake.task=context_address`，store barrier 后写 `aicpu_ready=RESIDENT_READY`。
+[publish_context_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp) 先写 `Handshake.task=context_address`，store barrier 后写 `aicpu_ready=RESIDENT_READY`。
 只有已接受本轮报告且配置成功的 worker 会被应答。
 
 AICore 在 READY 前通过 bootstrap 基址定位 pending_context，只用于找到超时配置；不能拿这个旧缓存视图执行。
-READY 后重新观察 context 的相关 cache line，再进入 [run_resident_scheduler](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L687)（第 687 行），依次建立 GraphView、LocalState、admission 和 async 状态。
+READY 后重新观察 context 的相关 cache line，再进入 [run_resident_scheduler](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h)，依次建立 GraphView、LocalState、admission 和 async 状态。
 
-[bootstrap_ready_graph](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L268)（第 268 行） 按 scheduler_index 均分节点：
+[bootstrap_ready_graph](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h) 按 scheduler_index 均分节点：
 
 1. 处理本分片节点；native child 绑定参数描述符。
 2. 有依赖 header 时读取 remaining：0 发布 ready，非零等待前驱通知；没有 header 时才挂 wake list。native 控制节点进入 control inbox；纯 AIC 和所有 MIX 进入共享 AIC 队列，纯 AIV 进入共享 AIV 队列。
@@ -174,14 +174,14 @@ READY 后重新观察 context 的相关 cache line，再进入 [run_resident_sch
 4. 初始化本核两个 free slot，尝试准备首批任务；可能只是等待协作准入，并不保证每核都有可执行任务。
 5. 推进 `bootstrap_arrived_count`；最后一核置 `bootstrap_complete=1`。
 
-启用参数抓取时，AICPU 在执行和等待阶段还轮询 `ResidentArgsDumpService`，但不接管逐任务调度。AICPU 等到最后一个标记后，才经 [platform_init_aicore_regs](../../../src/a5/platform/shared/aicpu/platform_regs.cpp#L34)（第 34 行） 写 `DATA_MAIN_BASE=AICPU_IDLE_TASK_ID`。
-AICore 在 [782 行](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h#L782)（第 782 行） 等这个值或 EXIT；正常开放后写 COND idle，再进入执行循环。
+启用参数抓取时，AICPU 在执行和等待阶段还轮询 `ResidentArgsDumpService`，但不接管逐任务调度。AICPU 等到最后一个标记后，才经 [platform_init_aicore_regs](../../../src/a5/platform/shared/aicpu/platform_regs.cpp) 写 `DATA_MAIN_BASE=AICPU_IDLE_TASK_ID`。
+AICore 在 [bootstrap 启动门禁](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h) 等这个值或 EXIT；正常开放后写 COND idle，再进入执行循环。
 
 READY 发布的是可读配置；DMB 开放的是 kernel 执行权限。bootstrap 期间允许处理调度控制和准备任务，尚不调用业务 kernel。
 
 ## 1.5 RunControl 与 GraphSummary
 
-[SchedulerRunControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L1130)（第 1130 行） 的字段：
+[SchedulerRunControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h) 的字段：
 
 **范围与用途：** 每轮一份，位于 GM，由所有参与核和 AICPU 共享。它用于判断全图 bootstrap、进展、完成与错误。当前为 384B、64B 对齐；动态完成计数从 offset 128 开始，错误载荷从 192 开始，最终错误发布字在独立的 offset 320 行。AICPU 补齐配置并监视，AICore 按协议更新计数和错误；各字段有各自写者，不是任意核都可以覆盖整个结构。
 
@@ -211,7 +211,7 @@ READY 发布的是可读配置；DMB 开放的是 kernel 执行权限。bootstra
 | `error_identity_fields` | 哪些附加错误身份字段有效 |
 | `scheduler_error` | 最后发布的错误码；0 表示尚无已发布错误 |
 
-[SchedulerGraphSummary](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h#L1023)（第 1023 行） 的全部字段：
+[SchedulerGraphSummary](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h) 的全部字段：
 
 **范围与用途：** 每轮一份 GM 摘要，表示这轮图有哪些任务形状、需要哪些调度区域及其布局。AICPU 确认拓扑并发布 READY 后，它保持不变。与 RunControl 的区别是：Summary 描述静态事实，RunControl 还承载动态执行进度。
 

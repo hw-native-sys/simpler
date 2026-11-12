@@ -56,7 +56,7 @@ NUMBERS = {
         "cluster_index lane active_mask flags block_num resource_mask"
     ),
     "execution": (
-        "index run_epoch task_ref order_key permit_tail worker_index block_idx generation "
+        "index run_epoch task_ref order_key permit_tail worker_index block_idx "
         "pending_slot subtask_slot flags ready_source group_seq block_num cluster_index cluster_lane "
         "publication_mode publication_before_cycles publication_after_cycles publication_count"
     ),

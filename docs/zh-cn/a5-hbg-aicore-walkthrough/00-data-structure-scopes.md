@@ -9,7 +9,7 @@
 - **一轮运行 run**：一次图的 device 执行。这里的“全局”均指本轮参与者共享，不是所有进程、所有设备或所有运行共用。
 - **worker**：一个常驻 AIC 或 AIV 执行核。**cluster**：一个 AIC 和两个 AIV。
 - **task/node**：resident 图中一个逻辑调度节点。一个 kernel task 可以有多个 logical block，每个 block 又可以有多个 subtask。
-- **slot**：某个 worker 的可复用执行位置。当前主线每核 2 个 own slot；一个 slot 先后可以属于不同 task/block/subtask，靠 generation 区分。
+- **slot**：某个 worker 的可复用执行位置。每核 2 个 own slot；一次执行由 run/task/block/subtask 标识，slot 状态与本核直接退休约束其复用。
 - **GM** 表示对象存于可跨核寻址的设备全局存储；并不表示任何核都可以写它。写权限由协议决定。
 - **AICore 私有**表示一个核自己的 C++ 局部对象或成员；是否进入寄存器或栈由编译器决定，不把它当成可跨核共享的数据结构。
 - 表里的“份数”描述逻辑对应关系。实际数组可能按最大容量预留，例如 WorkerContext 预留容量为 108，但只有本轮 worker_count 个条目有效。
@@ -60,7 +60,7 @@ flowchart TD
 | `SchedulerGraphView` | 每个 worker 建立自己的值 | AICore 私有 | 对共享图存储的地址、数量、版本做只读描述；不是复制图节点 | 本次 run_resident_scheduler 调用内 |
 | `SchedulerGraphAccess` | 从 GraphView 派生/转换的访问值 | AICore 私有 | 给普通/native 图访问提供统一接口；所指内容仍在 GM | 本次调用或其子调用 |
 | `SchedulerLocalConfig` | 每个 worker 1 份，嵌在 LocalState | AICore 私有 | 缓存本核常用的不变配置，减少每次循环读 GM context | READY 后初始化，本轮使用 |
-| `SchedulerLocalState` | 每个 worker 1 份 | AICore 私有 | 本核 ready bit、slot、generation、候选、完成待汇总数等运行账本；只由本核改写 | 本轮调度循环，退出时清理义务 |
+| `SchedulerLocalState` | 每个 worker 1 份 | AICore 私有 | 本核 ready bit/head、slot、候选、完成待汇总数等运行账本；只由本核改写 | 本轮调度循环，退出时清理义务 |
 | `SchedulerClusterCoordinate` | 一次 worker 到 cluster/lane 映射的结果 | 当前调用者局部值 | 启动拓扑检查中返回 cluster_index 与 cluster_lane | 该次拓扑映射调用 |
 
 ### 采集结构也有不同范围
@@ -71,8 +71,8 @@ flowchart TD
 | `SchedulerWorkerStats` | 每个 worker 1 份 | AICore 私有 | 保存 bootstrap 时间、扫描数和本地执行记录序号；只把保留的启动统计写回 WorkerContext | 本轮累计 |
 | `SchedulerLocalProfilingState` | 启用对应采集的 worker 各 1 份 | AICore 私有 | 保存本核采集配置、各 slot 暂存执行记录和循环编号 | 本轮；不开启时没有该类型的有效采集对象 |
 | `SchedulerNoProfilingState` | 未启用采集模板中的空占位类型 | AICore 私有 | 模板实例化时避免分配完整 profiling 状态，无业务字段 | 本轮调用内 |
-| `SchedulerWorkerTraceCache` | 本地 profiling 中按 cluster lane 缓存 | AICore 私有 | 缓存目标核的启动时间记录，避免反复读取 WorkerContext | 本轮，首次需要时填充 |
-| `SchedulerExecutorTaskTrace` | 当前 own slot 的一次执行暂存记录 | AICore 私有 profiling 槽 | executor 写 kernel 起止等，本核 completion 读取后合并最终任务记录 | 随 slot generation 复用 |
+| `SchedulerWorkerTraceCache` | 每份本地 profiling 中 1 份 | AICore 私有 | 缓存本核的启动时间记录，避免反复读取 WorkerContext | 本轮，首次需要时填充 |
+| `SchedulerExecutorTaskTrace` | 当前 own slot 的一次执行暂存记录 | AICore 私有 profiling 槽 | executor 写 kernel 起止等，直接退休时合并最终任务记录 | slot 退休后可供下一次执行复用 |
 | `SchedulerTaskTrace` | 每个 task/block/active subtask 一条 | GM | 派发与完成阶段填入同一次执行的身份和时间，最后发布 valid | 本轮不随 slot 复用，退休后汇总 |
 | `SchedulerTaskPmuCell` | 每个 task/block/active subtask 一条 | GM | 执行该 subtask 的核写计数器快照；AICPU 等所有核退休后读取 | 本轮对应执行写入，保存到采集结束 |
 | `SchedulerActivityBuffer` | 每个 worker 一块活动记录区 | GM | 本核追加空闲活动记录，并保存 committed/dropped | 本轮追加，退休后读取 |
@@ -111,9 +111,9 @@ flowchart TD
 | `SchedulerReadyInbox` | native control：每 worker 1 份 | GM | 只承载 Graph 控制节点的共享 FIFO，endpoints CAS 决定所有权 | 本轮；队列内容持续变化 |
 | `SchedulerReadyBatch` | 当前发布核的一批同类型任务 | AICore 私有，链节点在 GM TaskControl 中 | 暂存 head/tail/count，批量提交 ready | 当前收集与发布过程 |
 | `SchedulerReadyClaim` | 一次成功领取/直接后继交接的结果 | 当前拥有者私有 | 表示“这个任务现在归我处理”；也记录来源和发布方式 | 到派发、转交 admission 或其他受控交接为止 |
-| `SchedulerFreeSlotClaim` | 一次目标 slot 准备操作 | 当前核私有 | 指定 worker/slot/旧generation并核对所有权；不是新分配 payload | 当前认领/准备过程 |
-| `SchedulerLocalSlotState` | 当前主线每worker 2份 | AICore 私有，LocalState.slots 内 | 保存 slot 归属的 task/block/subtask、generation、状态；本核独占修改 | slot 对象活到本轮结束，任务绑定逐次复用 |
-| `DispatchPayload` | 每 worker 2 个 own，普通任务与 MIX 共用 | GM，按 worker+slot 定位 | 供一次函数调用读取的入口地址、args 及上下文；本核准备、本核执行 | 存储按轮有效，内容随 slot generation 改写；kernel 不能跨调用保留它作为旧执行身份 |
+| `SchedulerFreeSlotClaim` | 一次本核 slot 准备操作 | 当前核私有 | 只指定 slot_index；所属 worker/lane 从本核配置推导 | 当前认领/准备过程 |
+| `SchedulerLocalSlotState` | 每worker 2份 | AICore 私有，LocalState.slots 内 | 保存 slot 归属的 task/block/subtask、状态；本核独占修改 | slot 对象活到本轮结束，完成退休后才重新绑定 |
+| `DispatchPayload` | 每worker 2个 own | GM，按worker+slot定位 | 供一次函数调用读取的入口地址、args及上下文；本核准备、本核执行 | 存储按轮有效，内容在退休后可改写；kernel不能跨调用保留旧执行身份 |
 | `LocalContext` | 每个 DispatchPayload 内嵌1份 | GM，args[48]指向它 | 告诉本次kernel其logical block_idx/block_num | 地址随payload稳定，block值随派发更新 |
 | `GlobalContext` | 每个 DispatchPayload 内嵌1份 | GM，args[49]指向它 | 告诉本次kernel其物理AIV lane和resident async身份；不是全芯片单例 | 地址随payload稳定，执行内容可更新 |
 

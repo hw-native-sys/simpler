@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 MAX_SUBTASKS = (1 << 15) - 1
-MAX_GENERATION = (1 << 32) - 1
 MAX_EPOCH = (1 << 64) - 1
 
 
@@ -147,7 +146,6 @@ class Lease:
     task: int
     block: int
     owner: int
-    generation: int
 
 
 def trace_index(base, task, block, slot):

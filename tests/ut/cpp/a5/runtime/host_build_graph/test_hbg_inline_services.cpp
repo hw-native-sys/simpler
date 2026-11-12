@@ -93,7 +93,7 @@ struct InlineFixture {
     }
     bool fill(uint32_t worker = 1) {
         bool failed = false;
-        scheduler_fill_own_slots(graph.graph(), base(), locals[worker], run(), 4, 0, &failed);
+        scheduler_fill_own_slots(graph.graph(), base(), locals[worker], run(), 4, &failed);
         return !failed;
     }
     bool complete(uint32_t worker, uint32_t slot) {
@@ -102,15 +102,14 @@ struct InlineFixture {
         if (local->admission != nullptr &&
             (!scheduler_ordered_can_enter_slot(graph.graph(), base(), local, run(), slot, &permit) || !permit))
             return false;
-        local->local_ready_mask &= static_cast<uint8_t>(~(1U << slot));
-        local->local_completed_generations[slot] = local->slots[slot].generation;
-        return scheduler_service_cluster_completions(graph.graph(), base(), local, run(), 4, &refilled);
+        if (!scheduler_local_ready_execute(local, slot)) return false;
+        return scheduler_complete_own_slot(graph.graph(), base(), local, run(), slot, 4);
     }
     void expect_no_dispatch(uint32_t worker) {
         EXPECT_EQ(locals[worker]->local_ready_mask, 0u);
         for (const auto &slot : locals[worker]->slots) {
             EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
-            EXPECT_EQ(slot.generation, 0u);
+            EXPECT_EQ(slot.task_ref, SCHEDULER_TASK_REF_INVALID);
         }
         for (const auto &candidate : admissions[worker].candidates)
             EXPECT_TRUE(scheduler_task_ref_is_null(candidate.ready.task_ref));
@@ -120,7 +119,6 @@ struct InlineFixture {
     scheduler_test::BasicGraphBuffer<4> graph{3};
     std::array<SchedulerLocalState *, 3> locals{};
     std::array<SchedulerAdmissionLocalState, 3> admissions{};
-    uint64_t refilled{0};
 };
 
 class HbgInlineDispatch : public ::testing::TestWithParam<bool> {};
@@ -194,10 +192,9 @@ TEST(HbgInlineService, DirectCompletionServicesDummyWithoutReportingKernelRefill
     ASSERT_TRUE(fixture.enqueue(0));
     ASSERT_TRUE(fixture.fill());
     ASSERT_TRUE(fixture.complete(1, 0));
-    EXPECT_EQ(fixture.refilled, 0u);
     EXPECT_EQ(fixture.locals[1]->local_ready_mask, 0u);
     EXPECT_EQ(fixture.locals[1]->slots[0].state, SchedulerDispatchSlotState::FREE);
-    EXPECT_EQ(fixture.locals[1]->slots[0].generation, 1u);
+    EXPECT_EQ(fixture.locals[1]->slots[0].task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(scheduler_gm_load(fixture.control(1).state), static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(fixture.locals[1]->pending_completed, 2u);
     EXPECT_EQ(fixture.trace(2).valid, 0u);

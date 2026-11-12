@@ -1622,7 +1622,6 @@ def _with_execution_identity(args, row):
             "block_num",
             "subtask_slot",
             "pending_slot",
-            "dispatch_generation",
             "order_key",
             "group_seq",
             "cluster_index",

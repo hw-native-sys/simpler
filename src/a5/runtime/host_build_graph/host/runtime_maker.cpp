@@ -651,7 +651,6 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                         << ",\"block_num\":" << trace.execution_block_num
                         << ",\"subtask_slot\":" << trace.execution_subtask_slot
                         << ",\"pending_slot\":" << trace.execution_pending_slot
-                        << ",\"dispatch_generation\":" << trace.execution_generation
                         << ",\"cluster_index\":" << trace.execution_cluster_index
                         << ",\"cluster_lane\":" << trace.execution_cluster_lane << ",\"order_key\":";
         if ((flags & SCHEDULER_TRACE_ORDERED) != 0) identities_json << trace.execution_order_key;

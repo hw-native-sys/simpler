@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .types import MAX_EPOCH, MAX_GENERATION, Lease, require
+from .types import MAX_EPOCH, Lease, require
 
 
 @dataclass
@@ -60,7 +60,6 @@ class Protocol:
         self.closed = {w: set() for w in topology.by_id}
         self.running = {}
         self.events = []
-        self.generation = 0
         self.failed = False
         self.quiescent = False
 
@@ -118,7 +117,7 @@ class Protocol:
         state = self.state(lease.task)
         require(lease.block in state.blocks, "UNKNOWN_LEASE")
         block = state.blocks[lease.block]
-        require(block.lease == lease, "STALE_GENERATION")
+        require(block.lease == lease, "STALE_EXECUTION")
         return state, block
 
     def claim(self, ref, owner):
@@ -134,11 +133,9 @@ class Protocol:
         require(len(outstanding) < (1 if state.spec.mixed else 2), "PENDING_CAPACITY")
         if state.next_block == state.spec.blocks:
             return None
-        require(self.generation < MAX_GENERATION, "GENERATION_OVERFLOW")
         mapping = self.topology.mapping(state.spec, owner)
         require(set(mapping.values()) <= state.members, "MEMBERS")
-        self.generation += 1
-        lease = Lease(self.epoch, ref, state.next_block, owner, self.generation)
+        lease = Lease(self.epoch, ref, state.next_block, owner)
         state.blocks[lease.block] = BlockState(lease, mapping, self.topology.resource_members(state.spec, owner))
         state.next_block += 1
         if state.spec.sync_start:
@@ -148,7 +145,6 @@ class Protocol:
             task=ref,
             block=lease.block,
             owner=owner,
-            generation=lease.generation,
             mapping=sorted(mapping.items()),
             resources=sorted(state.blocks[lease.block].resources),
         )
@@ -191,7 +187,6 @@ class Protocol:
             slot=slot,
             worker=worker,
             order=state.order,
-            generation=lease.generation,
             block_num=state.spec.blocks,
             source=source,
         )

@@ -256,7 +256,6 @@ struct FixtureStorage {
         config.task_controls_offset = context->task_controls_offset;
         config.task_metadata_offset = context->task_metadata_offset;
         config.ready_pool_offset = ready_pool_offset;
-
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;
         config.worker_contexts_offset = context->worker_contexts_offset;

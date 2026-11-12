@@ -33,7 +33,6 @@ def capture(level=2):
                 block_num=2,
                 subtask_slot=1,
                 pending_slot=block,
-                dispatch_generation=block + 1,
                 order_key=0,
                 group_seq=None,
                 cluster_index=0,
@@ -168,13 +167,11 @@ def test_epoch_extremes_are_literal_identity_not_absence(tmp_path, epoch):
     assert all(row["run_epoch"] == epoch for row in read(tmp_path, raw))
 
 
-@pytest.mark.parametrize("field,value", [("order_key", 1), ("cluster_index", 1), ("dispatch_generation", 1)])
+@pytest.mark.parametrize("field,value", [("order_key", 1), ("cluster_index", 1), ("block_idx", 0)])
 def test_same_task_worker_or_slot_cannot_carry_inconsistent_identity(tmp_path, field, value):
     raw = capture()
     records = raw["aicore_execution_identities"]["records"]
     records[1][field] = value
-    if field == "dispatch_generation":
-        records[1]["pending_slot"] = records[0]["pending_slot"]
     with pytest.raises(ValueError, match="identity"):
         read(tmp_path, raw)
 
@@ -197,7 +194,6 @@ def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask):
                 block_num=1,
                 subtask_slot=slot,
                 pending_slot=0,
-                dispatch_generation=1,
                 order_key=0,
                 group_seq=9,
                 cluster_index=0,
@@ -216,7 +212,7 @@ def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask):
         read(tmp_path, raw)
 
 
-def test_identical_record_ids_and_generations_from_distinct_epochs_do_not_collide(tmp_path):
+def test_identical_record_ids_from_distinct_epochs_do_not_collide(tmp_path):
     raw = capture()
     later = copy.deepcopy(raw)
     for row in later["aicore_tasks"]:

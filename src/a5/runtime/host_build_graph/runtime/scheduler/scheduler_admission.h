@@ -904,7 +904,7 @@ static inline __aicore__ SchedulerBlockFinishResult scheduler_contribute_ordered
                                                           SchedulerBlockFinishResult::PARTIAL;
 }
 
-// Generation consumption and trace publication belong to the completion caller.
+// Execution retirement and trace publication belong to the completion caller.
 // Slot retirement precedes the shared contribution that can close computation.
 template <bool RecordProtocol = true>
 static inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_block(
@@ -922,7 +922,7 @@ static inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_blo
         return SchedulerBlockFinishResult::ERROR;
     }
     const auto slot = local->slots[slot_index];
-    if (!slot.cooperative || slot.state != SchedulerDispatchSlotState::READY ||
+    if (!slot.cooperative || slot.state != SchedulerDispatchSlotState::EXECUTING ||
         slot.task_ref != admission->current_task_ref || !scheduler_task_ref_valid(graph, slot.task_ref) ||
         slot.block_idx >= admission->current_block_num || scheduler_task_is_mix(admission->current_flags)) {
         scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::BLOCK_COMPLETION_INVALID, &slot);
@@ -984,9 +984,9 @@ inline __aicore__ bool scheduler_ordered_park_ordinary(
         candidate.args_observed = slot.args_observed;
         candidate.predicate = slot.predicate;
         candidate.slot_index = UINT8_MAX;
-        local->local_ready_mask &= static_cast<uint8_t>(~(1U << index));
+        scheduler_local_ready_remove(local, index);
         scheduler_initialize_free_slot(&slot);
-        local->set_timing_slot(local->config.self_lane, index, -1);
+        local->set_timing_slot(index, -1);
     }
     return true;
 }
@@ -1034,8 +1034,7 @@ static inline __aicore__ bool scheduler_ordered_can_enter_slot(
             );
         if (slot.gm_mix &&
             (admission->gm_mix.phase != SchedulerGmMixPhase::RUNNING || admission->gm_mix.slot_index != slot_index ||
-             admission->gm_mix.slot_generation != slot.generation || admission->gm_mix.block_idx != slot.block_idx ||
-             admission->gm_mix.subtask_slot != slot.subtask_slot))
+             admission->gm_mix.block_idx != slot.block_idx || admission->gm_mix.subtask_slot != slot.subtask_slot))
             return scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
         // Ordinary entry has its own strong gate below; cooperative entry
         // needs this one. Neither path reuses an earlier poll's permission.

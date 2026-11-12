@@ -19,7 +19,7 @@ inline __aicore__ bool scheduler_protocol_execution_matches(
 ) {
     return record->worker_index == local->worker_id() && record->task_ref == slot.task_ref &&
            record->block_idx == slot.block_idx && record->subtask_slot == slot.subtask_slot &&
-           record->pending_slot == pending_slot && record->generation == slot.generation;
+           record->pending_slot == pending_slot;
 }
 
 inline __aicore__ void scheduler_protocol_execution_permit(
@@ -61,7 +61,6 @@ inline __aicore__ void scheduler_protocol_execution_permit(
     record->worker_index = static_cast<uint32_t>(local->worker_id());
     record->pending_slot = static_cast<uint16_t>(pending_slot);
     record->subtask_slot = slot.subtask_slot;
-    record->generation = slot.generation;
     record->order_key = order;
     record->group_seq = slot.gm_mix ? local->admission->gm_mix.group_seq : 0;
     record->flags = SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED |
@@ -143,14 +142,14 @@ inline __aicore__ void scheduler_protocol_execution_consumed(
 
 inline __aicore__ void scheduler_protocol_execution_trace_published(
     __gm__ void *base, const SchedulerLocalState *local, int64_t task, uint32_t block, uint32_t subtask,
-    uint32_t pending_slot, uint32_t generation
+    uint32_t pending_slot
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
     auto *record = scheduler_protocol_execution_at(base, local, layout, task, block, subtask);
     if (record == nullptr) return;
     if (record->completion_consumed.sequence == 0 || record->worker_index != local->worker_id() ||
-        record->generation != generation || record->pending_slot != pending_slot) {
+        record->pending_slot != pending_slot) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }

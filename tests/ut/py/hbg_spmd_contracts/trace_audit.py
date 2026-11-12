@@ -10,9 +10,9 @@
 
 from __future__ import annotations
 
-from .types import MAX_EPOCH, MAX_GENERATION, ContractViolation, require
+from .types import MAX_EPOCH, ContractViolation, require
 
-SCHEMA = "hbg-spmd-contract-v1"
+SCHEMA = "hbg-spmd-contract-v2"
 
 
 class TraceAudit:
@@ -102,7 +102,6 @@ class TraceAudit:
         self._frontier(task.ref, owner)
         require(owner not in self.running, "TRACE_BUSY")
         require(key not in self.claims, "TRACE_DUPLICATE_CLAIM")
-        require(type(event["generation"]) is int and 0 < event["generation"] <= MAX_GENERATION, "TRACE_GENERATION")
         mapping = dict(event["mapping"])
         require(all(type(slot) is int and type(worker) is int for slot, worker in mapping.items()), "TRACE_MAPPING")
         require(len(mapping) == len(event["mapping"]) and set(mapping) == set(task.slots), "TRACE_MAPPING")
@@ -133,7 +132,6 @@ class TraceAudit:
             "owner": owner,
             "mapping": mapping,
             "resources": resources,
-            "generation": event["generation"],
         }
         self.arrived[key] = set()
 
@@ -153,9 +151,7 @@ class TraceAudit:
         self.arrived[key].add(worker)
 
     def _on_start(self, event):
-        require(
-            all(type(event[field]) is int for field in ("slot", "block_num", "generation", "order")), "TRACE_SCHEMA"
-        )
+        require(all(type(event[field]) is int for field in ("slot", "block_num", "order")), "TRACE_SCHEMA")
         key = self._key(event)
         identity, worker = self._execution(event)
         self._frontier(key[0], worker)
@@ -165,7 +161,6 @@ class TraceAudit:
         task = self.tasks[key[0]]
         claim = self.claims[key]
         require(event["slot"] == identity[2] and event["block_num"] == task.blocks, "TRACE_CONTEXT")
-        require(event["generation"] == claim["generation"], "TRACE_GENERATION")
         require(event["order"] == self.admissions[key[0]], "TRACE_ORDER")
         require(event["source"] in ("ordinary", "mix", "direct_refill"), "TRACE_SOURCE")
         require(not task.mixed or self.arrived[key] == claim["resources"], "TRACE_RESOURCE_NOT_READY")

@@ -773,6 +773,7 @@ enum class SchedulerDispatchSlotState : uint8_t {
     FREE = 1,
     FILLING = 2,
     READY = 3,
+    EXECUTING = 4,
 };
 
 enum SchedulerTaskMetadataFlags : uint8_t {
@@ -1039,8 +1040,8 @@ struct alignas(64) SchedulerGraphSummary {
     uint64_t async_layout_offset;
 };
 
-// Each core stages its execution trace locally before publishing completion.
-// Completion service copies it into the final per-task trace.
+// The executing core stages one own-slot trace and consolidates it into the
+// task's final trace during retirement, before the slot can execute again.
 struct SchedulerExecutorTaskTrace {
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
@@ -1072,7 +1073,7 @@ enum class SchedulerErrorSite : uint64_t {
     COMPLETION_INVALID_SHAPE = 67,
     COMPLETION_RESOLVE_FAILED = 68,
     COMPLETION_REFILL_DISPATCH_FAILED = 70,
-    COMPLETION_GENERATION_MISMATCH = 74,
+    COMPLETION_SLOT_BINDING_INVALID = 74,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
     READY_INBOX_REFRESH_FAILED = 80,
     BOOTSTRAP_FAILED = 90,
@@ -1295,7 +1296,6 @@ struct alignas(64) SchedulerTaskTrace {
     uint32_t execution_block_num;
     uint32_t execution_subtask_slot;
     uint32_t execution_pending_slot;
-    uint32_t execution_generation;
     uint32_t execution_identity_flags;
     uint32_t execution_cluster_index;
     uint32_t execution_cluster_lane;
@@ -1401,7 +1401,7 @@ static_assert(
 );
 static_assert(sizeof(SchedulerTaskTrace) == 320, "task trace layout changed");
 static_assert(offsetof(SchedulerTaskTrace, execution_run_epoch) == 264, "execution identity offset changed");
-static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 316, "execution identity exceeds trace tail");
+static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 312, "execution identity exceeds trace tail");
 static_assert(
     offsetof(SchedulerTaskTrace, dispatch_start_cycles) % 64 == 0,
     "Scheduler-owned dispatch and completion fields must begin on a cache-line boundary"

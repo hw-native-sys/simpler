@@ -77,7 +77,7 @@ struct alignas(64) SchedulerArgsDumpRequest {
     uint64_t run_epoch;
     uint64_t task_id;
     uint64_t stage;
-    uint64_t generation;
+    uint64_t publisher;
     uint64_t tick;
     uint64_t arg_index;
     uint64_t byte_cursor;
@@ -88,29 +88,37 @@ struct alignas(64) SchedulerArgsDumpAck {
     uint64_t run_epoch;
     uint64_t task_id;
     uint64_t stage;
-    uint64_t generation;
+    uint64_t publisher;
     uint64_t tick;
     uint64_t arg_index;
     uint64_t byte_cursor;
     uint64_t status;
 };
 
-// The commit binds the state to one dispatch generation and boundary. BEFORE
-// and AFTER may share a generation; the echoed request tick orders chunks.
+// Phase identity survives chunk requests on the publisher's channel.
+inline __aicore__ bool scheduler_args_dump_ack_matches_phase(
+    const SchedulerArgsDumpAck &ack, uint64_t epoch, uint64_t task_ref, ArgsDumpStage stage, uint64_t publisher
+) {
+    return ack.run_epoch == epoch && ack.task_id == task_ref && ack.stage == static_cast<uint64_t>(stage) &&
+           ack.publisher == publisher;
+}
+
+// The task and boundary identify one publisher in a run; the echoed request
+// tick orders chunks on that publisher's channel.
 inline __aicore__ uint64_t
-scheduler_args_dump_ack_commit(uint64_t generation, uint64_t stage, SchedulerArgsDumpStatus status) {
+scheduler_args_dump_ack_commit(uint64_t task_ref, uint64_t stage, SchedulerArgsDumpStatus status) {
     const uint64_t state = static_cast<uint64_t>(status);
-    if (generation == 0 || generation > UINT32_MAX || stage > static_cast<uint64_t>(ArgsDumpStage::AFTER_COMPLETION) ||
+    if (task_ref >= INT32_MAX || stage > static_cast<uint64_t>(ArgsDumpStage::AFTER_COMPLETION) ||
         state < static_cast<uint64_t>(SchedulerArgsDumpStatus::WouldBlock) ||
         state > static_cast<uint64_t>(SchedulerArgsDumpStatus::Aborted))
         return 0;
-    return (generation << 32) | (stage << 8) | state;
+    return ((task_ref + 1) << 32) | (stage << 8) | state;
 }
 
 inline __aicore__ SchedulerArgsDumpStatus scheduler_args_dump_ack_status(const SchedulerArgsDumpAck &ack) {
     const auto status = static_cast<SchedulerArgsDumpStatus>(ack.status & UINT64_C(0xff));
-    return ack.tick != 0 && ack.status != 0 &&
-                   ack.status == scheduler_args_dump_ack_commit(ack.generation, ack.stage, status) ?
+    return ack.tick != 0 && ack.publisher != 0 && ack.publisher <= SCHEDULER_WORKER_CAPACITY && ack.status != 0 &&
+                   ack.status == scheduler_args_dump_ack_commit(ack.task_id, ack.stage, status) ?
                status :
                SchedulerArgsDumpStatus::Idle;
 }
@@ -135,7 +143,7 @@ inline __aicore__ bool scheduler_args_dump_observe_ack(
     next.run_epoch = reader.load(ack->run_epoch);
     next.task_id = reader.load(ack->task_id);
     next.stage = reader.load(ack->stage);
-    next.generation = reader.load(ack->generation);
+    next.publisher = reader.load(ack->publisher);
     next.arg_index = reader.load(ack->arg_index);
     next.byte_cursor = reader.load(ack->byte_cursor);
     reader.barrier();
@@ -290,8 +298,8 @@ inline __aicore__ __gm__ SchedulerArgsDumpTask *scheduler_args_dump_task(__gm__ 
     return task->task_ref == task_id ? task : nullptr;
 }
 
-inline __aicore__ uint64_t scheduler_args_dump_publisher(uint32_t worker, uint32_t generation) {
-    return generation == 0 || worker == UINT32_MAX ? 0 : (static_cast<uint64_t>(generation) << 32) | (worker + 1U);
+inline __aicore__ uint64_t scheduler_args_dump_publisher(uint32_t worker) {
+    return worker >= SCHEDULER_WORKER_CAPACITY ? 0 : worker + 1U;
 }
 
 // These phase words are published by AICore atomics. On A5, ld_dev can
@@ -348,16 +356,16 @@ scheduler_args_dump_return(__gm__ SchedulerArgsDumpTask *task, Publish publish) 
 }
 
 inline __aicore__ bool scheduler_args_dump_seal(
-    __gm__ SchedulerArgsDumpTask *task, ArgsDumpStage stage, const SchedulerArgsDumpAck &ack, uint64_t epoch
+    __gm__ SchedulerArgsDumpTask *task, ArgsDumpStage stage, const SchedulerArgsDumpAck &ack, uint64_t epoch,
+    uint64_t request_tick
 ) {
     if (!scheduler_args_dump_task_valid(task) ||
         (stage != ArgsDumpStage::BEFORE_DISPATCH && stage != ArgsDumpStage::AFTER_COMPLETION))
         return false;
     const bool before = stage == ArgsDumpStage::BEFORE_DISPATCH;
     const uint64_t publisher = scheduler_args_dump_load(before ? task->publisher_before : task->publisher_after);
-    if (publisher == 0 || ack.run_epoch != epoch || ack.task_id != task->task_ref ||
-        ack.stage != static_cast<uint64_t>(stage) || ack.generation != publisher >> 32 ||
-        scheduler_args_dump_ack_status(ack) != SchedulerArgsDumpStatus::Sealed ||
+    if (publisher == 0 || !scheduler_args_dump_ack_matches_phase(ack, epoch, task->task_ref, stage, publisher) ||
+        ack.tick != request_tick || scheduler_args_dump_ack_status(ack) != SchedulerArgsDumpStatus::Sealed ||
         (before ? scheduler_args_dump_load(task->before_state) != 1 :
                   !scheduler_args_dump_can_execute(task) ||
                       scheduler_args_dump_load(task->returned_participants) != task->expected_participants))

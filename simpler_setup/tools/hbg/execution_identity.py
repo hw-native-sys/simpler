@@ -19,7 +19,6 @@ FIELDS = frozenset(
         "block_num",
         "subtask_slot",
         "pending_slot",
-        "dispatch_generation",
         "order_key",
         "group_seq",
         "cluster_index",
@@ -47,10 +46,9 @@ def _validate_record(record):
         or record["subtask_slot"] > 2
         or record["pending_slot"] > 1
         or record["cluster_lane"] > 2
-        or not 0 < record["dispatch_generation"] < 1 << 32
         or (record["block_num"] > 1 and record["order_key"] is None)
     ):
-        raise ValueError("invalid execution identity shape or generation")
+        raise ValueError("invalid execution identity shape")
 
 
 def attach_execution_identities(section, tasks, runtime):
@@ -66,7 +64,7 @@ def attach_execution_identities(section, tasks, runtime):
     rows = {tuple(task[field] for field in JOIN): task for task in tasks}
     if len(rows) != len(tasks):
         raise ValueError("duplicate execution identity row join")
-    observed, executions, generations = set(), set(), set()
+    observed, executions = set(), set()
     positions, orders, groups, block_counts = {}, {}, {}, {}
     for record in section["records"]:
         _validate_record(record)
@@ -82,9 +80,8 @@ def attach_execution_identities(section, tasks, runtime):
         ):
             raise ValueError("execution identity Mix placement mismatch")
         execution = (record["run_epoch"], record["task_id"], record["block_idx"], record["subtask_slot"])
-        generation = (record["run_epoch"], record["core_id"], record["pending_slot"], record["dispatch_generation"])
-        if execution in executions or generation in generations:
-            raise ValueError("duplicate execution identity or slot generation")
+        if execution in executions:
+            raise ValueError("duplicate execution identity")
         position_key = (record["run_epoch"], record["core_id"])
         position = (record["cluster_index"], record["cluster_lane"])
         if positions.setdefault(position_key, position) != position:
@@ -99,7 +96,6 @@ def attach_execution_identities(section, tasks, runtime):
         block_counts[group_key] = block_counts.get(group_key, 0) + 1
         observed.add(key)
         executions.add(execution)
-        generations.add(generation)
         task.update({field: record[field] for field in FIELDS - set(JOIN) - {"task_id"}})
     if observed != rows.keys():
         raise ValueError("execution identity coverage is incomplete")

@@ -117,12 +117,12 @@ protected:
     void request(uint32_t worker, uint32_t task_id, uint64_t cursor = 0, uint64_t byte_cursor = 0) {
         auto *task = scheduler_args_dump_task(image.data(), task_id);
         if (task->before_state == 0) ASSERT_EQ(scheduler_args_dump_enter(task), SchedulerArgsDumpArrival::Publisher);
-        task->publisher_before = scheduler_args_dump_publisher(worker, 19);
+        task->publisher_before = scheduler_args_dump_publisher(worker);
         auto &request = requests[worker];
         request.run_epoch = epoch;
         request.task_id = task_id;
         request.stage = static_cast<uint64_t>(ArgsDumpStage::BEFORE_DISPATCH);
-        request.generation = 19;
+        request.publisher = scheduler_args_dump_publisher(worker);
         request.arg_index = cursor;
         request.byte_cursor = byte_cursor;
         ++request.tick;
@@ -261,7 +261,7 @@ TEST_F(ResidentDumpServiceTest, AnOpenCopyCannotBeReboundOrDetachedFromItsOwner)
     EXPECT_EQ(states[0]->run_dropped_record_count, 1);
 }
 
-TEST_F(ResidentDumpServiceTest, RefusesStaleFullEpochAndWrongGenerationWithoutOpeningARecord) {
+TEST_F(ResidentDumpServiceTest, RefusesStaleFullEpochAndWrongPublisherWithoutOpeningARecord) {
     ResidentArgsDumpService service;
     ASSERT_TRUE(service.initialize(image.data(), table_address(), callables.size(), 0, 1));
     request(0, 0);
@@ -270,7 +270,7 @@ TEST_F(ResidentDumpServiceTest, RefusesStaleFullEpochAndWrongGenerationWithoutOp
     EXPECT_EQ(scheduler_args_dump_ack_status(acknowledgements[0]), SchedulerArgsDumpStatus::Aborted);
     EXPECT_FALSE(service.has_open_record());
     request(0, 0);
-    ++requests[0].generation;
+    ++requests[0].publisher;
     EXPECT_FALSE(service.step());
     EXPECT_FALSE(service.has_open_record());
     EXPECT_EQ(metadata[0]->count, 0);
