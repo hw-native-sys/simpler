@@ -15,7 +15,7 @@
 #include "scheduler_async_state.h"
 #include "scheduler_resolve_state.h"
 
-struct alignas(128) SchedulerAsyncLayout {
+struct alignas(64) SchedulerAsyncLayout {
     uint64_t run_epoch;
     uint64_t image_bytes;
     uint64_t task_map_offset;
@@ -41,24 +41,23 @@ struct SchedulerAsyncTaskData {
     uint32_t group_base;
     uint16_t block_count;
     LaneMask async_mask;
-    uint8_t reserved;
 };
 
-struct alignas(128) SchedulerAsyncGroupProgress {
+struct alignas(64) SchedulerAsyncGroupProgress {
     uint64_t pending_mask;
     uint32_t condition_cursor;
     uint32_t acquire_cursor;
 };
 
-struct alignas(128) SchedulerAsyncFinishProgress {
+struct alignas(64) SchedulerAsyncFinishProgress {
     SchedulerResolveCursor resolver;
 };
 
-struct alignas(128) SchedulerAsyncDirectoryWord {
+struct alignas(64) SchedulerAsyncDirectoryWord {
     volatile uint64_t bits;
 };
 
-struct alignas(128) SchedulerAsyncActivity {
+struct alignas(64) SchedulerAsyncActivity {
     volatile uint64_t activated;
 };
 
@@ -77,7 +76,7 @@ inline __aicore__ void scheduler_async_copy_resolver(Destination &destination, c
     destination.route.result = source.route.result;
     destination.publication.inbox_offset = source.publication.inbox_offset;
     destination.publication.count = source.publication.count;
-    destination.publication.type = source.publication.type;
+    destination.publication.destination = source.publication.destination;
     destination.publication.target = source.publication.target;
     destination.publication.phase = source.publication.phase;
     destination.phase = source.phase;
@@ -86,10 +85,10 @@ inline __aicore__ void scheduler_async_copy_resolver(Destination &destination, c
         destination.publication.refs[i] = source.publication.refs[i];
 }
 
-static_assert(sizeof(SchedulerAsyncLayout) == 128 && alignof(SchedulerAsyncLayout) == 128);
+static_assert(sizeof(SchedulerAsyncLayout) == 128 && alignof(SchedulerAsyncLayout) == 64);
 static_assert(offsetof(SchedulerAsyncLayout, task_count) == 96);
 static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 120);
-static_assert(sizeof(SchedulerAsyncActivity) == 128 && alignof(SchedulerAsyncActivity) == 128);
+static_assert(sizeof(SchedulerAsyncActivity) == 64 && alignof(SchedulerAsyncActivity) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncActivity> && std::is_trivially_copyable_v<SchedulerAsyncActivity>
 );
@@ -98,16 +97,16 @@ static_assert(sizeof(SchedulerAsyncTaskData) == 16 && alignof(SchedulerAsyncTask
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncTaskData> && std::is_trivially_copyable_v<SchedulerAsyncTaskData>
 );
-static_assert(sizeof(SchedulerAsyncGroupProgress) == 128 && alignof(SchedulerAsyncGroupProgress) == 128);
+static_assert(sizeof(SchedulerAsyncGroupProgress) == 64 && alignof(SchedulerAsyncGroupProgress) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncGroupProgress> && std::is_trivially_copyable_v<SchedulerAsyncGroupProgress>
 );
-static_assert(sizeof(SchedulerAsyncFinishProgress) == 256 && alignof(SchedulerAsyncFinishProgress) == 128);
+static_assert(sizeof(SchedulerAsyncFinishProgress) == 192 && alignof(SchedulerAsyncFinishProgress) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncFinishProgress> &&
     std::is_trivially_copyable_v<SchedulerAsyncFinishProgress>
 );
-static_assert(sizeof(SchedulerAsyncDirectoryWord) == 128 && alignof(SchedulerAsyncDirectoryWord) == 128);
+static_assert(sizeof(SchedulerAsyncDirectoryWord) == 64 && alignof(SchedulerAsyncDirectoryWord) == 64);
 
 inline __aicore__ uint64_t scheduler_async_condition_mask(uint32_t count) {
     return count == 64 ? UINT64_MAX : count < 64 ? (UINT64_C(1) << count) - 1 : 0;

@@ -107,7 +107,7 @@ inline __aicore__ void publish_activity(SchedulerAsyncLocalState &local) {
     // this isolated line has no cached writes or RMW, and never returns to zero.
 #if defined(__CCE_AICORE__)
     st_dev(UINT64_C(1), const_cast<__gm__ uint64_t *>(&activity->activated), 0);
-    dsb(DSB_DDR);
+    scheduler_ddr_barrier();
 #else
     __atomic_store_n(&activity->activated, UINT64_C(1), __ATOMIC_RELEASE);
 #endif
@@ -203,39 +203,59 @@ inline __aicore__ bool scheduler_initialize_async(
     using namespace scheduler_async_detail;
     local = SchedulerAsyncLocalState{};
     if (offset == 0) return true;
-    if (base == nullptr || reinterpret_cast<uintptr_t>(base) % 128 != 0 ||
+    if (base == nullptr || reinterpret_cast<uintptr_t>(base) % pto2::resident::ASYNC_RECORD_ALIGNMENT != 0 ||
         bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(base) ||
-        !span(bytes, offset, 1, sizeof(SchedulerAsyncLayout), 128))
+        !span(bytes, offset, 1, sizeof(SchedulerAsyncLayout), pto2::resident::ASYNC_RECORD_ALIGNMENT))
         return fail(local, -1);
     auto *layout = scheduler_state_at<SchedulerAsyncLayout>(base, offset);
     observe(layout, sizeof(*layout));
     if (epoch == 0 || layout->run_epoch != epoch || layout->image_bytes != bytes || layout->task_count != tasks ||
         layout->async_task_count == 0 || layout->async_task_count > tasks ||
         layout->group_count < layout->async_task_count ||
-        !span(bytes, layout->activity_offset, 1, sizeof(SchedulerAsyncActivity), 128) ||
-        (layout->sdma_guard_count != 0 && !span(
-                                              bytes, layout->sdma_guards_offset, layout->sdma_guard_count,
-                                              sizeof(pto2::resident::AsyncSdmaSubmissionGuard), 128
-                                          )) ||
+        !span(
+            bytes, layout->activity_offset, 1, sizeof(SchedulerAsyncActivity), pto2::resident::ASYNC_RECORD_ALIGNMENT
+        ) ||
+        (layout->sdma_guard_count != 0 &&
+         !span(
+             bytes, layout->sdma_guards_offset, layout->sdma_guard_count,
+             sizeof(pto2::resident::AsyncSdmaSubmissionGuard), pto2::resident::ASYNC_RECORD_ALIGNMENT
+         )) ||
         !span(bytes, layout->task_map_offset, tasks, sizeof(uint32_t), alignof(uint32_t)) ||
         !span(
             bytes, layout->task_data_offset, layout->async_task_count, sizeof(SchedulerAsyncTaskData),
             alignof(SchedulerAsyncTaskData)
         ) ||
-        !span(bytes, layout->groups_offset, layout->group_count, sizeof(AsyncGroupData), 128) ||
-        !span(bytes, layout->group_leases_offset, layout->group_count, sizeof(SchedulerAsyncLease), 128) ||
-        !span(bytes, layout->group_progress_offset, layout->group_count, sizeof(SchedulerAsyncGroupProgress), 128) ||
-        !span(bytes, layout->joins_offset, layout->async_task_count, sizeof(SchedulerAsyncTaskJoin), 128) ||
-        !span(bytes, layout->finish_leases_offset, layout->async_task_count, sizeof(SchedulerAsyncLease), 128) ||
         !span(
-            bytes, layout->finish_progress_offset, layout->async_task_count, sizeof(SchedulerAsyncFinishProgress), 128
+            bytes, layout->groups_offset, layout->group_count, sizeof(AsyncGroupData),
+            pto2::resident::ASYNC_RECORD_ALIGNMENT
         ) ||
         !span(
-            bytes, layout->check_directory_offset, (static_cast<uint64_t>(layout->group_count) + 63) / 64, 128, 128
+            bytes, layout->group_leases_offset, layout->group_count, sizeof(SchedulerAsyncLease),
+            pto2::resident::ASYNC_RECORD_ALIGNMENT
         ) ||
         !span(
-            bytes, layout->finish_directory_offset, (static_cast<uint64_t>(layout->async_task_count) + 63) / 64, 128,
-            128
+            bytes, layout->group_progress_offset, layout->group_count, sizeof(SchedulerAsyncGroupProgress),
+            pto2::resident::ASYNC_RECORD_ALIGNMENT
+        ) ||
+        !span(
+            bytes, layout->joins_offset, layout->async_task_count, sizeof(SchedulerAsyncTaskJoin),
+            pto2::resident::ASYNC_RECORD_ALIGNMENT
+        ) ||
+        !span(
+            bytes, layout->finish_leases_offset, layout->async_task_count, sizeof(SchedulerAsyncLease),
+            pto2::resident::ASYNC_RECORD_ALIGNMENT
+        ) ||
+        !span(
+            bytes, layout->finish_progress_offset, layout->async_task_count, sizeof(SchedulerAsyncFinishProgress),
+            pto2::resident::ASYNC_RECORD_ALIGNMENT
+        ) ||
+        !span(
+            bytes, layout->check_directory_offset, (static_cast<uint64_t>(layout->group_count) + 63) / 64,
+            pto2::resident::ASYNC_RECORD_ALIGNMENT, pto2::resident::ASYNC_RECORD_ALIGNMENT
+        ) ||
+        !span(
+            bytes, layout->finish_directory_offset, (static_cast<uint64_t>(layout->async_task_count) + 63) / 64,
+            pto2::resident::ASYNC_RECORD_ALIGNMENT, pto2::resident::ASYNC_RECORD_ALIGNMENT
         ))
         return fail(local, -1);
     local.base = static_cast<__gm__ uint8_t *>(base);
@@ -256,8 +276,7 @@ inline __aicore__ bool scheduler_async_map_execution(
     auto *tasks = scheduler_state_at<SchedulerAsyncTaskData>(local.base, local.layout->task_data_offset);
     const auto &task = tasks[index];
     const uint8_t mask = *reinterpret_cast<__gm__ const uint8_t *>(&task.async_mask);
-    if (lane >= 3 || mask == 0 || (mask & ~UINT8_C(7)) != 0 || task.reserved != 0 || block >= task.block_count)
-        return fail(local, task_ref);
+    if (lane >= 3 || mask == 0 || (mask & ~UINT8_C(7)) != 0 || block >= task.block_count) return fail(local, task_ref);
     if ((mask & (1U << lane)) == 0) return true;
     const uint64_t wide_group_index = static_cast<uint64_t>(task.group_base) +
                                       block * static_cast<uint32_t>(__builtin_popcount(mask)) +
@@ -303,7 +322,7 @@ inline __aicore__ bool scheduler_async_begin_execution(
     global.async_run_epoch = writer.run_epoch;
     global.async_group_offset = writer.group_offset;
     global.async_group_index = writer.group_index;
-    global.async_reserved = 0;
+    global.async_output_capture_refused = 0;
     global.async_present = 1;
     return true;
 }
@@ -338,8 +357,8 @@ inline __aicore__ bool scheduler_async_seal_execution(
             *local, task_ref, data->error_code != 0 ? data->error_code : SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED
         );
     }
-    // Identity and entry bounds in the second header line remain Host-owned.
-    // Only the mutable header prefix and [0, count) entries need publication.
+    // Registration state shares the first line with immutable identity/offsets.
+    // The second line is Host-owned; publish line one and [0, count) entries.
     writeback(data, offsetof(AsyncGroupData, sdma_guards_offset));
     if (data->count != 0)
         writeback(
@@ -394,19 +413,24 @@ struct SchedulerAsyncCompletionObserver {
             return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
         if (token.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
             auto *record = reinterpret_cast<__gm__ uint64_t *>(token.addr);
+            const uint64_t completed =
+                scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [record]() __aicore__ {
 #if defined(__CCE_AICORE__)
-            const uint64_t completed = __builtin_cce_ld_dev(record, 0);
+                    return static_cast<uint64_t>(__builtin_cce_ld_dev(record, 0));
 #else
-            const uint64_t completed = __atomic_load_n(record, __ATOMIC_ACQUIRE);
+                return __atomic_load_n(record, __ATOMIC_ACQUIRE);
 #endif
+                });
             return {completed >= token.backend_cookie ? CompletionPollState::READY : CompletionPollState::PENDING, 0};
         }
         auto *counter = reinterpret_cast<__gm__ uint32_t *>(token.addr);
+        const uint32_t value = scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [counter]() __aicore__ {
 #if defined(__CCE_AICORE__)
-        const uint32_t value = static_cast<uint32_t>(__builtin_cce_ld_dev(counter, 0));
+            return static_cast<uint32_t>(__builtin_cce_ld_dev(counter, 0));
 #else
-        const uint32_t value = __atomic_load_n(counter, __ATOMIC_ACQUIRE);
+            return __atomic_load_n(counter, __ATOMIC_ACQUIRE);
 #endif
+        });
         // COUNTER is INT32. A negative sample is below every supported
         // nonnegative threshold; it is neither completion nor malformed data.
         if (value > INT32_MAX) return {CompletionPollState::PENDING, 0};
@@ -438,14 +462,15 @@ inline __aicore__ bool scheduler_async_check_step(
         return fail(local, ref, code);
     };
     const uint64_t offset = local.layout->groups_offset + static_cast<uint64_t>(index) * sizeof(AsyncGroupData);
-    if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), 128)) return failed(-1);
+    if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), pto2::resident::ASYNC_RECORD_ALIGNMENT))
+        return failed(-1);
     auto *data = scheduler_state_at<AsyncGroupData>(local.base, offset);
     observe(data, sizeof(*data));
     const int64_t task_ref = data->task_ref;
     AsyncWriter writer{local.base, local.bytes, local.layout->run_epoch, offset, index};
     if (task_ref < 0 || static_cast<uint64_t>(task_ref) >= local.layout->task_count ||
         pto2::resident::detail::group(writer) == nullptr || data->state != AsyncPublicationState::SEALED ||
-        data->error_code != 0 || data->reserved != 0 || data->count == 0 || data->count > data->capacity ||
+        data->error_code != 0 || data->count == 0 || data->count > data->capacity ||
         !pto2::resident::detail::layout_valid(writer, *data))
         return failed(task_ref);
     auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset);

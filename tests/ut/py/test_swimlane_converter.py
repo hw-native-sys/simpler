@@ -43,7 +43,7 @@ def _trace(*args, **kwargs):
     clock placement and rank merging rather than anything a runtime decides. A test
     whose fixture carries runtime-specific data -- a task id in one layout, or a phase
     only one runtime emits (hbg: graph_prepare, resolve_standalone, and its AICore
-    scheduler's bootstrap / state_probe / worksteal / refill / idle; tmr: release,
+    scheduler's bootstrap / state_probe / refill / idle; tmr: release,
     dummy_task, predicated_skip) -- must name its runtime explicitly instead, so
     the document it builds is one a real run could produce.
 
@@ -995,6 +995,7 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
                 "register_release_end_cycles": device_base + 650,
             }
         ]
+        records["scheduler_tasks"]["producer"] = "aicore"
         records_path.write_text(json.dumps(records))
 
     output = tmp_path / "l3.json"
@@ -1022,6 +1023,7 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
     }
     assert "rank0 / AICore Scheduler" in process_names
     assert "rank1 / AICore Scheduler" in process_names
+    assert not any(name.endswith(" / Scheduler View") for name in process_names)
     register_releases = [event for event in events if event.get("name") == "register_release"]
     assert {event["args"]["rank"] for event in register_releases} == {0, 1}
 
@@ -1562,6 +1564,66 @@ def test_level_two_accepts_task_timing_from_either_scheduler_producer(tmp_path, 
     assert data["scheduler_task_producer"] == producer
     assert data["tasks"][0]["dispatch_time_us"] == pytest.approx(0.005)
     assert data["tasks"][0]["finish_time_us"] == pytest.approx(0.075)
+
+
+@pytest.mark.parametrize("producer", ["aicpu", "aicore"])
+@pytest.mark.parametrize("level", [2, 3, 4])
+def test_aicore_detail_keeps_task_boundaries_and_flows_on_worker_view(tmp_path, producer, level):
+    capture = Capture(runtime=HBG_RUNTIME, level=level, clock_freq_hz=1_000_000, scheduler_producer=producer)
+    for task_id, offset in [(7, 0), (8, 60)]:
+        capture.task(
+            task_id=task_id,
+            start=40 + offset,
+            end=70 + offset,
+            dispatch=20 + offset,
+            finish=75 + offset,
+            receive_to_start=5,
+        )
+        if level >= 3:
+            add_phase = capture.aicore_sched_phase if producer == "aicore" else capture.sched_phase
+            add_phase(phase="dispatch", start=18 + offset, end=22 + offset, task_id=task_id)
+            add_phase(phase="complete", start=75 + offset, end=78 + offset, task_id=task_id)
+    raw = tmp_path / "raw.json"
+    raw.write_text(json.dumps(capture.build()))
+    before = raw.read_bytes()
+    data = sc.read_perf_data(raw)
+    trace = _trace(
+        data["tasks"],
+        None,
+        runtime_name=HBG_RUNTIME,
+        scheduler_task_producer=data["scheduler_task_producer"],
+        chip_swimlane_level=data["chip_swimlane_level"],
+        scheduler_phases=data.get("scheduler_records"),
+        scheduler_streams=data.get("scheduler_streams"),
+        core_to_thread=[0],
+        deps_edges={7: [8]},
+    )
+    events = trace["traceEvents"]
+    hidden = producer == "aicore" and level >= 3
+    assert any(e.get("pid") == 3 for e in events) is not hidden
+    workers = [e for e in events if e.get("pid") == 4 and e.get("ph") == "X"]
+    assert len(workers) == 2
+    origin = 18 if level >= 3 else 20
+    for event, offset in zip(workers, (0, 60)):
+        assert event["ts"] == 35 + offset - origin
+        assert event["dur"] == 35
+        assert event["args"]["kernel-duration-us"] == 30
+        if hidden:
+            args = event["args"]
+            assert args["dispatch-time-us"] == 20 + offset - origin
+            assert args["receive-time-us"] == 35 + offset - origin
+            assert args["kernel-start-time-us"] == 40 + offset - origin
+            assert args["kernel-end-time-us"] == 70 + offset - origin
+            assert args["finish-time-us"] == 75 + offset - origin
+            assert args["scheduler-duration-us"] == 55
+    flows = [e for e in events if e.get("ph") in ("s", "f")]
+    for flow_id in {e["id"] for e in flows}:
+        assert sorted(e["ph"] for e in flows if e["id"] == flow_id) == ["f", "s"]
+    names = {e["name"] for e in flows}
+    assert "dependency" in names
+    if level >= 3:
+        assert {"dispatch", "complete"} <= names
+    assert raw.read_bytes() == before
 
 
 @pytest.mark.parametrize("dispatch_cycles,finish_cycles", [(125, 185), (115, 175)])
@@ -2507,7 +2569,7 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
             sched_record(phase="resolve", start=2.0, end=3.0, tasks_processed=1, task_id=23),
             sched_record(phase="state_probe", start=4.0, end=5.0, tasks_processed=1, task_id=5),
             sched_record(phase="dispatch", start=5.0, end=6.0, tasks_processed=1, task_id=5),
-            sched_record(phase="worksteal", start=6.0, end=7.0, tasks_processed=1, task_id=7),
+            sched_record(phase="dispatch", start=6.0, end=7.0, tasks_processed=1, task_id=7),
             sched_record(phase="refill", start=7.0, end=8.0, tasks_processed=1, task_id=9),
         ]
     ]
@@ -2547,7 +2609,7 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
         "Resolve(t23)",
         "StateProbe(t5)",
         "Dispatch(t5)",
-        "Worksteal(t7)",
+        "Dispatch(t7)",
         "Refill(t9)",
     ]
     assert [event["args"]["task_id"] for event in phases] == [23, 23, 5, 5, 7, 9]

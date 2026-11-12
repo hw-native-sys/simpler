@@ -1,12 +1,23 @@
 # A5 HBG Graph task 验证与性能采集
 
 架构、协议和实施细节见[中文设计](../../../docs/zh-cn/design/a5-hbg-graph-task.md)。
-当前实现使用 task 粒度调度，默认 T/H8；独立 block 原型仅保留为
+当前 task 粒度调度已实现两个固定业务 ready 队列：AIC（含所有 MIX）与 AIV，无分片。
+每个 worker 只查询本类业务队列；Graph control inbox、GM MIX 和异步 CHECK/FINISH 保留各自的进展协议。
+独立 block 原型仅保留为
 [后续优化候选](../../../docs/zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md)。
 
 ## 当前验证结果
 
-PR #2864 已重放主线 `313499d61`，并修复 PARAM 视图绑定的完整范围检查。
+两队列本轮 18 组模型功能通过，14 组单卡 L1 合计变化 −0.56%，按 ±5% 标准视为持平。
+462 份完整原语 L3 零丢失、零截断；两队列各项 L3/L1 增幅最高 13.65%。
+三臂详细表、初次 +5.23% 边界项及 A/B/A 复测、CPU/硬件覆盖范围见[本轮报告](two-ready-queues/README.zh-CN.md)。
+本轮采用 [dsv41_scheduler](../../fdwic/dsv41_scheduler/README.md) 的原始模型 case，
+范围、正常 `-O3 -g` 构建、每级 1 次预热及 10 次计时、完整 AICPU L1 边界见[两队列验收要求](../../../docs/zh-cn/design/a5-hbg-graph-task/two-ready-queues.md#性能与-dfx-验收)。
+跨卡 MoE 相关四组功能通过，并已补测 L1/L3 参考数据和波动范围，不计入当前 14 组单卡性能考核。下述历史记录不能替代本次证据。
+
+## 历史 Graph 验证记录
+
+PR #2864 当时已重放主线 `313499d61`，并修复 PARAM 视图绑定的完整范围检查。
 下述完整性能测量来自此前基于 `93f1fc98a` 的 `dbf39563c`，不能作为新主线和审查修复后的实测结果。
 
 - 审查修复后 473 项 Python 单测、8 个 C++ 目标和 pre-commit 通过。
@@ -26,7 +37,7 @@ PR #2864 已重放主线 `313499d61`，并修复 PARAM 视图绑定的完整范�
   中有 7 项 Device 中位数比历史主线高出 5% 以上；Qwen 比历史主线 29.478 ms 慢 30.38%。
   历史主线为 `8f42cef9b3f0ebbda800e239aab0949e95552f25`，设备与依赖版本差异已在报告说明。
 
-## 可复用的采集输入
+## 历史 Graph 采集输入
 
 | 文件 | 用途 |
 | ---- | ---- |
@@ -35,6 +46,7 @@ PR #2864 已重放主线 `313499d61`，并修复 PARAM 视图绑定的完整范�
 | [selected-st-cases.json](../../../tools/benchmarks/a5_hbg_graph_task/selected-st-cases.json) | 11 项具有调度性能价值的 ST 用例 |
 | [csa-cases.json](../../../tools/benchmarks/a5_hbg_graph_task/csa-cases.json) | CSA 补充用例 |
 
+以下清单和工具保留此前 Graph 评估的采集合同；本次两队列性能使用上文的 dsv41_scheduler 口径。
 清单仅包含场景选择、参数和筛选理由，不包含实测耗时。
 Qwen 单独测量；`spmd_paged_attention` 按本次范围约定排除。
 A2A3 的 Qwen 和 DeepSeek kernel 不适配 A5，不能作为本轮 A5 验证负载。
@@ -57,8 +69,8 @@ A2A3 的 Qwen 和 DeepSeek kernel 不适配 A5，不能作为本轮 A5 验证负
 逐轮结果、初筛 inventory、实验候选数据、设备日志、源码和二进制 manifest 存放在
 `outputs/a5-hbg-graph-task/`，不纳入 Git。文档目录仅保留 Markdown；可复用脚本和输入清单位于 `tools/benchmarks/a5_hbg_graph_task/`。
 
-- 当前完整性能报告：`outputs/a5-hbg-graph-task/pr2864-full-perf-20261104/report.zh-CN.md`。
-- 当前逐轮数据及比较：同目录 `comparison.json`。
+- PR #2864 历史完整性能报告：`outputs/a5-hbg-graph-task/pr2864-full-perf-20261104/report.zh-CN.md`。
+- 该轮逐次数据及比较：同目录 `comparison.json`。
 - 审查修复后的 Qwen 复测：`outputs/a5-hbg-graph-task/pr2864-review-fixes/qwen/comparison.json`。
 - 历史测量摘要：`outputs/a5-hbg-graph-task/evidence-summary/`；设计文档中保留的历史 JSON 文件名均指该本地归档。
 - CI 修复与日志：`outputs/a5-hbg-graph-task/pr2864-ci/`。

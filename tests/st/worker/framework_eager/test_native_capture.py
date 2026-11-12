@@ -16,6 +16,8 @@ import pytest
 
 _EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/native_capture.py"
 pytestmark = [
+    pytest.mark.runtime_product("kernel"),
+    pytest.mark.execution_mode("capture_replay"),
     pytest.mark.requires_hardware,
     pytest.mark.platforms(["a2a3", "a5"]),
     pytest.mark.test_environment("torch_npu"),
@@ -56,6 +58,6 @@ def test_native_cold_capture(runtime, task_queue, framework_module, tmp_path, re
     _run_capture(runtime, task_queue, framework_module, tmp_path, request, monkeypatch)
 
 
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.coverage_runtime("tensormap_and_ringbuffer")
 def test_native_cold_capture_destroy_refusal(framework_module, tmp_path, request, monkeypatch):
     _run_capture("tensormap_and_ringbuffer", "0", framework_module, tmp_path, request, monkeypatch, "--destroy-refusal")

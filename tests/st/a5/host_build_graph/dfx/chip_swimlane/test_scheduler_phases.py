@@ -21,7 +21,22 @@ from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _build_l3_task_args, _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools.hbg.scalar_profile import analyze_streams
 from simpler_setup.tools.strace_timing import parse_spans
+
+
+def _verify_scalar_streams(raw, streams):
+    records = []
+    for stream in streams:
+        rows = [dict(record) for record in stream["records"]]
+        for metric in stream.get("metrics", []):
+            rows[metric["record_index"]].update({key: value for key, value in metric.items() if key != "record_index"})
+        records.append(rows)
+    profiles = analyze_streams(records, streams, raw["aicore_tasks"], raw.get("aicore_execution_identities"))
+    assert len(profiles) == len(streams)
+    assert all(profile["complete"] for profile in profiles)
+    for profile in profiles:
+        assert sum(profile["exclusive_cycles"].values()) == profile["window_cycles"]
 
 
 def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
@@ -172,14 +187,13 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all("runtime" not in stream for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                # Ready Inbox tasks can all be launched through worksteal.
-                required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "refill", "idle"}
+                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )
-                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill"} & emitted_kinds)
+                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill", "worksteal"} & emitted_kinds)
                 records = [record for stream in streams for record in stream["records"]]
-                launch_kinds = {"dispatch", "worksteal", "refill"}
+                launch_kinds = {"dispatch", "refill"}
                 launches_by_task = Counter(
                     int(record["task_id"])
                     for record in records
@@ -194,14 +208,14 @@ class TestSchedulerPhases(SceneTestCase):
                     if record["kind"] == "state_probe" and record["task_id"] is not None
                 }
                 assert state_probe_task_ids <= profiled_task_ids
-                inbox_launch_task_ids = {
+                pool_launch_task_ids = {
                     int(record["task_id"])
                     for record in records
-                    if record["kind"] in {"dispatch", "worksteal"} and record["task_id"] is not None
+                    if record["kind"] == "dispatch" and record["task_id"] is not None
                 }
-                assert inbox_launch_task_ids <= state_probe_task_ids, (
-                    "Ready Inbox launches are missing state_probe records: "
-                    f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
+                assert pool_launch_task_ids <= state_probe_task_ids, (
+                    "Ready pool launches are missing state_probe records: "
+                    f"{sorted(pool_launch_task_ids - state_probe_task_ids)}"
                 )
                 refill_task_ids = {
                     int(record["task_id"])
@@ -214,13 +228,14 @@ class TestSchedulerPhases(SceneTestCase):
                 )
                 for stream in streams:
                     ordered = sorted(
-                        stream["records"],
+                        (record for record in stream["records"] if not record["kind"].startswith("scalar_")),
                         key=lambda record: (record["start_cycles"], record["end_cycles"]),
                     )
                     assert all(
                         previous["end_cycles"] <= current["start_cycles"]
                         for previous, current in zip(ordered, ordered[1:])
                     )
+                _verify_scalar_streams(raw, streams)
                 probe_by_task = {
                     int(record["task_id"]): record
                     for record in records

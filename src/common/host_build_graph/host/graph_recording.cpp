@@ -207,30 +207,6 @@ bool graph_boundary_relocate_params(GraphBoundary &boundary) {
     return true;
 }
 
-// The recorder thread's own storage for the body it is recording, and the reason none
-// of this is allocated per recording.
-//
-// A recorder thread outlives the bind that first used it: the pool parks
-// kPrewarmedWorkerCount threads at callable registration and keeps them across runs
-// (GraphAsyncRecordingState in orchestration_api.h). Its storage now does too. What a
-// recording needs is a hazard map of 2.17 MB and seven flat arrays; standing those up
-// per recording made the first touch of every page a minor fault, and paid it again on
-// every bind because the memory went back to the kernel in between — with the
-// allocation itself sitting on the submitting thread inside graph_begin, between two
-// outer shells. Held per thread instead, the pages fault once in the process's life and
-// a recording starts by resetting what is already resident.
-//
-// This retains no content across recordings: reset() clears every array and empties the
-// map. Only the pages stay.
-//
-// Safe as a thread_local because a thread records one body at a time: graph_prepare
-// refuses to bind while this thread already has a recording active, and a Graph nested
-// inside a recorded body is refused at graph_begin, so nothing claims this storage twice.
-GraphRecording &recorder_recording() {
-    static thread_local GraphRecording storage;
-    return storage;
-}
-
 // Stand this thread's storage up once, or report that it could not be. Idempotent.
 //
 // Either allocation failing drops whatever the other one took, so the next attempt starts
@@ -596,8 +572,8 @@ const GraphDefinition *graph_definition(const std::byte *data, size_t bytes) {
 // report whatever its x0 held.
 std::atomic<size_t> g_recorder_storage_failures{0};
 
-bool graph_recorder_stand_up_storage() {
-    if (graph_recording_stand_up(recorder_recording())) return true;
+bool graph_recorder_stand_up_storage(GraphRecording &recording) {
+    if (graph_recording_stand_up(recording)) return true;
     g_recorder_storage_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
 }

@@ -14,7 +14,6 @@
 namespace native_admission_test {
 void *primary_entry_points() { return nullptr; }
 void *alternate_entry_points() { return nullptr; }
-void set_dep_gen_capture(bool) {}
 uint32_t arena_bank(uint32_t) { return 0; }
 }  // namespace native_admission_test
 

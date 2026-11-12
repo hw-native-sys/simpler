@@ -16,13 +16,13 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <tuple>
 #include <utility>
 
 #include "hbg_scheduler_test_support.h"
 
-// The startup branch and dispatch-loop branch share this production translation unit.
-#include "aicore/aicore_executor.cpp"
+#include "aicore/resident_scheduler_impl.h"
 
 namespace {
 
@@ -30,7 +30,6 @@ thread_local volatile uint8_t *startup_reg_base = nullptr;
 thread_local std::function<void()> startup_register_observer;
 thread_local bool startup_observing_register = false;
 uint64_t startup_kernel_calls = 0;
-uint64_t startup_ssbuf_calls = 0;
 DispatchPayload *identity_test_payload = nullptr;
 
 void count_kernel_entry(__gm__ int64_t *) { ++startup_kernel_calls; }
@@ -81,9 +80,10 @@ struct StartupFixture {
             for (uint32_t lane = 0; lane < 3; ++lane)
                 metadata.kernel_ids[lane] = masks[task].has(static_cast<SubtaskSlot>(lane)) ? 1 : UINT16_MAX;
         }
+        storage.prepare_ready_pool();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 59));
         storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&count_kernel_entry);
-        storage.ssbuf_region = nullptr;
+
         auto *run = storage.run_control;
         run->active_worker_count = 6;
         run->expected_task_count = 2;
@@ -96,7 +96,6 @@ struct StartupFixture {
             context.scheduler_count = 6;
             context.physical_core_id = static_cast<int32_t>(worker);
             context.graph_storage_address = graph_view.storage_address;
-            context.graph_reserved_address = 0;
             context.graph_task_count = graph_view.task_count;
             context.original_task_count = graph_view.original_task_count;
             context.graph_view_version = graph_view.view_version;
@@ -141,15 +140,15 @@ struct StartupFixture {
         for (int64_t task = 0; task < 2; ++task) {
             const LaneMask resources = scheduler_mix_resource_mask(storage.metadata[task].active_mask);
             ASSERT_EQ(
-                scheduler_route_task(graph_view, base(), &locals[0], run, task, nullptr),
-                SchedulerRouteResult::READY_TO_ENQUEUE
+                scheduler_route_task(graph_view, base(), &locals[0], run, task), SchedulerRouteResult::READY_TO_ENQUEUE
             );
             SchedulerReadyBatch batch{};
-            ASSERT_TRUE(scheduler_ready_batch_append(base(), &locals[0], task, &batch, nullptr));
-            ASSERT_TRUE(scheduler_ready_batch_push(base(), &locals[0], SCHEDULER_MIX_QUEUE, &batch, nullptr));
+            ASSERT_TRUE(scheduler_ready_batch_append(base(), &locals[0], task, &batch));
+            constexpr uint32_t queue = static_cast<uint32_t>(SchedulerReadyClass::AIC);
+            ASSERT_TRUE(scheduler_ready_batch_push(base(), &locals[0], queue, &batch));
             SchedulerReadyClaim ready{};
-            ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-                graph_view, base(), &locals[0], run, SCHEDULER_MIX_QUEUE, 0, &ready.task_ref, nullptr
+            ASSERT_TRUE(scheduler_claim_ready_for_slot(
+                graph_view, base(), &locals[0], run, locals[0].config.scheduler_count, queue, &ready
             ));
             ASSERT_EQ(ready.task_ref, task);
             ASSERT_EQ(
@@ -193,14 +192,10 @@ struct StartupFixture {
                 if (scheduler_protocol_enabled(&local)) scheduler_execute_protocol_task(base(), &local, slot, payload);
                 else execute_task(payload);
                 local.local_completed_generations[slot] = scheduler_dispatch_generation(publication);
-                ASSERT_TRUE(scheduler_service_cluster_completions(
-                    graph_view, base(), &local, run, nullptr, nullptr, nullptr, 0, nullptr, nullptr
-                ));
+                ASSERT_TRUE(scheduler_service_cluster_completions(graph_view, base(), &local, run, 0, nullptr));
             }
             ASSERT_EQ(scheduler_gm_mix_retire(graph_view, base(), &locals[0], run), SchedulerGmMixResult::TASK_LAST);
-            ASSERT_TRUE(
-                scheduler_complete_ordered_task(graph_view, base(), &locals[0], run, task, 0, nullptr, nullptr, nullptr)
-            );
+            ASSERT_TRUE(scheduler_complete_ordered_task(graph_view, base(), &locals[0], run, task, 0));
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
                 bool closed = false;
@@ -213,7 +208,6 @@ struct StartupFixture {
 
     void run_late_worker(uint32_t worker = 3) {
         startup_kernel_calls = 0;
-        startup_ssbuf_calls = 0;
         scheduler_gm_store(storage.run_control->bootstrap_scan_arrived_count, UINT64_C(5));
         scheduler_gm_store(storage.run_control->bootstrap_arrived_count, UINT64_C(5));
         write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
@@ -241,7 +235,6 @@ TEST(HbgGmMixStartupExit, RejectsMalformedPublishedGraphBeforeBootstrap) {
         else context.original_task_count = 0;
         fixture.run_late_worker();
         EXPECT_EQ(startup_kernel_calls, 0u);
-        EXPECT_EQ(startup_ssbuf_calls, 0u);
         EXPECT_EQ(fixture.storage.run_control->bootstrap_scan_arrived_count, 5u);
         EXPECT_EQ(
             fixture.storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
@@ -266,7 +259,6 @@ TEST_P(HbgGmMixStartupExit, LateZeroWorkCoordinatorClosesEveryAdmittedMixBeforeE
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.storage.run_control->bootstrap_scan_arrived_count, UINT64_C(0)), 6u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.storage.run_control->bootstrap_arrived_count, UINT64_C(0)), 6u);
     EXPECT_EQ(startup_kernel_calls, 0u);
-    EXPECT_EQ(startup_ssbuf_calls, 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.storage.run_control->scheduler_error, UINT64_C(0)), 0u);
 }
 
@@ -291,7 +283,6 @@ TEST(HbgGmMixStartupExit, FailedRunAcknowledgesExitWithoutFabricatingCloseSeals)
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 1), UINT64_C(0)), 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(1, 1), UINT64_C(0)), 0u);
     EXPECT_EQ(startup_kernel_calls, 0u);
-    EXPECT_EQ(startup_ssbuf_calls, 0u);
     EXPECT_EQ(
         scheduler_gm_fetch_add(fixture.storage.run_control->scheduler_error, UINT64_C(0)),
         static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
@@ -315,12 +306,12 @@ TEST(HbgGmMixStartupExit, MissingCoordinatorSealTimeoutIdentifiesTheWaitingTaskA
     EXPECT_EQ(run.error_cluster_lane, 1u);
     EXPECT_EQ(run.error_identity_fields, 51u);
     EXPECT_EQ(startup_kernel_calls, 0u);
-    EXPECT_EQ(startup_ssbuf_calls, 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 1), UINT64_C(0)), 0u);
 }
 
 TEST(HbgProtocolStartupExit, RealExecutorFinishesLateZeroWorkMembersAfterClosingEveryObligation) {
     StartupFixture fixture({LaneMask::both_aiv(), LaneMask::all()}, true);
+    ASSERT_EQ(fixture.storage.layout.activity_buffers_offset, 0u);
     fixture.finish_both_tasks_on_cluster_zero();
     auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
         fixture.base(), fixture.storage.layout.protocol.workers_offset
@@ -330,6 +321,7 @@ TEST(HbgProtocolStartupExit, RealExecutorFinishesLateZeroWorkMembersAfterClosing
     );
     for (uint32_t worker = 3; worker < 6; ++worker) {
         fixture.run_late_worker(worker);
+        EXPECT_EQ(scheduler_scalar_current(), nullptr);
         ASSERT_EQ(fixture.storage.run_control->scheduler_error, 0u);
         EXPECT_EQ(workers[worker].finished, 1u);
         EXPECT_EQ(workers[worker].error_flags, 0u);
@@ -339,7 +331,6 @@ TEST(HbgProtocolStartupExit, RealExecutorFinishesLateZeroWorkMembersAfterClosing
         EXPECT_EQ(members[6 + worker].observed.sequence, 3u);
         EXPECT_EQ(members[6 + worker].closed.sequence, 4u);
         EXPECT_EQ(startup_kernel_calls, 0u);
-        EXPECT_EQ(startup_ssbuf_calls, 0u);
     }
 }
 
@@ -378,6 +369,95 @@ TEST(HbgProtocolStartupExit, RealExecutorSealTimeoutPreservesObservedButUnclosed
     EXPECT_EQ(fixture.storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
 }
 
+uint32_t scalar_record_count(const SchedulerScalarTrace &trace, SchedPhaseKind kind) {
+    uint32_t cursor = 0;
+    uint32_t count = 0;
+    while (cursor < trace.storage_slots) {
+        SchedulerScalarRecord record{};
+        if (!scheduler_decode_scalar_storage(trace.records, trace.storage_slots, cursor, record)) {
+            ADD_FAILURE() << "Invalid Scalar storage";
+            break;
+        }
+        if ((record.kind & 0xffffU) == static_cast<uint32_t>(kind)) ++count;
+    }
+    return count;
+}
+
+TEST(HbgScalarObserverLifetime, BootstrapPreservesTheResidentBinding) {
+    scheduler_test::FixtureStorage storage(1, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0});
+    scheduler_test::BasicGraphBuffer<1> graph(1);
+    graph.executable(0, 0);
+    auto *base = storage.scheduler_state->base();
+    storage.prepare_ready_pool();
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 59));
+    auto *local = storage.local_context(&storage.contexts[0]);
+    local->config.scheduler_count = 1;
+    storage.run_control->expected_task_count = 1;
+    storage.test_graphs[0] = graph.graph();
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        SchedulerWorkerStats stats{};
+        ASSERT_TRUE(
+            (bootstrap_ready_graph<false, true>(graph.graph(), base, local, storage.run_control, 1, &stats, 3))
+        );
+        EXPECT_EQ(scheduler_scalar_current(), &trace);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicFetchAdd), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarBypassLoad), 0u);
+    }
+    EXPECT_EQ(scheduler_scalar_current(), nullptr);
+}
+
+TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
+    scheduler_test::FixtureStorage storage(1, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0});
+    scheduler_test::BasicGraphBuffer<1> graph(1);
+    graph.executable(0, 0);
+    auto *base = storage.scheduler_state->base();
+    storage.prepare_ready_pool();
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 59));
+    storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&idle_ready_kernel);
+    storage.test_graphs[0] = graph.graph();
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        storage.contexts[0].cluster_worker_ids[lane] = lane;
+    auto *local = storage.local_context(&storage.contexts[0]);
+    local->config.scheduler_count = 3;
+    auto *run = storage.run_control;
+    run->expected_task_count = 1;
+    SchedulerReadyBatch batch{};
+    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch));
+    ASSERT_TRUE(scheduler_ready_batch_push(base, local, 0, &batch));
+    std::array<uint8_t, 64> registers{};
+    ScopedStartupRegisterObserver observer([] {});
+    startup_reg_base = registers.data();
+    startup_kernel_calls = 0;
+    write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        SchedulerWorkerStats stats{};
+        ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, 3)));
+        EXPECT_EQ(startup_kernel_calls, 1u);
+        EXPECT_EQ(scheduler_scalar_current(), &trace);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicCas), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarBypassLoad), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDcciOut), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDsbAll), 0u);
+    }
+    EXPECT_EQ(scheduler_scalar_current(), nullptr);
+}
+
 class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uint32_t, uint64_t, bool>> {};
 
 TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCanChangeIt) {
@@ -390,6 +470,7 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     metadata.kernel_ids[0] = worker == 0 ? 1 : UINT16_MAX;
     metadata.kernel_ids[1] = worker == 0 ? UINT16_MAX : 1;
     metadata.timing_slot = sampled ? 0 : -1;
+    storage.prepare_ready_pool();
     auto *base = storage.scheduler_state->base();
     ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 59));
     storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&identity_test_kernel);
@@ -404,8 +485,8 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     auto *run = storage.run_control;
     run->expected_task_count = 1;
     SchedulerReadyBatch batch{};
-    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch, nullptr));
-    ASSERT_TRUE(scheduler_ready_batch_push(base, local, worker == 0 ? 0 : 1, &batch, nullptr));
+    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch));
+    ASSERT_TRUE(scheduler_ready_batch_push(base, local, worker == 0 ? 0 : 1, &batch));
     std::array<uint8_t, 64> registers{};
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
@@ -421,9 +502,7 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     ASSERT_EQ(startup_kernel_calls, 1u);
     ASSERT_EQ(identity_test_payload->local_context.block_idx, 77);
     uint64_t refilled = 0;
-    ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph.graph(), base, local, run, nullptr, nullptr, nullptr, level, &refilled, nullptr
-    ));
+    ASSERT_TRUE(scheduler_service_cluster_completions(graph.graph(), base, local, run, level, &refilled));
     const auto *trace = scheduler_state_at<SchedulerTaskTrace>(base, storage.layout.trace_cells_offset);
     if (level == 0) {
         EXPECT_EQ(trace->execution_identity_flags, 0u);
@@ -517,6 +596,7 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
     } else {
         graph.executable(1, 0);
     }
+    storage.prepare_ready_pool();
     auto *base = storage.scheduler_state->base();
     ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 83));
     storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&idle_ready_kernel);
@@ -546,8 +626,8 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
         if (observations == 5) {
             if (arrival == IdleDispatchArrival::READY) {
                 SchedulerReadyBatch batch{};
-                queued = scheduler_ready_batch_append(base, local, 0, &batch, nullptr) &&
-                         scheduler_ready_batch_push(base, local, worker == 0 ? 0 : 1, &batch, nullptr);
+                queued = scheduler_ready_batch_append(base, local, 0, &batch) &&
+                         scheduler_ready_batch_push(base, local, worker == 0 ? 0 : 1, &batch);
                 if (!queued) write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
             } else if (arrival == IdleDispatchArrival::EXIT) {
                 write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
@@ -569,8 +649,6 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
     EXPECT_GE(observations, 5u);
     EXPECT_EQ(startup_kernel_calls, arrival == IdleDispatchArrival::READY ? 1u : 0u);
     EXPECT_EQ(queued, arrival == IdleDispatchArrival::READY);
-    if (level >= 3) EXPECT_GE(stats.idle_iteration_count, 4u);
-    else EXPECT_EQ(stats.idle_iteration_count, 0u);
     if (ordered) {
         EXPECT_EQ(admission.scan_cursor, 0u);
         EXPECT_EQ(admission.current_task_ref, SCHEDULER_TASK_REF_INVALID);
@@ -600,6 +678,7 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     graph.executable(0, 0);
     graph.executable(1, 0, {0});
     storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    storage.prepare_ready_pool();
     auto *base = storage.scheduler_state->base();
     ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 73));
     storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&protocol_chain_kernel);
@@ -611,10 +690,10 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     ASSERT_TRUE(scheduler_protocol_bind(base, local));
     auto *run = storage.run_control;
     run->expected_task_count = 2;
-    ASSERT_EQ(scheduler_route_task(graph.graph(), base, local, run, 1, nullptr), SchedulerRouteResult::WAITING);
+    ASSERT_EQ(scheduler_route_task(graph.graph(), base, local, run, 1), SchedulerRouteResult::WAITING);
     SchedulerReadyBatch batch{};
-    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch, nullptr));
-    ASSERT_TRUE(scheduler_ready_batch_push(base, local, 0, &batch, nullptr));
+    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch));
+    ASSERT_TRUE(scheduler_ready_batch_push(base, local, 0, &batch));
     std::array<uint8_t, 64> registers{};
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
@@ -622,9 +701,7 @@ TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromIt
     SchedulerWorkerStats stats{};
     ASSERT_TRUE((run_ready_dispatch_loop<false, true>(graph.graph(), base, local, run, &stats, 4)));
     ASSERT_EQ(startup_kernel_calls, 2u);
-    ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph.graph(), base, local, run, nullptr, nullptr, nullptr, 4, nullptr, nullptr
-    ));
+    ASSERT_TRUE(scheduler_service_cluster_completions(graph.graph(), base, local, run, 4, nullptr));
     const auto *events =
         scheduler_state_at<SchedulerProtocolExecutionTrace>(base, storage.layout.protocol.executions_offset);
     EXPECT_EQ(events[0].task_ref, 0);
@@ -652,10 +729,6 @@ volatile uint8_t *sim_get_reg_base() {
     return startup_reg_base;
 }
 uint32_t sim_get_physical_core_id() { return 3; }
-uint64_t platform_ssbuf_hardware_base_address() {
-    ++startup_ssbuf_calls;
-    return 0;
-}
 // A zero register base leaves the executor's PMU staging off, which is what
 // these startup cases observe: they drive the dispatch loop, not the counters.
 uint32_t get_aicore_profiling_flag() { return 0; }

@@ -1630,3 +1630,55 @@ TEST_F(TrbRuntimeTempBufferTest, PrewarmedBindingCapturesCapacityAndFailedRebind
     EXPECT_TRUE(runtime.scope_stats_capacity().required);
     EXPECT_FALSE(runtime.scope_stats_capacity().values);
 }
+
+TEST_F(TrbRuntimeTempBufferTest, EverySizingFieldChangesTheCacheKey) {
+    fake_.reset();
+    uint64_t windows[CHIP_MAX_RING_DEPTH] = {4, 4, 4, 4};
+    uint64_t heaps[CHIP_MAX_RING_DEPTH] = {1024, 1024, 1024, 1024};
+    uint64_t pools[CHIP_MAX_RING_DEPTH] = {4, 4, 4, 4};
+    EXPECT_EQ(prepared_run_config_compatible_impl(&api_, windows, heaps, pools), 0);
+    fake_.compatibility_key_valid = true;
+    fake_.compatibility_hash = fake_.observed_hash;
+    fake_.compatibility_key = fake_.observed_key;
+    for (auto *values : {windows, heaps, pools}) {
+        for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+            values[r] *= 2;
+            EXPECT_EQ(prepared_run_config_compatible_impl(&api_, windows, heaps, pools), 0);
+            values[r] /= 2;
+            EXPECT_EQ(prepared_run_config_compatible_impl(&api_, windows, heaps, pools), 1);
+        }
+    }
+}
+
+TEST_F(TrbRuntimeTempBufferTest, HostImageSurvivesDeviceArenaMutationAndNewArguments) {
+    fake_.reset();
+    fake_.ordered_images = true;
+    fake_.cache_recording = true;
+    Runtime first = make_runtime();
+    std::vector<uint8_t> input(64, 7), next_input(64, 19);
+    ChipStorageTaskArgs args, next_args;
+    args.add_tensor(make_tensor(input));
+    next_args.add_tensor(make_tensor(next_input));
+    args.add_scalar(uint64_t{0x1234});
+    next_args.add_scalar(uint64_t{0x5678});
+    ArgDirection signature[1] = {ArgDirection::IN};
+    ASSERT_EQ(bind_runtime(first, api_, args, signature, 1), 0);
+    const auto saved_host = fake_.cached_image_storage;
+    const int copies = fake_.copy_to_count;
+    std::fill(fake_.runtime_arena.begin(), fake_.runtime_arena.end(), 0xa5);
+    const auto saved_device = fake_.runtime_arena;
+    Runtime next = make_runtime();
+    ASSERT_EQ(bind_runtime(next, api_, next_args, signature, 1), 0);
+    ASSERT_EQ(first.get_orch_args().scalar_count(), 1);
+    ASSERT_EQ(next.get_orch_args().scalar_count(), 1);
+    EXPECT_EQ(first.get_orch_args().scalar(0), uint64_t{0x1234});
+    EXPECT_EQ(next.get_orch_args().scalar(0), uint64_t{0x5678});
+    EXPECT_EQ(fake_.cache_hit_count, 1);
+    EXPECT_EQ(fake_.cache_store_count, 1);
+    EXPECT_EQ(fake_.metadata_batches.size(), 2u);
+    EXPECT_EQ(fake_.copy_to_count, copies);
+    EXPECT_EQ(fake_.cached_image_storage, saved_host);
+    EXPECT_EQ(fake_.runtime_arena, saved_device);
+    ASSERT_EQ(release_run_bindings_impl(&first, &api_), 0);
+    ASSERT_EQ(release_run_bindings_impl(&next, &api_), 0);
+}

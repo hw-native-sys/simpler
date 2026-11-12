@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,8 +21,8 @@ import pytest
 import yaml
 
 _ROOT = Path(__file__).resolve().parents[3]
-_ACTION = _ROOT / ".github/actions/setup-framework-eager"
-_WORKFLOW = _ROOT / ".github/workflows/_st-framework-eager.yml"
+_ACTION = _ROOT / ".github/actions/setup-framework"
+_WORKFLOW = _ROOT / ".github/workflows/_st-framework.yml"
 
 
 def _yaml(path):
@@ -127,7 +128,7 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
         "pip",
         "install",
         "-c",
-        ".github/actions/setup-framework-eager/constraints.txt",
+        ".github/actions/setup-framework/constraints.txt",
         *requirements,
         "scikit-build-core>=0.10",
         "cmake>=3.20",
@@ -143,8 +144,10 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
     ]
 
 
-def _identity_module():
-    spec = importlib.util.spec_from_file_location("framework_ci_identity", _ACTION / "identity.py")
+def _identity_module(action_name="setup-framework"):
+    spec = importlib.util.spec_from_file_location(
+        "framework_ci_identity", _ROOT / ".github/actions" / action_name / "identity.py"
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -152,8 +155,13 @@ def _identity_module():
 
 
 @pytest.mark.parametrize("platform_name", ["a2a3", "a5"])
-def test_identity_records_the_selected_platform_runtime_and_environment(tmp_path, monkeypatch, platform_name):
-    identity = _identity_module()
+@pytest.mark.parametrize(
+    "action_name,output", [("setup-framework", "framework-ci"), ("setup-framework-eager", "framework-eager-ci")]
+)
+def test_identity_records_the_selected_platform_runtime_and_environment(
+    tmp_path, monkeypatch, platform_name, action_name, output
+):
+    identity = _identity_module(action_name)
     site_packages = tmp_path / "framework-site"
     assets = site_packages / "simpler_setup/_assets"
     for candidate in ("a2a3", "a5"):
@@ -170,18 +178,18 @@ def test_identity_records_the_selected_platform_runtime_and_environment(tmp_path
             name,
             SimpleNamespace(__file__=str(module_path), __version__="CPU-transport", __build_commit__="fixed-source"),
         )
-    monkeypatch.setattr(identity.subprocess, "check_output", lambda *args, **kwargs: "fixed-source\n")
+    monkeypatch.setattr(subprocess, "check_output", lambda *args, **kwargs: "fixed-source\n")
     observed_environment = {"cann": {"version": "9.2.0-beta.2"}, "cpu_transport": True}
     monkeypatch.setitem(sys.modules, "simpler_setup.environment", SimpleNamespace(PROJECT_ROOT=assets))
-    monkeypatch.setattr(identity.sysconfig, "get_path", lambda name: str(site_packages))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(site_packages))
     monkeypatch.setitem(
         sys.modules, "simpler_setup.test_environments", SimpleNamespace(preflight=lambda name: observed_environment)
     )
     monkeypatch.setattr(sys, "argv", ["identity.py", "--platform", platform_name])
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "outputs/framework-eager-ci").mkdir(parents=True)
+    (tmp_path / "outputs" / output).mkdir(parents=True)
     identity.main()
-    record = json.loads((tmp_path / "outputs/framework-eager-ci/identity.json").read_text())
+    record = json.loads((tmp_path / "outputs" / output / "identity.json").read_text())
     assert record["platform"] == platform_name
     assert record["environment"] == observed_environment
     for runtime in record["runtimes"].values():
@@ -190,6 +198,19 @@ def test_identity_records_the_selected_platform_runtime_and_environment(tmp_path
     monkeypatch.setitem(sys.modules, "simpler_setup.environment", SimpleNamespace(PROJECT_ROOT=tmp_path))
     with pytest.raises(RuntimeError, match="Framework runtime assets must come from"):
         identity.main()
+
+
+def test_default_branch_alias_delegates_setup_without_a_second_suite():
+    action = _yaml(_ROOT / ".github/actions/setup-framework-eager/action.yml")
+    assert action["inputs"]["platform"]["default"] == "a2a3"
+    assert action["runs"]["steps"] == [
+        {
+            "id": "setup",
+            "uses": "./.github/actions/setup-framework",
+            "with": {"platform": "${{ inputs.platform }}"},
+        }
+    ]
+    assert action["outputs"]["cann_env"]["value"] == "${{ steps.setup.outputs.cann_env }}"
 
 
 def test_identity_refuses_bad_platform_before_optional_backend_import(tmp_path):
@@ -221,7 +242,7 @@ runpy.run_path(sys.argv_path, run_name='__main__')
 def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_path, platform_name, actual_platform):
     workflow = _yaml(_WORKFLOW)
     steps = workflow["jobs"]["run"]["steps"]
-    setup = next(step for step in steps if "uses" in step and step["uses"].endswith("setup-framework-eager"))
+    setup = next(step for step in steps if "uses" in step and step["uses"].endswith("setup-framework"))
     assert setup["with"]["platform"] == "${{ inputs.platform }}"
     step = next(step for step in steps if "run" in step)
     assert step["env"]["PLATFORM"] == "${{ inputs.platform }}"
@@ -278,7 +299,7 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
         return
     assert result.returncode == 0, result.stdout + result.stderr
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    assert commands[0] == [".github/actions/setup-framework-eager/identity.py", "--platform", platform_name]
+    assert commands[0] == [".github/actions/setup-framework/identity.py", "--platform", platform_name]
     pytest_command = commands[1]
     assert pytest_command[:4] == ["-m", "pytest", "examples", "tests/st"]
     assert pytest_command[pytest_command.index("--platform") + 1] == platform_name
@@ -287,20 +308,20 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     assert commands[2][:3] == ["-m", "simpler_setup.test_environments", "verify"]
 
 
-@pytest.mark.parametrize("caller", ["ci", "ci-self", "daily"])
+@pytest.mark.parametrize("caller", ["ci", "daily"])
 def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller):
     jobs = _yaml(_ROOT / f".github/workflows/{caller}.yml")["jobs"]
     for platform_name in ("a2a3", "a5"):
         if caller == "ci" and platform_name == "a5":
-            assert "st-framework-eager-a5" not in jobs
-            job = _yaml(_ROOT / ".github/workflows/ci-a5-comment.yml")["jobs"]["st-framework-eager-a5"]
-            assert job["uses"] == "./.github/workflows/_st-framework-eager.yml"
+            assert "st-framework-a5" not in jobs
+            job = _yaml(_ROOT / ".github/workflows/ci-a5-comment.yml")["jobs"]["st-framework-a5"]
+            assert job["uses"] == "./.github/workflows/_st-framework.yml"
             assert job["with"]["platform"] == "a5"
             assert json.loads(job["with"]["runs_on"]) == ["self-hosted", "a5"]
             assert job["needs"] == ["gate-and-resolve"]
             continue
-        job = jobs[f"st-framework-eager-{platform_name}"]
-        assert job["uses"] == "./.github/workflows/_st-framework-eager.yml"
+        job = jobs[f"st-framework-{platform_name}"]
+        assert job["uses"] == "./.github/workflows/_st-framework.yml"
         assert job["with"]["platform"] == platform_name
         assert json.loads(job["with"]["runs_on"]) == ["self-hosted", platform_name]
         if caller == "daily":
@@ -312,5 +333,5 @@ def test_each_caller_routes_both_platforms_to_the_same_reusable_workflow(caller)
     workflow = _yaml(_WORKFLOW)
     assert workflow["jobs"]["run"]["timeout-minutes"] == "45"
     assert workflow["jobs"]["run"]["steps"][-1]["with"]["name"] == (
-        "framework-eager-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}"
+        "framework-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}"
     )

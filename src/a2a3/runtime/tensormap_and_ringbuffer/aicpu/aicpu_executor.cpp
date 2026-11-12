@@ -774,7 +774,7 @@ AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx, EntryArgs
             // Wire every arena-internal pointer field (host wrote host-mirror
             // addresses; we overwrite them with device addresses).
             runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
-            sm_size = SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.sizing.task_window_sizes);
+            sm_size = rt->prebuilt_layout.prepared.sm_bytes;
         }
 
         // Reset SM state. setup_pointers + init_header_per_ring restore
@@ -782,15 +782,16 @@ AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx, EntryArgs
         {
             AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->init_per_ring(
-                    sm_ptr, sm_size, rt->prebuilt_layout.sizing.task_window_sizes, rt->prebuilt_layout.sizing.heap_sizes
+            if (!rt->sm_handle->init_prepared(
+                    sm_ptr, sm_size, rt->prebuilt_layout.sizing.task_window_sizes,
+                    rt->prebuilt_layout.sizing.heap_sizes, rt->prebuilt_layout.prepared
                 )) {
-                LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
+                LOG_ERROR("Thread %d: sm_handle->init_prepared failed", thread_idx);
                 rt = nullptr;
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
-            if (!runtime_reset_for_reuse(runtime_arena_, rt->prebuilt_layout, rt)) {
+            if (!runtime_reset_for_reuse_prepared(rt->prebuilt_layout, rt)) {
                 LOG_ERROR("Thread %d: runtime_reset_for_reuse failed", thread_idx);
                 rt = nullptr;
                 runtime_init_ready_.store(true, std::memory_order_release);

@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "host/host_dependency_capture_scope.h"
+#include <stdexcept>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -42,10 +44,31 @@ std::string read_file(const std::filesystem::path &path) {
 
 }  // namespace
 
+TEST(DepGenHostGraphTest, ScopeConfigurationIsIndependentOfThreadHistory) {
+    using simpler::dfx::host_graph::HostGraphExport;
+    using simpler::dfx::host_graph::TakeOutcome;
+    std::thread caller([] {
+        for (bool enabled : {true, false, true}) {
+            HostGraphExport graph;
+            HostDependencyCaptureScope capture(enabled);
+            EXPECT_EQ(dep_gen_host_graph_enabled(), enabled);
+            EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+            dep_gen_host_graph_begin_capture();
+            capture_task(TaskId::make_global(601));
+            EXPECT_EQ(
+                dep_gen_host_graph_take(&graph),
+                static_cast<int>(enabled ? TakeOutcome::Complete : TakeOutcome::NotCaptured)
+            );
+            EXPECT_EQ(graph.tasks.size(), enabled ? 1u : 0u);
+        }
+    });
+    caller.join();
+}
+
 TEST(DepGenHostGraphTest, EmitWritesTheGraphCapturedOnTheSameThread) {
+    HostDependencyCaptureScope capture(true);
     const std::filesystem::path path = output_path("same_thread");
     std::filesystem::remove(path);
-    dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
     capture_task(TaskId::make_global(11));
     capture_task(TaskId::make_global(12), TaskId::make_global(11));
@@ -59,9 +82,9 @@ TEST(DepGenHostGraphTest, EmitWritesTheGraphCapturedOnTheSameThread) {
 }
 
 TEST(DepGenHostGraphTest, EmitOnAnotherThreadWritesNothingAndReports) {
+    HostDependencyCaptureScope capture(true);
     const std::filesystem::path path = output_path("cross_thread");
     std::filesystem::remove(path);
-    dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
     capture_task(TaskId::make_global(21));
 
@@ -78,13 +101,12 @@ TEST(DepGenHostGraphTest, EmitOnAnotherThreadWritesNothingAndReports) {
 }
 
 TEST(DepGenHostGraphTest, BeginCaptureClearsThePreviousRunsGraph) {
+    HostDependencyCaptureScope capture(true);
     const std::filesystem::path path = output_path("reset");
     std::filesystem::remove(path);
-    dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
     capture_task(TaskId::make_global(101));
 
-    dep_gen_host_graph_set_enabled(true);
     dep_gen_host_graph_begin_capture();
     capture_task(TaskId::make_global(202));
     ASSERT_EQ(dep_gen_host_graph_emit(path.c_str()), 0);
@@ -93,4 +115,63 @@ TEST(DepGenHostGraphTest, BeginCaptureClearsThePreviousRunsGraph) {
     EXPECT_EQ(json.find("\"task_id\":\"101\""), std::string::npos);
     EXPECT_NE(json.find("\"task_id\":\"202\""), std::string::npos);
     std::filesystem::remove(path);
+}
+
+TEST(DepGenHostGraphTest, EmptyAndIncompleteCapturesRemainDistinctFromNoSession) {
+    using simpler::dfx::host_graph::HostGraphExport;
+    using simpler::dfx::host_graph::TakeOutcome;
+    HostGraphExport graph;
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+    {
+        HostDependencyCaptureScope capture(true);
+        dep_gen_host_graph_begin_capture();
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::Complete));
+        EXPECT_TRUE(graph.tasks.empty());
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+        dep_gen_host_graph_begin_capture();
+        dep_gen_host_graph_begin_task(TaskId::make_global(301), false, false, nullptr, 1, 0, nullptr, nullptr);
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::Incomplete));
+    }
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+}
+
+TEST(DepGenHostGraphTest, NestedCaptureIsRejectedAndExceptionDiscardsOwnedState) {
+    using simpler::dfx::host_graph::HostGraphExport;
+    using simpler::dfx::host_graph::TakeOutcome;
+    HostGraphExport graph;
+    try {
+        HostDependencyCaptureScope capture(true);
+        dep_gen_host_graph_begin_capture();
+        capture_task(TaskId::make_global(401));
+        EXPECT_THROW(HostDependencyCaptureScope nested(true), std::logic_error);
+        throw 1;
+    } catch (int) {}
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::NotCaptured));
+    HostDependencyCaptureScope next(true);
+    dep_gen_host_graph_begin_capture();
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(TakeOutcome::Complete));
+    EXPECT_TRUE(graph.tasks.empty());
+}
+
+TEST(DepGenHostGraphTest, ParkedCaptureCanMoveToANewSessionOnAnotherThread) {
+    using simpler::dfx::host_graph::HostGraphExport;
+    using simpler::dfx::host_graph::TakeOutcome;
+    HostGraphExport saved;
+    int outcome;
+    {
+        HostDependencyCaptureScope capture(true);
+        dep_gen_host_graph_begin_capture();
+        capture_task(TaskId::make_global(501));
+        outcome = dep_gen_host_graph_take(&saved);
+    }
+    HostGraphExport restored;
+    std::thread other([&] {
+        HostDependencyCaptureScope capture(true);
+        dep_gen_host_graph_restore_for_export(&saved, outcome);
+        EXPECT_EQ(dep_gen_host_graph_take(&restored), static_cast<int>(TakeOutcome::Complete));
+    });
+    other.join();
+    ASSERT_EQ(restored.tasks.size(), 1u);
+    EXPECT_EQ(restored.tasks[0].task_id, 501u);
+    EXPECT_TRUE(saved.tasks.empty());
 }

@@ -53,8 +53,8 @@ struct ProtocolExportFixture : ::testing::Test {
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v8\""), std::string::npos);
-    EXPECT_NE(json.find("\"close_seal_stride\":128"), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v10\""), std::string::npos);
+    EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_NE(json.find("\"admission_claim_lock\":0"), std::string::npos);
     EXPECT_NE(json.find("\"block_num\":2"), std::string::npos);
@@ -74,7 +74,7 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v9\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v11\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }
@@ -221,11 +221,11 @@ TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCe
         return scheduler_export_protocol(storage.base(), layout.total_size, layout, 91, tasks);
     };
     const auto json = dump();
-    EXPECT_NE(json.find("\"close_seal_stride\":128"), std::string::npos);
+    EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"close_seals\":[17,29]"), std::string::npos);
     EXPECT_NE(json.find("\"close_seals\":[41,53]"), std::string::npos);
     auto *record = scheduler_state_at<SchedulerAdmissionRecord>(storage.base(), layout.admission_records_offset);
-    for (uint64_t delta : {UINT64_C(1), UINT64_C(8), UINT64_C(16), UINT64_C(128), UINT64_C(512)}) {
+    for (uint64_t delta : {UINT64_C(1), UINT64_C(8), UINT64_C(16), UINT64_C(64), UINT64_C(512)}) {
         SCOPED_TRACE(delta);
         record->mix_close_seals_offset = layout.mix_close_seals_offset + delta;
         EXPECT_THROW(dump(), std::invalid_argument);

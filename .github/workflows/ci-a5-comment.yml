@@ -19,6 +19,8 @@ jobs:
       ready: ${{ steps.resolve.outputs.ready }}
       repository: ${{ steps.resolve.outputs.repository }}
       ref: ${{ steps.resolve.outputs.ref }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
       pr_number: ${{ steps.resolve.outputs.pr_number }}
     steps:
       - name: Authorize command and resolve PR head
@@ -48,9 +50,21 @@ jobs:
               core.setFailed(`denied: ${user} requires admin repo permission to trigger /run-a5`);
               return;
             }
-            const { data: pr } = await github.rest.pulls.get({
+            // GitHub computes the test merge asynchronously; a comment issued
+            // right after a push can observe mergeable=null. Wait for a bounded
+            // interval instead of rejecting a healthy PR.
+            const MERGEABILITY_RETRY_MS = 5000;
+            const MERGEABILITY_ATTEMPTS = 12;
+            let { data: pr } = await github.rest.pulls.get({
               ...context.repo, pull_number: context.payload.issue.number,
             });
+            for (let attempt = 0; pr.mergeable == null && attempt < MERGEABILITY_ATTEMPTS; attempt += 1) {
+              core.info(`PR mergeability is pending; waiting ${MERGEABILITY_RETRY_MS} ms (attempt ${attempt + 1}/${MERGEABILITY_ATTEMPTS})`);
+              await new Promise(resolve => setTimeout(resolve, MERGEABILITY_RETRY_MS));
+              ({ data: pr } = await github.rest.pulls.get({
+                ...context.repo, pull_number: context.payload.issue.number,
+              }));
+            }
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             if (pr.state !== 'open' || pr.number !== context.payload.issue.number ||
                 pr.base.ref !== 'main' ||
@@ -60,9 +74,24 @@ jobs:
               core.setFailed('/run-a5 requires an open PR targeting this repo main with an available head');
               return;
             }
-            core.setOutput('repository', pr.head.repo.full_name);
-            core.setOutput('ref', pr.head.sha);
+            const mergeSha = pr.merge_commit_sha;
+            if (pr.mergeable !== true || !/^[0-9a-f]{40}$/i.test(mergeSha || '')) {
+              core.setFailed('PR merge snapshot unavailable or conflicting; update the PR and issue a new command');
+              return;
+            }
+            const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: mergeSha });
+            if (commit.sha !== mergeSha || commit.parents.length !== 2 ||
+                commit.parents[0].sha !== pr.base.sha || commit.parents[1].sha !== pr.head.sha) {
+              core.setFailed('PR merge snapshot is stale; issue a new command after GitHub refreshes it');
+              return;
+            }
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('base_sha', pr.base.sha);
+            core.setOutput('repository', `${context.repo.owner}/${context.repo.repo}`);
+            core.setOutput('ref', mergeSha);
             core.setOutput('pr_number', String(pr.number));
+            core.summary.addRaw(`Tested merge: ${mergeSha}\n\nPR head: ${pr.head.sha}\n\nBase: ${pr.base.sha}\n`);
+            await core.summary.write();
             core.setOutput('ready', 'true');
 
   ut-a5:
@@ -91,13 +120,13 @@ jobs:
       runs_on: '["self-hosted","a5"]'
       include_dfx_smokes: true
 
-  st-framework-eager-a5:
+  st-framework-a5:
     needs: [gate-and-resolve]
     if: needs.gate-and-resolve.outputs.ready == 'true'
     concurrency:
       group: ci-a5-framework-${{ needs.gate-and-resolve.outputs.pr_number }}
       cancel-in-progress: true
-    uses: ./.github/workflows/_st-framework-eager.yml
+    uses: ./.github/workflows/_st-framework.yml
     with:
       platform: a5
       repository: ${{ needs.gate-and-resolve.outputs.repository }}
@@ -105,7 +134,7 @@ jobs:
       runs_on: '["self-hosted","a5"]'
 
   report:
-    needs: [gate-and-resolve, ut-a5, st-onboard-a5, st-framework-eager-a5]
+    needs: [gate-and-resolve, ut-a5, st-onboard-a5, st-framework-a5]
     if: always() && needs.gate-and-resolve.result == 'success' && needs.gate-and-resolve.outputs.ready == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -121,8 +150,8 @@ jobs:
             const needs = JSON.parse(process.env.NEEDS_JSON);
             const gate = needs['gate-and-resolve'];
             if (gate.result !== 'success' || gate.outputs.ready !== 'true') return;
-            const { repository, ref, pr_number: number } = gate.outputs;
-            const suites = ['ut-a5', 'st-onboard-a5', 'st-framework-eager-a5'];
+            const { repository, ref, head_sha, base_sha, pr_number: number } = gate.outputs;
+            const suites = ['ut-a5', 'st-onboard-a5', 'st-framework-a5'];
             const results = suites.map(name => ({ name, result: needs[name]?.result || 'unknown' }));
             const passed = results.every(job => job.result === 'success');
             const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
@@ -131,5 +160,5 @@ jobs:
               ...context.repo,
               issue_number: Number(number),
               body: `**/run-a5 ${passed ? 'passed' : 'finished without all suites passing'}**\n\n` +
-                    `Tested head: \`${repository}@${ref}\`\n[Workflow run](${url})\n\n${lines.join('\n')}`,
+                    `Tested merge: \`${repository}@${ref}\`\nPR head: \`${head_sha}\`\nBase: \`${base_sha}\`\n[Workflow run](${url})\n\n${lines.join('\n')}`,
             });

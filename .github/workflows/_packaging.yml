@@ -79,9 +79,10 @@ jobs:
         with:
           python-version: ${{ inputs.python_version }}
 
-      - name: Cache pip packages
+      - name: Verify provisioned Python
         if: inputs.setup_variant == 'self-cpu'
-        uses: ./.github/actions/cache-pip
+        run: |
+          python3 -c 'import sys; expected = tuple(map(int, "${{ inputs.python_version }}".split("."))); assert sys.version_info[:2] == expected, f"CPU runner requires Python {expected}, got {sys.version}"'
 
       - name: Install build + runtime deps in venv
         uses: ./.github/actions/setup-venv

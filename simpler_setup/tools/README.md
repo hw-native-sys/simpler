@@ -2,7 +2,8 @@
 
 End-user CLIs for preparing scene tests and analyzing profiling data or args dumps.
 All are invokable as Python modules once the `simpler` wheel is installed —
-no repo checkout required.
+no repo checkout required for profiling tools. CI coverage tools additionally
+require the matching source checkout and its pytest configuration.
 
 > Dev-only scripts (`benchmark_rounds.sh`, `verify_packaging.sh`) live in the
 > repo-level [`tools/`](../../tools/) directory and are **not** shipped.
@@ -10,6 +11,8 @@ no repo checkout required.
 ## Tool list
 
 - **[scene_test_compile](#scene_test_compile)** — collect and compile selected Scene Test callables without an NPU
+- **[feature_coverage_report](#feature_coverage_report)** — reverify environment receipts and render CI coverage
+- **[collection_inventory](#collection_inventory)** — record the actual pytest collection without executing tests
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
@@ -25,6 +28,45 @@ For CLIs that allow an omitted input, auto-detection paths
 relative to the **current working directory** — run these from the directory
 that holds your `outputs/`. Each test case writes into its own
 `outputs/<case>_<ts>/` directory; those tools auto-pick the latest by mtime.
+
+---
+
+## feature_coverage_report
+
+Verify the explicit receipt files against their original plans before reporting
+selected, body-entered, passed, failed, skipped and missing counts. Run from the original checkout
+while the receipt paths recorded in the manifests still exist:
+
+```bash
+python -m simpler_setup.tools.feature_coverage_report \
+    --root outputs/default-ci --environment default --platform a2a3 --manual exclude
+```
+
+Default A2/A3 expects `main.plan.json`, `sdma.plan.json` and
+`sdma_fault.plan.json`; manual-only expects `main`. A5 expects `main`.
+The `torch_npu` environment expects `results.plan.json` and `results.xml` in
+`outputs/framework-ci`. Default plans have a matching `.plan.results.json`
+manifest listing dispatcher and retry receipts. Missing or invalid evidence
+exits nonzero, removes stale coverage for that partition and reports it as
+unverified. Source-checked partial results remain visible, with failed attempts
+counted once per case and absent/invalid results counted as missing. The tool writes
+`coverage-summary.md` and `coverage-summary.json`, including partition verification
+status, source/environment identity and evidence paths, and appends to
+`GITHUB_STEP_SUMMARY` when set. CI summaries link to the run and its artifacts.
+The report never changes a failed verification into success. It does not execute
+tests or access devices.
+
+## collection_inventory
+
+Load this pytest plugin with `-p simpler_setup.tools.collection_inventory`
+and supply `--collect-only --collection-inventory inventory.json` alongside the
+normal environment/platform filters. The inventory records exact node IDs,
+classification errors and duplicates. Coverage policy errors are retained as
+`policy_error` in the JSON; invalid inventories exit nonzero without a pytest
+internal-error traceback. Add
+`--environment-receipts --verify-feature-coverage` to check feature obligations.
+See [CI coverage verification](../../docs/ci.md#feature-coverage-verification)
+for the supported scopes and skip policy. Collection cannot prove execution.
 
 ---
 
@@ -422,7 +464,7 @@ Emitted in six parts:
 - **Part 1: Overhead verdict** — per-engine overhead (idle T-core *and* a ready, undispatched T-task, MIX-aware) + system `all_overhead` / `has_overhead`, all as % of makespan. An engine with no ready work is not overhead (dependency-mandated idle, not waste).
 - **Part 2: aicore switch** — the pre-dispatched pickup gap (`dispatch < prev_end`), reported **per core** (min/mean/max, ~0.8 µs each), the overhead-vs-independent split, and the makespan switch bound `[min over cores, sum of per-engine minima]`.
 - **Part 3 / 4: Head / Tail OH distributions** — P10–P99 + mean + total (per-task pickup and detect-latency magnitude).
-- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its flat bootstrap, completion, resolve, StateProbe, dispatch/worksteal/refill, and idle phase totals without applying AICPU-only queue formulas. Deferred waiting is left as an empty interval between StateProbe and publication. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
+- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its flat bootstrap, completion, resolve, StateProbe, dispatch/refill, and idle phase totals without applying AICPU-only queue formulas. Deferred waiting is left as an empty interval between StateProbe and publication. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
 - **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
 The common dependency-aware analysis works at chip_swimlane_level >= 2 for

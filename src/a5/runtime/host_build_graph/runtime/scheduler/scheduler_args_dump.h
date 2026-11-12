@@ -70,7 +70,7 @@ inline constexpr uint32_t SCHEDULER_ARGS_DUMP_ASYNC_OUTPUT_REFUSED = 1;
 inline __aicore__ void
 scheduler_args_dump_limit_async_output(__gm__ const SchedulerArgsDumpTask *task, __gm__ GlobalContext &context) {
     if (task != nullptr && task->output_tensor_mask != 0 && context.async_present == 1)
-        context.async_reserved = SCHEDULER_ARGS_DUMP_ASYNC_OUTPUT_REFUSED;
+        context.async_output_capture_refused = SCHEDULER_ARGS_DUMP_ASYNC_OUTPUT_REFUSED;
 }
 
 struct alignas(64) SchedulerArgsDumpRequest {

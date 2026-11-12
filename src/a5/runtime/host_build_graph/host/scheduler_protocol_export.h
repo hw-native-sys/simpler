@@ -287,10 +287,7 @@ inline void validate_layout(const Image &image, const AicoreSchedulerLayout &lay
         wire.trace_count != plan.trace_count || wire.cooperative_task_count != plan.cooperative_task_count ||
         wire.member_count != plan.member_count || wire.tasks_offset != plan.tasks_offset ||
         wire.members_offset != plan.members_offset || wire.blocks_offset != plan.blocks_offset ||
-        wire.executions_offset != plan.executions_offset || wire.workers_offset != plan.workers_offset ||
-        std::any_of(std::begin(wire.reserved), std::end(wire.reserved), [](uint64_t value) {
-            return value != 0;
-        }))
+        wire.executions_offset != plan.executions_offset || wire.workers_offset != plan.workers_offset)
         throw std::invalid_argument("protocol header disagrees with Host plan or run epoch");
     const auto &summary = *image.array<SchedulerGraphSummary>(layout.graph_summary_offset, 1);
     if (summary.run_epoch != epoch || summary.protocol_layout_offset != layout.protocol_layout_offset ||
@@ -342,6 +339,7 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
         row.number("order_key", record.order_key);
         row.number("block_num", record.logical_block_num);
         row.number("member_count", record.member_count);
+        row.number("member_rank_offset", record.member_rank_offset);
         row.lane_mask("active_mask", record.active_mask);
         row.number("flags", record.flags);
         row.number("member_words_offset", record.member_words_offset);
@@ -370,7 +368,7 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v8" : "hbg-native-protocol-v9");
+        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v10" : "hbg-native-protocol-v11");
         root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
@@ -400,7 +398,6 @@ inline std::string scheduler_export_protocol(
         root.number("expected_task_count", run.expected_task_count);
         root.number("inline_completed_count", run.inline_completed_count);
         root.number("resolved_task_count", run.resolved_task_count);
-        root.number("executed_task_count", run.executed_task_count);
         root.number("active_worker_count", run.active_worker_count);
         root.number("scheduler_count", run.scheduler_count);
         root.number("scheduler_error", run.scheduler_error);

@@ -390,12 +390,25 @@ TensorMap maps tensor regions to producer task IDs. For every task:
 3. OUTPUT/INOUT regions register the new task as producer.
 4. Each producer tracks its highest consumer local ID for completion metadata.
 
-There is no fanout adjacency or dependency pool. A per-slot progress state is
-the readiness truth on device.
+The public task payload stores fanins. For resident scheduling, Host converts
+these through the unified graph accessor into a deduplicated fanout CSR and
+initial remaining counters, excluding Host-completed edges. The immutable
+header/CSR and atomic-only counters occupy separate 64-byte-aligned regions.
+The legacy AICPU scheduler consumes fanins directly without this resident pool.
 
-## 6. Boot Classification and Wake Lists
+## 6. Boot Classification and Dependencies
 
-Submit does not push tasks into ready queues. After the graph arrives on device,
+Resident bootstrap classifies each node by its initial remaining count: zero
+enters ready discovery; nonzero waits for producer completion notifications.
+All scans finish before completion resolution starts. Each resolved producer
+visits its CSR successors once; the atomic transition 1→0 uniquely publishes
+a successor. The same bounded resolver supports kernel, control and async
+FINISH completion. Without a dependency header, resident helpers retain the
+intrusive wake-list path. See the
+[dependency contract](../../../../../docs/zh-cn/design/a5-hbg-graph-task/dependency-counters.md).
+
+The following boot classifier, wake/publish lists and early-dispatch description
+apply to the legacy AICPU scheduler. Submit does not push tasks into ready queues. After the graph arrives on device,
 boot classification scans every submitted task exactly once:
 
 - a task whose fanins are all complete is routed to its shape queue;
@@ -425,6 +438,8 @@ doorbells at the ready funnel (`push_ready_routed`), the moment readiness is
 decided. Completion readiness itself remains the boot classifier + wake lists.
 
 ## 7. Dispatch and Completion
+
+The legacy AICPU dispatch path has the following rules:
 
 - AIC/AIV dispatch claims ranges of logical block indices from
   `next_block_idx` and requeues unfinished wide tasks.
@@ -462,13 +477,24 @@ assignment and predecessor sequences preserve descriptor ownership when the
 resource mask changes between groups. This task-level selection does not remove
 workers from bootstrap or shutdown.
 
-Kernel Ready work uses a type-separated shared ticket pool with a fixed group
-width of eight (T/H8). The host appends its version-4 immutable header and
-descriptors to the run allocation and sizes each queue from actual executable
-metadata. Every eligible worker can claim from every group. Every fourth search
-prioritizes a remote group; other searches prefer the local group before
-visiting remote groups. Entries are immutable until the run fence, with separate
-atomic-only head/tail lines and bypass-published entry regions. Native control
+Ordinary single-type SPMD tasks admit at most one eligible worker per block.
+Their frozen membership is a cyclic interval in ascending worker-index order,
+starting at `member_rank_offset % eligible_count` when the block count is
+smaller than the eligible set. Host computes the prefix of ordinary non-sync
+SPMD blocks separately for AIC and AIV, in task-ref order, and stores it in
+the existing 64-byte admission header. Other resource types, single-block
+work, MIX and sync-start do not advance that prefix. This distributes independent small tasks across
+workers without changing block ownership or completion accounting. MIX and
+`sync_start` retain their full eligible membership. The exporter writes version 10
+(ordinary graph) and version 11 (native Graph). Only these current schemas are accepted. Producers and readers must match;
+historical formats are rejected. Both use the per-resource-type prefix and
+cooperative admission. Execution identities use the strict v1 contract.
+
+Kernel Ready work uses exactly two shared ticket queues: AIC and MIX tasks
+enter the AIC queue; ordinary AIV tasks enter the AIV queue. Each worker probes
+only its own core type. The host sizes capacity from logical task counts and
+publishes a version-11 header. Queue head, tail and entries use atomic-only
+publication words; entries remain immutable until the run fence. Native control
 nodes retain their separate control inboxes.
 
 A ticket reservation and publication complete in one bounded tail. Transferable
@@ -477,7 +503,9 @@ no ready-pool publication is held in a worker-local pending list. Historical
 alternative algorithms and the requirements for implementing them again are
 recorded in the [queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-task/ready-queue-design.md).
 
-Owner pending endpoints and publication masks are private to the Scheduler.
+Business-ready ticket positions are shared GM state; a successful head CAS
+transfers task ownership to one worker. Native control inboxes retain their
+separate atomic endpoints and task links.
 Self-execution notifications contain only a pending-slot mask: the slot stays
 READY with the same generation until the local Executor claims it, so the ready
 token is reconstructed from the slot. Completion generation validation still
@@ -486,13 +514,17 @@ prevents stale notifications from freeing or refilling a pending slot.
 Local configuration, execution slots, control resolution and the optional
 profiling pointer belong to the core-local state. A separate profiling state
 holds timing slots, self-execution traces, worker trace caches, profiling
-offsets, and the loop counter/valid mask. Remote traces reside in SSBUF.
+offsets, and the loop counter/valid mask. Each worker owns its local execution traces.
 Sampling is derived from the timing-slot range.
 
 The host records whether any task requests sampled timing in the run control.
 Only a run with chip profiling or sampled timing enters the resident function
 specialization that allocates profiling state; the plain specialization does
-not allocate it. These functions do not inline into the common entry. Struct
+not allocate it. Four `resident_*.cpp` translation units instantiate the
+ordinary/native and profiled/plain combinations from `resident_scheduler_impl.h`;
+`CoreType` distinguishes AIC and AIV entry symbols. The shared completion resolver
+is a TU-local `static noinline` function with natural-alignment guards on its
+local argument types. Struct
 sizes exclude other function locals, worker statistics and compiler spills,
 and do not establish the dynamic AICore stack high-water mark.
 
@@ -501,47 +533,23 @@ The callable table and task metadata are immutable throughout that run, allowing
 callable lookup and completion resolution to omit repeated invalidation of those
 immutable lines.
 
-Dispatch payloads remain in GM. Remote dispatch and completion generations,
-and Executor trace staging, occupy the last contiguous KiB of each cluster's
-3 KiB SSBUF; the low 2 KiB remain available to user kernels. Each of three
-lanes has two dispatch slots, two 64-byte trace slots, and one completion word.
-Local trace payloads have natural alignment independently of shared slots.
+Each worker owns two GM DispatchPayload slots and their core-local bookkeeping.
+Ordinary, SPMD and GM MIX execution reuse these same slots. The worker prepares
+its own payload, publishes local readiness, executes it, and consumes its local
+completion generation. The scheduler does not reserve or use cluster SSBUF.
 
-A dispatch word packs generation and signed timing slot; the Executor owns a
-completion-word shadow containing both slot generations. Polling misses need
-no barrier. A hit acquires before consuming payload or trace, while payload
-writeback and ready publication share a release barrier. Tokens are SPSC and
-use no SSBUF read-modify-write atomics. The Scheduler initializes every token
-before publishing the header, and each invocation validates the region.
-Self-execution uses local notifications, completion generations and trace storage.
-Each slot's embedded context pointers and constant single-block fields are
-initialized in the host-created resident payload image. Self-execution consumes
-its own payload writes after the publication barrier, without an additional
-payload invalidation on pickup. Remote Executors retain payload invalidation.
-
-The Scheduler and Executor share the SSBUF structure definitions in the same
-runtime build. Each run initializes the region before use.
-There is no compatibility contract between SSBUF layouts from different runtime
-builds: a launch replaces prior tokens and metadata instead of consuming them.
-Header validation checks the initialized region; initialization and the launch
-gate, rather than a layout-version field, establish its freshness.
-Reserved bytes have unspecified contents and must not be read. Any newly
-introduced field must be explicitly initialized before the header is published.
-
-Initialization and bootstrap precede execution: every Scheduler initializes its
-cluster's SSBUF before reporting bootstrap arrival; AICPU waits for the aggregate
-`bootstrap_complete` before releasing the DATA_MAIN_BASE launch gate. Executors
-validate the header only after that gate opens. The kernel-author storage
-boundary is documented in [A5 runtime variants](../../../docs/runtimes.md#host_build_graph).
+Each slot's embedded context pointers are initialized in the host-created
+payload image. Dispatch updates `block_idx` and `block_num` for the current
+logical block and task. Self-execution consumes its own
+payload writes after the publication barrier, without an additional payload
+invalidation on pickup. Each invocation initializes fresh local state before
+bootstrap; AICPU waits for `bootstrap_complete` before releasing the
+DATA_MAIN_BASE launch gate.
 
 The dispatch timing interval ends at `ready_publish_cycles`, immediately before
 READY token publication. It excludes READY publication and all subsequent
 dispatch-trace GM writes. Device RunWall measures the full on-NPU run
 independently of this phase boundary.
-
-Simulation allocates an aligned 3 KiB backing region per physical cluster,
-shared by its AIC and two AIV lanes and retired with the run. Initialization
-tolerates nonzero previous contents.
 
 Ordinary resident runs accumulate resolved counts locally until an idle pass
 with no local executable task or deferred reservation, or the common run epilogue.
@@ -554,43 +562,22 @@ completion accounting avoids periodic publication on the busy path; its
 continuous-busy timeout is an accepted limit outside that expected duration,
 not evidence that busy execution has stopped making progress.
 
-Single-block ordinary Mix uses the resident path. Each participating lane
-owns an independent GM DispatchPayload and one slot. A local six-entry tracker
-joins completions: each lane releases its slot immediately; only the final lane
-marks the task done and resolves dependencies. Kernels implement their own
-cross-lane synchronization. There is no cluster waiting-count gate or ACK state.
+MIX tasks use ordered admission and GM group mailboxes. The AIC coordinator
+assigns a logical block to the participating lanes. Each required resource lane
+publishes arrival after its local slots are free. After all required arrivals,
+lanes with subtasks prepare and execute their own slots, then publish release
+after slot retirement. Resource lanes without a subtask release without preparing
+a slot.
+The coordinator joins the required releases and retires the block; the final
+block closes computation and resolves dependencies, or enters async completion
+when required. Task traces retain the logical task/block/subtask identity.
 
-Ordinary and Mix dispatches share a per-lane sequence in the publication word.
-Preparation reserves resources without consuming a sequence; publication commits
-it after the final lane is known. Executors consume dispatch order across both
-slots, including Scheduler self-execution. Mix prepares every participating lane
-before publishing any lane, and finishes the group's publications before the
-next Mix. Published ordinary tasks retain their position.
-One local metadata snapshot and one argument-region parse serve all lanes of a
-Mix. Shared scalar values and tensor descriptor addresses are read or computed
-once, then written into each lane's independent payload. After all payloads
-are written back, one barrier precedes their individual READY publications.
-
-Mix admission checks all participating slots and a tracker before claiming the
-ready inbox head. With ordinary deferred reservations, local Mix may be claimed
-but remote Mix cannot be stolen. Mix never enters the deferred queue. On graphs
-containing Mix, a scheduling pass consumes completions, attempts the unlocked
-direct Mix candidate, admits queued Mix, and then refills ordinary work.
-Displaced direct successors return to ready queues;
-ordinary-only graphs keep immediate direct refill. Task traces use metadata's
-32-bit base index plus the logical subtask offset, independently of placement.
-An unlocked Mix may remain a candidate within the current scheduling pass when
-no Mix work was queued at its ready-queue snapshot. Complete lane and tracker
-capacity permit direct preparation before the next queue claim; otherwise the
-candidate joins its ready queue first. Queue arrivals between that snapshot
-and a failed placement can precede the candidate after it joins the queue.
-Phase profiling records ready transitions for every active subtask. With
-profiling disabled, refill candidates do not compute trace indices.
-
-Directory queries are skipped when no unreserved FREE slot can accept
-work. Idle polling backs off from 8 to at most 32 iterations. Dispatch trace
-GM writes follow ready publication; Host tooling computes ready-to-kernel
-latency from the recorded timestamps.
+Ordinary dispatch skips ready-pool queries when no usable local slot can accept
+work. Ordered discovery is bounded by candidate credits instead: it can claim
+and admit a cooperative task while all execution slots are occupied.
+Idle polling backs off from 8 to at most 128 iterations. Dispatch trace GM
+writes follow ready publication; Host tooling computes ready-to-kernel latency
+from the recorded timestamps.
 
 ## 8. Scalar Access During Construction
 

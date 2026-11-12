@@ -348,10 +348,12 @@ TEST_P(DeferredCompletionProgress, LateNotifierNeedsAnUnoccupiedExecutionSlot) {
     ASSERT_EQ(poll(), 0);
     ASSERT_EQ(core(0).running_slot_state, nullptr);
     ASSERT_EQ(poll_async(), 0);
-    const auto *deferred = scheduler->async_wait_list.find_entry_by_token(producer);
-    ASSERT_NE(deferred, nullptr);
-    ASSERT_TRUE(deferred->normal_done);
-    ASSERT_EQ(deferred->waiting_completion_count, 1);
+    const auto &waits = scheduler->async_wait_list;
+    ASSERT_EQ(waits.count.load(std::memory_order_relaxed), 1);
+    const auto &deferred = waits.entries[0];
+    ASSERT_EQ(deferred.task_token, producer);
+    ASSERT_TRUE(deferred.normal_done);
+    ASSERT_EQ(deferred.waiting_completion_count, 1);
     ASSERT_EQ(slot(producer)->completed_subtasks.load(), 1);
     ASSERT_EQ(slot(producer)->task_state.load(), CHIP_TASK_PENDING);
     ASSERT_EQ(slot(producer)->has_dispatch_propagated(), producer_early);

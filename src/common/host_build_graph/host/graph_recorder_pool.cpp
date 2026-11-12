@@ -9,7 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "host_build_graph/host/graph_recorder_pool.h"
+#include "worker/runtime_host_services.h"
 
+#include <atomic>
 #include <functional>
 #include <utility>
 
@@ -17,9 +19,80 @@
 // only as an opaque owner token, so nothing here dereferences it.
 #include "host_build_graph/runtime_core.h"
 
+namespace {
+struct RecorderLifetime {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::unique_ptr<GraphAsyncRecordingState> pool;
+    size_t owners{0};
+    bool closing{false};
+};
+RecorderLifetime &recorder_lifetime() {
+    static RecorderLifetime lifetime;
+    return lifetime;
+}
+#ifdef SIMPLER_HBG_RECORDER_TEST_HOOKS
+std::atomic<int> g_test_acquire_waiting{0};
+#endif
+}  // namespace
+
+#ifdef SIMPLER_HBG_RECORDER_TEST_HOOKS
+// Test-only observation of the acquire wait; this definition is compiled only
+// into the unit-test fixture.
+extern "C" int test_recorder_acquire_waiting() noexcept {
+    return g_test_acquire_waiting.load(std::memory_order_acquire);
+}
+#endif
+
 GraphAsyncRecordingState &graph_recorder_pool() {
-    static GraphAsyncRecordingState state;
-    return state;
+    auto &lifetime = recorder_lifetime();
+    std::scoped_lock lock(lifetime.mutex);
+    if (!lifetime.pool) lifetime.pool = std::make_unique<GraphAsyncRecordingState>();
+    return *lifetime.pool;
+}
+
+// RuntimeModule owns the lease, so callable and native-run owners sharing a
+// module keep its workers alive until the last safe module release.
+extern "C" int simpler_runtime_acquire_host_services() noexcept {
+    try {
+        auto &lifetime = recorder_lifetime();
+        std::unique_lock<std::mutex> lock(lifetime.mutex);
+#ifdef SIMPLER_HBG_RECORDER_TEST_HOOKS
+        g_test_acquire_waiting.fetch_add(1, std::memory_order_acq_rel);
+#endif
+        lifetime.cv.wait(lock, [&] {
+            return !lifetime.closing;
+        });
+#ifdef SIMPLER_HBG_RECORDER_TEST_HOOKS
+        g_test_acquire_waiting.fetch_sub(1, std::memory_order_acq_rel);
+#endif
+        ++lifetime.owners;
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+extern "C" void simpler_runtime_release_host_services() noexcept {
+    auto &lifetime = recorder_lifetime();
+    GraphAsyncRecordingState *pool;
+    {
+        std::scoped_lock lock(lifetime.mutex);
+        if (lifetime.owners == 0) return;
+        --lifetime.owners;
+        if (lifetime.owners != 0) return;
+        lifetime.closing = true;
+        pool = lifetime.pool.get();
+    }
+    // Jobs can still use graph_record_wait_impl while draining, so the lifetime
+    // mutex must not be held while waiting for their closures to be destroyed.
+    if (pool) pool->shutdown();
+    {
+        std::scoped_lock lock(lifetime.mutex);
+        lifetime.pool.reset();
+        lifetime.closing = false;
+    }
+    lifetime.cv.notify_all();
 }
 
 bool graph_recorder_prewarm() { return graph_recorder_pool().prewarm(); }

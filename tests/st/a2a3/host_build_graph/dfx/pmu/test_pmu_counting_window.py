@@ -74,6 +74,10 @@ def _assert_every_task_counted(path):
 
 
 @scene_test(level=2, runtime="host_build_graph")
+@pytest.mark.coverage_skip(
+    platforms=["a2a3"],
+    reason="the counting-window case requires --enable-pmu 1",
+)
 class TestPmuCountingWindow(SceneTestCase):
     CALLABLE = {
         "orchestration": {

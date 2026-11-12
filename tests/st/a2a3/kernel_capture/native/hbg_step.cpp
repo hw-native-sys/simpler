@@ -21,8 +21,14 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     dcci(src, SINGLE_CACHE_LINE);
     if (src[0] == -12345 || src[0] == -12346) {
         // A bounded kernel outlives the fault scene's 200ms scheduler budget.
+        // The A5 counter runs at 1 GHz and the A2/A3 counter at 50 MHz.
+#if __CCE_AICORE__ == 310
+        constexpr uint64_t delay_ticks = 400000000ULL;
+#else
+        constexpr uint64_t delay_ticks = 50000000ULL;
+#endif
         const uint64_t start = get_sys_cnt();
-        while (get_sys_cnt() - start < 50000000ULL) {}
+        while (get_sys_cnt() - start < delay_ticks) {}
     }
     for (int i = 0; i < 16; ++i)
         dst[i] = src[i] + static_cast<int32_t>(args[2]);

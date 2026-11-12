@@ -109,8 +109,6 @@ struct SchedulerGraphView {
     // Base of the ChipTaskStorage array. One address, because a task's descriptor
     // and payload are members of one entry rather than peers in two arrays.
     uint64_t storage_address;
-    // Reserved in the common prefix. Every producer writes zero.
-    uint64_t reserved;
     uint64_t task_count;
     // Kept in the wire view for diagnostics. HBG task refs directly index the
     // whole-graph-resident tables and never wrap, so this value must not be
@@ -124,19 +122,16 @@ struct SchedulerGraphView {
     uint16_t view_bytes;
 };
 
-inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 2;
+inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 3;
 
 inline __aicore__ constexpr SchedulerGraphView
 scheduler_ordinary_graph_view(uint64_t storage_address, uint32_t task_count, uint64_t window_last_index) {
-    return {
-        storage_address,           0, task_count, window_last_index, 0, 0, 0, task_count, SCHEDULER_GRAPH_VIEW_VERSION,
-        sizeof(SchedulerGraphView)
-    };
+    return {storage_address,           task_count, window_last_index, 0, 0, 0, task_count, SCHEDULER_GRAPH_VIEW_VERSION,
+            sizeof(SchedulerGraphView)};
 }
 
 inline __aicore__ bool scheduler_graph_view_format_valid(const SchedulerGraphView &graph) {
-    return graph.reserved == 0 && graph.view_version == SCHEDULER_GRAPH_VIEW_VERSION &&
-           graph.view_bytes == sizeof(SchedulerGraphView);
+    return graph.view_version == SCHEDULER_GRAPH_VIEW_VERSION && graph.view_bytes == sizeof(SchedulerGraphView);
 }
 
 inline __aicore__ bool scheduler_graph_storage_extent_valid(const SchedulerGraphView &graph) {
@@ -240,7 +235,6 @@ struct SchedulerTaskShape {
     int64_t task_ref;
     int32_t kernel_ids[3];
     LaneMask active_mask;
-    uint8_t reserved[3];
 };
 
 struct SchedulerDispatchPredicate {
@@ -250,14 +244,14 @@ struct SchedulerDispatchPredicate {
     uint8_t op;
 };
 
-static_assert(sizeof(SchedulerGraphView) == 64, "read-only graph view layout changed");
+static_assert(sizeof(SchedulerGraphView) == 56, "read-only graph view layout changed");
 static_assert(offsetof(SchedulerGraphView, storage_address) == 0, "storage address offset changed");
-static_assert(offsetof(SchedulerGraphView, scheduler_state_address) == 32);
-static_assert(offsetof(SchedulerGraphView, native_header_offset) == 40);
-static_assert(offsetof(SchedulerGraphView, scheduler_state_bytes) == 48);
-static_assert(offsetof(SchedulerGraphView, original_task_count) == 56);
-static_assert(offsetof(SchedulerGraphView, view_version) == 60);
-static_assert(offsetof(SchedulerGraphView, view_bytes) == 62);
+static_assert(offsetof(SchedulerGraphView, scheduler_state_address) == 24);
+static_assert(offsetof(SchedulerGraphView, native_header_offset) == 32);
+static_assert(offsetof(SchedulerGraphView, scheduler_state_bytes) == 40);
+static_assert(offsetof(SchedulerGraphView, original_task_count) == 48);
+static_assert(offsetof(SchedulerGraphView, view_version) == 52);
+static_assert(offsetof(SchedulerGraphView, view_bytes) == 54);
 static_assert(std::is_trivially_copyable_v<SchedulerGraphView> && std::is_standard_layout_v<SchedulerGraphView>);
 static_assert(sizeof(SchedulerTaskInfo) == 24, "root classification result layout changed");
 static_assert(sizeof(SchedulerTaskShape) == 24, "task shape result layout changed");
@@ -350,7 +344,7 @@ scheduler_native_child_plan_checked(const SchedulerGraphView &graph, const Sched
                       graph.scheduler_state_address + node.definition->child_plans_offset
                   ) +
                   node.binding->source_index;
-    if (child->reserved != 0 || child->tensor_count > MAX_TENSOR_ARGS || child->scalar_count > MAX_SCALAR_ARGS ||
+    if (child->tensor_count > MAX_TENSOR_ARGS || child->scalar_count > MAX_SCALAR_ARGS ||
         child->tensors_offset % 64 != 0 || child->scalars_offset % 64 != 0 ||
         child->tensors_offset > node.definition->args_bytes ||
         child->tensor_count > (node.definition->args_bytes - child->tensors_offset) / TASKPAYLOAD_TENSOR_STRIDE ||
@@ -530,11 +524,10 @@ scheduler_classify_task_shape(const SchedulerGraphAccess &graph, int64_t task_re
     *shape = {
         -1,
         {SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID},
-        LaneMask::none(),
-        {0, 0, 0}
+        LaneMask::none()
     };
+    if (!scheduler_graph_view_format_valid(graph)) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.task_count == 0) return SchedulerGraphResult::EMPTY;
-    if (graph.reserved != 0) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref)) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     }
@@ -616,8 +609,8 @@ struct SchedulerTaskPayloadArguments {
 inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
     const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerTaskPayloadArguments *arguments
 ) {
-    if (arguments == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
-    if (graph.reserved != 0) return SchedulerGraphResult::INVALID_ARGUMENTS;
+    if (arguments == nullptr || !scheduler_graph_view_format_valid(graph))
+        return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref)) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     }

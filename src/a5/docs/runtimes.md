@@ -18,15 +18,9 @@ Graph recording and replay are documented in
 [GRAPH_EXECUTION.md](../runtime/host_build_graph/docs/GRAPH_EXECUTION.md).
 
 Each A5 cluster shares 3 KiB of SSBUF between its AIC and two AIVs.
-For `host_build_graph`, user kernels may use only byte offsets `[0, 2048)`;
-the runtime owns `[2048, 3072)` for dispatch, completion and trace handoffs.
-Kernel authors must keep every SSBUF access, including library-managed buffers,
-within the user range and coordinate sharing between the cluster's lanes.
-This reservation is specific to A5 `host_build_graph`.
-
-The runtime validates its SSBUF header at startup, not after each kernel.
-An out-of-range kernel write can corrupt scheduling tokens; runtime detection
-of such writes is not provided.
+The HBG resident scheduler uses core-local slots and GM MIX mailboxes; it
+reserves no SSBUF region. User kernels must coordinate their own SSBUF use
+across the cluster's lanes.
 
 ## tensormap_and_ringbuffer
 

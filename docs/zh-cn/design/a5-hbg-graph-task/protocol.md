@@ -1,9 +1,34 @@
 # A5 Graph task 调度与发布协议
 
-本文是[设计总览](../a5-hbg-graph-task.md)的设备侧实施契约，接口均为拟新增或拟调整。
+本文是[设计总览](../a5-hbg-graph-task.md)的设备侧实施契约。
 节点编号和 GM 区域见[数据布局](data-layout.md)。
 当前代码恢复到全任务 cooperative admission。曾划分独立 block、MIX lease 和同步 cohort 的
 [重构原型](block-ready-scheduling.md)已经撤回，只保留为后续待选方案。
+两个固定业务 ready 队列已实现，完整硬件、故障及性能验收仍在进行中；下文历史测量不作为本次验收结果。
+
+## 两个业务 ready 队列 {#two-business-ready-queues}
+
+普通任务与 native Graph child 使用相同分类：纯 AIC 和所有 MIX 进入 AIC 队列，纯 AIV 进入 AIV 队列。
+包含双 AIV、没有 AIC kernel 的 MIX 仍由 AIC coordinator 领取；原 flags、active/resource mask、SPMD block 数和执行许可不变。
+任意核类型都可向任一业务队列发布后继。每个逻辑任务在一个 run 内最多占一个 entry，block/lane 不分别入队。
+
+| 结构 | 当前 wire 合同 |
+| ---- | -------------- |
+| `SchedulerReadyPoolHeader` | version 11，64 B；寻址两个队列及依赖区，校验 allocation 边界 |
+| `SchedulerReadyPoolDescriptor` | 每份 16 B，固定两份；容量按逻辑 executable metadata 精确计数，允许为零 |
+| `SchedulerTicketQueue` | 每份 128 B，固定两份；head 与 reserved_tail 分别独占 64 B 行 |
+| `SchedulerTicketEntry` | 每项 64 B；原子发布 task_ref，初始 INVALID，run 内不覆盖或回收 |
+
+Host writer 与 device reader 分别见 [ready_pool_plan.h](../../../../src/a5/runtime/host_build_graph/host/ready_pool_plan.h)、
+[scheduler_ready_pool.h](../../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready_pool.h)；
+entry 交权见 [scheduler_ticket_queue.h](../../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h)。
+head、tail 与 entry 发布字所在行不接受 cached 整行写回。数据发布先于原子交权，DSB 不替代跨核所有权协议。
+
+同一批最多发布 8 个同类 ref；预留后在有限路径内完成发布，不带着共享空洞去执行 kernel 或等待 MIX 资源。
+消费者只检查自身 AIC/AIV 队列，以 `ld_dev` 作可过期提示，再原子确认 entry、校验 ref 和 ready 类别，成功 CAS head 后取得唯一 claim。
+零容量直接返回空；前序预留尚未发布时不越过空洞，下轮重新探测。空提示只对本轮 discovery 有效，不证明图已完成。
+领取后的 SPMD/MIX 继续进入 admission/GM MIX，不能在共享队头等待 AIV 空闲；普通 direct refill 显式排除 MIX。
+Graph control inbox 不属于这两个业务队列，仍使用独立的 `CONTROL` publication 标签和控制节点协议。
 
 ## Bootstrap 与控制节点
 
@@ -11,27 +36,28 @@ Host 初始化完整 N-node control 表，只有确认已在 Host 完成的原�
 其余节点初态沿用 `SchedulerTaskState::BLOCKED`；ready、私有 claim 是所有权位置，不新增 GM task state。
 Graph body 的 DUMMY 也必须实际经过依赖路由，不能复制 recording 阶段的 early-resolve 状态。
 
-native header 的第一次读取必须在本 run 的缓存刷新之后。当前主线在 local config/admission 初始化后
-才执行整 data cache 的 bootstrap observe；如果把 native header 校验放进 local config，这个顺序会太晚。
-native 路径应在取得 READY 后的 context 并检查基础地址/长度后，先执行一次 bootstrap cache observe，
+native header 的第一次读取必须在本 run 的缓存刷新之后。native 路径在取得 READY 后的 context
+并检查基础地址/长度后、local config/admission 初始化前，先执行一次 bootstrap cache observe，
 再读取 header/template/binding；后面的同类 observe 不重复执行。无 Graph 路径保留原时序。
 这仅是每 run 的启动操作，不允许扩展为每 child 的整 cache 刷新。
 同地址连续 run 使用不同 Definition、boundary 和 scalar 的回归必须能发现旧 epoch 数据残留。
 
 所有 worker 按现有区间划分扫描 N 个节点：先读 kind，再决定跳过 HOST_DONE、路由控制节点或路由 kernel。
-无 fanin 的控制节点进入 control inbox，kernel 进入原有按 AIC/AIV/MIX 分类的 ready inbox。
-有 fanin 的节点注册到第一个未完成 producer；跨 Graph 的 producer 已经由 Host 映射。
+Host 为有边的图预建 fanout CSR 与 remaining；bootstrap 读取初始 remaining，零值节点 ready，非零节点等待通知。
+控制节点进入 control inbox，kernel 按 AIC（含 MIX）/AIV 分类进入 ready pool。跨 Graph 的 producer 已由统一访问器映射。
+没有依赖 header 的兼容路径才扫描 fanin，并把节点注册到第一个未完成 producer；详见[依赖计数](dependency-counters.md)。
 **全部扫描结束前，不 pop control inbox，也不完成任何 ENTER/DUMMY。**
 `bootstrap_scan_complete` 后才可以处理控制节点和准备首批 slot；AICPU 仍等待现有
 `bootstrap_complete` 后通过唯一 DMB gate 放行执行。
 
-这保留了 `scheduler_bootstrap_route_task` 的 exchange-before-link 前提：构造 wake-list 时没有 resolver。
-稳态必须继续使用带 CLOSED 检查的 CAS 路由，不能把 bootstrap 的无并发完成假设带到稳态。
+此屏障同时保证 remaining 初始读取不与完成通知竞争，并保留兼容路径
+`scheduler_bootstrap_route_task` 的 exchange-before-link 前提。兼容路径稳态使用带 CLOSED 检查的 CAS 路由，
+不能把 bootstrap 的无并发完成假设带到稳态。
 
 ### 独立 control inbox
 
 现有 `scheduler_complete_inline_task` 由 slot fill 路径调用，而且验证了 kernel 风格的 metadata。
-原样复用会让 ENTER/EXIT 等待空闲 payload slot。新增以下控制入口：
+原样复用会让 ENTER/EXIT 等待空闲 payload slot。控制节点使用独立入口：
 
 ```cpp
 bool scheduler_control_enqueue(/* base, local, node_ref */);
@@ -40,13 +66,13 @@ bool scheduler_service_controls(/* graph, base, local, run, budgets */);
 
 每 worker 一个 control inbox，复用 `SchedulerReadyInbox` 的 64-bit head/tail 原子协议和
 `next_waiter` 链，不使用 AIC/AIV/MIX 的资源过滤、type rank 或 directory mask。
-将现有 queue push/pop 的机械操作提取为接受 inbox 地址的共用 helper，保持原有 CAS、尾链发布和有限重试语义。
-运行中 ready 的控制节点先推到 resolver 所在 worker 的 inbox；bootstrap 按扫描 owner 分片。
+控制 queue push/pop 接收 inbox 地址，保持原有 CAS、尾链发布和有限重试语义。
+运行中 ready 的控制节点先推到 resolver 所在 worker 的 inbox；bootstrap 由各扫描分区的 owner 发布。
 所有 worker 都可消费控制节点，先查本地、再按轮转游标探查一个 peer，最终覆盖所有 worker。
-kernel inbox 的空目录提示不能屏蔽这次控制队列探查。
+业务 ready pool 的空提示不能屏蔽这次控制队列探查。
 
-一个节点从 wake-list detach 后先按 kind 分流：控制节点只进 control inbox；kernel 才能 direct refill、
-进入 type inbox 或 admission。禁止把 ENTER/EXIT 当作 AIV kernel，禁止递归调用其后继完成函数。
+一个节点经 remaining 归零或兼容 wake-list 路由成为 ready 后，先按 kind 分流：控制节点只进 control inbox；kernel 才能 direct refill、
+进入对应业务队列或 admission。禁止把 ENTER/EXIT 当作 AIV kernel，禁止递归调用其后继完成函数。
 MPMC pop 的成功 CAS 是唯一 owner 的获取点，不再增加 Graph 级 owner lock。
 
 ### 控制完成切片
@@ -56,21 +82,21 @@ MPMC pop 的成功 CAS 是唯一 owner 的获取点，不再增加 Graph 级 own
 已有 kernel completion 的控制后继只入队；下一切片处理，避免 completion→control 的递归。
 
 每轮最多开始 8 个控制节点，并消耗 64 个控制工作单位，作为内部常量。
-每 worker 持有一个 184 bytes 的 `SchedulerResolveCursor`，保存 producer、剩余链、当前 waiter 的旧 next、fanin 游标及最多 8 项的发布状态：
+每 worker 持有一个 160 bytes、自然 8-byte 对齐的 `SchedulerResolveCursor`，保存 producer、CSR/剩余链位置、当前后继、兼容 fanin 游标及最多 8 项的发布状态：
 
 1. pop 一个 ready 控制节点，校验 kind、BLOCKED 和无 kernel 资源；以原子写发布 DONE。
-2. 原子 exchange 将其 wake-list 置为 CLOSED，取得完整旧链；重复 CLOSED 是协议错误。
-3. 先原子读取并保存当前 waiter 的旧 next，再按工作预算推进 fanin 扫描及 wake-list 登记。
-4. 路由结果只能是重新挂到某个 producer、进入某个 ready inbox，或错误；不能同时存在两个位置。
-5. 预算耗尽时保存完整进度，包括已经准备但尚未公开的 batch；下轮继续。重新挂链成功后不再访问该 waiter，原链只按保存的旧 next 推进。
-6. 链耗尽且 batch 发布完成后才增加本 worker 的 `pending_completed`，清空 continuation。
+2. 原子 exchange 将 wake head 置为 CLOSED；重复 CLOSED 是协议错误。计数路径要求原 head 为空，兼容路径则取得完整旧链。
+3. 计数路径遍历 CSR 后继并对 remaining 原子减一；旧值为 1 的唯一通知者使后继 ready，旧值为 0 报错。兼容路径先保存旧 next，再推进 fanin 扫描及挂链。
+4. 后继只能继续等待、进入 ready 发布流程或报错；不能重复发布或重复消费同一条边。
+5. 预算耗尽保存完整进度，包括尚未公开的 batch，下轮继续。兼容路径重新挂链后不再访问该 waiter，按已保存旧 next 推进。
+6. 所有后继处理完且 batch 发布完成后，才增加本 worker 的 `pending_completed`，清空 continuation。
 
-continuation 私有拥有整条剩余链；不把它重新入队，不再次关闭 producer，也不再次发布 DONE。
-初始化、单个 fanin 观察、一次 wake-list 登记尝试、waiter 选择/暂存或一次 ready 发布步骤各消耗一个单位。
-ready 发布的准备及 ticket 发布最多处理 8 项；inbox tail 的成功 CAS 后必须立即完成旧 tail 挂链及屏障，之后才允许让出。
-可复用 ready directory 的置位独立续接，每步使用权威读取及至多一次 CAS。
+continuation 私有拥有剩余后继的处理责任；不把它重新入队，不再次关闭 producer，也不再次发布 DONE。
+初始化、单个 CSR credit、兼容路径的单个 fanin 观察或登记尝试、waiter 选择/暂存及 ready 发布步骤均计入预算。
+业务 ticket 发布最多处理 8 项，在同一有限步骤内完成预留与发布；control inbox tail 的成功 CAS 后必须立即完成旧 tail 挂链及屏障，之后才允许让出。
 64 是上述工作单位预算，**不是 64 次 GM 访问或硬实时周期上限**；每种单位的固定访问和屏障成本仍需计量。
-普通同步 kernel completion 保持直接 refill 和 MIX prefix 发布策略；可移交的 FINISH 使用同一有界 fanin 原语及完整解析游标。
+普通同步 kernel completion 保持符合条件的非 MIX direct refill；MIX 使用同一有界业务队列发布，不单独保留直接交付或两任务前缀路径。
+可移交的 FINISH 使用同一有界 resolver 及完整解析游标。
 本地状态避免新增过度对齐的大栈对象；GM wire 的对齐要求不直接搬到 CCEC 局部变量上。
 
 ## 参数绑定与资源准入
@@ -97,6 +123,9 @@ inherited scalar 取本次 boundary scalar，固定 scalar 取只读 Definition�
 普通 ready owner 可能不是参数写者，首次准备 payload 前必须 invalidate 参数范围并执行 barrier。
 私有 pending candidate 用 `args_observed` 保存已观察状态，随 task_ref park/restore，最终释放或 run 失败才清除。
 cooperative 的 claim owner 只准备 admission record；成员首次 adopt 后、尝试领取 block 前观察参数，后续 block 复用。
+普通非 MIX、非 sync_start 的小 grid 使用从 `member_rank_offset % eligible_count` 开始、长度为 block_num 的循环成员区间。
+Host 按 task_ref 顺序分别累计 AIC/AIV 普通 SPMD 的 block 数；MIX、sync_start、单 block 和另一类型任务不推进该前缀；
+其余 ordinary、MIX 和 sync_start 保留完整可用成员集合。冻结成员位图只决定参与资格，不直接分配 block。
 普通纯 SPMD 的迟到成员若不持有该任务的执行 slot，且通过原有强 atomic 路径确认 claim seal 已覆盖全部 block，
 可以记录 observed/closed 并直接推进本地 obligation，无须读取参数或暂存普通 payload。
 该路径仍校验 epoch、全局顺序、任务形状和 membership，每轮最多扫描八条记录；
@@ -106,7 +135,8 @@ cooperative 的 claim owner 只准备 admission record；成员首次 adopt 后�
 
 `SchedulerLocalSlotState` 用三态 predicate（未求值、通过、不通过）保存一次求值的结果，
 park/restore 与 `args_observed` 一起迁移，不因重试而读取更新后的 predicate operand。
-slot 保持 24 bytes，`SchedulerLocalState` 为 808 bytes（含可选异步服务状态的 8-byte 引用），其中控制解析游标占 184 bytes，均有 64-bit 构建的静态断言。
+`SchedulerWorkerContext` 为 320 bytes，`SchedulerLocalConfig` 为 104 bytes，
+slot 保持 24 bytes，`SchedulerLocalState` 为 384 bytes（含可选异步服务状态的 8-byte 引用），其中控制解析游标占 160 bytes，均有 64-bit 构建的静态断言。
 最初 I4 测试快照使用两个 predicate 布尔值，slot 为 32 bytes、总状态为 616 bytes；
 后续性能证据必须明确区分该快照与三态布局。
 这些局部状态也用于无 Graph 路径，P1 必须实测其开销，不能仅凭 native 分支未执行就断言零影响。
@@ -127,7 +157,8 @@ Graph 的拓扑编号不决定 runtime order key。不能为每个实例设置�
 记录以 node_ref 寻址，membership 冻结后不可扩展；同一个 child 的 args 地址对全体成员相同。
 
 SPMD 的逻辑完成仍为全部 blocks 完成；`sync_start` 仍要求单个 child 的规定成员共同到达。
-MIX 保留 AIC coordinator 和必要的三资源 lane 参与，包括 inactive lane 的资源握手，
+MIX 的资源成员仍为 active mask 加 AIC coordinator；双 AIV MIX 的 AIC 即使不执行 kernel 也参与协调，
+未被资源 mask 选中的 AIV 不额外参与握手。
 AIC 观察 release 后才聚合 block 完成。AIV 单 lane 返回不能提前完成 child 或释放 EXIT。
 复用现有 block owner、LocalDone、seal 和 ordered-exit；不因 Graph shell 完成而清除这些记录。
 
@@ -143,11 +174,14 @@ AIC 观察 release 后才聚合 block 完成。AIV 单 lane 返回不能提前�
 | admission immutable record/member bits | claim owner，现有协议 | 沿 PREPARED/ADMITTED 和 log tail 发布，成员按原有 epoch/order 校验后 acquire |
 | child 参数 reader | 普通 ready owner 或固定成员 | 普通首次 payload 准备、成员首次 adopt 后 invalidate 参数范围；不在每个 block 重复 invalidate |
 | task state、wake head、queue endpoint、next link | 多 worker 的原子协议 | 保持 GM 原子读写；缓存 load/`ld_dev` 只可作为 hint，不能确认原子发布完成 |
+| remaining | 多 producer 的原子通知；Host 初始化 | 独立原子区域，无 cached store/整行写回；1→0 的通知者发布 ready |
+| fanout CSR/header | Host；单 run 只读 | READY 后校验；通知范围与引用均需合法 |
 | fanin cursor、诊断字段 | 当前路由 owner | 与原子行分离，所有权交接前按现有规则 writeback/observe |
 | run error、完成汇总、退出状态 | 沿既有多核协议 | error payload 先发布，错误标记后发布；完成计数和退出证明分别检查 |
 
 不同 child 的 scalar/predicate 独占 64-byte cache line，不能沿用 packed scalar pool 后让多核并行整行写回。
-已有 task control 的 128-byte 原子域隔离不缩小，不能把 cached 字段塞入原子行再整行写回。
+TaskControl 为 384 bytes：state/链指针/claim tickets 共用首个原子行；cached resolver metadata、
+next_block、completed_blocks、bypass admission signal 和 claim seal 各占一行。禁止 cached 写回触及原子行。
 参数存放与定义存放不能混用一条可写 cache line。无参数时不对零地址或零长度范围做 cache 操作。
 运行中不使用全 cache flush 作为每 Graph/每 child 的发布方法，也不假设 AICPU LaunchEnvelope 对 AICore 可寻址。
 
@@ -165,23 +199,19 @@ bootstrap 并行绑定 `p2-bootstrap-bind` 已通过 93 个 C++ 目标、65 项 
 它把 O(N) 参数准备移入启动阶段，L3 的单 worker bootstrap 中位数为 570.739 µs；
 详见[候选测量与限制](qwen-performance.md)。最终全量功能、故障和性能验收仍须完成。
 
-## native ready 的跨分片发现
+## ready 为空时的持续进展
 
-native Graph 的 worker 先取自身 inbox，再搜索本地同类型 ready 分片；仍未取得任务时，
-按循环顺序搜索其他同类型分片。扫描上限由实际 owner_count 决定，最后一个分片屏蔽未启用 owner。
-普通图仍使用本地分片策略；bootstrap/dispatch 的既有图类型模板继续传入 slot fill、ordered poll 和 ready claim，
-在普通图实例中编译期移除 remote discovery，不依赖大函数内联后再消除 native 分支。
-远程分片不屏蔽与自身 rank 同余的 bit，也不能对负的 rank 差做位移。
+普通图和 native Graph 都使用上述两队列发现路径，所有合法 AIC/AIV rank 可领取对应业务队列。
+ordered poll 在本类队列为空时继续观察 admission tail、已有候选、待提交 admission 和当前 GM MIX 状态。
+因此 SPMD 被取走后其他成员仍可领取 block，AIV 队列为空时仍可参与 AIC 发布的 MIX assignment/ACK。
+控制切片和 async CHECK/FINISH 继续独立获得有界服务，通知未到或责任未退休时不得提前 DONE 或结束 run。
 
-所有取任务操作复用既有 inbox CAS；跨分片只改变发现范围，不改变依赖、入队唯一性或发布屏障。
-cooperative 任务被取出后仍走相同 claim/commit、固定成员、全局顺序和 block permit，
-不会因为被远程 worker 发现就直接取得执行资格。控制节点 inbox 的协议保持独立。
-ordered idle hint、ordered fill 和普通 slot fill 的 steal hint 必须采用同一发现范围；
-negative hint 只对本轮有效，不消耗任务、不授权执行。
+cooperative claim/commit、固定成员、全局顺序和 block permit 仍是执行资格的依据。
+负提示只对本轮 discovery 有效，不消耗任务、不授予执行权，也不消除已持有候选的责任。
 
-该候选标识为 `p2-global-ready`：93 个 C++ 目标、65 项 A5sim、6 个 Graph 真机专项和独立协议审计通过；
-完整 Qwen out/K/V 通过，单批 Device 为 43.676 ms，仍慢于历史主线。详见[测量口径与限制](qwen-performance.md)。
-代价是空闲时额外读取目录分片，以及跨分片竞争同一 inbox；须以 Qwen 核分布、稳态性能和无 Graph 回归验证。
+历史 `p2-global-ready` 跨分片候选曾通过 93 个 C++ 目标、65 项 A5sim、6 个 Graph 真机专项和独立协议审计；
+完整 Qwen out/K/V 通过，单批 Device 为 43.676 ms，仍慢于当时主线。该数据及其目录扫描代价仅对应历史版本，
+见[测量口径与限制](qwen-performance.md)，不代表当前两队列实现的验收结果。
 
 当前提交还传递了 ordinary/native 编译期发现能力，A5/A5sim 构建、93 个 C++ 目标与 65 项 A5sim 通过；
 该编译增量没有单独上板测量。用户要求保留已知退化形成阶段提交，随后重构全局唯一队列和分级队列，
@@ -225,7 +255,7 @@ AICPU 退出循环后仍检查 error，Host 仍检查最终 run status 和 compl
 未完成退出证明的 backing 进入 poison/quarantine，不能归还池后被下一 run 改写。
 
 进度论证依赖 worker 持续获得执行机会、kernel 有限返回、queue CAS 无永久饥饿以及全局 admission 的既有进度性质。
-控制队列不持有 kernel 资源；控制切片每轮获得机会；路由游标只前进，wake-list 不会丢失唯一 owner。
+控制队列不持有 kernel 资源；控制切片每轮获得机会；resolver 游标只前进，CSR credit 不重复，兼容 wake-list 不丢失唯一 owner。
 因此控制节点不会新增“等待空闲槽才能释放空闲槽”的环。
 这不是对硬件公平性或既有 cooperative 协议的全新形式化证明；压力测试须专门覆盖 slot 全满与长控制链。
 
@@ -240,8 +270,8 @@ AICPU 退出循环后仍检查 error，Host 仍检查最终 run status 和 compl
 
 ### 只读元数据的 worker 局部校验状态
 
-`SchedulerGraphView` 的 64-byte wire ABI 保持不变。设备侧 `SchedulerGraphAccess` 复制该 view，
-另外保存已校验的 header 指针和最近一个 Definition template 指针，64-bit 环境共 80 bytes。
+`SchedulerGraphView` 为 version 3、56-byte wire ABI。设备侧 `SchedulerGraphAccess` 复制该 view，
+另外保存已校验的 header 指针和最近一个 Definition template 指针，64-bit 环境共 72 bytes。
 构造只复制 view，不访问 GM；第一次 native 读取仍必须位于本 run 的启动 cache observe 之后。
 复制访问对象也重建校验状态，赋值被禁止，避免把已校验指针隐式带入另一个访问范围。
 仅在原有完整校验成功后保存指针，template 以检查过的表范围内的精确地址匹配。
@@ -261,7 +291,7 @@ task control、queue、predicate 取值和 Tensor 数据不进入该状态，参
 
 普通 `deps.json` 的外层 Graph task 不能替代内部 kernel DAG。使用
 `simpler_setup.tools.hbg.native_graph.export_kernel_dependencies(section, executed_task_ids)`
-从已通过协议审计的原生 Graph v9 或历史 Graph v6 来源构造实际执行 kernel 的依赖；
+从已通过协议审计的当前原生 Graph v11 来源构造实际执行 kernel 的依赖；
 该函数独立复审原始来源与 node map，
 穿透 ENTER/EXIT/DUMMY、Host service 和未执行的 predicate，并保留所有 root/sink 的前驱关系。
 未知 execution identity、缺失的非 predicate kernel 和不一致的原始边必须拒绝。

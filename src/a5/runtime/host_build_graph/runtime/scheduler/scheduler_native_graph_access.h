@@ -34,8 +34,8 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
     if (!scheduler_native_header_extent_valid(base, bytes, offset)) return nullptr;
     auto *header = reinterpret_cast<__gm__ const SchedulerNativeGraphHeader *>(base + offset);
     if (header->magic != SCHEDULER_NATIVE_GRAPH_MAGIC || header->version != SCHEDULER_NATIVE_GRAPH_VERSION ||
-        header->header_bytes != sizeof(SchedulerNativeGraphHeader) || header->flags != 0 || header->reserved != 0 ||
-        header->image_bytes != bytes || header->node_count != nodes || nodes == 0 || nodes > INT32_MAX ||
+        header->header_bytes != sizeof(SchedulerNativeGraphHeader) || header->image_bytes != bytes ||
+        header->node_count != nodes || nodes == 0 || nodes > INT32_MAX ||
         header->original_task_count != original_tasks || original_tasks == 0 ||
         original_tasks > TaskId::GLOBAL_TASK_MAX_NUM || header->instance_count == 0 ||
         header->instance_count > original_tasks || header->definition_count == 0 ||
@@ -78,11 +78,11 @@ scheduler_native_template_checked(uint64_t base, __gm__ const SchedulerNativeGra
     if (index >= header.definition_count) return nullptr;
     auto *entry = reinterpret_cast<__gm__ const SchedulerGraphTemplate *>(base + header.templates_offset) + index;
     const uint64_t end = header.readonly_end_offset;
-    if (entry->reserved[0] != 0 || entry->reserved[1] != 0 || entry->task_count == 0 ||
-        entry->task_count > SUB_TASK_MAX_NUM || entry->edge_count > entry->task_count * (entry->task_count - 1) / 2 ||
-        entry->sink_count == 0 || entry->sink_count > entry->task_count ||
-        entry->definition_bytes < sizeof(GraphDefinition) || entry->definition_bytes > UINT32_MAX ||
-        entry->args_bytes % 64 != 0 || entry->args_bytes > entry->legacy_execution_storage_bytes ||
+    if (entry->task_count == 0 || entry->task_count > SUB_TASK_MAX_NUM ||
+        entry->edge_count > entry->task_count * (entry->task_count - 1) / 2 || entry->sink_count == 0 ||
+        entry->sink_count > entry->task_count || entry->definition_bytes < sizeof(GraphDefinition) ||
+        entry->definition_bytes > UINT32_MAX || entry->args_bytes % 64 != 0 ||
+        entry->args_bytes > entry->legacy_execution_storage_bytes ||
         entry->definition_offset < header.instances_offset + header.instance_count * sizeof(SchedulerGraphInstance) ||
         !scheduler_native_region_valid(
             end, entry->definition_offset, entry->definition_bytes, 1, GRAPH_DEFINITION_OBJECT_ALIGN
@@ -137,8 +137,6 @@ inline __aicore__ __gm__ const SchedulerNodeBinding *
 scheduler_native_binding_checked(uint64_t base, __gm__ const SchedulerNativeGraphHeader &header, int64_t ref) {
     if (ref < 0 || static_cast<uint64_t>(ref) >= header.node_count) return nullptr;
     auto *binding = reinterpret_cast<__gm__ const SchedulerNodeBinding *>(base + header.bindings_offset) + ref;
-    for (uint32_t i = 0; i < sizeof(binding->reserved); ++i)
-        if (binding->reserved[i] != 0) return nullptr;
     const auto kind = binding->kind;
     if (binding->instance_index == SCHEDULER_NATIVE_NO_INSTANCE) {
         if (binding->source_index >= header.original_task_count ||

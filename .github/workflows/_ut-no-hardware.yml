@@ -69,6 +69,7 @@ jobs:
             echo "::warning::brew could not install ccache; the C++ build will compile from scratch"
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
 
       # Self-hosted runners keep one checkout and one home directory across
@@ -85,6 +86,11 @@ jobs:
           # Worker integration tests exercise both a2a3sim and a5sim.
           pip install --no-build-isolation \
             --config-settings=build.targets=build_package_sim -e '.[test]'
+
+      - name: Verify provisioned Python
+        if: inputs.setup_variant == 'self-cpu'
+        run: |
+          python3 -c 'import sys; expected = tuple(map(int, "${{ inputs.python_version }}".split("."))); assert sys.version_info[:2] == expected, f"CPU runner requires Python {expected}, got {sys.version}"'
 
       - name: venv + deps
         if: inputs.setup_variant == 'self-cpu'

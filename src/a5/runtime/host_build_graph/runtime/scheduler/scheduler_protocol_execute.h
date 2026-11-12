@@ -23,6 +23,6 @@ inline __aicore__ void scheduler_execute_protocol_task(
     const auto kernel = reinterpret_cast<Kernel>(payload->function_bin_addr);
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     const uint64_t returned = scheduler_cycles();
-    OUT_OF_ORDER_STORE_BARRIER();
+    scheduler_store_barrier();
     scheduler_protocol_execution_returned(base, local, pending_slot, returned, scheduler_cycles());
 }

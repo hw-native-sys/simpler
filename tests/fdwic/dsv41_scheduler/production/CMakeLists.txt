@@ -15,9 +15,11 @@ set(COMMON "${SIMPLER_ROOT}/src/common")
 add_executable(native-runner
     runner.cpp
     ${COMMON}/worker/chip_worker.cpp
+    ${COMMON}/worker/native_submission_state.cpp
     ${COMMON}/worker/runtime_module.cpp
     ${COMMON}/worker/chip_run_lane.cpp
     ${COMMON}/worker/device_fault_monitor_host.cpp
+    ${COMMON}/worker/native_submission_state.cpp
     ${COMMON}/log/host_log.cpp
     ${COMMON}/log/unified_log_host.cpp
     ${COMMON}/task_interface/assert_compat.cpp

@@ -31,12 +31,14 @@
  *   end_task()              — closes the task, after its last dependency step
  *
  * Control surface, called from the device runner (same host_runtime.so):
- *   set_enabled() / active() / take() / emit()
+ *   active() / take() / emit(), with prepare-owned session configuration
  *
  * Every runtime build links this .cpp. A unit test that takes the orchestrator
  * without it resolves to the no-ops in tests/ut/cpp/support/hbg_orch_stubs.cpp.
  *
- * The graph lives in thread-local state, so capture is lock-free and two
+ * HostDependencyCaptureScope owns the graph for one prepare attempt, including its
+ * exception cleanup. TLS only borrows that session; it owns no containers.
+ * Direct bind callers must establish the same scope. Capture is lock-free and
  * prepared contexts on different threads cannot overwrite one another. Both
  * `take` and `emit` read the calling thread's state, and the caller keeps that
  * read on the capturing thread by handing the graph over at the end of the
@@ -71,14 +73,14 @@
 // Capture surface (orchestrator side)
 // ---------------------------------------------------------------------------
 
-/** True while a run is capturing; every other capture call is gated on this. */
+/** True when this prepare owns an enabled host dependency capture session. */
 bool dep_gen_host_graph_enabled();
 
 /**
  * Start a fresh graph for the orchestration about to run. The graph a run emits
- * is the one that run built, so the reset belongs to the orchestration entry —
- * not to set_enabled(), which the runner may call again after the graph is
- * already built.
+ * is the one that run built, so the reset belongs to the orchestration entry.
+ * Session creation alone must not mark a graph as captured: a prepare may
+ * fail before orchestration, or restore a parked graph just for export.
  */
 void dep_gen_host_graph_begin_capture();
 
@@ -117,9 +119,6 @@ void dep_gen_host_graph_add_tensormap_edge(
 
 extern "C" {
 
-/** Enable/disable capture. The graph itself is cleared by begin_capture(). */
-void dep_gen_host_graph_set_enabled(bool enable);
-
 /**
  * True when this runtime captures the graph on the host, i.e. the runner must
  * not stand up the device-side dep_gen collector. The runner links a weak
@@ -131,7 +130,7 @@ bool dep_gen_host_graph_active();
  * Move this thread's captured graph into `out`, and report what was found.
  *
  * Returns a `simpler::dfx::host_graph::TakeOutcome` as an int. On `Complete`
- * the caller owns every byte the graph occupies and the thread-local holds
+ * the caller owns every byte the graph occupies and the capture session holds
  * nothing of it, so a background writer can read `out` while the next
  * orchestration captures into fresh storage. `NotCaptured` and `Incomplete`
  * leave `out`'s payload empty and mean no graph may be published.

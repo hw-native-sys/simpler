@@ -253,6 +253,14 @@ so a refresh is still "re-harvest a2a3, then re-apply this table".
 | `#include <pto/pto-inst.hpp>` moved after the vendor header | `kernel/fai_body.hpp` | `pto` and `KernelCommon` both declare `NUM_32` / `NUM_128` / `NUM_256` at namespace scope and `tensor.h` opens `namespace pto`, so including pto first makes those names ambiguous inside the vendor kernel |
 | hard `AscendC::SyncAll<false>` → `pto::SYNCALL<Soft, Mix>` | `kernel/fai_body.hpp`, `kernel/metadata_layout.h`, `tiling/entry.cpp` | the hard barrier is the FFTS flag region, whose base a2a3 gets from `rtGetC2cCtrlAddr`; that call is unsupported on a5 and simpler's a5 runtime sets no FFTS base, so the barrier never releases. The soft barrier's counter (`kSyncAllCounterWord`, one int32 past the kernel's own 48 slots) is zeroed by `clear_barrier` alongside them — it is a monotonic ticket counter, so a non-zero start splits the first round's arrivals across a participant boundary and hangs the half that lands above it |
 | `platforms: ["a5"]`, `ring_dep_pool=65536` | test `CASES` | the 40-layer graph's in-flight dependency footprint (~32 k) overflows a5's default 16 k pool |
+| Refresh inverse-RMS input lines before the generated RoPE body | `kernel/fai_body.hpp` | The generated body reads the 16-float inverse-RMS input through Scalar. Single-line DCCI followed by DSB makes each invocation observe the preceding RMS task's values without depending on an executor-wide cache flush. The dependency chain excludes concurrent writers during these reads; HBG Graph replay isolates and reuses this scratch range across layers. |
+
+The inverse-RMS refresh covers every cache line touched by the 16-float input,
+including a range that crosses a cache-line boundary. Its dependency chain
+excludes concurrent writes during the Scalar reads. The standalone test does
+not exercise HBG Graph resident replay; the historical resident-replay A5
+validation is recorded in PR #2821, not automated coverage of the current
+mainline runtime.
 
 The vendor `FusedInferAttentionScore` tree is otherwise untouched, including its
 `Arch::AtlasA2` budget (UB 192 KiB, L1 512 KiB). a5 has L1 512 KiB and UB 248 KiB,

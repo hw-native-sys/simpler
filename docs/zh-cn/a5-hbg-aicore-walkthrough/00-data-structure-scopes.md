@@ -2,7 +2,7 @@
 
 [回到执行流程](README.md)
 
-本表覆盖走读材料涉及的 resident 数据结构，以及直接相关的视图、临时结果和采集结构。host 实现与 legacy 调度内部结构继续跳过。字段含义仍放在各执行阶段文档中，先用这里判断“这一份数据属于谁”。
+本表覆盖走读材料涉及的 resident 数据结构，以及直接相关的视图、临时结果和采集结构。Host 只说明其输出的数据合同，legacy 调度内部结构继续跳过。字段含义仍放在各执行阶段文档中，先用这里判断“这一份数据属于谁”。
 
 ## 读表约定与结构关系
 
@@ -24,6 +24,8 @@ flowchart TD
     R --> WC["WorkerContext：每个 worker 一份"]
     R --> TM["TaskMetadata：每个节点一份"]
     R --> TC["TaskControl：每个节点一份"]
+    R --> DEP["依赖 header / CSR / remaining：本轮共享"]
+    R --> RQ["两个业务 ready 队列：AIC 含 MIX / AIV"]
     R --> DP["DispatchPayload：每 worker 两个 own 槽"]
     R --> MB["GroupMailbox：每 cluster 一份，MIX 复用"]
     WC --> LC["本核 LocalConfig：缓存配置"]
@@ -66,14 +68,11 @@ flowchart TD
 | 结构 | 作用范围 / 逻辑份数 | 存放位置 | 用途与主要读写者 | 生命周期 |
 | ---- | ------------------- | -------- | ---------------- | -------- |
 | `AicpuThreadLifecycleTrace` | 每个 AICPU 生命周期线程 1 条 | GM | 对应线程写自己的握手/发布/退出时间，leader 补全配置阶段时间 | 本轮记录；退休后用于汇总 |
-| `SchedulerWorkerStats` | 每个 worker 1 份 | AICore 私有 | 本核执行/轮询/阶段统计的累计器；最终写回 WorkerContext 统计区 | 本轮累计 |
-| `SchedulerWakeStats` | 本核统计对象内 1 份 | AICore 私有 | 统计依赖读取、挂链、关闭、迁移 | 本轮累计，未启用采集时可不传 |
-| `SchedulerReadyStats` | 本核统计对象内 1 份 | AICore 私有 | 统计 ready 入队、批次、领取、偷取、CAS 等 | 本轮累计，未启用采集时可不传 |
-| `SchedulerCompletionStats` | 本核统计对象内 1 份 | AICore 私有 | 统计本地完成登记与依赖完成解析 | 本轮累计，未启用采集时可不传 |
+| `SchedulerWorkerStats` | 每个 worker 1 份 | AICore 私有 | 保存 bootstrap 时间、扫描数和本地执行记录序号；只把保留的启动统计写回 WorkerContext | 本轮累计 |
 | `SchedulerLocalProfilingState` | 启用对应采集的 worker 各 1 份 | AICore 私有 | 保存本核采集配置、各 slot 暂存执行记录和循环编号 | 本轮；不开启时没有该类型的有效采集对象 |
 | `SchedulerNoProfilingState` | 未启用采集模板中的空占位类型 | AICore 私有 | 模板实例化时避免分配完整 profiling 状态，无业务字段 | 本轮调用内 |
 | `SchedulerWorkerTraceCache` | 本地 profiling 中按 cluster lane 缓存 | AICore 私有 | 缓存目标核的启动时间记录，避免反复读取 WorkerContext | 本轮，首次需要时填充 |
-| `SchedulerExecutorTaskTrace` | 当前 own slot 的一次执行暂存记录 | 当前主线为 AICore 私有 profiling 槽 | executor 写 kernel 起止等，completion 读取后合并最终任务记录；额外 MIX trace 区为保留路径 | 随 slot generation 复用 |
+| `SchedulerExecutorTaskTrace` | 当前 own slot 的一次执行暂存记录 | AICore 私有 profiling 槽 | executor 写 kernel 起止等，本核 completion 读取后合并最终任务记录 | 随 slot generation 复用 |
 | `SchedulerTaskTrace` | 每个 task/block/active subtask 一条 | GM | 派发与完成阶段填入同一次执行的身份和时间，最后发布 valid | 本轮不随 slot 复用，退休后汇总 |
 | `SchedulerTaskPmuCell` | 每个 task/block/active subtask 一条 | GM | 执行该 subtask 的核写计数器快照；AICPU 等所有核退休后读取 | 本轮对应执行写入，保存到采集结束 |
 | `SchedulerActivityBuffer` | 每个 worker 一块活动记录区 | GM | 本核追加空闲活动记录，并保存 committed/dropped | 本轮追加，退休后读取 |
@@ -100,22 +99,23 @@ flowchart TD
 | `SchedulerTaskShape` | 一次任务形状解析的结果 | 调用者局部值 | 保存任务的 kernel IDs 和 active mask，供分类/校验 | 当前分类调用 |
 | `SchedulerTaskPayloadArguments` | 一次参数解析/共享 materialize 的视图 | AICore 私有，指向 GM | 缓存 tensors/scalars 区地址及数量；实际参数不归它所有 | 本次准备过程 |
 | `SchedulerDispatchPredicate` | 某任务的派发条件描述 | 从 GM 参数/任务存储读取，可形成局部值 | 指定读取地址、比较值、类型宽度和操作；执行前求值 | 条件描述随任务，求值结果保留在候选/slot |
-| `SchedulerReadyPoolHeader` | 启用 pool 的本轮 1 份 | GM，只读 | 定义按 AIC/AIV/MIX 和 group 切分的 ticket 队列布局 | 本轮 |
-| `SchedulerReadyPoolDescriptor` | 每条 pool queue 1 份 | GM，只读数组 | 给出该队列 entry 区和容量 | 本轮 |
-| `SchedulerTicketQueue` | 每条 pool queue 1 份 | GM，原子控制区 | 多核发布者预留 tail，多核消费者 CAS head 领取任务 | 本轮，游标单调推进，entry 不覆盖重用 |
+| `SchedulerDependencyHeader` | 启用静态计数路径的本轮 1 份 | GM，64B 只读 header | 定位 remaining 与 fanout CSR；Host 初始化、device 校验后读取 | 本轮；偏移均相对 scheduler backing |
+| remaining 数组 | 每个 resident 节点一个 uint64_t | GM，独立原子区域 | Host 设未完成前驱数；每条 producer 完成边原子递减，1→0 的 owner 发布 ready | 从 bootstrap 到该节点 ready |
+| fanout offsets/refs | N+1 个 uint64_t 偏移及 E 个 int32_t 后继引用 | GM，只读 CSR | Host 从统一图访问器生成并去重；resolver 按 producer 遍历其后继 | 本轮；与 remaining 原子区分离 |
+| `SchedulerReadyPoolHeader` | 本轮 1 份 | GM，只读 | 定位共享 AIC 队列（含 MIX）、共享 AIV 队列及依赖区 | 本轮 |
+| `SchedulerReadyPoolDescriptor` | 固定 2 份，每条业务队列 1 份 | GM，只读数组 | 给出该队列 entry 区和容量，某类任务为空时容量可为 0 | 本轮 |
+| `SchedulerTicketQueue` | 固定 2 份，每条业务队列 1 份 | GM，原子控制区 | 多核发布者预留 tail，同类型消费者 CAS head 领取任务 | 本轮，游标单调推进，entry 不覆盖重用 |
+| `SchedulerTicketEntry` | 每个预留队列位置 1 份 | GM，每条独占 64B | 预留者原子发布 task_ref，消费者原子确认；发布后内容不变 | 从发布到全体 worker 退休 |
 | `SchedulerTicketQueueView` | 某次队列操作的访问视图 | AICore 私有，指向 GM | 把控制指针、entry 指针和边界传给队列函数 | 当前队列操作 |
 | `SchedulerTicketRange` | 发布者一次预留区间的结果 | 发布者私有 | 证明它独占哪些 entry 写槽，描述 begin/count | 该次 reserve→publish |
-| `SchedulerReadyInbox` | 普通后端：每类型/holder rank一份；native control：每worker一份 | GM | 多生产者/消费者共享 FIFO，endpoints CAS 决定所有权 | 本轮；队列内容持续变化 |
-| `SchedulerReadyDirectory` | 本轮 1 份目录 | GM | 聚合各类型/各 shard 的非空提示；帮助决定去哪里找工作 | 本轮，位图不断变化 |
-| `SchedulerReadyDirectoryShard` | 每种类型的每个 shard 1 份 | GM，目录成员 | 一组 inbox owner 的提示位，发布者置位、owner 清理自己的位 | 本轮，不能代替队列 claim |
+| `SchedulerReadyInbox` | native control：每 worker 1 份 | GM | 只承载 Graph 控制节点的共享 FIFO，endpoints CAS 决定所有权 | 本轮；队列内容持续变化 |
 | `SchedulerReadyBatch` | 当前发布核的一批同类型任务 | AICore 私有，链节点在 GM TaskControl 中 | 暂存 head/tail/count，批量提交 ready | 当前收集与发布过程 |
 | `SchedulerReadyClaim` | 一次成功领取/直接后继交接的结果 | 当前拥有者私有 | 表示“这个任务现在归我处理”；也记录来源和发布方式 | 到派发、转交 admission 或其他受控交接为止 |
 | `SchedulerFreeSlotClaim` | 一次目标 slot 准备操作 | 当前核私有 | 指定 worker/slot/旧generation并核对所有权；不是新分配 payload | 当前认领/准备过程 |
 | `SchedulerLocalSlotState` | 当前主线每worker 2份 | AICore 私有，LocalState.slots 内 | 保存 slot 归属的 task/block/subtask、generation、状态；本核独占修改 | slot 对象活到本轮结束，任务绑定逐次复用 |
-| `DispatchPayload` | 每worker 2个 own；AIV另有2个保留 MIX payload | GM，按worker+slot定位 | 供一次函数调用读取的入口地址、args及上下文；当前本核准备、本核执行 | 存储按轮有效，内容随slot generation改写；kernel不能跨调用保留它作为旧执行身份 |
+| `DispatchPayload` | 每 worker 2 个 own，普通任务与 MIX 共用 | GM，按 worker+slot 定位 | 供一次函数调用读取的入口地址、args 及上下文；本核准备、本核执行 | 存储按轮有效，内容随 slot generation 改写；kernel 不能跨调用保留它作为旧执行身份 |
 | `LocalContext` | 每个 DispatchPayload 内嵌1份 | GM，args[48]指向它 | 告诉本次kernel其logical block_idx/block_num | 地址随payload稳定，block值随派发更新 |
 | `GlobalContext` | 每个 DispatchPayload 内嵌1份 | GM，args[49]指向它 | 告诉本次kernel其物理AIV lane和resident async身份；不是全芯片单例 | 地址随payload稳定，执行内容可更新 |
-| `SchedulerMixTracker` | 本核保留的一组 MIX 聚合槽 | AICore 私有 | 用active/completed mask聚合另一套MIX slot的完成；当前GM MIX使用mailbox join | 当前resident主线不以它汇总MIX完成 |
 
 例如任务 T 有 10 个 block、2 个 AIV subtask：T 只有一份 TaskMetadata 和 TaskControl，可能发生 20 次业务 kernel 调用；这些调用复用执行核的 own payload。不能由“20 次执行”推导为“某个 worker 有 20 个 payload”。
 
@@ -137,7 +137,7 @@ flowchart TD
 | `SchedulerRouteCursor` | 一个waiter的一次依赖路由过程 | 私有局部值，或嵌在可持久化resolver中 | 保存当前fanin/producer，预算耗尽可续行；成功挂链后责任交给下一个resolver | 该waiter本次路由过程 |
 | `SchedulerRouteProgress` | 一次route_step返回值 | 调用者私有 | 返回推进结果与消耗预算，不保存共享任务状态 | 当前返回值使用期间 |
 | `SchedulerReadyPublication` | 一个resolver当前待发布批次 | 私有或作为resolver续行的一部分存GM | 保存最多8个ready ref及发布阶段，确保未完成的发布责任不会丢失 | 批次从收集到完整发布 |
-| `SchedulerResolveCursor` | 一个producer完成后的wake链解析过程 | 普通路径局部；native在LocalState持久化；async在GM续行区持久化 | 拥有已摘下的链、当前waiter和未发布批次；这是“正在做哪一步”的记录 | 直到所有后继责任交接完；位置随所用路径不同 |
+| `SchedulerResolveCursor` | 一个 producer 完成后的后继解析过程 | 普通路径局部；native在LocalState持久化；async在GM续行区持久化 | 保存 CSR 遍历位置或兼容路径已摘下的链、当前 waiter 和未发布批次 | 直到所有后继责任交接完；位置随所用路径不同 |
 | `SchedulerResolveProgress` | 一次resolve_step返回值 | 调用者私有 | DONE/YIELD/ERROR及本片work units | 当前调用返回值使用期间 |
 
 关闭一个 worker 的当前 admission 义务，不等于整个任务已经完成。

@@ -719,6 +719,11 @@ static bool build_runtime_image(
 ) {
     RuntimeArenaLayout layout =
         runtime_reserve_layout(*host_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
+    if (!build_prepared_run_layout(layout.sizing, layout.prepared) || layout.prepared.sm_bytes != sizes.sm_size ||
+        layout.prepared.heap_bytes != sizes.total_heap) {
+        LOG_ERROR("Invalid prebuilt runtime layout");
+        return false;
+    }
     if (host_arena->commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return false;
@@ -738,16 +743,21 @@ static bool build_runtime_image(
     return true;
 }
 
-static simpler::dfx::scope_stats_runs::Capacities scope_stats_capacities(const RuntimeArenaLayout &layout) {
+static simpler::dfx::scope_stats_runs::Capacities
+scope_stats_capacities(const ArenaSizingKey &sizing, int32_t pool_size) {
     static_assert(CHIP_MAX_RING_DEPTH == SCOPE_STATS_MAX_RING_DEPTH);
     simpler::dfx::scope_stats_runs::Capacities caps;
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
-        caps.task_window[r] = static_cast<int32_t>(layout.sizing.task_window_sizes[r]);
-        caps.heap[r] = layout.sizing.heap_sizes[r];
-        caps.dep_pool[r] = layout.sizing.dep_pool_capacities[r];
+        caps.task_window[r] = static_cast<int32_t>(sizing.task_window_sizes[r]);
+        caps.heap[r] = sizing.heap_sizes[r];
+        caps.dep_pool[r] = sizing.dep_pool_capacities[r];
     }
-    caps.tensormap = layout.offsets.orch.tensor_map.pool_size;
+    caps.tensormap = pool_size;
     return caps;
+}
+
+static simpler::dfx::scope_stats_runs::Capacities scope_stats_capacities(const RuntimeArenaLayout &layout) {
+    return scope_stats_capacities(layout.sizing, layout.offsets.orch.tensor_map.pool_size);
 }
 
 // The cache owns a host template, not proof that an earlier graph executed.
@@ -783,18 +793,25 @@ static int bind_cached_runtime_image(
         LOG_ERROR("Cached runtime arena has no complete host layout");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    RuntimeArenaLayout layout;
-    std::memcpy(
-        &layout, static_cast<const char *>(cached_image) + runtime_off + offsetof(RuntimeContext, prebuilt_layout),
-        sizeof(layout)
-    );
-    if (layout.offsets.arena_size != cached_image_size) {
+    const char *image_layout =
+        static_cast<const char *>(cached_image) + runtime_off + offsetof(RuntimeContext, prebuilt_layout);
+    const char *image_offsets = image_layout + offsetof(RuntimeArenaLayout, offsets);
+    size_t arena_size;
+    std::memcpy(&arena_size, image_offsets + offsetof(ArenaOffsets, arena_size), sizeof(arena_size));
+    if (arena_size != cached_image_size) {
         LOG_ERROR("Cached runtime image size differs from its layout");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     const int stage_rc = stage_runtime_image(api, runtime_arena_dev, cached_image, cached_image_size);
     if (stage_rc != 0) return stage_rc;
-    runtime->scope_stats_capacity_.values = scope_stats_capacities(layout);
+
+    ArenaSizingKey sizing;
+    std::memcpy(&sizing, image_layout + offsetof(RuntimeArenaLayout, sizing), sizeof(sizing));
+    int32_t pool_size;
+    constexpr size_t pool_off = offsetof(ArenaOffsets, orch) + offsetof(OrchestratorLayout, tensor_map) +
+                                offsetof(ChipTensorMapLayout, pool_size);
+    std::memcpy(&pool_size, image_offsets + pool_off, sizeof(pool_size));
+    runtime->scope_stats_capacity_.values = scope_stats_capacities(sizing, pool_size);
     runtime->set_orch_args(device_args);
     runtime->set_gm_sm_ptr(sm_ptr);
     runtime->set_prebuilt_arena(runtime_arena_dev, runtime_off);

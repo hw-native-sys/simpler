@@ -11,6 +11,10 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
 struct CaptureSubmitFaultResult {
     int accepted_core = 0;
     int cpu_calls = 0;
@@ -23,5 +27,25 @@ struct CaptureSubmitFaultResult {
 void arm_capture_submit_fault(void *caller, void *event);
 CaptureSubmitFaultResult finish_capture_submit_fault();
 
-void begin_capture_arena_probe();
-void *finish_capture_arena_probe();
+namespace simpler::capture_test {
+
+struct CapturedPublication {
+    void *destination = nullptr;
+    const void *source = nullptr;
+    uint64_t bytes = 0;
+};
+
+struct CapturedLaunch {
+    uint64_t runtime_args = 0;
+    size_t publication_count = 0;
+};
+
+struct CapturedSubmission {
+    std::vector<CapturedPublication> publications;
+    std::vector<CapturedLaunch> launches;
+};
+
+void begin_capture_publication_probe();
+CapturedSubmission finish_capture_publication_probe();
+
+}  // namespace simpler::capture_test

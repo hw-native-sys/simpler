@@ -21,27 +21,39 @@ _ROOT = Path(__file__).resolve().parents[3]
 _SUITES = {
     "ut-a5": "_ut-npu-a5.yml",
     "st-onboard-a5": "_st-npu-a5.yml",
-    "st-framework-eager-a5": "_st-framework-eager.yml",
+    "st-framework-a5": "_st-framework.yml",
 }
 _SHA = "1234567890abcdef" * 2 + "12345678"
+_BASE = "b" * 40
+_MERGE = "c" * 40
 _NODE = r"""
 const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const state = {outputs: {}, failures: [], calls: [], comments: []};
+const realSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (fn, _ms) => realSetTimeout(fn, 0);
 const core = {
   setOutput: (name, value) => { state.outputs[name] = value; },
   setFailed: message => state.failures.push(message),
   info: () => {},
+  summary: {addRaw: text => {state.summary = text;}, write: async () => {}},
 };
+let pullIndex = 0;
 const github = {rest: {
   repos: {getCollaboratorPermissionLevel: async args => {
     state.calls.push({api: 'permission', args});
     if (input.permissionError) throw new Error('permission unavailable');
     return {data: {permission: input.permission}};
+  }, getCommit: async args => {
+    state.calls.push({api: 'commit', args});
+    return {data: input.commit};
   }},
   pulls: {get: async args => {
     state.calls.push({api: 'pull', args});
     if (input.pullError) throw new Error('PR unavailable');
-    return {data: input.pr};
+    const sequence = input.prSequence || [input.pr];
+    const pr = sequence[Math.min(pullIndex, sequence.length - 1)];
+    pullIndex += 1;
+    return {data: pr};
   }},
   issues: {createComment: async args => { state.comments.push(args); }},
 }};
@@ -76,17 +88,20 @@ def _fixture():
         "pr": {
             "number": 42,
             "state": "open",
-            "base": {"ref": "main", "repo": {"full_name": "upstream/project"}},
+            "base": {"ref": "main", "sha": _BASE, "repo": {"full_name": "upstream/project"}},
             "head": {"sha": _SHA, "repo": {"full_name": "contributor/fork"}},
+            "mergeable": True,
+            "merge_commit_sha": _MERGE,
         },
+        "commit": {"sha": _MERGE, "parents": [{"sha": _BASE}, {"sha": _SHA}]},
     }
 
 
-def _execute(job, fixture):
+def _execute(job, fixture, workflow="ci-a5-comment", step_index=0):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is required to execute the workflow's github-script controls")
-    step = _workflow()["jobs"][job]["steps"][0]
+    step = _workflow(workflow)["jobs"][job]["steps"][step_index]
     result = subprocess.run(
         [node, "-e", _NODE],
         input=json.dumps({**fixture, "script": step["with"]["script"]}),
@@ -103,10 +118,9 @@ def test_only_three_hardware_suites_move_from_automatic_ci():
     assert all(name not in ci for name in _SUITES)
     for name in ("ut", "packaging-matrix", "st-sim-a5", "profiling-flags-smoke", "ut-a2a3", "st-onboard-a2a3"):
         assert name in ci
-    assert all(name in _workflow("ci-self")["jobs"] for name in _SUITES)
     daily = _workflow("daily")["jobs"]
     assert "ut-a5" not in daily
-    assert "st-onboard-a5" in daily and "st-framework-eager-a5" in daily
+    assert "st-onboard-a5" in daily and "st-framework-a5" in daily
 
 
 def test_authorized_topology_pins_all_suites_and_keeps_reporting_permission_separate():
@@ -148,7 +162,7 @@ def test_authorized_topology_pins_all_suites_and_keeps_reporting_permission_sepa
             assert step["with"]["ref"] == "${{ inputs.ref || github.ref }}"
     assert jobs["ut-a5"]["with"]["include_cann_examples"] == "true"
     assert jobs["st-onboard-a5"]["with"]["include_dfx_smokes"] == "true"
-    assert jobs["st-framework-eager-a5"]["with"]["platform"] == "a5"
+    assert jobs["st-framework-a5"]["with"]["platform"] == "a5"
     report = jobs["report"]
     assert set(report["needs"]) == {"gate-and-resolve", *_SUITES}
     assert report["if"].startswith("always() &&")
@@ -165,11 +179,83 @@ def test_admin_command_resolves_fork_and_full_head_sha(body):
     result = _execute("gate-and-resolve", fixture)
     assert result["failures"] == []
     assert "error" not in result
-    assert result["outputs"] == {"ready": "true", "repository": "contributor/fork", "ref": _SHA, "pr_number": "42"}
+    assert result["outputs"] == {
+        "ready": "true",
+        "repository": "upstream/project",
+        "ref": _MERGE,
+        "head_sha": _SHA,
+        "base_sha": _BASE,
+        "pr_number": "42",
+    }
     assert result["calls"] == [
         {"api": "permission", "args": {"owner": "upstream", "repo": "project", "username": "maintainer"}},
         {"api": "pull", "args": {"owner": "upstream", "repo": "project", "pull_number": 42}},
+        {"api": "commit", "args": {"owner": "upstream", "repo": "project", "ref": _MERGE}},
     ]
+
+
+@pytest.mark.parametrize("mutation", [None, "conflict", "pending", "stale_head", "stale_base", "missing"])
+def test_comment_lanes_pin_matching_merge_parents(mutation):
+    fixture = _fixture()
+    if mutation == "conflict":
+        fixture["pr"]["mergeable"] = False
+    elif mutation == "pending":
+        fixture["pr"]["mergeable"] = None
+    elif mutation == "missing":
+        fixture["pr"]["merge_commit_sha"] = None
+    elif mutation in ("stale_head", "stale_base"):
+        fixture["commit"]["parents"][int(mutation == "stale_head")]["sha"] = "d" * 40
+    result = _execute("gate-and-resolve", fixture)
+    assert "error" not in result
+    if mutation:
+        assert result["failures"]
+        assert "ref" not in result["outputs"]
+        assert result["outputs"]["ready"] == "false"
+    else:
+        assert result["outputs"]["ref"] == _MERGE
+        assert result["outputs"]["repository"] == "upstream/project"
+        assert _SHA in result["summary"] and _BASE in result["summary"] and _MERGE in result["summary"]
+        assert set(result["outputs"]) == set(_workflow()["jobs"]["gate-and-resolve"]["outputs"])
+
+
+def test_pending_mergeability_is_retried_before_admission():
+    fixture = _fixture()
+    fixture["prSequence"] = [
+        dict(fixture["pr"], mergeable=None),
+        dict(fixture["pr"], mergeable=True),
+    ]
+    result = _execute("gate-and-resolve", fixture)
+    assert result["failures"] == []
+    assert result["outputs"]["ready"] == "true"
+    assert result["outputs"]["ref"] == _MERGE
+    pulls = [call for call in result["calls"] if call["api"] == "pull"]
+    assert len(pulls) == 2
+    assert any(call["api"] == "commit" for call in result["calls"])
+
+
+def test_pending_mergeability_then_conflict_is_rejected():
+    fixture = _fixture()
+    fixture["prSequence"] = [
+        dict(fixture["pr"], mergeable=None),
+        dict(fixture["pr"], mergeable=False),
+    ]
+    result = _execute("gate-and-resolve", fixture)
+    assert result["failures"]
+    assert "unavailable or conflicting" in result["failures"][0]
+    assert result["outputs"] == {"ready": "false"}
+
+
+def test_pending_mergeability_then_stale_snapshot_is_rejected():
+    fixture = _fixture()
+    fixture["prSequence"] = [
+        dict(fixture["pr"], mergeable=None),
+        dict(fixture["pr"], mergeable=True),
+    ]
+    fixture["commit"] = {"sha": _MERGE, "parents": [{"sha": _BASE}, {"sha": "d" * 40}]}
+    result = _execute("gate-and-resolve", fixture)
+    assert result["failures"]
+    assert "stale" in result["failures"][0]
+    assert result["outputs"] == {"ready": "false"}
 
 
 @pytest.mark.parametrize("attempt", ["0", "2", "3"])
@@ -244,7 +330,14 @@ def _report_fixture():
     needs: dict[str, Any] = {name: {"result": "success"} for name in _SUITES}
     needs["gate-and-resolve"] = {
         "result": "success",
-        "outputs": {"ready": "true", "repository": "contributor/fork", "ref": _SHA, "pr_number": "42"},
+        "outputs": {
+            "ready": "true",
+            "repository": "upstream/project",
+            "ref": _MERGE,
+            "head_sha": _SHA,
+            "base_sha": _BASE,
+            "pr_number": "42",
+        },
     }
     fixture["needs"] = needs
     return fixture
@@ -260,7 +353,8 @@ def test_report_names_exact_tested_head_run_and_all_suite_results(status):
     comment = result["comments"][0]
     assert comment["issue_number"] == 42
     body = comment["body"]
-    assert f"contributor/fork@{_SHA}" in body
+    assert f"upstream/project@{_MERGE}" in body
+    assert f"PR head: `{_SHA}`" in body and f"Base: `{_BASE}`" in body
     assert fixture["context"]["sha"] not in body
     assert "https://github.example/upstream/project/actions/runs/321" in body
     for name in _SUITES:

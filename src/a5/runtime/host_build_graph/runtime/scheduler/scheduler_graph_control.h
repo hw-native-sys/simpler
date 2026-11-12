@@ -34,13 +34,13 @@ inline __aicore__ bool scheduler_service_controls(
             int64_t ref = SCHEDULER_TASK_REF_INVALID;
             auto *own = scheduler_state_at<SchedulerReadyInbox>(base, local->config.control_inboxes_offset) +
                         local->worker_id();
-            if (!scheduler_ready_pop_from_queue(graph, base, local, run, own, &ref, nullptr)) return false;
+            if (!scheduler_ready_pop_from_queue(graph, base, local, run, own, &ref)) return false;
             if (ref < 0 && local->config.runtime_worker_count > 1) {
                 const uint32_t peer = local->control_peer_cursor++ % local->config.runtime_worker_count;
                 if (peer != local->worker_id()) {
                     auto *inbox =
                         scheduler_state_at<SchedulerReadyInbox>(base, local->config.control_inboxes_offset) + peer;
-                    if (!scheduler_ready_pop_from_queue(graph, base, local, run, inbox, &ref, nullptr)) return false;
+                    if (!scheduler_ready_pop_from_queue(graph, base, local, run, inbox, &ref)) return false;
                 }
             }
             if (ref < 0) break;
@@ -76,7 +76,7 @@ inline __aicore__ bool scheduler_service_controls(
         if (work == SCHEDULER_CONTROL_WORK_BUDGET) break;
         const auto outcome = scheduler_resolve_completion_step(
             graph, base, local, run, continuation.producer_ref, continuation, SCHEDULER_CONTROL_WORK_BUDGET - work,
-            nullptr, nullptr, nullptr, profiling_level
+            profiling_level
         );
         work += outcome.work_units;
         *progress = *progress || outcome.work_units != 0;

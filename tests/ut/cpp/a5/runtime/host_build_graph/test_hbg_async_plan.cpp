@@ -42,9 +42,9 @@ struct Image {
     void *base;
 
     explicit Image(uint64_t size) :
-        backing(size + 127, 0xa5) {
+        backing(size + 191, 0xa5) {
         const uintptr_t aligned = (reinterpret_cast<uintptr_t>(backing.data()) + 127) & ~uintptr_t(127);
-        base = reinterpret_cast<void *>(aligned);
+        base = reinterpret_cast<void *>(aligned + 64);
     }
 };
 
@@ -65,7 +65,7 @@ TEST(HbgAsyncPlan, SdmaGuardsAreSharedByExecutionsAndIsolatedByCluster) {
     Image image(plan.total_bytes);
     ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
     EXPECT_EQ(plan.layout.sdma_guard_count, 32u);
-    EXPECT_EQ(plan.layout.sdma_guards_offset % 128, 0u);
+    EXPECT_EQ(plan.layout.sdma_guards_offset % ASYNC_RECORD_ALIGNMENT, 0u);
     AsyncSdmaSubmissionGuard *first = nullptr;
     for (uint32_t index = 0; index < plan.layout.group_count; ++index) {
         AsyncWriter writer{static_cast<uint8_t *>(image.base), plan.total_bytes, 1, group_offset(plan, index), index};
@@ -184,7 +184,7 @@ TEST(HbgAsyncPlan, ExpandedTasksBlocksAndLanesHaveIndependentStableRecords) {
                 EXPECT_EQ(data->block_index, block);
                 EXPECT_EQ(data->subtask_slot, lane);
                 EXPECT_EQ(data->group_index, group_index);
-                EXPECT_EQ(offset % 128, 0u);
+                EXPECT_EQ(offset % ASYNC_RECORD_ALIGNMENT, 0u);
                 AsyncWriter writer{static_cast<uint8_t *>(image.base), plan.total_bytes, 19, offset, group_index};
                 EXPECT_TRUE(seal_conditions(writer));
                 if (group_index != 0) EXPECT_GE(offset, group_offset(plan, group_index - 1) + sizeof(AsyncGroupData));
@@ -239,7 +239,7 @@ TEST(HbgAsyncPlan, HeterogeneousCapacitiesKeepEveryTokenRangeIndependent) {
         const auto &data = group_at(image, plan, index);
         EXPECT_EQ(data.capacity, capacities[index]);
         EXPECT_GE(data.entries_offset, previous_end);
-        EXPECT_EQ(data.entries_offset % 128, 0u);
+        EXPECT_EQ(data.entries_offset % ASYNC_RECORD_ALIGNMENT, 0u);
         EXPECT_EQ(data.entries_bytes, async_group_entry_bytes(capacities[index]));
         previous_end = data.entries_offset + data.entries_bytes;
         EXPECT_LE(previous_end, plan.total_bytes);

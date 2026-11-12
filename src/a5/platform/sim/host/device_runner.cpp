@@ -76,7 +76,6 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 }
 
 extern "C" __attribute__((weak, visibility("hidden"))) bool dep_gen_host_graph_active() { return false; }
-extern "C" __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_set_enabled(bool /*enable*/) {}
 extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_take(
     simpler::dfx::host_graph::HostGraphExport * /*out*/
 ) {
@@ -392,14 +391,6 @@ int DeviceRunner::invoke_device_register(const RegisterCallableArgs &reg_args) {
     // in reg_args stay valid for this synchronous call. The AICPU entry's C ABI
     // takes void* and only reads the args, so the const_cast is safe.
     return aicpu_register_callable_func_(const_cast<RegisterCallableArgs *>(&reg_args));
-}
-
-void DeviceRunner::arm_host_dep_gen_capture(bool enable) {
-    // Arms host-side capture for a host-orch runtime (no-op weak stub for the
-    // device-orch one). The capture is thread-local between orchestration and
-    // emit, so the c_api calls this on the binding thread before every bind; the
-    // orchestration entry resets the graph before recording it.
-    dep_gen_host_graph_set_enabled(enable);
 }
 
 void DeviceRunner::configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) {

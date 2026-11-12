@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "scheduler/scheduler_ready.h"
+#include "ready_pool_plan.h"
 #include "runtime_types.h"
 
 namespace scheduler_test {
@@ -34,15 +35,18 @@ inline void protocol_noop_kernel(__gm__ int64_t *) {}
 class SchedulerStateBuffer {
 public:
     explicit SchedulerStateBuffer(const AicoreSchedulerLayout &layout) :
-        base_(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, layout.total_size)) {
+        allocation_(std::aligned_alloc(128, (layout.total_size + 191) / 128 * 128)),
+        base_(allocation_ == nullptr ? nullptr : static_cast<uint8_t *>(allocation_) + 64) {
+        // Every fixture exercises a 64-byte-aligned base that is not 128-byte aligned.
         EXPECT_NE(base_, nullptr);
         if (base_ != nullptr)
             EXPECT_TRUE(scheduler_init_data_from_layout(base_, layout, reinterpret_cast<uint64_t>(base_)));
     }
-    ~SchedulerStateBuffer() { std::free(base_); }
+    ~SchedulerStateBuffer() { std::free(allocation_); }
     void *base() const { return base_; }
 
 private:
+    void *allocation_{nullptr};
     void *base_{nullptr};
 };
 
@@ -147,6 +151,18 @@ struct FixtureStorage {
             task_count, task_count, 0, &layout, false, task_count * traces_per_task, spmd, protocol_profiling
         ));
         if (extend_layout) extend_layout(layout);
+        // Reserve backing once. The final metadata later determines the two
+        // actual capacities; together they can never exceed task_count.
+        ready_pool_begin = layout.total_size;
+        std::vector<SchedulerTaskMetadata> upper_bound(task_count);
+        for (auto &task : upper_bound) {
+            task.flags = SCHEDULER_TASK_EXECUTABLE;
+            task.active_mask = LaneMask::aic();
+        }
+        SchedulerReadyPoolPlan reserve{};
+        if (!scheduler_plan_ready_pool(upper_bound, ready_pool_clusters(), ready_pool_begin, &reserve))
+            throw std::logic_error("cannot reserve fixture ready pool");
+        layout.total_size = reserve.total_size;
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
         contexts = scheduler_state_at<SchedulerWorkerContext>(scheduler_state->base(), layout.worker_contexts_offset);
@@ -158,10 +174,7 @@ struct FixtureStorage {
                 static_cast<int32_t>(worker % PLATFORM_CORES_PER_BLOCKDIM == 0 ? CoreType::AIC : CoreType::AIV);
             context.task_controls_offset = layout.task_controls_offset;
             context.task_metadata_offset = layout.task_metadata_offset;
-            context.ready_inboxes_offset = layout.ready_inboxes_offset;
-            context.ready_directory_offset = layout.ready_directory_offset;
-            context.mix_payloads_offset = layout.mix_payloads_offset;
-            context.mix_traces_offset = layout.mix_traces_offset;
+
             context.trace_cells_offset = layout.trace_cells_offset;
             context.worker_contexts_offset = layout.worker_contexts_offset;
             context.callable_addresses_address = reinterpret_cast<uint64_t>(callable_addresses);
@@ -200,6 +213,35 @@ struct FixtureStorage {
         }
     }
 
+    uint32_t ready_pool_clusters() const {
+        return std::max<uint32_t>(
+            1, static_cast<uint32_t>(
+                   (test_contexts.size() + PLATFORM_CORES_PER_BLOCKDIM - 1) / PLATFORM_CORES_PER_BLOCKDIM
+               )
+        );
+    }
+
+    // Call after finalizing metadata and before publishing any task. Replanning
+    // during a run would erase queue ownership, so preparation is explicit and
+    // may happen only once for this allocation.
+    void prepare_ready_pool() {
+        ASSERT_EQ(ready_pool_offset, 0u);
+        const std::vector<SchedulerTaskMetadata> tasks(metadata, metadata + layout.task_count);
+        SchedulerReadyPoolPlan plan{};
+        ASSERT_TRUE(scheduler_plan_ready_pool(tasks, ready_pool_clusters(), ready_pool_begin, &plan));
+        ASSERT_GE(plan.header_offset, ready_pool_begin);
+        ASSERT_LE(plan.total_size, layout.total_size);
+        scheduler_init_ready_pool(scheduler_state->base(), plan);
+        ready_pool_offset = plan.header_offset;
+        scheduler_state_at<SchedulerGraphSummary>(scheduler_state->base(), layout.graph_summary_offset)
+            ->ready_pool_offset = ready_pool_offset;
+        for (auto &local : test_contexts)
+            local.config.ready_pool_offset = ready_pool_offset;
+        for (auto &local : local_states)
+            local.config.ready_pool_offset = ready_pool_offset;
+        scheduler_local_state.config.ready_pool_offset = ready_pool_offset;
+    }
+
     // Queue/dispatch tests configure synthetic wire contexts directly. Snapshot
     // their immutable fields into the local state used by the operation under test.
     SchedulerLocalState *local_context(const SchedulerWorkerContext *context, SchedulerLocalState *local = nullptr) {
@@ -213,10 +255,8 @@ struct FixtureStorage {
         config.graph = &graph;
         config.task_controls_offset = context->task_controls_offset;
         config.task_metadata_offset = context->task_metadata_offset;
-        config.ready_inboxes_offset = context->ready_inboxes_offset;
-        config.ready_directory_offset = context->ready_directory_offset;
-        config.mix_payloads_offset = context->mix_payloads_offset;
-        config.mix_traces_offset = context->mix_traces_offset;
+        config.ready_pool_offset = ready_pool_offset;
+
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;
         config.worker_contexts_offset = context->worker_contexts_offset;
@@ -234,14 +274,6 @@ struct FixtureStorage {
         }
         config.worker_ids[config.self_lane] = context->worker_index;
         config.cluster_count = static_cast<uint16_t>(context->cluster_count);
-        // Each lane's rank comes from that lane's own context, as production
-        // reads it; a lane the case left unwired falls back to its position.
-        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            const uint64_t peer = config.worker_ids[lane];
-            config.cluster_type_ranks[lane] = peer < context->runtime_worker_count ?
-                                                  static_cast<uint16_t>(contexts[peer].type_rank) :
-                                                  static_cast<uint16_t>(lane == 0 ? 0 : lane - 1);
-        }
         return local;
     }
     std::vector<SchedulerLocalProfilingState> test_profiles;
@@ -249,6 +281,8 @@ struct FixtureStorage {
     std::vector<SchedulerGraphView> test_graphs;
 
     AicoreSchedulerLayout layout{};
+    uint64_t ready_pool_begin{0};
+    uint64_t ready_pool_offset{0};
     std::unique_ptr<SchedulerStateBuffer> scheduler_state;
     SchedulerRunControl *run_control{nullptr};
     SchedulerWorkerContext *contexts{nullptr};
@@ -261,8 +295,7 @@ struct FixtureStorage {
         std::make_unique<std::array<uint64_t, kFixtureCallableCount>>()
     };
     uint64_t *callable_addresses{callable_table->data()};
-    alignas(64) std::array<uint8_t, SCHEDULER_SSBUF_HARDWARE_SIZE> ssbuf_storage{};
-    SchedulerSsbufRegion *ssbuf_region{scheduler_ssbuf_region(reinterpret_cast<uint64_t>(ssbuf_storage.data()))};
+
     std::vector<SchedulerLocalState> local_states;
     SchedulerLocalState *owner_states{local_states.data()};
     SchedulerLocalProfilingState scheduler_profile{};

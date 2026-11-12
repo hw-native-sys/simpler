@@ -21,13 +21,13 @@
 #include "capture_submit_fault.h"
 #include "call_config.h"
 #include "task_args.h"
+#include "capture_recovery.h"
 
-static void check(int rc, const char *stage) {
-    std::printf("stage=%s rc=%d\n", stage, rc);
-    std::fflush(stdout);
-    if (rc != 0) std::exit(1);
-}
-static void require(bool condition, const char *stage) { check(condition ? 0 : -1, stage); }
+namespace capture_test = simpler::capture_test;
+
+using capture_test::check;
+using capture_test::require;
+
 static std::vector<uint8_t> read(const char *path) {
     std::ifstream in(path, std::ios::binary);
     require(in.good(), path);
@@ -98,7 +98,9 @@ int main(int argc, char **argv) {
         descriptor.generation = cycle + 1;
         descriptor.run_epoch = cycle + 1;
         descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+        const size_t publishes_before = capture_test::prepare_snapshot(ctx, scenario);
         check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
+        capture_test::check_prepare(ctx, scenario, publishes_before);
         host_control = 93;  // Changing the source must not change the prepared task arguments.
         RuntimeHandle reference = nullptr;
         check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain-once");
@@ -115,10 +117,11 @@ int main(int argc, char **argv) {
             check(aclrtRecordEvent(dependency_event, other_stream), "conflict-other-record");
             arm_capture_submit_fault(caller, dependency_event);
         }
-        if (scenario == 13) begin_capture_arena_probe();
+        const bool probe_publications = capture_test::needs_publications(scenario);
+        if (probe_publications) capture_test::begin_capture_publication_probe();
         const int launch_rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
-        void *arena_binding = scenario == 13 ? finish_capture_arena_probe() : nullptr;
-        if (scenario == 13) require(arena_binding != nullptr, "observed-arena-binding");
+        const auto submission =
+            probe_publications ? capture_test::finish_capture_publication_probe() : capture_test::CapturedSubmission{};
         if (partial_submission) {
             const auto fault = finish_capture_submit_fault();
             std::printf(
@@ -135,6 +138,7 @@ int main(int argc, char **argv) {
         } else {
             check(launch_rc, "capture-launch-once");
         }
+        capture_test::check_publications(scenario, submission);
         if (scenario == 4) {
             const int rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
             std::printf("capture-duplicate-rejected rc=%d expected=%d\n", rc, PTO_RUNTIME_ERR_INVALID_STATE);
@@ -222,11 +226,7 @@ int main(int argc, char **argv) {
         check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-before-replay");
         require(std::memcmp(poison, observed, bytes) == 0, "capture-did-not-execute");
         if (scenario == 13) {
-            void *saved_arena = nullptr;
-            std::memcpy(&saved_arena, arena_binding, sizeof(saved_arena));
-            require(saved_arena != nullptr, "prepared-arena-exists");
-            void *missing_arena = nullptr;
-            std::memcpy(arena_binding, &missing_arena, sizeof(missing_arena));
+            capture_test::inject_boot_failure();
             for (int fault_round = 0; fault_round < 2; ++fault_round) {
                 check(aclmdlRIExecuteAsync(model, caller), "boot-failure-replay");
                 ++total_replays;
@@ -234,6 +234,7 @@ int main(int argc, char **argv) {
                 std::printf("boot-failure=%d sync=%d\n", fault_round + 1, rc);
                 require(rc == ACL_ERROR_RT_MODEL_EXECUTE, "boot-failure-reported");
                 check(aclrtSynchronizeStreamWithTimeout(caller, 10000), "boot-failure-execution-ended");
+                capture_test::check_boot_failure();
                 check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-boot-output");
                 require(std::memcmp(poison, observed, bytes) == 0, "boot-failure-no-user-task");
                 require(
@@ -242,8 +243,7 @@ int main(int argc, char **argv) {
                 );
             }
             // Undo only the injected corruption, after the failed invocations ended.
-            std::memcpy(arena_binding, &saved_arena, sizeof(saved_arena));
-            check(0, "restore-injected-arena-binding");
+            capture_test::restore_boot_failure();
         }
         if (scenario == 12) {
             for (int fault_round = 0; fault_round < 2; ++fault_round) {
@@ -259,6 +259,7 @@ int main(int argc, char **argv) {
                 std::printf("fault-replay=%d sync=%d\n", fault_round + 1, rc);
                 require(rc == ACL_ERROR_RT_MODEL_EXECUTE, "scheduler-failure-reported");
                 check(aclrtSynchronizeStreamWithTimeout(caller, 10000), "fault-execution-ended");
+                capture_test::check_progress_timeout();
                 // Captured D2H can be skipped on failure. Read after stream completion.
                 check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-fault-output");
                 for (int i = 0; i < 16; ++i)

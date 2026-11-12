@@ -26,15 +26,15 @@
 #include "aicore/aicore_profiling_state.h"
 #include "lane_loop.h"
 #include "runtime.h"
-#include "scheduler/scheduler_memory.h"
+#include "scheduler/gm.h"
 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
     // The host's bootstrap and this worker's handshake are separate 64-byte
     // lines, so each needs its own observe; one observe covers a whole line.
     // The bootstrap carries the PercounterControl address every lane reads.
     __gm__ SchedulerBootstrapInputs *bootstrap = &runtime->dev.scheduler_bootstrap;
-    scheduler_observe_cache_line(bootstrap);
+    percounter_observe_cache_line(bootstrap);
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
-    scheduler_observe_cache_line(handshake);
+    percounter_observe_cache_line(handshake);
     simpler::percounter::percounter_aicore_execute(runtime, block_idx, core_type);
 }

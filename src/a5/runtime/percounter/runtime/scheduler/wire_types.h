@@ -32,7 +32,8 @@
 // it in scope by then, and this runtime's do not.
 #include "common/lane_mask.h"
 #include "scheduler/scheduler_layout.h"
-#include "scheduler/scheduler_ssbuf.h"
+#include "scheduler/ssbuf.h"
+#include "scheduler/gm.h"
 #include "scheduler/scheduler_types.h"
 
 // Continues the SCHEDULER_RUNTIME_MODE_* numbering scheduler_layout.h starts,
@@ -48,8 +49,8 @@ inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
 /**
  * One cluster's MIX rendezvous line. Lives in SSBUF, not in the GM region.
  *
- * SSBUF offers no atomics -- scheduler_ssbuf.h has relaxed and acquire/release
- * load/store and nothing else -- so every field here has exactly one writer.
+ * SSBUF offers no atomics -- `scheduler/ssbuf.h` has an acquire load and a
+ * release store and nothing else -- so every field here has exactly one writer.
  * `task_id`, `armed_generation`, `active_mask`, `block_idx`, `block_num` and
  * `cohort_block` are written only by the cluster's AIV0, which is why the
  * claimer is a fixed lane role rather than an election; entry `i` of the two
@@ -118,12 +119,12 @@ static_assert(std::is_standard_layout_v<PercounterMixSignal>);
  */
 struct alignas(64) PercounterSsbufRegion {
     PercounterMixSignal mix;
-    uint8_t reserved[SCHEDULER_SSBUF_REGION_SIZE - sizeof(PercounterMixSignal)];
+    uint8_t reserved[PERCOUNTER_SSBUF_REGION_SIZE - sizeof(PercounterMixSignal)];
 };
-static_assert(sizeof(PercounterSsbufRegion) == SCHEDULER_SSBUF_REGION_SIZE);
+static_assert(sizeof(PercounterSsbufRegion) == PERCOUNTER_SSBUF_REGION_SIZE);
 
-inline __aicore__ SCHEDULER_SSBUF PercounterSsbufRegion *percounter_ssbuf_region(uint64_t hardware_base) {
-    return reinterpret_cast<SCHEDULER_SSBUF PercounterSsbufRegion *>(hardware_base + SCHEDULER_SSBUF_REGION_OFFSET);
+inline __aicore__ PERCOUNTER_SSBUF PercounterSsbufRegion *percounter_ssbuf_region(uint64_t hardware_base) {
+    return reinterpret_cast<PERCOUNTER_SSBUF PercounterSsbufRegion *>(hardware_base + PERCOUNTER_SSBUF_REGION_OFFSET);
 }
 
 /**
@@ -133,7 +134,7 @@ inline __aicore__ SCHEDULER_SSBUF PercounterSsbufRegion *percounter_ssbuf_region
  * cluster's AIV0 calls it, and only before any lane of the cluster has read the
  * line, which the per-cluster ready word in GM establishes.
  */
-inline __aicore__ void percounter_mix_signal_clear(SCHEDULER_SSBUF PercounterMixSignal *signal) {
+inline __aicore__ void percounter_mix_signal_clear(PERCOUNTER_SSBUF PercounterMixSignal *signal) {
     signal->task_id = -1;
     signal->active_mask = 0;
     signal->block_idx = 0;
@@ -146,7 +147,7 @@ inline __aicore__ void percounter_mix_signal_clear(SCHEDULER_SSBUF PercounterMix
     }
     // Last, with release ordering: a lane that sees an even generation must see
     // the cleared payload behind it.
-    scheduler_ssbuf_store_release(&signal->armed_generation, 0);
+    percounter_ssbuf_store_release(&signal->armed_generation, 0);
 }
 
 /** Whether the cluster's slot currently holds a task. */
@@ -179,7 +180,7 @@ inline constexpr uint32_t PERCOUNTER_TICKET_GROUP_LANES = 8;
  * only slow.
  */
 struct alignas(64) PercounterCounter {
-    // 64-bit to match scheduler_gm_fetch_add, the runtime's only atomic add.
+    // 64-bit to match percounter_gm_fetch_add, the runtime's only atomic add.
     uint64_t value;
     // The rest describes a Graph body task, written with the preset by the
     // AICPU before the task's entry is published, and never changed after: the
@@ -717,7 +718,7 @@ inline __aicore__ uint64_t percounter_group_size(uint64_t order_count, uint32_t 
  * (see percounter_group_position). Returns false when the draw starts at or
  * past the end of the group's share, `group_size`.
  *
- *  - **Disjoint and ascending.** Each draw of `scheduler_gm_fetch_add(ticket,
+ *  - **Disjoint and ascending.** Each draw of `percounter_gm_fetch_add(ticket,
  *    BATCH)` gets a distinct base `BATCH` apart, so the ranges tile the share in
  *    order. A gap would strand a task -- a lane spinning on a counter nobody
  *    sets -- and an overlap would run one twice.

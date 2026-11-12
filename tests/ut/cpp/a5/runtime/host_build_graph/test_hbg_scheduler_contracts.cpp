@@ -25,7 +25,6 @@
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
 #include "scheduler/scheduler_graph.h"
-#include "scheduler/scheduler_ssbuf.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_watchdog.h"
@@ -522,56 +521,72 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     ASSERT_TRUE(scheduler_plan_layout(5, 3, 2, &layout));
     EXPECT_EQ(layout.total_size % SCHEDULER_STATE_ALIGNMENT, 0u);
     EXPECT_EQ(layout.task_metadata_offset % alignof(SchedulerTaskMetadata), 0u);
-    EXPECT_EQ(layout.ready_inboxes_offset % alignof(SchedulerReadyInbox), 0u);
-    EXPECT_EQ(layout.ready_directory_offset % alignof(SchedulerReadyDirectory), 0u);
     EXPECT_EQ(
         layout.worker_contexts_offset - layout.aicpu_lifecycle_traces_offset,
         static_cast<uint64_t>(PLATFORM_MAX_AICPU_THREADS) * sizeof(AicpuThreadLifecycleTrace)
     );
 
+    std::vector<SchedulerTaskMetadata> metadata(layout.task_count);
+    for (uint32_t task = 0; task < metadata.size(); ++task) {
+        metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
+        metadata[task].active_mask = task < 3 ? LaneMask::aic() : LaneMask::aiv0();
+    }
+    metadata[1].flags |= SCHEDULER_TASK_MIX;
+    metadata[1].active_mask = LaneMask::all();
+    metadata[2].flags |= SCHEDULER_TASK_MIX;
+    metadata[2].active_mask = LaneMask::both_aiv();
+    SchedulerReadyPoolPlan ready_plan{};
+    ASSERT_TRUE(scheduler_plan_ready_pool(metadata, 1, layout.total_size, &ready_plan));
+    EXPECT_GE(ready_plan.header_offset, layout.total_size);
+    EXPECT_EQ(ready_plan.header_offset % SCHEDULER_STATE_ALIGNMENT, 0u);
+    EXPECT_EQ(ready_plan.header.descriptors_offset % SCHEDULER_STATE_ALIGNMENT, 0u);
+    EXPECT_EQ(ready_plan.header.controls_offset % SCHEDULER_STATE_ALIGNMENT, 0u);
+    ASSERT_EQ(ready_plan.descriptors.size(), 2u);
+    EXPECT_EQ(ready_plan.descriptors[0].capacity, 3u);
+    EXPECT_EQ(ready_plan.descriptors[1].capacity, 2u);
+    layout.total_size = ready_plan.total_size;
+
     SchedulerStateBuffer storage(layout);
+    scheduler_init_ready_pool(storage.base(), ready_plan);
     auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         EXPECT_EQ(controls[task].state, static_cast<int64_t>(SchedulerTaskState::BLOCKED));
         EXPECT_EQ(controls[task].wake_list_head, SCHEDULER_WAKE_LIST_OPEN);
     }
-    auto *ready = scheduler_state_at<SchedulerReadyInbox>(storage.base(), layout.ready_inboxes_offset);
-    for (uint64_t inbox = 0; inbox < SCHEDULER_READY_INBOX_CAPACITY; ++inbox)
-        EXPECT_EQ(ready[inbox].endpoints, SCHEDULER_READY_ENDPOINTS_EMPTY);
-    auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), layout.worker_contexts_offset);
-    EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved0, 0u);
-    EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved1, 0u);
-    EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved2, 0u);
-
-    auto *directory = scheduler_state_at<SchedulerReadyDirectory>(storage.base(), layout.ready_directory_offset);
-    auto shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[0][0]);
-    auto shard1 = reinterpret_cast<uintptr_t>(&directory->core_types[0][1]);
-    auto aiv_shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[1][0]);
-    EXPECT_EQ(shard1 - shard0, 64u);
-    EXPECT_EQ(aiv_shard0 - shard0, SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64u);
+    const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(storage.base(), ready_plan.header_offset);
+    EXPECT_EQ(pool.version, SCHEDULER_READY_POOL_VERSION);
+    EXPECT_EQ(pool.entry_count, layout.task_count);
+    EXPECT_TRUE(scheduler_ready_pool_validate(storage.base(), layout.total_size, ready_plan.header_offset, 5, 1));
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
+        const auto queue = scheduler_ready_pool_queue(storage.base(), pool, type);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(queue.control) % SCHEDULER_STATE_ALIGNMENT, 0u);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(queue.entries) % SCHEDULER_STATE_ALIGNMENT, 0u);
+        EXPECT_EQ(queue.control->head, 0u);
+        EXPECT_EQ(queue.control->reserved_tail, 0u);
+        for (uint64_t entry = 0; entry < queue.capacity; ++entry)
+            EXPECT_EQ(queue.entries[entry].task_ref, SCHEDULER_TASK_REF_INVALID);
+    }
 }
 
 TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
-    EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
+    EXPECT_EQ(alignof(SchedulerTaskControl), 64u);
     EXPECT_EQ(alignof(SchedulerExecutorTaskTrace), alignof(uint64_t));
     EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 48u);
-    EXPECT_EQ(alignof(SchedulerSsbufRegion), 64u);
-    EXPECT_EQ(alignof(SchedulerRunControl), 128u);
-    EXPECT_EQ(alignof(SchedulerWorkerContext), 128u);
-    EXPECT_EQ(alignof(SchedulerTaskTrace), 128u);
+    EXPECT_EQ(alignof(SchedulerRunControl), 64u);
+    EXPECT_EQ(alignof(SchedulerWorkerContext), 64u);
+    EXPECT_EQ(alignof(SchedulerTaskTrace), 64u);
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 384u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 320u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     // Both chain links belong to the atomic line: they are written as single
     // device words, and nothing publishes that line as a whole, so no producer's
     // writeback can restore a stale copy of another's link.
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
     EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_fanin_index) / 64);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, mix_completion), 0x00u);
-    EXPECT_EQ(sizeof(SchedulerSsbufLane), 0x40u);
+
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
     );
@@ -583,23 +598,6 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
         offsetof(SchedulerTaskTrace, refill_scheduler_worker_id) / 64,
         offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) / 64
     );
-}
-
-TEST(SchedulerSsbuf, InitializesDirtyMailboxWithoutTouchingUserStorage) {
-    alignas(64) std::array<uint8_t, SCHEDULER_SSBUF_HARDWARE_SIZE> hardware{};
-    hardware.fill(0xa5);
-    auto *region = scheduler_ssbuf_region(reinterpret_cast<uint64_t>(hardware.data()));
-    scheduler_ssbuf_initialize(region);
-
-    EXPECT_EQ(reinterpret_cast<uint8_t *>(region) - hardware.data(), SCHEDULER_SSBUF_REGION_OFFSET);
-    EXPECT_TRUE(scheduler_ssbuf_is_initialized(region));
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot) {
-            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->mix_dispatch[lane][slot].publication), 0u);
-        }
-        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].mix_completion.publication), 0u);
-    }
-    EXPECT_EQ(hardware[SCHEDULER_SSBUF_REGION_OFFSET - 1], 0xa5);
 }
 
 TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics) {
@@ -704,16 +702,12 @@ TEST(SchedulerGraph, RejectsUnboundNonEmptyFaninRegion) {
     EXPECT_EQ(scheduler_classify_task_shape(graph.graph(), 1, &shape), SchedulerGraphResult::INVALID_FANIN_ID);
 }
 
-// The view's reserved word exists so its wire size survived the collapse from two
-// addresses to one. A non-zero read means the producer is writing a field this
-// build does not know about, so both entry points refuse rather than proceed on a
-// view they cannot fully interpret.
-TEST(SchedulerGraph, RejectsAViewWithANonZeroReservedWord) {
+TEST(SchedulerGraph, RejectsAViewWithAnUnsupportedVersion) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
 
     SchedulerGraphView dirty = graph.graph();
-    dirty.reserved = 1;
+    dirty.view_version = SCHEDULER_GRAPH_VIEW_VERSION + 1;
 
     SchedulerTaskShape shape{};
     EXPECT_EQ(scheduler_classify_task_shape(dirty, 0, &shape), SchedulerGraphResult::INVALID_ARGUMENTS);

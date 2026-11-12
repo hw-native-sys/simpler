@@ -157,15 +157,15 @@ CLIs load the unique existing artifact, building only when it is absent; the
 original same-stream CLI still checks its incremental build cache. All use
 the original `build_bridge` / `_load_bridge` helpers. The
 `test_environment("torch_npu")` marker selects an isolated framework venv in the
-dedicated `st-framework-eager-a2a3` and `st-framework-eager-a5` PR and Daily jobs. The default environment
+dedicated `st-framework-a2a3` and `st-framework-a5` PR and Daily jobs. The default environment
 automatically deselects these tests; no directory exclusion is needed.
-Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3-and-a5) for the pinned compatibility contract. Run this suite
+Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-environment-qualification-a2a3-and-a5) for the pinned compatibility contract. Run this suite
 serially inside one exclusive `task-submit` allocation of one device, as below;
 resource-parallel dispatch and xdist are not qualified by this example:
 
 ```sh
 .claude/skills/onboard-arch-precheck/check.sh a2a3
-task-submit --timeout 900 --max-time 900 --device auto --device-num 1 --run   'python -m pytest examples tests/st --test-environment torch_npu --platform a2a3 --device "$TASK_DEVICE" --junitxml outputs/framework-eager-ci/results.xml -v'
+task-submit --timeout 900 --max-time 900 --device auto --device-num 1 --run   'python -m pytest examples tests/st --test-environment torch_npu --platform a2a3 --device "$TASK_DEVICE" --junitxml outputs/framework-ci/results.xml -v'
 ```
 
 ## Ordering and lifetime contract

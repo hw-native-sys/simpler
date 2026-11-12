@@ -18,7 +18,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 
 def capture(epoch=0):
     return {
-        "schema": "hbg-native-protocol-v1",
+        "schema": "hbg-native-protocol-v10",
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,
@@ -31,7 +31,7 @@ def capture(epoch=0):
         "expected_task_count": 1,
         "inline_completed_count": 0,
         "resolved_task_count": 1,
-        "executed_task_count": 0,
+        "close_seal_stride": 64,
         "active_worker_count": 3,
         "scheduler_count": 3,
         "scheduler_error": 0,
@@ -68,7 +68,18 @@ def capture(epoch=0):
         ],
         "admission_log": [],
         "admissions": [],
-        "task_controls": [dict(task_ref=0, state=3, next_block=0, completed_blocks=0, admission_state=0)],
+        "task_controls": [
+            dict(
+                task_ref=0,
+                state=3,
+                next_block=0,
+                completed_blocks=0,
+                admission_state=0,
+                claim_tickets=0,
+                admission_claim_lock=0,
+                claim_seal=0,
+            )
+        ],
         "task_events": [
             dict(
                 index=0,
@@ -101,82 +112,21 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
     assert raw == before
 
 
-@pytest.mark.parametrize("tickets", (0, 1, (1 << 64) - 1))
-@pytest.mark.parametrize("schema", ("hbg-native-protocol-v2", "hbg-native-protocol-v3", "hbg-native-protocol-v4"))
-def test_versioned_protocol_preserves_raw_ticket_values_for_incomplete_capture_diagnosis(tickets, schema):
+@pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
+def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
     raw = capture()
-    raw["schema"] = schema
-    raw["task_controls"][0]["claim_tickets"] = tickets
-    before = copy.deepcopy(raw)
-    assert read_native_protocol(raw) == before
-
-
-def test_v1_does_not_silently_accept_v2_ticket_fields():
-    raw = capture()
-    raw["task_controls"][0]["claim_tickets"] = 0
-    with pytest.raises(ValueError, match="unknown fields"):
-        read_native_protocol(raw)
-
-
-@pytest.mark.parametrize("value", (0, 1, (1 << 64) - 1))
-def test_v5_preserves_admission_claim_lock_for_failed_capture_diagnosis(value):
-    raw = capture()
-    raw["schema"] = "hbg-native-protocol-v5"
-    raw["task_controls"][0].update(claim_tickets=0, admission_claim_lock=value)
-    before = copy.deepcopy(raw)
-    assert read_native_protocol(raw) == before
-
-
-@pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
-def test_v5_requires_a_typed_admission_claim_lock(value):
-    raw = capture()
-    raw["schema"] = "hbg-native-protocol-v5"
-    raw["task_controls"][0]["claim_tickets"] = 0
-    if value is not None:
-        raw["task_controls"][0]["admission_claim_lock"] = value
-    with pytest.raises(ValueError, match="missing or unknown fields" if value is None else "admission_claim_lock"):
-        read_native_protocol(raw)
-
-
-@pytest.mark.parametrize("version", (1, 2, 3, 4))
-def test_legacy_protocol_does_not_silently_accept_v5_claim_lock(version):
-    raw = capture()
-    raw["schema"] = f"hbg-native-protocol-v{version}"
-    if version != 1:
-        raw["task_controls"][0]["claim_tickets"] = 0
-    raw["task_controls"][0]["admission_claim_lock"] = 0
-    with pytest.raises(ValueError, match="unknown fields"):
-        read_native_protocol(raw)
-
-
-@pytest.mark.parametrize("stride", (None, 0, 8, 64, 127, 129, 256, True, 128.0, "128", -1, 1 << 64))
-@pytest.mark.parametrize("version", (7, 8))
-def test_isolated_close_versions_require_typed_exact_stride_even_without_mix(stride, version):
-    raw = capture()
-    raw.update(schema=f"hbg-native-protocol-v{version}", close_seal_stride=128)
+    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, admission_claim_lock=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
+    raw["executed_task_count"] = 0
+    with pytest.raises(ValueError, match="unknown fields"):
+        read_native_protocol(raw)
+    del raw["executed_task_count"]
     if stride is None:
         del raw["close_seal_stride"]
     else:
         raw["close_seal_stride"] = stride
     with pytest.raises(ValueError, match="close_seal_stride|missing or unknown fields"):
-        read_native_protocol(raw)
-
-
-@pytest.mark.parametrize("version", (1, 2, 3, 4, 5, 6))
-def test_old_production_schemas_cannot_silently_accept_v7_stride(version):
-    raw = capture()
-    raw["schema"] = f"hbg-native-protocol-v{version}"
-    if version > 1:
-        raw["task_controls"][0]["claim_tickets"] = 0
-    if version >= 5:
-        raw["task_controls"][0]["admission_claim_lock"] = 0
-    if version == 6:
-        raw["task_controls"][0]["claim_seal"] = 0
-    assert read_native_protocol(raw) == raw
-    raw["close_seal_stride"] = 128
-    with pytest.raises(ValueError, match="unknown fields"):
         read_native_protocol(raw)
 
 
@@ -279,3 +229,23 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
     assert read_native_protocol(raw) == raw
     with pytest.raises(ValueError, match="protocol"):
         audit_protocol_sequences(raw)
+
+
+@pytest.mark.parametrize("version", (*range(1, 10), 12, 13, 14, 15, 16, 17))
+def test_noncurrent_protocol_versions_are_rejected(version):
+    raw = capture()
+    raw["schema"] = f"hbg-native-protocol-v{version}"
+    with pytest.raises(ValueError, match="unsupported schema"):
+        read_native_protocol(raw)
+
+
+@pytest.mark.parametrize("field", ("claim_tickets", "admission_claim_lock", "claim_seal"))
+@pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
+def test_current_control_words_are_mandatory_uint64(field, value):
+    raw = capture()
+    if value is None:
+        del raw["task_controls"][0][field]
+    else:
+        raw["task_controls"][0][field] = value
+    with pytest.raises(ValueError, match="fields|integer"):
+        read_native_protocol(raw)

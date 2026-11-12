@@ -13,7 +13,6 @@ The recording graph and model notice are framework and RTS test leaves.
 
 import contextlib
 import importlib.util
-import json
 import sys
 import weakref
 from pathlib import Path
@@ -412,27 +411,6 @@ def driver():
     return module
 
 
-@pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_actual_run_and_driver_report_only_the_selected_lifetime_qualification(
-    scene, run_scene, driver, monkeypatch, capsys, task_queue
-):
-    monkeypatch.setenv("TASK_QUEUE_ENABLE", task_queue)
-    run_scene()
-    reports = [
-        json.loads(line.removeprefix("NATIVE_COLD_CAPTURE_PASS "))
-        for line in capsys.readouterr().out.splitlines()
-        if line.startswith("NATIVE_COLD_CAPTURE_PASS ")
-    ]
-    assert len(reports) == 1
-    assert reports[0]["task_queue"] == task_queue
-    assert reports[0]["tensor_impl_lifetime"] == ("observed" if task_queue == "0" else "not_observed")
-    driver._check_report(reports, "host_build_graph", "a2a3", task_queue)
-    reports[0]["tensor_impl_lifetime"] = "not_observed" if task_queue == "0" else "observed"
-    with pytest.raises(AssertionError):
-        driver._check_report(reports, "host_build_graph", "a2a3", task_queue)
-    assert scene.pending[0].retired
-
-
 def test_unsupported_queue_mode_is_rejected_before_backend_import(consumer, monkeypatch):
     monkeypatch.setenv("TASK_QUEUE_ENABLE", "2")
     monkeypatch.setitem(sys.modules, "torch_npu", None)
@@ -440,10 +418,11 @@ def test_unsupported_queue_mode_is_rejected_before_backend_import(consumer, monk
         consumer.run("host_build_graph", 0, Path("not-loaded"))
 
 
-def test_retained_capture_driver_checks_actual_replays_and_independent_release(driver):
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_retained_capture_driver_checks_actual_replays_and_independent_release(driver, platform):
     report = {
         "runtime": "host_build_graph",
-        "platform": "a2a3",
+        "platform": platform,
         "task_queue": "0",
         "grants": 2,
         "models": 3,
@@ -454,8 +433,9 @@ def test_retained_capture_driver_checks_actual_replays_and_independent_release(d
         "checked_close": True,
         "tensor_impl_lifetime": "observed",
     }
-    driver._check_retained_report([report], "host_build_graph", "0")
+    driver._check_retained_report([report], "host_build_graph", platform, "0")
     for invalid in (
+        {**report, "platform": "a5" if platform == "a2a3" else "a2a3"},
         {**report, "models": 2},
         {**report, "record_computed": True},
         {**report, "replays": [[10, 20, 44], [212, 222, 246], [414, 424, 446]]},
@@ -464,4 +444,20 @@ def test_retained_capture_driver_checks_actual_replays_and_independent_release(d
         {**report, "tensor_impl_lifetime": "not_observed"},
     ):
         with pytest.raises(AssertionError):
-            driver._check_retained_report([invalid], "host_build_graph", "0")
+            driver._check_retained_report([invalid], "host_build_graph", platform, "0")
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_destroy_refusal_report_requires_the_selected_platform(driver, platform):
+    report = {
+        "runtime": "tensormap_and_ringbuffer",
+        "platform": platform,
+        "task_queue": "0",
+        "expected": [10, 20, 44],
+        "real_destroy_calls": 1,
+        "acl_notice": True,
+        "checked_close": True,
+    }
+    driver._check_destroy_report([report], platform)
+    with pytest.raises(AssertionError):
+        driver._check_destroy_report([report], "a5" if platform == "a2a3" else "a2a3")

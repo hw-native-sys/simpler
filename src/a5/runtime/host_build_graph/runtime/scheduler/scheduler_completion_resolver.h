@@ -13,15 +13,24 @@
 
 #include "scheduler_ready_publication.h"
 
-// The producer is already DONE. This cursor owns its detached chain until all
-// successors are handed off and every ready publication has finished. Returning
+// CCEC has failed when over-aligned stack objects escape through an outlined
+// call (#2973). Local arguments at this boundary use natural alignment; shared
+// scheduler records are passed through their explicitly qualified GM pointers.
+static_assert(
+    alignof(SchedulerGraphAccess) <= 8 && alignof(SchedulerLocalState) <= 8 && alignof(SchedulerResolveCursor) <= 8 &&
+        alignof(SchedulerCompletionDirect) <= 8 && alignof(SchedulerReadyClaim) <= 8,
+    "outlined resolver local arguments must not require over-aligned stack storage"
+);
+
+// The producer is already DONE. This cursor owns its successor traversal until
+// every ready publication and direct handoff has finished. Returning
 // DONE does not itself contribute to the run's completion counter.
-inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
+static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_resolve_completion_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t producer_ref, SchedulerResolveCursor &cursor, uint32_t budget, SchedulerWakeStats *wake_stats = nullptr,
-    SchedulerReadyStats *ready_stats = nullptr, SchedulerCompletionStats *completion_stats = nullptr,
-    uint64_t profiling_level = 0, SchedulerCompletionDirect *direct = nullptr, bool validate_done_state = true
+    int64_t producer_ref, SchedulerResolveCursor &cursor, uint32_t budget, uint64_t profiling_level = 0,
+    SchedulerCompletionDirect *direct = nullptr, bool validate_done_state = true
 ) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarResolve, producer_ref);
     uint32_t used = 0;
     auto fail = [&](SchedulerErrorSite site = SchedulerErrorSite::UNKNOWN,
                     SchedulerGraphResult error = SchedulerGraphResult::INVALID_ARGUMENTS) __aicore__ {
@@ -39,6 +48,7 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
         cursor.phase = SchedulerResolvePhase::FAILED;
         return {SchedulerResolveResult::ERROR, 0};
     }
+    const auto *dependencies = scheduler_dependencies(base, local->config.ready_pool_offset);
     const bool timing = scheduler_phase_timing_enabled(profiling_level);
     if (timing && local->profiling == nullptr) return fail();
     while (used < budget) {
@@ -67,7 +77,11 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
             cursor.next_waiter = scheduler_gm_exchange(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
             if (cursor.next_waiter < SCHEDULER_WAKE_LIST_OPEN)
                 return fail(SchedulerErrorSite::COMPLETION_WAKE_ALREADY_CLOSED);
-            if (wake_stats != nullptr) ++wake_stats->wake_close_count;
+            if (dependencies != nullptr &&
+                (cursor.next_waiter != SCHEDULER_WAKE_LIST_OPEN ||
+                 !scheduler_dependency_successor(base, *dependencies, producer_ref, 0, &cursor.next_waiter)))
+                return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+
             cursor.phase = SchedulerResolvePhase::SELECT;
             break;
         }
@@ -85,11 +99,29 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
                     scheduler_publish_cache_line(&control->next_fanin_index);
                 }
                 cursor.phase = SchedulerResolvePhase::DONE;
-                if (completion_stats != nullptr) ++completion_stats->resolve_count;
+
                 return {SchedulerResolveResult::DONE, used};
             }
             if (!scheduler_task_ref_valid(graph, cursor.next_waiter) || cursor.visited_count >= graph.task_count)
                 return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+            if (dependencies != nullptr) {
+                cursor.waiter_ref = cursor.next_waiter;
+                if (!scheduler_dependency_successor(
+                        base, *dependencies, producer_ref, cursor.visited_count + 1, &cursor.saved_next
+                    ))
+                    return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+                ++cursor.visited_count;
+                const auto result = scheduler_dependency_notify(base, *dependencies, cursor.waiter_ref);
+                if (result == SchedulerDependencyResult::ERROR)
+                    return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
+                if (result == SchedulerDependencyResult::READY) {
+                    cursor.phase = SchedulerResolvePhase::APPEND;
+                } else {
+                    cursor.next_waiter = cursor.saved_next;
+                    cursor.waiter_ref = SCHEDULER_TASK_REF_INVALID;
+                }
+                break;
+            }
             uint32_t fanin_count = 0;
             if ((direct != nullptr || cursor.publication.count != 0) &&
                 scheduler_node_fanin_count(graph, cursor.next_waiter, &fanin_count) != SchedulerGraphResult::OK)
@@ -106,16 +138,15 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
                 return fail(SchedulerErrorSite::COMPLETION_INVALID_WAITER);
             ++cursor.visited_count;
             cursor.route = {};
-            if (wake_stats != nullptr) ++wake_stats->wake_migrate_count;
+
             // A detached single-fanin waiter is ready when its unique producer completes.
             cursor.phase =
                 direct != nullptr && fanin_count == 1 ? SchedulerResolvePhase::APPEND : SchedulerResolvePhase::ROUTE;
             break;
         }
         case SchedulerResolvePhase::ROUTE: {
-            const auto progress = scheduler_route_task_step(
-                graph, base, local, run, cursor.waiter_ref, cursor.route, budget - used, wake_stats
-            );
+            const auto progress =
+                scheduler_route_task_step(graph, base, local, run, cursor.waiter_ref, cursor.route, budget - used);
             used += progress.work_units;
             if (progress.result == SchedulerRouteResult::ERROR) return fail();
             if (progress.result == SchedulerRouteResult::YIELD) return {SchedulerResolveResult::YIELD, used};
@@ -132,8 +163,6 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
         case SchedulerResolvePhase::APPEND: {
             ++used;
             int64_t candidate = cursor.waiter_ref;
-            uint32_t type = SCHEDULER_CONTROL_PUBLICATION_QUEUE;
-            bool return_mix = false;
             if (direct != nullptr) {
                 bool control = false;
                 if (graph.native_header_offset != 0) {
@@ -152,33 +181,16 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
                         return fail(
                             SchedulerErrorSite::COMPLETION_INVALID_SHAPE, SchedulerGraphResult::UNSUPPORTED_SHAPE
                         );
-                    type = scheduler_task_ready_queue(metadata.flags, lanes);
-                    if (type == SCHEDULER_MIX_QUEUE && direct->mix != nullptr &&
-                        !scheduler_task_ref_is_null(direct->mix->task_ref)) {
-                        // Two MIX successors require ordered publication of the earlier candidate.
-                        candidate = direct->mix->task_ref;
-                        return_mix = true;
-                    } else {
-                        SchedulerReadyClaim *sink = nullptr;
-                        if (type == SCHEDULER_MIX_QUEUE && direct->mix != nullptr && !direct->mix_prefix_published &&
-                            (cursor.publication.count == 0 || cursor.publication.type != SCHEDULER_MIX_QUEUE)) {
-                            auto *inbox = scheduler_ready_inbox_at(base, local, type, local->self_type_rank());
-                            if (scheduler_ready_endpoints_empty(scheduler_gm_query(inbox->endpoints)) &&
-                                !scheduler_ready_directory_nonempty(base, local, local->config.scheduler_count, type))
-                                sink = direct->mix;
-                        }
-                        if (sink == nullptr && type == direct->core_type && direct->ready != nullptr &&
-                            scheduler_task_ref_is_null(direct->ready->task_ref))
-                            sink = direct->ready;
-                        if (sink != nullptr) {
-                            sink->task_ref = candidate;
-                            sink->source = SchedulerReadySource::DIRECT_RESOLVE;
-                            sink->publication_mode = SchedulerPublicationMode::REFILL;
-                            cursor.next_waiter = cursor.saved_next;
-                            cursor.waiter_ref = SCHEDULER_TASK_REF_INVALID;
-                            cursor.phase = SchedulerResolvePhase::SELECT;
-                            break;
-                        }
+                    const uint32_t type = scheduler_task_ready_queue(metadata.flags, lanes);
+                    if (!scheduler_task_is_mix(metadata.flags) && type == direct->core_type &&
+                        direct->ready != nullptr && scheduler_task_ref_is_null(direct->ready->task_ref)) {
+                        direct->ready->task_ref = candidate;
+                        direct->ready->source = SchedulerReadySource::DIRECT_RESOLVE;
+                        direct->ready->publication_mode = SchedulerPublicationMode::REFILL;
+                        cursor.next_waiter = cursor.saved_next;
+                        cursor.waiter_ref = SCHEDULER_TASK_REF_INVALID;
+                        cursor.phase = SchedulerResolvePhase::SELECT;
+                        break;
                     }
                 }
             }
@@ -189,30 +201,20 @@ inline __aicore__ SchedulerResolveProgress scheduler_resolve_completion_step(
                 cursor.phase = SchedulerResolvePhase::PUBLISH;
                 break;
             }
-            if (ready_stats != nullptr) ++ready_stats->enqueue_count;
-            if (return_mix) {
-                *direct->mix = {};
-            } else {
-                cursor.next_waiter = cursor.saved_next;
-                cursor.waiter_ref = SCHEDULER_TASK_REF_INVALID;
-            }
-            const bool mix_prefix = direct != nullptr && type == SCHEDULER_MIX_QUEUE && !direct->mix_prefix_published &&
-                                    !return_mix && cursor.next_waiter >= 0 && cursor.publication.count >= 2;
-            cursor.phase = cursor.publication.count == SCHEDULER_READY_PUBLICATION_CAPACITY || mix_prefix ?
+
+            cursor.next_waiter = cursor.saved_next;
+            cursor.waiter_ref = SCHEDULER_TASK_REF_INVALID;
+            cursor.phase = cursor.publication.count == SCHEDULER_READY_PUBLICATION_CAPACITY ?
                                SchedulerResolvePhase::PUBLISH :
-                           return_mix ? SchedulerResolvePhase::APPEND :
-                                        SchedulerResolvePhase::SELECT;
+                               SchedulerResolvePhase::SELECT;
             break;
         }
         case SchedulerResolvePhase::PUBLISH: {
             ++used;
-            const auto published =
-                scheduler_ready_publication_step(graph, base, local, cursor.publication, ready_stats);
+            const auto published = scheduler_ready_publication_step(graph, base, local, cursor.publication);
             if (published == SchedulerReadyPublishResult::ERROR)
                 return fail(SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED);
             if (published == SchedulerReadyPublishResult::DONE) {
-                if (direct != nullptr && cursor.publication.type == SCHEDULER_MIX_QUEUE)
-                    direct->mix_prefix_published = true;
                 cursor.publication = {};
                 cursor.phase = cursor.waiter_ref == SCHEDULER_TASK_REF_INVALID ? SchedulerResolvePhase::SELECT :
                                                                                  SchedulerResolvePhase::APPEND;

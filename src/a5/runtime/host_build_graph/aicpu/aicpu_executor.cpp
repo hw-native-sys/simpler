@@ -23,6 +23,7 @@
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
 #include "aicpu/aicpu_device_config.h"
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_run_result_aicpu.h"
@@ -32,6 +33,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler/scheduler_ready_pool.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
 
@@ -76,6 +78,99 @@ static bool wait_with_scheduler_timeout(Predicate predicate) {
         SPIN_WAIT_HINT();
     }
     return true;
+}
+
+static void log_resident_ready_pool(void *base, const SchedulerWorkerContext &context) {
+    const uint64_t state_bytes = context.scheduler_state_bytes;
+    const auto address = reinterpret_cast<uintptr_t>(base);
+    auto range_valid = [&](uint64_t offset, uint64_t count, uint64_t stride, uint64_t alignment, uint64_t limit) {
+        return offset != 0 && offset % alignment == 0 && offset <= limit && count <= (limit - offset) / stride;
+    };
+    if (base == nullptr || address % alignof(SchedulerGraphSummary) != 0 || state_bytes > UINTPTR_MAX - address ||
+        !range_valid(
+            context.graph_summary_offset, 1, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), state_bytes
+        )) {
+        LOG_ERROR("A5 HBG ready pool snapshot: invalid state or graph summary range");
+        return;
+    }
+    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, context.graph_summary_offset);
+    cache_invalidate_range(summary, sizeof(*summary));
+    rmb();
+    const uint64_t pool_offset = summary->ready_pool_offset;
+    if (!range_valid(
+            pool_offset, 1, sizeof(SchedulerReadyPoolHeader), alignof(SchedulerReadyPoolHeader), state_bytes
+        )) {
+        LOG_ERROR("A5 HBG ready pool snapshot: invalid header offset=%" PRIu64, pool_offset);
+        return;
+    }
+    const auto *shared_pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, pool_offset);
+    cache_invalidate_range(shared_pool, sizeof(*shared_pool));
+    rmb();
+    const auto pool = *shared_pool;
+    const uint64_t limit = pool.storage_end_offset;
+    const uint64_t descriptor_bytes = SCHEDULER_READY_QUEUE_COUNT * sizeof(SchedulerReadyPoolDescriptor);
+    const uint64_t control_bytes = SCHEDULER_READY_QUEUE_COUNT * sizeof(SchedulerTicketQueue);
+    if (pool.version != SCHEDULER_READY_POOL_VERSION || pool.task_count != context.graph_task_count ||
+        pool.entry_count > pool.task_count || limit > state_bytes ||
+        pool.descriptors_offset < pool_offset + sizeof(pool) ||
+        !range_valid(
+            pool.descriptors_offset, SCHEDULER_READY_QUEUE_COUNT, sizeof(SchedulerReadyPoolDescriptor),
+            SCHEDULER_STATE_ALIGNMENT, limit
+        ) ||
+        pool.controls_offset < pool.descriptors_offset + descriptor_bytes ||
+        !range_valid(
+            pool.controls_offset, SCHEDULER_READY_QUEUE_COUNT, sizeof(SchedulerTicketQueue), SCHEDULER_STATE_ALIGNMENT,
+            limit
+        )) {
+        LOG_ERROR("A5 HBG ready pool snapshot: invalid header or queue table");
+        return;
+    }
+    const auto *shared_descriptors = scheduler_state_at<SchedulerReadyPoolDescriptor>(base, pool.descriptors_offset);
+    cache_invalidate_range(shared_descriptors, descriptor_bytes);
+    rmb();
+    SchedulerReadyPoolDescriptor descriptors[SCHEDULER_READY_QUEUE_COUNT]{};
+    uint64_t cursor = pool.controls_offset + control_bytes;
+    uint64_t entries = 0;
+    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue) {
+        descriptors[queue] = shared_descriptors[queue];
+        const auto &descriptor = descriptors[queue];
+        if (descriptor.capacity > pool.task_count - entries || descriptor.entries_offset < cursor ||
+            !range_valid(
+                descriptor.entries_offset, descriptor.capacity, sizeof(SchedulerTicketEntry),
+                alignof(SchedulerTicketEntry), limit
+            )) {
+            LOG_ERROR("A5 HBG ready pool snapshot: invalid queue=%u descriptor", queue);
+            return;
+        }
+        entries += descriptor.capacity;
+        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(SchedulerTicketEntry);
+    }
+    if (entries != pool.entry_count) {
+        LOG_ERROR("A5 HBG ready pool snapshot: inconsistent entry count");
+        return;
+    }
+    const auto *controls = scheduler_state_at<SchedulerTicketQueue>(base, pool.controls_offset);
+    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue) {
+        const auto &descriptor = descriptors[queue];
+        cache_invalidate_range(&controls[queue], sizeof(controls[queue]));
+        rmb();
+        const uint64_t head = controls[queue].head;
+        const uint64_t reserved_tail = controls[queue].reserved_tail;
+        int64_t head_ref = SCHEDULER_TASK_REF_INVALID;
+        if (head < descriptor.capacity) {
+            const auto *entry = scheduler_state_at<SchedulerTicketEntry>(base, descriptor.entries_offset) + head;
+            cache_invalidate_range(entry, sizeof(*entry));
+            rmb();
+            head_ref = entry->task_ref;
+        }
+        // This is a read-only snapshot while publishers and consumers can move.
+        // Invalidation never writes back the queues' atomic-only cache lines.
+        LOG_ERROR(
+            "A5 HBG ready pool: queue=%u head=%" PRIu64 " reserved_tail=%" PRIu64 " capacity=%" PRIu64
+            " head_ref=%" PRId64,
+            queue, head, reserved_tail, descriptor.capacity, head_ref
+        );
+    }
 }
 
 // A stalled run leaves its state still: the tasks that never finished keep the
@@ -147,29 +242,7 @@ static void log_unfinished_tasks(Runtime *runtime) {
             metadata[task].active_mask.raw(), metadata[task].flags
         );
     }
-    // A task that is neither on a wake list nor in a queue was dropped between
-    // the two; one still queued was never dispatched. The inboxes say which.
-    auto *inboxes = scheduler_state_at<SchedulerReadyInbox>(scheduler_state_base, context->ready_inboxes_offset);
-    for (uint32_t index = 0; index < SCHEDULER_READY_INBOX_CAPACITY; ++index) {
-        const uint64_t packed = inboxes[index].endpoints;
-        // The endpoints pack two int32 task refs, head in the low half.
-        const int32_t head = static_cast<int32_t>(static_cast<uint32_t>(packed));
-        const int32_t tail = static_cast<int32_t>(static_cast<uint32_t>(packed >> 32));
-        if (head < 0 && tail < 0) continue;
-        LOG_ERROR("A5 HBG AICore scheduler: inbox %u not drained: head=%" PRId32 " tail=%" PRId32, index, head, tail);
-    }
-    // The directory is what a thief consults before looking at an inbox, so a
-    // bit set over an empty inbox wastes scans and a bit clear over a full one
-    // hides the work. Either way it belongs next to the endpoints above.
-    auto *directory =
-        scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->ready_directory_offset);
-    for (uint32_t type = 0; type < 3; ++type) {
-        for (uint32_t shard = 0; shard < SCHEDULER_READY_DIRECTORY_SHARD_COUNT; ++shard) {
-            const uint64_t bits = directory->core_types[type][shard].bits;
-            if (bits == 0) continue;
-            LOG_ERROR("A5 HBG AICore scheduler: directory type %u shard %u still flags 0x%" PRIx64, type, shard, bits);
-        }
-    }
+    log_resident_ready_pool(scheduler_state_base, *context);
     // The AICores are still running when this timeout fires, so one pass cannot
     // tell a chain nobody will drain from one being walked at this instant. A
     // second pass over the same tasks names whatever moved in between.
@@ -512,13 +585,6 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
         } else {
             const uint64_t executable_task_count =
                 run_control->expected_task_count - run_control->inline_completed_count;
-            const bool trace_enabled = is_chip_swimlane_enabled();
-            const uint64_t completion_wait_start_cycles = trace_enabled ? get_sys_cnt_aicpu() : 0;
-            uint64_t bootstrap_complete_cycles = 0;
-            uint64_t all_tasks_resolved_cycles = 0;
-            uint64_t completion_poll_count = 0;
-            uint64_t completion_poll_cycles = 0;
-            uint64_t error_poll_total = 0;
             uint32_t error_poll_count = 0;
             uint64_t last_progress_cycles = ready_watchdog_.last_progress();
             uint64_t last_resolved_task_count = run_control->resolved_task_count;
@@ -526,7 +592,6 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
             const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
             while (true) {
                 service_args_dump(thread_idx);
-                const uint64_t poll_start = trace_enabled ? get_sys_cnt_aicpu() : 0;
                 const bool bootstrap_complete = run_control->bootstrap_complete != 0;
                 const uint64_t resolved_task_count = run_control->resolved_task_count;
                 const bool tasks_resolved = resolved_task_count == executable_task_count;
@@ -535,29 +600,18 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
                     const uint64_t copy_progress = ready_watchdog_.last_progress();
                     if (copy_progress > last_progress_cycles) last_progress_cycles = copy_progress;
                 }
-                if (resolved_task_count != last_resolved_task_count || bootstrap_complete != bootstrap_was_complete) {
+                if (resolved_task_count != last_resolved_task_count ||
+                    bootstrap_complete != bootstrap_was_complete) {
                     last_resolved_task_count = resolved_task_count;
                     bootstrap_was_complete = bootstrap_complete;
                     last_progress_cycles = now;
                     ready_watchdog_.record_progress(now);
-                }
-                if (trace_enabled) {
-                    const uint64_t poll_end = get_sys_cnt_aicpu();
-                    ++completion_poll_count;
-                    completion_poll_cycles += poll_end - poll_start;
-                    if (bootstrap_complete && bootstrap_complete_cycles == 0) {
-                        bootstrap_complete_cycles = poll_end;
-                    }
-                    if (bootstrap_complete && tasks_resolved && all_tasks_resolved_cycles == 0) {
-                        all_tasks_resolved_cycles = poll_end;
-                    }
                 }
                 if (bootstrap_complete && tasks_resolved) {
                     break;
                 }
                 if (++error_poll_count == 64) {
                     error_poll_count = 0;
-                    ++error_poll_total;
                     if (run_control->scheduler_error != 0) break;
                 }
                 if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
@@ -573,14 +627,13 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
                     " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " storage=0x%" PRIx64
-                    " reserved=0x%" PRIx64 " window_last_index=0x%" PRIx64 " site=%" PRIu64 " executed=%" PRIu64
-                    " resolved=%" PRIu64 " expected=%" PRIu64 " inline=%" PRIu64,
+                    " window_last_index=0x%" PRIx64 " site=%" PRIu64 " resolved=%" PRIu64 " expected=%" PRIu64
+                    " inline=%" PRIu64,
                     run_control->error_task_ref, scheduler_error, run_control->error_core_id,
                     run_control->error_core_type, run_control->error_graph_task_count,
-                    run_control->error_storage_address, run_control->error_reserved_address,
-                    run_control->error_task_window_last_index, run_control->error_site,
-                    run_control->executed_task_count, run_control->resolved_task_count,
-                    run_control->expected_task_count, run_control->inline_completed_count
+                    run_control->error_storage_address, run_control->error_task_window_last_index,
+                    run_control->error_site, run_control->resolved_task_count, run_control->expected_task_count,
+                    run_control->inline_completed_count
                 );
                 supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
                 if (supervisor_rc == 0) supervisor_rc = -1;
@@ -589,19 +642,11 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
             if (supervisor_rc == 0 &&
                 resolved_task_count + run_control->inline_completed_count != run_control->expected_task_count) {
                 LOG_ERROR(
-                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64 " inline=%" PRIu64,
+                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64
+                    " inline=%" PRIu64,
                     run_control->expected_task_count, resolved_task_count, run_control->inline_completed_count
                 );
                 supervisor_rc = -1;
-            }
-            if (trace_enabled) {
-                run_control->completion_wait_start_cycles = completion_wait_start_cycles;
-                run_control->bootstrap_complete_cycles = bootstrap_complete_cycles;
-                run_control->all_tasks_resolved_cycles = all_tasks_resolved_cycles;
-                run_control->shutdown_ready_cycles = get_sys_cnt_aicpu();
-                run_control->completion_poll_count = completion_poll_count;
-                run_control->completion_poll_cycles = completion_poll_cycles;
-                run_control->error_poll_count = error_poll_total;
             }
         }
     }

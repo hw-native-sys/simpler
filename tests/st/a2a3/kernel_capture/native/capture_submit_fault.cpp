@@ -16,23 +16,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
+#include <utility>
 #include "runtime/mem.h"
 #include "common/kernel_args.h"
-#include "host_build_graph/runtime.h"
 #include "runtime/kernel.h"
 #include "runtime/rts/rts_kernel.h"
 
+namespace capture_test = simpler::capture_test;
+
 namespace {
 thread_local bool armed = false;
-thread_local bool observe_arena = false;
-thread_local void *arena_binding = nullptr;
-struct Publication {
-    void *destination;
-    const void *source;
-    uint64_t bytes;
-};
-thread_local std::vector<Publication> publications;
+thread_local bool observe_publications = false;
+thread_local capture_test::CapturedSubmission captured_submission;
 thread_local void *caller_stream = nullptr;
 thread_local void *conflict_event = nullptr;
 thread_local CaptureSubmitFaultResult result;
@@ -52,17 +47,19 @@ void note_submission() {
 }
 }  // namespace
 
-void begin_capture_arena_probe() {
-    arena_binding = nullptr;
-    publications.clear();
-    observe_arena = true;
+namespace simpler::capture_test {
+
+void begin_capture_publication_probe() {
+    captured_submission = {};
+    observe_publications = true;
 }
 
-void *finish_capture_arena_probe() {
-    observe_arena = false;
-    publications.clear();
-    return arena_binding;
+CapturedSubmission finish_capture_publication_probe() {
+    observe_publications = false;
+    return std::move(captured_submission);
 }
+
+}  // namespace simpler::capture_test
 
 void arm_capture_submit_fault(void *caller, void *event) {
     result = {};
@@ -84,18 +81,11 @@ extern "C" rtError_t rtKernelLaunchWithHandleV2(
     note_submission();
     const int rc = real(handle, key, blocks, args, sm, stream, config);
     if (armed && rc == 0) ++result.accepted_core;
-    if (observe_arena && rc == 0 && args != nullptr && args->args != nullptr &&
+    if (observe_publications && rc == 0 && args != nullptr && args->args != nullptr &&
         args->argsSize == sizeof(AicoreLaunchArgs)) {
         AicoreLaunchArgs launch{};
         std::memcpy(&launch, args->args, sizeof(launch));
-        constexpr size_t offset = offsetof(DeviceRuntimeLaunchDesc, prebuilt_arena_base_);
-        for (const auto &publication : publications) {
-            if (reinterpret_cast<uint64_t>(publication.destination) == launch.runtime_args &&
-                publication.bytes >= offset + sizeof(void *)) {
-                // RTS replays the publication from its retained pinned Host source.
-                arena_binding = static_cast<char *>(const_cast<void *>(publication.source)) + offset;
-            }
-        }
+        captured_submission.launches.push_back({launch.runtime_args, captured_submission.publications.size()});
     }
     return rc;
 }
@@ -146,7 +136,7 @@ extern "C" rtError_t rtMemcpyAsync(
 ) {
     static auto real = next_symbol<decltype(&rtMemcpyAsync)>("rtMemcpyAsync");
     const int rc = real(destination, capacity, source, bytes, kind, stream);
-    if (observe_arena && rc == 0 && kind == RT_MEMCPY_HOST_TO_DEVICE)
-        publications.push_back({destination, source, bytes});
+    if (observe_publications && rc == 0 && kind == RT_MEMCPY_HOST_TO_DEVICE)
+        captured_submission.publications.push_back({destination, source, bytes});
     return rc;
 }

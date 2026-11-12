@@ -451,11 +451,20 @@ until that private job has been installed in the recorder queue; it does not wai
 for the operating system to schedule the thread or for `graph_prepare` to bind
 the private recording state. The keyed in-flight entry and zero-heap outer shell
 already exist before the job is enqueued, so later same-identity submissions can
-safely proceed immediately. Threads remain parked on a condition variable for
-the lifetime of the loaded orchestration SO and are reused by later runs. Eight
-workers are created when the callable's orchestration SO is loaded, before any
-`host_orch` run; unloading the SO stops and joins them before their code is
-unmapped.
+safely proceed immediately. Threads remain parked on a condition variable in the
+runtime-owned pool and are reused across callables and runs. Callable registration
+prewarms eight workers before any `host_orch` run. Each worker owns its recording
+scratch as an ordinary object; a borrowed TLS pointer selects it while the worker
+runs, without registering a TLS destructor. Synchronous fallback recordings lease
+independent scratch from their GraphHostState and return it to a bounded cache on
+retirement. No scratch retains an entry's boundary after retirement.
+
+RuntimeModule acquires a host-service lease when loading an HBG runtime. Releasing
+the last safe owner closes pool admission, drains accepted jobs including closure
+destruction, joins workers and destroys scratch before dlclose. Releasing one of
+several owners does not stop their shared pool. A later owner can create a fresh
+pool if another loader reference kept the SO resident. Terminal abandonment retains
+both the module reference and its service lease.
 
 **Distinct identities record concurrently.** The recorder owns a fixed 16-slot
 job queue; each boundary lives on its own in-flight entry. The eight prewarmed

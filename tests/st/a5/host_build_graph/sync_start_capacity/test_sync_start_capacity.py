@@ -81,7 +81,7 @@ def _check_normalized_capture(path, mask):
     raw = json.loads(path.read_text())
     protocol = raw["aicore_protocol"]
     assert protocol["producer"] == "aicore"
-    assert protocol["schema"] == "hbg-native-protocol-v8"
+    assert protocol["schema"] == "hbg-native-protocol-v10"
     tasks = [
         task
         for task in protocol["tasks"]

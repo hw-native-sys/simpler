@@ -30,7 +30,7 @@ struct SchedulerProtocolStamp {
     uint64_t sequence;
 };
 
-struct alignas(128) SchedulerProtocolLayout {
+struct alignas(64) SchedulerProtocolLayout {
     uint64_t magic;
     uint64_t run_epoch;
     uint64_t storage_end_offset;
@@ -44,7 +44,6 @@ struct alignas(128) SchedulerProtocolLayout {
     uint64_t blocks_offset;
     uint64_t executions_offset;
     uint64_t workers_offset;
-    uint64_t reserved[3];
 };
 
 // Sequence zero denotes an unrecorded point, not cycle zero or epoch zero.
@@ -58,12 +57,12 @@ struct alignas(64) SchedulerProtocolTaskActor {
     uint32_t flags;
 };
 
-struct alignas(128) SchedulerProtocolTaskTrace {
+struct alignas(64) SchedulerProtocolTaskTrace {
     SchedulerProtocolTaskActor admission;
     SchedulerProtocolTaskActor completion;
 };
 
-struct alignas(128) SchedulerProtocolMemberTrace {
+struct alignas(64) SchedulerProtocolMemberTrace {
     SchedulerProtocolStamp observed;
     SchedulerProtocolStamp closed;
     uint64_t run_epoch;
@@ -78,7 +77,6 @@ struct alignas(128) SchedulerProtocolMemberTrace {
     uint64_t pending_mask;
     uint64_t claim_seal_seen;
     uint64_t claim_cursor_seen;
-    uint64_t reserved;
 };
 
 struct alignas(64) SchedulerProtocolBlockOwner {
@@ -103,7 +101,7 @@ struct alignas(64) SchedulerProtocolBlockOwner {
     uint64_t released_seq[3];
 };
 
-struct alignas(128) SchedulerProtocolLaneTrace {
+struct alignas(64) SchedulerProtocolLaneTrace {
     SchedulerProtocolStamp arrive_before;
     SchedulerProtocolStamp arrive_after;
     SchedulerProtocolStamp release_before;
@@ -124,7 +122,6 @@ struct alignas(128) SchedulerProtocolLaneTrace {
     uint32_t logical_block_num;
     LaneMask resource_mask;
     uint8_t lane_subtasks[3];
-    uint8_t reserved[5];
     uint64_t previous_lane_seq[3];
 };
 
@@ -138,13 +135,13 @@ struct alignas(64) SchedulerProtocolClaimTrace {
     uint64_t run_epoch;
 };
 
-struct alignas(128) SchedulerProtocolBlockTrace {
+struct alignas(64) SchedulerProtocolBlockTrace {
     SchedulerProtocolBlockOwner owner;
     SchedulerProtocolClaimTrace claim;
     SchedulerProtocolLaneTrace lanes[3];
 };
 
-struct alignas(128) SchedulerProtocolExecutionTrace {
+struct alignas(64) SchedulerProtocolExecutionTrace {
     SchedulerProtocolStamp entry;
     SchedulerProtocolStamp returned;
     SchedulerProtocolStamp visible;
@@ -172,7 +169,6 @@ struct alignas(128) SchedulerProtocolExecutionTrace {
     uint64_t publication_before_cycles;
     uint64_t publication_after_cycles;
     uint32_t publication_count;
-    uint32_t publication_reserved;
 };
 
 enum SchedulerProtocolExecutionFlags : uint32_t {
@@ -186,13 +182,12 @@ enum SchedulerProtocolExecutionFlags : uint32_t {
 };
 
 // One worker owns this record; no global event counter participates in scheduling.
-struct alignas(128) SchedulerProtocolWorkerTrace {
+struct alignas(64) SchedulerProtocolWorkerTrace {
     uint64_t run_epoch;
     uint64_t worker_index;
     volatile uint64_t next_sequence;
     volatile uint64_t error_flags;
     volatile uint64_t finished;
-    uint64_t reserved[11];
 };
 
 static_assert(sizeof(SchedulerProtocolStamp) == 16);
@@ -208,7 +203,7 @@ static_assert(sizeof(SchedulerProtocolLaneTrace) == 256);
 static_assert(offsetof(SchedulerProtocolBlockTrace, lanes) == 256);
 static_assert(sizeof(SchedulerProtocolBlockTrace) == 1024);
 static_assert(sizeof(SchedulerProtocolExecutionTrace) == 256);
-static_assert(sizeof(SchedulerProtocolWorkerTrace) == 128);
+static_assert(sizeof(SchedulerProtocolWorkerTrace) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerProtocolLayout> && std::is_trivially_copyable_v<SchedulerProtocolLayout>
 );

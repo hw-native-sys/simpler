@@ -271,7 +271,7 @@ bool native_graph_plan_nodes(
         const auto index = definition_indices[id];
         if (index == SCHEDULER_NATIVE_NO_INSTANCE) {
             completion_refs.push_back(static_cast<int64_t>(bindings.size()));
-            bindings.push_back({id, SCHEDULER_NATIVE_NO_INSTANCE, SchedulerNodeKind::TOP_KERNEL, {}});
+            bindings.push_back({id, SCHEDULER_NATIVE_NO_INSTANCE, SchedulerNodeKind::TOP_KERNEL});
             continue;
         }
         const auto &definition = plan->definitions[index];
@@ -285,14 +285,14 @@ bool native_graph_plan_nodes(
         instance.boundary_tensor_count = static_cast<uint32_t>(definition.definition.boundary_tensor_count);
         instance.boundary_scalar_count = static_cast<uint32_t>(definition.definition.boundary_scalar_count);
         const auto invocation = static_cast<uint32_t>(instances.size());
-        bindings.push_back({id, invocation, SchedulerNodeKind::GRAPH_ENTER, {}});
+        bindings.push_back({id, invocation, SchedulerNodeKind::GRAPH_ENTER});
         for (uint32_t child = 0; child < instance.child_count; ++child) {
             const auto kind = definition.children[child].metadata.active_mask.is_empty() ?
                                   SchedulerNodeKind::CONTROL_DUMMY :
                                   SchedulerNodeKind::CHILD_KERNEL;
-            bindings.push_back({child, invocation, kind, {}});
+            bindings.push_back({child, invocation, kind});
         }
-        bindings.push_back({id, invocation, SchedulerNodeKind::GRAPH_EXIT, {}});
+        bindings.push_back({id, invocation, SchedulerNodeKind::GRAPH_EXIT});
         completion_refs.push_back(instance.exit_ref);
         instances.push_back(instance);
     }

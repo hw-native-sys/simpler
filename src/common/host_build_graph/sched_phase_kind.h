@@ -51,7 +51,7 @@ namespace simpler::hbg {
  *   completed slots from Scheduler threads to a dedicated resolution thread, so these
  *   are standalone bars rather than nested ones. Resolve is the AICore completion walk.
  *
- *   AICORE SCHEDULER: Bootstrap, StateProbe, Worksteal, Refill and Idle, plus Dispatch,
+ *   AICORE SCHEDULER: Bootstrap, StateProbe, Refill and Idle, plus Dispatch,
  *   Complete and Resolve. These come from the scheduler running on an AICore rather
  *   than the AICPU. Idle is a measured record here — that scheduler publishes a
  *   SchedulerIdleRecord per spin — not the host-side gap reconstruction a report
@@ -82,9 +82,79 @@ enum class SchedPhaseKind : uint8_t {
     Bootstrap = 11,          // AICore scheduler bring-up.
                              // tasks_processed = tasks held at bootstrap.
     StateProbe = 12,         // Scheduler-local Dispatch Slot / Ready state read.
-    Worksteal = 13,          // Remote Inbox claim and dispatch.
     Refill = 14,             // Completed Slot reuse.
     Idle = 15,               // AICore scheduler spin with no progress.
+    ScalarWindow = 16,
+    ScalarCompletions = 18,
+    ScalarGraphControl = 19,
+    ScalarFillSlots = 20,
+    ScalarAdmission = 21,
+    ScalarExecutorScan = 22,
+    ScalarPrepare = 23,
+    ScalarSeal = 24,
+    ScalarPublishCompletion = 25,
+    ScalarAsyncService = 26,
+    ScalarBackoff = 27,
+    ScalarReadyClaim = 29,
+    ScalarPayload = 30,
+    ScalarResolve = 31,
+    ScalarMix = 32,
+    ScalarAsyncCheck = 33,
+    ScalarAsyncFinish = 34,
+    ScalarBootstrap = 35,
+    ScalarLaunchWait = 36,
+    ScalarExitDrain = 37,
+    ScalarAtomicClaim = 38,
+    ScalarCacheObserve = 39,
+    ScalarCachePublish = 40,
+    ScalarOrderedFill = 42,
+    ScalarFlushCompletions = 43,
+    ScalarLoopControl = 44,
+    ScalarOrderedPoll = 45,
+    ScalarAdmissionClaim = 46,
+    ScalarAdmissionPublish = 47,
+    ScalarAdmissionPrepare = 48,
+    ScalarAdmissionCommit = 49,
+    ScalarAdmissionRefresh = 50,
+    ScalarOrdinaryPark = 51,
+    ScalarBlockClaim = 52,
+    ScalarBlockCursorRead = 53,
+    ScalarAdmissionClose = 54,
+    ScalarOrdinaryPermit = 55,
+    ScalarDispatchMetadata = 57,
+    ScalarDispatchFill = 58,
+    ScalarDispatchPublish = 59,
+    ScalarInlineComplete = 60,
+    ScalarCursorValidate = 61,
+    ScalarClaimSealProbe = 62,
+    ScalarClaimSealConfirm = 63,
+    ScalarNextBlockProbe = 64,
+    ScalarNextBlockConfirm = 65,
+    ScalarPollLocalState = 66,
+    ScalarPollReadyQueue = 67,
+    ScalarPollReadyPool = 68,
+    ScalarPollAdmissionTail = 70,
+    ScalarPollMixState = 71,
+    ScalarPollMixCloseSeal = 72,
+    ScalarPollMixAssignment = 73,
+    ScalarPollMixArrived = 74,
+    ScalarPollMixReleased = 75,
+    ScalarAtomicLoad = 79,
+    ScalarAtomicCas = 80,
+    ScalarAtomicExchange = 81,
+    ScalarAtomicStoreIssue = 82,
+    ScalarAtomicFetchAdd = 83,
+    ScalarAtomicFetchAddIssue = 84,
+    ScalarDcciOut = 85,
+    ScalarDcciSingle = 86,
+    ScalarDcciEntire = 87,
+    ScalarDsbAll = 88,
+    ScalarDsbDdr = 89,
+    ScalarBypassLoad = 90,
+    ScalarBypassStore = 91,
+    ScalarTraceFinish = 92,
+    ScalarTraceFinishClean = 93,
+    ScalarTraceFinishBarrier = 94,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -119,12 +189,152 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "bootstrap";
     case SchedPhaseKind::StateProbe:
         return "state_probe";
-    case SchedPhaseKind::Worksteal:
-        return "worksteal";
     case SchedPhaseKind::Refill:
         return "refill";
     case SchedPhaseKind::Idle:
         return "idle";
+    case SchedPhaseKind::ScalarWindow:
+        return "scalar_window";
+    case SchedPhaseKind::ScalarCompletions:
+        return "scalar_completions";
+    case SchedPhaseKind::ScalarGraphControl:
+        return "scalar_graph_control";
+    case SchedPhaseKind::ScalarFillSlots:
+        return "scalar_fill_slots";
+    case SchedPhaseKind::ScalarAdmission:
+        return "scalar_admission";
+    case SchedPhaseKind::ScalarExecutorScan:
+        return "scalar_executor_scan";
+    case SchedPhaseKind::ScalarPrepare:
+        return "scalar_prepare";
+    case SchedPhaseKind::ScalarSeal:
+        return "scalar_seal";
+    case SchedPhaseKind::ScalarPublishCompletion:
+        return "scalar_publish_completion";
+    case SchedPhaseKind::ScalarAsyncService:
+        return "scalar_async_service";
+    case SchedPhaseKind::ScalarBackoff:
+        return "scalar_backoff";
+    case SchedPhaseKind::ScalarReadyClaim:
+        return "scalar_ready_claim";
+    case SchedPhaseKind::ScalarPayload:
+        return "scalar_payload";
+    case SchedPhaseKind::ScalarResolve:
+        return "scalar_resolve";
+    case SchedPhaseKind::ScalarMix:
+        return "scalar_mix";
+    case SchedPhaseKind::ScalarAsyncCheck:
+        return "scalar_async_check";
+    case SchedPhaseKind::ScalarAsyncFinish:
+        return "scalar_async_finish";
+    case SchedPhaseKind::ScalarBootstrap:
+        return "scalar_bootstrap";
+    case SchedPhaseKind::ScalarLaunchWait:
+        return "scalar_launch_wait";
+    case SchedPhaseKind::ScalarExitDrain:
+        return "scalar_exit_drain";
+    case SchedPhaseKind::ScalarAtomicClaim:
+        return "scalar_atomic_claim";
+    case SchedPhaseKind::ScalarCacheObserve:
+        return "scalar_cache_observe";
+    case SchedPhaseKind::ScalarCachePublish:
+        return "scalar_cache_publish";
+    case SchedPhaseKind::ScalarOrderedFill:
+        return "scalar_ordered_fill";
+    case SchedPhaseKind::ScalarFlushCompletions:
+        return "scalar_flush_completions";
+    case SchedPhaseKind::ScalarLoopControl:
+        return "scalar_loop_control";
+    case SchedPhaseKind::ScalarOrderedPoll:
+        return "scalar_ordered_poll";
+    case SchedPhaseKind::ScalarAdmissionClaim:
+        return "scalar_admission_claim";
+    case SchedPhaseKind::ScalarAdmissionPublish:
+        return "scalar_admission_publish";
+    case SchedPhaseKind::ScalarAdmissionPrepare:
+        return "scalar_admission_prepare";
+    case SchedPhaseKind::ScalarAdmissionCommit:
+        return "scalar_admission_commit";
+    case SchedPhaseKind::ScalarAdmissionRefresh:
+        return "scalar_admission_refresh";
+    case SchedPhaseKind::ScalarOrdinaryPark:
+        return "scalar_ordinary_park";
+    case SchedPhaseKind::ScalarBlockClaim:
+        return "scalar_block_claim";
+    case SchedPhaseKind::ScalarBlockCursorRead:
+        return "scalar_block_cursor_read";
+    case SchedPhaseKind::ScalarAdmissionClose:
+        return "scalar_admission_close";
+    case SchedPhaseKind::ScalarOrdinaryPermit:
+        return "scalar_ordinary_permit";
+    case SchedPhaseKind::ScalarDispatchMetadata:
+        return "scalar_dispatch_metadata";
+    case SchedPhaseKind::ScalarDispatchFill:
+        return "scalar_dispatch_fill";
+    case SchedPhaseKind::ScalarDispatchPublish:
+        return "scalar_dispatch_publish";
+    case SchedPhaseKind::ScalarInlineComplete:
+        return "scalar_inline_complete";
+    case SchedPhaseKind::ScalarCursorValidate:
+        return "scalar_cursor_validate";
+    case SchedPhaseKind::ScalarClaimSealProbe:
+        return "scalar_claim_seal_probe";
+    case SchedPhaseKind::ScalarClaimSealConfirm:
+        return "scalar_claim_seal_confirm";
+    case SchedPhaseKind::ScalarNextBlockProbe:
+        return "scalar_next_block_probe";
+    case SchedPhaseKind::ScalarNextBlockConfirm:
+        return "scalar_next_block_confirm";
+    case SchedPhaseKind::ScalarPollLocalState:
+        return "scalar_poll_local_state";
+    case SchedPhaseKind::ScalarPollReadyQueue:
+        return "scalar_poll_ready_queue";
+    case SchedPhaseKind::ScalarPollReadyPool:
+        return "scalar_poll_ready_pool";
+    case SchedPhaseKind::ScalarPollAdmissionTail:
+        return "scalar_poll_admission_tail";
+    case SchedPhaseKind::ScalarPollMixState:
+        return "scalar_poll_mix_state";
+    case SchedPhaseKind::ScalarPollMixCloseSeal:
+        return "scalar_poll_mix_close_seal";
+    case SchedPhaseKind::ScalarPollMixAssignment:
+        return "scalar_poll_mix_assignment";
+    case SchedPhaseKind::ScalarPollMixArrived:
+        return "scalar_poll_mix_arrived";
+    case SchedPhaseKind::ScalarPollMixReleased:
+        return "scalar_poll_mix_released";
+    case SchedPhaseKind::ScalarAtomicLoad:
+        return "scalar_atomic_load";
+    case SchedPhaseKind::ScalarAtomicCas:
+        return "scalar_atomic_cas";
+    case SchedPhaseKind::ScalarAtomicExchange:
+        return "scalar_atomic_exchange";
+    case SchedPhaseKind::ScalarAtomicStoreIssue:
+        return "scalar_atomic_store_issue";
+    case SchedPhaseKind::ScalarAtomicFetchAdd:
+        return "scalar_atomic_fetch_add";
+    case SchedPhaseKind::ScalarAtomicFetchAddIssue:
+        return "scalar_atomic_fetch_add_issue";
+    case SchedPhaseKind::ScalarDcciOut:
+        return "scalar_dcci_out";
+    case SchedPhaseKind::ScalarDcciSingle:
+        return "scalar_dcci_single";
+    case SchedPhaseKind::ScalarDcciEntire:
+        return "scalar_dcci_entire";
+    case SchedPhaseKind::ScalarDsbAll:
+        return "scalar_dsb_all";
+    case SchedPhaseKind::ScalarDsbDdr:
+        return "scalar_dsb_ddr";
+    case SchedPhaseKind::ScalarBypassLoad:
+        return "scalar_bypass_load";
+    case SchedPhaseKind::ScalarBypassStore:
+        return "scalar_bypass_store";
+    case SchedPhaseKind::ScalarTraceFinish:
+        return "scalar_trace_finish";
+    case SchedPhaseKind::ScalarTraceFinishClean:
+        return "scalar_trace_finish_clean";
+    case SchedPhaseKind::ScalarTraceFinishBarrier:
+        return "scalar_trace_finish_barrier";
     }
     return "unknown";
 }

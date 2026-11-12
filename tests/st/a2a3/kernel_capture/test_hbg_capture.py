@@ -28,17 +28,29 @@ from simpler.task_interface import ChipCallable, CoreCallable
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
+from simpler_setup.runtime_builder import RuntimeBuilder
 
 _ROOT = Path(__file__).resolve().parents[4]
 _NATIVE = Path(__file__).with_name("native")
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.runtime("host_build_graph")]
+pytestmark = [
+    pytest.mark.runtime_product("kernel"),
+    pytest.mark.execution_mode("capture_replay"),
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3"]),
+    pytest.mark.runtime("host_build_graph"),
+]
 
 
 def build_probe(
-    build: Path, *, retained_models: bool = False, args_dump: bool = False, runtime_name: str = "host_build_graph"
+    build: Path,
+    *,
+    retained_models: bool = False,
+    args_dump: bool = False,
+    runtime_name: str = "host_build_graph",
+    platform: str = "a2a3",
 ):
     build.mkdir(parents=True, exist_ok=True)
-    compiler = KernelCompiler("a2a3")
+    compiler = KernelCompiler(platform)
     kernel = compiler.compile_incore(
         str(_NATIVE / ("hbg_inout_step.cpp" if retained_models else "hbg_step.cpp")),
         core_type="aiv",
@@ -70,13 +82,22 @@ def build_probe(
 
     (build / "callable.bin").write_bytes(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
-    runtime = _ROOT / "build/lib/a2a3/onboard" / runtime_name
+    runtime = RuntimeBuilder(platform).get_binaries(runtime_name, build=False)
+    runtime_dir = runtime.host_path.parent
+    assert runtime.dispatcher_path is not None
     command = [
         "c++",
         "-std=c++17",
         "-O2",
         str(_NATIVE / ("hbg_retained_models.cpp" if retained_models else "hbg_driver.cpp")),
-        *([] if retained_models else [str(_NATIVE / "capture_submit_fault.cpp")]),
+        *(
+            []
+            if retained_models
+            else [
+                str(_NATIVE / "capture_submit_fault.cpp"),
+                str(_NATIVE / {"a2a3": "capture_recovery_a2a3.cpp", "a5": "capture_recovery_a5.cpp"}[platform]),
+            ]
+        ),
         f"-I{_ROOT / 'src/common/worker'}",
         f"-I{_ROOT / 'src/common/task_interface'}",
         f"-I{_ROOT / 'src/common'}",
@@ -86,8 +107,8 @@ def build_probe(
         f"-I{cann / 'pkg_inc/runtime'}",
         f"-I{cann / 'pkg_inc/profiling'}",
         f"-I{cann / 'pkg_inc/runtime/runtime'}",
-        f"-L{runtime}",
-        f"-Wl,-rpath,{runtime}",
+        f"-L{runtime_dir}",
+        f"-Wl,-rpath,{runtime_dir}",
         "-lhost_runtime",
         f"-L{cann / 'lib64'}",
         f"-Wl,-rpath,{cann / 'lib64'}",
@@ -103,20 +124,21 @@ def build_probe(
     return [
         str(build / "hbg_driver"),
         str(build / "callable.bin"),
-        str(runtime / "libaicpu_kernel.so"),
-        str(runtime / "aicore_kernel.o"),
-        str(_ROOT / "build/lib/a2a3/dispatcher/libsimpler_aicpu_dispatcher.so"),
+        str(runtime.aicpu_path),
+        str(runtime.aicore_path),
+        str(runtime.dispatcher_path),
     ]
 
 
 @pytest.fixture(scope="module")
-def hbg_capture_probe(tmp_path_factory):
+def hbg_capture_probe(tmp_path_factory, request):
     build = tmp_path_factory.mktemp("hbg-capture")
-    return build, build_probe(build)
+    return build, build_probe(build, platform=request.config.getoption("--platform"))
 
 
+@pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
-    binaries = build_probe(tmp_path, retained_models=True)
+    binaries = build_probe(tmp_path, retained_models=True, platform=request.config.getoption("--platform"))
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend-retained-models"
     logs.mkdir()
@@ -167,9 +189,36 @@ def _run_capture_probe(command, run, env):
     return result
 
 
+def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path) -> None:
+    if scenario == 12:
+        for round_id in (1, 2):
+            assert f"fault-replay={round_id} sync=507011" in stdout
+            assert f"fault-replay={round_id} executed=16" in stdout
+        if platform == "a5":
+            assert stdout.count("stage=resident-progress-timeout rc=0") == 2
+        else:
+            device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
+            assert device_log.count("TIMEOUT_EXIT after_idle_iterations=") == 2, device_log
+    if scenario == 13:
+        for round_id in (1, 2):
+            assert f"boot-failure={round_id} sync=507011" in stdout
+        assert stdout.count("stage=boot-failure-no-user-task rc=0") == 2
+        assert stdout.count("stage=boot-failure-retains-callable rc=0") == 2
+        assert stdout.count("stage=boot-failure-execution-ended rc=0") == 2
+        if platform == "a5":
+            assert stdout.count("stage=resident-bootstrap-failed rc=0") == 2
+            assert "stage=restore-injected-graph-view rc=0" in stdout
+        else:
+            assert "stage=restore-injected-arena-binding rc=0" in stdout
+            device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
+            assert device_log.count("host-orch: prebuilt_arena_base is null") == 2, device_log
+    assert stdout.count("verified=16") == 3
+    assert "stage=release-after-destroy rc=0" in stdout
+
+
 @pytest.mark.parametrize(
     "scenario",
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    [pytest.param(scenario, marks=pytest.mark.platforms(["a2a3", "a5"])) for scenario in range(14)],
     ids=[
         "dependency",
         "early-dispatch",
@@ -189,6 +238,7 @@ def _run_capture_probe(command, run, env):
 )
 def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scenario):
     _, binaries = hbg_capture_probe
+    platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     output = _ROOT / "outputs/hbg-capture"
     output.mkdir(parents=True, exist_ok=True)
@@ -232,25 +282,8 @@ def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scena
         assert "partial-capture core=1 cpu=0 after=0 boundary=0 conflict=107032 launch=107032" in result.stdout
         assert "stage=partial-capture-stops-submission rc=0" in result.stdout
         assert "finalize-capture rc=107032 expected=107032" in result.stdout
-    if scenario == 12:
-        for round_id in (1, 2):
-            assert f"fault-replay={round_id} sync=507011" in result.stdout
-            assert f"fault-replay={round_id} executed=16" in result.stdout
-        device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
-        assert device_log.count("TIMEOUT_EXIT after_idle_iterations=") == 2, device_log
-        assert result.stdout.count("verified=16") == 3
-        assert "stage=release-after-destroy rc=0" in result.stdout
-    if scenario == 13:
-        for round_id in (1, 2):
-            assert f"boot-failure={round_id} sync=507011" in result.stdout
-        assert result.stdout.count("stage=boot-failure-no-user-task rc=0") == 2
-        assert result.stdout.count("stage=boot-failure-retains-callable rc=0") == 2
-        assert result.stdout.count("stage=boot-failure-execution-ended rc=0") == 2
-        assert "stage=restore-injected-arena-binding rc=0" in result.stdout
-        device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
-        assert device_log.count("host-orch: prebuilt_arena_base is null") == 2, device_log
-        assert result.stdout.count("verified=16") == 3
-        assert "stage=release-after-destroy rc=0" in result.stdout
+    if scenario in (12, 13):
+        _check_fault_recovery(scenario, platform, result.stdout, logs)
     captures = 2 if 7 <= scenario <= 11 else 1
     replays = 0 if scenario == 3 else (5 if scenario in (12, 13) else 3)
     assert (

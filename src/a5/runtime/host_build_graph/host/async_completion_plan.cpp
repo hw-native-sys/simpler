@@ -76,7 +76,7 @@ bool plan_async_completion(
         if (groups > SCHEDULER_ASYNC_JOIN_COUNT_MAX || groups > UINT32_MAX - layout.group_count)
             return reject(error, "async group count exceeds join or index capacity");
         AsyncTaskHostPlan task;
-        task.data = {input.task_ref, layout.group_count, static_cast<uint16_t>(input.block_count), mask, 0};
+        task.data = {input.task_ref, layout.group_count, static_cast<uint16_t>(input.block_count), mask};
         task.capacities = input.capacities;
         next.tasks.push_back(task);
         layout.group_count += groups;

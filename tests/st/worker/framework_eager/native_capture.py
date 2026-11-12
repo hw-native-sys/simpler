@@ -21,25 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-def _check_report(reports, runtime, platform, task_queue):
-    if task_queue not in ("0", "1"):
-        raise ValueError("cold capture requires TASK_QUEUE_ENABLE=0 or 1")
-    assert reports == [
-        {
-            "runtime": runtime,
-            "platform": platform,
-            "record_computed": False,
-            "replay_inputs": [2, 7, 19],
-            "expected": [10, 20, 44],
-            "model_retained_until_reset": True,
-            "checked_close": True,
-            "task_queue": task_queue,
-            "tensor_impl_lifetime": "observed" if task_queue == "0" else "not_observed",
-        }
-    ], reports
-
-
-def _check_retained_report(reports, runtime, task_queue):
+def _check_retained_report(reports, runtime, platform, task_queue):
     assert len(reports) == 1, reports
     (report,) = reports
     grants = report["grants"]
@@ -47,7 +29,7 @@ def _check_retained_report(reports, runtime, task_queue):
     count = grants + 1
     assert report == {
         "runtime": runtime,
-        "platform": "a2a3",
+        "platform": platform,
         "task_queue": task_queue,
         "grants": grants,
         "models": count,
@@ -165,10 +147,10 @@ def _retained_child(args, example_path, roots, shim):
     queue = example._task_queue()
     helpers = example._helpers()
     bridge = helpers._load_bridge(args.bridge)
-    callable = helpers._compile(args.runtime, "a2a3")
+    callable = helpers._compile(args.runtime, args.platform)
     torch.npu.set_device(args.device)
     stream = torch.npu.Stream(device=args.device)
-    worker = worker_module.Worker(level=2, device_id=args.device, platform="a2a3", runtime=args.runtime)
+    worker = worker_module.Worker(level=2, device_id=args.device, platform=args.platform, runtime=args.runtime)
     roots.extend((worker, stream))
     handle = worker.register(callable)
     worker.init(borrowed_context_generation=1)
@@ -191,7 +173,7 @@ def _retained_child(args, example_path, roots, shim):
             _destroy_refusal(worker_module, worker, graph, slot, frames, example, shim, RunPreparationRefused)
             return {
                 "runtime": args.runtime,
-                "platform": "a2a3",
+                "platform": args.platform,
                 "task_queue": queue,
                 "expected": replays,
                 "real_destroy_calls": 1,
@@ -248,7 +230,7 @@ def _retained_child(args, example_path, roots, shim):
 
     return {
         "runtime": args.runtime,
-        "platform": "a2a3",
+        "platform": args.platform,
         "task_queue": queue,
         "grants": grants,
         "models": len(models),
@@ -326,11 +308,11 @@ def _destroy_refusal(worker_module, worker, graph, slot, frames, example, shim, 
     assert shim.stats() == rescued
 
 
-def _check_destroy_report(reports):
+def _check_destroy_report(reports, platform):
     assert reports == [
         {
             "runtime": "tensormap_and_ringbuffer",
-            "platform": "a2a3",
+            "platform": platform,
             "task_queue": "0",
             "expected": [10, 20, 44],
             "real_destroy_calls": 1,
@@ -352,7 +334,6 @@ def main():
     args = parser.parse_args()
     example = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/native_capture.py"
     if args.retained_child:
-        assert args.platform == "a2a3"
         roots = []
         try:
             shim = _DestroyShim() if args.destroy_refusal else None
@@ -373,7 +354,7 @@ def main():
     argv = [
         sys.executable,
         "-u",
-        str(Path(__file__).resolve() if args.platform == "a2a3" else example),
+        str(Path(__file__).resolve()),
         "--runtime",
         args.runtime,
         "--platform",
@@ -382,12 +363,13 @@ def main():
         str(args.device),
         "--bridge",
         str(args.bridge.resolve()),
+        "--output",
+        str(args.output),
+        "--retained-child",
     ]
-    if args.platform == "a2a3":
-        argv += ["--output", str(args.output), "--retained-child"]
     env = {**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0", "ASCEND_PROCESS_LOG_PATH": str(ascend.resolve())}
     if args.destroy_refusal:
-        assert args.platform == "a2a3" and args.runtime == "tensormap_and_ringbuffer"
+        assert args.runtime == "tensormap_and_ringbuffer"
         assert env.get("TASK_QUEUE_ENABLE") == "0" and not env.get("LD_PRELOAD")
         shim_path = args.output / "native_capture_destroy_shim.so"
         command = [
@@ -428,11 +410,9 @@ def main():
     ]
     queue = os.environ.get("TASK_QUEUE_ENABLE", "1")
     if args.destroy_refusal:
-        _check_destroy_report(reports)
-    elif args.platform == "a2a3":
-        _check_retained_report(reports, args.runtime, queue)
+        _check_destroy_report(reports, args.platform)
     else:
-        _check_report(reports, args.runtime, args.platform, queue)
+        _check_retained_report(reports, args.runtime, args.platform, queue)
     print("COLD_CAPTURE_PAYLOAD_PASS " + json.dumps(reports[0]), flush=True)
 
 

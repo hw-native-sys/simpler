@@ -50,7 +50,6 @@ struct EntryPoints {
 
 void *primary_entry_points() { return &entry_points; }
 void *alternate_entry_points() { return &other_entry_points; }
-void set_dep_gen_capture(bool enabled) { dep_gen_host_graph_set_enabled(enabled); }
 uint32_t arena_bank(uint32_t slot) { return slot; }
 
 }  // namespace native_admission_test

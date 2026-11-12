@@ -196,8 +196,6 @@ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() { return nullptr; }
 PmuAicoreRing *get_aicore_pmu_ring() { return nullptr; }
 uint64_t get_aicore_pmu_reg_base() { return 0; }
 uint64_t get_aicore_report_epoch() { return report_epoch; }
-// These cases exit before resident dispatch can access the hardware SSBUF.
-uint64_t platform_ssbuf_hardware_base_address() { return 0; }
 
 TEST(HbgNonceExitDeathTest, ResidentFailureBeforeReadyWaitsForCurrentExit) {
     for (auto epoch : {0ULL, 42ULL})

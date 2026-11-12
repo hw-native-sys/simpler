@@ -96,7 +96,6 @@ inline SchedulerRunControl *aicore_scheduler_run_control(SchedulerWorkerContext 
 inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerContext &context) {
     return {
         context.graph_storage_address,
-        context.graph_reserved_address,
         context.graph_task_count,
         context.task_window_last_index,
         context.scheduler_state_base_address,

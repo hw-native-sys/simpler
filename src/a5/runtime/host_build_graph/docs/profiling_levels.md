@@ -476,24 +476,22 @@ processing uses flat, non-overlapping phases:
 - `complete` consumes a Completion Inbox entry and marks the task done.
 - `resolve` updates successor dependencies and publishes newly Ready tasks.
 - `state_probe` checks Scheduler-local Dispatch Slot / Ready state, acquires a task from a Ready
-  Inbox locally or by stealing, and decides immediate or deferred placement.
-- `dispatch` fills and publishes a task acquired from the local Inbox.
-- `worksteal` fills and publishes a task acquired from another Inbox; the steal
-  operation itself is included in `state_probe`.
+  pool for its core class, and decides immediate or deferred placement.
+- `dispatch` fills and publishes a task acquired from the shared ready pool.
 - `refill` republishes a completed Slot with replacement work.
 
 A compatible single-fanin successor selected during completion resolution uses
 the `DIRECT_RESOLVE` source and moves directly from `resolve` to `refill`
-without a `state_probe`. A replacement acquired from a Ready Inbox retains its
+without a `state_probe`. A replacement acquired from a ready pool retains its
 `state_probe` even when the completed Slot is reused through `refill`.
 
 Deferred waiting is not emitted as a Scheduler phase. The original
 `state_probe` ends before the wait, and the eventual publication begins at its
 actual `dispatch` or `refill` start.
 
-Every executed task is published by exactly one of `dispatch`, `worksteal`, or
-`refill`. The converter displays these phases as Completion, Resolve,
-StateProbe, Dispatch, Worksteal, and Refill.
+Every executed task is published by exactly one of `dispatch` or `refill`.
+The converter displays these phases as Completion, Resolve, StateProbe,
+Dispatch, and Refill.
 
 At level 1 the AICore record carries the full `task_token`
 (a `TaskId`; see `src/common/host_build_graph/task_id.h`), read straight from

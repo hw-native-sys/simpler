@@ -17,9 +17,7 @@
 
 inline __aicore__ bool scheduler_async_finish_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerAsyncLocalState &async, uint32_t budget, bool &made_progress, uint64_t profiling_level = 0,
-    SchedulerWakeStats *wake = nullptr, SchedulerReadyStats *ready = nullptr,
-    SchedulerCompletionStats *completion = nullptr
+    SchedulerAsyncLocalState &async, uint32_t budget, bool &made_progress, uint64_t profiling_level = 0
 ) {
     using namespace scheduler_async_detail;
     made_progress = false;
@@ -58,9 +56,8 @@ inline __aicore__ bool scheduler_async_finish_step(
         scheduler_protocol_task_done(base, local, task_ref, false, true);
     }
     const SchedulerResolveCursor before = cursor;
-    const auto result = scheduler_resolve_completion_step(
-        graph, base, local, run, task_ref, cursor, budget, wake, ready, completion, profiling_level
-    );
+    const auto result =
+        scheduler_resolve_completion_step(graph, base, local, run, task_ref, cursor, budget, profiling_level);
     scheduler_async_copy_resolver(progress[index].resolver, cursor);
     publish(&progress[index], sizeof(SchedulerAsyncFinishProgress));
     if (result.result == SchedulerResolveResult::ERROR) return failed();
@@ -85,8 +82,7 @@ inline __aicore__ bool scheduler_async_finish_step(
 
 inline __aicore__ bool scheduler_service_async_slice(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, bool &made_progress, SchedulerWakeStats *wake = nullptr,
-    SchedulerReadyStats *ready = nullptr, SchedulerCompletionStats *completion = nullptr
+    uint64_t profiling_level, bool &made_progress
 ) {
     made_progress = false;
     if (local->async == nullptr) return true;
@@ -98,11 +94,12 @@ inline __aicore__ bool scheduler_service_async_slice(
     if (scheduler_read_error(run) != 0) return false;
     const bool finish = async.finish_first;
     async.finish_first = !finish;
+    SchedulerScalarScope scalar_step(
+        local, finish ? SchedPhaseKind::ScalarAsyncFinish : SchedPhaseKind::ScalarAsyncCheck
+    );
     const bool ok =
         finish ?
-            scheduler_async_finish_step(
-                graph, base, local, run, async, 8, made_progress, profiling_level, wake, ready, completion
-            ) :
+            scheduler_async_finish_step(graph, base, local, run, async, 8, made_progress, profiling_level) :
             scheduler_async_check_step(
                 async, UINT32_C(1) << local->config.self_core_type, 8, SchedulerAsyncCompletionObserver{}, made_progress
             );

@@ -2874,7 +2874,7 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
             reason = "requested communication workspace combination is unsupported by this runtime";
             break;
         case COMM_DOMAIN_URMA_CONFIG_INVALID:
-            reason = "URMA requires ranks in dense prefix order and a valid communication window";
+            reason = "invalid URMA domain rank mapping or communication window; check host logs";
             break;
         case COMM_DOMAIN_URMA_INIT_FAILED:
             reason = "URMA workspace initialization failed; check device/HCCL resources and host logs";

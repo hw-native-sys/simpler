@@ -194,19 +194,38 @@ def test_a5_urma_has_no_build_selection(ambient, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "platform,runtime,members,message",
+    "platform,runtime,message",
     [
-        ("a2a3sim", "tensormap_and_ringbuffer", [0, 1], "requires A5"),
-        ("a5", "host_build_graph", [0, 1], "tensormap_and_ringbuffer"),
-        ("a5", "tensormap_and_ringbuffer", [1, 0], "dense prefix"),
+        ("a2a3sim", "tensormap_and_ringbuffer", "requires A5"),
+        ("a5sim", "tensormap_and_ringbuffer", "requires A5"),
+        ("a5", "host_build_graph", "tensormap_and_ringbuffer"),
     ],
 )
-def test_unsupported_urma_domains_are_rejected_before_control(platform, runtime, members, message):
+def test_unsupported_urma_domains_are_rejected_before_control(platform, runtime, message):
     from simpler.worker import Worker  # noqa: PLC0415
 
     worker = Worker(level=3, platform=platform, runtime=runtime, device_ids=[0, 1], num_sub_workers=0)
     with pytest.raises(ValueError, match=message):
-        worker._domain_config(members, 4096, [], False, ("urma",))
+        worker._domain_config([0, 1], 4096, [], False, ("urma",))
+
+
+@pytest.mark.parametrize("members", [(1, 2), (2, 1)])
+def test_device_urma_configuration_preserves_ordered_members(members):
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker = Worker(level=3, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[1, 2, 3], num_sub_workers=0)
+    config = worker._domain_config(members, 4096, [], False, ("sdma", "urma"))
+    assert config.members == members
+    assert config.workspace_engines == ("sdma", "urma")
+
+
+def test_host_urma_configuration_keeps_dense_prefix_requirement():
+    from simpler.task_interface import AddressSpace  # noqa: PLC0415
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    worker = Worker(level=3, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[0, 1], num_sub_workers=0)
+    with pytest.raises(ValueError, match="dense prefix"):
+        worker._domain_config([1, 0], 4096, [], False, ("urma",), AddressSpace.HOST)
 
 
 def test_single_rank_urma_configuration_is_delegated_to_provider():
