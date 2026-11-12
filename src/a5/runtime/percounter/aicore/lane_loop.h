@@ -245,7 +245,7 @@ struct PercounterFaninView {
 /** True when the lane should stop: EXIT is signalled or some lane has failed. */
 inline __aicore__ bool percounter_should_stop(const LaneConfig &cfg) {
     return static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL ||
-           scheduler_gm_query(cfg.control->lane_error) != 0;
+           percounter_gm_read(cfg.control->lane_error) != 0;
 }
 
 /**
@@ -375,8 +375,8 @@ inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const PercounterTask &ta
  */
 inline __aicore__ void
 percounter_publish_completion(const LaneConfig &cfg, const PercounterTask &task, uint64_t count) {
-    scheduler_gm_fetch_add(cfg.counters[task.id].value, count);
-    if (task.sink) scheduler_gm_fetch_add(cfg.counters[task.shell].value, count);
+    percounter_gm_fetch_add(cfg.counters[task.id].value, count);
+    if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, count);
 }
 
 /**
@@ -403,14 +403,14 @@ inline __aicore__ __gm__ pto2::resident::AsyncGroupData *
 percounter_init_async_records(__gm__ PercounterControl *control, int block_idx) {
     using pto2::resident::AsyncGroupData;
     const uint64_t lane = static_cast<uint64_t>(block_idx);
-    const uint32_t capacity = static_cast<uint32_t>(scheduler_gm_query(control->async_capacity));
+    const uint32_t capacity = static_cast<uint32_t>(percounter_gm_read(control->async_capacity));
     const uint64_t entry_bytes = capacity * sizeof(DeferredCompletionEntry);
     const uint64_t first = lane * PERCOUNTER_ASYNC_SLOTS;
     auto *records = scheduler_state_at<AsyncGroupData>(
-        control, scheduler_gm_query(control->async_groups_offset) + first * sizeof(AsyncGroupData)
+        control, percounter_gm_read(control->async_groups_offset) + first * sizeof(AsyncGroupData)
     );
-    const uint64_t entries_base = scheduler_gm_query(control->async_entries_offset) + first * entry_bytes;
-    const uint64_t epoch = scheduler_gm_query(control->async_run_epoch);
+    const uint64_t entries_base = percounter_gm_read(control->async_entries_offset) + first * entry_bytes;
+    const uint64_t epoch = percounter_gm_read(control->async_run_epoch);
     for (uint32_t slot = 0; slot < PERCOUNTER_ASYNC_SLOTS; ++slot) {
         auto *record = &records[slot];
         record->run_epoch = epoch;
@@ -516,7 +516,7 @@ inline __aicore__ bool percounter_async_seal(
     held.task_id = task.id;
     held.shell = task.shell;
     held.sink = task.sink;
-    scheduler_gm_fetch_add(cfg.control->async_outstanding, uint64_t{1});
+    percounter_gm_fetch_add(cfg.control->async_outstanding, uint64_t{1});
     ++state->async_outstanding_hint;
     *deferred = true;
     return true;
@@ -539,8 +539,8 @@ inline __aicore__ bool percounter_async_seal(
  */
 inline __aicore__ void percounter_async_settle(const LaneConfig &cfg, PercounterLaneState *state, uint32_t slot) {
     PercounterAsyncSlot &held = state->async_slots[slot];
-    scheduler_gm_fetch_add(cfg.counters[held.task_id].value, uint64_t{1});
-    if (held.sink) scheduler_gm_fetch_add(cfg.counters[held.shell].value, uint64_t{1});
+    percounter_gm_fetch_add(cfg.counters[held.task_id].value, uint64_t{1});
+    if (held.sink) percounter_gm_fetch_add(cfg.counters[held.shell].value, uint64_t{1});
     held.pending_mask = 0;
     __gm__ pto2::resident::AsyncGroupData *record = &cfg.async_group[slot];
     record->count = 0;
@@ -550,8 +550,8 @@ inline __aicore__ void percounter_async_settle(const LaneConfig &cfg, Percounter
     record->reservation_written = 0;
     record->state = pto2::resident::AsyncPublicationState::OPEN;
     dcci((__gm__ uint8_t *)record, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    scheduler_gm_fetch_add(cfg.control->async_settled, uint64_t{1});
-    scheduler_gm_fetch_add(cfg.control->async_outstanding, ~uint64_t{0});
+    percounter_gm_fetch_add(cfg.control->async_settled, uint64_t{1});
+    percounter_gm_fetch_add(cfg.control->async_outstanding, ~uint64_t{0});
 }
 
 /**
@@ -1224,7 +1224,7 @@ percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state, u
         // exit predicate rather than on this order: a lane does not leave
         // while `async_outstanding` is non-zero, and a deferred cohort block
         // keeps it non-zero until its conditions hold.
-        scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
+        percounter_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
         // The count this block just raised is what the next cohort waits on,
         // and the lane that raises it is the only one that knows it changed.
         percounter_sync_promote(cfg);
@@ -1299,7 +1299,7 @@ inline __aicore__ bool percounter_sync_serve_released(
     if (percounter_line_staging_for(cfg)) return true;
     // Cohorts are promoted in sequence order, so this one is fully claimed
     // exactly when the counter passes it.
-    if (scheduler_gm_query(cfg.sync_queue->released) > sync->my_seq) {
+    if (percounter_gm_read(cfg.sync_queue->released) > sync->my_seq) {
         const bool ok = percounter_sync_serve_block(cfg, state, timeout_cycles);
         *served = sync->my_block < 0;
         return ok;
@@ -1561,8 +1561,8 @@ percounter_lane_may_exit(const LaneConfig &cfg, const PercounterLaneState *state
     // watchdog. The outstanding count gates completion only: it falls as well
     // as rises, and a term that can fall would refresh that watchdog on a
     // device going nowhere.
-    done += scheduler_gm_query(cfg.control->async_settled);
-    complete = complete && scheduler_gm_query(cfg.control->async_outstanding) == 0;
+    done += percounter_gm_read(cfg.control->async_settled);
+    complete = complete && percounter_gm_read(cfg.control->async_outstanding) == 0;
     *progress = done;
     return complete && state->sync.my_block < 0;
 }
@@ -1677,14 +1677,14 @@ inline __aicore__ bool percounter_serve_mix(
     // it can only make the task look less complete, so a consumer waits
     // longer, never starts early.
     if (deferred) {
-        scheduler_gm_fetch_add(cfg.counters[task.id].value, ~uint64_t{0});
-        if (task.sink) scheduler_gm_fetch_add(cfg.counters[task.shell].value, ~uint64_t{0});
+        percounter_gm_fetch_add(cfg.counters[task.id].value, ~uint64_t{0});
+        if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, ~uint64_t{0});
     }
     // After the kernel's store barrier, so a peer that observes this token has
     // observed the subtask's outputs -- and after the subtraction above, which
     // is what orders it before the publisher's add: that lane only adds once
     // it has acquire-read this token.
-    scheduler_ssbuf_store_release(&signal->finished[lane], generation);
+    percounter_ssbuf_store_release(&signal->finished[lane], generation);
 
     if ((uint32_t{1} << lane) == (mask & (~mask + 1U))) {
         if (!percounter_mix_wait(cfg, signal->finished, mask, generation, timeout_cycles)) return false;
@@ -2035,10 +2035,10 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
         groups == 0 ? 1 : (groups > PERCOUNTER_TICKET_CAPACITY ? PERCOUNTER_TICKET_CAPACITY : groups)
     );
     cfg.ticket_group = static_cast<uint32_t>(coordinate.cluster_index) % cfg.ticket_group_count;
-    cfg.has_predicates = scheduler_gm_query(control->has_predicates) != 0;
+    cfg.has_predicates = percounter_gm_read(control->has_predicates) != 0;
     cfg.async_group = percounter_init_async_records(control, block_idx);
     cfg.async_group_offset =
-        scheduler_gm_query(control->async_groups_offset) +
+        percounter_gm_read(control->async_groups_offset) +
         static_cast<uint64_t>(block_idx) * PERCOUNTER_ASYNC_SLOTS * sizeof(pto2::resident::AsyncGroupData);
     cfg.async_group_base_index = static_cast<uint32_t>(block_idx) * PERCOUNTER_ASYNC_SLOTS;
     cfg.cluster_index = coordinate.cluster_index;
