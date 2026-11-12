@@ -1,6 +1,6 @@
 ---
 name: onboard-arch-precheck
-description: Detect the host's actual Ascend silicon and refuse mismatched `--platform` onboard hardware test invocations BEFORE any device is locked. MUST invoke this skill before running pytest or task-submit commands that use `--platform a2a3` or `--platform a5` (onboard only — sim variants pass through). Use when invoking onboard hardware tests, repro'ing flaky-test reports, or wrapping pytest in task-submit. Skip for `--platform a2a3sim` / `--platform a5sim` (silicon-agnostic).
+description: Detect the host's actual Ascend silicon and refuse mismatched onboard hardware tests. On shared hosts, acquire a task-submit device allocation first and run the precheck and hardware test in that same job. Skip for a2a3sim and a5sim.
 ---
 
 # Onboard Arch Precheck
@@ -41,8 +41,7 @@ Invoke `check.sh` BEFORE running ANY of these commands:
 
 - `pytest ... --platform a2a3 ...` (onboard)
 - `pytest ... --platform a5 ...` (onboard)
-- `task-submit ... --run "... pytest ... --platform a2a3 ..."`
-- `task-submit ... --run "... pytest ... --platform a5 ..."`
+- The pytest command inside a `task-submit` allocation using either onboard platform
 - `python test_*.py -p a2a3 ...` / `-p a5 ...` (standalone scene-test runner)
 - Any wrapper script that calls the above
 
@@ -65,9 +64,10 @@ silicon by definition. Wasting the precheck on them adds latency.
 .claude/skills/onboard-arch-precheck/check.sh "$ARCH" || exit 1
 pytest ... --platform "$ARCH" ...
 
-# Before task-submit (gate BEFORE the device lock):
-.claude/skills/onboard-arch-precheck/check.sh "$ARCH" || exit 1
-task-submit --device auto --device-num 1 --run "pytest ... --platform $ARCH ..."
+# Shared hosts: query and test within the same device allocation.
+task-submit --device auto --device-num 1 --env ARCH --run \
+  '.claude/skills/onboard-arch-precheck/check.sh "$ARCH" && \
+   pytest ... --platform "$ARCH" --device "$TASK_DEVICE"'
 ```
 
 `check.sh` exits:
@@ -86,11 +86,18 @@ in-flight `task-submit` device locks).
 
 Pipeline:
 
-1. `npu-smi info -t board -i 0 -c 0` → get `Chip Name` and, when reported, `NPU Name` (~600 ms,
-   no ACL init, no device binding). On failure, retry the same query via
-   `task-submit --run "…"` when available, since some shared hosts restrict
-   DCMI to root. If it still fails, try `npu-smi info -t board -i 0` without
-   `-c 0`, with the same privilege retry: some devices/tools reject `-c`.
+1. Query for `Chip Name` and, when reported, `NPU Name` (~600 ms, no ACL
+   init or binding). A5 queries the first device in `TASK_DEVICE` (default `0`
+   outside an allocation) via `npu-smi info -t board -i <device>`; its driver
+   rejects `-c`. A2/A3 query card `0` (`npu-smi info -t board -i 0 -c 0`,
+   then without `-c 0` if that fails): `npu-smi -i` takes the NPU/card ID
+   while `TASK_DEVICE` is the task-submit logic ID, and the two differ on
+   A2/A3 multi-chip hosts, so card `0` — which always exists and suffices for
+   arch detection — is queried instead. Outside an allocation, the script
+   retains the `task-submit --run "…"` privilege retry where host policy
+   permits it. Shared hosts must use the allocated-job example above.
+   A call already inside a task allocation (`TASKQUEUE_INSIDE` is set) never
+   submits another task: it tries that platform's queries directly and retains failures.
    Retries depend on exit status; only a successful query is parsed. If all
    attempts fail, report their commands, exit statuses and output, then exit 1.
    A successful but unusable board report is retained in detection errors.
@@ -128,7 +135,8 @@ so you know exactly what silicon was detected (e.g.
 
 - **Multi-arch hosts**: not a real configuration in this org's fleet. If
   one ever exists, the cache will need to be keyed by `npu-smi info -i N`
-  per-device. The skill currently inspects device 0 only.
+  per-device. A5 inspects the first granted device (device 0 outside an
+  allocation); A2/A3 inspect card 0.
 - **Sim builds**: intentionally pass through — they're silicon-agnostic by
   construction (`src/{arch}/platform/sim/`).
 - **vNPU / virtualization**: irrelevant here — vNPU slicing happens within
@@ -143,8 +151,7 @@ so you know exactly what silicon was detected (e.g.
 
 - [running-onboard.md](../../rules/running-onboard.md) — sister
   rule that says all hardware work goes through `task-submit`. The
-  precheck runs BEFORE `task-submit` to avoid wasteful device lock
-  acquisition on a doomed-to-fail invocation.
+  precheck and test run within the same device allocation on shared hosts.
 - [chip-architecture.md SoC → arch mapping](../../../docs/hardware/chip-architecture.md#identifying-which-chip-generation-you-have) —
   the authoritative table for `Short_SoC_version` → repo arch. The
   `npu-smi` `Chip Name` can contain a family name or a full SoC. Both paths

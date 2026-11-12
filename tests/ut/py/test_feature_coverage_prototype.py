@@ -54,7 +54,7 @@ class TestL2:
 @pytest.mark.runtime_product("kernel")
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.execution_mode("capture_replay")
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3", "a5"])
 def test_native_capture():
     pass
 """
@@ -259,12 +259,13 @@ def test_skip_exemption_cannot_replace_required_group(execution):
     assert "Required feature groups absent" in result.stderr
 
 
-def test_a5_does_not_claim_native_capture(execution):
+def test_a5_requires_native_hbg_capture(execution):
     result, plan, _ = execution(SOURCE, "--verify-feature-coverage", "--platform", "a5", require_capture=False)
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(plan.with_suffix(".coverage.json").read_text())
-    assert "kernel/host_build_graph/capture_replay" in report["not_delivered"]
-    assert all("capture_replay" not in group for group in report["groups"])
+    assert "kernel/host_build_graph/capture_replay" in json.loads(plan.read_text())["coverage"]["required_groups"]
+    assert report["groups"]["kernel/host_build_graph/capture_replay"]["passed"] == 1
+    assert report["not_delivered"] == ["kernel/tensormap_and_ringbuffer/capture_replay"]
 
 
 def test_manual_only_does_not_demand_nonmanual_groups(execution):

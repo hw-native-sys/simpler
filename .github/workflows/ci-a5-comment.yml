@@ -37,53 +37,55 @@ jobs:
               return;
             }
             const user = context.payload.comment.user.login;
-            let permission = null;
+            let access = null;
             try {
               const response = await github.rest.repos.getCollaboratorPermissionLevel({
                 ...context.repo, username: user,
               });
-              permission = response.data.permission;
+              access = response.data;
             } catch (error) {
               core.info(`cannot verify repo permission for ${user}`);
             }
-            if (permission !== 'admin') {
-              core.setFailed(`denied: ${user} requires admin repo permission to trigger /run-a5`);
+            if (access?.permission !== 'admin' && access?.role_name !== 'maintain') {
+              core.setFailed(`denied: ${user} requires maintain or admin repo permission to trigger /run-a5`);
               return;
             }
-            // GitHub computes the test merge asynchronously; a comment issued
-            // right after a push can observe mergeable=null. Wait for a bounded
-            // interval instead of rejecting a healthy PR.
+            // PR metadata and its test merge can describe different snapshots
+            // while GitHub refreshes a merge after a push or base update.
             const MERGEABILITY_RETRY_MS = 5000;
             const MERGEABILITY_ATTEMPTS = 12;
-            let { data: pr } = await github.rest.pulls.get({
-              ...context.repo, pull_number: context.payload.issue.number,
-            });
-            for (let attempt = 0; pr.mergeable == null && attempt < MERGEABILITY_ATTEMPTS; attempt += 1) {
-              core.info(`PR mergeability is pending; waiting ${MERGEABILITY_RETRY_MS} ms (attempt ${attempt + 1}/${MERGEABILITY_ATTEMPTS})`);
-              await new Promise(resolve => setTimeout(resolve, MERGEABILITY_RETRY_MS));
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            let pr, mergeSha;
+            for (let attempt = 0; attempt <= MERGEABILITY_ATTEMPTS; attempt += 1) {
               ({ data: pr } = await github.rest.pulls.get({
                 ...context.repo, pull_number: context.payload.issue.number,
               }));
-            }
-            const repository = `${context.repo.owner}/${context.repo.repo}`;
-            if (pr.state !== 'open' || pr.number !== context.payload.issue.number ||
-                pr.base.ref !== 'main' ||
-                pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase() ||
-                !pr.head.repo || !/^[\w.-]+\/[\w.-]+$/.test(pr.head.repo.full_name) ||
-                !/^[0-9a-f]{40}$/i.test(pr.head.sha)) {
-              core.setFailed('/run-a5 requires an open PR targeting this repo main with an available head');
-              return;
-            }
-            const mergeSha = pr.merge_commit_sha;
-            if (pr.mergeable !== true || !/^[0-9a-f]{40}$/i.test(mergeSha || '')) {
-              core.setFailed('PR merge snapshot unavailable or conflicting; update the PR and issue a new command');
-              return;
-            }
-            const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: mergeSha });
-            if (commit.sha !== mergeSha || commit.parents.length !== 2 ||
-                commit.parents[0].sha !== pr.base.sha || commit.parents[1].sha !== pr.head.sha) {
-              core.setFailed('PR merge snapshot is stale; issue a new command after GitHub refreshes it');
-              return;
+              if (pr.state !== 'open' || pr.number !== context.payload.issue.number ||
+                  pr.base.ref !== 'main' ||
+                  pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase() ||
+                  !pr.head.repo || !/^[\w.-]+\/[\w.-]+$/.test(pr.head.repo.full_name) ||
+                  !/^[0-9a-f]{40}$/i.test(pr.head.sha)) {
+                core.setFailed('/run-a5 requires an open PR targeting this repo main with an available head');
+                return;
+              }
+              if (pr.mergeable === false) {
+                core.setFailed('PR merge snapshot unavailable or conflicting; update the PR and issue a new command');
+                return;
+              }
+              mergeSha = pr.merge_commit_sha;
+              let reason = 'PR merge snapshot unavailable or conflicting; update the PR and issue a new command';
+              if (pr.mergeable === true && /^[0-9a-f]{40}$/i.test(mergeSha || '')) {
+                const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: mergeSha });
+                if (commit.sha === mergeSha && commit.parents.length === 2 &&
+                    commit.parents[0].sha === pr.base.sha && commit.parents[1].sha === pr.head.sha) break;
+                reason = 'PR merge snapshot is stale; issue a new command after GitHub refreshes it';
+              }
+              if (attempt === MERGEABILITY_ATTEMPTS) {
+                core.setFailed(reason);
+                return;
+              }
+              core.info(`PR merge snapshot is pending or stale; retrying in ${MERGEABILITY_RETRY_MS} ms (attempt ${attempt + 1}/${MERGEABILITY_ATTEMPTS})`);
+              await new Promise(resolve => setTimeout(resolve, MERGEABILITY_RETRY_MS));
             }
             core.setOutput('head_sha', pr.head.sha);
             core.setOutput('base_sha', pr.base.sha);

@@ -834,7 +834,7 @@ For every added or modified case, check:
 5. **Obligations stay satisfiable.** Coverage groups are `program/<runtime>`,
    `auxiliary/<runtime>` and `kernel/<runtime>/<mode>`. Default onboard sweeps
    require Program and Kernel eager for both runtimes (plus native HBG capture
-   on A2/A3); framework sweeps require Kernel eager and their declared capture
+   on A2/A3 and A5); framework sweeps require Kernel eager and their declared capture
    groups. Flag removal or rename of the only case satisfying a mandatory
    group, or a partition narrowed without CI-visible justification.
 6. **Receipt invariants** (only when the PR edits the coverage machinery): an

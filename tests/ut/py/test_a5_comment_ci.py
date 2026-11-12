@@ -38,14 +38,18 @@ const core = {
   summary: {addRaw: text => {state.summary = text;}, write: async () => {}},
 };
 let pullIndex = 0;
+let commitIndex = 0;
 const github = {rest: {
   repos: {getCollaboratorPermissionLevel: async args => {
     state.calls.push({api: 'permission', args});
     if (input.permissionError) throw new Error('permission unavailable');
-    return {data: {permission: input.permission}};
+    return {data: {permission: input.permission, role_name: input.roleName}};
   }, getCommit: async args => {
     state.calls.push({api: 'commit', args});
-    return {data: input.commit};
+    const sequence = input.commitSequence || [input.commit];
+    const commit = sequence[Math.min(commitIndex, sequence.length - 1)];
+    commitIndex += 1;
+    return {data: commit};
   }},
   pulls: {get: async args => {
     state.calls.push({api: 'pull', args});
@@ -202,6 +206,15 @@ def test_admin_command_resolves_fork_and_full_head_sha(body):
     ]
 
 
+def test_maintainer_role_can_admit_a5_with_write_permission():
+    fixture = _fixture()
+    fixture.update(permission="write", roleName="maintain")
+    result = _execute("gate-and-resolve", fixture)
+    assert result["failures"] == []
+    assert result["outputs"]["ready"] == "true"
+    assert result["outputs"]["ref"] == _MERGE
+
+
 @pytest.mark.parametrize("mutation", [None, "conflict", "pending", "stale_head", "stale_base", "missing"])
 def test_comment_lanes_pin_matching_merge_parents(mutation):
     fixture = _fixture()
@@ -264,6 +277,23 @@ def test_pending_mergeability_then_stale_snapshot_is_rejected():
     assert result["failures"]
     assert "stale" in result["failures"][0]
     assert result["outputs"] == {"ready": "false"}
+    assert len([call for call in result["calls"] if call["api"] == "pull"]) == 13
+
+
+def test_stale_merge_snapshot_refreshes_before_admission():
+    fixture = _fixture()
+    previous = "a" * 40
+    fixture["prSequence"] = [dict(fixture["pr"], merge_commit_sha=previous), fixture["pr"]]
+    fixture["commitSequence"] = [
+        {"sha": previous, "parents": [{"sha": "d" * 40}, {"sha": _SHA}]},
+        fixture["commit"],
+    ]
+    result = _execute("gate-and-resolve", fixture)
+    assert result["failures"] == []
+    assert result["outputs"]["ready"] == "true"
+    assert result["outputs"]["ref"] == _MERGE
+    assert len([call for call in result["calls"] if call["api"] == "pull"]) == 2
+    assert [call["args"]["ref"] for call in result["calls"] if call["api"] == "commit"] == [previous, _MERGE]
 
 
 @pytest.mark.parametrize("attempt", ["0", "2", "3"])
@@ -296,7 +326,7 @@ def test_non_pr_comment_is_ignored():
 
 
 @pytest.mark.parametrize("permission", ["write", "maintain", "read", "none", None, "api-error"])
-def test_non_admin_and_permission_failure_never_resolve_a_head(permission):
+def test_unprivileged_or_unverified_access_never_resolves_a_head(permission):
     fixture = _fixture()
     fixture["permission"] = permission
     fixture["permissionError"] = permission == "api-error"

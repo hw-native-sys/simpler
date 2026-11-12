@@ -19,7 +19,9 @@ import pytest
 _CHECK = Path(__file__).resolve().parents[3] / ".claude/skills/onboard-arch-precheck/check.sh"
 
 
-def _run_check(tmp_path, chip, npu, requested, soc, short, *, board_status=0, privileged_board=None):
+def _run_check(
+    tmp_path, chip, npu, requested, soc, short, *, board_status=0, privileged_board=None, inside=False, device=""
+):
     binary = tmp_path / "bin"
     binary.mkdir()
     cache = tmp_path / "cache"
@@ -45,7 +47,14 @@ def _run_check(tmp_path, chip, npu, requested, soc, short, *, board_status=0, pr
         command.chmod(0o755)
     result = subprocess.run(
         ["bash", str(_CHECK), requested],
-        env={**os.environ, "PATH": f"{binary}:/usr/bin:/bin", "TMPDIR": str(cache), "ASCEND_HOME_PATH": str(cann)},
+        env={
+            **os.environ,
+            "PATH": f"{binary}:/usr/bin:/bin",
+            "TMPDIR": str(cache),
+            "ASCEND_HOME_PATH": str(cann),
+            "TASKQUEUE_INSIDE": "1" if inside else "",
+            "TASK_DEVICE": device,
+        },
         text=True,
         capture_output=True,
         check=False,
@@ -71,7 +80,7 @@ def _run_check(tmp_path, chip, npu, requested, soc, short, *, board_status=0, pr
 def test_actual_precheck_maps_only_the_installed_soc(tmp_path, chip, npu, soc, short, actual, requested):
     result, commands, _, cache = _run_check(tmp_path, chip, npu, requested, soc, short)
     assert result.returncode == (0 if requested == actual else 2), result.stdout + result.stderr
-    assert commands == [["npu-smi", "info", "-t", "board", "-i", "0", "-c", "0"]]
+    assert commands == [["npu-smi", "info", "-t", "board", "-i", "0", *([] if requested == "a5" else ["-c", "0"])]]
     assert next(cache.glob("*.cache")).read_text() == f"{actual}|{soc}|{short}\n"
     if requested != actual:
         assert "ARCH MISMATCH" in result.stderr
@@ -125,6 +134,31 @@ def test_all_nonzero_queries_preserve_exit_statuses_and_output(tmp_path):
     assert "(exit=7)" in result.stderr and "DCMI permission denied" in result.stderr
     assert "(exit=19)" in result.stderr and "unexpected privileged query" in result.stderr
     assert not list(cache.glob("*.cache"))
+
+
+def test_allocated_job_does_not_retry_through_a_nested_queue(tmp_path):
+    result, commands, _, cache = _run_check(tmp_path, "", None, "a5", None, None, board_status=7, inside=True)
+    assert result.returncode == 1
+    assert all(command[0] == "npu-smi" for command in commands)
+    assert "DCMI permission denied" in result.stderr
+    assert not list(cache.glob("*.cache"))
+
+
+def test_a5_queries_the_granted_device_without_a_chip_id(tmp_path):
+    result, commands, _, _ = _run_check(
+        tmp_path, "Ascend950PR", "9579", "a5", "Ascend950PR_9579", "Ascend950", inside=True, device="6,7"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert commands == [["npu-smi", "info", "-t", "board", "-i", "6"]]
+
+
+def test_a2a3_queries_card_zero_not_the_logic_device_id(tmp_path):
+    result, commands, _, cache = _run_check(
+        tmp_path, "Ascend910", "9392", "a2a3", "Ascend910_9392", "Ascend910_93", inside=True, device="8"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert commands == [["npu-smi", "info", "-t", "board", "-i", "0", "-c", "0"]]
+    assert next(cache.glob("*.cache")).read_text() == "a2a3|Ascend910_9392|Ascend910_93\n"
 
 
 @pytest.mark.parametrize("requested", ["a2a3sim", "a5sim"])
