@@ -1095,7 +1095,8 @@ class MappedArg:
         if ib.shm is not None:
             base = ib.shm.buf
             assert base is not None
-            base = base[ib.mapping_offset : ib.mapping_offset + ib.nbytes]
+            if ib.mapping_key is not None:
+                base = base[ib.mapping_offset : ib.mapping_offset + ib.nbytes]
         else:
             # FORK_SHM / FORK_COW: no shm object — the base is a host VA inherited across the
             # fork, so wrap that range directly.

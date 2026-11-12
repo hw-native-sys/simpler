@@ -131,6 +131,7 @@ def _reject_device_args(args: object, *, kind: str) -> None:
     """
     if not isinstance(args, TaskArgs):
         return
+    from .buffer import AddressSpace  # noqa: PLC0415
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer

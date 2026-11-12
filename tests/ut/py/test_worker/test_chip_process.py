@@ -267,3 +267,20 @@ def test_default_chip_launcher_scope(monkeypatch, platform, runtime, exec_chip):
     assert worker._launch_chip_process(0, 0, [], 25, 1, monotonic() + 30) == (123 if exec_chip else 456)
     worker._is_startup_root = False
     assert not worker._uses_exec_chip()
+
+
+def test_invalid_direct_a5_device_keeps_l3_fork(monkeypatch):
+    import simpler.worker as worker_module  # noqa: PLC0415
+
+    monkeypatch.setattr(worker_module, "_a5_l2_initialized", False)
+    monkeypatch.setattr("simpler_setup.runtime_builder.RuntimeBuilder", lambda _platform: Mock())
+    runtime = "tensormap_and_ringbuffer"
+    direct = Worker(level=2, platform="a5", runtime=runtime, device_id=-1)
+    try:
+        with pytest.raises(RuntimeError, match="non-negative device_id"):
+            direct.init()
+    finally:
+        direct.close()
+
+    hierarchical = Worker(level=3, platform="a5", runtime=runtime, device_ids=[0])
+    assert not hierarchical._uses_exec_chip()

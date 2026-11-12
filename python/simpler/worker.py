@@ -9507,8 +9507,11 @@ class Worker:
         workspace_budget = self._validated_workspace_budget(platform)
         self._chip_worker = _ChipWorker()
         if platform == "a5":
-            global _a5_l2_initialized  # noqa: PLW0603 -- CANN state persists across Worker lifetimes
-            _a5_l2_initialized = True
+            device_id = int(device_id)
+            # The binding accepts a C++ int, and native init rejects negatives before loading CANN.
+            if 0 <= device_id < (1 << 31):
+                global _a5_l2_initialized  # noqa: PLW0603 -- CANN state persists across Worker lifetimes
+                _a5_l2_initialized = True
         # The prebuilt runtime-arena is prewarmed inside cw.init for the declared
         # config's ring sizing (built right after the device comes up), so the
         # first run() with matching sizing skips the cold arena build. enable_sdma
@@ -13600,10 +13603,7 @@ class Worker:
         with self._registry_lock:
             if self._chip_import_registry is None:
                 registry = ImportRegistry(
-                    ImportContext(
-                        deployment=DEVICE_AICPU,
-                        device_owner_instance_id=self._owner_instance_id,
-                    )
+                    ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=self._owner_instance_id)
                 )
                 owner = weakref.ref(self)
                 chip = self._chip_worker

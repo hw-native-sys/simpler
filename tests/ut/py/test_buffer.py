@@ -845,6 +845,28 @@ def test_materialize_rejects_an_shm_object_shorter_than_its_descriptor():
         buffer.close()
 
 
+def test_posix_shm_mapping_keeps_backing_view():
+    backing = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
+    registry = ImportRegistry(ImportContext(deployment=HOST_CPU))
+    try:
+        descriptor = BufferDescriptor(
+            identity=backing.identity,
+            address_space=AddressSpace.HOST,
+            access=AccessMode.READWRITE,
+            backend_kind=BackendKind.POSIX_SHM,
+            nbytes=16,
+            body=backing.to_descriptor().body,
+        )
+        imported = registry.materialize(descriptor)
+        assert imported.shm is not None and imported.shm.buf is not None
+        arg = MappedArg(imported, 4, (3,), (1,), DataType.INT32.value)
+        with arg.buffer as view:
+            assert len(view) == len(imported.shm.buf) - arg.byte_offset
+    finally:
+        registry.close()
+        backing.close()
+
+
 def test_owner_instance_ids_are_distinct():
     ids = {mint_owner_instance_id() for _ in range(64)}
     assert len(ids) == 64
