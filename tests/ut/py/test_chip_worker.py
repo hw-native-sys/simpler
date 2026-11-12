@@ -1090,6 +1090,11 @@ class TestWorkerNativeChip:
             for node in frame_loop.body
             if isinstance(node, ast.FunctionDef) and node.name == "activate_pending_runs"
         )
+        discard = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "discard_unlaunched_ccu"
+        )
         observation = next(
             node
             for node in ast.walk(frame_loop)
@@ -1101,7 +1106,14 @@ class TestWorkerNativeChip:
         a_run = SimpleNamespace(launched=True, lane_poisoned=False)
         b_run = SimpleNamespace(abandon=lambda: events.append("abandon-b"))
         a = SimpleNamespace(
-            index=0, identity=(1,), entry_addr=100, entry_buf=b"a", activated=True, chip_run=a_run, ended_published=True
+            index=0,
+            identity=(1,),
+            entry_addr=100,
+            entry_buf=b"a",
+            activated=True,
+            native_activated=True,
+            chip_run=a_run,
+            ended_published=True,
         )
         b = SimpleNamespace(
             index=1,
@@ -1109,6 +1121,8 @@ class TestWorkerNativeChip:
             entry_addr=200,
             entry_buf=b"b",
             activated=False,
+            native_activated=False,
+            ccu_binding=None,
             chip_run=b_run,
             ended_published=False,
         )
@@ -1137,10 +1151,11 @@ class TestWorkerNativeChip:
         wrapper = ast.FunctionDef(
             name="exercise",
             args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-            body=[ast.parse('shutdown_message = ""').body[0], activation, observation],
+            body=[ast.parse('shutdown_message = ""').body[0], discard, activation, observation],
             decorator_list=[],
         )
         context = {
+            "_StagedRun": SimpleNamespace,
             "staged_runs": staged_runs,
             "device_id": 0,
             "live_execution": False,

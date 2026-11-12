@@ -692,6 +692,24 @@ TEST(HbgAsyncControl, NegativeCounterHandsOffUntilPublicationWithoutFailingTheRu
     EXPECT_EQ(f.signal[0], 0u);
 }
 
+TEST(HbgAsyncControl, CcuEventGatesResidentJoinUntilObservedAndCleared) {
+    AsyncFixture f(1);
+    alignas(64) uint64_t event = 0;
+    const auto writer = f.start();
+    const CompletionToken token{reinterpret_cast<uint64_t>(&event), 0, COMPLETION_ENGINE_CCU, COMPLETION_TYPE_CCU, 1};
+    ASSERT_TRUE(register_completion_condition(writer, token));
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    ASSERT_TRUE(f.close());
+    EXPECT_FALSE(f.check(1));
+    EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+    EXPECT_EQ(f.finish_lease().word, kUnused);
+    event = 1;
+    EXPECT_TRUE(f.check(2));
+    EXPECT_EQ(event, 0u);
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
+    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
+}
+
 TEST(HbgAsyncControl, InvalidCounterAndMalformedRecordFailWithoutNormalCompletion) {
     for (uint32_t mode = 0; mode < 2; ++mode) {
         AsyncFixture f(1);

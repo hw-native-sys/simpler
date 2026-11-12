@@ -362,6 +362,8 @@ class Orchestrator:
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
         worker = self._worker
+        if worker is not None and target_namespace == "LOCAL_CHIP":
+            worker._prepare_ccu_submission(callable_handle, [cpp_worker_id], [c_args])
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
         # submit can commit before an exception reaches Python.
@@ -471,6 +473,8 @@ class Orchestrator:
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
+        if worker is not None and target_namespace == "LOCAL_CHIP":
+            worker._prepare_ccu_submission(callable_handle, worker_ids, c_args_list)
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
@@ -568,8 +572,8 @@ class Orchestrator:
         ``workers`` is the legacy L3 spelling; it cannot be combined with ``members``.
         Retained domains survive successful runs until explicit release or Worker.close().
         Domains provide synchronous mapped-window communication by default.
-        On A5, workspace_engines accepts names from sdma/urma/rdma, or a mapping
-        from those names to SdmaConfig/UrmaConfig/RdmaConfig. Name sequences use
+        On A5, workspace_engines accepts names from sdma/urma/rdma/ccu, or a mapping
+        from those names to SdmaConfig/UrmaConfig/RdmaConfig/CcuConfig. Name sequences use
         default settings. Configuration is immutable for the domain's lifetime.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
         its own low-address window.
@@ -600,7 +604,7 @@ class Orchestrator:
             reuse=False,
         )
 
-    def get_or_allocate_domain(
+    def get_or_allocate_domain(  # noqa: PLR0913 -- same configuration contract as allocate_domain
         self,
         *,
         name: str,

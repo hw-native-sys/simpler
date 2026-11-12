@@ -183,6 +183,11 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
     return 1;
 }
 
+extern "C" int set_run_ccu_workspace_impl(Runtime *runtime, uint64_t address) {
+    runtime->dev.ccu_workspace_addr = address;
+    return 0;
+}
+
 extern "C" int joined_native_launch_supported_impl(void) {
     // Every per-run device region this runtime names is selected by the run's
     // own lease — the graph heap and the runtime image are both HOST_PER_RUN

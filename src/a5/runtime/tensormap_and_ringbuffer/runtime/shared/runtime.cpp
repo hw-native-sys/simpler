@@ -35,6 +35,7 @@ Runtime::Runtime() {
     dev.pmu_event_type = 0;
     dev.dump_args_level = 0;
     dev.aicpu_thread_num = 1;
+    dev.ccu_workspace_addr = 0;
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;

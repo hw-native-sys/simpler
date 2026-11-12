@@ -13,6 +13,7 @@
 
 #include "async_completion_types.h"
 #include "host_build_graph/completion_token.h"
+#include "platform_comm/ccu/ccu_native_abi.h"
 
 namespace pto2::resident {
 
@@ -93,7 +94,11 @@ inline __aicore__ bool seal_open_conditions(const AsyncWriter &writer, __gm__ As
 // The runtime validates the record format; existing run/communication owners
 // retain its storage until all accepted work has retired.
 inline __aicore__ bool token_valid(const CompletionToken &token) {
-    if (token.engine != COMPLETION_ENGINE_SDMA || token.addr == 0) return false;
+    if (token.addr == 0) return false;
+    if (token.engine == COMPLETION_ENGINE_CCU && token.completion_type == COMPLETION_TYPE_CCU)
+        return token.addr % alignof(uint64_t) == 0 && token.expected_value == 0 &&
+               token.backend_cookie == SIMPLER_CCU_EVENT_MASK;
+    if (token.engine != COMPLETION_ENGINE_SDMA) return false;
     if (token.completion_type == COMPLETION_TYPE_COUNTER)
         return token.addr % sizeof(uint32_t) == 0 && token.backend_cookie == 0 && token.expected_value <= INT32_MAX;
     if (token.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD)

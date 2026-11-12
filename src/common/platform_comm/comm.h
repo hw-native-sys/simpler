@@ -47,6 +47,8 @@ typedef struct CommWorkspaceConfig {
 static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
 static_assert(sizeof(CommWorkspaceConfig) == 8);
 #endif
+// Internal callable execution controls: activate=1, stop/poll=3, abort=4, discard preparation=7.
+int comm_control_ccu_run(CommHandle h, uint64_t registration_id, uint32_t operation, uint64_t generation);
 
 // Domain allocation failures that callers can distinguish from generic ACL errors.
 typedef enum CommDomainStatus {
@@ -324,6 +326,20 @@ int comm_alloc_host_domain_windows(
 #ifdef __cplusplus
     = nullptr
 #endif
+);
+
+/* Register/cache all callable kernels for a rank topology, independently of window allocation.
+ * collective_id is assigned once by the parent across all participating ranks.
+ * The returned registration_id is rank-local. The communicator owns registration
+ * resources until confirmed comm_destroy. */
+int comm_register_ccu_callable(
+    CommHandle h, uint32_t workspace_mask, uint64_t collective_id, const uint32_t *rank_ids, size_t rank_count,
+    uint32_t domain_rank, const void *module_package, size_t module_package_size, const uint8_t sdk_build_id[32],
+    const uint8_t pto_isa_build_id[32], uint64_t *registration_id
+);
+/* Prepare independent run storage; valid while a previous execution is active. */
+int comm_prepare_ccu_run(
+    CommHandle h, uint64_t registration_id, uint64_t generation, uint64_t allocation_id, uint64_t *workspace
 );
 
 /**

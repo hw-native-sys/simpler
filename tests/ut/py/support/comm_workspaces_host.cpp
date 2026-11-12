@@ -21,6 +21,14 @@
 #include "comm_workspace_managers.h"
 #include "comm_hccl.cpp"
 
+namespace simpler::ccu {
+bool fail_window_token = false;
+bool query_window_token(uint64_t, uint64_t, uint64_t &token) {
+    token = 123;
+    return !fail_window_token;
+}
+}  // namespace simpler::ccu
+
 namespace {
 std::unordered_map<void *, size_t> mappings;
 int physical_handles = 0;
@@ -491,6 +499,24 @@ int main(int argc, char **argv) {
     assert(allocate(0, first, first_ctx) == 0);
     assert(started[0] == 0 && started[1] == 0 && started[2] == 0);
     release(first);
+    assert(allocate(8, first, first_ctx) == 0);
+    {
+        const auto *ctx = reinterpret_cast<const CommContext *>(first_ctx);
+        const auto &workspace = comm_workspace<CommWorkspaceKind::CCU>(*ctx);
+        assert(workspace.size == sizeof(SimplerCcuWorkspace));
+        const auto *ccu = reinterpret_cast<const SimplerCcuWorkspace *>(workspace.addr);
+        assert(ccu->struct_size == sizeof(*ccu) && ccu->ccu_count == 0 && ccu->controls_addr == 0);
+        assert(ccu->window_count == 1 && ccu->window_size == sizeof(CommCcuWindow));
+        const auto *window = reinterpret_cast<const CommCcuWindow *>(ccu->windows_addr);
+        assert(window->address == ctx->windowsIn[0] && window->size == 4096 && window->token == 123);
+    }
+    release(first);
+    assert(mappings.empty() && physical_handles == 0);
+    simpler::ccu::fail_window_token = true;
+    assert(allocate(8, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+    assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
+    assert(mappings.empty() && physical_handles == 0);
+    simpler::ccu::fail_window_token = false;
     // Synchronous mappings do not depend on any asynchronous provider or RoCE bootstrap.
     unsetenv("PTO_ROCE_PHYIDS");
     unsetenv("PTO_ROCE_LOCAL_IP");
@@ -638,7 +664,7 @@ int main(int argc, char **argv) {
     );
     release(first);
     assert(allocate(7, first, first_ctx) != 0);
-    assert(allocate(8, first, first_ctx) != 0);
+    assert(allocate(16, first, first_ctx) != 0);
     assert(mappings.size() == 1 && mappings.count(h->sdma_workspace->GetWorkspaceAddr()) == 1);
     assert(physical_handles == 0);
     test_peer_import_rollback(h, next_id);

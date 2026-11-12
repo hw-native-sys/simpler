@@ -327,6 +327,8 @@ typedef struct NativeRunDescriptor {
      * CAPTURE requires Kernel mode and rejects writable HOST/NONE arguments
      * before user code runs. All callers must use this descriptor layout. */
     uint32_t prepare_purpose;
+    /** This execution's immutable CCU controls for AICPU READY admission. Zero without CCU. */
+    uint64_t ccu_workspace_addr;
 } NativeRunDescriptor;
 
 /**

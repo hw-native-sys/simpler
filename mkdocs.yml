@@ -128,6 +128,8 @@ nav:
       - A5 local Host DDR access: design/a5-host-ddr.md
       - Run completion fences: design/run-completion-fence.md
       - Native framework submission: design/native-framework-submission.md
+      - Native CCU ABI: design/ccu-native-abi.md
+      - CCU Window Validation: design/ccu-window-validation.md
       - A5 HBG Graph task 设计:
           - 设计总览: zh-cn/design/a5-hbg-graph-task.md
           - 数据布局与 Host 绑定: zh-cn/design/a5-hbg-graph-task/data-layout.md

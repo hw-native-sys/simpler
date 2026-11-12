@@ -181,6 +181,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
     int aicpu_thread_num;
+    uint64_t ccu_workspace_addr;
 
     // Filter-style affinity gate input (a5 onboard). Host fills before
     // launch from device-side OCCUPY + DSMI CPU_TOPO via

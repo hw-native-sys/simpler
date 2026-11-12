@@ -118,6 +118,11 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) { return 1; }
 
+extern "C" int set_run_ccu_workspace_impl(Runtime *runtime, uint64_t address) {
+    runtime->dev.ccu_workspace_addr = address;
+    return 0;
+}
+
 /**
  * One run's native submission may be ordered behind another's on this platform.
  *

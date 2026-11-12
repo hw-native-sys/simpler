@@ -254,10 +254,12 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
 def _check(st_platform, st_device_ids, runtime, borrowed, host_controls, workspace_budget=None):
     if borrowed and st_platform.endswith("sim"):
         pytest.skip("borrowed contexts require onboard RTS")
+    # Resolve simpler_setup from the repository and reuse pytest's pinned PTO-ISA checkout.
     result = subprocess.run(
         [
             sys.executable,
-            str(Path(__file__).resolve()),
+            "-m",
+            "tests.st.common.kernel_eager_state.test_stateful_calls",
             st_platform,
             runtime,
             str(st_device_ids[0]),
@@ -265,6 +267,7 @@ def _check(st_platform, st_device_ids, runtime, borrowed, host_controls, workspa
             str(int(host_controls)),
             str(workspace_budget) if workspace_budget is not None else "none",
         ],
+        cwd=_ROOT,
         capture_output=True,
         text=True,
         timeout=180,

@@ -49,6 +49,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/run_terminal_accumulator.h"
 #include "common/unified_log.h"
+#include "platform_comm/ccu/ccu_ready.h"
 #include "utils/thread_completion_gate.h"
 
 // Register-based communication
@@ -340,6 +341,20 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     const bool is_leader = (tidx == 0);
 
     if (is_leader) {
+        const uint64_t ready_start = get_sys_cnt_aicpu();
+        const int ready_rc = simpler::ccu::wait_local_ready(
+            runtime->dev.ccu_workspace_addr,
+            [ready_start] {
+                return get_sys_cnt_aicpu() - ready_start > PLATFORM_PROF_SYS_CNT_FREQ * uint64_t{10};
+            },
+            [] {}
+        );
+        if (ready_rc != 0) {
+            LOG_ERROR("Local CCU READY initialization failed: %d", ready_rc);
+            init_failed_.store(true, std::memory_order_release);
+            hs_setup_done_.store(true, std::memory_order_release);
+            return -1;
+        }
         LOG_INFO("AicpuExecutor: Initializing");
         // The 0 → 1 fixup already applied above; derive scheduler count from it.
         aicpu_thread_num_ = nthreads;

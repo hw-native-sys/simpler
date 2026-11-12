@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef PTO_ASYNC_KERNEL_API_H
-#define PTO_ASYNC_KERNEL_API_H
+#pragma once
 
 #include <stdint.h>
 
@@ -20,6 +19,8 @@
 #include "intrinsic.h"
 #include "aicore_completion_mailbox_types.h"
 #include "completion_token.h"
+#include "platform_comm/ccu/ccu_device_submission.h"
+#include "platform_comm/comm_context.h"
 #include "runtime_status.h"
 
 #ifndef __aicore__
@@ -140,6 +141,35 @@ inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const Comple
     return true;
 }
 
+inline __aicore__ bool submit_ccu_mission(
+    AsyncCtx &ctx, const __gm__ CommContext *domain, uint32_t ccu_id, const void *parameters, uint64_t parameter_size
+) {
+    const auto *workspace = simpler::ccu::ccu_workspace(domain);
+    const auto *mission = simpler::ccu::ccu_control(workspace, ccu_id);
+    auto register_ccu_completion = [&](uint64_t address, uint64_t mask) __aicore__ {
+        const CompletionToken token{address, 0, COMPLETION_ENGINE_CCU, COMPLETION_TYPE_CCU, mask};
+        if (!register_completion_condition(ctx, token)) return false;
+        pto2::detail::defer_flush(ctx);
+        return true;
+    };
+    const bool submitted = simpler::ccu::submit_mission(mission, parameters, parameter_size, register_ccu_completion);
+    if (!submitted) pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    return submitted;
+}
+
+template <size_t N>
+inline __aicore__ bool submit_ccu_mission(
+    AsyncCtx &ctx, const __gm__ CommContext *domain, uint32_t ccu_id, const simpler::ccu::CcuCallArg (&call_args)[N]
+) {
+    uint64_t words[N * 2]{};
+    uint64_t bytes = 0;
+    if (!simpler::ccu::resolve_call_args(domain, call_args, words, bytes)) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
+    return submit_ccu_mission(ctx, domain, ccu_id, words, bytes);
+}
+
 inline __aicore__ void
 send_notification(volatile __gm__ void *remote_counter_addr, int32_t value, pto::comm::NotifyOp notify_op) {
     __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t *>(const_cast<__gm__ void *>(remote_counter_addr));
@@ -155,5 +185,3 @@ save_expected_notification_counter(AsyncCtx &ctx, volatile __gm__ void *counter_
     (void)register_completion_condition(ctx, token);
     pto2::detail::defer_flush(ctx);
 }
-
-#endif  // PTO_ASYNC_KERNEL_API_H

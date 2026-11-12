@@ -425,6 +425,30 @@ struct SchedulerAsyncCompletionObserver {
     inline __aicore__ CompletionPollResult operator()(const CompletionToken &token, uint32_t observer_mask) const {
         if (observer_mask == 0 || (observer_mask & ~3U) != 0 || !pto2::resident::detail::token_valid(token))
             return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+        if (token.completion_type == COMPLETION_TYPE_CCU) {
+            auto *event = reinterpret_cast<__gm__ uint64_t *>(token.addr);
+            const auto load = [event]() __aicore__ {
+                return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [event]() __aicore__ {
+#if defined(__CCE_AICORE__)
+                    const auto value = static_cast<uint64_t>(__builtin_cce_ld_dev(event, 0));
+                    scheduler_ddr_barrier();
+                    return value;
+#else
+                    return __atomic_load_n(event, __ATOMIC_ACQUIRE);
+#endif
+                });
+            };
+            if ((load() & token.backend_cookie) != token.backend_cookie) return {CompletionPollState::PENDING, 0};
+#if defined(__CCE_AICORE__)
+            st_dev(UINT64_C(0), event, 0);
+            scheduler_ddr_barrier();
+#else
+            __atomic_store_n(event, UINT64_C(0), __ATOMIC_RELEASE);
+#endif
+            return load() == 0 ?
+                       CompletionPollResult{CompletionPollState::READY, 0} :
+                       CompletionPollResult{CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+        }
         if (token.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
             auto *record = reinterpret_cast<__gm__ uint64_t *>(token.addr);
             const uint64_t completed =

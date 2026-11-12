@@ -61,7 +61,7 @@ TEST(CallableScalarCount, EmptySignatureHasNoScalars) {
 TEST(CallableScalarCount, CachedBlobUsesSignatureRegardlessOfPadding) {
     auto buf = build_chip_callable(9);
     const auto *callable = reinterpret_cast<const ChipCallable *>(buf.data());
-    constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
+    constexpr size_t padding_begin = offsetof(ChipCallable, ccu_modules_size_) + sizeof(uint32_t);
     constexpr size_t padding_size = offsetof(ChipCallable, storage_) - padding_begin;
     for (size_t i = padding_begin; i < offsetof(ChipCallable, storage_); ++i) {
         ASSERT_EQ(buf[i], 0);

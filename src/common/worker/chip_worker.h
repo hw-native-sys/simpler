@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -31,6 +32,8 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
 #include "host/chip_swimlane_runs.h"
+#include "callable_artifacts.h"
+#include "platform_comm/ccu/ccu_native_module.h"
 #include "native_run_storage_tag.h"
 #include "run_resource_arena.h"
 #include "runtime_c_api.h"
@@ -480,6 +483,15 @@ public:
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
         const std::string &host_shm_name = {}, const CommWorkspaceConfig *workspace_config = nullptr
     );
+    uint64_t register_ccu_callable(
+        uint64_t comm_handle, uint64_t collective_id, int32_t callable_id, const std::vector<uint32_t> &rank_ids,
+        uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask
+    );
+    uint64_t prepare_ccu_run(
+        uint64_t comm_handle, uint64_t registration_id, uint64_t generation, uint64_t dispatch_id,
+        uint64_t allocation_id
+    );
+    int control_ccu_run(uint64_t comm_handle, uint64_t allocation_id, uint32_t operation, uint64_t generation);
     /// Release the rank's resources after the caller drains all domain users.
     /// `allocation_id` identifies the allocation. `rank_count` is the subset
     /// size and `domain_rank` is the caller's dense rank in it. Backends with
@@ -688,6 +700,11 @@ private:
         size_t *, const CommWorkspaceConfig *
     );
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
+    using CommRegisterCcuCallableFn = int (*)(
+        void *, uint32_t, uint64_t, const uint32_t *, size_t, uint32_t, const void *, size_t, const uint8_t *,
+        const uint8_t *, uint64_t *
+    );
+    using CommPrepareCcuRunFn = int (*)(void *, uint64_t, uint64_t, uint64_t, uint64_t *);
     using CommGlobalDomainPrepareFn =
         int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
     using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
@@ -716,6 +733,7 @@ private:
     uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
     void clear_comm_sessions();
     void retain_unconfirmed_comm_cleanup() noexcept;
+    void retain_unconfirmed_ccu_cleanup() noexcept;
     void retain_unconfirmed_comm_stream(void *stream);
     void require_comm_cleanup_confirmed() const;
     void require_comm_reclamation_safe() const;
@@ -837,6 +855,10 @@ private:
     CommAllocHostDomainWindowsFn comm_alloc_host_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;
+    CommRegisterCcuCallableFn comm_register_ccu_callable_fn_ = nullptr;
+    CommPrepareCcuRunFn comm_prepare_ccu_run_fn_ = nullptr;
+    using CommControlCcuRunFn = int (*)(void *, uint64_t, uint32_t, uint64_t);
+    CommControlCcuRunFn comm_control_ccu_run_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
@@ -851,6 +873,12 @@ private:
     std::unordered_map<uint64_t, size_t> comm_session_index_;
     std::unordered_set<uint64_t> global_domain_ids_;
     uint64_t base_comm_handle_ = 0;
+    // Only matching, confirmed stream stop retires a launched CCU generation.
+    std::set<std::tuple<uint64_t, uint64_t, uint64_t>> unstopped_ccu_runs_;
+    std::mutex ccu_preparation_mu_;
+    std::unordered_map<uint64_t, uint64_t> prepared_ccu_workspaces_;
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> ccu_preparation_keys_;
+    std::unordered_map<int32_t, CcuCallableArtifacts> callable_artifacts_;
 
     uint32_t arena_bank_for_slot(uint32_t slot_id) const;
 
@@ -1161,6 +1189,7 @@ private:
     bool worker_sdma_enabled_ = false;
     // A backend retained communication references; device reset is not a cleanup proof.
     bool comm_cleanup_unconfirmed_ = false;
+    bool ccu_cleanup_unconfirmed_ = false;
     std::unique_ptr<ChipRunLane> run_lane_;
     // Names a successful binding or an init whose rollback still needs close.
     // Cleared only after successful teardown. Control calls run on the owning
