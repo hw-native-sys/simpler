@@ -93,6 +93,9 @@ function(simpler_ut_includes arch runtime tier out_var)
         list(APPEND _dirs "${_rt}/host")
     endif()
     list(APPEND _dirs "${_rt}/runtime" "${_rt}/common")
+    if(arch STREQUAL "a5")
+        list(APPEND _dirs "${SIMPLER_SRC}/a5/runtime")
+    endif()
 
     simpler_ut_common_includes("${arch}" "${tier}" _common)
     list(APPEND _dirs ${_common} "${SIMPLER_SRC}/common/${runtime}"

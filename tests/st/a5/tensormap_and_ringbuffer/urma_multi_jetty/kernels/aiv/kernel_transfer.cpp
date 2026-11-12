@@ -63,7 +63,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     const auto &workspace_desc = comm_workspace<CommWorkspaceKind::URMA>(*comm);
     auto *workspace = reinterpret_cast<__gm__ uint8_t *>(workspace_desc.addr);
     pto::comm::AsyncSession session;
-    if (!pto2::urma_backend::build_urma_session(ctx, workspace, 1, session)) {
+    if (!simpler::urma::build_urma_session(ctx.urma_sender_id, workspace, 1, session)) {
         fail(ctx, record, -2);
         return;
     }
@@ -84,7 +84,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     record->workspace_bytes = workspace_desc.size;
     record->queue_rows = info->jettyCount;
     record->mode = mode;
-    record->chunks = pto2::urma_backend::chunk_count(static_cast<uint64_t>(elems) * sizeof(float));
+    record->chunks = simpler::urma::chunk_count(static_cast<uint64_t>(elems) * sizeof(float));
     record->repeats = repeats;
     record->logical_sender = logical;
     for (uint32_t j = 0; j < jetties; ++j) {
@@ -92,10 +92,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         queue.row = row_base + j;
         queue.sq_depth = wq[j].depth;
         queue.cq_depth = cq[j].depth;
-        queue.head_before = pto2::urma_backend::load_urma_counter(wq[j].headAddr);
-        queue.bb_tail_before = pto2::urma_backend::load_urma_counter(wq[j].tailAddr);
+        queue.head_before = simpler::urma::load_urma_counter(wq[j].headAddr);
+        queue.bb_tail_before = simpler::urma::load_urma_counter(wq[j].tailAddr);
         queue.submitted_before = wq[j].submittedWqeCount;
-        queue.cqe_tail_before = pto2::urma_backend::load_urma_counter(cq[j].tailAddr);
+        queue.cqe_tail_before = simpler::urma::load_urma_counter(cq[j].tailAddr);
         queue.target_bb = queue.head_before;
         queue.target_cqe = queue.submitted_before;
         queue.completion_count = 0;
@@ -132,7 +132,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         queue.completion_count += 1;
     }
     for (uint32_t j = 0; j < jetties; ++j) {
-        record->queues[j].head_after = pto2::urma_backend::load_urma_counter(wq[j].headAddr);
+        record->queues[j].head_after = simpler::urma::load_urma_counter(wq[j].headAddr);
         record->queues[j].submitted_after = wq[j].submittedWqeCount;
     }
     record->error = *ctx.completion_error_code;
