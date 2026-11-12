@@ -76,8 +76,6 @@ class NativeAudit:
         prior = None
         for record in records:
             key = (first, record["task_ref"], record["block_idx"])
-            if first == "contribution_before":
-                key += (record["subtask_slot"],)
             current = self.causal.bounded(key, point(record, first), point(record, last))
             if prior is not None:
                 self.causal.add(prior, current)
@@ -378,8 +376,6 @@ class NativeAudit:
                 "invalid source/publication mode",
             )
             self.chain(execution, "permit", "entry", "completion_consumed", "trace_published")
-            require(execution["contribution_worker"] == worker, "foreign subtask completion contributor")
-            self.chain(execution, "completion_consumed", "contribution_before", "contribution_after", "trace_published")
             if execution["flags"] & EXECUTED:
                 self.chain(execution, "entry", "returned", "visible", "completion_consumed")
                 require(
@@ -457,10 +453,10 @@ class NativeAudit:
             executions.sort(key=lambda row: row["permit"][1])
             for previous, current in zip(executions, executions[1:], strict=False):
                 require(
-                    previous["trace_published"][0] <= current["publication_before_cycles"],
-                    "payload overwrote a slot before trace retirement",
+                    previous["completion_consumed"][0] <= current["publication_before_cycles"],
+                    "payload overwrote an unconsumed slot",
                 )
-                self.causal.add(point(previous, "trace_published"), self.payload_points[current["index"]][0])
+                self.causal.add(point(previous, "completion_consumed"), self.payload_points[current["index"]][0])
                 self.before(
                     point(previous, "completion_consumed"), point(current, "permit"), "slot reused before retirement"
                 )
@@ -476,7 +472,7 @@ class NativeAudit:
             executions.sort(key=lambda row: row["entry"][1])
             for previous, current in zip(executions, executions[1:], strict=False):
                 self.before(
-                    point(previous, "trace_published"),
+                    point(previous, "completion_consumed"),
                     point(current, "permit"),
                     "one Scalar ran overlapping kernels",
                 )
@@ -558,28 +554,29 @@ class NativeAudit:
             self.before(
                 point(execution, "visible"), point(owner, "completion_before"), "block completed before outputs visible"
             )
-            self.before(
-                point(execution, "completion_consumed"),
-                point(owner, "completion_before"),
-                "pure completion join before local retirement",
-            )
-            self.before(
-                point(owner, "completion_after"),
-                point(execution, "trace_published"),
-                "pure trace published before completion contribution",
-            )
+            if owner["completion_after"][1] < execution["completion_consumed"][1]:
+                # Captures whose block counter precedes local retirement.
+                self.before(
+                    point(owner, "completion_after"),
+                    point(execution, "completion_consumed"),
+                    "pure completion ticket after retirement",
+                )
+            else:
+                # A release join may move after retirement, but never inside it.
+                self.before(
+                    point(execution, "trace_published"),
+                    point(owner, "completion_before"),
+                    "pure completion join before trace retirement",
+                )
         for ref, blocks in self.task_blocks.items():
             by_claim = sorted(blocks, key=lambda block: block["owner"]["block_idx"])
             self.ordered_intervals([b["owner"] for b in by_claim], "claim_before", "claim_after")
-            if self.tasks[ref]["flags"] & MIX:
-                require(all(b["owner"]["completion_ticket"] == MAX for b in blocks), "Mix retirement has a task ticket")
-            else:
-                by_ticket = sorted(blocks, key=lambda block: block["owner"]["completion_ticket"])
-                require(
-                    [b["owner"]["completion_ticket"] for b in by_ticket] == list(range(self.tasks[ref]["block_num"])),
-                    "duplicate or missing block completion ticket",
-                )
-                self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
+            by_ticket = sorted(blocks, key=lambda block: block["owner"]["completion_ticket"])
+            require(
+                [b["owner"]["completion_ticket"] for b in by_ticket] == list(range(self.tasks[ref]["block_num"])),
+                "duplicate or missing block completion ticket",
+            )
+            self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
             self.claim_certificates(ref, blocks)
             owned = defaultdict(list)
             for block in blocks:
@@ -691,14 +688,9 @@ class NativeAudit:
                 "invalid terminal task state",
             )
             require(
-                control["next_block"] == (task["block_num"] if cooperative else 0), "terminal block counters mismatch"
+                control["next_block"] == control["completed_blocks"] == (task["block_num"] if cooperative else 0),
+                "terminal block counters mismatch",
             )
-            total = (
-                task["block_num"] * task["active_mask"].bit_count()
-                if task["flags"] & EXECUTABLE and not task["flags"] & INLINE
-                else 0
-            )
-            require(control["completed_subtasks"] == total, "terminal subtask counter mismatch")
             require(control["admission_claim_lock"] == 0, "invalid terminal admission claim lock")
             require(control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal")
             positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
@@ -714,30 +706,63 @@ class NativeAudit:
             done = self.actors[ref]["completion"]
             require(done is not None, "missing TaskDone")
             self.actor(done, ref, completion=True)
-            if task["flags"] & EXECUTABLE and not task["flags"] & INLINE:
-                self.subtask_completion(task, done)
+            if done["flags"] & DEFERRED_FINISH:
+                require(
+                    task["flags"] & EXECUTABLE and not task["flags"] & INLINE and ref not in self.control_nodes,
+                    "deferred completion on an inline/control task",
+                )
+                if not cooperative:
+                    require(self.actors[ref]["admission"] is None, "ordinary deferred task has an admission event")
+                for block in self.task_blocks[ref]:
+                    self.before(
+                        point(block["owner"], "completion_after"),
+                        point(done, "before"),
+                        "deferred TaskDone before block release",
+                    )
+                count = task["block_num"] * task["active_mask"].bit_count()
+                for index in range(task["trace_base"], task["trace_base"] + count):
+                    execution = self.executions[index]
+                    self.before(
+                        point(execution, "trace_published"),
+                        point(done, "before"),
+                        "deferred TaskDone before execution release",
+                    )
+            elif cooperative:
+                last = max(self.task_blocks[ref], key=lambda block: block["owner"]["completion_ticket"])
+                owner = last["owner"]
+                require(owner["worker_index"] == done["worker_index"], "TaskDone not owned by last contributor")
+                self.before(
+                    point(owner, "completion_after"), point(done, "before"), "TaskDone before last contribution"
+                )
+                if not task["flags"] & MIX:
+                    self.before(
+                        point(self.executions[last["index"]], "trace_published"),
+                        point(done, "before"),
+                        "last pure trace unpublished at TaskDone",
+                    )
             else:
-                require(not done["flags"] & DEFERRED_FINISH, "deferred completion on an inline/control task")
                 require(self.actors[ref]["admission"] is None, "ordinary/service task has an admission event")
+                if not task["flags"] & INLINE and ref not in self.control_nodes:
+                    execution = self.executions[task["trace_base"]]
+                    require(execution["worker_index"] == done["worker_index"], "ordinary TaskDone wrong worker")
+                    self.before(
+                        point(execution, "completion_consumed"),
+                        point(done, "before"),
+                        "ordinary TaskDone before consumption",
+                    )
+                    if self.orders:
+                        self.before(
+                            point(execution, "trace_published"),
+                            point(done, "before"),
+                            "ordered ordinary TaskDone before trace",
+                        )
+                    else:
+                        self.before(
+                            point(done, "after"),
+                            point(execution, "trace_published"),
+                            "ordinary trace/TaskDone order mismatch",
+                        )
             self.dependencies(task, done)
-
-    def subtask_completion(self, task, done):
-        count = task["block_num"] * task["active_mask"].bit_count()
-        executions = [self.executions[index] for index in range(task["trace_base"], task["trace_base"] + count)]
-        by_ticket = sorted(executions, key=lambda execution: execution["contribution_ticket"])
-        require(
-            [execution["contribution_ticket"] for execution in by_ticket] == list(range(count)),
-            "duplicate or missing subtask completion ticket",
-        )
-        self.ordered_intervals(by_ticket, "contribution_before", "contribution_after")
-        last = by_ticket[-1]
-        if not done["flags"] & DEFERRED_FINISH:
-            require(last["contribution_worker"] == done["worker_index"], "TaskDone not owned by last subtask")
-        self.before(
-            point(last, "contribution_after"), point(done, "before"), "TaskDone before last subtask contribution"
-        )
-        if not done["flags"] & DEFERRED_FINISH:
-            self.before(point(done, "after"), point(last, "trace_published"), "last subtask trace preceded TaskDone")
 
     def dependencies(self, task, done):
         ref = task["task_ref"]

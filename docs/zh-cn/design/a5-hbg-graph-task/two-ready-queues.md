@@ -22,9 +22,7 @@
 
 生产者不受自身核类型限制：AIV 完成后可以向 AIC 队列发布后继，反之亦然。
 MIX 路由到 AIC 队列，只表示由 AIC 负责领取与组织，不改变 active/resource mask。
-每个逻辑 SPMD/MIX 任务最多入队一次，block 和 lane 不分别入队。
-完成路径也可直接持有 MIX 候选并推进 ordered admission，包括由 AIV 完成前驱的情况；
-该路径不从共享 AIC 队列领取，也不授予 MIX 执行权，后续仍由 AIC 协调和成员许可控制执行。
+每个逻辑 SPMD/MIX 任务只入队一次，block 和 lane 不分别入队。
 
 建议引入独立的 ready 类别，名称仅为接口设计示意：
 
@@ -226,7 +224,7 @@ atomic_probe 当前硬件 SyncAll 后的同址读测量中，64 个活动核的
 | 验证项 | 必须证明的结果 |
 | ------ | -------------- |
 | 路由与容量 | 普通/Graph child、双 AIV MIX、零任务/单类型任务、合法非完整拓扑分类正确，entries 总容量按逻辑任务计算 |
-| 全核可达性 | 包括旧 rank/8 大于 0 的 AIC/AIV 都能领取；AIV 不能从共享 AIC 队列领取 MIX；直接保留的 MIX 候选只授予 admission 权，不能因合并类别丢失 MIX mask |
+| 全核可达性 | 包括旧 rank/8 大于 0 的 AIC/AIV 都能领取；AIV 不能领取 MIX，不能因合并类别丢失 MIX mask |
 | 并发发布和领取 | 同队列多 producer/consumer 恰好一次，预留范围不重叠，最后一个 entry 竞争不会越界 |
 | 空洞与暂停 | 前序预留暂停时后序不可被越过；恢复后可推进；不以定时 sleep 或“足够慢”构造正确性交错 |
 | 资源未就绪 | MIX 被领取后 AIV 暂忙，既有候选/slot 满时仍有界服务，不在共享队头等待资源 |

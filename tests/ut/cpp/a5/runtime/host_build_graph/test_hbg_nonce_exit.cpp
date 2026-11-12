@@ -26,7 +26,6 @@
 #include "common/memory_barrier.h"
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
-#include "scheduler/scheduler_error.h"
 
 void aicore_execute(Runtime *runtime, int block_idx, CoreType core_type);
 
@@ -66,7 +65,7 @@ void check_exit(bool resident, uint64_t epoch, CoreType type, uint32_t old_cond)
     if (resident) {
         context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&run_control);
         context.run_control_offset = 0;
-        scheduler_publish_error(&run_control, 1);
+        run_control.scheduler_error = 1;
         runtime->publish_scheduler_bootstrap(
             SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(&context)
         );
@@ -134,7 +133,7 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
     SchedulerRunControl control{};
     context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&control);
     control.scheduler_timeout_cycles = 1;
-    scheduler_publish_error(&control, stale_error ? 7 : 0);
+    control.scheduler_error = stale_error ? 7 : 0;
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(&context));
     report_epoch = 42;
     registers.fill(0);
@@ -154,7 +153,7 @@ void check_ready_error_publication(bool publish_ready, bool stale_error) {
         std::_Exit(30);
     if (control.scheduler_error != (stale_error ? 7u : 0u) || control.error_claimed != 0) std::_Exit(31);
     if (publish_ready) {
-        scheduler_publish_error(&control, 0);
+        control.scheduler_error = 0;
         runtime->dev.workers[0].task = reinterpret_cast<uint64_t>(&context);
         runtime->dev.workers[0].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
     }

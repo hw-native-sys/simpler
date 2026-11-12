@@ -168,10 +168,6 @@ struct alignas(64) SchedulerProtocolExecutionTrace {
     uint64_t publication_before_cycles;
     uint64_t publication_after_cycles;
     uint32_t publication_count;
-    SchedulerProtocolStamp contribution_before;
-    SchedulerProtocolStamp contribution_after;
-    uint64_t contribution_ticket;
-    uint32_t contribution_worker;
 };
 
 enum SchedulerProtocolExecutionFlags : uint32_t {

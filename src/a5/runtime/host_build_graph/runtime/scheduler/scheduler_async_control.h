@@ -327,35 +327,26 @@ inline __aicore__ bool scheduler_async_begin_execution(
     return true;
 }
 
-// BoundExecution uses the private writer retained by the resident executor.
-// Run entry bounds its Host-built group array, and map_execution selects its
-// immutable identity/layout before the kernel. The kernel can mutate only
-// registration state through AsyncCtx; it never receives this private writer.
-template <bool BoundExecution = false>
 static inline __aicore__ bool scheduler_async_seal_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane,
     const pto2::resident::AsyncWriter &writer
 ) {
     using namespace scheduler_async_detail;
     if (local == nullptr) return true;
+    // The executing core keeps this binding across the kernel call. Mutable
+    // registration state and the group's identity are still checked on return.
     if (writer.image == nullptr) return true;
-    __gm__ AsyncGroupData *data;
-    if constexpr (BoundExecution) {
-        data = reinterpret_cast<__gm__ AsyncGroupData *>(writer.image + writer.group_offset);
-    } else {
-        if (writer.image != local->base || writer.image_bytes != local->bytes ||
-            writer.run_epoch != local->layout->run_epoch || writer.group_index >= local->layout->group_count ||
-            writer.group_offset !=
-                local->layout->groups_offset + static_cast<uint64_t>(writer.group_index) * sizeof(AsyncGroupData))
-            return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
-        data = pto2::resident::detail::group(writer);
-        if (data == nullptr || data->task_ref != task_ref || data->block_index != block || data->subtask_slot != lane)
-            return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
-    }
+    if (writer.image != local->base || writer.image_bytes != local->bytes ||
+        writer.run_epoch != local->layout->run_epoch || writer.group_index >= local->layout->group_count ||
+        writer.group_offset !=
+            local->layout->groups_offset + static_cast<uint64_t>(writer.group_index) * sizeof(AsyncGroupData))
+        return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+    auto *data = pto2::resident::detail::group(writer);
+    if (data == nullptr || data->task_ref != task_ref || data->block_index != block || data->subtask_slot != lane)
+        return fail(*local, task_ref, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local->base, local->layout->group_leases_offset);
     const bool unpublished = data->state == AsyncPublicationState::OPEN;
-    const uint32_t count = unpublished ? data->count : 0;
-    if (!unpublished || !pto2::resident::detail::seal_open_conditions<BoundExecution>(writer, *data, count)) {
+    if (!seal_conditions(writer)) {
         // No CHECK can own a group whose first seal failed. A duplicate seal
         // must not overwrite a lease that may already be RUNNABLE or OWNED.
         if (unpublished)
@@ -369,15 +360,12 @@ static inline __aicore__ bool scheduler_async_seal_execution(
     // Registration state shares the first line with immutable identity/offsets.
     // The second line is Host-owned; publish line one and [0, count) entries.
     writeback(data, offsetof(AsyncGroupData, sdma_guards_offset));
-    if (count == 0) {
-        // An empty group has no CHECK reader. The resident return's mandatory
-        // pre-contribution DSB publishes this header before the completion RMW;
-        // standalone callers publish it here instead.
-        if constexpr (!BoundExecution) scheduler_cache_barrier();
-        return true;
-    }
-    writeback(writer.image + data->entries_offset, static_cast<uint64_t>(count) * sizeof(DeferredCompletionEntry));
+    if (data->count != 0)
+        writeback(
+            writer.image + data->entries_offset, static_cast<uint64_t>(data->count) * sizeof(DeferredCompletionEntry)
+        );
     scheduler_cache_barrier();
+    if (data->count == 0) return true;
     uint32_t task_index_value = ASYNC_INVALID_INDEX;
     if (!task_index(*local, task_ref, task_index_value) || task_index_value == ASYNC_INVALID_INDEX)
         return fail(*local, task_ref);
@@ -386,7 +374,7 @@ static inline __aicore__ bool scheduler_async_seal_execution(
         scheduler_async_pending::Result::PENDING)
         return fail(*local, task_ref);
     auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local->base, local->layout->group_progress_offset);
-    progress[writer.group_index].pending_mask = scheduler_async_condition_mask(count);
+    progress[writer.group_index].pending_mask = scheduler_async_condition_mask(data->count);
     progress[writer.group_index].condition_cursor = 0;
     progress[writer.group_index].acquire_cursor = 0;
     publish(&progress[writer.group_index], sizeof(SchedulerAsyncGroupProgress));
@@ -401,7 +389,7 @@ static inline __aicore__ bool scheduler_async_seal_execution(
     return true;
 }
 
-// All executions have sealed their condition registrations before computation closes.
+// All execution resources and final traces have retired before computation closes.
 static inline __aicore__ bool
 scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_ref, bool &deferred) {
     using namespace scheduler_async_detail;

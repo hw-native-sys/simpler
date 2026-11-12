@@ -40,7 +40,7 @@ NUMBERS = {
         "index run_epoch task_ref order_key block_num member_count "
         "active_mask flags member_words_offset close_seals_offset"
     ),
-    "control": "task_ref state next_block completed_subtasks admission_state",
+    "control": "task_ref state next_block completed_blocks admission_state",
     "claim": "run_epoch worker_index block_idx confirmed_count seal_value",
     "actor": "run_epoch task_ref order_key worker_index flags",
     "member": (
@@ -58,8 +58,7 @@ NUMBERS = {
     "execution": (
         "index run_epoch task_ref order_key permit_tail worker_index block_idx "
         "pending_slot subtask_slot flags ready_source group_seq block_num cluster_index cluster_lane "
-        "publication_mode publication_before_cycles publication_after_cycles publication_count "
-        "contribution_ticket contribution_worker"
+        "publication_mode publication_before_cycles publication_after_cycles publication_count"
     ),
 }
 STAMPS = {
@@ -70,9 +69,7 @@ STAMPS = {
         "claim_before claim_after publish_before publish_after completion_before completion_after releases_observed"
     ),
     "lane": "descriptor_ready arrive_before arrive_after arrivals_observed release_before release_after",
-    "execution": (
-        "entry returned visible completion_consumed permit trace_published contribution_before contribution_after"
-    ),
+    "execution": "entry returned visible completion_consumed permit trace_published",
 }
 ARRAYS = {
     "task": {"kernel_ids": 3, "dependencies": None},

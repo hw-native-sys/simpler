@@ -345,7 +345,7 @@ __aicore__ bool bootstrap_ready_graph(
         uint32_t barrier_backoff = kInitialBackoffIterations;
         const uint64_t barrier_start = scheduler_cycles();
         while (scheduler_gm_query(run_control->bootstrap_scan_complete) == 0) {
-            if (scheduler_read_worker_error(run_control, scheduler->worker_id()) != 0) return false;
+            if (scheduler_read_error(run_control) != 0) return false;
             if (scheduler_watchdog_expired(barrier_start, scheduler_cycles(), timeout_cycles)) {
                 scheduler_record_error(
                     run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, scheduler,
@@ -446,7 +446,7 @@ __aicore__ bool run_ready_dispatch_loop(
         }
         if (++scheduler_error_poll_count == kSchedulerErrorPollInterval) {
             scheduler_error_poll_count = 0;
-            if (scheduler_read_worker_error(run_control, context->worker_id()) != 0) return Boundary::Error;
+            if (scheduler_read_error(run_control) != 0) return Boundary::Error;
         }
 
         return Boundary::Proceed;
@@ -621,8 +621,9 @@ __aicore__ bool run_ready_dispatch_loop(
             if (local_slot->state != SchedulerDispatchSlotState::EXECUTING ||
                 local_slot->task_ref != execution.task_ref || local_slot->block_idx != execution.block_idx ||
                 local_slot->subtask_slot != execution.subtask_slot || local_slot->gm_mix != execution.gm_mix ||
+                local_slot->cooperative != execution.cooperative ||
                 (execution.gm_mix && context->admission->gm_mix.group_seq != execution_group_seq) ||
-                !scheduler_async_seal_execution<true>(
+                !scheduler_async_seal_execution(
                     context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, execution_writer
                 )) {
                 scheduler_record_error(
@@ -648,15 +649,10 @@ __aicore__ bool run_ready_dispatch_loop(
             boundary = check_boundary();
             if (boundary != Boundary::Proceed) break;
             SchedulerScalarScope scalar_completions(context, SchedPhaseKind::ScalarCompletions, task_ref);
-            const bool completion_ok =
-                WithProfiling && scheduler_protocol_enabled(context) ?
-                    scheduler_complete_own_slot<true, true>(
-                        graph, scheduler_state_base, context, run_control, slot_index, profiling_level
-                    ) :
-                    scheduler_complete_own_slot<false, true>(
-                        graph, scheduler_state_base, context, run_control, slot_index, profiling_level
-                    );
-            if (!completion_ok) return false;
+            if (!scheduler_complete_own_slot<WithProfiling>(
+                    graph, scheduler_state_base, context, run_control, slot_index, profiling_level
+                ))
+                return false;
             continue;
         }
 

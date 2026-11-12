@@ -156,6 +156,7 @@ struct SchedulerLocalSlotState {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     SchedulerDispatchSlotState state{SchedulerDispatchSlotState::EMPTY};
     uint8_t subtask_slot{UINT8_MAX};
+    bool cooperative{false};
     uint32_t block_idx{0};
     uint8_t candidate_index{UINT8_MAX};
     SchedulerPredicateState predicate{SchedulerPredicateState::UNEVALUATED};
@@ -272,14 +273,6 @@ struct SchedulerLocalState {
     uint8_t local_ready_mask{0};
     uint8_t ready_head{UINT8_MAX};
 };
-
-// In an admission run, ordinary slots retain their candidate index as origin
-// through retirement. Block-claimed slots have no candidate index. The caller
-// supplies a live, assigned slot and an initialized local state.
-inline __aicore__ bool
-scheduler_slot_uses_admission(const SchedulerLocalState *local, const SchedulerLocalSlotState &slot) {
-    return local->admission != nullptr && slot.candidate_index == UINT8_MAX;
-}
 
 static_assert(SCHEDULER_WORKER_CAPACITY < UINT16_MAX, "worker IDs must fit the local config");
 static_assert(PLATFORM_CORES_PER_BLOCKDIM <= 8, "worker trace mask must fit one byte");
@@ -606,9 +599,7 @@ inline __aicore__ SchedulerErrorIdentity scheduler_error_identity(
     return identity;
 }
 
-static_assert(alignof(SchedulerLocalState) <= 8 && alignof(SchedulerLocalSlotState) <= 8);
-
-static __aicore__ __attribute__((noinline)) void scheduler_record_error(
+static inline __aicore__ void scheduler_record_error(
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph, const SchedulerLocalState *local,
     SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN, const SchedulerLocalSlotState *slot = nullptr
@@ -627,7 +618,7 @@ static inline __aicore__ void scheduler_record_dispatch_error(
 ) {
     auto identity = scheduler_error_identity(local, task_ref, slot);
     if (slot != nullptr && slot->state == SchedulerDispatchSlotState::FILLING &&
-        scheduler_task_ref_is_null(slot->task_ref) && metadata.logical_block_num == 1) {
+        scheduler_task_ref_is_null(slot->task_ref) && !slot->cooperative && metadata.logical_block_num == 1) {
         identity.block_idx = 0;
         identity.valid_fields |= SCHEDULER_ERROR_HAS_BLOCK;
     }
@@ -879,7 +870,7 @@ static inline __aicore__ void scheduler_capture_execution_identity(
     trace->execution_group_seq = 0;
     uint32_t flags = SCHEDULER_TRACE_IDENTITY_CAPTURED;
     if (payload->function_bin_addr != 0) flags |= SCHEDULER_TRACE_EXECUTED;
-    if (scheduler_slot_uses_admission(local, slot)) {
+    if (slot.cooperative && local->admission != nullptr) {
         trace->execution_order_key = local->admission->scan_cursor;
         flags |= SCHEDULER_TRACE_ORDERED;
         if (slot.gm_mix) {
@@ -1005,7 +996,7 @@ static inline __aicore__ bool scheduler_control_enqueue(
     if (local == nullptr || local->config.control_inboxes_offset == 0 ||
         local->worker_id() >= local->config.runtime_worker_count ||
         scheduler_node_kind(graph, ref, &kind) != SchedulerGraphResult::OK || !scheduler_node_is_control(kind) ||
-        scheduler_read_worker_error(run, local->worker_id()) != 0)
+        scheduler_read_error(run) != 0)
         return false;
     SchedulerReadyBatch batch{};
     auto *inbox =
@@ -1157,6 +1148,7 @@ inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *l
     local_slot->task_ref = SCHEDULER_TASK_REF_INVALID;
     local_slot->state = SchedulerDispatchSlotState::FREE;
     local_slot->subtask_slot = UINT8_MAX;
+    local_slot->cooperative = false;
     local_slot->gm_mix = false;
     local_slot->block_idx = 0;
     local_slot->candidate_index = UINT8_MAX;
@@ -1243,7 +1235,7 @@ static inline __aicore__ bool scheduler_prepare_dispatch_slot(
         payload->function_bin_addr = 0;
         payload->src_payload = 0;
     } else {
-        if (graph.native_header_offset != 0 && !reserved.args_observed) {
+        if (graph.native_header_offset != 0 && !reserved.cooperative && !reserved.args_observed) {
             const auto error = scheduler_observe_graph_arguments(graph, ready_claim.task_ref);
             if (error != SchedulerGraphBindingError::NONE) {
                 scheduler_record_dispatch_error(
@@ -1408,8 +1400,7 @@ static inline __aicore__ bool scheduler_fill_dispatch_slot(
 // These helpers also support direct inclusion of the publication/resolver headers.
 inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, int64_t ref,
-    SchedulerReadyPublication &publication, SchedulerReadyClaim *direct_ready = nullptr,
-    uint32_t direct_core_type = UINT32_MAX
+    SchedulerReadyPublication &publication
 );
 static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local,
@@ -1428,27 +1419,11 @@ static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_r
     SchedulerCompletionDirect *direct, bool validate_done_state
 );
 
-static __aicore__ __attribute__((noinline)) bool scheduler_resolve_completion_step(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t producer_ref, const __gm__ SchedulerDependencyHeader &dependencies, uint64_t profiling_level,
-    SchedulerReadyClaim *direct_ready, uint32_t direct_core_type
-);
-
 static inline __aicore__ bool scheduler_resolve_completion(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level, bool validate_done_state,
     SchedulerReadyClaim *direct_ready, uint32_t direct_core_type
 ) {
-    // Immediate completion owners hold a validated graph/local/run binding.
-    // CSR notification has no suspended waiter or dynamic wake-list ownership.
-    if (!validate_done_state) {
-        const auto *dependencies = scheduler_dependencies(scheduler_state_base, context->config.ready_pool_offset);
-        if (dependencies != nullptr)
-            return scheduler_resolve_completion_step(
-                graph, scheduler_state_base, context, run_control, task_ref, *dependencies, profiling_level,
-                direct_ready, direct_core_type
-            );
-    }
     SchedulerResolveCursor cursor{};
     SchedulerCompletionDirect direct{direct_ready, direct_core_type};
     for (;;) {
@@ -1469,7 +1444,6 @@ static inline __aicore__ bool scheduler_complete_inline_task(
 ) {
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarInlineComplete, task_ref);
     if (local == nullptr || !scheduler_task_ref_valid(graph, task_ref)) return false;
-    if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
     if (!scheduler_task_is_executable(metadata.flags) || !scheduler_task_is_inline(metadata.flags) ||
         scheduler_task_is_mix(metadata.flags) || scheduler_task_is_spmd(metadata.flags) ||

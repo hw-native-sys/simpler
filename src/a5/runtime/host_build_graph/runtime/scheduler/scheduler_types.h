@@ -808,9 +808,7 @@ inline uint8_t scheduler_task_metadata_flags_from_submit_state(
 
 constexpr int32_t SCHEDULER_TASK_TIMING_SLOT_COUNT = 16;
 
-// GM records have a 16-byte stride. Stack copies use scalar alignment: their
-// callers pass local objects across outlined boundaries without realigning SP.
-struct alignas(8) SchedulerTaskMetadata {
+struct alignas(16) SchedulerTaskMetadata {
     uint16_t kernel_ids[3];
     LaneMask active_mask;
     uint8_t flags;
@@ -929,22 +927,6 @@ enum class SchedulerAdmissionState : uint64_t {
     ADMITTED = 3,
 };
 
-inline constexpr uint64_t SCHEDULER_COMPLETION_ASYNC_UNIT = UINT64_C(1) << 32;
-inline constexpr uint64_t SCHEDULER_COMPLETION_TOTAL_MASK = UINT64_C(0xffff0000);
-static_assert(
-    static_cast<uint64_t>(INT16_MAX) < UINT16_MAX,
-    "Validated physical completion count must not carry into the expected total"
-);
-
-inline __aicore__ constexpr uint64_t scheduler_completion_count(uint64_t state) { return state & UINT16_MAX; }
-inline __aicore__ constexpr uint64_t scheduler_completion_total(uint64_t state) { return (state >> 16) & UINT16_MAX; }
-inline __aicore__ constexpr uint64_t scheduler_completion_progress(uint64_t state) {
-    return state & ~SCHEDULER_COMPLETION_TOTAL_MASK;
-}
-inline __aicore__ constexpr uint64_t scheduler_completion_initial_state(uint32_t total) {
-    return static_cast<uint64_t>(total) << 16;
-}
-
 struct alignas(64) SchedulerTaskControl {
     // Only atomic wrappers write this line. The link belongs to at most one
     // dependency list, Ready inbox or unpublished Ready batch at a time.
@@ -964,10 +946,7 @@ struct alignas(64) SchedulerTaskControl {
 
     // Block claimers and retiring workers update these counters concurrently.
     alignas(64) volatile uint64_t next_block;
-    // Bits [0,16) count retired subtasks; [16,32) hold the Host-validated total.
-    // Each high-half vote requires the last return to check async completion.
-    // Valid counts are at most INT16_MAX, so the same RMW cannot change the total.
-    alignas(64) volatile uint64_t completion_state;
+    alignas(64) volatile uint64_t completed_blocks;
 
     // Only the admission owner bypass-publishes this signal. No cached store
     // or atomic RMW may target its line.
@@ -1149,11 +1128,6 @@ enum SchedulerErrorIdentityField : uint32_t {
     SCHEDULER_ERROR_HAS_LANE = 1U << 5,
 };
 
-struct alignas(64) SchedulerErrorSignal {
-    volatile uint64_t status;
-};
-static_assert(sizeof(SchedulerErrorSignal) == 64);
-
 struct alignas(64) SchedulerRunControl {
     uint64_t aic_task_count;
     uint64_t aiv_task_count;
@@ -1196,9 +1170,6 @@ struct alignas(64) SchedulerRunControl {
     // Only the elected error writer publishes this word. Its line has no
     // atomic RMW or cached AICore store, including readers that add zero.
     alignas(64) volatile uint64_t scheduler_error;
-    // The first error writer publishes each reader's line before the canonical
-    // status above. A worker polls only its own line during steady execution.
-    alignas(64) SchedulerErrorSignal worker_errors[SCHEDULER_WORKER_CAPACITY];
 };
 
 struct alignas(64) AicpuThreadLifecycleTrace {
@@ -1354,7 +1325,7 @@ static_assert(sizeof(SchedulerTaskPmuCell) == 64, "one PMU cell per cache line")
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
 static_assert(offsetof(SchedulerTaskMetadata, active_mask) == 6);
 static_assert(std::is_trivially_copyable_v<SchedulerTaskMetadata> && std::is_standard_layout_v<SchedulerTaskMetadata>);
-static_assert(alignof(SchedulerTaskMetadata) == 8, "metadata copies require scalar-aligned call frames");
+static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
 static_assert(offsetof(SchedulerTaskMetadata, timing_slot) == 12, "timing tag offset changed");
 static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block count must occupy the metadata tail");
 static_assert(sizeof(SchedulerTaskControl) == 384, "task control layout changed");
@@ -1362,7 +1333,7 @@ static_assert(alignof(SchedulerTaskControl) == 64, "task control alignment chang
 static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 24, "ticket cursor must use the atomic region");
 static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor requires an isolated atomic line");
 static_assert(
-    offsetof(SchedulerTaskControl, completion_state) == 192, "completion counter requires an isolated atomic line"
+    offsetof(SchedulerTaskControl, completed_blocks) == 192, "completion counter requires an isolated atomic line"
 );
 static_assert(
     offsetof(SchedulerTaskControl, admission_claim_lock) == 32, "admission claim lock must use the atomic line"
@@ -1400,7 +1371,7 @@ static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment cha
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
 static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 40, "executor trace layout changed");
-static_assert(sizeof(SchedulerRunControl) == 384 + SCHEDULER_WORKER_CAPACITY * 64, "run control layout changed");
+static_assert(sizeof(SchedulerRunControl) == 384, "run control layout changed");
 static_assert(alignof(SchedulerRunControl) == 64, "run control alignment changed");
 static_assert(offsetof(SchedulerRunControl, resolved_task_count) == 128, "lifecycle atomics need their own line");
 static_assert(offsetof(SchedulerRunControl, error_claimed) == 192, "error state needs its own line");
@@ -1413,7 +1384,6 @@ static_assert(offsetof(SchedulerRunControl, error_worker_index) == 288, "error i
 static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 296, "error identity ABI changed");
 static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 300, "error identity ABI changed");
 static_assert(offsetof(SchedulerRunControl, scheduler_error) == 320, "error publication needs its own line");
-static_assert(offsetof(SchedulerRunControl, worker_errors) == 384, "worker error signals need disjoint lines");
 static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
 static_assert(sizeof(SchedulerWorkerContext) == 320, "worker context layout changed");
 static_assert(alignof(SchedulerWorkerContext) == 64, "worker context alignment changed");
@@ -1781,7 +1751,6 @@ inline bool scheduler_init_data_from_layout(
 inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLayout &layout, uint64_t run_epoch) {
     if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0) return false;
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset);
-    auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
     uint64_t cooperative_count = 0;
     uint64_t mix_count = 0;
     for (uint64_t task = 0; task < layout.task_count; ++task) {
@@ -1817,9 +1786,6 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
     uint64_t vector_rank_offset = 0;
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         const auto &meta = metadata[task];
-        if (scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags))
-            controls[task].completion_state =
-                scheduler_completion_initial_state(meta.logical_block_num * meta.active_mask.count());
         if (!scheduler_task_requires_admission(meta)) continue;
         auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
             base, layout.admission_records_offset + task * layout.admission_record_stride

@@ -52,11 +52,6 @@
 | `timing_slot` | 定点计时槽，-1 为未指定，有效范围 0..15 |
 | `logical_block_num` | 本任务逻辑 block 数 |
 
-该结构大小与数组步长均为 16B，类型对齐为 8B，字段偏移保持固定。栈上的 metadata 副本使用 Scalar 对齐。
-错误上报的身份采集入口和底层发布入口均为 `static noinline`，保留首次错误归属、诊断字段和发布屏障。
-调用边界的验收包括实际汇编检查：存在 SP 栈帧对齐且跨调用传递栈地址的函数按潜在 CCEC 误编译处理，
-不能仅凭参数类型的 `alignof <= 8` 或 CPU 测试通过认定安全。
-
 `MIX` 表示多个 active subtask；`SPMD` 表示多个 logical block，二者可同时存在。
 `INLINE` 是由调度器直接完成的节点标记；不要与 RunControl 中输入时已完成的 `inline_completed_count` 混同。
 
@@ -83,12 +78,12 @@
 | `scheduler_worker_id` | 执行该次完成解析的 worker |
 | `completion_resolve_loop_iter` | 对应 scheduler 循环序号 |
 | `next_block` | 已确认成功领取的 block 数/领取游标；ticket 分支中不是 next ticket 值 |
-| `completion_state` | 低16位累计已退休的实际子任务，16–31位为Host初始化的总数，高32位累计需要检查异步完成的保守票数 |
+| `completed_blocks` | 已完成的逻辑 block 数；MIX 一个 group 汇总后贡献一个 block |
 | `admission_state` | UNCLAIMED → CLAIMED → PREPARED → ADMITTED |
 | `claim_seal` | 全部有效 block 已确认领取的不可变凭据，值为逻辑 block 总数 |
 
 TaskControl 共六行：首行是原子 state/链指针/claim tickets；第二行是 resolver 的 cached metadata；
-`next_block`、`completion_state`、`admission_state` 和 `claim_seal` 分别独占后四行。
+`next_block`、`completed_blocks`、`admission_state` 和 `claim_seal` 分别独占后四行。
 完成与领取会并发访问，缓存行布局本身就是各字段访问协议的一部分。
 
 [SchedulerDependencyHeader](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dependency.h) 为一条 64B 只读记录，version=2：
@@ -241,8 +236,9 @@ inbox 的 head=tail>=0 表示恰好一个任务；head=tail=-1 才是空，和�
 | `task_ref` | slot 当前归属任务 |
 | `state` | EMPTY/FREE/FILLING/READY/EXECUTING |
 | `subtask_slot` | 当前逻辑子任务身份 0/1/2 |
+| `cooperative` | 是否属于有序协作任务 |
 | `block_idx` | 本次执行的逻辑 block |
-| `candidate_index` | 普通 ready 候选的位置；有 admission 且该值为 UINT8_MAX 时，slot 属于有序任务 |
+| `candidate_index` | 普通 ready 候选在 admission.candidates 中的位置 |
 | `predicate` | 条件是否尚未求值、通过或不通过 |
 | `args_observed` | 是否已经观察本轮相关参数缓存 |
 | `gm_mix` | 是否属于 GM mailbox 协调的 MIX 执行 |
@@ -327,7 +323,7 @@ Tensor 的字段定义在 [TensorData](../../../src/common/host_build_graph/tens
 回到 [run_ready_dispatch_loop](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h)：
 
 ```text
-初始化入口：检查 DMB EXIT；间隔检查本worker的错误signal
+初始化入口：检查 DMB EXIT；间隔检查共享错误
 native 图：服务控制节点
 fill own slots：领取/准入/准备任务
 peek ready_head
@@ -338,9 +334,8 @@ peek ready_head
 调用 function_bin_addr(args)
 seal 本次 async 注册
 启用参数抓取时完成 AFTER_COMPLETION 边界
-检查同一 EXIT/本worker错误门禁
-scheduler_complete_own_slot：校验执行绑定、释放slot、贡献子任务完成数
-最后贡献者推进逻辑完成与依赖传播，随后发布trace、释放MIX资源
+检查同一 EXIT/共享错误门禁
+scheduler_complete_own_slot：校验执行绑定、直接退休、推进完成
 回到控制节点与异步服务，不重复门禁
 ```
 

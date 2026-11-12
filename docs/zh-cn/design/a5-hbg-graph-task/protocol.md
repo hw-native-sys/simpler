@@ -130,7 +130,7 @@ Host 按 task_ref 顺序分别累计 AIC/AIV 普通 SPMD 的 block 数；MIX、s
 可以记录 observed/closed 并直接推进本地 obligation，无须读取参数或暂存普通 payload。
 该路径仍校验 epoch、全局顺序、任务形状和 membership，每轮最多扫描八条记录；
 扫描游标推进也计为调度进展，即使本轮未保留 current task，也不会触发空闲退避。
-不增加 completed_subtasks、不标记逻辑任务完成，MIX 和 sync_start 仍走原有准入与关闭路径。
+不增加 completed_blocks、不标记逻辑任务完成，MIX 和 sync_start 仍走原有准入与关闭路径。
 现有 PREPARED/ADMITTED、membership、短 commit lock 和 kernel 资源准入均不提前。
 
 `SchedulerLocalSlotState` 用三态 predicate（未求值、通过、不通过）保存一次求值的结果，
@@ -159,9 +159,8 @@ Graph 的拓扑编号不决定 runtime order key。不能为每个实例设置�
 SPMD 的逻辑完成仍为全部 blocks 完成；`sync_start` 仍要求单个 child 的规定成员共同到达。
 MIX 的资源成员仍为 active mask 加 AIC coordinator；双 AIV MIX 的 AIC 即使不执行 kernel 也参与协调，
 未被资源 mask 选中的 AIV 不额外参与握手。
-每个实际执行 lane 返回时贡献一次物理子任务完成；只有最后一个贡献者且异步条件满足，才允许完成 child 并解析后继。
-AIC 观察全部资源 lane 的 release 后退役 MIX 组，这属于资源收尾，不再聚合一次逻辑完成。
-逻辑完成可以先于协调核收尾，但 EXIT 仍须等待资源义务清空。block owner、lane release、seal 和 ordered-exit 记录不会因 Graph shell 完成而清除。
+AIC 观察 release 后才聚合 block 完成。AIV 单 lane 返回不能提前完成 child 或释放 EXIT。
+复用现有 block owner、LocalDone、seal 和 ordered-exit；不因 Graph shell 完成而清除这些记录。
 
 ## GM 可见性与所有权
 
@@ -182,7 +181,7 @@ AIC 观察全部资源 lane 的 release 后退役 MIX 组，这属于资源收�
 
 不同 child 的 scalar/predicate 独占 64-byte cache line，不能沿用 packed scalar pool 后让多核并行整行写回。
 TaskControl 为 384 bytes：state/链指针/claim tickets 共用首个原子行；cached resolver metadata、
-next_block、completion_state、bypass admission signal 和 claim seal 各占一行。禁止 cached 写回触及原子行。
+next_block、completed_blocks、bypass admission signal 和 claim seal 各占一行。禁止 cached 写回触及原子行。
 参数存放与定义存放不能混用一条可写 cache line。无参数时不对零地址或零长度范围做 cache 操作。
 运行中不使用全 cache flush 作为每 Graph/每 child 的发布方法，也不假设 AICPU LaunchEnvelope 对 AICore 可寻址。
 
@@ -251,11 +250,6 @@ Host 必须在发布前完成能力判断：非法输入直接失败；合法但
 能够观察到 fatal 的 worker 禁止继续发布新成功工作；并发中已发布或在途的工作仍要按退出协议处理。
 错误锁存与全部 worker 同时停发不是一个原子操作，不能承诺零条在途 publication。
 
-正常调度路径读取本worker独占cacheline的错误signal；全局错误状态用于AICPU与终止诊断。
-首个错误发布者先发布错误身份，再发布全部worker signal，最后发布全局状态。
-观察到全局非零状态意味着各worker signal均已发布；后续错误发布者不覆盖任何一份状态。
-每个worker仍在原有许可检查点读取错误signal，不将较早一次读取作为新的执行许可。
-
 现有失败清理可能推进完成统计，以便收敛；因此数值达到 N-H 不能覆盖非零 error。
 AICPU 退出循环后仍检查 error，Host 仍检查最终 run status 和 completion fence。
 未完成退出证明的 backing 进入 poison/quarantine，不能归还池后被下一 run 改写。
@@ -303,46 +297,3 @@ task control、queue、predicate 取值和 Tensor 数据不进入该状态，参
 未知 execution identity、缺失的非 predicate kernel 和不一致的原始边必须拒绝。
 该投影对应一次实际 predicate 结果；复用到另一 capture 前必须核对 callable、输入以及逐 task/block 执行集合。
 无插桩性能、单独 L3 性能采集和 L4 协议/拓扑采集分别报告。
-
-### 执行子任务完成与资源收尾
-
-每个实际 dispatch 子任务只贡献一次 `completed_subtasks`，总数为
-`logical_block_num × active_mask.count()`。普通任务、SPMD 和 MIX 使用同一计数路径；
-MIX 中不执行 kernel 的协调 lane 不贡献计数。predicate 跳过的 dispatch 仍退休一次，
-inline/control 节点使用各自的控制完成路径。
-
-`completion_state` 的低 16 位记录子任务完成数，16–31 位保留 Host 初始化的总子任务数，
-高 32 位累计需要检查 async join 的保守票数。核内从同一次 RMW 的返回值比较完成数与总数，
-无需再次读取任务形状；总数不超过 INT16_MAX，合法贡献不会修改总数字段。
-每个子任务在同一次 atomic add 中增加完成数，并按需增加一票；最大子任务数不会使低位进位。
-本核执行在登记异步条件后必然激活本地 async 状态，因此最后一次 RMW 返回的累计零票
-可证明所有已返回的执行均无异步登记，不需要另一轮 async-close 查表、屏障及 RMW。
-高位非零只表示需要检查，不等价于本任务一定有异步条件；外部 completion token 在有 async
-上下文时保守投票。JSON 的 `completed_subtasks` 和 completion ticket 始终导出低位实际完成数。
-
-需要检查时，最后一个贡献者关闭 async computation；存在待处理 `defer_wait` 时仍由 FINISH 完成逻辑任务，
-否则发布 TaskDone 并解析后继。MIX 的 lane release、协调核退役和 close seal 只管理资源，
-不重复贡献计数。逻辑 TaskDone 可以早于协调核收尾，正常退出 drain 会处理 RELEASED 组，
-所有本地资源收尾与平台 run fence 完成后才允许复用存储。
-
-执行核在 kernel 返回并封闭异步条件登记后直接处理完成槽，不经下一轮自身完成槽扫描。
-resident 返回入口使用执行前已验证的本核槽身份，不再重复外部 completion token 的
-索引、任务形状和 tracker 检查；外部 token 入口仍执行完整检查。
-resident 保留执行前映射的私有 AsyncWriter；Host 构造的 group 地址、身份和 layout 在本次运行内不变，
-返回时直接读取注册状态完成 seal，不重复校验这些不变字段。外部 writer 入口仍校验绑定。
-seal 使用一次读取的 count/error/reservation 状态；
-已封闭 group 的重复 seal 仍失败，首次错误、未结束的 reservation 和越界计数仍阻止发布。
-没有异步条件的 resident group 不进入 CHECK 队列；它的 header 写回由紧随其后的
-完成计数 RMW 前 DSB 一并发布。存在条件时，seal 仍在发布 join、lease 和目录前完成自身屏障；
-外部 standalone seal 入口也保留自身发布屏障。
-完成计数及后继 Ready 发布先于该执行的 trace 整理与写回；trace 不参与业务依赖。
-启用 ordered admission 时，完成核可将一个已就绪 MIX 后继直接留在自己的候选槽，
-包括由 AIV 完成前驱的情况。该槽只授予准入发布权，不授予 MIX 执行权；
-MIX 的 AIC 协调、成员选择、到达同步及执行许可仍由原有协议处理。
-候选槽已满或没有 ordered admission 时，MIX 后继仍通过共享 Ready 队列发布。
-trace 必须在本核复用槽、释放 MIX lane、关闭成员义务及确认 EXIT 前发布完毕。
-Host 仅在所有核退出握手完成后读取 trace，不能用 TaskDone 作为 trace 可读的依据。
-
-协议沿用 v10（普通图）/v11（原生 Graph）标签，只支持当前字段布局；在每条执行记录中保留贡献前后时间、ticket 和 worker；
-审计要求 ticket 覆盖全部实际子任务且无重复。非 deferred TaskDone 必须由最后贡献者发布。
-MIX block 记录的 completion 区间表示资源退役，ticket 为 `UINT64_MAX`。

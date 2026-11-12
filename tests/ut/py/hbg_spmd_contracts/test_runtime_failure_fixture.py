@@ -190,7 +190,7 @@ def _capture():
                 {
                     "task_ref": 0,
                     "state": 0,
-                    "completed_subtasks": 3,
+                    "completed_blocks": 1,
                     "next_block": 2,
                     "claim_tickets": 2,
                     "admission_claim_lock": 0,
@@ -199,7 +199,7 @@ def _capture():
                 {
                     "task_ref": 1,
                     "state": 0,
-                    "completed_subtasks": 0,
+                    "completed_blocks": 0,
                     "next_block": 0,
                     "claim_tickets": 0,
                     "admission_claim_lock": 0,
@@ -245,7 +245,7 @@ def _large_ticket_capture(mask, lane, blocks=257):
         block_num=blocks,
     )
     protocol["executions"][0].update(subtask_slot=slot, worker_index=slot)
-    protocol["task_controls"][0].update(next_block=blocks, claim_tickets=blocks, completed_subtasks=min(1, blocks - 1))
+    protocol["task_controls"][0].update(next_block=blocks, claim_tickets=blocks, completed_blocks=min(1, blocks - 1))
     # Either lifecycle partition may own the delayed lane.
     for record in raw["aicpu_lifecycle_records"]:
         record["exit_wait_end_cycles"] = 2_500_000_200
@@ -430,7 +430,7 @@ def test_nonreturning_capture_proves_missing_return_and_exit_ack_timeout(native)
         "late_signal_end",
         "consumer_entered",
         "task_done",
-        "completed_subtasks",
+        "completed_blocks",
         "resolved_count",
     ),
 )
@@ -490,7 +490,7 @@ def test_nonreturning_capture_rejects_fabricated_completion_or_unrelated_failure
         "duplicate_partition",
         "consumer_entered",
         "task_done",
-        "completed_subtasks",
+        "completed_blocks",
         "duplicate_control",
         "missing_control",
         "resolved_count",
@@ -555,9 +555,8 @@ def _corrupt_shutdown(raw, corruption):
         protocol["executions"].append({**execution, "task_ref": 1})
     elif corruption == "task_done":
         protocol["task_controls"][0]["state"] = 2
-    elif corruption == "completed_subtasks":
-        task = protocol["tasks"][0]
-        protocol["task_controls"][0]["completed_subtasks"] = task["block_num"] * task["active_mask"].bit_count()
+    elif corruption == "completed_blocks":
+        protocol["task_controls"][0]["completed_blocks"] = 2
     elif corruption == "duplicate_control":
         protocol["task_controls"].append(copy.deepcopy(protocol["task_controls"][0]))
     elif corruption == "missing_control":

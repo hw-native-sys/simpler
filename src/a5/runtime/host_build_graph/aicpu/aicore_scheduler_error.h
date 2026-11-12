@@ -91,11 +91,6 @@ inline bool record_aicore_scheduler_runtime_error(
         reinterpret_cast<const uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
         offsetof(SchedulerRunControl, scheduler_error) - offsetof(SchedulerRunControl, error_claimed)
     );
-    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker)
-        __atomic_store_n(
-            &run_control->worker_errors[worker].status, static_cast<uint64_t>(scheduler_error), __ATOMIC_RELEASE
-        );
-    cache_flush_range(run_control->worker_errors, sizeof(run_control->worker_errors));
     __atomic_store_n(&run_control->scheduler_error, static_cast<uint64_t>(scheduler_error), __ATOMIC_RELEASE);
     cache_flush_range(
         reinterpret_cast<const uint8_t *>(run_control) + offsetof(SchedulerRunControl, scheduler_error),

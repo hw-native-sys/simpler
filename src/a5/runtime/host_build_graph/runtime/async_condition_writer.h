@@ -66,29 +66,6 @@ inline __aicore__ bool valid(const AsyncWriter &writer) {
     return true;
 }
 
-// The caller has validated the group's address/identity and observed OPEN.
-// One execution owns its registration state until sealing completes.
-template <bool LayoutValidated = false>
-inline __aicore__ bool seal_open_conditions(const AsyncWriter &writer, __gm__ AsyncGroupData &data, uint32_t count) {
-    const int32_t first_error = data.error_code;
-    int32_t error = first_error;
-    if (error == SIMPLER_ERROR_NONE) {
-        if constexpr (!LayoutValidated)
-            if (!layout_valid(writer, data)) error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
-        if (error == SIMPLER_ERROR_NONE) {
-            if (count > data.capacity) error = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
-            else if (data.reservation_limit != 0) error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
-        }
-    }
-    if (error != SIMPLER_ERROR_NONE) {
-        if (first_error == SIMPLER_ERROR_NONE) data.error_code = error;
-        data.state = AsyncPublicationState::FAILED;
-        return false;
-    }
-    data.state = AsyncPublicationState::SEALED;
-    return true;
-}
-
 // Like the existing kernel API, the caller supplies a live completion address.
 // The runtime validates the record format; existing run/communication owners
 // retain its storage until all accepted work has retired.
@@ -181,7 +158,13 @@ inline __aicore__ bool register_completion_condition(const AsyncWriter &writer, 
 inline __aicore__ bool seal_conditions(const AsyncWriter &writer) {
     auto *data = detail::group(writer);
     if (data == nullptr || data->state != AsyncPublicationState::OPEN) return false;
-    return detail::seal_open_conditions(writer, *data, data->count);
+    if (!detail::valid(writer) || data->reservation_limit != 0) {
+        detail::fail(writer, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        data->state = AsyncPublicationState::FAILED;
+        return false;
+    }
+    data->state = AsyncPublicationState::SEALED;
+    return true;
 }
 
 }  // namespace pto2::resident

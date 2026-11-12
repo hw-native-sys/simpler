@@ -14,7 +14,7 @@
 #include "scheduler_admission.h"
 #include "scheduler_async_control.h"
 
-enum class SchedulerGmMixResult : uint8_t { WAIT, PROGRESS, ERROR };
+enum class SchedulerGmMixResult : uint8_t { WAIT, PROGRESS, TASK_LAST, ERROR };
 
 // StaticContextValidated is confined to one service call whose task, resource
 // membership and mailbox binding cannot change before returning. Every stage
@@ -96,7 +96,7 @@ static inline __aicore__ bool scheduler_gm_mix_close(
             return true;
         // The query may only postpone closing. The error gate and the atomic
         // exhausted-cursor confirmation precede publishing a close seal.
-        if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+        if (scheduler_read_error(run) != 0) return false;
         uint64_t cursor = 0;
         if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
         if (cursor < admission.current_block_num && !admission.sync_claimed) return true;
@@ -117,7 +117,7 @@ static inline __aicore__ bool scheduler_gm_mix_close(
         close_seal = group.task_last_seq + 1;
     } else {
         if (!critical && scheduler_gm_query(seal) == 0) return true;
-        if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+        if (scheduler_read_error(run) != 0) return false;
         const uint64_t published = scheduler_gm_fetch_add(seal, UINT64_C(0));
         if (published == 0) return true;
         if ((group.phase != SchedulerGmMixPhase::IDLE && group.phase != SchedulerGmMixPhase::RELEASED) ||
@@ -392,7 +392,7 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
         if (slot.state != SchedulerDispatchSlotState::FREE) continue;
         slot.task_ref = admission.current_task_ref;
         slot.block_idx = group.block_idx;
-        slot.args_observed = true;
+        slot.cooperative = true;
         slot.gm_mix = true;
         slot.subtask_slot = group.subtask_slot;
         slot.candidate_index = UINT8_MAX;
@@ -433,8 +433,8 @@ static inline __aicore__ bool scheduler_gm_mix_release_lane(
     const int64_t task_ref = completed.task_ref;
     if (group.phase != SchedulerGmMixPhase::RUNNING || task_ref != admission.current_task_ref ||
         slot_index >= SCHEDULER_PENDING_SLOT_COUNT || group.slot_index != slot_index ||
-        completed.state != SchedulerDispatchSlotState::EXECUTING || !scheduler_slot_uses_admission(local, completed) ||
-        !completed.gm_mix || group.block_idx != completed.block_idx || group.subtask_slot != completed.subtask_slot ||
+        completed.state != SchedulerDispatchSlotState::EXECUTING || !completed.cooperative || !completed.gm_mix ||
+        group.block_idx != completed.block_idx || group.subtask_slot != completed.subtask_slot ||
         group.group_seq == 0 || local->slots[slot_index].state != SchedulerDispatchSlotState::FREE)
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
@@ -446,8 +446,8 @@ static inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool query_prefiltered = false
 ) {
-    // Lane completion owns the task counter. Retirement releases only the
-    // retained group descriptor after every resource lane has returned it.
+    // The completion contribution below owns the error gate. A partial
+    // release observation neither retires the group nor contributes a block.
     if (!scheduler_gm_mix_context_valid<StaticContextValidated>(graph, base, local, run))
         return SchedulerGmMixResult::ERROR;
     auto &admission = *local->admission;
@@ -457,12 +457,11 @@ static inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
     if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, true, &all, query_prefiltered))
         return SchedulerGmMixResult::ERROR;
     if (!all) return SchedulerGmMixResult::WAIT;
-    if constexpr (RecordProtocol) {
-        scheduler_protocol_block_complete(base, local, group.block_idx, true, UINT64_MAX);
-        scheduler_protocol_block_complete(base, local, group.block_idx, false, UINT64_MAX);
-    }
+    const auto finished = scheduler_contribute_ordered_block<RecordProtocol>(graph, base, local, run);
+    if (finished == SchedulerBlockFinishResult::ERROR) return SchedulerGmMixResult::ERROR;
     group.phase = SchedulerGmMixPhase::IDLE;
     group.slot_index = UINT8_MAX;
     group.subtask_slot = UINT8_MAX;
-    return SchedulerGmMixResult::PROGRESS;
+    return finished == SchedulerBlockFinishResult::TASK_LAST ? SchedulerGmMixResult::TASK_LAST :
+                                                               SchedulerGmMixResult::PROGRESS;
 }

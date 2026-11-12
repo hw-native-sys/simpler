@@ -68,25 +68,9 @@ protected:
         const auto *pool =
             scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
         const auto queue = scheduler_ready_pool_queue(fixture.base(), *pool, 0);
-        // One successor belongs to ordered admission, never an ordinary slot.
-        // Existing queued tickets retain their head and FIFO order.
-        const int64_t direct_task = scenario == HandoffScenario::TWO_SUCCESSORS ? 2 : 1;
-        std::set<int64_t> reachable;
-        for (const auto &candidate : fixture.admissions[producer_lane].candidates) {
-            if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
-            EXPECT_EQ(candidate.ready.task_ref, direct_task);
-            EXPECT_EQ(candidate.ready.source, SchedulerReadySource::DIRECT_RESOLVE);
-            EXPECT_TRUE(reachable.insert(candidate.ready.task_ref).second);
-        }
-        EXPECT_EQ(reachable.size(), 1u);
-        EXPECT_EQ(fixture.locals[producer_lane]->slots[producer.slot].state, SchedulerDispatchSlotState::FREE);
-        ASSERT_EQ(queue.control->reserved_tail - queue.control->head, second_mix ? 1u : 0u);
-        if (second_mix) {
-            const int64_t queued = scenario == HandoffScenario::QUEUED_MIX ? 2 : 1;
-            EXPECT_EQ(queue.entries[queue.control->head].task_ref, queued);
-            EXPECT_TRUE(reachable.insert(queued).second);
-        }
-        EXPECT_EQ(reachable, second_mix ? (std::set<int64_t>{1, 2}) : (std::set<int64_t>{1}));
+        ASSERT_EQ(queue.control->reserved_tail - queue.control->head, second_mix ? 2u : 1u);
+        EXPECT_EQ(queue.entries[queue.control->head].task_ref, second_mix ? 2 : 1);
+        EXPECT_EQ(queue.entries[queue.control->reserved_tail - 1].task_ref, 1);
         for (uint32_t worker : {1u, 2u}) {
             SchedulerReadyClaim aiv{};
             ASSERT_TRUE(scheduler_claim_ready_for_slot(
@@ -103,7 +87,7 @@ protected:
                 EXPECT_FALSE(fixture.begin(worker, &premature));
             }
             EXPECT_EQ(fixture.locals[held_worker]->slots[held.slot].state, SchedulerDispatchSlotState::EXECUTING);
-            EXPECT_EQ(scheduler_completion_count(fixture.control(1)->completion_state), 0u);
+            EXPECT_EQ(fixture.control(1)->completed_blocks, 0u);
             ASSERT_TRUE(fixture.complete(held));
         }
         std::set<std::tuple<int64_t, uint32_t, uint8_t>> executions;
@@ -128,11 +112,7 @@ protected:
         }
         ASSERT_TRUE(finished);
         EXPECT_EQ(executions.size(), static_cast<size_t>(mask.count()) * (second_mix ? 2 : 1));
-        EXPECT_EQ(first_entries.size(), second_mix ? 2u : 1u);
-        EXPECT_EQ(
-            (std::set<int64_t>(first_entries.begin(), first_entries.end())),
-            second_mix ? (std::set<int64_t>{1, 2}) : (std::set<int64_t>{1})
-        );
+        EXPECT_EQ(first_entries, second_mix ? (std::vector<int64_t>{2, 1}) : (std::vector<int64_t>{1}));
         for (uint32_t task = 0; task < shapes.size(); ++task)
             EXPECT_EQ(fixture.control(task)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
         EXPECT_EQ(queue.control->head, queue.control->reserved_tail);

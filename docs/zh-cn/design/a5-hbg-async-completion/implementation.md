@@ -8,7 +8,7 @@
 | ---- | ---- |
 | A5 HBG Host planner/runtime maker | 根据现有图预留完整记录容量，只初始化和上传稳定映射、header 及必要控制字前缀 |
 | kernel context 与登记 helper | 保留地址式登记接口，写入本执行的稳定记录，检查容量与首错 |
-| 执行返回与 completion/MIX 收尾 | 封口登记，贡献物理子任务完成，分别汇合计算与实际 pending 条件并收尾执行资源 |
+| 执行返回与 completion/MIX 收尾 | 封口登记，释放实际执行资源，汇合计算释放和实际 pending 条件 |
 | CHECK | 任意参与核领取条件记录，每次有界检查，保存进度并交回执行机会 |
 | FINISH 与 resolver | 唯一发布 TaskDone，分段路由后继，排空发布后贡献 resolved_task_count |
 | 已有 run/domain owner | 保持 heap、staging、导入 backing、通信 context/window/workspace 至实际退休 |
@@ -32,9 +32,9 @@ Host 临时计划按逻辑 task 保存设备任务描述、条件区起点、每
 
 整个 run 尚未发布异步工作时跳过空目录扫描和额外消费者获取；尚未激活的空闲核每 16 个服务机会探测一次，业务返回、本核错误及消费者获取不受此空闲预算延迟。活动开始后，普通业务与控制工作共享服务额度：最多 4 次业务返回后服务一次 CHECK/FINISH；空闲和准入受阻时仍提供控制服务。CHECK/FINISH 轮转，每次最多领取一个记录，基础工作预算为 8。PENDING 或失败 CAS 不计为真实进展，不延长 watchdog。
 
-物理执行返回与逻辑任务完成独立。SPMD 和 MIX 的每个实际执行 lane 在返回并封口登记后贡献一次物理子任务完成；零登记及合法 skip 也必须封口。只有非零 group 增加 pending；全部物理执行已封口后才可关闭 computation，最后一次合法原子汇合授予 FINISH 激活权。trace 发布和 MIX 资源退役按各自顺序收尾，并在 EXIT ACK 或存储复用前完成。
+物理执行返回与逻辑任务完成独立。SPMD 的全部 block、MIX 的全部 active lane 必须按真实释放顺序记账；零登记及合法 skip 也必须封口并释放执行资源。只有非零 group 增加 pending；计算释放全部完成后关闭登记，最后一次合法原子汇合才有 FINISH 激活权。
 
-全部成员均零登记的普通、SPMD、MIX task 沿用既有同步完成和本核后继路径，不发布独立 FINISH 工作。完成计数总数为 block 数乘 active lane 数；最后一次物理贡献同时取得累计的保守异步票，只有票为零才跳过 join 检查。贡献与解依赖可以先于 trace 发布和 MIX 资源 release；不能根据先返回成员的零登记或暂时 pending=0 推断整个任务同步。
+全部成员均零登记的普通、SPMD、MIX task 沿用既有同步完成和本核后继路径，不发布独立 FINISH 工作。计算释放复用原有汇合，SPMD 必须在 trace 发布和 slot 释放后贡献 completed_blocks，MIX 必须先收齐 release。非 ordered 快路径只能在真实最后计算返回后判断是否曾登记；不能根据先返回成员的零登记或暂时 pending=0 推断整个任务同步。
 
 零登记执行不初始化任何 CHECK/FINISH 后缀状态；首次非零发布必须初始化其全部进度和 lease，目录零位保护未初始化存储。
 
@@ -65,4 +65,4 @@ FINISH 保存完整 resolver 游标及最多 8 项发布批次，跨核恢复不
 
 复用已有 DFX 输出和协议观测入口。必要事件关联 run/task/block/lane、登记封口、实际执行释放、条件满足、逻辑完成及 resolve 排空；不在热路径逐次打印 PENDING，也不为了观测扩展用户可见接口。
 
-FINISH 的 TaskDone actor 在既有 `flags` 字段中设置 bit 31，表示延迟完成。cooperative task 的 order 从已发布的 admission 记录读取，不依赖完成核仍持有原 cohort。校验器仅对带此标记的完成事件允许跨核 actor，并检查全部物理子任务贡献、封口登记先于 computation close 以及后继依赖；执行 trace 和 MIX release 的收尾由资源退休与 EXIT 顺序约束；admission、inline 和 Graph control 不能使用该标记。该诊断不替代外部完成条件和 payload 可见性的功能验证。
+FINISH 的 TaskDone actor 在既有 `flags` 字段中设置 bit 31，表示延迟完成。cooperative task 的 order 从已发布的 admission 记录读取，不依赖完成核仍持有原 cohort。校验器仅对带此标记的完成事件允许跨核 actor，并检查全部 block 贡献、执行 trace 发布先于逻辑完成以及后继依赖；admission、inline 和 Graph control 不能使用该标记。该诊断不替代外部完成条件和 payload 可见性的功能验证。
