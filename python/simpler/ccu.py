@@ -12,14 +12,26 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import time
 from pathlib import Path
+
+
+def ccu_sdk_root() -> Path:
+    """Locate the host CANN SDK used by CCU modules and their build identity."""
+    sdk = Path(os.environ["ASCEND_HOME_PATH"])
+    roots = (sdk, sdk / f"{platform.machine()}-linux")
+    headers = ("include/hcomm/ccu/ccu_res.h", "include/acl/acl.h")
+    for root in roots:
+        if all((root / header).is_file() for header in headers):
+            return root
+    raise FileNotFoundError(f"CANN CCU SDK requires {', '.join(headers)}; searched {', '.join(map(str, roots))}")
 
 
 def runtime_build_identity() -> tuple[bytes, bytes]:
     from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415 -- CCU-only toolchain discovery
 
-    sdk_header = Path(os.environ["ASCEND_HOME_PATH"]) / "aarch64-linux/include/hcomm/ccu/ccu_res.h"
+    sdk_header = ccu_sdk_root() / "include/hcomm/ccu/ccu_res.h"
     isa_header = Path(ensure_pto_isa_root()) / "include/pto/pto-inst.hpp"
     return hashlib.sha256(sdk_header.read_bytes()).digest(), hashlib.sha256(isa_header.read_bytes()).digest()
 
