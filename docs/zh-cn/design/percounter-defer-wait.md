@@ -347,6 +347,22 @@ kernel。若实测需要，加回 HBG 的 `check_directory` 位图与 `Scheduler
 
 容量、区域字节数与同步路径开销分别度量；优化不得引入强制的额外用户声明。
 
+### 8.1 生产工作负载
+
+`tests/fdwic/dsv41_scheduler` 的 DeepSeek-V4.1 九个 pypto_lib 用例是本设计的生产验证面：
+真实双卡、原始 kernel 二进制、输出按 fused-prefix 对照校验。其 MoE 路径的
+`dispatch_meta_wait` 与 `combine_wait` 两个 kernel 走 `pld.system.defer_wait`。
+
+九个用例在 percounter 上全部通过（`validated_against_fused_prefix: true`，两个 rank
+均为 `passed: true`）。该特性是这条路径的必要条件而非优化：把 percounter 换回本设计
+落地前的版本，`swa` 这类纯 attention 切片照常通过，而 `moe` 与 `layers_19_21` 在设备侧
+`trap` —— 没有 async 支持时 `async_present` 为 0，kernel 取到空 slab，正是 §1.1 所述的
+失败形态。
+
+与常驻调度器的时延对比按用例分两类，且仅在重复测量漂移小于两者差距时才成立：
+percounter 在 `swa` 上约 2.1 倍、在 MoE 系用例上约 1.2 倍更快，在 `c1a`/`c2a` 系的
+isolated case 上慢 8%–21%。
+
 ## 9. 落地顺序
 
 每一步各自正确、可单独提交，**不存在"合起来才对"的中间状态**。做到这一点靠一条规则：
