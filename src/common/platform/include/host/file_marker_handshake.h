@@ -12,6 +12,10 @@
 #ifndef SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_FILE_MARKER_HANDSHAKE_H
 #define SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_FILE_MARKER_HANDSHAKE_H
 
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -179,6 +183,20 @@ inline std::string release_path(const std::string &rootinfo_path, uint64_t run_t
     return rootinfo_path + ".destroy_released." + run_token_hex(run_token) + "." + std::to_string(rank);
 }
 
+inline std::string failure_path(const std::string &rootinfo_path, uint64_t run_token) {
+    // Like final releases, failures must survive cleanup and the next init's sweep.
+    return rootinfo_path + ".destroy_failed." + run_token_hex(run_token);
+}
+
+inline bool publish_failure(const std::string &path) {
+    if (path.empty()) return true;
+    // Existence is the entire message; multiple ranks can report the same failure.
+    const int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd < 0) return errno == EEXIST;
+    close(fd);
+    return true;
+}
+
 inline Result
 destroy_barrier(const std::string &rootinfo_path, int rank, int nranks, uint64_t run_token, WaitOptions options = {}) {
     constexpr const char *kArrivalTag = "destroy";
@@ -215,7 +233,10 @@ inline Result release_after_cleanup(
 ) {
     if (rank == 0) {
         Result cleanup_result = cleanup(rootinfo_path);
-        if (!cleanup_result.ok()) return cleanup_result;
+        if (!cleanup_result.ok()) {
+            (void)publish_failure(options.abort_path);
+            return cleanup_result;
+        }
 
         Result first_error;
         for (int follower_rank = 1; follower_rank < nranks; ++follower_rank) {
@@ -223,12 +244,14 @@ inline Result release_after_cleanup(
                 first_error = {Error::MARKER_WRITE_FAILED, Stage::RELEASE_PUBLISH, follower_rank};
             }
         }
+        if (!first_error.ok()) (void)publish_failure(options.abort_path);
         return first_error;
     }
 
     const std::string path = release_path(rootinfo_path, run_token, rank);
     Result wait_result = wait_for_path(
-        path, Stage::RELEASE_WAIT, rank, std::chrono::steady_clock::now() + options.timeout, options.poll_interval
+        path, Stage::RELEASE_WAIT, rank, std::chrono::steady_clock::now() + options.timeout, options.poll_interval,
+        options.abort_path
     );
     if (!wait_result.ok()) return wait_result;
 

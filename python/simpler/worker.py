@@ -74,6 +74,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -936,6 +937,17 @@ _PY_CALLABLE_HEADER = struct.Struct("<4sBBHQ")
 # shm at offset 0, reply shm at offset CTRL_SHM_NAME_BYTES).  _CTRL_RELEASE_DOMAIN
 # uses only the first slot.
 _CTRL_SHM_NAME_BYTES = 32
+
+_COMM_ROOTINFO_DIR = "/tmp"
+_COMM_ROOTINFO_NAME_PATTERN = r"pto_multi_comm_([0-9a-f]{32})_([0-9a-f]{1,8})\.bin"
+_COMM_DESTROY_MARKER_RE = re.compile(
+    _COMM_ROOTINFO_NAME_PATTERN + r"\.(?:destroy_failed\.[0-9a-f]{1,16}|destroy_released\.[0-9a-f]{1,16}\.[0-9]+)"
+)
+_COMM_HOST_PREPARE_MARKER_RE = re.compile(
+    r"barrier_"
+    + _COMM_ROOTINFO_NAME_PATTERN
+    + r"_alloc_[0-9]+_host_(?:ready|failed)_[0-9a-f]{1,16}_[0-9]+\.ready(?:\.tmp)?"
+)
 
 # Domain-allocation request shm layout: 40-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
@@ -6123,11 +6135,11 @@ class Worker:
     def _comm_plan_rootinfo_path(self) -> str:
         """Per-Worker rootinfo path used by HCCL/sim base comm_init.
 
-        Namespaced by parent pid + Python id(self) so two concurrent L3
-        Workers in the same process do not collide on the handshake file.
+        The startup-tree token and process group identify the owner to an
+        ancestor even if the L3 exits before its chip children.
         """
-        tag = f"pto_multi_comm_{os.getpid()}_{id(self):x}.bin"
-        return os.path.join("/tmp", tag)
+        tag = f"pto_multi_comm_{self._shm_token}_{os.getpgrp():x}.bin"
+        return os.path.join(_COMM_ROOTINFO_DIR, tag)
 
     def _allocate_next_level_worker_id(self) -> int:
         worker_id = self._next_level_worker_id_count
@@ -10993,9 +11005,8 @@ class Worker:
         host_names = {}
         if memory_source == AddressSpace.HOST:
             # Host windows belong to this startup tree even before allocation replies arrive.
-            prefix = "h-"
-            if self._config.get("platform") == "a2a3":
-                prefix = f"a3-{os.getpgrp():x}-"
+            kind = "a3" if self._config.get("platform") == "a2a3" else "h"
+            prefix = f"{kind}-{os.getpgrp():x}-"
             nonce_length = 18 - len(prefix)  # The startup-tree prefix takes 12 bytes.
             for chip in workers:
                 host_name = _shm_name(self._shm_token, prefix + uuid.uuid4().hex[:nonce_length])
@@ -15543,24 +15554,24 @@ class Worker:
         if errors:
             raise errors[0]
 
-    def _a3_backing_owner_exited(self, parts: list[str]) -> bool:
-        if len(parts) != 5 or not re.fullmatch(r"[0-9a-f]{1,8}", parts[3]):
+    def _host_domain_owner_exited(self, token_prefix: str, group: str) -> bool:
+        if not re.fullmatch(r"[0-9a-f]{1,8}", group):
             return False
-        pgid = int(parts[3], 16)
+        pgid = int(group, 16)
         if not 0 < pgid <= 0x7FFFFFFF:
             return False
         if pgid == os.getpgrp():
-            if self.level != 3 or parts[1] != self._shm_token[:8]:
+            if self.level != 3 or token_prefix != self._shm_token[:8]:
                 return False
             if self._chip_pids or self._cleanup_journal.has_kind("child"):
-                raise RuntimeError("Host backing still has unconfirmed L2 child exit")
+                raise RuntimeError("Host domain still has unconfirmed L2 child exit")
             return True
         # A reaped nested L3 may have left L2 descendants in its group.
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
             return True
-        raise RuntimeError(f"Host backing process group {pgid} is still alive")
+        raise RuntimeError(f"Host domain process group {pgid} is still alive")
 
     def _unlink_shm_namespace(self, protected_names: set[str]) -> None:
         """Unlink orphan shared memory belonging to this exact startup tree."""
@@ -15574,10 +15585,10 @@ class Worker:
                 continue
             try:
                 parts = entry.name.split("-", 4)
-                if parts[2] == "a3" and not self._a3_backing_owner_exited(parts):
-                    continue
                 if parts[2] in ("a3", "h"):
-                    # Native creators are untracked and may die before ftruncate.
+                    if len(parts) != 5 or not self._host_domain_owner_exited(parts[1], parts[3]):
+                        continue
+                    # Native creators are untracked and may die before reserving the window.
                     import _posixshmem  # noqa: PLC0415
 
                     _posixshmem.shm_unlink(f"/{entry.name}")
@@ -15590,6 +15601,29 @@ class Worker:
             except FileNotFoundError:
                 pass
             except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def _unlink_comm_markers(self) -> None:
+        """Retire this startup tree's Host preparation and destroy markers after their readers exit."""
+        if not self._shm_tree_tokens:
+            return
+        errors: list[BaseException] = []
+        for name in os.listdir(_COMM_ROOTINFO_DIR):
+            match = _COMM_DESTROY_MARKER_RE.fullmatch(name) or _COMM_HOST_PREPARE_MARKER_RE.fullmatch(name)
+            if match is None:
+                continue
+            token, group = match.groups()
+            if token not in self._shm_tree_tokens:
+                continue
+            try:
+                path = os.path.join(_COMM_ROOTINFO_DIR, name)
+                if stat.S_ISREG(os.lstat(path).st_mode) and self._host_domain_owner_exited(token[:8], group):
+                    os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except (OSError, RuntimeError) as exc:
                 errors.append(exc)
         if errors:
             raise errors[0]
@@ -15666,16 +15700,16 @@ class Worker:
         self._chip_shms.clear()
         self._next_level_shms.clear()
 
-        try:
-            self._unlink_shm_namespace(protected_names)
-        except BaseException as exc:  # noqa: BLE001
-            self._cleanup_journal.add_once(
-                "shm",
-                f"startup namespace {self._shm_token[:8]}",
-                lambda names=protected_names: self._unlink_shm_namespace(names),
-            )
-            if reap_error is None:
-                reap_error = exc
+        for identity, cleanup in (
+            (f"startup namespace {self._shm_token[:8]}", lambda: self._unlink_shm_namespace(protected_names)),
+            ("comm markers", self._unlink_comm_markers),
+        ):
+            try:
+                cleanup()
+            except BaseException as exc:  # noqa: BLE001
+                self._cleanup_journal.add_once("shm", identity, cleanup)
+                if reap_error is None:
+                    reap_error = exc
         if reap_error is not None:
             raise reap_error
 

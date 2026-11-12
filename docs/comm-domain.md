@@ -141,6 +141,10 @@ For Device-source domains, `device_ctx` exposes the local and imported peer
 window bases. For Host-source domains, peer access follows the platform rules
 below. Use `buffers[name].tensor(shapes, dtype)` to pass a local slice to a task.
 
+On both A5 and A2/A3, each owner reserves its POSIX backing before mapping and
+registering it. If tmpfs lacks space, domain creation fails and the existing
+rollback releases the partial allocation.
+
 ### A5 Host-source windows
 
 L3 A5 `tensormap_and_ringbuffer` domains accept `memory_source=AddressSpace.HOST`.

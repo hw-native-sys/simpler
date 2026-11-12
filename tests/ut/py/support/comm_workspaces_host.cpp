@@ -28,6 +28,8 @@ void *fail_free_once = nullptr;
 bool throw_hccl_destroy = false;
 bool fail_context_upload = false;
 bool fail_host_register = false;
+bool unsupported_host_udma = false;
+int subcomm_creates = 0;
 bool fail_host_pointer = false;
 bool fail_host_unregister = false;
 std::unordered_map<void *, int> registered_hosts;
@@ -73,9 +75,17 @@ extern "C" aclError aclrtHostGetDevicePointer(void *host, void **device, uint32_
 }
 extern "C" aclError aclrtHostUnregister(void *host) {
     assert(registered_hosts.count(host) == 1);
-    if (fail_host_unregister) return ACL_ERROR_FAILURE;
+    if (fail_host_unregister) {
+        fail_host_unregister = false;
+        return ACL_ERROR_FAILURE;
+    }
     assert(workspace_fixture::live[1] <= registered_hosts.at(host));
     registered_hosts.erase(host);
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtHostMemMapCapabilities(uint32_t, aclrtHacType engine, aclrtHostMemMapCapability *capability) {
+    assert(engine == ACL_RT_HAC_TYPE_UDMA);
+    *capability = unsupported_host_udma ? ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED : ACL_RT_HOST_MEM_MAP_SUPPORTED;
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtGetDevice(int32_t *id) {
@@ -168,6 +178,7 @@ extern "C" aclError aclrtDevicePeerAccessStatus(int32_t, int32_t, int32_t *statu
 }
 extern "C" HcclResult
 HcclCreateSubCommConfig(HcclComm *, uint32_t, uint32_t *, uint64_t id, uint32_t, HcclCommConfig *, HcclComm *out) {
+    ++subcomm_creates;
     *out = reinterpret_cast<HcclComm>(static_cast<uintptr_t>(id + 2));
     return HCCL_SUCCESS;
 }
@@ -300,6 +311,7 @@ static void test_host_domain(const std::string &scenario) {
     h->rank = 0;
     h->nranks = 2;
     h->rootinfo_path = std::string(folder) + "/root";
+    h->run_token = 2;
     h->hccl_comm = reinterpret_cast<HcclComm>(1);
     const std::string name = "simpler_host_" + std::to_string(getpid());
     const std::string path = "/" + name;
@@ -307,6 +319,57 @@ static void test_host_domain(const std::string &scenario) {
     uint64_t ctx = 0, base = 0;
     size_t size = 0;
     const uint32_t mask = scenario == "host_local" ? 0 : 2;
+    const bool aiv_preflight_failed = scenario == "host_aiv_preflight_failed";
+    const bool peer_prepare_failed = scenario == "host_peer_prepare_failed";
+    if (aiv_preflight_failed || peer_prepare_failed) {
+        auto peer = std::make_unique<CommHandle_>();
+        peer->rank = 1;
+        peer->nranks = h->nranks;
+        peer->rootinfo_path = h->rootinfo_path;
+        peer->run_token = h->run_token;
+        peer->hccl_comm = h->hccl_comm;
+        const auto aiv_count = device_aiv_count;
+        const auto failed_name = name + "_failed";
+        if (aiv_preflight_failed) device_aiv_count = 0;
+        fail_host_register = peer_prepare_failed;
+        const int failed_rc =
+            comm_alloc_host_domain_windows(h.get(), 1, ranks, 2, 0, 64, mask, failed_name.c_str(), &ctx, &base, &size);
+        assert(
+            aiv_preflight_failed ? failed_rc == COMM_DOMAIN_URMA_CONFIG_INVALID :
+                                   failed_rc == COMM_INITIALIZATION_ABORT_REQUIRED
+        );
+        assert(h->domain_allocations.size() == static_cast<size_t>(peer_prepare_failed) && registered_hosts.empty());
+        const auto failed = domain_barrier_tag(1, "host_failed");
+        assert(std::filesystem::is_regular_file(barrier_marker_path(h->rootinfo_path, h->run_token, failed, 0)));
+
+        device_aiv_count = aiv_count;
+        fail_host_register = false;
+        assert(
+            comm_alloc_host_domain_windows(peer.get(), 1, ranks, 2, 1, 64, mask, name.c_str(), &ctx, &base, &size) ==
+            COMM_INITIALIZATION_ABORT_REQUIRED
+        );
+        assert(subcomm_creates == 0 && ctx == 0 && base == 0 && peer->domain_allocations.count(1) == 1);
+        assert(peer->domain_allocations.at(1)->host_registered);
+        if (peer_prepare_failed) assert(comm_abort_domain_windows(h.get(), 1, 2, 0) == 0);
+        assert(comm_abort_domain_windows(peer.get(), 1, 2, 1) == 0);
+        assert(h->domain_allocations.empty() && peer->domain_allocations.empty());
+        assert(mappings.empty() && registered_hosts.empty());
+        assert(shm_open(("/" + failed_name).c_str(), O_RDWR, 0) < 0 && errno == ENOENT);
+        assert(shm_open(path.c_str(), O_RDWR, 0) < 0 && errno == ENOENT);
+
+        const auto ready = domain_barrier_tag(2, "host_ready");
+        assert(file_marker_handshake::publish_marker(barrier_marker_path(h->rootinfo_path, h->run_token, ready, 0)));
+        assert(
+            comm_alloc_host_domain_windows(peer.get(), 2, ranks, 2, 1, 64, mask, name.c_str(), &ctx, &base, &size) == 0
+        );
+        assert(subcomm_creates == 1 && ctx != 0 && base != 0);
+        const auto release = domain_barrier_tag(2, "release");
+        assert(file_marker_handshake::publish_marker(barrier_marker_path(h->rootinfo_path, h->run_token, release, 0)));
+        assert(comm_release_domain_windows(peer.get(), 2, 2, 1) == 0);
+        assert(peer->domain_allocations.empty() && mappings.empty() && registered_hosts.empty());
+        std::filesystem::remove_all(folder);
+        return;
+    }
     uint64_t device_context = 0;
     if (scenario == "host_coexist") {
         assert(domain_write_announce(h->rootinfo_path, 2, 1, h->run_token, getpid(), 1, 42));
@@ -320,7 +383,9 @@ static void test_host_domain(const std::string &scenario) {
     }
     fail_host_register = scenario == "host_register";
     fail_host_pointer = scenario == "host_pointer";
-    fail_host_unregister = scenario == "host_unregister";
+    const bool abort = scenario == "host_unregister_abort";
+    const bool destroy = scenario == "host_unregister_destroy";
+    fail_host_unregister = scenario == "host_unregister" || abort || destroy;
     fail_context_upload = scenario == "host_context";
     fail_engine = scenario == "host_workspace" ? 1 : -1;
     if (scenario == "host_collision") {
@@ -347,6 +412,18 @@ static void test_host_domain(const std::string &scenario) {
         return;
     }
     const bool configured = scenario == "host_urma_config";
+    unsupported_host_udma = scenario == "host_urma_unsupported";
+    const bool ready_publish_failed = scenario == "host_ready_publish_failed";
+    if (ready_publish_failed) {
+        const auto tag = domain_barrier_tag(1, "host_ready");
+        const auto marker = barrier_marker_path(h->rootinfo_path, h->run_token, tag, 0);
+        assert(std::filesystem::create_directory(marker + ".tmp"));
+    }
+    if (mask != 0) {
+        const auto tag = domain_barrier_tag(1, "host_ready");
+        const auto marker = barrier_marker_path(h->rootinfo_path, h->run_token, tag, 1);
+        assert(file_marker_handshake::publish_marker(marker));
+    }
     const CommWorkspaceConfig config{2, 512};
     const int rc = comm_alloc_host_domain_windows(
         h.get(), 1, ranks, 2, 0, 64, mask, name.c_str(), &ctx, &base, &size, configured ? &config : nullptr
@@ -356,7 +433,14 @@ static void test_host_domain(const std::string &scenario) {
         assert(sized_aivs == device_aiv_count && initialized_aivs == device_aiv_count);
     }
     if (scenario == "host_register" || scenario == "host_pointer" || scenario == "host_workspace" ||
-        scenario == "host_context" || scenario == "host_collision") {
+        scenario == "host_context" || scenario == "host_collision" || unsupported_host_udma || ready_publish_failed) {
+        if (unsupported_host_udma || ready_publish_failed) assert(live[1] == 0);
+        if (ready_publish_failed) {
+            assert(subcomm_creates == 0);
+            const auto tag = domain_barrier_tag(1, "host_failed");
+            assert(std::filesystem::exists(barrier_marker_path(h->rootinfo_path, h->run_token, tag, 0)));
+        }
+        if (unsupported_host_udma) assert(registered_hosts.empty());
         assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && base == 0);
         assert(h->domain_allocations.count(1) == 1);
         assert(comm_abort_domain_windows(h.get(), 1, 2, 0) == 0);
@@ -398,7 +482,29 @@ static void test_host_domain(const std::string &scenario) {
         marker << "1";
     }
     if (fail_host_unregister) {
-        assert(comm_release_domain_windows(h.get(), 1, 2, 0) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(file_marker_handshake::publish_failure(file_marker_handshake::failure_path(h->rootinfo_path, 1)));
+        if (destroy) {
+            for (const char *tag : {"destroy", "destroy_departed"}) {
+                assert(
+                    file_marker_handshake::publish_marker(barrier_marker_path(h->rootinfo_path, h->run_token, tag, 1))
+                );
+            }
+        }
+        const int cleanup_rc = destroy ? comm_destroy(h.get()) :
+                               abort   ? comm_abort_domain_windows(h.get(), 1, 2, 0) :
+                                         comm_release_domain_windows(h.get(), 1, 2, 0);
+        assert(cleanup_rc == COMM_RECLAMATION_UNCONFIRMED && !fail_host_unregister);
+        assert(std::filesystem::is_regular_file(file_marker_handshake::failure_path(h->rootinfo_path, h->run_token)));
+
+        auto peer = std::make_unique<CommHandle_>();
+        peer->rank = 1;
+        peer->nranks = h->nranks;
+        peer->rootinfo_path = h->rootinfo_path;
+        peer->run_token = h->run_token;
+        peer->hccl_comm = h->hccl_comm;
+        assert(comm_destroy(peer.get()) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(peer->hccl_comm != nullptr);
+
         assert(h->cleanup_failed && h->domain_allocations.at(1)->host_registered);
         assert(registered_hosts.size() == 1 && cpu[7] == 0x12345678);
         const int retained = shm_open(path.c_str(), O_RDWR, 0);
