@@ -85,8 +85,8 @@ bool graph_recording_init_tensor_map(GraphRecording &recording) {
 // get dense enough to push it past ~128 KB.
 //
 // The tensor pool is 4 MB and the rest ~1.3 MB per recorder thread, next to the 2.17 MB
-// hazard map. Only the pool's used prefix ever becomes resident: it is default-initialized
-// and a body writes the bytes its tensors need, contiguously.
+// hazard map. Default construction writes each tensor's TaskId invalid sentinel,
+// touching the pool throughout its allocation during recorder stand-up.
 //
 // Returns false when the pool cannot be allocated, which the caller treats like a hazard
 // map it could not stand up.
