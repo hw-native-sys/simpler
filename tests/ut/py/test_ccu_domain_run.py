@@ -224,6 +224,47 @@ def test_abort_marks_unconfirmed_resources():
     assert str(observed[0][1]) == "stream stop unconfirmed"
 
 
+@pytest.mark.parametrize("first_error", [RuntimeError("stop unconfirmed"), KeyboardInterrupt()])
+@pytest.mark.parametrize("already_poisoned", [False, True])
+def test_abort_attempts_every_callable_and_preserves_first_failure(first_error, already_poisoned):
+    attempted = []
+    digests = [bytes([i]) * 32 for i in range(4)]
+    prior_error = RuntimeError("prior failure") if already_poisoned else None
+    worker: Any = SimpleNamespace(
+        _ccu_run_registrations={
+            (9, digests[0]): [1, 2],
+            (10, digests[1]): [3, 4],
+            (9, digests[2]): [5, 6],
+            (9, digests[3]): [7, 8],
+        },
+        _hierarchical_start_cv=threading.Condition(),
+        _ordered_cleanup_error=prior_error,
+        _require_no_delegated_session_fatal=lambda _: None,
+    )
+
+    def collective(handle, operation, digest):
+        assert (handle.allocation_id, operation) == (9, 4)
+        attempted.append(digest)
+        if digest == digests[0]:
+            raise first_error
+        assert worker._ordered_cleanup_error is not None
+        if digest == digests[2]:
+            raise RuntimeError("second stop unconfirmed")
+        return [0, 0]
+
+    worker._ccu_domain_collective = collective
+    worker._record_unreclaimable = lambda message, error: Worker._record_unreclaimable(worker, message, error)
+    Worker._abort_ccu_domain(worker, _domain())
+    assert attempted == [digests[0], digests[2], digests[3]]
+    assert len(worker._ccu_run_registrations) == 4
+    if prior_error is not None:
+        assert worker._ordered_cleanup_error is prior_error
+    else:
+        assert worker._ordered_cleanup_error.__cause__ is first_error
+    with pytest.raises(RuntimeError, match="no further work is admitted"):
+        Worker._require_no_ordered_cleanup_failure(worker, "submit")
+
+
 def test_prepare_registers_selected_domain_and_reuses_without_launch():
     domain = _domain()
     resources = worker_mod._RunResources(live_domains={domain.name: domain})

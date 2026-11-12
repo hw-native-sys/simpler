@@ -1365,6 +1365,7 @@ class _TwoFrameLoopHarness:
         self.mailbox_addr = _mailbox_addr(self.shm)
         self._control_cv = threading.Condition()
         self._control_reads = 0
+        self._control_payloads: list[SharedMemory] = []
         self._mailbox_load_i32 = worker_mod._mailbox_load_i32
 
         def observed_mailbox_load(addr: int) -> int:
@@ -1539,6 +1540,18 @@ class _TwoFrameLoopHarness:
     def start(self) -> None:
         self.thread.start()
 
+    def publish_ccu_control(self, payload: bytes) -> SharedMemory:
+        staged = SharedMemory(create=True, size=len(payload))
+        self._control_payloads.append(staged)
+        assert staged.buf is not None
+        staged.buf[:] = payload
+        struct.pack_into("Q", self.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_CCU_DOMAIN)
+        struct.pack_into("Q", self.buf, worker_mod._CTRL_OFF_ARG0, len(payload))
+        name = staged.name.encode().ljust(worker_mod._CTRL_SHM_NAME_BYTES, b"\0")
+        self.buf[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES] = name
+        _mailbox_store_i32(self.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
+        return staged
+
     def stop(self) -> None:
         if self.thread.is_alive():
             _mailbox_store_i32(self.mailbox_addr + _OFF_STATE, worker_mod._SHUTDOWN)
@@ -1552,6 +1565,9 @@ class _TwoFrameLoopHarness:
             self._mailbox_load_patch.stop()
             self.shm.close()
             self.shm.unlink()
+            for payload in self._control_payloads:
+                payload.close()
+                payload.unlink()
 
 
 def test_two_frame_stages_b_without_native_prepare_until_a_finalizes():
@@ -1974,6 +1990,92 @@ def test_two_frame_processes_control_while_native_run_is_active():
         harness.wait_state(0, worker_mod._TASK_DONE)
     finally:
         harness.close()
+
+
+@pytest.fixture
+def ccu_control_loop(monkeypatch):
+    import simpler.ccu as ccu_mod
+
+    harness = _TwoFrameLoopHarness()
+    cw: Any = harness.cw
+    cw.ccu_registrations = []
+    cw.ccu_controls = []
+    cw.register_ccu_callable = lambda *args: cw.ccu_registrations.append(args) or 17
+    cw.control_ccu_run = lambda *args: cw.ccu_controls.append(args) or 0
+    monkeypatch.setattr(worker_mod, "_require_base_communicator", lambda _: 1)
+    monkeypatch.setattr(ccu_mod, "runtime_build_identity", lambda: (bytes(32), bytes(32)))
+    try:
+        harness.start()
+        registration = worker_mod._CCU_DOMAIN_REQUEST.pack(8, 0, 5, harness.digest, 0)
+        registration += struct.pack("<QII2I", 7, 2, 0, 0, 1)
+        harness.publish_ccu_control(registration)
+        harness.wait_control_state(worker_mod._CONTROL_DONE)
+        assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+        _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+        harness.publish(0, 1)
+        assert cw.launched[0].wait(5.0)
+        yield harness
+    finally:
+        harness.close()
+
+
+def test_two_frame_ccu_association_completes_while_run_is_active(ccu_control_loop):
+    harness = ccu_control_loop
+    payload = worker_mod._CCU_DOMAIN_REQUEST.pack(9, 0, 6, harness.digest, 0) + struct.pack("<Q", 100)
+    for _ in range(2):
+        reply = harness.publish_ccu_control(payload)
+        harness.wait_control_state(worker_mod._CONTROL_DONE)
+        assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+        assert worker_mod._CCU_DOMAIN_REQUEST.unpack_from(reply.buf)[-1] == 17
+        assert not harness.cw.completed[0].is_set()
+        assert not harness.cw.finalized[0].is_set()
+        assert harness.cw.ccu_controls == []
+        assert len(harness.cw.ccu_registrations) == 1
+        _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+    harness.cw.completed[0].set()
+    harness.wait_state(0, worker_mod._TASK_DONE)
+
+
+@pytest.mark.parametrize("operation", [1, 3, 4, 5, 7])
+def test_two_frame_ccu_hardware_control_waits_for_run_retirement(ccu_control_loop, operation):
+    harness = ccu_control_loop
+    payload = worker_mod._CCU_DOMAIN_REQUEST.pack(8, 0, operation, harness.digest, 0)
+    if operation == 5:
+        payload += struct.pack("<QII2I", 7, 2, 0, 0, 1)
+    harness.publish_ccu_control(payload)
+    harness.assert_control_stays_pending()
+    assert harness.cw.ccu_controls == []
+    assert len(harness.cw.ccu_registrations) == 1
+    harness.cw.completed[0].set()
+    assert harness.cw.finalized[0].wait(5.0)
+    harness.wait_control_state(worker_mod._CONTROL_DONE)
+    assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+    if operation == 5:
+        assert len(harness.cw.ccu_registrations) == 2
+    else:
+        assert harness.cw.ccu_controls == [(1, 8, operation, 0)]
+
+
+@pytest.mark.parametrize("invalid", ["header", "missing_context", "extra_context", "unknown_callable"])
+def test_two_frame_ccu_invalid_association_returns_control_error(ccu_control_loop, invalid):
+    harness = ccu_control_loop
+    digest = b"x" * 32 if invalid == "unknown_callable" else harness.digest
+    payload = worker_mod._CCU_DOMAIN_REQUEST.pack(9, 0, 6, digest, 0)
+    if invalid == "header":
+        payload = payload[:8]
+    elif invalid == "extra_context":
+        payload += struct.pack("<QQ", 100, 100)
+    elif invalid == "unknown_callable":
+        payload += struct.pack("<Q", 100)
+    harness.publish_ccu_control(payload)
+    harness.wait_control_state(worker_mod._CONTROL_DONE)
+    assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] != 0
+    assert not harness.cw.completed[0].is_set()
+    assert harness.cw.ccu_controls == []
+    assert harness.thread.is_alive()
+    _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+    harness.cw.completed[0].set()
+    harness.wait_state(0, worker_mod._TASK_DONE)
 
 
 def test_two_frame_defers_unregister_until_active_native_run_finalizes():

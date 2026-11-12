@@ -3019,6 +3019,22 @@ def _open_ctrl_payload(buf: memoryview, *, what: str) -> tuple[SharedMemory, mem
     return staged, staged_buf, payload_size
 
 
+def _ccu_control_requires_idle(buf: memoryview) -> bool:
+    try:
+        staged, payload, size = _open_ctrl_payload(buf, what="CCU domain")
+    except Exception:  # noqa: BLE001 -- the control handler reports malformed requests
+        return False
+    try:
+        if size < _CCU_DOMAIN_REQUEST.size:
+            return False
+        operation = _CCU_DOMAIN_REQUEST.unpack_from(payload)[2]
+        # Association only updates the child resolver; it does not touch live CCU resources.
+        return operation != 6
+    finally:
+        payload.release()
+        staged.close()
+
+
 def _release_ctrl_payload(staged: SharedMemory, payload: memoryview, view: memoryview) -> None:
     try:
         view.release()
@@ -4108,6 +4124,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         liveness_countdown = _PARENT_LIVENESS_POLL_INTERVAL
         shutdown_message = f"chip_process dev={device_id}: task loop shut down"
         shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
+        ccu_control_requires_idle: bool | None = None
 
         def activate_pending_runs() -> bool:
             nonlocal shutdown_message
@@ -4146,12 +4163,17 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     break
                 if control_state == _CONTROL_REQUEST:
                     sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-                    registry_control = sub_cmd in (_CTRL_PREPARE, _CTRL_REGISTER, _CTRL_UNREGISTER, _CTRL_CCU_DOMAIN)
+                    registry_control = sub_cmd in (_CTRL_PREPARE, _CTRL_REGISTER, _CTRL_UNREGISTER)
+                    if sub_cmd == _CTRL_CCU_DOMAIN:
+                        if ccu_control_requires_idle is None:
+                            ccu_control_requires_idle = _ccu_control_requires_idle(buf)
+                        registry_control = ccu_control_requires_idle
                     defer_control = registry_control and bool(staged_runs)
                     if sub_cmd == _CTRL_UNREGISTER:
                         defer_control = defer_control or task_frame_references_digest(_read_control_digest(buf))
                     if not defer_control:
                         code, msg = handle_control(int(sub_cmd))
+                        ccu_control_requires_idle = None
                         _write_error(buf, code, msg)
                         _mailbox_store_i32(state_addr, _CONTROL_DONE)
                         # A handler that could not establish conservative
@@ -11159,12 +11181,12 @@ class Worker:
         return results
 
     def _abort_ccu_domain(self, handle) -> None:
-        try:
-            for allocation, digest in self._ccu_run_registrations:
-                if allocation == handle.allocation_id:
+        for allocation, digest in self._ccu_run_registrations:
+            if allocation == handle.allocation_id:
+                try:
                     self._ccu_domain_collective(handle, 4, digest)
-        except BaseException as error:
-            self._record_unreclaimable("CCU stop is unconfirmed; domain resources are retained", error)
+                except BaseException as error:
+                    self._record_unreclaimable("CCU stop is unconfirmed; domain resources are retained", error)
 
     def _stop_run_ccu_domains(self, resources, native_error) -> None:
         if native_error is None:

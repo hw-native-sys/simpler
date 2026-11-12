@@ -11,12 +11,13 @@
 
 import hashlib
 import os
+import select
 import struct
 import subprocess
 from pathlib import Path
 
 import pytest
-from simpler.ccu import ChipCcuBinding
+from simpler.ccu import ChipCcuBinding, ChipCcuRun
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
@@ -250,8 +251,86 @@ def test_two_missions_b_before_a(st_platform, st_device_ids, tmp_path, request, 
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
+def test_interleaved_callable_association_during_active_run(st_platform, st_device_ids, tmp_path, monkeypatch):
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(device) for device in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    started_reader, started_writer = os.pipe()
+    begin = ChipCcuRun.begin
+
+    def observe_begin(run):
+        begin(run)
+        os.write(started_writer, b"1")
+
+    monkeypatch.setattr(ChipCcuRun, "begin", observe_begin)
+    try:
+        handles = [worker.register(_build_callable(tmp_path / str(index), variant=index)) for index in range(2)]
+        worker.init()
+        for handle in handles:
+            worker.register_ccu_callable(handle)
+        outputs = [[[worker.create_buffer(64) for _ in range(3)] for _ in range(2)] for _ in handles]
+        for callable_outputs in outputs:
+            for rank_outputs in callable_outputs:
+                for output in rank_outputs:
+                    output.shm.buf[:] = bytes(64)
+
+        def interleave(orch, _args, config):
+            domain = orch.allocate_domain(
+                name="interleaved_ccu",
+                members=[0, 1],
+                window_size=4 * 1024 * 1024,
+                workspace_engines=("ccu",),
+            )
+
+            def submit(index, rank, predecessor=None):
+                args = TaskArgs()
+                for output in outputs[index][rank]:
+                    args.add_tensor(output.tensor((8,), DataType.UINT64), TensorArgType.OUTPUT_EXISTING)
+                args.add_scalar(domain.device_context(rank))
+                args.add_scalar((index + 1) * 100 + rank * 10)
+                if predecessor is not None:
+                    args.add_dep(predecessor)
+                return orch.submit_next_level(handles[index], args, config, worker=rank)
+
+            first_rank0 = submit(0, 0)
+            # A started run cannot finish its exit handshake until the peer is submitted.
+            ready, _, _ = select.select([started_reader], [], [], 30.0)
+            assert ready, "rank 0 did not begin the first CCU run"
+            assert os.read(started_reader, 1) == b"1"
+            submit(1, 0, first_rank0)
+            first_rank1 = submit(0, 1)
+            submit(1, 1, first_rank1)
+
+        worker.run(interleave)
+        for index, callable_outputs in enumerate(outputs):
+            for rank, rank_outputs in enumerate(callable_outputs):
+                value = (index + 1) * 100 + rank * 10
+                assert [struct.unpack_from("<Q", output.shm.buf)[0] for output in rank_outputs] == [
+                    value + 2,
+                    value + 1,
+                    value,
+                ]
+                assert struct.unpack_from("<Q", rank_outputs[0].shm.buf, 8)[0] == value + 3
+    finally:
+        try:
+            worker.close()
+        finally:
+            os.close(started_reader)
+            os.close(started_writer)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
 @pytest.mark.parametrize("fault", ["missing_done", "missing_trigger", "missing_exit"])
 def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_device_ids, tmp_path, monkeypatch, fault):
+    log_root = tmp_path / "ascend"
+    log_root.mkdir()
+    monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(log_root))
     target = _build_callable(tmp_path)
     worker = Worker(
         level=3,
@@ -314,10 +393,11 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
             worker.run(fail_round)
         assert retained and not retained[0].freed
         assert worker._ordered_cleanup_error is not None
-        log_root = Path(os.environ["ASCEND_PROCESS_LOG_PATH"])
         for device in st_device_ids[:2]:
             logs = list(log_root.glob(f"debug/device-{device}/device-*.log"))
+            assert logs, f"no device logs for {fault} on device {device} under {log_root}"
             evidence = "\n".join(log.read_text(errors="replace") for log in logs)
+            assert evidence.strip(), f"empty device logs for {fault} on device {device} under {log_root}"
             assert (fault != "missing_exit") == any(
                 all(
                     field in line
