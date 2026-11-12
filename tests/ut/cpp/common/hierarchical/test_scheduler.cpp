@@ -2593,7 +2593,7 @@ TEST_P(MailboxChildExitTest, PreservesOnlyMatchingTerminalResults) {
         ASSERT_EQ(write(start_pipe[1], &start, sizeof(start)), sizeof(start));
         close(start_pipe[1]);
 
-        // WNOWAIT leaves the exit status for the endpoint's own waitpid.
+        // Leave the exit status available for the endpoint to observe.
         siginfo_t status{};
         int waited;
         do {
@@ -2802,6 +2802,11 @@ TEST(WorkerManagerTest, PoisonedProgressWithholdsCompletionUntilTheChildExits) {
             std::set<TaskSlot>({slot0, slot1})
         );
     }
+
+    // The mailbox detects the exit, but the worker owner must still be able to reap it.
+    int status = 0;
+    EXPECT_EQ(waitpid(child, &status, WNOHANG), child);
+    EXPECT_EQ(status, 0);
 
     close(terminal_pipe[0]);
     if (release_pipe[1] >= 0) close(release_pipe[1]);
@@ -4090,6 +4095,7 @@ TEST(WorkerManagerTest, ControlCommandFailsWhenChildExitsBeforeCompletion) {
         _exit(3);
     }
 
+    ScopedChildProcess child_guard(child);
     LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox, MAILBOX_SIZE, static_cast<int>(child));
 
     std::promise<std::string> result;
@@ -4110,6 +4116,8 @@ TEST(WorkerManagerTest, ControlCommandFailsWhenChildExitsBeforeCompletion) {
 
     EXPECT_NE(message.find("child process pid=" + std::to_string(child)), std::string::npos) << message;
     EXPECT_NE(message.find("exit_status=3"), std::string::npos) << message;
+    EXPECT_EQ(waitpid(child, nullptr, WNOHANG), -1);
+    EXPECT_EQ(errno, ECHILD);
 
     // The endpoint is poisoned once the child is gone: a later command reports
     // rather than resuming the spin.

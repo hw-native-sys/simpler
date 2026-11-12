@@ -70,6 +70,12 @@ class HostSharedMemory(SharedMemory):
         """Reject live exports before permanently closing new export admission."""
         seal_host_mappings((self,))
 
+    def stop_exports(self) -> None:
+        """Close export admission while retaining any existing views."""
+        self._check_pid()
+        with self._export_lock:
+            self._closing = True
+
     def close(self) -> None:
         if not hasattr(self, "_export_pid"):
             return

@@ -1,6 +1,6 @@
-# A5 same-device Host DDR access
+# Local Host DDR access
 
-A direct L2 Worker can use `TensorTransfer.MAP` to let its A5 device access owned
+A direct L2 Worker can use `TensorTransfer.MAP` to let its device access owned
 Host DDR through MTE. This supports large Host tables without a full Device
 replica and supports Device writes to Host backing. TMR and HBG share the API and
 registration implementation. No communication domain or URMA workspace is needed.
@@ -30,10 +30,9 @@ MAP supports IN, OUT and INOUT, with the usual INPUT, OUTPUT_EXISTING and INOUT
 argument tags. Buffer grants remain authoritative. Directions describe kernel use
 and dependencies; IN is not hardware write protection.
 
-This scope is this process's POSIX_SHM owned by a direct, initialized A5 L2 Worker.
-L3 distribution, other-device/remote access, Host compute leaves, borrowed L2
-contexts and capture paths without an owning mapping registry reject MAP. L3
-shared Host tables require their own per-device lifetime coordination.
+Direct L2 supports owned POSIX_SHM with both TMR and HBG on A3 and A5. Same-machine L3
+supports A3 and A5 TMR through coordinated preparation. Remote access, Host compute
+leaves, borrowed L2 contexts, L3 HBG and capture paths reject MAP.
 
 ## Usage
 
@@ -152,3 +151,53 @@ Export carriers pin the actual Host mapping even when NumPy outlives a temporary
 `host_view()`. Raw `buffer.shm.close()` and `unlink()` cannot bypass a registered
 Buffer's lifetime checks. Communication-domain mappings reuse export tracking but
 retain their own allocation and unlink ownership rules.
+
+## L3 shared tables
+
+An L3 Worker owns complete ordinary Host Buffers. Each local A3 or A5 TMR child imports
+that same backing and registers its own Device mapping. Outer `TaskArgs` declare
+`TensorTransfer.MAP` before the callback; every child must acknowledge preparation
+before the callback can submit any work. Callback-created subviews retain the
+canonical descriptor and select MAP per argument. A callback cannot first map
+undeclared backing, including backing cached by an earlier call.
+
+```text
+L3 Host Buffer -> outer args (MAP) -> prepare all child L2 processes
+                                      |                  |
+                                 CPU import         CPU import
+                                 Device0 map        Device1 map
+                                      |                  |
+                                 local MTE          local MTE
+```
+
+No peer relationship, rank communication, MR, URMA channel or communication
+workspace is created by MAP. One child is supported, and multi-device validation
+uses distinct devices and processes. Multiple backings and views coexist. There
+is no table-sized HBM replica or payload copy in the control transport.
+
+Each invocation declares its mapped backings, even when registrations are cached.
+Cache hits issue no preparation messages or physical registrations. First-time
+preparation requires previously accepted runs to drain; multiple accepted runs
+can overlap when all requested mappings are already prepared. Child submission
+resolves each MAP entry to that child's Device address; native NONE/H2D entries
+keep their original behavior. The same writable-alias restrictions as direct L2
+apply to each chip callable. Sharing backing does not order conflicting writers
+on different devices. CPU updates require every Device user to have drained.
+
+The parent retains accepted run uses, and children retain full dispatch identities.
+Completion or a native proof of safe failed cleanup retires only that invocation.
+Unknown completion retains the child use even if the parent receives a task error.
+Stale activation also requires the native cleanup proof before retiring Host uses:
+a terminal run can return from `abandon()` while cleanup remains unproven.
+Release first closes admission and checks all children, then unregisters each local
+mapping and closes its CPU import. Partial preparation rolls back every attempted
+child. During Worker close, a responsive, quiesced child can retry a failed unmap.
+If control cleanup is unconfirmed and cannot be retried through the child, Worker
+close retains the backing while draining and shutting down the children. It can
+release that backing after confirmed clean teardown of every child still holding
+it. Unproven device completion or abnormal exit leaves the backing retained.
+
+Use the [shared-table examples](../../examples/a5/tensormap_and_ringbuffer/host_ddr_map/README.md)
+for BF16 gathers and MXFP8 payloads with Device scales and dependent consumers,
+in serial and staged L3 execution. Historical URMA qualification does not qualify
+this MAP path.

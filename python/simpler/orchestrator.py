@@ -57,6 +57,7 @@ from .task_interface import (
     RemoteAddressSpace,
     TaskArgs,
     TaskHandle,
+    TensorTransfer,
     _empty_remote_sidecar_for,
     _remote_sidecar_for,
     _RemoteTaskArgsSidecar,
@@ -136,6 +137,8 @@ def _reject_device_args(args: object, *, kind: str) -> None:
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
+        if args.transfer(i) == TensorTransfer.MAP:
+            raise ValueError(f"{kind}: MAP requires its prepared device endpoint")
         if desc.address_space == AddressSpace.DEVICE:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
@@ -362,6 +365,8 @@ class Orchestrator:
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
         worker = self._worker
+        if worker is not None:
+            worker._validate_mapped_host_args(c_args, cpp_worker_id, device_target=target_namespace == "LOCAL_CHIP")
         if worker is not None and target_namespace == "LOCAL_CHIP":
             worker._prepare_ccu_submission(callable_handle, [cpp_worker_id], [c_args])
         # Provenance validation precedes run ownership publication. Once a remote
@@ -473,13 +478,14 @@ class Orchestrator:
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
-        if worker is not None and target_namespace == "LOCAL_CHIP":
-            worker._prepare_ccu_submission(callable_handle, worker_ids, c_args_list)
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
+                worker._validate_mapped_host_args(c_args, worker_ids[g], device_target=target_namespace == "LOCAL_CHIP")
                 if worker._names_device_allocation(c_args):
                     member_checks.append((g, c_args))
+        if worker is not None and target_namespace == "LOCAL_CHIP":
+            worker._prepare_ccu_submission(callable_handle, worker_ids, c_args_list)
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
