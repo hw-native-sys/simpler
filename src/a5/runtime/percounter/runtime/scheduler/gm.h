@@ -43,6 +43,26 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/profiling_memory.h"
 
+// pto-isa 8fb67fa7e routes urma_gather_async.hpp into every TU that includes
+// <pto/pto-inst.hpp>; on A5 that pulls in <simt_api/device_functions.h> and its
+// SIMT atomicAdd template wins overload resolution for the classic 64-bit add.
+// The self-contained incore link (ld.lld over the kernel object only) has no
+// SIMT device library to resolve it, so perform the add with the classic 64-bit
+// CAS, which is still inlined. Remove once pto-isa keeps the SIMT header out of
+// the common pto-inst.hpp chain.
+#if defined(__CCE_AICORE__)
+static inline __aicore__ uint64_t percounter_gm_atomic_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta) {
+    auto *word = const_cast<__gm__ int64_t *>(reinterpret_cast<__gm__ volatile int64_t *>(&value));
+    int64_t observed = atomicCAS(word, 0, 0);
+    while (true) {
+        const int64_t desired = static_cast<int64_t>(static_cast<uint64_t>(observed) + delta);
+        const int64_t actual = atomicCAS(word, observed, desired);
+        if (actual == observed) return static_cast<uint64_t>(observed);
+        observed = actual;
+    }
+}
+#endif
+
 /** Invalidate one line, then wait for it, so the next read sees publication. */
 static inline __aicore__ void percounter_observe_cache_line(__gm__ void *address) {
     simpler::percounter::percounter_scalar_memory_issue(
@@ -198,7 +218,7 @@ percounter_gm_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta, int ord
         simpler::percounter::ProfilePhase::AtomicFetchAdd, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
             (void)order;
-            return atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);
+            return percounter_gm_atomic_fetch_add(value, delta);
 #else
             return __atomic_fetch_add(&value, delta, order);
 #endif

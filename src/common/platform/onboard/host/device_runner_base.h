@@ -492,7 +492,7 @@ public:
     /** Stop admitting runs and publish what is still retained. */
     void finish_retained_runs();
 
-    void free_tensor(void *dev_ptr);
+    int free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
@@ -506,6 +506,16 @@ public:
      */
     void *allocate_caller_buffer(std::size_t bytes);
 
+    bool external_buffer_borrows_live() const {
+        return caller_device_buffers_.borrow_count(CallerDeviceBuffers::EXTERNAL_BORROW_MIN_ID) != 0;
+    }
+
+    /** Adopt one fresh caller allocation; the allocator owns storage only after a successful return. */
+    int adopt_caller_buffer(
+        void *base, size_t logical_bytes, size_t physical_bytes, MemoryAllocator::StorageReleaseFn release_storage,
+        void *storage
+    );
+
     /**
      * Release a caller's allocation, unless a run may still be using it.
      *
@@ -513,9 +523,7 @@ public:
      * borrow that is outstanding and changes nothing, so the caller retries once its run is done.
      *
      * @return 0 when the allocation is gone, `PTO_RUNTIME_ERR_INVALID_STATE` when a borrow still
-     *         holds it. Nothing else: the platform free underneath is `free_tensor`, which reports
-     *         no status, so a failure inside it is not visible here and 0 means "this path did not
-     *         refuse", not "the pages are provably returned".
+     *         holds it, or the allocator error if storage release fails.
      */
     int free_caller_buffer(void *dev_ptr);
 

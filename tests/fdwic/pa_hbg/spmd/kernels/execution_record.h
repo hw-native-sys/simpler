@@ -13,7 +13,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <pto/pto-inst.hpp>
 
 #include "intrinsic.h"
 #include "scheduler/scheduler_memory.h"

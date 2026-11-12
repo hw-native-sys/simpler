@@ -151,10 +151,12 @@ public:
         return manager_.control_digest_only(type, worker_id, sub_cmd, digest, timeout_s);
     }
     std::vector<uint8_t> control_payload(
-        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s,
+        bool retiring = false
     ) {
-        return manager_.control_payload(type, worker_id, sub_cmd, payload, payload_size, timeout_s);
+        return manager_.control_payload(type, worker_id, sub_cmd, payload, payload_size, timeout_s, retiring);
     }
+    void check_control_payloads_retired() { manager_.check_control_payloads_retired(); }
     ControlResult remote_prepare_register(
         int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
         size_t payload_size, const uint8_t *digest
