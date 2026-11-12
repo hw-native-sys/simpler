@@ -987,7 +987,7 @@ public:
      * Create a thread bound to this device. The thread calls
      * rtSetDevice(device_id) on entry.
      */
-    std::thread create_thread(std::function<void()> fn);
+    virtual std::thread create_thread(std::function<void()> fn);
 
     /**
      * Bind the calling thread to a device, taking nothing else from it.
@@ -998,7 +998,7 @@ public:
      * @param device_id  Device ID (0-15)
      * @return 0 on success, error code on failure.
      */
-    int bind_current_thread(int device_id);
+    virtual int bind_current_thread(int device_id);
 
     /**
      * Bind the current host thread and adopt the device for a program
@@ -2171,6 +2171,8 @@ protected:
     DeviceRunnerBase();
 
     virtual int finalize_impl() = 0;
+    // A failed device bind can still leave a process-level SDK reference.
+    virtual int finalize_unbound() { return 0; }
     void begin_fatal_close() {
         if (!terminal_close_generation_.has_value()) terminal_close_generation_ = device_health_.generation();
     }

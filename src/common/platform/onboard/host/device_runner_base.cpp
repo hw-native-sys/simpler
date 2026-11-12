@@ -1868,7 +1868,7 @@ int DeviceRunnerBase::finalize() {
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
     // Fatal teardown stops host readers even while their backing remains held.
     if (can_accept_run() && prepared_storage_in_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (device_id_ == -1) return 0;
+    if (device_id_ == -1) return finalize_unbound();
     const int rc = validate_current_context();
     if (rc != 0) return rc;
     return finalize_impl();

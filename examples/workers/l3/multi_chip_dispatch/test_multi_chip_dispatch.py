@@ -33,7 +33,12 @@ def test_multi_chip_dispatch(st_platform, st_device_ids):
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_exec_chips_compute_from_heap_slices(monkeypatch, st_platform, st_device_ids):
-    if st_platform == "a5":
+    if st_platform != "a5":
+        monkeypatch.setattr(Worker, "_uses_exec_chip", lambda _worker: True)
+        _check_exec_heap_slices(st_platform, st_device_ids)
+        return
+
+    for _ in range(3):
         direct = Worker(
             level=2, platform=st_platform, runtime="tensormap_and_ringbuffer", device_id=int(st_device_ids[0])
         )
@@ -41,8 +46,10 @@ def test_exec_chips_compute_from_heap_slices(monkeypatch, st_platform, st_device
             direct.init()
         finally:
             direct.close()
-    else:
-        monkeypatch.setattr(Worker, "_uses_exec_chip", lambda _worker: True)
+        _check_exec_heap_slices(st_platform, st_device_ids)
+
+
+def _check_exec_heap_slices(st_platform, st_device_ids):
     count = N_ROWS * N_COLS
     inputs = [struct.pack(f"{count}f", *(float(i + offset) for i in range(count))) for offset in (0, 3, 7)]
     expected = [struct.pack(f"{count}f", *(float(2 * i + offset) for i in range(count))) for offset in (3, 7)]

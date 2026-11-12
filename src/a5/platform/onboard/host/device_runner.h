@@ -29,6 +29,8 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -81,6 +83,8 @@ class DeviceRunner : public DeviceRunnerBase {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
+    int bind_current_thread(int device_id) override;
+    std::thread create_thread(std::function<void()> fn) override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
     // `copy_to_device`, `copy_from_device`,
@@ -153,13 +157,12 @@ public:
     /**
      * Make the ACL context ready on the current thread.
      *
-     * Calls aclInit() once per process (subsequent calls are idempotent and
-     * tolerate the ACL_ERROR_REPEAT_INITIALIZE sentinel) and aclrtSetDevice()
-     * on the current thread. This is the entry point for consumers that need
+     * Acquires one ACL initialization and device reference per runner, then
+     * binds the existing context on subsequent calls. This is the entry point for consumers that need
      * to call acl* / Hccl* APIs (for example the comm_hccl backend) but
      * intentionally do not want those modules to own ACL lifecycle themselves.
      *
-     * Symmetric with finalize(): aclrtResetDevice + aclFinalize run there.
+     * Symmetric with finalize(): aclrtResetDevice + aclFinalizeReference run there.
      *
      * @param device_id  Device ID to bind on the current thread.
      * @return 0 on success, error code on failure.
@@ -216,10 +219,15 @@ private:
     // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited
     // (protected) from `DeviceRunnerBase`.
 
-    // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
-    // gates it behind this flag. finalize() drives aclFinalize only if we observed
-    // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
-    bool acl_ready_{false};
+    int capture_owned_context(int device_id);
+    int finalize_unbound() override;
+
+    rtContext_t owned_context_{nullptr};
+    bool rts_device_ref_{false};
+    bool acl_device_ref_{false};
+    bool acl_init_ref_{false};
+    std::mutex acl_init_mutex_;
+    std::optional<bool> device_sweep_clean_;
 
     // Set true when an AICore launch/sync error (e.g. an op-timeout reaped by
     // STARS, surfaced as 507000/507018 at stream sync, or a 207001 launch
