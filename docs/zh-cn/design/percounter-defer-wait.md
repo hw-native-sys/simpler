@@ -346,7 +346,7 @@ host 只给本步已经支持的任务形状打"可能登记"标记，其余形�
 | S1 ✅ | 布局、寻址与**拒绝**：region 预留 group 与 entries、`PercounterControl` 新字段、host 预填、每次 dispatch 开启与封口；kernel 返回后 `count > 0` 或 `error_code != 0` 即报错 | 登记条件的 kernel 得到指名的运行时错误，而非 trap 或错误答案；不登记的图行为一字不变 |
 | S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
 | S3 ✅ | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | 单核 `require_sync_start` 多 block 的登记用例通过，同一用例在 S2 构建上报 error 13（0 of 7 blocks resolved）；回归集 11 passed，失败仍只有那两个 swimlane 用例 |
-| S4 | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | MIX 3/5/6/7 用例；计数器终值与全不延迟时一致 |
+| S4 ✅ | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | 两 AIV MIX 的登记用例通过，同一用例在 S3 构建上报 error 13（0 of 4 blocks resolved）；回归集 12 passed，连跑三遍一致 |
 | S5 | Graph body、溢出与非法条件、容量与开销度量 | 第 8 节矩阵补齐 |
 
 **S1 既是布局也是 1.1 的修复**，两者不可分：登记失败的 kernel 在设备上不留痕迹，所以只有
