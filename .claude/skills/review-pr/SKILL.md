@@ -851,6 +851,42 @@ verify the actual selection before flagging a collection gap, use the
 A missing declaration is a **blocking finding**, not an optional improvement:
 the lane cannot collect until it is fixed.
 
+## Step 7.7: A5 Device Stack-Realignment Check (repo-specific)
+
+Trigger this step when the diff adds or edits anything under `src/a5/**` that
+runs on the device. The device compiler has a known stack-realignment defect
+([simpler#2973](https://github.com/hw-native-sys/simpler/issues/2973)): a stack
+object with a large alignment can get inconsistent address fixups once its
+address escapes into an outlined call, so a predicate may read a shifted object
+and report an error that never happened. The source looks wrong to nobody, the
+build is clean and unit tests pass; only an A5 run shows it.
+
+Point the scanner at the build directory of the configuration under review:
+
+```bash
+./tools/a5-ir-check/a5_ir_check.py <build-dir>
+```
+
+Run it only where this session already authorizes building or testing (a
+development task, or an explicit ask): the scanner compiles each device TU, so a
+read-only review must not launch it. In that case read existing evidence whose
+configuration matches the reviewed head, or record the scan as not run.
+
+Record the exit status as evidence (0 clean, 1 findings, 2 tooling problem or an
+incomplete scan — a `SKIP`ped TU must not read as clean).
+
+- **A hit is a precondition, not a proven defect.** The object may never cross an
+  outlined boundary at that build's level. Removal or an explicit justification
+  is acceptable; silence is not.
+- **A clean run covers only the scanned configuration.** With upstream `inline`
+  nothing escapes and nothing is reported, so run it against the build the
+  configuration under review actually produces. Escapes routed through
+  `phi`/`select` are not traced at all, so a clean result is not a proof.
+
+Do not treat the scanner as evidence about hardware: it cannot see the
+miscompile, only the shape that exposes it. When the PR claims a fix for a
+device-functional failure, the A5 run remains the only signal.
+
 ## Step 8: Optional Cross-Check with External CLI Reviewers
 
 **Opt-in only.** Skip this entire step unless the user's `/review-pr`

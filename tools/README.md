@@ -180,3 +180,28 @@ when adding a new notification mechanism that needs head-to-head
 comparison with the existing two. See the tool's own
 [README](./cann-examples/aicore-notification-perf/README.md) for the
 pipeline diagram, build steps, and expected numbers.
+
+## a5-ir-check/
+
+Preflight scanner for the A5 **stack-realignment miscompile** ([simpler#2973](https://github.com/hw-native-sys/simpler/issues/2973)):
+a stack object with a large alignment can get inconsistent address fixups once
+its address escapes into an outlined call, so a predicate reads a shifted object
+and reports an error that never happened. The source looks correct, the build is
+clean, unit tests pass.
+
+Point it at the build directory of the configuration under review — Ninja and
+CMake Makefile trees are both detected — and it flags the objects whose escaping
+address it can trace to a non-`alwaysinline` call, function-pointer calls
+included:
+
+```bash
+./tools/a5-ir-check/a5_ir_check.py <build-dir>
+```
+
+On the real AICore target it maps the exposure: 0 findings at `-O1` (everything
+inlined, nothing crosses a boundary) versus 48 in `aicore_executor.cpp` at
+`-O0`, all on `SchedulerTaskMetadata` escaping into the dispatch path. A clean
+run only speaks for the configuration it scanned, and a scan that skipped a TU
+exits 2 rather than claiming clean. See the tool's own
+[README](./a5-ir-check/README.md) for the verified A/B matrix, runtime cost, and
+limits (`kernel.cpp` at `-O1` exceeds what system `llvm-dis` 17 can read).
