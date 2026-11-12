@@ -68,6 +68,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../platform/include/common/region_banks.h"
 #include "device_memory_info.h"
 
 // simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
@@ -162,26 +163,34 @@ enum {
 };
 
 enum {
-    PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
+    PTO_PIPELINE_CONTRACT_ABI_VERSION = 2,
     PTO_PIPELINE_MAX_RESOURCES = 8,
 };
 
 /**
- * How a resource behaves across the KernelLaunch boundary, which is what
- * decides its copy count: HOST_PER_RUN needs one instance per in-flight run
- * (`pipeline_depth`); DEVICE_SCRATCH and EXEC_HANDLE need exactly one.
+ * How a resource moves across the KernelLaunch boundary. The disposition is
+ * decided by the data flow, not by who populates the region: whether its
+ * content must arrive on every run, and whether the host must read back what
+ * the device wrote.
  */
 typedef enum PipelineResourceClass {
-    /* Carries this run's own content, so the device is still reading the
-       previous run's content while the next run is prepared. */
-    PTO_PIPELINE_HOST_PER_RUN = 0,
-    /* Not rewritten per run: whoever populates it does so once, and device ops
-       run one at a time, so a single instance is reused across runs. */
-    PTO_PIPELINE_DEVICE_SCRATCH = 1,
-    /* Execution context (stream) a run owns while its op runs and is reaped.
-       One instance serves every run: a role is declared once and the platform
-       holds that stream for the runner's lifetime. */
+    /* This run's own content must arrive, so the device may still be reading
+       the previous run's copy while the next run is prepared. One copy per
+       in-flight run, selected by the lease's slot. */
+    PTO_PIPELINE_DELIVERED = 0,
+    /* Neither delivered per run nor read back by the host: whoever populates it
+       does so once, and device ops run one at a time, so one instance is
+       reused across runs. */
+    PTO_PIPELINE_SCRATCH = 1,
+    /* Execution context (stream) a run uses while its op runs and is reaped.
+       One instance per execution role: the platform holds the stream for the
+       runner's lifetime. Not selected by a pipeline slot. */
     PTO_PIPELINE_EXEC_HANDLE = 2,
+    /* The device writes it and the host must read it back at an address it
+       knows. Keyed by run epoch rather than pipeline slot, so an unobserved
+       result is not overwritten by a successor. Declared here to reserve the
+       value; no runtime declares it before the Reported pool exists. */
+    PTO_PIPELINE_REPORTED = 3,
 } PipelineResourceClass;
 
 typedef enum PipelineResourceKind {
@@ -200,9 +209,10 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Program: must be 0. Kernel: DEVICE_SCRATCH states nonzero required
-       usable bytes per copy; HOST_PER_RUN may state 0 when host orchestration
-       determines its size at bind time. EXEC_HANDLE states 0.
+    /* Program: must be 0. Kernel: SCRATCH states nonzero required usable bytes
+       per copy; DELIVERED may state 0 when host orchestration determines its
+       size at bind time; EXEC_HANDLE states 0; REPORTED states 0 until its
+       pool decides the size at acquire time.
        The number is a per-copy requirement for the resource named by `kind`:
        it is neither committed HBM nor a capacity budget, and the declared
        resources are not a complete manifest of what a context commits. */
@@ -212,11 +222,11 @@ typedef struct PipelineResource {
 /**
  * Runtime-owned declaration of resources that cross KernelLaunch.
  *
- * `pipeline_depth` is the only replication count: a resource needs
- * `pipeline_depth` copies unless its class is DEVICE_SCRATCH, which needs one.
- * Per-resource copy counts stay derivable from the class, so a runtime that
- * wants a cheap resource replicated and an expensive one shared says so by
- * classifying them, not by carrying a second global count.
+ * `pipeline_depth` is the only replication count: DELIVERED needs one copy per
+ * in-flight run; SCRATCH, REPORTED and EXEC_HANDLE need one. Per-resource copy
+ * counts stay derivable from the class, so a runtime that wants a cheap
+ * resource replicated and an expensive one shared says so by classifying them,
+ * not by carrying a second global count.
  */
 typedef struct PipelineContract {
     uint32_t abi_version;
@@ -253,10 +263,11 @@ typedef struct NativeRunProvenance {
 /**
  * Ownership token for one pipeline resource slot.
  *
- * `slot_id` selects the per-run/exec-handle copies. `generation` changes every
- * time that slot is leased, so delayed completion or cleanup from an older run
- * cannot mutate resources now owned by its successor. Generation zero is
- * reserved for an invalid/uninitialised lease.
+ * `slot_id` selects the delivered copies; a scratch or reported resource is not
+ * indexed by it. `generation` changes every time that slot is leased, so
+ * delayed completion or cleanup from an older run cannot mutate resources now
+ * owned by its successor. Generation zero is reserved for an invalid or
+ * uninitialised lease.
  */
 typedef struct PipelineSlotLease {
     uint32_t slot_id;

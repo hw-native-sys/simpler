@@ -52,10 +52,10 @@ PipelineContract program_contract() {
         6,
         2,
         {
-            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0},
-            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0},
-            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_SCRATCH, 0},
+            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_SCRATCH, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_SCRATCH, 0},
+            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_DELIVERED, 0},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         }
@@ -108,7 +108,7 @@ TEST(PipelineContractLoader, MissingOrMisclassifiedStreamsRejectBeforeCreatingCo
         ASSERT_TRUE(is_valid_pipeline_contract(&contract));
         expect_factory_admission(contract, 0, "host runtime returned a PipelineContract this build cannot accept");
         contract = program_contract();
-        contract.resources[index].resource_class = PTO_PIPELINE_HOST_PER_RUN;
+        contract.resources[index].resource_class = PTO_PIPELINE_DELIVERED;
         expect_factory_admission(contract, 0, "host runtime returned a PipelineContract this build cannot accept");
     }
 }

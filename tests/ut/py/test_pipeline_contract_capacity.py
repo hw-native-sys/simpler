@@ -35,7 +35,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 #: uses is the grant it is given, which every per-run resource is built to.
 _UNLIMITED_DEPTH = 0xFFFFFFFF
 _MAX_RESOURCES = 8
-_CONTRACT_ABI_VERSION = 1
+_CONTRACT_ABI_VERSION = 2
 
 # RUNTIME_ENV_FIELD_GROUPS(3) * RUNTIME_ENV_RING_COUNT(4).
 _RUNTIME_ENV_UINT64_FIELDS = 12
@@ -75,10 +75,12 @@ class _CallConfig(ctypes.Structure):
     ]
 
 
-def _load(arch: str, runtime: str) -> ctypes.CDLL:
-    path = _PROJECT_ROOT / "build" / "lib" / arch / "onboard" / runtime / "libhost_runtime.so"
+def _load(arch: str, runtime: str, variant: str = "onboard") -> ctypes.CDLL:
+    path = _PROJECT_ROOT / "build" / "lib" / arch / variant / runtime / "libhost_runtime.so"
     if not path.exists():
         pytest.skip(f"{path} not built")
+    if variant == "sim":
+        ctypes.CDLL(str(_PROJECT_ROOT / "build/lib/libcpu_sim_context.so"), mode=ctypes.RTLD_GLOBAL)
     # RTLD_LOCAL, as the worker loads it: two runtimes export the same entry names, so a globally
     # scoped load would make the second one's calls land in the first.
     lib = ctypes.CDLL(str(path), mode=ctypes.RTLD_LOCAL)
@@ -145,3 +147,15 @@ def test_a5_tensormap_and_ringbuffer_declares_no_program_limit():
 def test_a2a3_host_build_graph_declares_no_program_limit():
     """The platform this capacity shipped on first declares no limit either."""
     assert _program_depth(_load("a2a3", "host_build_graph")) == _UNLIMITED_DEPTH
+
+
+def test_wse_keeps_heap_and_image_delivered_per_run():
+    lib = _load("wse", "host_build_graph", "sim")
+    assert _program_depth(lib) == _UNLIMITED_DEPTH
+    contract = lib.get_pipeline_contract().contents
+    # Heap and runtime image are delivered; the PE stream is an execution handle.
+    assert [(r.kind, r.resource_class) for r in contract.resources[: contract.resource_count]] == [
+        (1, 0),
+        (3, 0),
+        (6, 2),
+    ]

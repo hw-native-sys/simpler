@@ -10,7 +10,7 @@
 """Exercise both slots in the A5 tensor-map-and-ring-buffer pipeline.
 
 TMR classifies its GM heap, GM shared memory, and runtime image as
-`DEVICE_SCRATCH`, so every slot shares arena bank 0. Each live call owns its
+`SCRATCH`, so every slot shares arena bank 0. Each live call owns its
 native storage and the retained temporary buffer used to stage device args.
 """
 

@@ -302,7 +302,7 @@ public:
      * Two runs collide over the pooled device regions only when the slot lease
      * hands them the same bank, and that is a property of the contract rather
      * than of the depth: `pipeline_resource_slot` gives every slot its own bank
-     * for a `HOST_PER_RUN` arena and bank 0 to all of them for a shared one. So
+     * for a `DELIVERED` arena and bank 0 to all of them for a shared one. So
      * a successor whose bank differs cannot reach its predecessor's regions —
      * `setup_static_arena` only ever touches the bank it is given — while one
      * that shares a bank can grow or release regions the predecessor is
@@ -957,7 +957,12 @@ public:
      *
      * @return 0 on success, -1 on failure.
      */
-    int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    int setup_static_arena(RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+        return setup_static_arena(
+            RegionBanks{arena_bank, arena_bank, arena_bank}, gm_heap_size, gm_sm_size, runtime_arena_size
+        );
+    }
 
     /**
      * Return the pooled GM heap / shared memory / runtime arena base pointer of the
@@ -2206,7 +2211,7 @@ protected:
     /** The runner and bank one arena setup announces its regions against. */
     struct ArenaRegionAnnounce {
         DeviceRunnerBase *runner;
-        uint32_t bank;
+        RegionBanks banks;
     };
 
     /**
@@ -2243,7 +2248,7 @@ protected:
      * @return 0, or PTO_RUNTIME_ERR_INTERNAL when a reference could not be
      *         recorded — refused rather than silently unprotected
      */
-    int reference_bank_arenas(uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count);
+    int reference_bank_arenas(RegionBanks banks, const ArenaRegionRequest *requests, std::size_t count);
 
     /** Record one acquisition the transaction in flight on this thread caused. */
     void record_workspace_claim(void *base, bool was_region_backing);

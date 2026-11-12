@@ -36,6 +36,16 @@ struct FakeRunner {
         arena_banks.push_back(bank);
     }
 
+    void record_bank_set(RegionBanks banks) {
+        std::lock_guard<std::mutex> lock(mutex);
+        bank_sets.push_back(banks);
+    }
+
+    void record_pooled_bank(uint32_t bank) {
+        std::lock_guard<std::mutex> lock(mutex);
+        pooled_banks.push_back(bank);
+    }
+
     void record_run_epoch(uint64_t epoch) {
         std::lock_guard<std::mutex> lock(mutex);
         run_epochs.push_back(epoch);
@@ -45,15 +55,39 @@ struct FakeRunner {
     std::vector<uint32_t> pipeline_slots;
     std::vector<uint32_t> arena_banks;
     std::vector<uint64_t> run_epochs;
+    std::vector<RegionBanks> bank_sets;
+    std::vector<uint32_t> pooled_banks;
 };
 
 void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, void *, size_t) {
     static_cast<FakeRunner *>(runner_ctx)->record_pipeline_slot(pipeline_slot);
 }
 
-int setup_static_arena(void *runner_ctx, uint32_t arena_bank, size_t, size_t, size_t) {
-    static_cast<FakeRunner *>(runner_ctx)->record_arena_bank(arena_bank);
+int setup_static_arena(void *runner_ctx, RegionBanks banks, size_t, size_t, size_t) {
+    static_cast<FakeRunner *>(runner_ctx)->record_arena_bank(banks.heap);
     return 0;
+}
+
+int setup_static_arena_banks(void *runner_ctx, RegionBanks banks, size_t, size_t, size_t) {
+    static_cast<FakeRunner *>(runner_ctx)->record_bank_set(banks);
+    return 0;
+}
+
+void *acquire_pooled_bank(void *runner_ctx, uint32_t bank) {
+    static_cast<FakeRunner *>(runner_ctx)->record_pooled_bank(bank);
+    return nullptr;
+}
+
+const HostApiOps &bank_routing_ops() {
+    static const HostApiOps ops = []() {
+        HostApiOps result{};
+        result.setup_static_arena = setup_static_arena_banks;
+        result.acquire_pooled_gm_heap = acquire_pooled_bank;
+        result.acquire_pooled_gm_sm = acquire_pooled_bank;
+        result.acquire_pooled_runtime_arena = acquire_pooled_bank;
+        return result;
+    }();
+    return ops;
 }
 
 const void *get_run_result(void *runner_ctx, uint32_t, uint64_t run_epoch, size_t *bytes_out) {
@@ -163,6 +197,21 @@ TEST(HostApiTest, BoundRunnerSlotBankAndEpochSurviveConcurrentCrossThreadCalls) 
     EXPECT_EQ(runner_b.run_epochs.size(), kCallsPerThread);
     EXPECT_TRUE(all_equal(runner_a.run_epochs, kRunnerAEpoch));
     EXPECT_TRUE(all_equal(runner_b.run_epochs, kRunnerBEpoch));
+}
+
+TEST(HostApiTest, RoutesEachPooledRegionToItsSelectedBank) {
+    FakeRunner runner;
+    const HostApi api(&runner, 2, RegionBanks{3, 4, 5}, 9, &bank_routing_ops());
+    EXPECT_EQ(api.setup_static_arena(1, 2, 3), 0);
+    (void)api.acquire_pooled_gm_heap();
+    (void)api.acquire_pooled_gm_sm();
+    (void)api.acquire_pooled_runtime_arena();
+
+    ASSERT_EQ(runner.bank_sets.size(), 1u);
+    EXPECT_EQ(runner.bank_sets[0].heap, 3u);
+    EXPECT_EQ(runner.bank_sets[0].sm, 4u);
+    EXPECT_EQ(runner.bank_sets[0].image, 5u);
+    EXPECT_EQ(runner.pooled_banks, (std::vector<uint32_t>{3, 4, 5}));
 }
 
 TEST(HostApiTest, RunResultIsAbsentWhenTheBackendProvidesNoRegion) {

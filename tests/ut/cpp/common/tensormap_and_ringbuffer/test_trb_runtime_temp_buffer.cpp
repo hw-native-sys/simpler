@@ -225,7 +225,7 @@ void fake_set_retained_temp_buffer(void * /*runner_ctx*/, uint32_t /*pipeline_sl
 }
 
 int fake_setup_static_arena(
-    void * /*runner_ctx*/, uint32_t /*arena_bank*/, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    void * /*runner_ctx*/, RegionBanks /*banks*/, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
 ) {
     ++g_fake->setup_static_arena_count;
     if (g_fake->arena_status != 0) return g_fake->arena_status;
