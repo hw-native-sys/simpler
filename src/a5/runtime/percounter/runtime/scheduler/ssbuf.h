@@ -14,14 +14,18 @@
  * **The barrier in these two is the MIX rendezvous's only ordering.** A lane
  * publishes its arrival with the release store and reads its peers' with the
  * acquire load, and nothing else separates the token from the payload it
- * stands for. The barrier therefore has to be the instruction, in the loop
- * that polls -- `percounter_mix_wait` runs one of these per peer per spin.
+ * stands for; `percounter_mix_wait` runs one of these per peer per spin.
  *
  * The region layout this runtime puts in the window is its own
  * (`PercounterSsbufRegion`), so what was left to share with host_build_graph
  * was the address space, where the window sits, and these two accessors.
- * Small enough to own, and owning it keeps the window's cost from moving when
- * the sibling instruments its own scheduler.
+ * They are kept here because when the sibling instrumented its own scheduler,
+ * routing these two through the instrumentation faulted every device run of
+ * this one -- bisected to that commit, with the tree before it passing on the
+ * same machine. That commit changed more than these two accessors, so which
+ * of its changes a lane cannot absorb is not established; owning the window
+ * is what keeps the question from arising again. See
+ * `docs/investigations/2026-11-percounter-shared-primitive-coupling.md`.
  *
  * The offset and size are a hardware-and-convention fact rather than either
  * runtime's choice: A5 gives each 1AIC+2AIV cluster 3 KiB of SSBUF, and the

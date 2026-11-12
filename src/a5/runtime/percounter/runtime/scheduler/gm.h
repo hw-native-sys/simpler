@@ -26,7 +26,9 @@
  *
  *   - `percounter_gm_read` is a bypass load. It does observe the writing
  *     core's own atomic write, but across cores it can lag.
- *   - `percounter_gm_load` is a read-modify-write, which does not lag.
+ *   - `percounter_gm_fetch_add` adding zero is a read-modify-write, which
+ *     does not lag. `percounter_gate_read` in the lane loop is that read
+ *     followed by the fence.
  *   - Neither orders a *pair* of reads. Two GM reads are two samples, not one
  *     snapshot, and only a barrier between them makes the second no older
  *     than the first -- see `percounter_observe_fence` in the lane loop.
@@ -176,8 +178,9 @@ inline __aicore__ uint64_t percounter_gm_compare_exchange(
 /**
  * Push a whole dispatch payload out, line by line.
  *
- * The payload is larger than one line and the lane that fills it is not the
- * one that runs it, so every line has to leave this core's cache.
+ * A lane fills and runs its own payload, but the kernel reads its arguments
+ * from GM with ordinary loads, so what this lane wrote has to leave the
+ * core's cache first. The payload spans several lines, hence the loop.
  */
 inline __aicore__ void percounter_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
 #if defined(__CCE_AICORE__)

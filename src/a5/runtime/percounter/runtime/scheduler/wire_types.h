@@ -33,7 +33,6 @@
 #include "common/lane_mask.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/ssbuf.h"
-#include "scheduler/gm.h"
 #include "scheduler/scheduler_types.h"
 
 // Continues the SCHEDULER_RUNTIME_MODE_* numbering scheduler_layout.h starts,

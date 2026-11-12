@@ -581,8 +581,10 @@ inline __aicore__ void percounter_publish_fence() {
  * **Two GM reads are two samples, not one snapshot.** A lane that gates on
  * one word and then reads what that word vouches for needs this between them,
  * or the second read can return a value older than the first implies. Reading
- * both atomically is not a substitute: it orders a pair that shares a cache
- * line and not a pair that does not.
+ * both atomically is not a substitute: measured, that orders a pair sharing a
+ * cache line and makes a pair that does not far worse. The measurements, and
+ * why no barrier on the writing lane appears here, are in
+ * `docs/investigations/2026-11-a5-gm-read-ordering.md`.
  *
  * SSBUF needs no equivalent: `percounter_ssbuf_load_acquire` is a load
  * *followed* by the barrier, so consecutive acquire loads already carry it.
