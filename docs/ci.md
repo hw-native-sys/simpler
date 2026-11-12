@@ -655,6 +655,11 @@ retests the admitted SHA. The gate and report jobs only call the GitHub API and
 run on GitHub-hosted `ubuntu-24.04`, so a burst of comments never queues on the
 self-hosted pools.
 
+For a mainline baseline, create a test PR from the latest `main` with only a
+documentation change, then request `/run-a5`. Keep its runtime, tests and CI
+configuration unchanged until the baseline completes. Use the report's tested
+merge and base SHAs when diagnosing failures; a later push needs a new command.
+
 The final A5 PR comment records the tested merge, original head and base, each suite's
 result and the workflow run link. Skipped and cancelled jobs retain those results
 and are not reported as passing. The issue-comment workflow itself uses the
