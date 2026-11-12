@@ -243,10 +243,9 @@ inline __aicore__ bool preflight_urma_request(Runtime &runtime, const Session &s
         runtime.set_error(RequestError::REGISTRATION_FAILED);
         return false;
     }
-    if (per_peer && info->railCycleLen != 0) {
-        runtime.set_error(RequestError::INVALID);
-        return false;
-    }
+    // pto-isa 8fb67fa7e removes the rail-cycle queue selection and round-robins
+    // submissions over `nextWqeSeq % qpCount`, so there are no rail offsets to
+    // reject; the per-jetty share below still bounds the round-robin worst case.
     // Producers are serialized per sender; the runtime completion observer alone advances tails.
     for (uint32_t j = 0; j < jetties; ++j) {
         const uint64_t required = per_peer ? chunks / jetties + (j < chunks % jetties ? 1 : 0) : chunks;
