@@ -692,6 +692,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
 ) {
     // Each resident translation unit owns its block-local observer slot. A prior
     // aborted launch may not have unwound the binding before this invocation.
+    static_assert(!WithProfiling || kSchedulerScalarInstrumentation);
     scheduler_scalar_bind(nullptr);
     const uint64_t profiling_level = WithProfiling ? observed_profiling_level : 0;
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);

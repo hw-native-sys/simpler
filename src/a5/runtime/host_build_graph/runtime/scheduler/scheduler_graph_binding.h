@@ -128,7 +128,7 @@ inline __aicore__ void scheduler_graph_store_tensor(
     dst->extent_elem_cache = src.extent_elem_cache;
 }
 
-inline __aicore__ void scheduler_graph_argument_cache_lines(uint64_t address, uint64_t bytes, bool publish) {
+static inline __aicore__ void scheduler_graph_argument_cache_lines(uint64_t address, uint64_t bytes, bool publish) {
     for (uint64_t offset = 0; offset < bytes; offset += 64) {
         auto *line = reinterpret_cast<__gm__ void *>(address + offset);
         if (publish) scheduler_writeback_cache_line(line);
@@ -136,7 +136,7 @@ inline __aicore__ void scheduler_graph_argument_cache_lines(uint64_t address, ui
     }
 }
 
-inline __aicore__ void scheduler_graph_arguments_cache(
+static inline __aicore__ void scheduler_graph_arguments_cache(
     const __gm__ SchedulerGraphInstance &instance, const __gm__ SchedulerGraphChildPlan &child, bool publish
 ) {
     scheduler_graph_argument_cache_lines(
@@ -154,7 +154,7 @@ inline __aicore__ void scheduler_graph_arguments_cache(
 // Only the child's bootstrap partition owner writes its arguments. Publication
 // completes before scan arrival; ordinary owners and admission members observe
 // the immutable argument image after the bootstrap scan gate opens.
-inline __aicore__ SchedulerGraphBindingError
+static inline __aicore__ SchedulerGraphBindingError
 scheduler_bind_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
     if (graph.native_header_offset == 0) return SchedulerGraphBindingError::NONE;
     SchedulerNativeNode node{};
@@ -253,7 +253,7 @@ scheduler_bind_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
     return SchedulerGraphBindingError::NONE;
 }
 
-inline __aicore__ SchedulerGraphBindingError
+static inline __aicore__ SchedulerGraphBindingError
 scheduler_observe_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
     if (graph.native_header_offset == 0) return SchedulerGraphBindingError::NONE;
     SchedulerNativeNode node{};

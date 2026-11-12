@@ -19,7 +19,7 @@ namespace pto2::resident {
 enum class SdmaGuardResult : uint8_t { ACQUIRED, BUSY, FAILED };
 
 // One attempt only; the submission adapter owns the bounded contention wait.
-inline __aicore__ SdmaGuardResult sdma_try_acquire(__gm__ AsyncSdmaSubmissionGuard &guard) {
+static inline __aicore__ SdmaGuardResult sdma_try_acquire(__gm__ AsyncSdmaSubmissionGuard &guard) {
     const uint64_t previous = scheduler_gm_compare_exchange(guard.word, UINT64_C(0), UINT64_C(1));
     if (previous == 0) {
         scheduler_cache_barrier();
@@ -28,7 +28,7 @@ inline __aicore__ SdmaGuardResult sdma_try_acquire(__gm__ AsyncSdmaSubmissionGua
     return previous == 1 ? SdmaGuardResult::BUSY : SdmaGuardResult::FAILED;
 }
 
-inline __aicore__ bool sdma_release(__gm__ AsyncSdmaSubmissionGuard &guard, bool success) {
+static inline __aicore__ bool sdma_release(__gm__ AsyncSdmaSubmissionGuard &guard, bool success) {
     // SDK SQ tails and the persisted post ID must be visible before a successor
     // rebuilds its session. Failed submissions poison this run's channel group.
     scheduler_cache_barrier();

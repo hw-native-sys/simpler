@@ -14,7 +14,7 @@
 #include "inner_kernel.h"
 #include "scheduler_protocol_execution.h"
 
-inline __aicore__ void scheduler_execute_protocol_task(
+static inline __aicore__ void scheduler_execute_protocol_task(
     __gm__ void *base, SchedulerLocalState *local, uint32_t pending_slot, __gm__ DispatchPayload *payload
 ) {
     scheduler_protocol_execution_entry(base, local, pending_slot, payload);

@@ -13,7 +13,7 @@
 
 #include "scheduler_ready.h"
 
-inline __aicore__ __gm__ SchedulerProtocolBlockTrace *scheduler_protocol_block_at(
+static inline __aicore__ __gm__ SchedulerProtocolBlockTrace *scheduler_protocol_block_at(
     __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerProtocolLayout *layout, uint32_t block
 ) {
     const auto *admission = local->admission;
@@ -44,7 +44,7 @@ inline __aicore__ bool scheduler_protocol_owner_matches(
            owner->block_idx == block && owner->worker_index == local->worker_id();
 }
 
-inline __aicore__ void scheduler_protocol_block_claim(
+static inline __aicore__ void scheduler_protocol_block_claim(
     __gm__ void *base, const SchedulerLocalState *local, uint32_t block, uint64_t before, uint64_t after,
     uint64_t confirmed_count = 0
 ) {
@@ -77,7 +77,7 @@ inline __aicore__ void scheduler_protocol_block_claim(
     scheduler_protocol_publish_record(claim);
 }
 
-inline __aicore__ void scheduler_protocol_claim_seal(
+static inline __aicore__ void scheduler_protocol_claim_seal(
     __gm__ void *base, const SchedulerLocalState *local, uint32_t block, bool before, uint64_t value
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -97,7 +97,7 @@ inline __aicore__ void scheduler_protocol_claim_seal(
     scheduler_protocol_publish_record(claim);
 }
 
-inline __aicore__ void scheduler_protocol_block_complete(
+static inline __aicore__ void scheduler_protocol_block_complete(
     __gm__ void *base, const SchedulerLocalState *local, uint32_t block, bool before, uint64_t ticket
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -115,7 +115,7 @@ inline __aicore__ void scheduler_protocol_block_complete(
     scheduler_protocol_publish_record(owner);
 }
 
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_protocol_group_publish(__gm__ void *base, const SchedulerLocalState *local, bool before) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -133,7 +133,7 @@ scheduler_protocol_group_publish(__gm__ void *base, const SchedulerLocalState *l
     scheduler_protocol_publish_record(owner);
 }
 
-inline __aicore__ void scheduler_protocol_group_descriptor(
+static inline __aicore__ void scheduler_protocol_group_descriptor(
     __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerGroupDescriptor *descriptor
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -179,7 +179,7 @@ scheduler_protocol_lane_matches(const SchedulerLocalState *local, __gm__ const S
            lane->worker_index == local->worker_id() && lane->lane == local->config.self_lane;
 }
 
-inline __aicore__ void
+static inline __aicore__ void
 scheduler_protocol_lane_publication(__gm__ void *base, const SchedulerLocalState *local, bool release, bool before) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -197,7 +197,7 @@ scheduler_protocol_lane_publication(__gm__ void *base, const SchedulerLocalState
     scheduler_publish_cache_line(lane);
 }
 
-inline __aicore__ void scheduler_protocol_group_acks(
+static inline __aicore__ void scheduler_protocol_group_acks(
     __gm__ void *base, const SchedulerLocalState *local, bool releases, const uint64_t *observed
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);

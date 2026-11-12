@@ -31,7 +31,7 @@ static_assert(
     std::is_standard_layout_v<SchedulerDependencyHeader> && std::is_trivially_copyable_v<SchedulerDependencyHeader>
 );
 
-inline __aicore__ bool
+static inline __aicore__ bool
 scheduler_dependency_validate(__gm__ void *base, uint64_t state_bytes, uint64_t offset, uint64_t task_count) {
     if (base == nullptr || offset == 0 || offset % SCHEDULER_STATE_ALIGNMENT != 0 || offset > state_bytes ||
         sizeof(SchedulerDependencyHeader) > state_bytes - offset || task_count > INT32_MAX)
@@ -75,7 +75,7 @@ inline __aicore__ bool scheduler_dependency_successor(
 
 enum class SchedulerDependencyResult : uint8_t { WAITING, READY, ERROR };
 
-inline __aicore__ SchedulerDependencyResult
+static inline __aicore__ SchedulerDependencyResult
 scheduler_dependency_notify(__gm__ void *base, const __gm__ SchedulerDependencyHeader &header, int64_t successor) {
     if (successor < 0 || static_cast<uint64_t>(successor) >= header.task_count) return SchedulerDependencyResult::ERROR;
     auto &remaining = scheduler_state_at<uint64_t>(base, header.remaining_offset)[successor];

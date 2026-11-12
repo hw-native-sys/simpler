@@ -55,7 +55,7 @@ scheduler_ready_pool_queue(__gm__ void *base, const __gm__ SchedulerReadyPoolHea
 
 // Called once after READY acquire. All subsequent descriptor reads are of
 // immutable, already observed data; mutable queue words always bypass cache.
-inline __aicore__ bool scheduler_ready_pool_validate(
+static inline __aicore__ bool scheduler_ready_pool_validate(
     __gm__ void *base, uint64_t state_bytes, uint64_t pool_offset, uint64_t task_count, uint32_t clusters
 ) {
     if (base == nullptr || pool_offset == 0 || pool_offset % SCHEDULER_STATE_ALIGNMENT != 0 ||

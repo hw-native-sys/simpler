@@ -22,7 +22,7 @@ inline __aicore__ bool scheduler_admission_range_end(uint64_t offset, uint64_t c
     return true;
 }
 
-inline __aicore__ bool
+static inline __aicore__ bool
 scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *local, SchedulerAdmissionLocalState *out) {
     if (base == nullptr || local == nullptr || out == nullptr || local->config.graph == nullptr ||
         local->config.graph_summary_offset == 0 ||
@@ -119,7 +119,7 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
     return true;
 }
 
-inline __aicore__ bool scheduler_admission_fail(
+static inline __aicore__ bool scheduler_admission_fail(
     const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task_ref,
     SchedulerErrorSite site, const SchedulerLocalSlotState *slot = nullptr
 ) {
@@ -132,7 +132,7 @@ namespace scheduler_admission_detail {
 
 // Configuration pointers are validated by the enclosing bounded operation.
 // Neither the error signal nor the current run's epoch is a reusable permit.
-inline __aicore__ bool active_run_valid(
+static inline __aicore__ bool active_run_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAdmissionLocalState *admission
 ) {
@@ -150,7 +150,7 @@ inline __aicore__ bool active_run_valid(
 
 }  // namespace scheduler_admission_detail
 
-inline __aicore__ bool scheduler_admission_context_valid(
+static inline __aicore__ bool scheduler_admission_context_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAdmissionLocalState *admission
 ) {
@@ -169,7 +169,7 @@ scheduler_admission_record_at(__gm__ void *base, const SchedulerAdmissionLocalSt
     );
 }
 
-inline __aicore__ bool scheduler_admission_static_record_valid(
+static inline __aicore__ bool scheduler_admission_static_record_valid(
     __gm__ void *base, SchedulerLocalState *local, const SchedulerAdmissionLocalState *admission, int64_t task_ref,
     __gm__ const SchedulerAdmissionRecord *record
 ) {
@@ -204,7 +204,7 @@ inline __aicore__ bool scheduler_admission_static_record_valid(
 // Contexts are the READY-published topology. A bitmap bit is a compact worker
 // index, never a physical core ID, a type rank, or an assumed interleaved lane.
 // Validate the frozen topology once per local run, not once per published task.
-inline __aicore__ bool scheduler_admission_expected_members(
+static inline __aicore__ bool scheduler_admission_expected_members(
     __gm__ void *base, SchedulerLocalState *local, SchedulerAdmissionLocalState *admission,
     __gm__ const SchedulerAdmissionRecord *record, uint64_t *words, uint32_t *member_count
 ) {
@@ -301,7 +301,7 @@ inline __aicore__ bool scheduler_admission_expected_members(
            (!scheduler_task_requires_sync_start(record->flags) || record->logical_block_num <= positions);
 }
 
-inline __aicore__ bool scheduler_admission_published_record_valid(
+static inline __aicore__ bool scheduler_admission_published_record_valid(
     __gm__ void *base, SchedulerLocalState *local, SchedulerAdmissionLocalState *admission, int64_t task_ref,
     __gm__ const SchedulerAdmissionRecord *record
 ) {
@@ -319,7 +319,7 @@ inline __aicore__ bool scheduler_admission_published_record_valid(
 
 // The caller uniquely owns the candidate through ready pop or direct resolve.
 // Only PROGRESS transfers it into pending; RETRY leaves that ownership with the caller.
-inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
+static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission, const SchedulerReadyClaim &candidate
 ) {
@@ -354,7 +354,7 @@ inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
     return SchedulerAdmissionResult::PROGRESS;
 }
 
-inline __aicore__ bool scheduler_prepare_admission_record(
+static inline __aicore__ bool scheduler_prepare_admission_record(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission, bool *prepared_now = nullptr
 ) {
@@ -482,7 +482,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
     return scheduler_admission_detail::commit_validated_record<RecordProtocol>(graph, base, local, run, admission);
 }
 
-inline __aicore__ bool scheduler_read_claim_cursor(
+static inline __aicore__ bool scheduler_read_claim_cursor(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t *cursor, bool *used_seal = nullptr
 );
@@ -597,7 +597,7 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
     return true;
 }
 
-inline __aicore__ bool scheduler_can_enter_ordinary(
+static inline __aicore__ bool scheduler_can_enter_ordinary(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission, bool *permit, uint64_t *observed_tail = nullptr
 ) {
@@ -660,7 +660,7 @@ scheduler_ordered_retain_candidate(SchedulerAdmissionLocalState *admission, cons
 enum class SchedulerBlockClaimResult : uint8_t { CLAIMED, EXHAUSTED, RETRY, ERROR };
 enum class SchedulerBlockFinishResult : uint8_t { PARTIAL, TASK_LAST, ERROR };
 
-inline __aicore__ bool scheduler_read_claim_cursor(
+static inline __aicore__ bool scheduler_read_claim_cursor(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t *cursor, bool *used_seal
 ) {
@@ -962,7 +962,7 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
     return true;
 }
 
-inline __aicore__ bool scheduler_ordered_park_ordinary(
+static inline __aicore__ bool scheduler_ordered_park_ordinary(
     const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrdinaryPark, -1);

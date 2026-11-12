@@ -537,6 +537,14 @@ local argument types. Struct
 sizes exclude other function locals, worker statistics and compiler spills,
 and do not establish the dynamic AICore stack high-water mark.
 
+The Scalar policy is local to each translation unit. Policy-dependent memory
+helpers, their scheduler callers and observer-bound adapters have internal
+linkage, so emitted inline bodies cannot cross from plain to profiled residents.
+Shared wire types and the exported resident entry points retain their common
+identity. AICore plain residents disable instrumentation at compilation; CPU
+simulation residents retain observation. The Scalar trace test links both
+policies together and exercises emitted memory, ordered-poll and async bodies.
+
 Before bootstrap, every participating core invalidates its entire data cache.
 The callable table and task metadata are immutable throughout that run, allowing
 callable lookup and completion resolution to omit repeated invalidation of those

@@ -64,7 +64,7 @@ inline __aicore__ bool scheduler_ticket_view_valid(const SchedulerTicketQueueVie
 // Each logical task may reserve at most one entry. Capacity overflow is a
 // terminal caller/protocol error: the failed reservation must never be retried.
 // No entry is accessed on overflow, even when concurrent reservations caused it.
-inline __aicore__ SchedulerTicketResult
+static inline __aicore__ SchedulerTicketResult
 scheduler_ticket_reserve(const SchedulerTicketQueueView &queue, uint64_t count, SchedulerTicketRange *range) {
     if (range == nullptr) return SchedulerTicketResult::INVALID;
     *range = {};
@@ -80,7 +80,7 @@ scheduler_ticket_reserve(const SchedulerTicketQueueView &queue, uint64_t count, 
 // Each range is published once; entries are immutable after publication.
 // An earlier unpublished range may delay later ranges, so publication must
 // neither execute a kernel nor wait for another worker.
-inline __aicore__ SchedulerTicketResult scheduler_ticket_publish(
+static inline __aicore__ SchedulerTicketResult scheduler_ticket_publish(
     const SchedulerTicketQueueView &queue, const SchedulerTicketRange &range, const int64_t *refs
 ) {
     if (!scheduler_ticket_view_valid(queue) || range.begin > queue.capacity ||
@@ -101,7 +101,7 @@ inline __aicore__ SchedulerTicketResult scheduler_ticket_publish(
 // run-completion proof. An earlier reservation may still be unpublished.
 // A stale head can cause only a failed CAS: entries never change after publish.
 template <uint32_t Capacity>
-inline __aicore__ SchedulerTicketResult scheduler_ticket_try_pop_batch(
+static inline __aicore__ SchedulerTicketResult scheduler_ticket_try_pop_batch(
     const SchedulerTicketQueueView &queue, int64_t (&refs)[Capacity], uint32_t credit, uint32_t *count,
     uint32_t retry_budget = 8, uint64_t *cas_retries = nullptr
 ) {
@@ -139,7 +139,7 @@ inline __aicore__ SchedulerTicketResult scheduler_ticket_try_pop_batch(
     return SchedulerTicketResult::RETRY;
 }
 
-inline __aicore__ SchedulerTicketResult scheduler_ticket_try_pop(
+static inline __aicore__ SchedulerTicketResult scheduler_ticket_try_pop(
     const SchedulerTicketQueueView &queue, int64_t *task_ref, uint32_t retry_budget = 8, uint64_t *cas_retries = nullptr
 ) {
     if (task_ref == nullptr) return SchedulerTicketResult::INVALID;

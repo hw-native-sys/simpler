@@ -20,7 +20,7 @@ enum class SchedulerGmMixResult : uint8_t { WAIT, PROGRESS, TASK_LAST, ERROR };
 // membership and mailbox binding cannot change before returning. Every stage
 // still observes error and epoch; phase, identity and ACK checks are separate.
 template <bool StaticContextValidated = false>
-inline __aicore__ bool scheduler_gm_mix_context_valid(
+static inline __aicore__ bool scheduler_gm_mix_context_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     if constexpr (StaticContextValidated)

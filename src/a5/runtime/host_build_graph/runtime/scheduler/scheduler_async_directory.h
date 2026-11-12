@@ -27,6 +27,8 @@ inline constexpr uint32_t kWordBits = 64;
 // observes a value change; the target bit has one writer for each transition.
 inline constexpr uint32_t kMaxCasAttempts = 2 * (kWordBits - 1) + 1;
 
+namespace {
+
 struct GmAtomics {
     __gm__ volatile uint64_t &word;
 
@@ -36,6 +38,8 @@ struct GmAtomics {
         return scheduler_gm_compare_exchange(word, expected, desired);
     }
 };
+
+}  // namespace
 
 // Atomics supplies a linearizable load and a strong CAS returning the old word.
 template <bool Publish, typename Atomics>
@@ -59,13 +63,13 @@ inline __aicore__ SchedulerAsyncDirectoryResult update(Atomics &atomics, uint32_
 // not reused until run retirement. Its entire line admits only atomic accesses
 // while the run is live. Payload/terminal publication barriers belong to the
 // caller. Any non-success result requires run failure, never a normal retry.
-inline __aicore__ SchedulerAsyncDirectoryResult
+static inline __aicore__ SchedulerAsyncDirectoryResult
 scheduler_async_directory_publish(__gm__ volatile uint64_t &word, uint32_t bit_index) {
     scheduler_async_directory_detail::GmAtomics atomics{word};
     return scheduler_async_directory_detail::update<true>(atomics, bit_index);
 }
 
-inline __aicore__ SchedulerAsyncDirectoryResult
+static inline __aicore__ SchedulerAsyncDirectoryResult
 scheduler_async_directory_clear(__gm__ volatile uint64_t &word, uint32_t bit_index) {
     scheduler_async_directory_detail::GmAtomics atomics{word};
     return scheduler_async_directory_detail::update<false>(atomics, bit_index);

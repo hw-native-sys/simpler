@@ -80,7 +80,7 @@ inline __aicore__ bool span(uint64_t bytes, uint64_t offset, uint64_t count, uin
     return offset % alignment == 0 && offset <= bytes && count <= (bytes - offset) / stride;
 }
 
-inline __aicore__ void observe(__gm__ const void *address, uint64_t bytes) {
+static inline __aicore__ void observe(__gm__ const void *address, uint64_t bytes) {
     if (bytes == 0) return;
     const uint64_t first = reinterpret_cast<uint64_t>(address) & ~UINT64_C(63);
     const uint64_t end = reinterpret_cast<uint64_t>(address) + bytes;
@@ -89,18 +89,18 @@ inline __aicore__ void observe(__gm__ const void *address, uint64_t bytes) {
     scheduler_cache_barrier();
 }
 
-inline __aicore__ void writeback(__gm__ void *address, uint64_t bytes) {
+static inline __aicore__ void writeback(__gm__ void *address, uint64_t bytes) {
     // Publication spans start/end on isolated lines and exclude atomic words.
     for (uint64_t offset = 0; offset < bytes; offset += 64)
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(address) + offset);
 }
 
-inline __aicore__ void publish(__gm__ void *address, uint64_t bytes) {
+static inline __aicore__ void publish(__gm__ void *address, uint64_t bytes) {
     writeback(address, bytes);
     scheduler_cache_barrier();
 }
 
-inline __aicore__ void publish_activity(SchedulerAsyncLocalState &local) {
+static inline __aicore__ void publish_activity(SchedulerAsyncLocalState &local) {
     if (local.work_activated) return;
     auto *activity = scheduler_state_at<SchedulerAsyncActivity>(local.base, local.layout->activity_offset);
     // Host initializes zero before the run. Every device writer stores one;
@@ -128,7 +128,7 @@ inline __aicore__ bool task_index(SchedulerAsyncLocalState &local, int64_t task_
     return tasks[index].task_ref == task_ref || fail(local, task_ref);
 }
 
-inline __aicore__ bool activate_finish(SchedulerAsyncLocalState &local, uint32_t index) {
+static inline __aicore__ bool activate_finish(SchedulerAsyncLocalState &local, uint32_t index) {
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, local.layout->finish_leases_offset);
     auto *directory =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, local.layout->finish_directory_offset);
@@ -146,7 +146,7 @@ inline __aicore__ bool activate_finish(SchedulerAsyncLocalState &local, uint32_t
     return true;
 }
 
-inline __aicore__ bool settle_group(SchedulerAsyncLocalState &local, int64_t task_ref) {
+static inline __aicore__ bool settle_group(SchedulerAsyncLocalState &local, int64_t task_ref) {
     uint32_t index = ASYNC_INVALID_INDEX;
     if (!task_index(local, task_ref, index) || index == ASYNC_INVALID_INDEX) return fail(local, task_ref);
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local.base, local.layout->joins_offset);
@@ -158,7 +158,7 @@ inline __aicore__ bool settle_group(SchedulerAsyncLocalState &local, int64_t tas
 
 // A directory scan visits one word. Cursors advance past a claimed record so
 // a low pending bit cannot starve a later condition in the same word.
-inline __aicore__ bool claim(
+static inline __aicore__ bool claim(
     SchedulerAsyncLocalState &local, uint64_t directory_offset, uint64_t lease_offset, uint32_t count, uint32_t &cursor,
     uint32_t &index, uint64_t &owned
 ) {
@@ -189,7 +189,7 @@ inline __aicore__ bool claim(
 
 }  // namespace scheduler_async_detail
 
-inline __aicore__ bool scheduler_async_work_activated(SchedulerAsyncLocalState *local) {
+static inline __aicore__ bool scheduler_async_work_activated(SchedulerAsyncLocalState *local) {
     if (local == nullptr || local->layout == nullptr) return false;
     if (local->work_activated) return true;
     auto *activity = scheduler_state_at<SchedulerAsyncActivity>(local->base, local->layout->activity_offset);
@@ -197,7 +197,7 @@ inline __aicore__ bool scheduler_async_work_activated(SchedulerAsyncLocalState *
     return local->work_activated;
 }
 
-inline __aicore__ bool scheduler_initialize_async(
+static inline __aicore__ bool scheduler_initialize_async(
     __gm__ void *base, uint64_t bytes, uint64_t offset, uint64_t epoch, uint64_t tasks, SchedulerAsyncLocalState &local
 ) {
     using namespace scheduler_async_detail;
@@ -292,7 +292,7 @@ inline __aicore__ bool scheduler_async_map_execution(
 
 // The caller has observed the existing computation join's TASK_LAST result.
 // A pre-join zero observation cannot exclude another execution's registration.
-inline __aicore__ bool
+static inline __aicore__ bool
 scheduler_async_has_registered_groups(SchedulerAsyncLocalState *local, int64_t task_ref, bool &registered) {
     using namespace scheduler_async_detail;
     registered = false;
@@ -327,7 +327,7 @@ inline __aicore__ bool scheduler_async_begin_execution(
     return true;
 }
 
-inline __aicore__ bool scheduler_async_seal_execution(
+static inline __aicore__ bool scheduler_async_seal_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane,
     const pto2::resident::AsyncWriter &writer
 ) {
@@ -390,7 +390,7 @@ inline __aicore__ bool scheduler_async_seal_execution(
 }
 
 // All execution resources and final traces have retired before computation closes.
-inline __aicore__ bool
+static inline __aicore__ bool
 scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_ref, bool &deferred) {
     using namespace scheduler_async_detail;
     deferred = false;
@@ -406,6 +406,8 @@ scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_
     if (closed.result == scheduler_async_pending::Result::FINISH_OWNER) return activate_finish(*local, index);
     return closed.result == scheduler_async_pending::Result::PENDING || fail(*local, task_ref);
 }
+
+namespace {
 
 struct SchedulerAsyncCompletionObserver {
     inline __aicore__ CompletionPollResult operator()(const CompletionToken &token, uint32_t observer_mask) const {
@@ -438,8 +440,10 @@ struct SchedulerAsyncCompletionObserver {
     }
 };
 
+}  // namespace
+
 template <typename Observer>
-inline __aicore__ bool scheduler_async_check_step(
+static inline __aicore__ bool scheduler_async_check_step(
     SchedulerAsyncLocalState &local, uint32_t observer_mask, uint32_t budget, const Observer &observer,
     bool &made_progress
 ) {
