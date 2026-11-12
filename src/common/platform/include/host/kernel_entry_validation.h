@@ -67,6 +67,8 @@ inline int validate_kernel_callable_image(const void *callable_image, size_t cal
     if (callable_image == nullptr || callable_size < sizeof(ChipCallable)) {
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
+    if (reinterpret_cast<uintptr_t>(callable_image) % alignof(ChipCallable) != 0)
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const auto *callable = static_cast<const ChipCallable *>(callable_image);
     if (callable->sig_count_ < 0 || callable->sig_count_ > CHIP_MAX_TENSOR_ARGS || callable->child_count_ < 0 ||
         callable->child_count_ > ChipCallable::MAX_CHILDREN || callable->func_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
@@ -98,7 +100,14 @@ inline int validate_kernel_callable_image(const void *callable_image, size_t cal
         if (child_binary > storage_size - offset - child_header) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         used = offset + child_header + child_binary;
     }
-    return used == storage_size ? 0 : PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // Use the same size-aware wire/package checks as Python deserialization,
+    // before registration computes the layout hash or uploads the image.
+    try {
+        validate_chip_callable_buffer(callable_image, callable_size);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    return 0;
 }
 
 // Kernel callers own tensor placement. HOST/NONE remains available to a

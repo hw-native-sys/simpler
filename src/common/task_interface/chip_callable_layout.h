@@ -12,7 +12,7 @@
  * Platform-agnostic ChipCallable layout / content-hash / function-table helpers
  * used by DeviceRunner::upload_chip_callable_buffer on every platform variant.
  *
- * The byte-size math (mirroring make_callable<>()'s layout), the FNV-1a dedup
+ * The byte-size math (mirroring make_chip_callable()'s layout), the FNV-1a dedup
  * hash, and the derivation of the callable's two func_id-indexed tables are
  * identical on onboard and sim. Only the H2D mechanism diverges: onboard
  * rtMemcpy's the scratch into device GM after rewriting each child's
@@ -32,7 +32,7 @@
 
 struct ChipCallableLayout {
     size_t header_size;          // offsetof(ChipCallable, storage_)
-    size_t total_size;           // header_size + storage_used (matches make_callable())
+    size_t total_size;           // header_size + storage_used
     uint64_t content_hash;       // FNV-1a 64 over [callable, total_size)
     uint64_t aicore_image_hash;  // FNV-1a 64 over func ids and child binaries
 };
@@ -40,9 +40,9 @@ struct ChipCallableLayout {
 /**
  * Compute byte-size and content hash for a ChipCallable buffer.
  *
- * `storage_used` is max(binary_size, child_offset[i] + CoreCallable header +
- * child binary_size) over all children — same arithmetic make_callable<>()
- * uses when emitting the host buffer.
+ * `storage_used` is the maximum of the parent binary size, each child offset
+ * plus its binary data offset and binary size, and the CCU package end if present.
+ * The caller must validate the complete image against its actual buffer size first.
  */
 inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *callable) {
     constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
@@ -62,6 +62,11 @@ inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *calla
         size_t child_total = CoreCallable::binary_data_offset() + static_cast<size_t>(c.binary_size());
         size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
         if (end > storage_used) storage_used = end;
+    }
+    if (callable->ccu_modules_size_ != 0) {
+        const size_t ccu_end =
+            static_cast<size_t>(callable->ccu_modules_offset_) + static_cast<size_t>(callable->ccu_modules_size_);
+        if (ccu_end > storage_used) storage_used = ccu_end;
     }
     const size_t total_size = kHeaderSize + storage_used;
     const uint64_t hash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(callable), total_size);

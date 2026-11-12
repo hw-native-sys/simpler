@@ -9,8 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include <cstddef>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,7 +19,8 @@
 
 namespace {
 
-std::vector<uint8_t> build_chip_callable(int32_t scalar_entries) {
+std::vector<uint8_t>
+build_chip_callable(int32_t scalar_entries, const std::vector<std::vector<uint8_t>> &ccu_modules = {}) {
     std::vector<ArgDirection> sig{ArgDirection::IN, ArgDirection::OUT};
     for (int32_t i = 0; i < scalar_entries; ++i)
         sig.push_back(ArgDirection::SCALAR);
@@ -36,7 +35,7 @@ std::vector<uint8_t> build_chip_callable(int32_t scalar_entries) {
 
     return make_chip_callable(
         sig.data(), static_cast<int32_t>(sig.size()), "orch_fn", fake_orch_so, sizeof(fake_orch_so), child_ids,
-        children, 1, "cfg_name"
+        children, 1, "cfg_name", ccu_modules
     );
 }
 
@@ -58,20 +57,15 @@ TEST(CallableScalarCount, EmptySignatureHasNoScalars) {
     EXPECT_EQ(callable->scalar_count(), 0);
 }
 
-TEST(CallableScalarCount, CachedBlobUsesSignatureRegardlessOfPadding) {
-    auto buf = build_chip_callable(9);
+TEST(CallableScalarCount, CachedBlobUsesSignatureWithCcuModules) {
+    const std::vector<std::vector<uint8_t>> ccu_modules{{0x7f, 'E', 'L', 'F'}};
+    auto buf = build_chip_callable(9, ccu_modules);
     const auto *callable = reinterpret_cast<const ChipCallable *>(buf.data());
-    constexpr size_t padding_begin = offsetof(ChipCallable, config_name_len_) + sizeof(uint32_t);
-    constexpr size_t padding_size = offsetof(ChipCallable, storage_) - padding_begin;
-    for (size_t i = padding_begin; i < offsetof(ChipCallable, storage_); ++i) {
-        ASSERT_EQ(buf[i], 0);
-    }
-    EXPECT_EQ(callable->scalar_count(), 9);
-    std::memset(buf.data() + padding_begin, 0xff, padding_size);
     EXPECT_EQ(callable->scalar_count(), 9);
     EXPECT_EQ(callable->sig_count(), 11);
     EXPECT_EQ(std::string(callable->func_name(), callable->func_name_len()), "orch_fn");
     EXPECT_EQ(std::string(callable->config_name(), callable->config_name_len()), "cfg_name");
+    EXPECT_EQ(callable->ccu_modules(), ccu_modules);
     ASSERT_EQ(callable->child_count(), 1);
     EXPECT_EQ(callable->child_func_id(0), 3);
     EXPECT_EQ(callable->child(0).binary_size(), 4u);

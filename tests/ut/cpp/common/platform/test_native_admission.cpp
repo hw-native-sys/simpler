@@ -2636,6 +2636,43 @@ TEST_F(NativeAdmissionTest, FrameworkDebtPermitsAllThreeFreshCallableEntriesWith
     EXPECT_FALSE(runner.native_runs_outstanding());
 }
 
+TEST_F(NativeAdmissionTest, SizedRegistrationValidatesCcuPackageBeforeUpload) {
+    FrameworkCompletionRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    runner.qualify_registration_transport();
+    std::ifstream input(NATIVE_OBSERVATION_ORCH_PATH, std::ios::binary);
+    const std::vector<uint8_t> binary{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    ASSERT_FALSE(binary.empty());
+    const auto image = make_chip_callable(
+        nullptr, 0, "framework_observation_orch", binary.data(), binary.size(), nullptr, nullptr, 0, "", {{1, 2, 3}}
+    );
+    int32_t id = -1;
+    ASSERT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &id), 0);
+    EXPECT_TRUE(runner.has_callable(id));
+    const auto original_hash = runner.callable_hash(id);
+    for (int variant = 0; variant < 4; ++variant) {
+        SCOPED_TRACE(variant);
+        auto corrupt = image;
+        auto *callable = reinterpret_cast<ChipCallable *>(corrupt.data());
+        if (variant == 0) {
+            ++callable->wire_version_;
+        } else if (variant == 1) {
+            callable->ccu_modules_offset_ = UINT32_MAX;
+        } else if (variant == 2) {
+            callable->ccu_modules_size_ = UINT32_MAX;
+        } else {
+            corrupt[offsetof(ChipCallable, storage_) + callable->ccu_modules_offset_] = 0;
+        }
+        int32_t rejected_id = -1;
+        EXPECT_EQ(
+            simpler_register_callable_v2(&runner, corrupt.data(), corrupt.size(), &rejected_id),
+            PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        );
+        EXPECT_EQ(rejected_id, -1);
+        EXPECT_EQ(runner.callable_hash(id), original_hash);
+    }
+}
+
 TEST_F(NativeAdmissionTest, FrameworkTransferRefusesBeforePhysicalProofAndPreservesTheOriginalOwner) {
     FrameworkCompletionRunner runner;
     ASSERT_EQ(initialize_capture_runner(runner), 0);

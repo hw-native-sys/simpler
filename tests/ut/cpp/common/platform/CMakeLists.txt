@@ -176,6 +176,24 @@ platform_single_case(test_memory_allocator.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/memory_allocator.cpp ${HOST_LOG_TEST_SOURCES}
     INCLUDES ${SIMPLER_LOG_DIR})
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(ccu_native_test_module SHARED support/ccu_native_test_module.cpp)
+    target_include_directories(ccu_native_test_module PRIVATE ${SIMPLER_SRC}/common)
+    add_library(ccu_native_test_module_other SHARED support/ccu_native_test_module.cpp)
+    target_include_directories(ccu_native_test_module_other PRIVATE ${SIMPLER_SRC}/common)
+    target_compile_definitions(ccu_native_test_module_other PRIVATE CCU_TEST_ENTRY_RESULT=33)
+
+    platform_single_case(test_ccu_native_module.cpp
+        SOURCES ${SIMPLER_SRC}/common/platform_comm/ccu/ccu_native_module.cpp
+        LINK ccu_native_test_module ${CMAKE_DL_LIBS}
+        DEPENDS ccu_native_test_module ccu_native_test_module_other)
+    target_compile_definitions(test_ccu_native_module PRIVATE
+        CCU_TEST_OTHER_MODULE_PATH="$<TARGET_FILE:ccu_native_test_module_other>")
+    set_target_properties(test_ccu_native_module PROPERTIES ENABLE_EXPORTS ON)
+else()
+    simpler_ut_exclude_case(test_ccu_native_module.cpp)
+endif()
+
 # Each of these covers a header-only piece of the arch's platform surface and
 # needs nothing compiled in but the CANN platform stand-in.
 platform_cases(
