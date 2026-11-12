@@ -122,9 +122,9 @@ jobs:
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
-            python -m pytest tests/ut -m "not requires_hardware" -v
+            python -m pytest tests/ut -m "not requires_hardware" -q
           else
-            pytest tests/ut -m "not requires_hardware" -v
+            pytest tests/ut -m "not requires_hardware" -q
           fi
 
       - name: Build and run C++ unit tests

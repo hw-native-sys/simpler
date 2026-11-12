@@ -140,6 +140,8 @@ def test_actual_collection_plan_and_junit_follow_added_cases_and_changed_paths(t
         assert all(case["nodeid"].startswith(path + "::") for case in plan["cases"])
         test_environments.verify_results(plan_path, xml_path)
         assert "TEST_ENVIRONMENT_VERIFIED" in result.stdout
+        plan_lines = [line for line in result.stdout.splitlines() if line.startswith("TEST_ENVIRONMENT_PLAN ")]
+        assert len(plan_lines) == 1 and len(plan_lines[0]) < 512
 
 
 _FILTERS = """
