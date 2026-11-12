@@ -93,6 +93,7 @@ PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
 VERBOSE=0
 SERIAL_ORCH_SCHED=0
+PREPARE_ONLY=0
 EXTRA_ARGS=()
 EXTRA_ARGS_COUNT=0
 
@@ -122,12 +123,16 @@ while [[ $# -gt 0 ]]; do
             SERIAL_ORCH_SCHED=1
             shift
             ;;
+        --prepare-only)
+            PREPARE_ONLY=1
+            shift
+            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from [STRACE] markers
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v] [--serial-orch-sched]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v] [--serial-orch-sched] [--prepare-only]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
@@ -139,6 +144,8 @@ Options:
   --serial-orch-sched
                  Run each TMR case twice: default parallel mode, then serial
                  orch->sched mode with SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1.
+  --prepare-only Compile every selected case into simpler's persistent cache;
+                 CPU-only, does not initialize a Worker or use an NPU.
   -h, --help     Show this help
 
 All other options are passed through to the underlying `python test_*.py`
@@ -411,6 +418,30 @@ for example_case in "${EXAMPLE_CASES[@]}"; do
         exit 1
     fi
 done
+
+if [[ $PREPARE_ONLY -eq 1 ]]; then
+    echo "Preparing selected scene cases in the persistent compile cache (no NPU allocation)."
+    for example_case in "${EXAMPLE_CASES[@]}"; do
+        example="${example_case%%=*}"
+        case_list="${example_case#*=}"
+        EXAMPLE_DIR=$(find_example_dir "$example")
+        test_file=$(find "$EXAMPLE_DIR" -maxdepth 1 -name 'test_*.py' -print -quit 2>/dev/null || true)
+        [[ -n "$test_file" ]] || continue
+        if [[ -z "${case_list:-}" ]]; then
+            python3 "$test_file" --platform "$PLATFORM" --prepare-only
+        else
+            IFS=',' read -ra cases <<< "$case_list"
+            for c in "${cases[@]}"; do
+                prepare_cmd=(python3 "$test_file" --platform "$PLATFORM" --prepare-only --case "$c" --manual include)
+                if [[ $EXTRA_ARGS_COUNT -gt 0 ]]; then
+                    prepare_cmd+=("${EXTRA_ARGS[@]}")
+                fi
+                "${prepare_cmd[@]}"
+            done
+        fi
+    done
+    exit 0
+fi
 
 echo ""
 echo "Runtime: $RUNTIME"

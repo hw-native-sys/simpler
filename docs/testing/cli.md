@@ -78,7 +78,15 @@ python test_xxx.py -p a2a3 --enable-chip-swimlane                         # chip
 python test_xxx.py -p a2a3 --dump-args                         # dump unified argument artifacts
 python test_xxx.py -p a2a3 --enable-pmu 4                        # PMU CSV (MEMORY)
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
+python test_xxx.py -p a2a3 --case TestFoo::Case1 --prepare-only  # compile to cache, no Worker/device
 ```
+
+For shared-host benchmarks, prepare selected cases before allocating a device
+with `tools/benchmark_rounds.sh --prepare-only`. Submit the standalone scene
+test command for each case through the host's queue tool. Add `--single-case`
+to require the selector to match exactly one case, and parse timing logs only
+after the queued command exits. Keep the multi-case benchmark harness outside
+the device allocation.
 
 ### Option Reference
 
@@ -91,6 +99,8 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--level {2,3,4}` | | (all) | Restrict to one scene-test level. Level 4 selects network1 wrappers. |
 | `--exclude-level {2,3,4}` | | (none) | Exclude tests explicitly carrying that scene-test level. Ordinary onboard lanes use `--exclude-level 4`. |
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
+| `--prepare-only` | | false | Standalone only: compile selected callables into the persistent cache and exit before creating a Worker. |
+| `--single-case` | | false | Standalone only: fail unless selectors match exactly one case. |
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual scene-test cases and standalone pytest tests |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
 | `--enable-chip-swimlane [PERF_LEVEL]` | | `0` | Enable chip swimlane collection. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/chip-swimlane-profiling.md](../dfx/chip-swimlane-profiling.md#31-enable-chip-swimlane) for the level table. Records land under `outputs/<case>_<ts>/`; see [output-prefix collision limits](parallel-execution.md#profiling-under-parallelism). Disabled when `--rounds > 1`. |
