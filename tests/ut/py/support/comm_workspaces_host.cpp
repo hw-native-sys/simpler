@@ -31,11 +31,12 @@ bool fail_host_register = false;
 bool fail_host_pointer = false;
 bool fail_host_unregister = false;
 std::unordered_map<void *, int> registered_hosts;
-enum class PeerFailure { NONE, IMPORT, RESERVE, MAP, ACCESS };
+enum class PeerFailure { NONE, IMPORT, RESERVE, MAP };
 PeerFailure peer_failure = PeerFailure::NONE;
 bool peer_reserve_pending = false;
 int peer_import_calls = 0;
 int injected_peer_failures = 0;
+int explicit_access_calls = 0;
 std::unordered_set<aclrtDrvMemHandle> imported_handles;
 std::unordered_set<void *> peer_mappings;
 
@@ -134,11 +135,11 @@ extern "C" aclError aclrtUnmapMem(void *address) {
     peer_mappings.erase(address);
     return ACL_SUCCESS;
 }
-extern "C" aclError aclrtMemSetAccess(void *address, size_t, aclrtMemAccessDesc *, size_t) {
-    if (peer_mappings.count(address) != 0 && peer_failure == PeerFailure::ACCESS) {
-        ++injected_peer_failures;
-        return 1;
-    }
+// A5 window mappings rely on MapMem's owner grant and issue no explicit access
+// grant; any such call aborts the fixture.
+extern "C" aclError aclrtMemSetAccess(void *, size_t, aclrtMemAccessDesc *, size_t) {
+    ++explicit_access_calls;
+    assert(explicit_access_calls == 0);
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMemGetAllocationGranularity(aclrtPhysicalMemProp *, aclrtMemGranularityOptions, size_t *n) {
@@ -206,8 +207,7 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     std::vector<uint32_t> masks{0, 1};
     if ((compiled_comm_workspaces() & 2) != 0) masks.push_back(3);
     for (uint32_t mask : masks) {
-        for (auto failure :
-             {PeerFailure::IMPORT, PeerFailure::RESERVE, PeerFailure::MAP, PeerFailure::ACCESS, PeerFailure::NONE}) {
+        for (auto failure : {PeerFailure::IMPORT, PeerFailure::RESERVE, PeerFailure::MAP, PeerFailure::NONE}) {
             peer_failure = failure;
             fail_context_upload = failure == PeerFailure::NONE;
             const int old_calls = peer_import_calls;
@@ -690,5 +690,8 @@ int main(int argc, char **argv) {
     release(first);
     assert(comm_destroy(h) == 0);
     assert(live[0] == 0 && mappings.empty() && physical_handles == 0);
+    // Every local and imported window relies on MapMem's owner grant; an
+    // explicit access grant fails this fixture.
+    assert(explicit_access_calls == 0);
     std::filesystem::remove_all(folder);
 }
