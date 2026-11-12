@@ -242,7 +242,8 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         if ((local->local_ready_mask & (1U << claim.slot_index)) != 0 || record->permit.sequence != 0 ||
             record->entry.sequence != 0 ||
             (record->publication_count != 0 &&
-             (slot.cooperative || (record->flags & SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED) == 0 ||
+             (scheduler_slot_uses_admission(local, slot) ||
+              (record->flags & SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED) == 0 ||
               record->worker_index != local->worker_id() || record->run_epoch != layout->run_epoch ||
               record->task_ref != slot.task_ref || record->block_idx != slot.block_idx ||
               record->subtask_slot != slot.subtask_slot))) {
@@ -388,8 +389,7 @@ static inline __aicore__ void scheduler_protocol_member_closed(
     member->pending_mask = 0;
     for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
         const auto &slot = local->slots[index];
-        if (slot.cooperative && slot.task_ref == admission->current_task_ref &&
-            slot.state != SchedulerDispatchSlotState::FREE)
+        if (slot.task_ref == admission->current_task_ref && slot.state != SchedulerDispatchSlotState::FREE)
             member->pending_mask |= UINT64_C(1) << index;
     }
     scheduler_writeback_cache_line(member);

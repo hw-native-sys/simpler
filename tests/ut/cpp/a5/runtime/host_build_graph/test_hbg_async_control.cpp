@@ -274,7 +274,7 @@ TEST(HbgAsyncControl, ZeroConditionSingleExecutionKeepsItsSuccessorOnTheCompleti
         SchedulerRouteResult::WAITING
     );
     (void)f.start();
-    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    ASSERT_TRUE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 0, 0, f.executions[0]));
     auto &slot = f.local()->slots[0];
     slot.task_ref = 0;
     slot.block_idx = 0;
@@ -286,10 +286,39 @@ TEST(HbgAsyncControl, ZeroConditionSingleExecutionKeepsItsSuccessorOnTheCompleti
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::READY);
     EXPECT_EQ(f.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(f.join().word, 0u);
+    EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
     EXPECT_EQ(f.finish_lease().word, kUnused);
     EXPECT_FALSE(f.finish(1));
     scheduler_flush_completions(f.storage.run_control, f.local());
     EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
+}
+
+TEST(HbgAsyncControl, LastSynchronousReturnHonorsAnEarlierPeersAsyncRegistration) {
+    AsyncFixture f(1, {async_task(0, 2, LaneMask(false, true, false))});
+    f.register_counter(f.start(0, 0, 1, 1));
+    ASSERT_TRUE(scheduler_async_seal_execution<true>(&f.workers[1], 0, 0, 1, f.executions[1]));
+    (void)f.start(0, 1, 1, 2);
+    ASSERT_TRUE(scheduler_async_seal_execution<true>(&f.workers[2], 0, 1, 1, f.executions[2]));
+    ASSERT_TRUE(f.workers[1].work_activated);
+    ASSERT_FALSE(f.workers[2].work_activated);
+    for (uint32_t worker : {1u, 2u}) {
+        auto *local = f.local(worker);
+        auto &slot = local->slots[0];
+        slot.task_ref = 0;
+        slot.block_idx = worker - 1;
+        slot.subtask_slot = 1;
+        slot.state = SchedulerDispatchSlotState::EXECUTING;
+        ASSERT_TRUE(
+            (scheduler_complete_own_slot<true, true>(f.graph.graph(), f.base(), local, f.storage.run_control, 0, 0))
+        );
+        EXPECT_NE(f.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    }
+    EXPECT_TRUE(scheduler_async_pending::closed(f.join().word));
+    EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+    f.signal[0] = 1;
+    ASSERT_TRUE(f.check(0));
+    ASSERT_TRUE(f.finish(0, 64));
+    EXPECT_EQ(f.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
 }
 
 TEST(HbgAsyncControl, AllZeroMixShapesCloseSynchronouslyWithoutCheckOrFinishWork) {
@@ -323,6 +352,32 @@ TEST(HbgAsyncControl, OpenReservationFailsSealWithoutRegisteringPendingWork) {
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 0u);
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::FAILED);
     EXPECT_EQ(f.finish_lease().word, kUnused);
+}
+
+TEST(HbgAsyncControl, ResidentBoundSealPreservesMutableRegistrationFailures) {
+    for (uint32_t failure = 0; failure < 4; ++failure) {
+        SCOPED_TRACE(failure);
+        AsyncFixture f(1);
+        const auto writer = f.start();
+        auto *data = detail::group(writer);
+        ASSERT_NE(data, nullptr);
+        int32_t expected = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+        if (failure == 0) {
+            data->count = data->capacity + 1;
+            expected = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+        } else if (failure == 1) {
+            ASSERT_NE(reserve_conditions(writer, 1).serial, 0u);
+        } else if (failure == 2) {
+            data->error_code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+            expected = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+        } else {
+            ASSERT_TRUE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 0, 0, writer));
+        }
+        EXPECT_FALSE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 0, 0, writer));
+        EXPECT_EQ(f.workers[0].error_code, expected);
+        EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
+        EXPECT_EQ(f.finish_lease().word, kUnused);
+    }
 }
 
 TEST(HbgAsyncControl, ZeroWorkSkipsServiceAndActivationIsVisibleToOtherWorkers) {

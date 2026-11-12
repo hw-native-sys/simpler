@@ -136,7 +136,7 @@ static inline __aicore__ bool active_run_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAdmissionLocalState *admission
 ) {
-    const uint64_t error = scheduler_read_error(run);
+    const uint64_t error = scheduler_read_worker_error(run, local->worker_id());
     if (error != 0) return false;
     // READY freezes the summary for this run. This is a cached configuration
     // read, not a poll for a new epoch; teardown owns cross-run quiescence.
@@ -342,7 +342,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
     }
     // The lock protects the single UNCLAIMED transition, not the pending
     // candidate's lifetime. A late acquirer must recheck the published phase.
-    bool valid = scheduler_read_error(run) == 0;
+    bool valid = scheduler_read_worker_error(run, local->worker_id()) == 0;
     if (valid &&
         scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED))
         valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
@@ -371,7 +371,7 @@ static inline __aicore__ bool scheduler_prepare_admission_record(
         scheduler_gm_query(control->claim_seal) != 0 ||
         scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) != 0 ||
         scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) != 0 ||
-        scheduler_gm_fetch_add(control->completed_blocks, UINT64_C(0)) != 0)
+        scheduler_completion_progress(scheduler_gm_fetch_add(control->completion_state, UINT64_C(0))) != 0)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
     auto *record = scheduler_admission_record_at(base, admission, task);
     scheduler_observe_cache_line(record);
@@ -466,7 +466,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
         scheduler_gm_query(control->claim_seal) != 0 ||
         scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) != 0 ||
         scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) != 0 ||
-        scheduler_gm_fetch_add(control->completed_blocks, UINT64_C(0)) != 0) {
+        scheduler_completion_progress(scheduler_gm_fetch_add(control->completion_state, UINT64_C(0))) != 0) {
         scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
         return SchedulerAdmissionResult::ERROR;
     }
@@ -521,7 +521,7 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
     }
     // Retaining an existing local obligation does not change ownership. A
     // scan that may adopt or pass a new obligation still takes the strong gate.
-    if (scheduler_read_error(run) != 0) return false;
+    if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     auto *shared = scheduler_state_at<SchedulerAdmissionControl>(base, admission->control_offset);
     const uint64_t tail = scheduler_gm_query(shared->commit_tail);
     if (tail > admission->capacity || admission->scan_cursor > tail ||
@@ -565,8 +565,7 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
             // or parking ordinary payloads. MIX and sync-start keep their gates.
             bool owns_block = false;
             for (const auto &slot : local->slots)
-                owns_block = owns_block || (slot.cooperative && slot.task_ref == task &&
-                                            slot.state != SchedulerDispatchSlotState::FREE);
+                owns_block = owns_block || (slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE);
             if (!owns_block && !scheduler_task_is_mix(record->flags) &&
                 !scheduler_task_requires_sync_start(record->flags) &&
                 scheduler_gm_query(control->claim_seal) == record->logical_block_num) {
@@ -658,7 +657,6 @@ scheduler_ordered_retain_candidate(SchedulerAdmissionLocalState *admission, cons
 }
 
 enum class SchedulerBlockClaimResult : uint8_t { CLAIMED, EXHAUSTED, RETRY, ERROR };
-enum class SchedulerBlockFinishResult : uint8_t { PARTIAL, TASK_LAST, ERROR };
 
 static inline __aicore__ bool scheduler_read_claim_cursor(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
@@ -866,70 +864,13 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block
     auto &slot = local->slots[slot_index];
     slot.task_ref = task;
     slot.block_idx = block;
-    slot.cooperative = true;
+    slot.args_observed = true;
     slot.gm_mix = false;
     slot.candidate_index = UINT8_MAX;
     slot.predicate = SchedulerPredicateState::UNEVALUATED;
     slot.subtask_slot = scheduler_metadata_single_subtask_slot(admission->current_active_mask);
     slot.state = SchedulerDispatchSlotState::FILLING;
     return SchedulerBlockClaimResult::CLAIMED;
-}
-
-template <bool RecordProtocol = true>
-static inline __aicore__ SchedulerBlockFinishResult scheduler_contribute_ordered_block(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const SchedulerLocalSlotState *slot = nullptr
-) {
-    auto *admission = local == nullptr ? nullptr : local->admission;
-    if (!scheduler_admission_context_valid(graph, base, local, run, admission))
-        return SchedulerBlockFinishResult::ERROR;
-    const int64_t task = admission->current_task_ref;
-    if (!scheduler_task_ref_valid(graph, task) || admission->current_block_num == 0) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_COMPLETION_INVALID, slot);
-        return SchedulerBlockFinishResult::ERROR;
-    }
-    auto *control = scheduler_task_control_at(base, local, task);
-    const uint32_t block = slot != nullptr                                 ? slot->block_idx :
-                           scheduler_task_is_mix(admission->current_flags) ? admission->gm_mix.block_idx :
-                                                                             UINT32_MAX;
-    if constexpr (RecordProtocol) scheduler_protocol_block_complete(base, local, block, true, UINT64_MAX);
-    scheduler_cache_barrier();
-    const uint64_t previous = scheduler_gm_fetch_add(control->completed_blocks, UINT64_C(1));
-    if constexpr (RecordProtocol) scheduler_protocol_block_complete(base, local, block, false, previous);
-    if (previous >= admission->current_block_num) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_COMPLETION_INVALID, slot);
-        return SchedulerBlockFinishResult::ERROR;
-    }
-    return previous + 1 == admission->current_block_num ? SchedulerBlockFinishResult::TASK_LAST :
-                                                          SchedulerBlockFinishResult::PARTIAL;
-}
-
-// Execution retirement and trace publication belong to the completion caller.
-// Slot retirement precedes the shared contribution that can close computation.
-template <bool RecordProtocol = true>
-static inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_block(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint32_t slot_index
-) {
-    auto *admission = local == nullptr ? nullptr : local->admission;
-    // The contribution helper performs the error check before counting.
-    if (!scheduler_admission_context_valid(graph, base, local, run, admission))
-        return SchedulerBlockFinishResult::ERROR;
-    if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
-        scheduler_admission_fail(
-            graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_COMPLETION_INVALID
-        );
-        return SchedulerBlockFinishResult::ERROR;
-    }
-    const auto slot = local->slots[slot_index];
-    if (!slot.cooperative || slot.state != SchedulerDispatchSlotState::EXECUTING ||
-        slot.task_ref != admission->current_task_ref || !scheduler_task_ref_valid(graph, slot.task_ref) ||
-        slot.block_idx >= admission->current_block_num || scheduler_task_is_mix(admission->current_flags)) {
-        scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::BLOCK_COMPLETION_INVALID, &slot);
-        return SchedulerBlockFinishResult::ERROR;
-    }
-    scheduler_initialize_free_slot(&local->slots[slot_index]);
-    return scheduler_contribute_ordered_block<RecordProtocol>(graph, base, local, run, &slot);
 }
 
 template <bool RecordProtocol = true>
@@ -947,7 +888,7 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
     if (!scheduler_task_ref_valid(graph, task) || scheduler_task_is_mix(admission->current_flags))
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER);
     for (const auto &slot : local->slots)
-        if (slot.cooperative && slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE) return true;
+        if (slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE) return true;
     uint64_t cursor = 0;
     bool used_claim_seal = false;
     if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
@@ -969,7 +910,7 @@ static inline __aicore__ bool scheduler_ordered_park_ordinary(
     auto *admission = local->admission;
     for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
         auto &slot = local->slots[index];
-        if (slot.state != SchedulerDispatchSlotState::READY || slot.cooperative ||
+        if (slot.state != SchedulerDispatchSlotState::READY || scheduler_slot_uses_admission(local, slot) ||
             (local->local_ready_mask & (1U << index)) == 0)
             continue;
         if (slot.candidate_index >= SCHEDULER_PENDING_SLOT_COUNT)
@@ -1027,7 +968,7 @@ static inline __aicore__ bool scheduler_ordered_can_enter_slot(
         return scheduler_admission_fail(
             graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
         );
-    if (slot.cooperative) {
+    if (scheduler_slot_uses_admission(local, slot)) {
         if (slot.task_ref != admission->current_task_ref || slot.block_idx >= admission->current_block_num)
             return scheduler_admission_fail(
                 graph, local, run, slot.task_ref, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
@@ -1038,7 +979,7 @@ static inline __aicore__ bool scheduler_ordered_can_enter_slot(
             return scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
         // Ordinary entry has its own strong gate below; cooperative entry
         // needs this one. Neither path reuses an earlier poll's permission.
-        if (scheduler_read_error(run) != 0) return false;
+        if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
         *permit = true;
         if constexpr (RecordProtocol) scheduler_protocol_execution_permit(base, local, slot_index, UINT64_MAX, true);
         return true;
@@ -1062,6 +1003,7 @@ static inline __aicore__ bool scheduler_ordered_can_enter_slot(
         scheduler_protocol_execution_permit(base, local, slot_index, observed_tail, admission->capacity != 0);
     admission->next_candidate = static_cast<uint8_t>((slot.candidate_index + 1) % SCHEDULER_PENDING_SLOT_COUNT);
     candidate = {};
-    slot.candidate_index = UINT8_MAX;
+    // The slot retains its ordinary origin through completion; the index no
+    // longer owns the candidate after entry permission consumes that candidate.
     return true;
 }

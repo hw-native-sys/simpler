@@ -41,12 +41,7 @@ static inline __aicore__ bool scheduler_service_gm_mix(
                 graph, base, local, run, ack_prefilter_phase == SchedulerGmMixPhase::RELEASED
             );
             if (retired == SchedulerGmMixResult::ERROR) return false;
-            if (retired == SchedulerGmMixResult::TASK_LAST &&
-                !scheduler_complete_ordered_task<RecordProtocol>(
-                    graph, base, local, run, admission.current_task_ref, profiling_level
-                ))
-                return false;
-            if (retired == SchedulerGmMixResult::PROGRESS || retired == SchedulerGmMixResult::TASK_LAST) {
+            if (retired == SchedulerGmMixResult::PROGRESS) {
                 *progress = true;
                 if (!scheduler_gm_mix_close<RecordProtocol, true>(graph, base, local, run, &closed)) return false;
                 if (closed) return true;
@@ -183,7 +178,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     auto ack_prefilter_phase = SchedulerGmMixPhase::IDLE;
     if (!scheduler_ordered_poll_may_progress(graph, base, local, &ready_probe_empty, &ack_prefilter_phase))
         return false;
-    if (scheduler_read_error(run) != 0) {
+    if (scheduler_read_worker_error(run, local->worker_id()) != 0) {
         *failed = true;
         return false;
     }
@@ -387,6 +382,22 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
     if (!scheduler_task_ref_is_null(admission->current_task_ref)) {
         bool closed = false;
         if (scheduler_task_is_mix(admission->current_flags)) {
+            // An inactive coordinator can still owe its resource release
+            // after both executing AIV lanes have completed the logical task.
+            if (local->is_mix_coordinator() && admission->gm_mix.phase == SchedulerGmMixPhase::ARRIVED &&
+                !admission->current_active_mask.has_aic() && admission->gm_mix.subtask_slot == UINT8_MAX) {
+                if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return false;
+                bool arrived = false;
+                if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &arrived))
+                    return false;
+                if (!arrived) return true;
+                scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
+            }
+            if (local->is_mix_coordinator() && admission->gm_mix.phase == SchedulerGmMixPhase::RELEASED) {
+                const auto result = scheduler_gm_mix_retire<RecordProtocol>(graph, base, local, run);
+                if (result == SchedulerGmMixResult::ERROR) return false;
+                if (result == SchedulerGmMixResult::WAIT) return true;
+            }
             const auto phase = admission->gm_mix.phase;
             if ((local->is_mix_coordinator() && phase != SchedulerGmMixPhase::IDLE) ||
                 (!local->is_mix_coordinator() && phase != SchedulerGmMixPhase::IDLE &&

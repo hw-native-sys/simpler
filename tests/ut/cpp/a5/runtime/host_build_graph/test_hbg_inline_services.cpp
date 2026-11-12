@@ -147,6 +147,16 @@ TEST_P(HbgInlineDispatch, CompletesWithoutPayloadSlotGenerationOrKernelTrace) {
 
 INSTANTIATE_TEST_SUITE_P(OrdinaryAndOrdered, HbgInlineDispatch, ::testing::Bool());
 
+TEST(HbgInlineService, CancellationIsObservedBeforePublishingTaskDone) {
+    InlineFixture fixture;
+    scheduler_publish_error(fixture.run(), static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    EXPECT_FALSE(
+        scheduler_complete_inline_task(fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 1, 0)
+    );
+    EXPECT_EQ(fixture.control(1).state, static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+    EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
+}
+
 TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
     InlineFixture fixture(true, true, false, LaneMask::all());
     ASSERT_TRUE(fixture.enqueue(0, 0));
@@ -187,6 +197,7 @@ TEST(HbgInlineService, DirectCompletionServicesDummyWithoutReportingKernelRefill
     InlineFixture fixture(false);
     fixture.storage.metadata[0].logical_block_num = 1;
     fixture.storage.metadata[0].flags = SCHEDULER_TASK_EXECUTABLE;
+    fixture.control(0).completion_state = scheduler_completion_initial_state(1);
     fixture.dependency(1, 0);
     ASSERT_EQ(fixture.route(1), SchedulerRouteResult::WAITING);
     ASSERT_TRUE(fixture.enqueue(0));

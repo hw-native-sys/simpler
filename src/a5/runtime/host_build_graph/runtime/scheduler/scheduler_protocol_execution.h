@@ -22,6 +22,32 @@ inline __aicore__ bool scheduler_protocol_execution_matches(
            record->pending_slot == pending_slot;
 }
 
+static inline __aicore__ void scheduler_protocol_subtask_complete(
+    __gm__ void *base, const SchedulerLocalState *local, const SchedulerLocalSlotState &slot, uint32_t pending_slot,
+    bool before, uint64_t ticket
+) {
+    auto *layout = scheduler_protocol_layout_at(base, local);
+    if (layout == nullptr) return;
+    auto *record =
+        scheduler_protocol_execution_at(base, local, layout, slot.task_ref, slot.block_idx, slot.subtask_slot);
+    if (record == nullptr) return;
+    scheduler_protocol_observe_record(record);
+    if (!scheduler_protocol_execution_matches(local, record, slot, pending_slot) ||
+        record->completion_consumed.sequence == 0 ||
+        (before ? record->contribution_before.sequence != 0 :
+                  record->contribution_before.sequence == 0 || record->contribution_after.sequence != 0)) {
+        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+        return;
+    }
+    if (!scheduler_protocol_stamp(
+            base, local, layout, before ? &record->contribution_before : &record->contribution_after
+        ))
+        return;
+    record->contribution_worker = static_cast<uint32_t>(local->worker_id());
+    if (!before) record->contribution_ticket = ticket;
+    scheduler_protocol_publish_record(record);
+}
+
 static inline __aicore__ void scheduler_protocol_execution_permit(
     __gm__ void *base, const SchedulerLocalState *local, uint32_t pending_slot, uint64_t tail, bool has_log
 ) {
@@ -32,7 +58,8 @@ static inline __aicore__ void scheduler_protocol_execution_permit(
         return;
     }
     const auto &slot = local->slots[pending_slot];
-    if (slot.gm_mix && (!slot.cooperative || local->admission == nullptr)) {
+    const bool ordered = scheduler_slot_uses_admission(local, slot);
+    if (slot.gm_mix && (!ordered || local->admission == nullptr)) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
@@ -40,7 +67,7 @@ static inline __aicore__ void scheduler_protocol_execution_permit(
         scheduler_protocol_execution_at(base, local, layout, slot.task_ref, slot.block_idx, slot.subtask_slot);
     if (record == nullptr) return;
     uint64_t order = UINT64_MAX;
-    if (slot.cooperative) {
+    if (ordered) {
         if (local->admission == nullptr || local->admission->epoch != layout->run_epoch ||
             local->admission->current_task_ref != slot.task_ref) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
@@ -64,11 +91,11 @@ static inline __aicore__ void scheduler_protocol_execution_permit(
     record->order_key = order;
     record->group_seq = slot.gm_mix ? local->admission->gm_mix.group_seq : 0;
     record->flags = SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED |
-                    (slot.cooperative ? SCHEDULER_PROTOCOL_COOPERATIVE :
-                     has_log          ? SCHEDULER_PROTOCOL_PERMIT_TAIL :
-                                        SCHEDULER_PROTOCOL_PERMIT_NO_LOG) |
+                    (ordered ? SCHEDULER_PROTOCOL_COOPERATIVE :
+                     has_log ? SCHEDULER_PROTOCOL_PERMIT_TAIL :
+                               SCHEDULER_PROTOCOL_PERMIT_NO_LOG) |
                     (slot.gm_mix ? SCHEDULER_PROTOCOL_GM_GROUP : 0);
-    record->permit_tail = slot.cooperative ? UINT64_MAX : tail;
+    record->permit_tail = ordered ? UINT64_MAX : tail;
     scheduler_protocol_publish_record(record);
 }
 

@@ -212,8 +212,8 @@ struct GmMixFixture {
     SchedulerGmMixResult retire(uint32_t cluster) {
         return scheduler_gm_mix_retire(graph.graph(), base(), locals[cluster * 3], run());
     }
-    bool complete_task(uint64_t task, uint32_t cluster) {
-        return scheduler_complete_ordered_task(graph.graph(), base(), locals[cluster * 3], run(), task, 0);
+    bool task_done(uint64_t task) const {
+        return scheduler_gm_query(control(task)->state) == static_cast<int64_t>(SchedulerTaskState::DONE);
     }
     bool close(uint32_t worker, bool *closed) {
         return scheduler_gm_mix_close(graph.graph(), base(), locals[worker], run(), closed);
@@ -247,9 +247,11 @@ struct GmMixFixture {
         return true;
     }
     template <bool RecordProtocol = true>
-    bool complete(const GmExecution &execution) {
+    bool complete(const GmExecution &execution, uint64_t profiling = 0) {
         auto *local = locals[execution.worker];
-        return scheduler_complete_own_slot<RecordProtocol>(graph.graph(), base(), local, run(), execution.slot, 0);
+        return scheduler_complete_own_slot<RecordProtocol>(
+            graph.graph(), base(), local, run(), execution.slot, profiling
+        );
     }
     bool finish_lanes(uint32_t cluster) {
         const auto descriptor = mailbox(cluster)->descriptor;

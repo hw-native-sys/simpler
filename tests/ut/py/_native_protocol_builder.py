@@ -85,7 +85,7 @@ class ProtocolBuilder:
                     task_ref=ref,
                     state=2,
                     next_block=0,
-                    completed_blocks=0,
+                    completed_subtasks=0,
                     admission_state=0,
                     claim_tickets=0,
                     admission_claim_lock=0,
@@ -176,7 +176,6 @@ class ProtocolBuilder:
             for w in self.raw["workers"]
             if spec["flags"] & 4 or (w["core_type"] == 0) == bool(spec["active_mask"] & 1)
         ]
-
         if spec["flags"] & 8 and not spec["flags"] & (4 | 16):
             start = self.member_rank_offsets[task] % len(eligible)
             return [eligible[(start + i) % len(eligible)] for i in range(min(spec["block_num"], len(eligible)))]
@@ -271,10 +270,7 @@ class ProtocolBuilder:
 
     def complete_block(self, block):
         owner = block["owner"]
-        control = self.raw["task_controls"][owner["task_ref"]]
         self.stamp(owner, "completion_before")
-        owner["completion_ticket"] = control["completed_blocks"]
-        control["completed_blocks"] += 1
         self.stamp(owner, "completion_after")
 
     def execute(self, task, block, slot, worker, *, owner=None, group=0, skip=False) -> dict[str, Any]:
@@ -318,14 +314,9 @@ class ProtocolBuilder:
         if not skip:
             self.stamp(row, "returned")
             self.stamp(row, "visible")
-        if cooperative and not mixed:
-            self.complete_block(owner)
         self.stamp(row, "completion_consumed")
-        if not cooperative and not self.raw["cooperative_task_count"] and task not in self.deferred_tasks:
-            self.complete_task(task, worker)
+        self.contribute(row, None if mixed else owner)
         self.stamp(row, "trace_published")
-        if not cooperative and (self.raw["cooperative_task_count"] or task in self.deferred_tasks):
-            self.complete_task(task, worker)
         self.identities.append(
             dict(
                 run_epoch=self.raw["run_epoch"],
@@ -344,6 +335,23 @@ class ProtocolBuilder:
             )
         )
         return row
+
+    def contribute(self, execution, block=None):
+        task = execution["task_ref"]
+        spec = self.raw["tasks"][task]
+        control = self.raw["task_controls"][task]
+        self.stamp(execution, "contribution_before")
+        if block is not None:
+            self.stamp(block["owner"], "completion_before")
+        ticket = control["completed_subtasks"]
+        control["completed_subtasks"] += 1
+        execution.update(contribution_ticket=ticket, contribution_worker=execution["worker_index"])
+        self.stamp(execution, "contribution_after")
+        if block is not None:
+            block["owner"]["completion_ticket"] = ticket
+            self.stamp(block["owner"], "completion_after")
+        if control["completed_subtasks"] == spec["block_num"] * spec["active_mask"].bit_count():
+            self.complete_task(task, execution["worker_index"])
 
     def mix_block(self, task, block, cluster) -> dict[str, Any]:
         workers = [cluster * 3 + lane for lane in range(3)]
@@ -447,7 +455,6 @@ class ProtocolBuilder:
                             owner=last,
                         )
                 assert last is not None
-                self.complete_task(task, last["owner"]["worker_index"])
                 self.close(task)
             else:
                 slot = spec["active_mask"].bit_length() - 1

@@ -257,6 +257,10 @@ inline void execution(JsonObject &row, const SchedulerProtocolExecutionTrace &re
     row.stamp("completion_consumed", record.completion_consumed);
     row.stamp("permit", record.permit);
     row.stamp("trace_published", record.trace_published);
+    row.stamp("contribution_before", record.contribution_before);
+    row.stamp("contribution_after", record.contribution_after);
+    row.number("contribution_ticket", record.contribution_ticket);
+    row.number("contribution_worker", record.contribution_worker);
     row.number("run_epoch", record.run_epoch);
     row.number("task_ref", record.task_ref);
     row.number("order_key", record.order_key);
@@ -460,7 +464,7 @@ inline std::string scheduler_export_protocol(
             row.number("state", controls[task].state);
             row.number("next_block", controls[task].next_block);
             row.number("claim_tickets", controls[task].claim_tickets);
-            row.number("completed_blocks", controls[task].completed_blocks);
+            row.number("completed_subtasks", scheduler_completion_count(controls[task].completion_state));
             row.number("admission_state", controls[task].admission_state);
             row.number("admission_claim_lock", controls[task].admission_claim_lock);
             row.number("claim_seal", controls[task].claim_seal);

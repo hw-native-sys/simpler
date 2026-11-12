@@ -46,7 +46,7 @@ static_assert(offsetof(SchedulerRouteCursor, next_fanin) == 16 && offsetof(Sched
 static_assert(std::is_standard_layout_v<SchedulerRouteCursor> && std::is_trivially_copyable_v<SchedulerRouteCursor>);
 
 enum class SchedulerReadyPublishPhase : uint32_t { COLLECTING, PREPARED, DONE, FAILED };
-enum class SchedulerReadyAppendResult : uint8_t { ADDED, FULL, ERROR };
+enum class SchedulerReadyAppendResult : uint8_t { ADDED, DIRECT, FULL, ERROR };
 enum class SchedulerReadyPublishResult : uint8_t { DONE, YIELD, ERROR };
 inline constexpr uint32_t SCHEDULER_READY_PUBLICATION_CAPACITY = 8;
 enum class SchedulerReadyDestination : uint32_t { AIC, AIV, CONTROL, INVALID = UINT32_MAX };

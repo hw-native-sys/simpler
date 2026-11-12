@@ -210,6 +210,9 @@ struct FixtureStorage {
             metadata[task].trace_index_base = task;
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
             metadata[task].logical_block_num = 1;
+            auto *controls =
+                scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
+            controls[task].completion_state = scheduler_completion_initial_state(1);
         }
     }
 
@@ -226,6 +229,14 @@ struct FixtureStorage {
     // may happen only once for this allocation.
     void prepare_ready_pool() {
         ASSERT_EQ(ready_pool_offset, 0u);
+        auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
+        for (uint64_t task = 0; task < layout.task_count; ++task) {
+            const auto &meta = metadata[task];
+            const uint32_t total = scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
+                                       meta.logical_block_num * meta.active_mask.count() :
+                                       0;
+            controls[task].completion_state = scheduler_completion_initial_state(total);
+        }
         const std::vector<SchedulerTaskMetadata> tasks(metadata, metadata + layout.task_count);
         SchedulerReadyPoolPlan plan{};
         ASSERT_TRUE(scheduler_plan_ready_pool(tasks, ready_pool_clusters(), ready_pool_begin, &plan));

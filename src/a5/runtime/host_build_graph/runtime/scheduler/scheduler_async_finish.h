@@ -91,7 +91,7 @@ static inline __aicore__ bool scheduler_service_async_slice(
     // An inactive slice owns no shared work. The resident loop still polls
     // run errors; an active slice checks them before claiming any responsibility.
     if (async.error_code == 0 && !scheduler_async_work_activated(&async)) return true;
-    if (scheduler_read_error(run) != 0) return false;
+    if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     const bool finish = async.finish_first;
     async.finish_first = !finish;
     SchedulerScalarScope scalar_step(

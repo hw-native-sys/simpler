@@ -183,7 +183,7 @@ READY 发布的是可读配置；DMB 开放的是 kernel 执行权限。bootstra
 
 [SchedulerRunControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h) 的字段：
 
-**范围与用途：** 每轮一份，位于 GM，由所有参与核和 AICPU 共享。它用于判断全图 bootstrap、进展、完成与错误。当前为 384B、64B 对齐；动态完成计数从 offset 128 开始，错误载荷从 192 开始，最终错误发布字在独立的 offset 320 行。AICPU 补齐配置并监视，AICore 按协议更新计数和错误；各字段有各自写者，不是任意核都可以覆盖整个结构。
+**范围与用途：** 每轮一份，位于 GM，由所有参与核和 AICPU 共享。它用于判断全图 bootstrap、进展、完成与错误。当前为 7296B、64B 对齐；动态完成计数从 offset 128 开始，错误载荷从 192 开始，最终错误发布字在独立的 offset 320 行。384B 前缀之后是 `worker_errors[108]`，每个 worker 独占一条 64B 错误 signal 行，共 6912B。AICPU 补齐配置并监视，AICore 按协议更新计数和错误；各字段有各自写者，不是任意核都可以覆盖整个结构。
 
 | 字段 | 作用 |
 | ---- | ---- |
@@ -210,6 +210,7 @@ READY 发布的是可读配置；DMB 开放的是 kernel 执行权限。bootstra
 | `error_worker_index / error_cluster_lane` | 出错 worker 和 cluster lane |
 | `error_identity_fields` | 哪些附加错误身份字段有效 |
 | `scheduler_error` | 最后发布的错误码；0 表示尚无已发布错误 |
+| `worker_errors[108]` | 每个worker独占64B的错误signal；全部发布后才发布全局错误码 |
 
 [SchedulerGraphSummary](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h) 的全部字段：
 

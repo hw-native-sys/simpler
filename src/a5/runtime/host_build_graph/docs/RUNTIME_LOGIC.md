@@ -402,8 +402,9 @@ Resident bootstrap classifies each node by its initial remaining count: zero
 enters ready discovery; nonzero waits for producer completion notifications.
 All scans finish before completion resolution starts. Each resolved producer
 visits its CSR successors once; the atomic transition 1→0 uniquely publishes
-a successor. The same bounded resolver supports kernel, control and async
-FINISH completion. Without a dependency header, resident helpers retain the
+a successor. Synchronous TaskDone owners traverse the immutable CSR directly,
+without wake-list detachment or a continuation. Control and async FINISH owners
+retain the bounded resolver for resumable work. Without a dependency header, resident helpers retain the
 intrusive wake-list path. See the
 [dependency contract](../../../../../docs/zh-cn/design/a5-hbg-graph-task/dependency-counters.md).
 
@@ -485,10 +486,11 @@ SPMD blocks separately for AIC and AIV, in task-ref order, and stores it in
 the existing 64-byte admission header. Other resource types, single-block
 work, MIX and sync-start do not advance that prefix. This distributes independent small tasks across
 workers without changing block ownership or completion accounting. MIX and
-`sync_start` retain their full eligible membership. The exporter writes version 10
-(ordinary graph) and version 11 (native Graph). Only these current schemas are accepted. Producers and readers must match;
-historical formats are rejected. Both use the per-resource-type prefix and
-cooperative admission. Execution identities use the strict v1 contract:
+`sync_start` retain their full eligible membership. The ordinary and native Graph tags remain v10 and v11.
+Both carry the current subtask-completion fields, per-resource-type member
+prefix and cooperative admission. Historical field layouts are rejected.
+Each dispatch subtask contributes once; MIX resource retirement does not
+contribute again. Execution identities use the strict v1 contract:
 `(run_epoch, task_ref, block_idx, subtask_slot)` identifies an execution;
 worker and pending slot identify its placement. Worker event sequences prove
 that retirement precedes the next payload publication and permit on a reused slot.
@@ -522,8 +524,8 @@ execution in a local snapshot before rebinding the slot to its successor.
 Local configuration, execution slots, control resolution and the optional
 profiling pointer belong to the core-local state. A separate profiling state
 holds two timing slots, self-execution traces, one worker trace cache, profiling
-offsets, and the loop counter/cache-valid flag. Completion trace publication and
-slot release precede cooperative block contribution and GM MIX lane release.
+offsets, and the loop counter/cache-valid flag. Slot retirement precedes physical
+completion contribution. Completion trace publication precedes GM MIX lane release.
 Sampling is derived from the timing-slot range.
 
 The host records whether any task requests sampled timing in the run control.
@@ -562,6 +564,12 @@ invalidation on pickup. Each invocation initializes fresh local state before
 bootstrap; AICPU waits for `bootstrap_complete` before releasing the
 DATA_MAIN_BASE launch gate.
 
+Resident self-execution retires its EXECUTING slot directly on kernel return,
+after sealing asynchronous condition registrations and checking the run boundary. Computation contribution
+and successor resolution precede trace consolidation and writeback. Every trace
+is published before local slot reuse, MIX lane release and EXIT acknowledgement;
+the Host reads these records only after all cores have acknowledged retirement.
+
 The dispatch timing interval ends at `ready_publish_cycles`, immediately before
 READY token publication. It excludes READY publication and all subsequent
 dispatch-trace GM writes. Device RunWall measures the full on-NPU run
@@ -570,8 +578,9 @@ independently of this phase boundary.
 Ordinary resident runs accumulate resolved counts locally until an idle pass
 with no local executable task or deferred reservation, or the common run epilogue.
 Native Graph runs also flush pending counts when 32 completions have accumulated
-or at least 1 ms has elapsed since the previous flush. Trace and error publication
-precedes each count flush. The AICPU watchdog remains 20 seconds by default, so
+or at least 1 ms has elapsed since the previous flush. The flushing core's trace
+and error publication precedes its count flush; other contributors finish their
+trace publication before their own EXIT acknowledgement. The AICPU watchdog remains 20 seconds by default, so
 continuously busy ordinary work without count publication can reach that timeout.
 The intended ordinary runs normally complete in under one second. Ordinary
 completion accounting avoids periodic publication on the busy path; its
