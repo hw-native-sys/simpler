@@ -1291,6 +1291,30 @@ def test_region_vmm_begin_has_no_physical_side_effect(fake_vmm):
     assert _region_vmm_inspect(handle).present is False
 
 
+def test_region_vmm_has_no_explicit_access_stage(fake_vmm):
+    from _task_interface import _region_vmm_test_fail_stage  # pyright: ignore[reportMissingImports]
+
+    # MapMem grants owner access; there is no explicit-access stage to inject.
+    with pytest.raises(ValueError, match="unknown region VMM stage: set_access"):
+        _region_vmm_test_fail_stage("set_access", "before")
+
+
+def test_region_vmm_allocation_issues_no_explicit_access(fake_vmm):
+    from _task_interface import (  # pyright: ignore[reportMissingImports]
+        _region_vmm_allocate_export,
+        _region_vmm_begin,
+        _region_vmm_release,
+        _region_vmm_test_issued_ops,
+    )
+
+    handle = _region_vmm_begin(0)
+    try:
+        _region_vmm_allocate_export(handle, 8)
+        assert "set_access" not in _region_vmm_test_issued_ops()
+    finally:
+        _region_vmm_release(handle)
+
+
 @pytest.mark.parametrize(
     ("stage", "when", "allocated", "reserved", "mapped", "exported"),
     [
@@ -1300,8 +1324,6 @@ def test_region_vmm_begin_has_no_physical_side_effect(fake_vmm):
         ("va_reserve", "after", True, True, False, False),
         ("map", "before", True, True, False, False),
         ("map", "after", True, True, True, False),
-        ("set_access", "before", True, True, True, False),
-        ("set_access", "after", True, True, True, False),
         ("export", "before", True, True, True, False),
         ("export", "after", True, True, True, True),
     ],
@@ -2106,7 +2128,7 @@ def test_region_vmm_granularity_query_is_serialized_with_allocate(fake_vmm):
         assert [int(item.mapping_bytes) for item in exports] == [64] * alloc_count
         issued = _region_vmm_test_issued_ops()
         assert issued.count("granularity") == query_count + alloc_count
-        for op in ("bind_device", "physical_alloc", "va_reserve", "map", "set_access", "export"):
+        for op in ("bind_device", "physical_alloc", "va_reserve", "map", "export"):
             assert issued.count(op) == alloc_count
     finally:
         for handle in handles:

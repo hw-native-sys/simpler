@@ -501,7 +501,9 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     }
 
     // VMM own-window allocation: allocate a physical handle, reserve a VA
-    // range, map the handle into it, and grant our device read/write access.
+    // range, and map the handle into it. MapMem grants read/write access to
+    // the device that allocated the handle; this mapping relies on that
+    // owner grant and issues no explicit access grant.
     aclrtPhysicalMemProp prop{};
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
@@ -535,17 +537,6 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         LOG_ERROR("[comm rank %d] ipc: MapMem -> %d", rank, static_cast<int>(aret));
         aclrtReleaseMemAddress(localBuf);
         aclrtFreePhysical(handle);
-        return -1;
-    }
-    // The A5 ACL runtime validates access IDs in the ACL-logical space, including peer mappings.
-    aclrtMemAccessDesc accessDesc{};
-    accessDesc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
-    accessDesc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    accessDesc.location.id = static_cast<uint32_t>(myDevice);
-    aret = aclrtMemSetAccess(localBuf, aligned_size, &accessDesc, 1);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] ipc: MemSetAccess -> %d", rank, static_cast<int>(aret));
-        release_own_vmm_window(localBuf, handle);
         return -1;
     }
     // DISABLE_PID_VALIDATION drops the pid-whitelist requirement: any peer
@@ -682,15 +673,8 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
             release_own_vmm_window(localBuf, handle);
             return -1;
         }
-        aret = aclrtMemSetAccess(peerVa, aligned_size, &accessDesc, 1);
-        if (aret != ACL_SUCCESS) {
-            LOG_ERROR("[comm rank %d] ipc: peer MemSetAccess(peer=%d) -> %d", rank, p, static_cast<int>(aret));
-            aclrtUnmapMem(peerVa);
-            aclrtReleaseMemAddress(peerVa);
-            aclrtFreePhysical(peerHandle);
-            release_own_vmm_window(localBuf, handle);
-            return -1;
-        }
+        // MapMem grants this device read/write access to the imported handle;
+        // this peer mapping relies on that owner grant.
         h->host_ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peerVa);
     }
 
@@ -1497,7 +1481,6 @@ static int domain_alloc_via_ipc(
     out->nranks = subset_n;
     out->mapping_size = win_size;
     uint64_t shareableHandle = 0;
-    aclrtMemAccessDesc accessDesc{};
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     if (rdma_requested) {
         if (!aclrt_malloc_low_segment(&localBuf, win_size)) {
@@ -1538,15 +1521,6 @@ static int domain_alloc_via_ipc(
             return -1;
         }
         out->local_mapped = true;
-        // The peer mappings reuse this descriptor's ACL-logical device ID.
-        accessDesc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
-        accessDesc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-        accessDesc.location.id = static_cast<uint32_t>(myDevice);
-        aret = aclrtMemSetAccess(localBuf, aligned_size, &accessDesc, 1);
-        if (aret != ACL_SUCCESS) {
-            LOG_ERROR("[comm rank %d] alloc_domain: MemSetAccess -> %d", h->rank, static_cast<int>(aret));
-            return -1;
-        }
         aret = aclrtMemExportToShareableHandle(
             handle, ACL_MEM_HANDLE_TYPE_NONE, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareableHandle
         );
@@ -1757,14 +1731,7 @@ static int domain_alloc_via_ipc(
                 return -1;
             }
             peer_window.mapped = true;
-            aret = aclrtMemSetAccess(peerVa, aligned_size, &accessDesc, 1);
-            if (aret != ACL_SUCCESS) {
-                LOG_ERROR(
-                    "[comm rank %d] alloc_domain: peer MemSetAccess(peer_dr=%d) -> %d", h->rank, p,
-                    static_cast<int>(aret)
-                );
-                return -1;
-            }
+            // MapMem grants this device read/write access to the imported handle.
             ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peerVa);
         }
     }

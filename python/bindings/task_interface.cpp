@@ -257,11 +257,16 @@ public:
         acl_check(aclrtMapMem(va, static_cast<size_t>(bytes), 0, handle, 0), "aclrtMapMem");
     }
 
-    void vmm_set_access_with_check(void *va, uint64_t bytes, int device_id) const {
+    // Grants read/write access to a device through `access_location_id`. The id
+    // is in the namespace the installed Runtime consumes for
+    // aclrtMemAccessDesc::location.id (A2/A3: 9.0 driver-visible, 9.3
+    // ACL-logical; #2884). A mapping's owner device already receives access
+    // from aclrtMapMem and needs no grant.
+    void vmm_set_access_with_check(void *va, uint64_t bytes, uint32_t access_location_id) const {
         LocalAclMemAccessDesc access{};
         access.flags = kAclRtMemAccessReadwrite;
         access.location.type = kAclMemLocationTypeDevice;
-        access.location.id = static_cast<uint32_t>(device_id);
+        access.location.id = access_location_id;
         acl_check(aclrtMemSetAccess(va, static_cast<size_t>(bytes), &access, 1), "aclrtMemSetAccess");
     }
 
@@ -915,7 +920,9 @@ RegionHandle import_onboard_region(
     void *mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
     mapping->device_addr = reinterpret_cast<uint64_t>(mapped_addr);
     api.vmm_map_with_check(mapped_addr, mapping_bytes, mapping->vmm_handle);
-    api.vmm_set_access_with_check(mapped_addr, mapping_bytes, device_id);
+    // aclrtMapMem grants read/write access to the device that imported the
+    // handle; this mapping relies on that owner grant and issues no explicit
+    // access grant.
     uint64_t handle = region_registry().emplace(std::move(mapping));
     return RegionHandle(handle, std::move(handle_owner_token));
 }
@@ -950,7 +957,6 @@ enum class RegionVmmStage {
     PhysicalAlloc,
     VaReserve,
     Map,
-    SetAccess,
     Export,
     Unmap,
     VaRelease,
@@ -980,7 +986,6 @@ struct RegionVmmInspect {
     bool physical_allocated{false};
     bool va_reserved{false};
     bool mapped{false};
-    bool access_set{false};
     bool exported{false};
     bool unmap_attempted{false};
     bool unmap_complete{false};
@@ -1002,7 +1007,6 @@ struct RegionVmmAllocation {
     bool physical_allocated{false};
     bool va_reserved{false};
     bool mapped{false};
-    bool access_set{false};
     bool exported{false};
     bool unmap_attempted{false};
     bool unmap_complete{false};
@@ -1055,8 +1059,6 @@ const char *region_vmm_stage_name(RegionVmmStage stage) {
         return "va_reserve";
     case RegionVmmStage::Map:
         return "map";
-    case RegionVmmStage::SetAccess:
-        return "set_access";
     case RegionVmmStage::Export:
         return "export";
     case RegionVmmStage::Unmap:
@@ -1084,9 +1086,6 @@ RegionVmmStage region_vmm_parse_stage(const std::string &name) {
     }
     if (name == "map") {
         return RegionVmmStage::Map;
-    }
-    if (name == "set_access") {
-        return RegionVmmStage::SetAccess;
     }
     if (name == "export") {
         return RegionVmmStage::Export;
@@ -1189,17 +1188,6 @@ void region_vmm_map(void *va, uint64_t bytes, void *handle) {
         return;
     }
     acl_api().vmm_map_with_check(va, bytes, handle);
-}
-
-void region_vmm_set_access(void *va, uint64_t bytes, int device_id) {
-    region_vmm_record_issued("set_access");
-    if (region_vmm_test_hooks().use_fake) {
-        (void)va;
-        (void)bytes;
-        (void)device_id;
-        return;
-    }
-    acl_api().vmm_set_access_with_check(va, bytes, device_id);
 }
 
 uint64_t region_vmm_export_shareable(void *handle) {
@@ -1307,7 +1295,6 @@ RegionVmmInspect region_vmm_inspect_record(uint64_t handle, const RegionVmmAlloc
     inspect.physical_allocated = record->physical_allocated;
     inspect.va_reserved = record->va_reserved;
     inspect.mapped = record->mapped;
-    inspect.access_set = record->access_set;
     inspect.exported = record->exported;
     inspect.unmap_attempted = record->unmap_attempted;
     inspect.unmap_complete = record->unmap_complete;
@@ -1395,15 +1382,9 @@ RegionVmmExport region_vmm_allocate_export(uint64_t handle, uint64_t logical_byt
             record.mapped = true;
         }
     );
-    region_vmm_run_allocate_stage(
-        RegionVmmStage::SetAccess,
-        [&]() {
-            region_vmm_set_access(record.va, mapping_bytes, record.device_id);
-        },
-        [&]() {
-            record.access_set = true;
-        }
-    );
+    // MapMem grants read/write access to the device that owns the physical
+    // handle; this allocation relies on that owner grant and issues no
+    // explicit access grant.
     region_vmm_run_allocate_stage(
         RegionVmmStage::Export,
         [&]() {
@@ -4317,7 +4298,6 @@ NB_MODULE(_task_interface, m) {
         .def_ro("physical_allocated", &RegionVmmInspect::physical_allocated)
         .def_ro("va_reserved", &RegionVmmInspect::va_reserved)
         .def_ro("mapped", &RegionVmmInspect::mapped)
-        .def_ro("access_set", &RegionVmmInspect::access_set)
         .def_ro("exported", &RegionVmmInspect::exported)
         .def_ro("unmap_attempted", &RegionVmmInspect::unmap_attempted)
         .def_ro("unmap_complete", &RegionVmmInspect::unmap_complete)

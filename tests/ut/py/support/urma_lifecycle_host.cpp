@@ -59,11 +59,12 @@ std::unordered_map<aclrtDrvMemHandle, std::shared_ptr<PhysicalAllocation>> physi
 std::unordered_map<uint64_t, std::weak_ptr<PhysicalAllocation>> exported_resources;
 uint64_t last_exported = 0;
 bool fail_context_upload = false;
-enum class PeerFailure { NONE, IMPORT, RESERVE, MAP, ACCESS };
+enum class PeerFailure { NONE, IMPORT, RESERVE, MAP };
 PeerFailure peer_failure = PeerFailure::NONE;
 bool peer_reserve_pending = false;
 int peer_import_calls = 0;
 int injected_peer_failures = 0;
+int explicit_access_calls = 0;
 std::unordered_set<aclrtDrvMemHandle> imported_handles;
 std::unordered_set<void *> peer_mappings;
 
@@ -155,11 +156,11 @@ extern "C" aclError aclrtUnmapMem(void *address) {
     peer_mappings.erase(address);
     return ACL_SUCCESS;
 }
-extern "C" aclError aclrtMemSetAccess(void *address, size_t, aclrtMemAccessDesc *, size_t) {
-    if (peer_mappings.count(address) != 0 && peer_failure == PeerFailure::ACCESS) {
-        ++injected_peer_failures;
-        return 1;
-    }
+// A5 window mappings rely on MapMem's owner grant and issue no explicit access
+// grant; any such call aborts the fixture.
+extern "C" aclError aclrtMemSetAccess(void *, size_t, aclrtMemAccessDesc *, size_t) {
+    ++explicit_access_calls;
+    assert(explicit_access_calls == 0);
     return ACL_SUCCESS;
 }
 extern "C" aclError aclrtMemGetAllocationGranularity(aclrtPhysicalMemProp *, aclrtMemGranularityOptions, size_t *n) {
@@ -379,7 +380,6 @@ int main(int argc, char **argv) {
     if (scenario == "peer_import") peer_failure = PeerFailure::IMPORT;
     if (scenario == "peer_reserve") peer_failure = PeerFailure::RESERVE;
     if (scenario == "peer_map") peer_failure = PeerFailure::MAP;
-    if (scenario == "peer_access") peer_failure = PeerFailure::ACCESS;
     char folder[] = "/tmp/simpler-urma-lifecycle-XXXXXX";
     assert(mkdtemp(folder));
     auto *h = new CommHandle_{};
@@ -546,6 +546,9 @@ int main(int argc, char **argv) {
         assert(mappings.empty() && physical_handles == 0);
         delete h;
     }
+    // Every local and imported window relies on MapMem's owner grant; an
+    // explicit access grant fails this fixture.
+    assert(explicit_access_calls == 0);
     std::filesystem::remove_all(folder);
 }
 extern "C" errno_t memcpy_s(void *dest, size_t capacity, const void *src, size_t count) {

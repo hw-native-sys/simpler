@@ -112,7 +112,6 @@ def urma_lifecycle_binary(tmp_path_factory):
         "peer_import",
         "peer_reserve",
         "peer_map",
-        "peer_access",
         "success",
         "undrained",
         "cqe_pending",

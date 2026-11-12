@@ -36,10 +36,10 @@ namespace pto {
  *   - `aclrtMemAccessDesc::location.id` is Runtime-dependent on A2/A3:
  *     CANN 9.0.0 was measured to consume driver-visible ids, 9.3.0 ACL-logical
  *     ids; the version where the interpretation changed is unknown (issue #2884).
- *     A5 consumes logical ids. The A2/A3 communication-window path relies on
- *     MapMem's automatic read/write grant to the allocating/importing device
- *     and does not call MemSetAccess. `aclrtPhysicalMemProp::location.id` stays
- *     logical.
+ *     A5 consumes logical ids. The A2/A3 communication-window, region VMM and
+ *     A5 communication-window paths rely on MapMem's automatic read/write grant
+ *     to the allocating/importing device and do not call MemSetAccess.
+ *     `aclrtPhysicalMemProp::location.id` stays logical.
  *
  * `ASCEND_RT_VISIBLE_DEVICES` renumbers the logical space to `0..N-1` while the
  * HAL keeps indexing the driver-visible space; a direct HAL call made with the
