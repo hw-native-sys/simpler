@@ -6,7 +6,7 @@ scheduler, replacement arithmetic, timed busy loop, or simulated notification.
 The previous reference scanner has been removed. Its historical measurements
 are **not a production performance baseline**.
 
-The source forward uses EP2, 72 valid tokens per rank (80 padded rows),
+The replay source forward uses EP2, 72 valid tokens per rank (80 padded rows),
 64 local experts, and the original zero-weight inputs. This is a scheduling
 experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
@@ -29,7 +29,7 @@ inputs and cannot replace tensor parameters or initialization data.
 | `c1a_full` | Layer 20 attention | 38 / 818 | 25 / 550 |
 | `c1a_reindex` | Layer 24 attention | 34 / 801 | 23 / 625 |
 | `c1a_reuse` | Layer 21 attention | 24 / 583 | 17 / 391 |
-| `moe` | Layer 0 MoE | 479 / 3,069 | 32 / 913 |
+| `moe` | Native MoE (Lib); layer 0 replay (DSL) | Dynamic Host control | 32 / 913 |
 | `engram` | Layer 1 Engram | 12 / 960 | 12 / 960 |
 | `layers_19_21` | Three consecutive layers | 1,527 / 11,218 | 159 / 4,168 |
 
@@ -38,6 +38,38 @@ tensor shapes, strides, offsets, aliasing, argument directions, explicit
 dependencies, scope modes, block counts, and sync-start flags are recorded at
 the production Host submission interface. Device dispatch, ready queues,
 completion, MIX admission, and `defer_wait` use the unchanged production code.
+
+## Native PyPTO-lib MoE Host controls
+
+`pypto_lib/moe` executes `dev/hbg`'s `l3_moe` and its original HBG orchestration.
+It reads each rank's `num_tokens` with `get_tensor_data<int32_t>`. Frozen MoE
+submission plans are rejected; the DSL MoE and the other cases retain their
+existing execution paths. This case uses the model's numerical golden rather
+than the old zero-weight forward slice, so regenerate its performance baseline.
+
+Compile this case alone without reserving devices:
+
+```bash
+python3 "$DSV41/production/moe.py" "$DSV41/build/prepared/cases/pypto_lib/moe" \
+  "$DSV41/outputs/moe-compile" --compile-only --lib-root /path/to/pypto-lib-dev-hbg
+```
+
+Use a clean `dev/hbg` checkout (source: `a6a9a2d4`), its matching PyPTO
+(`fc50efe7`, PTOAS v0.72), and the installed Simpler runtime. The bundle records
+the Lib checkout and commit and requires that checkout for the original golden. Run the resulting
+bundle through the same `run.sh BUNDLE RUNTIME_LIB OUTPUT LEVEL WARMUP ROUNDS`
+interface. Native MoE requires `RUNTIME_LIB` to match the installed Simpler
+runtime; it does not silently substitute another runtime directory.
+
+The test checks generated orchestration for the actual control read, then runs
+numerical goldens at per-rank counts `0,6`, `6,0`, and `72,72` using one compiled
+program. The `72,72` case retains warmup and measured performance statistics.
+Each profiling level writes `L<level>/result.json`; compilation-only success is
+separate from hardware correctness. The case uses EP2 with 64 local experts.
+The aggregate auditor stores native MoE reports in `audit.json`; the replay-only
+`baseline.csv` does not invent source-task or kernel mappings for native MoE.
+Host control reads occur during graph construction and are not Device readback
+or a Device-kernel latency measurement.
 
 ## Boundary preparation and validation
 
@@ -158,12 +190,14 @@ bash "$DSV41/build.sh" --pto-isa "$PWD/build/pto-isa" > /tmp/dsv41-build.log 2>&
 ## Prepare and run
 
 Preparation executes each included original full forward once on two A5 devices
-and captures its Host submissions. It then generates nine replay bundles per
-organization and materializes the seven local cases using their original prefixes. Start with a new output directory:
+and captures its Host submissions. It generates eight Lib replay bundles and nine
+DSL replay bundles, plus the native Lib MoE program from `dev/hbg`. The seven local
+cases per organization are materialized using their original prefixes. Start with a new output directory:
 
 ```bash
 export DSV41_RUNTIME="$PWD/build/lib/a5/onboard"
-python3 "$DSV41/production/prepare.py" "$DSV41_RUNTIME" "$DSV41/build/prepared"
+python3 "$DSV41/production/prepare.py" "$DSV41_RUNTIME" "$DSV41/build/prepared" \
+  --pypto-lib-root /path/to/pypto-lib-dev-hbg
 
 bash "$DSV41/run.sh" \
   "$DSV41/build/prepared/cases/pypto_lib/swa" \

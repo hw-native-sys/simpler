@@ -65,14 +65,10 @@
       "incoming_edges": 70
     },
     "moe": {
-      "tasks": 479,
-      "executions": 3069,
-      "edges": 1496,
-      "first_source_task": "43",
-      "last_source_task": "659",
-      "task_table_sha256": "f66a18d977277fbd2439a0c5744a47e98e8cb200d39187c1ce1ad0cee024046c",
-      "edge_table_sha256": "6752e6bfb49bbd17d238c5b5a9c874d2267615631462e97d25d839a04b96c0de",
-      "incoming_edges": 1389
+      "execution": "native_moe_host_control",
+      "source_branch": "dev/hbg",
+      "entry": "models/deepseek_v4_1_flash/decode_moe.py:l3_moe",
+      "device_count": 2
     },
     "engram": {
       "tasks": 12,

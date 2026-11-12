@@ -29,7 +29,9 @@ if [[ -z "${TASK_DEVICE:-}" ]]; then
     printf -v command 'TASK_DEVICE="$TASK_DEVICE" bash %q' "$root/production/run.sh"
     for argument in "$@"; do printf -v command '%s %q' "$command" "$argument"; done
     command -v task-submit >/dev/null || { echo 'task-submit is required to reserve devices' >&2; exit 2; }
-    exec task-submit --device "${DSV41_DEVICES:-auto}" --device-num "$ranks" --max-time "${DSV41_MAX_TIME:-300}" --run "$command"
+    allocation=(--device "${DSV41_DEVICES:-auto}")
+    if [[ ${DSV41_DEVICES:-auto} == auto ]]; then allocation+=(--device-num "$ranks"); fi
+    exec task-submit "${allocation[@]}" --max-time "${DSV41_MAX_TIME:-300}" --run "$command"
 fi
 IFS=',' read -r -a devices <<< "$TASK_DEVICE"
 [[ ${#devices[@]} == "$ranks" ]] || { echo "Case requires $ranks devices; reservation contains ${#devices[@]}" >&2; exit 2; }
@@ -39,6 +41,22 @@ for ((rank=0; rank<ranks; ++rank)); do
         [[ ${devices[$rank]} != "${devices[$peer]}" ]] || { echo 'Device IDs must be distinct' >&2; exit 2; }
     done
 done
+if [[ -f "$bundle/case.json" ]] && "${DSV41_PYTHON:-python3}" -c 'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("execution") != "native_moe_host_control")' "$bundle/case.json"; then
+    [[ -d "$bundle/program" ]] || { echo 'Compile native MoE with production/moe.py first' >&2; exit 2; }
+    mkdir -p "$output/ascend"
+    export ASCEND_PROCESS_LOG_PATH="$output/ascend"
+    levels=("$4")
+    if [[ $4 == all ]]; then levels=(0 1 3); fi
+    for level in "${levels[@]}"; do
+        if ! "${DSV41_PYTHON:-python3}" "$root/production/moe.py" "$bundle" "$output/L$level" \
+            --runtime-lib "$runtime" --level "$level" --warmup "$5" --rounds "$6" > "$output/L$level.log" 2>&1; then
+            tail -n 60 "$output/L$level.log"
+            exit 1
+        fi
+        tail -n 12 "$output/L$level.log"
+    done
+    exit 0
+fi
 runner=${DSV41_RUNNER:-"${DSV41_BUILD_DIR:-$root/build/portable}/host/native-runner"}
 [[ -x "$runner" && -f "$bundle/callable.bin" ]] || { echo 'Build the native runner and bundle first' >&2; exit 2; }
 pids=()

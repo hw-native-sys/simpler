@@ -7,14 +7,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Assemble nine original-kernel cases from a production Host submission capture."""
+"""Assemble replay cases and compile the original dev/hbg MoE orchestration."""
 
 import argparse
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+from moe import create_bundle
 
 
 def link(source, target):
@@ -24,11 +27,26 @@ def link(source, target):
         shutil.copyfile(source, target)
 
 
-def export(bundle, capture, flavor, output, tools):
+def export(bundle, capture, flavor, output, tools, lib_root=None):
     root = Path(__file__).resolve().parents[1]
     cases = json.loads((root / "workloads" / flavor / "source.json").read_text())["cases"]
     for name, case in cases.items():
         destination = output / flavor / name
+        if case.get("execution") == "native_moe_host_control":
+            if lib_root is None:
+                raise ValueError("PyPTO-lib MoE requires --pypto-lib-root pointing to dev/hbg")
+            create_bundle(destination, lib_root)
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(root / "production/moe.py"),
+                    str(destination),
+                    str(destination / "compile"),
+                    "--compile-only",
+                ],
+                check=True,
+            )
+            continue
         destination.mkdir(parents=True, exist_ok=False)
         first, last = str(case["first_source_task"]), str(case["last_source_task"])
         metadata = []
@@ -116,6 +134,14 @@ if __name__ == "__main__":
     parser.add_argument("capture", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--flavor", choices=["pypto_lib", "pypto_lib_dsl"], required=True)
+    parser.add_argument("--pypto-lib-root", type=Path)
     parser.add_argument("--tools", type=Path, default=Path(__file__).resolve().parents[1] / "build/portable/host")
     args = parser.parse_args()
-    export(args.bundle.resolve(), args.capture.resolve(), args.flavor, args.output.resolve(), args.tools.resolve())
+    export(
+        args.bundle.resolve(),
+        args.capture.resolve(),
+        args.flavor,
+        args.output.resolve(),
+        args.tools.resolve(),
+        args.pypto_lib_root,
+    )

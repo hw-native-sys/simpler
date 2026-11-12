@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Freeze nine task-graph slices from a completed HBG capture; standard library only."""
+"""Export replay topology references and the native PyPTO-lib MoE case descriptor."""
 
 import argparse
 import gzip
@@ -60,6 +60,14 @@ def export(capture, flavor, output):
     )
     summary = {}
     for name, (begin, end) in ranges.items():
+        if flavor == "pypto_lib" and name == "moe":
+            summary[name] = {
+                "execution": "native_moe_host_control",
+                "source_branch": "dev/hbg",
+                "entry": "models/deepseek_v4_1_flash/decode_moe.py:l3_moe",
+                "device_count": 2,
+            }
+            continue
         selected = tasks[begin:end]
         ids = {str(task["task_id"]): index for index, task in enumerate(selected)}
         internal = set()

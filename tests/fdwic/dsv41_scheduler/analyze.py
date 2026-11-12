@@ -123,11 +123,29 @@ def compare_kernel_durations(records, source_records, source_tasks, selected, ma
     }
 
 
+def native_moe_reports(root, case):
+    reports = {level: load(root / case["case"] / f"L{level}" / "result.json") for level in (0, 1, 3)}
+    for level, report in reports.items():
+        if report.get("profiling_level") != level or report.get("source_commit") != case["lib_commit"]:
+            raise ValueError("Native MoE report has a different profiling level or source revision")
+        counts = {tuple(check["counts"]) for check in report["checks"] if check["passed"]}
+        if not report.get("passed") or report.get("compile_only") or counts != {(0, 6), (6, 0), (72, 72)}:
+            raise ValueError("Native MoE has not passed all Host-control goldens")
+        if not report.get("control_reads") or not report.get("performance"):
+            raise ValueError("Native MoE is missing its control-read or performance evidence")
+    return {"flavor": case["flavor"], "case": case["case"], "native_host_control": reports}
+
+
 def audit(root, cases, original, names, destination, convert):
     destination.mkdir(parents=True, exist_ok=True)
     rows, details = [], []
     for case_dir in sorted(cases.iterdir()):
         case = load(case_dir / "case.json")
+        if case.get("execution") == "native_moe_host_control":
+            details.append(native_moe_reports(root, case))
+            # Native orchestration has no source-task mapping to the captured forward.
+            # Its numerical and timing evidence remains in the native report.
+            continue
         expected = case["source"]
         for rank in range(case.get("device_count", 2)):
             directory = root / case["case"] / f"rank{rank}"
@@ -267,10 +285,11 @@ def audit(root, cases, original, names, destination, convert):
         + "\n"
     )
     with (destination / "baseline.csv").open("w") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Production audit passed: {len(rows)} case/rank combinations, {len(rows) * 2} L1/L3 captures")
+        if rows:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    print(f"Production audit passed: {len(rows)} replay case/rank combinations; native cases are in audit.json")
 
 
 if __name__ == "__main__":

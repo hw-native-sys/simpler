@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Regenerate the nine case bundles by running the included original orchestration."""
+"""Prepare the DSV4.1 replay cases and the native PyPTO-lib MoE case."""
 
 import argparse
 import json
@@ -29,7 +29,10 @@ def main():
         "--build-dir", type=Path, default=Path(os.environ.get("DSV41_BUILD_DIR", ROOT / "build/portable"))
     )
     parser.add_argument("--flavor", choices=["pypto_lib", "pypto_lib_dsl", "both"], default="both")
+    parser.add_argument("--pypto-lib-root", type=Path, help="PyPTO-lib dev/hbg checkout for native MoE")
     args = parser.parse_args()
+    if args.flavor != "pypto_lib_dsl" and args.pypto_lib_root is None:
+        parser.error("--pypto-lib-root is required for PyPTO-lib MoE")
     output, build, runtime = args.output.resolve(), args.build_dir.resolve(), args.runtime.resolve()
     runtime_files = (
         "host_build_graph/libhost_runtime.so",
@@ -52,7 +55,7 @@ def main():
             env=env,
             check=True,
         )
-        export(bundle, capture, flavor, output / "cases", build / "host")
+        export(bundle, capture, flavor, output / "cases", build / "host", args.pypto_lib_root)
         for case in sorted((output / "cases" / flavor).iterdir()):
             if json.loads((case / "case.json").read_text())["device_count"] == 1:
                 materialize(case, runtime, output / "preparation" / flavor / case.name, env)
