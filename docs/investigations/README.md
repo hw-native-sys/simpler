@@ -90,6 +90,8 @@ Newest first.
 
 - [2026-11 — A5 HBG Scalar observer inlining](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#scalar-observer-inlining) — reverted: cold build grew from 257.749 s to 1031.377 s; three-round SWA L3 measurements did not establish a completion benefit, with different devices limiting the comparison.
 
+- [A5 full-sync single-FAA allocation](a5-spmd-full-sync-claim-results.md) — retained runtime change: 27 hardware correctness cases pass and three matched C1A pairs reduce the targeted ramps and kernel window; level3 profiling evidence, lower-instrumentation validation pending.
+
 - [2026-11 — A5 HBG admission shortcuts](../zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md) — withdrawn: batched publication showed no established benefit; replacing claim-seal atomics with bypass stores lacks the required A5 hardware evidence despite passing selected functional tests.
 
 - [2026-11 — A5 HBG DSV4.1 scheduler review](../zh-cn/investigations/2026-11-a5-hbg-dsv-scheduler-review.md) — same-allocation commit comparisons isolate independent block dispatch as an Engram/SWA regression. Reviews the retained layout/build changes and restores cooperative SPMD scheduling.

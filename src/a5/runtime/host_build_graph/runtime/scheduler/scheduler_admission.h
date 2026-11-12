@@ -788,6 +788,40 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
             return SchedulerBlockClaimResult::ERROR;
         return SchedulerBlockClaimResult::CLAIMED;
     }
+    // A full-residency sync cohort has exactly one eligible claim position per
+    // logical block: one AIC lane per cluster (the Mix coordinator when the
+    // task is Mix), or the two AIV lanes of a cluster, as
+    // `scheduler_block_claim_positions` counts them. The `sync_claimed` gate
+    // above allows each position one claim, so the bounded retry loop buys
+    // nothing here. One fetch-add on next_block hands out the dynamic index and
+    // publishes the claim; the actual last claim still publishes the seal, and
+    // claim_tickets stays zero for this branch.
+    if (scheduler_task_requires_sync_start(admission->current_flags) &&
+        admission->current_block_num ==
+            scheduler_block_claim_positions(admission->current_active_mask, local->config.cluster_count)) {
+        const uint64_t count = admission->current_block_num;
+        const uint64_t claim_start = RecordProtocol ? scheduler_protocol_cycles(local) : 0;
+        const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
+        if (block >= count) {
+            // No valid position can arrive here: the cohort has as many
+            // positions as blocks and each already claimed its own. Treat the
+            // extra reservation as cursor corruption rather than return an
+            // index outside the block range.
+            scheduler_admission_fail(
+                graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
+            );
+            return SchedulerBlockClaimResult::ERROR;
+        }
+        *block_idx = static_cast<uint32_t>(block);
+        admission->sync_claimed = true;
+        if constexpr (RecordProtocol)
+            scheduler_protocol_block_claim(
+                base, local, *block_idx, claim_start, scheduler_protocol_cycles(local), block + 1
+            );
+        if (block + 1 == count && !scheduler_publish_claim_seal<RecordProtocol>(graph, base, local, run, *block_idx))
+            return SchedulerBlockClaimResult::ERROR;
+        return SchedulerBlockClaimResult::CLAIMED;
+    }
     uint64_t observed = scheduler_gm_query(control->next_block);
     bool critical = false;
     for (uint32_t attempt = 0; attempt < 8; ++attempt) {

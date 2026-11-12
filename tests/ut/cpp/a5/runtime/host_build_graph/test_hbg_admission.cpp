@@ -2538,4 +2538,239 @@ TEST_P(HbgClaimSeal, BootstrapRejectsPreexistingSealAndRunInitializationClearsIt
 
 INSTANTIATE_TEST_SUITE_P(MasksSizesAndSyncModes, HbgClaimSeal, ::testing::ValuesIn(claim_seal_shapes()));
 
+// Full-residency sync shapes: the logical block count equals the number of
+// claimable positions the mask and cluster count allow.
+struct FullSyncCase {
+    LaneMask mask;
+    uint16_t blocks;
+};
+
+std::vector<FullSyncCase> full_sync_cases(uint64_t clusters) {
+    return {
+        {LaneMask::aic(), static_cast<uint16_t>(clusters)},
+        {LaneMask::aiv0(), static_cast<uint16_t>(2 * clusters)},
+        {kAicAiv0, static_cast<uint16_t>(clusters)},
+        {kAicAiv1, static_cast<uint16_t>(clusters)},
+        {LaneMask::both_aiv(), static_cast<uint16_t>(clusters)},
+        {LaneMask::all(), static_cast<uint16_t>(clusters)},
+    };
+}
+
+bool full_sync_claimant_position(LaneMask mask, uint64_t worker) {
+    return mask.to_shape() == ResourceShape::AIV ? worker % PLATFORM_CORES_PER_BLOCKDIM != 0 :
+                                                   worker % PLATFORM_CORES_PER_BLOCKDIM == 0;
+}
+
+class HbgFullSyncClaim : public ::testing::TestWithParam<FullSyncCase> {};
+
+TEST_P(HbgFullSyncClaim, EveryEligiblePositionClaimsOneUniqueBlockAndTheActualLastClaimSeals) {
+    constexpr uint64_t clusters = 4;
+    const auto shape = GetParam();
+    AdmissionFixture fixture({{shape.blocks, shape.mask, SCHEDULER_TASK_SYNC_START}}, clusters * 3);
+    ASSERT_TRUE(fixture.publish(0));
+    std::vector<uint64_t> claimants;
+    for (uint64_t worker = 0; worker < clusters * PLATFORM_CORES_PER_BLOCKDIM; ++worker) {
+        if (!full_sync_claimant_position(shape.mask, worker)) continue;
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(fixture.admissions[worker].current_task_ref, 0);
+        claimants.push_back(worker);
+    }
+    ASSERT_EQ(claimants.size(), shape.blocks);
+    std::vector<bool> seen(shape.blocks, false);
+    for (uint32_t index = 0; index < shape.blocks; ++index) {
+        SCOPED_TRACE(index);
+        uint32_t block = UINT32_MAX;
+        ASSERT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[claimants[index]], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        ASSERT_LT(block, shape.blocks);
+        EXPECT_FALSE(seen[block]);
+        seen[block] = true;
+        // The seal is the actual last valid claim's, not a planned rank.
+        EXPECT_EQ(fixture.task_control(0)->claim_seal, index + 1 == shape.blocks ? shape.blocks : 0u);
+        EXPECT_EQ(fixture.task_control(0)->completed_blocks, 0u);
+    }
+    EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) {
+        return value;
+    }));
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->claim_tickets, UINT64_C(0)), 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->next_block, UINT64_C(0)), shape.blocks);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, shape.blocks);
+    uint64_t cursor = UINT64_MAX;
+    bool sealed = false;
+    ASSERT_TRUE(scheduler_read_claim_cursor(
+        fixture.graph.graph(), fixture.base(), fixture.locals[claimants[0]], fixture.run(), &cursor, &sealed
+    ));
+    EXPECT_EQ(cursor, shape.blocks);
+    EXPECT_TRUE(sealed);
+    // A position that already claimed gets no second block from the cohort.
+    for (const uint64_t worker : claimants) {
+        uint32_t block = UINT32_MAX;
+        EXPECT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::RETRY
+        );
+        EXPECT_EQ(block, UINT32_MAX);
+    }
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+    EXPECT_EQ(fixture.task_control(0)->next_block, shape.blocks);
+    EXPECT_EQ(fixture.task_control(0)->completed_blocks, 0u);
+    EXPECT_NE(fixture.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+}
+
+INSTANTIATE_TEST_SUITE_P(LaneMasks, HbgFullSyncClaim, ::testing::ValuesIn(full_sync_cases(4)));
+
+TEST(HbgFullSyncClaim, AnExtraReservationPastTheSealedCohortFailsInsteadOfReturningAClaim) {
+    constexpr uint64_t clusters = 4;
+    AdmissionFixture fixture({{clusters, LaneMask::aic(), SCHEDULER_TASK_SYNC_START}}, clusters * 3);
+    ASSERT_TRUE(fixture.publish(0));
+    for (uint64_t cluster = 0; cluster < clusters; ++cluster) {
+        const uint64_t worker = cluster * PLATFORM_CORES_PER_BLOCKDIM;
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(fixture.admissions[worker].current_task_ref, 0);
+        uint32_t block = UINT32_MAX;
+        ASSERT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+    }
+    ASSERT_EQ(fixture.task_control(0)->next_block, clusters);
+    ASSERT_EQ(fixture.task_control(0)->claim_seal, clusters);
+    // An AIV lane is outside this AIC cohort; giving it the obligation models a
+    // duplicate or an unforeseen extra caller. The position budget is already
+    // spent, so the reservation must not hand out a block at or past the count.
+    auto &extra = fixture.admissions[1];
+    fixture.locals[1]->admission = &extra;
+    extra.current_task_ref = 0;
+    extra.current_block_num = clusters;
+    extra.current_active_mask = LaneMask::aic();
+    extra.current_flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
+    extra.sync_claimed = false;
+    uint32_t block = UINT32_MAX;
+    EXPECT_EQ(
+        scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), &block),
+        SchedulerBlockClaimResult::ERROR
+    );
+    EXPECT_EQ(block, UINT32_MAX);
+    EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
+}
+
+TEST(HbgFullSyncClaim, PartialSyncCohortKeepsTheBoundedRetryAllocator) {
+    // Four AIC positions but only two blocks: this is not the full shape, so it
+    // stays on the trusted-compare path and its exhaustion is a clean answer.
+    AdmissionFixture fixture({{2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START}}, 12);
+    ASSERT_TRUE(fixture.publish(0));
+    for (uint64_t worker = 0; worker < 12; worker += 3) {
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(fixture.admissions[worker].current_task_ref, 0);
+    }
+    for (uint32_t index = 0; index < 2; ++index) {
+        uint32_t block = UINT32_MAX;
+        ASSERT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[index * 3], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        EXPECT_EQ(block, index);
+    }
+    for (uint64_t worker : {UINT64_C(6), UINT64_C(9)}) {
+        uint32_t block = UINT32_MAX;
+        EXPECT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::EXHAUSTED
+        );
+        EXPECT_EQ(block, UINT32_MAX);
+    }
+    EXPECT_EQ(fixture.task_control(0)->next_block, 2u);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 2u);
+    EXPECT_EQ(fixture.task_control(0)->claim_tickets, 0u);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
+TEST(HbgFullSyncClaim, OrdinaryFullWidthCohortKeepsTheTicketAllocator) {
+    AdmissionFixture fixture({{4, LaneMask::aic()}}, 12);
+    ASSERT_TRUE(fixture.publish(0));
+    std::vector<bool> seen(4, false);
+    for (uint64_t worker = 0; worker < 12; worker += 3) {
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(fixture.admissions[worker].current_task_ref, 0);
+        uint32_t block = UINT32_MAX;
+        ASSERT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        ASSERT_LT(block, 4u);
+        EXPECT_FALSE(seen[block]);
+        seen[block] = true;
+    }
+    EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) {
+        return value;
+    }));
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 4u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->next_block, UINT64_C(0)), 4u);
+    uint32_t block = UINT32_MAX;
+    EXPECT_EQ(
+        scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &block),
+        SchedulerBlockClaimResult::EXHAUSTED
+    );
+    EXPECT_EQ(block, UINT32_MAX);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
+TEST(HbgFullSyncClaim, IndependentOrdinaryTaskStillClaimsWhileTheSyncCohortSealIsComplete) {
+    AdmissionFixture fixture({{4, LaneMask::aic(), SCHEDULER_TASK_SYNC_START}, {2, LaneMask::aiv0()}}, 12);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.publish(1));
+    for (uint64_t cluster = 0; cluster < 4; ++cluster) {
+        const uint64_t worker = cluster * 3;
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(fixture.admissions[worker].current_task_ref, 0);
+        uint32_t block = UINT32_MAX;
+        ASSERT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+    }
+    ASSERT_EQ(fixture.task_control(0)->claim_seal, 4u);
+    // A nonmember of the AIC cohort passes the sealed sync record and services
+    // the independent vector task without disturbing the cohort's certificate.
+    for (uint64_t worker : {UINT64_C(1), UINT64_C(2)}) {
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(fixture.admissions[worker].current_task_ref, 1);
+        uint32_t block = UINT32_MAX;
+        ASSERT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        ASSERT_LT(block, 2u);
+    }
+    EXPECT_EQ(fixture.task_control(0)->next_block, 4u);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 4u);
+    EXPECT_EQ(fixture.task_control(1)->next_block, 2u);
+    EXPECT_EQ(fixture.task_control(1)->claim_seal, 2u);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
 }  // namespace
