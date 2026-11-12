@@ -62,6 +62,38 @@ def discover_runtimes(arch: str) -> list[str]:
     return sorted(d.name for d in runtime_base.iterdir() if d.is_dir() and (d / "build_config.py").exists())
 
 
+def runtime_builds_by_default(arch: str, runtime: str) -> bool:
+    """Whether a build that names no runtimes builds this one.
+
+    A runtime declares `BUILD_BY_DEFAULT = False` in its own build_config.py to
+    stay out of such a build; it is still discovered, still selectable by name,
+    and still built when asked for. Saying nothing means yes, so a runtime that
+    predates the marker is unaffected and a name with no config at all -- a
+    caller's stand-in -- is taken at face value rather than silently dropped.
+    """
+    config_path = PROJECT_ROOT / "src" / arch / "runtime" / runtime / "build_config.py"
+    if not config_path.is_file():
+        return True
+    spec = importlib.util.spec_from_file_location("build_config", config_path)
+    if spec is None or spec.loader is None:
+        return True
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return bool(getattr(module, "BUILD_BY_DEFAULT", True))
+
+
+def default_build_runtimes(arch: str) -> list[str]:
+    """The runtimes a build that names none produces for this arch.
+
+    Discovery says what a runtime is; this says which of them an unqualified
+    build leaves behind. The two were the same list until a runtime opted out,
+    so anything that reads one while meaning the other -- a check that every
+    discovered runtime has a built artifact, say -- breaks on the first one
+    that does. One definition, so such a check has something to call.
+    """
+    return [name for name in discover_runtimes(arch) if runtime_builds_by_default(arch, name)]
+
+
 def load_build_config(config_path: Path) -> dict:
     """Load BUILD_CONFIG dict from a build_config.py file."""
     spec = importlib.util.spec_from_file_location("build_config", config_path)

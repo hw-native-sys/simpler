@@ -88,6 +88,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/types.h"
 #include "host_build_graph/runtime.h"
+#include "scheduler_extension.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/runtime_c_api.h"
@@ -468,6 +469,16 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
         "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
         counts.external_noop
     );
+}
+
+// Declined unless a runtime that schedules AICore differently links its own.
+// Outside the anonymous namespace below: an internal-linkage symbol cannot be
+// the weak half of an override.
+__attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
+    Runtime *, const HostApi *, SharedMemoryHandle &, int32_t, const std::vector<SchedulerTaskMetadata> &,
+    const std::vector<int64_t> &, const sm_layout::SegmentOffsets &
+) {
+    return SchedulerExtensionResult::DECLINED;
 }
 
 namespace {
@@ -1565,6 +1576,13 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
+    // Offered before this runtime's own fallbacks and before its native Graph
+    // expansion: an extension that takes the graph owns the rest of the bind,
+    // and a declining one leaves them to decide.
+    const auto extension = scheduler_extension_select(
+        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, device_segments
+    );
+    if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
     if (legacy_graph_required) {
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
         return true;

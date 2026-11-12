@@ -17,6 +17,7 @@
 #include <new>
 
 #include "aicore_lifecycle.h"
+#include "aicpu_executor.h"
 #include "args_dump_service.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
@@ -45,74 +46,6 @@
 #include "common/platform_config.h"
 #include "common/memory_barrier.h"
 #include "utils/thread_completion_gate.h"
-
-struct AicpuExecutor {
-    // ===== Thread management state =====
-    std::atomic<int32_t> thread_idx_{0};
-    std::atomic<bool> init_done_{false};
-    std::atomic<bool> init_failed_{false};
-
-    // Parallel-handshake coordination (see AicpuExecutor::init). hs_setup_done_
-    // is published by the leader once the shared pre-handshake setup is visible;
-    // hs_arrived_ is the barrier counting threads that finished their core slice.
-    // hs_thread_seq_ hands out a distinct [0, nthreads) index when the platform
-    // exposes no affinity idx (sim, where platform_aicpu_affinity_thread_idx()
-    // is -1 during init) so the threads don't all collapse to leader 0.
-    std::atomic<bool> hs_setup_done_{false};
-    std::atomic<bool> hs_config_done_{false};
-    std::atomic<bool> hs_bootstrap_done_{false};
-    std::atomic<int32_t> hs_arrived_{0};
-    std::atomic<int32_t> hs_release_arrived_{0};
-    std::atomic<int32_t> hs_thread_seq_{0};
-    std::atomic<int32_t> init_failure_arrived_{0};
-
-    int32_t aicpu_thread_num_{0};
-
-    simpler::ThreadCompletionGate completion_gate_;
-
-    // This run's terminal record. `terminal_` collects each participant's own
-    // failure as it retires; `normal_path_claims_` counts the participants that
-    // positively reached the end of their audited path, so a run is a success
-    // only when every one of them did rather than when none of them complained;
-    // `terminal_publisher_` carries the finalizer's decision across teardown to
-    // the sole cleanup owner that publishes it. This runtime attaches no
-    // diagnostic payload: its scene lives in the AICore run control, which the
-    // supervisor already latches into the shared header.
-    RunTerminalAccumulator terminal_;
-    std::atomic<int32_t> normal_path_claims_{0};
-    RunTerminalPublisher terminal_publisher_;
-
-    AicpuReadyWatchdog ready_watchdog_;
-    std::atomic<bool> shutdown_ready_{false};
-    std::atomic<int32_t> shutdown_signaled_{0};
-    std::atomic<int32_t> run_status_{0};
-
-    // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
-    // dependency resolution, Ready scheduling, and task execution.
-    AicoreLifecycle aicore_lifecycle_;
-    ResidentArgsDumpService *args_dump_services_{nullptr};
-    int32_t args_dump_service_count_{0};
-    bool args_dump_services_allocated_this_init_{false};
-    bool args_dump_services_stopped() const {
-        for (int32_t thread = 0; args_dump_services_ != nullptr && thread < args_dump_service_count_; ++thread)
-            if (args_dump_services_[thread].has_open_record() || dump_arg_has_open_record(thread)) return false;
-        return true;
-    }
-
-    // ===== Methods =====
-    int32_t init(Runtime *runtime);
-    int32_t run(Runtime *runtime);
-    void deinit(Runtime *runtime);
-    void reset_entry_state();
-    int32_t finish_failed_init(Runtime *runtime);
-    // Decide this run's terminal record while the state it reads is still
-    // valid. Runs inside the completion gate's finalizer, on the last
-    // participant out.
-    void snapshot_run_terminal(Runtime *runtime, bool cores_retired);
-    // Commit the decided record. Runs on the thread that claims cleanup, after
-    // teardown and before it returns from the kernel.
-    void handoff_run_terminal();
-};
 
 static AicpuExecutor g_aicpu_executor;
 
@@ -486,7 +419,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             init_failed_.store(true, std::memory_order_release);
         }
         completion_gate_.reset();
-        if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.post_handshake_init(runtime) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) && post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
         if (!init_failed_.load(std::memory_order_acquire)) {
@@ -520,14 +453,15 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // observation, Ready bootstrap, and initial slot fill while the DMB gate
     // remains closed. This is a one-way publication, not a second launch gate.
     if (!init_failed_.load(std::memory_order_acquire)) {
-        aicore_lifecycle_.publish_context_partition(runtime, tidx);
+        publish_partition(runtime, tidx, nthreads);
     }
 
     // Only the leader polls GM bootstrap state; peers acquire its local
     // completion flag. The following release is the AICore-wide DMB gate.
     aicore_lifecycle_.begin_bootstrap_wait(tidx);
     if (is_leader) {
-        if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) && awaits_bootstrap() &&
+            aicore_lifecycle_.wait_bootstrap_complete(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
         hs_bootstrap_done_.store(true, std::memory_order_release);
@@ -614,6 +548,133 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
+// The AICPU-dispatched and resident schedulers' supervision wait: poll the
+// run control until every task is accounted for, then latch what the cores
+// reported into the shared header.
+__attribute__((weak)) bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
+    return aicore_scheduler_runtime_enabled(runtime);
+}
+
+__attribute__((weak)) bool AicpuExecutor::awaits_bootstrap() const { return true; }
+
+__attribute__((weak)) int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
+    return aicore_lifecycle_.post_handshake_init(runtime);
+}
+
+__attribute__((weak)) void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
+    (void)nthreads;
+    aicore_lifecycle_.publish_context_partition(runtime, tidx);
+}
+
+void AicpuExecutor::service_args_dump(int32_t thread_idx) {
+    if (args_dump_services_ != nullptr && args_dump_services_[thread_idx].step())
+        ready_watchdog_.record_progress(get_sys_cnt_aicpu());
+}
+
+__attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t thread_idx) {
+    int32_t supervisor_rc = 0;
+    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
+    if (context == nullptr || runtime->dev.host_total_tasks < 0) {
+        LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
+        supervisor_rc = -1;
+    } else {
+        auto *run_control = aicore_scheduler_run_control(context);
+        if (run_control == nullptr) {
+            LOG_ERROR("A5 HBG AICore scheduler is missing run control");
+            supervisor_rc = -1;
+        } else {
+            const uint64_t executable_task_count =
+                run_control->expected_task_count - run_control->inline_completed_count;
+            uint32_t error_poll_count = 0;
+            uint64_t last_progress_cycles = ready_watchdog_.last_progress();
+            uint64_t last_resolved_task_count = run_control->resolved_task_count;
+            bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
+            const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
+            while (true) {
+                service_args_dump(thread_idx);
+                const bool bootstrap_complete = run_control->bootstrap_complete != 0;
+                const uint64_t resolved_task_count = run_control->resolved_task_count;
+                const bool tasks_resolved = resolved_task_count == executable_task_count;
+                const uint64_t now = get_sys_cnt_aicpu();
+                if (args_dump_services_ != nullptr) {
+                    const uint64_t copy_progress = ready_watchdog_.last_progress();
+                    if (copy_progress > last_progress_cycles) last_progress_cycles = copy_progress;
+                }
+                if (resolved_task_count != last_resolved_task_count || bootstrap_complete != bootstrap_was_complete) {
+                    last_resolved_task_count = resolved_task_count;
+                    bootstrap_was_complete = bootstrap_complete;
+                    last_progress_cycles = now;
+                    ready_watchdog_.record_progress(now);
+                }
+                if (bootstrap_complete && tasks_resolved) {
+                    break;
+                }
+                if (++error_poll_count == 64) {
+                    error_poll_count = 0;
+                    if (run_control->scheduler_error != 0) break;
+                }
+                if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
+                    record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
+                    break;
+                }
+                SPIN_WAIT_HINT();
+            }
+            const uint64_t scheduler_error = run_control->scheduler_error;
+            if (scheduler_error != 0) {
+                // Error details are published before the error marker.
+                rmb();
+                LOG_ERROR(
+                    "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
+                    " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " storage=0x%" PRIx64
+                    " window_last_index=0x%" PRIx64 " site=%" PRIu64 " resolved=%" PRIu64 " expected=%" PRIu64
+                    " inline=%" PRIu64,
+                    run_control->error_task_ref, scheduler_error, run_control->error_core_id,
+                    run_control->error_core_type, run_control->error_graph_task_count,
+                    run_control->error_storage_address, run_control->error_task_window_last_index,
+                    run_control->error_site, run_control->resolved_task_count, run_control->expected_task_count,
+                    run_control->inline_completed_count
+                );
+                supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
+                if (supervisor_rc == 0) supervisor_rc = -1;
+            }
+            const uint64_t resolved_task_count = run_control->resolved_task_count;
+            if (supervisor_rc == 0 &&
+                resolved_task_count + run_control->inline_completed_count != run_control->expected_task_count) {
+                LOG_ERROR(
+                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64 " inline=%" PRIu64,
+                    run_control->expected_task_count, resolved_task_count, run_control->inline_completed_count
+                );
+                supervisor_rc = -1;
+            }
+        }
+    }
+    return supervisor_rc;
+}
+
+__attribute__((weak)) int32_t AicpuExecutor::settle_run_error(Runtime *runtime) {
+    return publish_aicore_scheduler_runtime_error(runtime, "terminal");
+}
+
+__attribute__((weak)) bool AicpuExecutor::await_shutdown(Runtime *runtime, int32_t thread_idx) {
+    if (!ready_watchdog_.wait_until_ready(
+            [this] {
+                return shutdown_ready_.load(std::memory_order_acquire);
+            },
+            [] {
+                return get_sys_cnt_aicpu();
+            },
+            [&] {
+                service_args_dump(thread_idx);
+                SPIN_WAIT_HINT();
+            },
+            resident_scheduler_timeout_cycles()
+        )) {
+        record_resident_timeout(runtime, SchedulerErrorSite::AICPU_SHUTDOWN_BARRIER_TIMEOUT);
+        return true;
+    }
+    return false;
+}
+
 int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
     int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
@@ -624,109 +685,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         );
         return -1;
     }
-    auto service_args_dump = [&] {
-        if (args_dump_services_ != nullptr && args_dump_services_[thread_idx].step())
-            ready_watchdog_.record_progress(get_sys_cnt_aicpu());
-    };
     bool shutdown_wait_timed_out = false;
     if (thread_idx == aicpu_thread_num_ - 1) {
-        int32_t supervisor_rc = 0;
-        SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-        if (context == nullptr || runtime->dev.host_total_tasks < 0) {
-            LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
-            supervisor_rc = -1;
-        } else {
-            auto *run_control = aicore_scheduler_run_control(context);
-            if (run_control == nullptr) {
-                LOG_ERROR("A5 HBG AICore scheduler is missing run control");
-                supervisor_rc = -1;
-            } else {
-                const uint64_t executable_task_count =
-                    run_control->expected_task_count - run_control->inline_completed_count;
-                uint32_t error_poll_count = 0;
-                uint64_t last_progress_cycles = ready_watchdog_.last_progress();
-                uint64_t last_resolved_task_count = run_control->resolved_task_count;
-                bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
-                const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
-                while (true) {
-                    service_args_dump();
-                    const bool bootstrap_complete = run_control->bootstrap_complete != 0;
-                    const uint64_t resolved_task_count = run_control->resolved_task_count;
-                    const bool tasks_resolved = resolved_task_count == executable_task_count;
-                    const uint64_t now = get_sys_cnt_aicpu();
-                    if (args_dump_services_ != nullptr) {
-                        const uint64_t copy_progress = ready_watchdog_.last_progress();
-                        if (copy_progress > last_progress_cycles) last_progress_cycles = copy_progress;
-                    }
-                    if (resolved_task_count != last_resolved_task_count ||
-                        bootstrap_complete != bootstrap_was_complete) {
-                        last_resolved_task_count = resolved_task_count;
-                        bootstrap_was_complete = bootstrap_complete;
-                        last_progress_cycles = now;
-                        ready_watchdog_.record_progress(now);
-                    }
-                    if (bootstrap_complete && tasks_resolved) {
-                        break;
-                    }
-                    if (++error_poll_count == 64) {
-                        error_poll_count = 0;
-                        if (run_control->scheduler_error != 0) break;
-                    }
-                    if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
-                        record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
-                        break;
-                    }
-                    SPIN_WAIT_HINT();
-                }
-                const uint64_t scheduler_error = run_control->scheduler_error;
-                if (scheduler_error != 0) {
-                    // Error details are published before the error marker.
-                    rmb();
-                    LOG_ERROR(
-                        "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
-                        " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " storage=0x%" PRIx64
-                        " window_last_index=0x%" PRIx64 " site=%" PRIu64 " resolved=%" PRIu64 " expected=%" PRIu64
-                        " inline=%" PRIu64,
-                        run_control->error_task_ref, scheduler_error, run_control->error_core_id,
-                        run_control->error_core_type, run_control->error_graph_task_count,
-                        run_control->error_storage_address, run_control->error_task_window_last_index,
-                        run_control->error_site, run_control->resolved_task_count, run_control->expected_task_count,
-                        run_control->inline_completed_count
-                    );
-                    supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
-                    if (supervisor_rc == 0) supervisor_rc = -1;
-                }
-                const uint64_t resolved_task_count = run_control->resolved_task_count;
-                if (supervisor_rc == 0 &&
-                    resolved_task_count + run_control->inline_completed_count != run_control->expected_task_count) {
-                    LOG_ERROR(
-                        "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64
-                        " inline=%" PRIu64,
-                        run_control->expected_task_count, resolved_task_count, run_control->inline_completed_count
-                    );
-                    supervisor_rc = -1;
-                }
-            }
-        }
-        run_status_.store(supervisor_rc, std::memory_order_release);
+        run_status_.store(supervise(runtime, thread_idx), std::memory_order_release);
         shutdown_ready_.store(true, std::memory_order_release);
     } else {
-        if (!ready_watchdog_.wait_until_ready(
-                [this] {
-                    return shutdown_ready_.load(std::memory_order_acquire);
-                },
-                [] {
-                    return get_sys_cnt_aicpu();
-                },
-                [&] {
-                    service_args_dump();
-                    SPIN_WAIT_HINT();
-                },
-                resident_scheduler_timeout_cycles()
-            )) {
-            record_resident_timeout(runtime, SchedulerErrorSite::AICPU_SHUTDOWN_BARRIER_TIMEOUT);
-            shutdown_wait_timed_out = true;
-        }
+        shutdown_wait_timed_out = await_shutdown(runtime, thread_idx);
     }
 
     int32_t run_rc =
@@ -800,7 +764,7 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime, bool cores_retired) 
     // zero, and the error carried by nothing. This is the boundary where every
     // participant has finished its shutdown partition, so one settle covers
     // every core.
-    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime, "terminal");
+    const int32_t header_status = settle_run_error(runtime);
     // The header is one cache line a core may still be writing when retirement
     // was not proved, so what it returns cannot make such a run Ok. It can
     // still make it worse: `run_terminal_select` reports a header or
@@ -889,7 +853,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("%s", "Invalid argument: null Runtime pointer");
         return -1;
     }
-    if (!aicore_scheduler_runtime_enabled(runtime)) {
+    if (!g_aicpu_executor.schedules_on_aicore(runtime)) {
         const bool explicit_legacy = aicore_scheduler_explicit_legacy_enabled(runtime);
         // Legacy execution also owns the cleanup handshake for the AICores that
         // were already launched. Run it before rejecting an unmarked fallback.

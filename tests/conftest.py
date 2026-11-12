@@ -44,13 +44,20 @@ def discover_platforms() -> list[str]:
 
 
 def discover_runtimes_for_arch(arch: str) -> list[str]:
-    """Scan src/{arch}/runtime/*/build_config.py for available runtimes."""
-    runtime_dir = PROJECT_ROOT / "src" / arch / "runtime"
-    if not runtime_dir.exists():
+    """The runtimes an unqualified run of this suite covers.
+
+    The default build set, not every runtime under src/{arch}/runtime: the
+    cases parametrized over this list build the runtime they name on demand,
+    so one left out of that set has to be left out here too -- otherwise a
+    suite that builds nothing of it still compiles it, once per platform, to
+    look at the binaries. Naming such a runtime is how it gets built, and a
+    suite that covers it is that runtime's own to add.
+    """
+    if not (PROJECT_ROOT / "src" / arch / "runtime").exists():
         return []
-    return [
-        item.name for item in sorted(runtime_dir.iterdir()) if item.is_dir() and (item / "build_config.py").exists()
-    ]
+    from simpler_setup.platform_info import default_build_runtimes  # noqa: PLC0415
+
+    return default_build_runtimes(arch)
 
 
 @pytest.fixture

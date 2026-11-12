@@ -260,14 +260,17 @@ class KernelCompiler:
         """
         Get all include directories needed for orchestration compilation.
 
-        Combines the runtime-specific directory with platform include directories.
+        The conventional directories come first, then whatever the runtime's
+        build_config declares. A runtime that compiles a sibling's sources keeps
+        no copy of that sibling's headers, so the declaration is the only record
+        of where they are. It goes last because the first match on an include
+        path wins: appending can only resolve an include that had none.
 
         Args:
             runtime_name: Name of the runtime (e.g., "host_build_graph")
 
         Returns:
-            List of include directory paths:
-            [runtime_dir, platform_host_dir, platform_include_dir]
+            List of include directory paths, in search order.
         """
         # Map platform to runtime architecture
         if self.platform in ("a2a3", "a2a3sim"):
@@ -281,7 +284,10 @@ class KernelCompiler:
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         src_common_dir = str(self.project_root / "src" / "common")
-        return [runtime_dir, runtime_common_dir, common_dir, src_common_dir] + self.get_platform_include_dirs()
+        conventional = [runtime_dir, runtime_common_dir, common_dir, src_common_dir]
+        conventional += self.get_platform_include_dirs()
+        config_include_dirs, _ = self._get_orchestration_config(runtime_name)
+        return conventional + [d for d in config_include_dirs if d not in conventional]
 
     def get_incore_include_dirs(self) -> list[str]:
         """
@@ -401,19 +407,19 @@ class KernelCompiler:
         persistent scene-test cache hashes the same inputs the compiler sees.
         """
         include_dirs = self.get_orchestration_include_dirs(runtime_name)
-        config_include_dirs, config_sources = self._get_orchestration_config(runtime_name)
+        _, config_sources = self._get_orchestration_config(runtime_name)
         platform_sources = self._get_orchestration_platform_sources()
         if self._orchestration_toolchain(runtime_name).is_host:
             include_dirs.append(str(self.project_root / "src" / "common" / "log" / "include"))
             host_log_dir = self.project_root / "src" / "common" / "log"
             platform_sources.extend([str(host_log_dir / "host_log.cpp"), str(host_log_dir / "unified_log_host.cpp")])
         return (
-            [*include_dirs, *config_include_dirs],
+            include_dirs,
             [*config_sources, *platform_sources],
         )
 
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
-        if runtime_name == "host_build_graph":
+        if runtime_name in ("host_build_graph", "percounter"):
             return self.host_gxx
         if runtime_name == "tensormap_and_ringbuffer":
             if self.platform.endswith("sim"):

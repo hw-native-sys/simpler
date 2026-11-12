@@ -36,9 +36,18 @@ independently. A case built for a2a3/tmr, a2a3/hbg and a5/hbg uses both arches
 and both runtimes, so neither axis looks short on its own — while the a5/tmr
 cell it never builds is exactly the configuration nothing covers.
 
-A combination that is wanted and never built is a gap. The ones that cannot
-exist are listed in WAIVERS with the reason; a gap that is not listed fails,
-and so does a waiver whose gap no longer exists.
+A value is only wanted where a build the case already has could be repeated
+under it — every file that build opens on the axis has to exist there. A runtime
+carried by one arch only has no tree under the other, and a runtime that shares
+a sibling's src/common/ tree rather than carrying its own holds no counterpart
+for the bare-name headers a per-runtime case resolves. Such a cell compiles the
+same sources as the sibling it shares them with, so it is a second name for a
+configuration already covered rather than one left uncovered, and it is not
+asked for.
+
+A combination that is wanted and never built is a gap. The ones that are wanted
+and deliberately skipped are listed in WAIVERS with the reason; a gap that is
+not listed fails, and so does a waiver whose gap no longer exists.
 
 This needs a configured build, so it runs in CI's C++ unit test job rather than
 in pre-commit:
@@ -178,6 +187,42 @@ def differs_across(relative: str, axis: str) -> bool:
         (SRC / other).exists() and not filecmp.cmp(SRC / relative, SRC / other, shallow=False)
         for other in siblings(relative, axis)
     )
+
+
+def counterpart(relative: str, axis: str, value: str) -> str | None:
+    """This file under the axis's `value`, or None when the file is not on the axis."""
+    if axis == "arch":
+        for here in ARCHES:
+            if relative.startswith(here + "/"):
+                return value + relative[len(here) :]
+        return None
+    for here in RUNTIMES:
+        if f"/{here}/" in relative:
+            return relative.replace(f"/{here}/", f"/{value}/", 1)
+    return None
+
+
+def reachable(builds: list[set[str]], axis: str, value: str) -> bool:
+    """True when some build the case already has could be repeated under `value`.
+
+    Read one build at a time rather than their union. The union holds files only
+    one build opens, so a single missing counterpart there says nothing about
+    `value` — and one incidental match says as little the other way, since two
+    trees can share a file name without sharing what the case needs. A build
+    repeats under `value` when every file it opens on this axis exists there.
+    """
+    return any(
+        any(counterpart(f, axis, value) is not None for f in opened)
+        and all((SRC / other).exists() for other in (counterpart(f, axis, value) for f in opened) if other is not None)
+        for opened in builds
+    )
+
+
+def runtime_under_arch(arch: str | None, runtime: str | None) -> bool:
+    """True when this arch carries this runtime, by the build's own discovery rule."""
+    if arch is None or runtime is None:
+        return True
+    return (SRC / arch / "runtime" / runtime / "build_config.py").exists()
 
 
 def axis_value(opened: set[str], axis: str) -> str | None:
@@ -335,7 +380,7 @@ def case_of(entries: list[dict]) -> str | None:
     return None
 
 
-def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str]]], list[str]]:
+def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str]]], list[str], list[tuple[str, str]]]:
     by_target = read_targets(build_dir)
     cases = {name: case_of(entries) for name, entries in by_target.items()}
     covered = [name for name, case in cases.items() if case]
@@ -367,7 +412,7 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
     for name in covered:
         by_case[cases[name]].append(name)
 
-    gaps, unclassified = [], []
+    gaps, unclassified, unreachable = [], [], []
     for case, targets in sorted(by_case.items()):
         try:
             arch_axis, runtime_axis = applicable_axes(case)
@@ -380,12 +425,15 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
         # actually differs along it. Otherwise it collapses to whatever the
         # builds happen to use, and contributes one value rather than all.
         wanted = {}
+        dropped = {"arch": [], "runtime": []}
         for axis, values, applicable in (
             ("arch", ARCHES, arch_axis),
             ("runtime", RUNTIMES, runtime_axis),
         ):
             if applicable and any(differs_across(f, axis) for f in opened):
-                wanted[axis] = set(values)
+                builds = [per_target[t] for t in targets]
+                wanted[axis] = {value for value in values if reachable(builds, axis, value)}
+                dropped[axis] = sorted(set(values) - wanted[axis])
             else:
                 wanted[axis] = {None}
 
@@ -403,11 +451,26 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
                 )
             )
         missing = sorted(
-            (arch, runtime) for arch in wanted["arch"] for runtime in wanted["runtime"] if (arch, runtime) not in built
+            (arch, runtime)
+            for arch in wanted["arch"]
+            for runtime in wanted["runtime"]
+            if (arch, runtime) not in built and runtime_under_arch(arch, runtime)
         )
         for cell in missing:
             gaps.append((case, cell_name(cell), sorted(cell_name(b) for b in built)))
-    return gaps, unclassified
+
+        # A value left out of `wanted` that no build covers either. Left out
+        # means there is nothing under it for this case to compile, so it is
+        # not a gap -- but it is still a configuration the run does not cover,
+        # and the one thing this check must not do is decide that in silence.
+        # A value that was dropped and is built anyway says nothing: the
+        # coverage is there whether or not the cell was asked for.
+        covered = {value for _, value in built} | {value for value, _ in built}
+        for axis in ("arch", "runtime"):
+            for value in dropped[axis]:
+                if value not in covered:
+                    unreachable.append((case, f"{axis} {value}"))
+    return gaps, unclassified, unreachable
 
 
 def main() -> int:
@@ -421,11 +484,24 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=8, help="parallel preprocessor runs")
     args = parser.parse_args()
 
-    gaps, unclassified = find_gaps(args.build_dir, args.jobs)
+    gaps, unclassified, unreachable = find_gaps(args.build_dir, args.jobs)
     found = {(case, cell) for case, cell, _ in gaps}
 
     unwaived = [(case, cell, built) for case, cell, built in gaps if (case, cell) not in WAIVERS]
     stale = sorted(key for key in WAIVERS if key not in found)
+
+    # A value this check decided not to ask any case for. It is not a gap --
+    # there is nothing under that value for the case to compile -- but it is
+    # coverage the run does not have, and a check that drops it in silence is
+    # one nobody can audit. Printed whatever the verdict, and never fatal.
+    if unreachable:
+        by_value: dict[str, int] = {}
+        for _, value in unreachable:
+            by_value[value] = by_value.get(value, 0) + 1
+        print("Not asked for, nothing under it to compile:")
+        for value, count in sorted(by_value.items()):
+            print(f"  {value}: {count} case(s)")
+        print()
 
     if not unwaived and not stale and not unclassified:
         return 0

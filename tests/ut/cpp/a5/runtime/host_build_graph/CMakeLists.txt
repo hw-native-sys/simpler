@@ -164,6 +164,7 @@ a5_hbg_case(test_hbg_resident_late_aicore_error.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/aicpu_device_config.cpp
         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS    ${_gc_link_option})
 
