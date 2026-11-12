@@ -139,15 +139,15 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
 
     // === ERROR REPORTING ===
 
-    // Orchestrator fatal error code (Orchestrator → Scheduler, AICPU → Host)
-    // Non-zero signals fatal error. Written by orchestrator, read by scheduler and host.
+    // Fatal channel polled by orchestration waits, scheduler and Host.
+    // Orchestrator reports its own errors; scheduler relays completion failures.
     std::atomic<int32_t> orch_error_code;
 
     // Scheduler error state (Scheduler → Host, independent of orchestrator)
     // Written by scheduler threads on timeout; read by orchestrator and host.
     std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
-    std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
-    std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+    std::atomic<int32_t> sched_error_code;     // First scheduler error code
+    std::atomic<int32_t> sched_error_thread;   // Thread index of first error writer
 
     // Sub-classification + locators for a sched_error_code==100 timeout. Written
     // by the scheduler thread that wins the code latch; read by host so it can

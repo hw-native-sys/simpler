@@ -72,6 +72,14 @@ static inline const char *error_name(int32_t code) {
     case SIMPLER_ERROR_READY_QUEUE_OVERFLOW:
         return "READY_QUEUE_OVERFLOW";
 #endif
+#ifdef SIMPLER_ERROR_KERNEL_INVALID_OUTPUT
+    case SIMPLER_ERROR_KERNEL_INVALID_OUTPUT:
+        return "KERNEL_INVALID_OUTPUT";
+    case SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE:
+        return "KERNEL_INDEX_OUT_OF_RANGE";
+    case SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE:
+        return "KERNEL_NON_FINITE_VALUE";
+#endif
     default:
         return "unknown";
     }
@@ -80,6 +88,14 @@ static inline const char *error_name(int32_t code) {
 // One-sentence meaning of a latched SIMPLER_ERROR_* code. Empty string for an uncovered code.
 static inline const char *error_desc(int32_t code) {
     switch (code) {
+#ifdef SIMPLER_ERROR_KERNEL_INVALID_OUTPUT
+    case SIMPLER_ERROR_KERNEL_INVALID_OUTPUT:
+        return "an AICore kernel rejected its output before publishing it";
+    case SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE:
+        return "an AICore kernel rejected an index outside its valid range";
+    case SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE:
+        return "an AICore kernel rejected a non-finite value";
+#endif
     case SIMPLER_ERROR_NONE:
         return "no error";
     case SIMPLER_ERROR_SCOPE_DEADLOCK:
@@ -136,6 +152,13 @@ static inline const char *error_desc(int32_t code) {
 // What to do next about a latched SIMPLER_ERROR_* code. Empty string for an uncovered code.
 static inline const char *error_hint(int32_t code) {
     switch (code) {
+#ifdef SIMPLER_ERROR_KERNEL_INVALID_OUTPUT
+    case SIMPLER_ERROR_KERNEL_INVALID_OUTPUT:
+    case SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE:
+    case SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE:
+        return "inspect the Kernel failure diagnostic for task/function/block/core; "
+               "check the reporting kernel and its input data";
+#endif
     case SIMPLER_ERROR_NONE:
         return "";
     case SIMPLER_ERROR_SCOPE_DEADLOCK:
