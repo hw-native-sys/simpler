@@ -426,6 +426,11 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 }
 
 DeviceRunnerBase::DeviceRunnerBase() {
+    heap_pool_ = std::make_shared<ScratchPool>(
+        &arena_alloc_trampoline, &arena_free_trampoline, this, [this](uint64_t generation, void *raw) {
+            on_heap_generation_retired(generation, raw);
+        }
+    );
     // The sub-owners exist before the first grant is committed, because the
     // commit hands each of them its own per-set storage.
     queued_waits_ = std::make_unique<QueuedStreamWaits>(make_acl_event_ops());
@@ -965,14 +970,20 @@ void DeviceRunnerBase::note_run_resources_proven(uint32_t pipeline_slot, std::ui
 }
 
 int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) {
-    if (!auto_admission_.enabled()) return 0;
+    if (!auto_admission_.enabled()) {
+        if (native_run_claim_count() == 0) release_heap_lease(pipeline_slot);
+        return 0;
+    }
     if (pipeline_slot >= temporary_storage_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const AutoAdmissionState::SlotPlan plan = auto_admission_.plan(pipeline_slot);
     // Already gone, or taken over by a later run: nothing of this epoch's is
     // held, so the caller's unwind has nothing to do and may say so. Epoch zero
     // names whatever plan the slot holds, which is what a caller abandoning a
     // run whose prepare never returned an identity can say.
-    if (plan.phase == AutoAdmissionState::Phase::None) return 0;
+    if (plan.phase == AutoAdmissionState::Phase::None) {
+        if (native_run_claim_count() == 0) release_heap_lease(pipeline_slot);
+        return 0;
+    }
     if (run_epoch != 0 && plan.epoch != run_epoch) return 0;
     const std::uint64_t epoch = plan.epoch;
     // A plan whose run could still have reached the device is not a plan to
@@ -987,6 +998,7 @@ int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_e
         );
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    release_heap_lease(pipeline_slot);
     release_plan_epoch_refs(pipeline_slot, epoch);
     prepare_plans_[pipeline_slot].reset();
     if (plan.plan_stamped) {
@@ -1512,11 +1524,33 @@ int DeviceRunnerBase::clear_temporary_buffer() {
     return first;
 }
 
-void *DeviceRunnerBase::acquire_pooled_gm_heap(uint32_t arena_bank) {
+void *DeviceRunnerBase::acquire_pooled_gm_heap(uint32_t pipeline_slot, uint32_t arena_bank) {
+    {
+        std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+        if (pipeline_slot < heap_leases_.size() && heap_leases_[pipeline_slot].valid())
+            return heap_leases_[pipeline_slot].base;
+    }
     if (arena_bank >= arena_banks_.size()) return nullptr;
     DeviceArena &arena = this->arena_bank(arena_bank).gm_heap;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
+}
+
+void DeviceRunnerBase::release_heap_lease(uint32_t pipeline_slot) {
+    ScratchPool::Lease lease;
+    {
+        std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+        if (pipeline_slot >= heap_leases_.size()) return;
+        lease = heap_leases_[pipeline_slot];
+        heap_leases_[pipeline_slot] = {};
+    }
+    if (lease.valid() && heap_pool_) heap_pool_->release(lease);
+}
+
+void DeviceRunnerBase::on_heap_generation_retired(uint64_t generation, void *raw) {
+    if (workspace_.enabled() && raw != nullptr) workspace_.note_unpublished(raw);
+    std::lock_guard<std::mutex> lock(heap_backing_mutex_);
+    heap_backing_leases_.erase(generation);
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_sm(uint32_t arena_bank) {
@@ -1557,7 +1591,8 @@ void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
 }
 
 int DeviceRunnerBase::setup_static_arena(
-    RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    uint32_t pipeline_slot, RegionBanks banks, bool pooled_heap, size_t gm_heap_size, size_t gm_sm_size,
+    size_t runtime_arena_size
 ) {
     for (uint32_t bank : {banks.heap, banks.sm, banks.image}) {
         if (bank >= arena_banks_.size()) {
@@ -1577,6 +1612,70 @@ int DeviceRunnerBase::setup_static_arena(
             LOG_ERROR("setup_static_arena: context workspace plan initialization failed");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+    }
+    ScratchPool::Lease pool_lease;
+    bool lease_held = false;
+    auto release_pool_lease = RAIIScopeGuard([&]() {
+        if (lease_held && heap_pool_) heap_pool_->release(pool_lease);
+    });
+    if (pooled_heap) {
+        const uint32_t heap_bank = banks.heap;
+        set_workspace_plan_region(WorkspaceManager::arena_region(heap_bank, WorkspaceManager::ArenaRegion::GmHeap));
+        set_workspace_plan_region_backing(arena_region_backing(heap_bank, 0));
+        if (!heap_pool_->covers(gm_heap_size) && auto_admission_.enabled()) {
+            const int permission = claim_growth_permission(
+                pipeline_slot, workspace_prepare_state().epoch, AutoAdmissionState::Phase::Committing
+            );
+            if (permission != 0) return permission;
+        }
+        struct PoolAttempt {
+            DeviceRunnerBase *runner;
+            size_t bytes;
+            ScratchPool::Lease *lease;
+        } pool_attempt{this, gm_heap_size, &pool_lease};
+        const auto stage_pool = [](void *ctx) -> GrowthAttempt {
+            auto *a = static_cast<PoolAttempt *>(ctx);
+            if (active_workspace_plan()) active_workspace_plan()->last_refusal = WorkspaceManager::AcquireRefusal::None;
+            ScratchPool::Lease lease;
+            const int rc = a->runner->heap_pool_->acquire(a->bytes, &lease);
+            if (rc == 0) {
+                *a->lease = lease;
+                return GrowthAttempt::Served;
+            }
+            return classify_growth_refusal(workspace_prepare_state().last_refusal);
+        };
+        const GrowthAttempt growth =
+            grow_with_one_retry(pipeline_slot, /*rollback_before_retry=*/true, stage_pool, &pool_attempt);
+        if (growth != GrowthAttempt::Served) {
+            const int refusal =
+                report_growth_refusal(pipeline_slot, AutoAdmissionState::Phase::Committing, gm_heap_size, growth);
+            rollback_workspace_claims();
+            return refusal != 0 ? refusal : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        lease_held = true;
+        if (workspace_.enabled()) {
+            const WorkspaceManager::RegionKey region =
+                WorkspaceManager::arena_region(heap_bank, WorkspaceManager::ArenaRegion::GmHeap);
+            if (!workspace_.reference(pool_lease.raw, workspace_prepare_state().epoch)) {
+                LOG_ERROR(
+                    "setup_static_arena: pooled heap %p could not register this run as a consumer", pool_lease.raw
+                );
+                rollback_workspace_claims();
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+            workspace_.note_published(region, pool_lease.raw);
+            commit_workspace_claims();
+            auto backing = workspace_.retain_backing(pool_lease.raw);
+            if (!backing) {
+                rollback_workspace_claims();
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+            std::lock_guard<std::mutex> lock(heap_backing_mutex_);
+            heap_backing_leases_[pool_lease.generation] = std::move(backing);
+        }
+        gm_heap_size = 0;
+    } else {
+        release_heap_lease(pipeline_slot);
     }
     // Three independent device_malloc'd buffers: GM heap, shared memory,
     // prebuilt runtime arena. Split out from a single large allocation because
@@ -1716,6 +1815,12 @@ int DeviceRunnerBase::setup_static_arena(
         // its consumer would let a later growth treat those bytes as free.
         const int ref_rc = reference_bank_arenas(banks, requests, kRegionCount);
         if (ref_rc != 0) return ref_rc;
+    }
+    if (outcome.rc == 0) {
+        std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+        if (pipeline_slot >= heap_leases_.size()) heap_leases_.resize(pipeline_slot + 1);
+        heap_leases_[pipeline_slot] = pool_lease;
+        lease_held = false;
     }
     if (outcome.rc != 0) {
         const int failed = outcome.transaction.failed_region;
@@ -3402,6 +3507,21 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         }
     }
     prebuilt_runtime_arena_cache_.invalidate();
+    if (heap_pool_) {
+        if (abandon_device_resources) {
+            heap_pool_->abandon();
+        } else {
+            heap_pool_->reset();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(heap_lease_mutex_);
+        heap_leases_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(heap_backing_mutex_);
+        heap_backing_leases_.clear();
+    }
 
     if (abandon_device_resources) {
         abandon_scheduler_state_storage();
@@ -4064,26 +4184,47 @@ std::shared_ptr<const void> prepared_initial_publication(const RuntimeType &, lo
 }  // namespace
 
 int DeviceRunnerBase::retain_prepared_run_resources(
-    PreparedExecution &prepared, uint32_t bank_id, int32_t callable_id
+    PreparedExecution &prepared, RegionBanks banks, int32_t callable_id
 ) {
     std::shared_ptr<const void> streams;
     const int streams_rc = prepare_execution_streams(prepared, &streams);
     if (streams_rc != 0) return streams_rc;
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
     const uint32_t slot = prepared.pipeline_slot;
-    if (slot >= run_image_stagings_.size() || bank_id >= arena_banks_.size() || prepared.prepared_resources)
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    auto bank = arena_banks_[bank_id];
-    std::vector<WorkspaceManager::BackingLease> leases;
-    for (void *raw : {bank->gm_heap.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
-        if (raw == nullptr || !workspace_.owns(raw)) continue;
-        auto lease = workspace_.retain_backing(raw);
-        if (!lease) return PTO_RUNTIME_ERR_INVALID_STATE;
-        leases.push_back(std::move(lease));
+    if (slot >= run_image_stagings_.size() || prepared.prepared_resources) return PTO_RUNTIME_ERR_INVALID_STATE;
+    std::vector<std::shared_ptr<ArenaBank>> selected;
+    for (uint32_t bank_id : {banks.heap, banks.sm, banks.image}) {
+        if (bank_id >= arena_banks_.size()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        auto duplicate = std::find_if(selected.begin(), selected.end(), [&](const auto &bank) {
+            return bank == arena_banks_[bank_id];
+        });
+        if (duplicate == selected.end()) selected.push_back(arena_banks_[bank_id]);
     }
+    std::vector<WorkspaceManager::BackingLease> leases;
+    for (const auto &bank : selected) {
+        for (void *raw : {bank->gm_heap.raw_backing(), bank->gm_sm.raw_backing(), bank->runtime_pool.raw_backing()}) {
+            if (raw == nullptr || !workspace_.owns(raw)) continue;
+            auto lease = workspace_.retain_backing(raw);
+            if (!lease) return PTO_RUNTIME_ERR_INVALID_STATE;
+            leases.push_back(std::move(lease));
+        }
+    }
+    ScratchPool::Lease heap_lease;
+    {
+        std::lock_guard<std::mutex> lease_lock(heap_lease_mutex_);
+        if (slot < heap_leases_.size()) {
+            heap_lease = heap_leases_[slot];
+            heap_leases_[slot] = {};
+        }
+    }
+    auto release_heap_on_fail = RAIIScopeGuard([&]() {
+        if (heap_lease.valid() && heap_pool_) heap_pool_->release(heap_lease);
+    });
     auto resources = std::make_shared<PreparedRunResources>(
-        run_image_stagings_[slot], scheduler_state_storage_[slot], std::move(bank), std::move(leases)
+        run_image_stagings_[slot], scheduler_state_storage_[slot], std::move(selected), std::move(leases)
     );
+    resources->take_heap_lease(heap_pool_, heap_lease);
+    heap_lease = {};
     if (callable_id >= 0) {
         auto callable = callables_.find(callable_id);
         if (callable == callables_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;

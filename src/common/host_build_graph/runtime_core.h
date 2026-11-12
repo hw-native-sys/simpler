@@ -168,6 +168,16 @@ static_assert(
 RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity);
 
 /**
+ * Phase 1 with the run's reachable scheduler-queue populations. A run whose
+ * graph is already known supplies them so the arena holds queue slots sized to
+ * the graph; the task-capacity form above reserves the capacity limits and is
+ * for callers without a graph.
+ */
+RuntimeArenaLayout runtime_reserve_layout(
+    DeviceArena &arena, uint64_t task_capacity, const ReadyQueueCapacities &ready_queue_capacities
+);
+
+/**
  * Phase 2 — write the data half of the runtime arena: standalone fields,
  * memset'd arena regions, sub-structure initializers, and SM-side device
  * pointers. The arena must already be committed (or attached); writes go

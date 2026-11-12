@@ -493,21 +493,29 @@ host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submit
 }
 
 static int setup_static_arena_wrapper(
-    void *runner_ctx, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    void *runner_ctx, uint32_t pipeline_slot, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size,
+    size_t runtime_arena_size
 ) {
     if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     try {
-        return static_cast<DeviceRunnerBase *>(runner_ctx)
-            ->setup_static_arena(banks, gm_heap_size, gm_sm_size, runtime_arena_size);
+        auto *runner = static_cast<DeviceRunnerBase *>(runner_ctx);
+        const PipelineContract *contract = get_pipeline_contract();
+        const PipelineResource *heap =
+            contract != nullptr ? find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP) : nullptr;
+        const bool pooled_heap = !runner->execution_mode_latch().is_kernel() && heap != nullptr &&
+                                 heap->resource_class == PTO_PIPELINE_POOLED_SCRATCH;
+        return runner->setup_static_arena(
+            pipeline_slot, banks, pooled_heap, gm_heap_size, gm_sm_size, runtime_arena_size
+        );
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 
-static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t arena_bank) {
+static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank) {
     if (runner_ctx == nullptr) return nullptr;
     try {
-        return static_cast<DeviceRunnerBase *>(runner_ctx)->acquire_pooled_gm_heap(arena_bank);
+        return static_cast<DeviceRunnerBase *>(runner_ctx)->acquire_pooled_gm_heap(pipeline_slot, arena_bank);
     } catch (...) {
         return nullptr;
     }
@@ -1505,8 +1513,15 @@ static void quarantine_undrained_run(DeviceRunnerBase &runner, int rc) noexcept 
  */
 static const PipelineResource *declared_arena_resource(const PipelineContract *contract) {
     if (contract == nullptr) return nullptr;
+    // The pooled heap is not a per-run arena bank: its base comes from a
+    // ScratchPool lease, and two runs share it by design. The bank a run owns
+    // exclusively is the image (or shared memory, when the runtime has one).
     const PipelineResource *arena = find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP);
-    if (arena == nullptr) arena = find_pipeline_resource(*contract, PTO_PIPELINE_GM_SM);
+    if (arena != nullptr && arena->resource_class == PTO_PIPELINE_POOLED_SCRATCH) arena = nullptr;
+    if (arena == nullptr) {
+        arena = find_pipeline_resource(*contract, PTO_PIPELINE_GM_SM);
+        if (arena != nullptr && arena->resource_class == PTO_PIPELINE_POOLED_SCRATCH) arena = nullptr;
+    }
     if (arena == nullptr) arena = find_pipeline_resource(*contract, PTO_PIPELINE_RUNTIME_IMAGE);
     return arena;
 }
@@ -1534,31 +1549,19 @@ static bool declares_per_run_arena() {
  * result rather than a failure, so it must not be reachable through a
  * descriptor field.
  */
-static uint32_t resolved_arena_bank_for_slot(uint32_t pipeline_slot) {
-    const PipelineContract *contract = get_pipeline_contract();
-    const PipelineResource *arena = declared_arena_resource(contract);
-    if (arena == nullptr) return 0;
-    return pipeline_resource_slot(*contract, *arena, PipelineSlotLease{pipeline_slot, 0, 0});
-}
-
-/** Whether the declared arena regions select more than one bank. */
-static bool declared_region_banks_disagree(const PipelineContract *contract, RegionBanks banks) {
-    if (contract == nullptr) return false;
-    bool seen = false;
-    uint32_t first = 0;
-    auto check = [&](uint32_t kind, uint32_t bank) {
-        if (find_pipeline_resource(*contract, kind) == nullptr) return true;
-        if (!seen) {
-            first = bank;
-            seen = true;
-            return true;
-        }
-        return bank == first;
-    };
-    return !(
-        check(PTO_PIPELINE_GM_HEAP, banks.heap) && check(PTO_PIPELINE_GM_SM, banks.sm) &&
-        check(PTO_PIPELINE_RUNTIME_IMAGE, banks.image)
-    );
+/**
+ * The contract that governs this preparation.
+ *
+ * Kernel mode has its own declaration: a program contract may pool its heap,
+ * while a kernel context must keep every device region per run.
+ */
+static PipelineContract active_pipeline_contract(DeviceRunnerBase &runner, const CallConfig &config) {
+    if (runner.execution_mode_latch().is_kernel()) {
+        PipelineContract kernel{};
+        if (build_kernel_pipeline_contract_impl(&config, &kernel) == 0) return kernel;
+    }
+    const PipelineContract *program = get_pipeline_contract();
+    return program != nullptr ? *program : PipelineContract{};
 }
 
 /**
@@ -1600,7 +1603,9 @@ static void emit_overlap_storage_marks(OnboardNativeRunContext *state, bool shar
         image == nullptr ? -1 : static_cast<int>(image->resource_class), live
     );
     for (size_t i = 0; i < live && at > 0 && static_cast<size_t>(at) < sizeof(attrs); ++i) {
-        const void *heap_base = runner->acquire_pooled_gm_heap(rows[i].arena_bank);
+        const bool pooled_heap = heap != nullptr && heap->resource_class == PTO_PIPELINE_POOLED_SCRATCH;
+        const void *heap_base =
+            pooled_heap ? runner->pooled_heap_base() : runner->acquire_pooled_gm_heap(rows[i].arena_bank);
         const void *image_base = runner->acquire_pooled_runtime_arena(rows[i].arena_bank);
         const int written = std::snprintf(
             attrs + at, sizeof(attrs) - static_cast<size_t>(at),
@@ -1849,24 +1854,15 @@ int simpler_prepare_run(
         // HostApi the bind receives, `setup_static_arena` — reads one value with
         // one provenance. A descriptor that disagreed is reported and not used.
         NativeRunDescriptor resolved = *descriptor;
-        resolved.arena_bank = resolved_arena_bank_for_slot(resolved.pipeline_slot);
+        const PipelineContract contract = active_pipeline_contract(*runner, *config);
+        const RegionBanks region_banks = pipeline_resource_banks_for_slot(contract, resolved.pipeline_slot);
+        resolved.arena_bank = region_banks.image;
         if (resolved.arena_bank != descriptor->arena_bank) {
             LOG_ERROR(
                 "simpler_prepare_run: slot %u was given arena bank %u, but this runtime's declaration selects bank "
                 "%u for it; using the declared selection",
                 resolved.pipeline_slot, descriptor->arena_bank, resolved.arena_bank
             );
-        }
-        const PipelineContract *contract = get_pipeline_contract();
-        const RegionBanks region_banks =
-            contract != nullptr ? pipeline_resource_banks_for_slot(*contract, resolved.pipeline_slot) : RegionBanks{};
-        if (declared_region_banks_disagree(contract, region_banks)) {
-            LOG_ERROR(
-                "simpler_prepare_run: slot %u selects different banks for its declared arena regions; a retained "
-                "prepared run names one bank",
-                resolved.pipeline_slot
-            );
-            return PTO_RUNTIME_ERR_UNSUPPORTED;
         }
         state =
             new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops, region_banks);
@@ -2078,9 +2074,7 @@ int simpler_prepare_run(
             );
         }
         if (rc != 0) return cleanup_failed_prepare(state, rc);
-        rc = runner->retain_prepared_run_resources(
-            *state->prepared_execution, state->descriptor.arena_bank, callable_id
-        );
+        rc = runner->retain_prepared_run_resources(*state->prepared_execution, state->banks, callable_id);
         if (rc != 0) return cleanup_failed_prepare(state, rc);
         // A launch-time property of the run, carried from the descriptor the
         // caller filled: whether it builds the boundary that makes it joinable.

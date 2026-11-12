@@ -408,7 +408,8 @@ host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submit
 }
 
 static int setup_static_arena_wrapper(
-    void *runner_ctx, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    void *runner_ctx, uint32_t /*pipeline_slot*/, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size,
+    size_t runtime_arena_size
 ) {
     if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     try {
@@ -419,7 +420,7 @@ static int setup_static_arena_wrapper(
     }
 }
 
-static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t arena_bank) {
+static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t /*pipeline_slot*/, uint32_t arena_bank) {
     if (runner_ctx == nullptr) return nullptr;
     try {
         return static_cast<SimDeviceRunnerBase *>(runner_ctx)->acquire_pooled_gm_heap(arena_bank);

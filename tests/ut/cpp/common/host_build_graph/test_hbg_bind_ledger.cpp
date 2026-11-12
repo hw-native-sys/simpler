@@ -572,7 +572,7 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
     g_fake->retained_addr = addr;
     g_fake->retained_size = size;
 }
-int fake_setup_static_arena(void *, RegionBanks, size_t heap, size_t, size_t arena) {
+int fake_setup_static_arena(void *, uint32_t /*pipeline_slot*/, RegionBanks, size_t heap, size_t, size_t arena) {
     if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->gm_heap.assign(std::max<size_t>(heap, kAlign) + kAlign, 0);
     g_fake->runtime_arena.assign(std::max<size_t>(arena, kAlign) + kAlign, 0);
@@ -582,7 +582,7 @@ void *aligned_in(std::vector<uint8_t> &v) {
     auto raw = reinterpret_cast<uintptr_t>(v.data());
     return reinterpret_cast<void *>((raw + kAlign - 1) & ~static_cast<uintptr_t>(kAlign - 1));
 }
-void *fake_acquire_gm_heap(void *, uint32_t) { return aligned_in(g_fake->gm_heap); }
+void *fake_acquire_gm_heap(void *, uint32_t /*pipeline_slot*/, uint32_t) { return aligned_in(g_fake->gm_heap); }
 void *fake_acquire_runtime_arena(void *, uint32_t) { return aligned_in(g_fake->runtime_arena); }
 int fake_acquire_sm_mirror(void *, uint32_t, size_t bytes, size_t alignment, void **out) {
     g_fake->sm_mirror.assign(bytes + alignment, 0);

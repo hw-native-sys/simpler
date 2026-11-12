@@ -63,17 +63,22 @@ void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, void *, 
     static_cast<FakeRunner *>(runner_ctx)->record_pipeline_slot(pipeline_slot);
 }
 
-int setup_static_arena(void *runner_ctx, RegionBanks banks, size_t, size_t, size_t) {
+int setup_static_arena(void *runner_ctx, uint32_t /*pipeline_slot*/, RegionBanks banks, size_t, size_t, size_t) {
     static_cast<FakeRunner *>(runner_ctx)->record_arena_bank(banks.heap);
     return 0;
 }
 
-int setup_static_arena_banks(void *runner_ctx, RegionBanks banks, size_t, size_t, size_t) {
+int setup_static_arena_banks(void *runner_ctx, uint32_t /*pipeline_slot*/, RegionBanks banks, size_t, size_t, size_t) {
     static_cast<FakeRunner *>(runner_ctx)->record_bank_set(banks);
     return 0;
 }
 
-void *acquire_pooled_bank(void *runner_ctx, uint32_t bank) {
+void *acquire_pooled_bank(void *runner_ctx, uint32_t /*pipeline_slot*/, uint32_t bank) {
+    static_cast<FakeRunner *>(runner_ctx)->record_pooled_bank(bank);
+    return nullptr;
+}
+
+void *acquire_pooled_sm_or_image(void *runner_ctx, uint32_t bank) {
     static_cast<FakeRunner *>(runner_ctx)->record_pooled_bank(bank);
     return nullptr;
 }
@@ -83,8 +88,8 @@ const HostApiOps &bank_routing_ops() {
         HostApiOps result{};
         result.setup_static_arena = setup_static_arena_banks;
         result.acquire_pooled_gm_heap = acquire_pooled_bank;
-        result.acquire_pooled_gm_sm = acquire_pooled_bank;
-        result.acquire_pooled_runtime_arena = acquire_pooled_bank;
+        result.acquire_pooled_gm_sm = acquire_pooled_sm_or_image;
+        result.acquire_pooled_runtime_arena = acquire_pooled_sm_or_image;
         return result;
     }();
     return ops;

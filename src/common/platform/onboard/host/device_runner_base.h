@@ -66,6 +66,7 @@
 #include "utils/device_arena.h"
 #include "utils/retained_scheduler_storage.h"
 #include "host/prepared_run_resources.h"
+#include "host/scratch_pool.h"
 #include "aicore_pmu_lease.h"
 #include "device_phase_capture.h"
 #include "device_runner_helpers.h"
@@ -957,10 +958,16 @@ public:
      *
      * @return 0 on success, -1 on failure.
      */
-    int setup_static_arena(RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    int setup_static_arena(
+        uint32_t pipeline_slot, RegionBanks banks, bool pooled_heap, size_t gm_heap_size, size_t gm_sm_size,
+        size_t runtime_arena_size
+    );
+    int setup_static_arena(RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+        return setup_static_arena(0, banks, false, gm_heap_size, gm_sm_size, runtime_arena_size);
+    }
     int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
         return setup_static_arena(
-            RegionBanks{arena_bank, arena_bank, arena_bank}, gm_heap_size, gm_sm_size, runtime_arena_size
+            0, RegionBanks{arena_bank, arena_bank, arena_bank}, false, gm_heap_size, gm_sm_size, runtime_arena_size
         );
     }
 
@@ -976,9 +983,16 @@ public:
      * memory stays uncommitted and `acquire_pooled_gm_sm` returns nullptr for
      * it, while its runtime arena is committed and is a region it acquires.
      */
-    void *acquire_pooled_gm_heap(uint32_t arena_bank);
+    void *acquire_pooled_gm_heap(uint32_t pipeline_slot, uint32_t arena_bank);
+    void *acquire_pooled_gm_heap(uint32_t arena_bank) { return acquire_pooled_gm_heap(0, arena_bank); }
     void *acquire_pooled_gm_sm(uint32_t arena_bank);
     void *acquire_pooled_runtime_arena(uint32_t arena_bank);
+    /** The current pooled heap generation's base, or nullptr when unpooled. */
+    void *pooled_heap_base() const { return heap_pool_ ? heap_pool_->current_base() : nullptr; }
+    /** Release a pooled heap lease that no prepared resource took ownership of. */
+    void release_heap_lease(uint32_t pipeline_slot);
+    /** Hand a retired pool generation's block back to the workspace ledger. */
+    void on_heap_generation_retired(uint64_t generation, void *raw);
     bool lookup_prebuilt_runtime_arena_cache(
         uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
         void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
@@ -1861,7 +1875,10 @@ public:
     }
     virtual int reclaim_execution_streams() { return 0; }
     int prepare_run_storage(uint32_t pipeline_slot, bool capture_preparation = false);
-    int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1);
+    int retain_prepared_run_resources(PreparedExecution &prepared, RegionBanks banks, int32_t callable_id = -1);
+    int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1) {
+        return retain_prepared_run_resources(prepared, RegionBanks{arena_bank, arena_bank, arena_bank}, callable_id);
+    }
     int retain_external_run_resources(
         PreparedExecution &prepared, void *caller_stream, void **out_reference, NativeRunPreparePurpose purpose
     );
@@ -3175,6 +3192,14 @@ protected:
     // bank is constructed in place with its allocator rather than default-built
     // with the rest of its set.
     RunResourceSlots<std::shared_ptr<ArenaBank>> arena_banks_;
+    // Shared scratch generations for a contract whose GM heap is pooled. It is
+    // declared after the allocator and ledger it allocates through, so it is
+    // destroyed before either of them.
+    std::mutex heap_backing_mutex_;
+    std::unordered_map<uint64_t, WorkspaceManager::BackingLease> heap_backing_leases_;
+    std::shared_ptr<ScratchPool> heap_pool_;
+    std::mutex heap_lease_mutex_;
+    std::vector<ScratchPool::Lease> heap_leases_;
     mutable std::mutex prepared_storage_mutex_;
     std::vector<PreparedRunResources::RetiredArena> retired_prepared_arenas_;
     std::vector<std::shared_ptr<RetainedSchedulerStorage>> retired_prepared_schedulers_;

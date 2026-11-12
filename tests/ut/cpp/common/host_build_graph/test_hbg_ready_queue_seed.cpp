@@ -409,6 +409,46 @@ TEST(HbgReadyQueueSizing, FullGraphSeedPreservesTheCopiedRuntimeAndSharedMemoryT
         EXPECT_EQ(tail[i], 0xA5);
 }
 
+TEST(HbgReadyQueueSizing, ReachablePopulationsSizeEachQueueRegion) {
+    ReadyQueueCapacities capacities{};
+    for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+        capacities.ready[i] = 4;
+        capacities.ready_sync[i] = 8;
+    }
+    capacities.dummy = 2;
+    capacities.graph_prepare = 16;
+
+    DeviceArena limit_arena;
+    const auto limit_layout = runtime_reserve_layout(limit_arena, 2048);
+
+    DeviceArena arena;
+    const auto layout = runtime_reserve_layout(arena, 2048, capacities);
+    EXPECT_EQ(layout.sched.capacities.ready[0], capacities.ready[0]);
+    EXPECT_EQ(layout.sched.capacities.ready_sync[0], capacities.ready_sync[0]);
+    EXPECT_EQ(layout.sched.capacities.dummy, capacities.dummy);
+    EXPECT_EQ(layout.sched.capacities.graph_prepare, capacities.graph_prepare);
+    const size_t slot_bytes = sizeof(ChipReadyQueueSlot);
+    for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+        EXPECT_EQ(arena.region_size(layout.sched.off_ready_queue_slots[i]), capacities.ready[i] * slot_bytes);
+        EXPECT_EQ(arena.region_size(layout.sched.off_ready_sync_queue_slots[i]), capacities.ready_sync[i] * slot_bytes);
+    }
+    EXPECT_EQ(arena.region_size(layout.sched.off_dummy_ready_queue_slots), capacities.dummy * slot_bytes);
+    EXPECT_EQ(arena.region_size(layout.sched.off_graph_prepare_queue_slots), capacities.graph_prepare * slot_bytes);
+    EXPECT_LT(layout.arena_size, limit_layout.arena_size);
+
+    ASSERT_NE(arena.commit(), nullptr);
+    auto *runtime = runtime_init_data_from_layout(arena, layout, MODE_EXECUTE, nullptr, 0);
+    ASSERT_NE(runtime, nullptr);
+    runtime_wire_arena_pointers(arena, layout, runtime);
+    auto &queue = runtime->scheduler->ready_queues[0];
+    ready_queue_init_data_from_layout(&queue, capacities.ready[0]);
+    queue.seed_slots();
+    EXPECT_EQ(queue.capacity, capacities.ready[0]);
+    EXPECT_EQ(queue.mask, capacities.ready[0] - 1);
+    EXPECT_TRUE(queue.push(fake_slot_state(0)));
+    EXPECT_EQ(queue.pop(), fake_slot_state(0));
+}
+
 TEST(HbgReadyQueueSeed, DirtyDeviceRebindPreservesThePopulatedGraphAndExternalInout) {
     constexpr uint64_t task_capacity = 8;
     DeviceArena arena;

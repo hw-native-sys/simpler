@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "host/aligned_image_storage.h"
+#include "host/scratch_pool.h"
 #include "utils/device_arena.h"
 #include "utils/retained_scheduler_storage.h"
 #include "workspace_manager.h"
@@ -140,12 +141,22 @@ public:
 
     PreparedRunResources(
         std::shared_ptr<ImageStorage> image, std::shared_ptr<RetainedSchedulerStorage> scheduler,
-        std::shared_ptr<ArenaBank> arena, std::vector<WorkspaceManager::BackingLease> backing
+        std::vector<std::shared_ptr<ArenaBank>> banks, std::vector<WorkspaceManager::BackingLease> backing
     ) :
         image_(std::move(image)),
         scheduler_(std::move(scheduler)),
-        arena_(std::move(arena)),
+        banks_(std::move(banks)),
         backing_(std::move(backing)) {}
+
+    PreparedRunResources(
+        std::shared_ptr<ImageStorage> image, std::shared_ptr<RetainedSchedulerStorage> scheduler,
+        std::shared_ptr<ArenaBank> bank, std::vector<WorkspaceManager::BackingLease> backing
+    ) :
+        PreparedRunResources(
+            std::move(image), std::move(scheduler),
+            bank ? std::vector<std::shared_ptr<ArenaBank>>{std::move(bank)} : std::vector<std::shared_ptr<ArenaBank>>{},
+            std::move(backing)
+        ) {}
 
     // A candidate is published only after allocation succeeds; same-capacity
     // acquires also detach when an older prepared execution holds the bytes.
@@ -184,6 +195,16 @@ public:
         initial_publication_ = std::move(publication);
     }
 
+    // Transfer ownership of a pooled heap lease to these prepared resources.
+    void take_heap_lease(std::shared_ptr<ScratchPool> pool, ScratchPool::Lease lease) {
+        heap_pool_ = std::move(pool);
+        heap_lease_ = lease;
+    }
+
+    ~PreparedRunResources() {
+        if (heap_pool_ != nullptr && heap_lease_.valid()) heap_pool_->release(heap_lease_);
+    }
+
 private:
     std::shared_ptr<const void> streams_;
     std::shared_ptr<TemporaryStorage> temporary_;
@@ -192,7 +213,12 @@ private:
     std::shared_ptr<const void> initial_publication_;
     std::shared_ptr<ImageStorage> image_;
     std::shared_ptr<RetainedSchedulerStorage> scheduler_;
-    std::shared_ptr<ArenaBank> arena_;
+    // The banks whose regions this preparation retained. Usually one; a
+    // contract may select a different bank for its heap and its image.
+    std::vector<std::shared_ptr<ArenaBank>> banks_;
+    // A pooled heap generation, when the contract selected one.
+    std::shared_ptr<ScratchPool> heap_pool_;
+    ScratchPool::Lease heap_lease_{};
     std::vector<WorkspaceManager::BackingLease> backing_;
 };
 
