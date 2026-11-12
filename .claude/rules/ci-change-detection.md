@@ -10,7 +10,7 @@ ninety seconds on a GitHub runner. They are cheap to get subtly wrong and the
 symptom is silent — a job that should have skipped merely *passes*, so nobody
 notices until a flake in it reddens an unrelated PR.
 
-The explicit admin `/run-a5` command in `ci-a5-comment.yml` is a separate
+The explicit maintainer/admin `/run-a5` command in `ci-a5-comment.yml` is a separate
 exception: it runs all three requested A5 hardware suites without change
 detection, even for non-code PRs. Ordinary `ci.yml` has no automatic A5 hardware
 jobs; A5 simulation, CPU and profiling gates remain automatic. Daily retains its A5 jobs.

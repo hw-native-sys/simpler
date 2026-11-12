@@ -2567,6 +2567,7 @@ TEST_P(HbgFullSyncClaim, EveryEligiblePositionClaimsOneUniqueBlockAndTheActualLa
     constexpr uint64_t clusters = 4;
     const auto shape = GetParam();
     AdmissionFixture fixture({{shape.blocks, shape.mask, SCHEDULER_TASK_SYNC_START}}, clusters * 3);
+    ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
     std::vector<uint64_t> claimants;
     for (uint64_t worker = 0; worker < clusters * PLATFORM_CORES_PER_BLOCKDIM; ++worker) {
@@ -2592,7 +2593,7 @@ TEST_P(HbgFullSyncClaim, EveryEligiblePositionClaimsOneUniqueBlockAndTheActualLa
         seen[block] = true;
         // The seal is the actual last valid claim's, not a planned rank.
         EXPECT_EQ(fixture.task_control(0)->claim_seal, index + 1 == shape.blocks ? shape.blocks : 0u);
-        EXPECT_EQ(fixture.task_control(0)->completed_blocks, 0u);
+        EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 0u);
     }
     EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) {
         return value;
@@ -2620,7 +2621,7 @@ TEST_P(HbgFullSyncClaim, EveryEligiblePositionClaimsOneUniqueBlockAndTheActualLa
     }
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
     EXPECT_EQ(fixture.task_control(0)->next_block, shape.blocks);
-    EXPECT_EQ(fixture.task_control(0)->completed_blocks, 0u);
+    EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 0u);
     EXPECT_NE(fixture.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
 }
 
@@ -2629,6 +2630,7 @@ INSTANTIATE_TEST_SUITE_P(LaneMasks, HbgFullSyncClaim, ::testing::ValuesIn(full_s
 TEST(HbgFullSyncClaim, AnExtraReservationPastTheSealedCohortFailsInsteadOfReturningAClaim) {
     constexpr uint64_t clusters = 4;
     AdmissionFixture fixture({{clusters, LaneMask::aic(), SCHEDULER_TASK_SYNC_START}}, clusters * 3);
+    ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
     for (uint64_t cluster = 0; cluster < clusters; ++cluster) {
         const uint64_t worker = cluster * PLATFORM_CORES_PER_BLOCKDIM;
@@ -2668,6 +2670,7 @@ TEST(HbgFullSyncClaim, PartialSyncCohortKeepsTheBoundedRetryAllocator) {
     // Four AIC positions but only two blocks: this is not the full shape, so it
     // stays on the trusted-compare path and its exhaustion is a clean answer.
     AdmissionFixture fixture({{2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START}}, 12);
+    ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
     for (uint64_t worker = 0; worker < 12; worker += 3) {
         fixture.locals[worker]->admission = &fixture.admissions[worker];
@@ -2702,6 +2705,7 @@ TEST(HbgFullSyncClaim, PartialSyncCohortKeepsTheBoundedRetryAllocator) {
 
 TEST(HbgFullSyncClaim, OrdinaryFullWidthCohortKeepsTheTicketAllocator) {
     AdmissionFixture fixture({{4, LaneMask::aic()}}, 12);
+    ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
     std::vector<bool> seen(4, false);
     for (uint64_t worker = 0; worker < 12; worker += 3) {
@@ -2735,6 +2739,7 @@ TEST(HbgFullSyncClaim, OrdinaryFullWidthCohortKeepsTheTicketAllocator) {
 
 TEST(HbgFullSyncClaim, IndependentOrdinaryTaskStillClaimsWhileTheSyncCohortSealIsComplete) {
     AdmissionFixture fixture({{4, LaneMask::aic(), SCHEDULER_TASK_SYNC_START}, {2, LaneMask::aiv0()}}, 12);
+    ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
     ASSERT_TRUE(fixture.publish(1));
     for (uint64_t cluster = 0; cluster < 4; ++cluster) {

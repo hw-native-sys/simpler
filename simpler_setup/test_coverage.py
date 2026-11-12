@@ -140,7 +140,7 @@ def policy(config, cases):
         capture = f"kernel/{rt}/capture_replay"
         if environment == "torch_npu" and any(group(value) == capture for value in config._feature_candidates.values()):
             required.add(capture)
-        elif environment == "default" and platform == "a2a3" and rt == "host_build_graph":
+        elif environment == "default" and platform in ("a2a3", "a5") and rt == "host_build_graph":
             required.add(capture)
         else:
             gaps.add(capture)
@@ -164,8 +164,9 @@ def policy(config, cases):
     selected = {case["nodeid"] for case in cases}
     if expected - selected:
         raise ValueError(f"Required feature cases deselected: {sorted(expected - selected)}")
-    if any(group(case["feature"]) in gaps for case in cases):
-        raise ValueError("Tests claim a feature not delivered by the declared coverage policy")
+    conflicts = {case["nodeid"]: group(case["feature"]) for case in cases if group(case["feature"]) in gaps}
+    if conflicts:
+        raise ValueError(f"Tests claim a feature not delivered by the declared coverage policy: {conflicts}")
     return {
         "scope": {
             "platform": platform,

@@ -72,8 +72,26 @@ detect_silicon() {
     # The retry is keyed on the exit status: a DCMI refusal is written to
     # stdout, so an emptiness test would never fire.
     local query output status chip npu
+    # npu-smi -i takes the NPU/card ID; TASK_DEVICE is the task-submit logic
+    # ID, and the two differ on A2/A3 multi-chip hosts. Card 0 always exists
+    # on those hosts and suffices for arch detection, so A2/A3 query card 0
+    # while A5 (whose driver rejects -c) queries the allocated device.
+    local device=0
+    if [ "$REQUESTED" = a5 ]; then
+        device="${TASK_DEVICE:-0}"
+        device="${device%%,*}"
+        device="${device%%-*}"
+        if [[ ! "$device" =~ ^[0-9]+$ ]]; then
+            echo "onboard-arch-precheck: invalid allocated device '$device'." >&2
+            return 1
+        fi
+    fi
+    local queries=("npu-smi info -t board -i $device")
+    if [ "$REQUESTED" != a5 ]; then
+        queries=("npu-smi info -t board -i $device -c 0" "${queries[@]}")
+    fi
     local board="" errors="" query_ok=0
-    for query in "npu-smi info -t board -i 0 -c 0" "npu-smi info -t board -i 0"; do
+    for query in "${queries[@]}"; do
         if output=$($query 2>&1); then
             board="$output"
             query_ok=1
@@ -82,7 +100,7 @@ detect_silicon() {
             status=$?
         fi
         errors+="$query (exit=$status):"$'\n'"$output"$'\n'
-        if command -v task-submit >/dev/null 2>&1; then
+        if [ -z "${TASKQUEUE_INSIDE:-}" ] && command -v task-submit >/dev/null 2>&1; then
             if output=$(task-submit --run "$query" 2>&1); then
                 board="$output"
                 query_ok=1

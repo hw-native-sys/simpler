@@ -13,7 +13,7 @@ Design principles:
 5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so pure-a5 PRs skip a2a3 scene-test runs and vice versa. **UT jobs are still not gated by platform** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings. They *are* gated by test category: a diff confined to `tests/st/` or `examples/` cannot break a unit test, and one confined to `tests/ut/` cannot break a scene test, because the two suites execute disjoint trees (`pytest examples tests/st` vs `pytest tests/ut` plus the C++ ctest) and no unit test reads `examples/` or `tests/st/`. Shared test infrastructure — the root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/` — belongs to neither category and runs both.
 6. **Non-code PRs automatically run pre-commit and docs, and nothing else** — `detect-changes` sets `non_code_only` when *no* changed file falls outside the `NON_CODE` set. Skipping the UT jobs is riskless there because nothing in that set can change what the code does, and each member already has its own gate: markdownlint inside `pre-commit` reads the markdown, `docs.yml` (unconditional on every PR) builds the site with `--strict`, and `pre-commit` itself is ungated so a `.pre-commit-config.yaml` change is fully exercised by it.
 
-A5 hardware validation for ordinary PRs is requested by an admin with `/run-a5`.
+A5 hardware validation for ordinary PRs is requested by a maintainer or admin with `/run-a5`.
 A5 simulation, CPU tests and profiling remain automatic under their existing
 change gates. Daily retains its A5 jobs. A2/A3 multi-machine Network1 validation
 runs only in Daily, including manually dispatched Daily runs.
@@ -406,7 +406,7 @@ feature groups; they never narrow the corresponding Kernel capture gap.
 Coverage groups are `program/<runtime>`, `auxiliary/<runtime>` and
 `kernel/<runtime>/eager|capture_replay`. The policy in
 `simpler_setup/test_coverage.py` requires Program and Kernel eager
-for both runtimes in default onboard sweeps, plus native HBG capture on A2/A3.
+for both runtimes in default onboard sweeps, plus native HBG capture on A2/A3 and A5.
 Framework sweeps require Kernel eager for both runtimes and the graph-capture
 groups declared in the applicable corpus, including their mandatory members.
 The stock Torch-NPU native-capture tests declare Kernel capture/replay separately
@@ -622,19 +622,20 @@ Qualification is limited to the actual platform and environment in each receipt.
 
 ### A5 hardware validation (`/run-a5`)
 
-A repo admin can comment exactly `/run-a5` on an open PR targeting this repo's
+A repo maintainer or admin can comment exactly `/run-a5` on an open PR targeting this repo's
 `main` branch. Surrounding whitespace is accepted; extra arguments or text are
 ignored. `ci-a5-comment.yml` checks the commenter's current `admin` permission
+or `maintain` role (returned as `role_name`, with `permission: write`)
 with `getCollaboratorPermissionLevel` before resolving the PR's head repository
 and base SHA, then pinning their GitHub-generated merge commit in the upstream
 repository, including fork PRs. The gate verifies that the
-merge commit has exactly the observed base and head as its two parents. A missing,
-conflicting or stale merge snapshot fails the gate before any suite is scheduled;
-issue a new command after GitHub refreshes it. The gate summary records all three
+merge commit has exactly the observed base and head as its two parents. Pending
+or stale snapshots are re-read for up to 60 seconds; a persistent mismatch or
+conflict fails the gate before any suite is scheduled. The gate summary records all three
 SHAs. Testing the merge includes current main's CI interfaces even for a PR whose
 head predates their introduction. This qualifies integration with that base,
 not the standalone head. Non-PR comments and unverified or
-non-admin requests cannot schedule hardware work.
+requests without maintain or admin access cannot schedule hardware work.
 
 Every admitted request runs `ut-a5` with CANN examples, `st-onboard-a5` with DFX
 smokes, and `st-framework-a5` through the existing reusable workflows.
