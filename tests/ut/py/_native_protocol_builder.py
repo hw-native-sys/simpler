@@ -24,8 +24,10 @@ class ProtocolBuilder:
         epoch=0,
         sync_tasks=(),
         deferred_tasks=(),
+        fixed_assignment=False,
     ):
         self.raw: dict[str, Any] = capture(epoch)
+        self.fixed_assignment = fixed_assignment
         self.clock = 0
         self.groups = [0] * clusters
         self.member_rank_offsets = {}
@@ -169,7 +171,14 @@ class ProtocolBuilder:
     def members(self, task):
         spec = self.raw["tasks"][task]
         if spec["flags"] & 4:
-            return [w["index"] for w in self.raw["workers"] if (spec["active_mask"] | 1) & (1 << (w["index"] % 3))]
+            clusters = self.raw["cluster_count"]
+            if spec["flags"] & 8 and not spec["flags"] & 16 and 1 < spec["block_num"] <= clusters:
+                clusters = spec["block_num"]
+            return [
+                w["index"]
+                for w in self.raw["workers"]
+                if w["index"] // 3 < clusters and (spec["active_mask"] | 1) & (1 << (w["index"] % 3))
+            ]
         eligible = [
             w["index"]
             for w in self.raw["workers"]
@@ -215,6 +224,7 @@ class ProtocolBuilder:
                 pending_mask=0,
                 claim_seal_seen=0,
                 claim_cursor_seen=0,
+                local_claim_confirmed=0,
             )
             self.raw["members"].append(row)
             if observe_members:
@@ -247,14 +257,23 @@ class ProtocolBuilder:
         self.stamp(row, "claim_before")
         self.stamp(row, "claim_after")
         control = self.raw["task_controls"][task]
-        control["next_block"] += 1
-        if spec["block_num"] > 1 and not spec["flags"] & 16:
+        positions = self.raw["cluster_count"] * (2 if spec["active_mask"] in (2, 4) else 1)
+        fixed = (
+            self.fixed_assignment
+            and spec["flags"] & 8
+            and not spec["flags"] & 16
+            and spec["block_num"] > 1
+            and spec["block_num"] <= positions
+        )
+        if not fixed:
+            control["next_block"] += 1
+        if spec["block_num"] > 1 and not spec["flags"] & 16 and spec["block_num"] > positions:
             control["claim_tickets"] += 1
         certificate = dict(
             run_epoch=self.raw["run_epoch"],
             worker_index=worker,
             block_idx=block,
-            confirmed_count=control["next_block"],
+            confirmed_count=MAX if fixed else control["next_block"],
             seal_value=0,
             published_before=[0, 0],
             published_after=[0, 0],
@@ -425,7 +444,22 @@ class ProtocolBuilder:
                 self.raw["admissions"][task]["close_seals"][worker // 3] = row["close_seal"]
                 if worker % 3:
                     row["closed_cursor"] = MAX
-            if not (spec["flags"] & 4 and worker % 3) and row["closed_cursor"] == spec["block_num"]:
+            positions = self.raw["cluster_count"] * (2 if spec["active_mask"] in (2, 4) else 1)
+            single_wave = (
+                spec["flags"] & 8
+                and not spec["flags"] & 16
+                and spec["block_num"] > 1
+                and spec["block_num"] <= positions
+            )
+            owners = [
+                item["owner"]
+                for item in self.raw["blocks"]
+                if item["owner"]["task_ref"] == task and item["owner"]["worker_index"] == worker
+            ]
+            if single_wave and owners:
+                row["local_claim_confirmed"] = owners[0]["block_idx"] + 1
+                row["closed_cursor"] = MAX
+            elif not (spec["flags"] & 4 and worker % 3) and row["closed_cursor"] == spec["block_num"]:
                 row["claim_seal_seen"] = row["claim_cursor_seen"] = spec["block_num"]
             self.stamp(row, "closed")
 

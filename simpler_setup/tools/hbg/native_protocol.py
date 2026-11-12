@@ -13,7 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = ("hbg-native-protocol-v10", "hbg-native-protocol-v11")
+SCHEMAS = ("hbg-native-protocol-v12", "hbg-native-protocol-v13")
 
 ROOT_NUMBERS = frozenset(
     """
@@ -91,7 +91,7 @@ def protocol_version(section):
 
 def has_native_graph(section):
     """The native Graph schema includes independent source and node maps."""
-    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v11"
+    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v13"
 
 
 def _error(message):
@@ -193,7 +193,7 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table)
         for row in section[table]:
-            extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" else ()
+            extra = ("claim_seal_seen", "claim_cursor_seen", "local_claim_confirmed") if kind == "member" else ()
             _record(row, kind, f"{table}[{row['index']}]", extra)
     _read_nested_events(section)
     if native:

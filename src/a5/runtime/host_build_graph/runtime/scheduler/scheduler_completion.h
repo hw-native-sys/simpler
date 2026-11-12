@@ -38,7 +38,41 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
 ) {
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return SchedulerSubtaskFinishResult::ERROR;
     auto *control = scheduler_task_control_at(base, local, completed.task_ref);
-    const bool block_owner = scheduler_slot_uses_admission(local, completed) && !completed.gm_mix;
+    const bool admitted = scheduler_slot_uses_admission(local, completed);
+    const bool block_owner = admitted && !completed.gm_mix;
+    auto *admission = local->admission;
+    const bool single_wave = admitted && scheduler_task_uses_single_wave_claim(
+                                             admission->current_flags, admission->current_active_mask,
+                                             admission->current_block_num, local->config.cluster_count
+                                         );
+    if (single_wave) {
+        auto *record = scheduler_admission_record_at(base, admission, admission->current_task_ref);
+        const auto *members = reinterpret_cast<__gm__ const uint64_t *>(record + 1);
+        uint32_t assigned = UINT32_MAX;
+        if (!scheduler_single_wave_assignment(
+                admission->current_flags, admission->current_active_mask, admission->current_block_num,
+                local->config.cluster_count, members, local->config.runtime_worker_count, local->worker_id(),
+                admission->gm_mix.cluster_index, &assigned
+            ) ||
+            assigned != completed.block_idx) {
+            scheduler_record_error(
+                run, completed.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
+                SchedulerErrorSite::BLOCK_COMPLETION_INVALID, &completed
+            );
+            return SchedulerSubtaskFinishResult::ERROR;
+        }
+    }
+    if (single_wave && block_owner &&
+        (admission->single_wave_claim_confirmed == 0 ||
+         admission->single_wave_claim_confirmed > admission->current_block_num ||
+         admission->single_wave_claim_confirmed != static_cast<uint64_t>(completed.block_idx) + 1 ||
+         admission->single_wave_retired)) {
+        scheduler_record_error(
+            run, completed.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
+            SchedulerErrorSite::BLOCK_COMPLETION_INVALID, &completed
+        );
+        return SchedulerSubtaskFinishResult::ERROR;
+    }
     if constexpr (RecordProtocol) {
         scheduler_protocol_subtask_complete(base, local, completed, pending_slot, true, UINT64_MAX);
         if (block_owner) scheduler_protocol_block_complete(base, local, completed.block_idx, true, UINT64_MAX);
@@ -62,6 +96,10 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
         );
         return SchedulerSubtaskFinishResult::ERROR;
     }
+    // Full waves have no shared claim cursor. Each physical contributor
+    // validates its assigned identity before counting; the existing packed
+    // completion total still selects the last real contributor and async gate.
+    if (single_wave && block_owner) admission->single_wave_retired = true;
     if (previous + 1 != total) return SchedulerSubtaskFinishResult::PARTIAL;
     return ((previous_state | contribution) >> 32) != 0 ? SchedulerSubtaskFinishResult::TASK_LAST_CHECK_ASYNC :
                                                           SchedulerSubtaskFinishResult::TASK_LAST;
@@ -286,6 +324,13 @@ static inline __aicore__ bool scheduler_complete_own_slot(
                   ))
         return false;
     if (!completion_ok) return false;
+    if (scheduler->admission != nullptr) {
+        auto &hint = *scheduler->admission;
+        hint.advance_producer = task_ref;
+        hint.advance_index = 0;
+        hint.advance_task = SCHEDULER_TASK_REF_INVALID;
+    }
+
     SchedulerReadyClaim ready = resolved_ready;
     if (!scheduler_task_ref_is_null(ready.task_ref)) {
         if (refill_start_cycles == 0) refill_start_cycles = phase_timing_enabled ? scheduler_cycles() : 0;

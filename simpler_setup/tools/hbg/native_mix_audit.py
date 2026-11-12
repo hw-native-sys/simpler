@@ -152,6 +152,8 @@ def audit_mix(audit):
             seal = ("seal", ref, cluster)
             audit.causal.add(seal, point(member, "closed"))
             if lane == 0:
-                audit.causal.add(audit.close_reads[(ref, worker)], seal)
+                proof = audit.local_close_proofs.get((ref, worker), audit.close_reads.get((ref, worker)))
+                require(proof is not None, "Mix close has no ownership proof")
+                audit.causal.add(proof, seal)
             for group in groups:
                 audit.causal.add(point(group, "completion_after"), seal)

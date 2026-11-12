@@ -115,6 +115,11 @@ struct SchedulerGmMixLocalState {
     uint8_t slot_index{UINT8_MAX};
     uint8_t subtask_slot{UINT8_MAX};
     SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
+    // Read-only argument layout prepared after this lane's arrival. This
+    // cache owns no dispatch slot and contains no scalar values or predicate.
+    SchedulerTaskPayloadArguments prepared_arguments{};
+    SchedulerTaskMetadata prepared_metadata{};
+    uint64_t prepared_arguments_seq{0};
 };
 
 struct SchedulerAdmissionLocalState {
@@ -135,6 +140,8 @@ struct SchedulerAdmissionLocalState {
     uint8_t next_candidate{0};
     bool sync_claimed{false};
     bool ticket_exhausted{false};
+    bool single_wave_retired{false};
+    uint32_t single_wave_claim_confirmed{0};
     SchedulerOrderedCandidate candidates[SCHEDULER_PENDING_SLOT_COUNT]{};
     SchedulerGmMixLocalState gm_mix{};
     // READY freezes topology for this run. This cache contains membership
@@ -142,11 +149,22 @@ struct SchedulerAdmissionLocalState {
     uint64_t topology_cube_words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
     uint64_t topology_vector0_words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
     uint64_t topology_worker_count{0};
+    // Discardable preparation only: no readiness, slot or admission ownership.
+    int64_t advance_producer{SCHEDULER_TASK_REF_INVALID};
+    int64_t advance_task{SCHEDULER_TASK_REF_INVALID};
+    uint64_t advance_epoch{0};
+    uint32_t advance_index{0};
+    SchedulerTaskPayloadArguments advance_arguments{};
+    uint32_t advance_block{UINT32_MAX};
+    bool advance_member_valid{false};
+    bool advance_is_member{false};
 };
 
 static_assert(sizeof(SchedulerOrderedCandidate) == 40, "ordered candidate size changed");
-static_assert(sizeof(SchedulerGmMixLocalState) == 56, "GM group-local state size changed");
-static_assert(sizeof(SchedulerAdmissionLocalState) == 272, "admission-local state size changed");
+static_assert(sizeof(SchedulerGmMixLocalState) == 104, "GM group-local state size changed");
+static_assert(sizeof(SchedulerAdmissionLocalState) == 384, "admission-local state size changed");
+static_assert(offsetof(SchedulerAdmissionLocalState, single_wave_claim_confirmed) == 92);
+static_assert(offsetof(SchedulerAdmissionLocalState, candidates) == 96);
 
 struct SchedulerFreeSlotClaim {
     uint32_t slot_index{UINT32_MAX};
@@ -1134,6 +1152,47 @@ static inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
     return metadata;
 }
 
+// At most one CSR edge per idle pass. Failure discards the hint; the normal
+// checked dispatch path remains responsible for reporting invalid task data.
+static inline __aicore__ bool
+scheduler_prepare_advance_hint(const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local) {
+    auto *state = local->admission;
+    if (state == nullptr || state->advance_producer < 0 || state->advance_task >= 0) return false;
+    const auto *deps = scheduler_dependencies(base, local->config.ready_pool_offset);
+    int64_t next = SCHEDULER_TASK_REF_INVALID;
+    if (deps == nullptr ||
+        !scheduler_dependency_successor(base, *deps, state->advance_producer, state->advance_index, &next) ||
+        next < 0) {
+        state->advance_producer = SCHEDULER_TASK_REF_INVALID;
+        return false;
+    }
+    ++state->advance_index;
+    const auto *meta = scheduler_task_metadata_at(base, local, next);
+    if (!scheduler_task_is_executable(meta->flags) || scheduler_task_is_inline(meta->flags) ||
+        !scheduler_task_is_spmd(meta->flags) || scheduler_task_has_predicate(meta->flags))
+        return true;
+    const auto lanes = scheduler_task_lanes(*meta);
+    // Ordinary AIV work may run on either vector lane. MIX keeps exact lane roles.
+    const bool eligible = scheduler_task_is_mix(meta->flags) ?
+                              lanes.has(static_cast<SubtaskSlot>(local->config.self_lane)) :
+                              (local->config.self_lane == 0 ? lanes.has_aic() : lanes.has_any_aiv());
+    if (!eligible) return true;
+    // Native child argument storage can be materialized later. Start with
+    // ordinary no-graph tasks whose immutable layout already exists.
+    if (graph.native_header_offset != 0) {
+        state->advance_producer = SCHEDULER_TASK_REF_INVALID;
+        return false;
+    }
+    SchedulerTaskPayloadArguments args{};
+    if (scheduler_parse_task_payload_arguments(graph, next, &args) != SchedulerGraphResult::OK) return true;
+    state->advance_member_valid = false;
+    state->advance_block = UINT32_MAX;
+    state->advance_arguments = args;
+    state->advance_epoch = state->epoch;
+    state->advance_task = next;
+    return true;
+}
+
 static inline __aicore__ bool scheduler_prepare_dispatch_slot(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
@@ -1163,6 +1222,11 @@ static inline __aicore__ bool scheduler_prepare_dispatch_slot(
             scheduler->slot_state(slot_claim), metadata, SchedulerErrorSite::DISPATCH_INVALID_SHAPE
         );
         return false;
+    }
+    if (arguments == nullptr && scheduler->admission != nullptr) {
+        const auto &hint = *scheduler->admission;
+        if (hint.advance_task == ready_claim.task_ref && hint.advance_epoch == hint.epoch)
+            arguments = &hint.advance_arguments;
     }
     const uint16_t kernel_id = metadata.kernel_ids[subtask_slot];
     auto &reserved = *scheduler->slot_state(slot_claim);

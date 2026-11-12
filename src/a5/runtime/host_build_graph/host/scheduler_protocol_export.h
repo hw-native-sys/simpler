@@ -371,7 +371,7 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v10" : "hbg-native-protocol-v11");
+        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v12" : "hbg-native-protocol-v13");
         root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
@@ -493,6 +493,7 @@ inline std::string scheduler_export_protocol(
                 row.number("pending_mask", record.pending_mask);
                 row.number("claim_seal_seen", record.claim_seal_seen);
                 row.number("claim_cursor_seen", record.claim_cursor_seen);
+                row.number("local_claim_confirmed", record.local_claim_confirmed);
             }
         );
         sparse(

@@ -254,7 +254,7 @@ class PeerCounterRunner:
         raw = json.loads(paths[0].read_text())
         protocol = raw.get("aicore_protocol", {})
         assert protocol.get("producer") == "aicore", paths[0]
-        assert protocol.get("schema") in ("hbg-native-protocol-v10", "hbg-native-protocol-v11"), (
+        assert protocol.get("schema") in ("hbg-native-protocol-v12", "hbg-native-protocol-v13"), (
             "resident diagnostic qualification requires resource-scoped native evidence",
             paths[0],
         )

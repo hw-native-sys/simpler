@@ -9,10 +9,10 @@ Paths and identifiers refer to `src/a5/runtime/host_build_graph/` unless noted.
 1. Existing ready pop or direct refill uniquely owns a logical task. Cooperative
    tasks leave the intrusive queue once; block distribution does not requeue the
    same node. Generic pop is not an expected-task conditional removal operation.
-2. A task-local `admission_claim_lock` protects a recheck of UNCLAIMED and the
-   publication of CLAIMED. Only its owner may release that lock. PREPARED and
-   ADMITTED are published by the same admission owner. RETRY preserves a pending
-   candidate; errors must not silently drop it.
+2. Ready pop or direct resolve transfers unique ownership to the pending
+   admission owner. Bootstrap publishes the immutable INITIALIZED record before
+   the candidate is visible. Commit publishes ADMITTED; RETRY preserves the
+   candidate, and errors must not silently drop it.
 3. Host-preallocated records freeze epoch, shape, roles and membership. The
    short commit lock assigns `order_key`, publishes the complete record and log
    cell, then advances a contiguous visible tail. It never spans a kernel,
@@ -38,7 +38,8 @@ a fixed upper bound on discovery latency.
 
 | Path | Ownership operation | Closure requirement |
 | ---- | ------------------- | ------------------- |
-| Ordinary N>1 | FAA on `claim_tickets`; t<N owns block t and confirms a valid claim in `next_block` | Confirm exhaustion atomically or through the final claimant's certificate, then retire local obligations |
+| Ordinary single wave, 1<N<=eligible positions, without `sync_start` | Membership rank assigns one block per worker or MIX cluster; no shared claim cursor | Physical retirement and MIX close seals complete the local obligation |
+| Ordinary multi-wave N>eligible positions | FAA on `claim_tickets`; t<N owns block t and confirms a valid claim in `next_block` | Confirm exhaustion atomically or through the final claimant's certificate, then retire local obligations |
 | N=1 or `sync_start` | Bounded CAS on `next_block` | No outstanding local execution/publication/resource work |
 | `sync_start` member | At most one successful claim at a distinct execution position | A claimant may close after retirement; an unclaimed member waits for exhaustion |
 | Mix AIV | Consumes its AIC's published descriptor, never independently claims a block | Observes and consumes its task/cluster close seal |
@@ -51,7 +52,7 @@ exhaustion alone is insufficient: the last valid claimant may not yet have
 confirmed `next_block`. No claim can be transferred to a worker that passed the
 task. Preparation failure fails the run instead of reissuing the owned block.
 
-Only the final valid claimant publishes `claim_seal=N`. The certificate occupies
+On the shared-cursor paths, only the final valid claimant publishes `claim_seal=N`. The certificate occupies
 an isolated atomic-only region and is published with atomic exchange. A positive
 bypass hint is confirmed atomically before it can authorize closure; a missing
 certificate retains the original strong cursor-read path. Reservation tickets
@@ -167,20 +168,22 @@ captures identity from the actual payload; Host export preserves independent
 `hbg-execution-identity-v1` records. Predicate skips use `executed=false`.
 Compact worker IDs in swimlanes are not physical core IDs in topology records.
 
-L4 additionally exports `hbg-native-protocol-v10` (or v11 for native graph identity): frozen graph/members, admission,
+L4 additionally exports `hbg-native-protocol-v12` (or v13 for native graph identity): frozen graph/members, admission,
 claims, entry permits, LocalDone, group publication/release, completion and terminal
 state. Readers in `simpler_setup/tools/hbg/` check per-worker sequences, exact
 execution joins, ownership and causal edges from observed values and atomic
 tickets. Cross-core timestamps are not a total-order proof.
 
-Only the current v10/v11 schemas are accepted. Producer and reader must use
+Only the current v12/v13 schemas are accepted. Producer and reader must use
 matching contracts; historical and experimental formats are rejected. Admission
-and close-seal regions use 64-byte alignment. Ordinary multi-block tasks require
-admission and ticket claims; N1 and sync_start do not use tickets. Successful
-termination requires a free claim lock and a complete claim certificate.
+records and close seals use 64-byte alignment; shared admission control separates
+its lock and tail into 128-byte regions. Ordinary multi-block tasks require
+admission. Single waves use membership-based block assignment; larger waves use
+tickets. N1 and sync_start do not use tickets. Terminal validation checks the
+completion total and the closure evidence for the selected claim policy.
 MIX membership follows its resource mask and records per-lane predecessor sequences.
 
-Native Graph v11 includes `node_map` and `graph_source` for an independent topology
+Native Graph v13 includes `node_map` and `graph_source` for an independent topology
 audit. Both schemas validate member_rank_offset against a per-resource-type block
 prefix reconstructed from frozen task shapes. All tasks use the current cooperative
 admission rules. Execution identities use only the strict v1 format.

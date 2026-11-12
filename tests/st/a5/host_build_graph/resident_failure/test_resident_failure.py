@@ -229,7 +229,7 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
     positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
     version = protocol_version(protocol)
-    assert version in (10, 11)
+    assert version in (12, 13)
     assert type(protocol.get("close_seal_stride")) is int and protocol["close_seal_stride"] == 64
     for task in protocol["tasks"]:
         control = controls[task["task_ref"]]
@@ -237,14 +237,15 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
         assert type(seal) is int and seal >= 0
         cooperative = task["block_num"] > 1 or task["active_mask"].bit_count() > 1
         assert seal == 0 or (cooperative and seal == control["next_block"] == task["block_num"])
-    minimum_blocks = 2
-    uses_tickets = blocks >= minimum_blocks
-    tickets = controls[root["task_ref"]]["claim_tickets"]
-    if uses_tickets:
+    root_control = controls[root["task_ref"]]
+    tickets = root_control["claim_tickets"]
+    if blocks > positions:
         assert 1 <= tickets <= blocks + positions
-        assert controls[root["task_ref"]]["next_block"] <= min(blocks, tickets)
+        assert root_control["next_block"] <= min(blocks, tickets)
     else:
         assert tickets == 0
+        if blocks > 1:
+            assert root_control["next_block"] == root_control["claim_seal"] == 0
     assert controls[consumer["task_ref"]]["claim_tickets"] == 0
     if has_native_graph(protocol):
         enters = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 3]
@@ -355,7 +356,7 @@ def _check_two_wave_topology(protocol, blocks, mask, required):
     if not required:
         return
     version = protocol_version(protocol)
-    assert version in (10, 11)
+    assert version in (12, 13)
     positions = protocol["cluster_count"] * _lane_positions_per_cluster(mask)
     assert blocks == positions * 2, "two-wave fault must use the actual device topology"
 
@@ -640,7 +641,7 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             path, raw = _capture(prefix)
             proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
             assert raw["aicore_protocol"]["schema"] == (
-                "hbg-native-protocol-v11" if native_graph else "hbg-native-protocol-v10"
+                "hbg-native-protocol-v13" if native_graph else "hbg-native-protocol-v12"
             )
             launched = _root_block_num(raw["aicore_protocol"])
             assert blocks < 0 or launched == blocks

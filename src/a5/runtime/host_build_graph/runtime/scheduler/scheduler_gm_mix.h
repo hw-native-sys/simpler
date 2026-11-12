@@ -89,19 +89,39 @@ static inline __aicore__ bool scheduler_gm_mix_close(
     uint64_t closed_cursor = UINT64_MAX;
     uint64_t close_seal = 0;
     bool used_claim_seal = false;
+    uint64_t local_claim_confirmed = 0;
     if (local->is_mix_coordinator()) {
         if (group.phase != SchedulerGmMixPhase::IDLE) return true;
-        auto *control = scheduler_task_control_at(base, local, admission.current_task_ref);
-        if (scheduler_gm_query(control->next_block) < admission.current_block_num && !admission.sync_claimed)
-            return true;
-        // The query may only postpone closing. The error gate and the atomic
-        // exhausted-cursor confirmation precede publishing a close seal.
-        if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
-        uint64_t cursor = 0;
-        if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
-        if (cursor < admission.current_block_num && !admission.sync_claimed) return true;
-        if (cursor > admission.current_block_num || (admission.sync_claimed && cursor == 0) ||
-            group.task_last_seq == UINT64_MAX)
+        uint64_t cursor = UINT64_MAX;
+        if (scheduler_task_uses_single_wave_claim(
+                admission.current_flags, admission.current_active_mask, admission.current_block_num,
+                local->config.cluster_count
+            )) {
+            local_claim_confirmed = admission.single_wave_claim_confirmed;
+            if (local_claim_confirmed > admission.current_block_num ||
+                (local_claim_confirmed == 0 && admission.single_wave_retired))
+                return scheduler_admission_fail(
+                    graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
+                );
+            if (local_claim_confirmed == 0 || !admission.single_wave_retired) return true;
+            if (local_claim_confirmed != static_cast<uint64_t>(group.block_idx) + 1 || group.task_last_seq == 0)
+                return scheduler_admission_fail(
+                    graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
+                );
+            if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+        } else {
+            auto *control = scheduler_task_control_at(base, local, admission.current_task_ref);
+            if (scheduler_gm_query(control->next_block) < admission.current_block_num && !admission.sync_claimed)
+                return true;
+            if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+            if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
+            if (cursor < admission.current_block_num && !admission.sync_claimed) return true;
+            if (cursor > admission.current_block_num || (admission.sync_claimed && cursor == 0))
+                return scheduler_admission_fail(
+                    graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
+                );
+        }
+        if (group.task_last_seq == UINT64_MAX)
             return scheduler_admission_fail(
                 graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
             );
@@ -138,7 +158,8 @@ static inline __aicore__ bool scheduler_gm_mix_close(
         );
     if constexpr (RecordProtocol)
         scheduler_protocol_member_closed(
-            base, local, &admission, closed_cursor, close_seal, group.task_last_seq, used_claim_seal
+            base, local, &admission, closed_cursor, close_seal, group.task_last_seq, used_claim_seal,
+            local_claim_confirmed
         );
     ++admission.scan_cursor;
     admission.current_task_ref = SCHEDULER_TASK_REF_INVALID;
@@ -146,6 +167,8 @@ static inline __aicore__ bool scheduler_gm_mix_close(
     admission.current_active_mask = LaneMask::none();
     admission.current_flags = 0;
     admission.sync_claimed = false;
+    admission.single_wave_claim_confirmed = 0;
+    admission.single_wave_retired = false;
     admission.ticket_exhausted = false;
     group.phase = SchedulerGmMixPhase::IDLE;
     group.task_last_seq = 0;
@@ -321,6 +344,38 @@ static inline __aicore__ bool scheduler_gm_mix_arrive(
     scheduler_gm_store(mailbox->lanes[local->config.self_lane].arrived_seq, group.group_seq);
     if constexpr (RecordProtocol) scheduler_protocol_lane_publication(base, local, false, false);
     group.phase = SchedulerGmMixPhase::ARRIVED;
+    // Publish arrival before independent parsing so peers can rendezvous while
+    // this core prepares. Only immutable addresses/counts are cached; argument
+    // values, predicate evaluation and slot ownership stay after the ACK gate.
+    group.prepared_arguments = {};
+    group.prepared_arguments_seq = 0;
+    if (group.subtask_slot != UINT8_MAX && !scheduler_task_is_inline(local->admission->current_flags)) {
+        const auto &hint = *local->admission;
+        if (hint.advance_task == hint.current_task_ref && hint.advance_epoch == hint.epoch) {
+            // Reuse only immutable argument layout prepared while peers were
+            // still completing the predecessor. Values remain dispatch-time reads.
+            group.prepared_arguments = hint.advance_arguments;
+        } else if (scheduler_parse_task_payload_arguments(graph, hint.current_task_ref, &group.prepared_arguments) !=
+                   SchedulerGraphResult::OK) {
+            return scheduler_admission_fail(
+                graph, local, run, hint.current_task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
+            );
+        }
+    }
+    // Dispatch metadata is immutable for the run, including trace identity.
+    // Cache the complete record so diagnostic and ordinary paths use the same
+    // preparation; no slot or execution permission is acquired here.
+    const auto *source = scheduler_task_metadata_at(base, local, local->admission->current_task_ref);
+    auto &metadata = group.prepared_metadata;
+    metadata.kernel_ids[0] = source->kernel_ids[0];
+    metadata.kernel_ids[1] = source->kernel_ids[1];
+    metadata.kernel_ids[2] = source->kernel_ids[2];
+    metadata.active_mask = scheduler_task_lanes(*source);
+    metadata.flags = source->flags;
+    metadata.timing_slot = source->timing_slot;
+    metadata.logical_block_num = source->logical_block_num;
+    metadata.trace_index_base = source->trace_index_base;
+    group.prepared_arguments_seq = group.group_seq;
     *progress = true;
     return true;
 }
@@ -382,6 +437,10 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &all, query_prefiltered))
         return false;
     if (!all) return true;
+    if (group.prepared_arguments_seq != group.group_seq)
+        return scheduler_admission_fail(
+            graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_INVALID_STATE
+        );
     if (group.subtask_slot == UINT8_MAX) {
         scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
         *progress = true;
@@ -401,10 +460,11 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
         ready.task_ref = admission.current_task_ref;
         ready.source = SchedulerReadySource::COOPERATIVE;
         const SchedulerFreeSlotClaim claim{index};
-        const auto metadata = scheduler_load_dispatch_metadata(base, local, ready.task_ref, profiling_level);
+        const auto &metadata = group.prepared_metadata;
         uint64_t prepare_start = 0;
         if (!scheduler_prepare_dispatch_slot(
-                graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot, &prepare_start
+                graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot, &prepare_start,
+                &group.prepared_arguments
             ))
             return scheduler_admission_fail(
                 graph, local, run, ready.task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
@@ -457,6 +517,21 @@ static inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
     if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, true, &all, query_prefiltered))
         return SchedulerGmMixResult::ERROR;
     if (!all) return SchedulerGmMixResult::WAIT;
+    if (scheduler_task_uses_single_wave_claim(
+            admission.current_flags, admission.current_active_mask, admission.current_block_num,
+            local->config.cluster_count
+        )) {
+        if (admission.single_wave_claim_confirmed == 0 ||
+            admission.single_wave_claim_confirmed > admission.current_block_num ||
+            admission.single_wave_claim_confirmed != static_cast<uint64_t>(group.block_idx) + 1 ||
+            admission.single_wave_retired) {
+            scheduler_admission_fail(
+                graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
+            );
+            return SchedulerGmMixResult::ERROR;
+        }
+        admission.single_wave_retired = true;
+    }
     if constexpr (RecordProtocol) {
         scheduler_protocol_block_complete(base, local, group.block_idx, true, UINT64_MAX);
         scheduler_protocol_block_complete(base, local, group.block_idx, false, UINT64_MAX);

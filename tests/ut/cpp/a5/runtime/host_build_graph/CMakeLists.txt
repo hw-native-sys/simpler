@@ -69,7 +69,8 @@ a5_hbg_case(test_hbg_admission_progress.cpp TIMEOUT 20
 
 a5_hbg_case(test_hbg_gm_mix.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
-    DEFINES __CPU_SIM)
+    DEFINES __CPU_SIM
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
 
 a5_hbg_case(test_hbg_scheduler_dispatch.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore

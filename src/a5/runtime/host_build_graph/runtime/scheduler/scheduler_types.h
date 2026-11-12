@@ -912,9 +912,16 @@ inline __aicore__ uint64_t scheduler_block_claim_positions(LaneMask active_mask,
 }
 
 inline __aicore__ bool
+scheduler_task_uses_single_wave_claim(uint8_t flags, LaneMask active_mask, uint64_t blocks, uint64_t clusters) {
+    return scheduler_task_is_spmd(flags) && !scheduler_task_requires_sync_start(flags) && blocks > 1 &&
+           blocks <= scheduler_block_claim_positions(active_mask, clusters);
+}
+
+inline __aicore__ bool
 scheduler_task_uses_ticket_claim(uint8_t flags, LaneMask active_mask, uint64_t blocks, uint64_t clusters) {
     const uint64_t positions = scheduler_block_claim_positions(active_mask, clusters);
-    return !scheduler_task_requires_sync_start(flags) && positions != 0 && blocks > 1;
+    return !scheduler_task_requires_sync_start(flags) && positions != 0 && blocks > 1 &&
+           !scheduler_task_uses_single_wave_claim(flags, active_mask, blocks, clusters);
 }
 
 inline __aicore__ bool scheduler_task_is_inline(uint8_t flags) { return (flags & SCHEDULER_TASK_INLINE) != 0; }

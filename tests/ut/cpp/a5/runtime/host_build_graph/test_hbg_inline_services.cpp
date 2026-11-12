@@ -239,24 +239,26 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
     EXPECT_NE(scheduler_gm_load(fixture.control(1).state), static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(fixture.control(1).wake_list_head, 2);
-    ASSERT_TRUE(fixture.fill());
-    ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
-    ASSERT_EQ(fixture.locals[1]->slots[0].block_idx, 1u);
-    ASSERT_TRUE(fixture.complete(1, 0));
-    ASSERT_TRUE(fixture.fill());
+    // The other AIV owns the second block of this full wave.
+    ASSERT_TRUE(fixture.fill(2));
+    ASSERT_EQ(fixture.locals[2]->slots[0].task_ref, 0);
+    ASSERT_EQ(fixture.locals[2]->slots[0].block_idx, 1u);
+    ASSERT_TRUE(fixture.complete(2, 0));
+    ASSERT_TRUE(fixture.fill(2));
     EXPECT_EQ(scheduler_gm_load(fixture.control(1).state), static_cast<int64_t>(SchedulerTaskState::DONE));
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 2u);
-    ASSERT_TRUE(fixture.fill());
+    EXPECT_EQ(fixture.locals[2]->pending_completed, 2u);
+    ASSERT_TRUE(fixture.fill(2));
     uint32_t successor_slots = 0;
     for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        if (fixture.locals[1]->slots[slot].state != SchedulerDispatchSlotState::READY) continue;
-        ASSERT_EQ(fixture.locals[1]->slots[slot].task_ref, 2);
+        if (fixture.locals[2]->slots[slot].state != SchedulerDispatchSlotState::READY) continue;
+        ASSERT_EQ(fixture.locals[2]->slots[slot].task_ref, 2);
         ++successor_slots;
-        ASSERT_TRUE(fixture.complete(1, slot));
+        ASSERT_TRUE(fixture.complete(2, slot));
     }
     EXPECT_EQ(successor_slots, 1u);
-    ASSERT_TRUE(fixture.fill());
-    scheduler_flush_completions(fixture.run(), fixture.locals[1]);
+    ASSERT_TRUE(fixture.fill(2));
+    for (auto *local : fixture.locals)
+        scheduler_flush_completions(fixture.run(), local);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->resolved_task_count, UINT64_C(0)), 3u);
     EXPECT_EQ(fixture.trace(0).valid, 1u);
     EXPECT_EQ(fixture.trace(1).valid, 1u);
