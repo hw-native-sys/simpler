@@ -185,11 +185,32 @@ class NativeAudit:
     def admission(self):
         rank_offsets = {}
         next_rank = [0, 0]
+        clusters = self.raw["cluster_count"]
+        host_seeded = self.raw["schema"] == "hbg-native-protocol-v14"
+        if host_seeded:
+            require(
+                all(
+                    self.positions[worker]
+                    == ((worker, 0) if worker < clusters else ((worker - clusters) // 2, 1 + (worker - clusters) % 2))
+                    for worker in self.workers
+                ),
+                "host-seeded admission requires compact launch topology",
+            )
         for ref, task in sorted(self.tasks.items()):
             if task["flags"] & SPMD and not task["flags"] & (MIX | SYNC):
                 resource = 0 if task["active_mask"] & 1 else 1
-                rank_offsets[ref] = next_rank[resource]
-                next_rank[resource] += task["block_num"]
+                offset = next_rank[resource]
+                blocks = task["block_num"]
+                if (
+                    host_seeded
+                    and self.raw["mix_task_count"]
+                    and resource == 1
+                    and blocks < 2 * clusters
+                    and blocks % 2 == 0
+                ):
+                    offset += offset % 2
+                rank_offsets[ref] = offset
+                next_rank[resource] += blocks
                 require(next_rank[resource] <= MAX, "member rank prefix overflow")
         for ref, record in self.admissions.items():
             require(record["member_rank_offset"] == rank_offsets.get(ref, 0), "wrong member rank prefix")

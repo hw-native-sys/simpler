@@ -229,7 +229,7 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
     positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
     version = protocol_version(protocol)
-    assert version in (12, 13)
+    assert version in (12, 13, 14)
     assert type(protocol.get("close_seal_stride")) is int and protocol["close_seal_stride"] == 64
     for task in protocol["tasks"]:
         control = controls[task["task_ref"]]
@@ -356,7 +356,7 @@ def _check_two_wave_topology(protocol, blocks, mask, required):
     if not required:
         return
     version = protocol_version(protocol)
-    assert version in (12, 13)
+    assert version in (12, 13, 14)
     positions = protocol["cluster_count"] * _lane_positions_per_cluster(mask)
     assert blocks == positions * 2, "two-wave fault must use the actual device topology"
 
@@ -640,9 +640,11 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             assert worker.scheduler_runtime_mode in (1, 2)
             path, raw = _capture(prefix)
             proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
-            assert raw["aicore_protocol"]["schema"] == (
-                "hbg-native-protocol-v13" if native_graph else "hbg-native-protocol-v12"
-            )
+            schema = raw["aicore_protocol"]["schema"]
+            if native_graph:
+                assert schema == "hbg-native-protocol-v13"
+            else:
+                assert schema in ("hbg-native-protocol-v12", "hbg-native-protocol-v14")
             launched = _root_block_num(raw["aicore_protocol"])
             assert blocks < 0 or launched == blocks
             # A STARS-killed op can poison device access; its D2H output is

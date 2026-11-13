@@ -371,7 +371,13 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v12" : "hbg-native-protocol-v13");
+        const auto &run = *image.array<SchedulerRunControl>(layout.run_control_offset, 1);
+        const char *schema = "hbg-native-protocol-v13";
+        if (graph_source.empty()) {
+            schema = run.bootstrap_scan_complete == SCHEDULER_BOOTSTRAP_HOST_SEEDED ? "hbg-native-protocol-v14" :
+                                                                                      "hbg-native-protocol-v12";
+        }
+        root.string("schema", schema);
         root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
@@ -397,7 +403,6 @@ inline std::string scheduler_export_protocol(
         root.number("cooperative_task_count", plan.cooperative_task_count);
         root.number("cluster_count", layout.spmd.cluster_count);
         root.number("mix_task_count", layout.spmd.mix_task_count);
-        const auto &run = *image.array<SchedulerRunControl>(layout.run_control_offset, 1);
         root.number("expected_task_count", run.expected_task_count);
         root.number("inline_completed_count", run.inline_completed_count);
         root.number("resolved_task_count", run.resolved_task_count);

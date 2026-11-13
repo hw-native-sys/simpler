@@ -565,6 +565,16 @@ invalidation on pickup. Each invocation initializes fresh local state before
 bootstrap; AICPU waits for `bootstrap_complete` before releasing the
 DATA_MAIN_BASE launch gate.
 
+For ordinary CSR graphs, the Host seeds ready tickets from the initial fanin
+counts and writes the immutable cooperative admission members before uploading
+the scheduler image. AICPU validates the compact launch topology before READY.
+The image's scan-complete marker lets each worker proceed directly to local
+slot preparation. Admission ownership and block claims still occur after
+dependency resolution. For even-sized partial AIV waves in a graph with MIX
+work, the Host rounds the starting type rank to a cluster boundary to keep
+whole clusters available for other work. Native Graph and wake-list graphs
+use the device scan.
+
 Resident self-execution retires its EXECUTING slot directly on kernel return,
 after sealing asynchronous condition registrations and checking the run boundary. Computation contribution
 and successor resolution precede trace consolidation and writeback. Every trace

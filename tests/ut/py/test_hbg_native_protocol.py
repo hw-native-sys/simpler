@@ -230,7 +230,13 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
         audit_protocol_sequences(raw)
 
 
-@pytest.mark.parametrize("version", (*range(1, 12), 14, 15, 16, 17))
+def test_host_seeded_protocol_version_preserves_capture_fields():
+    raw = capture()
+    raw["schema"] = "hbg-native-protocol-v14"
+    assert read_native_protocol(raw) == raw
+
+
+@pytest.mark.parametrize("version", (*range(1, 12), 15, 16, 17))
 def test_noncurrent_protocol_versions_are_rejected(version):
     raw = capture()
     raw["schema"] = f"hbg-native-protocol-v{version}"

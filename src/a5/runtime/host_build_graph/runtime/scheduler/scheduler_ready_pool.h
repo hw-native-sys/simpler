@@ -14,7 +14,7 @@
 #include "scheduler_ticket_queue.h"
 #include "scheduler_dependency.h"
 
-inline constexpr uint32_t SCHEDULER_READY_POOL_VERSION = 11;
+inline constexpr uint32_t SCHEDULER_READY_POOL_VERSION = 12;
 
 // Two immutable queue descriptions share the run's scheduler allocation.
 struct alignas(64) SchedulerReadyPoolHeader {
