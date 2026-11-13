@@ -77,6 +77,8 @@ def sdma_workspace_binary(tmp_path_factory):
         "zero_size",
         "allocation_failure",
         "success",
+        "before_bind_free_failure",
+        "release_free_failure",
     ],
 )
 def test_sdma_workspace_ownership(sdma_workspace_binary, scenario):

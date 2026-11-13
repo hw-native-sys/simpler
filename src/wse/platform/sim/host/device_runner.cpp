@@ -310,7 +310,8 @@ int DeviceRunner::finalize() {
     }
 
     if (dma_workspace_handle_ != nullptr) {
-        dma_workspace_release(dma_workspace_handle_);
+        const int rc = dma_workspace_release(dma_workspace_handle_);
+        if (rc != 0) return rc;
         dma_workspace_handle_ = nullptr;
     }
     for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {

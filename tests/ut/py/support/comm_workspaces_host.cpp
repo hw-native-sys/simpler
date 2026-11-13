@@ -33,6 +33,8 @@ namespace {
 std::unordered_map<void *, size_t> mappings;
 int physical_handles = 0;
 void *fail_free_once = nullptr;
+bool fail_rollback_free = false;
+int rollback_free_attempts = 0;
 bool throw_hccl_destroy = false;
 bool fail_context_upload = false;
 bool fail_host_register = false;
@@ -103,6 +105,12 @@ extern "C" aclError aclrtGetDevice(int32_t *id) {
 }
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
 extern "C" aclError aclrtFree(void *p) {
+    const int failed_engine =
+        workspace_fixture::fail_engine >= 0 ? workspace_fixture::fail_engine : workspace_fixture::throw_engine;
+    if (fail_rollback_free && failed_engine >= 0 && p == workspace_fixture::last_workspace[failed_engine]) {
+        ++rollback_free_attempts;
+        return ACL_ERROR_FAILURE;
+    }
     if (p == fail_free_once) {
         fail_free_once = nullptr;
         return ACL_ERROR_FAILURE;
@@ -308,6 +316,49 @@ static void test_cleanup_failure(const std::string &scenario) {
     const auto retained_mappings = mappings.size();
     assert(comm_destroy(h) == COMM_RECLAMATION_UNCONFIRMED);
     assert(mappings.size() == retained_mappings);
+    std::filesystem::remove_all(folder);
+}
+
+static void test_init_rollback_failure(const std::string &scenario) {
+    using namespace workspace_fixture;
+    setenv("PTO_ROCE_PHYIDS", "0", 1);
+    setenv("PTO_ROCE_LOCAL_IP", "127.0.0.1", 1);
+    char folder[] = "/tmp/simpler-workspace-init-XXXXXX";
+    assert(mkdtemp(folder));
+    auto *h = new CommHandle_{};
+    h->rank = 0;
+    h->nranks = 1;
+    h->rootinfo_path = std::string(folder) + "/root";
+    h->hccl_comm = reinterpret_cast<HcclComm>(1);
+    const int engine = scenario.find("sdma") != std::string::npos ? 0 :
+                       scenario.find("urma") != std::string::npos ? 1 :
+                                                                    2;
+    if (scenario.find("throw") != std::string::npos) throw_engine = engine;
+    else fail_engine = engine;
+    fail_rollback_free = true;
+    const uint32_t ranks[] = {0};
+    uint64_t ctx = 0, base = 0;
+    size_t size = 0;
+    assert(
+        comm_alloc_domain_windows(h, 1, ranks, 1, 0, 4096, 1U << engine, &ctx, &base, &size) ==
+        COMM_INITIALIZATION_ABORT_REQUIRED
+    );
+    assert(ctx == 0 && base == 0 && size == 0);
+    assert(comm_abort_domain_windows(h, 1, 1, 0) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(h->cleanup_failed && rollback_free_attempts == 1);
+    void *workspace = last_workspace[engine];
+    assert(workspace != nullptr && mappings.count(workspace) == 1 && live[engine] == 0);
+    if (engine == 0) assert(h->sdma_workspace_addr == workspace);
+    else {
+        const auto &allocation = *h->domain_allocations.at(1);
+        if (engine == 1) assert(allocation.urma_workspace_addr == workspace);
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+        else assert(allocation.rdma_workspace_addr == workspace);
+#endif
+    }
+    assert(comm_abort_domain_windows(h, 1, 1, 0) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(comm_destroy(h) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(rollback_free_attempts == 1 && mappings.count(workspace) == 1);
     std::filesystem::remove_all(folder);
 }
 
@@ -541,6 +592,10 @@ static void test_host_domain(const std::string &scenario) {
 
 int main(int argc, char **argv) {
     if (argc == 2) {
+        if (std::string(argv[1]).find("init_") == 0) {
+            test_init_rollback_failure(argv[1]);
+            return 0;
+        }
         if (std::string(argv[1]).find("host_") == 0) {
             test_host_domain(argv[1]);
             return 0;

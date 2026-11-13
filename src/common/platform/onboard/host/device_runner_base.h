@@ -2920,8 +2920,10 @@ protected:
     uint64_t next_callable_generation_{1};
     // Opaque provider handle from dma_workspace_provision(), owned for the
     // Worker's life and released by finalize_common(). Null unless the Worker
-    // was created with SDMA enabled.
+    // was created with SDMA enabled; failed provisioning can retain an owner
+    // without publishing any usable workspace address.
     void *dma_workspace_handle_{nullptr};
+    bool dma_workspace_failed_{false};
     // Provisioned async-DMA workspace device addresses, indexed by
     // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_initialized()
     // so the resident AICPU SO latches them into g_dma_workspace_addr; the
