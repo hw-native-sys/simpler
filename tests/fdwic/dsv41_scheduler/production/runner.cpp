@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -348,6 +349,7 @@ int run(int argc, char **argv) {
         }
         if (!manifest) throw std::runtime_error("Cannot save boundary manifest");
     };
+    uint64_t launch_generation = 0;
     auto launch = [&](uint64_t phase, int profiling, const std::string &label) {
         config.enable_chip_swimlane = profiling;
         config.enable_dep_gen = profiling != 0;
@@ -357,8 +359,22 @@ int run(int argc, char **argv) {
         std::strcpy(config.output_prefix, directory.c_str());
         setenv("DSV41_MAPPING_PATH", (directory / "source-task-map.txt").c_str(), 1);
         if (sliced) args.scalars_[scalar_count] = phase;
-        host_barrier(output, "launch-" + label, rank, ranks);
-        worker.run(callable_id, &args, config);
+        const auto run = worker.prepare_native_run(callable_id, &args, config, {0, 0, ++launch_generation});
+        try {
+            // Both ranks finish Host binding and image upload before either
+            // enters Device execution; peer preparation is outside this sample.
+            host_barrier(output, "launch-" + label, rank, ranks);
+            if (worker.launch_native_run(run) != ChipWorker::NativeLaunch::Launched)
+                throw std::runtime_error("Native launch did not acquire diagnostic credit");
+            worker.wait_native_run(run);
+        } catch (...) {
+            const auto error = std::current_exception();
+            try {
+                worker.finalize_native_run(run);
+            } catch (...) {}
+            std::rethrow_exception(error);
+        }
+        worker.finalize_native_run(run);
         const auto mode = worker.last_scheduler_runtime_mode();
         if (mode != 1 && mode != 2) throw std::runtime_error("Production AICore scheduler was not selected");
         host_barrier(output, "complete-" + label, rank, ranks);
