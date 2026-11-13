@@ -9,6 +9,7 @@
 """WSE compiler inputs use the ordinary include closure and cache schema."""
 
 import ctypes
+import os
 
 import pytest
 
@@ -28,14 +29,15 @@ def test_sim_role_macros_follow_the_explicit_argument(platform, role, macro):
     assert set(token) == {"schema", "logic", "identity", "core_type", "flags", "linker", "pto_isa_commit"}
 
 
-def test_only_included_wse_headers_invalidate_real_kernel_cache(tmp_path, monkeypatch):
+@pytest.mark.parametrize("shared_source", [False, True])
+def test_only_included_wse_headers_invalidate_real_kernel_cache(tmp_path, monkeypatch, shared_source):
     compiler = KernelCompiler("wsesim")
     include = tmp_path / "platform/include"
-    operations = tmp_path / "platform/sim/operations"
+    operations = tmp_path / ("a5/include" if shared_source else "platform/sim/operations")
     (include / "wse").mkdir(parents=True)
     operations.mkdir(parents=True)
     public = include / "wse/probe.h"
-    public.write_text('#include "../../sim/operations/semantic.h"\n')
+    public.write_text('#include "' + os.path.relpath(operations / "semantic.h", public.parent) + '"\n')
     semantic = operations / "semantic.h"
     semantic.write_text("inline int wse_value() { return 7; }\n")
     source = tmp_path / "kernel.cpp"

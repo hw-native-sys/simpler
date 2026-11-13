@@ -30,6 +30,7 @@ WORKFLOW_PATHS = (
     REPO_ROOT / ".github/workflows/_st-npu-a2a3.yml",
     REPO_ROOT / ".github/workflows/_st-sim-a2a3.yml",
     REPO_ROOT / ".github/workflows/_st-sim-a5.yml",
+    REPO_ROOT / ".github/workflows/_st-sim-wse.yml",
     REPO_ROOT / ".github/workflows/ci.yml",
     REPO_ROOT / ".github/workflows/daily.yml",
     REPO_ROOT / ".github/workflows/sanitizers.yml",
@@ -488,13 +489,13 @@ def test_a2a3_scene_workflow_has_no_legacy_sdma_mode() -> None:
         assert "a2a3_sdma_mode" not in (REPO_ROOT / ".github/workflows" / caller_name).read_text()
 
 
-@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml"])
+@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml", "_st-sim-wse.yml"])
 def test_scene_tests_request_graphviz(workflow_name: str) -> None:
     step = _setup_step(REPO_ROOT / ".github/workflows" / workflow_name)
     assert step["with"]["install-graphviz"] == "true"
 
 
-@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml"])
+@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml", "_st-sim-wse.yml"])
 @pytest.mark.parametrize("has_gcc_15", [False, True])
 def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(
     tmp_path: Path, workflow_name: str, has_gcc_15: bool

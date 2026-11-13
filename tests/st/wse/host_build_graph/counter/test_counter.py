@@ -15,11 +15,11 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 from tests.st.wse.host_build_graph.tile_operations.test_execution import load_gate
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
@@ -29,20 +29,12 @@ PRODUCERS, CONSUMERS, ROUNDS = 2, 2, 3
 
 @lru_cache
 def build_counter(platform):
-    compiler = KernelCompiler(platform)
-    children = []
-    for index, name in enumerate(("mixed", "producer", "consumer")):
-        binary = compiler.compile_incore(
-            str(HERE / f"kernels/{name}.cpp"),
-            core_type="",
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-        )
-        children.append((index, CoreCallable.build(signature=[D.INOUT] * 3 + [D.IN] * 5, binary=binary)))
-    return ChipCallable.build(
-        signature=[D.INOUT] * 3 + [D.IN] * 6,
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(HERE / "kernels/orchestration.cpp")),
-        children=children,
+    return build_callable(
+        platform,
+        HERE / "kernels",
+        "orchestration.cpp",
+        [D.INOUT] * 3 + [D.IN] * 6,
+        [(f"{name}.cpp", [D.INOUT] * 3 + [D.IN] * 5) for name in ("mixed", "producer", "consumer")],
     )
 
 

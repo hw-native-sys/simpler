@@ -15,11 +15,12 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
+from tests.st.wse.host_build_graph.scene_helpers import ffn_inputs as shared_ffn_inputs
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 HERE = Path(__file__).parent
@@ -27,43 +28,18 @@ HERE = Path(__file__).parent
 
 @lru_cache
 def build_ffn(platform):
-    compiler = KernelCompiler(platform)
     signatures = [[D.IN, D.IN, D.OUT, D.OUT], [D.IN, D.OUT], [D.IN, D.IN, D.OUT]]
-    children = []
-    for stage, signature in enumerate(signatures):
-        binary = compiler.compile_incore(
-            str(HERE / f"kernels/ffn_{stage}.cpp"),
-            core_type="",
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-        )
-        children.append((stage, CoreCallable.build(signature=signature, binary=binary)))
-    return ChipCallable.build(
-        signature=[D.IN] * 3 + [D.OUT] * 4,
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(HERE / "kernels/ffn_orch.cpp")),
-        children=children,
+    return build_callable(
+        platform,
+        HERE / "kernels",
+        "ffn_orch.cpp",
+        [D.IN] * 3 + [D.OUT] * 4,
+        [(f"ffn_{stage}.cpp", signature) for stage, signature in enumerate(signatures)],
     )
 
 
 def ffn_inputs(seed):
-    row = torch.arange(128).reshape(-1, 1)
-    k = torch.arange(32).reshape(1, -1)
-    x = ((row + 2 * k + seed) % 5 - 2).float()
-    w1 = ((2 * torch.arange(32).reshape(-1, 1) + 3 * torch.arange(1280).reshape(1, -1) + seed) % 7 - 3).float()
-    w2 = ((3 * torch.arange(1280).reshape(-1, 1) + torch.arange(1280).reshape(1, -1) + seed) % 5 - 2).float()
-    h = x @ w1
-    a = torch.relu(h)
-    y = a @ w2
-
-    def shard(t):
-        return t.reshape(128, 40, 32).permute(1, 0, 2).contiguous()
-
-    inputs = [
-        x,
-        w1.reshape(32, 40, 32).permute(1, 2, 0).contiguous(),
-        w2.reshape(40, 32, 40, 32).permute(2, 0, 3, 1).contiguous(),
-    ]
-    return inputs, [shard(t) for t in (h, a, y)]
+    return shared_ffn_inputs(seed, 40)
 
 
 def audit_ffn(path):

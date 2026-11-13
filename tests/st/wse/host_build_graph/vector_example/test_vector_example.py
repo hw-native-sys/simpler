@@ -15,41 +15,28 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _bound_host_logs
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 
 
 @lru_cache
 def build_vector(platform):
-    compiler = KernelCompiler(platform)
-    here = Path(__file__).parent / "kernels"
-    names = ["kernel_add", "kernel_add_scalar", "kernel_mul"]
-    signatures = [[D.IN, D.IN, D.OUT], [D.IN, D.OUT], [D.IN, D.IN, D.OUT]]
-    children = [
-        (
-            i,
-            CoreCallable.build(
-                signature=signature,
-                binary=compiler.compile_incore(
-                    str(here / "aiv" / (name + ".cpp")),
-                    core_type="",
-                    extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-                ),
-            ),
-        )
-        for i, (name, signature) in enumerate(zip(names, signatures, strict=True))
-    ]
-    return ChipCallable.build(
-        signature=[D.IN, D.IN] + [D.OUT] * 4,
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(here / "orchestration/example_orch.cpp")),
-        children=children,
+    return build_callable(
+        platform,
+        Path(__file__).parent / "kernels",
+        "orchestration/example_orch.cpp",
+        [D.IN, D.IN] + [D.OUT] * 4,
+        [
+            ("aiv/kernel_add.cpp", [D.IN, D.IN, D.OUT]),
+            ("aiv/kernel_add_scalar.cpp", [D.IN, D.OUT]),
+            ("aiv/kernel_mul.cpp", [D.IN, D.IN, D.OUT]),
+        ],
     )
 
 

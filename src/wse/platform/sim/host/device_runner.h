@@ -41,7 +41,6 @@ public:
 private:
     WseLaunchTransactionResult launch_execution_impl(PreparedExecution &, WseLaunchPermit) override;
     int ensure_binaries_loaded() override;
-    int invoke_device_register(const RegisterCallableArgs &) override { return PTO_RUNTIME_ERR_UNSUPPORTED; }
     void cleanup_run() noexcept;
     void unload_executor();
     wse::SramStorage sram_;

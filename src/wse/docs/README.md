@@ -103,9 +103,17 @@ Graph submit units retain complete Block access sets while reusing unchanged
 common HBG declarations and other graph algorithms.
 
 `host-source-provenance.json` records these derived sources and their maintenance
-boundary. `source-copy-manifest.json` records the earlier A5-derived platform and
-runtime sources. These are explicit WSE compilation units, not replacement
-headers placed ahead of common headers on the include path.
+boundary. `source-copy-manifest.json` records derived files and `reused_sources`.
+WSE directly compiles unchanged A5 PMU, profiling-copy and compiler-info sources;
+small include entries reference unchanged argument and mailbox definitions.
+Those source dependencies do not load an A5 runtime binary. Recorded source hashes
+identify the reviewed revision, not a pin: normal include dependencies and the
+runtime source stamp invalidate caches when shared inputs change.
+
+WSE predicate scenes read unchanged A5 fixture sources; all WSE execution and
+assertions remain in WSE tests. Existing A3/A5 tests and CI selection are unchanged.
+A5-only changes still do not automatically select the separate WSE scene job, so
+changes to reused sources need WSE regression validation.
 
 The WSE backend exports `requires_aicpu_executor()` with a zero result. A backend
 without this optional query retains the existing mandatory AICPU path.

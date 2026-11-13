@@ -5,317 +5,234 @@
     {
       "source": "src/a5/platform/include/common/kernel_args.h",
       "destination": "src/wse/platform/include/common/kernel_args.h",
-      "baseline_sha256": "6c1744005429681f21bc05c6f368eebd136330a5d1580d089156b9df07f7ef76",
-      "sha256": "eec830f8e0b5edbef70ebf134c31c70578dc6101be00244b30dc2b6a507c7d25",
-      "reason": "derived WSE implementation retaining common Host argument layout"
+      "sha256": "68752e319f2608a82e074d5ed9f62a92a8e1d611e5bb2a061fd89664799593b0"
     },
     {
       "source": "src/a5/platform/include/common/platform_config.h",
       "destination": "src/wse/platform/include/common/platform_config.h",
-      "baseline_sha256": "aa440b6160cd05363cd5a44ee059d725d15d1ca2e018082abd7ef1c49d4e1dd2",
-      "sha256": "492335fcb8e1fda2e94f70c3af733a477c570a9bdea8f64a71d63640e49bac41",
-      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
-      "step00_sha256": "aa440b6160cd05363cd5a44ee059d725d15d1ca2e018082abd7ef1c49d4e1dd2"
+      "sha256": "c83764c47df1bf34c44a44e24a0b283038a9f43873de6e1153b32adb5b865328"
     },
     {
       "source": "src/a5/platform/include/common/pmu_profiling.h",
       "destination": "src/wse/platform/include/common/pmu_profiling.h",
-      "baseline_sha256": "961eb73e5645e6b516f59916b36ea336a4e8c2b69c7f60edbf3948b2af085199",
-      "sha256": "961eb73e5645e6b516f59916b36ea336a4e8c2b69c7f60edbf3948b2af085199",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "b54c88fc1577e448ba62749eaa7cc777e1bf86f0895c59c4b27905150c76880a"
     },
     {
       "source": "src/a5/platform/include/common/scheduler_profiling.h",
       "destination": "src/wse/platform/include/common/scheduler_profiling.h",
-      "baseline_sha256": "a1aaf5c2389ac76187ec6ebc8145f49a1742c731645c757ab3e4b1e552000104",
-      "sha256": "a1aaf5c2389ac76187ec6ebc8145f49a1742c731645c757ab3e4b1e552000104",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "125bb3b752e77664cceed12a19385807f92a0dbc19b8a3098b1f0dc46be8ddb1"
     },
     {
       "source": "src/a5/platform/include/host/pmu_collector.h",
       "destination": "src/wse/platform/include/host/pmu_collector.h",
-      "baseline_sha256": "0233a0b3614f2d83057ca6c9cb92560f2c1acec98aa4132b90a6626f43968145",
-      "sha256": "0233a0b3614f2d83057ca6c9cb92560f2c1acec98aa4132b90a6626f43968145",
-      "reason": "verbatim A5 compatibility implementation"
-    },
-    {
-      "source": "src/a5/platform/shared/host/pmu_collector.cpp",
-      "destination": "src/wse/platform/shared/host/pmu_collector.cpp",
-      "baseline_sha256": "4d2bb62348e8710ae7b358a79d7fecfe48aa4a1c266e7c394d306acd797f51a0",
-      "sha256": "4d2bb62348e8710ae7b358a79d7fecfe48aa4a1c266e7c394d306acd797f51a0",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "eceb6d38e5e08c52e1d262b9c02eb84c306c9d02b46930821daf29ba638e5b58"
     },
     {
       "source": "src/a5/platform/sim/CMakeLists.txt",
       "destination": "src/wse/platform/sim/CMakeLists.txt",
-      "baseline_sha256": "af517073fdd29477c8ebfaf3585e305005f31807d2e11fdf6e46d89ea2f46320",
-      "sha256": "698b693f26d5e568bdb6457b165065bb098c2436d1b444a1422cf027702bb034",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "sha256": "698b693f26d5e568bdb6457b165065bb098c2436d1b444a1422cf027702bb034"
     },
     {
       "source": "src/a5/platform/sim/aicore/CMakeLists.txt",
       "destination": "src/wse/platform/sim/aicore/CMakeLists.txt",
-      "baseline_sha256": "2cdd38508c98dfd0996bd6becdf9b49e47e6e15a683b6adc9e822a31bc2df8dc",
-      "sha256": "e65a4aa0859a931df379284429556cc207aab096740b00e77380699cc1acce63",
-      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
-      "step00_sha256": "2cdd38508c98dfd0996bd6becdf9b49e47e6e15a683b6adc9e822a31bc2df8dc"
+      "sha256": "e65a4aa0859a931df379284429556cc207aab096740b00e77380699cc1acce63"
     },
     {
       "source": "src/a5/platform/sim/host/CMakeLists.txt",
       "destination": "src/wse/platform/sim/host/CMakeLists.txt",
-      "baseline_sha256": "151b633d524e4c0c801228470b77785d00f6c9a5356d0cb9073e3cba9a464372",
-      "sha256": "07689ca79794f7871e87022c049008eaad041e37a011e6a444b1141e545e12d7",
-      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
-      "step00_sha256": "8de42b1238031388e60806b167afdff810e4bd182bc5d3def71f001d9f217c21"
+      "sha256": "61bdbc742386c9301a668988162821f8e37a575709e7a230652134a9642d70fc"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.cpp",
       "destination": "src/wse/platform/sim/host/device_runner.cpp",
-      "baseline_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
-      "sha256": "a0c010ae94465b1342764faba0e2042ec93e451d4d1de0868a75037b7e976e76",
-      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
-      "step00_sha256": "620853d3e8e64d9021935b82921c5a1a8a3eb1bfe7fb4eb3922c38c914ff671e",
-      "step01_sha256": "865c801d8ee2201a672f6185a58586d57fc27c4bc627118fa3929692b7a1825a"
+      "sha256": "6b37aaaa7b5177fb85aca3e1e7f16273847b357fa49b94bc45e6c808fc8a3244"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.h",
       "destination": "src/wse/platform/sim/host/device_runner.h",
-      "baseline_sha256": "54f7b460fe979734167abd8ababe9a6391ad25108ee20e4ef9716b10c010862f",
-      "sha256": "452bf5093577e668213b3753bd866884537d80a270473cb8cac44b99a9207d6b",
-      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
-      "step00_sha256": "4d9a687a4b5a63e66089e4b7a1b89c10264287de4d045b36b192de2cd595d64d"
-    },
-    {
-      "source": "src/a5/platform/sim/host/profiling_copy.cpp",
-      "destination": "src/wse/platform/sim/host/profiling_copy.cpp",
-      "baseline_sha256": "c2b47cfed9f26e311c7ea570f1891514e48550adc92dbc748e22ad9cce12a413",
-      "sha256": "c2b47cfed9f26e311c7ea570f1891514e48550adc92dbc748e22ad9cce12a413",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "21c5f0dfbcfdfface247f515b38ba20c954d6927fc791cbd544552ccc8265a7c"
     },
     {
       "source": "src/a5/platform/sim/host/runtime_c_api.cpp",
       "destination": "src/wse/platform/sim/host/runtime_c_api.cpp",
-      "baseline_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087",
-      "sha256": "f9568d33d073957980727f2a438c54456d53cedc25104390edf775d178518771",
-      "reason": "derived WSE implementation with configurable topology and finite SRAM execution",
-      "step00_sha256": "09c7ab9a3b4b7e76a4e4c55b7c070b1b17e168d2f12cf667135e01b5c5e88087"
+      "sha256": "f9568d33d073957980727f2a438c54456d53cedc25104390edf775d178518771"
     },
     {
       "source": "src/a5/runtime/host_build_graph/build_config.py",
       "destination": "src/wse/runtime/host_build_graph/build_config.py",
-      "baseline_sha256": "57569e02e0945a47d9306b727d767da8b724bca1e3b178c8727cf937630a31d1",
-      "sha256": "203dd70451657e530632edd56f2068771bb46e4c79a657c7acd4489a68ea7293",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
-      "step00_sha256": "57569e02e0945a47d9306b727d767da8b724bca1e3b178c8727cf937630a31d1",
-      "step01_sha256": "0f299faaa880f157a2f0a5ea81a5c015c94990aa7e7b2d2bcc5d69c90f832339"
+      "sha256": "203dd70451657e530632edd56f2068771bb46e4c79a657c7acd4489a68ea7293"
     },
     {
       "source": "src/a5/runtime/host_build_graph/common/intrinsic.h",
       "destination": "src/wse/runtime/host_build_graph/common/intrinsic.h",
-      "baseline_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
-      "sha256": "547bd7a6a1b1e41208365bb287e3212f6290715d2b58253ac1213ebacda58057",
-      "reason": "derived WSE implementation with static AICore Blocks, local PE Threads and finite SRAM execution",
-      "step00_sha256": "8ccb073100c82a353e372cafade7671b30e77e3b058e95a85eaacadebb153cf3",
-      "step01_sha256": "bb51c732944266e291d5c32b8fb36fbbc652dceb01baf9691151ee53d496efd7"
+      "sha256": "547bd7a6a1b1e41208365bb287e3212f6290715d2b58253ac1213ebacda58057"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.cpp",
-      "baseline_sha256": "e300c85f84a5ed48ecd798ba4b7f61f4c5bf9ec4caa78b6e5c8e513849a6f6e7",
-      "sha256": "50d7ba75dbf21a7912dc349867b6f00e2497ff32b694b6f7c3ea3deb2098d797",
-      "reason": "derived WSE implementation with static AICore Blocks, local PE Threads and finite SRAM execution"
+      "sha256": "50d7ba75dbf21a7912dc349867b6f00e2497ff32b694b6f7c3ea3deb2098d797"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.h",
       "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.h",
-      "baseline_sha256": "dc565152e3fdd71cb2bf9899ff75a5c8bf1215afbef3da98bc264fbfb0ef62ea",
-      "sha256": "c759a8ba6a8f3e04d2eb0503d6c25a974093cf8fb4076a062f2cddbbb1e285a8",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
-    },
-    {
-      "source": "src/a5/runtime/host_build_graph/host/runtime_compile_info.cpp",
-      "destination": "src/wse/runtime/host_build_graph/host/runtime_compile_info.cpp",
-      "baseline_sha256": "80e119aee2ebf4b628ce662d0d1bd9a3df3639b7acdc930d6ca4f100356ba45a",
-      "sha256": "80e119aee2ebf4b628ce662d0d1bd9a3df3639b7acdc930d6ca4f100356ba45a",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "c759a8ba6a8f3e04d2eb0503d6c25a974093cf8fb4076a062f2cddbbb1e285a8"
     },
     {
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
-      "baseline_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660",
-      "sha256": "b3328634cfdf2f8b8eeb0e172b2cb392f561322470594ee92e5252c119f22fb7",
-      "reason": "derived WSE implementation with static AICore Blocks, local PE Threads and finite SRAM execution",
-      "step00_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660"
+      "sha256": "d0b0a430c4ab9c3fa415627e48adc85403ca44c03c907e781674525f6f311e76"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
-      "baseline_sha256": "ef6ed6ef50c43adcbc46318bda2604ccf4e9a813370d1b9d838e86e05efae151",
-      "sha256": "ef6ed6ef50c43adcbc46318bda2604ccf4e9a813370d1b9d838e86e05efae151",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "afc27eb5a6407b6a3ddc324a7007ea4928d2b33241640019f5eaa9776b8ae568"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
-      "baseline_sha256": "a972ba2332010d67e04a882bc7dff643fdec3c20183762058f16e3ca4e81c682",
-      "sha256": "a972ba2332010d67e04a882bc7dff643fdec3c20183762058f16e3ca4e81c682",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "e0bbc7c8706f1a76a3df053bfe84235da57b904fc1aa19849ddaa1489dcf754e"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/async_wait.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/async_wait.h",
-      "baseline_sha256": "6e4cb9e5850729a7504e7d5a4f4604f2aec4550aa16d18fc5c9d74973e260267",
-      "sha256": "29c0e675da693ce641ead62ef9689d84997d4a696b218e89f44b5cb032abddc4",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "sha256": "29c0e675da693ce641ead62ef9689d84997d4a696b218e89f44b5cb032abddc4"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/dispatch_payload.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/dispatch_payload.h",
-      "baseline_sha256": "4ce1d60e5182cb4e83aca76d46a1dd37e0f7b065c816f3739f42c69a2f23f8cc",
-      "sha256": "944975d3ca04a539ef3a83c322e82ebd4be8413e056d8c9b9d8ebbc6b3ab3b5b",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "sha256": "944975d3ca04a539ef3a83c322e82ebd4be8413e056d8c9b9d8ebbc6b3ab3b5b"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler.h",
-      "baseline_sha256": "efdc8a78690b55dca307c4f531bf83fa254373f49b502a03c2c288528e4a7697",
-      "sha256": "caa845669f43c21412768c29b7cc43172209370437c0dfe19a82c7b10d4d0dc0",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "sha256": "caa845669f43c21412768c29b7cc43172209370437c0dfe19a82c7b10d4d0dc0"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h",
-      "baseline_sha256": "4f7929e79fda7c8b73f423ca5415f5024e097cd221300da3c70fefa3c04a2d11",
-      "sha256": "91a31b7578b3bcc705cf4974e643df9ec3415c85cab54a69f4603423745db8fa",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "sha256": "91a31b7578b3bcc705cf4974e643df9ec3415c85cab54a69f4603423745db8fa"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
-      "baseline_sha256": "6aa576fdd18952742e8319dee8f512ce248ce618c16de3ad631992a8e3576173",
-      "sha256": "c2cff91f56e3314acd7f88457d434aa5254f9ecc02aa9c82c7802772339c697d",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "sha256": "c2cff91f56e3314acd7f88457d434aa5254f9ecc02aa9c82c7802772339c697d"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
-      "baseline_sha256": "b0cbd2e6d2be1f47b6edcb345ccbf2545a6da23a6fbcfca288af93cdc728afe2",
-      "sha256": "4e518a4d6d880ba44e214e989ef248a6c73d44370ea25d1d1779e7051e2598e3",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required"
+      "sha256": "4e518a4d6d880ba44e214e989ef248a6c73d44370ea25d1d1779e7051e2598e3"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
-      "baseline_sha256": "5ea2419ec474faebe54f95c2d70ac77feb3c09c5fa7c6fd4d2f0d596cf2808d1",
-      "sha256": "ac5e1278aeb0b007729a9ec195b3632aecc849f203ba3b18d1f163bddf3dd62a",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
-      "step00_sha256": "5ea2419ec474faebe54f95c2d70ac77feb3c09c5fa7c6fd4d2f0d596cf2808d1"
+      "sha256": "ac5e1278aeb0b007729a9ec195b3632aecc849f203ba3b18d1f163bddf3dd62a"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_types.h",
-      "baseline_sha256": "1c177ee96fb9eeadd0b94200baeb546f03b63c2d8de4d256fe4f8e5f103de7d3",
-      "sha256": "fb7eb38aec2dc4f3a2f094e70cc58140ae6f60ba7c95f4f84fba7e62885f062b",
-      "reason": "derived WSE implementation; common Host layout declarations retained where required",
-      "step00_sha256": "1c177ee96fb9eeadd0b94200baeb546f03b63c2d8de4d256fe4f8e5f103de7d3"
+      "sha256": "fb7eb38aec2dc4f3a2f094e70cc58140ae6f60ba7c95f4f84fba7e62885f062b"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/tensor.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/tensor.h",
-      "baseline_sha256": "8dcd808289e2c3beb2f0df513a8e034f79b914c489b0e2fc6e8b999a26fe0c99",
-      "sha256": "8dcd808289e2c3beb2f0df513a8e034f79b914c489b0e2fc6e8b999a26fe0c99",
-      "reason": "verbatim A5 compatibility implementation"
+      "sha256": "79476ac8aec87b25d8420bdabf3dc7d9ead26a6d5622d7125773b56bd89a462d"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "2f674211e7feab7e6537f9cb791f31837a48c09f95eeb162bd6f89565737ef4d",
-      "sha256": "b240fc91ff48a3b43868a3df7f410cc44cac9ecd81d7eaa5c48911674eee2efe",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
+      "sha256": "b240fc91ff48a3b43868a3df7f410cc44cac9ecd81d7eaa5c48911674eee2efe"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_add_scalar.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_add_scalar.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "136caa389f251e5c6ec4bfc94de2223b83371b3382e70bee41541e8b90b7155b",
-      "sha256": "ee38c9431a659be5481c2e24cf412e4118b912c1ef03fee87f14bd74aeedf3b3",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
+      "sha256": "25bda1ff1e9523f75bf468ac36f32487760f51506131ef84963bcbcd51261032"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_add.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_add.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "c4359e57f78b51a611e6c0c3c144f51fdb0ed1af6580b7cba4b889afda949238",
-      "sha256": "e7f61be6f052ca33813e515e50fcb4364d0780dfaca2c482e1cd392b6a5a96a2",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
+      "sha256": "97210de242d4d771fc576ac0f4fa8ae9ef6e15739162688ca0a39d140830bc2b"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_mul.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_mul.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "76276d4620b7a6ca0ec4cbb9499883f868fc72ec951765c7ab5171dcfdd0b65b",
-      "sha256": "8add6dfbaccc9976f3cbd396c46a6fd5b0f6bbbc5ad0932a8cf1f4fbea8bb08f",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
+      "sha256": "1267d768188feb99ad6cfa05b70362e6f8a71173d27385a0ae6cb6e731b20ab3"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/test_vector_example.py",
       "destination": "tests/st/wse/host_build_graph/vector_example/test_vector_example.py",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "b2a2bbcb9b5c5a9b2ddd38e5a8fd0add90d597f5f9bc384f1c32dee5517e221d",
-      "sha256": "6719e6b72365732be566ee1a9924c46b53fcf3c0a1a725c898425ae050bced9b",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_gate.cpp",
-      "destination": "tests/st/wse/host_build_graph/direct_launch/kernels/predicate/aic/kernel_write_gate.cpp",
-      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "3cb84e7cac466b6a73f7defe0718f077b16cebc52c5c381902e436266c1a8030",
-      "sha256": "3cb84e7cac466b6a73f7defe0718f077b16cebc52c5c381902e436266c1a8030",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_copy_first.cpp",
-      "destination": "tests/st/wse/host_build_graph/direct_launch/kernels/predicate/aic/kernel_copy_first.cpp",
-      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "f9dc321482e73938ca0ace2f8f8f09004617f30986689f7200e778eca0504751",
-      "sha256": "f9dc321482e73938ca0ace2f8f8f09004617f30986689f7200e778eca0504751",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_clobber.cpp",
-      "destination": "tests/st/wse/host_build_graph/direct_launch/kernels/predicate/aic/kernel_clobber.cpp",
-      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "f323ad50f897b0452c154ea260f167438cdab447ce4d3c3cbe5d4da0504ee3ea",
-      "sha256": "f323ad50f897b0452c154ea260f167438cdab447ce4d3c3cbe5d4da0504ee3ea",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_const.cpp",
-      "destination": "tests/st/wse/host_build_graph/direct_launch/kernels/predicate/aic/kernel_write_const.cpp",
-      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "74abaf7aaf19db0347be56e174df0ae2166178553aa2cba0a25f0bfa7bb8370b",
-      "sha256": "74abaf7aaf19db0347be56e174df0ae2166178553aa2cba0a25f0bfa7bb8370b",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/orchestration/predicated_dispatch_orch.cpp",
-      "destination": "tests/st/wse/host_build_graph/direct_launch/kernels/predicate/orchestration/predicated_dispatch_orch.cpp",
-      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "db2af41e502fb952fc7133d4aa8f7d850208a4b3cc3539c9c79ed13820d1efd0",
-      "sha256": "db2af41e502fb952fc7133d4aa8f7d850208a4b3cc3539c9c79ed13820d1efd0",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
+      "sha256": "15ac2a02cce0dad98db256fbffe722a67a21f16c8cbd38c4999ebe10f77b8afd"
     },
     {
       "source": "tests/st/a5/host_build_graph/predicated_dispatch/test_predicated_dispatch.py",
       "destination": "tests/st/wse/host_build_graph/direct_launch/test_predicate.py",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "baseline_sha256": "b9ea89acc045a9b5f29df2bcf2f13e3aa07e1efc5077a8c5f15c75276623e781",
-      "sha256": "1a2dbd73c673926a321f10bd2ea1dfdac08db306e206958732b2bf382349375a",
-      "reason": "WSE-owned scene fixture; no live dependency on the A5 scene tree"
+      "sha256": "54bfcfbb919155a6e6a0c3623c70883be05b0e0e675aa4fe8495017a3095b431"
     }
   ],
   "derivation_baseline": "a3a951a1f9ef4dd898b254dc88f233b9cfac0b32",
   "scope": "Provenance of inherited files; this is not a build or runtime component manifest.",
-  "operation_backend": "wse-temporary-fp32"
+  "operation_backend": "wse-temporary-fp32",
+  "reused_sources": [
+    {
+      "source": "src/a5/platform/include/common/pmu_profiling.h",
+      "sha256": "961eb73e5645e6b516f59916b36ea336a4e8c2b69c7f60edbf3948b2af085199"
+    },
+    {
+      "source": "src/a5/platform/include/common/scheduler_profiling.h",
+      "sha256": "a1aaf5c2389ac76187ec6ebc8145f49a1742c731645c757ab3e4b1e552000104"
+    },
+    {
+      "source": "src/a5/platform/include/host/pmu_collector.h",
+      "sha256": "0233a0b3614f2d83057ca6c9cb92560f2c1acec98aa4132b90a6626f43968145"
+    },
+    {
+      "source": "src/a5/platform/shared/host/pmu_collector.cpp",
+      "sha256": "4d2bb62348e8710ae7b358a79d7fecfe48aa4a1c266e7c394d306acd797f51a0"
+    },
+    {
+      "source": "src/a5/platform/sim/host/profiling_copy.cpp",
+      "sha256": "c2b47cfed9f26e311c7ea570f1891514e48550adc92dbc748e22ad9cce12a413"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/host/runtime_compile_info.cpp",
+      "sha256": "80e119aee2ebf4b628ce662d0d1bd9a3df3639b7acdc930d6ca4f100356ba45a"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
+      "sha256": "ef6ed6ef50c43adcbc46318bda2604ccf4e9a813370d1b9d838e86e05efae151"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_gate.cpp",
+      "sha256": "3cb84e7cac466b6a73f7defe0718f077b16cebc52c5c381902e436266c1a8030"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_copy_first.cpp",
+      "sha256": "f9dc321482e73938ca0ace2f8f8f09004617f30986689f7200e778eca0504751"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_clobber.cpp",
+      "sha256": "f323ad50f897b0452c154ea260f167438cdab447ce4d3c3cbe5d4da0504ee3ea"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_const.cpp",
+      "sha256": "74abaf7aaf19db0347be56e174df0ae2166178553aa2cba0a25f0bfa7bb8370b"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/orchestration/predicated_dispatch_orch.cpp",
+      "sha256": "db2af41e502fb952fc7133d4aa8f7d850208a4b3cc3539c9c79ed13820d1efd0"
+    },
+    {
+      "source": "src/a5/platform/include/common/kernel_args.h",
+      "sha256": "f7e3c8fd711f38fd6c528525444095ec484713aab7cba14e4ec00c0376184ed4"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
+      "sha256": "5306aa2c152255661d465204d5bf090bf00feae74aec07a23ff60fb3bc693bb0"
+    }
+  ]
 }

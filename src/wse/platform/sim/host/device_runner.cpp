@@ -155,7 +155,6 @@ int DeviceRunner::prepare_execution(
     run->expected = descriptor->expected_tasks;
     active_run_ = std::move(run);
     completion_.reset(prepared->num_aicore);
-    last_runtime_ = &runtime;
     *out = std::move(prepared);
     return 0;
 }
@@ -309,12 +308,6 @@ int DeviceRunner::finalize() {
         bank->cached_gm_sm_size = 0;
         bank->cached_runtime_arena_size = 0;
     }
-    prebuilt_runtime_arena_cache_valid_ = false;
-    prebuilt_runtime_arena_cache_key_.clear();
-    prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-    prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-    prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-    prebuilt_runtime_arena_cache_image_.clear();
 
     if (dma_workspace_handle_ != nullptr) {
         dma_workspace_release(dma_workspace_handle_);
@@ -330,6 +323,5 @@ int DeviceRunner::finalize() {
 
     device_id_ = -1;
     worker_count_ = 0;
-    last_runtime_ = nullptr;
     return 0;
 }

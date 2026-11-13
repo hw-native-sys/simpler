@@ -8,31 +8,9 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * host_build_graph runtime maker (host orchestration).
- *
- * The HOST runs the orchestrator to completion, populates shared memory + the
- * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
- *
- * register_callable_impl:
- *   - dlopens the orchestration SO on the host and resolves its entry points,
- *     which bind then invokes per run
- *
- * bind_callable_to_runtime_impl:
- *   - Gives host-memory tensor arguments slices of the pipeline slot's retained
- *     temporary buffer, copies every readable input H2D, and records one lease
- *     each with its transfer directions. The copy is here rather than in
- *     copy_in_run_inputs_impl because the orchestration entry below reads these
- *     tensors while it builds the graph
- *   - Runs the resolved orchestration entry to build the graph
- *   - Sets up runtime state for host orchestration
- *
- * copy_back_run_outputs_impl / release_run_bindings_impl:
- *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
- *     are skipped)
- *   - Releases the run's leases. The slices are no-ops: the retained buffer
- *     outlives the run and is freed once at Worker finalization.
- */
+// WSE HBG prepares a Host graph, publishes its image, then launches homogeneous PEs.
+// Registration owns code; each bind owns arguments, leases and graph state.
+// Result delivery and resource release are separate lifecycle operations.
 
 #include <dlfcn.h>
 #include <stddef.h>
@@ -64,6 +42,7 @@
 
 #include "assert_compat.h"
 #include "wse_launch.h"
+#include "wse_dso.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
@@ -115,13 +94,7 @@ static_assert(
     "host-side C API codes must stay below the negation of every latched device code"
 );
 
-/**
- * Run-resource sets a kernel-mode context of this runtime declares.
- *
- * A separate number from the program declaration below: `simpler_kernel_mode_init`
- * validates this contract and discards it, so the two are independent
- * declarations rather than one capability read twice.
- */
+// Kernel-mode contract declaration; WSE validates but does not support kernel mode.
 static constexpr uint32_t kKernelPipelineDepth = 2;
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
@@ -180,41 +153,12 @@ extern "C" int joined_native_launch_supported_impl(void) {
 }
 
 extern "C" int joined_diagnostic_launch_supported_impl(void) {
-    // Every device owner this runtime admits can hold two runs open on it —
-    // which is the four other than the argument dump, whose request this
-    // runtime refuses below. Every producer stamps the run epoch its AICPU op
-    // was launched with onto the buffer it publishes, and settles that run's
-    // own accounting into the terminal bank its pipeline slot reserves, so the
-    // host tells the two apart by identity rather than by arrival order.
-    //
-    // Both AICPU routes bring those producers up and settle them: the legacy
-    // scheduler does it across its cold path and its dispatch exits, and the
-    // AICore-scheduler route does it across `AicoreLifecycle`'s own init and
-    // shutdown partitions. A run on either route therefore publishes a
-    // terminal of its own rather than leaving its accounting unreadable.
+    // DeviceRunner exposes no joined diagnostic launch through the runtime C ABI.
     return 1;
 }
 
 extern "C" int args_dump_capture_supported_impl(void) {
-    // No per-task argument capture on this runtime. Its route is the AICore
-    // Scheduler, where the on-core schedulers both dispatch tasks and reap
-    // their completions, so no AICPU thread holds a task's own boundaries and
-    // `dump_args_for_task` has no instant to run at. The two instants an AICPU
-    // thread does own are the run's, and a read there is not that task's data:
-    // a consumer's input would carry the content from before its producer ran,
-    // and a buffer several tasks write in turn would report the last write as
-    // every one of their outputs.
-    //
-    // Zero for the runtime, not for a bind. The AICPU-scheduled fallback this
-    // runtime keeps is selected inside `create_scheduler_state` from the
-    // graph's own task kinds, and from nothing a caller states, so an answer
-    // that followed the selection would make the capture available or not
-    // depending on whether a graph happened to hold a task the resident route
-    // declines.
-    //
-    // `docs/investigations/2026-10-a5-resident-per-task-args-capture.md` is the
-    // design for a task-boundary producer here; the capability is deferred to
-    // its own change.
+    // WSE has no task-boundary argument-dump producer.
     return 0;
 }
 
@@ -414,18 +358,8 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
         *task_capacity = override_value;
     }
 
-    // Any positive count is usable: a task ref indexes its slot directly, so no slot
-    // lookup masks with this value. The power-of-two, >= 4 requirement belongs to
-    // tensormap_and_ringbuffer, which does mask there, and is enforced in that
-    // runtime's own resolve; neither the RuntimeEnv setter nor Worker.run constrains
-    // the value, so this bound is the only one a ring_task_window passes through.
-    //
-    // The upper bound is the one place a task id IS masked: a sub-task's id carries
-    // its modular task's local id in a fixed-width parent field, and that mint masks
-    // rather than fails, so a count past the field would truncate a parent silently.
-    // The shared-memory limit below is the tighter of the two in practice -- a slot
-    // costs kilobytes, so INT32_MAX bytes runs out first -- which makes this a guard
-    // that should never be the one to fire rather than a cap anyone meets.
+    // HBG indexes task slots directly, so any positive capacity is valid.
+    // The parent-ID bit width and shared-memory byte limit bound the maximum.
     if (*task_capacity < 1 || *task_capacity > static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM)) {
         LOG_ERROR(
             "ring_task_window=%" PRIu64 " must be in [1, %d]: a modular task's local id has to fit the parent field "
@@ -477,59 +411,15 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 
 namespace {
 
-// host_build_graph is host-orchestration-first: the HOST dlopens the
-// orchestration .so and runs it to completion. Every cross-task reference the
-// shared memory and arena carry is an offset or an index from its own block, so
-// the image the device schedules is the bytes the host wrote — there is nothing
-// to fix up after the H2D copy.
-
-bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
-    size_t total = 0;
-    while (total < size) {
-        ssize_t w = write(fd, data + total, size - total);
-        if (w <= 0) {
-            return false;
-        }
-        total += static_cast<size_t>(w);
-    }
-    return true;
-}
-
-// Materialize the orchestration .so bytes to a temp file so it can be dlopen'd
-// on the host (dlopen needs a real path + the exec bit).
-bool create_orch_so_tempfile(const uint8_t *data, size_t size, std::string *out_path) {
-    char tmpl[] = "/tmp/orch_so_XXXXXX";
-    int fd = mkstemp(tmpl);
-    if (fd < 0) {
-        return false;
-    }
-    if (fchmod(fd, 0755) != 0) {
-        close(fd);
-        unlink(tmpl);
-        return false;
-    }
-    bool ok = write_all_bytes(fd, data, size);
-    if (close(fd) != 0) {
-        ok = false;
-    }
-    if (!ok) {
-        unlink(tmpl);
-        return false;
-    }
-    *out_path = tmpl;
-    return true;
-}
+// Host orchestration builds the graph; copied image references are offsets or indices.
 
 // The orchestration .so exports these (submit_task form).
 typedef void (*OrchestrationEntryFunc)(const ChipTaskArgs &);
 typedef void (*OrchestrationBindFunc)(OrchContext *);
 typedef void (*OrchestrationFinishFunc)();
 
-// Resolved orchestration .so entry points. register_callable_impl allocates one
-// of these (the entry, plus the .so's own framework_bind_orch_context, which sets
-// the .so-private context pointer its inline rt_submit_* read) and stores its
-// pointer in CallableArtifacts::host_orch_func_ptr. Owned for the callable's
-// lifetime alongside host_dlopen_handle.
+// Registration owns these resolved entries and their DSO for the callable lifetime.
+// The bind entry sets the context used by the DSO's inline orchestration API.
 struct HostOrchEntryPoints {
     OrchestrationEntryFunc entry{nullptr};
     OrchestrationBindFunc bind{nullptr};
@@ -543,23 +433,16 @@ struct HostOrchEntryPoints {
 // an index from its own block. The bytes the host wrote are therefore the bytes
 // the device schedules, with no on-device or pre-copy pointer fixup.
 
-// What the Definition pass copied to the device: the distinct objects, the bytes
-// of the one block holding them (inter-object alignment padding included), and how
-// many of them the recorders could not build in the block, so that this pass had to
-// copy them in. The object count is smaller than the run's Graph task count, which exceeds it
-// by the replay factor — one Definition serves every task with its key.
+// Counts distinct Definition objects and packed bytes, including alignment.
+// Replay can create more Graph tasks than Definitions; fallback objects require copying.
 struct DefinitionUploads {
     size_t count;
     uint64_t bytes;
     size_t spilled;
 };
 
-// Prepare the run's Definition objects and bind every outer Graph task to the one
-// with its key. The recorders built most or all of them in place in the block's
-// host staging, each as [GraphDefinitionHeader][Definition image] at the offset it
-// claimed, so this pass writes the headers, copies in whatever did not fit, and
-// records the used prefix for synchronous publication. Device initial classify
-// replaces each task's graph_context with an execution constructed in its own heap.
+// Bind each outer Graph task to its Definition. Recorders build into retained staging;
+// headers and fallback objects are copied before the used prefix is published.
 bool bind_graph_definitions(
     Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
     ReadyQueuePopulations *ready_queue_populations, NativeGraphHostPlan *native_plan, int32_t total_tasks
@@ -1041,21 +924,11 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
     const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
 
-    // One host source for one copy: the copied zone and shared-memory image at
-    // exactly the offsets they occupy on the device.
-    // Over-allocated and rounded up because every segment offset is
-    // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
-    // vector's data() is not.
+    // The copied zone and shared-memory segments share one CHIP_ALIGN_SIZE-aligned image.
     const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
     const uint64_t upload_bytes = copied_bytes + image_bytes;
-    // Assembled in staging the runner retains rather than in a buffer that dies
-    // with this frame: publication is a separate step, so the bytes have to still
-    // be here when it reads them. Over-allocated by the alignment the layout
-    // needs, and handed over uninitialized: what this bind writes are the copied
-    // zone and the live segments `compact_live_image` emits, so the alignment gaps
-    // between segments carry whatever the block last held. No device code reads a
-    // gap — every reader indexes a segment through the layout — which is what makes
-    // clearing the whole block per bind unnecessary rather than merely expensive.
+    // Per-slot staging outlives bind because publication is separate.
+    // Only live segments are initialized and copied; no consumer reads alignment gaps.
     void *staging_addr = nullptr;
     if (api->acquire_run_image_staging(static_cast<size_t>(upload_bytes), CHIP_ALIGN_SIZE, &staging_addr) != 0 ||
         staging_addr == nullptr) {
@@ -1132,13 +1005,8 @@ int32_t run_host_orchestration(
     // only the fixed-size header here; the per-slot segments are initialized in
     // orch::prepare_task and shipped bounded to total_tasks below.
     const sm_layout::SegmentOffsets sm_segs = sm_layout::segment_offsets(task_capacity);
-    // The mirror belongs to the runner, one per pipeline slot, and lives past the
-    // bind that writes it: at the configured task capacity it is tens of MB, far
-    // above the block size glibc recycles, so a per-bind buffer costs an mmap and
-    // an munmap per bind. Nothing carries over inside it — the header is cleared
-    // here, and the prefix of each segment that ships is one this bind wrote. The
-    // layout needs CHIP_ALIGN_SIZE: every segment offset is a multiple of it and
-    // ChipTaskSlotState is alignas(64).
+    // Per-slot retained Host mirror, aligned to CHIP_ALIGN_SIZE. Each bind clears the header
+    // and initializes every live segment prefix it publishes; earlier bytes do not carry over.
     void *host_sm = nullptr;
     if (api->acquire_sm_mirror(static_cast<size_t>(sm_size), CHIP_ALIGN_SIZE, &host_sm) != 0 || host_sm == nullptr) {
         LOG_ERROR("host-orch: host SM mirror of %" PRIu64 " bytes unavailable", sm_size);
@@ -1184,12 +1052,8 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    // The recorders build their Definition objects straight into the retained
-    // staging block, so it is claimed before orchestration starts and at whatever
-    // capacity the previous bind left behind — the run's real total is not known
-    // until every recording has ended. What does not fit is built in its own
-    // buffer and copied by the upload, which then grows the block, so the arena
-    // reaches a run's high-water mark within one bind of needing it.
+    // Recorders use retained Definition staging; overflow objects are built separately.
+    // Publication grows staging and copies those objects, reaching the run's high-water mark.
     GraphDefinitionArena definition_arena{};
     definition_arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
     definition_arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
@@ -1233,19 +1097,11 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     orch_ctx.tensor_access = &tensor_access;
-    // Binds the orchestration .so's own framework_current_orch_context, which its
-    // inline rt_submit_* read. The host library links a same-named copy from
-    // orchestration/common.cpp, but nothing outside the .so includes
-    // orchestration_api.h, so nothing reads that one — rt_scope_* and
-    // rt_orchestration_done take the context as an argument.
+    // Bind the orchestration DSO's context used by inline rt_submit_* calls.
     entry_points->bind(&orch_ctx);
 
-    // What the .so holds for this bind is released when this function leaves, by whichever
-    // path: the state it covers -- the Graph Config registry today -- is paired with
-    // graph_state below, which is a local of this function and dies the same way. The
-    // bound context is one of them: orch_ctx is a local of this frame, so the .so's
-    // global may not outlive it. Unbinding after finish() keeps the context reachable
-    // for whatever the .so still does there.
+    // Finish the DSO's per-bind state on every exit, then unbind the stack-owned context.
+    // The context remains reachable until finish returns.
     RAIIScopeGuard orch_finish([entry_points]() {
         if (entry_points->finish != nullptr) entry_points->finish();
         entry_points->bind(nullptr);
@@ -1265,11 +1121,8 @@ int32_t run_host_orchestration(
     }
     rt_orchestration_done(&orch_ctx);
 #if SIMPLER_ORCH_PROFILING
-    // Per-sub-step cumulatives across this bind's submits. The accumulators only
-    // exist in a SIMPLER_ORCH_PROFILING build (build_runtimes.py --profiling-orch 1),
-    // and reading them also resets them, so this is the bind's own total. Emitted
-    // as spans rather than LOG_INFO because INFO is suppressed at the default log
-    // level. Like the phase spans these are summed cost shares, not intervals.
+    // Profiling reads reset these per-bind accumulators. Spans represent summed cost shares,
+    // not overlapping time intervals, and remain visible when INFO logs are disabled.
     {
         const OrchProfilingData prof = orchestrator_get_profiling();
         const std::pair<const char *, uint64_t> steps[] = {
@@ -1355,16 +1208,8 @@ int32_t run_host_orchestration(
     // is one the segments are actually pitched to.
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.total_tasks = total_tasks;
 
-    // The device reads no task slot past total_tasks, so only that prefix of each
-    // segment has to travel. In the mirror the orchestrator wrote, the four
-    // prefixes are a whole task_capacity apart, which would make the upload four
-    // copies of a few hundred kilobytes each — and at these sizes a copy_to_device
-    // is priced by the call, not by the bytes.
-    //
-    // So the prefixes are restacked into an image pitched to total_tasks, where
-    // they are contiguous, and that image goes up as one copy. The device attaches
-    // with the same pitch, which is sound because a task ref is its own slot index:
-    // every ref is below total_tasks and indexes the image directly.
+    // Only live task prefixes are compacted, pitched to total_tasks and copied together.
+    // Every task ref directly indexes that same pitch and is below total_tasks.
     const uint64_t nt = static_cast<uint64_t>(total_tasks);
     // What this bind actually put in the pools. The orchestrator's cursors are the
     // exact populated extent of each one — no scan of the mirror is needed, and the
@@ -1379,23 +1224,9 @@ int32_t run_host_orchestration(
     const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
     runtime->dev.sm_image_bytes = image_bytes;
 
-    // Only now are both sizes known, so this is where the two device regions are
-    // committed: the arena up to its shared-memory tail, and the graph heap to the
-    // bytes orchestration actually handed out. setup_static_arena commits per
-    // region and short-circuits a request an existing one already covers, so a
-    // repeated workload pays for neither twice and the heap is grow-only across a
-    // Worker's binds.
-    // The compact shared-memory image is the only per-run tail in the device
-    // arena. GraphExecution is initialized later in each outer Graph heap.
-    // A graph whose every output is caller-owned allocates nothing, but its tasks
-    // still carry the window's base as their zero-length packed buffer, so the
-    // region has to exist for that address to be rebasable. Asking for 0 would
-    // release it and leave acquire_pooled_gm_heap with nothing to return.
-    //
-    // Rounded up to the region's base alignment: the committed span then ends on the
-    // same boundary it starts on, so an access at the tail of the last packed buffer
-    // stays inside the region even when its width exceeds the bytes that buffer
-    // asked for.
+    // Commit grow-only arenas after orchestration determines image and heap sizes.
+    // Even caller-owned outputs need a nonzero heap base for zero-length packed views.
+    // Round capacity to base alignment so tail accesses remain within the committed span.
     const uint64_t heap_bytes = CHIP_ALIGN_UP(
         std::max<uint64_t>(orchestrator.task_allocator.heap_used_bytes(), CHIP_ALIGN_SIZE),
         DeviceArena::kDefaultBaseAlign
@@ -1457,16 +1288,8 @@ int resume_host_plan(Runtime *runtime, const HostApi *api, const std::shared_ptr
 
 }  // namespace
 
-/**
- * Stage the per-callable resources (kernel binaries + orchestration SO) into
- * CallableArtifacts for subsequent per-run binding. Nothing here depends on
- * per-run argument values, so registration runs once per callable_id.
- *
- * @param callable  ChipCallable carrying the orch SO + child kernel binaries
- * @param api       Context-bound platform operations used during registration
- * @param out       Callable-owned artifacts retained across runs
- * @return 0 on success, -1 on failure
- */
+// Registration retains kernel binaries and the Host orchestration DSO across runs.
+// No per-run arguments are consumed; returns zero on success.
 extern "C" int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
@@ -1506,12 +1329,8 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
     out->func_name = callable->func_name();
     out->config_name = callable->config_name();
 
-    // host_build_graph host-orch: dlopen the orchestration .so ON THE HOST and
-    // resolve its entry symbol now. The handle is held across the prepared
-    // callable's lifetime (closed by DeviceRunner::unregister_callable via
-    // host_dlopen_handle); bind_callable_to_runtime_impl invokes the resolved
-    // entry per run. This is what makes the host-side dlopen observable
-    // (host_dlopen_count) while the AICPU never dlopens the orch .so.
+    // Registration loads Host orchestration once; bind invokes its resolved entry per run.
+    // The handle lives until callable unregistration or Worker finalization.
     {
         const char *orch_func_name = callable->func_name();
         if (orch_func_name == nullptr || orch_func_name[0] == '\0') {
@@ -1519,7 +1338,9 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         std::string so_path;
-        if (!create_orch_so_tempfile(orch_so_binary, orch_so_size, &so_path)) {
+        if (!simpler::common::sim_host::create_temp_so_file(
+                "/tmp/orch_so_XXXXXX", orch_so_binary, orch_so_size, &so_path
+            )) {
             LOG_ERROR("host-orch: failed to materialize orchestration .so");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
@@ -1557,11 +1378,8 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
             dlclose(handle);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        // The recorder pool is the runtime's, one per process, so this is a plain call
-        // rather than a symbol in the .so just loaded: it parks the prewarmed workers and
-        // stands each one's recording storage up, and a later registration finds the pool
-        // already warm. Failing here fails registration, where the caller can act on it,
-        // instead of abandoning a recording mid-bind.
+        // Prewarm the process-wide recorder pool during registration; failure refuses the callable
+        // before any bind starts recording a Graph.
         if (!graph_recorder_prewarm()) {
             LOG_ERROR("host-orch: could not park the graph recorder pool");
             dlclose(handle);
@@ -1583,28 +1401,11 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
     return 0;
 }
 
-/**
- * The A5 host_build_graph AICore scheduler dispatches from resolved kernel-entry
- * addresses it reads out of the registration-owned entry table, so registration
- * builds that view alongside the object one.
- */
+// WSE PE dispatch uses registration-owned resolved kernel entry addresses.
 extern "C" bool runtime_uses_callable_entry_table_impl() { return true; }
 
-/**
- * Per-run binding: build device-side argument storage (tensor copy-out, GM
- * heap, shared memory) and publish it to the runtime. Assumes the
- * callable-side state (kernel binaries, orch SO bytes, func/config names)
- * is already populated by register_callable_impl.
- *
- * Splitting this from register_callable_impl matches the per-callable_id
- * design: register/simpler_run invokes this every call, while the prep
- * half runs only once per callable_id.
- *
- * @param runtime    Pointer to the per-run Runtime
- * @param api        Context-bound platform operations for this run
- * @param orch_args  Separated tensor/scalar arguments for this run
- * @return 0 on success, -1 on failure
- */
+// Bind arguments and prepare graph storage against registration-owned callable entries.
+// Returns zero on success; publication and output delivery are separate operations.
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
@@ -1690,24 +1491,11 @@ extern "C" int bind_callable_to_runtime_impl(
     // by the caller's Runtime, and this is where it starts empty.
     runtime->tensor_leases().clear();
 
-    // No scheduler is selected until this bind selects one. Without this, a bind
-    // that fails before it reaches a selection would leave the previous run's
-    // mode and its base — naming an allocation this bind may already have freed —
-    // in the descriptor the next launch uploads. The handshake words the platform
-    // zeroes in prepare_launch_shape give the same guarantee for their half.
+    // Clear scheduler bootstrap before bind can fail or free a predecessor's allocation.
     runtime->publish_scheduler_bootstrap(0, 0);
 
-    // The retained temporary buffer is always used on the hbg path — it is an
-    // internal allocation optimization, not user-facing config. The buffer
-    // lives on the runner across runs, one per pipeline slot; here we grow it
-    // to this run's packed size and bump-slice from it. A run holds its
-    // pipeline slot from bind through validate and a concurrent reservation is
-    // admitted only on a distinct slot, so no other run can re-slice this
-    // buffer while these slices are live.
-    //
-    // Inside the args span: growing the buffer is the only device allocation
-    // this phase can make, so a steady-state workload reporting no allocation
-    // cost here is a measurement rather than a definition.
+    // Retained input backing is grow-only and owned by the pipeline slot.
+    // The run holds the slot through result validation; other reservations use distinct slots.
     const BindPhaseMark args_phase = bind_phase_begin();
     RetainedTempBump bump;
     const size_t required_temp_bytes = packed_temp_bytes(orch_args);
@@ -1756,13 +1544,8 @@ extern "C" int bind_callable_to_runtime_impl(
             return PTO_RUNTIME_ERR_INTERNAL;
         }
 
-        // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no copy-in — the
-        // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are copied in H2D. The copy happens here
-        // rather than in copy_in_run_inputs_impl because the orchestrator below
-        // runs on the host and reads these tensors while it builds the graph;
-        // that function documents what makes the earlier copy sound.
+        // OUTPUT has no copy-in; IN/INOUT must be copied before Host orchestration reads them.
+        // The bind and its input bytes belong to exactly one run.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
         bool needs_copy_in = !is_pure_output;
         if (needs_copy_in) {
@@ -1774,12 +1557,8 @@ extern "C" int bind_callable_to_runtime_impl(
             h2d_bytes += static_cast<uint64_t>(size);
             ++h2d_tensors;
         }
-        // Read-only INPUT tensors are never written by the kernel, so there is
-        // no point copying them back D2H at the end. Index the signature
-        // by the orch tensor index `i` (device-space tensors are skipped above
-        // but do not consume a separate signature slot — scalars follow the
-        // tensor entries). Anything not provably IN keeps the safe default of
-        // copying back.
+        // Skip copy-back only for proven IN arguments. Signature indices remain the original
+        // tensor indices, including DEVICE tensors; scalars follow the tensor entries.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
         runtime->tensor_leases().push_back(
             {host_ptr, dev_ptr, size, needs_copy_in, needs_copy_back, TensorReleaseKind::BufferNoop}
@@ -1801,15 +1580,9 @@ extern "C" int bind_callable_to_runtime_impl(
         record_bind_phase(HostPhaseKind::BindArgs, args_phase, attrs);
     }
 
-    // Lay out the per-Worker static device arena. The GM heap and the prebuilt
-    // runtime arena are two independent pooled device allocations, and neither is
-    // committed here: the arena's size is known only once orchestration has
-    // submitted its tasks, and the heap's only once orchestration has allocated
-    // its intermediate buffers. Both are committed by the single
-    // setup_static_arena in run_host_orchestration. Owned by DeviceRunner across
-    // runs — do NOT record in tensor_leases(); the free is deferred to
-    // DeviceRunner::finalize(). The runtime-arena size is determined by replaying
-    // the reserve sequence on a host-side arena.
+    // The runner owns pooled heap and runtime arenas across binds; finalization releases them.
+    // Orchestration measures their sizes before setup_static_arena commits them.
+    // These pools are not per-run tensor leases.
     uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
 
     const BindPhaseMark arena_build_phase = bind_phase_begin();
@@ -1853,22 +1626,13 @@ extern "C" int bind_callable_to_runtime_impl(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     runtime_wire_arena_pointers(host_arena, layout, rt);
-    // Stash the layout inside the RuntimeContext image so the AICPU can recover every
-    // arena-internal offset after the copy. It is written before orchestration
-    // because orchestration assembles the image this header is part of, and the
-    // publication uploads what it assembled. The runtime arena's device base does
-    // NOT travel — it is on the host Runtime (set_prebuilt_arena below), since the
-    // AICPU needs that pointer before it can dereference the image.
+    // Store arena offsets before orchestration assembles its execution image.
+    // The arena base is carried by the Host Runtime, outside that image.
     rt->prebuilt_layout = layout;
     record_bind_phase(HostPhaseKind::BindRuntimeInit, runtime_init_phase);
 
-    // host_build_graph host-orch: run the orchestrator on the host now, against
-    // a host SM mirror, and ship the populated SM to the device. The arena
-    // (copied to the device below) carries the scheduler state; the orchestrator
-    // itself stays on the host, and the device boots scheduler-only.
-    // register_callable_impl guarantees host_orch_func_ptr is non-null on success
-    // (it fails the whole prepare otherwise), so this is an assertion-style
-    // guard, not a fallback path.
+    // Run Host orchestration against its mirror and build the PE execution image.
+    // Registration guarantees a nonnull Host entry; absence is an error, not a fallback.
     if (host_orch_func_ptr == nullptr) {
         LOG_ERROR("host-orch: orchestration entry points were not resolved");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1902,11 +1666,8 @@ extern "C" int bind_callable_to_runtime_impl(
     return 0;
 }
 
-/**
- * Consume this run's metadata in dependency order, synchronously.
- * A failed copy stops publication and consumes the remaining sources. Device
- * destinations remain owned until the failed-prepare cleanup releases them.
- */
+// Publish metadata in dependency order. Failure consumes remaining sources;
+// destination ownership ends only during failed-prepare cleanup.
 extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     if (runtime == nullptr || api == nullptr) {
         LOG_ERROR("publish_run_image_impl: null runtime or HostApi");
@@ -1932,11 +1693,7 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         // the pool counters had to travel.
         const uint64_t image_bytes = runtime->dev.sm_image_bytes;
         const uint64_t copied_bytes = publication.bytes - image_bytes;
-        // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first. `dest` leads instead, because the
-        // range a run published into is what tells two runs' images apart, and it
-        // is the one field a truncated tail must not lose.
+        // Put dest before the eight counters so truncation cannot hide the publication address.
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),
@@ -1957,25 +1714,11 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     return 0;
 }
 
-/**
- * Stage one run's inputs. A no-op for this runtime.
- *
- * host_build_graph runs its orchestrator on the host during bind, and that
- * orchestrator reads the input tensors it was given while it builds the graph,
- * so the bytes have to be in place before orchestration rather than after it —
- * `bind_callable_to_runtime_impl` copies them there. What makes that sound is
- * that a bind serves exactly one run: the graph this bind materializes carries
- * the values it read, so the bytes and the graph belong to the same run.
- */
+// Inputs are already staged before Host orchestration during bind.
+// This bind and its graph belong to one run, so no separate copy-in is required.
 extern "C" int copy_in_run_inputs_impl(const Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
 
-/**
- * Release the tensor bindings the bind recorded, and end this run's claim on
- * the scheduler state it published.
- *
- * Its own entry rather than the tail of the copy-back, so that reading a run's
- * results and retiring the device memory behind them are separately orderable.
- */
+// Release run-owned tensor bindings and scheduler bootstrap independently of output delivery.
 extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
     if (runtime == nullptr || api == nullptr) {
         LOG_ERROR("release_run_bindings_impl: null runtime or HostApi");
@@ -1987,30 +1730,13 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
     runtime->clear_prepared_publication();
     release_run_tensor_leases(runtime, api);
     runtime->publish_scheduler_bootstrap(0, 0);
-    // The dispatch table is owned by bind_callable_to_runtime, which clears it
-    // before replaying the active callable's addresses. The chip-callable device
-    // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
-    // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
-    // same callable repeatedly does not re-upload.
+    // Each bind clears and repopulates the dispatch table from retained callable entries.
+    // Registration backing stays pooled until unregistration or finalization.
     return 0;
 }
 
-/**
- * Inspect one run's results.
- *
- * This function:
- * 1. Reads the device-side runtime status when the run failed on the device
- * 2. Copies written tensors from device back to host
- *
- * It releases nothing; `release_run_bindings_impl` ends the bindings it reads.
- *
- * @param runtime       Pointer to Runtime
- * @param execution_rc  Device-runner drain status after successful enqueue,
- *                      or enqueue status on failure
- * @param launched      Nonzero when this run reached a stream, and its
- *                      device-side status is therefore readable
- * @return 0 on success, -1 on failure
- */
+// Read device status only after launch and copy back written tensors.
+// This function releases nothing; release_run_bindings_impl retires its storage.
 extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
     if (runtime == nullptr && execution_rc == 0) {
         LOG_ERROR("Runtime pointer is null");
