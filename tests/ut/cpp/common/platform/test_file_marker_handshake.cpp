@@ -191,3 +191,68 @@ TEST(FileMarkerHandshakeTest, FailedAtomicPublishLeavesNoVisibleMarker) {
     EXPECT_FALSE(std::filesystem::exists(path));
     EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
 }
+
+TEST(FileMarkerHandshakeTest, FinalReleaseObservesAbort) {
+    HandshakeDirectory directory;
+    const std::string root = directory.rootinfo_path();
+    const std::string failure = root + ".failed";
+    ASSERT_TRUE(file_marker_handshake::publish_marker(failure));
+    const auto result = file_marker_handshake::release_after_cleanup(
+        root, 1, 2, 7, {std::chrono::milliseconds(20), std::chrono::milliseconds(1), failure}
+    );
+    EXPECT_EQ(result.error, file_marker_handshake::Error::ABORTED);
+    EXPECT_EQ(result.stage, file_marker_handshake::Stage::RELEASE_WAIT);
+}
+
+TEST(FileMarkerHandshakeTest, FinalReleasePublishFailureNotifiesOtherFollowers) {
+    HandshakeDirectory directory;
+    const std::string root = directory.rootinfo_path();
+    const std::string failure = root + ".failed";
+    const auto blocked = file_marker_handshake::release_path(root, 7, 1);
+    std::filesystem::create_directory(blocked);
+    const file_marker_handshake::WaitOptions options{
+        std::chrono::milliseconds(20), std::chrono::milliseconds(1), failure
+    };
+    const auto result = file_marker_handshake::release_after_cleanup(root, 0, 3, 7, options);
+    EXPECT_EQ(result.error, file_marker_handshake::Error::MARKER_WRITE_FAILED);
+    EXPECT_TRUE(std::filesystem::exists(failure));
+    const auto follower = file_marker_handshake::release_after_cleanup(root, 1, 3, 7, options);
+    EXPECT_EQ(follower.error, file_marker_handshake::Error::ABORTED);
+    const auto healthy_follower = file_marker_handshake::release_after_cleanup(root, 2, 3, 7, options);
+    EXPECT_EQ(healthy_follower.error, file_marker_handshake::Error::ABORTED);
+    EXPECT_TRUE(std::filesystem::is_regular_file(file_marker_handshake::release_path(root, 7, 2)));
+}
+
+TEST(FileMarkerHandshakeTest, FinalCleanupFailureNotifiesFollowers) {
+    HandshakeDirectory directory;
+    const std::string root = directory.rootinfo_path();
+    const std::string failure = root + ".failed";
+    std::filesystem::create_directory(root);
+    { std::ofstream(std::filesystem::path(root) / "keep") << "not empty"; }
+    const file_marker_handshake::WaitOptions options{
+        std::chrono::milliseconds(20), std::chrono::milliseconds(1), failure
+    };
+    const auto result = file_marker_handshake::release_after_cleanup(root, 0, 2, 7, options);
+    EXPECT_EQ(result.error, file_marker_handshake::Error::CLEANUP_FAILED);
+    EXPECT_TRUE(std::filesystem::exists(failure));
+    const auto follower = file_marker_handshake::release_after_cleanup(root, 1, 2, 7, options);
+    EXPECT_EQ(follower.error, file_marker_handshake::Error::ABORTED);
+}
+
+TEST(FileMarkerHandshakeTest, FailureSurvivesCleanupWithoutAbortingNextGeneration) {
+    HandshakeDirectory directory;
+    const std::string root = directory.rootinfo_path();
+    const std::string failure = file_marker_handshake::failure_path(root, 7);
+    ASSERT_TRUE(file_marker_handshake::publish_failure(failure));
+    ASSERT_TRUE(file_marker_handshake::publish_failure(failure));
+    ASSERT_TRUE(file_marker_handshake::cleanup(root).ok());
+    const auto old_result = file_marker_handshake::release_after_cleanup(
+        root, 1, 2, 7, {std::chrono::milliseconds(20), std::chrono::milliseconds(1), failure}
+    );
+    EXPECT_EQ(old_result.error, file_marker_handshake::Error::ABORTED);
+    const file_marker_handshake::WaitOptions next_options{
+        std::chrono::milliseconds(20), std::chrono::milliseconds(1), file_marker_handshake::failure_path(root, 8)
+    };
+    ASSERT_TRUE(file_marker_handshake::release_after_cleanup(root, 0, 2, 8, next_options).ok());
+    EXPECT_TRUE(file_marker_handshake::release_after_cleanup(root, 1, 2, 8, next_options).ok());
+}

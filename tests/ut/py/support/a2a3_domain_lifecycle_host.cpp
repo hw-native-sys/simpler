@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <sys/mman.h>
 
 #include <cassert>
@@ -21,14 +22,23 @@
 
 namespace {
 bool fail_host_unlink = false;
+bool fail_host_reserve = false;
+int reserve_host_window(int fd, off_t offset, off_t size);
 int unlink_host_window(const char *path);
 }  // namespace
 
 #define shm_unlink unlink_host_window
+#define posix_fallocate reserve_host_window
 #include "comm_hccl.cpp"
+#undef posix_fallocate
 #undef shm_unlink
 
 namespace {
+int reserve_host_window(int fd, off_t offset, off_t size) {
+    if (fail_host_reserve) return ENOSPC;
+    return posix_fallocate(fd, offset, size);
+}
+
 int unlink_host_window(const char *path) {
     if (fail_host_unlink) {
         errno = EACCES;
@@ -267,6 +277,7 @@ static void test_host_registration_lifecycle(const std::string &scenario) {
     size_t mapped = 0;
     const uint32_t ranks[] = {0, 1};
     fail_host_register = fail_init;
+    fail_host_reserve = scenario == "host_reserve_failure";
     const uint32_t mask = sdma ? comm_workspace_bit(CommWorkspaceKind::SDMA) : 0;
     // A2/A3 has no URMA engine, so any non-default engine configuration is rejected.
     const CommWorkspaceConfig urma_config{2, 0};
@@ -277,7 +288,7 @@ static void test_host_registration_lifecycle(const std::string &scenario) {
     );
     const int rc =
         comm_alloc_host_domain_windows(h.get(), 1, ranks, h->nranks, 0, size, mask, name.c_str(), &ctx, &base, &mapped);
-    if (fail_init || collision) {
+    if (fail_init || fail_host_reserve || collision) {
         assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && registered_hosts.empty());
         assert(comm_abort_domain_windows(h.get(), 1, 2, 0) == 0);
     } else {
@@ -387,7 +398,7 @@ static void test_host_cleanup_failure_notifies_peer(const std::string &scenario)
             failed.get(), 1, ranks, 2, failed_rank, size, 0, name.c_str(), &ctx, &base, &mapped
         ) == 0
     );
-    const auto old_failure = barrier_marker_path(root, 1, "a3_host_cleanup_failed", 0);
+    const auto old_failure = file_marker_handshake::failure_path(root, 1);
     assert(file_marker_handshake::publish_marker(old_failure));
     assert(!host_cleanup_failed(peer.get()));
     auto device_domain = std::make_unique<DomainAllocation>();
@@ -438,6 +449,8 @@ static void test_host_cleanup_failure_notifies_peer(const std::string &scenario)
             peer.get(), 3, ranks, 2, peer_rank, size, 0, name.c_str(), &ctx, &base, &mapped
         ) == COMM_RECLAMATION_UNCONFIRMED
     );
+    assert(std::filesystem::remove(old_failure));
+    assert(std::filesystem::remove(host_cleanup_failure_path(peer.get())));
     assert(file_marker_handshake::cleanup(root).ok() && rmdir(folder.c_str()) == 0);
 }
 
@@ -456,7 +469,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (scenario == "host_register_failure" || scenario == "host_unregister_failure" ||
-        scenario == "host_borrow_sdma" || scenario == "host_name_collision") {
+        scenario == "host_borrow_sdma" || scenario == "host_name_collision" || scenario == "host_reserve_failure") {
         test_host_registration_lifecycle(scenario);
         return 0;
     }

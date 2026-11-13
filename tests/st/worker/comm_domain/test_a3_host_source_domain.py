@@ -134,7 +134,7 @@ def _build_sdma_callable(platform):
     ],
 )
 def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejected domain lifecycles
-    st_platform, st_device_ids, sdma, depth, tmp_path, monkeypatch, drain_host_log
+    st_platform, st_device_ids, sdma, depth, tmp_path, monkeypatch, drain_host_log, capsys
 ):
     if sdma:
         log_dir = tmp_path / "ascend"
@@ -186,6 +186,8 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
         worker.init()
         if sdma and 0 in capabilities:
             _assert_host_sdma_rejected(worker, request, st_device_ids[:2], capabilities)
+            with capsys.disabled():
+                print(f"Host SDMA unsupported ({capabilities}); rejection verified, no numeric transfer", flush=True)
             return
         scratch = worker.create_buffer(nbytes) if sdma else None
 

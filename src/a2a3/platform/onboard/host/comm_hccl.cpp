@@ -1157,7 +1157,7 @@ extern "C" void dma_workspace_release(void *handle) {
 
 static std::string host_cleanup_failure_path(CommHandle h) {
     if (h->nranks < 2 || h->rootinfo_path.empty()) return {};
-    return barrier_marker_path(h->rootinfo_path, h->run_token, "a3_host_cleanup_failed", 0);
+    return file_marker_handshake::failure_path(h->rootinfo_path, h->run_token);
 }
 
 static bool host_cleanup_failed(CommHandle h) {
@@ -1168,11 +1168,7 @@ static bool host_cleanup_failed(CommHandle h) {
 static void publish_host_cleanup_failure(CommHandle h) noexcept try {
     const auto path = host_cleanup_failure_path(h);
     if (path.empty()) return;
-    // Existence is the entire message. Any rank can publish it once.
-    const int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd >= 0) {
-        close(fd);
-    } else if (errno != EEXIST) {
+    if (!file_marker_handshake::publish_failure(path)) {
         LOG_WARN("[comm rank %d] Host cleanup failure marker could not be published: errno=%d", h->rank, errno);
     }
 } catch (...) {
@@ -1566,10 +1562,10 @@ static bool map_host_domain_window(DomainAllocation &owner, uint32_t rank, const
     const auto size = static_cast<off_t>(owner.host_window_size);
     if (create) {
         owner.host_shm_owned = true;
-        if (ftruncate(fd, size) != 0) {
-            const int error = errno;
+        const int error = posix_fallocate(fd, 0, size);
+        if (error != 0) {
             close(fd);
-            LOG_ERROR("Host domain: ftruncate for window %u failed: errno=%d", rank, error);
+            LOG_ERROR("Host domain: posix_fallocate for window %u failed: error=%d", rank, error);
             return false;
         }
     } else {
@@ -2060,7 +2056,7 @@ extern "C" int comm_destroy(CommHandle h) try {
     // communicator resource needed by rank 0's teardown.
     if (destroy_handshake.ok()) {
         const auto destroy_release =
-            file_marker_handshake::release_after_cleanup(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+            file_marker_handshake::release_after_cleanup(h->rootinfo_path, h->rank, h->nranks, h->run_token, options);
         if (!destroy_release.ok()) {
             LOG_WARN(
                 "[comm rank %d] comm_destroy: final release failed during %s for rank %d", h->rank,

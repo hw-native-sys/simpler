@@ -149,6 +149,10 @@ def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_re
     [
         "host_local",
         "host_urma",
+        "host_urma_unsupported",
+        "host_peer_prepare_failed",
+        "host_ready_publish_failed",
+        "host_aiv_preflight_failed",
         "host_urma_config",
         "host_coexist",
         "host_register",
@@ -158,6 +162,8 @@ def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_re
         "host_collision",
         "host_invalid",
         "host_unregister",
+        "host_unregister_abort",
+        "host_unregister_destroy",
     ],
 )
 def test_host_domain_backing_and_native_failure_ownership(host_resource_binary, scenario):

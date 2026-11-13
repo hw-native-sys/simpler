@@ -90,6 +90,7 @@ def test_a2a3_mapped_owner_needs_no_explicit_access_grant(a2a3_lifecycle_binary,
 @pytest.mark.parametrize(
     "scenario",
     [
+        "host_reserve_failure",
         "host_register_failure",
         "host_unregister_failure",
         "host_borrow_sdma",
