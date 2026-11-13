@@ -26,9 +26,9 @@ header 的前 64 B 包含本执行可变字段，以及 Host 初始化后保持�
 
 ## 3. 内部上下文
 
-`LocalContext` 保持 48 B，已有 slab 上下文保持 40 B，`DispatchPayload.args` 起点保持 64，完整 payload 保持 512 B。48 B `GlobalContext` 的 resident 字段提供当前执行的稳定完成记录地址与身份；`async_present` 只表示这个 dispatch 是否带 resident 上下文，不是跨 runtime 的注册协议版本。`async_output_capture_refused` 表示参数诊断请求了不能在异步完成前读取的输出；每次 resident dispatch 清零，命中诊断限制时设置，并由 kernel 注册入口拒绝。
+`LocalContext` 仅保留 8 B 的逻辑 block 信息；旧 40 B slab 上下文与 `src_payload` 已删除。`DispatchPayload.args` 起点保持 64，完整 payload 保持 512 B。48 B `GlobalContext` 的 resident 字段提供当前执行的稳定完成记录地址与身份；`async_present` 只表示这个 dispatch 是否带 resident 上下文，不是跨 runtime 的注册协议版本。`async_output_capture_refused` 表示参数诊断请求了不能在异步完成前读取的输出；每次 resident dispatch 清零，命中诊断限制时设置，并由 kernel 注册入口拒绝。
 
-旧调度路径仍使用原 slab；resident 路径使用稳定 group。二者由当前 dispatch 填入的上下文决定，公开登记函数不要求调用方选择或重写接口。
+A5 HBG 的公开登记函数只使用当前 dispatch 的稳定 resident group。缺少 group 时返回失败且不访问 GM，不保留 slab fallback；A2A3/WSE 与 A5 TMR 的活跃 slab 属于各自执行器。活跃 kernel 使用的通用范围发布接口保留；`defer_flush(ctx)` 仅写回当前 resident group，封口与 join 仍由 executor 负责。
 
 有效 resident `AsyncCtx` 的 `completion_count`、`completion_error_code`、`completion_entries` 和 `completion_capacity` 直接映射该 group 的真实存储，支持既有前端对登记区的检查；不另分配 slab，也不构造虚假的 `task_token`。`async_ctx_is_deferred()` 判断上下文身份、布局及 OPEN 状态，首个登记错误不使这个身份失效。后续登记与封口独立检查并保留首错，重复获取上下文不能清空已有条件或将溢出改写成其他错误。
 

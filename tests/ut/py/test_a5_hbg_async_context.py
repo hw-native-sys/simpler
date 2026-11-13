@@ -61,6 +61,6 @@ def async_context_binary(tmp_path_factory):
 
 
 @pytest.mark.parametrize("scenario", range(37))
-def test_kernel_context_preserves_resident_and_legacy_boundaries(async_context_binary, scenario):
+def test_kernel_context_preserves_resident_and_absent_group_boundaries(async_context_binary, scenario):
     result = subprocess.run([str(async_context_binary), str(scenario)], check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

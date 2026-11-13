@@ -59,7 +59,7 @@ inline __aicore__ bool register_pto_async_event(
             return false;
         }
         if (ctx.completion_error_code != nullptr && *ctx.completion_error_code != 0) return false;
-        return ctx.resident_enabled == 0 || pto2::resident::finish_reservation(ctx.resident, reservation, 0);
+        return pto2::resident::finish_reservation(ctx.resident, reservation, 0);
     }
     const uint32_t count = event.CompletionRecordCount(session);
     if (count == 0 || count > record_limit) {
@@ -80,12 +80,10 @@ inline __aicore__ bool register_pto_async_event(
             defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
             return false;
         }
-        const bool registered = ctx.resident_enabled != 0 ?
-                                    pto2::resident::commit_condition(ctx.resident, reservation, token) :
-                                    register_completion_condition(ctx, token);
+        const bool registered = pto2::resident::commit_condition(ctx.resident, reservation, token);
         if (!registered) return false;
     }
-    return ctx.resident_enabled == 0 || pto2::resident::finish_reservation(ctx.resident, reservation, count);
+    return pto2::resident::finish_reservation(ctx.resident, reservation, count);
 }
 
 }  // namespace pto2::detail

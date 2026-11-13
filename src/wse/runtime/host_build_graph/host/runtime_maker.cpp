@@ -1032,7 +1032,6 @@ int32_t run_host_orchestration(
     storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
-    orch_ctx.rt = rt;
     RAIIScopeGuard retained_storage_return([&storage, &orchestrator]() {
         storage.swap_storage(orchestrator);
     });
@@ -1120,6 +1119,7 @@ int32_t run_host_orchestration(
         rt_scope_end(&orch_ctx);
     }
     rt_orchestration_done(&orch_ctx);
+    rt->inline_completed_tasks = orchestrator.inline_completed_tasks;
 #if SIMPLER_ORCH_PROFILING
     // Profiling reads reset these per-bind accumulators. Spans represent summed cost shares,
     // not overlapping time intervals, and remain visible when INFO logs are disabled.

@@ -279,8 +279,7 @@ EXECUTING 覆盖 kernel 和返回收尾，直到本核退休检查通过。退�
 | 字段 | 作用 |
 | ---- | ---- |
 | `function_bin_addr` | 将要间接调用的 kernel 入口；0 表示此次跳过函数调用 |
-| `local_context` | 本次逻辑 block 信息 |
-| `src_payload` | 另一套 early-dispatch 协议字段；当前 resident own payload 执行不轮询它 |
+| `local_context` | 8 B，本次逻辑 block 信息；不含 slab/token |
 | `args[50]` | tensor 描述符指针、scalar 值和末尾两个 context 指针 |
 | `global_context` | 当前物理 AIV lane 与 resident async 执行身份 |
 
@@ -306,7 +305,6 @@ tensor 槽保存的是 Tensor 描述符地址，不是直接把数据 buffer 地
 | ---- | ---- |
 | `LocalContext.block_idx` | 当前任务逻辑 block 序号 |
 | `LocalContext.block_num` | 当前任务全部逻辑 block 数，多波执行仍保持总数 |
-| `LocalContext.async_ctx` | legacy ABI 字段，不属于 resident 路径，此处不展开 |
 | `GlobalContext.sub_block_id` | MIX 中当前 AIV 的物理左右 lane：0/1 |
 | `GlobalContext.async_present` | 是否附带有效 resident async writer 身份 |
 | `GlobalContext.async_image_address / async_image_bytes` | async 所在 image 的基址/范围 |

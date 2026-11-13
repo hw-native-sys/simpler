@@ -226,7 +226,7 @@ there is no runtime header or device-only prefix before it.
 | compact task image | shared-memory header, live task storage and argument/dependency pools | exclusive pipeline slot; one retained staging source and one image publication |
 | resident scheduler backing | run control, worker contexts, ready queues, native graph image, dispatch payloads and optional async/diagnostic state | independent scheduler storage; published before the task image |
 | graph heap | per-run task buffers and Graph execution argument/storage tails | independent pooled allocation; task addresses rebased before publication |
-| Host orchestration context | `RuntimeContext`, `OrchContext`, `OrchestratorState` and borrowed scratch | Host only; never published |
+| Host orchestration context | `OrchContext`, `OrchestratorState` and borrowed scratch | Host only; never published |
 
 A5 does not reserve, wire or initialize the common arena's `SharedMemoryHandle`,
 `SchedulerState`, AICPU ready/early/sync/dummy/graph queues or completion mailbox.
@@ -235,11 +235,11 @@ starts from `scheduler_bootstrap` and the report/READY lifecycle; workers receiv
 resident contexts through that bootstrap, independently of the task image base.
 A2A3 and WSE still use the common full arena lifecycle for their active executors.
 
-The host-local `RuntimeContext` lives until the orchestration callback and its
-recorders have joined. Its inline-completion scalar is bookkeeping for the common
-orchestration API; the A5 scheduler plan derives completed nodes from the host
-SM. A retained prepare plan stores callback results, leases and diagnostic sources,
-so a resource-wait retry needs neither this stack object nor a second callback.
+A5 orchestration needs no RuntimeContext. Its plan derives completed nodes from
+the host SM. A retained prepare plan stores callback results, leases and diagnostic
+sources, so a resource-wait retry needs no second callback. The full-arena
+initializer and mailbox are built only for A2A3/WSE; their makers explicitly copy
+the orchestrator's inline-completion count into their device RuntimeContext.
 Commit attaches to the populated host mirror at its reservation pitch without
 resetting its task count or execution header. This also holds across resource-wait
 retries. The slot's staging remains alive until launch publication or failed-prepare cleanup.
@@ -556,6 +556,13 @@ immutable lines.
 Each worker owns two GM DispatchPayload slots and their core-local bookkeeping.
 Ordinary, SPMD and GM MIX execution reuse these same slots. The worker prepares
 its own payload, publishes local readiness, executes it, and directly retires it after execution. The scheduler does not reserve or use cluster SSBUF.
+
+LocalContext holds only logical block geometry (8 bytes). GlobalContext holds
+physical lane and resident async addressing (48 bytes). The fixed suffix at
+args[48]/args[49] names those contexts. There is no source-payload gate, task-token
+or slab in the A5 dispatch ABI. Args remain at offset 64 and GlobalContext at 464;
+the 64-byte aligned DispatchPayload stride remains 512 bytes. Kernel registration
+uses only the resident async group; absence of that group rejects registration.
 
 Each slot's embedded context pointers are initialized in the host-created
 payload image. Dispatch updates `block_idx` and `block_num` for the current

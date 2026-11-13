@@ -10,7 +10,7 @@
 
 本轮 `gm_sm_ptr` 直接指向 pooled runtime arena 起点，`sm_image_bytes` 就是紧凑任务镜像长度。
 该 arena 没有旧 SchedulerState、AICPU ready/early/sync 队列、completion mailbox 或 RuntimeContext 前缀。
-Host 编排的 RuntimeContext 只在 Host；设备通过独立的 `scheduler_bootstrap` 找到 resident backing，
+Host 编排直接使用 OrchContext/OrchestratorState；设备通过独立的 `scheduler_bootstrap` 找到 resident backing，
 再按 worker context 的 offset 找到 run control、ready pool、payload 与 async 数据。
 launch descriptor 的 prebuilt arena 字段保持空/0；AICPU 不 attach/wire 旧 runtime arena。
 

@@ -13,7 +13,8 @@
 
 #include <cstdint>
 
-#include "scheduler/scheduler.h"
+#include "host_build_graph/shared_arena_layout.h"
+#include "host_build_graph/runtime_types.h"
 
 struct ReadyQueuePopulations {
     uint64_t ready[NUM_RESOURCE_SHAPES]{};

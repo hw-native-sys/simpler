@@ -21,6 +21,7 @@ BUILD_CONFIG = {
             "host",
             f"{SHARED}/host",
             f"{SHARED}/shared",
+            f"{SHARED}/full_arena",
         ],
     },
     "orchestration": {

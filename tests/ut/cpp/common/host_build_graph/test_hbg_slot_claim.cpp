@@ -25,7 +25,6 @@
 #include "graph_execution.h"
 #include "graph_image_view.h"
 #include "graph_host_state.h"
-#include "scheduler/scheduler.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
 #include "utils/device_arena.h"
@@ -34,11 +33,8 @@
 class HbgSlotClaimTest : public ::testing::Test {
 protected:
     DeviceArena sm_arena;
-    DeviceArena runtime_arena;
     SharedMemoryHandle *sm_handle = nullptr;
     OrchestratorState orch{};
-    SchedulerState sched{};
-    SchedulerLayout sched_layout{};
     GraphHostStatePtr graph_state;
     std::vector<char> gm_heap;
     // Stands in for a bind's retained staging: the Definition objects are built
@@ -53,11 +49,6 @@ protected:
         ASSERT_NE(sm_handle, nullptr);
         gm_heap.resize(HEAP_BYTES + 63);
 
-        sched_layout = SchedulerState::reserve_layout(runtime_arena);
-        ASSERT_NE(runtime_arena.commit(), nullptr);
-
-        ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
-        sched.wire_arena_pointers(sched_layout, runtime_arena);
         void *heap = reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(gm_heap.data()) + 63) & ~uintptr_t{63});
         ASSERT_TRUE(orch.init(sm_handle->sm_base, heap, HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
 
@@ -75,8 +66,6 @@ protected:
     void TearDown() override {
         orch.graph_host_state = nullptr;
         graph_state.reset();
-        sched.destroy();
-        runtime_arena.release();
         sm_arena.release();
     }
 

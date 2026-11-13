@@ -515,11 +515,6 @@ inline __aicore__ bool percounter_prepare_subtask(
         SchedulerGraphResult::OK) {
         return false;
     }
-    if (cfg.profile != nullptr) {
-        const TaskId token = task.shell < 0 ? TaskId::make_global(static_cast<int32_t>(task.id)) :
-                                              TaskId::make_sub_task(task.shell, task.local);
-        TaskId::assign(payload->local_context.async_ctx.task_token, token);
-    }
     payload->local_context.block_idx = block_idx;
     payload->local_context.block_num = block_num;
     payload->global_context.sub_block_id = subtask_slot == 2 ? 1 : 0;
@@ -564,10 +559,11 @@ inline __aicore__ bool percounter_run_prepared(
     OUT_OF_ORDER_STORE_BARRIER();
     if (cfg.profile != nullptr) {
         const uint64_t end_time = get_sys_cnt_aicore();
+        const TaskId token = task.shell < 0 ? TaskId::make_global(static_cast<int32_t>(task.id)) :
+                                              TaskId::make_sub_task(task.shell, task.local);
         chip_swimlane_aicore_commit_task_record(
-            record, payload->local_context.async_ctx.task_token,
-            cfg.profile->cached_buf_seq * PLATFORM_AICORE_BUFFER_SIZE + cfg.profile->slot_within_buf, receive_time,
-            start_time, end_time
+            record, token, cfg.profile->cached_buf_seq * PLATFORM_AICORE_BUFFER_SIZE + cfg.profile->slot_within_buf,
+            receive_time, start_time, end_time
         );
         if (cfg.profile->slot_within_buf == PLATFORM_AICORE_BUFFER_SIZE) {
             chip_swimlane_aicore_publish_task_count(cfg.profile);

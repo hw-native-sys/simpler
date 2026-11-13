@@ -19,7 +19,7 @@
 #include "async_kernel_api.h"
 #include "sdma_completion_registration.h"
 #include "sdma_submission_guard.h"
-#include "aicore_completion_mailbox_types.h"
+#include "host_build_graph/completion_types.h"
 #include "common/platform_config.h"
 #include "host_build_graph/runtime_status.h"
 
@@ -45,7 +45,6 @@ public:
     SdmaSubmissionScope &operator=(const SdmaSubmissionScope &) = delete;
 
     inline __aicore__ bool acquire(AsyncCtx &ctx) {
-        if (ctx.resident_enabled == 0) return true;
         guard_ = resident::sdma_submission_guard(ctx.resident, static_cast<uint32_t>(get_block_idx()));
         if (guard_ == nullptr) return false;
         const uint64_t start = get_sys_cnt();
@@ -130,15 +129,12 @@ inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> Sdma
 
 // SDMA overload of the runtime's send_request_entry. Submits the descriptor
 // to PTO-ISA, then registers the resulting AsyncEvent's GM post-done records into the
-// AsyncCtx deferred-wait slab and flushes. Returns false on submit/session
+// resident async group. Returns false on submit/session
 // failure (also records the error in ctx.completion_error_code).
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 static inline __aicore__ bool
 send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
-    if (!async_ctx_is_deferred(ctx) ||
-        (ctx.resident_enabled == 0 && (ctx.completion_count == nullptr || ctx.completion_entries == nullptr ||
-                                       (ctx.completion_error_code != nullptr && *ctx.completion_error_code != 0))))
-        return false;
+    if (!async_ctx_is_deferred(ctx)) return false;
     uint64_t source_bytes = 0;
     uint64_t destination_bytes = 0;
     if ((desc.op != SdmaOp::TGET && desc.op != SdmaOp::TPUT) ||
@@ -158,14 +154,8 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
 
     const uint32_t record_limit = session.cfg.sdma.queueNum;
     pto2::resident::AsyncReservation reservation{};
-    if (ctx.resident_enabled != 0) {
-        reservation = pto2::resident::reserve_conditions(ctx.resident, record_limit);
-        if (reservation.serial == 0) return false;
-    } else if (record_limit == 0 || *ctx.completion_count > ctx.completion_capacity ||
-               record_limit > ctx.completion_capacity - *ctx.completion_count) {
-        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
-        return false;
-    }
+    reservation = pto2::resident::reserve_conditions(ctx.resident, record_limit);
+    if (reservation.serial == 0) return false;
 
     pto::comm::AsyncEvent event;
     if (desc.op == SdmaOp::TGET) {
@@ -179,6 +169,5 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
-    pto2::detail::defer_flush(ctx);
     return registered;
 }

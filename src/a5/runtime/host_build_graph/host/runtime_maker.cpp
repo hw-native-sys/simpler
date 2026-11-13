@@ -462,6 +462,12 @@ __attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
     return SchedulerExtensionResult::DECLINED;
 }
 
+// Host packing and device readers share these fixed task-image offsets.
+static_assert(sizeof(ChipTaskStorage) == SCHEDULER_GRAPH_TASK_STORAGE_STRIDE);
+static_assert(offsetof(ChipTaskStorage, task) == SCHEDULER_GRAPH_DESCRIPTOR_OFFSET);
+static_assert(offsetof(ChipTaskStorage, payload) == SCHEDULER_GRAPH_PAYLOAD_OFFSET);
+static_assert(offsetof(TaskPayload, predicate) == SCHEDULER_GRAPH_PREDICATE_OFFSET);
+
 namespace {
 
 // The swimlane JSON's own schema key. Spelled out here rather than inline so a
@@ -2016,8 +2022,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
 }
 
 int32_t run_host_orchestration(
-    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt, uint64_t sm_size,
-    uint64_t task_capacity, void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
+    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, uint64_t sm_size, uint64_t task_capacity,
+    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
 ) {
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
@@ -2057,7 +2063,6 @@ int32_t run_host_orchestration(
     storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
-    orch_ctx.rt = rt;
     RAIIScopeGuard retained_storage_return([&storage, &orchestrator]() {
         storage.swap_storage(orchestrator);
     });
@@ -2115,7 +2120,6 @@ int32_t run_host_orchestration(
     orch_bind_ops(&orch_ctx);
     orchestrator.total_cluster_count = block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM;
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
-    rt->mode = MODE_EXECUTE;
     // Host get/set operates only on explicit HOST/NONE arguments. Uploaded
     // arguments and runtime outputs are DEVICE tensors and cannot be read here.
     const auto *entry_points = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
@@ -2675,11 +2679,6 @@ extern "C" int bind_callable_to_runtime_impl(
     api->get_retained_temp_buffer(&plan->staging_backing, &staging_capacity);
     runtime->set_orch_args(device_args);
 
-    // Only the host orchestration API reaches this context. The device consumes
-    // the compact task image and the independent scheduler bootstrap.
-    RuntimeContext rt{};
-    rt.mode = MODE_EXECUTE;
-
     // host_build_graph host-orch: run the orchestrator on the host now, against
     // a host SM mirror. Commit stages the compact task image and resident state
     // for the launch-owned publication.
@@ -2694,7 +2693,7 @@ extern "C" int bind_callable_to_runtime_impl(
         ChipTaskArgs orch_l2;
         orch_l2.create_from_entry_storage(runtime->get_orch_args());
         int32_t total_tasks = run_host_orchestration(
-            runtime, api, tensor_access, &rt, sm_size, task_capacity, host_orch_func_ptr, orch_l2, *plan
+            runtime, api, tensor_access, sm_size, task_capacity, host_orch_func_ptr, orch_l2, *plan
         );
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();

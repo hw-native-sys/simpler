@@ -56,6 +56,7 @@ BUILD_CONFIG = {
             "runtime",
             f"{SHARED}/device",
             f"{SHARED}/shared",
+            f"{SHARED}/full_arena",
         ],
     },
     "host": {
@@ -64,6 +65,7 @@ BUILD_CONFIG = {
             "host",
             f"{SHARED}/host",
             f"{SHARED}/shared",
+            f"{SHARED}/full_arena",
         ],
     },
     "orchestration": {

@@ -8,6 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 #pragma once
 
-#include "../../../../a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h"
+#include "host_build_graph/completion_types.h"
+#include "host_build_graph/full_arena/deferred_completion_slab.h"

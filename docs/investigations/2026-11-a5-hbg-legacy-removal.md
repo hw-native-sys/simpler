@@ -32,7 +32,7 @@ hardware task IDs and failure comparisons.
   and cleanup outcome. PMU settlement requires ownership established by this run.
 
 The shared arena allocation is removed in the follow-up described below. The
-512-byte kernel dispatch/context ABI remains for separate cleanup. A2A3 HBG, A5 TMR and the active percounter extension remain
+kernel context cleanup below completes removal of the obsolete A5 scheduler stack. A2A3 HBG, A5 TMR and the active percounter extension remain
 supported.
 
 ## Compact task-image arena follow-up
@@ -42,8 +42,8 @@ stops reserving the common full arena. The task image occupies offset zero of th
 pooled runtime allocation: request size, `sm_image_bytes` and publication length
 are equal, and publication targets `gm_sm_ptr`. No SchedulerState, ready queue,
 completion mailbox, SM wrapper or copied RuntimeContext header precedes it.
-Host orchestration uses a local RuntimeContext; retained retries store their
-callback result independently. Commit attaches the populated host mirror without
+Host orchestration uses OrchContext and OrchestratorState directly; retained retries
+store their callback result independently. Commit attaches the populated host mirror without
 resetting its task count or execution header. Native boundary addresses, ordinary storage
 addresses and protocol source mapping all use the compact image base.
 
@@ -66,6 +66,50 @@ with 12 normal tests passing (one simulator-only skip) and both cross-run epoch
 reuse nodes passing in a separate submission. The admission trimming test injects
 one explicit allocation refusal instead of depending on the arena's size.
 Historical results below apply only to #3064.
+
+## Obsolete scheduler and kernel context cleanup
+
+After #3071 merged, the A5 build no longer includes the old AICPU SchedulerState,
+mailbox or async wait-list implementation. The active A2A3/WSE full-arena initializer
+and mailbox live under `src/common/host_build_graph/full_arena/`, selected by their
+build configurations. Shared Host orchestration and queue-capacity POD types no
+longer include a concrete device scheduler. A2A3/WSE makers explicitly carry the
+inline-completion count into their device RuntimeContext.
+
+A5 LocalContext contains only logical block geometry (8 bytes). DispatchPayload
+has no source-payload gate or embedded legacy slab/token context. Its argument
+array stays 64-byte aligned at offset 64; GlobalContext remains 48 bytes at offset
+464, and the slot stride stays 512 bytes. All current producers and consumers,
+including percounter, are rebuilt together. No historical-object reader is kept.
+Percounter derives L1 task identity from the selected task when committing the
+record, preserving global and Graph-child attribution without storing an async token.
+
+The kernel async API uses the resident group exclusively. Its existing completion
+aliases address real group storage. An absent group rejects registration without
+touching GM; invalid epochs/layouts and unsafe output capture retain fail-closed
+and first-error behavior. SDMA reservations and synchronous TPUT completion use
+the same resident writer. Address-based kernels retain generic range publication;
+context publication writes back the current resident group without sealing it. The 32-byte completion-entry format, 320-byte common
+task storage, resident ready/control queues and retirement protocol remain active.
+Shared Host tests retain both architectures; AICPU queue/wait-list tests target
+A2A3 and the independent A5 TMR mailbox test targets TMR.
+
+Validation uses the #3071 merge base `3bcaf8d4f` plus this cleanup, with
+Ascend950DT_9581, CANN 9.3.0 and the repository-pinned PTO-ISA. HBG/percounter
+and the independent A5 TMR production builds passed; A2A3 HBG and WSE production
+compilation also passed. Static hooks and strict MkDocs passed. A5 IR scanning
+completed 16/16 HBG/percounter device TUs with zero findings. Symbol inspection
+found no old SchedulerState/full-arena/mailbox implementation in the built A5
+HBG/percounter Host or AICPU libraries.
+
+Five task-submit jobs passed 43 cases with one existing simulator-only skip:
+normal/Graph/shape/trace 31, async capacity/last-condition/epoch reuse 7, peer SDMA
+3, percounter L1 rotation/repeated-run 1 and deferred-wait data visibility 1.
+Six DSV4.1 wait adapters also passed A5 kernel compilation. The Chinese record contains task IDs.
+This is directed validation, not full hardware CI or a new fault-acceptance result.
+No local CPU/simulator functional tests were run. Workload compilation was warmed
+outside allocations; plain probes also invoke the compiler cache from their test
+entry points. No size or latency gain is inferred from source deletion.
 
 ## Execution-removal validation on 2026-11-13
 

@@ -134,11 +134,6 @@ a5_hbg_case(test_hbg_gm_mix_startup.cpp
 # Drives the real orchestrator submit path.
 a5_hbg_case(test_hbg_submit_poison.cpp ORCH)
 
-# Incremental activation inits a real SchedulerState (ready queues), so it links
-# the scheduler and shared runtime out-of-line members.
-a5_hbg_case(test_graph_activation.cpp
-    SOURCES ${HBG_SHARED_RUNTIME_SOURCES})
-
 a5_hbg_case(test_hbg_report_epoch.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)

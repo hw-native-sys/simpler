@@ -1,7 +1,7 @@
 # A5 HBG legacy 调度路径移除研究与实施边界
 
 研究日期为 2026-11-12，研究基线为 `ca27b263d5b6576b9f5dbd9050fa7b7ab6c53ff0`。
-状态：第一阶段已通过 #3064 合入主线（`e37461139e7e58dc57f3b8914d278494c76bddd7`）；第二阶段删除 A5 旧 shared arena 分配。第一阶段 A5DT 正常用例有通过结果，故障验收仍未通过。按用户要求不运行本地 CPU 验证。
+状态：第一阶段已通过 #3064 合入主线（`e37461139e7e58dc57f3b8914d278494c76bddd7`）；第二阶段 #3071 已合入（`3bcaf8d4f`）；当前整块删除余留 A5 旧调度栈和 kernel ABI 残留。第一阶段 A5DT 正常用例有通过结果，故障验收仍未通过。按用户要求不运行本地 CPU 验证。
 首次发布 rebase 到 `6c691bef8a1752aff34889b366204da36fe41701`，保留上游 scalar trace 所有权修复；
 该基线下 HBG/percounter 生产构建与完整提交静态检查通过。
 第一阶段后续 review 更新另随 upstream/main rebase；其历史上板数据早于这些更新，
@@ -137,8 +137,8 @@ prebuilt_arena_base = nullptr; prebuilt_runtime_offset = 0
 
 因此不分配旧 SchedulerState、early/ready/sync/dummy/graph 队列、completion mailbox
 或 SharedMemoryHandle 包装，也不分配或上传旧 RuntimeContext header。
-Host 编排临时使用栈上的 RuntimeContext；callback 与 recorder 收尾后即可销毁。
-资源等待重试保留的是任务镜像、native plan、leases 和诊断来源，不持有该栈对象。
+Host 编排直接使用 OrchContext/OrchestratorState，不再创建空的 RuntimeContext。
+资源等待重试保留任务镜像、native plan、leases、诊断来源与 callback 结果。
 commit 按原 reservation pitch attach 已建好的 Host mirror，不重新 init，保留 task count 与执行 header。
 共享 prepare owner 拆为不含 arena 的状态基类，以及供 A2A3/WSE 使用的带 arena 派生类。
 
@@ -149,7 +149,7 @@ compact/rebase 直接写 staging 起点；ordinary task storage、native boundar
 `BindArenaBuild/BindRuntimeInit`，`BindStaticArena.arena` 就是紧凑镜像大小。
 
 A2A3/WSE 的公共完整 arena 仍有活跃消费者，不能删除其布局和生命周期 API。
-percounter 编译 A5 maker，使用同一个无前缀镜像。kernel context/async ABI 留待单独修改。
+percounter 编译 A5 maker，使用同一个无前缀镜像。A2A3/WSE 显式编译 `common/host_build_graph/full_arena/`，旧 mailbox 也归到该目录；A5 构建不再包含这些实现。
 历史布局证据为[共享 RuntimeContext][runtime-context]、[arena 生命周期][shared-arena]和[Host 调用][host-arena]。
 
 shared `TaskPayload` 的 early-dispatch、staged masks 与 deferred 状态仍服务 A2A3。
@@ -161,8 +161,11 @@ A5 投影、reader、packing 与布局断言；本次不改变这些结构。
 
 当前 `DispatchPayload` 仍为 512 B，`args[48]`/`args[49]` 指向 LocalContext/GlobalContext。
 block_idx/block_num、physical AIV lane 与 resident async image/epoch/group 都有实际调用者。
-第一阶段不缩减该 ABI。`src_payload` 与 LocalContext 的 slab/token 字段后续清理时，
-必须同时更新 Host 初始化、resident 物化、kernel async accessor 和 percounter producer。
+当前删除 `src_payload` 和 LocalContext 中 40 B 的 legacy async/slab/token，LocalContext 仅保留 8 B block geometry。
+args 起点仍为 64，GlobalContext 仍为 48 B、偏移 464，64 B 对齐后的 payload 仍为 512 B。
+Host、resident、SDMA 与 percounter 同步迁移；percounter 在发布 L1 record 时由 task 的 shell/local/id 重建身份。
+kernel 登记仅使用 resident group，无 group 时拒绝登记且不访问 GM，保留 epoch/布局校验、首错、封口和输出抓取限制。
+旧 A5 SchedulerState、mailbox、wait-list 已删除；共享 Host 用例仍测两种架构，旧 AICPU 协议用例归 A2A3，独立 TMR mailbox 用例归 TMR。
 不为历史 `.o` 增加兼容读取，所有当前生产者与消费者按同一合同构建。
 
 percounter 直接编译 HBG 的 host/aicpu/runtime，并通过 scheduler 步骤替换默认实现。
@@ -266,7 +269,12 @@ bounded/native 故障验收的五个唯一 case 均失败。四个 AIV/MIX 用�
 现有 A5 HBG ordinary/native、AIC/AIV/MIX、sync_start、predicate、inline、async、
 args dump、profiling 与重复 run/reuse 功能都需要保持，不能用删除场景换取通过。
 
-第二阶段删除旧 shared arena 分配；后续单独精简 kernel context/async ABI。
+本轮验证基于 #3071 合并点 `3bcaf8d4f` 加当前改动，A5DT/CANN/PTO-ISA 与第二阶段一致。
+HBG/percounter、独立 A5 TMR 生产构建通过；A2A3 HBG/WSE 仅生产编译通过；静态 hooks、严格 MkDocs 通过，A5 IR 16/16 TU 零发现，四个 HBG/percounter Host/AICPU 库无旧 full-arena 调度符号。
+五个 task-submit 任务共 43 项通过、1 模拟器专用项跳过：`task_20261113_204352_22613465517`（设备 2，普通/Graph/shape/trace 31 passed/1 skipped）；
+`task_20261113_204609_240126732380`（设备 3，async 容量、最后条件、epoch 复用 7 passed）；`task_20261113_204614_240687818604`（设备 4/5，peer SDMA 3 passed）；`task_20261113_204524_23541065717`（设备 6，percounter L1 轮转与重复 run 1 passed）。
+`task_20261113_211054_377107531077`（设备 0，defer-wait 数据可见性 1 passed）；六个 DSV4.1 wait adapter 的 A5 编译也通过。
+编译预热在分配设备前完成，plain probe 的入口仍会调用编译缓存；未运行本地 CPU/模拟器功能验证，不代表全量 CI、故障验收或性能提升。
 空图 fast path 与性能优化另行依据证据决定。源码、生成代码或保留空间变小不自动意味着更快；
 应在相同设备和负载比较真实 bind/arena bytes、cold build 与 Device latency。
 当前运行合同另见 [runtime design](../../../src/a5/runtime/host_build_graph/docs/RUNTIME_LOGIC.md)、
