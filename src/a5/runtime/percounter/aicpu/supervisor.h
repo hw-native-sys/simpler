@@ -190,25 +190,18 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     uint32_t error_poll_count = 0;
     uint64_t error = 0;
     uint64_t outstanding = 0;
+    uint64_t settled = 0;
     while (true) {
         cache_invalidate_range(&control->completed_block_count, sizeof(control->completed_block_count));
         const uint64_t resolved = control->completed_block_count;
-        // Read after the block count, never before. A lane seals a deferred
-        // group before it counts the block that opened it, so a count that
-        // already includes that block was published after the seal and this
-        // read cannot miss the group. Reading the other order would let a run
-        // whose last task defers report success with its condition unmet.
-        cache_invalidate_range(
-            &control->async_outstanding, sizeof(control->async_outstanding) + sizeof(control->async_settled)
-        );
-        outstanding = control->async_outstanding;
-        const uint64_t settled = control->async_settled;
+        // The final block publication follows every registration allocation.
+        if (resolved >= expected || error_poll_count == 63) {
+            cache_invalidate_range(&control->async_registered, 2 * sizeof(uint64_t));
+            const uint64_t registered = control->async_registered;
+            settled = control->async_settled;
+            outstanding = registered - settled;
+        }
         const uint64_t now = get_sys_cnt_aicpu();
-        // Both terms here only rise, so a device still publishing deferred
-        // completions keeps refreshing the watchdog. `async_outstanding` stays
-        // out of the sum and gates the exit alone, for the reason
-        // `PercounterControl` gives: a term that falls as well as rises would
-        // refresh the watchdog on a device going nowhere.
         const uint64_t progress = resolved + settled;
         if (progress != last_progress) {
             last_progress = progress;

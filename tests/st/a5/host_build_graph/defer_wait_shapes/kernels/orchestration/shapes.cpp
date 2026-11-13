@@ -17,14 +17,17 @@ struct ShapeConfig : simpler::hbg::ConfigBase {
     int32_t mask;
     int32_t blocks;
     int32_t mode;
+    int32_t condition_capacity;
 
-    ShapeConfig(int32_t lanes, int32_t count, int32_t kind) :
+    ShapeConfig(int32_t lanes, int32_t count, int32_t kind, int32_t limit) :
         mask(lanes),
         blocks(count),
-        mode(kind) {}
-    uint64_t hash() const { return simpler::hbg::config_hash(mask, blocks, mode); }
+        mode(kind),
+        condition_capacity(limit) {}
+    uint64_t hash() const { return simpler::hbg::config_hash(mask, blocks, mode, condition_capacity); }
     bool operator==(const ShapeConfig &other) const {
-        return mask == other.mask && blocks == other.blocks && mode == other.mode;
+        return mask == other.mask && blocks == other.blocks && mode == other.mode &&
+               condition_capacity == other.condition_capacity;
     }
 };
 
@@ -34,7 +37,7 @@ void submit_shape(const simpler::hbg::Tensor &out, const ShapeConfig &config) {
     CoreTaskArgs initialize;
     initialize.add_output(state_info);
     initialize.add_no_dep(out);
-    initialize.add_scalar(0, config.mask, config.blocks, config.mode == 3 ? 1 : 0);
+    initialize.add_scalar(0, config.mask, config.blocks, config.mode == 3 ? 1 : 0, config.condition_capacity);
     const auto initialized = rt_submit_aiv_task(1, initialize);
     const auto state = initialized.get_ref(0);
     const TaskId init = initialized.task_id();
@@ -45,7 +48,7 @@ void submit_shape(const simpler::hbg::Tensor &out, const ShapeConfig &config) {
     };
     CoreTaskArgs waiter;
     waiter.add_no_dep(state, out);
-    waiter.add_scalar(1, config.mask, config.blocks, config.mode == 3 ? 1 : 0);
+    waiter.add_scalar(1, config.mask, config.blocks, config.mode == 3 ? 1 : 0, config.condition_capacity);
     waiter.set_dependencies(&init, 1);
     waiter.launch_spec.set_block_num(config.blocks);
     waiter.launch_spec.set_require_sync_start(config.mode == 2);
@@ -61,7 +64,7 @@ void submit_shape(const simpler::hbg::Tensor &out, const ShapeConfig &config) {
     const TaskId waiting = rt_submit_task(kernels, waiter).task_id();
     CoreTaskArgs publisher;
     publisher.add_no_dep(state, out);
-    publisher.add_scalar(2, config.mask, config.blocks, config.mode == 3 ? 1 : 0);
+    publisher.add_scalar(2, config.mask, config.blocks, config.mode == 3 ? 1 : 0, config.condition_capacity);
     publisher.set_dependencies(&init, 1);
     publisher.launch_spec.set_block_num(config.blocks);
     publisher.launch_spec.set_require_sync_start(config.mode == 2);
@@ -70,7 +73,7 @@ void submit_shape(const simpler::hbg::Tensor &out, const ShapeConfig &config) {
     CoreTaskArgs consumer;
     consumer.add_no_dep(state);
     consumer.add_output(out);
-    consumer.add_scalar(3, config.mask, config.blocks, config.mode == 3 ? 1 : 0);
+    consumer.add_scalar(3, config.mask, config.blocks, config.mode == 3 ? 1 : 0, config.condition_capacity);
     consumer.set_dependencies(&waiting, 1);
     (void)rt_submit_aiv_task(1, consumer);
 }
@@ -79,7 +82,7 @@ void graph_shape(const GraphTaskArgs &args, const ShapeConfig &config) { submit_
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 4};
+    return OrchestrationConfig{.expected_arg_count = 5};
 }
 
 extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
@@ -88,7 +91,7 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     const bool graph = args.scalar<int64_t>(2) != 0;
     const int32_t capacity = mask == 2 ? rt_available_aiv_count() : rt_available_cluster_count();
     const int32_t blocks = mode == 1 ? capacity + 1 : mode == 2 ? capacity : 1;
-    const ShapeConfig config{mask, blocks, mode};
+    const ShapeConfig config{mask, blocks, mode, static_cast<int32_t>(args.scalar<int64_t>(3))};
     const auto &out = args.tensor(0).ref();
     const uint32_t shape[]{64};
     for (int32_t instance = 0; instance < (graph ? 2 : 1); ++instance) {

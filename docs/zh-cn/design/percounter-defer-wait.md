@@ -1,408 +1,101 @@
-# percounter COUNTER defer_wait 设计
+# percounter defer completion
 
-本文定义 a5 `percounter` runtime 的 deferred completion 第一期：业务 kernel 登记
-COUNTER 条件后正常返回，lane 立刻去跑别的工作，任务的计数器要等条件满足才发布。
+A5 `percounter` 的 kernel 可以登记完成条件后返回。物理 lane 继续执行其他任务；
+逻辑任务及 Graph shell 的完成计数器，等待所有条件满足后才发布。
+用户接口沿用 `get_async_ctx`、`save_expected_notification_counter` 和
+`register_completion_condition`，无需预先声明 kernel 是否会 defer。
 
-本文规定待实现的行为与接口，不表示功能已交付。基础是现有的 per-lane 自调度、MIX
-rendezvous 与 sync-start cohort 协议；A5 HBG 的[异步完成设计](a5-hbg-async-completion.md)
-定义了同一套用户接口与条件语义，本文只记录 percounter 与之不同的部分。
+## 支持范围
 
-## 1. 范围
-
-| 范围 | 第一期 |
-| ---- | ------ |
-| 条件类型 | COUNTER（int32 单调通知）；一个 group 可含多条 |
-| 检查者 | 登记该 group 的 lane 自己（owner-only） |
-| 任务形状 | 普通 AIC/AIV、SPMD、MIX 掩码 3/5/6/7、sync-start cohort、Graph body |
-| 前端 | 既有 `save_expected_notification_counter` / `register_completion_condition` |
-| 错误 | 登记失败、条件非法、溢出、超时、lane 故障 |
-
-**不做**：SDMA post-done 条件与其提交互斥字、跨 lane 的共享检查、kernel 抢占与恢复、
-AICPU 侧条件轮询。第 7 节记录这些需要什么才能加上。
-
-### 1.1 现状缺陷
-
-percounter 的 aicore include 路径含 `{HBG}/runtime`，`async_kernel_api.h` 现在就能编译；
-而 `host/state.h` 只预填 `local_context.async_ctx.task_token = TaskId::invalid()`，
-`global_context.async_*` 全为零，`build_tables` 的 `memset` 覆盖整个 payload 数组，所以
-`completion_count` 确实是空指针。于是 `async_ctx_is_deferred()` 为假，而**后果取决于
-kernel 怎么写**：
-
-| kernel | 今天在 percounter 上的行为 |
-| ------ | -------------------------- |
-| PyPTO 生成的 waiter（自带检查，见 `tests/fdwic/.../combine_wait.cpp`） | slab 指针为空 ⇒ `trap()`，核故障，不说明原因 |
-| 直接用 runtime 自带的 `save_expected_notification_counter()` | 返回值被 `(void)` 丢弃 ⇒ **任务照常发布，消费者在数据落地前执行** |
-
-两种都不可接受，且都不指向 percounter 或 defer_wait。**运行时侧无法单独修好第二种**：
-登记失败时 kernel 什么也没写，设备上不留痕迹。所以"先堵住静默失败"不能作为独立一步，
-它与第 9 节的 S1 合并 —— 一旦每个 lane 有了真正的 group 记录，登记就会机械地成功并留下
-`count > 0`，percounter 在 kernel 返回后读到它，就能指名道姓地报错。
-
-## 2. 为什么 percounter 的延迟完成比 HBG 小一个量级
-
-percounter 发布完成就是两条原子加（`percounter_publish_completion`）：
-
-```cpp
-percounter_gm_fetch_add(cfg.counters[task.id].value, count);
-if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, count);
-```
-
-消费者 `percounter_fanin_ready` 读的就是这个字。计数器本身已经是一个 N 路 join —— 每个
-block / subtask 加自己那份，消费者判的是"达到预置总数"。**所以每个 deferred group 各自
-独立结算，不需要 join 对象、pending 计数或 FINISH owner 选举。**
-
-其次，percounter 已经把两件事分在不同的字上：
-
-| 语义 | 载体 | 延迟完成是否改变 |
-| ---- | ---- | ---------------- |
-| 这个 block 跑完了（进度、退出、看门狗） | `completed_block_count`、`sync_queue->completed`、`mix_tickets[DONE]` | **不变** |
-| 这个 task 的消费者可以跑了 | `counters[id].value` | **推迟** |
-
-cohort block 尤其如此：`sync_queue->completed` 必须仍在 kernel 返回处加，否则 cohort
-协议停滞，全设备等待一个已经执行完的 block。
-
-因此 HBG 的异步调度层在此处的对应物是：
-
-| HBG | percounter |
-| --- | ---------- |
-| `async_completion_types.h`、`aicore_completion_mailbox_types.h` 等线格式与记录布局 | 原样复用，不复制：后端写、两个运行时读 |
-| `SchedulerAsyncCompletionObserver` | 改为 `scheduler/async_completion.h` 的 `percounter_poll_completion`：同一套判定，去掉调度器的阶段埋点 |
-| `SchedulerAsyncLease` 与 CAS 租约 | 不需要：一个 group 只有 owner 一个检查者 |
-| `check_directory` / `finish_directory` 位图、`activity` | 不需要：owner 知道自己的 index |
-| `SchedulerAsyncTaskJoin`、`close_computation`、FINISH owner 选举 | 不需要：计数器就是 join |
-| `finish_leases`、`finish_progress`、`scheduler_async_copy_resolver` | 不需要：没有 ready queue 要路由 |
-| `task_map` / `task_data` | 不需要：group index 即 lane |
-
-上表第一行「原样复用」与第二行「改为私有」这条边界由 `tests/lint/check_percounter_fork_isolation.py` 守着：它走一遍 AICore 目标的 include 闭包，被 fork 掉的那三个 host_build_graph 头只要重新可达就报错，反向也不允许 percounter 之外的文件 include 本运行时的头。
-
-## 3. 数据布局
-
-### 3.1 group 按 lane 索引
-
-与 `DispatchPayload` 完全一致：一个 lane 同时只跑一个 kernel，也只拥有一个 payload。
-
-```cpp
-// host/region_plan.h，排在 counters 之后，与 mix / sync 的按需保留不同形
-!PERCOUNTER_RESERVE(
-    SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS, pto2::resident::AsyncGroupData, async_groups_offset
-) ||
-!PERCOUNTER_RESERVE(
-    SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry,
-    async_entries_offset
-)
-```
-
-**无条件保留，不按图开关。** 一个 kernel 会不会登记条件，bind 时看不出来 —— host 只知道
-kernel id，不知道函数体里有没有 `defer_wait`。记录正是"看出来"的手段，所以它必须对每张图
-都在。
-
-**排在 counters 之后**，于是整块落在 `upload_size` 之外：bind 不为它付任何 DMA，由每个
-lane 在进入自己的循环前写一次自己那条记录（`percounter_init_async_records`）。那次写必须
-带写回 —— 记录所在的存储是 pipeline slot 跨 run 复用的、`memset` 不覆盖的区域，而且一个
-在入口做整 cache 失效的 kernel 否则会读到上一次 bind 留下的字节。
-
-三条布局约束，由 `pto2::resident::detail::layout_valid` 强制：
-
-- entries 数组排在 groups 数组之后（`entries_offset >= group_offset + sizeof(AsyncGroupData)`）。
-- region 基址 64 对齐。`SCHEDULER_STATE_ALIGNMENT == 64 == ASYNC_RECORD_ALIGNMENT`，已成立。
-- 每条记录的 entry 跨距必须已经是 64 的倍数，否则按 `lane * 跨距` 寻址会落在非对齐处。
-  `PERCOUNTER_ASYNC_CAPACITY = 4` 时 `4 × 32 B = 128 B`，一条 static_assert 顶着。
-
-容量取 4 而**不取 `MAX_COMPLETIONS_PER_TASK = 64`**：记录是按 lane 而非按 task 的，所以这
-个上限要乘 108 再乘 slot 数付一遍，无论有没有 kernel 登记。4 时每 lane 每 slot 是 128 B 头部加
-128 B entries，全设备记录 27 KiB、entries 27 KiB；64 时 entries 变成 432 KiB，是旁边那个
-54 KiB payload 数组的八倍。
-
-**每 lane 不止一条记录（`PERCOUNTER_ASYNC_SLOTS = 2`），否则这个特性什么也不做。** 一条
-记录从开启它的那次 dispatch 一直活到条件满足，而 lane 在这期间照常跑别的任务 —— 那个间
-隔正是全部意义所在。那些任务需要自己的记录：拿到一条已封口记录的 kernel 根本登记不了，
-而运行时读回一条已结算但未释放的记录，会把一个什么都没登记的任务当成登记了而拒绝。换句
-话说，1 深不是"连续两个登记任务要排队"，是**任何下一个任务都撞车**。
-
-槽位满了的 lane 在下一次 dispatch 前等一个结算，这是槽数唯一被感觉到的地方。那个等待只轮询
-这个 lane 自己的条件：调用方已经提交了这次 dispatch，所以它不服务 MIX 也不服务 cohort（见
-4.3）。它看得见 EXIT 和别人的错误，并以看门狗收尾，所以是停顿不是挂死。2 是 COUNTER 用例
-需要的；加大只多一条记录加它的 entries，不改协议。
-
-### 3.2 寻址不额外碰任何 cache line
-
-`async_image_address` / `async_image_bytes` / `async_run_epoch` / `async_group_offset` /
-`async_group_index` / `async_present` 都在 `GlobalContext` 里，而 `GlobalContext` 落在
-`DispatchPayload` 的第 7 条 cache line —— 也就是 `sub_block_id` 所在那条，
-`percounter_launch_kernel` 每次 dispatch 本就在写、本就在
-`percounter_writeback_dispatch_payload` 里刷。**带 slot 维度、每次 dispatch 重写 group 地址，
-不增加任何脏行，也不增加任何 dcci。**
-
-**这一条成立，但它不等于零成本。** 实测在一张 4096 任务、无人登记的图上，这套机制让
-device wall 从 256.2 µs 涨到 274.0 µs（+5.6%，两组分布不重叠，同构建漂移 1.7%）。其中约
-三分之一来自 `percounter_async_seal` 读 `record->count` —— 每次 dispatch 开头的
-`percounter_observe_data_cache` 是整缓存失效，所以那条线必然是冷的。单独去掉这次读的对照是
-在它自己那一轮里测的，269.3 → 265.6 µs，和上面那对数不同轮，不能直接相减。**余下的部分
-尚未归因**，aicore 目标文件增大是候选而非证据。
-完整数据与方法见 `docs/investigations/2026-11-percounter-defer-wait-dispatch-overhead.md`。
-
-### 3.3 `PercounterControl` 的新字段
-
-只读字段放进现有 `reserved` 区（48 B 可用，需 32 B）：
-
-| 字段 | 含义 |
+| 项目 | 合同 |
 | ---- | ---- |
-| `async_run_epoch` | 非零；`AsyncWriter` 用它拒绝上一次 run 遗留的记录 |
-| `async_groups_offset` / `async_entries_offset` | 区域偏移，无条件保留，任何图上都非零 |
-| `async_capacity` | 每个 group 的条件上限 |
+| 任务形状 | 普通 AIC/AIV、SPMD、MIX 掩码 3/5/6/7、sync-start cohort、Graph body、dispatch predicate |
+| 每次 kernel 调用的条件数 | 0 到 4；超出时返回 `ASYNC_WAIT_OVERFLOW` |
+| COUNTER | 对齐的 int32 通知，非负阈值；负样本（含 `INT32_MIN`）保持 pending |
+| 其他可观察 token | SDMA event record 的单调阈值、CCU event 的消费式检查 |
+| 检查者 | 执行该 kernel 的 lane；AICPU 仅监督进度与终止 |
+| 用户要求 | kernel 返回后不再修改本次登记；通知必须有可推进的实际生产者 |
 
-两个跨核原子字**单独占一条 64 B 线**，不与 `completed_block_count` 共线，也不与只读字段
-共线 —— 与该字段注释记录的理由相同（`lane_error` 与它共线时 paged_attention Case1 每任务
-从 94 周期涨到 919）：
+SDMA 提交互斥字没有在本 runtime 中配置；能观察一个已有 token 不表示支持
+所有产生该 token 的提交接口。CPU 和设备共用当前记录格式，没有历史格式分支。
 
-| 字段 | 写 | 读 |
-| ---- | -- | -- |
-| `async_outstanding` | seal 时 +1，settle 时 −1 | `percounter_lane_may_exit` 的完成判据 |
-| `async_settled` | settle 时 +1，单调 | `percounter_lane_may_exit` 的进展量 |
+## 数据与资源
 
-两者分开的理由见第 6 节，这不是冗余。
+每个 lane 有一份固定的 `AsyncGroupData` 注册区和四个 `DeferredCompletionEntry`。
+Host 在每份 prepared payload 的 `GlobalContext` 中预填同一个 lane 的注册区地址、
+边界和 run epoch；设备启动时初始化注册区并写回。正常 dispatch 不改这些地址。
 
-## 4. 协议
+注册区只在一次 kernel 调用期间归该 kernel 使用。kernel 返回后，lane 读取登记状态：
+没有条件时，沿用同步完成；有条件时，先校验一次，再复制到独立的
+`PercounterAsyncCompletion`。复制和注册区复位都完成写回后，注册区可供下一次调用使用。
+后续条件检查不占用注册区，因此等待任务的数量不会阻止通知 kernel 执行。
 
-### 4.1 登记
+完成记录按本次图的实际 `(task, block, subtask)` 调用数预留，每条 192 字节。
+每次调用至多产生一条记录，因此即使所有调用都 defer，也不会因固定 per-lane 槽数耗尽而等待。
+Graph 的调用数来自每个实例的 body 形状；MIX 的每个活跃 subtask 单独计数。
+记录只在实际发生 defer 时分配和初始化；Host 上传前缀不包含这些记录。
 
-`percounter_launch_kernel` 增加入参 `bool may_defer` 和出参 `bool *deferred`。
+每条记录保存任务、shell、sink 标志、尚未满足的条件位图和条件副本。
+每个 lane 独占自己的链表，链接使用区域内的索引加一，零为空。
+无跨 lane 的条件记录访问或复用；条件满足时从链表摘除。
 
-**kernel 之前**：取一个空闲槽位，把 `global_context.async_group_offset` /
-`async_group_index` 指向它。**就这两条存储，不碰记录本身。**
+## 执行与发布
 
-原本设计的是"按任务上的一个位决定要不要开记录，开就重置头部并写回"。实现下来发现那个位
-拿不到 —— kernel 会不会登记在 bind 时不可见 —— 而**重置也不需要**：空闲记录本来就是重置
-过的。lane 启动时的初始化让它是，不登记的 dispatch 让它保持是，
-`percounter_async_settle` 把它放回去。两个端点之间唯一的写者是持有该槽位的 kernel，而没有
-dispatch 会去拿一个被持有的槽位。
+1. 参数准备、fanin 检查及谓词求值继续使用 prepared payload 协议。
+2. kernel 使用既有接口向固定注册区登记；kernel 返回的 store barrier 先于状态读取。
+3. 有条件时校验类型、对齐、阈值、保留字段、登记错误及未结束的 reservation。
+4. 分配完成记录、复制条件和发布目标、复位注册区，并完成相关 cache writeback。
+5. lane 在 checkpoint 轮询自己的链表。无 pending 记录时只检查本地空链表标记。
+6. 条件全部满足后补上本调用的完成份额；若是 body sink，同时补上 shell 的份额。
 
-于是**不登记的任务多付的就是那两条存储，落在 `global_context` 这条本来每次 dispatch 就要
-写、要刷的线上 —— 不多一条脏行，不多一次 dcci**。记录的 `task_ref` / `block_index` /
-`subtask_slot` 一直保持初始化时的零：它们是 `layout_valid` 的边界检查和 dump 的读物，运行时
-对一次登记做的任何事都不从它们取值，因为 lane 发布用的是自己解析出来的 task。
+COUNTER 的 pending 检查只做一次 GM 样本读取和有符号范围/阈值比较。
+结构和 token 合法性在登记返回时校验一次，轮询时不重复校验。
+同一个 group 的条件可逐个完成，不必每次重新检查已满足的条件。
+不同 group 可乱序结算。
 
-**kernel 返回后**：调用 `seal_conditions()`。
+普通调用直接扣住自己的发布份额。MIX 沿用 rendezvous 的整块发布：
+登记了条件的 subtask 在报告 finished 前先减去自己的份额，条件完成时再补回。
+cohort 的物理 block 完成与逻辑条件完成分开计数，因此后续 cohort 可以继续。
 
-- `count == 0` → `*deferred = false`，走原同步路径。**这条必须保留**：waiter kernel 通常
-  按条件登记，零登记是常态而非异常。
-- `count > 0` → 由 `scheduler_async_condition_mask(count)` 算出 `pending_mask`，发布 group，
-  `async_outstanding += 1`，`*deferred = true`。
-- `state == FAILED` 或 `error_code != 0` → `percounter_fail()`，不发布也不延迟。
+## 满候选窗口的进度
 
-### 4.2 检查
+仅按 b-level 排序并保留有限候选，不能保证 defer 图的执行进度。例如一个 waiter 后面
+有许多依赖它的消费者，而独立 notifier 排在消费者之后；所有窗口都被消费者占满后，
+notifier 仍未领取。
 
-插入点只有一个 —— `percounter_checkpoint_serve`：
+窗口阻塞且已经观察到本次图使用 defer 时，lane 把一个阻塞位置放到自己的 GM 停放链表，
+释放其 prepared payload 槽，继续领取后面的普通任务。停止领取新位置后，lane 重查停放位置，
+只恢复已经满足 fanin 的任务。位置始终由原领取 lane 持有，不重复执行；恢复时重新准备参数。
 
-```cpp
-if (!percounter_async_tick(cfg, state, served)) return false;   // 新增，且排在最前
-if (*served) return true;
-if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
-if (*served) return true;
-return percounter_mix_discover(cfg, state, timeout_cycles, served);
-```
+停放链接按实际普通 order 位置预留，每个位置一个 uint64，不上传、不预清零。
+相邻位置可能属于不同 lane，链接以原子交换写入，避免 cache line 写回覆盖邻居。
+普通图只在原有的周期检查点探测是否出现 defer；没有每次阻塞轮询都读取两个共享计数器。
 
-排在最前且无条件执行：这一项是本 lane 欠下的、别人替不了的债，而后两项是可以由别的 lane
-服务的工作。一个欠着完成的 lane 必须在服务别人之前先看自己那笔。不欠时它只是一次本地
-整数判断（`async_outstanding_hint`），不走记录也不读 entries。
+## 进度、退出与错误
 
-**这一行是死锁正确性的要求，不只是延迟优化。** `percounter_wait_for_fanin` 与
-`percounter_wait_for_entry` 的自旋体每轮都调 `percounter_checkpoint_serve`。一个 lane 延迟
-了任务 X，而它 range 里的下一个任务以 X 为 fanin 时，它会阻塞在只有自己能发布的计数器上；
-tick 在 checkpoint 里，这个自环自动解开，三个阻塞点全部继承这一性质。
+`async_registered` 在分配完成记录时递增，`async_settled` 在发布该份额后递增。
+两者均单调；每条 defer 记录使用这两次共享进度原子操作。
+任务和 shell 自身的计数器仍按现有发布规则更新。
 
-`percounter_async_tick` 的内容：group 头部 `observe`，按 `pending_mask` 逐条取
-`DeferredCompletionEntry`，用 `percounter_poll_completion` 判定，每次调用有条数预算；
-`pending_mask` 清空则结算。COUNTER 的观察是一次对齐的 32-bit device load 加一次有符号比较，
-负值（含 `INT32_MIN`）为 PENDING，不清零通知。
+AICPU 先读取 `completed_block_count`，再检查异步计数。
+只有全部物理 block 已运行且 `async_registered == async_settled` 才允许结束。
+登记分配发生在对应 block 计数发布之前，因此末尾任务的条件不会漏查。
+没有 pending 记录的 lane 可按原 MIX/cohort 退出条件离开；拥有 pending 的 lane 留在 checkpoint。
+看门狗使用单调完成进度；条件永不满足时报告运行时超时。
 
-### 4.3 结算
+登记错误、非法 token、条件溢出沿现有错误通道返回，不能发布为成功。
+异常终止不代表外部通信引擎已经完成；通信资源仍遵守平台的 teardown 证明。
 
-结算就是 owner lane 代替当初的发布点做那次 `percounter_publish_completion`，随后
-`async_outstanding -= 1`、`async_settled += 1`。没有其他任何动作。
+Graph Definition 的设备载体由 percounter 自己的 bind 发布：真机使用 launch envelope，
+模拟器使用本次 run 的快照。HBG 的 native Graph 路径不承担 percounter 的 AICPU 物化职责。
 
-### 4.4 三个发布点
+## 验收
 
-| 位置 | 改动 |
-| ---- | ---- |
-| `percounter_lane_loop` | `deferred` 为真时跳过 `percounter_publish_completion`；`++state.local_done` 保留 |
-| `percounter_sync_serve_block` | 同上；`sync_queue->completed` 的加、`cohort_hold_set(0)` 保留在原处 |
-| `percounter_serve_mix` | 见 4.5 |
+`tests/st/a5/percounter/defer_wait` 覆盖普通/SPMD/MIX/cohort/Graph/谓词形状、
+超过原固定槽数的等待任务，以及 notifier 排在满候选窗口之后的情况。
+该 runtime 不参加默认构建；这些 scene 用例需显式构建 percounter，并使用 `--manual include`。
+共享形状测试以输入参数分别验证 HBG 的 64 条条件和 percounter 的 4 条条件。
+CPU 测试还验证末尾 defer 的退出门槛和 group 乱序结算。
 
-`local_done`、`sync_queue->completed`、`mix_tickets[DONE]` 三者**全部不动**：它们计的是
-"block 执行完了"，而 block 确实执行完了。
-
-cohort 这条路上，`sync_queue->completed` 原本遵守一条顺序规则 —— 它排在任务计数器之后，
-因为看到它达到总数的 lane 可以退出，而那时不能还有消费者在等。延迟之后任务计数器不在那里
-加了，这条规则改由**退出判据**保证：`async_outstanding` 非零时 lane 不退出，而一个被延迟
-的 cohort block 会一直让它非零。
-
-**槽位等待发生在已经承诺执行之后。** `percounter_async_acquire` 在
-`percounter_launch_kernel` 内部，所以在那里等的 lane 不服务 MIX 和 cohort，服务 cohort
-block 的还握着那个 block。这是停顿不是挂死：等待期间它轮询自己的条件、检查停止信号、到
-看门狗为止，而 MIX 的 arming 读到它的 hold 会正确地不点它的名。
-
-### 4.5 MIX：延迟的 subtask 先把自己那份减掉
-
-MIX 由掩码最低位的 lane 在 `percounter_mix_wait(finished)` 之后一次性加
-`popcount(mask)`。若某个 subtask 延迟，这次加不能带它那份 —— 而发布者在加之前无从知道
-哪几份该去掉。
-
-**`PercounterMixSignal` 恰好是满的 64 B，没有位置放一个 deferred 掩码**，所以不走"告诉
-发布者"这条路：延迟的 lane 在 `percounter_ssbuf_store_release(&signal->finished[lane],
-generation)` **之前**自己做一次 `fetch_add(counter, -1)`（sink 任务两个计数器都减），结算
-时再加回来。发布者照旧加 `popcount(mask)`，不需要知道任何事。
-
-这不是绕路，而是该计数器本来的用法：host 把它预置成 `1 - total_subtasks`，
-`percounter_counter_published` 判的是 `(int64_t)value > 0`，负的中间值是这套机制的常态。
-
-顺序由既有的 release/acquire 对保证，不需要新的 fence：发布者只在 acquire 读到
-`finished[lane] >= generation` 之后才加，所以减一定排在加之前；计数器在中间只会偏小，
-消费者只会多等，不会早走。
-
-代价是延迟的 MIX subtask 多一次原子（sink 两次）。不延迟的 subtask、不含异步任务的图、
-以及所有非 MIX 路径都是零。替代方案是改成每 lane 各加 1，热路径上每个 MIX block 从
-1 次原子变 3 次，不取。
-
-### 4.6 与 cohort 协议的关系
-
-延迟完成不改变 cohort 协议的任何一处。队列保持一个 cohort outstanding，
-`cohort_hold[lane]` 只被读作"该 lane 是否欠一个 block"；`defer_wait` 不阻塞，kernel 正常
-返回，lane 在 `percounter_sync_serve_block` 里清除 hold 的时机不变。
-
-这成立的前提是 **COUNTER 条件不往 kernel 内部引入任何新的阻塞点**。一个 lane 在 kernel
-里到不了任何 checkpoint，而 cohort 与 MIX 的 gathering 都可能在等它 —— 这是该协议最敏感
-的性质。SDMA 会引入这样的阻塞点，这是第一期不做它的第三个理由（见 7.1）。
-
-## 5. 不变量
-
-1. 一个 group 只有一个写者（其 owner lane）和一个检查者（同一个 lane）。
-2. group 身份由 `run_epoch`、`group_index` 和头部的 `task_ref` / `block_index` /
-   `subtask_slot` 确定，不依赖可复用的 slot。
-3. 每个非零 group 恰好结算一次；零登记任务仍须 seal，并走同步发布路径。
-4. 每个逻辑 block 恰好贡献一次执行进度（`local_done` 或 cohort / MIX 的 done 计数），
-   与它是否延迟完成无关。
-5. 每个 block / subtask 对计数器的净贡献恰好为 1：lane 自己发布时要么在 kernel 返回处加、
-   要么在结算处加；由他人代发布时（MIX）先减后加，净值不变。
-6. 存在未结算 group 时这次 run 不结束。这要**两处**同时成立：lane 不退出
-   （`percounter_lane_may_exit`），supervisor 也不收工（`percounter_supervise`）。
-7. 延迟完成不向 percounter 的 list-order 无环性论证增加任何边：它只延迟沿既有边的发布。
-
-## 6. 退出、看门狗与错误
-
-`percounter_lane_may_exit` 的两处改动，**必须是两处而不是一处**：
-
-- `complete` 的合取加上 `percounter_gm_read(cfg.control->async_outstanding) == 0`。
-- `*progress` 的和加上 `async_settled`。
-
-**同一个判据必须在 supervisor 上再写一遍，光守 lane 不够。** EXIT 是
-`AicpuExecutor::supervise` 返回之后才由 `signal_shutdown_partition` 拉起的，而一个 block
-无论是否延迟都照不变量 4 计入 `completed_block_count`。所以当一次 run 的终端任务登记了条件，
-`completed_block_count` 已经等于 `executable_block_count`，supervisor 若只看这一项就收工，
-EXIT 随即拉起；lane 在 `percounter_mix_drain` 里先读到 `percounter_should_stop` 就直接返回，
-永远到不了那次 `percounter_async_settle`。条件被丢下不管，host 却已经拿到成功。
-
-因此 `percounter_supervise` 用同样的两项拆分：`completed_block_count + async_settled`
-进单调的进展和，`async_outstanding == 0` 单独作为收工合取项。它读这两个字的**顺序**也是
-判据的一部分 —— 先读块计数再读 outstanding：lane 是先 seal 再计块的，所以一个已经包含该块的
-计数必然发布在 seal 之后，随后那次读不可能漏掉它开的 group。反过来读就有一个窗口。
-
-`async_outstanding` 有升有降，而 `progress` 的整个看门狗论证建立在被加数单调上。把它折进
-`progress`，一个 outstanding 震荡的设备会不断刷新看门狗，挂死最后由 STARS 的 45 秒
-`HandleTaskTimeout` 杀 `aicpu-sd` 收场 —— 按 `running-onboard.md` 的分诊表那是另一类故障。
-分开之后，真死锁表现为 settled 停止前进、outstanding 非零、progress 平坦，
-由 `scheduler_watchdog_expired` 报 `SchedulerGraphResult::TIMEOUT`。
-
-**跨卡死锁。** rank0 等 rank1、rank1 等 rank0 的依赖环是用户程序的错误，运行时不可能阻止，
-与 MPI 中写错收发顺序同类。但要区分它与**资源死锁**：阻塞式等待下，rank0 的所有核都卡在
-kernel 里等通知，而"给 rank1 发通知"的任务没有空闲核去跑 —— 两边依赖图都无环却照样挂死。
-percounter 比 HBG 更暴露于此，因为 lane 就是核，没有 dispatch slot 的间接层。消除这一类
-正是本特性的目的。
-
-**超时不等于可以回收通信资源。** lane 报错退出时若 `async_outstanding != 0`，对端引擎可能
-仍在读本卡内存。核的 ACK 不是外部访问结束的证明，run 不得据此回收通信域或 workspace。
-percounter 目前没有任何通信资源，但这条必须与第一个跨卡条件类型在同一改动中落地。
-
-## 7. 后续
-
-### 7.1 SDMA
-
-需要三样 COUNTER 不需要的东西：
-
-- **预留协议**。一次 TGET 的完成记录条数要提交后问 SDK 才知道，所以要提交前按上界预留、
-  提交后登记实际条数、归还未用预留。`async_condition_writer.h` 里的
-  `reserve_conditions` / `commit_condition` / `finish_reservation` 已经是这个，免费。
-  没有它，半途失败的登记会表现为零登记成功，即 DMA 在飞而任务已发布。
-- **每 cluster 一个提交互斥字**。SDK 按 `get_block_idx()` 选 channel group，同 cluster
-  两个 AIV 共享该值；交权要整 DCache 写回加设备屏障，否则旧 owner 的后续 session 缓存维护
-  会覆盖新 owner 已推进的 SQ 状态。`AsyncGroupData` 的 `sdma_guards_offset` /
-  `sdma_guard_count` 已为此预留，第一期置零。
-- **提交争用的 5 秒有界自旋是一次 kernel 内阻塞**。同 cluster 的 peer lane 若正在一次 MIX
-  或 cohort 的 gathering 中等待持有互斥字的 lane，该 gathering 最长等 5 秒。不是死锁，
-  但它正是 4.6 所说的"lane 在 kernel 里到不了 checkpoint"，须与 cohort 协议一并论证。
-
-另须注意提交资格与观察资格分开：提交 helper 可能仅在 AIV 可用，观察必须每个参与调度的核
-都能做。
-
-### 7.2 共享检查
-
-owner-only 的代价是延迟：owner 在长 kernel 里时，已满足的条件无人观察，消费者多等一个
-kernel。若实测需要，加回 HBG 的 `check_directory` 位图与 `SchedulerAsyncLease` 即可让任何
-已排空的 lane 检查任何 group —— `percounter_mix_drain` 已经是这些 lane 的驻留点。这是纯粹
-的增量，不改变本文其余任何合同。
-
-## 8. 验证
-
-| 用例 | 覆盖 |
-| ---- | ---- |
-| 单 lane COUNTER | 登记一条、kernel 返回、消费者在信号到达前不执行 |
-| 等待者多于核数 | 等待不占核；对照上游 `defer_wait_progress` 的 `c_plus_one` |
-| 负初值与边界 | `INT32_MIN`、`-1`、`0`、`1`、`INT32_MAX` 阈值与当前值 |
-| 零登记 | 带标记但未登记的任务走同步路径，不创建 CHECK |
-| 自环 | 延迟任务的消费者由同一 lane 领取，不死锁 |
-| SPMD | 同一任务的多个 block 分别延迟与不延迟，计数器总数正确 |
-| MIX 3/5/6/7 | 部分 subtask 延迟；计数器终值与全不延迟时一致，中间值可为负 |
-| sync-start cohort | 延迟不影响 `sync_queue->completed` 与 cohort 释放 |
-| Graph body | body sink 延迟时 shell 计数器同样推迟 |
-| 溢出与非法 ✅ | 超过 capacity 的登记以 error 12 (`ASYNC_WAIT_OVERFLOW`) 结束整个 run，0 blocks resolved；记录里的具体码映射到对应的 `SchedulerGraphResult`，不再统一压成 13 |
-| 超时 | 条件永不满足时报 TIMEOUT，而非由 45 秒 op 超时收场 |
-
-容量、区域字节数与同步路径开销分别度量；优化不得引入强制的额外用户声明。
-
-### 8.1 生产工作负载
-
-`tests/fdwic/dsv41_scheduler` 的 DeepSeek-V4.1 九个 pypto_lib 用例是本设计的生产验证面：
-真实双卡、原始 kernel 二进制、输出按 fused-prefix 对照校验。其 MoE 路径的
-`dispatch_meta_wait` 与 `combine_wait` 两个 kernel 走 `pld.system.defer_wait`。
-
-九个用例在 percounter 上全部通过（`validated_against_fused_prefix: true`，两个 rank
-均为 `passed: true`）。该特性是这条路径的必要条件而非优化：把 percounter 换回本设计
-落地前的版本，`swa` 这类纯 attention 切片照常通过，而 `moe` 与 `layers_19_21` 在设备侧
-`trap` —— 没有 async 支持时 `async_present` 为 0，kernel 取到空 slab，正是 §1.1 所述的
-失败形态。
-
-与常驻调度器的时延对比按用例分两类，且仅在重复测量漂移小于两者差距时才成立：
-percounter 在 `swa` 上约 2.1 倍、在 MoE 系用例上约 1.2 倍更快，在 `c1a`/`c2a` 系的
-isolated case 上慢 8%–21%。
-
-## 9. 落地顺序
-
-每一步各自正确、可单独提交，**不存在"合起来才对"的中间状态**。做到这一点靠一条规则：
-host 只给本步已经支持的任务形状打"可能登记"标记，其余形状按既有的
-`TaskPlacement::UNSUPPORTED` 路径拒绝，而不是默默走同步发布。
-
-| 步 | 内容 | 完成判据 |
-| -- | ---- | -------- |
-| S1 ✅ | 布局、寻址与**拒绝**：region 预留 group 与 entries、`PercounterControl` 新字段、host 预填、每次 dispatch 开启与封口；kernel 返回后 `count > 0` 或 `error_code != 0` 即报错 | 登记条件的 kernel 得到指名的运行时错误，而非 trap 或错误答案；不登记的图行为一字不变 |
-| S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
-| S3 ✅ | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | 单核 `require_sync_start` 多 block 的登记用例通过，同一用例在 S2 构建上报 error 13（0 of 7 blocks resolved）；回归集 11 passed，失败仍只有那两个 swimlane 用例 |
-| S4 ✅ | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | 两 AIV MIX 的登记用例通过，同一用例在 S3 构建上报 error 13（0 of 4 blocks resolved）；回归集 12 passed，连跑三遍一致 |
-| S5 ✅ | Graph body、溢出、非法对齐、上游用例对比、开销实测 | 见第 8 节与 `docs/investigations/2026-11-percounter-defer-wait-dispatch-overhead.md`：溢出报 error 12、非法对齐报 error 11；上游 `defer_wait_progress` 五个 case 通过（含 `c_plus_one`）；开销在 4096 任务图上实测为 +5.6%，未全部归因 |
-
-**S1 既是布局也是 1.1 的修复**，两者不可分：登记失败的 kernel 在设备上不留痕迹，所以只有
-先给它一个真正能写进去的 group，percounter 才看得见"这个任务登记了条件"。S1 之后登记机械
-地成功、被读到、被拒绝；S2 把拒绝换成延迟，只改"读到之后做什么"。
-
-S2 是第一个有功能的提交，也是第一个不能再拆的：只登记不检查会挂死，检查了不改退出判据
-会在消费者未释放时退出。S3 到 S5 在它之后各自独立成立，靠的是 host 只给本步支持的任务
-形状打"可能登记"标记，其余形状仍走 S1 的拒绝路径。
+性能比较分别报告无 defer 的主线 percounter 与当前实现，以及含 defer 的对应工作负载。
+构建版本、设备、预热、轮数和时延层次必须匹配；历史测量不代替当前主线验证。

@@ -244,43 +244,23 @@ inline constexpr uint64_t percounter_counter_preset(int64_t total_subtasks) {
     return static_cast<uint64_t>(static_cast<int64_t>(PERCOUNTER_COUNTER_PUBLISHED) - total_subtasks);
 }
 
-/**
- * Completion conditions one deferred-completion record holds.
- *
- * Four, not `MAX_COMPLETIONS_PER_TASK`: the record is per lane rather than per
- * task, so the cap is paid 108 lanes times `PERCOUNTER_ASYNC_SLOTS` over,
- * whether or not a kernel registers anything. At four, a record's entries are
- * two cache lines and the whole array is 27 KiB, beside 27 KiB of record
- * headers; at 64 the entries would be 432 KiB, eight times the 54 KiB payload
- * array that sits next to them.
- */
 inline constexpr uint32_t PERCOUNTER_ASYNC_CAPACITY = 4;
-
-/**
- * Deferred-completion records a lane owns, and so the deferred tasks it can
- * have outstanding at once.
- *
- * **More than one, or the feature does nothing.** A record is live from the
- * dispatch that opens it until its conditions settle, and the lane goes on
- * running other tasks in between -- that interval is the whole point. Those
- * tasks need a record of their own: a kernel handed a sealed one cannot
- * register at all, and the runtime reading a settled-but-unreleased one back
- * would refuse a task that registered nothing.
- *
- * A lane that fills every slot waits for one to settle before its next
- * dispatch, which is the only place the count is felt. Two is what the single
- * deferred producer the COUNTER cases exercise needs; raising it costs one
- * record plus its entries per lane and changes nothing else.
- */
-inline constexpr uint32_t PERCOUNTER_ASYNC_SLOTS = 2;
-// A record's entries are addressed by multiplying this stride, so it has to be
-// the padded size `layout_valid` checks against, not the raw one.
-static_assert(
-    pto2::resident::async_group_entry_bytes(PERCOUNTER_ASYNC_CAPACITY) ==
-        PERCOUNTER_ASYNC_CAPACITY * sizeof(DeferredCompletionEntry),
-    "the entry stride must already be a multiple of the record alignment"
-);
 static_assert(PERCOUNTER_ASYNC_CAPACITY <= MAX_COMPLETIONS_PER_TASK);
+
+// One physical invocation can append at most one completion record.
+struct alignas(64) PercounterAsyncCompletion {
+    uint64_t next;
+    uint64_t pending_mask;
+    int64_t task_id;
+    int64_t shell;
+    uint64_t sink;
+    uint64_t reserved[3];
+    DeferredCompletionEntry entries[PERCOUNTER_ASYNC_CAPACITY];
+};
+static_assert(sizeof(PercounterAsyncCompletion) == 192);
+static_assert(
+    std::is_trivially_copyable_v<PercounterAsyncCompletion> && std::is_standard_layout_v<PercounterAsyncCompletion>
+);
 
 /** A ticket, line-isolated for the same reason the counters are. */
 struct alignas(64) PercounterTicket {
@@ -694,11 +674,14 @@ struct alignas(128) PercounterControl {
     uint64_t async_entries_offset;
     uint64_t async_capacity;
     uint64_t async_run_epoch;
+    uint64_t async_completions_offset;
+    uint64_t async_completion_capacity;
+    uint64_t parked_next_offset[PERCOUNTER_CORE_TYPE_COUNT];
     // Prefilled by the host so a lane can bound its startup wait; the AICPU
     // overwrites it with any override when it publishes the topology.
     uint64_t scheduler_timeout_cycles;
     // Pads the progress counter below onto its own 64 B line.
-    uint8_t reserved[320 - 38 * sizeof(uint64_t)];
+    uint8_t reserved[384 - 42 * sizeof(uint64_t)];
 
     // **Alone on the last line.** Lanes batch their completions into this, and
     // the AICPU supervisor polls it against `executable_block_count`. It is the
@@ -713,25 +696,16 @@ struct alignas(128) PercounterControl {
     alignas(64) uint64_t completed_block_count;
     uint8_t resolved_reserved[56];
 
-    // **A line of their own**, for the reason the progress counter has one:
-    // both are written by an atomic, here whenever a deferred group opens or
-    // settles, and a field sharing the line would queue behind them.
-    //
-    // Two counts rather than one, and the difference is load-bearing.
-    // `async_settled` only rises, so `percounter_lane_may_exit` can add it to
-    // the progress sum its watchdog reads -- a device still settling groups
-    // keeps refreshing that watchdog. `async_outstanding` rises and falls, so
-    // it gates exit alone: folded into progress it would refresh the watchdog
-    // on a device going nowhere, and the hang would surface 45 s later as an
-    // op-execute timeout rather than as this runtime's own TIMEOUT.
-    alignas(64) uint64_t async_outstanding;
+    // Allocation precedes the corresponding block's completed publication.
+    // Both counters are monotone; equality after all blocks ran permits exit.
+    alignas(64) uint64_t async_registered;
     uint64_t async_settled;
     uint8_t async_reserved[48];
 };
 static_assert(sizeof(PercounterControl) == 512, "percounter control is four 128 B lines");
 static_assert(
-    offsetof(PercounterControl, async_outstanding) % 64 == 0 &&
-        offsetof(PercounterControl, async_outstanding) / 64 != offsetof(PercounterControl, completed_block_count) / 64,
+    offsetof(PercounterControl, async_registered) % 64 == 0 &&
+        offsetof(PercounterControl, async_registered) / 64 != offsetof(PercounterControl, completed_block_count) / 64,
     "the deferred-group counts are atomics and own their line"
 );
 static_assert(

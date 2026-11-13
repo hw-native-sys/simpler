@@ -78,10 +78,7 @@ inline __aicore__ bool percounter_completion_token_valid(const CompletionToken &
 }
 
 /** One sample of one condition; the caller re-reads a pending one later. */
-inline __aicore__ CompletionPollResult percounter_poll_completion(const CompletionToken &token) {
-    if (!percounter_completion_token_valid(token))
-        return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
-
+inline __aicore__ CompletionPollResult percounter_poll_valid_completion(const CompletionToken &token) {
     if (token.completion_type == COMPLETION_TYPE_CCU) {
         auto *event = reinterpret_cast<__gm__ uint64_t *>(token.addr);
         if ((percounter_ccu_event_read(event) & token.backend_cookie) != token.backend_cookie)

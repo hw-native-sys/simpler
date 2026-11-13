@@ -34,13 +34,6 @@ SchedulerExtensionResult scheduler_extension_select(
     const auto selection = simpler::percounter::select_percounter_state(
         runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
     );
-    if (selection != simpler::percounter::StateSelection::PERCOUNTER) return SchedulerExtensionResult::FAILED;
-    // The bind publishes this mode into the device bootstrap, which the lanes
-    // read and which the run clears when it releases its bindings. The runner
-    // keeps a copy that outlives the run, and that copy is the only thing a
-    // host-side caller can ask which scheduler executed. Without this it keeps
-    // reading the legacy mode, so a tool that refuses a silent fallback to the
-    // AICPU dispatcher refuses a percounter run instead.
-    if (api != nullptr) api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_PERCOUNTER);
-    return SchedulerExtensionResult::TAKEN;
+    return selection == simpler::percounter::StateSelection::PERCOUNTER ? SchedulerExtensionResult::TAKEN :
+                                                                          SchedulerExtensionResult::FAILED;
 }

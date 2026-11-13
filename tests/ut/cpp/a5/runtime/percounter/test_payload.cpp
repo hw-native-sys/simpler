@@ -54,6 +54,10 @@ struct Fixture {
     PercounterSyncQueue queue{};
     std::array<LaneConfig, 6> cfg{};
     std::array<PercounterLaneState, 6> state{};
+    std::array<pto2::resident::AsyncGroupData, 6> async_groups{};
+    std::array<std::array<DeferredCompletionEntry, PERCOUNTER_ASYNC_CAPACITY>, 6> async_entries{};
+    std::array<PercounterAsyncCompletion, 16> async_completions{};
+    std::array<uint64_t, 3> parked_next{};
 
     Fixture() {
         registers.fill(0);
@@ -76,6 +80,12 @@ struct Fixture {
             c.callable_addresses = callable.data();
             c.callable_count = callable.size();
             c.payloads = payloads[i].data();
+            c.async_group = &async_groups[i];
+            c.async_entries = async_entries[i].data();
+            c.async_completions = async_completions.data();
+            c.async_completion_capacity = async_completions.size();
+            c.parked_next = parked_next.data();
+            c.async_group->capacity = PERCOUNTER_ASYNC_CAPACITY;
             for (auto &p : payloads[i]) {
                 p.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&p.local_context);
                 p.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&p.global_context);
@@ -95,6 +105,11 @@ struct Fixture {
             c.sync_queue = &queue;
             c.sync_pending = sync_pending.data();
         }
+    }
+
+    bool run(int lane, const PercounterTask &task, DispatchPayload *payload) {
+        bool deferred = false;
+        return percounter_run_prepared(cfg[lane], &state[lane], task, payload, &deferred);
     }
 
     void set_task(int task, uint32_t mask, int blocks) {
@@ -161,7 +176,7 @@ TEST(PercounterPayload, MixNonCoordinatorsPrepareWhileDependencyIsBlocked) {
     // An ordinary task executes in another slot while MIX still waits.
     auto ordinary = f.resolve(1);
     ASSERT_TRUE(percounter_prepare_task(f.cfg[2], ordinary, 0, 1, &f.payloads[2][0]));
-    ASSERT_TRUE(percounter_run_prepared(f.cfg[2], ordinary, &f.payloads[2][0]));
+    ASSERT_TRUE(f.run(2, ordinary, &f.payloads[2][0]));
     EXPECT_EQ(f.payloads[2][PERCOUNTER_MIX_PAYLOAD_SLOT].args[0], 11U);
     EXPECT_EQ(f.producer, 0U);
     EXPECT_EQ(f.signals[0].active_mask, 0U);
@@ -324,10 +339,10 @@ TEST(PercounterPayload, PredicateIsEvaluatedAtExecution) {
     };
     value = 1;
     f.producer = 1;
-    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
     EXPECT_EQ(calls, 1);
     value = 0;
-    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
     EXPECT_EQ(calls, 1);
 }
 
@@ -360,7 +375,7 @@ TEST(PercounterPayload, TaskTimingPreparesIdentityAndBatchesCommittedCount) {
         ++calls;
     };
     for (uint32_t i = 0; i < 3; ++i) {
-        ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
     }
     EXPECT_EQ(calls, 3);
     EXPECT_EQ(buffer->count, 0U);
@@ -394,7 +409,7 @@ TEST(PercounterPayload, TaskTimingUsesGraphBodyIdentityAndResetsEachRun) {
             TaskId::to_uint64(f.payloads[0][0].local_context.async_ctx.task_token),
             TaskId::to_uint64(TaskId::make_sub_task(7, 2))
         );
-        ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
         chip_swimlane_aicore_flush_task_count(&profile);
         EXPECT_EQ(buffer->count, 1U);
         EXPECT_EQ(buffer->records[0].reg_task_id, 1U);
@@ -415,7 +430,7 @@ TEST(PercounterPayload, FullTimingBufferIsPublishedOnceAndReplacementKeepsIdenti
     ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
     for (int i = 0; i < PLATFORM_AICORE_BUFFER_SIZE; ++i) {
         EXPECT_EQ(first->count, 0U);
-        ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
     }
     EXPECT_EQ(first->count, PLATFORM_AICORE_BUFFER_SIZE);
 
@@ -427,7 +442,7 @@ TEST(PercounterPayload, FullTimingBufferIsPublishedOnceAndReplacementKeepsIdenti
     chip_swimlane_aicore_flush_task_count(&profile);
     EXPECT_EQ(first->count, 17U);
 
-    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
     EXPECT_EQ(second->count, 0U);
     EXPECT_EQ(second->records[0].reg_task_id, PLATFORM_AICORE_BUFFER_SIZE + 1U);
     EXPECT_EQ(TaskId::to_uint64(second->records[0].task_token), TaskId::to_uint64(TaskId::make_global(0)));
@@ -435,6 +450,66 @@ TEST(PercounterPayload, FullTimingBufferIsPublishedOnceAndReplacementKeepsIdenti
     EXPECT_EQ(second->count, 1U);
     EXPECT_EQ(first->count, 17U);
 }
+TEST(PercounterPayload, TerminalDeferralKeepsLaneLiveUntilConditionHolds) {
+    Fixture f;
+    int32_t signal = 0;
+    f.fanin[0].count = 0;
+    f.counters[0].value = percounter_counter_preset(1);
+    auto task = f.resolve(0);
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+    execute = [&](int64_t *) {
+        f.async_entries[0][0] = {
+            reinterpret_cast<uint64_t>(&signal), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+        };
+        f.async_groups[0].count = 1;
+    };
+    bool deferred = false;
+    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], &f.state[0], task, &f.payloads[0][0], &deferred));
+    ASSERT_TRUE(deferred);
+    uint64_t progress = 0;
+    EXPECT_FALSE(percounter_lane_may_exit(f.cfg[0], &f.state[0], &progress));
+    bool settled = false;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    EXPECT_FALSE(settled);
+    EXPECT_FALSE(percounter_counter_published(f.counters[0].value));
+    signal = 1;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    EXPECT_TRUE(settled);
+    EXPECT_TRUE(percounter_counter_published(f.counters[0].value));
+    EXPECT_TRUE(percounter_lane_may_exit(f.cfg[0], &f.state[0], &progress));
+}
+
+TEST(PercounterPayload, IndependentConditionsSettleOutOfRegistrationOrder) {
+    Fixture f;
+    std::array<int32_t, 3> signals{};
+    int current = 0;
+    execute = [&](int64_t *) {
+        f.async_entries[0][0] = {
+            reinterpret_cast<uint64_t>(&signals[current]), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+        };
+        f.async_groups[0].count = 1;
+    };
+    for (; current < 3; ++current) {
+        f.fanin[current].count = 0;
+        f.counters[current].value = percounter_counter_preset(1);
+        auto task = f.resolve(current);
+        ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+    }
+    signals[1] = 1;
+    bool settled = false;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    ASSERT_TRUE(settled);
+    EXPECT_FALSE(percounter_counter_published(f.counters[0].value));
+    EXPECT_TRUE(percounter_counter_published(f.counters[1].value));
+    EXPECT_FALSE(percounter_counter_published(f.counters[2].value));
+    signals[0] = signals[2] = 1;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    EXPECT_EQ(f.state[0].async_head, 0U);
+    EXPECT_EQ(f.control.async_registered, 3U);
+    EXPECT_EQ(f.control.async_settled, 3U);
+}
+
 }  // namespace
 
 volatile uint8_t *sim_get_reg_base() {

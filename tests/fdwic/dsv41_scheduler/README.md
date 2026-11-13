@@ -1,8 +1,8 @@
 # DSV4.1 cases using the production AICore scheduler
 
 The runner uses Simpler's production `ChipWorker` and HBG graph builder, and runs
-the graph on whichever AICore scheduler `DSV41_RUNTIME_NAME` names -- the resident
-one by default. It compiles the included original model kernel sources and loads their binaries. There is no test
+the graph on the AICore scheduler selected by `--runtime=percounter` or
+`--runtime=host_build_graph` (the default). It compiles the included original model kernel sources and loads their binaries. There is no test
 scheduler, replacement arithmetic, timed busy loop, or simulated notification.
 The previous reference scanner has been removed. Its historical measurements
 are **not a production performance baseline**.
@@ -268,11 +268,10 @@ outputs are never overwritten. `DSV41_MAX_TIME` controls the queue's per-job
 runtime limit (default 300 seconds); avoid grouping all cases under a single
 short reservation. `DSV41_RUNNER` optionally selects a frozen native executable.
 
-`DSV41_RUNTIME_NAME` picks the scheduler by naming a directory under the runtime
-tree: `host_build_graph` (the default, the resident scheduler) or `percounter`.
-The device graph image and the orchestration `.so` are the same for both, so the
-name is the whole difference, and the run log reports which one answered as
-`scheduler_mode=1` or `scheduler_mode=5`.
+Append `--runtime=percounter` to select the percounter runtime directory.
+Build it explicitly first: `python -m simpler_setup.build_runtimes --platforms a5 --runtime percounter`
+(or set `SIMPLER_BUILD_RUNTIMES=percounter` during installation).
+The default runtime build does not include percounter.
 
 The three arguments after the output directory are profiling level, warmup
 count, and measured round count. `all 1 3` performs one warmup, three L0

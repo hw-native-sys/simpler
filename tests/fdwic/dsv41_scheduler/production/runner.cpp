@@ -128,7 +128,8 @@ int run(int argc, char **argv) {
         // The host ELF shares this image with the model's machine code. A
         // smaller test entry must not move every kernel to new I-cache sets.
         if (orchestration.size() > source->binary_size()) {
-            throw std::runtime_error("Host adapter exceeds original orchestration slot; build it without debug symbols"
+            throw std::runtime_error(
+                "Host adapter exceeds original orchestration slot; build it without debug symbols"
             );
         }
         orchestration.resize(source->binary_size(), 0);

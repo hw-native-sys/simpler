@@ -54,6 +54,9 @@ struct PercounterLayout {
     // cost no DMA and a lane writes its own record's header before its loop.
     uint64_t async_groups_offset;
     uint64_t async_entries_offset;
+    uint64_t async_completions_offset;
+    uint64_t async_completion_capacity;
+    uint64_t parked_next_offset[PERCOUNTER_CORE_TYPE_COUNT];
     // The MIX list, its tickets, and the per-cluster word saying the cluster's
     // SSBUF line has been cleared. MIX is not a third core type -- a lane is AIC
     // or AIV, never MIX -- so it keeps its own offsets. All four are zero on a
@@ -163,7 +166,7 @@ struct ExternalAddresses {
 inline bool plan_layout(
     uint64_t task_count, uint64_t block_total, uint64_t edge_count,
     const uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT], PercounterLayout *layout, uint64_t mix_order_count = 0,
-    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}
+    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}, uint64_t execution_count = 0
 ) {
     if (layout == nullptr || order_count == nullptr) return false;
     const uint64_t table_task_count = task_count;
@@ -193,6 +196,7 @@ inline bool plan_layout(
     next.graph_invocation_count = graph.invocation_count;
     next.graph_templates_bytes = graph.templates_bytes;
     next.entry_count = placed;
+    next.async_completion_capacity = execution_count;
 
     uint64_t cursor = 0;
     uint64_t bytes = 0;
@@ -231,13 +235,13 @@ inline bool plan_layout(
         // After the counters, so the records fall outside `upload_size` below.
         // The entries follow the records for the reason `layout_valid` checks:
         // a record's entry span has to start after the record itself.
+        !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, pto2::resident::AsyncGroupData, async_groups_offset) ||
         !PERCOUNTER_RESERVE(
-            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS, pto2::resident::AsyncGroupData, async_groups_offset
+            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry, async_entries_offset
         ) ||
-        !PERCOUNTER_RESERVE(
-            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry,
-            async_entries_offset
-        ) ||
+        !PERCOUNTER_RESERVE(execution_count, PercounterAsyncCompletion, async_completions_offset) ||
+        !PERCOUNTER_RESERVE(order_count[0], uint64_t, parked_next_offset[0]) ||
+        !PERCOUNTER_RESERVE(order_count[1], uint64_t, parked_next_offset[1]) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef PERCOUNTER_RESERVE
         return false;
@@ -704,6 +708,10 @@ inline bool build_tables(
     control->async_groups_offset = layout.async_groups_offset;
     control->async_entries_offset = layout.async_entries_offset;
     control->async_capacity = PERCOUNTER_ASYNC_CAPACITY;
+    control->async_completions_offset = layout.async_completions_offset;
+    control->async_completion_capacity = layout.async_completion_capacity;
+    for (uint32_t type = 0; type < PERCOUNTER_CORE_TYPE_COUNT; ++type)
+        control->parked_next_offset[type] = layout.parked_next_offset[type];
     control->async_run_epoch = next_async_run_epoch();
     // The memset leaves this at 0, which is a real task id. A cohort takes the
     // open slot by flipping its generation and publishes by writing this field

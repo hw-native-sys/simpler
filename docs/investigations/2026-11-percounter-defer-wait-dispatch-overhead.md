@@ -1,6 +1,11 @@
 # percounter defer_wait: where the per-dispatch overhead is, and what did not fix it
 
-The COUNTER `defer_wait` support on `feat/percounter-defer-wait` costs a percounter
+The measurements below describe earlier revisions. The current percounter
+implementation has been rebased and functionally validated; refreshed DSV4.1
+performance acceptance is deferred to follow-up work. These historical figures
+are not a performance claim for the current PR head.
+
+The historical COUNTER `defer_wait` support on `feat/percounter-defer-wait` costs a percounter
 graph about 6% even when no kernel registers anything. This records what the cost was
 measured to be, which parts were attributed, and the attempts that did not reduce it,
 so the next person does not repeat them.
@@ -24,9 +29,13 @@ same branch binary is 1.7%, so the 5.6% mean gap is not drift.
 
 ## What the cost is made of
 
+This decomposition uses the **second branch measurement, 270.5 us**, against
+the same 256.2 us base. Each component below uses the base as denominator.
+
 - **Code present but not executed: +1.8%** (260.8 against 256.2). The short-circuited
   build keeps every added function, type and include and skips only their bodies.
-- **Code executed: +4.4%** (274.0 against 260.8).
+- **Code executed: +3.8 percentage points** ((270.5 − 260.8) / 256.2).
+  Together with the 1.8 points above, the total is 5.6%.
 - Of the executed part, roughly a third of the *total* gap is the seal's read of
   `record->count` / `record->error_code`: a separate build that skips that read alone
   measured 265.6 us against the branch's 269.3 us in the same session. The read is a

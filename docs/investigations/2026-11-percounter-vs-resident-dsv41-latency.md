@@ -1,11 +1,16 @@
 # percounter on DSV4.1: the claim range, and a probe that faked a 45% win
 
+The measurements below describe earlier revisions. The current percounter
+implementation has been rebased and functionally validated; refreshed DSV4.1
+performance acceptance is deferred to follow-up work. These historical figures
+are not a performance claim for the current PR head.
+
 `tests/fdwic/dsv41_scheduler` runs real DeepSeek-V4.1 regions on two A5 devices with
 the original kernel binaries. percounter started this investigation between **2.11x
 faster and 37% slower** than the resident scheduler across its eighteen cases, and the
 spread is now attributed: a lane drew four order-list positions at a time and withheld
-the ones it had not reached. Taking one position per draw moves sixteen of the eighteen
-by 7% to 48% and puts percounter ahead on all of them. The margin over the resident
+the ones it had not reached. In that historical comparison, taking one position per draw improves all eighteen
+cases by 9.0% to 78.4% and puts percounter ahead on all of them. The margin over the resident
 scheduler has since narrowed, because that scheduler was itself made faster -- see
 "The margin on current main" below.
 

@@ -44,6 +44,8 @@ src/a5/runtime/ on its include path, so `percounter/...` resolves from there, an
 sibling runtime reaching into this one would compile.
 """
 
+from __future__ import annotations
+
 import re
 import sys
 from pathlib import Path
@@ -51,28 +53,21 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 PERCOUNTER = REPO / "src/a5/runtime/percounter"
 
-# The AICore compile's search path, in order: BUILD_CONFIG["aicore"]["include_dirs"]
-# from src/a5/runtime/percounter/build_config.py, then the platform directories
-# src/a5/platform/onboard/aicore/CMakeLists.txt prepends to every AICore target.
-#
-# This is a hand-maintained mirror, and a mirror that silently loses a directory
-# would make this hook pass over a closure it cannot see. `unresolved_includes`
-# is what keeps it honest: a quoted include that resolves nowhere is reported
-# rather than dropped, so a missing directory here fails the hook instead of
-# shrinking what it checks.
+# Platform directories precede BUILD_CONFIG's runtime include directories.
+# Quoted includes additionally search the including file's directory first.
 AICORE_INCLUDE_DIRS = (
-    "src/a5/runtime/percounter/aicore",
-    "src/a5/runtime/percounter/runtime",
-    "src/a5/runtime/host_build_graph/runtime",
-    "src/a5/runtime/host_build_graph/common",
-    "src/a5/runtime",
-    "src/common/host_build_graph",
     "src/a5/platform/onboard/aicore",
     "src/a5/platform/include",
     "src/common/platform/include",
     "src/common/task_interface",
     "src/common/log/include",
     "src/common",
+    "src/a5/runtime/percounter/aicore",
+    "src/a5/runtime/percounter/runtime",
+    "src/a5/runtime/host_build_graph/runtime",
+    "src/a5/runtime/host_build_graph/common",
+    "src/a5/runtime",
+    "src/common/host_build_graph",
 )
 
 # Each key is a header percounter's AICore program has its own version of.
@@ -88,7 +83,7 @@ FORKED = {
     ),
 }
 
-INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
+INCLUDE = re.compile(r'^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)', re.M)
 # An include the source itself marks as optional. `scheduler_types.h` reaches
 # `spin_hint.h` this way: the header exists once per platform backend and the
 # AICore build adds neither, which is a resolution failure this hook must not
@@ -104,9 +99,9 @@ def rel(path: Path) -> str:
     return path.relative_to(REPO).as_posix()
 
 
-def resolve(including: Path, name: str, search: list[Path]) -> Path | None:
+def resolve(including: Path, name: str, search: list[Path], *, quoted: bool = True) -> Path | None:
     candidate = including.parent / name
-    if candidate.is_file():
+    if quoted and candidate.is_file():
         return candidate.resolve()
     for directory in search:
         candidate = directory / name
@@ -126,6 +121,8 @@ def closure(roots: list[Path], search: list[Path]) -> tuple[dict[Path, Path | No
     came_from: dict[Path, Path | None] = {root.resolve(): None for root in roots}
     unresolved: dict[str, str] = {}
     pending = [root.resolve() for root in roots]
+    project_prefixes = {child.name for directory in search for child in directory.iterdir() if child.is_dir()}
+    project_names = {child.name for directory in search for child in directory.iterdir() if child.is_file()}
     while pending:
         current = pending.pop()
         try:
@@ -133,10 +130,12 @@ def closure(roots: list[Path], search: list[Path]) -> tuple[dict[Path, Path | No
         except OSError:
             continue
         optional = set(OPTIONAL.findall(text))
-        for name in INCLUDE.findall(text):
-            target = resolve(current, name, search)
+        for quoted_name, angle_name in INCLUDE.findall(text):
+            name = quoted_name or angle_name
+            target = resolve(current, name, search, quoted=bool(quoted_name))
             if target is None:
-                if name not in optional:
+                project_angle = name in project_names or name.split("/", 1)[0] in project_prefixes
+                if name not in optional and (quoted_name or project_angle):
                     unresolved.setdefault(name, rel(current))
                 continue
             if target in came_from:
