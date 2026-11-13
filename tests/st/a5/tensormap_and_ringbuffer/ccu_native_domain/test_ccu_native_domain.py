@@ -9,7 +9,6 @@
 
 """Real native modules, Worker registration, READY, AIV/TMR and confirmed stop."""
 
-import hashlib
 import os
 import select
 import struct
@@ -17,7 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from simpler.ccu import ChipCcuBinding, ChipCcuRun
+from simpler.ccu import ChipCcuBinding, ChipCcuRun, ccu_sdk_root, runtime_build_identity
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
@@ -32,12 +31,10 @@ _RUNTIME = "tensormap_and_ringbuffer"
 
 def _build_callable(tmp_path, variant=0, source_root=_ROOT, runtime=_RUNTIME):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    sdk = Path(os.environ["ASCEND_HOME_PATH"])
-    arch = sdk / "aarch64-linux"
+    sdk = ccu_sdk_root()
     common = Path(__file__).resolve().parents[5] / "src/common"
-    sdk_identity = hashlib.sha256((arch / "include/hcomm/ccu/ccu_res.h").read_bytes()).digest()
+    sdk_identity, isa_identity = runtime_build_identity()
     isa_root = Path(ensure_pto_isa_root())
-    isa_identity = hashlib.sha256((isa_root / "include/pto/pto-inst.hpp").read_bytes()).digest()
     identities = tmp_path / "identities.cpp"
     identities.write_text(
         "#include <cstdint>\n"
@@ -56,10 +53,10 @@ def _build_callable(tmp_path, variant=0, source_root=_ROOT, runtime=_RUNTIME):
             str(source_root / "native_module.cpp"),
             str(identities),
             f"-I{common}",
-            f"-I{arch / 'include'}",
-            f"-I{arch / 'include/hccl'}",
-            f"-I{arch / 'pkg_inc/hcomm/ccu'}",
-            f"-I{arch / 'include/hcomm/ccu'}",
+            f"-I{sdk / 'include'}",
+            f"-I{sdk / 'include/hccl'}",
+            f"-I{sdk / 'pkg_inc/hcomm/ccu'}",
+            f"-I{sdk / 'include/hcomm/ccu'}",
             f"-L{sdk / 'lib64'}",
             "-lasccomm_ccu",
             "-lhcomm",

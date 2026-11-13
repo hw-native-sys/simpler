@@ -9,14 +9,13 @@
 """Hold actual CCU streams at trigger while preparing an independent successor."""
 
 import ctypes
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
-from simpler.ccu import runtime_build_identity
+from simpler.ccu import ccu_sdk_root, runtime_build_identity
 from simpler.task_interface import ChipWorker
 
 from simpler_setup.runtime_builder import RuntimeBuilder
@@ -153,7 +152,7 @@ def _rank(rank, device, directory):
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_prepared_successor_preserves_executing_ccu_resources(st_device_ids, tmp_path):
-    sdk = Path(os.environ["ASCEND_HOME_PATH"])
+    sdk = ccu_sdk_root()
     subprocess.run(
         [
             "g++",
@@ -161,7 +160,7 @@ def test_prepared_successor_preserves_executing_ccu_resources(st_device_ids, tmp
             "-shared",
             "-fPIC",
             str(Path(__file__).with_name("event_access.cpp")),
-            f"-I{sdk / 'aarch64-linux/include'}",
+            f"-I{sdk / 'include'}",
             f"-L{sdk / 'lib64'}",
             "-lascendcl",
             "-o",
