@@ -63,9 +63,9 @@ inline __aicore__ void shape_write(__gm__ int32_t *address, int32_t value) {
 #endif
 }
 
-inline __aicore__ int32_t shape_conditions(int32_t block, int32_t lane) {
+inline __aicore__ int32_t shape_conditions(int32_t block, int32_t lane, int32_t capacity) {
     const int32_t kind = (block + lane + 1) % 3;
-    return kind == 0 ? 0 : kind == 1 ? 1 : 64;
+    return kind == 0 ? 0 : kind == 1 ? 1 : capacity;
 }
 
 inline __aicore__ void run_shape(__gm__ int64_t *args, bool vector) {
@@ -77,6 +77,7 @@ inline __aicore__ void run_shape(__gm__ int64_t *args, bool vector) {
     const int32_t mask = static_cast<int32_t>(args[3]);
     const int32_t blocks = static_cast<int32_t>(args[4]);
     const bool skip = args[5] != 0;
+    const int32_t capacity = static_cast<int32_t>(args[6]);
     if (role == 0) {
         for (int32_t i = 0; i < 1 + 3 * blocks * kExecutionLines; ++i)
             shape_write(state + i * kLineWords, 0);
@@ -91,7 +92,7 @@ inline __aicore__ void run_shape(__gm__ int64_t *args, bool vector) {
                 if ((mask & (1 << lane)) == 0) continue;
                 auto *row = state + (1 + (block * 3 + lane) * kExecutionLines) * kLineWords;
                 returned = returned && shape_read(row) == (skip ? 0 : 2);
-                for (int32_t condition = 0; !skip && condition < shape_conditions(block, lane); ++condition)
+                for (int32_t condition = 0; !skip && condition < shape_conditions(block, lane, capacity); ++condition)
                     satisfied = satisfied && shape_read(row + (condition + 1) * kLineWords) == 1;
             }
         }
@@ -102,7 +103,7 @@ inline __aicore__ void run_shape(__gm__ int64_t *args, bool vector) {
     const int32_t block = get_block_idx(args);
     const int32_t lane = vector ? (mask == 2 ? 1 : 1 + get_sub_block_id(args)) : 0;
     auto *row = state + (1 + (block * 3 + lane) * kExecutionLines) * kLineWords;
-    const int32_t count = shape_conditions(block, lane);
+    const int32_t count = shape_conditions(block, lane, capacity);
     if (role == 1) {
         auto ctx = get_async_ctx(args);
         if (ctx.resident_enabled != 1) {

@@ -29,8 +29,11 @@
 
 #include "aicore/aicore.h"
 #include "common/platform_config.h"
+#include "async_completion_types.h"
 #include "dispatch_payload.h"
+#include "host_build_graph/runtime_status.h"
 #include "runtime.h"
+#include "scheduler/async_completion.h"
 #include "scheduler/wire_types.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_layout.h"
@@ -120,6 +123,12 @@ struct LaneConfig {
     // reads the predicate words.
     bool has_predicates;
 
+    __gm__ pto2::resident::AsyncGroupData *async_group;
+    __gm__ DeferredCompletionEntry *async_entries;
+    __gm__ PercounterAsyncCompletion *async_completions;
+    uint64_t async_completion_capacity;
+    __gm__ uint64_t *parked_next;
+
     // This lane's place in its cluster: lane 0 is the AIC, 1 and 2 the AIVs,
     // which is also the subtask slot it runs of a MIX task.
     int32_t cluster_index;
@@ -187,6 +196,10 @@ struct PercounterLaneState {
     uint32_t last_served;
     PercounterMixClaim claim;
     PercounterSyncState sync;
+    // Links are indices plus one; only this lane reads or changes its lists.
+    uint64_t async_head{0};
+    uint64_t parked_head{0};
+    bool async_seen{false};
     uint32_t prepared_mix_generation{0};
     int64_t prepared_mix_task{-1};
     int32_t prepared_mix_block{-1};
@@ -203,6 +216,12 @@ struct PercounterFaninView {
     __gm__ uint64_t *addresses;
     int32_t count;
 };
+
+/** True when the lane should stop: EXIT is signalled or some lane has failed. */
+inline __aicore__ bool percounter_should_stop(const LaneConfig &cfg) {
+    return static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL ||
+           percounter_gm_read(cfg.control->lane_error) != 0;
+}
 
 /**
  * Locate `task_id`'s producers.
@@ -325,6 +344,155 @@ inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const PercounterTask &ta
 }
 
 /**
+ * Record `count` finished subtasks of `task`; called after their store
+ * barriers. A body sink's subtasks also count toward its shell, whose counter
+ * is preset against every sink subtask of the body.
+ */
+inline __aicore__ void
+percounter_publish_completion(const LaneConfig &cfg, const PercounterTask &task, uint64_t count) {
+    percounter_gm_fetch_add(cfg.counters[task.id].value, count);
+    if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, count);
+}
+
+inline __aicore__ __gm__ pto2::resident::AsyncGroupData *
+percounter_init_async_record(__gm__ PercounterControl *control, int block_idx) {
+    using pto2::resident::AsyncGroupData;
+    const uint64_t lane = static_cast<uint64_t>(block_idx);
+    auto *record = scheduler_state_at<AsyncGroupData>(
+        control, percounter_gm_read(control->async_groups_offset) + lane * sizeof(AsyncGroupData)
+    );
+    record->run_epoch = percounter_gm_read(control->async_run_epoch);
+    record->task_ref = 0;
+    record->group_index = static_cast<uint32_t>(lane);
+    record->block_index = 0;
+    record->subtask_slot = 0;
+    record->capacity = PERCOUNTER_ASYNC_CAPACITY;
+    record->entries_bytes = PERCOUNTER_ASYNC_CAPACITY * sizeof(DeferredCompletionEntry);
+    record->count = 0;
+    record->error_code = SIMPLER_ERROR_NONE;
+    record->reservation_serial = 0;
+    record->reservation_limit = 0;
+    record->reservation_begin = 0;
+    record->reservation_written = 0;
+    record->state = pto2::resident::AsyncPublicationState::OPEN;
+    record->sdma_guards_offset = 0;
+    record->sdma_guard_count = 0;
+    record->entries_offset = percounter_gm_read(control->async_entries_offset) + lane * record->entries_bytes;
+    for (uint64_t offset = 0; offset < sizeof(AsyncGroupData); offset += 64)
+        dcci(reinterpret_cast<__gm__ uint8_t *>(record) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
+    return record;
+}
+
+// Only actual deferrals occupy persistent storage. Each physical invocation
+// appends at most one group; the registration scratch is reusable at return.
+inline __aicore__ bool
+percounter_async_seal(const LaneConfig &cfg, PercounterLaneState *state, const PercounterTask &task, bool *deferred) {
+    auto *record = cfg.async_group;
+    const uint32_t count = record->count;
+    const int32_t error = record->error_code;
+    if (error != SIMPLER_ERROR_NONE || count > PERCOUNTER_ASYNC_CAPACITY || record->reservation_limit != 0) {
+        percounter_fail(
+            cfg, error == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW      ? SchedulerGraphResult::ASYNC_WAIT_OVERFLOW :
+                 error == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ? SchedulerGraphResult::ASYNC_COMPLETION_INVALID :
+                                                                   SchedulerGraphResult::ASYNC_REGISTRATION_FAILED
+        );
+        return false;
+    }
+    if (count == 0) return true;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &entry = cfg.async_entries[i];
+        const CompletionToken token{
+            entry.addr, entry.expected_value, entry.engine, entry.completion_type, entry.backend_cookie
+        };
+        if (entry._pad != 0 || !percounter_completion_token_valid(token)) {
+            percounter_fail(cfg, SchedulerGraphResult::ASYNC_COMPLETION_INVALID);
+            return false;
+        }
+    }
+    const uint64_t index = percounter_gm_fetch_add(cfg.control->async_registered, uint64_t{1});
+    if (index >= cfg.async_completion_capacity) {
+        percounter_fail(cfg, SchedulerGraphResult::ASYNC_REGISTRATION_FAILED);
+        return false;
+    }
+    auto *held = &cfg.async_completions[index];
+    held->next = state->async_head;
+    held->pending_mask = (uint64_t{1} << count) - 1;
+    held->task_id = task.id;
+    held->shell = task.shell;
+    held->sink = task.sink;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &source = cfg.async_entries[i];
+        auto &target = held->entries[i];
+        target.addr = source.addr;
+        target.backend_cookie = source.backend_cookie;
+        target.expected_value = source.expected_value;
+        target.engine = source.engine;
+        target.completion_type = source.completion_type;
+        target._pad = 0;
+    }
+    const uint64_t bytes = offsetof(PercounterAsyncCompletion, entries) + count * sizeof(DeferredCompletionEntry);
+    for (uint64_t offset = 0; offset < bytes; offset += 64)
+        dcci(reinterpret_cast<__gm__ uint8_t *>(held) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    state->async_head = index + 1;
+    state->async_seen = true;
+    record->count = 0;
+    dcci(reinterpret_cast<__gm__ uint8_t *>(record), SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
+    *deferred = true;
+    return true;
+}
+
+inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLaneState *state, bool *settled) {
+    *settled = false;
+    uint64_t current = state->async_head;
+    uint64_t previous = 0;
+    bool wrote = false;
+    while (current != 0) {
+        auto *held = &cfg.async_completions[current - 1];
+        uint64_t pending = held->pending_mask;
+        const uint64_t next = held->next;
+        while (pending != 0) {
+            const uint32_t index = static_cast<uint32_t>(__builtin_ctzll(pending));
+            const auto &entry = held->entries[index];
+            const CompletionToken token{
+                entry.addr, entry.expected_value, entry.engine, entry.completion_type, entry.backend_cookie
+            };
+            const CompletionPollResult result = percounter_poll_valid_completion(token);
+            if (result.state == CompletionPollState::FAILED) {
+                percounter_fail(cfg, SchedulerGraphResult::ASYNC_COMPLETION_INVALID);
+                return false;
+            }
+            if (result.state != CompletionPollState::READY) break;
+            pending &= pending - 1;
+        }
+        if (pending == 0) {
+            percounter_gm_fetch_add(cfg.counters[held->task_id].value, uint64_t{1});
+            if (held->sink) percounter_gm_fetch_add(cfg.counters[held->shell].value, uint64_t{1});
+            percounter_gm_fetch_add(cfg.control->async_settled, uint64_t{1});
+            if (previous == 0) state->async_head = next;
+            else {
+                auto *link = &cfg.async_completions[previous - 1];
+                link->next = next;
+                wrote = true;
+                dcci(reinterpret_cast<__gm__ uint8_t *>(link), SINGLE_CACHE_LINE, CACHELINE_OUT);
+            }
+            *settled = true;
+        } else {
+            if (pending != held->pending_mask) {
+                held->pending_mask = pending;
+                wrote = true;
+                dcci(reinterpret_cast<__gm__ uint8_t *>(held), SINGLE_CACHE_LINE, CACHELINE_OUT);
+            }
+            previous = current;
+        }
+        current = next;
+    }
+    if (wrote) dsb((mem_dsb_t)0);
+    return true;
+}
+
+/**
  * Prepare one block's subtask from published argument metadata. Tensor values
  * and the dispatch predicate may still be produced elsewhere; neither is read
  * here. The slot remains owned by this candidate until it executes.
@@ -362,8 +530,11 @@ inline __aicore__ bool percounter_prepare_subtask(
 }
 
 /** Execute a prepared slot only after its caller has established readiness. */
-inline __aicore__ bool
-percounter_run_prepared(const LaneConfig &cfg, const PercounterTask &task, __gm__ DispatchPayload *payload) {
+inline __aicore__ bool percounter_run_prepared(
+    const LaneConfig &cfg, PercounterLaneState *state, const PercounterTask &task, __gm__ DispatchPayload *payload,
+    bool *deferred
+) {
+    *deferred = false;
     const uint64_t receive_time = cfg.profile != nullptr ? get_sys_cnt_aicore() : 0;
     percounter_observe_data_cache(reinterpret_cast<__gm__ void *>(payload));
     if (cfg.has_predicates) {
@@ -402,7 +573,7 @@ percounter_run_prepared(const LaneConfig &cfg, const PercounterTask &task, __gm_
             chip_swimlane_aicore_publish_task_count(cfg.profile);
         }
     }
-    return true;
+    return percounter_async_seal(cfg, state, task, deferred);
 }
 
 /**
@@ -439,23 +610,6 @@ inline __aicore__ bool percounter_prepare_pending(
     }
     pending->prepared = true;
     return true;
-}
-
-/**
- * Record `count` finished subtasks of `task`; called after their store
- * barriers. A body sink's subtasks also count toward its shell, whose counter
- * is preset against every sink subtask of the body.
- */
-inline __aicore__ void
-percounter_publish_completion(const LaneConfig &cfg, const PercounterTask &task, uint64_t count) {
-    percounter_gm_fetch_add(cfg.counters[task.id].value, count);
-    if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, count);
-}
-
-/** True when the lane should stop: EXIT is signalled or some lane has failed. */
-inline __aicore__ bool percounter_should_stop(const LaneConfig &cfg) {
-    return static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL ||
-           percounter_gm_read(cfg.control->lane_error) != 0;
 }
 
 /**
@@ -882,19 +1036,31 @@ inline __aicore__ int32_t percounter_sync_take_block(const LaneConfig &cfg, uint
  * every participant it names is already gathering. `my_block` stays set until
  * the block is run or armed.
  */
-inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state) {
+inline __aicore__ bool
+percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles) {
     PercounterSyncState *sync = &state->sync;
     if ((sync->active_mask & (sync->active_mask - 1U)) == 0) {
         PercounterTask task{};
         if (!percounter_resolve(cfg, sync->task_id, &task)) return false;
-        if (!percounter_run_prepared(cfg, task, cfg.payloads + PERCOUNTER_SYNC_PAYLOAD_SLOT)) {
+        bool deferred = false;
+        if (!percounter_run_prepared(cfg, state, task, cfg.payloads + PERCOUNTER_SYNC_PAYLOAD_SLOT, &deferred)) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             return false;
         }
-        percounter_publish_completion(cfg, task, uint64_t{1});
+        if (!deferred) percounter_publish_completion(cfg, task, uint64_t{1});
         ++state->local_done;
         sync->my_block = -1;
         percounter_cohort_hold_set(cfg, 0);
+        // **Raised whether or not the task published**, and the four lines
+        // above it are why: the block has run, this lane is out of its kernel
+        // and holds nothing, so the cohort protocol is free to proceed. Only
+        // the counter the task's consumers watch waits.
+        //
+        // The rule that count obeys -- a lane seeing it reach the total may
+        // stop, and no consumer may still be waiting then -- now rests on the
+        // exit predicate rather than on this order: a lane does not leave
+        // while any deferred completion remains pending, and a deferred cohort block
+        // keeps it non-zero until its conditions hold.
         percounter_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
         // The count this block just raised is what the next cohort waits on,
         // and the lane that raises it is the only one that knows it changed.
@@ -971,7 +1137,7 @@ inline __aicore__ bool percounter_sync_serve_released(
     // Cohorts are promoted in sequence order, so this one is fully claimed
     // exactly when the counter passes it.
     if (percounter_gm_read(cfg.sync_queue->released) > sync->my_seq) {
-        const bool ok = percounter_sync_serve_block(cfg, state);
+        const bool ok = percounter_sync_serve_block(cfg, state, timeout_cycles);
         *served = sync->my_block < 0;
         return ok;
     }
@@ -1227,6 +1393,12 @@ percounter_lane_may_exit(const LaneConfig &cfg, const PercounterLaneState *state
         done += cohort_done;
         complete = complete && cohort_done >= cfg.sync_block_total;
     }
+    // Registered and settled are monotone; registration precedes the block's
+    // physical completion publication.
+    const uint64_t registered = percounter_gm_read(cfg.control->async_registered);
+    const uint64_t settled = percounter_gm_read(cfg.control->async_settled);
+    done += settled;
+    complete = complete && registered == settled;
     *progress = done;
     return complete && state->sync.my_block < 0;
 }
@@ -1326,12 +1498,28 @@ inline __aicore__ bool percounter_serve_mix(
     if (!percounter_mix_wait(cfg, signal->arrived, mask, generation, timeout_cycles)) return false;
     // Inside the kernel this lane polls nothing. Every participant has arrived,
     // so a cross-core channel wait in it has a peer to meet.
-    if (!percounter_run_prepared(cfg, task, payload)) {
+    bool deferred = false;
+    if (!percounter_run_prepared(cfg, state, task, payload, &deferred)) {
         percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
         return false;
     }
+    // **A deferring subtask takes its own share back out.** The lowest
+    // participant publishes the block's whole share below and cannot be told
+    // which of them to leave out -- the signal line is a full cache line with
+    // nowhere to carry a mask -- so this lane subtracts the one it owes and
+    // `percounter_async_settle` adds it again when its conditions hold. The
+    // counter is already signed and preset negative, so an intermediate below
+    // the preset is this mechanism's own arithmetic, not a special case; and
+    // it can only make the task look less complete, so a consumer waits
+    // longer, never starts early.
+    if (deferred) {
+        percounter_gm_fetch_add(cfg.counters[task.id].value, ~uint64_t{0});
+        if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, ~uint64_t{0});
+    }
     // After the kernel's store barrier, so a peer that observes this token has
-    // observed the subtask's outputs.
+    // observed the subtask's outputs -- and after the subtraction above, which
+    // is what orders it before the publisher's add: that lane only adds once
+    // it has acquire-read this token.
     percounter_ssbuf_store_release(&signal->finished[lane], generation);
 
     if ((uint32_t{1} << lane) == (mask & (~mask + 1U))) {
@@ -1402,6 +1590,13 @@ percounter_mix_discover(const LaneConfig &cfg, PercounterLaneState *state, uint6
  */
 inline __aicore__ bool
 percounter_checkpoint_serve(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served) {
+    // **First, and unconditional.** Every blocking wait in this runtime calls
+    // this function each round, so putting the deferred-group poll here is
+    // what makes a lane's own deferral safe: the lane that owes a completion
+    // keeps making it while it waits on producers, and a task consuming the
+    // one this lane just deferred cannot wedge the lane that must publish it.
+    if (!percounter_async_tick(cfg, state, served)) return false;
+    if (*served) return true;
     if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
     if (*served) return true;
     if (!percounter_mix_discover(cfg, state, timeout_cycles, served)) return false;
@@ -1430,7 +1625,13 @@ inline __aicore__ void percounter_flush_done(const LaneConfig &cfg, PercounterLa
  */
 inline __aicore__ void
 percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles) {
-    if (cfg.mix_order_count == 0 && cfg.sync_cohort_count == 0) return;
+    // **A deferred group keeps its lane here too**, and not only on a graph
+    // with MIX or cohort work. The lane that owes a completion is the only one
+    // that can make it, so leaving with one outstanding strands the task's
+    // consumers on a counter nobody will ever raise. This is the loop that
+    // consults `percounter_lane_may_exit`, which is where the device-wide
+    // outstanding count gates the exit.
+    if (cfg.mix_order_count == 0 && cfg.sync_cohort_count == 0 && state->async_head == 0) return;
     // Restarted whenever this lane serves, and whenever the device completes a
     // rendezvous or a cohort block. What this lane waits for is device-wide, so
     // its own idleness is not evidence of a stall: a long task on another
@@ -1469,17 +1670,48 @@ percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
     }
 }
 
+// Parked positions retain ticket ownership but release their payload slot.
+// Their links are stored by atomic exchange because neighbours share a line.
+inline __aicore__ bool percounter_resume_parked(
+    const LaneConfig &cfg, PercounterLaneState *state, PercounterPending *pending, uint32_t *pending_count,
+    bool *resumed
+) {
+    *resumed = false;
+    uint64_t current = state->parked_head;
+    uint64_t previous = 0;
+    while (current != 0) {
+        const uint64_t position = current - 1;
+        const uint64_t next = percounter_gm_read(cfg.parked_next[position]);
+        const uint64_t entry = percounter_gm_read(cfg.order[position]);
+        if (percounter_order_block_num(entry) != 0) {
+            PercounterTask task{};
+            if (!percounter_resolve(cfg, percounter_order_task_id(entry), &task)) return false;
+            if (percounter_fanin_ready(cfg, task)) {
+                if (previous == 0) state->parked_head = next;
+                else percounter_gm_store(cfg.parked_next[previous - 1], next);
+                auto &candidate = pending[(*pending_count)++];
+                candidate.position = position;
+                candidate.prepared = false;
+                *resumed = true;
+                return true;
+            }
+        }
+        previous = current;
+        current = next;
+    }
+    return true;
+}
+
 /**
  * A lane draws one position at a time and keeps at most
  * PERCOUNTER_PENDING_CAPACITY candidates. It scans held positions before
  * drawing another, and rechecks every candidate while the window is blocked.
  * Unpublished Graph body entries remain candidates until the AICPU publishes.
  *
- * Every list uses the same descending (b-level, -id) key. The highest-key
- * incomplete task has no incomplete producer. A lane holding its position
- * finds it on the scan; if it is undrawn, every earlier position in that
- * group's share is complete, leaving a lane free to draw it. Graph publication
- * advances on the AICPU without waiting on any lane.
+ * Synchronous work follows the descending (b-level, -id) order: the
+ * highest-key incomplete task has no incomplete producer. Deferred conditions
+ * may require a later ordinary notifier; parking blocked positions keeps
+ * that notifier reachable without reserving another payload window.
  *
  * A sync-start entry only queues a ready cohort. Its blocks run exclusively
  * through the global cohort protocol, which admits one incomplete cohort.
@@ -1567,7 +1799,22 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
                 }
             }
             if (claimed) continue;
-            if (pending_count == 0) {
+            if (pending_count == PERCOUNTER_PENDING_CAPACITY &&
+                (state.async_seen || (checks == PERCOUNTER_SPIN_CHECK_INTERVAL - 1 &&
+                                      percounter_gm_read(cfg.control->async_registered) != 0))) {
+                state.async_seen = true;
+                auto &blocked = pending[--pending_count];
+                percounter_gm_store(cfg.parked_next[blocked.position], state.parked_head);
+                state.parked_head = blocked.position + 1;
+                blocked.prepared = false;
+                continue;
+            }
+            if (pending_count < PERCOUNTER_PENDING_CAPACITY && state.parked_head != 0) {
+                bool resumed = false;
+                if (!percounter_resume_parked(cfg, &state, pending, &pending_count, &resumed)) break;
+                if (resumed) continue;
+            }
+            if (pending_count == 0 && state.parked_head == 0) {
                 percounter_flush_done(cfg, &state);
                 percounter_mix_drain(cfg, &state, timeout_cycles);
                 break;
@@ -1603,11 +1850,12 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
             percounter_sync_enqueue(cfg, task, percounter_order_block_num(entry));
             continue;
         }
-        if (!percounter_run_prepared(cfg, task, cfg.payloads + payload_slot)) {
+        bool deferred = false;
+        if (!percounter_run_prepared(cfg, &state, task, cfg.payloads + payload_slot, &deferred)) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             break;
         }
-        percounter_publish_completion(cfg, task, uint64_t{1});
+        if (!deferred) percounter_publish_completion(cfg, task, uint64_t{1});
         if (++state.local_done >= PERCOUNTER_COMPLETION_BATCH) percounter_flush_done(cfg, &state);
     }
     percounter_flush_done(cfg, &state);
@@ -1670,6 +1918,16 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     );
     cfg.ticket_group = static_cast<uint32_t>(coordinate.cluster_index) % cfg.ticket_group_count;
     cfg.has_predicates = percounter_gm_read(control->has_predicates) != 0;
+    cfg.async_group = percounter_init_async_record(control, block_idx);
+    cfg.async_entries = scheduler_state_at<DeferredCompletionEntry>(
+        control, percounter_gm_read(control->async_entries_offset) +
+                     static_cast<uint64_t>(block_idx) * PERCOUNTER_ASYNC_CAPACITY * sizeof(DeferredCompletionEntry)
+    );
+    cfg.async_completions =
+        scheduler_state_at<PercounterAsyncCompletion>(control, percounter_gm_read(control->async_completions_offset));
+    cfg.async_completion_capacity = percounter_gm_read(control->async_completion_capacity);
+    cfg.parked_next =
+        scheduler_state_at<uint64_t>(control, percounter_gm_read(control->parked_next_offset[type_index]));
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
 

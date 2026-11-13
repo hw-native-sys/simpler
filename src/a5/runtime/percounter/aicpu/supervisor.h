@@ -185,19 +185,29 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     cache_invalidate_range(control, sizeof(*control));
     if (aicpu_thread_count <= 1) percounter_prepare_graphs(runtime, control);
     const uint64_t expected = control->executable_block_count;
-    uint64_t last_resolved = ~uint64_t{0};
+    uint64_t last_progress = ~uint64_t{0};
     uint64_t last_progress_cycles = get_sys_cnt_aicpu();
     uint32_t error_poll_count = 0;
     uint64_t error = 0;
+    uint64_t outstanding = 0;
+    uint64_t settled = 0;
     while (true) {
         cache_invalidate_range(&control->completed_block_count, sizeof(control->completed_block_count));
         const uint64_t resolved = control->completed_block_count;
+        // The final block publication follows every registration allocation.
+        if (resolved >= expected || error_poll_count == 63) {
+            cache_invalidate_range(&control->async_registered, 2 * sizeof(uint64_t));
+            const uint64_t registered = control->async_registered;
+            settled = control->async_settled;
+            outstanding = registered - settled;
+        }
         const uint64_t now = get_sys_cnt_aicpu();
-        if (resolved != last_resolved) {
-            last_resolved = resolved;
+        const uint64_t progress = resolved + settled;
+        if (progress != last_progress) {
+            last_progress = progress;
             last_progress_cycles = now;
         }
-        if (resolved >= expected) break;
+        if (resolved >= expected && outstanding == 0) break;
         if (++error_poll_count == 64) {
             error_poll_count = 0;
             chip_swimlane_aicpu_poll_self_scheduled_cores(thread_idx, aicpu_thread_count, runtime->get_worker_count());
@@ -215,7 +225,11 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
         }
         if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
             error = static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
-            LOG_ERROR("A5 percounter: no progress; %" PRIu64 " of %" PRIu64 " blocks resolved", resolved, expected);
+            LOG_ERROR(
+                "A5 percounter: no progress; %" PRIu64 " of %" PRIu64 " blocks resolved, %" PRIu64
+                " deferred completions outstanding",
+                resolved, expected, outstanding
+            );
             break;
         }
         SPIN_WAIT_HINT();

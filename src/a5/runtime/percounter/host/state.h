@@ -61,6 +61,8 @@ struct GraphInputs {
     std::vector<GraphInvocationInput> invocations;
     GraphLayoutInput layout{};
     uint64_t body_blocks{0};
+    const std::byte *section{nullptr};
+    uint32_t section_bytes{0};
 };
 
 /**
@@ -100,6 +102,13 @@ inline TemplateResult gather_graph_inputs(
                 *failed_task_id = task_id;
                 return built;
             }
+            GraphDefinitionValue definition{};
+            if (!graph_definition_decode_framed(view, definition_offset, &definition)) {
+                *failed_task_id = task_id;
+                return TemplateResult{TemplateStatus::MALFORMED, "the Definition framing is invalid", -1};
+            }
+            out->section = view.section;
+            out->section_bytes = std::max(out->section_bytes, definition_offset + definition.definition.total_bytes);
             out->layout.templates_bytes += graph_template_bytes(tmpl);
             out->templates.push_back(std::move(tmpl));
             found = template_of_definition.emplace(definition_offset, out->templates.size() - 1).first;
@@ -172,6 +181,7 @@ inline StateSelection select_percounter_state(
     // Each GRAPH task places its body's blocks, and holds one of its own that
     // no list carries.
     uint64_t block_total = graph.body_blocks;
+    uint64_t execution_count = 0;
     for (size_t t = 0; t < task_count; ++t) {
         const int64_t task_id = static_cast<int64_t>(t);
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
@@ -185,6 +195,8 @@ inline StateSelection select_percounter_state(
             mix_order_count += tmpl.orders[PERCOUNTER_LIST_MIX].size();
             sync_cohort_count += tmpl.sync_cohort_count;
             ++block_total;
+            for (const auto &body_task : tmpl.tasks)
+                execution_count += body_task.subtask_total;
         } else if (!input.inline_completed) {
             input.sync_start = slot.task_attrs.requires_sync_start();
             input.has_predicate = slot.task_attrs.has_predicate();
@@ -199,6 +211,7 @@ inline StateSelection select_percounter_state(
             input.block_num = slot.logical_block_num;
             input.is_mix = placement == TaskPlacement::MIX;
             input.subtask_count = __builtin_popcount(active_mask);
+            execution_count += static_cast<uint64_t>(input.block_num) * input.subtask_count;
             // A sync-start task holds one arming entry; its blocks are handed
             // out from the cohort queue instead of from a list.
             const uint64_t entries = input.sync_start ? 1 : static_cast<uint64_t>(input.block_num);
@@ -221,7 +234,7 @@ inline StateSelection select_percounter_state(
     PercounterLayout layout{};
     if (!plan_layout(
             task_count, block_total, edges.size(), order_count, &layout, mix_order_count, sync_cohort_count,
-            graph.layout
+            graph.layout, execution_count
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;
@@ -255,6 +268,7 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
 
+    const uint64_t async_run_epoch = region_at<PercounterControl>(host_base, layout.control_offset)->async_run_epoch;
     // Each slot points at its own contexts, so preparing another candidate
     // cannot replace the block identity of a payload already held by the lane.
     for (uint64_t slot = 0; slot < SCHEDULER_WORKER_CAPACITY * PERCOUNTER_PAYLOAD_SLOT_COUNT; ++slot) {
@@ -267,8 +281,27 @@ inline StateSelection select_percounter_state(
         payload->local_context.block_num = 1;
         payload->local_context.async_ctx.task_token = TaskId::invalid();
         payload->src_payload = 0;
+        // Every prepared payload on a lane names that lane's registration scratch.
+        const uint64_t first_record = slot / PERCOUNTER_PAYLOAD_SLOT_COUNT;
+        payload->global_context.async_present = 1;
+        payload->global_context.async_image_address = device_base;
+        payload->global_context.async_image_bytes = layout.total_size;
+        payload->global_context.async_run_epoch = async_run_epoch;
+        payload->global_context.async_group_offset =
+            layout.async_groups_offset + first_record * sizeof(pto2::resident::AsyncGroupData);
+        payload->global_context.async_group_index = static_cast<uint32_t>(first_record);
+        payload->global_context.async_output_capture_refused = 0;
     }
 
+    if (graph.section_bytes != 0) {
+        uint32_t source = 0;
+        uint64_t base = 0;
+        if (api->publish_graph_section(graph.section, graph.section_bytes, &source, &base) != 0) {
+            LOG_ERROR("A5 percounter: failed to publish %u Graph Definition bytes", graph.section_bytes);
+            return StateSelection::FAILED;
+        }
+        runtime->publish_graph_section(static_cast<GraphSectionSource>(source), base, graph.section_bytes);
+    }
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
     if (api != nullptr) api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_PERCOUNTER);
     runtime->add_pending_metadata(

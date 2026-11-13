@@ -24,14 +24,14 @@ class TestDeferWaitShapes(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/shapes.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR],
+            "signature": [D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR, D.SCALAR],
         },
         "incores": [
             {
                 "func_id": func_id,
                 "source": f"kernels/{core_type}.cpp",
                 "core_type": core_type,
-                "signature": [D.INOUT, D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR, D.SCALAR],
+                "signature": [D.INOUT, D.INOUT, D.SCALAR, D.SCALAR, D.SCALAR, D.SCALAR, D.SCALAR],
             }
             for func_id, core_type in enumerate(["aic", "aiv"])
         ],
@@ -65,6 +65,7 @@ class TestDeferWaitShapes(SceneTestCase):
             Scalar("mask", params["mask"]),
             Scalar("mode", params["mode"]),
             Scalar("graph", int(params["graph"])),
+            Scalar("condition_capacity", params.get("condition_capacity", 64)),
         )
 
     def compute_golden(self, args, params):

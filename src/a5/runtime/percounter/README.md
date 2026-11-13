@@ -76,3 +76,16 @@ the earliest post-handshake lane-work start to the latest lane-work end. It
 includes AICore scheduling and dependency waits, with two clock reads per lane.
 It excludes the handshake and the final retirement wait. See
 [Host trace timing](../../../../docs/dfx/host-trace.md) for the metric boundary.
+
+## Deferred completion regression tests
+
+Percounter is an opt-in runtime (`BUILD_BY_DEFAULT = False`). Its deferred
+completion scenes are manual, matching the explicit runtime build requirement:
+
+```bash
+python -m simpler_setup.build_runtimes --platforms a5sim --runtime percounter
+pytest tests/st/a5/percounter/defer_wait --platform a5sim --manual include
+```
+
+The same scene cases support `a5`; submit each hardware case in its own device
+allocation after preparing its kernels.

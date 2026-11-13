@@ -61,6 +61,7 @@ not_in_nav: |
   remote-l3-worker-design/*
   troubleshooting/device-error-codes/*
   zh-cn/design/percounter-runtime-split.md
+  zh-cn/design/percounter-defer-wait.md
 
 hooks:
   - docs/_hooks/repo_links.py

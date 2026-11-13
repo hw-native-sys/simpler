@@ -30,6 +30,7 @@
 // scheduler_protocol_types.h, which scheduler_layout.h pulls in, names LaneMask
 // without including it; host_build_graph's own translation units happen to have
 // it in scope by then, and this runtime's do not.
+#include "async_completion_types.h"
 #include "common/lane_mask.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/ssbuf.h"
@@ -242,6 +243,24 @@ inline __aicore__ bool percounter_counter_published(uint64_t value) { return sta
 inline constexpr uint64_t percounter_counter_preset(int64_t total_subtasks) {
     return static_cast<uint64_t>(static_cast<int64_t>(PERCOUNTER_COUNTER_PUBLISHED) - total_subtasks);
 }
+
+inline constexpr uint32_t PERCOUNTER_ASYNC_CAPACITY = 4;
+static_assert(PERCOUNTER_ASYNC_CAPACITY <= MAX_COMPLETIONS_PER_TASK);
+
+// One physical invocation can append at most one completion record.
+struct alignas(64) PercounterAsyncCompletion {
+    uint64_t next;
+    uint64_t pending_mask;
+    int64_t task_id;
+    int64_t shell;
+    uint64_t sink;
+    uint64_t reserved[3];
+    DeferredCompletionEntry entries[PERCOUNTER_ASYNC_CAPACITY];
+};
+static_assert(sizeof(PercounterAsyncCompletion) == 192);
+static_assert(
+    std::is_trivially_copyable_v<PercounterAsyncCompletion> && std::is_standard_layout_v<PercounterAsyncCompletion>
+);
 
 /** A ticket, line-isolated for the same reason the counters are. */
 struct alignas(64) PercounterTicket {
@@ -647,11 +666,22 @@ struct alignas(128) PercounterControl {
     // PERCOUNTER_PAYLOAD_SLOT_COUNT DispatchPayloads per lane: ordinary
     // candidates, a MIX subtask, and a cohort block have separate lifetimes.
     uint64_t dispatch_payloads_offset;
+    // One deferred-completion record per lane and the entry slots behind it,
+    // indexed the way the payloads are and for the same reason. The condition
+    // cap is one record's, and the epoch is what tells a record of this run
+    // from one the retained storage still held.
+    uint64_t async_groups_offset;
+    uint64_t async_entries_offset;
+    uint64_t async_capacity;
+    uint64_t async_run_epoch;
+    uint64_t async_completions_offset;
+    uint64_t async_completion_capacity;
+    uint64_t parked_next_offset[PERCOUNTER_CORE_TYPE_COUNT];
     // Prefilled by the host so a lane can bound its startup wait; the AICPU
     // overwrites it with any override when it publishes the topology.
     uint64_t scheduler_timeout_cycles;
     // Pads the progress counter below onto its own 64 B line.
-    uint8_t reserved[320 - 34 * sizeof(uint64_t)];
+    uint8_t reserved[384 - 42 * sizeof(uint64_t)];
 
     // **Alone on the last line.** Lanes batch their completions into this, and
     // the AICPU supervisor polls it against `executable_block_count`. It is the
@@ -665,8 +695,19 @@ struct alignas(128) PercounterControl {
     // discipline -- an atomic add to write, ld_dev or an invalidate to read.
     alignas(64) uint64_t completed_block_count;
     uint8_t resolved_reserved[56];
+
+    // Allocation precedes the corresponding block's completed publication.
+    // Both counters are monotone; equality after all blocks ran permits exit.
+    alignas(64) uint64_t async_registered;
+    uint64_t async_settled;
+    uint8_t async_reserved[48];
 };
-static_assert(sizeof(PercounterControl) == 384, "percounter control is three 128 B lines");
+static_assert(sizeof(PercounterControl) == 512, "percounter control is four 128 B lines");
+static_assert(
+    offsetof(PercounterControl, async_registered) % 64 == 0 &&
+        offsetof(PercounterControl, async_registered) / 64 != offsetof(PercounterControl, completed_block_count) / 64,
+    "the deferred-group counts are atomics and own their line"
+);
 static_assert(
     offsetof(PercounterControl, completed_block_count) % 64 == 0,
     "the one field lanes write must start a cache line, or every reader of its neighbours pays for it"
