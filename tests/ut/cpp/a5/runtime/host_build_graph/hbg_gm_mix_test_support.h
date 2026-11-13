@@ -175,14 +175,13 @@ struct GmMixFixture {
         const auto &metadata = storage.metadata[task];
         const uint32_t queue = scheduler_task_ready_queue(metadata.flags, metadata.active_mask);
         SchedulerReadyClaim ready{};
-        return scheduler_claim_ready_for_slot(graph.graph(), base(), local, run(), locals.size(), queue, &ready) &&
+        return scheduler_claim_ready_for_slot(graph.graph(), base(), local, run(), queue, &ready) &&
                ready.task_ref == static_cast<int64_t>(task) &&
                scheduler_try_claim_admission(graph.graph(), base(), local, run(), &admissions[worker], ready) ==
                    SchedulerAdmissionResult::PROGRESS;
     }
     bool admit(uint64_t task, uint32_t worker = 0) {
         return claim_pending(task, worker) &&
-               scheduler_prepare_admission_record(graph.graph(), base(), locals[worker], run(), &admissions[worker]) &&
                scheduler_try_commit_admission(graph.graph(), base(), locals[worker], run(), &admissions[worker]) ==
                    SchedulerAdmissionResult::PROGRESS;
     }

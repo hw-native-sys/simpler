@@ -94,7 +94,7 @@ protected:
         for (uint32_t worker : {1u, 2u}) {
             SchedulerReadyClaim aiv{};
             ASSERT_TRUE(scheduler_claim_ready_for_slot(
-                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 3, 1, &aiv
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 1, &aiv
             ));
             EXPECT_EQ(aiv.task_ref, SCHEDULER_TASK_REF_INVALID);
         }

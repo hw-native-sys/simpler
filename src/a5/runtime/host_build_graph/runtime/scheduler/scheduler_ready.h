@@ -231,7 +231,6 @@ struct SchedulerLocalState {
     SchedulerAdmissionLocalState *admission{nullptr};
     SchedulerAsyncLocalState *async{nullptr};
     uint64_t pending_completed{0};
-    SchedulerResolveCursor control_resolve{};
     uint64_t last_completion_flush_cycles{0};
     uint32_t control_peer_cursor{0};
 
@@ -288,7 +287,7 @@ static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 104, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 368, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 208, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 168 + sizeof(SchedulerScalarTrace),
     "64-bit local profiling size changed"
@@ -634,15 +633,9 @@ static inline __aicore__ void scheduler_record_dispatch_error(
     scheduler_record_error(run, task_ref, status, graph, local->config.shared_context, site, &identity);
 }
 
-static inline __aicore__ void scheduler_publish_waiter_metadata(
-    __gm__ SchedulerTaskControl *control, int64_t next_waiter, int32_t next_fanin_index, int32_t waiting_producer
-) {
-    control->next_fanin_index = next_fanin_index;
-    control->waiting_producer = waiting_producer;
-    scheduler_publish_cache_line(&control->next_fanin_index);
-    // The link lands after the fields it is read alongside, and as a single
-    // atomic word: the waiter becomes reachable only once its link is readable.
-    scheduler_gm_store(control->next_waiter, next_waiter);
+static inline __aicore__ void
+scheduler_publish_wake_cursor(__gm__ SchedulerTaskControl *control, int64_t next_waiter, uint32_t next_fanin) {
+    scheduler_gm_store(control->wake_cursor, scheduler_wake_cursor_pack(next_waiter, next_fanin));
 }
 
 // The chain link is published by another core's atomic, and ld_dev does not
@@ -653,116 +646,76 @@ static inline __aicore__ int64_t scheduler_observe_next_waiter(__gm__ SchedulerT
     return scheduler_gm_load(control->next_waiter);
 }
 
-// One unit initializes the cursor, observes one fanin, or attempts one wake
-// registration. A successful registration hands the waiter to another resolver:
-// every later call returns its saved verdict without reading that waiter again.
-static inline __aicore__ SchedulerRouteProgress scheduler_route_task_step(
-    const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
-    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerRouteCursor &cursor, uint32_t budget,
-    bool validate_current_state = true
+// A detached waiter has one owner until a successful head CAS transfers it.
+// The caller validates the ref and the saved fanin position against this view;
+// the synchronous route keeps both local and never exports a continuation.
+static inline __aicore__ SchedulerRouteResult scheduler_route_detached_waiter(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    int64_t waiter_ref, const SchedulerFaninView &fanin, uint32_t next_fanin
 ) {
-    uint32_t used = 0;
-    auto fail = [&](SchedulerGraphResult error, SchedulerErrorSite site = SchedulerErrorSite::UNKNOWN) __aicore__ {
-        cursor.result = SchedulerRouteResult::ERROR;
-        scheduler_record_error(run_control, task_ref, error, &graph, context, site);
-        return SchedulerRouteProgress{cursor.result, used};
-    };
-    if (context == nullptr || !scheduler_task_ref_valid(graph, task_ref))
-        return fail(SchedulerGraphResult::INVALID_TASK_ID);
-    if (cursor.task_ref != SCHEDULER_TASK_REF_INVALID && cursor.task_ref != task_ref)
-        return fail(SchedulerGraphResult::INVALID_ARGUMENTS);
-    if (cursor.result != SchedulerRouteResult::YIELD) {
-        if (cursor.task_ref == SCHEDULER_TASK_REF_INVALID) return fail(SchedulerGraphResult::INVALID_ARGUMENTS);
-        if (cursor.result != SchedulerRouteResult::WAITING && cursor.result != SchedulerRouteResult::READY_TO_ENQUEUE &&
-            cursor.result != SchedulerRouteResult::COMPLETED && cursor.result != SchedulerRouteResult::ERROR)
-            return fail(SchedulerGraphResult::INVALID_ARGUMENTS);
-        return {cursor.result, 0};
-    }
-    if (budget == 0) return {SchedulerRouteResult::YIELD, 0};
-    const bool initialize = cursor.task_ref == SCHEDULER_TASK_REF_INVALID;
-    auto *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
-    if (initialize) {
-        ++used;
-        cursor.task_ref = task_ref;
-        if (validate_current_state) {
-            const int64_t state = scheduler_gm_query(control->state);
-            if (state == static_cast<int64_t>(SchedulerTaskState::DONE)) {
-                cursor.result = SchedulerRouteResult::COMPLETED;
-                return {cursor.result, used};
+    auto *control = scheduler_task_control_at(base, local, waiter_ref);
+    uint32_t attempts = 0;
+    for (; next_fanin < fanin.count; ++next_fanin) {
+        int64_t producer_ref;
+        if (scheduler_fanin_ref(fanin, waiter_ref, next_fanin, &producer_ref) != SchedulerGraphResult::OK) {
+            scheduler_record_error(run, waiter_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, local);
+            return SchedulerRouteResult::ERROR;
+        }
+        auto *producer = scheduler_task_control_at(base, local, producer_ref);
+        int64_t observed = scheduler_gm_query(producer->wake_list_head);
+        for (;;) {
+            if (++attempts % 32 == 0 && scheduler_read_worker_error(run, local->worker_id()) != 0)
+                return SchedulerRouteResult::ERROR;
+            if (observed == SCHEDULER_WAKE_LIST_CLOSED) break;
+            if (observed < SCHEDULER_WAKE_LIST_OPEN || (observed >= 0 && !scheduler_task_ref_valid(graph, observed))) {
+                scheduler_record_error(run, waiter_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, local);
+                return SchedulerRouteResult::ERROR;
             }
-            if (state != static_cast<int64_t>(SchedulerTaskState::BLOCKED))
-                return fail(SchedulerGraphResult::INVALID_ARGUMENTS, SchedulerErrorSite::ROUTE_INVALID_STATE);
-        }
-        scheduler_observe_cache_line(&control->next_fanin_index);
-        cursor.next_fanin = control->next_fanin_index;
-        cursor.producer_ref = SCHEDULER_TASK_REF_INVALID;
-    }
-    SchedulerFaninView fanin{};
-    const auto fanin_status = scheduler_node_fanin_view(graph, task_ref, &fanin);
-    if (fanin_status != SchedulerGraphResult::OK) return fail(fanin_status);
-    if (initialize) cursor.fanin_count = fanin.count;
-    if (cursor.fanin_count != fanin.count || cursor.next_fanin < 0 ||
-        static_cast<uint32_t>(cursor.next_fanin) > fanin.count || cursor.producer_ref < SCHEDULER_TASK_REF_INVALID ||
-        (cursor.producer_ref >= 0 && (static_cast<uint32_t>(cursor.next_fanin) == fanin.count ||
-                                      !scheduler_task_ref_valid(graph, cursor.producer_ref))))
-        return fail(SchedulerGraphResult::INVALID_FANIN_ID);
-
-    while (used < budget && static_cast<uint32_t>(cursor.next_fanin) < fanin.count) {
-        ++used;
-        if (cursor.producer_ref == SCHEDULER_TASK_REF_INVALID) {
-            int64_t producer = SCHEDULER_TASK_REF_INVALID;
-            if (scheduler_fanin_ref(fanin, task_ref, static_cast<uint32_t>(cursor.next_fanin), &producer) !=
-                SchedulerGraphResult::OK)
-                return fail(SchedulerGraphResult::INVALID_FANIN_ID);
-
-            auto *producer_control = scheduler_task_control_at(scheduler_state_base, context, producer);
-            if (scheduler_gm_query(producer_control->state) == static_cast<int64_t>(SchedulerTaskState::DONE)) {
-                ++cursor.next_fanin;
-            } else {
-                cursor.producer_ref = producer;
-            }
-            continue;
-        }
-        auto *producer_control = scheduler_task_control_at(scheduler_state_base, context, cursor.producer_ref);
-        const int64_t observed = scheduler_gm_query(producer_control->wake_list_head);
-        if (observed == SCHEDULER_WAKE_LIST_CLOSED) {
-            ++cursor.next_fanin;
-            cursor.producer_ref = SCHEDULER_TASK_REF_INVALID;
-            continue;
-        }
-        if (observed < SCHEDULER_WAKE_LIST_OPEN || (observed >= 0 && !scheduler_task_ref_valid(graph, observed)))
-            return fail(SchedulerGraphResult::INVALID_TASK_ID);
-        scheduler_publish_waiter_metadata(control, observed, cursor.next_fanin, cursor.producer_ref);
-        const int64_t actual = scheduler_scalar_atomic_result(context, [&]() __aicore__ {
-            return scheduler_gm_compare_exchange(producer_control->wake_list_head, observed, task_ref);
-        });
-        if (actual == observed) {
-            cursor.result = SchedulerRouteResult::WAITING;
-            return {cursor.result, used};
-        }
-
-        if (actual == SCHEDULER_WAKE_LIST_CLOSED) {
-            ++cursor.next_fanin;
-            cursor.producer_ref = SCHEDULER_TASK_REF_INVALID;
-        } else if (actual < SCHEDULER_WAKE_LIST_OPEN || (actual >= 0 && !scheduler_task_ref_valid(graph, actual))) {
-            return fail(SchedulerGraphResult::INVALID_TASK_ID);
+            scheduler_publish_wake_cursor(control, observed, next_fanin + 1);
+            const int64_t actual = scheduler_scalar_atomic_result(local, [&]() __aicore__ {
+                return scheduler_gm_compare_exchange(producer->wake_list_head, observed, waiter_ref);
+            });
+            if (actual == observed) return SchedulerRouteResult::WAITING;
+            observed = actual;
         }
     }
-    if (static_cast<uint32_t>(cursor.next_fanin) == fanin.count) cursor.result = SchedulerRouteResult::READY_TO_ENQUEUE;
-    return {cursor.result, used};
+    return SchedulerRouteResult::READY_TO_ENQUEUE;
 }
 
+// Callers own this unqueued waiter. The stored index is the first unexamined
+// fanin; routing either transfers ownership once or returns a Ready candidate.
 static inline __aicore__ SchedulerRouteResult scheduler_route_task(
-    const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
-    __gm__ SchedulerRunControl *run_control, int64_t task_ref, bool validate_current_state = true
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    int64_t task_ref, bool validate_current_state = true
 ) {
-    SchedulerRouteCursor cursor;
-    do {
-        scheduler_route_task_step(
-            graph, scheduler_state_base, context, run_control, task_ref, cursor, UINT32_MAX, validate_current_state
-        );
-    } while (cursor.result == SchedulerRouteResult::YIELD);
-    return cursor.result;
+    if (!scheduler_task_ref_valid(graph, task_ref)) {
+        scheduler_record_error(run, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, local);
+        return SchedulerRouteResult::ERROR;
+    }
+    auto *control = scheduler_task_control_at(base, local, task_ref);
+    if (validate_current_state) {
+        const int64_t state = scheduler_gm_query(control->state);
+        if (state == static_cast<int64_t>(SchedulerTaskState::DONE)) return SchedulerRouteResult::COMPLETED;
+        if (state != static_cast<int64_t>(SchedulerTaskState::BLOCKED)) {
+            scheduler_record_error(
+                run, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
+                SchedulerErrorSite::ROUTE_INVALID_STATE
+            );
+            return SchedulerRouteResult::ERROR;
+        }
+    }
+    SchedulerFaninView fanin{};
+    const auto status = scheduler_node_fanin_view(graph, task_ref, &fanin);
+    if (status != SchedulerGraphResult::OK) {
+        scheduler_record_error(run, task_ref, status, &graph, local);
+        return SchedulerRouteResult::ERROR;
+    }
+    const uint32_t next_fanin = scheduler_wake_cursor_fanin(scheduler_gm_fetch_add(control->wake_cursor, UINT64_C(0)));
+    if (next_fanin > fanin.count) {
+        scheduler_record_error(run, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, local);
+        return SchedulerRouteResult::ERROR;
+    }
+    return scheduler_route_detached_waiter(graph, base, local, run, task_ref, fanin, next_fanin);
 }
 
 // The bootstrap partition gives every child one argument writer. Its exact
@@ -815,13 +768,18 @@ static inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
         return SchedulerRouteResult::ERROR;
     }
 
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
-    for (uint32_t next_fanin = 0; next_fanin < fanin_count; ++next_fanin) {
-        int64_t producer = -1;
-        if (scheduler_fanin_ref(fanin, task_ref, next_fanin, &producer) != SchedulerGraphResult::OK) {
+    // HostDone and duplicate references are immutable topology. Bootstrap
+    // records the next distinct device predecessor, so a later completion
+    // need not query these already-satisfied entries or split a Ready batch.
+    int64_t selected = SCHEDULER_TASK_REF_INVALID;
+    uint32_t resume_fanin = fanin_count;
+    for (uint32_t index = 0; index < fanin_count; ++index) {
+        int64_t producer = SCHEDULER_TASK_REF_INVALID;
+        if (scheduler_fanin_ref(fanin, task_ref, index, &producer) != SchedulerGraphResult::OK) {
             scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
             return SchedulerRouteResult::ERROR;
         }
+        if (producer == selected) continue;
         if (graph.native_header_offset != 0) {
             SchedulerNodeKind kind{};
             if (scheduler_node_kind(graph, producer, &kind) != SchedulerGraphResult::OK) {
@@ -830,31 +788,30 @@ static inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
             }
             if (kind == SchedulerNodeKind::HOST_DONE) continue;
         } else {
-            __gm__ SchedulerTaskMetadata *producer_metadata =
-                scheduler_task_metadata_at(scheduler_state_base, context, producer);
-            scheduler_observe_cache_line(producer_metadata);
-            if (!scheduler_task_is_executable(producer_metadata->flags)) continue;
+            // Run-entry READY acquire covers this immutable metadata table.
+            const auto *metadata = scheduler_task_metadata_at(scheduler_state_base, context, producer);
+            if (!scheduler_task_is_executable(metadata->flags)) continue;
         }
-
-        __gm__ SchedulerTaskControl *producer_control =
-            scheduler_task_control_at(scheduler_state_base, context, producer);
-        int64_t previous = scheduler_gm_exchange(producer_control->wake_list_head, task_ref);
-        if (previous < SCHEDULER_WAKE_LIST_OPEN) {
-            scheduler_record_error(
-                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                SchedulerErrorSite::BOOTSTRAP_WAKE_INVALID_HEAD
-            );
-            return SchedulerRouteResult::ERROR;
+        if (selected != SCHEDULER_TASK_REF_INVALID) {
+            resume_fanin = index;
+            break;
         }
-        control->next_fanin_index = next_fanin;
-        control->waiting_producer = producer;
-        scheduler_writeback_cache_line(&control->next_fanin_index);
-        scheduler_gm_store(control->next_waiter, previous);
-
-        return SchedulerRouteResult::WAITING;
+        selected = producer;
     }
-
-    return SchedulerRouteResult::READY_TO_ENQUEUE;
+    if (selected == SCHEDULER_TASK_REF_INVALID) return SchedulerRouteResult::READY_TO_ENQUEUE;
+    auto *producer_control = scheduler_task_control_at(scheduler_state_base, context, selected);
+    const int64_t previous = scheduler_gm_exchange(producer_control->wake_list_head, task_ref);
+    if (previous < SCHEDULER_WAKE_LIST_OPEN) {
+        scheduler_record_error(
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+            SchedulerErrorSite::BOOTSTRAP_WAKE_INVALID_HEAD
+        );
+        return SchedulerRouteResult::ERROR;
+    }
+    scheduler_publish_wake_cursor(
+        scheduler_task_control_at(scheduler_state_base, context, task_ref), previous, resume_fanin
+    );
+    return SchedulerRouteResult::WAITING;
 }
 
 inline __aicore__ uint32_t scheduler_trace_index_at(
@@ -1080,15 +1037,15 @@ static inline __aicore__ bool scheduler_ready_pop_from_queue(
     return true;
 }
 
+// Both fill paths pass their own claim storage and a live run binding. Local
+// initialization has validated the immutable pool layout; only queue contents
+// and the successful head CAS determine whether this call acquires a task.
 static inline __aicore__ bool scheduler_ready_pool_claim(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t queue_class, SchedulerReadyClaim *claim
 ) {
-    if (claim == nullptr) return false;
     *claim = {};
-    if (base == nullptr || local == nullptr || run == nullptr || local->config.ready_pool_offset == 0 ||
-        !scheduler_ready_queue_holder(queue_class, local->config.self_core_type))
-        return false;
+    if (!scheduler_ready_queue_holder(queue_class, local->config.self_core_type)) return false;
     const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
     const auto queue = scheduler_ready_pool_queue(base, pool, queue_class);
     auto fail = [&](int64_t ref) __aicore__ {
@@ -1097,7 +1054,6 @@ static inline __aicore__ bool scheduler_ready_pool_claim(
         );
         return false;
     };
-    if (!scheduler_ticket_view_valid(queue)) return fail(SCHEDULER_TASK_REF_INVALID);
     if (queue.capacity == 0) return true;
     for (uint32_t attempt = 0; attempt < 2; ++attempt) {
         const uint64_t head = scheduler_gm_query(queue.control->head);
@@ -1111,9 +1067,10 @@ static inline __aicore__ bool scheduler_ready_pool_claim(
         if (ref == SCHEDULER_TASK_REF_INVALID) return true;
         if (!scheduler_task_ref_valid(graph, ref)) return fail(ref);
         const auto &metadata = *scheduler_task_metadata_at(base, local, ref);
+        // MIX uses the AIC queue. A valid AIC worker is its cluster's
+        // coordinator, as established by local-config topology validation.
         if (!scheduler_task_is_executable(metadata.flags) ||
-            scheduler_task_ready_queue(metadata.flags, scheduler_task_lanes(metadata)) != queue_class ||
-            (scheduler_task_is_mix(metadata.flags) && !local->is_mix_coordinator()))
+            scheduler_task_ready_queue(metadata.flags, scheduler_task_lanes(metadata)) != queue_class)
             return fail(ref);
         if (scheduler_gm_compare_exchange(queue.control->head, head, head + 1) == head) {
             scheduler_cache_barrier();
@@ -1128,13 +1085,11 @@ static inline __aicore__ bool scheduler_ready_pool_claim(
 
 static inline __aicore__ bool
 scheduler_ready_pool_may_have_work(__gm__ void *base, const SchedulerLocalState *local, uint32_t queue_class) {
-    // Invalid discovery must reach the checked claim path instead of hiding work.
-    if (base == nullptr || local == nullptr || local->config.ready_pool_offset == 0 ||
-        !scheduler_ready_queue_holder(queue_class, local->config.self_core_type))
-        return true;
+    // This hint shares claim's initialized-binding/pool-layout precondition.
+    // Invalid routing or dynamic head state must reach claim instead of hiding work.
+    if (!scheduler_ready_queue_holder(queue_class, local->config.self_core_type)) return true;
     const auto &pool = *scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
     const auto queue = scheduler_ready_pool_queue(base, pool, queue_class);
-    if (!scheduler_ticket_view_valid(queue)) return true;
     if (queue.capacity == 0) return false;
     const uint64_t head = scheduler_gm_query(queue.control->head);
     if (head > queue.capacity) return true;
@@ -1143,13 +1098,11 @@ scheduler_ready_pool_may_have_work(__gm__ void *base, const SchedulerLocalState 
 
 static inline __aicore__ bool scheduler_claim_ready_for_slot(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t scheduler_count, uint32_t queue_class, SchedulerReadyClaim *claim
+    uint32_t queue_class, SchedulerReadyClaim *claim
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarReadyClaim, -1);
-    if (local == nullptr || claim == nullptr || scheduler_count == 0 || scheduler_count > SCHEDULER_WORKER_CAPACITY ||
-        local->config.scheduler_index >= scheduler_count ||
-        !scheduler_ready_queue_holder(queue_class, local->config.self_core_type))
-        return false;
+    // Shared queues are independent of scheduler_count. The resident's
+    // configuration and the caller-owned output already have claim's lifetime.
     return scheduler_ready_pool_claim(graph, base, local, run, queue_class, claim);
 }
 
@@ -1416,23 +1369,16 @@ static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication
     SchedulerReadyPublication &publication
 );
 
-// Direct candidates belong only to a synchronous call, never to a saved FINISH cursor.
-struct SchedulerCompletionDirect {
-    SchedulerReadyClaim *ready{nullptr};
-    uint32_t core_type{0};
-    bool admission_owner{false};
-};
-
-static __aicore__ __attribute__((noinline)) SchedulerResolveProgress scheduler_resolve_completion_step(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t producer_ref, SchedulerResolveCursor &cursor, uint32_t budget, uint64_t profiling_level,
-    SchedulerCompletionDirect *direct, bool validate_done_state
-);
-
-static __aicore__ __attribute__((noinline)) bool scheduler_resolve_completion_step(
+static __aicore__ __attribute__((noinline)) bool scheduler_resolve_csr_completion(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t producer_ref, const __gm__ SchedulerDependencyHeader &dependencies, uint64_t profiling_level,
     SchedulerReadyClaim *direct_ready, uint32_t direct_core_type, bool admission_owner
+);
+
+static __aicore__ __attribute__((noinline)) bool scheduler_resolve_wake_completion(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    int64_t producer_ref, uint64_t profiling_level, SchedulerReadyClaim *direct_ready, uint32_t direct_core_type,
+    bool admission_owner
 );
 
 static inline __aicore__ bool scheduler_resolve_completion(
@@ -1440,26 +1386,28 @@ static inline __aicore__ bool scheduler_resolve_completion(
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level, bool validate_done_state,
     SchedulerReadyClaim *direct_ready, uint32_t direct_core_type, bool admission_owner = false
 ) {
-    // Immediate completion owners hold a validated graph/local/run binding.
-    // CSR notification has no suspended waiter or dynamic wake-list ownership.
-    if (!validate_done_state) {
-        const auto *dependencies = scheduler_dependencies(scheduler_state_base, context->config.ready_pool_offset);
-        if (dependencies != nullptr)
-            return scheduler_resolve_completion_step(
-                graph, scheduler_state_base, context, run_control, task_ref, *dependencies, profiling_level,
-                direct_ready, direct_core_type, admission_owner
+    // The caller owns completion exclusively; no continuation escapes this call.
+    if (validate_done_state) {
+        if (scheduler_read_worker_error(run_control, context->worker_id()) != 0) return false;
+        if (scheduler_gm_query(scheduler_task_control_at(scheduler_state_base, context, task_ref)->state) !=
+            static_cast<int64_t>(SchedulerTaskState::DONE)) {
+            scheduler_record_error(
+                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                SchedulerErrorSite::COMPLETION_TASK_NOT_DONE
             );
+            return false;
+        }
     }
-    SchedulerResolveCursor cursor{};
-    SchedulerCompletionDirect direct{direct_ready, direct_core_type, admission_owner};
-    for (;;) {
-        const auto progress = scheduler_resolve_completion_step(
-            graph, scheduler_state_base, context, run_control, task_ref, cursor, UINT32_MAX, profiling_level, &direct,
-            validate_done_state
+    const auto *dependencies = scheduler_dependencies(scheduler_state_base, context->config.ready_pool_offset);
+    if (dependencies != nullptr)
+        return scheduler_resolve_csr_completion(
+            graph, scheduler_state_base, context, run_control, task_ref, *dependencies, profiling_level, direct_ready,
+            direct_core_type, admission_owner
         );
-        if (progress.result == SchedulerResolveResult::ERROR) return false;
-        if (progress.result == SchedulerResolveResult::DONE) return true;
-    }
+    return scheduler_resolve_wake_completion(
+        graph, scheduler_state_base, context, run_control, task_ref, profiling_level, direct_ready, direct_core_type,
+        admission_owner
+    );
 }
 
 // The ready owner services dependency-only nodes without a payload or kernel

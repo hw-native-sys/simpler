@@ -466,7 +466,6 @@ inline std::string scheduler_export_protocol(
             row.number("claim_tickets", controls[task].claim_tickets);
             row.number("completed_subtasks", scheduler_completion_count(controls[task].completion_state));
             row.number("admission_state", controls[task].admission_state);
-            row.number("admission_claim_lock", controls[task].admission_claim_lock);
             row.number("claim_seal", controls[task].claim_seal);
         }
         out << ']';

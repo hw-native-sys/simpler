@@ -8,9 +8,9 @@
 
 跳过 host 的分配、建图和上传，只接受这些输入：Runtime 启动描述、只读图/参数、scheduler state，以及每个核的 context 和 payload 存储。
 
-初值契约可核对 [scheduler_types.h](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：尚未完成任务的 `state=BLOCKED`，`wake_list_head=-1`，`next_waiter=-1`，`waiting_producer=-1`；领取/完成游标为 0；依赖 remaining 由 Host 填入未完成且去重的前驱数；payload 的 `args[48]`、`args[49]` 已指向自身两个 context。已经 inline 完成的节点另作 DONE 处理。
+初值契约可核对 [scheduler_types.h](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：尚未完成任务的 `state=BLOCKED`，`wake_list_head=-1`，`next_waiter=-1`，`wake_cursor=pack(-1,0)`；领取/完成游标为 0；CSR 候选的依赖 remaining 由 Host 填入未完成且去重的前驱数；payload 的 `args[48]`、`args[49]` 已指向自身两个 context。已经 inline 完成的节点另作 DONE 处理。
 两个业务 ready 队列的 `head/reserved_tail` 初始为 0，所有 `SchedulerTicketEntry.task_ref` 初始为 -1，见 [ready pool 初始化](../../../src/a5/runtime/host_build_graph/host/ready_pool_plan.h)。native control inbox 的 head/tail 初始均为 -1。
-静态依赖路径通过 ready-pool header 的 `dependencies_offset` 定位 CSR/remaining；为 0 时保留 wake-list 路由。这只是输入契约，不沿 Host 构造流程展开。
+默认 Host 生成 CSR，bootstrap 对有依赖表的图使用 remaining 计数。通过 ready-pool header 的 `dependencies_offset` 定位 CSR/remaining；为 0 的有效图使用动态挂链。这只是输入契约，不沿 Host 构造流程展开。
 
 从 [AicpuExecutor::init](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp) 开始，leader 先调用 `pre_handshake_init`：
 

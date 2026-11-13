@@ -113,7 +113,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarOrderedPoll = 45,
     ScalarAdmissionClaim = 46,
     ScalarAdmissionPublish = 47,
-    ScalarAdmissionPrepare = 48,
     ScalarAdmissionCommit = 49,
     ScalarAdmissionRefresh = 50,
     ScalarOrdinaryPark = 51,
@@ -251,8 +250,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_admission_claim";
     case SchedPhaseKind::ScalarAdmissionPublish:
         return "scalar_admission_publish";
-    case SchedPhaseKind::ScalarAdmissionPrepare:
-        return "scalar_admission_prepare";
     case SchedPhaseKind::ScalarAdmissionCommit:
         return "scalar_admission_commit";
     case SchedPhaseKind::ScalarAdmissionRefresh:

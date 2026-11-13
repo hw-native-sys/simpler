@@ -97,7 +97,7 @@ TEST(HbgPayloadContext, RejectsInvalidDestinationBeforeChangingTheMirror) {
     scheduler_test::SchedulerStateBuffer storage(layout);
     auto *payload = scheduler_state_at<DispatchPayload>(storage.base(), layout.dispatch_payloads_offset);
     payload->function_bin_addr = 123;
-    for (uint64_t device_base : {UINT64_C(0), UINT64_C(1), UINT64_C(32), UINT64_MAX - UINT64_C(127)}) {
+    for (uint64_t device_base : {UINT64_C(0), UINT64_C(1), UINT64_C(32), UINT64_C(64), UINT64_MAX - UINT64_C(127)}) {
         SCOPED_TRACE(device_base);
         EXPECT_FALSE(scheduler_init_data_from_layout(storage.base(), layout, device_base));
         EXPECT_EQ(payload->function_bin_addr, 123u);

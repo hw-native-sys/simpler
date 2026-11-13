@@ -79,7 +79,8 @@ __aicore__ __attribute__((always_inline)) void stage_task_pmu(
 }
 
 __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPayload *payload) {
-    if (payload == nullptr || payload->function_bin_addr == 0) return;
+    // Dispatch binds a valid per-core payload before making its slot READY.
+    if (payload->function_bin_addr == 0) return;
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     scheduler_store_barrier();
@@ -307,10 +308,7 @@ __aicore__ bool bootstrap_ready_graph(
                 return false;
         }
         if (!control_node && !scheduler_task_is_executable(metadata->flags)) continue;
-        if (!control_node &&
-            scheduler_task_requires_admission(
-                scheduler_load_dispatch_metadata(scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), 0)
-            ) &&
+        if (!control_node && scheduler_task_requires_admission(metadata->flags) &&
             !scheduler_bootstrap_prepare_admission(
                 graph, scheduler_state_base, scheduler, run_control, scheduler->admission,
                 static_cast<int64_t>(task_ref)
@@ -539,8 +537,6 @@ __aicore__ bool run_ready_dispatch_loop(
                 return false;
             }
             SchedulerLocalSlotState *local_slot = &context->slots[slot_index];
-            const SchedulerLocalSlotState execution = *local_slot;
-            const uint64_t execution_group_seq = execution.gm_mix ? context->admission->gm_mix.group_seq : 0;
             const int32_t timing_slot = context->timing_slot(slot_index);
             __gm__ DispatchPayload *payload = scheduler_state_at<DispatchPayload>(
                 scheduler_state_base, context->dispatch_payload_offset(context->config.self_lane, slot_index)
@@ -556,13 +552,6 @@ __aicore__ bool run_ready_dispatch_loop(
             if (phase_timing_enabled && idle_active) {
                 scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, ready_observe);
                 idle_active = false;
-            }
-            if (!scheduler_task_ref_valid(graph, task_ref)) {
-                scheduler_record_error(
-                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                    SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT, local_slot
-                );
-                return false;
             }
             SchedulerExecutorTaskTrace execution_trace{};
             if (commit_scheduler_trace || commit_task_timing) {
@@ -582,16 +571,20 @@ __aicore__ bool run_ready_dispatch_loop(
                 SchedulerScalarScope scalar_cache(context, SchedPhaseKind::ScalarCacheObserve, task_ref);
                 scheduler_observe_data_cache(payload);
             }
-            pto2::resident::AsyncWriter execution_writer{};
-            if (!scheduler_async_begin_execution(
-                    context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, payload->global_context,
-                    execution_writer
-                )) {
-                scheduler_record_error(
-                    run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
-                    SchedulerErrorSite::ASYNC_CONTEXT_INVALID, local_slot
-                );
-                return false;
+            uint32_t execution_group_index = pto2::resident::ASYNC_INVALID_INDEX;
+            {
+                pto2::resident::AsyncWriter writer{};
+                if (!scheduler_async_begin_execution(
+                        context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot,
+                        payload->global_context, writer
+                    )) {
+                    scheduler_record_error(
+                        run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
+                        SchedulerErrorSite::ASYNC_CONTEXT_INVALID, local_slot
+                    );
+                    return false;
+                }
+                execution_group_index = writer.group_index;
             }
             if (context->config.shared_context->args_dump_address != 0 &&
                 !args_dump_boundary(
@@ -627,18 +620,21 @@ __aicore__ bool run_ready_dispatch_loop(
             SchedulerScalarScope scalar_seal(context, SchedPhaseKind::ScalarSeal, task_ref, kernel_end);
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
-            if (local_slot->state != SchedulerDispatchSlotState::EXECUTING ||
-                local_slot->task_ref != execution.task_ref || local_slot->block_idx != execution.block_idx ||
-                local_slot->subtask_slot != execution.subtask_slot || local_slot->gm_mix != execution.gm_mix ||
-                (execution.gm_mix && context->admission->gm_mix.group_seq != execution_group_seq) ||
-                !scheduler_async_seal_execution<true>(
-                    context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, execution_writer
-                )) {
-                scheduler_record_error(
-                    run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
-                    SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
-                );
-                return false;
+            // The kernel receives only payload->args and its GM contexts. No
+            // private slot/admission address escapes, and this core cannot run
+            // its scheduler while inside the kernel. Dispatch's validated task
+            // and group binding therefore remain owned through normal return.
+            if (execution_group_index != pto2::resident::ASYNC_INVALID_INDEX) {
+                const auto writer = scheduler_async_writer_for_group(*context->async, execution_group_index);
+                if (!scheduler_async_seal_execution<true>(
+                        context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, writer
+                    )) {
+                    scheduler_record_error(
+                        run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
+                        SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
+                    );
+                    return false;
+                }
             }
             if (context->config.shared_context->args_dump_address != 0 &&
                 !args_dump_boundary(

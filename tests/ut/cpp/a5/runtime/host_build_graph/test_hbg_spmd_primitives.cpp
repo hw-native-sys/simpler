@@ -37,11 +37,11 @@ TEST(HbgSpmdPrimitiveBoundary, PositiveHintDoesNotOwnOrPinTheNextTask) {
     EXPECT_TRUE(scheduler_ready_pool_may_have_work(storage.scheduler_state->base(), first, 0));
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(), second, storage.run_control, 6, 0, &claim
+        graph.graph(), storage.scheduler_state->base(), second, storage.run_control, 0, &claim
     ));
     EXPECT_EQ(claim.task_ref, 0);
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(), first, storage.run_control, 6, 0, &claim
+        graph.graph(), storage.scheduler_state->base(), first, storage.run_control, 0, &claim
     ));
     EXPECT_EQ(claim.task_ref, 1);
     const auto *pool =
@@ -66,7 +66,7 @@ TEST(HbgSpmdPrimitiveBoundary, TailAppendDoesNotChangeTheHead) {
     EXPECT_EQ(queue.control->reserved_tail, 2u);
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 3, 0, &claim
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, &claim
     ));
     EXPECT_EQ(claim.task_ref, 0);
     EXPECT_EQ(queue.control->head, head + 1);
@@ -83,7 +83,7 @@ TEST(HbgSpmdPrimitiveBoundary, AnEmptyHintDoesNotProveFutureQueueQuiescence) {
     EXPECT_TRUE(scheduler_ready_pool_may_have_work(storage.scheduler_state->base(), local, 0));
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 3, 0, &claim
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, &claim
     ));
     EXPECT_EQ(claim.task_ref, 0);
 }

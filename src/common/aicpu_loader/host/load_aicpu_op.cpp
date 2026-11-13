@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <vector>
@@ -448,13 +449,19 @@ int LoadAicpuOp::Init(const std::vector<std::string> &extra_symbols) {
     kernel_symbols_ = {KernelNames::RunName, KernelNames::InitName, KernelNames::FinalizeName};
     kernel_symbols_.insert(kernel_symbols_.end(), extra_symbols.begin(), extra_symbols.end());
 
-    // Per-process JSON path. /tmp is always writable.
+    // Honor the process temporary directory, including TMPDIR on shared hosts.
+    std::error_code temp_error;
+    const auto temp_directory = std::filesystem::temp_directory_path(temp_error);
+    if (temp_error) {
+        LOG_ERROR("LoadAicpuOp::Init: temporary directory unavailable: %s", temp_error.message().c_str());
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     char json_name_buf[128];
     snprintf(
-        json_name_buf, sizeof(json_name_buf), "/tmp/simpler_inner_%016lx_%d_%d.json", inner_fp_, device_id_,
+        json_name_buf, sizeof(json_name_buf), "simpler_inner_%016lx_%d_%d.json", inner_fp_, device_id_,
         static_cast<int>(getpid())
     );
-    json_file_path_ = json_name_buf;
+    json_file_path_ = (temp_directory / json_name_buf).string();
 
     if (!GenerateAicpuOpJson(json_file_path_, inner_so_basename_)) {
         json_file_path_.clear();

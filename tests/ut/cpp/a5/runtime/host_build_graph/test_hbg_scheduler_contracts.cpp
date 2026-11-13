@@ -568,8 +568,21 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     }
 }
 
+TEST(SchedulerState, RejectsA64ByteOnlyAllocationBeforeWritingState) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &layout));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
+    controls[0].state = 123;
+    EXPECT_FALSE(
+        scheduler_init_data_from_layout(static_cast<uint8_t *>(storage.base()) + 64, layout, UINT64_C(0x400000000))
+    );
+    EXPECT_FALSE(scheduler_init_data_from_layout(storage.base(), layout, UINT64_C(0x400000040)));
+    EXPECT_EQ(controls[0].state, 123);
+}
+
 TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
-    EXPECT_EQ(alignof(SchedulerTaskControl), 64u);
+    EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
     EXPECT_EQ(alignof(SchedulerExecutorTaskTrace), alignof(uint64_t));
     EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 48u);
     EXPECT_EQ(alignof(SchedulerRunControl), 64u);
@@ -578,14 +591,16 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 384u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 320u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     // Both chain links belong to the atomic line: they are written as single
     // device words, and nothing publishes that line as a whole, so no producer's
     // writeback can restore a stale copy of another's link.
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
-    EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_fanin_index) / 64);
+    EXPECT_NE(
+        offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, completion_resolve_start_cycles) / 64
+    );
 
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64

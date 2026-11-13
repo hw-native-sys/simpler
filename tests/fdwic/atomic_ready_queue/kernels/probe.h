@@ -17,6 +17,16 @@
 
 #include "inner_kernel.h"
 #include "intrinsic.h"
+#include "scheduler/scheduler_scalar_policy.h"
+
+namespace {
+// This independently linked callable has no resident scalar-trace binding.
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = false;
+};
+}  // namespace
+
 #include "scheduler/scheduler_ticket_queue.h"
 #include "tensor.h"
 
@@ -34,7 +44,7 @@ struct alignas(64) Payload {
     uint64_t words[8]{};
 };
 
-struct alignas(64) State {
+struct alignas(SCHEDULER_STATE_BASE_ALIGNMENT) State {
     SchedulerTicketQueue queue;
     SchedulerTicketQueue zero_queue;
     SchedulerTicketQueue last_queue;
@@ -63,8 +73,12 @@ struct alignas(64) Record {
 };
 
 static_assert(sizeof(AtomicLine) == 64 && sizeof(Payload) == 64);
-static_assert(sizeof(SchedulerTicketEntry) == 64 && sizeof(SchedulerTicketQueue) == 128);
-static_assert(sizeof(State) == (6 + kMaxTasks + 1 + 2 + 6 * kMaxWorkers + 12 + 2 * kMaxTasks) * 64);
+static_assert(sizeof(SchedulerTicketEntry) == 64 && sizeof(SchedulerTicketQueue) == 256);
+constexpr uint64_t state_bytes = (12 + kMaxTasks + 1 + 2 + 6 * kMaxWorkers + 12 + 2 * kMaxTasks) * 64;
+static_assert(
+    sizeof(State) ==
+    (state_bytes + SCHEDULER_STATE_BASE_ALIGNMENT - 1) / SCHEDULER_STATE_BASE_ALIGNMENT * SCHEDULER_STATE_BASE_ALIGNMENT
+);
 static_assert(sizeof(Record) == 192 && offsetof(Record, values) == 64);
 
 static inline __aicore__ __gm__ int64_t *data(int64_t arg) {

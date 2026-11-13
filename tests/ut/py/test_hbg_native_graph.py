@@ -28,7 +28,7 @@ def native_capture(*, deferred_tasks=()):
     ).run()
     raw["schema"] = "hbg-native-protocol-v11"
     for control in raw["task_controls"]:
-        control.update(claim_tickets=0, admission_claim_lock=0)
+        control.update(claim_tickets=0)
     raw["graph_source"] = dict(
         tasks=[
             dict(task_id=0, kind=0, graph_key=0, dependencies=[]),

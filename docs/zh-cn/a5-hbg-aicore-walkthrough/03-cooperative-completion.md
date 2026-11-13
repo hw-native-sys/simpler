@@ -36,7 +36,7 @@ MIX 和 sync_start 继续采用其完整资源成员集合。成员位图使用 
 **范围与用途：** 存在协作任务时，本轮 GM 中一份共享控制对象。多个核竞争提交锁以发布同一条全局 admission 日志；每个核自己的阅读位置放在 AdmissionLocalState，不放在这里。
 `commit_lock` 串行化日志提交，持锁者只做有界发布；
 `commit_tail` 为已经完整提交的日志长度；
-两者各占独立 64B 行，控制对象总长 128B。
+两者各占独立128B原子区域，控制对象总长256B。
 
 [SchedulerAdmissionRecord](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：
 
@@ -172,7 +172,8 @@ descriptor 占 128B，published_seq 位于单独的 64B 行；`lanes[3]` 各占 
 ## 3.4 kernel 返回怎样变成逻辑任务完成
 
 读 [executor 的返回路径](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h)：
-核对保存的 task/block/subtask/group 绑定，seal async，完成启用的 DFX 与 AFTER_COMPLETION 抓取，然后进入 EXIT/本worker错误门禁。
+dispatch 已验证 task/block/subtask/group 绑定；kernel 只接收 GM 参数和 payload context，不接收本核私有 slot/admission 地址，因此正常返回期间绑定保持不变。
+executor 跨调用仅保留已验证的 async group index，从本轮固定布局重建 writer 并 seal 注册状态，完成启用的 DFX 与 AFTER_COMPLETION 抓取，然后进入 EXIT/本worker错误门禁。
 门禁允许继续时，同一调用链直接调用 [scheduler_complete_own_slot](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h)：
 
 1. 保留本次 EXECUTING 身份，释放本地 slot 的业务绑定。
@@ -186,37 +187,17 @@ predicate 跳过业务调用仍走一次相同退休路径；INLINE/native 控�
 
 ## 3.5 完成传播：CSR 计数与 wake-list 共用 resolver
 
-[scheduler_resolve_completion_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h) 有两个 `static noinline` 入口：同步 CSR 完成直接遍历已验证的 fanout，不关闭动态 wake list；控制节点、async FINISH 及其他续行路径使用有界游标。
-以下状态机描述有界入口，外联不改变每片预算和唯一 owner 的规则。
+[同步 resolver](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion_resolver.h) 提供 `scheduler_resolve_csr_completion` 与 `scheduler_resolve_wake_completion` 两种算法。普通 kernel、native control、async FINISH 都由唯一完成者在当前调用中传播到结束；没有跨调用保存的 resolver phase 或 route cursor。
 
-```text
-START   确认 producer DONE，关闭 wake_list_head；计数路径要求没有动态 waiter
-SELECT  有依赖 header：从 producer 的 CSR 行取后继，原子递减其 remaining
-        旧值大于 1 → 继续下一后继；旧值等于 1 → 进入 APPEND
-        无 header：取已摘下链的 waiter，并保存其旧 next
-ROUTE   仅 wake-list 路径：推进剩余 fanin，必要时把 waiter 迁移到下一 producer
-APPEND  保留可直接执行的后继，或收集入按类型分组的 ready 发布批次
-PUBLISH 完成批次发布；预算不足则保存全部游标状态
-DONE    该 producer 的全部后继已经处理或责任已交接
-```
+默认Host生成CSR，执行同步计数传播。未附依赖表的有效图执行同步wake-list：原子关闭producer的head，依次读取waiter的`wake_cursor`，把旧next与下一fanin位置保存在本次调用的局部值中。位置已到fanin末尾就发布Ready，否则使用`scheduler_route_detached_waiter`寻找尚未完成的前驱。挂链CAS成功即转移waiter所有权，原完成者只能沿之前保存的旧next前进。Ready前缀发布不会丢弃当前fanin view或要求重读原子游标。
 
-wake-list 路径必须先保存旧 next，因为 route 可能改写 waiter 的 next_waiter。
-计数路径按 immutable CSR 前进，visited_count 同时定位当前行中的边，不重复通知已经消费的边。
-计数从 1→0 的后继可以直接保留：同核类型的非 MIX kernel 可交给原派发入口；有 ordered admission 时，完成核也可直接持有 MIX 候选（包括 AIV）。后者只获得准入发布权，MIX 的执行仍由 AIC 协调与各 lane 的许可决定。其他 kernel 按 AIC（含 MIX）/AIV 发布到两个共享队列，控制节点进入 control inbox。
+CSR 算法只读取一次后继行范围，对每条去重边原子递减 remaining；旧值为1的唯一通知者使后继Ready。它不领取 wake-list。同核类型的非MIX后继可以直接保留；有ordered admission时，完成核也能持有MIX候选，但执行仍由AIC与各lane许可控制。其他kernel进入AIC（含MIX）/AIV两个共享队列，控制节点进入control inbox。
 
-[解析游标](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_resolve_state.h) 的所有字段：
+局部 `SchedulerReadyPublication` 保存最多8个同destination的ref、count及CONTROL目标。普通业务队列在一次调用内完成reserve和publish；control inbox先准备链，再循环尝试CAS接入。内部发布phase仅活在同步调用期间，不写入FINISH或LocalState供其他核接续。
 
-**范围与用途：** 完整 SchedulerResolveCursor 为 160B、自然 8B 对齐；这些结构表示一个正在推进的解析过程。需要游标的普通同步解析使用调用内局部值；直接 CSR 入口不保存续行游标；native 控制解析放在本核 LocalState 中跨循环保存；async FINISH 的 cursor 则保存到 GM，持有 lease 的服务核可接续。它们的归属取决于谁拥有当前解析责任，不能仅凭结构名判断都在本核或都在 GM。
+native control每轮最多处理8个节点，每个节点完整解完依赖后才计入 `pending_completed`。async FINISH在join满足后取得唯一lease，完成TaskDone、全部后继传播后将lease置为TERMINAL；条件CHECK仍独立按片检查，未满足的异步条件不会阻塞业务。
 
-| 结构 | 字段及作用 |
-| ---- | ---------- |
-| `SchedulerRouteCursor` | `task_ref`：正在路由的 waiter；`producer_ref`：待注册前驱；`next_fanin`：当前依赖位置；`fanin_count`：总依赖数；`result`：就绪、等待、已完成、错误或续行 |
-| `SchedulerRouteProgress` | `result`：这次推进结果；`work_units`：消耗的预算单位 |
-| `SchedulerReadyPublication` | `refs[8]`：待发布任务；`count`：数量；`destination`：AIC/AIV/CONTROL；`inbox_offset/target`：仅 CONTROL 使用，分别定位 inbox 和 worker，业务队列时均为 0；`phase`：COLLECTING/PREPARED/DONE/FAILED |
-| `SchedulerResolveCursor` | `producer_ref`：正在解析哪个完成任务；`next_waiter`：下一个 CSR 后继或链节点；`waiter_ref`：当前节点；`saved_next`：下一个 CSR 后继或迁移前保存的 next；`route`：依赖检查子游标；`publication`：ready 发布子状态；`phase`：上述 START..DONE 状态；`visited_count`：已消费的 CSR 边/链节点数，亦用于边界检查 |
-| `SchedulerResolveProgress` | `result`：DONE/YIELD/ERROR；`work_units`：本片工作量 |
-
-一个发布批次最多容纳 8 个同 destination 的 ref；AIC 与 MIX 可以共用一个批次。业务队列在一次有界调用内完成预留和原子发布；control inbox 则先准备链，再 CAS 追加，争用时保留 PREPARED 状态续行。续行保存整个 publication，不能只保存下一个后继索引。
+完整resolve计时包含摘链、fanins扫描、重挂链和Ready发布；唯一owner在返回前发布起止计时。局部结构保持自然8B对齐，不能把GM结构的过度对齐搬入CCEC栈对象。
 
 同步任务发布 DONE 后，由唯一完成者在解析返回时增加本地 `pending_completed`；解析报错也只计一次。在空闲、收尾，以及 native 的有界批次条件下，
 [flush_completions](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h#L21)（第 21 行） 先屏障，再原子相加到 `run_control.resolved_task_count`。

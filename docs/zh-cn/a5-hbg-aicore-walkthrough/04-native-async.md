@@ -32,8 +32,8 @@
 
 子图外部依赖通过 completion_refs 指向相应完成节点，不能把 GRAPH shell 进入当成整个子图完成。
 
-在 [scheduler_service_controls](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h#L23)（第 23 行），本核每片最多开始 8 个控制节点、消耗 64 个 work units。
-从 own 或轮转 peer control inbox 领到控制节点后，将其 BLOCKED→DONE，随后沿同一 resolver 的 CSR/remaining 或兼容 wake-list 分支传播完成；解析未结束时保存 `local.control_resolve`，下一轮继续。
+在 [scheduler_service_controls](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_control.h#L23)（第 23 行），本核每轮最多处理8个控制节点，每个节点的completion同步完成。
+从 own 或轮转 peer control inbox 领到控制节点后，将其 BLOCKED→DONE，随后调用同步CSR或wake-list resolver传播全部后继；解析过程不跨调用保存。
 只有 resolver 真正结束才增加 pending_completed。
 
 控制节点不领取业务 slot，也不进入 kernel admission。即使当前 payload slot 或 admission candidate 已占用，主循环仍在 fill 之前给控制服务一个有界切片；两个共享业务队列不会替代这条控制进展路径。
@@ -120,10 +120,10 @@ resident 需要先等已注册 completion 条件，再发布 task DONE。
 2. kernel 执行：使用 writer 登记 completion 条件。
 3. [scheduler_async_seal_execution](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_control.h#L330)（第 330 行）：封存条件，发布 group 数据和检查任务；之后释放本次执行资源。
 4. [scheduler_async_close_computation](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_control.h#L394)（第 394 行）：所有 block/subtask 的计算已完成，给逻辑任务关闭 computation。
-5. [scheduler_service_async_slice](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_finish.h#L82)（第 82 行）：交替服务 CHECK 与 FINISH，每次有界预算。
+5. [scheduler_service_async_slice](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_finish.h#L82)（第 82 行）：交替服务CHECK与FINISH；CHECK按预算检查，FINISH每次处理一个任务的完整同步传播。
 6. CHECK 观察 completion 条件、完成所需 acquire，减少该任务 pending group 数。
 7. computation 已关闭且 pending=0 时，仅有一个 FINISH owner。
-8. [scheduler_async_finish_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_finish.h#L19)（第 19 行） 写任务 DONE，运行可续行 resolver，传播完所有后继后增加 pending_completed。
+8. [scheduler_async_finish_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_async_finish.h#L19)（第 19 行） 写任务DONE，在独占lease内同步传播所有后继，终结lease后增加pending_completed。
 
 参数抓取选中输出时，入口会设置 `async_output_capture_refused`；异步登记入口据此拒绝过早输出快照。该限制由有效字段表达，每次 dispatch 重置。
 
@@ -162,7 +162,6 @@ resident 需要先等已注册 completion 条件，再发布 task DONE。
 | `group_progress_offset` | CHECK 的可续行检查进度 |
 | `joins_offset` | 每任务计算与异步完成的汇合字 |
 | `finish_leases_offset` | FINISH 所有权/状态表 |
-| `finish_progress_offset` | FINISH 的 resolver 续行状态 |
 | `check_directory_offset / finish_directory_offset` | 两类可服务工作位图 |
 | `task_count / async_task_count / group_count` | 总调度节点数、有 async 布局的任务数、group 数 |
 | `sdma_guard_count / sdma_guards_offset` | SDMA 提交互斥 guard 数与位置 |
@@ -174,7 +173,6 @@ resident 需要先等已注册 completion 条件，再发布 task DONE。
 | ---- | -------------- |
 | `SchedulerAsyncTaskData` | `task_ref`：逻辑任务；`group_base`：首 group 索引；`block_count`：逻辑 block 数；`async_mask`：需要 async group 的子任务位图 |
 | `SchedulerAsyncGroupProgress` | `pending_mask`：尚未通过的条件位图；`condition_cursor`：下次检查位置；`acquire_cursor`：完成 acquire 的推进位置 |
-| `SchedulerAsyncFinishProgress` | `resolver`：可迁移的完整依赖解析游标 |
 | `SchedulerAsyncDirectoryWord` | `bits`：64 个工作项的可发现位 |
 | `SchedulerAsyncActivity` | `activated`：本轮存在 async 工作，device 从 0 发布成 1 |
 | `SchedulerAsyncLease` | `word`：高位 generation、低 3 位 phase；phase 为 DORMANT/RUNNABLE/OWNED/TERMINAL/FAILED |
@@ -183,7 +181,7 @@ resident 需要先等已注册 completion 条件，再发布 task DONE。
 | `AsyncSdmaSubmissionGuard` | `word`：同物理 cluster SDMA 提交路径的独占状态 |
 | `AsyncReservation` | `run_epoch/group_index/serial`：本次登记预留身份；`capacity`：预留容量 |
 
-`SchedulerAsyncTaskData` 为 16B；CHECK progress、lease、join、directory word、activity 与 SDMA guard 各以 64B 行隔离。FINISH progress 为 192B，内含 160B resolver。
+`SchedulerAsyncTaskData` 为 16B；CHECK progress、lease、join、directory word、activity 与 SDMA guard 各以 64B 行隔离。FINISH没有额外进度区。
 
 join 的原子操作使“最后一个 group 完成”和“computation 关闭”竞态时，也只能产生一个 FINISH owner。
 lease generation 让旧 owner 无法提交到已经换代的服务记录。

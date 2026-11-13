@@ -209,17 +209,14 @@ static void log_unfinished_tasks(Runtime *runtime) {
             };
         }
         for (uint64_t other = 0; other < count; ++other) {
-            if (controls[other].next_waiter != static_cast<int64_t>(task)) continue;
+            if (scheduler_wake_cursor_next(controls[other].wake_cursor) != static_cast<int64_t>(task)) continue;
             LOG_ERROR(
                 "A5 HBG AICore scheduler: task=%" PRIu64 " is linked from task=%" PRIu64 " (state=%" PRId64
-                " wake_head=%" PRId64 " waiting_producer=%" PRId32 ")",
-                task, other, controls[other].state, controls[other].wake_list_head, controls[other].waiting_producer
+                " wake_head=%" PRId64 ")",
+                task, other, controls[other].state, controls[other].wake_list_head
             );
         }
-        // waiting_producer is advisory: no functional path reads it, and the
-        // line it sits on is published as a whole, so a stale copy can be
-        // restored over it. The chain owner is whichever task's wake-list head
-        // actually names this one.
+        // Ownership is represented by the producer head and its published wake cursors.
         for (uint64_t owner = 0; owner < count; ++owner) {
             if (controls[owner].wake_list_head != static_cast<int64_t>(task)) continue;
             LOG_ERROR(
@@ -230,17 +227,11 @@ static void log_unfinished_tasks(Runtime *runtime) {
         }
         LOG_ERROR(
             "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " state=%" PRId64 " wake_head=%" PRId64
-            " next_waiter=%" PRId64 " fanin_index=%" PRId32 " waiting_producer=%" PRId32 " producer_state=%" PRId64
-            " producer_wake_head=%" PRId64 " active_mask=0x%x flags=0x%x",
+            " next_waiter=%" PRId64 " wake_next=%" PRId64 " fanin_index=%" PRIu32 " active_mask=0x%x flags=0x%x",
             task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter,
-            controls[task].next_fanin_index, controls[task].waiting_producer,
-            controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
-                controls[controls[task].waiting_producer].state :
-                INT64_C(-1),
-            controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
-                controls[controls[task].waiting_producer].wake_list_head :
-                INT64_C(-1),
-            metadata[task].active_mask.raw(), metadata[task].flags
+            scheduler_wake_cursor_next(controls[task].wake_cursor),
+            scheduler_wake_cursor_fanin(controls[task].wake_cursor), metadata[task].active_mask.raw(),
+            metadata[task].flags
         );
     }
     log_resident_ready_pool(scheduler_state_base, *context);

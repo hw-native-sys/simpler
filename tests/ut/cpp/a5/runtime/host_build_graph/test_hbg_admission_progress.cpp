@@ -112,7 +112,7 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
                 ));
                 ASSERT_TRUE(scheduler_async_finish_step(
                     fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), async_workers[worker],
-                    8, progress
+                    progress
                 ));
             }
         }

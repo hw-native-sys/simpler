@@ -542,9 +542,10 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         owner = it->second;
     }
 
-    std::vector<uint8_t> storage(static_cast<size_t>(owner.layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1));
-    const uintptr_t aligned_address = (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_ALIGNMENT - 1) &
-                                      ~(static_cast<uintptr_t>(SCHEDULER_STATE_ALIGNMENT) - 1);
+    std::vector<uint8_t> storage(static_cast<size_t>(owner.layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1));
+    const uintptr_t aligned_address =
+        (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_BASE_ALIGNMENT - 1) &
+        ~(static_cast<uintptr_t>(SCHEDULER_STATE_BASE_ALIGNMENT) - 1);
     void *host_base = reinterpret_cast<void *>(aligned_address);
     if (api->copy_from_device(host_base, owner.state_base, static_cast<size_t>(owner.layout.total_size)) != 0) {
         LOG_WARN("A5 HBG: failed to copy AICore Scheduler profiling state");
@@ -1701,7 +1702,7 @@ bool create_scheduler_state(
             runtime->dev.chip_swimlane_level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
             executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled(), native_image.bytes.size()
         ) ||
-        layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
+        layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
         return false;
     }
@@ -1784,8 +1785,8 @@ bool create_scheduler_state(
         return false;
     }
 
-    if (layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) return false;
-    const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
+    if (layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) return false;
+    const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1;
     // The slot's retained pair, each side aligned with at least total_size
     // behind it. Handed over uninitialized and never carrying anything between
     // runs: initialization publishes the current metadata prefix. Reserved
@@ -1793,7 +1794,7 @@ bool create_scheduler_state(
     void *device_state = nullptr;
     void *host_base = nullptr;
     if (api->acquire_scheduler_state_storage(
-            static_cast<size_t>(layout.total_size), static_cast<size_t>(SCHEDULER_STATE_ALIGNMENT), &device_state,
+            static_cast<size_t>(layout.total_size), static_cast<size_t>(SCHEDULER_STATE_BASE_ALIGNMENT), &device_state,
             &host_base
         ) != 0 ||
         device_state == nullptr || host_base == nullptr) {

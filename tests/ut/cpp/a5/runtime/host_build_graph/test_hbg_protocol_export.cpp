@@ -56,7 +56,7 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v10\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
-    EXPECT_NE(json.find("\"admission_claim_lock\":0"), std::string::npos);
+    EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
     EXPECT_NE(json.find("\"block_num\":2"), std::string::npos);
     EXPECT_EQ(json.find("\"block_num\":99"), std::string::npos);
     EXPECT_NE(json.find("\"dependencies\":[0]"), std::string::npos);

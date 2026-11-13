@@ -25,7 +25,7 @@ static inline __aicore__ bool scheduler_gm_mix_context_valid(
 ) {
     if constexpr (StaticContextValidated)
         return scheduler_admission_detail::active_run_valid(graph, base, local, run, local->admission);
-    auto *admission = local == nullptr ? nullptr : local->admission;
+    auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     if (!scheduler_task_ref_valid(graph, admission->current_task_ref) ||
         !scheduler_task_is_mix(admission->current_flags) || admission->gm_mix.mailbox_offset == 0 ||

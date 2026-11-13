@@ -392,21 +392,38 @@ TensorMap maps tensor regions to producer task IDs. For every task:
 
 The public task payload stores fanins. For resident scheduling, Host converts
 these through the unified graph accessor into a deduplicated fanout CSR and
-initial remaining counters, excluding Host-completed edges. The immutable
+initial remaining counters, excluding Host-completed edges, when selecting the CSR candidate. The immutable
 header/CSR and atomic-only counters occupy separate 64-byte-aligned regions.
 The legacy AICPU scheduler consumes fanins directly without this resident pool.
 
 ## 6. Boot Classification and Dependencies
 
-Resident bootstrap classifies each node by its initial remaining count: zero
-enters ready discovery; nonzero waits for producer completion notifications.
-All scans finish before completion resolution starts. Each resolved producer
-visits its CSR successors once; the atomic transition 1→0 uniquely publishes
-a successor. Synchronous TaskDone owners traverse the immutable CSR directly,
-without wake-list detachment or a continuation. Control and async FINISH owners
-retain the bounded resolver for resumable work. Without a dependency header, resident helpers retain the
-intrusive wake-list path. See the
-[dependency contract](../../../../../docs/zh-cn/design/a5-hbg-graph-task/dependency-counters.md).
+The Host maker constructs deduplicated fanout CSR rows and remaining counters
+by default. Resident completion traverses them synchronously. Valid images
+without a dependency table use synchronous wake lists: bootstrap registers
+each blocked node on its first unfinished producer. Invalid storage is rejected,
+not routed through the other algorithm. Neither path exports a continuation.
+
+A wake-list resolver atomically closes its producer head and owns the detached
+chain. Each waiter's `wake_cursor` packs the next signed 32-bit task ref and the
+next unexamined 32-bit fanin index into one atomic word. The resolver captures
+both before routing can transfer the waiter. Registration publishes this word
+before the head CAS. A successful CAS transfers ownership; the old owner never
+reads or writes the waiter afterward. CLOSED producer heads are monotonic.
+The separate `next_waiter` word belongs to control inboxes and Ready batches.
+
+All completion owners resolve synchronously. `scheduler_resolve_wake_completion`
+drains the detached chain, retaining each waiter's immutable fanin view and old
+next link across Ready-prefix publication. `scheduler_route_detached_waiter`
+transfers it to an unfinished producer or returns it for Ready publication.
+The CSR candidate uses `scheduler_resolve_csr_completion` with the same ownership
+contract. Complete resolver timing includes traversal, routing and publication.
+
+Native control service handles at most eight nodes per invocation and fully
+resolves each node. Async FINISH holds its exclusive lease until TaskDone and
+all successor responsibilities are published, then terminates the lease and
+clears its directory bit. Async condition CHECK retains its bounded polling;
+FINISH has no GM progress record and LocalState has no resolver continuation.
 
 The following boot classifier, wake/publish lists and early-dispatch description
 apply to the legacy AICPU scheduler. Submit does not push tasks into ready queues. After the graph arrives on device,
@@ -475,8 +492,8 @@ The scan also validates and constructs each cooperative task's immutable
 admission record and member bitmap. INITIALIZED grants no Ready ownership,
 order key or block. The completed scan gate gives every Scheduler proof
 that these records belong to the current run. Dependency routing remains dynamic:
-only the unique Ready owner changes INITIALIZED to PREPARED and publishes the
-record through the existing commit lock. Members still check the run epoch,
+the unique Ready owner retains the candidate in private pending storage and
+publishes the record through the global commit lock. Members still check the run epoch,
 committed order and ADMITTED signal; they reuse the scan's static membership
 validation. No block counter can change before admission, and commit retries
 retain the same pending owner. Task and completion counts are unchanged.
@@ -486,8 +503,8 @@ The validation contract distinguishes initialization from publication:
 | Boundary | Checks |
 | -------- | ------ |
 | Bootstrap, before publishing INITIALIZED | Initial claim/next counters, completion progress and seal are zero; the packed completion total remains intact; record shape, flags and storage offsets match task metadata; member storage is empty; topology determines the frozen bitmap. |
-| Each ready claim and pending publication, including retries | A unique ready owner transfers INITIALIZED to PREPARED; the run/error and epoch gates remain live; PREPARED, record epoch and the unassigned order key are checked before commit. |
-| Under the commit lock | Owner identity, active run/error, epoch and remaining log capacity are checked before the record, ADMITTED signal and tail are published. |
+| Each ready claim | Ready pop or direct resolve already grants unique ownership; a live run/error/epoch check and an empty private pending slot permit the local transfer. No shared phase or per-task lock is published. |
+| Every commit attempt | A busy global lock returns RETRY after checking the active run. Under the acquired lock, active run/error, INITIALIZED, record epoch/order and log capacity are checked before publishing the record, ADMITTED and tail. Only its owner releases the lock. |
 | Member adoption | The log task, run epoch, order key and ADMITTED publication are checked before the frozen bitmap is consumed. |
 
 No legitimate writer changes a task's initial block counters before ADMITTED, or
@@ -498,8 +515,8 @@ counters exercise rejection at bootstrap. Tests of retry-time epoch, order,
 state, error and capacity violations exercise the production publication path.
 Both ordinary and native resident entry points and low-level scheduler fixtures
 bootstrap their complete task configuration before dispatch. There is one
-preparation lifecycle: UNCLAIMED to INITIALIZED at bootstrap, then PREPARED
-and ADMITTED after readiness. No construct-on-claim fallback is retained.
+preparation lifecycle: UNCLAIMED to INITIALIZED at bootstrap, then ADMITTED on
+commit. No construct-on-claim fallback is retained.
 
 Task-level Mix membership is the active lane mask plus the AIC coordinator.
 A 1C1V task therefore coordinates two lanes per cluster; 1C2V and 2V coordinate
@@ -542,8 +559,8 @@ publishes a version-11 header. Queue head, tail and entries use atomic-only
 publication words; entries remain immutable until the run fence. Native control
 nodes retain their separate control inboxes.
 
-A ticket reservation and publication complete in one bounded tail. Transferable
-FINISH/control resolution keeps its own eight-ref publication buffer and cursor;
+A ticket reservation and publication complete in one call. Synchronous
+FINISH/control resolution uses a private eight-ref publication buffer;
 no ready-pool publication is held in a worker-local pending list. Historical
 alternative algorithms and the requirements for implementing them again are
 recorded in the [queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-task/ready-queue-design.md).
@@ -551,15 +568,32 @@ recorded in the [queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-tas
 Business-ready ticket positions are shared GM state; a successful head CAS
 transfers task ownership to one worker. Native control inboxes retain their
 separate atomic endpoints and task links.
+Run entry validates the immutable graph, worker topology and queue layout.
+Internal helpers require those live bindings instead of repeating pointer and
+configuration checks. Shared queue references and resumed cursor state are
+validated when consumed; dynamic head, count, epoch and ownership checks remain.
+Ticket claiming uses the shared queue directly and does not take a scheduler
+count parameter.
+
+Candidate classification reads the immutable metadata flags. Host construction
+and record validation establish that SPMD means more than one logical block;
+MIX and sync-start are encoded alongside it. The ordered discovery and ordinary
+preparation passes therefore do not load the complete metadata just to classify
+a candidate. Payload preparation still reads its kernel IDs and execution shape.
 Two own slots use a ready mask and head index to preserve publication order.
 The executor peeks at the head and checks final admission before consuming it
 and changing READY to EXECUTING. A denied permit leaves the order intact;
 parking removes a candidate's slot, and preparing it again appends it at the tail.
 Kernel return, async sealing and enabled argument capture precede the loop's
 EXIT/error gate and a direct `scheduler_complete_own_slot` call. Retirement
-checks EXECUTING and the task/block/subtask/group binding. There is no completion
-notification or periodic completion scan. Direct refill preserves the old
-execution in a local snapshot before rebinding the slot to its successor.
+retains the executor's private slot ownership through normal kernel return:
+the kernel receives the GM argument vector and payload contexts, not private
+slot/admission addresses. The checked completion entry validates bindings for
+other callers. There is no completion notification or periodic completion scan.
+Direct refill preserves the old execution in a local snapshot before rebinding
+the slot to its successor. The executor carries only its validated async group
+index across the kernel call and rebuilds the writer from its immutable run
+layout; mutable registration state is still validated when sealing the group.
 
 Local configuration, execution slots, control resolution and the optional
 profiling pointer belong to the core-local state. A separate profiling state
@@ -567,6 +601,8 @@ holds two timing slots, self-execution traces, one worker trace cache, profiling
 offsets, and the loop counter/cache-valid flag. Slot retirement precedes physical
 completion contribution. Completion trace publication precedes GM MIX lane release.
 Sampling is derived from the timing-slot range.
+Retirement reads the executor's trace in place: the same core owns that storage,
+and it cannot be rebound until the current retirement has finished publishing.
 
 The host records whether any task requests sampled timing in the run control.
 Only a run with chip profiling or sampled timing enters the resident function

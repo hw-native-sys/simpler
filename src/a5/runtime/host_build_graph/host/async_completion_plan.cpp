@@ -109,8 +109,7 @@ bool plan_async_completion(
     cursor = next.initialized_bytes;
     if (!reserve_array<SchedulerAsyncLease>(&cursor, layout.group_count, &layout.group_leases_offset) ||
         !reserve_array<SchedulerAsyncGroupProgress>(&cursor, layout.group_count, &layout.group_progress_offset) ||
-        !reserve_array<SchedulerAsyncLease>(&cursor, layout.async_task_count, &layout.finish_leases_offset) ||
-        !reserve_array<SchedulerAsyncFinishProgress>(&cursor, layout.async_task_count, &layout.finish_progress_offset))
+        !reserve_array<SchedulerAsyncLease>(&cursor, layout.async_task_count, &layout.finish_leases_offset))
         return reject(error, "deferred control storage overflows");
     for (auto &task : next.tasks) {
         for (uint32_t lane = 0; lane < 3; ++lane) {
