@@ -1414,15 +1414,17 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912, PLR0915
             tag = "PASS" if res.returncode == 0 else f"FAIL rc={res.returncode}"
             nodeid = res.nodeid or "<unknown>"
             header = f"{res.label} nodeid={nodeid} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
+            if res.returncode == 0:
+                print(header, flush=True)
+                return
             spooled = _spool_child_output(nodeid, res.output)
             _emit_group(header, _bounded_child_output(res.output, spooled))
-            if res.returncode != 0:
-                # Out-of-group summary so a reviewer scanning the collapsed
-                # log still sees the failure without having to expand.
-                print(
-                    f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
-                    flush=True,
-                )
+            # Out-of-group summary so a reviewer scanning the collapsed
+            # log still sees the failure without having to expand.
+            print(
+                f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
+                flush=True,
+            )
 
         print(
             f"\nResource phase: {len(jobs)} case(s), pool={device_ids}, max_parallel={max_parallel}",

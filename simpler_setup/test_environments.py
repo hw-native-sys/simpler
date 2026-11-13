@@ -387,8 +387,11 @@ def prepare_session(session) -> None:  # noqa: PLR0912
         if opted_in and _environment(name).execution == "dispatcher":
             config._environment_plan = destination
             config._environment_results = [Path(xmlpath)]
+    # The plan itself is the file at ``path``; the console line only identifies
+    # it, so every dispatched child does not re-echo the whole case list.
     print(
-        "TEST_ENVIRONMENT_PLAN " + json.dumps({"path": str(destination), "plan": plan, "identity": identity}),
+        "TEST_ENVIRONMENT_PLAN "
+        + json.dumps({"path": str(destination), "digest": digest, "cases": len(plan["cases"])}),
         flush=True,
     )
 
@@ -561,7 +564,11 @@ def verify_result_files(  # noqa: PLR0912
         raise ResultVerificationError(list(dict.fromkeys(errors)), summary if "coverage" in plan else None)
     if summary is not None:
         plan_path.with_suffix(".coverage.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print("TEST_ENVIRONMENT_VERIFIED " + ", ".join(sorted(observed)), flush=True)
+    print(
+        "TEST_ENVIRONMENT_VERIFIED "
+        + json.dumps({"cases": len(observed), "plan": plan_path.name, "digest": _plan_digest(plan)}),
+        flush=True,
+    )
 
 
 def finish_session(session) -> None:
