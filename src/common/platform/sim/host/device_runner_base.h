@@ -546,6 +546,7 @@ public:
     // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
     // device-phase trace markers from the sim c_api, mirroring onboard.
     uint64_t last_device_phase_ns(AicpuPhase phase) const { return device_phase_ns_[static_cast<int>(phase)]; }
+    uint64_t last_aicore_wall_ns() const { return aicore_wall_ns_; }
     // Per-phase start offset (ns) on a common device-clock timeline (origin =
     // earliest sub-phase start), so device spans carry a device-domain `ts` and
     // the orch∪sched "Effective" window is computable. 0 for RunWall / unstamped.
@@ -1100,6 +1101,7 @@ protected:
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
     uint64_t device_phase_ns_[NUM_AICPU_PHASES] = {0};
+    uint64_t aicore_wall_ns_{0};
     // Per-phase start offset (ns) from the earliest sub-phase start; see
     // last_device_phase_start_ns().
     uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};

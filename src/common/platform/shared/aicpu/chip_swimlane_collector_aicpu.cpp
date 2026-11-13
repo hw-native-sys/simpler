@@ -38,6 +38,7 @@
 // without re-reading the device-shared header.
 static ChipSwimlaneDataHeader *s_chip_swimlane_header = nullptr;
 static bool s_phase_initialized = false;
+static bool s_self_scheduled_cores = false;
 
 // Per-core ChipSwimlaneAicpuTaskPool cache
 static ChipSwimlaneAicpuTaskPool *s_aicpu_task_pools[PLATFORM_MAX_CORES] = {};
@@ -351,11 +352,15 @@ static int enqueue_ready_buffer(
 static ChipSwimlaneAicpuTaskBuffer *
 try_pop_records_buffer(int core_id, ChipSwimlaneAicpuTaskPool *state, uint32_t next_seq) {
     return ChipSwimlaneTaskEngine::pop_free(
-        l2_task_context(/*thread_idx=*/0, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicpuTask,
-                        &s_current_aicpu_task_buffers[core_id]),
+        l2_task_context(
+            /*thread_idx=*/0, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicpuTask,
+            &s_current_aicpu_task_buffers[core_id]
+        ),
         state, next_seq
     );
 }
+
+void chip_swimlane_aicpu_use_self_scheduled_cores() { s_self_scheduled_cores = true; }
 
 void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level) {
     // Each profiled launch starts counting AICore dispatches from 0 so the rotation boundary check
@@ -429,6 +434,7 @@ void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level) {
     // The caller supplies this invocation's published descriptor value. The
     // shared collector header is not a per-run configuration carrier.
     g_chip_swimlane_level = level;
+    s_self_scheduled_cores = false;
 
     LOG_INFO(
         "Initializing performance profiling for %d cores (free queue), chip_swimlane_level=%u", worker_count,
@@ -734,6 +740,35 @@ static void aicore_rotate(int core_id, int thread_idx, uint32_t new_buf_first_re
     wmb();
 }
 
+static uint32_t observe_self_scheduled_count(ChipSwimlaneAicoreTaskPool *state) {
+    auto *buffer = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(state->head.current_buf_ptr);
+    if (buffer == nullptr) return 0;
+    cache_invalidate_range(const_cast<const uint32_t *>(&buffer->count), sizeof(buffer->count));
+    rmb();
+    const uint32_t committed = buffer->count;
+    const uint32_t live = state->head.live_record_count;
+    if (committed > live) {
+        chip_swimlane_add_saturating(state->head.total_record_count, committed - live);
+        state->head.live_record_count = committed;
+    }
+    return committed;
+}
+
+void chip_swimlane_aicpu_poll_self_scheduled_cores(int thread_idx, int thread_count, int worker_count) {
+    if (!g_enable_chip_swimlane || !s_self_scheduled_cores) return;
+    const int lo = static_cast<int>((static_cast<int64_t>(thread_idx) * worker_count) / thread_count);
+    const int hi = static_cast<int>((static_cast<int64_t>(thread_idx + 1) * worker_count) / thread_count);
+    for (int core = lo; core < hi; ++core) {
+        auto *state = s_aicore_task_pools[core];
+        if (state == nullptr || observe_self_scheduled_count(state) < PLATFORM_AICORE_BUFFER_SIZE) continue;
+        const uint32_t seq = state->head.current_buf_seq;
+        aicore_rotate(core, thread_idx, 0);
+        // The published count follows every record's writeback. Unlike FIN,
+        // it proves the full buffer can be handed off without a later ACK.
+        if (state->head.current_buf_seq != seq) publish_aicore_pending_buffer(core, thread_idx);
+    }
+}
+
 // Pre-dispatch hook. Called from the dispatch path (scheduler_dispatch in
 // tensormap_and_ringbuffer; aicpu_executor in host_build_graph) immediately
 // before `write_reg(DATA_MAIN_BASE)` for each AICore task. Maintains the
@@ -931,6 +966,7 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
         // before the current buffer so ready-queue order follows buffer_seq.
         publish_aicore_pending_buffer(core_id, thread_idx);
 
+        if (s_self_scheduled_cores) observe_self_scheduled_count(ac_state);
         rmb();
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;

@@ -928,6 +928,12 @@ static bool device_profiling_enabled() {
 // STRACE_DEV_SPAN_AT self-compiles to nothing when profiling is off.
 static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
     if (!device_profiling_enabled()) return;
+    if (runner->last_aicore_wall_ns() != 0) {
+        STRACE_DEV_SPAN_AT_A(
+            "chip.run.runner_run.aicore_wall", 0, static_cast<long long>(runner->last_aicore_wall_ns()), 2,
+            "clk=dev clock_source=aicore"
+        );
+    }
     const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
     if (run_wall_ns != 0) {
         STRACE_DEV_SPAN_AT("chip.run.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);

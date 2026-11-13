@@ -85,6 +85,12 @@ ChipSwimlaneLevel get_chip_swimlane_level();
  */
 void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level);
 
+// Self-scheduling cores publish committed buffer counts instead of dispatch
+// notifications. Each AICPU thread services its retirement partition using the
+// same pools, rotation and Host handoff as dispatch-driven collection.
+void chip_swimlane_aicpu_use_self_scheduled_cores();
+void chip_swimlane_aicpu_poll_self_scheduled_cores(int thread_idx, int thread_count, int worker_count);
+
 /**
  * Pre-dispatch hook for AICore buffer rotation and per-pool stats.
  *

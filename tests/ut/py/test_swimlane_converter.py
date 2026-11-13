@@ -3597,3 +3597,17 @@ def test_an_unpaired_retained_capture_converts_from_what_it_was_given(tmp_path, 
 
     assert func_names == {}
     assert "is not paired with a dispatch identity" in capsys.readouterr().err
+
+
+def test_percounter_l1_keeps_graph_task_identity_and_setup_interval(tmp_path):
+    task = _task_row(_hbg_sub_task(7, 2), 0, start=11.0, end=20.0, receive=10.5, run_epoch=4)
+    output = tmp_path / "percounter.json"
+    sc.generate_chrome_trace_json([task], str(output), runtime_name="percounter")
+    events = json.loads(output.read_text())["traceEvents"]
+    worker = [e for e in events if e.get("ph") == "X" and e.get("pid") == 4]
+    assert len(worker) == 1
+    assert "g7t2" in worker[0]["name"]
+    assert worker[0]["dur"] == pytest.approx(9.5)
+    assert worker[0]["args"]["kernel-duration-us"] == pytest.approx(9.0)
+    assert worker[0]["args"]["local_setup_us"] == pytest.approx(0.5)
+    assert worker[0]["args"]["run_epoch"] == 4

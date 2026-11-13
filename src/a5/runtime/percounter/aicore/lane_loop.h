@@ -38,6 +38,8 @@
 #include "scheduler/gm.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_watchdog.h"
+#include "aicore/aicore_profiling_state.h"
+#include "aicore/chip_swimlane_collector_aicore.h"
 
 namespace simpler::percounter {
 
@@ -92,6 +94,8 @@ inline constexpr uint64_t PERCOUNTER_SPIN_BACKOFF_AFTER = 16;
 inline constexpr uint64_t PERCOUNTER_SPIN_BACKOFF_CYCLES = 256;
 
 struct LaneConfig {
+    __gm__ ChipSwimlaneActiveHead *profile_head{nullptr};
+    ChipSwimlaneAicoreLocalState *profile{nullptr};
     __gm__ PercounterControl *control;
     SchedulerGraphView graph;
     __gm__ uint64_t *callable_addresses;
@@ -343,6 +347,11 @@ inline __aicore__ bool percounter_prepare_subtask(
         SchedulerGraphResult::OK) {
         return false;
     }
+    if (cfg.profile != nullptr) {
+        const TaskId token = task.shell < 0 ? TaskId::make_global(static_cast<int32_t>(task.id)) :
+                                              TaskId::make_sub_task(task.shell, task.local);
+        TaskId::assign(payload->local_context.async_ctx.task_token, token);
+    }
     payload->local_context.block_idx = block_idx;
     payload->local_context.block_num = block_num;
     payload->global_context.sub_block_id = subtask_slot == 2 ? 1 : 0;
@@ -355,6 +364,7 @@ inline __aicore__ bool percounter_prepare_subtask(
 /** Execute a prepared slot only after its caller has established readiness. */
 inline __aicore__ bool
 percounter_run_prepared(const LaneConfig &cfg, const PercounterTask &task, __gm__ DispatchPayload *payload) {
+    const uint64_t receive_time = cfg.profile != nullptr ? get_sys_cnt_aicore() : 0;
     percounter_observe_data_cache(reinterpret_cast<__gm__ void *>(payload));
     if (cfg.has_predicates) {
         const SchedulerPredicateResult verdict = scheduler_evaluate_task_predicate(task.graph, task.local);
@@ -366,11 +376,32 @@ percounter_run_prepared(const LaneConfig &cfg, const PercounterTask &task, __gm_
     }
     if (payload->function_bin_addr == 0) return true;
 
+    __gm__ ChipSwimlaneAicoreTaskRecord *record = nullptr;
+    if (cfg.profile != nullptr) {
+        record = chip_swimlane_aicore_wait_task_record(cfg.profile_head, cfg.profile);
+        if (record == nullptr) {
+            percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
+            return false;
+        }
+    }
+
     // The barrier is the publication fence a consumer's spin depends on: the
     // kernel's outputs are in memory before the atomic that announces them.
     PercounterKernelFunc kernel = reinterpret_cast<PercounterKernelFunc>(payload->function_bin_addr);
+    const uint64_t start_time = cfg.profile != nullptr ? get_sys_cnt_aicore() : 0;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
+    if (cfg.profile != nullptr) {
+        const uint64_t end_time = get_sys_cnt_aicore();
+        chip_swimlane_aicore_commit_task_record(
+            record, payload->local_context.async_ctx.task_token,
+            cfg.profile->cached_buf_seq * PLATFORM_AICORE_BUFFER_SIZE + cfg.profile->slot_within_buf, receive_time,
+            start_time, end_time
+        );
+        if (cfg.profile->slot_within_buf == PLATFORM_AICORE_BUFFER_SIZE) {
+            chip_swimlane_aicore_publish_task_count(cfg.profile);
+        }
+    }
     return true;
 }
 
@@ -1661,7 +1692,13 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
         if (!percounter_clear_mix_signal(cfg, timeout_cycles)) return;
     }
 
+    ChipSwimlaneAicoreLocalState profile{};
+    if (SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_CHIP_SWIMLANE)) {
+        cfg.profile_head = get_chip_swimlane_aicore_head();
+        if (cfg.profile_head != nullptr) cfg.profile = &profile;
+    }
     percounter_lane_loop(cfg, timeout_cycles);
+    if (cfg.profile != nullptr) chip_swimlane_aicore_flush_task_count(&profile);
 }
 
 /**
@@ -1678,6 +1715,8 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
     percounter_observe_cache_line(handshake);
 
     const uint64_t report_epoch = get_aicore_report_epoch();
+    handshake->work_start_cycle = 0;
+    handshake->work_end_cycle = 0;
     if (report_epoch != 0) {
         aicore_stage_native_report(
             handshake, get_physical_core_id(), core_type, static_cast<uint32_t>(block_idx) + 1, 0
@@ -1729,8 +1768,14 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
         released = signal == AICPU_IDLE_TASK_ID;
     }
     if (released) {
+        const uint64_t work_start = get_sys_cnt_aicore();
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
         run_percounter_lane(control, block_idx, core_type);
+        const uint64_t work_end = get_sys_cnt_aicore();
+        handshake->work_start_cycle = work_start;
+        handshake->work_end_cycle = work_end;
+        dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        dsb((mem_dsb_t)0);
     }
     // A lane arrives here when its share of the run is done, which can be long
     // before the run ends, or after a local watchdog ended a wait above. The

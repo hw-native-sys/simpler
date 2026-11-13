@@ -27,6 +27,7 @@
 #include <cstdint>
 
 #include "aicpu/aicpu_device_config.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu_executor.h"
 #include "common/platform_config.h"
 #include "supervisor.h"
@@ -52,6 +53,7 @@ bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
 }
 
 int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
+    if (is_chip_swimlane_enabled()) chip_swimlane_aicpu_use_self_scheduled_cores();
     return simpler::percounter::percounter_post_handshake_init(runtime, aicore_lifecycle_, scheduler_timeout_cycles());
 }
 
@@ -63,16 +65,23 @@ void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nt
 // launch, so there is no bootstrap acknowledgement to wait for.
 bool AicpuExecutor::awaits_bootstrap() const { return false; }
 
-int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t /*thread_idx*/) {
-    return simpler::percounter::percounter_supervise(runtime, scheduler_timeout_cycles(), aicpu_thread_num_);
+int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t thread_idx) {
+    return simpler::percounter::percounter_supervise(
+        runtime, scheduler_timeout_cycles(), aicpu_thread_num_, thread_idx
+    );
 }
 
 // This thread first materializes any graph bodies the lanes will run, then
 // waits. The percounter supervisor's own progress watchdog bounds the wait;
 // the ready watchdog's stamp is never advanced in this runtime.
-bool AicpuExecutor::await_shutdown(Runtime *runtime, int32_t /*thread_idx*/) {
+bool AicpuExecutor::await_shutdown(Runtime *runtime, int32_t thread_idx) {
     simpler::percounter::percounter_assist(runtime);
+    uint32_t checks = 0;
     while (!shutdown_ready_.load(std::memory_order_acquire)) {
+        if (++checks == 64) {
+            checks = 0;
+            chip_swimlane_aicpu_poll_self_scheduled_cores(thread_idx, aicpu_thread_num_, runtime->get_worker_count());
+        }
         SPIN_WAIT_HINT();
     }
     return false;

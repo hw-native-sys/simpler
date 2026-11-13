@@ -801,6 +801,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // so it cannot be published as Ok.
         snapshot_run_terminal(runtime, cores_retired);
         if (cores_retired) {
+            AicoreWorkWindow work_window{};
+            for (int i = 0; i < runtime->get_worker_count(); ++i) {
+                cache_invalidate_range(&runtime->dev.workers[i], sizeof(Handshake));
+            }
+            rmb();
+            if (aicore_reduce_work_window(runtime->dev.workers, runtime->get_worker_count(), work_window)) {
+                device_phase_set_aicore_work_window(work_window);
+            }
             publish_aicore_task_timing(runtime);
         } else {
             // Device-owned trace cells, written by the cores. Reading them

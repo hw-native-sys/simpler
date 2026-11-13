@@ -5132,6 +5132,11 @@ void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {
     uint64_t start_cycles[NUM_AICPU_PHASES];
     uint64_t span_cycles[NUM_AICPU_PHASES];
     reduce_aicpu_phase_windows(buf.phases, kThreads, start_cycles, span_cycles);
+    const auto &aicore_work = buf.header.aicore_work;
+    if (aicore_work.start_cycle != 0 && aicore_work.end_cycle > aicore_work.start_cycle) {
+        out.aicore_wall_ns =
+            static_cast<uint64_t>(cycles_to_us(aicore_work.end_cycle - aicore_work.start_cycle) * 1000.0);
+    }
 
     // Origin = earliest sub-phase start (Preamble..SchedWindow share the device
     // clock; RunWall is the bracket at offset 0). Sub-phase start offsets from
