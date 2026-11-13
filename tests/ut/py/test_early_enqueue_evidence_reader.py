@@ -34,6 +34,7 @@ import inspect
 import mmap
 import sys
 import textwrap
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,6 +89,8 @@ def _refill_scene_body(relative_path):
             nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in functions:
             nodes.append(node)
+        elif isinstance(node, ast.ClassDef) and node.name == "_ChildTrace":
+            nodes.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "TestDfxJoinedLaunchAttribution":
             for member in node.body:
                 if isinstance(member, ast.FunctionDef) and member.name in methods:
@@ -102,7 +105,8 @@ def _refill_scene_body(relative_path):
 
 
 @pytest.mark.parametrize("name", sorted(_REFILL_SUITES))
-def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
+@pytest.mark.parametrize("fail_at_flush", [False, True])
+def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path, fail_at_flush):
     """A stream observer can finish later executions without observing their own results.
 
     Two physical credits admit new work independently of retained semantic results. Waiting
@@ -115,6 +119,13 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
     torch = scene["torch"]
     jobs, events, spans, tiles = [], [], [], []
     generations = [0, 0]
+    tensor_refs = []
+
+    def tracked_frombuffer(*args, **kwargs):
+        tensor = torch.frombuffer(*args, **kwargs)
+        tensor_refs.append(weakref.ref(tensor))
+        return tensor
+
     owner_patterns = {
         owner: pattern.replace("*", "1")
         for owner, pattern in scene["_OWNER_ARTIFACTS"].items()
@@ -174,6 +185,8 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
     def flush():
         assert len(jobs) == 6 and all(job.observed for job in jobs)
         events.append(("flush", len(jobs)))
+        if fail_at_flush:
+            raise RuntimeError("injected diagnostic failure")
         for job in jobs:
             for pattern in owner_patterns.values():
                 artifact = job.prefix / pattern
@@ -197,7 +210,7 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
         tiles.append(actual.numel())
         return torch.allclose(actual, expected, **kwargs)
 
-    scene["torch"] = SimpleNamespace(frombuffer=torch.frombuffer, allclose=allclose)
+    scene["torch"] = SimpleNamespace(frombuffer=tracked_frombuffer, allclose=allclose)
     case = SimpleNamespace(
         RTOL=0,
         ATOL=0,
@@ -212,6 +225,12 @@ def test_dfx_refill_offers_successors_before_strong_observation(name, tmp_path):
         create_buffer=lambda nbytes: SimpleNamespace(shm=SimpleNamespace(buf=bytearray(nbytes))),
         flush_diagnostics=flush,
     )
+    if fail_at_flush:
+        with pytest.raises(RuntimeError, match="injected diagnostic failure") as failure:
+            scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, None)
+        assert failure.value.__traceback__ is not None
+        assert not any(ref() is not None for ref in tensor_refs), "traceback retained CPU tensor exports"
+        return
     try:
         scene["_refill_owns_its_records"](case, worker, tmp_path / name, False, None)
     except AssertionError as error:
@@ -1056,3 +1075,21 @@ def test_hbg_three_run_wait_does_not_accept_a_permanently_missing_boundary(hbg_s
     records = []
     assert not hbg_suite._await_records(trace, records, 0, _three_run_wait_predicate(hbg_suite, trace, runs))
     assert hbg_suite._whole_operator_order(trace, records, runs)[3] == {(_SUCCESSOR, third)}
+
+
+@pytest.mark.parametrize("name", sorted(_REFILL_SUITES))
+def test_dfx_failure_keeps_initial_timing_outside_log_tail(name):
+    scene = _refill_scene_body(_REFILL_SUITES[name][0])
+    spans = [
+        SimpleNamespace(pid=42, inv=inv, name="chip.run.prepare_execution", ts=inv * 100, dur=10, attrs="")
+        for inv in (7, 8, 9)
+    ]
+    spans.append(
+        SimpleNamespace(pid=42, inv=8, name="chip.run.joined_launch", ts=999, dur=0, attrs="observed=1 unfired=0 rc=0")
+    )
+    trace = SimpleNamespace(spans=lambda: spans, window_text=lambda: "tail omits first pair")
+    result = scene["_ChildTrace"].safe_window_text(trace)
+    assert "inv=7 name=chip.run.prepare_execution ts=700 dur=10" in result
+    assert "inv=8 name=chip.run.joined_launch ts=999 dur=0 observed=1 unfired=0 rc=0" in result
+    assert "inv=9" not in result
+    assert result.endswith("tail omits first pair")

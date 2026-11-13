@@ -379,7 +379,11 @@ class TestRunStreamReuseHbg(SceneTestCase):
                 staging = chip_worker.retained_temp_addr(slot_id)
                 assert storage != 0 and staging != 0
                 assert all(storage != old["storage"] and staging != old["staging"] for old in records[:-1])
-                record.update(storage=storage, staging=staging)
+                # Read this run's heap before a later prepare replaces the bank.
+                heap = chip_worker.arena_bank_gm_heap_base(slot_id)
+                assert heap != 0, "prepared run has no committed heap"
+                assert all(heap != old["heap"] for old in records[:-1] if old["slot_id"] != slot_id)
+                record.update(storage=storage, staging=staging, heap=heap, slot_id=slot_id)
                 chip_worker._launch_native_run(native_run)
                 deadline = time.monotonic() + 60.0
                 while not chip_worker._poll_native_run(native_run):
@@ -392,10 +396,6 @@ class TestRunStreamReuseHbg(SceneTestCase):
                     )
                 expected_increment = 1 if st_platform == "a2a3" else 0
                 assert st_worker.run_stream_set_create_count == stream_sets + expected_increment
-            bank0 = chip_worker.arena_bank_gm_heap_base(0)
-            bank1 = chip_worker.arena_bank_gm_heap_base(1)
-            assert bank0 != 0 and bank1 != 0, f"a served bank is uncommitted: {bank0:#x}, {bank1:#x}"
-            assert bank0 != bank1, f"both arena banks resolve to one GM heap: {bank0:#x}"
             # Both same-slot successors are admitted before any strong observation.
             while records:
                 record = records[-1]

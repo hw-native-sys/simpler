@@ -493,12 +493,12 @@ host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submit
 }
 
 static int setup_static_arena_wrapper(
-    void *runner_ctx, uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    void *runner_ctx, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
 ) {
     if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     try {
         return static_cast<DeviceRunnerBase *>(runner_ctx)
-            ->setup_static_arena(arena_bank, gm_heap_size, gm_sm_size, runtime_arena_size);
+            ->setup_static_arena(banks, gm_heap_size, gm_sm_size, runtime_arena_size);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1497,7 +1497,7 @@ static void quarantine_undrained_run(DeviceRunnerBase &runner, int rc) noexcept 
 /**
  * Whether the loaded runtime declares its pooled arena regions per run.
  *
- * The declaration is what makes a per-slot bank meaningful: a `HOST_PER_RUN`
+ * The declaration is what makes a per-slot bank meaningful: a `DELIVERED`
  * arena at a depth above one has one copy per run and every slot selects its
  * own, while a shared one has a single copy every slot selects. So this is the
  * statement a selected bank must agree with, read from the contract the loaded
@@ -1506,6 +1506,7 @@ static void quarantine_undrained_run(DeviceRunnerBase &runner, int rc) noexcept 
 static const PipelineResource *declared_arena_resource(const PipelineContract *contract) {
     if (contract == nullptr) return nullptr;
     const PipelineResource *arena = find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP);
+    if (arena == nullptr) arena = find_pipeline_resource(*contract, PTO_PIPELINE_GM_SM);
     if (arena == nullptr) arena = find_pipeline_resource(*contract, PTO_PIPELINE_RUNTIME_IMAGE);
     return arena;
 }
@@ -1538,6 +1539,26 @@ static uint32_t resolved_arena_bank_for_slot(uint32_t pipeline_slot) {
     const PipelineResource *arena = declared_arena_resource(contract);
     if (arena == nullptr) return 0;
     return pipeline_resource_slot(*contract, *arena, PipelineSlotLease{pipeline_slot, 0, 0});
+}
+
+/** Whether the declared arena regions select more than one bank. */
+static bool declared_region_banks_disagree(const PipelineContract *contract, RegionBanks banks) {
+    if (contract == nullptr) return false;
+    bool seen = false;
+    uint32_t first = 0;
+    auto check = [&](uint32_t kind, uint32_t bank) {
+        if (find_pipeline_resource(*contract, kind) == nullptr) return true;
+        if (!seen) {
+            first = bank;
+            seen = true;
+            return true;
+        }
+        return bank == first;
+    };
+    return !(
+        check(PTO_PIPELINE_GM_HEAP, banks.heap) && check(PTO_PIPELINE_GM_SM, banks.sm) &&
+        check(PTO_PIPELINE_RUNTIME_IMAGE, banks.image)
+    );
 }
 
 /**
@@ -1836,7 +1857,19 @@ int simpler_prepare_run(
                 resolved.pipeline_slot, descriptor->arena_bank, resolved.arena_bank
             );
         }
-        state = new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops);
+        const PipelineContract *contract = get_pipeline_contract();
+        const RegionBanks region_banks =
+            contract != nullptr ? pipeline_resource_banks_for_slot(*contract, resolved.pipeline_slot) : RegionBanks{};
+        if (declared_region_banks_disagree(contract, region_banks)) {
+            LOG_ERROR(
+                "simpler_prepare_run: slot %u selects different banks for its declared arena regions; a retained "
+                "prepared run names one bank",
+                resolved.pipeline_slot
+            );
+            return PTO_RUNTIME_ERR_UNSUPPORTED;
+        }
+        state =
+            new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops, region_banks);
         state->framework_transfer_eligible = args != nullptr && runner->execution_mode_latch().is_kernel() &&
                                              resolved.prepare_purpose == SIMPLER_PREPARE_EAGER &&
                                              !DfxRunConfig::from(*config).diagnostics_any();

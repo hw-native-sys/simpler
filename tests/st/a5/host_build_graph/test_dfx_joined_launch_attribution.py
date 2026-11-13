@@ -468,7 +468,29 @@ class _ChildTrace:
     def safe_window_text(self) -> str:
         """`window_text` that never raises, so it cannot replace the failure it is reporting."""
         try:
-            return self.window_text()
+            spans = self.spans()
+            initial = {}
+            lines = []
+            names = {
+                "chip.run",
+                "chip.run.bind",
+                "chip.run.prepare_execution",
+                "chip.run.runner_run",
+                "chip.run.runner_run.device_wall",
+                "chip.run.runner_run.device_boundaries",
+                "chip.run.joined_launch",
+            }
+            for span in spans:
+                if span.inv <= 0:
+                    continue
+                invocations = initial.setdefault(span.pid, [])
+                if span.inv not in invocations and len(invocations) < 2:
+                    invocations.append(span.inv)
+                if span.inv in invocations and span.name in names:
+                    lines.append(
+                        f"pid={span.pid} inv={span.inv} name={span.name} ts={span.ts} dur={span.dur} {span.attrs}"
+                    )
+            return "--- initial invocation timing ---\n" + "\n".join(lines) + "\n" + self.window_text()
         except BaseException as error:  # noqa: BLE001 -- reported in place of the window it could not read
             return f"--- the child log window could not be read: {error!r} ---"
 
@@ -666,6 +688,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         what = "six continuously refilled diagnostic runs"
         root.mkdir(parents=True, exist_ok=True)
         prepared = []
+        tensors = []
         handles = []
         try:
             # Allocation and tensor initialization must not consume the overlap window between
@@ -696,6 +719,10 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 self._drain(handles)
             raise
         finally:
+            # Tracebacks retain loop locals; empty the view lists themselves.
+            for entry in prepared:
+                entry[1].clear()
+            tensors.clear()
             prepared.clear()
 
         # This is the first flush in the sequence. It observes background publication rather

@@ -53,15 +53,17 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
     for (uint32_t i = 0; i < contract->resource_count; ++i) {
         const PipelineResource &resource = contract->resources[i];
         if (resource.kind == PTO_PIPELINE_KIND_UNSPECIFIED || resource.kind > PTO_PIPELINE_AICORE_STREAM ||
-            resource.resource_class > PTO_PIPELINE_EXEC_HANDLE) {
+            resource.resource_class > PTO_PIPELINE_REPORTED) {
             return false;
         }
         // Per-run images may be sized by host orchestration at bind time.
         // Shared scratch has a config-derived size before kernel init; handles
-        // never carry bytes. Program declarations remain topology-only.
-        if (mode == SIMPLER_MODE_PROGRAM || resource.resource_class == PTO_PIPELINE_EXEC_HANDLE) {
+        // never carry bytes, and a reported region's size is chosen when its
+        // pool acquires it. Program declarations remain topology-only.
+        if (mode == SIMPLER_MODE_PROGRAM || resource.resource_class == PTO_PIPELINE_EXEC_HANDLE ||
+            resource.resource_class == PTO_PIPELINE_REPORTED) {
             if (resource.bytes_per_copy != 0) return false;
-        } else if (resource.resource_class == PTO_PIPELINE_DEVICE_SCRATCH && resource.bytes_per_copy == 0) {
+        } else if (resource.resource_class == PTO_PIPELINE_SCRATCH && resource.bytes_per_copy == 0) {
             return false;
         }
     }
@@ -75,7 +77,7 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract) {
 
 /** Return the number of concrete copies required for one resource. */
 inline uint32_t pipeline_resource_copy_count(const PipelineContract &contract, const PipelineResource &resource) {
-    return resource.resource_class == PTO_PIPELINE_HOST_PER_RUN ? contract.pipeline_depth : 1u;
+    return resource.resource_class == PTO_PIPELINE_DELIVERED ? contract.pipeline_depth : 1u;
 }
 
 /** Select the concrete copy of `resource` owned by `lease`. */
@@ -94,21 +96,31 @@ inline const PipelineResource *find_pipeline_resource(const PipelineContract &co
     return nullptr;
 }
 
+/** Select the bank of each pooled region owned by the lease at `slot_id`. */
+inline RegionBanks pipeline_resource_banks_for_slot(const PipelineContract &contract, uint32_t slot_id) {
+    const PipelineSlotLease lease{slot_id, 0, 0};
+    RegionBanks banks{0, 0, 0};
+    if (const PipelineResource *heap = find_pipeline_resource(contract, PTO_PIPELINE_GM_HEAP))
+        banks.heap = pipeline_resource_slot(contract, *heap, lease);
+    if (const PipelineResource *sm = find_pipeline_resource(contract, PTO_PIPELINE_GM_SM))
+        banks.sm = pipeline_resource_slot(contract, *sm, lease);
+    if (const PipelineResource *image = find_pipeline_resource(contract, PTO_PIPELINE_RUNTIME_IMAGE))
+        banks.image = pipeline_resource_slot(contract, *image, lease);
+    return banks;
+}
+
 /**
- * Whether the three pooled device regions can be served by one bank selector.
+ * Whether each pooled device region has a distinct, selectable declaration.
  *
- * GM heap, GM shared memory, and the runtime image are committed together by
- * one `setup_static_arena` call into one arena bank, so they cannot be given
- * different copy counts. A contract that classifies them inconsistently — or
- * declares one of them twice, where only the first entry would ever be read —
- * describes a layout the executor cannot produce, and is rejected at load
- * rather than at the first launch that would need the second bank.
+ * GM heap, GM shared memory and the runtime image are selected independently:
+ * one may be shared scratch while another is delivered per run. The only
+ * structural requirements are that a kind is declared at most once — a second
+ * entry of the same kind would never be read — and that an arena region is
+ * either delivered or scratch; a stream or a reported region cannot be one.
  * The caller must validate the contract before checking this topology.
  */
 inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
     constexpr uint32_t ARENA_KINDS[] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_GM_SM, PTO_PIPELINE_RUNTIME_IMAGE};
-    bool seen = false;
-    uint32_t shared_copies = 0;
     for (uint32_t kind : ARENA_KINDS) {
         uint32_t declared = 0;
         const PipelineResource *resource = nullptr;
@@ -119,10 +131,9 @@ inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
         }
         if (declared > 1) return false;
         if (resource == nullptr) continue;
-        uint32_t copies = pipeline_resource_copy_count(contract, *resource);
-        if (seen && copies != shared_copies) return false;
-        shared_copies = copies;
-        seen = true;
+        if (resource->resource_class != PTO_PIPELINE_DELIVERED && resource->resource_class != PTO_PIPELINE_SCRATCH) {
+            return false;
+        }
     }
     return true;
 }
@@ -154,10 +165,10 @@ inline bool is_valid_tmr_kernel_pipeline_contract(const PipelineContract *contra
         return false;
     }
     constexpr PipelineResource REQUIRED_STORAGE[] = {
-        {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0},
-        {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0},
-        {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0},
-        {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
+        {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_SCRATCH, 0},
+        {PTO_PIPELINE_GM_SM, PTO_PIPELINE_SCRATCH, 0},
+        {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_SCRATCH, 0},
+        {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_DELIVERED, 0},
     };
     for (const auto &required : REQUIRED_STORAGE) {
         const auto *resource = find_pipeline_resource(*contract, required.kind);

@@ -1070,18 +1070,14 @@ void ChipWorker::run(
     (void)run.wait_until(ChipRun::Deadline::max());
 }
 
-uint32_t ChipWorker::arena_bank_for_slot(uint32_t slot_id) const {
-    // init() rejected any contract whose three arena kinds disagree, so
-    // whichever of them the runtime declares yields the same bank.
-    const PipelineSlotLease selector{slot_id, 0, 0};
-    uint32_t arena_bank = 0;
-    for (uint32_t kind : {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_GM_SM, PTO_PIPELINE_RUNTIME_IMAGE}) {
-        const PipelineResource *resource = find_pipeline_resource(pipeline_contract_, kind);
-        if (resource == nullptr) continue;
-        arena_bank = pipeline_resource_slot(pipeline_contract_, *resource, selector);
-        break;
-    }
-    return arena_bank;
+uint32_t ChipWorker::resource_bank_for_slot(uint32_t kind, uint32_t slot_id) const {
+    const PipelineResource *resource = find_pipeline_resource(pipeline_contract_, kind);
+    if (resource == nullptr) return 0;
+    return pipeline_resource_slot(pipeline_contract_, *resource, PipelineSlotLease{slot_id, 0, 0});
+}
+
+RegionBanks ChipWorker::region_banks_for_slot(uint32_t slot_id) const {
+    return pipeline_resource_banks_for_slot(pipeline_contract_, slot_id);
 }
 
 std::vector<uint64_t> ChipWorker::runtime_buffer_addrs() const {
@@ -1374,7 +1370,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         }
         const NativeRunDescriptor descriptor{
             slot_id,
-            arena_bank_for_slot(slot_id),
+            region_banks_for_slot(slot_id).heap,
             run_id,
             generation,
             dispatch_id,

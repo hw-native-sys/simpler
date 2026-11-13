@@ -123,8 +123,8 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
         4,
         UINT32_MAX,
         {
-            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         },
@@ -156,7 +156,7 @@ extern "C" int teardown_report_supported_impl(void) {
 
 extern "C" int joined_native_launch_supported_impl(void) {
     // Every per-run device region this runtime names is selected by the run's
-    // own lease — the graph heap and the runtime image are both HOST_PER_RUN
+    // own lease — the graph heap and the runtime image are both DELIVERED
     // above — so a second launched run reads and writes nothing the first is
     // still executing against. What orders the two on the device is a queued
     // event wait, not this answer.

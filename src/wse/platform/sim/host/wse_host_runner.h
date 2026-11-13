@@ -311,7 +311,7 @@ public:
 
     // --- Shared methods --------------------------------------------------
 
-    int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    int setup_static_arena(RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     void *acquire_pooled_gm_heap(uint32_t arena_bank);
     void *acquire_pooled_gm_sm(uint32_t arena_bank);

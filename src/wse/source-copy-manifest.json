@@ -143,7 +143,7 @@
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
       "baseline_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660",
-      "sha256": "b3328634cfdf2f8b8eeb0e172b2cb392f561322470594ee92e5252c119f22fb7",
+      "sha256": "904547d65f3de7a63a7f8b1a81703b685585efb07fe817671c90ff98f14b1cfc",
       "reason": "derived WSE implementation with static AICore Blocks, local PE Threads and finite SRAM execution",
       "step00_sha256": "f9a3d1817a6068f12f2097c8f85818a8a3e28a2027024de5354479b2fed56660"
     },

@@ -726,6 +726,19 @@ set(CAPACITY_REFUSAL_INCLUDES
     ${SIMPLER_LOG_DIR}
     ${SIMPLER_SRC}/common/worker)
 
+hbg_case(test_sim_region_banks.cpp
+    SOURCES ${CAPACITY_REFUSAL_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK ${CMAKE_DL_LIBS})
+
+tmr_case(test_sim_region_banks.cpp
+    SOURCES ${CAPACITY_REFUSAL_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+    LINK ${CMAKE_DL_LIBS})
+
 hbg_case(test_diagnostic_capacity_refusal_phase.cpp
     SOURCES
         ${CAPACITY_REFUSAL_SOURCES}

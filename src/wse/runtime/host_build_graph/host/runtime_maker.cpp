@@ -142,8 +142,8 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
         3,
         UINT32_MAX,
         {
-            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         },
     };

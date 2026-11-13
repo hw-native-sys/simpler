@@ -805,6 +805,17 @@ void DeviceRunnerBase::rollback_workspace_claims() {
 
 void DeviceRunnerBase::commit_workspace_claims() { AutoAdmissionState::commit_claims(); }
 
+static uint32_t bank_for_region(const RegionBanks &banks, std::size_t region_index) {
+    switch (region_index) {
+    case 0:
+        return banks.heap;
+    case 1:
+        return banks.sm;
+    default:
+        return banks.image;
+    }
+}
+
 /**
  * The facts `RunResourceGrowth` decides against, from this runner's own state.
  *
@@ -821,7 +832,8 @@ public:
         announces_(granted_) {
         reserved_ = runner_->snapshot_native_run_reservations(reservations_.data(), reservations_.size());
         for (std::size_t i = 0; i < granted_; ++i) {
-            announces_[i] = ArenaRegionAnnounce{runner_, static_cast<uint32_t>(i)};
+            const uint32_t bank = static_cast<uint32_t>(i);
+            announces_[i] = ArenaRegionAnnounce{runner_, RegionBanks{bank, bank, bank}};
         }
     }
 
@@ -858,8 +870,7 @@ public:
         ArenaBank &bank = *runner_->arena_banks_[slot];
         auto region_gave_up = [](void *ctx, std::size_t region_index, ArenaRegionDisposition what, void *base) {
             auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
-            (void)region_index;
-            a->runner->note_arena_region_disposition(a->bank, what, base);
+            a->runner->note_arena_region_disposition(bank_for_region(a->banks, region_index), what, base);
         };
         void *announce_ctx = &announces_[slot];
         out[0] =
@@ -988,17 +999,16 @@ int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_e
     return 0;
 }
 
-int DeviceRunnerBase::reference_bank_arenas(
-    uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count
-) {
+int DeviceRunnerBase::reference_bank_arenas(RegionBanks banks, const ArenaRegionRequest *requests, std::size_t count) {
     for (std::size_t i = 0; i < count; ++i) {
         const DeviceArena *arena = requests[i].arena;
         // A region asked to hold nothing has no backing and no consumer. Its
         // previous block was reported detached by the transaction, so nothing
         // here has to speak for it.
         if (arena == nullptr || !arena->is_committed()) continue;
+        const uint32_t bank = bank_for_region(banks, i);
         const WorkspaceManager::RegionKey region =
-            WorkspaceManager::arena_region(arena_bank, static_cast<WorkspaceManager::ArenaRegion>(i));
+            WorkspaceManager::arena_region(bank, static_cast<WorkspaceManager::ArenaRegion>(i));
         // The ledger is keyed by what its own allocation callback handed over,
         // which is the raw block — `base()` is the forward-aligned address
         // inside it and is not the same value when the platform returns an
@@ -1025,7 +1035,7 @@ int DeviceRunnerBase::reference_bank_arenas(
             why = "its release was attempted and the outcome is unconfirmed: ownership of the allocation is unknown";
         }
         LOG_ERROR(
-            "setup_static_arena: bank %u region %s could not register this run as a consumer of %p: %s", arena_bank,
+            "setup_static_arena: bank %u region %s could not register this run as a consumer of %p: %s", bank,
             requests[i].name, owned, why
         );
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1547,11 +1557,13 @@ void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
 }
 
 int DeviceRunnerBase::setup_static_arena(
-    uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
 ) {
-    if (arena_bank >= arena_banks_.size()) {
-        LOG_ERROR("arena bank %u is outside [0, %zu)", arena_bank, arena_banks_.size());
-        return PTO_RUNTIME_ERR_INTERNAL;
+    for (uint32_t bank : {banks.heap, banks.sm, banks.image}) {
+        if (bank >= arena_banks_.size()) {
+            LOG_ERROR("arena bank %u is outside [0, %zu)", bank, arena_banks_.size());
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
     }
     // Context prewarm reaches this function without a prepare transaction. The
     // region setters only target an active scope, so establish a context-epoch
@@ -1580,61 +1592,73 @@ int DeviceRunnerBase::setup_static_arena(
     // together until publication.
     const int reclaim_rc = reclaim_prepared_storage();
     if (reclaim_rc != 0) return reclaim_rc;
-    auto &cached_bank = arena_banks_[arena_bank];
-    std::shared_ptr<ArenaBank> previous_bank;
+    // A prepared run may still hold any of the selected banks. Replace each
+    // such bank once, and restore every replacement if the staged transaction
+    // below fails.
+    std::vector<std::pair<uint32_t, std::shared_ptr<ArenaBank>>> previous_banks;
     bool bank_committed = false;
-    {
+    auto restore_banks = RAIIScopeGuard([&]() {
+        if (bank_committed || previous_banks.empty()) return;
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        if (cached_bank.use_count() > 1) {
-            auto next = std::make_shared<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
-            PreparedRunResources::RetiredArena retired;
-            const int retain_rc = retired.retain(cached_bank, workspace_);
-            if (retain_rc != 0) return retain_rc;
-            retired_prepared_arenas_.push_back(std::move(retired));
-            previous_bank = cached_bank;
-            cached_bank = std::move(next);
-            prebuilt_runtime_arena_cache_.invalidate();
-        }
-    }
-    auto restore_bank = RAIIScopeGuard([&]() {
-        if (previous_bank && !bank_committed) {
-            std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-            // Other banks can retire while this allocation transaction runs.
-            auto retired =
-                std::find_if(retired_prepared_arenas_.begin(), retired_prepared_arenas_.end(), [&](const auto &entry) {
-                    return entry.holds(previous_bank);
-                });
-            cached_bank = std::move(previous_bank);
+        // Other banks can retire while this allocation transaction runs.
+        for (auto &entry : previous_banks) {
+            auto retired = std::find_if(
+                retired_prepared_arenas_.begin(), retired_prepared_arenas_.end(), [&](const auto &retired) {
+                    return retired.holds(entry.second);
+                }
+            );
+            arena_banks_[entry.first] = std::move(entry.second);
             if (retired != retired_prepared_arenas_.end()) retired_prepared_arenas_.erase(retired);
         }
     });
-    ArenaBank &bank = this->arena_bank(arena_bank);
+    {
+        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
+        const uint32_t selected[] = {banks.heap, banks.sm, banks.image};
+        for (size_t i = 0; i < 3; ++i) {
+            bool seen = false;
+            for (size_t j = 0; j < i; ++j)
+                seen = seen || selected[j] == selected[i];
+            if (seen || arena_banks_[selected[i]].use_count() <= 1) continue;
+            auto next = std::make_shared<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
+            PreparedRunResources::RetiredArena retired;
+            const int retain_rc = retired.retain(arena_banks_[selected[i]], workspace_);
+            if (retain_rc != 0) return retain_rc;
+            retired_prepared_arenas_.push_back(std::move(retired));
+            previous_banks.emplace_back(selected[i], arena_banks_[selected[i]]);
+            arena_banks_[selected[i]] = std::move(next);
+            prebuilt_runtime_arena_cache_.invalidate();
+        }
+    }
+    ArenaBank &heap_bank = arena_bank(banks.heap);
+    ArenaBank &sm_bank = arena_bank(banks.sm);
+    ArenaBank &image_bank = arena_bank(banks.image);
 
     // The ledger keys a block by the one region that owns it, and the arena
     // allocation callback sees only a byte count, so each region names itself
     // just before its own backing is staged.
-    ArenaRegionAnnounce announce{this, arena_bank};
+    ArenaRegionAnnounce announce{this, banks};
     auto name_region = [](void *ctx, std::size_t region_index) {
         auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
+        const uint32_t bank = bank_for_region(a->banks, region_index);
         a->runner->set_workspace_plan_region(
-            WorkspaceManager::arena_region(a->bank, static_cast<WorkspaceManager::ArenaRegion>(region_index))
+            WorkspaceManager::arena_region(bank, static_cast<WorkspaceManager::ArenaRegion>(region_index))
         );
-        a->runner->set_workspace_plan_region_backing(a->runner->arena_region_backing(a->bank, region_index));
+        a->runner->set_workspace_plan_region_backing(a->runner->arena_region_backing(bank, region_index));
     };
     // The two boundaries at which a region stops publishing a block without a
     // successor taking over. Reported to the ledger, which owns the block the
     // arena is only using.
     auto region_gave_up = [](void *ctx, std::size_t region_index, ArenaRegionDisposition what, void *base) {
         auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
-        (void)region_index;
-        a->runner->note_arena_region_disposition(a->bank, what, base);
+        a->runner->note_arena_region_disposition(bank_for_region(a->banks, region_index), what, base);
     };
     ArenaRegionRequest requests[] = {
-        {&bank.gm_heap, &bank.cached_gm_heap_size, gm_heap_size, "gm_heap", name_region, &announce, region_gave_up,
+        {&heap_bank.gm_heap, &heap_bank.cached_gm_heap_size, gm_heap_size, "gm_heap", name_region, &announce,
+         region_gave_up, &announce},
+        {&sm_bank.gm_sm, &sm_bank.cached_gm_sm_size, gm_sm_size, "gm_sm", name_region, &announce, region_gave_up,
          &announce},
-        {&bank.gm_sm, &bank.cached_gm_sm_size, gm_sm_size, "gm_sm", name_region, &announce, region_gave_up, &announce},
-        {&bank.runtime_pool, &bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool", name_region,
-         &announce, region_gave_up, &announce},
+        {&image_bank.runtime_pool, &image_bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool",
+         name_region, &announce, region_gave_up, &announce},
     };
     constexpr size_t kRegionCount = sizeof(requests) / sizeof(requests[0]);
     // What this call would have to replace, decided before anything is staged.
@@ -1664,15 +1688,15 @@ int DeviceRunnerBase::setup_static_arena(
         DeviceRunnerBase *runner;
         ArenaRegionRequest *requests;
         std::size_t count;
-        uint32_t bank;
+        RegionBanks banks;
         BankArenaSetupOutcome outcome{};
-    } attempt{this, requests, kRegionCount, arena_bank};
+    } attempt{this, requests, kRegionCount, banks};
     const auto stage_bank = [](void *ctx) {
         auto *a = static_cast<ArenaAttempt *>(ctx);
         if (active_workspace_plan()) active_workspace_plan()->last_refusal = WorkspaceManager::AcquireRefusal::None;
         a->outcome = run_bank_arena_setup(
-            a->requests, a->count, /*owns_prebuilt_cache=*/a->bank == 0, &a->runner->prebuilt_runtime_arena_cache_,
-            DeviceArena::kDefaultBaseAlign
+            a->requests, a->count, /*owns_prebuilt_cache=*/a->banks.image == 0,
+            &a->runner->prebuilt_runtime_arena_cache_, DeviceArena::kDefaultBaseAlign
         );
         if (a->outcome.rc == 0) return GrowthAttempt::Served;
         return classify_growth_refusal(workspace_prepare_state().last_refusal);
@@ -1686,11 +1710,11 @@ int DeviceRunnerBase::setup_static_arena(
         // Publication transferred ownership to the regions. A later reference
         // failure must not roll those current blocks back into obsolete storage.
         commit_workspace_claims();
-        // Every region this bank now publishes is used by this plan, including
+        // Every region this run now publishes is used by this plan, including
         // the ones whose existing capacity was enough and therefore allocated
         // nothing. A plan that read and wrote a region without registering as
         // its consumer would let a later growth treat those bytes as free.
-        const int ref_rc = reference_bank_arenas(arena_bank, requests, kRegionCount);
+        const int ref_rc = reference_bank_arenas(banks, requests, kRegionCount);
         if (ref_rc != 0) return ref_rc;
     }
     if (outcome.rc != 0) {
@@ -1699,9 +1723,9 @@ int DeviceRunnerBase::setup_static_arena(
         const size_t requested =
             (failed >= 0 && static_cast<size_t>(failed) < kRegionCount) ? requests[failed].requested_size : 0;
         LOG_ERROR(
-            "setup_static_arena: staging %s (%zu bytes) failed on bank %u; this bank keeps its committed addresses "
-            "and capacities",
-            name, requested, arena_bank
+            "setup_static_arena: staging %s (%zu bytes) failed on banks heap=%u sm=%u image=%u; the selected banks "
+            "keep their committed addresses and capacities",
+            name, requested, banks.heap, banks.sm, banks.image
         );
         const int refusal = report_growth_refusal(
             workspace_prepare_state().pipeline_slot, AutoAdmissionState::Phase::Committing, requested, growth

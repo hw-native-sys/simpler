@@ -2332,6 +2332,19 @@ TEST_F(NativeAdmissionTest, UnscopedArenaSetupKeepsContextRegionBackingsDistinct
     EXPECT_EQ(control().successful_allocations - before, 3u);
 }
 
+TEST_F(NativeAdmissionTest, PerRegionBanksCommitEachRegionToItsOwnBank) {
+    Runner runner;
+    DeviceRunnerBase::PrepareWorkspaceScope scope(0, 10);
+    ASSERT_EQ(runner.setup_static_arena(RegionBanks{0, 1, 0}, 2 * kUnit, 2 * kUnit, 2 * kUnit), 0);
+    EXPECT_NE(runner.arena_region_backing(0, 0), nullptr);
+    EXPECT_NE(runner.arena_region_backing(1, 1), nullptr);
+    EXPECT_NE(runner.arena_region_backing(0, 2), nullptr);
+    EXPECT_EQ(runner.arena_region_backing(0, 1), nullptr);
+    EXPECT_EQ(runner.arena_region_backing(1, 0), nullptr);
+    EXPECT_EQ(runner.arena_region_backing(1, 2), nullptr);
+    EXPECT_EQ(runner.finalize(), 0);
+}
+
 TEST_F(NativeAdmissionTest, NativePrepareParksAndDestroysTheAttemptBeforeAnEarlyRetryAttachFailure) {
     Runner runner;
     ASSERT_EQ(staging(runner, 0, 10, 20 * kUnit), 0);

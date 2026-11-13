@@ -32,15 +32,15 @@ static_assert(
     "ChipWorker::init signature changed: append new parameters, never insert"
 );
 
-// A contract a runtime could legitimately ship today: one host-filled region,
-// one device-built region, and the two execution handles.
+// A contract a runtime could legitimately ship today: one delivered region,
+// one scratch region, and the two execution handles.
 PipelineContract accepted_contract() {
     PipelineContract c{};
     c.abi_version = PTO_PIPELINE_CONTRACT_ABI_VERSION;
     c.resource_count = 4;
     c.pipeline_depth = 1;
-    c.resources[0] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0};
-    c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0};
+    c.resources[0] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_DELIVERED, 0};
+    c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_SCRATCH, 0};
     c.resources[2] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     c.resources[3] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     return c;
@@ -78,11 +78,11 @@ TEST(PipelineContract, AcceptsDepthTwoAndDerivesResourceCopies) {
     PipelineContract c = accepted_contract();
     c.pipeline_depth = 2;
     ASSERT_TRUE(is_valid_pipeline_contract(&c));
-    // Only a host-filled region is replicated per in-flight run. A device
-    // scratch region is reused across runs, and an execution handle is held
-    // for the runner's lifetime, so both stay at one.
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), 2u);  // TASK_ARGS, HOST_PER_RUN
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[1]), 1u);  // RUNTIME_IMAGE, DEVICE_SCRATCH
+    // Only a delivered region is replicated per in-flight run. A scratch
+    // region is reused across runs, and an execution handle is held for the
+    // runner's lifetime, so both stay at one.
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), 2u);  // TASK_ARGS, DELIVERED
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[1]), 1u);  // RUNTIME_IMAGE, SCRATCH
     EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[2]), 1u);  // AICPU_STREAM, EXEC_HANDLE
 
     const PipelineSlotLease second_slot{1, 0, 7};
@@ -110,7 +110,7 @@ TEST(PipelineContract, RejectsAnOutOfRangeKindOrClass) {
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
 
     c = accepted_contract();
-    c.resources[0].resource_class = PTO_PIPELINE_EXEC_HANDLE + 1;
+    c.resources[0].resource_class = PTO_PIPELINE_REPORTED + 1;
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
 }
 
@@ -138,7 +138,7 @@ TEST(PipelineContract, RejectsAResourceCountPastTheFilledEntries) {
         PipelineContract c{};
         c.abi_version = PTO_PIPELINE_CONTRACT_ABI_VERSION;
         c.pipeline_depth = 1;
-        c.resources[0] = {filled, PTO_PIPELINE_HOST_PER_RUN, 0};
+        c.resources[0] = {filled, PTO_PIPELINE_DELIVERED, 0};
 
         c.resource_count = 2;  // overstates by exactly one
         EXPECT_FALSE(is_valid_pipeline_contract(&c)) << "filled kind " << filled;
@@ -161,37 +161,77 @@ TEST(PipelineContract, AcceptsEveryKindOnce) {
     c.pipeline_depth = 1;
     c.resource_count = PTO_PIPELINE_AICORE_STREAM;
     for (uint32_t kind = PTO_PIPELINE_GM_HEAP; kind <= PTO_PIPELINE_AICORE_STREAM; ++kind) {
-        c.resources[kind - 1] = {kind, PTO_PIPELINE_HOST_PER_RUN, 0};
+        c.resources[kind - 1] = {kind, PTO_PIPELINE_DELIVERED, 0};
     }
     EXPECT_TRUE(is_valid_pipeline_contract(&c));
 }
 
-// GM heap, GM shared memory, and the runtime image are committed by one
-// setup_static_arena call into one bank, so a contract that gives them
-// different copy counts describes a layout no runner can build.
-TEST(PipelineContract, RejectsArenaKindsThatDisagreeOnCopyCount) {
+// The three pooled regions are selected independently: a shared scratch region
+// can live beside a per-run delivered one. The old equal-copy-count rule
+// described one bank carrying all three, not region-granular selection.
+TEST(PipelineContract, AcceptsArenaKindsThatDisagreeOnCopyCount) {
     PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 2, 2, {}};
-    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0};
-    c.resources[1] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0};
+    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_SCRATCH, 0};
+    c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0};
+    ASSERT_TRUE(is_valid_pipeline_contract(&c));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+
+    const PipelineSlotLease second_slot{1, 0, 7};
+    EXPECT_EQ(pipeline_resource_slot(c, c.resources[0], second_slot), 0u);
+    EXPECT_EQ(pipeline_resource_slot(c, c.resources[1], second_slot), 1u);
+
+    // GM shared memory may be delivered while the heap is scratch.
+    c.resources[0].resource_class = PTO_PIPELINE_DELIVERED;
+    c.resources[1].resource_class = PTO_PIPELINE_SCRATCH;
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+}
+
+// Each region's own class selects its bank; a missing kind names no region and
+// keeps bank zero.
+TEST(PipelineContract, SelectsEachArenaBankFromItsOwnClass) {
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 3, 4, {}};
+    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_SCRATCH, 0};
+    c.resources[1] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DELIVERED, 0};
+    c.resources[2] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0};
+    ASSERT_TRUE(is_valid_pipeline_contract(&c));
+    ASSERT_TRUE(has_serviceable_arena_topology(c));
+
+    const RegionBanks banks = pipeline_resource_banks_for_slot(c, 3);
+    EXPECT_EQ(banks.heap, 0u);
+    EXPECT_EQ(banks.sm, 3u);
+    EXPECT_EQ(banks.image, 3u);
+}
+
+TEST(PipelineContract, MissingArenaKindKeepsBankZero) {
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 2, 4, {}};
+    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 0};
+    c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0};
+    ASSERT_TRUE(is_valid_pipeline_contract(&c));
+
+    const RegionBanks banks = pipeline_resource_banks_for_slot(c, 2);
+    EXPECT_EQ(banks.heap, 2u);
+    EXPECT_EQ(banks.sm, 0u);
+    EXPECT_EQ(banks.image, 2u);
+}
+
+// A stream or a reported region is not an arena region: it has no bank to
+// select for `setup_static_arena`.
+TEST(PipelineContract, RejectsArenaKindWithNonArenaClass) {
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 1, 2, {}};
+    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_REPORTED, 0};
     ASSERT_TRUE(is_valid_pipeline_contract(&c));
     EXPECT_FALSE(has_serviceable_arena_topology(c));
 
-    c.resources[1].resource_class = PTO_PIPELINE_HOST_PER_RUN;
-    EXPECT_TRUE(has_serviceable_arena_topology(c));
-
-    // At depth one every class collapses to one copy, so the same declaration
-    // is serviceable there.
-    c.resources[1].resource_class = PTO_PIPELINE_DEVICE_SCRATCH;
-    c.pipeline_depth = 1;
-    EXPECT_TRUE(has_serviceable_arena_topology(c));
+    c.resources[0].resource_class = PTO_PIPELINE_EXEC_HANDLE;
+    EXPECT_FALSE(has_serviceable_arena_topology(c));
 }
 
 // Only the first entry of a kind is ever read, so a second one is a silent
 // misdeclaration for the kinds that select a bank.
 TEST(PipelineContract, RejectsARepeatedArenaKind) {
     PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 2, 2, {}};
-    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0};
-    c.resources[1] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0};
+    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 0};
+    c.resources[1] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 0};
     ASSERT_TRUE(is_valid_pipeline_contract(&c));
     EXPECT_FALSE(has_serviceable_arena_topology(c));
 }
@@ -208,24 +248,24 @@ TEST(PipelineContract, AcceptsARepeatedNonArenaKind) {
 // Both shipped A2/A3 contracts must be serviceable as declared.
 TEST(PipelineContract, ShippedArenaTopologiesAreServiceable) {
     PipelineContract hbg{PTO_PIPELINE_CONTRACT_ABI_VERSION, 3, 2, {}};
-    hbg.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0};
-    hbg.resources[1] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_HOST_PER_RUN, 0};
-    hbg.resources[2] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0};
+    hbg.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 0};
+    hbg.resources[1] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DELIVERED, 0};
+    hbg.resources[2] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0};
     EXPECT_TRUE(has_serviceable_arena_topology(hbg));
 
     PipelineContract tmr{PTO_PIPELINE_CONTRACT_ABI_VERSION, 3, 2, {}};
-    tmr.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0};
-    tmr.resources[1] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0};
-    tmr.resources[2] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0};
+    tmr.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_SCRATCH, 0};
+    tmr.resources[1] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_SCRATCH, 0};
+    tmr.resources[2] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_SCRATCH, 0};
     EXPECT_TRUE(has_serviceable_arena_topology(tmr));
 }
 
 PipelineContract kernel_contract() {
     PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 6, 2, {}};
     for (uint32_t kind = PTO_PIPELINE_GM_HEAP; kind <= PTO_PIPELINE_RUNTIME_IMAGE; ++kind) {
-        c.resources[kind - 1] = {kind, PTO_PIPELINE_DEVICE_SCRATCH, 4096};
+        c.resources[kind - 1] = {kind, PTO_PIPELINE_SCRATCH, 4096};
     }
-    c.resources[3] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 4096};
+    c.resources[3] = {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_DELIVERED, 4096};
     c.resources[4] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     c.resources[5] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     return c;
@@ -250,15 +290,15 @@ TEST(PipelineContract, KernelByteRulesAreModeSpecific) {
 TEST(PipelineContract, KernelPerRunImagesMayBeSizedAtBind) {
     constexpr uint32_t kDeclaredDepth = 3;
     PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 4, kDeclaredDepth, {}};
-    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0};
-    c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0};
+    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 0};
+    c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0};
     c.resources[2] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     c.resources[3] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
     EXPECT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
     EXPECT_TRUE(has_serviceable_arena_topology(c));
     EXPECT_TRUE(has_serviceable_stream_topology(c));
     EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), kDeclaredDepth);
-    c.resources[0].resource_class = PTO_PIPELINE_DEVICE_SCRATCH;
+    c.resources[0].resource_class = PTO_PIPELINE_SCRATCH;
     EXPECT_FALSE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
 }
 
@@ -269,7 +309,7 @@ TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {
         missing.resources[i] = missing.resources[--missing.resource_count];
         EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&missing)) << i;
         auto wrong_class = c;
-        wrong_class.resources[i].resource_class = (wrong_class.resources[i].resource_class + 1) % 3;
+        wrong_class.resources[i].resource_class = (wrong_class.resources[i].resource_class + 1) % 4;
         EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&wrong_class)) << i;
         auto duplicate = c;
         duplicate.resources[i] = duplicate.resources[(i + 1) % c.resource_count];
@@ -316,7 +356,7 @@ TEST(PipelineContract, StreamServiceabilityDoesNotChangeStructuralRules) {
     EXPECT_TRUE(has_serviceable_arena_topology(c));
     EXPECT_FALSE(has_serviceable_stream_topology(c));
     c = accepted_contract();
-    c.resources[2].resource_class = PTO_PIPELINE_HOST_PER_RUN;
+    c.resources[2].resource_class = PTO_PIPELINE_DELIVERED;
     EXPECT_FALSE(has_serviceable_stream_topology(c));
     c.resource_count = 0;
     EXPECT_TRUE(is_valid_pipeline_contract(&c));
@@ -329,8 +369,8 @@ TEST(PipelineContract, CommonKernelAdmissionDoesNotRequireTmrResourceSet) {
         4,
         1,
         {
-            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 4096},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 4096},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DELIVERED, 4096},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 4096},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         }
@@ -496,7 +536,7 @@ TEST(PipelineContract, OptionalAicpuRequiresExactlyTheDeclaredExecutionRoles) {
     c.resource_count = 3;
     EXPECT_FALSE(has_serviceable_stream_topology(c));
     EXPECT_TRUE(has_serviceable_stream_topology(c, false));
-    c.resources[2].resource_class = PTO_PIPELINE_HOST_PER_RUN;
+    c.resources[2].resource_class = PTO_PIPELINE_DELIVERED;
     EXPECT_FALSE(has_serviceable_stream_topology(c, false));
     c.resources[2].resource_class = PTO_PIPELINE_EXEC_HANDLE;
     c.resource_count = 4;

@@ -10,8 +10,8 @@
 """tensormap_and_ringbuffer's depth-two slot topology differs from host_build_graph's.
 
 TMR classifies its GM heap, GM shared memory, and runtime image as
-`DEVICE_SCRATCH`, so every slot shares arena bank 0 — only its task args are
-`HOST_PER_RUN`. Each live call owns its native storage and the retained temporary buffer
+`SCRATCH`, so every slot shares arena bank 0 — only its task args are
+`DELIVERED`. Each live call owns its native storage and the retained temporary buffer
 TMR stages device args through.
 host_build_graph exercises the opposite split, so neither runtime's coverage
 substitutes for the other's.
