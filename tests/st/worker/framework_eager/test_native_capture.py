@@ -55,6 +55,7 @@ def _run_capture(runtime, task_queue, framework_module, tmp_path, request, monke
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
 def test_native_cold_capture(runtime, task_queue, framework_module, tmp_path, request, monkeypatch):
+    """Both queues observe exact TensorImpl roots and last release for every model."""
     _run_capture(runtime, task_queue, framework_module, tmp_path, request, monkeypatch)
 
 
