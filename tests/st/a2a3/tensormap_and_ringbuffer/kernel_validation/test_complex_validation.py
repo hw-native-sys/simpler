@@ -97,8 +97,10 @@ def test_complex_validation(st_platform, st_device_ids, tmp_path, capfd, mode, c
         config.enable_chip_swimlane = 0
         started = time.monotonic()
         if code:
+            args.output.fill_(77)
             with pytest.raises(RuntimeError):
                 worker.run(handle, task_args, config)
+            assert torch.all(args.output == 77)
         else:
             worker.run(handle, task_args, config)
             assert args.output[0].item() == 1
