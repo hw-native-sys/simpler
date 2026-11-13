@@ -9,17 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "scheduler/scheduler_scalar_policy.h"
-
-#if defined(__CCE_AICORE__)
-namespace {
-template <>
-struct SchedulerScalarCompilation<void> {
-    static constexpr bool enabled = false;
-};
-}  // namespace
-#endif
-
 #include "resident_scheduler_impl.h"
 
 namespace simpler::hbg::resident {

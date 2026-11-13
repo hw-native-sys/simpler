@@ -387,6 +387,11 @@ host architecture, run ID and attempt. Artifact upload failure does not override
 the test verdict. Sim, Network1, standalone model tests and DFX smokes keep their
 existing validation paths and are not covered by these new summaries.
 
+A5 onboard runs with a JUnit report also place CANN process and device logs in
+an `ascend/` directory beside that report. Child processes inherit this location,
+so the existing default-environment artifact retains the native failure details.
+An explicit `ASCEND_PROCESS_LOG_PATH` takes precedence.
+
 Program is the default product: a test declares
 `runtime_product("kernel"|"auxiliary")` only when it is not Program. Kernel tests
 also declare `execution_mode("eager"|"capture_replay")`; Program and auxiliary

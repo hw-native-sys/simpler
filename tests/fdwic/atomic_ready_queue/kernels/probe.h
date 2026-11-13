@@ -17,16 +17,6 @@
 
 #include "inner_kernel.h"
 #include "intrinsic.h"
-#include "scheduler/scheduler_scalar_policy.h"
-
-namespace {
-// This independently linked callable has no resident scalar-trace binding.
-template <>
-struct SchedulerScalarCompilation<void> {
-    static constexpr bool enabled = false;
-};
-}  // namespace
-
 #include "scheduler/scheduler_ticket_queue.h"
 #include "tensor.h"
 
