@@ -45,13 +45,14 @@ struct NativeRunContext {
 
     NativeRunContext(
         Runner *runner_in, const CallConfig &config_in, uint64_t trace_hid_in, const NativeRunDescriptor &descriptor_in,
-        const HostApiOps *host_api_ops, RegionBanks banks
+        const HostApiOps *host_api_ops, RegionBanks banks_in
     ) :
         runner(runner_in),
         config(config_in),
         descriptor(descriptor_in),
+        banks(banks_in),
         host_api(
-            runner_in, descriptor_in.pipeline_slot, banks, descriptor_in.run_epoch, host_api_ops,
+            runner_in, descriptor_in.pipeline_slot, banks_in, descriptor_in.run_epoch, host_api_ops,
             HostApi::DiagnosticConfig{static_cast<uint32_t>(config_in.enable_chip_swimlane), config_in.enable_pmu > 0}
         ),
         trace_hid(trace_hid_in) {
@@ -79,6 +80,9 @@ struct NativeRunContext {
     Runner *runner{nullptr};
     CallConfig config{};
     NativeRunDescriptor descriptor{};
+    // The bank selection this context's HostApi was built with; retained
+    // resources use the same one rather than re-deriving it from the contract.
+    RegionBanks banks{};
     HostApi host_api;
     std::unique_ptr<Runtime> runtime{std::make_unique<Runtime>()};
     uint64_t trace_hid{0};

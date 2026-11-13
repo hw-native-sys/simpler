@@ -1699,6 +1699,11 @@ struct SchedulerState {
     // the same values.
     static SchedulerLayout reserve_layout(DeviceArena &arena);
 
+    // Same, with the run's reachable queue populations. A queue's slot storage
+    // is sized so it holds every task that can reach it, instead of the
+    // capacity limit.
+    static SchedulerLayout reserve_layout(DeviceArena &arena, const ReadyQueueCapacities &capacities);
+
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // `sm_dev_base` is the device address of the SM (only stored, never
     // dereferenced here). Safe to call on a host arena that holds the

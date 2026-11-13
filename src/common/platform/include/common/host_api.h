@@ -190,7 +190,8 @@ struct HostApiOps {
     // Idempotent on identical sizes; returns 0 on success, -1 on allocation
     // failure.
     int (*setup_static_arena)(
-        void *runner_ctx, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+        void *runner_ctx, uint32_t pipeline_slot, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size,
+        size_t runtime_arena_size
     );
     // Return the per-Worker pooled pointer for the GM heap / runtime shared
     // memory / prebuilt runtime arena. setup_static_arena must have already
@@ -201,7 +202,7 @@ struct HostApiOps {
     // The runtime-arena region exists only when setup_static_arena was invoked
     // with runtime_arena_size > 0; otherwise acquire_pooled_runtime_arena
     // returns nullptr.
-    void *(*acquire_pooled_gm_heap)(void *runner_ctx, uint32_t arena_bank);
+    void *(*acquire_pooled_gm_heap)(void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank);
     void *(*acquire_pooled_gm_sm)(void *runner_ctx, uint32_t arena_bank);
     void *(*acquire_pooled_runtime_arena)(void *runner_ctx, uint32_t arena_bank);
     // Prebuilt runtime-arena image cache (trb): look up a previously built
@@ -437,9 +438,13 @@ public:
         return ops_->acquire_run_image_staging(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
     }
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) const {
-        return ops_->setup_static_arena(runner_ctx_, banks_, gm_heap_size, gm_sm_size, runtime_arena_size);
+        return ops_->setup_static_arena(
+            runner_ctx_, pipeline_slot_, banks_, gm_heap_size, gm_sm_size, runtime_arena_size
+        );
     }
-    void *acquire_pooled_gm_heap() const { return ops_->acquire_pooled_gm_heap(runner_ctx_, banks_.heap); }
+    void *acquire_pooled_gm_heap() const {
+        return ops_->acquire_pooled_gm_heap(runner_ctx_, pipeline_slot_, banks_.heap);
+    }
     void *acquire_pooled_gm_sm() const { return ops_->acquire_pooled_gm_sm(runner_ctx_, banks_.sm); }
     void *acquire_pooled_runtime_arena() const { return ops_->acquire_pooled_runtime_arena(runner_ctx_, banks_.image); }
     bool lookup_prebuilt_runtime_arena_cache(

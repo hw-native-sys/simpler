@@ -53,7 +53,10 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
     for (uint32_t i = 0; i < contract->resource_count; ++i) {
         const PipelineResource &resource = contract->resources[i];
         if (resource.kind == PTO_PIPELINE_KIND_UNSPECIFIED || resource.kind > PTO_PIPELINE_AICORE_STREAM ||
-            resource.resource_class > PTO_PIPELINE_REPORTED) {
+            resource.resource_class > PTO_PIPELINE_POOLED_SCRATCH) {
+            return false;
+        }
+        if (resource.resource_class == PTO_PIPELINE_POOLED_SCRATCH && resource.kind != PTO_PIPELINE_GM_HEAP) {
             return false;
         }
         // Per-run images may be sized by host orchestration at bind time.
@@ -63,7 +66,9 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
         if (mode == SIMPLER_MODE_PROGRAM || resource.resource_class == PTO_PIPELINE_EXEC_HANDLE ||
             resource.resource_class == PTO_PIPELINE_REPORTED) {
             if (resource.bytes_per_copy != 0) return false;
-        } else if (resource.resource_class == PTO_PIPELINE_SCRATCH && resource.bytes_per_copy == 0) {
+        } else if ((resource.resource_class == PTO_PIPELINE_SCRATCH ||
+                    resource.resource_class == PTO_PIPELINE_POOLED_SCRATCH) &&
+                   resource.bytes_per_copy == 0) {
             return false;
         }
     }
@@ -131,6 +136,10 @@ inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
         }
         if (declared > 1) return false;
         if (resource == nullptr) continue;
+        if (resource->resource_class == PTO_PIPELINE_POOLED_SCRATCH) {
+            if (kind != PTO_PIPELINE_GM_HEAP) return false;
+            continue;
+        }
         if (resource->resource_class != PTO_PIPELINE_DELIVERED && resource->resource_class != PTO_PIPELINE_SCRATCH) {
             return false;
         }

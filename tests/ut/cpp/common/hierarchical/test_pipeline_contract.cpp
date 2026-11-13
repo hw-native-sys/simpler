@@ -68,6 +68,20 @@ TEST(PipelineContract, RejectsAnotherAbiVersion) {
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
 }
 
+TEST(PipelineContract, AcceptsAPooledHeapAndRejectsPooledNonHeapRegions) {
+    PipelineContract c = accepted_contract();
+    c.resources[1] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_POOLED_SCRATCH, 0};
+    ASSERT_TRUE(is_valid_pipeline_contract(&c));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+
+    const PipelineSlotLease second_slot{1, 0, 7};
+    EXPECT_EQ(pipeline_resource_slot(c, c.resources[1], second_slot), 0u);
+
+    c.resources[1].kind = PTO_PIPELINE_RUNTIME_IMAGE;
+    EXPECT_FALSE(is_valid_pipeline_contract(&c));
+    EXPECT_FALSE(has_serviceable_arena_topology(c));
+}
+
 TEST(PipelineContract, RejectsMoreResourcesThanFit) {
     PipelineContract c = accepted_contract();
     c.resource_count = PTO_PIPELINE_MAX_RESOURCES + 1;
@@ -110,7 +124,7 @@ TEST(PipelineContract, RejectsAnOutOfRangeKindOrClass) {
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
 
     c = accepted_contract();
-    c.resources[0].resource_class = PTO_PIPELINE_REPORTED + 1;
+    c.resources[0].resource_class = PTO_PIPELINE_POOLED_SCRATCH + 1;
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
 }
 

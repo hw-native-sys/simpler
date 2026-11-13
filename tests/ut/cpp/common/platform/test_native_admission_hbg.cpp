@@ -59,7 +59,7 @@ TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunSta
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);
     EXPECT_EQ(callbacks, 1);
-    EXPECT_TRUE(outer_runner.arena_referenced(1, 0));
+    EXPECT_NE(outer_runner.pooled_heap(1), nullptr);
     EXPECT_TRUE(outer_runner.arena_referenced(1, 2));
     EXPECT_TRUE(outer_runner.holds_epoch(20));
     EXPECT_FALSE(outer_runner.holds_epoch(30));
@@ -129,7 +129,7 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
     Attempt warmup(runner, 2, 10);
     ASSERT_EQ(warmup.prepare(), 0);
     ASSERT_EQ(simpler_finalize_run(&runner, warmup.storage), 0);
-    void *const idle_heap = runner.arena_region_backing(2, 0);
+    void *const idle_heap = runner.pooled_heap(2);
     void *const idle_image = runner.arena_region_backing(2, 2);
     ASSERT_NE(idle_heap, nullptr);
     ASSERT_NE(idle_image, nullptr);
@@ -151,7 +151,7 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
         EXPECT_EQ(control().allocations, allocations);
         EXPECT_EQ(runner.charged(), charged);
         EXPECT_EQ(runner.reservations(), 1u);
-        EXPECT_EQ(runner.arena_region_backing(2, 0), idle_heap);
+        EXPECT_EQ(runner.pooled_heap(2), idle_heap);
         EXPECT_EQ(runner.arena_region_backing(2, 2), idle_image);
         if (rc == 0) EXPECT_EQ(simpler_finalize_run(&runner, warm_consumer.storage), 0);
         // Scheduler storage is per pipeline slot and survives idle arena trim.

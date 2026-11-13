@@ -1147,6 +1147,7 @@ simpler_ut_cases(platform_single_case
     test_retained_temp_bump.cpp
     test_run_caller_order.cpp
     test_run_completion_fence.cpp
+    test_scratch_pool.cpp
     test_run_drain_decision.cpp
     test_run_drain_result_separation.cpp
     test_run_outcome_decision.cpp

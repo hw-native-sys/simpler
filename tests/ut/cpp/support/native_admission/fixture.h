@@ -184,6 +184,7 @@ public:
         void *backing = arena_region_backing(bank, region);
         return backing != nullptr && workspace_.block_state(backing) == WorkspaceManager::BlockState::Referenced;
     }
+    void *pooled_heap(uint32_t /*pipeline_slot*/) { return pooled_heap_base(); }
     const simpler::dfx::HostPhaseRecordStore &phases(uint32_t slot) const { return host_phase_runs_[slot].records; }
     size_t reservations() const {
         size_t n = 0;

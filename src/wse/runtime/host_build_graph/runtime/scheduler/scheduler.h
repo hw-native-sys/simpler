@@ -112,6 +112,7 @@ struct SchedulerState {
     ChipReadyQueue early_sync_start_queue;
     ChipReadyQueue ed_publish_drain_queue;
     static SchedulerLayout reserve_layout(DeviceArena &arena);
+    static SchedulerLayout reserve_layout(DeviceArena &arena, const ReadyQueueCapacities &capacities);
     bool init_data_from_layout(const SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base);
     void wire_arena_pointers(const SchedulerLayout &layout, DeviceArena &arena);
     void seed_queue_slots();

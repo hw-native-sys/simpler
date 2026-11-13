@@ -1370,7 +1370,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         }
         const NativeRunDescriptor descriptor{
             slot_id,
-            region_banks_for_slot(slot_id).heap,
+            region_banks_for_slot(slot_id).image,
             run_id,
             generation,
             dispatch_id,

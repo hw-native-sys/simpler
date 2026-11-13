@@ -379,11 +379,7 @@ class TestRunStreamReuseHbg(SceneTestCase):
                 staging = chip_worker.retained_temp_addr(slot_id)
                 assert storage != 0 and staging != 0
                 assert all(storage != old["storage"] and staging != old["staging"] for old in records[:-1])
-                # Read this run's heap before a later prepare replaces the bank.
-                heap = chip_worker.arena_bank_gm_heap_base(slot_id)
-                assert heap != 0, "prepared run has no committed heap"
-                assert all(heap != old["heap"] for old in records[:-1] if old["slot_id"] != slot_id)
-                record.update(storage=storage, staging=staging, heap=heap, slot_id=slot_id)
+                record.update(storage=storage, staging=staging)
                 chip_worker._launch_native_run(native_run)
                 deadline = time.monotonic() + 60.0
                 while not chip_worker._poll_native_run(native_run):
@@ -396,6 +392,9 @@ class TestRunStreamReuseHbg(SceneTestCase):
                     )
                 expected_increment = 1 if st_platform == "a2a3" else 0
                 assert st_worker.run_stream_set_create_count == stream_sets + expected_increment
+            # host_build_graph serves every bank's graph heap from the Worker's
+            # shared ScratchPool, so the per-slot runtime and staging addresses
+            # above are the ownership evidence; a per-bank heap base is not.
             # Both same-slot successors are admitted before any strong observation.
             while records:
                 record = records[-1]
