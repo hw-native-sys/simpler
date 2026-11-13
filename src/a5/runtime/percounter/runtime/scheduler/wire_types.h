@@ -45,13 +45,20 @@ namespace simpler::percounter {
 
 inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
 
+// Ordinary candidates per lane; the MIX and cohort slots are additional.
+inline constexpr uint32_t PERCOUNTER_PENDING_CAPACITY = 1;
+static_assert(PERCOUNTER_PENDING_CAPACITY > 0);
+inline constexpr uint32_t PERCOUNTER_MIX_PAYLOAD_SLOT = PERCOUNTER_PENDING_CAPACITY;
+inline constexpr uint32_t PERCOUNTER_SYNC_PAYLOAD_SLOT = PERCOUNTER_MIX_PAYLOAD_SLOT + 1;
+inline constexpr uint32_t PERCOUNTER_PAYLOAD_SLOT_COUNT = PERCOUNTER_SYNC_PAYLOAD_SLOT + 1;
+
 /**
- * One cluster's MIX rendezvous line. Lives in SSBUF, not in the GM region.
+ * One cluster's MIX rendezvous and preparation records, held in SSBUF.
  *
  * SSBUF offers no atomics -- `scheduler/ssbuf.h` has an acquire load and a
  * release store and nothing else -- so every field here has exactly one writer.
  * `task_id`, `armed_generation`, `active_mask`, `block_idx`, `block_num` and
- * `cohort_block` are written only by the cluster's AIV0, which is why the
+ * `cohort_block` and the preparation record are written only by AIV0, which is why the
  * claimer is a fixed lane role rather than an election; entry `i` of the two
  * arrays is written only by cluster lane `i`.
  *
@@ -102,8 +109,18 @@ struct alignas(64) PercounterMixSignal {
     // that takes a block, so the lane's own service order resolves what they
     // could not exclude.
     volatile uint32_t cohort_hold[PLATFORM_CORES_PER_BLOCKDIM];
+
+    // Preparation does not reserve any participant. A named lane may prepare
+    // this payload while the task's producers still run, then serve other work.
+    // Only armed_generation admits the rendezvous. The claimer writes this
+    // separate record under an odd-writing/even-published sequence.
+    volatile int64_t prepare_task_id;
+    volatile int32_t prepare_block_idx;
+    volatile int32_t prepare_block_num;
+    volatile uint32_t prepare_mask;
+    volatile uint32_t prepare_generation;
 };
-static_assert(sizeof(PercounterMixSignal) == 64, "the MIX signal owns exactly one cache line");
+static_assert(sizeof(PercounterMixSignal) == 128, "MIX rendezvous and preparation own two cache lines");
 static_assert(alignof(PercounterMixSignal) == 64, "two clusters must not share a line");
 // Every member is volatile, so the type is not trivially copyable: the line is
 // written field by field under a seqlock, never memcpy'd as a whole.
@@ -139,6 +156,11 @@ inline __aicore__ void percounter_mix_signal_clear(PERCOUNTER_SSBUF PercounterMi
     signal->block_idx = 0;
     signal->block_num = 1;
     signal->cohort_block = 0;
+    signal->prepare_task_id = -1;
+    signal->prepare_block_idx = 0;
+    signal->prepare_block_num = 1;
+    signal->prepare_mask = 0;
+    percounter_ssbuf_store_release(&signal->prepare_generation, 0);
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         signal->arrived[lane] = 0;
         signal->finished[lane] = 0;
@@ -622,8 +644,8 @@ struct alignas(128) PercounterControl {
     uint64_t graph_storage_count;
     uint64_t callable_addresses_address;
     uint64_t callable_addresses_count;
-    // One DispatchPayload per lane. A lane fills its own payload and then runs
-    // it, so there is never a second one in flight.
+    // PERCOUNTER_PAYLOAD_SLOT_COUNT DispatchPayloads per lane: ordinary
+    // candidates, a MIX subtask, and a cohort block have separate lifetimes.
     uint64_t dispatch_payloads_offset;
     // Prefilled by the host so a lane can bound its startup wait; the AICPU
     // overwrites it with any override when it publishes the topology.
@@ -655,93 +677,29 @@ static_assert(
 );
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
 
-/**
- * How many consecutive order-list positions one ticket draw hands out.
- *
- * With one position per draw the ticket bounds any graph whose tasks are shorter
- * than the draw cost times the lane count: `mixed_multi_root_4096` (4096 tasks,
- * no edges) spent 355 of its 844 us on the ticket. A range divides the draws by
- * `BATCH` and keeps the queue work-conserving -- nothing is bound to a lane
- * before it asks.
- *
- * What a range costs is availability: a lane is committed to its positions, so
- * one holding `BATCH` blocked positions cannot hand them to an idle lane. The
- * two costs move against each other and no value wins everywhere; 4 is chosen on
- * the worst case against each shape's own best (B=1 3.11x off, B=2 1.76x, B=4
- * 1.39x, B=8 1.96x across the mixed_* DAGs and paged_attention Case1 on a5).
- */
-inline constexpr uint64_t PERCOUNTER_CLAIM_BATCH = 4;
-
-// A kernel at least this long (3 us) makes a lane draw one position at a time. A
-// draw plus its readiness check is about 1 us, so above a few of those a range
-// saves a small share of each task while risking a whole kernel per position it
-// withholds. Measured on a5: qwen3 decode 29.60 -> 23.02 ms device wall, with no
-// change on the mixed_* DAGs or paged_attention Case1, whose ~2 us kernels stay
-// below it.
-inline constexpr uint64_t PERCOUNTER_LONG_KERNEL_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1000000 * 3;
-
-// A list of at most this many positions per lane of its type makes each lane's
-// first draw a single position. A lane has timed no kernel before its first
-// draw, and on such a list a first range of long or not-yet-ready tasks is a
-// large share of the lane's work, held while other lanes go idle. Measured on a5
-// (AICore window): paged_attention_unroll Case2 -18%, manual_scope Case2 -10%,
-// batch_paged_attention Case1 (64 per AIC lane) -5%; applied to every list it
-// cost paged_attention B64 (256 per lane) +5% and Case1 (1024) +1.6%.
-inline constexpr uint64_t PERCOUNTER_SHORT_LIST_PER_LANE = 64;
+inline constexpr uint64_t PERCOUNTER_TICKET_STRIPE = 4;
 
 /**
  * The order-list position of index `index` of group `group`'s share.
  *
- * The list is cut into blocks of PERCOUNTER_CLAIM_BATCH positions, block `c`
- * belonging to group `c % group_count`. A group's indices run through its own
- * blocks in list order, so a group's ticket hands out its share in list order.
+ * Stripes of PERCOUNTER_TICKET_STRIPE positions belong to successive groups.
+ * A group's indices run through its stripes in list order. Each ticket draw
+ * claims one index, independently of the stripe width.
  */
 inline __aicore__ uint64_t percounter_group_position(uint64_t index, uint32_t group, uint32_t group_count) {
-    return ((index / PERCOUNTER_CLAIM_BATCH) * group_count + group) * PERCOUNTER_CLAIM_BATCH +
-           index % PERCOUNTER_CLAIM_BATCH;
+    return ((index / PERCOUNTER_TICKET_STRIPE) * group_count + group) * PERCOUNTER_TICKET_STRIPE +
+           index % PERCOUNTER_TICKET_STRIPE;
 }
 
 /** How many of a list's `order_count` positions are group `group`'s share. */
 inline __aicore__ uint64_t percounter_group_size(uint64_t order_count, uint32_t group, uint32_t group_count) {
-    const uint64_t blocks = (order_count + PERCOUNTER_CLAIM_BATCH - 1) / PERCOUNTER_CLAIM_BATCH;
+    const uint64_t blocks = (order_count + PERCOUNTER_TICKET_STRIPE - 1) / PERCOUNTER_TICKET_STRIPE;
     if (group >= blocks) return 0;
     const uint64_t own = (blocks - group + group_count - 1) / group_count;
-    uint64_t size = own * PERCOUNTER_CLAIM_BATCH;
+    uint64_t size = own * PERCOUNTER_TICKET_STRIPE;
     // The list's last block, short when the list does not fill it.
-    if ((blocks - 1) % group_count == group) size -= blocks * PERCOUNTER_CLAIM_BATCH - order_count;
+    if ((blocks - 1) % group_count == group) size -= blocks * PERCOUNTER_TICKET_STRIPE - order_count;
     return size;
-}
-
-/**
- * Turn a ticket draw into the half-open range of a group's indices it owns
- * (see percounter_group_position). Returns false when the draw starts at or
- * past the end of the group's share, `group_size`.
- *
- *  - **Disjoint and ascending.** Each draw of `percounter_gm_fetch_add(ticket,
- *    BATCH)` gets a distinct base `BATCH` apart, so the ranges tile the share in
- *    order. A gap would strand a task -- a lane spinning on a counter nobody
- *    sets -- and an overlap would run one twice.
- *  - **Deadlock-free.** Every list is ordered by descending (b-level, -id), a
- *    key global across the lists (see build_tables). Take the incomplete task T
- *    with the greatest key. Its producers have strictly greater b-levels and
- *    everything before it in its own list has a greater key, so all of them are
- *    complete. If T's position is drawn, the lane holding it has nothing left
- *    to wait for. If not, its group's ticket has reached it, so every position
- *    that group has drawn is complete; a lane takes from another group only once
- *    its own group's share is spent, so the group's lanes hold nothing but
- *    complete positions and the next of them to draw takes T.
- *
- * The clamp matters: the draw counter keeps rising past the end of the share,
- * so the last real range straddles it and every later draw starts beyond it.
- */
-inline __aicore__ bool
-percounter_claim_range(uint64_t base, uint64_t batch, uint64_t group_size, uint64_t *first, uint64_t *last_exclusive) {
-    if (first == nullptr || last_exclusive == nullptr || batch == 0) return false;
-    if (base >= group_size) return false;
-    *first = base;
-    // base < group_size holds, so this cannot wrap.
-    *last_exclusive = (group_size - base < batch) ? group_size : base + batch;
-    return true;
 }
 
 }  // namespace simpler::percounter
