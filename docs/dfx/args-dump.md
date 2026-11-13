@@ -49,7 +49,7 @@ supplies these through its scheduler or the A5 HBG task-time copy service:
 | a2a3 | `host_build_graph` | yes — AICPU scheduler dispatches and reaps | served |
 | a2a3 | `tensormap_and_ringbuffer` | yes | served |
 | a5 | `tensormap_and_ringbuffer` | yes | served |
-| a5 | `host_build_graph` | yes — AICore task boundaries with AICPU copy service | served for AICore-scheduled graphs; fallback shapes refused with `PTO_RUNTIME_ERR_UNSUPPORTED` |
+| a5 | `host_build_graph` | yes — AICore task boundaries with AICPU copy service | served for resident ordinary/native Graph runs |
 
 The table describes ordinary runs, including native graph child tasks, on both
 onboard and simulated backends. It does not add ArgsDump to retained Kernel
@@ -111,8 +111,7 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-args        # partial
 
 # pytest
 pytest tests/st/<case> --platform a5sim --dump-args full
-# A5 HBG argument dumping requires an AICore-scheduled graph (§3.1.1).
-# A graph selecting the AICPU fallback is refused while dumping is enabled.
+# A5 HBG uses resident task-time capture (§3.1.1).
 pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args full
 pytest tests/st/a2a3/host_build_graph/dump_args --platform a2a3sim --dump-args full
 pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump --platform a5sim --dump-args hybrid
@@ -188,11 +187,10 @@ Stale epochs, tasks, stages, publishers, chunks and torn ACKs cannot seal a boun
 The last returning participant remains EXECUTING until its AFTER seal and return
 gate permit direct slot retirement.
 
-The runtime answers `args_dump_capture_supported_impl = 1`. A dump-enabled bind
-requires an AICore-scheduled graph; an unsupported scheduler shape returns
-`PTO_RUNTIME_ERR_UNSUPPORTED` before publication. Requests with argument dumping
-disabled retain their normal scheduling behavior. The AICPU-scheduled fallback
-is outside the argument-dump support contract.
+The runtime answers `args_dump_capture_supported_impl = 1`. A5 HBG uses
+resident scheduling with or without argument dumping. Invalid shapes or
+Definition layouts fail preparation under the same input contract; a dump flag
+does not select a different execution path.
 
 The copy service uses the existing bounded metadata buffers and payload arena.
 One reservation per AICPU lane prevents partially copied records from being
@@ -993,10 +991,8 @@ device.
 
 ## 7. Limitations
 
-On A5 `host_build_graph`, argument dumping requires AICore scheduling. A graph
-that selects the AICPU fallback returns `PTO_RUNTIME_ERR_UNSUPPORTED` before
-launch publication. With dumping disabled, the normal scheduler choice is
-unchanged. This task-time copy service does not add ArgsDump support to retained
+On A5 `host_build_graph`, argument dumping uses resident task-time boundaries.
+It does not change scheduler selection or add ArgsDump support to retained
 Kernel capture/replay (§3.1.1).
 
 Three pressure or failure conditions then exist, on the runtimes that do
@@ -1120,7 +1116,6 @@ host hand-off queue).
 
 | Condition | Flag | Metadata | Payload | a2a3 | a5 |
 | --------- | ---- | -------- | ------- | ---- | -- |
-| A5 HBG graph selects the AICPU fallback with dumping enabled | request refused `-1001` before launch | None | None | — | AICore scheduling is required (§3.1.1) |
 | Tensor > arena | `truncated` | Preserved | Partial (`arena/2` bytes) | Same | Same |
 | Arena host writer falls behind | none on success | Preserved | Preserved after bounded wait for this thread's ack | Same | Same |
 | Record buffer full, no free buffer | `dropped_records`; `dropped_records_complete` states accounting confidence | Lost | Lost | After gate timeout | Same |

@@ -144,6 +144,7 @@ nav:
           - 性能与自主迭代流程: zh-cn/design/a5-hbg-graph-task/performance.md
           - Admission 方案排查记录: zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md
           - DSV4.1 调度改动取舍: zh-cn/investigations/2026-11-a5-hbg-dsv-scheduler-review.md
+          - Legacy 执行路径移除: zh-cn/investigations/2026-11-a5-hbg-legacy-removal.md
           - 设计复审: zh-cn/design/a5-hbg-graph-task/review.md
           - 已否定的性能尝试: zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md
           - 固定前缀成员历史测量: zh-cn/design/a5-hbg-graph-task/fixed-prefix-members.md

@@ -84,6 +84,8 @@ that ...".
 
 Newest first.
 
+- [2026-11 — A5 HBG legacy removal](2026-11-a5-hbg-legacy-removal.md) — implementation candidate: resident-only A5 HBG with canonical Graph arguments and failed-start retirement; shared arena and kernel context cleanup remain separate stages, with no CPU validation run.
+
 - [2026-11 — A5 HBG synchronous completion](2026-11-a5-hbg-synchronous-completion.md) — select synchronous CSR by default; remove resumable completion and redundant per-task admission ownership, while retaining global commit ordering and recording the unmet full-completion target.
 
 - [2026-11 — A5 HBG execution snapshot reuse](2026-11-a5-hbg-execution-snapshot-reuse.md) — reverted: reusing the executor snapshot did not shorten SWA completion; same-device L0 remained flat despite one fewer source-level copy.

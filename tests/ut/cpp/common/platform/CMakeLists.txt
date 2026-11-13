@@ -105,19 +105,14 @@ if(APPLE)
 else()
     set(_mix_lane_gc -Wl,--gc-sections)
 endif()
-foreach(arch a2a3 a5)
-    simpler_ut_add_target(NAME test_${arch}_hbg_mix_lane_priority ARCH ${arch} RUNTIME host_build_graph TIER aicpu
-        SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
-            ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp
-            ${SIMPLER_SRC}/${arch}/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.cpp
-            ${SIMPLER_SRC}/${arch}/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
-            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
-        DEFINES SIMPLER_DFX=0 LINK ${arch}_ut_support
-        COMPILE_OPTIONS -ffunction-sections -fdata-sections LINK_OPTIONS ${_mix_lane_gc} TIMEOUT 30)
-endforeach()
-
-target_sources(test_a5_hbg_mix_lane_priority PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host_build_graph/support/scheduler_drain_a5_stubs.cpp)
+simpler_ut_add_target(NAME test_a2a3_hbg_mix_lane_priority ARCH a2a3 RUNTIME host_build_graph TIER aicpu
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp
+        ${SIMPLER_SRC}/a2a3/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/a2a3/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+    DEFINES SIMPLER_DFX=0 LINK a2a3_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections LINK_OPTIONS ${_mix_lane_gc} TIMEOUT 30)
 
 simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_priority ARCH a2a3 RUNTIME tensormap_and_ringbuffer TIER aicpu
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
@@ -1243,8 +1238,7 @@ target_sources(test_a5_hbg_abort_aicore_startup PRIVATE
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary.cpp
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native.cpp
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_profiled.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/aicore_legacy_executor.cpp)
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp)
 target_compile_definitions(test_a5_hbg_abort_aicore_startup PRIVATE TEST_RESIDENT_STARTUP=1)
 foreach(arch a2a3 a5)
     foreach(tag hbg tmr)

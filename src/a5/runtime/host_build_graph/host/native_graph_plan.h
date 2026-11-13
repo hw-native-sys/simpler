@@ -28,17 +28,16 @@ struct NativeGraphDefinitionPlan {
     std::vector<uint16_t> sinks;
     uint64_t args_bytes{0};
     uint64_t execution_count{0};
-    bool resident_supported{true};
 };
 
-// Invalid input leaves out unchanged. Legal shapes not currently supported by
-// the resident executor still receive full validation before fallback is chosen.
+// Invalid input leaves out unchanged. Child argument spans partition the
+// Definition pools in recording order, including children with no arguments.
 bool native_graph_plan_definition(
     const void *image, size_t bytes, uint64_t graph_key, NativeGraphDefinitionPlan *out, std::string *error
 );
 
 struct NativeGraphHostPlan {
-    std::vector<std::byte> legacy_section;
+    std::vector<std::byte> original_definition_section;
     std::vector<NativeGraphDefinitionPlan> definitions;
     std::vector<SchedulerNodeBinding> bindings;
     std::vector<int64_t> completion_refs;
@@ -51,7 +50,7 @@ bool native_graph_plan_nodes(
     const std::vector<uint32_t> &definition_indices, NativeGraphHostPlan *plan, std::string *error
 );
 
-// Validate device-wide barriers even when the whole run needs the legacy path.
+// Validate device-wide barriers against the launched worker population.
 bool native_graph_plan_worker_capacity(const NativeGraphHostPlan &plan, uint64_t workers, std::string *error);
 
 struct NativeGraphReadonlyImage {

@@ -205,11 +205,8 @@ extern "C" int joined_diagnostic_launch_supported_impl(void) {
     // own accounting into the terminal bank its pipeline slot reserves, so the
     // host tells the two apart by identity rather than by arrival order.
     //
-    // The other diagnostics initialize and settle on both routes: the legacy
-    // scheduler does it across its cold path and its dispatch exits, and the
-    // AICore-scheduler route does it across `AicoreLifecycle`'s own init and
-    // shutdown partitions. A run on either route therefore publishes a
-    // terminal of its own rather than leaving its accounting unreadable.
+    // AicoreLifecycle initializes and settles each run's diagnostics across
+    // its init and shutdown partitions.
     return 1;
 }
 
@@ -445,27 +442,6 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
     }
 
     return true;
-}
-
-static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
-    if (api == nullptr || host_header == nullptr) return 0;
-    // The shared scheduler header can already belong to a successor.
-    if (const auto observed = api->observed_run_status(); observed.has_value()) return *observed;
-    if (runtime == nullptr) return 0;
-
-    void *device_sm = runtime->get_gm_sm_ptr();
-    if (device_sm == nullptr) {
-        return 0;
-    }
-
-    int hdr_rc = api->copy_from_device(host_header, device_sm, sizeof(SharedMemoryHeader));
-    if (hdr_rc != 0) {
-        LOG_WARN("Failed to copy the shared-memory header from device");
-        return 0;
-    }
-
-    int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
-    return runtime_status_from_error_code(sched_error_code);
 }
 
 static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
@@ -1134,8 +1110,8 @@ bool bind_graph_definitions(
             attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", uploads->count, block_bytes, count,
             uploads->spilled
         );
-        // Packing retains a host section. The selected scheduler determines
-        // whether commit copies Definitions to GM or the AICPU launch package.
+        // The host section is the original Definition source for protocol
+        // validation; commit copies native plans into scheduler GM.
         record_bind_phase(HostPhaseKind::BindGraphPack, pack_phase, attrs, block_bytes);
     }
 
@@ -1219,10 +1195,8 @@ bool bind_graph_definitions(
             packed_definition.populations_ready = true;
         }
         ready_queue_populations->add(packed_definition.ready_queue_populations);
-        // The Definition is named by its position in this run's section, not by an
-        // address: the bytes reach the device as the tail of each AICPU thread's
-        // own launch arguments, so no address in them is shared. graph_context
-        // stays null until the device installs this task's execution.
+        // Protocol source capture names the original Definition by its section
+        // offset. The device uses the native node map and instance bindings.
         upload->outer_slot->to_descriptor().graph_definition_offset =
             static_cast<uint32_t>(object_it->second.object_offset + sizeof(GraphDefinitionHeader));
         upload->outer_slot->graph_context = nullptr;
@@ -1242,7 +1216,7 @@ bool bind_graph_definitions(
             return false;
         }
     }
-    if (block_bytes != 0) native_plan->legacy_section.assign(staging, staging + block_bytes);
+    if (block_bytes != 0) native_plan->original_definition_section.assign(staging, staging + block_bytes);
     return true;
 }
 
@@ -1256,9 +1230,8 @@ struct GraphHostStateBinding {
     OrchestratorState &orchestrator;
 };
 
-// The two bootstrap words move together: a resident base surviving a legacy
-// selection would name storage this run no longer describes, and a mode without
-// its base would send the AICore to a null context. Every selection path goes
+// The two bootstrap words move together: a released run must not name resident
+// storage, and a selected run requires a context base. Both words are published
 // through publish_scheduler_bootstrap.
 //
 // The storage that base named belongs to the pipeline slot. What ends here is
@@ -1273,18 +1246,6 @@ void release_scheduler_state(Runtime *runtime) {
         scheduler_state_owners.erase(runtime);
     }
     runtime->publish_scheduler_bootstrap(0, 0);
-    for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->dev.workers[i].aicpu_ready = 0;
-        runtime->dev.workers[i].task = 0;
-    }
-}
-
-void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode) {
-    always_assert(
-        mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
-    );
-    runtime->publish_scheduler_bootstrap(mode, 0);
-    if (api != nullptr) api->record_scheduler_runtime_mode(mode);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         runtime->dev.workers[i].aicpu_ready = 0;
         runtime->dev.workers[i].task = 0;
@@ -1374,9 +1335,7 @@ bool create_scheduler_state(
     );
     const bool native_graph = !native_plan.instances.empty();
     const uint64_t node_count = native_graph ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
-    bool legacy_graph_required = false;
     for (const auto &definition : native_plan.definitions) {
-        legacy_graph_required = legacy_graph_required || !definition.resident_supported;
         for (const auto &child : definition.children) {
             for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
                 if (child.metadata.active_mask.has(static_cast<SubtaskSlot>(lane)) &&
@@ -1413,7 +1372,6 @@ bool create_scheduler_state(
     uint64_t mix_task_count = 0;
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
-    int64_t legacy_shape_task_ref = -1;
     int64_t trace_overflow_task_ref = -1;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
@@ -1453,11 +1411,8 @@ bool create_scheduler_state(
             shape.task_ref = task_ref;
             shape.active_mask = LaneMask::aiv0();
         }
-        // Ordinary tasks retain the existing ChipTaskSlotState scheduling
-        // semantics. Only the legacy inline-dispatch fallback synthesizes its
-        // AIV0 execution shape because it has no active subtask in the slot;
-        // such a node routes as AIV but owns no trace cell, so it is excluded
-        // from the subtask count the trace and PMU arrays are sized by.
+        // An inline control task routes through AIV0 with no kernel execution
+        // or trace cell, so it contributes no physical subtask count.
         const LaneMask classified_active_mask = shape.active_mask;
         const LaneMask metadata_active_mask = inline_dispatch_task ? classified_active_mask : slot.active_mask;
         const LaneMask active_mask = metadata_active_mask;
@@ -1519,7 +1474,8 @@ bool create_scheduler_state(
         if (!scheduler_resident_task_shape_supported(
                 active_subtasks, logical_block_num, slot.task_attrs.requires_sync_start()
             )) {
-            if (legacy_shape_task_ref < 0) legacy_shape_task_ref = task_ref;
+            LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " has an unsupported shape", task_ref);
+            return false;
         }
         uint64_t next_subtask_count = executable_subtask_count;
         if (!inline_dispatch_task &&
@@ -1582,17 +1538,12 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
-    // Offered before this runtime's own fallbacks and before its native Graph
-    // expansion: an extension that takes the graph owns the rest of the bind,
-    // and a declining one leaves them to decide.
+    // An extension receives the validated top-level graph before native Graph
+    // expansion and owns the remaining bind when it accepts the graph.
     const auto extension = scheduler_extension_select(
         runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, device_segments
     );
     if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
-    if (legacy_graph_required) {
-        select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
-        return true;
-    }
     if (native_graph) {
         std::vector<SchedulerTaskMetadata> expanded(node_count);
         for (uint64_t ref = 0; ref < node_count; ++ref) {
@@ -1662,14 +1613,6 @@ bool create_scheduler_state(
             LOG_ERROR("A5 HBG: native metadata does not cover all nodes");
             return false;
         }
-    }
-    if (legacy_shape_task_ref >= 0) {
-        select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
-        LOG_INFO(
-            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with unsupported task shape",
-            legacy_shape_task_ref
-        );
-        return true;
     }
     if (trace_overflow_task_ref >= 0) {
         LOG_ERROR(
@@ -1874,7 +1817,8 @@ bool create_scheduler_state(
                                                                                            0;
                     sources.push_back({kind, slot.to_descriptor().graph_definition_offset});
                 }
-                protocol_source = scheduler_protocol_freeze_source(host_graph, sources, native_plan.legacy_section);
+                protocol_source =
+                    scheduler_protocol_freeze_source(host_graph, sources, native_plan.original_definition_section);
             }
             protocol_tasks = scheduler_protocol_freeze_graph(snapshot, task_metadata);
         } catch (const std::exception &error) {
@@ -2104,17 +2048,6 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     if (runtime->dev.dump_args_level != static_cast<uint32_t>(DumpArgsLevel::OFF) &&
         runtime->dev.scheduler_bootstrap.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING)
         return PTO_RUNTIME_ERR_UNSUPPORTED;
-    if (!plan.native_graph.legacy_section.empty() &&
-        runtime->dev.scheduler_bootstrap.runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING) {
-        uint32_t source = static_cast<uint32_t>(GraphSectionSource::None);
-        uint64_t base = 0;
-        const auto &section = plan.native_graph.legacy_section;
-        if (api->publish_graph_section(section.data(), section.size(), &source, &base) != 0)
-            return PTO_RUNTIME_ERR_INTERNAL;
-        runtime->publish_graph_section(
-            static_cast<GraphSectionSource>(source), base, static_cast<uint32_t>(section.size())
-        );
-    }
 
     // Prepared, not published: `publish_run_image_impl` stages this write for
     // the launch-owned upload and records its host staging cost. The pool counters travel
@@ -3011,7 +2944,7 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
  * Inspect one run's results.
  *
  * This function:
- * 1. Reads the device-side runtime status when the run failed on the device
+ * 1. Reports the observed run terminal status when device execution failed
  * 2. Copies written tensors from device back to host
  *
  * It releases nothing; `release_run_bindings_impl` ends the bindings it reads.
@@ -3019,8 +2952,8 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
  * @param runtime       Pointer to Runtime
  * @param execution_rc  Device-runner drain status after successful enqueue,
  *                      or enqueue status on failure
- * @param launched      Nonzero when this run reached a stream, and its
- *                      device-side status is therefore readable
+ * @param launched      Nonzero when this run reached a stream and may have an
+ *                      observed terminal status
  * @return 0 on success, -1 on failure
  */
 extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
@@ -3044,25 +2977,14 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
     bool skip_tensor_copy_back = execution_rc != 0;
-    int32_t runtime_status = 0;
-    SharedMemoryHeader host_header;
-    memset(&host_header, 0, sizeof(host_header));
-
-    // A common observer's status has no shared-header scheduler provenance.
-    // Only the legacy fallback reads the shared header of a launched run.
-    if (execution_rc != 0 && launched != 0) {
-        runtime_status = read_runtime_status(runtime, api, &host_header);
-    }
+    // The shared header may belong to a successor; status belongs to the
+    // launch-owned terminal record observed for this run.
+    const int32_t runtime_status = execution_rc != 0 && launched != 0 ? api->observed_run_status().value_or(0) : 0;
     if (runtime_status != 0) {
-        if (api->observed_run_status().has_value()) {
-            const char *name = runtime_status < 0 && runtime_status >= -PTO_RUNTIME_LATCHED_CODE_MAX ?
-                                   error_name(-runtime_status) :
-                                   "unknown";
-            LOG_ERROR("Observed runtime status: %d (shared scheduler header not read) error=%s", runtime_status, name);
-        } else {
-            int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
-            LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, sched_error_code, runtime_status);
-        }
+        const char *name = runtime_status < 0 && runtime_status >= -PTO_RUNTIME_LATCHED_CODE_MAX ?
+                               error_name(-runtime_status) :
+                               "unknown";
+        LOG_ERROR("Observed runtime status: %d (shared scheduler header not read) error=%s", runtime_status, name);
     }
 
     if (skip_tensor_copy_back) {

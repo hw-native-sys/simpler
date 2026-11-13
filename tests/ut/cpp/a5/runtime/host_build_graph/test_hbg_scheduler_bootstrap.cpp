@@ -55,32 +55,9 @@ TEST_F(SchedulerBootstrapFields, AFreshRuntimePublishesNoSelection) {
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
     EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_FALSE(aicore_scheduler_explicit_legacy_enabled(&runtime));
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 }
 
-// Each selection replaces the previous one whole. A legacy run that kept the
-// previous resident base would hand the AICPU an address into an allocation the
-// same selection released.
-TEST_F(SchedulerBootstrapFields, LegacySelectionClearsTheResidentBase) {
-    select_resident();
-    ASSERT_TRUE(aicore_scheduler_runtime_enabled(&runtime));
-
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH, 0);
-    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_TRUE(aicore_scheduler_explicit_legacy_enabled(&runtime));
-    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
-    EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
-
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE, 0);
-    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_TRUE(aicore_scheduler_explicit_legacy_enabled(&runtime));
-    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
-}
-
-// Release is not a legacy selection: it publishes no mode at all, so a run that
-// reached the device without selecting one is rejected rather than falling back
-// silently.
 TEST_F(SchedulerBootstrapFields, ReleaseLeavesNoModeAndNoBase) {
     select_resident();
     runtime.publish_scheduler_bootstrap(0, 0);
@@ -88,14 +65,13 @@ TEST_F(SchedulerBootstrapFields, ReleaseLeavesNoModeAndNoBase) {
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
     EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_FALSE(aicore_scheduler_explicit_legacy_enabled(&runtime));
 }
 
-TEST_F(SchedulerBootstrapFields, ResidentSelectionSurvivesALegacyRunBetweenTwoResidentOnes) {
+TEST_F(SchedulerBootstrapFields, ResidentSelectionAfterReleaseUsesTheCurrentBase) {
     select_resident();
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), reinterpret_cast<SchedulerWorkerContext *>(kContextBase));
 
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH, 0);
+    runtime.publish_scheduler_bootstrap(0, 0);
     ASSERT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 
     // A second bind allocates its own state, so the base moves. Nothing of the
@@ -121,14 +97,30 @@ TEST_F(SchedulerBootstrapFields, RepeatedResidentSelectionRepublishesTheCurrentB
 // and it must not produce a context pointer.
 TEST_F(SchedulerBootstrapFields, AResidentModeWithoutABaseYieldsNoContext) {
     runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, 0);
-    EXPECT_TRUE(aicore_scheduler_runtime_enabled(&runtime));
+    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 }
 
 // A base with no resident mode is the mirror case: the AICPU must not follow it
 // just because it is non-zero.
 TEST_F(SchedulerBootstrapFields, ABaseWithoutAResidentModeYieldsNoContext) {
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH, kContextBase);
+    runtime.publish_scheduler_bootstrap(UINT32_MAX, kContextBase);
+    EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
+}
+
+TEST_F(SchedulerBootstrapFields, InvalidBaseExtentNeverNamesAContext) {
+    for (uint64_t base : {UINT64_C(1), kContextBase + 1, UINT64_MAX - UINT64_C(63)}) {
+        SCOPED_TRACE(base);
+        runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, base);
+        EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
+        EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
+    }
+}
+
+TEST_F(SchedulerBootstrapFields, AnOversizedWorkerArrayNeverNamesAContext) {
+    select_resident();
+    runtime.set_worker_count(SCHEDULER_WORKER_CAPACITY + 1);
+    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 }
 

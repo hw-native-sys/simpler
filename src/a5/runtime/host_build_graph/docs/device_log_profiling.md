@@ -1,92 +1,59 @@
-# `host_build_graph` Device-Log Profiling
+# A5 HBG Device-Log Profiling
 
 ## Execution Boundary
 
-`host_build_graph` runs its orchestration shared object on the host before the
-device launch. The device boots scheduler-only, so its device log contains no
-orchestrator-thread block and no device-side `dlopen` timing.
-
-Host graph-construction timing belongs in host-side diagnostics. This guide is
-only for the AICPU scheduler portion of a run.
+`host_build_graph` executes orchestration on the host before device launch.
+Resident AIC/AIV workers schedule and execute tasks; AICPU handles startup,
+supervision, argument-dump services and retirement. Device logs therefore contain
+no orchestration-thread block or device-side orchestration `dlopen` timing.
+Host construction and bind timing belong in host diagnostics.
 
 ## Finding the Log
 
-On hardware, AICPU `LOG_INFO` records are written by CANN's dlog subsystem:
+On hardware, AICPU log records are written by CANN's dlog subsystem:
 
 ```text
 $HOME/ascend/log/debug/device-<device_id>/device-<pid>_<timestamp>.log
 ```
 
-Find the newest file and filter the current scheduler records:
+Filter by the current run's process and time, then inspect `A5 HBG`,
+`AicpuExecutor`, `aicpu_execute`, discovery, initialization and retirement
+records. Correlate the log with the native run identity and terminal result;
+lines from another run are not evidence for the current launch.
 
-```bash
-ls -t "$HOME/ascend/log/debug/device-<device_id>"/device-*.log | head -1
-grep -E "sched_start=|Scheduler summary|Scheduler Phase Breakdown" <logfile>
-```
+## What the Records Mean
 
-## Scheduler Summary
+A normal launch discovers workers, validates the cluster topology, publishes
+contexts, opens the execution gate, supervises the graph and retires the cores.
+AICPU does not emit a per-task dispatch-loop summary for A5 HBG. Do not expect
+`tasks_scheduled`, `sched_start`, or old AICPU scan/pop/setup breakdowns from
+this runtime.
 
-With `SIMPLER_DFX` enabled, each scheduler thread emits timing bounds and a
-summary when its dispatch loop completes:
+Scheduler task timing and phases live in the resident capture. At level 2 and
+above, AICPU lifecycle records describe handshake, configuration, context
+publication, bootstrap wait, gate release and exit. Per-task Completion,
+Resolve, StateProbe, Dispatch and Refill belong to the AICore scheduler.
+See [profiling levels](profiling_levels.md).
 
-```text
-Thread 0: sched_start=... sched_end=... sched_cost=3477.420us
-Thread 0: Scheduler summary: total_time=3460.100us, loops=147, tasks_scheduled=352
-```
+On failure, inspect the first error identity and error site, the timeout
+classification when present, each partition's retirement result and the final
+run status. A ready-pool snapshot is a diagnostic observation, not a decision
+that the graph is complete. Logs must not substitute for EXIT/ACK or terminal
+publication evidence.
 
-| Field | Meaning |
-| ----- | ------- |
-| `sched_cost` | Wall time from scheduler-loop entry to exit |
-| `total_time` | Accounted complete + dispatch + idle cycles |
-| `loops` | Scheduler-loop iterations |
-| `tasks_scheduled` | Mixed tasks this thread completed |
+## Startup Failures
 
-All launched AICPU threads participate in scheduling their assigned cores. The
-highest-index thread performs one-time prebuilt-runtime attachment before it
-enters the same scheduler path; it is not an orchestrator thread.
-
-## Optional Phase Breakdown
-
-When `SIMPLER_SCHED_PROFILING` is also enabled, the summary includes:
-
-```text
-Thread 0: === Scheduler Phase Breakdown: total=3460.100us, 352 tasks ===
-Thread 0:   complete       : ...
-Thread 0:     poll         : ... hit=... miss=... hit_rate=...%
-Thread 0:   dispatch       : ...
-Thread 0:     pop          : ... work=... wait=... atomics=...
-Thread 0:     setup        : ...
-Thread 0:   idle           : ...
-Thread 0:   avg/complete   : ...
-```
-
-- `complete` polls core completion and retires mixed tasks.
-- `dispatch` selects ready work, builds payloads, and publishes core commands.
-- `pop` separates ready-queue work from contention wait.
-- `setup` covers payload/MMIO preparation.
-- `idle` is accounted time when the loop made no progress.
-
-Dependency fanout/fanin aggregates are derived from `deps.json` by the DFX
-analysis tools; current HBG device logs do not print the obsolete adjacency-list
-statistics described by older guides.
-
-## Timeout Record
-
-A scheduler timeout uses an explicit end marker:
-
-```text
-Thread 0: sched_start=... sched_end(timeout)=... sched_cost=...
-```
-
-Use the accompanying runtime-status and stall-classification records to identify
-the failure. Do not infer an orchestration stall from a missing Thread-3 block;
-that block never exists in this runtime.
+Unknown mode or invalid bootstrap metadata is a failed launch. AICore reports
+its current identity, avoids scheduler backing, and waits for EXIT/nonce ACK
+and teardown release. AICPU discovers the reported cores and completes failure
+retirement. This path can produce a failed terminal result without a task trace.
+Missing task records must not be interpreted as a successful empty run.
 
 ## Related Tools
 
-- `python -m simpler_setup.tools.strace_timing` summarizes host/device run markers.
-- `simpler_setup.tools.core_swimlane` reconstructs intra-core execution from
-  per-task argument dumps produced by the AICore scheduler. Argument dumping on
-  the AICPU fallback route is refused at preparation.
-- The repository's DFX analysis workflow combines scheduler timing with
-  dependency and task records.
+- `python -m simpler_setup.tools.strace_timing` summarizes host/device markers.
+- Chip swimlane and the independent native protocol inspect scheduling,
+  execution identities and dependency causality.
+- `simpler_setup.tools.core_swimlane` reconstructs a captured task's intra-core
+  execution from resident argument dumps.
+- The repository's DFX workflow combines timing, dependencies and task records.

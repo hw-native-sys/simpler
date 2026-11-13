@@ -137,12 +137,12 @@ slot 保持 24 bytes，`SchedulerLocalState` 为 208 bytes（含可选异步服�
 
 Definition predicate 先重定位 operand 地址，在依赖满足后按当前 resident predicate 语义取值。
 false 分支完成一次逻辑任务并唤醒后继，不执行 kernel，也不创建 cooperative record。
-predicate 的非法 type、越界或 native 不支持的 shape 必须在 Host preflight 区分为输入错误或 legacy 能力回退。
+predicate 的非法 type、越界或不支持的 shape 必须在 Host preflight 拒绝。
 不能先分配 membership，再用 predicate 跳过其中部分成员。
 
 绑定失败必须携带 node_ref、原始 shell/local identity 和失败字段，锁存 run error。
 该候选不得发布payload或ADMITTED；参数区可以保留部分内容，退出前不再有合法reader。
-运行中不能改走 legacy，也不能把绑定失败包装为一次正常 child completion。
+绑定失败不能包装为一次正常 child completion。
 
 ### Cooperative 与 MIX 保持同一顺序域
 
@@ -240,7 +240,7 @@ EXIT 只保证数据依赖意义上的完成，不保证所有 predecessor 的 w
 
 ## 错误与进度边界
 
-Host 必须在发布前完成能力判断：非法输入直接失败；合法但 native 不支持则整 run legacy。
+Host 必须在发布前完成形状、参数布局和容量校验；不满足当前合同的输入直接失败。
 选定 native 后，地址错误、publication 失败、CAS 状态非法、参数错误、超时统一进入现有 fatal/abort 路径。
 能够观察到 fatal 的 worker 禁止继续发布新成功工作；并发中已发布或在途的工作仍要按退出协议处理。
 错误锁存与全部 worker 同时停发不是一个原子操作，不能承诺零条在途 publication。
@@ -251,6 +251,11 @@ Host 必须在发布前完成能力判断：非法输入直接失败；合法但
 每个worker仍在原有许可检查点读取错误signal，不将较早一次读取作为新的执行许可。
 
 现有失败清理可能推进完成统计，以便收敛；因此数值达到 N-H 不能覆盖非零 error。
+
+启动描述无效时，AICore 仍报告本轮身份，但不解引用 scheduler backing，
+只参与 EXIT、nonce ACK 与 teardown gate。AICPU 负责发现本轮已经报告的核，
+发送 EXIT 并完成寄存器窗口清理、退出 gate 放行与退休确认。
+失败 terminal 必须保持错误状态；未证明退休时不得复用该 run 的存储。
 AICPU 退出循环后仍检查 error，Host 仍检查最终 run status 和 completion fence。
 未完成退出证明的 backing 进入 poison/quarantine，不能归还池后被下一 run 改写。
 

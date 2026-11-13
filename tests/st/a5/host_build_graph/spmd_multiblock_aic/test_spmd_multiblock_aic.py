@@ -10,15 +10,8 @@
 """An AIC-only task of many blocks, dispatched by the resident AICore scheduler.
 
 Every block stamps its own index and the task's block count into a slot of its
-own, so the golden is sensitive to both. A kernel that wrote one fixed cell
-would pass whether all eight blocks ran or one block ran eight times, which is
-what the case this replaces actually did: it wrote `out[0] = 42` from two blocks
-and could not tell them apart.
-
-The `resident` marker is the other half. Until SPMD reached the resident
-scheduler a task like this sent the whole graph to the legacy AICPU scheduler,
-and both schedulers compute the same answer -- so a correct result proves
-nothing about which one ran.
+own, so the golden checks that all logical blocks execute exactly once.
+The resident marker independently checks the scheduler selected for the run.
 
 `test_spmd_per_block_trace` checks that every logical block has its own AIV
 trace record, including when a core reuses its dispatch slots. It enables the

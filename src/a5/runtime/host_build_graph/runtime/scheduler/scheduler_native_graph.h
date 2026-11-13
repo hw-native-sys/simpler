@@ -72,7 +72,7 @@ struct alignas(64) SchedulerGraphTemplate {
     uint64_t args_bytes;
     uint64_t execution_count;
     uint64_t required_heap;
-    uint64_t legacy_execution_storage_bytes;
+    uint64_t reserved_execution_storage_bytes;
     uint64_t graph_key;
 };
 

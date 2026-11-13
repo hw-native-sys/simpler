@@ -19,42 +19,18 @@ inline bool aicore_scheduler_runtime_mode_is_resident(uint32_t mode) {
     return mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING || mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
 }
 
-inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
-    return mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE;
-}
-
 inline bool aicore_scheduler_runtime_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode);
-}
-
-inline bool aicore_scheduler_explicit_legacy_enabled(const Runtime *runtime) {
-    return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_explicit_legacy(runtime->dev.scheduler_bootstrap.runtime_mode);
-}
-
-/**
- * Whether a legacy run reached the end of the path its terminal record may call
- * a success — what `LegacyAicpuExecutor::snapshot_run_terminal` passes to
- * `run_terminal_select` as `normal_path_completed`.
- *
- * Two conditions, and the first is this producer's alone. `aicpu_execute`
- * rejects a legacy run whose mode does not say legacy was chosen, and that
- * rejection reaches the host only as the kernel's return; a record calling such
- * a run Ok would contradict it. The second is the shared one: a participant
- * that never dispatched withholds its claim, so a short tally means some thread
- * cannot vouch for the path.
- *
- * Neither condition suppresses a failure — `run_terminal_select` reports a
- * header or participant error whatever this answers.
- */
-inline bool aicore_legacy_run_completed_audited_path(const Runtime *runtime, int32_t claims, int32_t participants) {
-    return aicore_scheduler_explicit_legacy_enabled(runtime) && claims == participants;
+           runtime->get_worker_count() <= static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) &&
+           aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode) &&
+           runtime->dev.scheduler_bootstrap.worker_context_base != 0 &&
+           runtime->dev.scheduler_bootstrap.worker_context_base % alignof(SchedulerWorkerContext) == 0 &&
+           runtime->dev.scheduler_bootstrap.worker_context_base <=
+               UINT64_MAX - static_cast<uint64_t>(runtime->get_worker_count()) * sizeof(SchedulerWorkerContext);
 }
 
 // Worker 0's context sits at the published base, so the bootstrap context is the
-// base itself. A zero base is "no resident scheduler state", the same verdict a
-// zero handshake task carried before.
+// base itself. Invalid bootstrap inputs never name a scheduler context.
 inline SchedulerWorkerContext *aicore_scheduler_bootstrap_context(Runtime *runtime) {
     if (!aicore_scheduler_runtime_enabled(runtime) || runtime->dev.scheduler_bootstrap.worker_context_base == 0) {
         return nullptr;

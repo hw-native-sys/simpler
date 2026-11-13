@@ -32,6 +32,7 @@
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
 #include "runtime.h"
+#include "host_build_graph/shared_memory.h"
 #include "spin_hint.h"
 
 namespace {
@@ -55,17 +56,29 @@ CoreType subtask_core_type(uint8_t subtask) { return subtask == 0 ? CoreType::AI
 
 void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    if (context == nullptr) return;
     SchedulerRunControl *run_control = aicore_scheduler_run_control(context);
-    if (run_control == nullptr ||
-        !record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site))
-        return;
-    wmb();
+    if (run_control != nullptr &&
+        record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site))
+        wmb();
+    if (runtime != nullptr && runtime->get_gm_sm_ptr() != nullptr) {
+        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+        (void)settle_aicore_runtime_status(run_control, &header->sched_error_code);
+        (void)latch_aicore_scheduler_runtime_error(
+            &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
+        );
+    }
 }
 
 }  // namespace
 
 int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base) {
+    core_count_ = 0;
+    aicpu_thread_num_ = aicpu_thread_num;
+    regs_base_ = regs_base;
+    lifecycle_traces_ = nullptr;
+    pmu_initialized_ = false;
+    handshake_failed_.store(false, std::memory_order_release);
+    retired_core_count_.store(0, std::memory_order_release);
     if (runtime == nullptr || runtime->dev.worker_count <= 0 || runtime->dev.worker_count > kMaxWorkers) {
         LOG_ERROR("Invalid AICore lifecycle worker count");
         return -1;
@@ -79,11 +92,6 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     // Clear prior-run releases before any partition can open a register window.
     std::memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * core_count_);
     wmb();
-    aicpu_thread_num_ = aicpu_thread_num;
-    regs_base_ = regs_base;
-    lifecycle_traces_ = nullptr;
-    handshake_failed_.store(false, std::memory_order_release);
-    retired_core_count_.store(0, std::memory_order_release);
 
     const bool chip_swimlane_enabled = is_chip_swimlane_enabled();
     if (is_dump_args_enabled()) {
@@ -97,6 +105,10 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
 }
 
 void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
+    if (regs_base_ == 0) {
+        handshake_failed_.store(true, std::memory_order_release);
+        return;
+    }
     Handshake *handshakes = runtime->dev.workers;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * core_count_) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * core_count_) / nthreads);
@@ -149,6 +161,27 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
     }
 
     if (record_lifecycle_timing) thread_handshake_timing_[tidx].end_cycles = get_sys_cnt_aicpu();
+}
+
+int32_t AicoreLifecycle::validate_discovery() {
+    bool valid = core_count_ > 0 && !handshake_failed_.load(std::memory_order_acquire);
+    for (int32_t i = 0; i < core_count_; ++i) {
+        if (cores_[i].reg_addr == 0) {
+            valid = false;
+            continue;
+        }
+        for (int32_t previous = 0; previous < i; ++previous) {
+            if (cores_[previous].reg_addr != cores_[i].reg_addr) continue;
+            // A register window has one retirement owner. The duplicate report
+            // remains unacknowledged and cannot contribute retirement proof.
+            LOG_ERROR("Duplicate AICore register window reported by workers %d and %d", previous, i);
+            cores_[i].reg_addr = 0;
+            valid = false;
+            break;
+        }
+    }
+    if (!valid) handshake_failed_.store(true, std::memory_order_release);
+    return valid ? 0 : -SIMPLER_ERROR_INVALID_ARGS;
 }
 
 int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
@@ -291,8 +324,11 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
 
     // Leader-only, after the topology, because `pmu_aicpu_init` needs every
     // core's physical id.
-    if (is_pmu_enabled())
+    if (is_pmu_enabled()) {
+        if (get_platform_pmu_base() == 0) return -SIMPLER_ERROR_INVALID_ARGS;
         pmu_aicpu_init(physical_core_ids_, core_count_, static_cast<PmuEventType>(runtime->dev.pmu_event_type));
+        pmu_initialized_ = true;
+    }
     wmb();
     return 0;
 }
@@ -383,42 +419,18 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
 }
 
 int32_t AicoreLifecycle::release_partition(Runtime *runtime, int32_t thread_idx, bool start_execution) {
+    if (core_count_ <= 0 || aicpu_thread_num_ <= 0) return -SIMPLER_ERROR_INVALID_ARGS;
+    if (!start_execution) return finish_shutdown_partition(thread_idx, runtime);
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
-    int32_t rc = 0;
     AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
-    if (start_execution && trace != nullptr && lifecycle_timing_enabled())
-        trace->register_release_start_cycles = get_sys_cnt_aicpu();
+    if (trace != nullptr && lifecycle_timing_enabled()) trace->register_release_start_cycles = get_sys_cnt_aicpu();
     wmb();
-    if (start_execution) {
-        for (int32_t i = lo; i < hi; ++i) {
-            if (cores_[i].reg_addr != 0) platform_init_aicore_regs(cores_[i].reg_addr);
-        }
-    } else {
-        AicoreExitTarget targets[kMaxWorkers];
-        int32_t core_ids[kMaxWorkers];
-        size_t count = 0;
-        for (int32_t i = lo; i < hi; ++i) {
-            if (cores_[i].reg_addr == 0) continue;
-            targets[count] = {cores_[i].reg_addr, &runtime->get_teardown_gates()[i]};
-            core_ids[count] = i;
-            ++count;
-        }
-        bool released[kMaxWorkers];
-        if (count != 0) {
-            rc = platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
-            for (size_t i = 0; i < count; ++i) {
-                if (!released[i]) continue;
-                Handshake *report = &runtime->dev.workers[core_ids[i]];
-                aicore_invalidate_retired_report(report);
-                cache_flush_range(report, sizeof(*report));
-            }
-            wmb();
-        }
+    for (int32_t i = lo; i < hi; ++i) {
+        if (cores_[i].reg_addr != 0) platform_init_aicore_regs(cores_[i].reg_addr);
     }
-    if (start_execution && trace != nullptr && lifecycle_timing_enabled())
-        trace->register_release_end_cycles = get_sys_cnt_aicpu();
-    return rc;
+    if (trace != nullptr && lifecycle_timing_enabled()) trace->register_release_end_cycles = get_sys_cnt_aicpu();
+    return 0;
 }
 
 void AicoreLifecycle::signal_shutdown_partition(int32_t thread_idx) {
@@ -435,6 +447,7 @@ void AicoreLifecycle::signal_shutdown_partition(int32_t thread_idx) {
 }
 
 int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *runtime) {
+    if (core_count_ <= 0 || aicpu_thread_num_ <= 0) return -SIMPLER_ERROR_INVALID_ARGS;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
     AicoreExitTarget targets[kMaxWorkers];
@@ -448,17 +461,15 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
     }
     AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
     if (trace != nullptr && lifecycle_timing_enabled()) trace->exit_wait_start_cycles = get_sys_cnt_aicpu();
-    bool released[kMaxWorkers];
-    const int32_t rc =
+    bool released[kMaxWorkers]{};
+    int32_t rc =
         count == 0 ? 0 : platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
-    // What this partition can vouch for, core by core. A core this run never
-    // opened a window on cannot be executing, and a core in `targets` counts
-    // only on its own acknowledgement — the group's return code is the
-    // partition's summary, not each core's. The sum across partitions is what
-    // gates every later read of what these cores wrote.
+    // A missing report cannot prove that its launched core stopped polling GM.
+    // Each core contributes retirement only after its own acknowledged release.
     int32_t proved = 0;
-    for (int32_t i = lo; i < hi; ++i) {
-        if (cores_[i].reg_addr == 0) ++proved;
+    if (count != static_cast<size_t>(hi - lo) && rc == 0) {
+        record_lifecycle_timeout(runtime, SchedulerErrorSite::AICPU_HANDSHAKE_TIMEOUT);
+        rc = -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
     }
     for (size_t i = 0; i < count; ++i) {
         if (released[i]) {
@@ -468,6 +479,7 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
             ++proved;
         } else {
             LOG_ERROR("AICore retirement: core %d not released", core_ids[i]);
+            if (rc == 0) rc = -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
         }
     }
     wmb();
@@ -568,6 +580,7 @@ bool AicoreLifecycle::settle_run_diagnostics(Runtime *runtime, bool graph_comple
         }
     }
     if (!is_pmu_enabled()) return true;
+    if (!pmu_initialized_) return false;
 
     // Every core, from the one participant that reaches here: the records are
     // written against each executing core's own buffer, so the publication and
@@ -616,6 +629,7 @@ bool AicoreLifecycle::settle_run_diagnostics(Runtime *runtime, bool graph_comple
 }
 
 void AicoreLifecycle::deinit() {
+    pmu_initialized_ = false;
     std::memset(physical_core_ids_, 0, sizeof(physical_core_ids_));
     std::memset(thread_handshake_timing_, 0, sizeof(thread_handshake_timing_));
     handshake_failed_.store(false, std::memory_order_release);

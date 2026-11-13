@@ -295,11 +295,11 @@ class HbgSpmdWorkerLayout : public ::testing::TestWithParam<uint64_t> {};
 
 TEST_P(HbgSpmdWorkerLayout, OrdinaryGraphHasNoProtocolAllocation) {
     AicoreSchedulerLayout ordinary{};
-    AicoreSchedulerLayout legacy{};
+    AicoreSchedulerLayout default_layout{};
     ASSERT_TRUE(scheduler_plan_layout(5, 2, 3, &ordinary, false, 0, requirements(GetParam(), 0, 0)));
-    ASSERT_TRUE(scheduler_plan_layout(5, 2, 3, &legacy));
+    ASSERT_TRUE(scheduler_plan_layout(5, 2, 3, &default_layout));
     expect_no_protocol_storage(ordinary);
-    EXPECT_EQ(ordinary.total_size, legacy.total_size);
+    EXPECT_EQ(ordinary.total_size, default_layout.total_size);
     scheduler_test::SchedulerStateBuffer storage(ordinary);
     ASSERT_NE(storage.base(), nullptr);
     expect_empty_protocol(storage.base(), ordinary);

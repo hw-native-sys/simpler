@@ -79,7 +79,7 @@
 | `args_bytes` | 一次实例所需参数描述符存储大小 |
 | `execution_count` | 模板所描述的 block/subtask 执行数量 |
 | `required_heap` | 实例所需 heap 字节数 |
-| `legacy_execution_storage_bytes` | 与输入 Definition 对齐校验的 execution_storage_bytes；保留字段名不表示转入 legacy 流程 |
+| `reserved_execution_storage_bytes` | 输入 Definition 的 execution_storage_bytes，作为当前参数 backing 的容量边界 |
 | `graph_key` | 图定义标识 |
 
 **范围与用途：** 每个模板中的每个 child 一份 64B GM 计划，随模板被多个实例共享；其中参数偏移与具体 instance.args_base 合起来才得到本次 child 的参数地址。

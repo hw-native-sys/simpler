@@ -7,28 +7,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Which scheduler every a5 host_build_graph test actually ran on.
+"""Check that each marked A5 HBG run publishes its own resident selection.
 
-The runtime falls back to the legacy AICPU scheduler silently — one LOG_INFO and
-nothing a test can see. Every guard in this directory would stay green through
-such a fallback, because legacy produces correct results; the resident AICore
-scheduler simply would not have run. That makes result-only tests blind to the
-one thing the per-core Scheduler work changes.
+    pytestmark = pytest.mark.scheduler_mode("resident")
 
-`Worker.scheduler_runtime_mode` closes that hole. This fixture reads it after
-every test and fails when the selection is not the one the test declares, so a
-change that quietly reroutes a test to the legacy scheduler is reported at that
-test rather than discovered later.
-
-Declaring the expectation:
-
-    pytestmark = pytest.mark.scheduler_mode("legacy")        # whole module
-    @pytest.mark.scheduler_mode("resident")                  # one class or test
-
-Unmarked tests are not checked, so the coverage can be filled in gradually.
-A marked test whose worker published no selection at all also fails: that means
-either the test never ran a graph, or the hook is not wired on this build — both
-are things a guard should report rather than pass over.
+A marked test must bind a graph and publish a fresh mode for its invocation.
+A successful output alone does not establish which runtime executed the graph.
 """
 
 import json
@@ -43,18 +27,15 @@ _MODE_NAMES = {
     0: "none",
     1: "resident (pending)",
     2: "resident (ready)",
-    3: "legacy (Graph capability fallback)",
-    4: "legacy (unsupported shape)",
 }
 _RESIDENT_MODES = frozenset({1, 2})
-_LEGACY_MODES = frozenset({3, 4})
-_EXPECTED = {"resident": _RESIDENT_MODES, "legacy": _LEGACY_MODES}
+_EXPECTED = {"resident": _RESIDENT_MODES}
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "scheduler_mode(kind): assert this test ran on the 'resident' or 'legacy' a5 HBG scheduler",
+        "scheduler_mode(kind): assert this test ran on the resident A5 HBG scheduler",
     )
 
 
@@ -64,7 +45,7 @@ def _expected_kind(request):
         return None
     kind = marker.args[0] if marker.args else None
     if kind not in _EXPECTED:
-        raise pytest.UsageError(f"scheduler_mode expects 'resident' or 'legacy', got {kind!r}")
+        raise pytest.UsageError(f"scheduler_mode expects 'resident', got {kind!r}")
     return kind
 
 
@@ -101,7 +82,7 @@ def _assert_scheduler_mode(request, st_platform):
     )
     assert mode in _EXPECTED[kind], (
         f"test declares scheduler_mode({kind!r}) but ran on {name}; "
-        f"a silent fallback would leave a result-only guard green"
+        f"the current A5 HBG contract requires resident execution"
     )
 
 

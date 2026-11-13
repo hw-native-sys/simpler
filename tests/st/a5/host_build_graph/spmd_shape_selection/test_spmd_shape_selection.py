@@ -22,7 +22,7 @@ class TestSpmdShapeSelection(SceneTestCase):
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/spmd_legacy_fallback_orch.cpp",
+            "source": "kernels/orchestration/spmd_shape_selection_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.INOUT],
         },

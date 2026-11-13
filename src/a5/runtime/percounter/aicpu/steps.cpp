@@ -46,8 +46,7 @@ uint64_t scheduler_timeout_cycles() {
 
 }  // namespace
 
-// A percounter graph is the only thing this runtime is built to run, so the
-// legacy dispatch path behind a false here is never the right answer.
+// A percounter graph is the only bootstrap this runtime accepts.
 bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
     return simpler::percounter::percounter_mode_enabled(runtime);
 }

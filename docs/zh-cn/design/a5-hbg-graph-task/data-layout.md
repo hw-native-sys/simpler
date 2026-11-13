@@ -126,7 +126,7 @@ AICore 读端使用 address-space-aware 的 POD 访问辅助函数，不复制 C
 
 每个唯一 Definition 生成一份 128-byte A5 template：`definition_offset/definition_bytes/child_plans_offset/`
 `fanin_offsets_offset/fanin_indices_offset/sinks_offset/task_count/edge_count/sink_count/args_bytes/`
-`execution_count/required_heap/legacy_execution_storage_bytes/graph_key` 十四个 `uint64_t`。
+`execution_count/required_heap/reserved_execution_storage_bytes/graph_key` 十四个 `uint64_t`。
 fanin offset/indices 指向 blob 内既有 CSR，不另复制一份 CSR；sink 为额外的 `uint16_t[]`。
 所有偏移以 native scheduler image 起点为基准，使用 `uint64_t`；数量在转换为 unsigned wire 前先拒绝负值。
 Definition 内原始 32-bit section offsets 保持原布局，解析时做 checked widening/addition。
@@ -204,25 +204,27 @@ bootstrap 的 node 分区 owner 并行写各自 child 参数，利用现有 scan
 
 首版 args_base 指向 `heap_base + definition.required_heap`，复用当前 shell 已预留的 execution tail。
 检查 args_base 的 64-byte 对齐，以及 `native_args_bytes <= definition.execution_storage_bytes`。
-这是布局校验，不是遇到不等式失败就运行中换地址；合法但 native 布局不适配可在发布前选择 legacy。
+这是发布前的硬校验；不等式失败就拒绝 prepare，不改变执行器或在运行中换地址。
+每个 child 的 tensor/scalar offset 必须等于对应池的连续游标，最终游标必须覆盖完整池。
+参数区间重叠、留洞和未使用的池尾部都不属于当前 Definition 合同。
 该区域只写 native 参数，不同时 placement-new `GraphExecution` 或 child `ChipTaskStorage`。
 旧 tail 的预留大小仍计入内存报告，不能宣称已节省其 320×child_count 字节。
 
 ## Host 准备与生命周期
 
-当前 `bind_graph_definitions` 同时 pack、校验和选择 AICPU carrier，而 `create_scheduler_state` 位于更晚的 commit。
-需要拆开这两个职责，按下面顺序执行：
+`bind_graph_definitions` pack 并校验 Definition，`create_scheduler_state` 在 commit 阶段创建 resident image。
+它们按下面顺序执行：
 
 1. 等待所有 recording job 完成，保持现有 Graph shell 提交、heap 预留与 boundary 校验。
 2. pack 并验证所有唯一 Definition；从 fanin 推导 roots/sinks，检查扇出 CSR 与其一致。
-3. 汇总整个 run 的能力。先拒绝非法图；再选 native 或合法的整 run legacy fallback。
+3. 汇总整个 run 的形状与容量，拒绝非法图或不满足当前 resident 合同的输入。
 4. 生成不含本次设备地址的 `NativeGraphHostPlan`：blob 自有字节、template、node map、prefix、计数和静态元数据。
 5. 通过当前静态 arena/heap 流程取得实际 device backing，compact/rebase 原始 SM。
 6. 根据实际 GM base 填实例地址，生成 native scheduler image，初始化每个 control 和 admission record。
 7. 将所有待上传内容交给本 run slot 的 publication batch；完成既有 publication 后才能启动。
 
 native 模式的 Definition 位于同一份 GM scheduler backing 的只读区域，每个 Definition 每 run 复制一次。
-legacy 模式继续使用 LaunchEnvelope/HostSnapshot。native 不同时再把整份 Definition 附到每个 AICPU launch envelope。
+Definition 不附到每个 AICPU launch envelope；Host 另外保留原始 Definition section，供独立 protocol oracle 使用。
 总定义字节影响一次合并上传的大小，实例数不增加 Definition 复制次数；并不承诺整个 run 只有一次 H2D。
 
 `GraphHostState` 是 orchestration 函数的局部对象，返回后销毁。
@@ -263,7 +265,7 @@ native_scheduler_bytes = header + Definition blobs + templates + child plans + s
                        + ready pool descriptors/controls + actual kernel ready entries
                        + existing worker/run/ready regions + alignment padding
                        + actual enabled diagnostics
-reserved_graph_heap = sum(required_heap + legacy_execution_storage_bytes)
+reserved_graph_heap = sum(required_heap + reserved_execution_storage_bytes)
 ```
 
 native_scheduler_bytes 是 scheduler backing 总量，不是相对于旧 scheduler 的增量；公共原始 SM 和其他 runtime backing 另计。
