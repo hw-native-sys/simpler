@@ -1732,12 +1732,7 @@ struct SchedulerState {
 
     // Forget per-region pointers; arena owns the backing memory.
     void destroy();
-    void print_stats();
-    void print_queues();
 };
-
-// Scheduler cold-path API is declared as SchedulerState member functions.
-// See init()/destroy()/print_stats()/print_queues() below the struct definition.
 
 // try_inline_complete_locked: short-circuit NotDeferred completions seen during
 // drain so they don't grow entries[]. Defined here (not in async_wait.h)
@@ -1837,37 +1832,3 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     unlock();
     return result;
 }
-
-// =============================================================================
-// Scheduler Profiling Data
-// =============================================================================
-
-#if SIMPLER_SCHED_PROFILING
-struct SchedProfilingData {
-    // Sub-phase cycle breakdown within on_task_complete
-    uint64_t lock_cycle;           // lock_fanout + state store + unlock
-    uint64_t fanout_cycle;         // fanout traversal
-    uint64_t fanin_cycle;          // fanin traversal
-    uint64_t self_consumed_cycle;  // self check_and_handle_consumed
-
-    // Wait times
-    uint64_t lock_wait_cycle;  // Legacy (wiring): fanout_lock spin-wait; polling has no such lock
-    uint64_t push_wait_cycle;  // CAS contention in push()
-    uint64_t pop_wait_cycle;   // CAS contention in pop()
-
-    // Atomic counts per sub-phase
-    uint64_t lock_atomic_count;
-    uint64_t fanout_atomic_count;
-    uint64_t fanin_atomic_count;
-    uint64_t self_atomic_count;
-    uint64_t pop_atomic_count;
-
-    int64_t complete_count;
-};
-
-/**
- * Get and reset scheduler profiling data for a specific thread.
- * Returns accumulated profiling data and resets counters.
- */
-SchedProfilingData scheduler_get_profiling(int thread_idx);
-#endif

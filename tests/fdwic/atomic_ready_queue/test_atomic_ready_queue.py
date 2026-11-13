@@ -26,8 +26,8 @@ from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_
 MAX_WORKERS = 96
 PER_PRODUCER = 16
 MAX_TASKS = MAX_WORKERS // 3 * PER_PRODUCER
-STATE_LINES = 6 + MAX_TASKS + 1 + 2 + 6 * MAX_WORKERS + 12 + 2 * MAX_TASKS
-STATE_BYTES = STATE_LINES * 64
+STATE_LINES = 12 + MAX_TASKS + 1 + 2 + 6 * MAX_WORKERS + 12 + 2 * MAX_TASKS
+STATE_BYTES = (STATE_LINES * 64 + 127) // 128 * 128
 RECORD_WORDS = 24
 
 
@@ -71,7 +71,7 @@ def validate_records(records, params):
         )
         assert torch.all(members[:, 14] == params["mask"]).item(), "wrong task mask"
         assert torch.all(members[:, 15] == workers).item(), "wrong participant count"
-        expected_summary = [0, epoch, tasks, tasks, tasks, tasks, 4, 4, 1, 2, 15, 64, 128, STATE_BYTES, -1, workers]
+        expected_summary = [0, epoch, tasks, tasks, tasks, tasks, 4, 4, 1, 2, 15, 64, 256, STATE_BYTES, -1, workers]
         assert summary.tolist() == expected_summary, f"queue/guard/summary mismatch: {summary.tolist()}"
     return {
         "workers": workers,

@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "aicpu/pmu_collector_aicpu.h"
 #include "common/args_dump.h"
@@ -50,6 +51,7 @@ struct RegisterTransport {
     std::condition_variable changed;
     std::array<bool, kParticipants> returned{};
     std::array<int, kParticipants> opened{};
+    std::array<int, kParticipants> exit_windows{};
     std::array<int, kParticipants> signaled{};
     std::array<int, kParticipants> retired{};
     int held_participant = -1;
@@ -57,6 +59,8 @@ struct RegisterTransport {
     int32_t header_before_late = SIMPLER_ERROR_NONE;
     bool late_error = false;
     bool invalidate_graph_on_release = false;
+    bool fail_after_partitions_open = false;
+    int opened_partitions = 0;
     bool invalidated = false;
     bool saw_held_owner = false;
 
@@ -85,12 +89,25 @@ void write_reg(uint64_t, RegId, uint64_t) {}
 uint64_t read_reg(uint64_t, RegId) { return 0; }
 
 void platform_init_aicore_regs(uint64_t address) {
-    std::lock_guard<std::mutex> lock(transport->mutex);
+    std::unique_lock<std::mutex> lock(transport->mutex);
     ++transport->opened[register_index(address)];
+    if (transport->fail_after_partitions_open) {
+        ++transport->opened_partitions;
+        transport->changed.notify_all();
+        transport->changed.wait(lock, [] {
+            return transport->opened_partitions == kParticipants;
+        });
+        g_aicpu_executor.init_failed_.store(true, std::memory_order_release);
+    }
     if (transport->invalidate_graph_on_release && !transport->invalidated) {
         transport->runtime->dev.host_total_tasks = -1;
         transport->invalidated = true;
     }
+}
+
+void platform_open_aicore_exit_window(uint64_t address) {
+    std::lock_guard<std::mutex> lock(transport->mutex);
+    ++transport->exit_windows[register_index(address)];
 }
 
 void platform_signal_aicore_exit(uint64_t address) {
@@ -126,13 +143,6 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         if (released != nullptr) released[i] = success;
     }
     return success ? 0 : -1;
-}
-
-extern "C" void aicpu_reset_legacy_execution_entry() {}
-
-extern "C" int32_t legacy_aicpu_execute(Runtime *) {
-    ADD_FAILURE() << "resident entry reached legacy execution";
-    return -1;
 }
 
 namespace {
@@ -375,16 +385,227 @@ TEST_F(ResidentEntryResult, AnInvalidGraphAtRunEntryReturnsTheSupervisorsOwnFail
     expect_normal_lifecycle();
 }
 
+TEST_F(ResidentEntryResult, InvalidModesRetireEveryReportedCoreAndPermitTheNextRun) {
+    for (uint32_t mode : {0U, 3U, 4U, UINT32_MAX}) {
+        SCOPED_TRACE(mode);
+        configure(mode);
+        EXPECT_EQ(
+            execute(), (std::array<int32_t, kParticipants>{
+                           -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
+                       })
+        );
+        EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
+        EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
+        for (const auto &report : runtime->dev.workers)
+            EXPECT_EQ(report.aicore_done, 0u);
+        const auto terminal = device_run_result_terminal(result, kEpoch);
+        EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+        EXPECT_EQ(terminal.code, -SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(aicpu_release_callables(), 0);
+        configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
+        EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));
+        expect_normal_lifecycle();
+    }
+}
+
+TEST_F(ResidentEntryResult, DuplicateReportsInAnInvalidModeHaveOneRetirementOwner) {
+    configure(UINT32_MAX);
+    for (int32_t worker = 0; worker < kParticipants; ++worker)
+        runtime->dev.workers[worker].physical_core_id = 0;
+    for (int32_t status : execute())
+        EXPECT_NE(status, 0);
+    EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
+    EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 0, 0}));
+    EXPECT_EQ(runtime->dev.workers[0].aicore_done, 0u);
+    EXPECT_EQ(runtime->dev.workers[1].aicore_done, 2u);
+    EXPECT_EQ(runtime->dev.workers[2].aicore_done, 3u);
+    EXPECT_EQ(image->control.scheduler_error, 0u);
+    EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Failed);
+}
+
+TEST_F(ResidentEntryResult, InvalidBootstrapBasesRetireWithoutReadingTheSchedulerImage) {
+    for (uint32_t mode : {SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, SCHEDULER_RUNTIME_MODE_RESIDENT_READY}) {
+        for (uint64_t base : {UINT64_C(0), UINT64_C(1), UINT64_MAX - UINT64_C(63)}) {
+            SCOPED_TRACE(mode);
+            SCOPED_TRACE(base);
+            configure(mode);
+            runtime->publish_scheduler_bootstrap(mode, base);
+            EXPECT_EQ(
+                execute(), (std::array<int32_t, kParticipants>{
+                               -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
+                           })
+            );
+            EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
+            EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
+            EXPECT_EQ(image->control.scheduler_error, 0u);
+            EXPECT_EQ(image->control.bootstrap_complete, 1u);
+            EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Failed);
+        }
+    }
+}
+
+TEST_F(ResidentEntryResult, FailedStartupKeepsAnUnacknowledgedCoreOwnedAndCannotPublishSuccess) {
+    configure(UINT32_MAX);
+    state->failed_participant = 0;
+    const auto statuses = execute();
+    for (int32_t status : statuses)
+        EXPECT_NE(status, 0);
+    EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
+    EXPECT_EQ(runtime->dev.workers[0].aicore_done, 1u);
+    EXPECT_EQ(runtime->dev.workers[1].aicore_done, 0u);
+    EXPECT_EQ(runtime->dev.workers[2].aicore_done, 0u);
+    EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Failed);
+}
+
+TEST_F(ResidentEntryResult, FailedStartupPreservesTheFirstHeaderError) {
+    configure(UINT32_MAX);
+    header.sched_error_code.store(SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    EXPECT_EQ(
+        execute(), (std::array<int32_t, kParticipants>{
+                       -SIMPLER_ERROR_READY_QUEUE_OVERFLOW, -SIMPLER_ERROR_READY_QUEUE_OVERFLOW,
+                       -SIMPLER_ERROR_READY_QUEUE_OVERFLOW
+                   })
+    );
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    EXPECT_EQ(device_run_result_terminal(result, kEpoch).code, -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+}
+
+TEST_F(ResidentEntryResult, AFailureFlagDoesNotReplacePhaseOwnerCompletion) {
+    enum class Event { WaitingForOwner, OwnerCompleted, JoinReturned };
+    std::atomic<bool> failed{true};
+    bool observed_pending = false;
+    bool owner_completed = false;
+    std::vector<Event> events;
+    join_initialization_phase(
+        runtime.get(),
+        [&] {
+            if (!observed_pending) {
+                observed_pending = true;
+                events.push_back(Event::WaitingForOwner);
+                return false;
+            }
+            if (!owner_completed) {
+                owner_completed = true;
+                events.push_back(Event::OwnerCompleted);
+            }
+            return owner_completed;
+        },
+        failed
+    );
+    events.push_back(Event::JoinReturned);
+    EXPECT_EQ(events, (std::vector<Event>{Event::WaitingForOwner, Event::OwnerCompleted, Event::JoinReturned}));
+    EXPECT_TRUE(owner_completed);
+    EXPECT_TRUE(failed.load());
+}
+
+TEST_F(ResidentEntryResult, AFailureAfterPartitionReleaseRetiresEveryStartedCore) {
+    state->fail_after_partitions_open = true;
+    EXPECT_EQ(
+        execute(), (std::array<int32_t, kParticipants>{
+                       -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
+                   })
+    );
+    EXPECT_EQ(state->opened_partitions, kParticipants);
+    EXPECT_EQ(state->opened, (std::array<int, kParticipants>{1, 1, 1}));
+    EXPECT_EQ(state->signaled, (std::array<int, kParticipants>{1, 1, 1}));
+    EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
+    EXPECT_EQ(g_aicpu_executor.normal_path_claims_.load(), 0);
+    EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Failed);
+    EXPECT_EQ(device_run_result_terminal(result, kEpoch).source, DeviceRunCodeSource::Header);
+}
+
+TEST_F(ResidentEntryResult, InvalidAicpuThreadCountsHaveOneStartupAbortOwner) {
+    for (int32_t threads : {-1, static_cast<int32_t>(PLATFORM_MAX_AICPU_THREADS) + 1}) {
+        SCOPED_TRACE(threads);
+        configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
+        runtime->dev.aicpu_thread_num = threads;
+        EXPECT_EQ(
+            execute(), (std::array<int32_t, kParticipants>{
+                           -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
+                       })
+        );
+        EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
+        EXPECT_EQ(state->exit_windows, (std::array<int, kParticipants>{1, 1, 1}));
+        EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
+        for (int32_t worker = 0; worker < kParticipants; ++worker)
+            EXPECT_EQ(runtime->dev.workers[worker].aicore_done, 0u);
+        const auto terminal = device_run_result_terminal(result, kEpoch);
+        EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+        EXPECT_EQ(terminal.code, -SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(terminal.source, DeviceRunCodeSource::Header);
+        configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
+        EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));
+        expect_normal_lifecycle();
+    }
+}
+
+TEST_F(ResidentEntryResult, InvalidAicpuThreadCountCannotReleaseReportsWithoutAnAck) {
+    runtime->dev.aicpu_thread_num = -1;
+    state->failed_participant = 0;
+    EXPECT_EQ(
+        execute(), (std::array<int32_t, kParticipants>{
+                       -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
+                   })
+    );
+    EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
+    EXPECT_EQ(state->exit_windows, (std::array<int, kParticipants>{1, 1, 1}));
+    EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
+    for (int32_t worker = 0; worker < kParticipants; ++worker)
+        EXPECT_EQ(runtime->dev.workers[worker].aicore_done, static_cast<uint32_t>(worker + 1));
+    EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Failed);
+}
+
+TEST_F(ResidentEntryResult, InvalidWorkerCountsReturnFailureWithoutARegisterPartition) {
+    for (int32_t workers : {-1, 0, static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) + 1}) {
+        SCOPED_TRACE(workers);
+        configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
+        runtime->set_worker_count(workers);
+        EXPECT_EQ(
+            execute(), (std::array<int32_t, kParticipants>{
+                           -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
+                       })
+        );
+        EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
+        EXPECT_EQ(state->signaled, (std::array<int, kParticipants>{0, 0, 0}));
+        EXPECT_EQ(state->retired, (std::array<int, kParticipants>{0, 0, 0}));
+        EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Failed);
+        EXPECT_EQ(device_run_result_terminal(result, kEpoch).source, DeviceRunCodeSource::Header);
+    }
+}
+
+TEST_F(ResidentEntryResult, FailedInitializationPreservesAnAlreadyPublishedAsyncError) {
+    ASSERT_TRUE(record_aicore_scheduler_runtime_error(
+        &image->control, SchedulerGraphResult::ASYNC_WAIT_OVERFLOW, SchedulerErrorSite::ASYNC_CONTEXT_INVALID
+    ));
+    runtime->dev.workers[2].core_type = CoreType::AIC;
+    EXPECT_EQ(
+        execute(),
+        (std::array<int32_t, kParticipants>{
+            -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW, -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW, -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW
+        })
+    );
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    const auto terminal = device_run_result_terminal(result, kEpoch);
+    EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+    EXPECT_EQ(terminal.code, -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_EQ(terminal.source, DeviceRunCodeSource::Header);
+}
+
 TEST_F(ResidentEntryResult, FailedTopologyInitializationReturnsThroughTheActualAbortCleanup) {
     runtime->dev.workers[2].core_type = CoreType::AIC;
-    EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{-1, -1, -1}));
+    EXPECT_EQ(
+        execute(), (std::array<int32_t, kParticipants>{
+                       -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
+                   })
+    );
     EXPECT_EQ(state->opened, (std::array<int, kParticipants>{0, 0, 0}));
     EXPECT_EQ(state->signaled, (std::array<int, kParticipants>{0, 0, 0}));
     EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
     const auto terminal = device_run_result_terminal(result, kEpoch);
     EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
-    EXPECT_EQ(terminal.code, -1);
-    EXPECT_EQ(terminal.source, DeviceRunCodeSource::ThreadRc);
+    EXPECT_EQ(terminal.code, -SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(terminal.source, DeviceRunCodeSource::Header);
     EXPECT_EQ(aicpu_release_callables(), 0);
     configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
     EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));

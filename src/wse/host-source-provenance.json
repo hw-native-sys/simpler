@@ -1,0 +1,42 @@
+{
+  "source_revision": "e45ff348c6ccf63878adf9bf50a89dbe91af89f2",
+  "owner": "WSE",
+  "copies": [
+    {
+      "source": "src/common/platform/sim/host/device_runner_base.h",
+      "destination": "src/wse/platform/sim/host/wse_host_runner.h",
+      "sha256": "0f0b6d42e0016576a64f8a4ba04268ffbadc7f7355fb3e678b63175da9cbf334"
+    },
+    {
+      "source": "src/common/platform/sim/host/device_runner_base.cpp",
+      "destination": "src/wse/platform/sim/host/wse_host_runner.cpp",
+      "sha256": "ab2723c0f6a004fb7b35e620ccb8413fb646f4f3221b94a4234ec37a30f0c64c"
+    },
+    {
+      "source": "src/common/platform/sim/host/c_api_shared.cpp",
+      "destination": "src/wse/platform/sim/host/wse_runtime_api.cpp",
+      "sha256": "e2afea60f4ac88258b8a6dc55faf0167042585f69cc47b34a6331154368da2fb"
+    },
+    {
+      "source": "src/common/worker/native_run_execution.h",
+      "destination": "src/wse/platform/sim/host/wse_launch_transaction.h",
+      "sha256": "171ceed6409bfe34df3c3023934705d84fe2051e85ac71723c64745ea146f1b5"
+    },
+    {
+      "source": "src/common/host_build_graph/host/orchestrator.cpp",
+      "destination": "src/wse/runtime/host_build_graph/host/wse_graph_orchestrator.cpp",
+      "sha256": "df7776aea4c5dbf667e6d71f38193e6a6564aae5bf3f51f8c2bc0d9fc5334646"
+    },
+    {
+      "source": "src/common/host_build_graph/host/graph_submit.cpp",
+      "destination": "src/wse/runtime/host_build_graph/host/wse_graph_submit.cpp",
+      "sha256": "64059eedb545b52e25fc925b6451076033ca986349e006b9ccd925230deefda6"
+    },
+    {
+      "source": "src/common/worker/native_run_context.h",
+      "destination": "src/wse/platform/sim/host/wse_native_run_context.h",
+      "sha256": "2009b734b0da580b040abe4cce68ae5bf49cc04fe2a707e6c6b1cec35ef7b84a"
+    }
+  ],
+  "maintenance": "WSE-owned implementations of the existing runtime C ABI and HBG declarations; shared headers are not shadowed."
+}

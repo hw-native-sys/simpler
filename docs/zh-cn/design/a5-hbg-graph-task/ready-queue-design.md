@@ -254,7 +254,7 @@ AIC/AIV 编译探针实例化单项与批量接口，CCEC 编译通过；CPU hoo
 原始证据保存在 `outputs/a5-hbg-graph-task/queue-refactor/`。
 共用原语及接入版本包含 `SchedulerReadyPoolHeader`、
 逐组 descriptor 和 Host 规划器；`SchedulerGraphSummary.ready_pool_offset` 明确定义新字段，
-summary 仍为 128 bytes。每个队列的 head/tail 各占 64-byte 行，entries 独立按 64-byte 对齐。
+summary 仍为 128 bytes。每个队列的 head/tail 各占128-byte原子区域，entries保持64-byte步长。
 Host 按实际 metadata 分配；同址新 run 清空全部 backing，并将每个 entry 置为 -1。
 
 bootstrap、kernel completion 和 control resolve 的 kernel batch 共用新发布入口；

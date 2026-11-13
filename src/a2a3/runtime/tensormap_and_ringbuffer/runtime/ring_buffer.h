@@ -485,7 +485,8 @@ private:
         LOG_ERROR("========================================");
         if (error_code_ptr_) {
             int32_t code = heap_blocked ? SIMPLER_ERROR_HEAP_RING_DEADLOCK : SIMPLER_ERROR_FLOW_CONTROL_DEADLOCK;
-            error_code_ptr_->store(code, std::memory_order_release);
+            int32_t expected = SIMPLER_ERROR_NONE;
+            error_code_ptr_->compare_exchange_strong(expected, code, std::memory_order_acq_rel);
         }
     }
 };
@@ -553,7 +554,10 @@ struct FaninPool {
             LOG_ERROR("  Per task:     CallConfig.runtime_env.ring_dep_pool=%d", capacity * 2);
             LOG_ERROR("========================================");
             if (error_code_ptr) {
-                error_code_ptr->store(SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, std::memory_order_release);
+                int32_t expected = SIMPLER_ERROR_NONE;
+                error_code_ptr->compare_exchange_strong(
+                    expected, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, std::memory_order_acq_rel
+                );
             }
             return nullptr;
         }
@@ -758,7 +762,10 @@ struct DepListPool {
             LOG_ERROR("  Per task:     CallConfig.runtime_env.ring_dep_pool=%d", capacity * 2);
             LOG_ERROR("========================================");
             if (error_code_ptr) {
-                error_code_ptr->store(SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, std::memory_order_release);
+                int32_t expected = SIMPLER_ERROR_NONE;
+                error_code_ptr->compare_exchange_strong(
+                    expected, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, std::memory_order_acq_rel
+                );
             }
             return nullptr;
         }

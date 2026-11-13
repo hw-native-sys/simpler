@@ -51,13 +51,13 @@ inline bool scheduler_plan_ready_pool(
             &header.descriptors_offset
         ) ||
         !scheduler_layout_reserve(
-            &cursor, next.descriptors.size() * sizeof(SchedulerTicketQueue), SCHEDULER_STATE_ALIGNMENT,
+            &cursor, next.descriptors.size() * sizeof(SchedulerTicketQueue), alignof(SchedulerTicketQueue),
             &header.controls_offset
         ))
         return false;
     for (auto &descriptor : next.descriptors)
         if (!scheduler_layout_reserve(
-                &cursor, descriptor.capacity * sizeof(SchedulerTicketEntry), SCHEDULER_STATE_ALIGNMENT,
+                &cursor, descriptor.capacity * sizeof(SchedulerTicketEntry), alignof(SchedulerTicketEntry),
                 &descriptor.entries_offset
             ))
             return false;

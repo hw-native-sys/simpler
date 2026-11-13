@@ -27,6 +27,11 @@ class RdmaConfig:
 
 
 @dataclass(frozen=True)
+class CcuConfig:
+    """CCU window credentials with the provider's default configuration."""
+
+
+@dataclass(frozen=True)
 class UrmaConfig:
     """PER_PEER queues per AIV; sq_depth requests provider depth (zero selects its default).
 
@@ -48,9 +53,9 @@ class UrmaConfig:
             raise ValueError("sq_depth must be zero or a power of two below 2**31")
 
 
-WorkspaceEngineConfig = Union[SdmaConfig, UrmaConfig, RdmaConfig]
+WorkspaceEngineConfig = Union[SdmaConfig, UrmaConfig, RdmaConfig, CcuConfig]
 WorkspaceEngines = Union[Sequence[str], Mapping[str, WorkspaceEngineConfig]]
-_CONFIG_TYPES = {"sdma": SdmaConfig, "urma": UrmaConfig, "rdma": RdmaConfig}
+_CONFIG_TYPES = {"sdma": SdmaConfig, "urma": UrmaConfig, "rdma": RdmaConfig, "ccu": CcuConfig}
 
 
 def normalize_workspace_configs(workspace_engines) -> tuple[tuple[str, WorkspaceEngineConfig], ...]:
@@ -58,7 +63,7 @@ def normalize_workspace_configs(workspace_engines) -> tuple[tuple[str, Workspace
         raise TypeError("workspace_engines must be a sequence of engine names or a configuration mapping")
     names = tuple(workspace_engines)
     if any(not isinstance(name, str) or name not in _CONFIG_TYPES for name in names) or len(set(names)) != len(names):
-        raise ValueError("workspace_engines requires distinct names from sdma, urma, rdma")
+        raise ValueError("workspace_engines requires distinct names from sdma, urma, rdma, ccu")
     if "rdma" in names and len(names) > 1:
         raise ValueError("RDMA domains do not map peer windows; use separate domains for other engines")
     configs = []

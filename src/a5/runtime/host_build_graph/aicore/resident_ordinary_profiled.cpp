@@ -9,6 +9,15 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "scheduler/scheduler_scalar_policy.h"
+
+namespace {
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = true;
+};
+}  // namespace
+
 #include "resident_scheduler_impl.h"
 
 namespace simpler::hbg::resident {

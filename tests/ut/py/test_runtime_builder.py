@@ -15,6 +15,11 @@ from unittest.mock import patch
 
 import pytest
 
+
+def _execution_targets(platform):
+    return ("host", "aicore") if platform == "wsesim" else ("host", "aicpu", "aicore")
+
+
 # --- Discovery tests (no compilation needed) ---
 
 
@@ -241,18 +246,22 @@ class TestRuntimeBuilderGetBinaries:
                 }
             }
         """)
+        if test_arch == "wse":
+            config_content += '\nBUILD_CONFIG.pop("aicpu")\n'
         (rt_dir / "build_config.py").write_text(config_content)
         return rt_dir
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_returns_runtime_binaries(self, MockCompiler, tmp_path, default_test_platform, test_arch):
-        """get_binaries(build=True) returns RuntimeBinaries with three paths."""
+        """get_binaries(build=True) returns paths for the declared components."""
         from simpler_setup.runtime_builder import RuntimeBinaries, RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, test_arch)
 
         # compile() returns Path when output_dir is set
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -260,7 +269,11 @@ class TestRuntimeBuilderGetBinaries:
 
         assert isinstance(result, RuntimeBinaries)
         assert result.host_path.name == "libhost.so"
-        assert result.aicpu_path.name == "libaicpu.so"
+        if "aicpu" in _execution_targets(default_test_platform):
+            assert result.aicpu_path is not None
+            assert result.aicpu_path.name == "libaicpu.so"
+        else:
+            assert result.aicpu_path is None
         assert result.aicore_path.name == "libaicore.so"
 
     def _isolated_builder(self, MockCompiler, tmp_path, monkeypatch, platform):
@@ -276,6 +289,8 @@ class TestRuntimeBuilderGetBinaries:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         mock_instance = MockCompiler.get_instance.return_value
+        if platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "a" * 40)
         monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
@@ -375,21 +390,23 @@ class TestRuntimeBuilderGetBinaries:
         assert dests["aicore"] == builder._LIB_DIR / "a2a3" / "sdma_warmup"
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
-    def test_calls_compiler_three_times(self, MockCompiler, tmp_path, default_test_platform, test_arch):
-        """get_binaries(build=True) invokes compiler.compile() exactly 3 times."""
+    def test_calls_compiler_for_each_runtime_target(self, MockCompiler, tmp_path, default_test_platform, test_arch):
+        """get_binaries(build=True) compiles each declared component exactly once."""
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
         builder.get_binaries("test_rt", build=True)
 
-        assert mock_instance.compile.call_count == 3
+        assert mock_instance.compile.call_count == len(_execution_targets(default_test_platform))
         targets = sorted(call.args[0] for call in mock_instance.compile.call_args_list)
-        assert targets == ["aicore", "aicpu", "host"]
+        assert targets == sorted(_execution_targets(default_test_platform))
         expected_defaults = {
             "SIMPLER_DFX": "1",
             "SIMPLER_ORCH_PROFILING": "0",
@@ -400,6 +417,10 @@ class TestRuntimeBuilderGetBinaries:
             expected = dict(expected_defaults)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+                from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+                expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
             assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -410,6 +431,8 @@ class TestRuntimeBuilderGetBinaries:
         self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -425,6 +448,8 @@ class TestRuntimeBuilderGetBinaries:
 
         self._make_runtime(tmp_path, test_arch)
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         config = {
             "SIMPLER_DFX": "1",
@@ -435,11 +460,15 @@ class TestRuntimeBuilderGetBinaries:
 
         RuntimeBuilder(platform=default_test_platform).get_binaries("test_rt", build=True, profiling_config=config)
 
-        assert mock_instance.compile.call_count == 3
+        assert mock_instance.compile.call_count == len(_execution_targets(default_test_platform))
         for call in mock_instance.compile.call_args_list:
             expected = dict(config)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+                from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+                expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
             assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -450,6 +479,8 @@ class TestRuntimeBuilderGetBinaries:
         rt_dir = self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -470,6 +501,8 @@ class TestRuntimeBuilderGetBinaries:
         self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = RuntimeError("cmake failed")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -979,11 +1012,12 @@ class TestRuntimeBuilderIntegration:
         result = builder.get_binaries(runtime_name, build=True)
 
         assert isinstance(result, RuntimeBinaries)
-        for label, path in [
-            ("host", result.host_path),
-            ("aicpu", result.aicpu_path),
-            ("aicore", result.aicore_path),
-        ]:
+        targets = _execution_targets(platform)
+        if "aicpu" not in targets:
+            assert result.aicpu_path is None
+        for label in targets:
+            path = getattr(result, f"{label}_path")
+            assert path is not None
             assert path.is_file(), f"{label} binary not found: {path}"
             assert path.stat().st_size > 0, f"{label} binary is empty: {path}"
 

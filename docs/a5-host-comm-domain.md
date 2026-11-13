@@ -7,9 +7,19 @@ and URMA can asynchronously fetch another rank's window into local Device memory
 The Host does not become an additional rank, and the table needs no matching
 HBM allocation.
 
-This implementation supports one machine, A5, and the
-`tensormap_and_ringbuffer` runtime. Cross-machine Host windows, A2/A3 support,
-and automatic table partitioning are outside this interface's current support.
+This A5 implementation supports one machine and the
+`tensormap_and_ringbuffer` runtime. Cross-machine Host windows and automatic
+table partitioning are outside its current support. A2/A3 uses the same domain
+API with MTE and SDMA; see [A2/A3 Host-source windows](comm-domain.md#a2a3-host-source-windows).
+
+Host-source URMA has passed on Ascend950DT_9581, including CANN 9.3.0 validation.
+On the A5 PR PCIe CI machine, Host mapping and segment registration succeeded
+but Host-source URMA reported an ACK timeout; this remains an unresolved
+[hardware-specific failure](https://github.com/hw-native-sys/simpler/pull/2913#issuecomment-6681762026).
+Before entering the URMA collective, all ranks must prepare their local windows.
+A positive registration result or UDMA capability does not establish peer
+reachability. If CANN reports that UDMA cannot access registered Host memory,
+the Host-source URMA allocation fails before entering the collective.
 
 ## Create and retain a table
 
@@ -167,7 +177,7 @@ creation and unlink; L3 only borrows the mapping and does not register Python
 resource-tracker ownership. Use `domain.release()`, not `buf.close()` or
 `buf.shm.unlink()`.
 
-Host windows use the owning Worker's `sp-<token>-h-...` namespace. Worker
+Host windows use the owning Worker's `sp-<token>-h-<pgid>-...` namespace. Worker
 teardown also unlinks orphan windows left by an abruptly terminated L2,
 including allocations that never returned a reply. Other Worker trees are
 outside that namespace and are not swept.

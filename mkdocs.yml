@@ -112,6 +112,7 @@ nav:
       - Chip-Level Architecture: chip-level-arch.md
       - Hierarchical Level Runtime: hierarchical-level-runtime.md
       - Task Flow: task-flow.md
+      - Run Pipeline and the KernelLaunch Stream: run-pipeline.md
       - Buffer Memory Model: buffer-abi.md
       - HBG host data access: hbg-host-data-access.md
       - Orchestrator: orchestrator.md
@@ -128,6 +129,8 @@ nav:
       - A5 local Host DDR access: design/a5-host-ddr.md
       - Run completion fences: design/run-completion-fence.md
       - Native framework submission: design/native-framework-submission.md
+      - Native CCU ABI: design/ccu-native-abi.md
+      - CCU Window Validation: design/ccu-window-validation.md
       - A5 HBG Graph task 设计:
           - 设计总览: zh-cn/design/a5-hbg-graph-task.md
           - 数据布局与 Host 绑定: zh-cn/design/a5-hbg-graph-task/data-layout.md
@@ -141,6 +144,7 @@ nav:
           - 性能与自主迭代流程: zh-cn/design/a5-hbg-graph-task/performance.md
           - Admission 方案排查记录: zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md
           - DSV4.1 调度改动取舍: zh-cn/investigations/2026-11-a5-hbg-dsv-scheduler-review.md
+          - Legacy 执行路径移除: zh-cn/investigations/2026-11-a5-hbg-legacy-removal.md
           - 设计复审: zh-cn/design/a5-hbg-graph-task/review.md
           - 已否定的性能尝试: zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md
           - 固定前缀成员历史测量: zh-cn/design/a5-hbg-graph-task/fixed-prefix-members.md

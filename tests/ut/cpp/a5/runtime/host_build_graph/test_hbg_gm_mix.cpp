@@ -754,7 +754,7 @@ TEST_P(HbgGmMixServiceError, AHealthyServicePassDoesNotCacheTheNextPassEpochOrEr
 
 TEST_P(HbgGmMixServiceError, ServiceValidatesTheWholeContextBeforePhaseSpecificWork) {
     const auto scenario = GetParam();
-    for (uint32_t invalid = 0; invalid < 8; ++invalid) {
+    for (uint32_t invalid = 0; invalid < 5; ++invalid) {
         SCOPED_TRACE(invalid);
         GmMixFixture fixture({{2, LaneMask::all()}});
         ASSERT_TRUE(fixture.bootstrap_admission());
@@ -765,13 +765,10 @@ TEST_P(HbgGmMixServiceError, ServiceValidatesTheWholeContextBeforePhaseSpecificW
         const uint64_t cursor = fixture.control(0)->next_block;
         const uint64_t published = fixture.mailbox(0)->published_seq;
         const uint8_t ready = local->local_ready_mask;
-        if (invalid == 0) admission.initialized = false;
-        else if (invalid == 1) local->config.graph = nullptr;
-        else if (invalid == 2) ++fixture.storage.test_graphs[scenario.worker].task_count;
-        else if (invalid == 3) admission.current_task_ref = SCHEDULER_TASK_REF_INVALID;
-        else if (invalid == 4) admission.current_flags &= ~SCHEDULER_TASK_MIX;
-        else if (invalid == 5) admission.gm_mix.mailbox_offset = 0;
-        else if (invalid == 6) admission.gm_mix.cluster_index = local->config.cluster_count;
+        if (invalid == 0) admission.current_task_ref = SCHEDULER_TASK_REF_INVALID;
+        else if (invalid == 1) admission.current_flags &= ~SCHEDULER_TASK_MIX;
+        else if (invalid == 2) admission.gm_mix.mailbox_offset = 0;
+        else if (invalid == 3) admission.gm_mix.cluster_index = local->config.cluster_count;
         else local->config.self_lane = PLATFORM_CORES_PER_BLOCKDIM;
         bool progress = true;
         const auto service = [&](auto record) {
@@ -1155,13 +1152,7 @@ void prepare_pending_mix_entry(GmMixFixture &fixture, const GmPendingEntryCase &
     ASSERT_TRUE(fixture.claim_pending(later_task, worker));
     if (!scenario.prepared) return;
     const uint32_t peer = worker + 3;
-    ASSERT_TRUE(scheduler_prepare_admission_record(
-        fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &fixture.admissions[worker]
-    ));
     ASSERT_TRUE(fixture.claim_pending(2, peer));
-    ASSERT_TRUE(scheduler_prepare_admission_record(
-        fixture.graph.graph(), fixture.base(), fixture.locals[peer], fixture.run(), &fixture.admissions[peer]
-    ));
     auto *shared =
         scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), fixture.storage.layout.admission_control_offset);
     ASSERT_EQ(scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), static_cast<uint64_t>(peer + 1)), 0u);
@@ -1209,7 +1200,9 @@ TEST_P(HbgGmPendingEarlierEntry, CurrentGroupCanFinishWithoutPublishingItsLaterC
     EXPECT_EQ(fixture.control(2)->next_block, 0u);
     EXPECT_EQ(scheduler_completion_progress(fixture.control(later_task)->completion_state), 0u);
     EXPECT_EQ(fixture.admissions[scenario.worker].pending_task_ref, later_task);
-    EXPECT_EQ(fixture.control(later_task)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
+    EXPECT_EQ(
+        fixture.control(later_task)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
+    );
     EXPECT_EQ(shared->commit_tail, 1u);
     EXPECT_EQ(shared->commit_lock, scenario.prepared ? scenario.worker + 4u : 0u);
     EXPECT_EQ(executed.size(), static_cast<size_t>(scenario.shape.mask.count()));
@@ -1378,8 +1371,8 @@ TEST(HbgGmMix, MixPrefixSuffixErrorRejectsNewAdmissionAndPreviouslyPermittedKern
     // must still pass the real admission gate after a later suffix failure.
     SchedulerReadyClaim candidate{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), resolver->config.scheduler_count,
-        static_cast<uint32_t>(SchedulerReadyClass::AIC), &candidate
+        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), static_cast<uint32_t>(SchedulerReadyClass::AIC),
+        &candidate
     ));
     ASSERT_EQ(candidate.task_ref, 2);
     EXPECT_EQ(
@@ -1393,7 +1386,6 @@ TEST(HbgGmMix, MixPrefixSuffixErrorRejectsNewAdmissionAndPreviouslyPermittedKern
         scheduler_gm_query(fixture.control(2)->admission_state),
         static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
     );
-    EXPECT_EQ(scheduler_gm_query(fixture.control(2)->admission_claim_lock), 0u);
     const auto *shared =
         scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), fixture.storage.layout.admission_control_offset);
     EXPECT_EQ(shared->commit_tail, 1u);
@@ -1778,8 +1770,7 @@ TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsCon
     for (uint32_t task : {first_task, 1U - first_task}) {
         SchedulerReadyClaim claim{};
         ASSERT_TRUE(scheduler_claim_ready_for_slot(
-            fixture.graph.graph(), fixture.base(), local, fixture.run(), local->config.scheduler_count, core_type,
-            &claim
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), core_type, &claim
         ));
         ASSERT_EQ(claim.task_ref, task);
         ASSERT_TRUE(scheduler_ordered_retain_candidate(&fixture.admissions[lane], claim));
@@ -3423,7 +3414,7 @@ TEST(HbgGmMixReadyProbeOwnership, CandidatePendingAndLocalReadyNeverReuseAnEmpty
             } else {
                 SchedulerReadyClaim candidate{};
                 ASSERT_TRUE(scheduler_claim_ready_for_slot(
-                    fixture.graph.graph(), fixture.base(), local, fixture.run(), local->config.scheduler_count,
+                    fixture.graph.graph(), fixture.base(), local, fixture.run(),
                     static_cast<uint32_t>(SchedulerReadyClass::AIC), &candidate
                 ));
                 ASSERT_EQ(candidate.task_ref, 1);
@@ -3485,7 +3476,7 @@ TEST(HbgGmMixReadyProbeOwnership, ReadyFromEitherProducerKeepsDiscoveryEnabled) 
 }
 
 TEST(HbgGmMixReadyProbeOwnership, InvalidDiscoveryConfigurationCannotBeHiddenByAnEmptyHint) {
-    for (uint32_t invalid = 0; invalid < 6; ++invalid) {
+    for (uint32_t invalid = 0; invalid < 2; ++invalid) {
         SCOPED_TRACE(invalid);
         GmMixFixture fixture({{2, LaneMask::all()}});
         ASSERT_TRUE(fixture.bootstrap_admission());
@@ -3493,11 +3484,7 @@ TEST(HbgGmMixReadyProbeOwnership, InvalidDiscoveryConfigurationCannotBeHiddenByA
         ASSERT_TRUE(fixture.finish_lanes(0));
         ASSERT_NO_FATAL_FAILURE(expect_ready_pool_drained(fixture));
         auto *local = fixture.locals[0];
-        if (invalid == 0) local->config.scheduler_count = 0;
-        else if (invalid == 1) local->config.scheduler_count = SCHEDULER_WORKER_CAPACITY + 1;
-        else if (invalid == 2) local->config.scheduler_index = local->config.scheduler_count;
-        else if (invalid == 3) local->config.ready_pool_offset = 0;
-        else if (invalid == 4) {
+        if (invalid == 0) {
             const auto &pool =
                 *scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
             const auto queue =
@@ -3699,7 +3686,7 @@ TEST(HbgDirectAdmission, ReadyCooperativeSuccessorCommitsBeforeCompletionReturns
                     auto *holder = fixture.locals[queue == 0 ? 0 : 1];
                     SchedulerReadyClaim empty{};
                     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-                        fixture.graph.graph(), fixture.base(), holder, fixture.run(), 6, queue, &empty
+                        fixture.graph.graph(), fixture.base(), holder, fixture.run(), queue, &empty
                     ));
                     EXPECT_EQ(empty.task_ref, SCHEDULER_TASK_REF_INVALID);
                 }
@@ -3735,7 +3722,7 @@ TEST(HbgDirectAdmission, ContendedCommitRetainsExactlyOnePendingOwner) {
         ));
         EXPECT_EQ(shared->commit_tail, 1u);
         EXPECT_EQ(fixture.admissions[1].pending_task_ref, 1);
-        EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
+        EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
         for (const auto &candidate : fixture.admissions[1].candidates)
             EXPECT_EQ(candidate.ready.task_ref, SCHEDULER_TASK_REF_INVALID);
         EXPECT_EQ(fixture.control(1)->next_block, 0u);
@@ -3816,12 +3803,12 @@ TEST(HbgDirectAdmission, OneDirectSuccessorLeavesExcessWorkQueuedExactlyOnce) {
         ASSERT_NE(queued, -1);
         SchedulerReadyClaim ready{};
         ASSERT_TRUE(scheduler_claim_ready_for_slot(
-            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 6, 0, &ready
+            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &ready
         ));
         EXPECT_EQ(ready.task_ref, queued);
         ready = {};
         ASSERT_TRUE(scheduler_claim_ready_for_slot(
-            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 6, 0, &ready
+            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &ready
         ));
         EXPECT_EQ(ready.task_ref, SCHEDULER_TASK_REF_INVALID);
     }

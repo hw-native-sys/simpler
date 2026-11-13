@@ -85,6 +85,8 @@ def urma_lifecycle_binary(tmp_path_factory):
             "-Wl,--gc-sections",
             *[f"-I{p}" for p in includes],
             str(ROOT / "tests/ut/py/support/urma_lifecycle_host.cpp"),
+            str(ROOT / "src/common/platform_comm/ccu/ccu_domain_owner.cpp"),
+            str(ROOT / "src/common/platform_comm/ccu/ccu_run_lifecycle.cpp"),
             "-ldl",
             "-lrt",
             "-pthread",

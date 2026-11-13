@@ -223,24 +223,21 @@ def test_pure_trace_retirement_follows_completion_contribution(mask, partial_ret
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 3, 16))
 @pytest.mark.parametrize("tail", (False, True))
-def test_current_terminal_claim_lock_is_free_without_changing_ticket_policy(mask, blocks, tail):
+def test_current_terminal_ticket_policy_accepts_bounded_tail(mask, blocks, tail):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
     raw["schema"] = "hbg-native-protocol-v10"
     control = raw["task_controls"][0]
-    control.update(admission_claim_lock=0, claim_tickets=blocks + (positions if tail else 0) if blocks > 1 else 0)
+    control.update(claim_tickets=blocks + (positions if tail else 0) if blocks > 1 else 0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    control["admission_claim_lock"] = 1
-    with pytest.raises(ValueError, match="terminal admission claim lock"):
-        audit_native_protocol(raw, identities)
 
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-def test_current_sync_start_remains_ticket_free_and_releases_claim_lock(mask):
+def test_current_sync_start_remains_ticket_free(mask):
     blocks = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
     raw["schema"] = "hbg-native-protocol-v10"
-    raw["task_controls"][0].update(claim_tickets=0, admission_claim_lock=0)
+    raw["task_controls"][0].update(claim_tickets=0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_controls"][0]["claim_tickets"] = 1
     with pytest.raises(ValueError, match="ticket"):

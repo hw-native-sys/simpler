@@ -82,7 +82,7 @@ ST 最终入选集必须由 B0 真实结果决定，以下仅为待测候选：
 | `spmd_cohort_with_ordinary`、`spmd_cohort_saturation` | 普通与 cohort 争用、饱和公平性 | correctness rendezvous/timeout 决定时间 |
 | `single_block_mix`、`mix_coresidency` | MIX lane 协作 | 仅验证共驻且耗时由忙等决定 |
 
-故障注入、empty_lifecycle、capacity 拒绝、legacy fallback、DFX dump、predicate correctness 等不自动列为性能门禁。
+故障注入、empty_lifecycle、capacity 拒绝、失败启动清退、DFX dump、predicate correctness 等不自动列为性能门禁。
 逐 case 审查 kernel 和 timing 分布；保留能稳定测量短任务、fanout、cooperative、MIX 等差异的最小代表集。
 仅功能用例也记录基线运行结果与不入选原因，不能因为“慢”就排除。
 
@@ -110,17 +110,16 @@ DeepSeek 的迁移候选、预编译或单组件试验不构成本轮验收证�
 先用完整 40 层 Torch golden
 检查输出、K/V cache、跨层依赖及重复运行，再测试冷启动、稳态和现有 driver 支持的 sequence 形状。
 不报告未经实际运行的 batch/layer 覆盖，也不能以退出码为零代替数值检查。
-Graph Definition 复用数、child 数、cooperative 数、scheduler mode 和 fallback 原因进入报告，
+Graph Definition 复用数、child 数、cooperative 数、scheduler mode 和 prepare 拒绝原因进入报告，
 确认测到 AICore native Graph。
 
-主对照是**同一 A5 设备的 legacy Graph 与 native Graph**，使用相同 A5 Qwen kernel、输入与编译选项。
-B0 的 A5 Qwen 编译命中 `.rodata` 守卫，失败证据保留；当时没有可用的 legacy 延迟数据。
-使用修复后的同一份 A5 callable，在冻结主线 runtime 与新 runtime 上补采对照。
-保留 B0 构建，隔离安装/导入路径并核实实际加载库；不需要新 worktree。
-若 legacy 无法执行，明确缺失该对照，不捏造加速比。A2A3 数据不能用来计算本次 scheduler 加速比。
+当前主对照是**同一 A5 设备、冻结主线 resident 与候选 resident**，使用相同 A5 Qwen kernel、输入与编译选项。
+核实实际加载库、revision 和是否 native Graph，不能用 A2A3 数据计算本次 scheduler 加速比。
+早期 legacy/native 对比属于[历史性能记录](qwen-performance-history.md)，不要求当前 runtime 保留该执行器。
+B0 的 `.rodata` 构建失败及当时缺失的延迟数据仍按原始证据记录，不能补写为成功对照。
 
 无 Graph 门禁和 A5 Qwen 的完整功能、性能验证均完成后才能验收。
-native 比 legacy 慢、首 child 延迟异常或 tail 明显偏大时，进入下一节优化循环。
+候选比冻结主线慢、首 child 延迟异常或 tail 明显偏大时，进入下一节优化循环。
 若计算已主导、调度改进低于噪声，则提供分解证据和多批次结果。
 
 ## 性能归因与自主优化循环
@@ -136,7 +135,7 @@ native 比 legacy 慢、首 child 延迟异常或 tail 明显偏大时，进入�
 | 短 child 间隙大 | fanin 扫描、ready steal、参数 bytes/flush | accessor 快路、按逻辑任务一次绑定；可测有界提前准备，先补所有权证明 |
 | MIX/SPMD 吞吐低 | claim/commit、membership、release、wave、order head blocking | 缩短锁内工作、提高服务公平性；不拆分全局 admission 域 |
 | EXIT/tail 长 | 全 sink join、control backlog、completion flush、LocalDone | 调整有界服务与真实完成批量发布；不提前释放或少等 sink |
-| 内存或上传异常 | legacy reserved tail、512N control、block×lane trace | 按真实 allocation 核算；诊断按需分配先审计所有 reader |
+| 内存或上传异常 | 预留 execution tail、当前 task-control stride、block×lane trace | 按真实 allocation 核算；诊断按需分配先审计所有 reader |
 | kernel 本体慢 | 相同 args 与 lane/block 的单任务时间 | 用 core swimlane 区分 kernel 适配和 scheduler 问题，避免归错因 |
 
 使用 `hbg-bind-phases`、`dfx-analyze`、chip swimlane/dep_gen；kernel 内部问题再用 core-swimlane。
@@ -146,7 +145,7 @@ native 比 legacy 慢、首 child 延迟异常或 tail 明显偏大时，进入�
 ## 最终交付证据
 
 最终报告至少包含：基线与最终 SHA/二进制来源、完整新旧功能矩阵、无 Graph 固定集和入选 ST 的逐 case 对照、
-A5 Qwen native/legacy 数据、Host bind/Device/尾延迟/内存、性能迭代记录以及所有未完成或不支持项。
+A5 Qwen 冻结主线/候选 resident 数据、Host bind/Device/尾延迟/内存、性能迭代记录以及所有未完成或不支持项。
 HBG 标准 marker 通常只有 Host/Device；缺失 Orch/Sched/Effective 时写缺失，不能当零，也不能移用 TMR 的口径。
 额外阶段数据使用其工具明确的指标名，保留 raw marker 让结果可重算。
 

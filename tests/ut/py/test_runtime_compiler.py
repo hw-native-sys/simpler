@@ -10,6 +10,8 @@
 
 import logging
 
+import pytest
+
 from simpler_setup.toolchain import Toolchain
 
 
@@ -22,6 +24,34 @@ class _StubToolchain(Toolchain):
 
     def get_cmake_args(self):
         return []
+
+
+@pytest.mark.parametrize("trigger_present", [False, True])
+def test_a5_host_export_requires_ccu_trigger(tmp_path, monkeypatch, trigger_present):
+    from simpler_setup import runtime_compiler  # noqa: PLC0415
+
+    compiler = runtime_compiler.RuntimeCompiler.__new__(runtime_compiler.RuntimeCompiler)
+    compiler.platform = "a5"
+    compiler._sanitizers = ""
+    compiler.host_target = runtime_compiler.BuildTarget(_StubToolchain(is_host=True), str(tmp_path), "libtest.so")
+    binary = tmp_path / "libtest.so"
+    binary.write_bytes(b"host")
+    (tmp_path / "aicpu_cpu_topo_fallback.json").write_text("{}")
+    trigger = tmp_path / "cache/host/ccu_event_trigger.o"
+    trigger.parent.mkdir(parents=True)
+    if trigger_present:
+        trigger.write_bytes(b"trigger")
+    monkeypatch.setattr(compiler, "_run_compilation", lambda *args, **kwargs: binary)
+    output = tmp_path / "published"
+
+    if not trigger_present:
+        with pytest.raises(FileNotFoundError):
+            compiler.compile("host", [], [], build_dir=str(tmp_path / "cache"), output_dir=output)
+        return
+
+    compiler.compile("host", [], [], build_dir=str(tmp_path / "cache"), output_dir=output)
+    assert (output / "ccu_event_trigger.o").read_bytes() == b"trigger"
+    assert (output / "libtest.so").read_bytes() == b"host"
 
 
 def test_host_build_target_always_receives_shared_cmake_dir(tmp_path):

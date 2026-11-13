@@ -199,20 +199,17 @@ if(TARGET test_a2a3_hbg_bind_ledger)
         PRIVATE SIMPLER_TEST_HBG_MAKER_DECLARES_CALLER_WRITES=1)
 endif()
 
-# The scheduler pair links its arch's scheduler TUs plus the AICPU collectors
-# the scheduler raises into. a2a3 reaches the sim register shim directly; a5
-# needs a stub for the completion path its scheduler does not provide here.
-hbg_case(test_hbg_scheduler_drain.cpp
+# A2A3 uses AICPU dispatch and its drain/stall protocol.
+hbg_case(test_hbg_scheduler_drain.cpp ARCHS a2a3
     SOURCES
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
-    A2A3_SOURCES ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
-    A5_SOURCES   ${CMAKE_CURRENT_SOURCE_DIR}/support/scheduler_drain_a5_stubs.cpp)
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp)
 
-hbg_case(test_hbg_stall_dump_level.cpp
+hbg_case(test_hbg_stall_dump_level.cpp ARCHS a2a3
     SOURCES
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_cold_path.cpp
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
@@ -223,12 +220,8 @@ hbg_case(test_hbg_stall_dump_level.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
-    A2A3_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/support/stall_dump_level_a2a3_stubs.cpp
-        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
-    A5_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/support/scheduler_drain_a5_stubs.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/support/stall_dump_level_a5_stubs.cpp)
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp)
 
 # The accumulator is header-only and arch-agnostic, and the test reaches it by
 # the host_build_graph/ prefix rather than by bare name, so src/common alone

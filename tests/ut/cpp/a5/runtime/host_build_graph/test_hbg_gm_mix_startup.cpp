@@ -9,6 +9,15 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "scheduler/scheduler_scalar_policy.h"
+
+namespace {
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = true;
+};
+}  // namespace
+
 #include "inner_kernel.h"
 
 #include <gtest/gtest.h>
@@ -149,15 +158,13 @@ struct StartupFixture {
             constexpr uint32_t queue = static_cast<uint32_t>(SchedulerReadyClass::AIC);
             ASSERT_TRUE(scheduler_ready_batch_push(base(), &locals[0], queue, &batch));
             SchedulerReadyClaim ready{};
-            ASSERT_TRUE(scheduler_claim_ready_for_slot(
-                graph_view, base(), &locals[0], run, locals[0].config.scheduler_count, queue, &ready
-            ));
+            ASSERT_TRUE(scheduler_claim_ready_for_slot(graph_view, base(), &locals[0], run, queue, &ready));
             ASSERT_EQ(ready.task_ref, task);
             ASSERT_EQ(
                 scheduler_try_claim_admission(graph_view, base(), &locals[0], run, &admissions[0], ready),
                 SchedulerAdmissionResult::PROGRESS
             );
-            ASSERT_TRUE(scheduler_prepare_admission_record(graph_view, base(), &locals[0], run, &admissions[0]));
+
             ASSERT_EQ(
                 scheduler_try_commit_admission(graph_view, base(), &locals[0], run, &admissions[0]),
                 SchedulerAdmissionResult::PROGRESS

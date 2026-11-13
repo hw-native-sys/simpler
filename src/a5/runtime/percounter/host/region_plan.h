@@ -215,7 +215,10 @@ inline bool plan_layout(
           ))) ||
         !PERCOUNTER_RESERVE(table_task_count, PercounterFanin, fanin_offset) ||
         !PERCOUNTER_RESERVE(edge_count, uint64_t, fanin_addr_offset) ||
-        !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, DispatchPayload, dispatch_payloads_offset) ||
+        !PERCOUNTER_RESERVE(
+            static_cast<uint64_t>(SCHEDULER_WORKER_CAPACITY) * PERCOUNTER_PAYLOAD_SLOT_COUNT, DispatchPayload,
+            dispatch_payloads_offset
+        ) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef PERCOUNTER_RESERVE
@@ -545,7 +548,7 @@ inline bool build_tables(
     //
     // No deadlock: A -> B implies blevel(A) >= blevel(B) + 1, so a producer is
     // strictly earlier than its consumer under the global key, and tasks at
-    // equal level have no edge between them. See percounter_claim_range.
+    // equal level have no edge between them.
     //
     // A body sits in one range, keyed as its GRAPH task, with its own tasks by
     // level inside it. The argument carries over: a root's producers precede

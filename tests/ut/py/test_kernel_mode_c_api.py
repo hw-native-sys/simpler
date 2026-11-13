@@ -1432,6 +1432,7 @@ class NativeRunDescriptor(ctypes.Structure):
         ("joinable_boundary", ctypes.c_uint32),
         ("provenance", NativeRunProvenance),
         ("prepare_purpose", ctypes.c_uint32),
+        ("ccu_workspace_addr", ctypes.c_uint64),
     ]
 
 

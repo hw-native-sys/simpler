@@ -43,6 +43,9 @@ on:
       a5_changed:
         description: "Whether the diff can affect a5."
         value: ${{ jobs.detect.outputs.a5_changed }}
+      wse_changed:
+        description: "Whether the diff can affect WSE."
+        value: ${{ jobs.detect.outputs.wse_changed }}
       non_code_only:
         description: "Whether every changed file is non-code."
         value: ${{ jobs.detect.outputs.non_code_only }}
@@ -66,6 +69,7 @@ jobs:
     outputs:
       a2a3_changed: ${{ steps.check.outputs.a2a3_changed }}
       a5_changed: ${{ steps.check.outputs.a5_changed }}
+      wse_changed: ${{ steps.check.outputs.wse_changed }}
       non_code_only: ${{ steps.check.outputs.non_code_only }}
       st_affected: ${{ steps.check.outputs.st_affected }}
       ut_affected: ${{ steps.check.outputs.ut_affected }}
@@ -141,6 +145,7 @@ jobs:
             echo "non_code_only=false" >> "$GITHUB_OUTPUT"
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
+            echo "wse_changed=true" >> "$GITHUB_OUTPUT"
             echo "st_affected=true" >> "$GITHUB_OUTPUT"
             echo "ut_affected=true" >> "$GITHUB_OUTPUT"
             echo "examples_only=false" >> "$GITHUB_OUTPUT"
@@ -167,26 +172,37 @@ jobs:
 
           # Architecture axis: skip a partition only when every changed file is
           # in the sibling partition or non-code.
+          WSE_ONLY='^(src/wse/|examples/wse/|tests/(st|ut/cpp)/wse/)'
           A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
-          A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY" | grep -vE "$NON_CODE" || true)
+          A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A2A3_REMAINING" ]; then
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting a2a3:"
             echo "$A2A3_REMAINING"
           else
             echo "a2a3_changed=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are a5-only or non-code; skipping a2a3"
+            echo "All changes are confined to other architectures or non-code; skipping a2a3"
           fi
 
           A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp)/a2a3/)'
-          A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
+          A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A5_REMAINING" ]; then
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting a5:"
             echo "$A5_REMAINING"
           else
             echo "a5_changed=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are a2a3-only or non-code; skipping a5"
+            echo "All changes are confined to other architectures or non-code; skipping a5"
+          fi
+
+          WSE_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY|$A5_ONLY" | grep -vE "$NON_CODE" || true)
+          if [ -n "$WSE_REMAINING" ]; then
+            echo "wse_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Files affecting wse:"
+            echo "$WSE_REMAINING"
+          else
+            echo "wse_changed=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are confined to other architectures or non-code; skipping wse"
           fi
 
           # Test-category axis. Repo-local tools are not used by scene tests.

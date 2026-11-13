@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -159,10 +160,19 @@ int run(int argc, char **argv) {
         std::cout << "preserved_original_kernels=" << children.size() << '\n';
         return 0;
     }
-    const bool materialize = argc == 11 && std::string(argv[10]) == "--materialize";
-    if (argc != 10 && !materialize) {
-        std::cerr << "usage: native-runner BUNDLE RUNTIME_LIB DEVICE RANK ROOTINFO OUTPUT LEVEL WARMUP ROUNDS\n";
+    bool materialize = false;
+    std::string runtime_name = "host_build_graph";
+    if (argc < 10) {
+        std::cerr << "usage: native-runner BUNDLE RUNTIME_LIB DEVICE RANK ROOTINFO OUTPUT LEVEL WARMUP ROUNDS "
+                     "[--materialize] [--runtime=host_build_graph|percounter]\n";
         return 2;
+    }
+    for (int i = 10; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "--materialize") materialize = true;
+        else if (option == "--runtime=host_build_graph") runtime_name = "host_build_graph";
+        else if (option == "--runtime=percounter") runtime_name = "percounter";
+        else throw std::runtime_error("Unknown runner option: " + option);
     }
     const fs::path bundle = argv[1], libraries = argv[2], output = argv[6];
     const int device = std::stoi(argv[3]), rank = std::stoi(argv[4]);
@@ -204,9 +214,9 @@ int run(int argc, char **argv) {
         config.runtime_env.ring_dep_pool[i] = 131072;
     }
     worker.init(
-        (libraries / "host_build_graph/libhost_runtime.so").string(),
-        (libraries / "host_build_graph/libaicpu_kernel.so").string(),
-        (libraries / "host_build_graph/aicore_kernel.o").string(),
+        (libraries / runtime_name / "libhost_runtime.so").string(),
+        (libraries / runtime_name / "libaicpu_kernel.so").string(),
+        (libraries / runtime_name / "aicore_kernel.o").string(),
         (libraries / "../dispatcher/libsimpler_aicpu_dispatcher.so").string(), device, &config
     );
     uint64_t comm = 0, comm_context = 0, window = 0;
@@ -348,6 +358,7 @@ int run(int argc, char **argv) {
         }
         if (!manifest) throw std::runtime_error("Cannot save boundary manifest");
     };
+    uint64_t launch_generation = 0;
     auto launch = [&](uint64_t phase, int profiling, const std::string &label) {
         config.enable_chip_swimlane = profiling;
         config.enable_dep_gen = profiling != 0;
@@ -357,10 +368,26 @@ int run(int argc, char **argv) {
         std::strcpy(config.output_prefix, directory.c_str());
         setenv("DSV41_MAPPING_PATH", (directory / "source-task-map.txt").c_str(), 1);
         if (sliced) args.scalars_[scalar_count] = phase;
-        host_barrier(output, "launch-" + label, rank, ranks);
-        worker.run(callable_id, &args, config);
+        const auto run = worker.prepare_native_run(callable_id, &args, config, {0, 0, ++launch_generation});
+        try {
+            // Both ranks finish Host binding and image upload before either
+            // enters Device execution; peer preparation is outside this sample.
+            host_barrier(output, "launch-" + label, rank, ranks);
+            if (worker.launch_native_run(run) != ChipWorker::NativeLaunch::Launched)
+                throw std::runtime_error("Native launch did not acquire diagnostic credit");
+            worker.wait_native_run(run);
+        } catch (...) {
+            const auto error = std::current_exception();
+            try {
+                worker.finalize_native_run(run);
+            } catch (...) {}
+            std::rethrow_exception(error);
+        }
+        worker.finalize_native_run(run);
         const auto mode = worker.last_scheduler_runtime_mode();
-        if (mode != 1 && mode != 2) throw std::runtime_error("Production AICore scheduler was not selected");
+        // Percounter publishes its device bootstrap but may omit the Host mode observer.
+        const bool supported = runtime_name == "percounter" ? (mode == 0 || mode == 5) : (mode == 1 || mode == 2);
+        if (!supported) throw std::runtime_error("Unexpected scheduler mode: " + std::to_string(mode));
         host_barrier(output, "complete-" + label, rank, ranks);
         return mode;
     };
@@ -405,7 +432,8 @@ int run(int argc, char **argv) {
     worker.finalize();
     HostLogger::get_instance().flush();
     std::ofstream result(output / "result.json");
-    result << "{\"passed\":true,\"device\":" << device << ",\"rank\":" << rank
+    result << "{\"passed\":true,\"device\":" << device << ",\"rank\":" << rank << ",\"runtime\":\"" << runtime_name
+           << "\""
            << ",\"original_kernels\":" << registered->child_count()
            << ",\"isolated_case\":" << (sliced ? "true" : "false")
            << ",\"validated_against_fused_prefix\":" << (sliced ? "true" : "false") << ",\"warmup\":" << warmup

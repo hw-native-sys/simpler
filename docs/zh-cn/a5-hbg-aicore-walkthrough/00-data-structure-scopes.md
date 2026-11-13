@@ -2,7 +2,7 @@
 
 [回到执行流程](README.md)
 
-本表覆盖走读材料涉及的 resident 数据结构，以及直接相关的视图、临时结果和采集结构。Host 只说明其输出的数据合同，legacy 调度内部结构继续跳过。字段含义仍放在各执行阶段文档中，先用这里判断“这一份数据属于谁”。
+本表覆盖走读材料涉及的 resident 数据结构，以及直接相关的视图、临时结果和采集结构。Host 只说明其输出的数据合同。字段含义仍放在各执行阶段文档中，先用这里判断“这一份数据属于谁”。
 
 ## 读表约定与结构关系
 
@@ -134,11 +134,7 @@ flowchart TD
 | `SchedulerGroupLaneAck` | 每个mailbox内3份，分别对应3个物理lane | GM | assigned_seq由AIC写；arrived_seq/released_seq由该lane写；用于到场与释放确认 | 整轮保留单调序号，跨group使用 |
 | `SchedulerGmMixLocalState` | 每个worker1份，嵌在admission中 | AICore 私有 | 当前核对所属cluster mailbox的观察/推进状态；各核phase可暂时不同 | 本轮，逐group更新 |
 | `SchedulerMixCloseSeal` | 每个MIX task × 每个cluster一份 | GM | 该cluster的AIC发布任务不再产生group的凭据，其成员读取后可关闭本地义务 | 本轮为该task保留，不能随mailbox下一group覆盖 |
-| `SchedulerRouteCursor` | 一个waiter的一次依赖路由过程 | 私有局部值，或嵌在可持久化resolver中 | 保存当前fanin/producer，预算耗尽可续行；成功挂链后责任交给下一个resolver | 该waiter本次路由过程 |
-| `SchedulerRouteProgress` | 一次route_step返回值 | 调用者私有 | 返回推进结果与消耗预算，不保存共享任务状态 | 当前返回值使用期间 |
-| `SchedulerReadyPublication` | 一个resolver当前待发布批次 | 私有或作为resolver续行的一部分存GM | 保存最多8个ready ref及发布阶段，确保未完成的发布责任不会丢失 | 批次从收集到完整发布 |
-| `SchedulerResolveCursor` | 一个 producer 完成后的后继解析过程 | 普通路径局部；native在LocalState持久化；async在GM续行区持久化 | 保存 CSR 遍历位置或兼容路径已摘下的链、当前 waiter 和未发布批次 | 直到所有后继责任交接完；位置随所用路径不同 |
-| `SchedulerResolveProgress` | 一次resolve_step返回值 | 调用者私有 | DONE/YIELD/ERROR及本片work units | 当前调用返回值使用期间 |
+| `SchedulerReadyPublication` | 一个resolver当前待发布批次 | 同步调用私有 | 保存最多8个ready ref及内部发布状态，不跨核移交 | 本次同步传播中的批次收集与发布 |
 
 关闭一个 worker 的当前 admission 义务，不等于整个任务已经完成。
 该核可能已完成自己承担的部分并确认不再领取，而别的核还在运行；逻辑完成需要全部实际子任务汇合；存在异步条件时还需等待 FINISH，MIX 资源退役不重复计数。
@@ -176,7 +172,6 @@ template描述“这是什么子图”；instance描述“本轮这次子图使�
 | `SchedulerAsyncLease` | 每个CHECK group1份，另每个async task的FINISH1份 | GM，独立原子区 | 多核通过CAS领取独占服务权，generation防止旧owner误提交 | 本轮，多次领取/释放直到terminal |
 | `SchedulerAsyncLeaseOutcome` | 一次lease原子操作的返回值 | 调用者私有 | 告知成功、争用或错误，以及新/观察到的word | 当前调用结果 |
 | `SchedulerAsyncTaskJoin` | 每个async逻辑任务1份 | GM，独立原子区 | 汇合“所有计算已返回”和“所有异步group已完成”，选出唯一FINISH owner | 整个逻辑任务 |
-| `SchedulerAsyncFinishProgress` | 每个async逻辑任务1份 | GM | FINISH owner保存完整依赖resolver；预算耗尽后可换核继续 | 从FINISH启动到全部后继发布完 |
 | `SchedulerAsyncDirectoryWord` | CHECK和FINISH目录中每64个工作项1个word | GM | 发布者设置工作位，服务核扫描、领取lease，完成后清理 | 本轮，bits动态变化 |
 | `SchedulerAsyncActivity` | 本轮async布局1份 | GM，独立区域 | 发布本轮已经出现async工作；各核读取以减少空轮询 | 本轮只从未激活变为激活 |
 | `AsyncSdmaSubmissionGuard` | 按物理cluster准备对应guard | GM，独立原子区 | 同cluster相关AIV提交SDK session/SQ/post-id更新时互斥 | 仅提交临界区独占，不持锁等待整个异步操作完成 |

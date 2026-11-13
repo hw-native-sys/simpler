@@ -22,6 +22,7 @@
 #include "pipeline_contract.h"
 #include "../platform_comm/comm_context.h"
 #include "runtime_module.h"
+#include "task_interface/ccu_module_package.h"
 #include "host/raii_scope_guard.h"
 
 #include <dlfcn.h>
@@ -472,6 +473,9 @@ void ChipWorker::init(
             module->optional<CommAllocHostDomainWindowsFn>("comm_alloc_host_domain_windows");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
+        comm_register_ccu_callable_fn_ = module->optional<CommRegisterCcuCallableFn>("comm_register_ccu_callable");
+        comm_prepare_ccu_run_fn_ = module->optional<CommPrepareCcuRunFn>("comm_prepare_ccu_run");
+        comm_control_ccu_run_fn_ = module->optional<CommControlCcuRunFn>("comm_control_ccu_run");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
@@ -491,9 +495,12 @@ void ChipWorker::init(
         throw std::runtime_error("borrowed initialization requires native caller ordering and context validation");
     }
 
+    const auto requires_aicpu_executor = module->optional<int (*)()>("requires_aicpu_executor");
+    const bool requires_aicpu = !requires_aicpu_executor || requires_aicpu_executor() != 0;
+
     const PipelineContract *contract = get_pipeline_contract_fn();
     if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
-        !has_serviceable_stream_topology(*contract)) {
+        !has_serviceable_stream_topology(*contract, requires_aicpu)) {
         throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
     }
     PipelineContract resolved_contract = *contract;
@@ -588,7 +595,12 @@ void ChipWorker::init(
     int init_rc = 0;
     std::string init_error_detail;
     try {
-        std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
+        std::vector<uint8_t> aicpu_bytes;
+        if (requires_aicpu) {
+            aicpu_bytes = read_binary_file(aicpu_path);
+        } else if (!aicpu_path.empty()) {
+            throw std::invalid_argument("runtime does not accept an AICPU binary");
+        }
         std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
         // dispatcher_path is empty on sim (no dispatcher) and on tests that
         // exercise _ChipWorker.init directly without a RuntimeBinaries.
@@ -779,12 +791,15 @@ bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
 }
 
 void ChipWorker::finalize() {
+    validate_execution_process();
+    if (!unstopped_ccu_runs_.empty()) retain_unconfirmed_ccu_cleanup();
     validate_execution_context();
     {
         std::lock_guard<std::mutex> lock(native_run_mu_);
         if (native_resource_references_ != 0)
             throw std::runtime_error("ChipWorker::finalize: external run resources still require checked release");
     }
+    if (ccu_cleanup_unconfirmed_) require_comm_cleanup_confirmed();
     std::exception_ptr lane_error;
     if (run_lane_ != nullptr) {
         run_lane_->stop_admission();
@@ -967,6 +982,9 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_alloc_host_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_abort_domain_windows_fn_ = nullptr;
+    comm_register_ccu_callable_fn_ = nullptr;
+    comm_prepare_ccu_run_fn_ = nullptr;
+    comm_control_ccu_run_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
@@ -980,6 +998,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     kernel_init_fn_ = nullptr;
     kernel_prepare_callable_fn_ = nullptr;
     kernel_launch_fn_ = nullptr;
+    callable_artifacts_.clear();
     runtime_bufs_.clear();
     runtime_module_.reset();
     pipeline_generations_.reset();
@@ -1001,10 +1020,13 @@ int32_t ChipWorker::register_callable(const void *callable, size_t callable_size
     validate_execution_context();
     if (register_callable_v2_fn_ == nullptr)
         throw std::runtime_error("runtime does not support versioned callable registration");
+    CcuCallableArtifacts artifacts = CcuCallableArtifacts::capture(callable, callable_size);
     auto registration = [&] {
         int32_t id = -1;
         const int rc = register_callable_v2_fn_(device_ctx_, callable, callable_size, &id);
         if (rc != 0) throw std::runtime_error("callable registration failed with code " + std::to_string(rc));
+        const auto inserted = callable_artifacts_.emplace(id, std::move(artifacts)).second;
+        if (!inserted) throw std::runtime_error("runtime returned an already registered callable ID");
         return id;
     };
     return run_lane_ ? run_lane_->with_callable_addition(registration) : registration();
@@ -1018,9 +1040,17 @@ void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
         throw std::runtime_error("register_callable: callable must not be null");
     }
     validate_execution_context();
+    if (callable_artifacts_.count(callable_id) != 0) {
+        throw std::runtime_error(
+            "register_callable failed with code " + std::to_string(PTO_RUNTIME_ERR_INVALID_ARGUMENT) +
+            ": callable ID is already registered in the host artifact table"
+        );
+    }
+    CcuCallableArtifacts artifacts = CcuCallableArtifacts::capture(*static_cast<const ChipCallable *>(callable));
     auto registration = [&] {
         const int rc = register_callable_fn_(device_ctx_, callable_id, callable);
         if (rc != 0) throw std::runtime_error("register_callable failed with code " + std::to_string(rc));
+        callable_artifacts_.emplace(callable_id, std::move(artifacts));
         return int32_t{0};
     };
     if (run_lane_) (void)run_lane_->with_callable_addition(registration);
@@ -1336,6 +1366,12 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             }
             native_runs_.at(run_epoch)->permits_prepared_successor = allow_prepared_successor;
         }
+        uint64_t ccu_workspace = 0;
+        {
+            std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
+            const auto prepared = prepared_ccu_workspaces_.find(dispatch_id);
+            if (prepared != prepared_ccu_workspaces_.end()) ccu_workspace = prepared->second;
+        }
         const NativeRunDescriptor descriptor{
             slot_id,
             arena_bank_for_slot(slot_id),
@@ -1347,7 +1383,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             accepted_value,
             purpose == SIMPLER_PREPARE_EAGER && launch_depth_ > 1 ? 1u : 0u,
             provenance,
-            static_cast<uint32_t>(purpose)
+            static_cast<uint32_t>(purpose),
+            ccu_workspace
         };
         rc = prepare_run_fn_(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
     } catch (...) {
@@ -2398,6 +2435,7 @@ void ChipWorker::unregister_callable(int32_t callable_id) {
     if (rc != 0) {
         throw std::runtime_error("unregister_callable failed with code " + std::to_string(rc));
     }
+    callable_artifacts_.erase(callable_id);
 }
 
 size_t ChipWorker::aicpu_dlopen_count() const {
@@ -2583,6 +2621,14 @@ void ChipWorker::clear_comm_sessions() {
     comm_sessions_.clear();
     comm_session_index_.clear();
     base_comm_handle_ = 0;
+    std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
+    prepared_ccu_workspaces_.clear();
+    ccu_preparation_keys_.clear();
+}
+
+void ChipWorker::retain_unconfirmed_ccu_cleanup() noexcept {
+    ccu_cleanup_unconfirmed_ = true;
+    retain_unconfirmed_comm_cleanup();
 }
 
 void ChipWorker::retain_unconfirmed_comm_cleanup() noexcept {
@@ -2891,6 +2937,76 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
     }
     return {device_ctx, local_window_base, actual_window_size};
+}
+
+uint64_t ChipWorker::register_ccu_callable(
+    uint64_t comm_handle, uint64_t collective_id, int32_t callable_id, const std::vector<uint32_t> &rank_ids,
+    uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask
+) {
+    require_comm_cleanup_confirmed();
+    validate_execution_context();
+    if (comm_register_ccu_callable_fn_ == nullptr)
+        throw std::runtime_error("this runtime does not support native CCU registration");
+    const auto found = callable_artifacts_.find(callable_id);
+    if (found == callable_artifacts_.end()) throw std::runtime_error("CCU callable ID is not registered");
+    if (found->second.ccu_modules.empty()) throw std::runtime_error("callable has no native CCU modules");
+    const auto package = pack_ccu_modules(found->second.ccu_modules);
+    uint64_t registration_id = 0;
+    const int rc = comm_register_ccu_callable_fn_(
+        reinterpret_cast<void *>(comm_handle), workspace_mask, collective_id, rank_ids.data(), rank_ids.size(),
+        domain_rank, package.data(), package.size(), expected_identity.sdk.data(), expected_identity.pto_isa.data(),
+        &registration_id
+    );
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (rc != 0 || registration_id == 0)
+        throw std::runtime_error("native CCU registration failed with code " + std::to_string(rc));
+    return registration_id;
+}
+
+uint64_t ChipWorker::prepare_ccu_run(
+    uint64_t comm_handle, uint64_t registration_id, uint64_t generation, uint64_t dispatch_id, uint64_t allocation_id
+) {
+    require_comm_cleanup_confirmed();
+    validate_execution_context();
+    if (!comm_prepare_ccu_run_fn_) throw std::runtime_error("runtime has no CCU preparation backend");
+    uint64_t workspace{};
+    const int rc = comm_prepare_ccu_run_fn_(
+        reinterpret_cast<void *>(comm_handle), registration_id, generation, allocation_id, &workspace
+    );
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (rc != 0 || workspace == 0)
+        throw std::runtime_error("CCU run preparation failed with code " + std::to_string(rc));
+    std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
+    prepared_ccu_workspaces_[dispatch_id] = workspace;
+    ccu_preparation_keys_[std::make_tuple(comm_handle, registration_id, generation)] = dispatch_id;
+    return workspace;
+}
+
+int ChipWorker::control_ccu_run(uint64_t comm_handle, uint64_t allocation_id, uint32_t operation, uint64_t generation) {
+    validate_execution_process();
+    if (operation == 4) retain_unconfirmed_ccu_cleanup();
+    validate_execution_context();
+    if (!comm_control_ccu_run_fn_) throw std::runtime_error("runtime has no CCU run backend");
+    const auto identity = std::make_tuple(comm_handle, allocation_id, generation);
+    if (operation == 1) {
+        require_comm_cleanup_confirmed();
+        // Begin may partially launch before returning an error.
+    }
+    const int result =
+        comm_control_ccu_run_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, operation, generation);
+    if (operation == 1 && (result == 0 || result == COMM_RECLAMATION_UNCONFIRMED)) unstopped_ccu_runs_.insert(identity);
+    if (operation == 3 && result == 0) unstopped_ccu_runs_.erase(identity);
+    if (operation == 7 && result == 0) {
+        std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
+        const auto found = ccu_preparation_keys_.find(identity);
+        if (found != ccu_preparation_keys_.end()) {
+            prepared_ccu_workspaces_.erase(found->second);
+            ccu_preparation_keys_.erase(found);
+        }
+    }
+    if (result == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (result < 0) throw std::runtime_error("CCU run control failed with code " + std::to_string(result));
+    return result;
 }
 
 void ChipWorker::comm_release_domain_windows(

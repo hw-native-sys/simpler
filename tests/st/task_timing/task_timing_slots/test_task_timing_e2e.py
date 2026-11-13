@@ -201,10 +201,8 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_h
     assert slot0[0][1] > 0, f"merged task_slot_0 must be a complete window (dispatch < finish), got {slot0}"
 
 
-# a2a3 host_build_graph exercises a distinct fold path from tensormap_and_ringbuffer:
-# the RT2 orch is identical, but hbg builds the graph on the host and its Scheduler
-# folds dispatch via the PublishHandle (scheduler_context.h) rather than the inline
-# tensormap dispatch. These two cases give that path direct e2e coverage.
+# host_build_graph builds the graph on the host. A2A3 folds timing through
+# PublishHandle; A5 collects resident per-subtask windows at retirement.
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)

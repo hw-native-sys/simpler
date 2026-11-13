@@ -1359,7 +1359,6 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
     );
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     uint32_t resident_mode = 0;
-    uint32_t graph_mode = 0;
     // A5 keeps ordinary, MIX and Graph nodes in one resident state. A2/A3
     // carries Definitions through its AICPU launch package.
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry, ordinary_orch_entry}) {
@@ -1394,22 +1393,11 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
             const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
             const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
             EXPECT_NE(mode, 0u);
-            if (resident) {
-                if (resident_mode == 0) resident_mode = mode;
-                EXPECT_EQ(mode, resident_mode);
-                const auto &scheduler = pending.prerequisites.front();
-                EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
-                EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
-            } else {
-                EXPECT_EQ(base, 0u) << "legacy launch must not borrow a previous scheduler";
-                EXPECT_NE(mode, resident_mode);
-                if (definitions) {
-                    if (graph_mode == 0) graph_mode = mode;
-                    EXPECT_EQ(mode, graph_mode);
-                } else {
-                    EXPECT_NE(mode, graph_mode);
-                }
-            }
+            if (resident_mode == 0) resident_mode = mode;
+            EXPECT_EQ(mode, resident_mode);
+            const auto &scheduler = pending.prerequisites.front();
+            EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
+            EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
             for (int i = 0; i < runtime.get_worker_count(); ++i) {
                 EXPECT_EQ(runtime.dev.workers[i].task, 0u) << "handshake state is the AICPU's to write";
                 EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
@@ -1496,13 +1484,9 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
                 const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
                 EXPECT_NE(mode, 0u);
                 EXPECT_EQ(mode, failed_mode);
-                if (resident) {
-                    const auto &scheduler = replacement.prerequisites.front();
-                    EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
-                    EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
-                } else {
-                    EXPECT_EQ(base, 0u) << "legacy call must not reuse the failed scheduler";
-                }
+                const auto &scheduler = replacement.prerequisites.front();
+                EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
+                EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
             }
             ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
             ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
@@ -1976,6 +1960,26 @@ protected:
         ASSERT_GT(first.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
         const size_t predecessor_bytes = slot(0).capacity;
         const auto predecessor_host = slot(0).host;
+#if __has_include("scheduler/scheduler_args_dump.h")
+        const auto check_diagnostics = [](const Runtime &rt, int pmu, int level) {
+            const auto &prerequisites = rt.pending_publication().prerequisites;
+            ASSERT_EQ(prerequisites.size(), 1u);
+            const auto &region = prerequisites.front();
+            const uint64_t device_base = reinterpret_cast<uint64_t>(region.device_target);
+            const uint64_t context_address = rt.dev.scheduler_bootstrap.worker_context_base;
+            ASSERT_GE(context_address, device_base);
+            const uint64_t context_offset = context_address - device_base;
+            ASSERT_LE(context_offset + sizeof(SchedulerWorkerContext), region.bytes);
+            const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+                static_cast<const uint8_t *>(region.source) + context_offset
+            );
+            EXPECT_EQ(context->pmu_cells_offset != 0, pmu != 0);
+            EXPECT_EQ(context->activity_buffers_offset != 0, level >= 3);
+            if (pmu != 0) EXPECT_LE(context->pmu_cells_offset + sizeof(SchedulerTaskPmuCell), region.bytes);
+            if (level >= 3) EXPECT_LE(context->activity_buffers_offset + sizeof(SchedulerActivityBuffer), region.bytes);
+        };
+        check_diagnostics(*first.runtime, before_pmu, before_level);
+#endif
         ASSERT_EQ(
             bind_callable_to_runtime_impl(
                 second.runtime.get(), &second.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
@@ -1983,13 +1987,11 @@ protected:
             0
         );
         ASSERT_GT(second.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
-        // Identical task shape, distinct fresh slots: only the current run's
-        // optional PMU cells or activity buffers can change the requested size.
-        if (after_pmu > before_pmu || after_level > before_level) {
-            EXPECT_GT(slot(1).capacity, predecessor_bytes);
-        } else {
-            EXPECT_LT(slot(1).capacity, predecessor_bytes);
-        }
+        // Optional cells can occupy alignment padding without changing total capacity.
+#if __has_include("scheduler/scheduler_args_dump.h")
+        check_diagnostics(*second.runtime, after_pmu, after_level);
+        check_diagnostics(*first.runtime, before_pmu, before_level);
+#endif
         EXPECT_EQ(slot(0).capacity, predecessor_bytes);
         EXPECT_EQ(slot(0).host, predecessor_host);
         EXPECT_EQ(runner.pmu, before_pmu);
@@ -2146,9 +2148,7 @@ TEST_F(HbgResidentSchedulerStorageTest, TwoPipelineSlotsHoldDistinctStorage) {
     EXPECT_NE(first.dev.scheduler_bootstrap.worker_context_base, second.dev.scheduler_bootstrap.worker_context_base);
 }
 
-// A graph-execution run selects the legacy scheduler, which publishes no
-// context base — and the storage its predecessor retained stays untouched
-// rather than being named by a run that never initialized it.
+// Graph and ordinary runs publish initialized resident state owned by their slot.
 TEST_F(HbgResidentSchedulerStorageTest, AGraphRunPublishesItsOwnResidentStorage) {
     Runtime runtime;
     init_runtime(runtime);

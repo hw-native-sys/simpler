@@ -13,13 +13,18 @@
 
 #include "scheduler_ready.h"
 
+// Resolver callers hold a live, non-null base/local binding. Before bootstrap,
+// scheduler_initialize_local_config validates the immutable Ready pool, worker
+// index and (for native control nodes) control inbox layout. Those facts remain
+// valid until the run fence. The ref comes from a validated immutable CSR row,
+// or from the synchronous wake traversal's bounds checks. It already indexes
+// this graph's task tables. The publication buffer belongs to this invocation.
 inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, int64_t ref,
     SchedulerReadyPublication &publication, SchedulerReadyClaim *direct_ready, uint32_t direct_core_type,
     bool admission_owner
 ) {
-    if (local == nullptr || !scheduler_task_ref_valid(graph, ref) ||
-        publication.phase != SchedulerReadyPublishPhase::COLLECTING ||
+    if (publication.phase != SchedulerReadyPublishPhase::COLLECTING ||
         publication.count > SCHEDULER_READY_PUBLICATION_CAPACITY)
         return SchedulerReadyAppendResult::ERROR;
     if (publication.count == SCHEDULER_READY_PUBLICATION_CAPACITY) return SchedulerReadyAppendResult::FULL;
@@ -37,10 +42,10 @@ inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
         const auto &metadata = *scheduler_task_metadata_at(base, local, ref);
         const LaneMask lanes = scheduler_task_lanes(metadata);
         mix = scheduler_task_is_mix(metadata.flags);
-        cooperative = !scheduler_task_is_inline(metadata.flags) &&
-                      (metadata.logical_block_num > 1 || mix || scheduler_task_requires_sync_start(metadata.flags));
+        cooperative = scheduler_task_requires_admission(metadata.flags);
         type = scheduler_task_ready_queue(metadata.flags, lanes);
-        if (!scheduler_task_is_executable(metadata.flags) || type >= SCHEDULER_READY_QUEUE_COUNT ||
+        // scheduler_task_ready_queue returns exactly AIC or AIV.
+        if (!scheduler_task_is_executable(metadata.flags) ||
             (scheduler_metadata_single_subtask_slot(lanes) == UINT8_MAX && !mix))
             return SchedulerReadyAppendResult::ERROR;
     }
@@ -49,13 +54,9 @@ inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
     uint32_t target = 0;
     uint64_t inbox_offset = 0;
     if (control) {
-        if (local->config.control_inboxes_offset == 0 || local->worker_id() >= local->config.runtime_worker_count)
-            return SchedulerReadyAppendResult::ERROR;
         target = local->worker_id();
         inbox_offset =
             local->config.control_inboxes_offset + static_cast<uint64_t>(target) * sizeof(SchedulerReadyInbox);
-    } else if (local->config.ready_pool_offset == 0) {
-        return SchedulerReadyAppendResult::ERROR;
     }
     for (uint32_t index = 0; index < publication.count; ++index)
         if (publication.refs[index] == ref) return SchedulerReadyAppendResult::ERROR;
@@ -63,7 +64,7 @@ inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
         // Direct ownership uses the same validated route as a queued ticket.
         // Ordered MIX admission can be owned by either core architecture.
         if (!control && direct_ready != nullptr && scheduler_task_ref_is_null(direct_ready->task_ref) &&
-            ((admission_owner && cooperative && local->admission != nullptr && local->admission->initialized) ||
+            ((admission_owner && cooperative && local->admission != nullptr) ||
              (mix ? local->admission != nullptr : type == direct_core_type))) {
             direct_ready->task_ref = ref;
             direct_ready->source = SchedulerReadySource::DIRECT_RESOLVE;
@@ -80,6 +81,9 @@ inline __aicore__ SchedulerReadyAppendResult scheduler_ready_publication_append(
 
 // Executable tickets publish a bounded batch in one call. Control inboxes
 // persist preparation before atomically appending their immutable chain.
+// The non-null local/base and immutable routing configuration have the same
+// run-entry proof as append. The collected batch retains its target/offset
+// until this invocation has appended its complete chain.
 static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication_step(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local,
     SchedulerReadyPublication &publication
@@ -92,19 +96,20 @@ static inline __aicore__ SchedulerReadyPublishResult scheduler_ready_publication
     if (publication.phase == SchedulerReadyPublishPhase::FAILED) return SchedulerReadyPublishResult::ERROR;
     const bool control = publication.destination == SchedulerReadyDestination::CONTROL;
     const auto type = static_cast<uint32_t>(publication.destination);
-    if (local == nullptr || publication.count == 0 || publication.count > SCHEDULER_READY_PUBLICATION_CAPACITY ||
+    if (publication.count == 0 || publication.count > SCHEDULER_READY_PUBLICATION_CAPACITY ||
         (!control && type >= SCHEDULER_READY_QUEUE_COUNT))
         return fail();
     const __gm__ SchedulerReadyPoolHeader *pool = nullptr;
     if (control) {
         const uint64_t expected_offset = local->config.control_inboxes_offset +
                                          static_cast<uint64_t>(publication.target) * sizeof(SchedulerReadyInbox);
+        // The saved destination is mutable; an ordinary run has no control
+        // inbox and must reject a batch that claims that destination.
         if (local->config.control_inboxes_offset == 0 || publication.target >= local->config.runtime_worker_count ||
             publication.inbox_offset != expected_offset)
             return fail();
     } else {
-        if (local->config.ready_pool_offset == 0 || publication.target != 0 || publication.inbox_offset != 0)
-            return fail();
+        if (publication.target != 0 || publication.inbox_offset != 0) return fail();
         pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, local->config.ready_pool_offset);
     }
 

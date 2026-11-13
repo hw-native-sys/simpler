@@ -158,17 +158,12 @@ struct AdmissionFixture {
         if (!scheduler_ready_batch_append(base(), local, task, &batch) ||
             !scheduler_ready_batch_push(base(), local, queue, &batch))
             return false;
-        return scheduler_claim_ready_for_slot(
-                   graph.graph(), base(), local, run(), local->config.scheduler_count, queue, claim
-               ) &&
+        return scheduler_claim_ready_for_slot(graph.graph(), base(), local, run(), queue, claim) &&
                claim->task_ref == static_cast<int64_t>(task);
     }
 
     SchedulerAdmissionResult claim(uint64_t worker, const SchedulerReadyClaim &ready) {
         return scheduler_try_claim_admission(graph.graph(), base(), locals[worker], run(), &admissions[worker], ready);
-    }
-    bool prepare(uint64_t worker) {
-        return scheduler_prepare_admission_record(graph.graph(), base(), locals[worker], run(), &admissions[worker]);
     }
     SchedulerAdmissionResult commit(uint64_t worker) {
         return scheduler_try_commit_admission(graph.graph(), base(), locals[worker], run(), &admissions[worker]);
@@ -189,7 +184,7 @@ struct AdmissionFixture {
         if (worker >= locals.size()) return false;
         SchedulerReadyClaim ready{};
         return ready_pop(task, worker, &ready) && claim(worker, ready) == SchedulerAdmissionResult::PROGRESS &&
-               prepare(worker) && commit(worker) == SchedulerAdmissionResult::PROGRESS;
+               commit(worker) == SchedulerAdmissionResult::PROGRESS;
     }
     bool refresh(uint64_t worker) {
         return scheduler_refresh_local_obligation(graph.graph(), base(), locals[worker], run(), &admissions[worker]);
@@ -372,7 +367,7 @@ TEST(HbgAdmissionBootstrap, ReadyOwnerCanCommitInitializedRecordAfterScanGate) {
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
     ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-    EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
+    EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
     EXPECT_EQ(fixture.control()->commit_tail, 0u);
     fixture.control()->commit_lock = 4;
     EXPECT_EQ(fixture.publish_pending(0), SchedulerAdmissionResult::RETRY);
@@ -413,14 +408,15 @@ TEST(HbgAdmissionBootstrap, InitializedConsumerStillWaitsForItsProducer) {
     EXPECT_EQ(fixture.log()[0], 1);
 }
 
-TEST(HbgAdmissionBootstrap, InitializedRecordCannotBeClaimedBeforeTheScanGate) {
+TEST(HbgAdmissionBootstrap, InitializedRecordDoesNotPublishAdmissionBeforeReadyTransfer) {
     AdmissionFixture fixture({{2, LaneMask::aic()}});
     ASSERT_TRUE(scheduler_bootstrap_prepare_admission(
         fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &fixture.admissions[0], 0
     ));
-    SchedulerReadyClaim ready{};
-    ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
-    EXPECT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::ERROR);
+    EXPECT_EQ(fixture.run()->bootstrap_scan_complete, 0u);
+    EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
+    EXPECT_EQ(fixture.record(0)->order_key, UINT64_MAX);
     EXPECT_EQ(fixture.control()->commit_tail, 0u);
 }
 
@@ -429,9 +425,10 @@ TEST(HbgAdmissionBootstrap, ScanGateCannotReplacePreparingTheImmutableRecord) {
     scheduler_publish_signal(fixture.run()->bootstrap_scan_complete, UINT64_C(1));
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
-    EXPECT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::ERROR);
+    ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
+    EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::ERROR);
     EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED));
-    EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
     EXPECT_EQ(fixture.record(0)->member_count, 0u);
     EXPECT_EQ(fixture.control()->commit_tail, 0u);
 }
@@ -445,7 +442,11 @@ TEST(HbgAdmissionBootstrap, InitializedRecordTransfersReadyOwnershipOnlyOnce) {
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
     ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-    EXPECT_EQ(fixture.claim(3, ready), SchedulerAdmissionResult::ERROR);
+    SchedulerReadyClaim second{};
+    ASSERT_TRUE(scheduler_claim_ready_for_slot(
+        fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), 0, &second
+    ));
+    EXPECT_EQ(second.task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(fixture.admissions[3].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(fixture.control()->commit_tail, 0u);
 }
@@ -519,7 +520,7 @@ TEST(HbgAdmissionBootstrap, DynamicCommitGatesRemainActiveBeforeAndAfterRetry) {
             ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
             ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
             ASSERT_EQ(
-                fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED)
+                fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
             );
             if (after_retry) {
                 fixture.control()->commit_lock = 4;
@@ -561,7 +562,7 @@ TEST(HbgAdmissionBootstrap, DynamicCommitGatesRemainActiveBeforeAndAfterRetry) {
     }
 }
 
-TEST(HbgAdmission, PrepareDoesNotPublishTailOrLogAndCommitTransfersPendingOwnership) {
+TEST(HbgAdmission, PendingOwnershipDoesNotPublishTailOrLogAndCommitTransfersIt) {
     AdmissionFixture fixture({{5, LaneMask::aic()}});
     ASSERT_TRUE(fixture.bootstrap());
     SchedulerReadyClaim ready{};
@@ -570,9 +571,9 @@ TEST(HbgAdmission, PrepareDoesNotPublishTailOrLogAndCommitTransfersPendingOwners
     EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
     EXPECT_EQ(
         scheduler_gm_query(fixture.task_control(0)->admission_state),
-        static_cast<uint64_t>(SchedulerAdmissionState::PREPARED)
+        static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
     );
-    ASSERT_TRUE(fixture.prepare(0));
+
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
     EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(fixture.record(0)->order_key, UINT64_MAX);
@@ -586,7 +587,7 @@ TEST(HbgAdmission, PrepareDoesNotPublishTailOrLogAndCommitTransfersPendingOwners
     );
     EXPECT_EQ(
         scheduler_gm_query(fixture.task_control(0)->admission_state),
-        static_cast<uint64_t>(SchedulerAdmissionState::PREPARED)
+        static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
     );
     ASSERT_EQ(fixture.commit(0), SchedulerAdmissionResult::PROGRESS);
     EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
@@ -717,9 +718,9 @@ TEST(HbgAdmission, ContendedCommitRetainsPreparedCandidateWithoutCreatingALogHol
     ASSERT_TRUE(fixture.ready_pop(0, 0, &first));
     ASSERT_TRUE(fixture.ready_pop(1, 3, &second));
     ASSERT_EQ(fixture.claim(0, first), SchedulerAdmissionResult::PROGRESS);
-    ASSERT_TRUE(fixture.prepare(0));
+
     ASSERT_EQ(fixture.claim(3, second), SchedulerAdmissionResult::PROGRESS);
-    ASSERT_TRUE(fixture.prepare(3));
+
     scheduler_gm_store(fixture.control()->commit_lock, UINT64_C(1));
     for (uint32_t attempt = 0; attempt < 3; ++attempt) {
         EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::RETRY);
@@ -755,10 +756,10 @@ TEST(HbgAdmission, ExistingPendingCandidateDoesNotConsumeAnotherReadyOwnership) 
         static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
     );
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
-    ASSERT_TRUE(fixture.prepare(0));
+
     ASSERT_EQ(fixture.commit(0), SchedulerAdmissionResult::PROGRESS);
     ASSERT_EQ(fixture.claim(0, second), SchedulerAdmissionResult::PROGRESS);
-    ASSERT_TRUE(fixture.prepare(0));
+
     ASSERT_EQ(fixture.commit(0), SchedulerAdmissionResult::PROGRESS);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 2u);
 }
@@ -780,20 +781,20 @@ TEST(HbgAdmission, PublishedRunErrorRejectsReadyOwnershipWithoutChangingTheCandi
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ORDERED_EXIT_TIMEOUT));
 }
 
-TEST(HbgAdmission, PublishedRunErrorPreventsPreparedCandidateFromCommitting) {
+TEST(HbgAdmission, PublishedRunErrorPreventsPendingCandidateFromCommitting) {
     AdmissionFixture fixture({{2, LaneMask::aic()}});
     ASSERT_TRUE(fixture.bootstrap());
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
     ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-    ASSERT_TRUE(fixture.prepare(0));
+
     scheduler_record_error(
         fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[3],
         SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
     );
     EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::ERROR);
     EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
-    EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
+    EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
     EXPECT_EQ(fixture.control()->commit_tail, 0u);
     EXPECT_EQ(fixture.control()->commit_lock, 0u);
     EXPECT_EQ(fixture.log()[0], SCHEDULER_TASK_REF_INVALID);
@@ -801,53 +802,39 @@ TEST(HbgAdmission, PublishedRunErrorPreventsPreparedCandidateFromCommitting) {
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ORDERED_EXIT_TIMEOUT));
 }
 
-TEST(HbgAdmission, DuplicateTaskOwnershipIsRejectedAcrossWorkers) {
+TEST(HbgAdmission, DuplicateCandidateCannotCommitAcrossWorkers) {
     AdmissionFixture fixture({{2, LaneMask::aic()}});
     ASSERT_TRUE(fixture.bootstrap());
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
     ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-    EXPECT_EQ(fixture.claim(3, ready), SchedulerAdmissionResult::ERROR);
-    EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
-    EXPECT_EQ(fixture.admissions[3].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
-    EXPECT_NE(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+    ASSERT_EQ(fixture.claim(3, ready), SchedulerAdmissionResult::PROGRESS);
+    ASSERT_EQ(fixture.commit(0), SchedulerAdmissionResult::PROGRESS);
+    EXPECT_EQ(fixture.commit(3), SchedulerAdmissionResult::ERROR);
+    EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.admissions[3].pending_task_ref, 0);
+    EXPECT_EQ(fixture.control()->commit_tail, 1u);
+    EXPECT_EQ(fixture.control()->commit_lock, 0u);
+    EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
 }
 
-TEST(HbgAdmission, BusyClaimLockNeverTransfersPendingOwnershipOrReleasesAnotherOwner) {
-    for (uint64_t owner : {UINT64_C(1), UINT64_C(64), UINT64_MAX}) {
-        AdmissionFixture fixture({{2, LaneMask::aic()}});
-        ASSERT_TRUE(fixture.bootstrap());
-        SchedulerReadyClaim ready{};
-        ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
-        scheduler_gm_store(fixture.task_control(0)->admission_claim_lock, owner);
-        EXPECT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::ERROR);
-        EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
-        EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->admission_claim_lock, UINT64_C(0)), owner);
-        EXPECT_EQ(
-            scheduler_gm_query(fixture.task_control(0)->admission_state),
-            static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
-        );
-        EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ADMISSION_INVALID_STATE));
-    }
-}
-
-TEST(HbgAdmission, LateClaimRechecksPhaseUnderLockAndReleasesItsOwnLockOnRejection) {
+TEST(HbgAdmission, CommitRechecksPhaseUnderLockAndReleasesItsOwnLockOnRejection) {
     for (uint64_t phase : {UINT64_C(1), UINT64_C(2), UINT64_C(3), UINT64_MAX}) {
         AdmissionFixture fixture({{2, LaneMask::aic()}});
         ASSERT_TRUE(fixture.bootstrap());
         SchedulerReadyClaim ready{};
         ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
         scheduler_publish_signal(fixture.task_control(0)->admission_state, phase);
-        EXPECT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::ERROR);
-        EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
-        EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->admission_claim_lock, UINT64_C(0)), 0u);
+        ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
+        EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::ERROR);
+        EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
+        EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_lock, UINT64_C(0)), 0u);
         EXPECT_EQ(scheduler_gm_query(fixture.task_control(0)->admission_state), phase);
         EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ADMISSION_INVALID_STATE));
     }
 }
 
-TEST(HbgAdmission, SuccessfulClaimPublishesPhaseBeforeReturningWithoutHoldingTheLock) {
+TEST(HbgAdmission, SuccessfulClaimOnlyTransfersPrivatePendingOwnership) {
     for (LaneMask mask : kAllMasks) {
         AdmissionFixture fixture({{2, mask}});
         ASSERT_TRUE(fixture.bootstrap());
@@ -857,51 +844,48 @@ TEST(HbgAdmission, SuccessfulClaimPublishesPhaseBeforeReturningWithoutHoldingThe
         ASSERT_EQ(fixture.claim(worker, ready), SchedulerAdmissionResult::PROGRESS);
         EXPECT_EQ(
             scheduler_gm_query(fixture.task_control(0)->admission_state),
-            static_cast<uint64_t>(SchedulerAdmissionState::PREPARED)
+            static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
         );
-        EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->admission_claim_lock, UINT64_C(0)), 0u);
-        ASSERT_TRUE(fixture.prepare(worker));
-        EXPECT_EQ(scheduler_gm_query(fixture.task_control(0)->admission_state), 2u);
-        EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->admission_claim_lock, UINT64_C(0)), 0u);
+
+        EXPECT_EQ(
+            scheduler_gm_query(fixture.task_control(0)->admission_state),
+            static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
+        );
         ASSERT_EQ(fixture.commit(worker), SchedulerAdmissionResult::PROGRESS);
         EXPECT_EQ(scheduler_gm_query(fixture.task_control(0)->admission_state), 3u);
-        EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->admission_claim_lock, UINT64_C(0)), 0u);
         EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
     }
 }
 
-TEST(HbgAdmission, ConcurrentDuplicateClaimCannotAcquireTwoPendingOwnersOrLeakTheClaimLock) {
+TEST(HbgAdmission, ConcurrentDuplicateCandidatesCommitExactlyOnce) {
     for (uint32_t repeat = 0; repeat < 32; ++repeat) {
         AdmissionFixture fixture({{2, LaneMask::aic()}});
         ASSERT_TRUE(fixture.bootstrap());
         SchedulerReadyClaim ready{};
         ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
+        ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
+        ASSERT_EQ(fixture.claim(3, ready), SchedulerAdmissionResult::PROGRESS);
         std::atomic<uint32_t> arrived{0};
         std::array<SchedulerAdmissionResult, 2> results{};
-        std::vector<std::thread> claimers;
+        std::vector<std::thread> committers;
         for (uint32_t index = 0; index < 2; ++index)
-            claimers.emplace_back([&, index] {
+            committers.emplace_back([&, index] {
                 arrived.fetch_add(1, std::memory_order_release);
                 while (arrived.load(std::memory_order_acquire) != 2) {}
-                results[index] = fixture.claim(index * 3, ready);
+                do {
+                    results[index] = fixture.commit(index * 3);
+                } while (results[index] == SchedulerAdmissionResult::RETRY);
             });
-        for (auto &thread : claimers)
+        for (auto &thread : committers)
             thread.join();
-        uint32_t owners = 0;
-        for (uint32_t index = 0; index < 2; ++index) {
-            const bool owns = fixture.admissions[index * 3].pending_task_ref == 0;
-            EXPECT_EQ(results[index] == SchedulerAdmissionResult::PROGRESS, owns);
-            owners += owns;
-        }
-        EXPECT_LE(owners, 1u);
         EXPECT_EQ(
-            scheduler_gm_query(fixture.task_control(0)->admission_state),
-            static_cast<uint64_t>(
-                owners == 0 ? SchedulerAdmissionState::INITIALIZED : SchedulerAdmissionState::PREPARED
-            )
+            (results[0] == SchedulerAdmissionResult::PROGRESS) + (results[1] == SchedulerAdmissionResult::PROGRESS), 1
         );
-        EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->admission_claim_lock, UINT64_C(0)), 0u);
-        EXPECT_EQ(scheduler_gm_query(fixture.control()->commit_tail), 0u);
+        EXPECT_EQ(fixture.control()->commit_tail, 1u);
+        EXPECT_EQ(fixture.control()->commit_lock, 0u);
+        EXPECT_EQ(fixture.record(0)->order_key, 0u);
+        EXPECT_EQ(fixture.log()[0], 0);
+        EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
         EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
     }
 }
@@ -1115,17 +1099,20 @@ TEST(HbgAdmission, EpochZeroAndMaximumAreExactIdentitiesNotSentinels) {
     }
 }
 
-TEST(HbgAdmission, UninitializedZeroEpochStateCannotBypassAPublishedObligation) {
+TEST(HbgAdmission, FreshZeroEpochStateObservesPublishedObligationAfterInitialization) {
     AdmissionFixture fixture({{2, LaneMask::aic()}}, 6, 0);
     ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
-    SchedulerAdmissionLocalState uninitialized{};
+    SchedulerAdmissionLocalState fresh{};
+    ASSERT_TRUE(scheduler_initialize_admission(fixture.base(), fixture.locals[3], &fresh));
+    ASSERT_TRUE(fresh.initialized);
+    ASSERT_EQ(fresh.capacity, 1u);
     bool permit = true;
-    EXPECT_FALSE(scheduler_can_enter_ordinary(
-        fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), &uninitialized, &permit
+    EXPECT_TRUE(scheduler_can_enter_ordinary(
+        fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), &fresh, &permit
     ));
     EXPECT_FALSE(permit);
-    EXPECT_NE(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
 }
 
 TEST(HbgAdmission, OrdinaryPermitRejectsAPrefixMadeStaleByAnotherWorkerCommit) {
@@ -1159,7 +1146,7 @@ TEST(HbgAdmission, PendingClaimAndPreparedRecordCannotBeCarriedIntoAnOrdinaryKer
     bool permit = true;
     ASSERT_TRUE(fixture.ordinary_permit(0, &permit));
     EXPECT_FALSE(permit);
-    ASSERT_TRUE(fixture.prepare(0));
+
     permit = true;
     ASSERT_TRUE(fixture.ordinary_permit(0, &permit));
     EXPECT_FALSE(permit);
@@ -1474,25 +1461,6 @@ TEST(HbgAdmission, PendingPublicationKeepsFreshErrorAndFullLogGates) {
     }
 }
 
-TEST(HbgAdmission, InvalidTaskReferenceAndNoncooperativeTaskCannotAcquireOwnership) {
-    for (int64_t task_ref : {INT64_C(-2), INT64_C(-1), INT64_C(1), INT64_MAX}) {
-        SCOPED_TRACE(task_ref);
-        AdmissionFixture fixture({{2, LaneMask::aic()}});
-        ASSERT_TRUE(fixture.bootstrap());
-        SchedulerReadyClaim invalid{};
-        invalid.task_ref = task_ref;
-        EXPECT_EQ(fixture.claim(0, invalid), SchedulerAdmissionResult::ERROR);
-        EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
-        EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
-    }
-    AdmissionFixture fixture({{2, LaneMask::aic()}, {1, LaneMask::aiv0()}});
-    ASSERT_TRUE(fixture.bootstrap());
-    SchedulerReadyClaim ordinary{};
-    ASSERT_TRUE(fixture.ready_pop(1, 1, &ordinary));
-    EXPECT_EQ(fixture.claim(1, ordinary), SchedulerAdmissionResult::ERROR);
-    EXPECT_EQ(fixture.admissions[1].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
-}
-
 TEST(HbgAdmission, FullCommitLogIsAnErrorAndNeverWrapsOrDropsPendingCandidate) {
     for (uint64_t tail : {UINT64_C(1), UINT64_C(2), UINT64_MAX}) {
         SCOPED_TRACE(tail);
@@ -1501,7 +1469,7 @@ TEST(HbgAdmission, FullCommitLogIsAnErrorAndNeverWrapsOrDropsPendingCandidate) {
         SchedulerReadyClaim ready{};
         ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
         ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-        ASSERT_TRUE(fixture.prepare(0));
+
         scheduler_gm_store(fixture.control()->commit_tail, tail);
         EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::ERROR);
         EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
@@ -1518,7 +1486,7 @@ TEST(HbgAdmission, EpochMismatchBeforeCommitDoesNotPublishARecord) {
         SchedulerReadyClaim ready{};
         ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
         ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-        ASSERT_TRUE(fixture.prepare(0));
+
         fixture.record(0)->run_epoch = epoch == 0 ? UINT64_MAX : 0;
         EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::ERROR);
         EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
@@ -1614,7 +1582,6 @@ TEST(HbgAdmission, PendingPublicationRevalidatesOrderAfterExplicitPreparationAnd
             ASSERT_EQ(fixture.publish_pending(0), SchedulerAdmissionResult::RETRY);
             scheduler_gm_store(fixture.control()->commit_lock, UINT64_C(0));
         } else {
-            ASSERT_TRUE(fixture.prepare(0));
         }
         fixture.record(0)->order_key = 1;
         EXPECT_EQ(fixture.publish_pending(0), SchedulerAdmissionResult::ERROR);
@@ -1915,8 +1882,7 @@ TEST(HbgAdmission, ConcurrentRealCommitsPublishUniqueCompleteContiguousLogEntrie
             while (!start.load(std::memory_order_acquire)) {}
             for (uint64_t index = 0; index < tasks_per_thread; ++index) {
                 const uint64_t task = thread * tasks_per_thread + index;
-                if (fixture.claim(worker, claims[task]) != SchedulerAdmissionResult::PROGRESS ||
-                    !fixture.prepare(worker)) {
+                if (fixture.claim(worker, claims[task]) != SchedulerAdmissionResult::PROGRESS) {
                     errors.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
@@ -2076,7 +2042,7 @@ TEST(HbgAdmissionProtocol, SuccessfulPublicationRecordsActualPublisherOrderAndEp
 }
 
 TEST(HbgAdmissionProtocol, ExplicitNoRecordPathPreservesAdmissionAndEntryErrorGate) {
-    for (const bool prepare_first : {false, true}) {
+    for (const bool commit_contended : {false, true}) {
         AdmissionFixture fixture({{2, LaneMask::aic()}}, 6, 17, {}, true);
         ASSERT_TRUE(fixture.bootstrap());
         auto *local = fixture.locals[0];
@@ -2084,7 +2050,14 @@ TEST(HbgAdmissionProtocol, ExplicitNoRecordPathPreservesAdmissionAndEntryErrorGa
         SchedulerReadyClaim ready{};
         ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
         ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-        if (prepare_first) ASSERT_TRUE(fixture.prepare(0));
+        if (commit_contended) {
+            fixture.control()->commit_lock = 4;
+            EXPECT_EQ(
+                scheduler_ordered_publish_pending<false>(fixture.graph.graph(), fixture.base(), local, fixture.run()),
+                SchedulerAdmissionResult::RETRY
+            );
+            fixture.control()->commit_lock = 0;
+        }
         ASSERT_EQ(
             scheduler_ordered_publish_pending<false>(fixture.graph.graph(), fixture.base(), local, fixture.run()),
             SchedulerAdmissionResult::PROGRESS
@@ -2142,7 +2115,7 @@ TEST(HbgAdmissionProtocol, CommitRetryDoesNotInventASequenceOrPublishAnInterval)
     SchedulerReadyClaim ready{};
     ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
     ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
-    ASSERT_TRUE(fixture.prepare(0));
+
     auto *task =
         scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
     auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(

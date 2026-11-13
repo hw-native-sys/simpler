@@ -8,9 +8,9 @@
 
 跳过 host 的分配、建图和上传，只接受这些输入：Runtime 启动描述、只读图/参数、scheduler state，以及每个核的 context 和 payload 存储。
 
-初值契约可核对 [scheduler_types.h](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：尚未完成任务的 `state=BLOCKED`，`wake_list_head=-1`，`next_waiter=-1`，`waiting_producer=-1`；领取/完成游标为 0；依赖 remaining 由 Host 填入未完成且去重的前驱数；payload 的 `args[48]`、`args[49]` 已指向自身两个 context。已经 inline 完成的节点另作 DONE 处理。
+初值契约可核对 [scheduler_types.h](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：尚未完成任务的 `state=BLOCKED`，`wake_list_head=-1`，`next_waiter=-1`，`wake_cursor=pack(-1,0)`；领取/完成游标为 0；CSR 候选的依赖 remaining 由 Host 填入未完成且去重的前驱数；payload 的 `args[48]`、`args[49]` 已指向自身两个 context。已经 inline 完成的节点另作 DONE 处理。
 两个业务 ready 队列的 `head/reserved_tail` 初始为 0，所有 `SchedulerTicketEntry.task_ref` 初始为 -1，见 [ready pool 初始化](../../../src/a5/runtime/host_build_graph/host/ready_pool_plan.h)。native control inbox 的 head/tail 初始均为 -1。
-静态依赖路径通过 ready-pool header 的 `dependencies_offset` 定位 CSR/remaining；为 0 时保留 wake-list 路由。这只是输入契约，不沿 Host 构造流程展开。
+默认 Host 生成 CSR，bootstrap 对有依赖表的图使用 remaining 计数。通过 ready-pool header 的 `dependencies_offset` 定位 CSR/remaining；为 0 的有效图使用动态挂链。这只是输入契约，不沿 Host 构造流程展开。
 
 从 [AicpuExecutor::init](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp) 开始，leader 先调用 `pre_handshake_init`：
 
@@ -56,7 +56,7 @@
 
 | 字段 | 作用 |
 | ---- | ---- |
-| `runtime_mode` | 选择 resident/明确 fallback；这里读 1 或 2 才走主线 |
+| `runtime_mode` | A5 HBG 选择 resident，取值 1 或 2；无效值进入失败启动清退 |
 | `reserved_` | 对齐保留字段 |
 | `worker_context_base` | worker 0 的 SchedulerWorkerContext 完整 GM 地址 |
 
@@ -79,7 +79,18 @@ epoch 为 0 时，沿无 stamp 的报告协议写身份，屏障后写 done。AI
 [handshake_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp) 中线程 t 负责
 `[t*N/T, (t+1)*N/T)`。每轮扫描自己分区，接受报告后执行 `rmb()`，再读报告 payload 并建立 `cores_[i]`。
 
-所有分区完成后，leader 进入 [post_handshake_init](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp)：
+所有分区完成后，leader 先校验当前 scheduler 启动步骤。A5 HBG 的 mode 必须为 1/2，
+context base 必须非零、满足对齐并容纳全部 worker context，地址计算不能溢出。
+拒绝时锁存 `INVALID_ARGS` 并走各分区失败退休；AICore 在报告身份后只等 EXIT，
+不读取 scheduler backing，nonce ACK 和 teardown release 仍须完成。
+
+READY 前的正常等待同样不解引用 context；READY 发布后才按实际配置的 timeout 检查累计等待时长。
+发现完成后，每个物理寄存器窗口只能有一个退休 owner；重复或缺失 report 不贡献退休证明。
+启动阶段失败不能越过仍在写共享状态的配置 owner。leader 统一发布最终启动结果；
+若某分区已经放行而后续启动屏障失败，该分区仍负责 EXIT/ACK 清退。
+非法 AICPU 线程数由 callback 0 使用平台 startup-abort 清退，不建立非法线程数的 executor 屏障。
+
+校验成功后，leader 进入 [post_handshake_init](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp)：
 
 1. 分别为 AIC、AIV 编排 `type_rank`。
 2. 校验 AIV 数恰好为 AIC 数的两倍，与图中预期 worker/cluster 数一致。

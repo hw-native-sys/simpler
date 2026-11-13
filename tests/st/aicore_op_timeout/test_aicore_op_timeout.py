@@ -70,8 +70,16 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
         device_id=int(st_device_ids[0]),
         enable_sdma=enable_sdma,
     )
-    handle = worker.register(chip_callable)
-    worker.init()
+    try:
+        handle = worker.register(chip_callable)
+        worker.init()
+    except BaseException as init_error:
+        try:
+            worker.close()
+        except BaseException as close_error:
+            raise init_error from close_error
+        raise
+
     close_elapsed = None
     try:
         config = CallConfig()

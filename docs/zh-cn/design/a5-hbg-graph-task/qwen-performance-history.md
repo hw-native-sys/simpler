@@ -3,6 +3,7 @@
 本文历史测量所引用的 JSON 仅保存在本地 `outputs/a5-hbg-graph-task/evidence-summary/`，不随仓库分发；下文保留文件名用于追溯。
 
 本页保留早期冻结结果及失败排查，不作为当前候选的性能结论。
+其中 legacy/native 对比只属于记录的历史版本；当前 A5 HBG 不提供 legacy 执行路径。
 最新数字和验收状态见[当前性能记录](qwen-performance.md)。
 
 ## 复用本次运行的只读元数据校验

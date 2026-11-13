@@ -9,6 +9,15 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "scheduler/scheduler_scalar_policy.h"
+
+namespace {
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = true;
+};
+}  // namespace
+
 #include "inner_kernel.h"
 
 #include <gtest/gtest.h>
@@ -144,9 +153,7 @@ struct OrderedFixture {
         if (!enqueue(task, worker)) return false;
         const uint32_t queue =
             scheduler_task_ready_queue(storage.metadata[task].flags, storage.metadata[task].active_mask);
-        return scheduler_claim_ready_for_slot(
-                   graph.graph(), base(), locals[worker], run(), locals[worker]->config.scheduler_count, queue, ready
-               ) &&
+        return scheduler_claim_ready_for_slot(graph.graph(), base(), locals[worker], run(), queue, ready) &&
                ready->task_ref == static_cast<int64_t>(task);
     }
     bool admit(uint64_t task, uint32_t worker) {
@@ -155,7 +162,6 @@ struct OrderedFixture {
                scheduler_try_claim_admission(
                    graph.graph(), base(), locals[worker], run(), &admissions[worker], ready
                ) == SchedulerAdmissionResult::PROGRESS &&
-               scheduler_prepare_admission_record(graph.graph(), base(), locals[worker], run(), &admissions[worker]) &&
                scheduler_try_commit_admission(graph.graph(), base(), locals[worker], run(), &admissions[worker]) ==
                    SchedulerAdmissionResult::PROGRESS;
     }
@@ -277,10 +283,9 @@ TEST_P(HbgOrderedScalarDetail, FillPublishesExecutableWorkAndBalancesNestedRecor
     ASSERT_NE(ordered, nullptr);
     EXPECT_EQ(ordered->kind >> 16, (fill->kind >> 16) + 1);
     for (const char *name :
-         {"scalar_ordered_poll", "scalar_admission_claim", "scalar_admission_publish", "scalar_admission_prepare",
-          "scalar_admission_commit", "scalar_admission_refresh", "scalar_ordinary_park", "scalar_block_claim",
-          "scalar_admission_close", "scalar_ready_claim", "scalar_dispatch_metadata", "scalar_dispatch_fill",
-          "scalar_dispatch_publish"}) {
+         {"scalar_ordered_poll", "scalar_admission_claim", "scalar_admission_publish", "scalar_admission_commit",
+          "scalar_admission_refresh", "scalar_ordinary_park", "scalar_block_claim", "scalar_admission_close",
+          "scalar_ready_claim", "scalar_dispatch_metadata", "scalar_dispatch_fill", "scalar_dispatch_publish"}) {
         const auto *child = find(name);
         ASSERT_NE(child, nullptr) << name;
         EXPECT_GT(child->kind >> 16, ordered->kind >> 16) << name;
@@ -314,6 +319,16 @@ TEST(HbgOrderedScalarDetail, EmptyPollStillRecordsItsEarlyReturn) {
             ++polls;
     EXPECT_EQ(polls, 1u);
     EXPECT_EQ(buffer->scalar_dropped, 0u);
+}
+
+TEST(HbgOrderedExecution, OrdinaryFlagsBypassAdmissionClaimWhileTheRunHasCooperativeTasks) {
+    OrderedFixture fixture({{2, LaneMask::aic()}, {1, LaneMask::aiv0()}});
+    ASSERT_TRUE(fixture.enqueue(1, 1));
+    ASSERT_TRUE(fixture.fill(1));
+    const auto *local = fixture.locals[1];
+    ASSERT_NE(local->local_ready_mask, 0u);
+    EXPECT_EQ(fixture.admissions[1].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED));
 }
 
 TEST(HbgOrderedScalarDetail, NonAdmissionFillExposesReadyAndDispatchWork) {
@@ -1359,13 +1374,11 @@ TEST(HbgOrderedExecution, PendingLaterAdmissionDoesNotPreemptTheCurrentCooperati
     EXPECT_EQ(first.task, 0);
     EXPECT_EQ(first.block, 0u);
     EXPECT_EQ(fixture.admissions[0].pending_task_ref, 1);
-    EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
+    EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
     EXPECT_EQ(fixture.control(1)->next_block, 0u);
     EXPECT_EQ(fixture.locals[0]->local_ready_mask, 0u);
     ASSERT_TRUE(fixture.complete(first));
-    ASSERT_TRUE(scheduler_prepare_admission_record(
-        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &fixture.admissions[0]
-    ));
+
     ASSERT_EQ(
         scheduler_try_commit_admission(
             fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &fixture.admissions[0]
@@ -1385,7 +1398,7 @@ struct OrderedPendingEntryCase {
     uint32_t worker;
     uint16_t blocks;
     bool sync;
-    bool prepared;
+    bool commit_contended;
     bool protocol;
     bool reversed_task_ids{false};
 };
@@ -1418,15 +1431,9 @@ TEST_P(HbgOrderedPendingEarlierEntry, CurrentBlockRetiresWhileLaterPublicationRe
     auto *shared =
         scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), fixture.storage.layout.admission_control_offset);
     const uint32_t peer = (scenario.worker + 3) % 6;
-    if (scenario.prepared) {
-        ASSERT_TRUE(scheduler_prepare_admission_record(
-            fixture.graph.graph(), fixture.base(), fixture.locals[scenario.worker], fixture.run(),
-            &fixture.admissions[scenario.worker]
-        ));
+    if (scenario.commit_contended) {
         ASSERT_TRUE(claim(2, peer));
-        ASSERT_TRUE(scheduler_prepare_admission_record(
-            fixture.graph.graph(), fixture.base(), fixture.locals[peer], fixture.run(), &fixture.admissions[peer]
-        ));
+
         ASSERT_EQ(scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), static_cast<uint64_t>(peer + 1)), 0u);
         ASSERT_EQ(
             scheduler_try_commit_admission(
@@ -1446,7 +1453,7 @@ TEST_P(HbgOrderedPendingEarlierEntry, CurrentBlockRetiresWhileLaterPublicationRe
     EXPECT_EQ(fixture.control(later_task)->next_block, 0u);
     EXPECT_EQ(fixture.control(2)->next_block, 0u);
     EXPECT_EQ(shared->commit_tail, 1u);
-    EXPECT_EQ(shared->commit_lock, scenario.prepared ? peer + 1u : 0u);
+    EXPECT_EQ(shared->commit_lock, scenario.commit_contended ? peer + 1u : 0u);
     EXPECT_EQ(fixture.admissions[scenario.worker].pending_task_ref, later_task);
     EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
@@ -1457,9 +1464,9 @@ std::vector<OrderedPendingEntryCase> ordered_pending_entry_cases() {
         for (uint16_t blocks : {2, 65})
             for (bool sync : {false, true}) {
                 if (sync && blocks != 2) continue;
-                for (bool prepared : {false, true})
+                for (bool commit_contended : {false, true})
                     for (bool protocol : {false, true})
-                        cases.push_back({worker, blocks, sync, prepared, protocol});
+                        cases.push_back({worker, blocks, sync, commit_contended, protocol});
             }
     for (uint32_t worker = 0; worker < 6; ++worker)
         for (bool protocol : {false, true})

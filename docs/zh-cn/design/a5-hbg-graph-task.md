@@ -15,7 +15,7 @@ SPMD 使用既有 cooperative admission，每个逻辑任务只进入 ready 队�
 
 ## 目标与边界
 
-复用 resident 的依赖 resolver（CSR/remaining 与兼容 wake-list）、direct refill、SPMD admission、
+复用 resident 的依赖 resolver（CSR/remaining 与无 dependency header 的 wake-list）、direct refill、SPMD admission、
 GM MIX 和退出握手，让 Graph 内外的 kernel 在同一套调度协议中执行。
 Host 负责拓扑和资源规划，AICore 只解释已验证的执行计划与绑定参数，AICPU 保持生命周期监督职责。
 
@@ -23,8 +23,10 @@ Host 负责拓扑和资源规划，AICore 只解释已验证的执行计划与�
 DUMMY、多实例复用 Definition、普通任务与 Graph 交错。
 `rt_submit_graph`、boundary alias/shape 契约、原始 `TaskId` 和 kernel 参数 ABI 不变。
 嵌套 Graph、动态 topology、Graph boundary 显式依赖、任意异步完成不扩展。
-Graph 内合法但 resident 尚不支持的形状在 bind 前整 run 选择 legacy；非法输入失败。
-执行开始后不允许 fallback，不引入新的行为环境变量或编译开关。
+A5 HBG 只使用 resident ordinary/native Graph 执行。Host 在发布前拒绝非法形状、
+非连续的 Definition 参数区间及容量不足，不为这些输入选择另一套执行器。
+设备发现无效 mode 或缺失 bootstrap 时进入失败启动清退，不能访问未发布的 scheduler backing。
+不引入新的行为环境变量或编译开关。
 
 契约与后续重构设计分为以下几份：
 
@@ -40,6 +42,9 @@ Graph 内合法但 resident 尚不支持的形状在 bind 前整 run 选择 lega
 | [设计复审](a5-hbg-graph-task/review.md) | 反例、修正、证明边界、并行 PR 与剩余风险 |
 
 ## 设计基线事实与复用范围（2026-10-31）
+
+下表是 native Graph 开发前的历史基线，不表示当前 A5 仍提供旧执行路径。
+当前启动、执行与退核合同见[resident 走读](../a5-hbg-aicore-walkthrough/README.md)。
 
 | 位置 | 已核对行为 |
 | ---- | ---------- |
@@ -149,7 +154,7 @@ bootstrap 并行绑定会增加首 kernel 前的工作量；虽然移出 ready�
 仍不能预先断言比 AICPU 提前物化更快。
 该候选仍待功能和性能验证，不引入跨调度轮持有的物化锁。
 
-首版复用公共 Graph 已预留的 legacy execution tail 作为参数 backing。
+当前复用公共 Graph 已预留的 execution tail 作为参数 backing。
 **不写 `ChipTaskStorage` 不等于不预留这段 heap**；实际内存节省必须在后续 allocator 改造后单独证明。
 当前 resident 的 384-byte task control 和按 block/lane 放大的 trace 存储必须纳入预算。
 验收同时报告 Host bind、首任务延迟、设备总时间、尾延迟、初始化/H2D 字节和峰值内存。

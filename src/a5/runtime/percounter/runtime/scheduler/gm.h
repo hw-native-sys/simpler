@@ -207,6 +207,9 @@ inline __aicore__ void percounter_writeback_dispatch_payload(__gm__ DispatchPayl
     for (uint64_t offset = 0; offset < sizeof(DispatchPayload); offset += 64) {
         dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
     }
+    // Preparation can yield to another task, whose input acquisition drops
+    // this cache. Finish every slot writeback before that invalidation.
+    dsb((mem_dsb_t)0);
 #else
     (void)payload;
 #endif

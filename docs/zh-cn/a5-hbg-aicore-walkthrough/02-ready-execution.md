@@ -25,7 +25,7 @@
 
 **范围与用途：** `ChipTaskStorage` 及其 `TaskDescriptor`、`TaskPayload` 属于原始任务存储条目，与 worker/执行 slot 无关。某任务的多个 block 可以反复读取同一份参数源。native child 的描述来自 template/instance，不必各占一个原始 ChipTaskStorage。
 
-[TaskDescriptor](../../../src/common/host_build_graph/runtime_types.h)：`task_id` 为公开任务身份；`kernel_id[3]` 对应三个子任务入口 ID；`packed_buffer_base/end` 为打包输出区的起止地址；`graph_definition_offset` 为 GRAPH 定义偏移；`reserved[20]` 保留。本次不展开它们的 host 构造或 legacy 管理。
+[TaskDescriptor](../../../src/common/host_build_graph/runtime_types.h)：`task_id` 为公开任务身份；`kernel_id[3]` 对应三个子任务入口 ID；`packed_buffer_base/end` 为打包输出区的起止地址；`graph_definition_offset` 为 GRAPH 定义偏移；`reserved[20]` 保留。本次不展开它们的 host 构造。
 
 [TaskPayload](../../../src/common/host_build_graph/runtime_types.h) 中 resident 参数读取关心：
 
@@ -53,6 +53,10 @@
 | `logical_block_num` | 本任务逻辑 block 数 |
 
 该结构大小与数组步长均为 16B，类型对齐为 8B，字段偏移保持固定。栈上的 metadata 副本使用 Scalar 对齐。
+
+候选分类只读取 `flags`：Host 构造和记录校验保证 SPMD 位与 `logical_block_num > 1` 一致，
+MIX、sync-start、INLINE 也已有对应位。因此扫描候选、判断是否进入 admission 时不需要重复读取整份 metadata；
+真正准备 payload 时才读取 kernel ID 和执行形状。全局 Ready ticket 的领取不依赖 scheduler 数量分片。
 错误上报的身份采集入口和底层发布入口均为 `static noinline`，保留首次错误归属、诊断字段和发布屏障。
 调用边界的验收包括实际汇编检查：存在 SP 栈帧对齐且跨调用传递栈地址的函数按潜在 CCEC 误编译处理，
 不能仅凭参数类型的 `alignof <= 8` 或 CPU 测试通过认定安全。
@@ -62,11 +66,11 @@
 
 ## 2.2 依赖不是每轮扫描整图
 
-当前优先使用 Host 预建的静态依赖计数。[bootstrap_route_task](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h) 读取 remaining，
+默认 CSR 图使用静态依赖计数；无依赖表的有效图使用动态挂链。有依赖表的图中，[bootstrap_route_task](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h) 读取 remaining，
 为 0 才发布初始 ready；非零等待实际前驱完成通知。Host 已去掉输入时完成的节点和重复边。
-没有依赖 header 时，才使用下文的 wake-list 兼容路径。
+默认 Host 生成依赖 header 与 CSR；`dependencies_offset=0` 的有效图执行下文的 wake-list 路径。
 
-[SchedulerTaskControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h) 为 384B、64B 对齐，每字段的含义：
+[SchedulerTaskControl](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h) 为 640B、128B 对齐，每字段的含义：
 
 **范围与用途：** 每个 resident 节点一份 GM 可变控制记录，所有 scheduler 共同推进这一份。它跟随逻辑任务，而不是跟随某个 worker；同一任务被多个核执行时，block join 和依赖完成都必须汇总到这里。
 
@@ -74,21 +78,20 @@
 | ---- | ---- |
 | `state` | BLOCKED=0 或 DONE=2；READY 由队列/slot 表达，不写成这里的第三个状态 |
 | `wake_list_head` | 等待本任务的任务链表头；-1 空且可注册，-2 已关闭 |
-| `next_waiter` | 自己在 wake list、ready inbox 或待发布批次中的链指针；同时只属于一处 |
+| `next_waiter` | control inbox 或待发布 Ready 批次中的链指针 |
+| `wake_cursor` | 原子打包的 wake next ref（低32位）与下一条待检查 fanin 位置（高32位） |
 | `claim_tickets` | 协作 block 的原子领票计数，可能包含少量越过有效 block 范围的票 |
-| `admission_claim_lock` | 保证任务 admission 初次认领只发生一次 |
-| `next_fanin_index` | 本任务扫描依赖的保存位置 |
-| `waiting_producer` | 当前挂在哪个前驱上，-1 表示无 |
 | `completion_resolve_start_cycles / completion_resolve_end_cycles` | 本任务作为 producer 的依赖传播开始/结束时间 |
 | `scheduler_worker_id` | 执行该次完成解析的 worker |
 | `completion_resolve_loop_iter` | 对应 scheduler 循环序号 |
 | `next_block` | 已确认成功领取的 block 数/领取游标；ticket 分支中不是 next ticket 值 |
 | `completion_state` | 低16位累计已退休的实际子任务，16–31位为Host初始化的总数，高32位累计需要检查异步完成的保守票数 |
-| `admission_state` | UNCLAIMED → INITIALIZED → PREPARED → ADMITTED |
+| `admission_state` | UNCLAIMED → INITIALIZED → ADMITTED；Ready到pending的唯一所有权保存在领取核本地 |
 | `claim_seal` | 全部有效 block 已确认领取的不可变凭据，值为逻辑 block 总数 |
 
-TaskControl 共六行：首行是原子 state/链指针/claim tickets；第二行是 resolver 的 cached metadata；
-`next_block`、`completion_state`、`admission_state` 和 `claim_seal` 分别独占后四行。
+TaskControl包含5个128B Sector：首个放state、链指针和claim tickets，wake_cursor位于offset32。
+next_block位于128，completion_state位于256，resolver timing位于320；后两者位于同一Sector的不同64B行，计时写入发生在贡献结束之后。
+admission_state和claim_seal分别位于384和512。
 完成与领取会并发访问，缓存行布局本身就是各字段访问协议的一部分。
 
 [SchedulerDependencyHeader](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_dependency.h) 为一条 64B 只读记录，version=2：
@@ -114,9 +117,9 @@ T1 完成解析：remaining[T2] 1→0，由这次通知的 owner 发布 ready
 两个前驱可以以任意顺序完成，只有取到旧值 1 的通知者使后继 ready。
 CSR 与计数器沿用同一个图访问器的依赖身份和越界检查，不改变 predicate、MIX 或 async 的 DONE 条件。
 
-**无依赖 header 的兼容路径：** bootstrap 为 waiter 找到第一个未完成前驱，用 exchange 挂入 wake list；
+**动态挂链路径：** bootstrap 为 waiter 找到第一个未完成前驱，用 exchange 挂入 wake list；
 producer 完成时摘链，[scheduler_route_task_step](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h) 继续扫描剩余 fanin，必要时用 CAS 迁移到下一个 producer。
-稳态 CAS 路由必须先发布 waiter 的 next 和扫描位置，再挂入新链；遇到 CLOSED 则继续路由。
+稳态 CAS 路由必须先原子发布 waiter 的 wake_cursor（next 与扫描位置），再挂入新链；遇到 CLOSED 则继续路由。
 bootstrap 的 exchange-before-link 只在扫描屏障尚未开放、没有 resolver 并发摘链时使用。
 
 [SchedulerFaninView](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h)：
@@ -140,7 +143,7 @@ bootstrap 的 exchange-before-link 只在扫描屏障尚未开放、没有 resol
 发布与领取的次序见 [ticket reserve/publish/pop](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ticket_queue.h#L67)（第 67 行）及 [scheduler_ready_pool_claim](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h#L1128)：
 
 1. 发布者原子增加 `reserved_tail`，取得独占的 entry 区间。
-2. 用 `scheduler_gm_store` 原子发布各 entry 的 `task_ref`；每个 entry 独占 64B，发布后到本轮退休均不变。
+2. 用 `scheduler_gm_store` 原子发布各 entry 的 `task_ref`；每个 entry 保持64B步长，发布后到本轮退休均不变。
 3. 消费者用 `gm_query` 预筛 head 对应 entry，再用 `gm_load` 原子确认 ref，并检查任务类别。
 4. 只有成功 CAS head 的消费者取得任务所有权；CAS 失败则有界重试或留待下一轮。
 
@@ -157,7 +160,7 @@ bootstrap 的 exchange-before-link 只在扫描屏障尚未开放、没有 resol
 | `task_count` | 合法 task_ref 的上界 |
 | `descriptors_offset` | 队列描述符数组偏移 |
 | `controls_offset` | 队列 head/tail 控制数组偏移 |
-| `dependencies_offset` | 静态依赖 header 偏移，0 表示采用 wake-list 兼容路径 |
+| `dependencies_offset` | 静态依赖 header 偏移，0 表示采用动态 wake-list 路径 |
 | `storage_end_offset` | pool 存储的末端边界 |
 | `entry_count` | 全部队列 entry 容量之和 |
 
@@ -166,7 +169,7 @@ bootstrap 的 exchange-before-link 只在扫描屏障尚未开放、没有 resol
 | 结构 | 字段及作用 |
 | ---- | ---------- |
 | `SchedulerReadyPoolDescriptor` | `entries_offset`：entry 区偏移；`capacity`：此队列容量 |
-| `SchedulerTicketQueue` | `head`：下一消费位置；`reserved_tail`：下一个未预留位置；head 与 reserved_tail 分别以 64B 对齐，总长 128B |
+| `SchedulerTicketQueue` | `head`：下一消费位置；`reserved_tail`：下一个未预留位置；head 与 reserved_tail 分别以 128B 对齐，总长 256B |
 | `SchedulerTicketEntry` | `task_ref`：初值 -1，原子发布后为有效节点索引；总长/对齐均为 64B |
 | `SchedulerTicketQueueView` | `control`：控制对象指针；`entries`：entry 指针；`capacity`：队列容量；`task_count`：ref 边界 |
 | `SchedulerTicketRange` | `begin/count`：本发布者取得的连续写入区间 |
@@ -223,14 +226,13 @@ inbox 的 head=tail>=0 表示恰好一个任务；head=tail=-1 才是空，和�
 | `admission` | 图存在协作任务时的本地有序准入状态 |
 | `async` | 图存在异步完成布局时的本地服务状态 |
 | `pending_completed` | 已完成依赖传播、尚未累加到全局的节点数 |
-| `control_resolve` | native 控制节点的可续行完成解析游标 |
 | `last_completion_flush_cycles` | 最近一次相应批量完成刷新时间 |
 | `control_peer_cursor` | native 控制 inbox 的轮转搜索位置 |
 | `slots[2]` | 本核自己的两个执行 slot |
 | `local_ready_mask` | 哪些 own slot 已发布 ready |
 | `ready_head` | READY 集合中先发布的 slot 下标；空集合为 UINT8_MAX |
 
-64 位构建中 LocalConfig 为 104B，LocalState 为 368B。完成直接发生在执行返回的调用链中，没有本地完成通知或待扫描完成队列。
+64 位构建中 LocalConfig 为 104B，LocalState 为 208B。完成直接发生在执行返回的调用链中，没有本地完成通知或待扫描完成队列。
 
 [SchedulerLocalSlotState](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h)：
 

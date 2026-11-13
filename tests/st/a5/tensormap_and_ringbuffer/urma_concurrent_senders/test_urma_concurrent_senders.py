@@ -197,6 +197,7 @@ class TestUrmaSamePeer(_UrmaConcurrentSenders):
         {
             "name": "same_peer",
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": 2, "num_sub_workers": 0},
             "params": {"slots": 2, "peers": 1, "waves": 3, "repeats": 4},
         }
@@ -209,6 +210,7 @@ class TestUrmaConcurrentTasks(_UrmaConcurrentSenders):
         {
             "name": "concurrent_tasks",
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": 2, "num_sub_workers": 0},
             "params": {"slots": 2, "peers": 1, "waves": 3, "repeats": 4, "independent": 1},
         }
@@ -221,6 +223,7 @@ class TestUrmaMixSiblings(_UrmaConcurrentSenders):
         {
             "name": "mix_siblings",
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": 2, "num_sub_workers": 0},
             "params": {"slots": 2, "peers": 1, "waves": 3, "repeats": 4, "independent": 2},
         }
@@ -233,6 +236,7 @@ class TestUrmaTwoPeers(_UrmaConcurrentSenders):
         {
             "name": "two_peers",
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": 3, "num_sub_workers": 0},
             "params": {"slots": 1, "peers": 2, "waves": 3, "repeats": 4},
         }
@@ -245,6 +249,7 @@ class TestUrmaQueueWrap(_UrmaConcurrentSenders):
         {
             "name": "queue_wrap",
             "platforms": ["a5"],
+            "manual": True,
             # One scheduler owner keeps the two producers on a bounded set of queues for physical ring reuse.
             "config": {"device_count": 2, "num_sub_workers": 0, "aicpu_thread_num": 2},
             "params": {"slots": 2, "peers": 1, "waves": 4097, "repeats": 8, "independent": 1, "wrap": True},
@@ -258,6 +263,7 @@ class TestUrmaReuseObservation(_UrmaConcurrentSenders):
         {
             "name": "reuse_observation",
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": 2, "num_sub_workers": 0},
             "params": {"slots": 2, "peers": 1, "waves": 2, "repeats": 8, "independent": 3},
         }

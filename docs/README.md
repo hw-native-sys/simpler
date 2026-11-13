@@ -40,6 +40,7 @@ changing simpler's own internals.
 | [Chip-Level Architecture (L2)](chip-level-arch.md) | Three-program model (host / AICPU / AICore), API layers, handshake |
 | [Hierarchical Level Runtime](hierarchical-level-runtime.md) | The L0–L6 level model and component composition |
 | [Task Flow](task-flow.md) | Callable / TaskArgs / CallConfig pass-through, `IWorker` |
+| [Run Pipeline and the KernelLaunch Stream](run-pipeline.md) | Why a run has a host/device/host pipeline and what the CANN stream cannot provide |
 | [Buffer Memory Model](buffer-abi.md) | How L3+ tasks name data: canonical identity, backend descriptor, strided view |
 | [Orchestrator](orchestrator.md) | DAG submission: TensorMap, Scope, Ring, task state machine |
 | [Scheduler](scheduler.md) | DAG dispatch: wiring / ready / completion queues, dispatch loop |

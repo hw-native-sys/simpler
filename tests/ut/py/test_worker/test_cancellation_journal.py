@@ -440,7 +440,8 @@ class TestShmNames:
             with contextlib.suppress(FileNotFoundError):
                 foreign_shm.unlink()
 
-    def test_a3_backing_sweep_waits_for_the_creator_group(self, monkeypatch):
+    @pytest.mark.parametrize("kind", ["a3", "h"])
+    def test_host_backing_sweep_waits_for_the_creator_group(self, monkeypatch, kind):
         posixshmem = pytest.importorskip("_posixshmem")
         nested = Worker(level=3, num_sub_workers=0)
         root = Worker(level=4, num_sub_workers=0)
@@ -448,10 +449,10 @@ class TestShmNames:
         root._assign_shm_namespace()
         own_group = os.getpgrp()
         child_group = own_group + 1
-        backing = _shm_name(nested._shm_token, f"a3-{child_group:x}-backing")
-        local = _shm_name(root._shm_token, f"a3-{own_group:x}-local")
-        foreign = _shm_name(uuid.uuid4().hex, f"a3-{child_group:x}-foreign")
-        invalid = _shm_name(nested._shm_token, "a3-0-invalid")
+        backing = _shm_name(nested._shm_token, f"{kind}-{child_group:x}-backing")
+        local = _shm_name(root._shm_token, f"{kind}-{own_group:x}-local")
+        foreign = _shm_name(uuid.uuid4().hex, f"{kind}-{child_group:x}-foreign")
+        invalid = _shm_name(nested._shm_token, f"{kind}-0-invalid")
         names = [backing, local, foreign, invalid]
         unlinked = []
         probe_error = None
@@ -479,11 +480,12 @@ class TestShmNames:
             assert root._cleanup_journal.empty
             assert unlinked == [f"/{backing}"]
 
-    def test_a3_local_backing_sweep_waits_for_l2_and_retries_unlink(self, monkeypatch):
+    @pytest.mark.parametrize("kind", ["a3", "h"])
+    def test_local_host_backing_sweep_waits_for_l2_and_retries_unlink(self, monkeypatch, kind):
         posixshmem = pytest.importorskip("_posixshmem")
         worker = Worker(level=3, num_sub_workers=0)
         worker._assign_shm_namespace()
-        backing = _shm_name(worker._shm_token, f"a3-{os.getpgrp():x}-backing")
+        backing = _shm_name(worker._shm_token, f"{kind}-{os.getpgrp():x}-backing")
         calls = []
         child_alive = True
         unlink_fails = True
@@ -515,6 +517,73 @@ class TestShmNames:
         assert worker._cleanup_journal.drive_kinds({"shm"}) is None
         assert worker._cleanup_journal.empty
         assert calls == [f"/{backing}"] * 2
+
+    @pytest.mark.parametrize("nested", [False, True], ids=["local", "nested"])
+    def test_comm_marker_sweep_waits_for_l2_and_retries_unlink(self, monkeypatch, tmp_path, nested):
+        l3 = Worker(level=3, num_sub_workers=0)
+        owner = Worker(level=4, num_sub_workers=0) if nested else l3
+        if nested:
+            owner.add_worker(l3)
+        owner._assign_shm_namespace()
+        monkeypatch.setattr(worker_mod, "_COMM_ROOTINFO_DIR", str(tmp_path))
+
+        group = os.getpgrp() + int(nested)
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "getpgrp", lambda: group)
+            rootinfo = os.path.basename(l3._comm_plan_rootinfo_path())
+        marker = tmp_path / f"{rootinfo}.destroy_failed.1"
+        other_rootinfo = f"pto_multi_comm_{uuid.uuid4().hex}_{group:x}.bin"
+        unrelated = tmp_path / f"{other_rootinfo}.destroy_released.1.2"
+        unrelated_ready = tmp_path / f"barrier_{other_rootinfo}_alloc_1_host_ready_1_1.ready"
+        unrelated_pending = tmp_path / f"barrier_{other_rootinfo}_alloc_2_host_ready_1_1.ready.tmp"
+        blocked = tmp_path / f"{rootinfo}.destroy_released.1.1"
+        blocked.mkdir()
+        release = tmp_path / f"{rootinfo}.destroy_released.1.2"
+        ready = tmp_path / f"barrier_{rootinfo}_alloc_1_host_ready_1_1.ready"
+        pending = tmp_path / f"barrier_{rootinfo}_alloc_2_host_ready_1_1.ready.tmp"
+        failed = tmp_path / f"barrier_{rootinfo}_alloc_1_host_failed_1_0.ready"
+        owned = (marker, release, ready, pending, failed)
+        for path in (*owned, unrelated, unrelated_ready, unrelated_pending):
+            path.touch()
+
+        child_alive = True
+
+        def reap_l2():
+            if child_alive:
+                raise RuntimeError("L2 still alive")
+
+        def probe_group(pgid, sig):
+            assert (pgid, sig) == (group, 0)
+            if not child_alive:
+                raise ProcessLookupError
+
+        if nested:
+            # The L3 leader is already reaped. Its L2 descendants still own the group.
+            monkeypatch.setattr(os, "killpg", probe_group)
+        else:
+            owner._cleanup_journal.add("child", "chip survivor", reap_l2)
+        with pytest.raises(RuntimeError, match="(still alive|unconfirmed L2 child exit)"):
+            owner._reclaim_child_groups(time.monotonic())
+        assert all(path.exists() for path in owned)
+
+        child_alive = False
+        assert owner._cleanup_journal.drive_kinds({"child"}) is None
+        unlink = os.unlink
+
+        def fail_unlink(path, *args, **kwargs):
+            if os.fspath(path) == str(failed):
+                raise PermissionError("injected marker unlink failure")
+            unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "unlink", fail_unlink)
+            assert isinstance(owner._cleanup_journal.drive_kinds({"shm"}), PermissionError)
+            assert failed.exists()
+
+        assert owner._cleanup_journal.drive_kinds({"shm"}) is None
+        assert owner._cleanup_journal.empty
+        assert all(not path.exists() for path in owned)
+        assert unrelated.exists() and unrelated_ready.exists() and unrelated_pending.exists() and blocked.is_dir()
 
 
 class TestNewWorkerClose:

@@ -9,6 +9,7 @@
 """A scalar or HOST control selects empty/active calls over one persistent DEVICE view."""
 
 import ctypes
+import json
 import struct
 import subprocess
 import sys
@@ -254,9 +255,16 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
 def _check(st_platform, st_device_ids, runtime, borrowed, host_controls, workspace_budget=None):
     if borrowed and st_platform.endswith("sim"):
         pytest.skip("borrowed contexts require onboard RTS")
+    # Resolve simpler_setup from the repository and reuse pytest's pinned PTO-ISA checkout.
     result = subprocess.run(
         [
             sys.executable,
+            "-c",
+            "import json, runpy, sys; "
+            "sys.path[:] = json.loads(sys.argv[1]); "
+            "sys.argv = sys.argv[2:]; "
+            "runpy.run_path(sys.argv[0], run_name='__main__')",
+            json.dumps(sys.path),
             str(Path(__file__).resolve()),
             st_platform,
             runtime,
@@ -265,6 +273,7 @@ def _check(st_platform, st_device_ids, runtime, borrowed, host_controls, workspa
             str(int(host_controls)),
             str(workspace_budget) if workspace_budget is not None else "none",
         ],
+        cwd=_ROOT,
         capture_output=True,
         text=True,
         timeout=180,

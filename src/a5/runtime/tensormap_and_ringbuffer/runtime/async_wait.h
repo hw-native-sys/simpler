@@ -22,7 +22,9 @@
 #include "intrinsic.h"
 #include "aicore_completion_mailbox.h"
 #include "completion_token.h"
+#include "platform_comm/ccu/ccu_completion.h"
 #include "runtime_types.h"
+#include "common/unified_log.h"
 
 struct SchedulerState;
 struct CompletionStats;
@@ -97,12 +99,28 @@ inline void rdma_event_handle_retire_op(CompletionCondition &cond) {
     pto2::rdma_backend::retire_rdma_event_handle(cond.addr, cond.backend_cookie);
 }
 
+inline CompletionPollResult ccu_poll_op(const CompletionCondition &cond) {
+    const auto result = simpler::ccu::poll_completion(cond.addr, cond.backend_cookie);
+    if (result.state == simpler::ccu::CompletionPollState::pending)
+        return {CompletionPollState::PENDING, SIMPLER_ERROR_NONE};
+    if (result.state == simpler::ccu::CompletionPollState::ready)
+        return {CompletionPollState::READY, SIMPLER_ERROR_NONE};
+    LOG_ERROR(
+        "CCU completion failed: event=0x%llx mask=%llu native_error=%lld", static_cast<unsigned long long>(cond.addr),
+        static_cast<unsigned long long>(cond.backend_cookie), static_cast<long long>(result.native_error)
+    );
+    return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+}
+
+inline void ccu_retire_op(CompletionCondition & /*cond*/) {}
+
 inline const CompletionBackendOps *completion_backend_ops_for(int completion_type) {
     static const CompletionBackendOps kOps[] = {
         {counter_poll_op, counter_retire_op},                      // COMPLETION_TYPE_COUNTER = 0
         {sdma_event_record_poll_op, sdma_event_record_retire_op},  // COMPLETION_TYPE_SDMA_EVENT_RECORD = 1
         {urma_event_handle_poll_op, urma_event_handle_retire_op},  // COMPLETION_TYPE_URMA_EVENT_HANDLE = 2
         {rdma_event_handle_poll_op, rdma_event_handle_retire_op},  // COMPLETION_TYPE_RDMA_EVENT_HANDLE = 3
+        {ccu_poll_op, ccu_retire_op},                              // COMPLETION_TYPE_CCU = 4
     };
     constexpr int kOpsCount = static_cast<int>(sizeof(kOps) / sizeof(kOps[0]));
     if (completion_type < 0 || completion_type >= kOpsCount) return nullptr;

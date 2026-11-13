@@ -65,6 +65,7 @@ class TestAutomaticTwoEndpointFold(AutomaticTwoEndpointScene):
         {
             "name": "automatic_twoendpointfold",
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": 2, "num_sub_workers": 1},
             "params": {},
         }

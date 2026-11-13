@@ -81,6 +81,19 @@ a2a3_tmr_case(test_entry_args_preparation.cpp NO_OBJS
     LINK_OPTIONS ${_entry_preparation_gc}
     TIMEOUT 20)
 
+# Supply an event-controlled clock to exercise a failure during a real wait.
+get_target_property(_kernel_error_sources a2a3_tmr_objs SOURCES)
+list(FILTER _kernel_error_sources EXCLUDE REGEX "device_time_stub.cpp$")
+a2a3_tmr_case(test_kernel_error.cpp NO_OBJS
+    SOURCES ${_kernel_error_sources}
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${A2A3_RUNTIME_DIR}/runtime_core.cpp
+    LINK a2a3_ut_support
+    DEFINES SIMPLER_DFX=0
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_entry_preparation_gc}
+    TIMEOUT 30)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it

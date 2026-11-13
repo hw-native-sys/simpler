@@ -31,7 +31,7 @@ the `chip.run.bind` span:
 | `args` | copying readable caller tensors in H2D, into slices of the pipeline slot's retained temporary buffer, and exposing their existing host buffers to orchestration; pure outputs skip both. The buffer grows to the high-water packed size and is reused, so a steady-state workload allocates no device memory here |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
 | `host_orch` | orchestration and recording: every task submitted and every sub-task recorded; excludes the later Definition packing and Graph task binding in `bind_graph_definitions` |
-| `graph_pack` | assembling this run's Definition section in `bind_graph_definitions` — staging growth, header writes, spill copies. Legacy Graph hands this section to the AICPU launch package; A5 native Graph retains it in the host plan and publishes a separate scheduler image later. This segment has no H2D of its own. Excludes Graph task binding. Absent when there is no Definition |
+| `graph_pack` | assembling this run's Definition section in `bind_graph_definitions` — staging growth, header writes, spill copies. A2A3 Graph hands its section to the AICPU launch package; A5 retains an independent Host source snapshot and publishes a resident scheduler image later. This segment has no H2D of its own. Excludes Graph task binding. Absent when there is no Definition |
 | `image_stage` | snapshotting prerequisites and the compact execution image into run-owned host metadata. Onboard H2D queues during launch, outside this segment. Synchronous CPU transports copy in the same call; their timing is not the onboard staging cost |
 | `arena_h2d` | historical synchronous H2D of the arena's copied zone and shared-memory image; retained for old traces, not emitted by the current image-staging path |
 | `host_view_close` | dropping the explicit HOST/NONE access registrations after host orchestration and recorder completion; no mapping or device-copy fallback is performed. Historical `count`, `bytes`, and `devcopy` attributes are no longer emitted |
@@ -79,7 +79,6 @@ Their H2D copies queue in that order in the later launch transaction, before the
 Runtime descriptor and entry fork. CPU transports without a staging callback
 retain synchronous publication inside this call. Neither route has a dedicated
 scheduler segment, and the onboard enqueue cost is outside `chip.run.bind`.
-The legacy A5 path has no separate resident scheduler publication.
 
 `image_stage` is host preparation, not a device-upload clock anchor. The phase
 artifact excludes it from the upload projection. A skipped-device timing run

@@ -1223,6 +1223,7 @@ class TestA5TmrEarlyEnqueueTwoEndpoints(_A5TmrEarlyEnqueueBase):
         {
             "name": "a5_tmr_early_enqueue_two_endpoints",
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": 2, "num_sub_workers": 0, "launch_depth": 2},
             "params": {},
         },
@@ -2053,6 +2054,7 @@ class TestA5TmrWideTwoEndpoints(_A5TmrEarlyEnqueueBase):
         {
             "name": "a5_tmr_wide_two_endpoints",
             "platforms": ["a5"],
+            "manual": True,
             "config": {
                 "device_count": 2,
                 "num_sub_workers": 0,

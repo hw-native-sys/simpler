@@ -88,7 +88,6 @@ class ProtocolBuilder:
                     completed_subtasks=0,
                     admission_state=0,
                     claim_tickets=0,
-                    admission_claim_lock=0,
                     claim_seal=0,
                 )
             )

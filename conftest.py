@@ -619,6 +619,20 @@ def _validate_level_filters(config) -> None:
         raise pytest.UsageError("--level and --exclude-level cannot be used together")
 
 
+def _configure_ascend_logs(config) -> None:
+    """Keep A5 process/device logs with the JUnit artifacts, including child processes."""
+    report = config.getoption("xmlpath", default=None)
+    if config.getoption("--platform", default=None) != "a5" or not report:
+        return
+    if os.environ.get("ASCEND_PROCESS_LOG_PATH"):
+        return
+    log_dir = Path(report).resolve().parent / "ascend"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    patch = pytest.MonkeyPatch()
+    patch.setenv("ASCEND_PROCESS_LOG_PATH", str(log_dir))
+    config.add_cleanup(patch.undo)
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -676,6 +690,7 @@ def pytest_configure(config):
     _validate_level_filters(config)
     _validate_diagnostic_flags(config)
     _configure_sanitizer(config)
+    _configure_ascend_logs(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
     # simpler's own WARNINGs — e.g. the device-log-timing "no device log written"
@@ -1414,15 +1429,17 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912, PLR0915
             tag = "PASS" if res.returncode == 0 else f"FAIL rc={res.returncode}"
             nodeid = res.nodeid or "<unknown>"
             header = f"{res.label} nodeid={nodeid} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
+            if res.returncode == 0:
+                print(header, flush=True)
+                return
             spooled = _spool_child_output(nodeid, res.output)
             _emit_group(header, _bounded_child_output(res.output, spooled))
-            if res.returncode != 0:
-                # Out-of-group summary so a reviewer scanning the collapsed
-                # log still sees the failure without having to expand.
-                print(
-                    f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
-                    flush=True,
-                )
+            # Out-of-group summary so a reviewer scanning the collapsed
+            # log still sees the failure without having to expand.
+            print(
+                f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
+                flush=True,
+            )
 
         print(
             f"\nResource phase: {len(jobs)} case(s), pool={device_ids}, max_parallel={max_parallel}",

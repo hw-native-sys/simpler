@@ -1,0 +1,238 @@
+{
+  "baseline": "c1c234667d54f4aea1582249448b24f9a08753f6",
+  "semantics": "wse-fixed-sram-full-device-block-scheduling-with-temporary-fp32-operations",
+  "files": [
+    {
+      "source": "src/a5/platform/include/common/kernel_args.h",
+      "destination": "src/wse/platform/include/common/kernel_args.h",
+      "sha256": "68752e319f2608a82e074d5ed9f62a92a8e1d611e5bb2a061fd89664799593b0"
+    },
+    {
+      "source": "src/a5/platform/include/common/platform_config.h",
+      "destination": "src/wse/platform/include/common/platform_config.h",
+      "sha256": "c83764c47df1bf34c44a44e24a0b283038a9f43873de6e1153b32adb5b865328"
+    },
+    {
+      "source": "src/a5/platform/include/common/pmu_profiling.h",
+      "destination": "src/wse/platform/include/common/pmu_profiling.h",
+      "sha256": "b54c88fc1577e448ba62749eaa7cc777e1bf86f0895c59c4b27905150c76880a"
+    },
+    {
+      "source": "src/a5/platform/include/common/scheduler_profiling.h",
+      "destination": "src/wse/platform/include/common/scheduler_profiling.h",
+      "sha256": "125bb3b752e77664cceed12a19385807f92a0dbc19b8a3098b1f0dc46be8ddb1"
+    },
+    {
+      "source": "src/a5/platform/include/host/pmu_collector.h",
+      "destination": "src/wse/platform/include/host/pmu_collector.h",
+      "sha256": "eceb6d38e5e08c52e1d262b9c02eb84c306c9d02b46930821daf29ba638e5b58"
+    },
+    {
+      "source": "src/a5/platform/sim/CMakeLists.txt",
+      "destination": "src/wse/platform/sim/CMakeLists.txt",
+      "sha256": "698b693f26d5e568bdb6457b165065bb098c2436d1b444a1422cf027702bb034"
+    },
+    {
+      "source": "src/a5/platform/sim/aicore/CMakeLists.txt",
+      "destination": "src/wse/platform/sim/aicore/CMakeLists.txt",
+      "sha256": "e65a4aa0859a931df379284429556cc207aab096740b00e77380699cc1acce63"
+    },
+    {
+      "source": "src/a5/platform/sim/host/CMakeLists.txt",
+      "destination": "src/wse/platform/sim/host/CMakeLists.txt",
+      "sha256": "61bdbc742386c9301a668988162821f8e37a575709e7a230652134a9642d70fc"
+    },
+    {
+      "source": "src/a5/platform/sim/host/device_runner.cpp",
+      "destination": "src/wse/platform/sim/host/device_runner.cpp",
+      "sha256": "6b37aaaa7b5177fb85aca3e1e7f16273847b357fa49b94bc45e6c808fc8a3244"
+    },
+    {
+      "source": "src/a5/platform/sim/host/device_runner.h",
+      "destination": "src/wse/platform/sim/host/device_runner.h",
+      "sha256": "21c5f0dfbcfdfface247f515b38ba20c954d6927fc791cbd544552ccc8265a7c"
+    },
+    {
+      "source": "src/a5/platform/sim/host/runtime_c_api.cpp",
+      "destination": "src/wse/platform/sim/host/runtime_c_api.cpp",
+      "sha256": "f9568d33d073957980727f2a438c54456d53cedc25104390edf775d178518771"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/build_config.py",
+      "destination": "src/wse/runtime/host_build_graph/build_config.py",
+      "sha256": "203dd70451657e530632edd56f2068771bb46e4c79a657c7acd4489a68ea7293"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/common/intrinsic.h",
+      "destination": "src/wse/runtime/host_build_graph/common/intrinsic.h",
+      "sha256": "547bd7a6a1b1e41208365bb287e3212f6290715d2b58253ac1213ebacda58057"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.cpp",
+      "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.cpp",
+      "sha256": "50d7ba75dbf21a7912dc349867b6f00e2497ff32b694b6f7c3ea3deb2098d797"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/host/native_graph_plan.h",
+      "destination": "src/wse/runtime/host_build_graph/host/native_graph_plan.h",
+      "sha256": "c759a8ba6a8f3e04d2eb0503d6c25a974093cf8fb4076a062f2cddbbb1e285a8"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
+      "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
+      "sha256": "d0b0a430c4ab9c3fa415627e48adc85403ca44c03c907e781674525f6f311e76"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
+      "sha256": "afc27eb5a6407b6a3ddc324a7007ea4928d2b33241640019f5eaa9776b8ae568"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
+      "sha256": "e0bbc7c8706f1a76a3df053bfe84235da57b904fc1aa19849ddaa1489dcf754e"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/async_wait.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/async_wait.h",
+      "sha256": "29c0e675da693ce641ead62ef9689d84997d4a696b218e89f44b5cb032abddc4"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/dispatch_payload.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/dispatch_payload.h",
+      "sha256": "944975d3ca04a539ef3a83c322e82ebd4be8413e056d8c9b9d8ebbc6b3ab3b5b"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler.h",
+      "sha256": "caa845669f43c21412768c29b7cc43172209370437c0dfe19a82c7b10d4d0dc0"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h",
+      "sha256": "91a31b7578b3bcc705cf4974e643df9ec3415c85cab54a69f4603423745db8fa"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_graph_binding.h",
+      "sha256": "c2cff91f56e3314acd7f88457d434aa5254f9ecc02aa9c82c7802772339c697d"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph.h",
+      "sha256": "4e518a4d6d880ba44e214e989ef248a6c73d44370ea25d1d1779e7051e2598e3"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_native_graph_access.h",
+      "sha256": "ac5e1278aeb0b007729a9ec195b3632aecc849f203ba3b18d1f163bddf3dd62a"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler_types.h",
+      "sha256": "fb7eb38aec2dc4f3a2f094e70cc58140ae6f60ba7c95f4f84fba7e62885f062b"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/tensor.h",
+      "destination": "src/wse/runtime/host_build_graph/runtime/tensor.h",
+      "sha256": "79476ac8aec87b25d8420bdabf3dc7d9ead26a6d5622d7125773b56bd89a462d"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp",
+      "destination": "tests/st/wse/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp",
+      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
+      "sha256": "b240fc91ff48a3b43868a3df7f410cc44cac9ecd81d7eaa5c48911674eee2efe"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_add_scalar.cpp",
+      "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_add_scalar.cpp",
+      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
+      "sha256": "25bda1ff1e9523f75bf468ac36f32487760f51506131ef84963bcbcd51261032"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_add.cpp",
+      "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_add.cpp",
+      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
+      "sha256": "97210de242d4d771fc576ac0f4fa8ae9ef6e15739162688ca0a39d140830bc2b"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_mul.cpp",
+      "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_mul.cpp",
+      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
+      "sha256": "1267d768188feb99ad6cfa05b70362e6f8a71173d27385a0ae6cb6e731b20ab3"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/vector_example/test_vector_example.py",
+      "destination": "tests/st/wse/host_build_graph/vector_example/test_vector_example.py",
+      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
+      "sha256": "15ac2a02cce0dad98db256fbffe722a67a21f16c8cbd38c4999ebe10f77b8afd"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/test_predicated_dispatch.py",
+      "destination": "tests/st/wse/host_build_graph/direct_launch/test_predicate.py",
+      "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
+      "sha256": "54bfcfbb919155a6e6a0c3623c70883be05b0e0e675aa4fe8495017a3095b431"
+    }
+  ],
+  "derivation_baseline": "a3a951a1f9ef4dd898b254dc88f233b9cfac0b32",
+  "scope": "Provenance of inherited files; this is not a build or runtime component manifest.",
+  "operation_backend": "wse-temporary-fp32",
+  "reused_sources": [
+    {
+      "source": "src/a5/platform/include/common/pmu_profiling.h",
+      "sha256": "961eb73e5645e6b516f59916b36ea336a4e8c2b69c7f60edbf3948b2af085199"
+    },
+    {
+      "source": "src/a5/platform/include/common/scheduler_profiling.h",
+      "sha256": "a1aaf5c2389ac76187ec6ebc8145f49a1742c731645c757ab3e4b1e552000104"
+    },
+    {
+      "source": "src/a5/platform/include/host/pmu_collector.h",
+      "sha256": "0233a0b3614f2d83057ca6c9cb92560f2c1acec98aa4132b90a6626f43968145"
+    },
+    {
+      "source": "src/a5/platform/shared/host/pmu_collector.cpp",
+      "sha256": "4d2bb62348e8710ae7b358a79d7fecfe48aa4a1c266e7c394d306acd797f51a0"
+    },
+    {
+      "source": "src/a5/platform/sim/host/profiling_copy.cpp",
+      "sha256": "c2b47cfed9f26e311c7ea570f1891514e48550adc92dbc748e22ad9cce12a413"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/host/runtime_compile_info.cpp",
+      "sha256": "80e119aee2ebf4b628ce662d0d1bd9a3df3639b7acdc930d6ca4f100356ba45a"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
+      "sha256": "ef6ed6ef50c43adcbc46318bda2604ccf4e9a813370d1b9d838e86e05efae151"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_gate.cpp",
+      "sha256": "3cb84e7cac466b6a73f7defe0718f077b16cebc52c5c381902e436266c1a8030"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_copy_first.cpp",
+      "sha256": "f9dc321482e73938ca0ace2f8f8f09004617f30986689f7200e778eca0504751"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_clobber.cpp",
+      "sha256": "f323ad50f897b0452c154ea260f167438cdab447ce4d3c3cbe5d4da0504ee3ea"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_const.cpp",
+      "sha256": "74abaf7aaf19db0347be56e174df0ae2166178553aa2cba0a25f0bfa7bb8370b"
+    },
+    {
+      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/orchestration/predicated_dispatch_orch.cpp",
+      "sha256": "db2af41e502fb952fc7133d4aa8f7d850208a4b3cc3539c9c79ed13820d1efd0"
+    },
+    {
+      "source": "src/a5/platform/include/common/kernel_args.h",
+      "sha256": "f7e3c8fd711f38fd6c528525444095ec484713aab7cba14e4ec00c0376184ed4"
+    },
+    {
+      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
+      "sha256": "5306aa2c152255661d465204d5bf090bf00feae74aec07a23ff60fb3bc693bb0"
+    }
+  ]
+}

@@ -58,24 +58,32 @@ task_window_last_index、scheduler_state_address、native_header_offset、schedu
 
 | 类型 | 大小 | cacheline 所有权 |
 | ---- | ---- | ---------------- |
-| SchedulerTaskControl | 384 B | state/claim tickets、resolver metadata、block cursor、completion、admission signal、claim seal 各一行 |
+| SchedulerTaskControl | 640 B | state/claim tickets、block cursor、completion、admission signal、claim seal 分别隔离128B Sector |
 | SchedulerWorkerContext | 320 B | 4 行 READY 发布的配置，1 行本核写回诊断 |
 | SchedulerTaskTrace | 320 B | publication header；kernel timing；dispatch/completion；refill/startup；execution identity，各一行 |
 | SchedulerRunControl | 7296 B | 384 B配置、生命周期原子及错误身份前缀，加108个独占cacheline的worker错误signal |
-| SchedulerTicketQueue | 128 B | head 和 reserved_tail 各一行；reserved_tail 是有效预留游标 |
+| SchedulerTicketQueue | 256 B | head 和 reserved_tail 各一个128B区域；reserved_tail 是有效预留游标 |
 | SchedulerTicketEntry | 64 B | 每个 entry 的 task_ref 独占原子行，发布后本轮不覆盖 |
 | SchedulerGroupMailbox | 384 B | descriptor 128 B、publication 64 B、三个 lane ack 各 64 B |
 | SchedulerMixCloseSeal / SchedulerReadyInbox | 64 B | 每项独立原子行 |
 
-TaskControl 的 state、wake_list_head、next_waiter、claim_tickets、admission_claim_lock 共用原子行。
-next_block、completion_state 与 claim_seal 分别占用独立的 64 B 行，隔离并发领取、退休与领取结束观察。
+scheduler allocation 的 Host/设备基址均满足128B对齐。TaskControl、TicketQueue 和 AdmissionControl 的选定原子热点按128B隔离；TicketEntry保留64B步长；标量DCache维护仍为64B，局部状态保持自然对齐。
+
+常量分别表达不同合同：`SCHEDULER_SCALAR_DCACHE_LINE_BYTES=64`用于标量缓存维护，`SCHEDULER_GM_ATOMIC_SECTOR_BYTES=128`用于选定GM热点隔离，`SCHEDULER_STATE_BASE_ALIGNMENT`由共享GM类型的对齐要求推导。
+
+依据与适用范围：CANN master预览版[SIMT原子操作简介](https://asc.gitcode.com/api/SIMT-API/atomic_operations/atomic_operations_intro.html)给出512B L2 Cache Line及每行4个128B Sector；[优化章节](https://asc.gitcode.com/guide/operator_practice/simt_operator_optimization/instruction_optimization/atomic_instruction_optimization.html)以不同Sector分布减少争用。[标量AtomicCas](https://asc.gitcode.com/api/SIMD-API/basic_api/atomic_operations/AtomicCas.html)说明绕过DCache，但没有承诺争用粒度；[DCache维护](https://asc.gitcode.com/api/SIMD-API/basic_api/cache_control/DataCacheCleanAndInvalid.html)明确64B行。当前布局的128B选择还由AIC/AIV标量atomicAdd与ld_dev上板对照支持，不构成所有标量接口的排序或无争用保证。
+
+TaskControl按Sector的布局为：0起为state/链指针/claim tickets等协议字；128起为next_block；256起为completion_state，320起的独立DCache行放resolver timing；384起为admission_state；512起为claim_seal。timing只在计算贡献完成后由唯一resolver写入，复用已静止counter所在Sector，避免把每个冷字段都扩大为128B。总大小640B，相对384B每任务增加256B；ticket entry仍64B，两个业务queue及commit控制对象合计固定增加384B，另有allocation对齐padding。
+
+TaskControl 的 state、wake_list_head、next_waiter、claim_tickets、wake_cursor 共用首个原子Sector；wake_cursor位于offset32。
+next_block、completion_state 与 claim_seal 分别占用独立的 128 B 原子区域，隔离并发领取、退休与领取结束观察。
 completion_state 的低 16 位是实际子任务完成数，16–31 位是 Host 初始化的总子任务数，
 高 32 位是需要检查异步完成的保守票数。每次子任务完成通过同一次 RMW 更新完成数和票数，
 并从返回值取得总数；总子任务数不超过 INT16_MAX，合法贡献不会进位到总数字段。
 导出的 completed_subtasks 只取低 16 位。
 所有原子行禁止 cached 整行写回；resolver metadata 与 admission bypass signal 保持各自独立的写入区域。
-next_fanin_index、waiting_producer 和 resolver timing 在第二行；admission_state 单独 bypass 发布。
-等待链、MIX admission、sync_start、defer_wait 和可恢复 resolver 的状态均保留。
+wake_cursor 原子打包 next ref 与下一 fanin 位置；resolver timing 在offset320的64B行，与offset256的已静止completion计数共用一个Sector；admission_state 单独 bypass 发布。
+等待链、MIX admission、sync_start 和 defer_wait 的状态均保留；completion 同步完成后继传播，不保存 resolver 续行状态。
 
 AdmissionRecord 为 64B，offset 40 的 `uint64_t member_rank_offset` 保存同类型普通非同步 SPMD 的 block 前缀，
 与 block 数/成员数同处 header 行。Host 按 task_ref 分别累计 AIC/AIV，并检查加法溢出；
@@ -118,7 +126,7 @@ AICore 读端使用 address-space-aware 的 POD 访问辅助函数，不复制 C
 
 每个唯一 Definition 生成一份 128-byte A5 template：`definition_offset/definition_bytes/child_plans_offset/`
 `fanin_offsets_offset/fanin_indices_offset/sinks_offset/task_count/edge_count/sink_count/args_bytes/`
-`execution_count/required_heap/legacy_execution_storage_bytes/graph_key` 十四个 `uint64_t`。
+`execution_count/required_heap/reserved_execution_storage_bytes/graph_key` 十四个 `uint64_t`。
 fanin offset/indices 指向 blob 内既有 CSR，不另复制一份 CSR；sink 为额外的 `uint16_t[]`。
 所有偏移以 native scheduler image 起点为基准，使用 `uint64_t`；数量在转换为 unsigned wire 前先拒绝负值。
 Definition 内原始 32-bit section offsets 保持原布局，解析时做 checked widening/addition。
@@ -146,7 +154,7 @@ Definition 内原始 32-bit section offsets 保持原布局，解析时做 check
 同一 native image 内部引用使用 offset；不把 Host pointer 或虚拟 heap 地址写进这些字段。
 boundary 地址取 compacted device SM 的 payload regions；不能取尚未 rebase 的 host_sm_handle。
 
-每个 node 仍保留独立的 16-byte metadata 与 384-byte control，方便原调度热路径直接寻址。
+每个 node 仍保留独立的 16-byte metadata 与 640-byte control，方便原调度热路径直接寻址。
 child metadata 由 template 复制 shape，并设置实例自己的 trace base；不重新执行 shape 推导或依赖发现。
 ENTER/EXIT/CONTROL_DUMMY 无 active lane，trace index 为无效值。读端必须先按 kind 分流，
 不得将空 lane 解释成非法 kernel，也不得用 `is_executable(flags)` 单独跳过控制节点。
@@ -166,9 +174,9 @@ Host 依赖计划与设备兼容路由使用同一套访问器；kind、参数�
 | EXIT | template 的所有 sink local index，加 child_begin |
 | HOST_DONE | 无须注册；消费者观察其 DONE |
 
-Host 由这些 fanin 行生成统一的 fanout CSR 与 remaining，去重并过滤 HostDone 边；
+默认Host由这些fanin行生成统一的fanout CSR与remaining，去重并过滤HostDone边；
 其 header/数组为 ready pool 的独立追加区，见[前向依赖计数](dependency-counters.md)。
-未配置依赖区时使用兼容 wake-list，保留 fanin 游标单调前进和 CLOSED sentinel 语义。
+未附CSR依赖区的有效图使用同步wake-list，保留fanin位置单调前进和CLOSED sentinel语义。
 Graph 的内部 row 可达 1023 个 producer，EXIT 可有 1024 个 sink；使用至少 32-bit count/cursor，
 不套用普通顶层 `CHIP_MAX_FANIN=128` 的准入限制。
 
@@ -196,25 +204,27 @@ bootstrap 的 node 分区 owner 并行写各自 child 参数，利用现有 scan
 
 首版 args_base 指向 `heap_base + definition.required_heap`，复用当前 shell 已预留的 execution tail。
 检查 args_base 的 64-byte 对齐，以及 `native_args_bytes <= definition.execution_storage_bytes`。
-这是布局校验，不是遇到不等式失败就运行中换地址；合法但 native 布局不适配可在发布前选择 legacy。
+这是发布前的硬校验；不等式失败就拒绝 prepare，不改变执行器或在运行中换地址。
+每个 child 的 tensor/scalar offset 必须等于对应池的连续游标，最终游标必须覆盖完整池。
+参数区间重叠、留洞和未使用的池尾部都不属于当前 Definition 合同。
 该区域只写 native 参数，不同时 placement-new `GraphExecution` 或 child `ChipTaskStorage`。
 旧 tail 的预留大小仍计入内存报告，不能宣称已节省其 320×child_count 字节。
 
 ## Host 准备与生命周期
 
-当前 `bind_graph_definitions` 同时 pack、校验和选择 AICPU carrier，而 `create_scheduler_state` 位于更晚的 commit。
-需要拆开这两个职责，按下面顺序执行：
+`bind_graph_definitions` pack 并校验 Definition，`create_scheduler_state` 在 commit 阶段创建 resident image。
+它们按下面顺序执行：
 
 1. 等待所有 recording job 完成，保持现有 Graph shell 提交、heap 预留与 boundary 校验。
 2. pack 并验证所有唯一 Definition；从 fanin 推导 roots/sinks，检查扇出 CSR 与其一致。
-3. 汇总整个 run 的能力。先拒绝非法图；再选 native 或合法的整 run legacy fallback。
+3. 汇总整个 run 的形状与容量，拒绝非法图或不满足当前 resident 合同的输入。
 4. 生成不含本次设备地址的 `NativeGraphHostPlan`：blob 自有字节、template、node map、prefix、计数和静态元数据。
 5. 通过当前静态 arena/heap 流程取得实际 device backing，compact/rebase 原始 SM。
 6. 根据实际 GM base 填实例地址，生成 native scheduler image，初始化每个 control 和 admission record。
 7. 将所有待上传内容交给本 run slot 的 publication batch；完成既有 publication 后才能启动。
 
 native 模式的 Definition 位于同一份 GM scheduler backing 的只读区域，每个 Definition 每 run 复制一次。
-legacy 模式继续使用 LaunchEnvelope/HostSnapshot。native 不同时再把整份 Definition 附到每个 AICPU launch envelope。
+Definition 不附到每个 AICPU launch envelope；Host 另外保留原始 Definition section，供独立 protocol oracle 使用。
 总定义字节影响一次合并上传的大小，实例数不增加 Definition 复制次数；并不承诺整个 run 只有一次 H2D。
 
 `GraphHostState` 是 orchestration 函数的局部对象，返回后销毁。
@@ -250,12 +260,12 @@ Host 展开 binding/metadata、初始化 control 和设备 bootstrap 仍是 O(N)
 ```text
 native_scheduler_bytes = header + Definition blobs + templates + child plans + sinks
                        + 8*T completion refs + 64*G instances
-                       + 12*N node bindings + 16*N metadata + 384*N controls
+                       + 12*N node bindings + 16*N metadata + 640*N controls
                        + control inboxes + actual cooperative records/log/seals
                        + ready pool descriptors/controls + actual kernel ready entries
                        + existing worker/run/ready regions + alignment padding
                        + actual enabled diagnostics
-reserved_graph_heap = sum(required_heap + legacy_execution_storage_bytes)
+reserved_graph_heap = sum(required_heap + reserved_execution_storage_bytes)
 ```
 
 native_scheduler_bytes 是 scheduler backing 总量，不是相对于旧 scheduler 的增量；公共原始 SM 和其他 runtime backing 另计。

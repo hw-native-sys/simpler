@@ -11,11 +11,11 @@
 
 **历史决策（2026-11-03）：独立 block 原型因编译成本撤回，当时恢复到测得 38.454 ms 的 `queue-ordinary-credit-v1`。该数值只属于当时的版本。**
 
-当前继续使用全任务 cooperative admission，并包含 64B 共享布局、Host CSR/remaining、ordinary 小 grid 的循环成员集合及 resident 编译单元拆分。当前代码合同见[数据布局](data-layout.md)、[依赖计数](dependency-counters.md)与[调度协议](protocol.md)；历史阶段的验证不自动覆盖后续改动。
+当前使用全任务cooperative admission、按128B Sector隔离的共享热点、默认Host CSR/remaining、同步completion、ordinary小grid的循环成员集合及resident编译单元拆分。Scalar DCache仍按64B行处理。当前代码合同见[数据布局](data-layout.md)、[依赖计数](dependency-counters.md)与[调度协议](protocol.md)；历史阶段的验证不自动覆盖后续改动。
 
 **用户约定：方案确定后按阶段自主实现，遇到问题自行分析、修复、验证和迭代，不因常规实现选择反复询问用户。**
 每阶段保留代码差异、验证结果、未解决问题和下一步，不把上下文切换当作停止任务或重新确认的理由。
-不得通过缩减功能覆盖、掩盖 native fallback、删掉慢用例或放宽数值正确性来完成门禁。
+不得通过缩减功能覆盖、隐藏 prepare 拒绝、删掉慢用例或放宽数值正确性来完成门禁。
 
 执行顺序：修改前主线基线 → 分阶段实现与局部回归 → 新旧功能验证 → 无 Graph 与现有 A5 Qwen3 的性能测量和优化 → 最终复审。
 用户于 2026-11-02 调整优先级：无 Graph 性能尚未达标时，也要优先测出并反馈 Qwen 的主线/候选数据。
@@ -80,10 +80,10 @@ Qwen 性能接近目标后再执行完整性能回归；已有局部退化如实
 | A5 `host/runtime_maker.cpp` 的 HostPreparePlan | 自有 plan、park/resume、retry、pipeline slot publication/lease 生命周期 |
 | A5 `runtime/scheduler/scheduler_graph.h` | versioned view、统一 kind/fanin/args/identity 访问器，旧路径仍直接寻址 |
 | A5 `runtime/scheduler/scheduler_graph_binding.h`，新增 | AICore POD Tensor/scalar/predicate 重定位及精确范围发布 |
-| A5 `runtime/scheduler/scheduler_graph_control.h`，新增 | 无资源 control inbox、可继续的 wake resolve、DONE 与汇总 |
+| A5 `runtime/scheduler/scheduler_graph_control.h`，新增 | 无资源 control inbox、完整同步后继传播、DONE 与汇总 |
 | A5 `runtime/scheduler/scheduler_ready.h` | bootstrap/route/resolve 的 fanin 读取统一，控制与 kernel 分流，direct refill 保持 kernel 专用 |
-| A5 `runtime/scheduler/scheduler_admission.h` | PREPARED publication，成员首次观察 bootstrap 已发布的参数 |
-| A5 `runtime/scheduler/scheduler_types.h`、layout 创建处 | node/instance/template/header wire、counts、inbox/continuation 与 checked size |
+| A5 `runtime/scheduler/scheduler_admission.h` | Ready唯一owner保留本地pending，提交时发布ADMITTED；成员首次观察bootstrap已发布的参数 |
+| A5 `runtime/scheduler/scheduler_types.h`、layout 创建处 | node/instance/template/header wire、counts、inbox、CHECK 进度与 checked size |
 | A5 `aicore/aicore_executor.cpp`、`resident_scheduler.h` | 启动握手、变体选择与窄入口声明 |
 | A5 `aicore/resident_scheduler_impl.h` 及四个 `resident_*.cpp` | bootstrap、每轮调度/控制服务、完成 flush 与退出；普通/native × profile 开关显式实例化 |
 | A5 `aicpu/aicpu_executor.cpp` | N-node supervision、mapped error identity、保持原 run fence |
@@ -99,7 +99,7 @@ Graph 模式的 raw storage accessor 应拒绝 synthetic/child ref，防止漏�
 | 阶段 | 依赖与产物 | 离开本阶段的证据 |
 | ---- | ---------- | ---------------- |
 | B0 基线 | 冻结主线 SHA、工具链与工作负载 manifest；采集 ST 并筛选性能用例 | 原始日志、机器信息、用例选择理由、可比较的 timing marker 齐全 |
-| I1 统一视图 | B0 后实现 view/accessor，先保持 Graph 仍走 legacy | 无 Graph 新旧结果一致；所有访问器和版本/边界 UT 通过 |
+| I1 统一视图 | view/accessor 统一 ordinary 与 native Graph 输入 | 无 Graph 原有结果保持；所有访问器和版本/边界检查保持有效 |
 | I2 最小 native Graph | I1 后接 plan/GM、ENTER/EXIT/control inbox、普通 child 参数与 completion | 单 Graph、多个实例、交错普通任务端到端 native；进入模式有证据 |
 | I3 完整调度语义 | I2 后接 SPMD、MIX、sync_start、predicate、失败与 pipeline lifecycle | 下面的并发矩阵通过，A2A3 公共层无回归 |
 | I4 DFX 与完整功能 | I3 后补 identity/schema/oracle，审计 trace allocation 与所有诊断读者 | 新用例与原 A5 HBG corpus 通过；结果来自同一 revision |
@@ -107,8 +107,8 @@ Graph 模式的 raw storage accessor 应拒绝 synthetic/child ref，防止漏�
 | P2 A5 Qwen Graph 模型 | 对已有必要功能证据的候选，优先验证完整输出/KV 状态并 benchmark；可先于 P1 达标 | native 路径正确，主线/候选数值及时反馈，性能问题完成归因和迭代验证 |
 | R 最终复审 | 协议、代码、功能、性能、内存/退出证据汇总 | 无未解决正确性缺陷；剩余限制和实测数据明确 |
 
-I2/I3 的中间版本可按已完成 capability 选择整 run legacy，不能用一个总开关掩盖未实现的 shape。
-最终支持集合必须达到总览范围，不能把中间 fallback 视为需求完成。
+A5 HBG 的当前执行合同只包含 resident ordinary/native Graph。Host 拒绝不满足形状、
+canonical 参数布局或容量的输入，不发布另一套执行器的选择。中间实现不能以缩减支持集合完成门禁。
 每轮优化只改变有证据支持的瓶颈；性能变化后复跑相关正确性、协议和生命周期用例。
 
 ## 功能与故障矩阵
@@ -124,17 +124,19 @@ I2/I3 的中间版本可按已完成 capability 选择整 run legacy，不能用
 | fanin | 1、128、129、1023，EXIT 1024 sinks；重复/前向/自环边 | 合法图完整路由，非法图在发布前失败，无截断 |
 | 多实例 | 相同 Definition、多 key、不同 boundary 地址/origin/scalar、并发 recording | 元数据共享，参数和控制互不覆盖；不跨 run 复用旧地址 |
 | 参数 | 非连续 view、非零 start_offset、heap output、零 scalar、最大参数数 | 与公共 AICPU binder 的合法输入结果一致；checked arithmetic 拒绝溢出 |
-| 控制服务 | 所有 slots 满、admission 暂存、长 DUMMY 链、fanout 超过切片预算 | control 仍前进，continuation 无丢失/重复；无递归栈增长 |
+| 控制服务 | 所有 slots 满、admission 暂存、长 DUMMY 链、大 fanout | 处理下一个 control 节点前完整传播当前节点后继；每次服务有界处理完整节点，无丢失/重复或递归栈增长 |
 | SPMD/MIX | 单/多 block、波次、满宽、inactive lane、slow last block/lane、sync_start | identity/membership/order 正确，最后真实完成前不释放依赖 |
 | predicate | true/false、PARAM/内部 operand、多个实例取不同值 | 跳过恰好一次；无多成员部分跳过；非法组合先选择明确结果 |
 | 缓存 | 两 writer 相邻 scalar、两个 worker 消费同一参数、同地址新 epoch | 参数完整、无旧 cache line 覆盖，无每 block 重复绑定 |
 | 完成 | EXIT 先于某 producer 的 resolve 尾部、空 control queue、有未 flush 计数 | 计数 N-H 与完整 drain 同时满足才成功 |
 | 错误 | 部分绑定、非法 wire、重复 DONE、queue 发布失败、late error、退出超时 | fatal 保留身份；计数不能掩盖错误；未安全退出不得复用 backing |
 | Host 生命周期 | allocation retry、park/resume、partial publication、连续及流水运行 | plan 自有字节、重新 rebase、slot 隔离、资源保留到 fence |
-| 兼容 | 无 Graph 全量、已有 Graph legacy、合法不支持 shape、A2A3 公共路径 | 原语义保留，native/fallback 选择可观测且符合 capability |
+| 当前运行变体 | 无 Graph 全量、native Graph、A2A3 公共路径、显式 percounter | A5 HBG 每次发布 resident 选择；其他活跃 runtime 的构建与语义保持 |
+| 失败启动 | 未知 mode、缺失/不对齐 bootstrap、worker 地址溢出 | AICore 报告身份后不读 backing；AICPU 拒绝并完成 EXIT/ACK/退核，失败 terminal 不得报告成功 |
 
 执行前应用仓库 testing/onboard-arch-precheck 流程，真实检测 A5 silicon，通过 `task-submit` 持有设备锁。
-运行新增 UT、受影响原 UT、A5 HBG 全部原有与新增 scene 的 sim/onboard 验证；手工标记和故障类按各自隔离要求运行。
+新增与修改的 UT 保留给 CI。legacy 执行路径移除任务按用户要求不运行 CPU 验证；
+设备/模拟器验收应记录实际执行范围，手工标记和故障类按各自隔离要求运行。
 改公共 wire/binder 校验时补 A2A3 HBG 的对应 sim 与可用硬件回归；没有对应硬件不能声称 onboard 已通过。
 基线自身失败单独复现并记录，不能当成本次成功或静默跳过；本次引入的问题自行修复。
 

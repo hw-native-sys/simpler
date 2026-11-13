@@ -15,10 +15,7 @@
 
 #include "scheduler/scheduler_context.h"
 
-// Weak, because the a2a3 target also links sim/aicpu/inner_platform_regs.cpp, which
-// defines these strongly and overrides the definitions here. The a5 target links no
-// equivalent, so it supplies its own strong stubs in
-// test_hbg_scheduler_drain_a5_stubs.cpp. Both targets compile this file.
+// The sim register implementation overrides these weak stand-ins.
 uint64_t __attribute__((weak)) read_reg(uint64_t, RegId) { return 0; }
 
 void __attribute__((weak)) reg_store_release(volatile uint32_t *, uint32_t) {}

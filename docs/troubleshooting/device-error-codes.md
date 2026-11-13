@@ -114,6 +114,15 @@ layer to go looking in, which is what these columns are for.
 | 102 | ASYNC_WAIT_OVERFLOW | kernel (async) |
 | 103 | ASYNC_REGISTRATION_FAILED | runtime-internal |
 | 104 | READY_QUEUE_OVERFLOW | host bind / runtime-internal / config |
+| 105 | KERNEL_INVALID_OUTPUT | kernel output validation (A2/A3 T&R) |
+| 106 | KERNEL_INDEX_OUT_OF_RANGE | kernel index validation / input data (A2/A3 T&R) |
+| 107 | KERNEL_NON_FINITE_VALUE | kernel numerical validation / input data (A2/A3 T&R) |
+
+Codes 105–107 come from explicit checks in ordinary AIC/AIV kernels. The
+`Kernel failure:` line carries the task/function/block/core identity from the scheduler;
+start with that diagnostic and the reporting kernel.
+See [kernel validation reporting](../aicore-kernel-programming.md#reporting-invalid-kernel-data-a2a3-tmr)
+for the API and supported exit contract.
 
 ### READY_QUEUE_OVERFLOW origins
 

@@ -43,20 +43,17 @@ int32_t finish(int32_t index, int32_t rc) {
 }
 // The subprocess bounds a broken startup/retirement wait without leaving live
 // core threads behind. This runs the actual executor and register protocol.
-void rejected_launch(bool resident) {
+void rejected_launch(uint32_t mode, bool valid_base = true) {
     auto runtime = std::make_unique<Runtime>();
     runtime->dev.worker_count = 1;
 #ifdef TEST_RESIDENT_STARTUP
     SchedulerWorkerContext context{};
     SchedulerRunControl control{};
-    if (resident) {
-        context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&control);
-        runtime->publish_scheduler_bootstrap(
-            SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(&context)
-        );
-    }
+    context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&control);
+    runtime->publish_scheduler_bootstrap(mode, valid_base ? reinterpret_cast<uint64_t>(&context) : 0);
 #else
-    (void)resident;
+    (void)mode;
+    (void)valid_base;
 #endif
     std::array<uint64_t, PLATFORM_MAX_CORES> regs{};
     regs[0] = reinterpret_cast<uint64_t>(registers.data());
@@ -123,9 +120,12 @@ uint64_t platform_ssbuf_hardware_base_address() { return 0; }
 TEST(AbortAicoreStartupDeathTest, BindingFailureRetiresRealCoreBeforeLastCallback) {
     for (bool final_bind : {false, true}) {
         final_bind_only = final_bind;
-        EXPECT_EXIT(rejected_launch(false), testing::ExitedWithCode(0), "");
+        EXPECT_EXIT(rejected_launch(0), testing::ExitedWithCode(0), "");
 #ifdef TEST_RESIDENT_STARTUP
-        EXPECT_EXIT(rejected_launch(true), testing::ExitedWithCode(0), "");
+        EXPECT_EXIT(rejected_launch(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING), testing::ExitedWithCode(0), "");
+        for (uint32_t mode : {3U, 4U, UINT32_MAX})
+            EXPECT_EXIT(rejected_launch(mode), testing::ExitedWithCode(0), "");
+        EXPECT_EXIT(rejected_launch(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, false), testing::ExitedWithCode(0), "");
 #endif
     }
 }

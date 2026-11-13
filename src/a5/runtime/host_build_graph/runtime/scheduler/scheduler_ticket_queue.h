@@ -15,13 +15,14 @@
 
 // Cursors and entry publication words occupy separate atomic-only lines.
 // A published entry remains immutable until every worker crosses the run fence.
-struct alignas(64) SchedulerTicketQueue {
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTicketQueue {
     volatile uint64_t head{0};
-    alignas(64) volatile uint64_t reserved_tail{0};
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t reserved_tail{0};
 };
 
-static_assert(sizeof(SchedulerTicketQueue) == 128);
-static_assert(offsetof(SchedulerTicketQueue, reserved_tail) == 64);
+static_assert(sizeof(SchedulerTicketQueue) == 256);
+static_assert(alignof(SchedulerTicketQueue) <= SCHEDULER_STATE_BASE_ALIGNMENT);
+static_assert(offsetof(SchedulerTicketQueue, reserved_tail) == 128);
 static_assert(std::is_standard_layout_v<SchedulerTicketQueue>);
 static_assert(std::is_trivially_copyable_v<SchedulerTicketQueue>);
 

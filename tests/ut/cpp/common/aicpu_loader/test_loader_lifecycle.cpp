@@ -171,6 +171,18 @@ rtsLaunchCpuKernel(rtFuncHandle function, uint32_t, rtStream_t, const rtKernelLa
 }
 
 namespace {
+struct ScopedTmpdir {
+    std::optional<std::string> previous;
+    explicit ScopedTmpdir(const std::string &path) {
+        if (const char *value = std::getenv("TMPDIR")) previous = value;
+        setenv("TMPDIR", path.c_str(), 1);
+    }
+    ~ScopedTmpdir() {
+        if (previous) setenv("TMPDIR", previous->c_str(), 1);
+        else unsetenv("TMPDIR");
+    }
+};
+
 class LoadOwnership : public testing::Test {
 protected:
     Transport state;
@@ -178,8 +190,8 @@ protected:
     std::vector<char> orchestration;
     std::vector<char> second_orchestration;
     void SetUp() override {
-        char path[] = "/tmp/simpler-load-ownership-XXXXXX";
-        ASSERT_NE(mkdtemp(path), nullptr);
+        std::string path = (fs::temp_directory_path() / "simpler-load-ownership-XXXXXX").string();
+        ASSERT_NE(mkdtemp(path.data()), nullptr);
         state.dir = path;
         transport = &state;
         image = ReadBytes(TEST_RUNTIME_IMAGE);
@@ -215,6 +227,32 @@ protected:
         return probe == nullptr ? -1 : probe(slot);
     }
 };
+
+TEST_F(LoadOwnership, RegistrationUsesProcessTemporaryDirectoryAndRemovesJson) {
+    ScopedTmpdir temporary(state.dir);
+    host::LoadAicpuOp loader;
+    ASSERT_EQ(Bootstrap(loader), 0);
+    ASSERT_EQ(Init(loader), 0);
+    ASSERT_EQ(state.json_paths.size(), 1);
+    EXPECT_EQ(fs::path(state.json_paths.back()).parent_path(), fs::path(state.dir));
+    EXPECT_TRUE(fs::exists(state.json_paths.back()));
+    ASSERT_EQ(Finalize(loader), 0);
+    EXPECT_FALSE(fs::exists(state.json_paths.back()));
+}
+
+TEST_F(LoadOwnership, UnavailableTemporaryDirectoryDoesNotLoadBinaryAndAllowsRetry) {
+    host::LoadAicpuOp loader;
+    ASSERT_EQ(Bootstrap(loader), 0);
+    {
+        ScopedTmpdir temporary(state.dir + "/missing");
+        EXPECT_NE(Init(loader), 0);
+        EXPECT_TRUE(state.json_paths.empty());
+        EXPECT_TRUE(state.binaries.empty());
+    }
+    ScopedTmpdir temporary(state.dir);
+    ASSERT_EQ(Init(loader), 0);
+    ASSERT_EQ(Finalize(loader), 0);
+}
 
 TEST_F(LoadOwnership, SequentialGenerationsReuseImageAndReleaseActualCallableHandles) {
     void *resident = nullptr;

@@ -699,7 +699,6 @@ class NativeAudit:
                 else 0
             )
             require(control["completed_subtasks"] == total, "terminal subtask counter mismatch")
-            require(control["admission_claim_lock"] == 0, "invalid terminal admission claim lock")
             require(control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal")
             positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
             minimum_blocks = 2

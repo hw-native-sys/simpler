@@ -91,36 +91,28 @@ describes the rendezvous itself and what the cohort is scoped to.
 5. A resident node with zero remaining dependencies enters its ready queue.
 6. Each resolved producer notifies its CSR successors; the unique remaining
    transition 1→0 publishes ready. Helpers without a dependency header retain
-   the intrusive wake-list fallback.
-
-The legacy AICPU path scans fanins and registers each blocked task on its
-latest-submitted unmet producer. Producer completion reclassifies detached
-waiters. Neither path periodically scans all tasks for dependency readiness.
+   the synchronous intrusive wake-list variant.
 
 ## Dispatch and Completion
 
-Resident workers use cooperative admission, frozen membership and logical-block
-completion; the [resident walkthrough](../../../../../docs/zh-cn/a5-hbg-aicore-walkthrough/README.md)
-describes its shared 64-byte layout and completion resolver. The following
-range-claim and drain behavior applies to legacy AICPU scheduling.
+Resident workers prepare their own two slots and participate in cooperative
+admission when the task shape requires it. Pure AIC and MIX tasks share the AIC
+ready queue; pure AIV tasks use the AIV queue. The
+[resident walkthrough](../../../../../docs/zh-cn/a5-hbg-aicore-walkthrough/README.md)
+describes membership, physical placement and the completion resolver.
 
-- AIC and AIV tasks claim as many free cores as the current scheduler owns and
-  requeue remaining logical blocks for later waves.
-- MIX placement selects whole clusters whose used lanes can all accept the
-  task. High cluster offsets are represented by the runtime's 128-bit bitset.
-- `require_sync_start` uses local staging when possible and a generation-tagged
-  global drain when the cohort spans scheduler ownership domains.
-- Each completed lane increments `completed_subtasks`; the mixed task completes
-  exactly once when it reaches `block_num * popcount(active_mask)`.
+Every executed block/lane contributes once to the packed physical completion
+counter. The last contribution owns TaskDone or the async join. MIX cluster
+release retires resources; it is not another completion contribution. TaskDone
+propagates dependencies synchronously before the node joins the resolved count.
 
 ## Executor Model
 
-The host loads and executes the orchestration shared object synchronously. The
-device has no orchestration thread. In resident mode AICore schedules and AICPU
-supervises startup, progress and exit. In legacy mode every launched AICPU thread
-schedules its assigned cores after the boot thread attaches the prebuilt graph.
-Cluster ownership is assigned during the AICore handshake and remains stable for
-the run.
+The host executes orchestration synchronously and publishes the complete graph.
+AICore owns dependency resolution, ready scheduling and kernel execution. AICPU
+owns discovery, topology/context publication, supervision and partitioned EXIT/ACK
+retirement. Invalid startup descriptors enter failure retirement without
+executing tasks or reading an unpublished scheduler backing.
 
 ## Capacity
 
@@ -139,6 +131,7 @@ pytest examples tests/st --platform a2a3sim --runtime host_build_graph
 pytest examples tests/st --platform a5sim --runtime host_build_graph
 ```
 
-The `host_build_graph_wide_dispatch` scene specifically covers wide AIV work,
-sync-start MIX placement, normal MIX placement, and bit offsets above 63 with
-`aicpu_thread_num=2`.
+The A5 HBG SPMD, sync-start capacity, MIX and empty-lifecycle scenes cover
+resident shape selection and retirement. The `spmd_shape_selection` scene checks
+that both ordinary and sync-start multi-block AIC tasks publish a fresh resident
+mode and produce the expected output.

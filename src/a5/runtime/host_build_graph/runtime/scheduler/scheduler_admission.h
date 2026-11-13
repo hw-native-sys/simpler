@@ -150,15 +150,16 @@ static inline __aicore__ bool active_run_valid(
 
 }  // namespace scheduler_admission_detail
 
+// Admission operations require the resident's live base/local/run and an
+// initialized admission object. run_resident_scheduler installs admission only
+// after both initializers succeed; fill/entry dispatch select this path only
+// when it is present, and exit drain handles absence before calling here.
+// The cached graph binding is immutable until the run fence. Error and epoch
+// observations remain per-operation checks, including after lock acquisition.
 static inline __aicore__ bool scheduler_admission_context_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAdmissionLocalState *admission
 ) {
-    if (base == nullptr || local == nullptr || run == nullptr || admission == nullptr || !admission->initialized ||
-        local->config.graph == nullptr || graph.task_count != local->config.graph->task_count)
-        return scheduler_admission_fail(
-            graph, local, run, SCHEDULER_TASK_REF_INVALID, SchedulerErrorSite::ADMISSION_INVALID_CONFIG
-        );
     return scheduler_admission_detail::active_run_valid(graph, base, local, run, admission);
 }
 
@@ -301,7 +302,9 @@ static inline __aicore__ bool scheduler_admission_expected_members(
            (!scheduler_task_requires_sync_start(record->flags) || record->logical_block_num <= positions);
 }
 
-// The caller uniquely owns the candidate through ready pop or direct resolve.
+// The caller uniquely owns the valid candidate through ready pop or direct
+// resolve and has classified its immutable flags as requiring admission.
+// The admission object is initialized with nonzero capacity by run entry.
 // Only PROGRESS transfers it into pending; RETRY leaves ownership with the caller.
 static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
@@ -310,32 +313,9 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionClaim, candidate.task_ref);
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
     if (admission->pending_task_ref != SCHEDULER_TASK_REF_INVALID) return SchedulerAdmissionResult::RETRY;
-    const int64_t task = candidate.task_ref;
-    if (admission->capacity == 0 || !scheduler_task_ref_valid(graph, task) ||
-        !scheduler_task_requires_admission(scheduler_load_dispatch_metadata(base, local, task, 0))) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-        return SchedulerAdmissionResult::ERROR;
-    }
-    auto *control = scheduler_task_control_at(base, local, task);
-    if (scheduler_gm_load(control->state) != static_cast<int64_t>(SchedulerTaskState::BLOCKED) ||
-        scheduler_scalar_atomic_result(local, [&]() __aicore__ {
-            return scheduler_gm_compare_exchange(control->admission_claim_lock, UINT64_C(0), UINT64_C(1));
-        }) != 0) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-        return SchedulerAdmissionResult::ERROR;
-    }
-    // The lock protects the single ready-owner transition, not the pending
-    // candidate's lifetime. A late acquirer must recheck the published phase.
-    bool valid = scheduler_read_worker_error(run, local->worker_id()) == 0;
-    const auto expected = SchedulerAdmissionState::INITIALIZED;
-    if (valid && (scheduler_gm_query(run->bootstrap_scan_complete) == 0 ||
-                  scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(expected)))
-        valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-    if (valid)
-        scheduler_publish_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
-    scheduler_gm_store(control->admission_claim_lock, UINT64_C(0));
-    if (!valid) return SchedulerAdmissionResult::ERROR;
-    admission->pending_task_ref = task;
+    // Ready pop/direct resolve already transferred unique ownership. Bootstrap
+    // published the immutable admission record before this candidate was visible.
+    admission->pending_task_ref = candidate.task_ref;
     return SchedulerAdmissionResult::PROGRESS;
 }
 
@@ -385,54 +365,42 @@ static inline __aicore__ bool scheduler_bootstrap_prepare_admission(
     return true;
 }
 
-// Readiness transfers a bootstrap-validated record to one pending owner.
-// Only epoch, order and publication state can change before commit.
-static inline __aicore__ bool scheduler_prepare_admission_record(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerAdmissionLocalState *admission
-) {
-    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionPrepare, -1);
-    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
-    const int64_t task = admission->pending_task_ref;
-    if (admission->capacity == 0 || !scheduler_task_ref_valid(graph, task))
-        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-    auto *control = scheduler_task_control_at(base, local, task);
-    if (scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::PREPARED))
-        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-    auto *record = scheduler_admission_record_at(base, admission, task);
-    scheduler_observe_cache_line(record);
-    if (record->run_epoch != admission->epoch)
-        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
-    if (record->order_key != UINT64_MAX)
-        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-    return true;
-}
-
-namespace scheduler_admission_detail {
-
-// The pending owner holds an immutable record validated by the closed bootstrap
-// scan. Before ADMITTED, no legitimate block claimant can modify its counters.
+// Ready ownership remains private until commit. The global lock serializes
+// different tasks' order assignment and rejects a duplicate candidate before it
+// can publish another log entry. Only this owner releases an acquired lock.
 template <bool RecordProtocol = true>
-static inline __aicore__ SchedulerAdmissionResult commit_validated_record(
+static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerAdmissionLocalState *admission
 ) {
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionCommit, -1);
     const int64_t task = admission->pending_task_ref;
+    if (!scheduler_task_ref_valid(graph, task)) {
+        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
+        return SchedulerAdmissionResult::ERROR;
+    }
     auto *control = scheduler_task_control_at(base, local, task);
     auto *record = scheduler_admission_record_at(base, admission, task);
     auto *shared = scheduler_state_at<SchedulerAdmissionControl>(base, admission->control_offset);
+    // Run entry validates the immutable worker index against runtime_worker_count.
     const uint64_t owner = local->worker_id() + 1;
-    if (owner == 0 || owner > local->config.runtime_worker_count) {
-        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_TOPOLOGY);
-        return SchedulerAdmissionResult::ERROR;
-    }
-    if (scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), owner) != 0)
+    if (scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), owner) != 0) {
+        if (!scheduler_admission_context_valid(graph, base, local, run, admission))
+            return SchedulerAdmissionResult::ERROR;
         return SchedulerAdmissionResult::RETRY;
-    // Only this owner releases the lock, including a failed commit. No waiting
-    // for a worker, kernel, ready queue, or task completion occurs under it.
+    }
     const uint64_t tail = scheduler_gm_query(shared->commit_tail);
     bool valid = scheduler_admission_context_valid(graph, base, local, run, admission);
+    if (valid &&
+        scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED))
+        valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
+    if (valid) {
+        scheduler_observe_cache_line(record);
+        if (record->run_epoch != admission->epoch)
+            valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
+        else if (record->order_key != UINT64_MAX)
+            valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
+    }
     if (valid && tail >= admission->capacity)
         valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_LOG_CAPACITY);
     if (valid) {
@@ -451,17 +419,6 @@ static inline __aicore__ SchedulerAdmissionResult commit_validated_record(
     if (!valid) return SchedulerAdmissionResult::ERROR;
     admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
     return SchedulerAdmissionResult::PROGRESS;
-}
-
-}  // namespace scheduler_admission_detail
-
-template <bool RecordProtocol = true>
-static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerAdmissionLocalState *admission
-) {
-    if (!scheduler_prepare_admission_record(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
-    return scheduler_admission_detail::commit_validated_record<RecordProtocol>(graph, base, local, run, admission);
 }
 
 static inline __aicore__ bool scheduler_read_claim_cursor(
@@ -615,8 +572,11 @@ static inline __aicore__ bool scheduler_can_enter_ordinary(
     return true;
 }
 
+// Completion enters this path only when local->admission is present. The
+// resident installs that pointer after successful admission initialization;
+// retain_candidate has the same live-admission precondition. A null result
+// means that all candidate credits are occupied, not that admission is absent.
 inline __aicore__ SchedulerReadyClaim *scheduler_ordered_direct_sink(SchedulerAdmissionLocalState *admission) {
-    if (admission == nullptr || !admission->initialized) return nullptr;
     for (auto &candidate : admission->candidates) {
         if (scheduler_task_ref_is_null(candidate.ready.task_ref)) {
             candidate = {};
@@ -626,10 +586,12 @@ inline __aicore__ SchedulerReadyClaim *scheduler_ordered_direct_sink(SchedulerAd
     return nullptr;
 }
 
+// The caller holds the initialized admission object for this run. Candidate
+// identity and capacity remain dynamic and must still be checked.
 inline __aicore__ bool
 scheduler_ordered_retain_candidate(SchedulerAdmissionLocalState *admission, const SchedulerReadyClaim &ready) {
-    if (admission == nullptr || scheduler_task_ref_is_null(ready.task_ref) ||
-        ready.task_ref == admission->pending_task_ref || ready.task_ref == admission->current_task_ref)
+    if (scheduler_task_ref_is_null(ready.task_ref) || ready.task_ref == admission->pending_task_ref ||
+        ready.task_ref == admission->current_task_ref)
         return false;
     for (const auto &candidate : admission->candidates)
         if (candidate.ready.task_ref == ready.task_ref) return false;
@@ -648,7 +610,7 @@ static inline __aicore__ bool scheduler_read_claim_cursor(
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarBlockCursorRead, -1);
     SchedulerScalarScope scalar_validate(local, SchedPhaseKind::ScalarCursorValidate);
     if (used_seal != nullptr) *used_seal = false;
-    auto *admission = local == nullptr ? nullptr : local->admission;
+    auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     if (cursor == nullptr || !scheduler_task_ref_valid(graph, admission->current_task_ref) ||
         admission->current_block_num == 0)
@@ -716,7 +678,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t *block_idx
 ) {
-    auto *admission = local == nullptr ? nullptr : local->admission;
+    auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerBlockClaimResult::ERROR;
     if (block_idx == nullptr || !scheduler_task_ref_valid(graph, admission->current_task_ref) ||
         admission->current_block_num == 0) {
@@ -862,7 +824,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block
     uint32_t slot_index
 ) {
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarBlockClaim, -1);
-    auto *admission = local == nullptr ? nullptr : local->admission;
+    auto *admission = local->admission;
     // The cursor helper performs the error check before ownership changes.
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerBlockClaimResult::ERROR;
     const int64_t task = admission->current_task_ref;
@@ -898,7 +860,7 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionClose, -1);
     if (closed == nullptr) return false;
     *closed = false;
-    auto *admission = local == nullptr ? nullptr : local->admission;
+    auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     const int64_t task = admission->current_task_ref;
     if (scheduler_task_ref_is_null(task)) return true;
@@ -967,7 +929,7 @@ static inline __aicore__ bool scheduler_ordered_can_enter_slot(
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarAdmission, -1);
     if (permit == nullptr) return false;
     *permit = false;
-    auto *admission = local == nullptr ? nullptr : local->admission;
+    auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
         return scheduler_admission_fail(

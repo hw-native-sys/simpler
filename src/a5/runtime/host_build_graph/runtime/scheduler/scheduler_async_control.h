@@ -132,10 +132,6 @@ static inline __aicore__ bool activate_finish(SchedulerAsyncLocalState &local, u
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, local.layout->finish_leases_offset);
     auto *directory =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, local.layout->finish_directory_offset);
-    auto *progress = scheduler_state_at<SchedulerAsyncFinishProgress>(local.base, local.layout->finish_progress_offset);
-    const SchedulerResolveCursor empty{};
-    scheduler_async_copy_resolver(progress[index].resolver, empty);
-    publish(&progress[index], sizeof(SchedulerAsyncFinishProgress));
     scheduler_gm_store(leases[index].word, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT));
     publish_activity(local);
     scheduler_cache_barrier();
@@ -246,10 +242,6 @@ static inline __aicore__ bool scheduler_initialize_async(
             pto2::resident::ASYNC_RECORD_ALIGNMENT
         ) ||
         !span(
-            bytes, layout->finish_progress_offset, layout->async_task_count, sizeof(SchedulerAsyncFinishProgress),
-            pto2::resident::ASYNC_RECORD_ALIGNMENT
-        ) ||
-        !span(
             bytes, layout->check_directory_offset, (static_cast<uint64_t>(layout->group_count) + 63) / 64,
             pto2::resident::ASYNC_RECORD_ALIGNMENT, pto2::resident::ASYNC_RECORD_ALIGNMENT
         ) ||
@@ -262,6 +254,16 @@ static inline __aicore__ bool scheduler_initialize_async(
     local.bytes = bytes;
     local.layout = layout;
     return true;
+}
+
+// group_index is a valid index obtained from map_execution in this same run.
+// The layout and base remain fixed; kernels receive a GM context, not this
+// private state. Reconstructing here need not retain a full writer across a call.
+static inline __aicore__ pto2::resident::AsyncWriter
+scheduler_async_writer_for_group(const SchedulerAsyncLocalState &local, uint32_t group_index) {
+    const uint64_t offset =
+        local.layout->groups_offset + static_cast<uint64_t>(group_index) * sizeof(pto2::resident::AsyncGroupData);
+    return {local.base, local.bytes, local.layout->run_epoch, offset, group_index};
 }
 
 inline __aicore__ bool scheduler_async_map_execution(
@@ -285,8 +287,7 @@ inline __aicore__ bool scheduler_async_map_execution(
     const uint32_t group_index = static_cast<uint32_t>(wide_group_index);
     // Bootstrap bounds the contiguous, Host-initialized header array. No
     // header is read until the kernel requests AsyncCtx or returns to seal it.
-    const uint64_t offset = local.layout->groups_offset + static_cast<uint64_t>(group_index) * sizeof(AsyncGroupData);
-    writer = {local.base, local.bytes, local.layout->run_epoch, offset, group_index};
+    writer = scheduler_async_writer_for_group(local, group_index);
     return true;
 }
 
@@ -327,7 +328,7 @@ inline __aicore__ bool scheduler_async_begin_execution(
     return true;
 }
 
-// BoundExecution uses the private writer retained by the resident executor.
+// BoundExecution uses the private group identity retained by the resident executor.
 // Run entry bounds its Host-built group array, and map_execution selects its
 // immutable identity/layout before the kernel. The kernel can mutate only
 // registration state through AsyncCtx; it never receives this private writer.
@@ -425,6 +426,30 @@ struct SchedulerAsyncCompletionObserver {
     inline __aicore__ CompletionPollResult operator()(const CompletionToken &token, uint32_t observer_mask) const {
         if (observer_mask == 0 || (observer_mask & ~3U) != 0 || !pto2::resident::detail::token_valid(token))
             return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+        if (token.completion_type == COMPLETION_TYPE_CCU) {
+            auto *event = reinterpret_cast<__gm__ uint64_t *>(token.addr);
+            const auto load = [event]() __aicore__ {
+                return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [event]() __aicore__ {
+#if defined(__CCE_AICORE__)
+                    const auto value = static_cast<uint64_t>(__builtin_cce_ld_dev(event, 0));
+                    scheduler_ddr_barrier();
+                    return value;
+#else
+                    return __atomic_load_n(event, __ATOMIC_ACQUIRE);
+#endif
+                });
+            };
+            if ((load() & token.backend_cookie) != token.backend_cookie) return {CompletionPollState::PENDING, 0};
+#if defined(__CCE_AICORE__)
+            st_dev(UINT64_C(0), event, 0);
+            scheduler_ddr_barrier();
+#else
+            __atomic_store_n(event, UINT64_C(0), __ATOMIC_RELEASE);
+#endif
+            return load() == 0 ?
+                       CompletionPollResult{CompletionPollState::READY, 0} :
+                       CompletionPollResult{CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+        }
         if (token.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) {
             auto *record = reinterpret_cast<__gm__ uint64_t *>(token.addr);
             const uint64_t completed =

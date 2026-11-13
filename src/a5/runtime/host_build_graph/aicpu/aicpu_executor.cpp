@@ -18,6 +18,7 @@
 
 #include "aicore_lifecycle.h"
 #include "aicpu_executor.h"
+#include "aicpu/abort_aicore_startup.h"
 #include "args_dump_service.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
@@ -39,6 +40,7 @@
 
 #include "common/run_terminal_accumulator.h"
 #include "common/unified_log.h"
+#include "platform_comm/ccu/ccu_ready.h"
 
 // Register-based communication
 #include "aicpu/platform_aicpu_affinity.h"
@@ -49,10 +51,8 @@
 
 static AicpuExecutor g_aicpu_executor;
 
-extern "C" void aicpu_reset_legacy_execution_entry();
 extern "C" __attribute__((visibility("default"))) void aicpu_reset_execution_entry() {
     g_aicpu_executor.reset_entry_state();
-    aicpu_reset_legacy_execution_entry();
 }
 
 // HBG orchestration handles belong to the host. Per-run deinit releases its
@@ -60,8 +60,6 @@ extern "C" __attribute__((visibility("default"))) void aicpu_reset_execution_ent
 extern "C" int32_t aicpu_release_callables() {
     return g_aicpu_executor.init_done_.load(std::memory_order_acquire) ? -1 : 0;
 }
-
-extern "C" int32_t legacy_aicpu_execute(Runtime *runtime);
 
 static uint64_t resident_scheduler_timeout_cycles() {
     const int32_t timeout_ms = get_scheduler_timeout_ms();
@@ -208,17 +206,14 @@ static void log_unfinished_tasks(Runtime *runtime) {
             };
         }
         for (uint64_t other = 0; other < count; ++other) {
-            if (controls[other].next_waiter != static_cast<int64_t>(task)) continue;
+            if (scheduler_wake_cursor_next(controls[other].wake_cursor) != static_cast<int64_t>(task)) continue;
             LOG_ERROR(
                 "A5 HBG AICore scheduler: task=%" PRIu64 " is linked from task=%" PRIu64 " (state=%" PRId64
-                " wake_head=%" PRId64 " waiting_producer=%" PRId32 ")",
-                task, other, controls[other].state, controls[other].wake_list_head, controls[other].waiting_producer
+                " wake_head=%" PRId64 ")",
+                task, other, controls[other].state, controls[other].wake_list_head
             );
         }
-        // waiting_producer is advisory: no functional path reads it, and the
-        // line it sits on is published as a whole, so a stale copy can be
-        // restored over it. The chain owner is whichever task's wake-list head
-        // actually names this one.
+        // Ownership is represented by the producer head and its published wake cursors.
         for (uint64_t owner = 0; owner < count; ++owner) {
             if (controls[owner].wake_list_head != static_cast<int64_t>(task)) continue;
             LOG_ERROR(
@@ -229,17 +224,11 @@ static void log_unfinished_tasks(Runtime *runtime) {
         }
         LOG_ERROR(
             "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " state=%" PRId64 " wake_head=%" PRId64
-            " next_waiter=%" PRId64 " fanin_index=%" PRId32 " waiting_producer=%" PRId32 " producer_state=%" PRId64
-            " producer_wake_head=%" PRId64 " active_mask=0x%x flags=0x%x",
+            " next_waiter=%" PRId64 " wake_next=%" PRId64 " fanin_index=%" PRIu32 " active_mask=0x%x flags=0x%x",
             task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter,
-            controls[task].next_fanin_index, controls[task].waiting_producer,
-            controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
-                controls[controls[task].waiting_producer].state :
-                INT64_C(-1),
-            controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
-                controls[controls[task].waiting_producer].wake_list_head :
-                INT64_C(-1),
-            metadata[task].active_mask.raw(), metadata[task].flags
+            scheduler_wake_cursor_next(controls[task].wake_cursor),
+            scheduler_wake_cursor_fanin(controls[task].wake_cursor), metadata[task].active_mask.raw(),
+            metadata[task].flags
         );
     }
     log_resident_ready_pool(scheduler_state_base, *context);
@@ -284,6 +273,17 @@ static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_s
         );
     }
     LOG_ERROR("A5 HBG AICore Scheduler timeout site=%" PRIu64, static_cast<uint64_t>(error_site));
+}
+
+template <typename Predicate>
+static void join_initialization_phase(Runtime *runtime, Predicate predicate, std::atomic<bool> &failed) {
+    if (wait_with_scheduler_timeout(predicate)) return;
+    record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
+    failed.store(true, std::memory_order_release);
+    // Phase owners may still write lifecycle state. Retirement and destruction
+    // require their completion even when the run has already failed.
+    while (!predicate())
+        SPIN_WAIT_HINT();
 }
 
 static int32_t read_runtime_status(Runtime *runtime) {
@@ -356,7 +356,22 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     if (nthreads == 0) nthreads = 1;
     if (nthreads < 1 || nthreads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
-        return -1;
+        int32_t callback = platform_aicpu_affinity_thread_idx();
+        if (callback < 0) callback = hs_thread_seq_.fetch_add(1, std::memory_order_acq_rel);
+        if (callback == 0) {
+            if (runtime->get_gm_sm_ptr() != nullptr) {
+                auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+                (void)latch_aicore_scheduler_runtime_error(
+                    &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+                );
+            }
+            const int32_t shutdown_rc =
+                abort_aicore_startup(runtime, get_platform_regs(), get_platform_run_result_epoch());
+            terminal_.record_participant(-SIMPLER_ERROR_INVALID_ARGS, shutdown_rc);
+            terminal_publisher_.take(run_terminal_select(false, read_runtime_status(runtime), terminal_), nullptr, 0);
+            handoff_run_terminal();
+        }
+        return -SIMPLER_ERROR_INVALID_ARGS;
     }
     // Each thread needs a distinct index in [0, nthreads) to pick the leader and
     // partition the cores. Onboard the gate filter assigns it (exec_idx); sim's
@@ -382,6 +397,20 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     if (is_leader) {
         LOG_INFO("AicpuExecutor: Initializing");
+        const uint64_t ready_start = get_sys_cnt_aicpu();
+        const int ready_rc = simpler::ccu::wait_local_ready(
+            runtime->dev.ccu_workspace_addr,
+            [ready_start] {
+                return get_sys_cnt_aicpu() - ready_start > PLATFORM_PROF_SYS_CNT_FREQ * uint64_t{10};
+            },
+            [] {
+                SPIN_WAIT_HINT();
+            }
+        );
+        if (ready_rc != 0) {
+            LOG_ERROR("Local CCU READY initialization failed: %d", ready_rc);
+            init_failed_.store(true, std::memory_order_release);
+        }
         args_dump_services_allocated_this_init_ = false;
         if (args_dump_services_ != nullptr) init_failed_.store(true, std::memory_order_release);
         // The 0 → 1 fixup already applied above.
@@ -395,16 +424,17 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         }
         hs_setup_done_.store(true, std::memory_order_release);
     } else {
-        if (!wait_with_scheduler_timeout([this] {
-                return hs_setup_done_.load(std::memory_order_acquire) || init_failed_.load(std::memory_order_acquire);
-            })) {
-            record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
-            init_failed_.store(true, std::memory_order_release);
-        }
+        join_initialization_phase(
+            runtime,
+            [this] {
+                return hs_setup_done_.load(std::memory_order_acquire);
+            },
+            init_failed_
+        );
     }
 
     // All threads: handshake this thread's slice of cores in parallel.
-    if (!init_failed_.load(std::memory_order_acquire)) {
+    if (hs_setup_done_.load(std::memory_order_acquire) && aicore_lifecycle_.core_count() > 0) {
         aicore_lifecycle_.handshake_partition(runtime, tidx, nthreads);
     }
 
@@ -412,13 +442,24 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // and publishes the topology-dependent execution configuration.
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
-        if (!wait_with_scheduler_timeout([this, nthreads] {
+        join_initialization_phase(
+            runtime,
+            [this, nthreads] {
                 return hs_arrived_.load(std::memory_order_acquire) >= nthreads;
-            })) {
-            record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
+            },
+            init_failed_
+        );
+        completion_gate_.reset();
+        if (aicore_lifecycle_.validate_discovery() != 0 || !schedules_on_aicore(runtime)) {
+            LOG_ERROR("A5 HBG: invalid scheduler bootstrap");
+            if (runtime->get_gm_sm_ptr() != nullptr) {
+                auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+                (void)latch_aicore_scheduler_runtime_error(
+                    &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+                );
+            }
             init_failed_.store(true, std::memory_order_release);
         }
-        completion_gate_.reset();
         if (!init_failed_.load(std::memory_order_acquire) && post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }
@@ -441,12 +482,13 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         }
         hs_config_done_.store(true, std::memory_order_release);
     } else {
-        if (!wait_with_scheduler_timeout([this] {
-                return hs_config_done_.load(std::memory_order_acquire) || init_failed_.load(std::memory_order_acquire);
-            })) {
-            record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
-            init_failed_.store(true, std::memory_order_release);
-        }
+        join_initialization_phase(
+            runtime,
+            [this] {
+                return hs_config_done_.load(std::memory_order_acquire);
+            },
+            init_failed_
+        );
     }
 
     // Publish the configured context through GM. AICore performs descriptor
@@ -466,19 +508,21 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         }
         hs_bootstrap_done_.store(true, std::memory_order_release);
     } else {
-        if (!wait_with_scheduler_timeout([this] {
-                return hs_bootstrap_done_.load(std::memory_order_acquire) ||
-                       init_failed_.load(std::memory_order_acquire);
-            })) {
-            record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
-            init_failed_.store(true, std::memory_order_release);
-        }
+        join_initialization_phase(
+            runtime,
+            [this] {
+                return hs_bootstrap_done_.load(std::memory_order_acquire);
+            },
+            init_failed_
+        );
     }
     aicore_lifecycle_.end_bootstrap_wait(tidx);
 
     // The DMB register is the only execution gate. On failure the same
     // partitioned path sends EXIT and waits for every ACK.
-    if (aicore_lifecycle_.release_partition(runtime, tidx, !init_failed_.load(std::memory_order_acquire)) != 0) {
+    const bool started = !init_failed_.load(std::memory_order_acquire);
+    int32_t shutdown_rc = aicore_lifecycle_.release_partition(runtime, tidx, started);
+    if (shutdown_rc != 0) {
         init_failed_.store(true, std::memory_order_release);
     }
 
@@ -486,30 +530,47 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // or every failed slice has acknowledged EXIT.
     hs_release_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
-        if (!wait_with_scheduler_timeout([this, nthreads] {
+        join_initialization_phase(
+            runtime,
+            [this, nthreads] {
                 return hs_release_arrived_.load(std::memory_order_acquire) >= nthreads;
-            })) {
-            record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
-            init_failed_.store(true, std::memory_order_release);
-        }
+            },
+            init_failed_
+        );
         if (!init_failed_.load(std::memory_order_acquire)) ready_watchdog_.reset(get_sys_cnt_aicpu());
         init_done_.store(true, std::memory_order_release);
         if (!init_failed_.load(std::memory_order_acquire)) LOG_INFO("AicpuExecutor: Init complete");
     } else {
-        if (!wait_with_scheduler_timeout([this] {
-                return init_done_.load(std::memory_order_acquire) || init_failed_.load(std::memory_order_acquire);
-            })) {
-            record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
-            init_failed_.store(true, std::memory_order_release);
-        }
+        // The leader owns the final failure decision. Participants acquire it
+        // without introducing another failure after a peer enters run().
+        while (!init_done_.load(std::memory_order_acquire))
+            SPIN_WAIT_HINT();
     }
-    return init_failed_.load(std::memory_order_acquire) ? finish_failed_init(runtime) : 0;
+    if (init_failed_.load(std::memory_order_acquire)) {
+        if (started) {
+            aicore_lifecycle_.signal_shutdown_partition(tidx);
+            shutdown_rc = aicore_lifecycle_.finish_shutdown_partition(tidx, runtime);
+        }
+        return finish_failed_init(runtime, shutdown_rc);
+    }
+    return 0;
 }
 
-int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
+int32_t AicpuExecutor::finish_failed_init(Runtime *runtime, int32_t shutdown_rc) {
+    if (schedules_on_aicore(runtime)) (void)settle_run_error(runtime);
+    if (runtime->get_gm_sm_ptr() != nullptr) {
+        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+        (void)latch_aicore_scheduler_runtime_error(
+            &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+        );
+    }
+    const int32_t header_status = read_runtime_status(runtime);
+    const int32_t init_rc = header_status != 0 ? header_status : -SIMPLER_ERROR_INVALID_ARGS;
+    terminal_.record_participant(init_rc, shutdown_rc);
     const int32_t nthreads = aicpu_thread_num_;
     const bool last = init_failure_arrived_.fetch_add(1, std::memory_order_acq_rel) + 1 == nthreads;
     if (last) {
+        terminal_publisher_.take(run_terminal_select(false, header_status, terminal_), nullptr, 0);
         if (args_dump_services_allocated_this_init_ && aicore_lifecycle_.cores_retired()) {
             for (int32_t thread = 0; thread < args_dump_service_count_; ++thread)
                 args_dump_services_[thread].stop();
@@ -520,6 +581,7 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
                 args_dump_services_allocated_this_init_ = false;
             }
         }
+        (void)aicore_lifecycle_.settle_run_diagnostics(runtime, false);
         aicore_lifecycle_.deinit();
         completion_gate_.reset();
         ready_watchdog_.reset();
@@ -537,18 +599,19 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
         aicpu_thread_num_ = 0;
         init_failure_arrived_.store(0, std::memory_order_relaxed);
         init_failed_.store(false, std::memory_order_release);
+        handoff_run_terminal();
     } else if (!wait_with_scheduler_timeout([this] {
                    return !init_failed_.load(std::memory_order_acquire);
                })) {
         record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
     }
-    return -1;
+    return init_rc;
 }
 
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
-// The AICPU-dispatched and resident schedulers' supervision wait: poll the
+// The resident scheduler's supervision wait: poll the
 // run control until every task is accounted for, then latch what the cores
 // reported into the shared header.
 __attribute__((weak)) bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
@@ -853,27 +916,16 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("%s", "Invalid argument: null Runtime pointer");
         return -1;
     }
-    if (!g_aicpu_executor.schedules_on_aicore(runtime)) {
-        const bool explicit_legacy = aicore_scheduler_explicit_legacy_enabled(runtime);
-        // Legacy execution also owns the cleanup handshake for the AICores that
-        // were already launched. Run it before rejecting an unmarked fallback.
-        const int32_t legacy_rc = legacy_aicpu_execute(runtime);
-        if (!explicit_legacy && legacy_rc == 0) {
-            LOG_ERROR("A5 HBG: ordinary run reached legacy scheduling without an explicit fallback mode");
-            return -1;
-        }
-        return legacy_rc;
-    }
-
     LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
 
     // init() barriers every thread internally until init is complete on the
     // leader (or a thread failed), then returns the status — so a non-zero
     // return is authoritative on all threads and no extra spin is needed.
-    if (g_aicpu_executor.init(runtime) != 0) {
+    const int32_t init_rc = g_aicpu_executor.init(runtime);
+    if (init_rc != 0) {
         LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
         const int32_t runtime_rc = publish_aicore_scheduler_runtime_error(runtime);
-        return runtime_rc != 0 ? runtime_rc : -1;
+        return runtime_rc != 0 ? runtime_rc : init_rc;
     }
 
     int32_t rc = g_aicpu_executor.run(runtime);

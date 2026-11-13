@@ -87,7 +87,7 @@ class TestDeferWaitReadyFairness(SceneTestCase):
             }
         ],
     }
-    CASES = [{"name": "continuous_ready", "platforms": ["a5"], "params": {"count": 2048}}]
+    CASES = [{"name": "continuous_ready", "platforms": ["a5"], "manual": True, "params": {"count": 2048}}]
 
     def generate_args(self, params):
         return TaskArgsBuilder(

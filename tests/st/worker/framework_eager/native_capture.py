@@ -16,6 +16,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +40,7 @@ def _check_retained_report(reports, runtime, platform, task_queue):
         "release_order": list(reversed(range(count))),
         "survivor_replays": [1006 + 2 * index for index in reversed(range(1, count))],
         "checked_close": True,
-        "tensor_impl_lifetime": "observed" if task_queue == "0" else "not_observed",
+        "tensor_impl_lifetime": "observed",
     }, reports
 
 
@@ -50,10 +52,35 @@ def _load_example(path):
     return module
 
 
+def _require_tensor_impl_live(frame, owners):
+    assert not frame["rhs_probe"].expired(), "captured RHS TensorImpl expired"
+    # Queue parameters may retain an extra TensorImpl after their host callback.
+    # The original ticket must independently retain this exact TensorImpl.
+    assert any(getattr(owner, "_cdata", None) == frame["rhs_identity"] for owner in owners), (
+        "original ticket did not retain the RHS TensorImpl"
+    )
+
+
+def _await_tensor_impl_release(frame):
+    deadline = time.monotonic() + 5.0
+    wakeup = threading.Event()
+    while not frame["rhs_probe"].expired():
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "RHS TensorImpl remained live after checked model/ticket release"
+        # This is observation only; the framework's existing release thread runs
+        # independently of checked Simpler retirement. No queue work is added.
+        wakeup.wait(min(remaining, 0.001))
+
+
 def _require_live(graph_ticket, frame, queue):
+    from simpler import worker as worker_module  # noqa: PLC0415
+
     assert not graph_ticket.safe_to_release and not graph_ticket._native_submission._model_destroyed()
     if queue == "0":
         gc.collect()
+    if queue == "1" or "rhs_identity" in frame:
+        _require_tensor_impl_live(frame, worker_module._native_submission_roots[graph_ticket][1])
+    else:
         assert not frame["rhs_probe"].expired()
     try:
         graph_ticket.wait(timeout=0)
@@ -75,6 +102,7 @@ def _record(torch, worker, handle, config, stream, raw_stream, bridge, example, 
     a, rhs, output = frame["tensors"]
     result = frame["result"]
     frame["rhs_probe"] = torch._C._WeakTensorRef(rhs)
+    frame["rhs_identity"] = rhs._cdata
     frame["pointers"] = tuple(tensor.data_ptr() for tensor in (a, output, result))
     a.fill_(example.INPUTS[0])
     rhs.fill_(model.rhs_value)
@@ -207,15 +235,17 @@ def _retained_child(args, example_path, roots, shim):
             model.graph.reset()
             assert ticket._native_submission._model_destroyed()
             assert not ticket.safe_to_release
-            if queue == "0":
-                assert not frame["rhs_probe"].expired()
+            _require_tensor_impl_live(frame, worker_module._native_submission_roots[ticket][1])
             error = example._retire_ticket(ticket)
             if error is not None:
                 raise error
             assert ticket.safe_to_release
+            assert ticket not in worker_module._native_submission_roots
             if queue == "0":
                 gc.collect()
                 assert frame["rhs_probe"].expired()
+            else:
+                _await_tensor_impl_release(frame)
             release_order.append(index)
             for survivor in models[:index]:
                 _require_live(survivor.ticket, survivor.frame, queue)
@@ -239,7 +269,7 @@ def _retained_child(args, example_path, roots, shim):
         "release_order": release_order,
         "survivor_replays": survivor_replays,
         "checked_close": True,
-        "tensor_impl_lifetime": "observed" if queue == "0" else "not_observed",
+        "tensor_impl_lifetime": "observed",
     }
 
 

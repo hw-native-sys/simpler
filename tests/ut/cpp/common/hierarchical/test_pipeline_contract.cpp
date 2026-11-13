@@ -487,3 +487,20 @@ TEST(PipelineSlotGenerationFilter, CommitRechecksGenerationAfterCompatibilityPre
 }
 
 }  // namespace
+
+TEST(PipelineContract, OptionalAicpuRequiresExactlyTheDeclaredExecutionRoles) {
+    auto c = accepted_contract();
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+    c.resources[2] = c.resources[3];
+    c.resource_count = 3;
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+    EXPECT_TRUE(has_serviceable_stream_topology(c, false));
+    c.resources[2].resource_class = PTO_PIPELINE_HOST_PER_RUN;
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+    c.resources[2].resource_class = PTO_PIPELINE_EXEC_HANDLE;
+    c.resource_count = 4;
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+    c.resource_count = 2;
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+}

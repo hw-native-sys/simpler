@@ -1,7 +1,7 @@
 # A5 HBG AICore 调度：按执行顺序走读
 
 本文对应当前采用两个共享业务 ready 队列与 GM MIX 的 A5 HBG resident 实现；own slot 在执行后直接退休，按 ready_head 保持本核 FIFO。GraphView 为 v3，ready pool 为主线 v11，native graph image 为 v2，native protocol 为 v10/v11，execution identity 为 v1。
-范围：从 device 已拿到本次运行的 GM 数据开始，覆盖初始化、依赖、取任务、准入、kernel 调用、完成传播和退出。Host 预建的 CSR/remaining 作为输入合同介绍，不展开 Host 构图实现；legacy 只标入口。
+范围：从 device 已拿到本次运行的 GM 数据开始，覆盖初始化、依赖、取任务、准入、kernel 调用、完成传播和退出。Host 预建的 CSR/remaining 作为输入合同介绍，不展开 Host 构图实现；无效启动描述的失败退核也包含在范围内。
 本文的源码链接使用相对于本 Markdown 文件的路径；进入文件后可按链接名称或上下文中的符号定位。VS Code Markdown 会将 `/` 开头的链接按工作区根目录解析，因此此处不使用磁盘绝对路径。
 
 ## 阅读顺序
@@ -99,15 +99,15 @@ sequenceDiagram
 
 业务 ready 只有两个队列：AIC 队列接收纯 AIC 和所有 MIX 任务，AIV 队列接收纯 AIV 任务。Graph 控制节点使用独立 control inbox。领取 ready 决定任务由谁接手；admission、SPMD block 领取和 MIX mailbox 决定哪些核参与执行。每个参与核都用自己的两个 slot 准备、执行和回收 payload。
 
-## legacy 只标入口
+## 启动描述无效时的入口
 
-- [AICPU 入口判断](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp)：`!aicore_scheduler_runtime_enabled(runtime)` 进入 `legacy_aicpu_execute`。
-- [AICore 入口判断](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp)：mode 不是 `RESIDENT_PENDING` 或 `RESIDENT_READY` 时进入 `legacy_aicore_execute`。
-- [mode 常量](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_layout.h)：resident 为 1/2，明确 legacy 为 3/4。0 表示未发布选择。
-- 以下只走读 resident 路径。
+- [mode 常量](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_layout.h)：A5 HBG resident 为 1/2；0 表示未发布选择。其他值不能选择备用执行器。
+- [AICore 入口](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp)：先报告本轮身份；mode 无效、context base 缺失/不对齐或 worker 地址溢出时，不解引用 scheduler backing，只等待 EXIT、nonce ACK 与 teardown release。
+- [AICPU 初始化](../../../src/a5/runtime/host_build_graph/aicpu/aicpu_executor.cpp)：先发现已经启动的核，再校验 scheduler 步骤；拒绝启动时锁存 `INVALID_ARGS`，各分区完成失败退休，最后参与者发布失败 terminal。
+- 未证明退休的核不能被视为已安全释放；错误计数、空 ready 和缺失 task trace 都不能替代退核证明。
 
-导航时读 `scheduler_dispatch.h`、`scheduler_completion.h`；它们的同名 `.cpp` 是独立的 AICPU 调度实现，不在此次主线。
-一些共享文件的开头注释仍以 AICPU 投递模型叙述；判断 resident 行为应沿上述实际调用点。
+导航时读 `scheduler_dispatch.h`、`scheduler_completion.h` 和 `aicore_lifecycle.*`。
+共享 arena 仍预留的结构以及 kernel context 中仍存在的字段不构成额外执行路径。
 
 ## 三个不能混同的完成点
 

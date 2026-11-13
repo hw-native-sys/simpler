@@ -1033,11 +1033,11 @@ class _CommContextStruct(ctypes.Structure):
         ("winSize", ctypes.c_uint64),
         ("windowsIn", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
         ("windowsOut", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
-        ("workspaces", _CommWorkspaceStruct * 3),
+        ("workspaces", _CommWorkspaceStruct * 4),
     ]
 
 
-assert ctypes.sizeof(_CommContextStruct) == 1088
+assert ctypes.sizeof(_CommContextStruct) == 1104
 
 
 def scalar_to_uint64(value) -> int:
@@ -1183,6 +1183,7 @@ class CommDomainHandle:
         "requested_window_size",
         "memory_source",
         "_host_mappings",
+        "_ccu_run_generation",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1211,6 +1212,7 @@ class CommDomainHandle:
         self.name = name
         self.memory_source = memory_source
         self._host_mappings = []
+        self._ccu_run_generation = 0
         self.workers = tuple(workers)
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
@@ -1580,7 +1582,7 @@ def _initialize_chip_runtime(  # noqa: PLR0913 -- explicit binary, workspace and
     # no dispatcher; onboard bootstrap consumes its actual binary path.
     impl.init(
         str(bins.host_path),
-        str(bins.aicpu_path),
+        "" if bins.aicpu_path is None else str(bins.aicpu_path),
         str(bins.aicore_path),
         "" if dispatcher_path is None else str(dispatcher_path),
         int(device_id),

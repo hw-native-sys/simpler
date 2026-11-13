@@ -55,8 +55,9 @@ _ARTIFACT_LOGIC_MODULES = (
 )
 
 _CPU_SIM_TARGET_FLAGS = {
-    "a2a3sim": "-DPTO_CPU_SIM_TARGET_A2A3",
-    "a5sim": "-DPTO_CPU_SIM_TARGET_A5",
+    "a2a3sim": ("-DPTO_CPU_SIM_TARGET_A2A3",),
+    "a5sim": ("-DPTO_CPU_SIM_TARGET_A5",),
+    "wsesim": ("-DPTO_CPU_SIM_TARGET_A5", "-DSIMPLER_CPU_SIM_TARGET_WSE"),
 }
 
 
@@ -197,6 +198,8 @@ class KernelCompiler:
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
         elif platform in ("a5", "a5sim"):
             self.platform_dir = self.project_root / "src" / "a5" / "platform"
+        elif platform == "wsesim":
+            self.platform_dir = self.project_root / "src" / "wse" / "platform"
         else:
             raise ValueError(f"Unknown platform: {platform}")
 
@@ -227,12 +230,12 @@ class KernelCompiler:
     def _sim_incore_compile_flags(self, core_type: str) -> list[str]:
         """Return the complete compiler flags for one CPU-sim kernel."""
         try:
-            target_flag = _CPU_SIM_TARGET_FLAGS[self.platform]
+            target_flags = _CPU_SIM_TARGET_FLAGS[self.platform]
         except KeyError as error:
             raise ValueError(f"Unsupported CPU simulator platform: {self.platform}") from error
         return [
             *self.gxx15.get_compile_flags(core_type=core_type),
-            target_flag,
+            *target_flags,
             "-include",
             "pto/cpu/target_config.hpp",
             "-include",
@@ -277,6 +280,8 @@ class KernelCompiler:
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
             arch = "a5"  # Phase 2: A5 uses A5 runtime
+        elif self.platform == "wsesim":
+            arch = "wse"
         else:
             arch = "a2a3"
 
@@ -304,7 +309,8 @@ class KernelCompiler:
         headers (e.g. ``intrinsic.h``) can pull shared platform headers like
         ``common/dma_workspace.h`` regardless of what the call site passes.
         """
-        include_dirs = [
+        platform_dirs = [str(self.platform_dir / "include")] if self.platform == "wsesim" else []
+        include_dirs = platform_dirs + [
             str(Path(__file__).resolve().parent / "incore"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
@@ -354,6 +360,8 @@ class KernelCompiler:
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
             arch = "a5"  # Phase 2: A5 uses A5 runtime
+        elif self.platform == "wsesim":
+            arch = "wse"
         else:
             arch = "a2a3"
 
@@ -615,7 +623,7 @@ class KernelCompiler:
 
         Args:
             source_path: Path to kernel source file (.cpp)
-            core_type: Core type: "aic" (cube) or "aiv" (vector). Default: "aiv"
+            core_type: "aic" (cube), "aiv" (vector), or empty for a homogeneous simulator. Default: "aiv"
             pto_isa_root: Path to PTO-ISA root directory. Required for hardware;
                 simulator builds default to the managed pinned checkout.
             extra_include_dirs: Additional include directories
@@ -636,6 +644,7 @@ class KernelCompiler:
                 "a2a3sim": ToolchainType.HOST_GXX_15,
                 "a5": ToolchainType.CCEC,  # Phase 1: A5 uses same as A2A3
                 "a5sim": ToolchainType.HOST_GXX_15,  # Phase 1: A5sim uses same as A2A3sim
+                "wsesim": ToolchainType.HOST_GXX_15,
             },
         )
 
@@ -857,7 +866,7 @@ class KernelCompiler:
 
         Args:
             source_path: Path to kernel source file (.cpp)
-            core_type: Core type: "aic" (cube) or "aiv" (vector).
+            core_type: "aic" (cube), "aiv" (vector), or empty for a homogeneous simulator.
             pto_isa_root: Path to PTO-ISA root directory (for PTO ISA headers)
             extra_include_dirs: Additional include directories
 

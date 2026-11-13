@@ -198,16 +198,9 @@ inline __aicore__ bool scheduler_graph_view_valid(const SchedulerGraphAccess &gr
                                              graph.native_header() != nullptr;
 }
 
-// The three predicates every reader of a task ref goes through. They exist so
-// that the one assumption behind them -- a ref is an index into tables sized by
-// task_count -- is stated in three places rather than at each of the forty-odd
-// sites that would otherwise open-code it. Widening the encoding to carry a
-// parent (which supporting a graph task's sub-tasks needs) changes these and the
-// two `_at` accessors in scheduler_ready.h, not a search for bare subscripts.
-
-// True when `ref` names a task this graph holds. A caller that is about to
-// subscript a table with the ref has to pass this first; the cast is the only
-// place the signed-to-unsigned narrowing lives.
+// True when ref indexes this graph's task tables. Establish this at the input,
+// publication or resumption boundary; internal helpers may require an already
+// validated ref when both its value and the graph's table bounds are unchanged.
 inline __aicore__ bool scheduler_task_ref_valid(const SchedulerGraphView &graph, int64_t ref) {
     return ref >= 0 && static_cast<uint64_t>(ref) < graph.task_count;
 }

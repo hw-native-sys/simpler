@@ -16,6 +16,10 @@ why. The #2368 and #2369 revisions share the `31da0560e` baseline below; the lat
 **outbound audit section pins its own, newer baseline** and its code references and
 extent figures belong to that commit alone.
 
+A5 HBG legacy executor references below describe the pinned historical revision.
+See [the removal investigation](2026-11-a5-hbg-legacy-removal.md) for the current
+execution-path change; the historical field-by-field audit remains unchanged.
+
 ## Current disposition (2026-10-26)
 
 The owner clarified the architecture contract for #2745: A5 GM accesses

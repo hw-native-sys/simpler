@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include "common/scheduler_profiling.h"
 #include "launch_entry_args_fixture.h"
 
 using namespace launch_entry_args_test;
@@ -223,12 +224,14 @@ TEST_F(LaunchEntryArgs, AdoptionRejectsCountsTheDescriptorDoesNotName) {
 // The descriptor's wire offsets, which all three programs decode by. A field
 // added ahead of the entry storage moves the values under the AICPU.
 TEST_F(LaunchEntryArgs, TheDescriptorsWireOffsetsAreFixed) {
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_tensor_count_), 124U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_scalar_count_), 128U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_args_source_), 132U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, chip_swimlane_level), 136U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, pmu_event_type), 140U);
-    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, dump_args_level), 144U);
+    // A5 carries the CCU workspace between the thread count and affinity list.
+    const size_t ccu_bytes = std::strcmp(CHIP_SWIMLANE_ARCHITECTURE_NAME, "a5") == 0 ? sizeof(uint64_t) : 0;
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_tensor_count_), 124U + ccu_bytes);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_scalar_count_), 128U + ccu_bytes);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_args_source_), 132U + ccu_bytes);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, chip_swimlane_level), 136U + ccu_bytes);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, pmu_event_type), 140U + ccu_bytes);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, dump_args_level), 144U + ccu_bytes);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_), 192U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers), 34048U)
         << "the handshake region's address is what the first publication's length and the device both depend on";

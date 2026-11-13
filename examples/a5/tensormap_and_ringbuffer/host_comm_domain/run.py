@@ -11,6 +11,7 @@
 
 import argparse
 import sys
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -61,29 +62,24 @@ def _table(rank, generation, *, device=False):
     return values + rank * 10000 + generation * 100000 + (500000 if device else 0)
 
 
-def _specs(*, outputs=False):
+def _specs(*, outputs=False, depth=1):
     specs = [
         CommBufferSpec("reserved", "uint8", PREFIX_BYTES, PREFIX_BYTES),
         CommBufferSpec("table", "float32", ROWS * WIDTH, TABLE_BYTES),
     ]
-    if outputs:
-        specs.extend(
-            CommBufferSpec(f"{source}_{name}", "float32", len(INDICES) * WIDTH, OUTPUT_BYTES)
-            for source in ("host", "device")
-            for name in ("local", "peer", "result")
-        )
-    else:
-        specs.append(CommBufferSpec("local_echo", "float32", len(INDICES) * WIDTH, OUTPUT_BYTES))
+    names = ("host_peer", "host_result", "device_local", "device_peer", "device_result") if outputs else ("local_echo",)
+    specs.extend(CommBufferSpec(name, "float32", depth * len(INDICES) * WIDTH, depth * OUTPUT_BYTES) for name in names)
     return specs
 
 
-def _allocate(orch, source, *, initializer=None):
+def _allocate(orch, source, *, initializer=None, depth=1):
     host = source == "host"
+    buffers = _specs(outputs=not host, depth=depth)
     return orch.get_or_allocate_domain(
         name=f"engram_{source}",
         members=[0, 1],
-        window_size=PREFIX_BYTES + TABLE_BYTES + (OUTPUT_BYTES if host else 6 * OUTPUT_BYTES),
-        buffers=_specs(outputs=not host),
+        window_size=sum(spec.nbytes for spec in buffers),
+        buffers=buffers,
         memory_source=AddressSpace.HOST if host else AddressSpace.DEVICE,
         workspace_engines=("urma",),
         retain_after_run=True,
@@ -102,11 +98,11 @@ def _clear_host_output(domain):
     offset, nbytes = domain.buffer_range("local_echo")
     for rank in range(2):
         with domain.member(rank).buffers["local_echo"].shm.buf[offset : offset + nbytes] as memory:
-            memory[:] = bytes(OUTPUT_BYTES)
+            memory[:] = bytes(nbytes)
 
 
-def _read_device(worker, buffer, scratch):
-    worker.copy_from(scratch, buffer)
+def _read_device(worker, buffer, scratch, *, slot=0):
+    worker.copy_from(scratch, buffer, src_offset=slot * OUTPUT_BYTES)
     with scratch.shm.buf[:] as memory:
         return np.frombuffer(memory, dtype=np.float32).reshape(len(INDICES), WIDTH).copy()
 
@@ -116,6 +112,7 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
         raise ValueError("this example requires two distinct A5 devices")
     if aiv_blocks not in (1, 4):
         raise ValueError("aiv_blocks must be 1 or 4")
+    depth = 2 if staged else 1
     compiled = build_callable()
     worker = Worker(
         level=3,
@@ -139,9 +136,9 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
             _clear_host_output(domain)
             initialized.append(domain.domain_id)
 
-        def submit(orch, _args, config, *, sources=("host", "device")):
+        def submit(orch, _args, config, *, sources=("host", "device"), slot=0):
             for source in sources:
-                domain = _allocate(orch, source, initializer=initialize_host if source == "host" else None)
+                domain = _allocate(orch, source, initializer=initialize_host if source == "host" else None, depth=depth)
                 previous = domains.get(source)
                 if previous is None:
                     if source == "device":
@@ -151,6 +148,12 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                 else:
                     assert domain is previous
             target = domains["device"]
+            if slot == 0:
+                start, _ = target.buffer_range("host_peer")
+                last, size = target.buffer_range("device_result")
+                zeros = bytes(last + size - start)
+                for rank in range(2):
+                    orch.copy_to_domain(target, rank, zeros, offset=start)
             for source in sources:
                 domain = domains[source]
                 for rank in range(2):
@@ -163,13 +166,14 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                             else target.member(rank).buffers[f"{source}_{name}"]
                         )
                         args.add_tensor(
-                            output.tensor((len(INDICES), WIDTH), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING
+                            output.tensor((len(INDICES), WIDTH), DataType.FLOAT32, byte_offset=slot * OUTPUT_BYTES),
+                            TensorArgType.OUTPUT_EXISTING,
                         )
                     args.add_scalar(domain.device_context(rank, workspace_engines=("urma",)))
                     args.add_scalar(aiv_blocks)
                     orch.submit_next_level(entry, args, config, worker=rank)
 
-        def verify(generation, *, sources=("host", "device")):
+        def verify(generation, *, sources=("host", "device"), slot=0):
             for source in sources:
                 is_device = source == "device"
                 source_generation = 1 if is_device else generation
@@ -178,11 +182,18 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                     peer = _table(1 - rank, source_generation, device=is_device)[list(INDICES)]
                     for name, expected in (("local", local), ("peer", peer), ("result", peer + 1.0)):
                         if source == "host" and name == "local":
-                            offset, nbytes = host.buffer_range("local_echo")
-                            with host.member(rank).buffers["local_echo"].shm.buf[offset : offset + nbytes] as memory:
+                            offset, _ = host.buffer_range("local_echo")
+                            offset += slot * OUTPUT_BYTES
+                            with (
+                                host.member(rank)
+                                .buffers["local_echo"]
+                                .shm.buf[offset : offset + OUTPUT_BYTES] as memory
+                            ):
                                 actual = np.frombuffer(memory, dtype=np.float32).reshape(len(INDICES), WIDTH).copy()
                         else:
-                            actual = _read_device(worker, device.member(rank).buffers[f"{source}_{name}"], scratch)
+                            actual = _read_device(
+                                worker, device.member(rank).buffers[f"{source}_{name}"], scratch, slot=slot
+                            )
                         np.testing.assert_array_equal(actual, expected)
             print(f"PASS generation={generation} sources={sources} staged={staged} aiv_blocks={aiv_blocks}", flush=True)
 
@@ -194,7 +205,7 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
             if "host" in domains:
                 _clear_host_output(domains["host"])
             pending = worker.submit(submit)
-            following = worker.submit(submit) if staged else None
+            following = worker.submit(partial(submit, slot=1)) if staged else None
             pending.wait()
             if following is not None:
                 following.wait()
@@ -204,7 +215,8 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                 original_host_bases = tuple(host.local_context(rank).local_window_base for rank in range(2))
             assert host.buffer_range("table") == (PREFIX_BYTES, TABLE_BYTES)
             assert initialized == [original_host_id]
-            verify(generation)
+            for slot in range(depth):
+                verify(generation, slot=slot)
             assert host.domain_id == original_host_id and not host.freed
             assert tuple(host.local_context(rank).local_window_base for rank in range(2)) == original_host_bases
 
@@ -216,6 +228,11 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
         def device_only(orch, args, config):
             submit(orch, args, config, sources=("device",))
 
+        # This slot is invalidated even if the Device-only callback does not run.
+        assert scratch.shm is not None and scratch.shm.buf is not None
+        with scratch.shm.buf[:] as memory:
+            memory[:] = bytes(OUTPUT_BYTES)
+        worker.copy_to(device.member(0).buffers["device_result"], scratch)
         worker.run(device_only)
         verify(2, sources=("device",))
         assert not device.released

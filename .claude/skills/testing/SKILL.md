@@ -5,6 +5,11 @@ description: Testing guide and pre-commit testing strategy for simpler. Use when
 
 # Testing
 
+To add a capability or fix a defect test-first, read [tdd](references/tdd.md)
+before writing the test. It covers seams, the red-green loop, anti-patterns and
+mocking boundaries; the sections below still decide which suite and platform to
+run.
+
 ## Test Types
 
 1. **Python unit tests (ut-py)** (`tests/ut/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests/ut`. Tests declaring `@pytest.mark.requires_hardware[("<platform>")]` auto-skip unless `--platform` points to a matching device.

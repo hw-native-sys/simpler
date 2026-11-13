@@ -35,8 +35,7 @@ bool is_blank(const char *s) { return s == nullptr || s[0] == '\0'; }
 // Every runtime error code, including the ones no ST can provoke. 6 is retired and no longer
 // defined by any runtime's header.
 //
-// A code only one runtime raises still belongs here: a number is reserved across runtimes so
-// that every runtime's table can name it, which is what lets this list be unconditional.
+// Include feature-specific codes when the selected runtime defines them.
 constexpr int32_t kAllRuntimeCodes[] = {
     SIMPLER_ERROR_SCOPE_DEADLOCK,
     SIMPLER_ERROR_HEAP_RING_DEADLOCK,
@@ -53,6 +52,11 @@ constexpr int32_t kAllRuntimeCodes[] = {
     SIMPLER_ERROR_ASYNC_COMPLETION_INVALID,
     SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW,
     SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED,
+#ifdef SIMPLER_ERROR_KERNEL_INVALID_OUTPUT
+    SIMPLER_ERROR_KERNEL_INVALID_OUTPUT,
+    SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE,
+    SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE,
+#endif
 };
 
 TEST(RuntimeErrorNames, EveryCodeHasNameDescAndHint) {
@@ -80,7 +84,7 @@ TEST(RuntimeErrorNames, NoErrorIsNotAnError) {
 // An unrecognised code must be reported as such. Annotating it with a neighbouring code's
 // text would be worse than printing the bare number.
 TEST(RuntimeErrorNames, UnknownCodeFallsBack) {
-    for (int32_t code : {6, 42, 99, 105, 9999, -1}) {
+    for (int32_t code : {6, 42, 99, 9999, -1}) {
         EXPECT_STREQ(error_name(code), "unknown") << "code " << code;
         EXPECT_TRUE(is_blank(error_desc(code))) << "code " << code;
         EXPECT_TRUE(is_blank(error_hint(code))) << "code " << code;

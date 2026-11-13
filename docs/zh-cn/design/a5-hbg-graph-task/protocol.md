@@ -71,7 +71,7 @@ bool scheduler_service_controls(/* graph, base, local, run, budgets */);
 所有 worker 都可消费控制节点，先查本地、再按轮转游标探查一个 peer，最终覆盖所有 worker。
 业务 ready pool 的空提示不能屏蔽这次控制队列探查。
 
-一个节点经 remaining 归零或兼容 wake-list 路由成为 ready 后，先按 kind 分流：控制节点只进 control inbox；kernel 才能 direct refill、
+一个节点经 remaining 归零或动态 wake-list 路由成为 ready 后，先按 kind 分流：控制节点只进 control inbox；kernel 才能 direct refill、
 进入对应业务队列或 admission。禁止把 ENTER/EXIT 当作 AIV kernel，禁止递归调用其后继完成函数。
 MPMC pop 的成功 CAS 是唯一 owner 的获取点，不再增加 Graph 级 owner lock。
 
@@ -81,22 +81,16 @@ kernel 返回收尾与 EXIT/错误门禁之后直接处理当前 slot completion
 即使所有 payload slot 占满或 admission candidate 被暂存，也必须运行控制切片。
 已有 kernel completion 的控制后继只入队；下一切片处理，避免 completion→control 的递归。
 
-每轮最多开始 8 个控制节点，并消耗 64 个控制工作单位，作为内部常量。
-每 worker 持有一个 160 bytes、自然 8-byte 对齐的 `SchedulerResolveCursor`，保存 producer、CSR/剩余链位置、当前后继、兼容 fanin 游标及最多 8 项的发布状态：
+每轮最多处理8个控制节点，作为内部常量。单个节点的completion同步完成：
 
-1. pop 一个 ready 控制节点，校验 kind、BLOCKED 和无 kernel 资源；以原子写发布 DONE。
-2. 原子 exchange 将 wake head 置为 CLOSED；重复 CLOSED 是协议错误。计数路径要求原 head 为空，兼容路径则取得完整旧链。
-3. 计数路径遍历 CSR 后继并对 remaining 原子减一；旧值为 1 的唯一通知者使后继 ready，旧值为 0 报错。兼容路径先保存旧 next，再推进 fanin 扫描及挂链。
-4. 后继只能继续等待、进入 ready 发布流程或报错；不能重复发布或重复消费同一条边。
-5. 预算耗尽保存完整进度，包括尚未公开的 batch，下轮继续。兼容路径重新挂链后不再访问该 waiter，按已保存旧 next 推进。
-6. 所有后继处理完且 batch 发布完成后，才增加本 worker 的 `pending_completed`，清空 continuation。
+1. pop获得唯一节点owner，校验kind、BLOCKED和无kernel资源，以原子操作发布DONE。
+2. 动态wake-list原子关闭head并取得链；CSR候选则直接读取后继行，不领取wake-list。
+3. 依次处理后继：CSR减remaining，动态挂链保存旧next后扫描剩余fanin、就绪或转挂到未完成前驱。
+4. 挂链成功后不得再访问waiter；Ready批次全部发布后才能累计该producer的pending_completed。
 
-continuation 私有拥有剩余后继的处理责任；不把它重新入队，不再次关闭 producer，也不再次发布 DONE。
-初始化、单个 CSR credit、兼容路径的单个 fanin 观察或登记尝试、waiter 选择/暂存及 ready 发布步骤均计入预算。
-业务 ticket 发布最多处理 8 项，在同一有限步骤内完成预留与发布；control inbox tail 的成功 CAS 后必须立即完成旧 tail 挂链及屏障，之后才允许让出。
-64 是上述工作单位预算，**不是 64 次 GM 访问或硬实时周期上限**；每种单位的固定访问和屏障成本仍需计量。
-普通同步 kernel completion 保持符合条件的非 MIX direct refill；MIX 使用同一有界业务队列发布，不单独保留直接交付或两任务前缀路径。
-可移交的 FINISH 使用同一有界 resolver 及完整解析游标。
+没有core-local resolver续行。Ready业务ticket在同次调用中完成预留与发布；control inbox成功CAS后立即完成旧tail挂链与屏障。
+普通completion保留direct refill；ordered admission存在时也可直接持有MIX后继的准入责任。
+async FINISH在join满足后获得唯一lease，同步执行TaskDone与后继传播，再终结lease与清理directory；FINISH不保存192B进度区。异步条件CHECK的预算扫描保留。
 本地状态避免新增过度对齐的大栈对象；GM wire 的对齐要求不直接搬到 CCEC 局部变量上。
 
 ## 参数绑定与资源准入
@@ -131,24 +125,24 @@ Host 按 task_ref 顺序分别累计 AIC/AIV 普通 SPMD 的 block 数；MIX、s
 该路径仍校验 epoch、全局顺序、任务形状和 membership，每轮最多扫描八条记录；
 扫描游标推进也计为调度进展，即使本轮未保留 current task，也不会触发空闲退避。
 不增加 completed_subtasks、不标记逻辑任务完成，MIX 和 sync_start 仍走原有准入与关闭路径。
-现有 PREPARED/ADMITTED、membership、短 commit lock 和 kernel 资源准入均不提前。
+全局ADMITTED发布、membership消费、短commit lock和kernel资源准入均不提前；Ready到pending只转移本核私有所有权。
 
 `SchedulerLocalSlotState` 用三态 predicate（未求值、通过、不通过）保存一次求值的结果，
 park/restore 与 `args_observed` 一起迁移，不因重试而读取更新后的 predicate operand。
 `SchedulerWorkerContext` 为 320 bytes，`SchedulerLocalConfig` 为 104 bytes，
-slot 保持 24 bytes，`SchedulerLocalState` 为 368 bytes（含可选异步服务状态的 8-byte 引用），其中控制解析游标占 160 bytes，均有 64-bit 构建的静态断言。
+slot 保持 24 bytes，`SchedulerLocalState` 为 208 bytes（含可选异步服务状态的 8-byte 引用），均有 64-bit 构建的静态断言。
 最初 I4 测试快照使用两个 predicate 布尔值，slot 为 32 bytes、总状态为 616 bytes；
 后续性能证据必须明确区分该快照与三态布局。
 这些局部状态也用于无 Graph 路径，P1 必须实测其开销，不能仅凭 native 分支未执行就断言零影响。
 
 Definition predicate 先重定位 operand 地址，在依赖满足后按当前 resident predicate 语义取值。
 false 分支完成一次逻辑任务并唤醒后继，不执行 kernel，也不创建 cooperative record。
-predicate 的非法 type、越界或 native 不支持的 shape 必须在 Host preflight 区分为输入错误或 legacy 能力回退。
+predicate 的非法 type、越界或不支持的 shape 必须在 Host preflight 拒绝。
 不能先分配 membership，再用 predicate 跳过其中部分成员。
 
 绑定失败必须携带 node_ref、原始 shell/local identity 和失败字段，锁存 run error。
-该候选不得发布 payload/PREPARED；参数区可以保留部分内容，退出前不再有合法 reader。
-运行中不能改走 legacy，也不能把绑定失败包装为一次正常 child completion。
+该候选不得发布payload或ADMITTED；参数区可以保留部分内容，退出前不再有合法reader。
+绑定失败不能包装为一次正常 child completion。
 
 ### Cooperative 与 MIX 保持同一顺序域
 
@@ -172,7 +166,7 @@ AIC 观察全部资源 lane 的 release 后退役 MIX 组，这属于资源收�
 | ---- | ------------ | ---------- |
 | Definition、template、binding、实例地址 | Host；单 run 只读 | H2D/publication 完成后启动；AICore 使用既有启动观察屏障 |
 | child Tensor/scalar/predicate ABI | 唯一 bootstrap 分区 owner；run 内不覆盖 | 精确范围 writeback + DDR barrier → scan arrival → scan complete → reader invalidate + barrier |
-| admission immutable record/member bits | claim owner，现有协议 | 沿 PREPARED/ADMITTED 和 log tail 发布，成员按原有 epoch/order 校验后 acquire |
+| admission immutable record/member bits | bootstrap唯一writer；commit owner只赋order_key | scan gate发布immutable字段；commit按record、log、ADMITTED、tail排序，成员按epoch/order校验后acquire |
 | child 参数 reader | 普通 ready owner 或固定成员 | 普通首次 payload 准备、成员首次 adopt 后 invalidate 参数范围；不在每个 block 重复 invalidate |
 | task state、wake head、queue endpoint、next link | 多 worker 的原子协议 | 保持 GM 原子读写；缓存 load/`ld_dev` 只可作为 hint，不能确认原子发布完成 |
 | remaining | 多 producer 的原子通知；Host 初始化 | 独立原子区域，无 cached store/整行写回；1→0 的通知者发布 ready |
@@ -181,7 +175,7 @@ AIC 观察全部资源 lane 的 release 后退役 MIX 组，这属于资源收�
 | run error、完成汇总、退出状态 | 沿既有多核协议 | error payload 先发布，错误标记后发布；完成计数和退出证明分别检查 |
 
 不同 child 的 scalar/predicate 独占 64-byte cache line，不能沿用 packed scalar pool 后让多核并行整行写回。
-TaskControl 为 384 bytes：state/链指针/claim tickets 共用首个原子行；cached resolver metadata、
+TaskControl 为 640 bytes：state/链指针/claim tickets 共用首个原子行；cached resolver metadata、
 next_block、completion_state、bypass admission signal 和 claim seal 各占一行。禁止 cached 写回触及原子行。
 参数存放与定义存放不能混用一条可写 cache line。无参数时不对零地址或零长度范围做 cache 操作。
 运行中不使用全 cache flush 作为每 Graph/每 child 的发布方法，也不假设 AICPU LaunchEnvelope 对 AICore 可寻址。
@@ -246,7 +240,7 @@ EXIT 只保证数据依赖意义上的完成，不保证所有 predecessor 的 w
 
 ## 错误与进度边界
 
-Host 必须在发布前完成能力判断：非法输入直接失败；合法但 native 不支持则整 run legacy。
+Host 必须在发布前完成形状、参数布局和容量校验；不满足当前合同的输入直接失败。
 选定 native 后，地址错误、publication 失败、CAS 状态非法、参数错误、超时统一进入现有 fatal/abort 路径。
 能够观察到 fatal 的 worker 禁止继续发布新成功工作；并发中已发布或在途的工作仍要按退出协议处理。
 错误锁存与全部 worker 同时停发不是一个原子操作，不能承诺零条在途 publication。
@@ -257,11 +251,16 @@ Host 必须在发布前完成能力判断：非法输入直接失败；合法但
 每个worker仍在原有许可检查点读取错误signal，不将较早一次读取作为新的执行许可。
 
 现有失败清理可能推进完成统计，以便收敛；因此数值达到 N-H 不能覆盖非零 error。
+
+启动描述无效时，AICore 仍报告本轮身份，但不解引用 scheduler backing，
+只参与 EXIT、nonce ACK 与 teardown gate。AICPU 负责发现本轮已经报告的核，
+发送 EXIT 并完成寄存器窗口清理、退出 gate 放行与退休确认。
+失败 terminal 必须保持错误状态；未证明退休时不得复用该 run 的存储。
 AICPU 退出循环后仍检查 error，Host 仍检查最终 run status 和 completion fence。
 未完成退出证明的 backing 进入 poison/quarantine，不能归还池后被下一 run 改写。
 
 进度论证依赖 worker 持续获得执行机会、kernel 有限返回、queue CAS 无永久饥饿以及全局 admission 的既有进度性质。
-控制队列不持有 kernel 资源；控制切片每轮获得机会；resolver 游标只前进，CSR credit 不重复，兼容 wake-list 不丢失唯一 owner。
+控制队列不持有 kernel 资源；控制切片每轮获得机会；同步resolver一次处理全部后继，CSR credit不重复，动态wake-list不丢失唯一owner。
 因此控制节点不会新增“等待空闲槽才能释放空闲槽”的环。
 这不是对硬件公平性或既有 cooperative 协议的全新形式化证明；压力测试须专门覆盖 slot 全满与长控制链。
 

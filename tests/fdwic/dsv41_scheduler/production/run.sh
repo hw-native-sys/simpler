@@ -9,14 +9,22 @@
 # -----------------------------------------------------------------------------------------------------------
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-if (($# != 6 && $# != 7)) || [[ $# == 7 && $7 != --materialize ]]; then
-    echo 'usage: production/run.sh BUNDLE RUNTIME_LIB OUTPUT LEVEL WARMUP ROUNDS' >&2
+if (($# < 6)); then
+    echo 'usage: production/run.sh BUNDLE RUNTIME_LIB OUTPUT LEVEL WARMUP ROUNDS [--runtime=host_build_graph|percounter] [--materialize]' >&2
     exit 2
 fi
+preparation=""
+for option in "${@:7}"; do
+    case "$option" in
+        --materialize) preparation=--materialize ;;
+        --runtime=host_build_graph|--runtime=percounter) ;;
+        *) echo "Unknown option: $option" >&2; exit 2 ;;
+    esac
+done
 : "${ASCEND_HOME_PATH:?source the CANN set_env.sh first}"
 bundle=$(realpath "$1")
 runtime=$(realpath "$2")
-ranks=$("${DSV41_PYTHON:-python3}" "$root/production/topology.py" "$bundle" "${7:-}")
+ranks=$("${DSV41_PYTHON:-python3}" "$root/production/topology.py" "$bundle" "$preparation")
 mkdir -p "$3"
 output=$(realpath "$3")
 [[ ! -e "$output/rank0" && ! -e "$output/rank1" ]] || { echo 'Refusing to overwrite a run' >&2; exit 2; }

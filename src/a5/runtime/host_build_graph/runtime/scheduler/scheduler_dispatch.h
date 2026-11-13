@@ -99,9 +99,6 @@ static inline __aicore__ bool scheduler_ordered_poll_may_progress(
     scalar_local.close();
 
     const uint32_t type = local->config.self_core_type;
-    if (type >= SCHEDULER_READY_QUEUE_COUNT || local->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
-        !scheduler_ready_queue_holder(type, local->config.self_core_type))
-        return true;
     {
         SchedulerScalarScope scalar_queue(local, SchedPhaseKind::ScalarPollReadyQueue);
         if (scheduler_scalar_result(local, SchedPhaseKind::ScalarPollReadyPool, [&]() __aicore__ {
@@ -109,12 +106,9 @@ static inline __aicore__ bool scheduler_ordered_poll_may_progress(
             }))
             return true;
     }
-    // Reuse only this poll's completed negative Ready probes. Invalid discovery
-    // configuration must still reach the original claim validation path.
-    if (ready_probe_empty != nullptr && local->config.scheduler_count != 0 &&
-        local->config.scheduler_count <= SCHEDULER_WORKER_CAPACITY &&
-        local->config.scheduler_index < local->config.scheduler_count)
-        *ready_probe_empty = true;
+    // Reuse only this poll's completed negative Ready probes. Immutable
+    // scheduler configuration was validated before entering the loop.
+    if (ready_probe_empty != nullptr) *ready_probe_empty = true;
     if (scheduler_task_ref_is_null(admission.current_task_ref)) {
         auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, admission.control_offset);
         return scheduler_scalar_result(local, SchedPhaseKind::ScalarPollAdmissionTail, [&]() __aicore__ {
@@ -169,7 +163,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarOrderedFill, -1);
     if (failed == nullptr) return false;
     *failed = false;
-    auto *admission = local == nullptr ? nullptr : local->admission;
+    auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) {
         *failed = true;
         return false;
@@ -192,8 +186,8 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
     bool holds_ordinary = false;
     for (const auto &candidate : admission->candidates) {
         if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
-        const auto metadata = scheduler_load_dispatch_metadata(base, local, candidate.ready.task_ref, profiling_level);
-        if (!scheduler_task_is_inline(metadata.flags) && !scheduler_task_requires_admission(metadata)) {
+        const uint8_t flags = scheduler_task_metadata_at(base, local, candidate.ready.task_ref)->flags;
+        if (!scheduler_task_is_inline(flags) && !scheduler_task_requires_admission(flags)) {
             holds_ordinary = true;
             break;
         }
@@ -212,8 +206,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             candidate = {};
             const uint64_t probe_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             if (!scheduler_claim_ready_for_slot(
-                    graph, base, local, run, local->config.scheduler_count, local->config.self_core_type,
-                    &candidate.ready
+                    graph, base, local, run, local->config.self_core_type, &candidate.ready
                 )) {
                 *failed = true;
                 return progress;
@@ -224,8 +217,8 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
                 scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
             progress = true;
         }
-        const auto metadata = scheduler_load_dispatch_metadata(base, local, candidate.ready.task_ref, profiling_level);
-        if (scheduler_task_is_inline(metadata.flags)) {
+        const uint8_t flags = scheduler_task_metadata_at(base, local, candidate.ready.task_ref)->flags;
+        if (scheduler_task_is_inline(flags)) {
             const int64_t task_ref = candidate.ready.task_ref;
             candidate = {};
             if (!scheduler_complete_inline_task(graph, base, local, run, task_ref, profiling_level)) {
@@ -235,7 +228,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             progress = true;
             continue;
         }
-        if (!scheduler_task_requires_admission(metadata)) {
+        if (!scheduler_task_requires_admission(flags)) {
             holds_ordinary = true;
             continue;
         }
@@ -317,8 +310,8 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         if (scheduler_task_ref_is_null(candidate.ready.task_ref) || candidate.slot_index != UINT8_MAX) continue;
         // Completion can retain a direct successor after discovery. Inline
         // services and cooperative successors still require that path.
-        const auto metadata = scheduler_load_dispatch_metadata(base, local, candidate.ready.task_ref, profiling_level);
-        if (scheduler_task_is_inline(metadata.flags) || scheduler_task_requires_admission(metadata)) continue;
+        const uint8_t flags = scheduler_task_metadata_at(base, local, candidate.ready.task_ref)->flags;
+        if (scheduler_task_is_inline(flags) || scheduler_task_requires_admission(flags)) continue;
         for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
             auto &slot = local->slots[index];
             if (slot.state != SchedulerDispatchSlotState::FREE) continue;
@@ -465,10 +458,7 @@ static inline __aicore__ bool scheduler_fill_own_slots(
         if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
 
         SchedulerReadyClaim ready{};
-        if (!scheduler_claim_ready_for_slot(
-                graph, scheduler_state_base, scheduler, run_control, scheduler->config.scheduler_count, core_type,
-                &ready
-            )) {
+        if (!scheduler_claim_ready_for_slot(graph, scheduler_state_base, scheduler, run_control, core_type, &ready)) {
             if (failed != nullptr) *failed = true;
             return progress;
         }

@@ -25,7 +25,7 @@
 
 static constexpr uint32_t COMM_MAX_RANK_NUM = 64;
 
-enum class CommWorkspaceKind : uint32_t { SDMA = 0, URMA = 1, RDMA = 2, COUNT = 3 };
+enum class CommWorkspaceKind : uint32_t { SDMA = 0, URMA = 1, RDMA = 2, CCU = 3, COUNT = 4 };
 static constexpr size_t COMM_WORKSPACE_COUNT = static_cast<size_t>(CommWorkspaceKind::COUNT);
 
 constexpr uint32_t comm_workspace_bit(CommWorkspaceKind kind) {
@@ -36,6 +36,15 @@ constexpr uint32_t comm_workspace_bit(CommWorkspaceKind kind) {
 struct CommWorkspace {
     uint64_t addr;
     uint64_t size;
+};
+
+// CCU uses the owner's VA and token, independently of AIV peer mappings.
+struct CommCcuWindow {
+    uint64_t address;
+    uint64_t size;
+    uint64_t token;
+    uint32_t l2_rank;
+    uint32_t reserved;
 };
 
 struct CommContext {
@@ -80,7 +89,11 @@ inline bool set_comm_workspace(CommContext &ctx, CommWorkspaceKind kind, uint64_
 static_assert(std::is_trivially_copyable_v<CommWorkspace> && std::is_standard_layout_v<CommWorkspace>);
 static_assert(std::is_trivially_copyable_v<CommContext> && std::is_standard_layout_v<CommContext>);
 static_assert(sizeof(CommWorkspace) == 16, "CommWorkspace size shifted");
-static_assert(sizeof(CommContext) == 1088, "CommContext size shifted");
+static_assert(
+    sizeof(CommCcuWindow) == 32 && std::is_trivially_copyable_v<CommCcuWindow> &&
+    std::is_standard_layout_v<CommCcuWindow>
+);
+static_assert(sizeof(CommContext) == 1104, "CommContext size shifted");
 static_assert(offsetof(CommContext, rankId) == 0, "CommContext layout drift");
 static_assert(offsetof(CommContext, rankNum) == 4, "CommContext layout drift");
 static_assert(offsetof(CommContext, winSize) == 8, "CommContext layout drift");

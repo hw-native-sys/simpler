@@ -103,8 +103,7 @@ struct AsyncFixture {
     SchedulerLocalState *local(uint32_t worker = 0) { return storage.local_context(&storage.contexts[worker]); }
     bool pop_ready(int64_t *task) {
         SchedulerReadyClaim claim{};
-        const bool ok =
-            scheduler_claim_ready_for_slot(graph.graph(), base(), local(), storage.run_control, 3, 0, &claim);
+        const bool ok = scheduler_claim_ready_for_slot(graph.graph(), base(), local(), storage.run_control, 0, &claim);
         *task = claim.task_ref;
         return ok;
     }
@@ -152,10 +151,10 @@ struct AsyncFixture {
         if (held != nullptr) *held = deferred;
         return ok;
     }
-    bool finish(uint32_t worker = 0, uint32_t budget = 1) {
+    bool finish(uint32_t worker = 0) {
         bool progress = false;
         EXPECT_TRUE(scheduler_async_finish_step(
-            graph.graph(), base(), local(worker), storage.run_control, workers[worker], budget, progress
+            graph.graph(), base(), local(worker), storage.run_control, workers[worker], progress
         ));
         return progress;
     }
@@ -260,9 +259,9 @@ TEST(HbgAsyncControl, ConditionsMaySettleBeforeTheLastPhysicalBlockReleases) {
     EXPECT_FALSE(f.finish());
     EXPECT_TRUE(f.close(2));
     EXPECT_TRUE(f.finish(1));
-    EXPECT_EQ(f.local(1)->pending_completed, 0u);
-    EXPECT_TRUE(f.finish(2));
-    EXPECT_EQ(f.local(2)->pending_completed, 1u);
+    EXPECT_EQ(f.local(1)->pending_completed, 1u);
+    EXPECT_FALSE(f.finish(2));
+    EXPECT_EQ(f.local(2)->pending_completed, 0u);
 }
 
 TEST(HbgAsyncControl, ZeroConditionSingleExecutionKeepsItsSuccessorOnTheCompletingCore) {
@@ -317,7 +316,7 @@ TEST(HbgAsyncControl, LastSynchronousReturnHonorsAnEarlierPeersAsyncRegistration
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
     f.signal[0] = 1;
     ASSERT_TRUE(f.check(0));
-    ASSERT_TRUE(f.finish(0, 64));
+    ASSERT_TRUE(f.finish(0));
     EXPECT_EQ(f.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
 }
 
@@ -354,6 +353,45 @@ TEST(HbgAsyncControl, OpenReservationFailsSealWithoutRegisteringPendingWork) {
     EXPECT_EQ(f.finish_lease().word, kUnused);
 }
 
+TEST(HbgAsyncControl, UnmappedExecutionClearsThePreviousGroupHandle) {
+    AsyncFixture f;
+    auto writer = f.start();
+    ASSERT_NE(writer.group_index, ASYNC_INVALID_INDEX);
+    GlobalContext context{};
+    context.async_present = 1;
+    ASSERT_TRUE(scheduler_async_begin_execution(&f.workers[0], 1, 0, 0, context, writer));
+    EXPECT_EQ(writer.group_index, ASYNC_INVALID_INDEX);
+    EXPECT_EQ(writer.image, nullptr);
+    EXPECT_EQ(context.async_present, 0u);
+    ASSERT_TRUE(scheduler_async_begin_execution(nullptr, 0, 0, 0, context, writer));
+    EXPECT_EQ(writer.group_index, ASYNC_INVALID_INDEX);
+}
+
+TEST(HbgAsyncControl, BoundGroupRebuildUsesPrivateIndexInsteadOfKernelContext) {
+    AsyncFixture f(1, {async_task(0, 2)});
+    GlobalContext context{};
+    uint32_t index = ASYNC_INVALID_INDEX;
+    {
+        AsyncWriter writer{};
+        ASSERT_TRUE(scheduler_async_begin_execution(&f.workers[0], 0, 1, 0, context, writer));
+        index = writer.group_index;
+        ASSERT_NE(index, 0u);
+        f.register_counter(writer);
+    }
+    // Kernel-visible context is not the return identity retained by the executor.
+    context.async_image_address = 0;
+    context.async_group_index = 0;
+    context.async_group_offset = 0;
+    context.async_run_epoch = 0;
+    const auto writer = scheduler_async_writer_for_group(f.workers[0], index);
+    ASSERT_TRUE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 1, 0, writer));
+    auto *groups = scheduler_state_at<AsyncGroupData>(f.base(), f.plan.layout.groups_offset);
+    EXPECT_EQ(static_cast<AsyncPublicationState>(groups[0].state), AsyncPublicationState::OPEN);
+    EXPECT_EQ(static_cast<AsyncPublicationState>(groups[index].state), AsyncPublicationState::SEALED);
+    EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 1u);
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease(index).word), SchedulerAsyncPhase::RUNNABLE);
+}
+
 TEST(HbgAsyncControl, ResidentBoundSealPreservesMutableRegistrationFailures) {
     for (uint32_t failure = 0; failure < 4; ++failure) {
         SCOPED_TRACE(failure);
@@ -373,7 +411,8 @@ TEST(HbgAsyncControl, ResidentBoundSealPreservesMutableRegistrationFailures) {
         } else {
             ASSERT_TRUE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 0, 0, writer));
         }
-        EXPECT_FALSE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 0, 0, writer));
+        const auto rebuilt = scheduler_async_writer_for_group(f.workers[0], writer.group_index);
+        EXPECT_FALSE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 0, 0, rebuilt));
         EXPECT_EQ(f.workers[0].error_code, expected);
         EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
         EXPECT_EQ(f.finish_lease().word, kUnused);
@@ -607,7 +646,7 @@ TEST(HbgAsyncControl, CheckBudgetAndSatisfiedMaskSurviveObserverMigration) {
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 0u);
 }
 
-TEST(HbgAsyncControl, FinishMigratesWithAnUnpublishedBatchAndCountsOnlyAfterDrain) {
+TEST(HbgAsyncControl, FinishPublishesAllSuccessorsInOneLeaseAndCountsOnce) {
     AsyncFixture f(12);
     for (uint32_t task = 1; task < 12; ++task) {
         f.graph.executable(task, 0, {0});
@@ -621,18 +660,11 @@ TEST(HbgAsyncControl, FinishMigratesWithAnUnpublishedBatchAndCountsOnlyAfterDrai
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     ASSERT_TRUE(f.close());
     EXPECT_TRUE(f.check(1));
-    bool saw_pending_batch = false;
-    for (uint32_t step = 0;
-         step < 500 && scheduler_async_lease_phase(f.finish_lease().word) != SchedulerAsyncPhase::TERMINAL; ++step) {
-        f.finish(step % 3, 1);
-        auto *saved = scheduler_state_at<SchedulerAsyncFinishProgress>(f.base(), f.plan.layout.finish_progress_offset);
-        saw_pending_batch = saw_pending_batch || saved->resolver.publication.count != 0;
-        for (uint32_t worker = 0; worker < 3; ++worker)
-            scheduler_flush_completions(f.storage.run_control, f.local(worker));
-        if (saved->resolver.phase != SchedulerResolvePhase::DONE)
-            EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
-    }
-    EXPECT_TRUE(saw_pending_batch);
+    ASSERT_TRUE(f.finish(2));
+    for (uint32_t worker = 0; worker < 3; ++worker)
+        scheduler_flush_completions(f.storage.run_control, f.local(worker));
+    EXPECT_FALSE(f.finish(0));
+    EXPECT_FALSE(f.finish(1));
     EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::TERMINAL);
     EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
     std::array<bool, 12> seen{};
@@ -690,6 +722,24 @@ TEST(HbgAsyncControl, NegativeCounterHandsOffUntilPublicationWithoutFailingTheRu
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
     EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
     EXPECT_EQ(f.signal[0], 0u);
+}
+
+TEST(HbgAsyncControl, CcuEventGatesResidentJoinUntilObservedAndCleared) {
+    AsyncFixture f(1);
+    alignas(64) uint64_t event = 0;
+    const auto writer = f.start();
+    const CompletionToken token{reinterpret_cast<uint64_t>(&event), 0, COMPLETION_ENGINE_CCU, COMPLETION_TYPE_CCU, 1};
+    ASSERT_TRUE(register_completion_condition(writer, token));
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    ASSERT_TRUE(f.close());
+    EXPECT_FALSE(f.check(1));
+    EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+    EXPECT_EQ(f.finish_lease().word, kUnused);
+    event = 1;
+    EXPECT_TRUE(f.check(2));
+    EXPECT_EQ(event, 0u);
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
+    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
 }
 
 TEST(HbgAsyncControl, InvalidCounterAndMalformedRecordFailWithoutNormalCompletion) {

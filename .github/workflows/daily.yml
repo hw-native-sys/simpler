@@ -56,6 +56,21 @@ jobs:
       session_timeout_seconds: 1800
       job_timeout_minutes: 60
 
+  st-sim-wse:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    uses: ./.github/workflows/_st-sim-wse.yml
+    with:
+      runs_on: ${{ toJSON(matrix.os) }}
+      setup_variant: github
+      include_dfx_smokes: true
+      manual_mode: include
+      scheduler_timeout_ms: "60000"
+      session_timeout_seconds: 1800
+      job_timeout_minutes: 60
+
   st-framework-a2a3:
     uses: ./.github/workflows/_st-framework.yml
     with:

@@ -43,6 +43,53 @@ The constants live in
 treat them as private to the runtime and always go through the
 accessor functions defined in that header.
 
+### Reporting invalid kernel data (A2/A3 TMR)
+
+After the usual kernel prelude (for example `<pto/pto-inst.hpp>`), ordinary
+AIC and AIV kernels can include `kernel_error_api.h` and report
+invalid data before using it to calculate an address or publishing an output:
+
+```cpp
+if (index < 0 || index >= vocab_size) {
+    auto ctx = get_async_ctx(args);
+    report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
+    return;
+}
+```
+
+The codes are `INVALID_OUTPUT` (105), `INDEX_OUT_OF_RANGE` (106), and
+`NON_FINITE_VALUE` (107). Call the API through the current
+`get_async_ctx(args)` result, then return from `kernel_entry` immediately.
+The boolean result says whether this call published the error; false means an
+error was already present or the context or code was invalid. Do not continue
+with the invalid data in either case.
+
+The API stores only the error code in the existing per-block completion slab
+and flushes it before the executor publishes FIN. Normal kernels perform no
+error-code write or flush. The scheduler reuses its existing slab check,
+retains the first code, and stops before releasing consumer dependencies.
+It logs task/function/block/core identity from its existing scheduling state.
+No error-detail record or shared-header expansion is required.
+
+Before scheduler diagnostics, the error path publishes to the existing
+orchestration fatal channel, stopping tensor waits and allocation backpressure.
+The first publication to that channel selects the Host primary error; an
+already-present orchestration error stays primary. A previously observed
+scheduler failure is preserved too. Concurrent scheduler diagnostics may carry
+a different code, without changing the primary. Later cleanup errors preserve
+that code. Host reports failure through the existing nonzero runtime/RTS
+path, which can surface as an AICPU exception. This API does not introduce a
+typed Python exception or certify worker reuse after failure. Diagnostics work
+with DFX disabled. Argument values and ranges are not transported by this API.
+
+This initial contract covers ordinary local AIC/AIV tasks on A2/A3 TMR.
+Kernels must have no outstanding asynchronous operation and no cooperating
+lane waiting for work they would skip by returning. MIX, deferred operations,
+communication cancellation, HBG, and A5 require their own exit protocols;
+this API does not provide those protocols. Checks belong before the unsafe
+operation and must respect the operator's valid shape, masking, and index
+semantics. The runtime does not insert checks into existing kernels.
+
 ---
 
 ## 2. SPMD execution context

@@ -38,8 +38,11 @@ task-submit --device auto --device-num 2 --run \
   '.venv/bin/python examples/a5/tensormap_and_ringbuffer/host_comm_domain/run.py --devices "$TASK_DEVICE"'
 ```
 
-Add `--staged` to exercise the staged child execution path, and `--aiv-blocks 4`
-for multiple AIV senders. Pytest collects all four combinations of serial/staged
+Add `--staged` to exercise two submissions with independent output slices,
+checking both slices after completion. Retained-domain submissions keep their
+existing ordered cleanup; this does not assert that the runs overlap. Outputs
+are cleared between rounds and before the final Device-only run to detect
+missing writes. Add `--aiv-blocks 4` for multiple AIV senders. Pytest collects all four combinations of serial/staged
 execution and one/four AIV blocks:
 
 ```bash
