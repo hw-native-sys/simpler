@@ -112,10 +112,30 @@ void SchedulerContext::complete_slot_task(
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
         int32_t slab_err = deferred_slab->error_code;
         if (slab_err != SIMPLER_ERROR_NONE) {
+            // Publish the primary fatal before diagnostics: a concurrent tensor
+            // timeout must not win after this completion has reported failure.
+            // Preserve a scheduler error that was already observed before us.
+            const int32_t prior_sched_error = sched_->sm_header->sched_error_code.load(std::memory_order_acquire);
+            const int32_t primary_error = prior_sched_error == SIMPLER_ERROR_NONE ? slab_err : prior_sched_error;
             int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
-            );
+            if (sched_->sm_header->orch_error_code.compare_exchange_strong(
+                    expected, primary_error, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                LOG_ERROR(
+                    "Kernel failure: code=%d task=0x%llx func=%d block=%d core=%d primary_code=%d", slab_err,
+                    (unsigned long long)TaskId::to_uint64(slot_state.task->task_id),
+                    slot_state.task->kernel_id[static_cast<int32_t>(subslot)],
+                    payload_per_core_[core_id][expected_reg_task_id & 1].local_context.block_idx, core_id, primary_error
+                );
+            }
+            // Keep the scheduler channel's own first code/thread diagnostic.
+            // The Host primary is the common fatal-channel CAS winner above.
+            expected = SIMPLER_ERROR_NONE;
+            if (sched_->sm_header->sched_error_code.compare_exchange_strong(
+                    expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                sched_->sm_header->sched_error_thread.store(thread_idx, std::memory_order_relaxed);
+            }
             completed_.store(true, std::memory_order_release);
             return;
         }

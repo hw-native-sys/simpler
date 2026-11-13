@@ -70,7 +70,14 @@ void rt_scope_end(RuntimeContext *rt) { rt->orchestrator.end_scope(); }
 
 void rt_orchestration_done(RuntimeContext *rt) { rt->orchestrator.mark_done(); }
 
-static bool is_fatal_impl(RuntimeContext *rt) { return rt->orchestrator.fatal; }
+static bool is_fatal_impl(RuntimeContext *rt) {
+    auto &orch = rt->orchestrator;
+    if (!orch.fatal && orch.sm_header != nullptr &&
+        orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+        orch.fatal = true;
+    }
+    return orch.fatal;
+}
 
 void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
@@ -120,7 +127,7 @@ static bool wait_for_tensor_ready(
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                if (is_fatal_impl(rt)) {
                     failed = true;
                     return;
                 }
@@ -150,7 +157,7 @@ static bool wait_for_tensor_ready(
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                if (is_fatal_impl(rt)) {
                     failed = true;
                     return;
                 }
