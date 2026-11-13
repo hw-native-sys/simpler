@@ -27,6 +27,7 @@
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
 #include "profiler_test_allocator.h"
+#include "runtime_c_api.h"
 
 TEST(ChipSwimlaneCollectorTest, BeginRunReleasesRuntimeExtensionSlots) {
     ChipSwimlaneCollector collector;
@@ -1214,6 +1215,9 @@ TEST_F(ChipSwimlaneExportIdentityTest, ExportsTwoRunsDistinctly) {
     const std::string json = read_whole_file(dir_ + "/chip_swimlane_records.json");
     ASSERT_FALSE(json.empty()) << "the exporter wrote no file";
 
+    EXPECT_NE(json.find("\"producer\": \"aicpu\""), std::string::npos)
+        << "a transport without native scheduler identity must retain its AICPU producer";
+
     // Three AICore rows and three scheduler rows per run, each ending in its epoch.
     EXPECT_EQ(count_occurrences(json, ", 7]"), 6u) << "run 7 lost rows or lost its identity";
     EXPECT_EQ(count_occurrences(json, ", 8]"), 6u) << "run 8 lost rows or lost its identity";
@@ -1260,6 +1264,34 @@ TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowIsSevenColumnsEndingInItsEp
     }
     EXPECT_EQ(rows, 2u) << "expected one row per dispatch";
     EXPECT_EQ(count_occurrences(section, ", 11]"), 2u) << "a row carries an epoch other than its run's";
+}
+
+TEST_F(ChipSwimlaneExportIdentityTest, NativeSnapshotSelectsSchedulerProducerOnlyForItsRuntime) {
+    collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
+    device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
+    const std::string identity = R"({"schema":"hbg-execution-identity-v1","producer":"aicore","records":[]})";
+    ASSERT_TRUE(collector_.set_json_extension(
+        7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
+    ));
+    ASSERT_EQ(collector_.export_swimlane_json(), 0);
+    const std::string json = read_whole_file(dir_ + "/chip_swimlane_records.json");
+    const auto scheduler = json.find("\"scheduler_tasks\":");
+    ASSERT_NE(scheduler, std::string::npos);
+    const auto section = json.substr(scheduler, json.find("\"records\":", scheduler) - scheduler);
+    const auto expected = std::string(SIMPLER_RUNTIME_NAME) == "host_build_graph" ? "aicore" : "aicpu";
+    EXPECT_NE(section.find(std::string("\"producer\": \"") + expected + "\""), std::string::npos);
+    EXPECT_EQ(count_occurrences(json, ", 7]"), 4u) << "source selection must keep both joined task streams";
+}
+
+TEST_F(ChipSwimlaneExportIdentityTest, NativeIdentityDoesNotAuthorizeAmbiguousTaskSources) {
+    collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
+    device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
+    const std::string identity = R"({"schema":"hbg-execution-identity-v1","producer":"aicore","records":[]})";
+    ASSERT_TRUE(collector_.set_json_extension(
+        7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
+    ));
+    ASSERT_TRUE(collector_.set_json_extension(7, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
+    EXPECT_EQ(collector_.export_swimlane_json(), PTO_RUNTIME_ERR_INTERNAL);
 }
 
 // ---------------------------------------------------------------------------

@@ -1302,8 +1302,9 @@ int simpler_observe_framework_submissions(DeviceContextHandle ctx, int *all_obse
  *
  * Onboard Program and Kernel retain their actual internal backing, including
  * Program input staging; Program execution remains eager-only. Kernel A3 TMR
- * additionally retains ScopeStats-only diagnostic windows; A3 TMR/HBG retain
- * PMU-only, ArgsDump-only or Swimlane-only windows. All producers sharing a
+ * additionally retains ScopeStats-only diagnostic windows; onboard A3/A5
+ * retain PMU-only, ArgsDump-only or Swimlane-only windows when the runtime
+ * provides the requested task-time producer. All producers sharing a
  * diagnostic pool must be caller-ordered
  * and stopped during resource-reference release. Other diagnostic combinations
  * are refused; sim returns

@@ -499,6 +499,100 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
 }
 
 #if SIMPLER_DFX
+void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
+    auto *context = aicore_scheduler_bootstrap_context(runtime);
+    if (context == nullptr || context->trace_cells_offset == 0) return;
+    void *base = aicore_scheduler_state_base(context);
+    if (base == nullptr) return;
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, context->task_metadata_offset);
+    auto *traces = scheduler_state_at<SchedulerTaskTrace>(base, context->trace_cells_offset);
+    const auto graph = aicore_scheduler_graph_view(*context);
+    const auto level = get_chip_swimlane_level();
+    const uint64_t epoch = get_platform_run_result_epoch();
+    auto phase = [&](uint64_t worker, SchedPhaseKind kind, uint64_t start, uint64_t end, uint64_t loop, TaskId task) {
+        if (level < ChipSwimlaneLevel::SCHED_PHASES || worker >= static_cast<uint64_t>(core_count_) || start == 0 ||
+            end < start)
+            return;
+        ChipSwimlaneAicpuSchedPhaseRecord record{};
+        record.start_time = start;
+        record.end_time = end;
+        record.kind = kind;
+        record.loop_iter = static_cast<uint32_t>(loop);
+        record.tasks_processed = 1;
+        record.phase_data.task_id = task;
+        record.participant_has_task = 1;
+        record.participant_kind = runtime->dev.workers[worker].core_type == CoreType::AIC ?
+                                      SchedPhaseParticipantKind::Aic :
+                                      SchedPhaseParticipantKind::Aiv;
+        record.participant_worker_id = static_cast<uint32_t>(worker);
+        record.participant_physical_core_id = runtime->dev.workers[worker].physical_core_id;
+        chip_swimlane_aicpu_record_staged_phase(kDiagnosticDumpLane, record);
+    };
+    for (uint64_t task = 0; task < context->graph_task_count; ++task) {
+        if (!scheduler_task_is_executable(metadata[task].flags)) continue;
+        const auto identity = aicore_scheduler_public_identity(graph, task);
+        if (!identity.is_valid()) continue;
+        for (uint32_t block = 0; block < metadata[task].logical_block_num; ++block) {
+            for (uint8_t subtask = 0; subtask < SUBTASK_SLOT_COUNT; ++subtask) {
+                if (!metadata[task].active_mask.has(static_cast<SubtaskSlot>(subtask))) continue;
+                const uint64_t index = scheduler_task_trace_index(
+                    metadata[task].trace_index_base, metadata[task].active_mask, static_cast<SubtaskSlot>(subtask),
+                    block
+                );
+                const uint64_t bytes = context->scheduler_state_bytes;
+                if (index > UINT32_MAX || context->trace_cells_offset > bytes ||
+                    index >= (bytes - context->trace_cells_offset) / sizeof(SchedulerTaskTrace))
+                    continue;
+                const auto &trace = traces[index];
+                if (trace.valid == 0 || trace.task_ref != task ||
+                    trace.worker_id >= static_cast<uint64_t>(core_count_) || trace.execution_run_epoch != epoch ||
+                    trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles)
+                    continue;
+                if (level >= ChipSwimlaneLevel::SCHEDULE_TIMING &&
+                    (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles))
+                    continue;
+                const uint64_t receive =
+                    trace.ready_observe_cycles != 0 && trace.kernel_start_cycles >= trace.ready_observe_cycles ?
+                        trace.kernel_start_cycles - trace.ready_observe_cycles :
+                        0;
+                ChipSwimlaneAicoreTaskRecord record{
+                    trace.kernel_start_cycles, trace.kernel_end_cycles, identity, static_cast<uint32_t>(index),
+                    static_cast<uint32_t>(std::min(receive, uint64_t{UINT32_MAX}))
+                };
+                chip_swimlane_aicpu_record_staged_task(
+                    static_cast<int>(trace.worker_id), kDiagnosticDumpLane, record, trace.dispatch_end_cycles,
+                    trace.complete_start_cycles
+                );
+                phase(
+                    trace.state_probe_scheduler_worker_id, SchedPhaseKind::StateProbe, trace.state_probe_start_cycles,
+                    trace.state_probe_end_cycles, trace.dispatch_loop_iter, identity
+                );
+                if (static_cast<SchedulerPublicationMode>(trace.publication_mode) != SchedulerPublicationMode::REFILL)
+                    phase(
+                        trace.dispatch_scheduler_worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles,
+                        trace.dispatch_end_cycles, trace.dispatch_loop_iter, identity
+                    );
+                phase(
+                    trace.complete_scheduler_worker_id, SchedPhaseKind::Complete, trace.complete_start_cycles,
+                    trace.complete_end_cycles, trace.complete_loop_iter, identity
+                );
+                if (trace.refill_task_ref < context->graph_task_count) {
+                    const auto refill = aicore_scheduler_public_identity(graph, trace.refill_task_ref);
+                    if (refill.is_valid())
+                        phase(
+                            trace.refill_scheduler_worker_id, SchedPhaseKind::Refill, trace.refill_start_cycles,
+                            trace.refill_end_cycles, trace.refill_loop_iter, refill
+                        );
+                }
+            }
+        }
+    }
+    int32_t core_ids[kMaxWorkers];
+    for (int32_t i = 0; i < core_count_; ++i)
+        core_ids[i] = i;
+    chip_swimlane_aicpu_flush_staged(kDiagnosticDumpLane, core_ids, core_count_);
+}
+
 /**
  * Turn this run's staged per-subtask PMU snapshots into the collector's records.
  *
@@ -581,6 +675,9 @@ bool AicoreLifecycle::settle_run_diagnostics(Runtime *runtime, bool graph_comple
             if (graph_completed) dump_args_close_run(thread);
         }
     }
+#if SIMPLER_DFX
+    if (is_chip_swimlane_enabled()) collect_run_swimlane_records(runtime);
+#endif
     if (!is_pmu_enabled()) return true;
     if (!pmu_initialized_) return false;
 

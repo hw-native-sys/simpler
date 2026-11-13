@@ -85,6 +85,7 @@ private:
     };
 
     AicpuThreadLifecycleTrace *thread_lifecycle_trace(int32_t thread_idx);
+    void collect_run_swimlane_records(Runtime *runtime);
     bool collect_run_pmu_records(Runtime *runtime, uint64_t *missing_out);
 
     CoreState cores_[kMaxWorkers]{};

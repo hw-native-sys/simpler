@@ -36,8 +36,8 @@ constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
 /**
  * AICPU Scheduler phase record (64 bytes).
  *
- * Position in the per-thread buffer is the thread identity. All timestamps are
- * raw system-counter cycles.
+ * The pool identifies the transport writer. Named participant fields identify
+ * the scheduler that produced the event. Timestamps are raw system-counter cycles.
  *
  * ``phase_data`` is tagged by ``kind``, and which member a kind selects is the owning
  * runtime's to state rather than this header's:
@@ -50,6 +50,8 @@ constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
  * ready-queue occupancy at phase boundaries. They remain zero below
  * SCHED_PHASES.
  */
+enum class SchedPhaseParticipantKind : uint8_t { Aicpu, Aic, Aiv };
+
 struct ChipSwimlaneAicpuSchedPhaseRecord {
     uint64_t start_time;  // Phase start, in system-counter cycles
     uint64_t end_time;    // Phase end, in system-counter cycles
@@ -77,7 +79,12 @@ struct ChipSwimlaneAicpuSchedPhaseRecord {
     // alignment forces and nothing can use, where here they fall into _pad and stay
     // available. See sched_phase_kind.h for what the values mean.
     SchedPhaseKind kind;
-    uint8_t _pad[19];  // Keep the wire record at 64 bytes
+    SchedPhaseParticipantKind participant_kind;
+    uint8_t participant_has_task;
+    uint8_t participant_padding;
+    uint32_t participant_worker_id;
+    uint32_t participant_physical_core_id;
+    uint8_t _pad[8];  // Keep the wire record at 64 bytes
 };
 
 static_assert(
@@ -89,3 +96,5 @@ static_assert(
     "ChipSwimlaneAicpuSchedPhaseRecord phase data offset drift"
 );
 static_assert(sizeof(ChipSwimlaneAicpuSchedPhaseRecord) == 64, "ChipSwimlaneAicpuSchedPhaseRecord layout drift");
+
+static_assert(offsetof(ChipSwimlaneAicpuSchedPhaseRecord, participant_worker_id) == 48, "participant offset changed");
