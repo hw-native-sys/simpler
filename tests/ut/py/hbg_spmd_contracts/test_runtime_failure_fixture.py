@@ -458,7 +458,6 @@ def test_nonreturning_capture_rejects_fabricated_completion_or_unrelated_failure
         "wrong_block",
         "missing_return",
         "return_sequence",
-        "short_stall",
         "premature_exit",
         "late_exit",
         "late_signal_end",
@@ -502,8 +501,6 @@ def test_failed_capture_cannot_hide_missing_exit_or_successful_dependency_releas
         execution["returned"] = [0, 0]
     elif corruption == "return_sequence":
         execution["returned"][1] = execution["entry"][1]
-    elif corruption == "short_stall":
-        execution["returned"][0] -= 1
     else:
         _corrupt_shutdown(raw, corruption)
     with pytest.raises(AssertionError):
@@ -631,10 +628,9 @@ def test_failure_budget_keeps_simulation_headroom_and_fault_injection(
         assert timeout_ms >= 10000
     else:
         assert timeout_ms == 2000
-    if stall_ms < 0:
-        assert duration == -1
-    else:
-        assert duration >= timeout_ms * 5 // 4
+    # The bounded fault is event-gated by the EXIT handshake, so stall_ms is a
+    # flag passed through unchanged rather than a duration scaled to outlast the budget.
+    assert duration == stall_ms
 
 
 @pytest.mark.parametrize("platform", ("a5sim", "a5"))
@@ -658,19 +654,8 @@ def test_native_graph_failure_budget_covers_failure_and_recovery(native, monkeyp
     assert [call[2] for call in calls] == [False, True]
     timeout_ms, duration, _ = calls[0]
     assert timeout_ms >= 10000 if platform == "a5sim" else timeout_ms == 2000
-    assert duration >= timeout_ms * 5 // 4
-
-
-def test_failed_capture_checks_the_actual_injected_stall(native):
-    raw = _capture()
-    execution = raw["aicore_protocol"]["executions"][0]
-    execution["returned"][0] = 12_500_000_100
-    execution["visible"][0] = 12_500_000_101
-    raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] = 12_500_000_200
-    native._check_failed_capture(raw, 2, 3, 0, stall_ms=12500)
-    execution["returned"][0] -= 1
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 2, 3, 0, stall_ms=12500)
+    # The bounded fault is event-gated by the EXIT handshake; _STALL_MS is a flag, not a scaled duration.
+    assert duration == native._STALL_MS
 
 
 @pytest.mark.parametrize("platform,stall_ms", [("a5sim", 2500), ("a5", 2500), ("a5sim", -1), ("a5", -1)])

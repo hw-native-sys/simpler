@@ -19,6 +19,8 @@ class Runtime;
 // Same-build internal ABI shared by the loader, wrappers and test fixtures.
 using SimIdentitySetFn = int (*)(uint32_t);
 using SimIdentityHelpersInstallFn = void (*)(SimIdentitySetFn, SimIdentitySetFn);
+using SimRegBaseSetFn = void (*)(uint64_t);
+using SimRegBaseSetterInstallFn = void (*)(SimRegBaseSetFn);
 using SimAdmissionReportFn = bool (*)(void *, int);
 using SimA2a3CoreEntryFn =
     int (*)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t, SimAdmissionReportFn, void *);
@@ -27,3 +29,4 @@ using SimA5CoreEntryFn = int (*)(
     SimAdmissionReportFn, void *
 );
 extern "C" void sim_install_core_identity_setters(SimIdentitySetFn, SimIdentitySetFn);
+extern "C" void sim_install_reg_base_setter(SimRegBaseSetFn);

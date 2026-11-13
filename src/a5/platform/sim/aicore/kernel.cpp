@@ -34,7 +34,6 @@
 // Per-thread simulated register state — use pthread TLS instead of C++
 // thread_local to avoid glibc TLSDESC issues when the AICore SO is loaded
 // with RTLD_LOCAL on aarch64.
-static pthread_key_t g_reg_base_key;
 static pthread_key_t g_core_id_key;
 static pthread_key_t g_block_idx_key;
 static pthread_key_t g_aicore_profiling_flag_key;
@@ -48,7 +47,6 @@ static pthread_key_t g_aicore_report_epoch_key;
 static pthread_key_t g_ssbuf_base_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 static pthread_key_t *const g_tls_keys[] = {
-    &g_reg_base_key,
     &g_core_id_key,
     &g_block_idx_key,
     &g_aicore_profiling_flag_key,
@@ -91,8 +89,6 @@ extern "C" int initialize_aicore_sim_tls() {
     const int result = pthread_once(&g_tls_once, create_tls_keys);
     return result != 0 ? result : g_tls_init_result;
 }
-
-volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(sim_tls_value(g_reg_base_key)); }
 
 uint32_t sim_get_physical_core_id() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sim_tls_value(g_core_id_key)));
@@ -162,6 +158,12 @@ extern "C" void sim_install_core_identity_setters(SimIdentitySetFn set_subblock_
     g_set_cluster_id_fn = set_cluster_id;
 }
 
+// Register-base setter, resolved from cpu_sim_context.cpp via function pointer
+// injection (see above).
+static SimRegBaseSetFn g_set_reg_base_fn = nullptr;
+
+extern "C" void sim_install_reg_base_setter(SimRegBaseSetFn set_reg_base) { g_set_reg_base_fn = set_reg_base; }
+
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
 void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
@@ -189,7 +191,7 @@ extern "C" int aicore_execute_wrapper_checked(
     if (regs != 0) {
         uint64_t *regs_array = reinterpret_cast<uint64_t *>(regs);
         this_core_reg_base = regs_array[physical_core_id];
-        sim_set_tls_value(g_reg_base_key, reinterpret_cast<void *>(this_core_reg_base));
+        if (g_set_reg_base_fn != nullptr) g_set_reg_base_fn(this_core_reg_base);
     }
 
     sim_set_tls_value(g_core_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(physical_core_id)));

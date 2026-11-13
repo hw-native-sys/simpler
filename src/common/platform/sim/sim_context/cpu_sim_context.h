@@ -80,6 +80,19 @@ int sim_context_set_subblock_id(uint32_t subblock_id);
  */
 int sim_context_set_cluster_id(uint32_t cluster_id);
 
+/**
+ * Return the calling thread's simulated register base (an absolute byte
+ * address), or nullptr before the kernel wrapper binds it. Resolved by
+ * separately loaded kernel SOs from this SO's RTLD_GLOBAL scope.
+ */
+volatile uint8_t *sim_get_reg_base();
+
+/**
+ * Bind the calling thread's simulated register base (an absolute byte address).
+ * Called by aicore_execute_wrapper_checked (via function pointer injection).
+ */
+void sim_context_set_reg_base(uint64_t reg_base);
+
 /** Clear pipe shared state for the current thread's device. */
 void clear_cpu_sim_shared_storage();
 

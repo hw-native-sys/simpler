@@ -103,14 +103,14 @@ TEST(SimAicoreTls, RealWrapperAllocatesOnceAndUnloadReturnsEveryKey) {
         EXPECT_EQ(settle.run(1, guard.first()), UINT64_C(6) << 32);
     }
     const size_t baseline = available_keys();
-    ASSERT_GT(baseline, 10u);
+    ASSERT_GT(baseline, 9u);
     {
         WrapperModule module;
         ASSERT_TRUE(module.valid()) << dlerror();
         EXPECT_EQ(module.run(101, guard.first()), UINT64_C(6) << 32);
-        EXPECT_EQ(available_keys(), baseline - 10);
+        EXPECT_EQ(available_keys(), baseline - 9);
         EXPECT_EQ(module.run(UINT64_MAX, guard.first()), UINT64_C(6) << 32);
-        EXPECT_EQ(available_keys(), baseline - 10);
+        EXPECT_EQ(available_keys(), baseline - 9);
     }
     EXPECT_EQ(available_keys(), baseline);
 }
@@ -136,7 +136,7 @@ TEST_P(SimAicoreTlsExhaustion, PartialCreationRollsBackWithoutCallingExecutorOrU
     ReservedKeys guard;
     ASSERT_TRUE(guard.acquire(1));
     const size_t baseline = available_keys();
-    ASSERT_GE(baseline, 10u);
+    ASSERT_GE(baseline, 9u);
     ReservedKeys held;
     ASSERT_TRUE(held.acquire(baseline - GetParam()));
     {
@@ -160,7 +160,7 @@ TEST_P(SimAicoreTlsExhaustion, LoaderPreflightReportsExhaustionBeforeAnyWrapperS
     ReservedKeys guard;
     ASSERT_TRUE(guard.acquire(1));
     const size_t baseline = available_keys();
-    ASSERT_GE(baseline, 10u);
+    ASSERT_GE(baseline, 9u);
     ReservedKeys held;
     ASSERT_TRUE(held.acquire(baseline - GetParam()));
     WrapperModule module;
@@ -170,6 +170,6 @@ TEST_P(SimAicoreTlsExhaustion, LoaderPreflightReportsExhaustionBeforeAnyWrapperS
     EXPECT_EQ(module.run(101, guard.first()), 0u);
 }
 
-INSTANTIATE_TEST_SUITE_P(EachPartialKeySet, SimAicoreTlsExhaustion, ::testing::Range<size_t>(0, 10));
+INSTANTIATE_TEST_SUITE_P(EachPartialKeySet, SimAicoreTlsExhaustion, ::testing::Range<size_t>(0, 9));
 
 }  // namespace
