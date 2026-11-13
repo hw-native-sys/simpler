@@ -474,6 +474,8 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
     for (size_t i = 0; i < count; ++i) {
         if (released[i]) {
             Handshake *report = &runtime->dev.workers[core_ids[i]];
+            cache_invalidate_range(report, sizeof(*report));
+            rmb();
             aicore_invalidate_retired_report(report);
             cache_flush_range(report, sizeof(*report));
             ++proved;

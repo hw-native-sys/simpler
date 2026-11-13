@@ -38,6 +38,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "graph_prepare.h"
 #include "runtime.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "scheduler/wire_types.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_watchdog.h"
@@ -171,7 +172,8 @@ inline int32_t percounter_settle_run_error(Runtime *runtime) {
     return runtime_status_from_error_code(header->sched_error_code.load(std::memory_order_acquire));
 }
 
-inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_thread_count) {
+inline int32_t
+percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_thread_count, int32_t thread_idx) {
     PercounterControl *control = percounter_control(runtime);
     if (control == nullptr || runtime->dev.host_total_tasks < 0 || runtime->get_gm_sm_ptr() == nullptr) {
         LOG_ERROR("A5 percounter: supervisor requires an initialized graph");
@@ -198,6 +200,7 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, i
         if (resolved >= expected) break;
         if (++error_poll_count == 64) {
             error_poll_count = 0;
+            chip_swimlane_aicpu_poll_self_scheduled_cores(thread_idx, aicpu_thread_count, runtime->get_worker_count());
             cache_invalidate_range(&control->lane_error, sizeof(control->lane_error));
             if (control->lane_error != 0) {
                 error = control->lane_error;

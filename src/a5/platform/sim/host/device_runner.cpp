@@ -862,6 +862,10 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     auto cyc_to_ns = [](uint64_t c) {
         return static_cast<uint64_t>(c * 1'000'000'000.0 / static_cast<double>(PLATFORM_PROF_SYS_CNT_FREQ));
     };
+    const auto &aicore_work = device_phase_buffer_header(phase_buffer)->aicore_work;
+    aicore_wall_ns_ = aicore_work.start_cycle != 0 && aicore_work.end_cycle > aicore_work.start_cycle ?
+                          cyc_to_ns(aicore_work.end_cycle - aicore_work.start_cycle) :
+                          0;
     uint64_t origin = kPhaseUnset;
     for (int p = static_cast<int>(AicpuPhase::Preamble); p < NUM_AICPU_PHASES; ++p) {
         if (phase_start[p] != kPhaseUnset && phase_start[p] < origin) origin = phase_start[p];

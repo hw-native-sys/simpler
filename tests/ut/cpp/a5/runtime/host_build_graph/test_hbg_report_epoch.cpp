@@ -78,6 +78,33 @@ TEST(HandshakeReportEpoch, AZeroedLineIsNotAReport) {
     EXPECT_FALSE(aicore_report_accepted(&handshake, 0));
 }
 
+TEST(HandshakeReportEpoch, WorkWindowUsesChipEndpointsRatherThanCoreDurationSum) {
+    Handshake reports[3]{};
+    reports[0].work_start_cycle = 100;
+    reports[0].work_end_cycle = 250;
+    reports[1].work_start_cycle = 140;
+    reports[1].work_end_cycle = 400;
+    reports[2].work_start_cycle = 120;
+    reports[2].work_end_cycle = 220;
+    AicoreWorkWindow window{};
+    ASSERT_TRUE(aicore_reduce_work_window(reports, 3, window));
+    EXPECT_EQ(window.start_cycle, 100u);
+    EXPECT_EQ(window.end_cycle, 400u);
+
+    reports[1].work_end_cycle = 0;
+    EXPECT_FALSE(aicore_reduce_work_window(reports, 3, window));
+    EXPECT_EQ(window.start_cycle, 0u);
+    EXPECT_EQ(window.end_cycle, 0u);
+}
+
+TEST(HandshakeReportEpoch, WorkWindowDoesNotSurvivePhaseBufferReuse) {
+    DevicePhaseBufferStorage<2> buffer{};
+    buffer.header.aicore_work = {100, 400};
+    reset_device_phase_buffer(&buffer, 2);
+    EXPECT_EQ(buffer.header.aicore_work.start_cycle, 0u);
+    EXPECT_EQ(buffer.header.aicore_work.end_cycle, 0u);
+}
+
 TEST(HandshakeReportEpoch, APriorRunsReportIsRejected) {
     const Handshake stale = left_by_previous_resident_run();
     EXPECT_TRUE(aicore_report_accepted(&stale, kRunN)) << "its own run must still accept it";

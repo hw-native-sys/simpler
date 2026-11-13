@@ -24,6 +24,7 @@ from typing import Callable
 
 HBG_RUNTIME = "host_build_graph"
 TMR_RUNTIME = "tensormap_and_ringbuffer"
+PERCOUNTER_RUNTIME = "percounter"
 
 
 @dataclass(frozen=True)
@@ -82,17 +83,17 @@ def resolve_runtime(runtime_name, *, source="metadata.runtime"):
     Raises:
         ValueError: the name is absent, blank, or not a runtime this module handles.
     """
-    if runtime_name in (HBG_RUNTIME, TMR_RUNTIME):
+    if runtime_name in (HBG_RUNTIME, TMR_RUNTIME, PERCOUNTER_RUNTIME):
         return runtime_name
     if runtime_name is None or (isinstance(runtime_name, str) and not runtime_name.strip()):
         raise ValueError(
             f"{source} is missing; this capture predates the runtime name and its TaskId "
             f"layout cannot be determined. Re-capture with a current build, which writes "
-            f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}."
+            f"{HBG_RUNTIME!r}, {TMR_RUNTIME!r}, or {PERCOUNTER_RUNTIME!r}."
         )
     raise ValueError(
         f"{source} is {runtime_name!r}, which this module does not decode; expected "
-        f"{HBG_RUNTIME!r} or {TMR_RUNTIME!r}. A task id has no self-describing layout, so "
+        f"{HBG_RUNTIME!r}, {TMR_RUNTIME!r}, or {PERCOUNTER_RUNTIME!r}. A task id has no self-describing layout, so "
         f"an unrecognised runtime cannot be decoded by guessing."
     )
 
@@ -104,7 +105,7 @@ def get(runtime_name):
     runtime package, letting both runtime packages import back from here
     (``normalize_task_id_int``) without a cycle.
     """
-    if resolve_runtime(runtime_name) == HBG_RUNTIME:
+    if resolve_runtime(runtime_name) in (HBG_RUNTIME, PERCOUNTER_RUNTIME):
         from simpler_setup.tools import hbg  # noqa: PLC0415
 
         return hbg

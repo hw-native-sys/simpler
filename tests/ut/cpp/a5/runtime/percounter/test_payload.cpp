@@ -22,6 +22,7 @@ uint64_t get_aicore_report_epoch();
 #include <array>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -338,6 +339,101 @@ TEST(PercounterPayload, LayoutReservesEveryLaneSlot) {
         layout.counters_offset - layout.dispatch_payloads_offset,
         SCHEDULER_WORKER_CAPACITY * PERCOUNTER_PAYLOAD_SLOT_COUNT * sizeof(DispatchPayload)
     );
+}
+
+TEST(PercounterPayload, TaskTimingPreparesIdentityAndBatchesCommittedCount) {
+    Fixture f;
+    auto buffer = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    ChipSwimlaneActiveHead head{};
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(buffer.get());
+    ChipSwimlaneAicoreLocalState profile{};
+    f.cfg[0].profile_head = &head;
+    f.cfg[0].profile = &profile;
+    auto task = f.resolve(0);
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+    EXPECT_EQ(
+        TaskId::to_uint64(f.payloads[0][0].local_context.async_ctx.task_token),
+        TaskId::to_uint64(TaskId::make_global(0))
+    );
+    int calls = 0;
+    execute = [&](int64_t *) {
+        ++calls;
+    };
+    for (uint32_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    }
+    EXPECT_EQ(calls, 3);
+    EXPECT_EQ(buffer->count, 0U);
+    chip_swimlane_aicore_flush_task_count(&profile);
+    EXPECT_EQ(buffer->count, 3U);
+    EXPECT_EQ(head.total_record_count, 0U);
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto &record = buffer->records[i];
+        EXPECT_EQ(TaskId::to_uint64(record.task_token), TaskId::to_uint64(TaskId::make_global(0)));
+        EXPECT_EQ(record.reg_task_id, i + 1);
+        EXPECT_GT(record.start_time, 0U);
+        EXPECT_GE(record.end_time, record.start_time);
+    }
+}
+
+TEST(PercounterPayload, TaskTimingUsesGraphBodyIdentityAndResetsEachRun) {
+    Fixture f;
+    auto buffer = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    ChipSwimlaneActiveHead head{};
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(buffer.get());
+    auto task = f.resolve(0);
+    task.shell = 7;
+    task.local = 2;
+    for (int run = 0; run < 2; ++run) {
+        buffer->count = 0;
+        ChipSwimlaneAicoreLocalState profile{};
+        f.cfg[0].profile_head = &head;
+        f.cfg[0].profile = &profile;
+        ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+        EXPECT_EQ(
+            TaskId::to_uint64(f.payloads[0][0].local_context.async_ctx.task_token),
+            TaskId::to_uint64(TaskId::make_sub_task(7, 2))
+        );
+        ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+        chip_swimlane_aicore_flush_task_count(&profile);
+        EXPECT_EQ(buffer->count, 1U);
+        EXPECT_EQ(buffer->records[0].reg_task_id, 1U);
+        EXPECT_EQ(TaskId::to_uint64(buffer->records[0].task_token), TaskId::to_uint64(TaskId::make_sub_task(7, 2)));
+    }
+}
+
+TEST(PercounterPayload, FullTimingBufferIsPublishedOnceAndReplacementKeepsIdentity) {
+    Fixture f;
+    auto first = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    auto second = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    ChipSwimlaneActiveHead head{};
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(first.get());
+    ChipSwimlaneAicoreLocalState profile{};
+    f.cfg[0].profile_head = &head;
+    f.cfg[0].profile = &profile;
+    auto task = f.resolve(0);
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+    for (int i = 0; i < PLATFORM_AICORE_BUFFER_SIZE; ++i) {
+        EXPECT_EQ(first->count, 0U);
+        ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    }
+    EXPECT_EQ(first->count, PLATFORM_AICORE_BUFFER_SIZE);
+
+    // Model rotation and Host reuse of the published buffer. Lane exit must
+    // not write its stale cached pointer after ownership was transferred.
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(second.get());
+    head.current_buf_seq = 1;
+    first->count = 17;
+    chip_swimlane_aicore_flush_task_count(&profile);
+    EXPECT_EQ(first->count, 17U);
+
+    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    EXPECT_EQ(second->count, 0U);
+    EXPECT_EQ(second->records[0].reg_task_id, PLATFORM_AICORE_BUFFER_SIZE + 1U);
+    EXPECT_EQ(TaskId::to_uint64(second->records[0].task_token), TaskId::to_uint64(TaskId::make_global(0)));
+    chip_swimlane_aicore_flush_task_count(&profile);
+    EXPECT_EQ(second->count, 1U);
+    EXPECT_EQ(first->count, 17U);
 }
 }  // namespace
 

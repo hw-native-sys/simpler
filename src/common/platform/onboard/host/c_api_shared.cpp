@@ -1264,6 +1264,12 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner, uint32_t pipelin
     // One read of this run's own record: every field below belongs to the run
     // that owned `pipeline_slot`, not to whatever the runner is doing now.
     const DeviceRunnerBase::DeviceRunTiming &timing = runner->device_run_timing(pipeline_slot);
+    if (timing.aicore_wall_ns != 0) {
+        STRACE_DEV_SPAN_AT_A(
+            "chip.run.runner_run.aicore_wall", 0, static_cast<long long>(timing.aicore_wall_ns), 2,
+            "clk=dev clock_source=aicore"
+        );
+    }
     const uint64_t run_wall_ns = timing.phase_ns[static_cast<int>(AicpuPhase::RunWall)];
     if (run_wall_ns != 0) {
         // `ts` stays 0: it is this run's device-clock origin, and the sub-phases

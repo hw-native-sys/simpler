@@ -42,3 +42,37 @@ materialized metadata and order entry.
 The allocation is bounded by lane count rather than task or SPMD block count.
 It does not expand all task payloads on the Host or move payload construction
 to the AICPU. The default uses 1536 bytes per lane; capacity 4 uses 3072 bytes.
+
+## Task swimlanes
+
+`enable_chip_swimlane=1` records each executed kernel through the shared
+`ChipSwimlaneAicore` collector. The standard `swimlane_converter` accepts
+`runtime=percounter` and decodes the shared HBG task identity, including Graph
+body tasks. Host runtime selection reports mode 5.
+
+The receive timestamp is entry to execution of an already prepared payload;
+start is immediately before the kernel call, and end follows its output-store
+barrier. Local setup therefore includes execution-time cache acquisition and
+record reservation, but excludes earlier payload preparation and fanin waits.
+Predicated-off and dependency-only tasks do not emit kernel records.
+
+Task identity is written during payload preparation and shares its existing
+writeback. A self-scheduling core reserves from its cached buffer without
+observing the shared head while space remains; only the first reservation and
+full-buffer replacement need to observe it. This rule belongs to the
+self-scheduled path, whose core alone publishes the full count.
+
+Each buffer holds `PLATFORM_AICORE_BUFFER_SIZE` records. A self-scheduling core
+publishes its committed count only when full or when the lane exits with a
+partial tail, and waits for replacement when a full buffer has no space.
+The shared AICPU collector uses the existing rotation, ready queue, Host drain
+and free-buffer refill paths; there is no per-run 1024-record limit. The final
+partial buffer uses the same flush path. A replacement wait that exceeds the
+platform DFX backpressure budget reports a runtime timeout. L1 does not record
+scheduler phases. Profiling disabled uses the same runtime binary.
+
+The common device-timing output also reports `AICore` wall independently of L1:
+the earliest post-handshake lane-work start to the latest lane-work end. It
+includes AICore scheduling and dependency waits, with two clock reads per lane.
+It excludes the handshake and the final retirement wait. See
+[Host trace timing](../../../../docs/dfx/host-trace.md) for the metric boundary.

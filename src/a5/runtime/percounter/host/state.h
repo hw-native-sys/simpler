@@ -270,6 +270,7 @@ inline StateSelection select_percounter_state(
     }
 
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
+    if (api != nullptr) api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_PERCOUNTER);
     runtime->add_pending_metadata(
         device_state, host_base, static_cast<size_t>(layout.upload_size), HostPhaseKind::Count, {}
     );

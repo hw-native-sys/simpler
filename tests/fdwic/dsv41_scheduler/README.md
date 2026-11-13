@@ -283,12 +283,24 @@ HBG and percounter use the same prepared bundles and original model kernels.
 Build both runtimes from one source revision and run each pair in the same
 automatic device allocation. Select percounter with `--runtime=percounter` after the round count; the default
 is `--runtime=host_build_graph`. The runner loads that runtime's subdirectory
-under the supplied library root. HBG reports modes 1/2; percounter uses bootstrap
-mode 5 but its Host mode observer currently returns 0 (unavailable). The result
-records the selected runtime separately from this observer. Do not mix runtime
-components across builds. Percounter multi-device communication is not yet
+under the supplied library root. HBG requires reported mode 1/2; percounter
+requires reported mode 5. The result also records the selected runtime. Do not
+mix runtime components across builds. Percounter multi-device communication is not yet
 supported: mark its MoE and layers_19_21 entries unavailable.
 [RESULTS.md](RESULTS.md) lists both L0 means.
+
+Percounter L1 uses the standard shared task-buffer rotation and Host recycling
+paths; no diagnostic source copy or replacement recorder is needed. For example,
+one SWA L1 capture after two warmups is:
+
+```bash
+bash "$DSV41/run.sh" "$PREPARED/cases/pypto_lib/swa" \
+  "$DSV41_RUNTIME" "$RUN_DIR/pypto_lib/swa" 1 2 1 --runtime=percounter
+```
+
+Its L1 records include kernel execution and final input acquisition, not earlier
+payload preparation or dependency waits. This selection does not make unsupported
+task kinds runnable.
 
 The local `plan-rank*.bin` records use current production C++ types. They are
 **derived build artifacts**, not portable runtime protocols. Regenerate them
