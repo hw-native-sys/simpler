@@ -10,8 +10,10 @@
  */
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include "fixture.h"
 #include "kernel_platform_ops.h"
+#include "host/platform_compile_info.h"
 #include "host/raii_scope_guard.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
@@ -471,6 +473,69 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesPinnedLaunchSourceThroughOrigina
     cleanup.dismiss();
 }
 
+TEST_F(NativeAdmissionTest, CapturePreparationStaysOutOfTheProgramScratchPools) {
+    if (std::strcmp(get_platform(), "a5sim") != 0)
+        GTEST_SKIP() << "the a5 scheduler scratch pool is the subject; a2a3 has no resident state";
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt attempt(runner, 0, 7003);
+    attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(attempt.prepare(), 0);
+    // The kernel contract keeps its heap in the per-run arena and its scheduler
+    // state in the single retained allocation; neither program pool is touched.
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 0u);
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 0u);
+    EXPECT_EQ(runner.pooled_heap(0), nullptr);
+    EXPECT_GT(runner.scheduler_capacity(0), 0u);
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, RetainedCaptureBackingIsReplacedNotOverwrittenByASuccessor) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt capture(runner, 0, 7004);
+    capture.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    capture.args.tensor(0).address_space = AddressSpace::DEVICE;
+    capture.args.tensor(0).transfer = TensorTransfer::NONE;
+    auto reset_recording = RAIIScopeGuard([] {
+        control().recording_active = false;
+    });
+    ASSERT_EQ(capture.prepare(), 0);
+    auto *capture_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(capture.storage);
+    const auto capture_publication = capture_state->runtime->prepared_publication();
+    ASSERT_NE(capture_publication, nullptr);
+    const void *const capture_target = capture_publication->device_target;
+    const uint64_t capture_state_base = capture_state->runtime->dev.scheduler_bootstrap.worker_context_base;
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, capture.storage, &caller, &reference), 0);
+    auto release = RAIIScopeGuard([&] {
+        control().recording_active = false;
+        (void)simpler_release_run_resources(&runner, reference);
+    });
+    control().recording_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, capture.storage, &caller, nullptr), 0);
+    control().recording_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, capture.storage), 0);
+
+    // With the external reference still alive, the slot can prepare a
+    // successor. The retained backing must be replaced, never overwritten.
+    Attempt successor(runner, 0, 7005);
+    successor.args.tensor(0).address_space = AddressSpace::DEVICE;
+    successor.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(successor.prepare(), 0);
+    auto *successor_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(successor.storage);
+    const auto successor_publication = successor_state->runtime->prepared_publication();
+    ASSERT_NE(successor_publication, nullptr);
+    EXPECT_NE(successor_publication->device_target, capture_target);
+    if (std::strcmp(get_platform(), "a5sim") == 0)
+        EXPECT_NE(successor_state->runtime->dev.scheduler_bootstrap.worker_context_base, capture_state_base)
+            << "the retained scheduler storage is detached, not rewritten";
+    ASSERT_EQ(simpler_finalize_run(&runner, successor.storage), 0);
+}
+
 TEST_F(NativeAdmissionTest, HbgPrerequisitesAndImagePublishBeforeTheDescriptorFromOwnedSnapshots) {
     HbgImageCaptureRunner runner;
     auto runtime = std::make_unique<Runtime>();
@@ -628,5 +693,72 @@ TEST_F(NativeAdmissionTest, FailedHbgPublicationPreservesTheUnprovenBindingRelea
     );
 }
 #endif
+
+TEST_F(NativeAdmissionTest, SchedulerScratchIsOneSharedGenerationWithPerSlotHostStaging) {
+    Runner runner;
+    void *dev0 = nullptr;
+    void *host0 = nullptr;
+    void *dev1 = nullptr;
+    void *host1 = nullptr;
+    ASSERT_EQ(runner.acquire_scheduler_scratch(0, 4096, &dev0, &host0), 0);
+    ASSERT_EQ(runner.acquire_scheduler_scratch(1, 4096, &dev1, &host1), 0);
+    ASSERT_NE(dev0, nullptr);
+    EXPECT_EQ(dev0, dev1) << "a prepared successor shares the generation";
+    EXPECT_NE(host0, host1) << "each slot builds its own launch staging";
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 1u);
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 2u);
+    // A request the slot's lease already covers reuses it, host side included.
+    void *dev0_again = nullptr;
+    void *host0_again = nullptr;
+    ASSERT_EQ(runner.acquire_scheduler_scratch(0, 2048, &dev0_again, &host0_again), 0);
+    EXPECT_EQ(dev0_again, dev0);
+    EXPECT_EQ(host0_again, host0);
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 2u);
+    runner.release_scheduler_scratch(0);
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 1u);
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 1u);
+    runner.release_scheduler_scratch(1);
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 0u);
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 1u) << "the current generation stays";
+}
+
+TEST_F(NativeAdmissionTest, SchedulerScratchGrowthRetiresOnlyAfterTheLastLease) {
+    Runner runner;
+    void *dev0 = nullptr;
+    void *host0 = nullptr;
+    void *dev1 = nullptr;
+    void *host1 = nullptr;
+    ASSERT_EQ(runner.acquire_scheduler_scratch(0, 4096, &dev0, &host0), 0);
+    ASSERT_EQ(runner.acquire_scheduler_scratch(1, 8192, &dev1, &host1), 0);
+    EXPECT_NE(dev0, dev1) << "a larger request publishes a new generation";
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 2u);
+    runner.release_scheduler_scratch(0);
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 1u) << "the predecessor retires on its last lease";
+    runner.release_scheduler_scratch(1);
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, SchedulerScratchRefusesAKernelContext) {
+    Runner runner;
+    ASSERT_EQ(runner.latch_kernel_mode(), 0);
+    void *device = nullptr;
+    void *host = nullptr;
+    EXPECT_NE(runner.acquire_scheduler_scratch(0, 4096, &device, &host), 0);
+    EXPECT_EQ(device, nullptr);
+    EXPECT_EQ(host, nullptr);
+}
+
+TEST_F(NativeAdmissionTest, PreparedRunHoldsTheSchedulerScratchLeaseUntilRetirement) {
+    if (std::strcmp(get_platform(), "a5sim") != 0) GTEST_SKIP() << "a5 scheduler state is the subject";
+    Runner runner;
+    Attempt attempt(runner, 0, 4242);
+    ASSERT_EQ(attempt.prepare(), 0);
+    // prepare hands the slot's lease to this run's PreparedRunResources.
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 1u);
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 1u);
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_EQ(runner.scheduler_scratch_leases(), 0u);
+    EXPECT_EQ(runner.scheduler_scratch_generations(), 1u) << "the current generation stays";
+}
 
 }  // namespace native_admission_test

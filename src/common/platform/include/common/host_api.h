@@ -152,6 +152,24 @@ struct HostApiOps {
     int (*acquire_scheduler_state_storage)(
         void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
     );
+    // Whether this context runs as a kernel (capture/replay) rather than a
+    // program. Only a program context may split the scheduler state. An absent
+    // entry reads as a program context, so the bind then requires
+    // acquire_scheduler_scratch and fails without it: a platform that does not
+    // implement the split cannot silently fall back to the single allocation.
+    int (*execution_is_kernel_mode)(void *runner_ctx);
+    // This run's ready-pool scratch: `device_out` receives the shared pool
+    // lease base the device scheduler reads, `host_out` the per-pipeline-slot
+    // staging block the caller builds the ready pool and dependency plan in
+    // before the launch H2D. Both are aligned to `alignment` with at least
+    // `bytes` behind them. Refused for a kernel context, which keeps the ready
+    // pool inside its single scheduler allocation.
+    //
+    // Reuse is the slot's: the caller acquires during its bind, and a slot
+    // admits one run at a time. Returns 0 on success.
+    int (*acquire_scheduler_scratch)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+    );
     // Records which device-side scheduler a bind selected, so a caller can
     // observe the choice after the run. The runtime publishes the same value
     // into its own launch descriptor, but that field is cleared when the run
@@ -405,6 +423,17 @@ public:
         return ops_->acquire_scheduler_state_storage(
             runner_ctx_, pipeline_slot_, bytes, alignment, device_out, host_out
         );
+    }
+    bool execution_is_kernel_mode() const {
+        return ops_->execution_is_kernel_mode != nullptr && ops_->execution_is_kernel_mode(runner_ctx_) != 0;
+    }
+    int acquire_scheduler_scratch(size_t bytes, size_t alignment, void **device_out, void **host_out) const {
+        if (ops_->acquire_scheduler_scratch == nullptr) {
+            if (device_out != nullptr) *device_out = nullptr;
+            if (host_out != nullptr) *host_out = nullptr;
+            return -1;
+        }
+        return ops_->acquire_scheduler_scratch(runner_ctx_, pipeline_slot_, bytes, alignment, device_out, host_out);
     }
     std::shared_ptr<void> get_orchestration_scratch() const {
         return ops_->get_orchestration_scratch == nullptr ?

@@ -1282,6 +1282,14 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t activity_buffers_offset;
     uint64_t pmu_cells_offset;
     uint64_t args_dump_address;
+    // The delivered native image region and the ready-pool scratch region. A
+    // kernel/capture context names the state allocation itself for both, which
+    // is its single-allocation layout; a program context names the run's
+    // delivered image (zero without a native plan) and the acquired scratch.
+    uint64_t native_image_address;
+    uint64_t native_image_bytes;
+    uint64_t ready_scratch_address;
+    uint64_t ready_scratch_bytes;
 
     // Only this worker writes the diagnostic line; peers read its startup
     // timestamps when consolidating executed-task traces.
@@ -1443,7 +1451,7 @@ static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 300, "erro
 static_assert(offsetof(SchedulerRunControl, scheduler_error) == 320, "error publication needs its own line");
 static_assert(offsetof(SchedulerRunControl, worker_errors) == 384, "worker error signals need disjoint lines");
 static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
-static_assert(sizeof(SchedulerWorkerContext) == 320, "worker context layout changed");
+static_assert(sizeof(SchedulerWorkerContext) == 384, "worker context layout changed");
 static_assert(alignof(SchedulerWorkerContext) == 64, "worker context alignment changed");
 static_assert(offsetof(SchedulerWorkerContext, worker_contexts_offset) == 56, "peer routing must share the first line");
 static_assert(offsetof(SchedulerWorkerContext, graph_storage_address) == 64, "graph view must share one line");
@@ -1452,9 +1460,13 @@ static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "di
 static_assert(offsetof(SchedulerWorkerContext, scheduler_count) == 160, "topology configuration offset changed");
 static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 224, "diagnostic offsets changed");
 static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 248, "argument capture address changed");
-static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 256, "worker diagnostics need an owned line");
+static_assert(offsetof(SchedulerWorkerContext, native_image_address) == 256, "region reference offset changed");
+static_assert(offsetof(SchedulerWorkerContext, native_image_bytes) == 264, "region reference offset changed");
+static_assert(offsetof(SchedulerWorkerContext, ready_scratch_address) == 272, "region reference offset changed");
+static_assert(offsetof(SchedulerWorkerContext, ready_scratch_bytes) == 280, "region reference offset changed");
+static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 320, "worker diagnostics need an owned line");
 static_assert(
-    offsetof(SchedulerWorkerContext, trace_descriptor_cache_observed_cycles) == 304,
+    offsetof(SchedulerWorkerContext, trace_descriptor_cache_observed_cycles) == 368,
     "worker timestamps must share their owner's line"
 );
 static_assert(sizeof(SchedulerTaskTrace) == 320, "task trace layout changed");
@@ -1623,7 +1635,8 @@ inline bool scheduler_plan_protocol_storage(uint64_t *cursor, AicoreSchedulerLay
 inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
     bool enable_activity_profiling = false, uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {},
-    bool enable_protocol_profiling = false, bool enable_pmu = false, uint64_t native_readonly_end_offset = 0
+    bool enable_protocol_profiling = false, bool enable_pmu = false, uint64_t native_readonly_end_offset = 0,
+    bool native_control_inboxes = false
 ) {
     // A ready inbox holds its endpoints as int32 task refs, so a graph whose
     // refs would not fit that encoding cannot be scheduled at all.
@@ -1634,6 +1647,9 @@ inline bool scheduler_plan_layout(
         (native_readonly_end_offset < sizeof(SchedulerRunControl) ||
          native_readonly_end_offset % SCHEDULER_STATE_ALIGNMENT != 0 || spmd.worker_count == 0))
         return false;
+    // A program context delivers the native image in its own region, so its
+    // control inboxes follow the run control directly instead of the image.
+    if (native_control_inboxes && (native_readonly_end_offset != 0 || spmd.worker_count == 0)) return false;
     AicoreSchedulerLayout next{};
     next.task_count = task_count;
     next.aic_task_count = aic_task_count;
@@ -1649,10 +1665,10 @@ inline bool scheduler_plan_layout(
             &cursor, sizeof(SchedulerRunControl), alignof(SchedulerRunControl), &next.run_control_offset
         ))
         return false;
-    if (native_readonly_end_offset != 0) {
-        cursor = native_readonly_end_offset;
-        if (!SCHEDULER_RESERVE_ARRAY(spmd.worker_count, SchedulerReadyInbox, control_inboxes_offset)) return false;
-    }
+    if (native_readonly_end_offset != 0) cursor = native_readonly_end_offset;
+    if ((native_readonly_end_offset != 0 || native_control_inboxes) &&
+        !SCHEDULER_RESERVE_ARRAY(spmd.worker_count, SchedulerReadyInbox, control_inboxes_offset))
+        return false;
     if (!SCHEDULER_RESERVE_ARRAY(
             PLATFORM_MAX_AICPU_THREADS, AicpuThreadLifecycleTrace, aicpu_lifecycle_traces_offset
         ) ||

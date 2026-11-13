@@ -57,20 +57,24 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
         !scheduler_native_region_valid(
             end, header->instances_offset, header->instance_count, sizeof(SchedulerGraphInstance),
             alignof(SchedulerGraphInstance)
-        ) ||
-        !scheduler_native_region_valid(
-            bytes, header->control_inboxes_offset, header->control_inbox_count, sizeof(SchedulerReadyInbox),
-            alignof(SchedulerReadyInbox)
         ))
         return nullptr;
     if (header->bindings_offset < offset + sizeof(SchedulerNativeGraphHeader) ||
         header->completion_refs_offset < header->bindings_offset + nodes * sizeof(SchedulerNodeBinding) ||
         header->templates_offset < header->completion_refs_offset + original_tasks * sizeof(int64_t) ||
-        header->instances_offset <
-            header->templates_offset + header->definition_count * sizeof(SchedulerGraphTemplate) ||
-        header->control_inboxes_offset < end)
+        header->instances_offset < header->templates_offset + header->definition_count * sizeof(SchedulerGraphTemplate))
         return nullptr;
     return header;
+}
+
+// The control inboxes live in the control state, not in the image: a program
+// context delivers the image in its own region, so the header names a
+// state-relative offset and the caller validates it against the state it holds.
+inline __aicore__ bool
+scheduler_control_inboxes_valid(uint64_t state_base, uint64_t state_bytes, uint64_t offset, uint64_t count) {
+    return state_base != 0 && state_bytes <= UINT64_MAX - state_base && offset != 0 &&
+           offset % SCHEDULER_STATE_ALIGNMENT == 0 && offset <= state_bytes && count != 0 &&
+           count <= SCHEDULER_WORKER_CAPACITY && count <= (state_bytes - offset) / sizeof(SchedulerReadyInbox);
 }
 
 inline __aicore__ __gm__ const SchedulerGraphTemplate *

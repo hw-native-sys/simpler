@@ -129,8 +129,8 @@ Host 按 task_ref 顺序分别累计 AIC/AIV 普通 SPMD 的 block 数；MIX、s
 
 `SchedulerLocalSlotState` 用三态 predicate（未求值、通过、不通过）保存一次求值的结果，
 park/restore 与 `args_observed` 一起迁移，不因重试而读取更新后的 predicate operand。
-`SchedulerWorkerContext` 为 320 bytes，`SchedulerLocalConfig` 为 104 bytes，
-slot 保持 24 bytes，`SchedulerLocalState` 为 208 bytes（含可选异步服务状态的 8-byte 引用），均有 64-bit 构建的静态断言。
+`SchedulerWorkerContext` 为 384 bytes，`SchedulerLocalConfig` 为 120 bytes，
+slot 保持 24 bytes，`SchedulerLocalState` 为 224 bytes（含可选异步服务状态的 8-byte 引用），均有 64-bit 构建的静态断言。
 最初 I4 测试快照使用两个 predicate 布尔值，slot 为 32 bytes、总状态为 616 bytes；
 后续性能证据必须明确区分该快照与三态布局。
 这些局部状态也用于无 Graph 路径，P1 必须实测其开销，不能仅凭 native 分支未执行就断言零影响。

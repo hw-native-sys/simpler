@@ -90,7 +90,7 @@ epoch 为 0 时，沿无 stamp 的报告协议写身份，屏障后写 done。AI
 
 ## 1.3 每核 context 的字段
 
-[SchedulerWorkerContext 定义](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)。当前结构为 320B、64B 对齐：前四行配置 READY 后不变，最后一行保存本核诊断时间。
+[SchedulerWorkerContext 定义](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)。当前结构为 384B、64B 对齐：前五行配置 READY 后不变，最后一行保存本核诊断时间。
 
 **范围与用途：** 这是 GM 中每个 worker 的一份配置入口，按 `worker_index` 寻址。它既包含本核身份和本核 payload 起点，也包含指向本轮共享任务表、队列和 RunControl 的偏移。不同 worker 的 context 可以指向同一个共享对象；并不是每核复制整张图。启动前输入和 AICPU 拓扑发现共同填好配置；READY 后配置只读，末尾统计区由本核更新。
 
@@ -117,6 +117,8 @@ epoch 为 0 时，沿无 stamp 的报告协议写身份，屏障后写 done。AI
 | `callable_addresses_count` | kernel 地址表长度，用于 kernel_id 越界检查 |
 | `pmu_cells_offset` | 每次 subtask 执行的 PMU 记录存储偏移 |
 | `args_dump_address` | 本轮参数抓取 image 的完整 GM 地址，0 表示未启用 |
+| `native_image_address / native_image_bytes` | native 只读 image 的区域基址和可信长度；kernel/capture 指向调度状态自身，program 指向随 run image 交付的独立区域 |
+| `ready_scratch_address / ready_scratch_bytes` | ready pool + dependency 的区域基址和可信长度；kernel/capture 指向调度状态自身，program 指向共享 scratch |
 | `graph_summary_offset` | 本轮不可变图/拓扑摘要偏移 |
 | `scheduler_count` | scheduler 数；当前等于 worker 数 |
 | `cluster_count` | cluster 总数 |
@@ -142,7 +144,8 @@ WorkerContext 的物理分组与访问范围如下。这里的间距由 `alignas
 | 128–159 | metadata、callable 表和实际 worker 数 |
 | 160–223 | scheduler/cluster 拓扑与 AICPU lifecycle trace 定位 |
 | 224–255 | task trace、activity、PMU、参数抓取的配置入口 |
-| 256–319 | 本核写入的启动诊断行 |
+| 256–287 | native image 和 ready scratch 的地址与长度 |
+| 320–383 | 本核写入的启动诊断行 |
 
 保留的诊断字段：
 

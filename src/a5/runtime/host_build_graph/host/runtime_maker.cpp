@@ -506,6 +506,10 @@ struct SchedulerStateOwner {
     void *state_base;
     AicoreSchedulerLayout layout;
     const HostApi *api;
+    // Zero while the native image shares the state allocation (kernel/capture);
+    // a program context names it in the run's delivered image instead.
+    uint64_t native_image_device_base;
+    uint64_t native_image_bytes;
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
     std::string protocol_source;
 };
@@ -558,6 +562,28 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         LOG_WARN("A5 HBG: failed to copy AICore Scheduler profiling state");
         return false;
     }
+    // A program context delivers the native image in its own region, so the
+    // diagnostic graph needs that region read back under its own base. The
+    // graph validator requires a 64-byte-aligned base, and a byte vector's
+    // data() satisfies only the allocator's alignment, so the copy lands at an
+    // aligned address inside an over-allocated buffer.
+    std::vector<uint8_t> image_storage;
+    const void *image_host = host_base;
+    if (owner.native_image_device_base != 0) {
+        image_storage.resize(static_cast<size_t>(owner.native_image_bytes) + SCHEDULER_STATE_ALIGNMENT - 1);
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(image_storage.data());
+        void *image_base = reinterpret_cast<void *>(
+            (raw + SCHEDULER_STATE_ALIGNMENT - 1) & ~(static_cast<uintptr_t>(SCHEDULER_STATE_ALIGNMENT) - 1)
+        );
+        if (api->copy_from_device(
+                image_base, reinterpret_cast<void *>(owner.native_image_device_base),
+                static_cast<size_t>(owner.native_image_bytes)
+            ) != 0) {
+            LOG_WARN("A5 HBG: failed to copy AICore Scheduler native image");
+            return false;
+        }
+        image_host = image_base;
+    }
 
     if (owner.layout.protocol_layout_offset != 0) {
         try {
@@ -586,6 +612,9 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     diagnostic_graph.native_header_offset = contexts[0].native_header_offset;
     diagnostic_graph.scheduler_state_address = reinterpret_cast<uint64_t>(host_base);
     diagnostic_graph.scheduler_state_bytes = owner.layout.total_size;
+    diagnostic_graph.native_image_address = reinterpret_cast<uint64_t>(image_host);
+    diagnostic_graph.native_image_bytes =
+        owner.native_image_device_base != 0 ? owner.native_image_bytes : owner.layout.total_size;
     for (uint64_t ref = 0; ref < owner.layout.task_count; ++ref) {
         if (scheduler_node_identity(diagnostic_graph, ref, &public_ids[ref]) != SchedulerGraphResult::OK) {
             LOG_WARN("A5 HBG: invalid public task identity in profiling snapshot");
@@ -1366,7 +1395,8 @@ bool plan_scheduler_args_dump(
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
-    const void *uploaded_sm
+    const void *uploaded_sm, uint64_t scheduler_image_bytes, void *scheduler_image_device_base,
+    void *scheduler_image_host_base
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1380,6 +1410,11 @@ bool create_scheduler_state(
         task_window_size - 1
     );
     const bool native_graph = !native_plan.instances.empty();
+    // A program context ships the native image inside the run's delivered
+    // image, so the state allocation holds only control data and the image
+    // extent reserves nothing there. Kernel and capture contexts keep the image
+    // inside the state allocation, which is what pins their capture state.
+    const bool delivered_image = native_graph && scheduler_image_device_base != nullptr;
     const uint64_t node_count = native_graph ? native_plan.bindings.size() : static_cast<uint64_t>(total_tasks);
     bool legacy_graph_required = false;
     for (const auto &definition : native_plan.definitions) {
@@ -1700,6 +1735,14 @@ bool create_scheduler_state(
             LOG_ERROR("A5 HBG: native readonly image failed: %s", error.c_str());
             return false;
         }
+        if (delivered_image &&
+            (scheduler_image_host_base == nullptr || native_image.bytes.size() != scheduler_image_bytes)) {
+            LOG_ERROR(
+                "A5 HBG: native readonly image of %zu bytes does not match its reserved %" PRIu64 "-byte extent",
+                native_image.bytes.size(), scheduler_image_bytes
+            );
+            return false;
+        }
     }
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
     std::string protocol_source;
@@ -1707,21 +1750,28 @@ bool create_scheduler_state(
     if (!scheduler_plan_layout(
             node_count, aic_task_count, aiv_task_count, &layout,
             runtime->dev.chip_swimlane_level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
-            executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled(), native_image.bytes.size()
+            executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled(),
+            delivered_image ? 0 : native_image.bytes.size(), delivered_image
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
         return false;
     }
+    // A program context keeps the ready pool and the dependency plan it names
+    // in this run's shared scratch; a kernel/capture context appends them to
+    // its single scheduler allocation. The scratch starts one alignment unit
+    // in, because zero is the planner's "absent" offset.
+    const bool split_scratch = !api->execution_is_kernel_mode();
     // Each logical executable task occupies one entry in its shared core-class queue.
     SchedulerReadyPoolPlan ready_pool_plan;
     if (!scheduler_plan_ready_pool(
-            task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &ready_pool_plan
+            task_metadata, static_cast<uint32_t>(spmd.cluster_count),
+            split_scratch ? SCHEDULER_STATE_ALIGNMENT : layout.total_size, &ready_pool_plan
         )) {
         LOG_ERROR("A5 HBG: ready pool layout overflow or invalid topology");
         return false;
     }
-    layout.total_size = ready_pool_plan.total_size;
+    if (!split_scratch) layout.total_size = ready_pool_plan.total_size;
     uint64_t dependency_edges = 0;
     for (int64_t ref = 0; ref < host_graph.task_count; ++ref) {
         uint32_t count = 0;
@@ -1734,13 +1784,17 @@ bool create_scheduler_state(
             definition.definition.edge_count + definition.definition.root_count + definition.sinks.size();
     }
     SchedulerDependencyPlan dependency_plan;
-    if (!scheduler_plan_dependencies(node_count, dependency_edges, layout.total_size, &dependency_plan)) {
+    if (!scheduler_plan_dependencies(
+            node_count, dependency_edges, split_scratch ? ready_pool_plan.total_size : layout.total_size,
+            &dependency_plan
+        )) {
         LOG_ERROR("A5 HBG: dependency layout overflow");
         return false;
     }
     ready_pool_plan.header.dependencies_offset = dependency_plan.header_offset;
     ready_pool_plan.header.storage_end_offset = dependency_plan.total_size;
-    layout.total_size = dependency_plan.total_size;
+    if (!split_scratch) layout.total_size = dependency_plan.total_size;
+    const uint64_t scratch_bytes = dependency_plan.total_size;
 
     // Keep the dump image in the published prefix, before the reserved async suffix.
     std::vector<SchedulerArgsDumpTask> dump_tasks;
@@ -1813,6 +1867,25 @@ bool create_scheduler_state(
     }
     const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
 
+    // A program context's ready pool and dependency plan live in this run's
+    // scratch block, shared across the context's pipeline slots. The host
+    // staging is handed over uninitialized, so it is cleared before the pool
+    // and plan are written into it.
+    void *scratch_device = nullptr;
+    void *scratch_host = nullptr;
+    if (split_scratch) {
+        if (api->acquire_scheduler_scratch(
+                static_cast<size_t>(scratch_bytes), static_cast<size_t>(SCHEDULER_STATE_BASE_ALIGNMENT),
+                &scratch_device, &scratch_host
+            ) != 0 ||
+            scratch_device == nullptr || scratch_host == nullptr) {
+            LOG_ERROR("A5 HBG AICore scheduler: failed to obtain %" PRIu64 " scheduler scratch bytes", scratch_bytes);
+            return false;
+        }
+        std::memset(scratch_host, 0, static_cast<size_t>(scratch_bytes));
+    }
+    void *scratch_base = split_scratch ? scratch_host : host_base;
+
     const uint64_t initialized_bytes =
         async_plan.layout_offset == 0 ?
             (layout.scalar_records_offset == 0 ? layout.total_size : layout.scalar_records_offset) :
@@ -1840,14 +1913,25 @@ bool create_scheduler_state(
         for (const auto &task : dump_tasks)
             if (!scheduler_args_dump_select_task(dump_image, task)) return false;
     }
+    void *native_image_host = nullptr;
+    uint64_t native_image_device = 0;
+    uint64_t native_image_extent = 0;
     if (native_graph) {
-        std::memcpy(
-            static_cast<std::byte *>(host_base) + sizeof(SchedulerRunControl),
-            native_image.bytes.data() + sizeof(SchedulerRunControl),
-            native_image.bytes.size() - sizeof(SchedulerRunControl)
-        );
-        auto *header = scheduler_state_at<SchedulerNativeGraphHeader>(host_base, native_image.header_offset);
-        header->image_bytes = layout.total_size;
+        native_image_host = delivered_image ? scheduler_image_host_base : host_base;
+        native_image_device =
+            delivered_image ? reinterpret_cast<uint64_t>(scheduler_image_device_base) : aligned_address;
+        native_image_extent = delivered_image ? native_image.bytes.size() : layout.total_size;
+        if (delivered_image) {
+            std::memcpy(scheduler_image_host_base, native_image.bytes.data(), native_image.bytes.size());
+        } else {
+            std::memcpy(
+                static_cast<std::byte *>(host_base) + sizeof(SchedulerRunControl),
+                native_image.bytes.data() + sizeof(SchedulerRunControl),
+                native_image.bytes.size() - sizeof(SchedulerRunControl)
+            );
+        }
+        auto *header = scheduler_state_at<SchedulerNativeGraphHeader>(native_image_host, native_image.header_offset);
+        header->image_bytes = native_image_extent;
         header->control_inboxes_offset = layout.control_inboxes_offset;
         header->control_inbox_count = worker_count;
         header->run_epoch = api->run_epoch();
@@ -1858,8 +1942,10 @@ bool create_scheduler_state(
         dependency_graph.scheduler_state_address = reinterpret_cast<uint64_t>(host_base);
         dependency_graph.scheduler_state_bytes = layout.total_size;
         dependency_graph.native_header_offset = native_image.header_offset;
+        dependency_graph.native_image_address = reinterpret_cast<uint64_t>(native_image_host);
+        dependency_graph.native_image_bytes = native_image_extent;
     }
-    if (!scheduler_init_dependencies(host_base, dependency_plan, dependency_graph, inline_completed_task_refs)) {
+    if (!scheduler_init_dependencies(scratch_base, dependency_plan, dependency_graph, inline_completed_task_refs)) {
         LOG_ERROR("A5 HBG: invalid dependency graph or insufficient edge capacity");
         return false;
     }
@@ -1871,6 +1957,8 @@ bool create_scheduler_state(
                 snapshot.scheduler_state_address = reinterpret_cast<uint64_t>(host_base);
                 snapshot.scheduler_state_bytes = layout.total_size;
                 snapshot.native_header_offset = native_image.header_offset;
+                snapshot.native_image_address = reinterpret_cast<uint64_t>(native_image_host);
+                snapshot.native_image_bytes = native_image_extent;
                 std::vector<SchedulerProtocolSourceTask> sources;
                 sources.reserve(total_tasks);
                 for (int64_t ref = 0; ref < total_tasks; ++ref) {
@@ -1889,7 +1977,7 @@ bool create_scheduler_state(
             return false;
         }
     }
-    scheduler_init_ready_pool(host_base, ready_pool_plan);
+    scheduler_init_ready_pool(scratch_base, ready_pool_plan);
     scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset)->ready_pool_offset =
         ready_pool_plan.header_offset;
     auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, layout.task_controls_offset);
@@ -1950,6 +2038,14 @@ bool create_scheduler_state(
         context.trace_cells_offset = layout.trace_cells_offset;
         context.pmu_cells_offset = layout.pmu_cells_offset;
         context.args_dump_address = dump_layout.total_size == 0 ? 0 : aligned_address + dump_offset;
+        // The ready pool rides this run's scratch region in a program context;
+        // a kernel/capture context keeps it here. A kernel/capture context
+        // keeps the native image here too; a program context's image ref names
+        // the run's delivered region instead.
+        context.native_image_address = native_graph ? native_image_device : 0;
+        context.native_image_bytes = native_graph ? native_image_extent : 0;
+        context.ready_scratch_address = split_scratch ? reinterpret_cast<uint64_t>(scratch_device) : aligned_address;
+        context.ready_scratch_bytes = split_scratch ? scratch_bytes : layout.total_size;
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = node_count;
         context.native_header_offset = native_image.header_offset;
@@ -1967,16 +2063,21 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime, SchedulerStateOwner{
-                         reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks),
-                         std::move(protocol_source)
-                     }
+            runtime,
+            SchedulerStateOwner{
+                reinterpret_cast<void *>(aligned_address), layout, api, delivered_image ? native_image_device : 0,
+                native_graph ? native_image_extent : 0, std::move(protocol_tasks), std::move(protocol_source)
+            }
         );
     }
     runtime->add_pending_metadata(
         reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(initialized_bytes),
         HostPhaseKind::Count, {}
     );
+    if (split_scratch)
+        runtime->add_pending_metadata(
+            scratch_device, scratch_host, static_cast<size_t>(scratch_bytes), HostPhaseKind::Count, {}
+        );
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);
     return true;
 }
@@ -1994,7 +2095,29 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     const uint64_t image_bytes = plan.image_bytes;
     const int32_t total_tasks = plan.total_tasks;
     const auto &bind_usage = plan.bind_usage;
-    const uint64_t device_arena_bytes = layout.off_copied_end + image_bytes;
+    // A program context ships the scheduler's native readonly image as the run
+    // image's tail; a kernel/capture context keeps it inside the scheduler
+    // state allocation. The extent depends only on the plan's counts, so it is
+    // known before the arena is committed and the instance addresses exist.
+    uint64_t scheduler_image_bytes = 0;
+    uint64_t scheduler_image_start = 0;
+    uint64_t scheduler_image_end = 0;
+    if (!scheduler_layout_checked_add(layout.off_copied_end, image_bytes, &scheduler_image_end))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    scheduler_image_start = scheduler_image_end;
+    if (!api->execution_is_kernel_mode() && !plan.native_graph.instances.empty()) {
+        std::string error;
+        if (!native_graph_plan_readonly_image_extent(plan.native_graph, &scheduler_image_bytes, &error)) {
+            LOG_ERROR("host-orch: native readonly image extent failed: %s", error.c_str());
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (!scheduler_layout_checked_align(scheduler_image_start, SCHEDULER_STATE_ALIGNMENT, &scheduler_image_start) ||
+            !scheduler_layout_checked_add(scheduler_image_start, scheduler_image_bytes, &scheduler_image_end)) {
+            LOG_ERROR("host-orch: scheduler image extent overflow");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+    const uint64_t device_arena_bytes = scheduler_image_end;
     const BindPhaseMark static_arena_phase = bind_phase_begin();
     runtime->dev.sm_image_bytes = image_bytes;
     SharedMemoryHandle host_sm_handle;
@@ -2058,7 +2181,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
     // vector's data() is not.
     const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
-    const uint64_t upload_bytes = copied_bytes + image_bytes;
+    const uint64_t upload_bytes = scheduler_image_end - layout.off_copied_begin;
     // Assembled in staging the runner retains rather than in a buffer that dies
     // with this frame: publication is a separate step, so the bytes have to still
     // be here when it reads them. Over-allocated by the alignment the layout
@@ -2104,7 +2227,11 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     }
     if (!create_scheduler_state(
             runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph,
-            upload_base + copied_bytes
+            upload_base + copied_bytes, scheduler_image_bytes,
+            scheduler_image_bytes == 0 ?
+                nullptr :
+                reinterpret_cast<void *>(reinterpret_cast<uint64_t>(arena_dev) + scheduler_image_start),
+            scheduler_image_bytes == 0 ? nullptr : upload_base + (scheduler_image_start - layout.off_copied_begin)
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2129,7 +2256,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     // segment's attributes the publication rebuilds from `dev` and the length.
     runtime->set_pending_publication(
         arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
-        bind_usage.scalar_elems
+        bind_usage.scalar_elems, scheduler_image_bytes
     );
     return total_tasks;
 }
@@ -2951,8 +3078,9 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         // filled, and the copied zone is what the length has left over, so only
         // the pool counters had to travel.
         const uint64_t image_bytes = runtime->dev.sm_image_bytes;
-        const uint64_t copied_bytes = publication.bytes - image_bytes;
-        // The widest attribute string a segment formats: eight uint64 fields plus
+        const uint64_t scheduler_image_bytes = publication.scheduler_image_bytes;
+        const uint64_t copied_bytes = publication.bytes - image_bytes - scheduler_image_bytes;
+        // The widest attribute string a segment formats: nine uint64 fields plus
         // their labels. With the counters ahead of it in the recorded string, this
         // is the tail a truncation eats first. `dest` leads instead, because the
         // range a run published into is what tells two runs' images apart, and it
@@ -2960,10 +3088,11 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),
-            "dest=%p nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64
-            "/%" PRIu64,
+            "dest=%p nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " sched=%" PRIu64 " args=%" PRIu64
+            "/%" PRIu64 "/%" PRIu64,
             publication.device_target, static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes,
-            copied_bytes, image_bytes, publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
+            copied_bytes, image_bytes, scheduler_image_bytes, publication.fanin_elems, publication.tensor_elems,
+            publication.scalar_elems
         );
         record_bind_phase(HostPhaseKind::BindImageStage, staging_phase, attrs, publication.bytes);
     }

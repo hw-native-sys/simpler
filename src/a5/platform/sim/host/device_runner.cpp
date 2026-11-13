@@ -1065,6 +1065,7 @@ int DeviceRunner::finalize() {
     // Host allocations here, so a failure has no device meaning; this
     // finalize reports none of its releases, as its siblings above do not.
     (void)release_scheduler_state_storage();
+    (void)release_scheduler_scratch_storage();
     release_sm_mirrors();
     release_run_image_stagings();
 

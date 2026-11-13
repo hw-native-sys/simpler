@@ -280,6 +280,27 @@ static int acquire_scheduler_state_storage(
     }
 }
 
+static int execution_is_kernel_mode(void *runner_ctx) {
+    if (runner_ctx == nullptr) return 0;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)->execution_mode_latch().is_kernel() ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+static int acquire_scheduler_scratch(
+    void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+            ->acquire_scheduler_scratch(pipeline_slot, bytes, alignment, device_out, host_out);
+    } catch (...) {
+        return -1;
+    }
+}
+
 static void record_scheduler_runtime_mode(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode) {
     (void)pipeline_slot;
     if (runner_ctx == nullptr) return;
@@ -548,6 +569,8 @@ static const HostApiOps g_host_api_ops = {
     .publish_graph_section = publish_graph_section,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_scheduler_state_storage = acquire_scheduler_state_storage,
+    .execution_is_kernel_mode = execution_is_kernel_mode,
+    .acquire_scheduler_scratch = acquire_scheduler_scratch,
     .record_scheduler_runtime_mode = record_scheduler_runtime_mode,
     .acquire_sm_mirror = acquire_sm_mirror,
     .acquire_run_image_staging = acquire_run_image_staging,

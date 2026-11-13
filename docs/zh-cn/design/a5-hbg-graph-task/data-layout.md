@@ -47,9 +47,11 @@ CONTROL_DUMMY 的来源由 instance_index 判别。kernel 身份由 kind、sourc
 不存在 Graph 时 `native_header_offset == 0`，不分配 node bindings，保持当前普通任务 ref 与 SM slot 一一对应的访问路径。
 存在 Graph 时所有节点均有 binding，禁止部分调用点假设普通任务仍使用原始 ID。
 
-`SchedulerGraphView` 为 56 bytes，version 3。字段为 storage_address、task_count、
-task_window_last_index、scheduler_state_address、native_header_offset、scheduler_state_bytes
-六个 `uint64_t`，original_task_count 一个 `uint32_t`，view_version/view_bytes 两个 `uint16_t`。
+`SchedulerGraphView` 为 72 bytes，version 4。字段为 storage_address、task_count、
+task_window_last_index、scheduler_state_address、native_header_offset、scheduler_state_bytes、
+native_image_address、native_image_bytes 八个 `uint64_t`，original_task_count 一个 `uint32_t`，
+view_version/view_bytes 两个 `uint16_t`。`native_image_*` 是 native 只读 image 的区域基址和可信长度；
+kernel/capture 上下文把它们指向调度状态本身，program 上下文指向随 run image 交付的独立区域。
 原始任务数受公共 TaskId 的 20-bit parent 容量约束，写入 `uint32_t` 前显式检查。
 无 Graph 时 header offset 为零；Host/AICPU/AICore 必须配套重编译，不承诺旧二进制读取新 view。
 
@@ -59,7 +61,7 @@ task_window_last_index、scheduler_state_address、native_header_offset、schedu
 | 类型 | 大小 | cacheline 所有权 |
 | ---- | ---- | ---------------- |
 | SchedulerTaskControl | 640 B | state/claim tickets、block cursor、completion、admission signal、claim seal 分别隔离128B Sector |
-| SchedulerWorkerContext | 320 B | 4 行 READY 发布的配置，1 行本核写回诊断 |
+| SchedulerWorkerContext | 384 B | 5 行 READY 发布的配置，1 行本核写回诊断 |
 | SchedulerTaskTrace | 320 B | publication header；kernel timing；dispatch/completion；refill/startup；execution identity，各一行 |
 | SchedulerRunControl | 7296 B | 384 B配置、生命周期原子及错误身份前缀，加108个独占cacheline的worker错误signal |
 | SchedulerTicketQueue | 256 B | head 和 reserved_tail 各一个128B区域；reserved_tail 是有效预留游标 |
@@ -94,24 +96,35 @@ task_controls_offset、scheduler_state_base_address、dispatch_payload_offset、
 启动 watchdog 与 peer route 校验只需观察这一行。第二行保存 graph view 与 graph_summary_offset；
 第三行从 offset 128 开始，保存 metadata、kernel-entry table、worker 数量，以及 offset 160 开始的 scheduler/cluster 计数和索引；
 第四行从 offset 192 开始，保存 cluster_worker_ids、AICPU lifecycle offset、offset 224 开始的 trace/activity/PMU offsets 和 offset 248 的 args_dump_address。
-前四行是配置；offset 256 开始的第五行是本核诊断行，保存 bootstrap_task_count、
+第五行从 offset 256 开始，保存 native image 与 ready scratch 的地址和长度。
+前五行是配置；offset 320 开始的第六行是本核诊断行，保存 bootstrap_task_count、
 bootstrap_start_cycles、target_bootstrap_end_cycles 和四个 trace 启动时间戳。
 未被读取的聚合统计不写入 GM；本地 completion ID 计数和退出时间戳仍参与调度控制。
 
-native header 为 128-byte、64-byte 对齐 POD，version 2。magic/version 是两个 `uint32_t`，
+native header 为 128-byte、64-byte 对齐 POD，version 3。magic/version 是两个 `uint32_t`，
 随后为 image_bytes/node_count/original_task_count/definition_count/instance_count、
 bindings_offset/completion_refs_offset/templates_offset/instances_offset/control_inboxes_offset、
 control_inbox_count/readonly_end_offset/run_epoch 共十三个 `uint64_t`，最后为 `uint32_t header_bytes`。
-image_bytes 覆盖整个 scheduler backing；
+image_bytes 是 native 只读 image 自身的区域长度：kernel/capture 上下文里它等于整个 scheduler backing，
+program 上下文里它是随 run image 交付的独立区域，不再包含任何 mutable control/queue 区域；
 保留现有 offset 0 的 `SchedulerRunControl` 固定前缀；其后的 native 只读区域按 header、binding、
 completion_ref、template、instance、blob、child plan、sink 的顺序排列。
 每个 region 按其 ABI 对齐；除固定 run control 前缀以外，其余 mutable control/queue 等区域放在 readonly_end 后。
+program 上下文不预留 image 前缀，`SchedulerRunControl` 之后直接排 control inbox；
+kernel/capture 上下文让 control inbox 跟在 readonly_end 之后。
 无 Graph 时不插入这段 native 只读区域，也不预留 control inbox。
 普通图与 native Graph 都使用[ready pool 的独立追加区域](ready-queue-design.md)，不再承诺完整 allocation layout 与旧队列实现相同。
+program 上下文把 ready pool 与它用 `dependencies_offset/storage_end_offset` 命名的 dependency plan 放在
+本 run 的 scratch lease 里（启动元数据的第二条前置 copy）。`ScratchPool` 是 ×1 共享缓冲：同一 generation
+的所有 lease 共享同一个 device base，per-slot 只隔离 host staging；安全证明是执行域内设备算子串行，
+启动元数据也经同一条 run stream 的 `rtMemcpyAsync` 排队。`SchedulerGraphSummary.ready_pool_offset` 因此相对
+`ready_scratch_address` 解析；kernel/capture 上下文仍把它们追加在 scheduler state 分配内，
+`ready_scratch_address` 指向 state 自身。两种放置的 pool 起始 offset 都非零。
 每个 offset/count 对、区域不重叠、epoch、原始/展开数量一致性都在 Host 和设备 bind helper 中校验。
-`SchedulerGraphView.scheduler_state_bytes` 由实际 allocation layout 提供；读取 header 之前先用它
+`SchedulerGraphView.native_image_bytes` 由实际 image 区域提供；读取 header 之前先用它
 检查 header offset/size 和 base 加法不溢出，再要求 header.image_bytes 与该可信长度相等。
 不能先解引用任意 header offset，或仅使用待校验 header 自己声明的 image_bytes 作为边界。
+control inbox 的 offset 属于调度状态，按 `scheduler_state_address/scheduler_state_bytes` 单独校验。
 completion_ref 使用 `int64_t[T]`，值必须位于 `[0,N)`，Graph shell 必须映射到其 EXIT。
 
 ## Definition 与实例 wire
@@ -267,6 +280,11 @@ reserved_graph_heap = sum(required_heap + legacy_execution_storage_bytes)
 ```
 
 native_scheduler_bytes 是 scheduler backing 总量，不是相对于旧 scheduler 的增量；公共原始 SM 和其他 runtime backing 另计。
+program 上下文的公式不含 header/Definition blob 等只读 image 部分：这些字节随 run image 的
+`RUNTIME_IMAGE` 区域按 `native_graph_plan_readonly_image_extent` 追加交付，scheduler backing 只保留
+control 状态；ready pool 与 dependency plan 也不在 backing 内，而是由平台按
+`acquire_scheduler_scratch` 提供的共享 scratch 区域承载。kernel/capture 上下文仍把这三部分都计入 backing。
+两种放置都由同一个 host planner 生成。
 公式中的 reserved_graph_heap 已包含 native 参数 backing，禁止再把同一参数区算成额外 allocation。
 cooperative metadata 只计合法 kernel，ENTER/EXIT/DUMMY 不增加 admission log capacity。
 首版可保留现有按 N 索引的 admission records；必须如实计算这种稀疏分配成本。

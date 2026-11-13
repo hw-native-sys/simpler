@@ -303,14 +303,18 @@ bool native_graph_plan_nodes(
     return true;
 }
 
-bool native_graph_plan_readonly_image(
-    const NativeGraphHostPlan &plan, NativeGraphReadonlyImage *out, std::string *error
+namespace {
+// Lays out the readonly image's header, top-level arrays and per-definition
+// payloads. The extent query and the materializer share this pass, so a run
+// image sized from the extent cannot disagree with the bytes it ships.
+bool readonly_image_layout(
+    const NativeGraphHostPlan &plan, SchedulerNativeGraphHeader &header, uint64_t *header_offset,
+    std::vector<SchedulerGraphTemplate> &templates, std::string *error
 ) {
-    if (out == nullptr || plan.definitions.empty() || plan.instances.empty() || plan.bindings.empty() ||
+    if (header_offset == nullptr || plan.definitions.empty() || plan.instances.empty() || plan.bindings.empty() ||
         plan.bindings.size() > INT32_MAX || plan.completion_refs.size() > TaskId::GLOBAL_TASK_MAX_NUM)
         return fail(error, "invalid native image population");
-    NativeGraphReadonlyImage next;
-    SchedulerNativeGraphHeader header{};
+    header = SchedulerNativeGraphHeader{};
     header.magic = SCHEDULER_NATIVE_GRAPH_MAGIC;
     header.version = SCHEDULER_NATIVE_GRAPH_VERSION;
     header.header_bytes = sizeof(header);
@@ -324,7 +328,7 @@ bool native_graph_plan_readonly_image(
         return scheduler_layout_checked_mul(count, stride, &bytes) &&
                scheduler_layout_reserve(&cursor, bytes, alignment, offset);
     };
-    if (!reserve(1, sizeof(header), alignof(SchedulerNativeGraphHeader), &next.header_offset) ||
+    if (!reserve(1, sizeof(header), alignof(SchedulerNativeGraphHeader), header_offset) ||
         !reserve(
             header.node_count, sizeof(SchedulerNodeBinding), alignof(SchedulerNodeBinding), &header.bindings_offset
         ) ||
@@ -338,7 +342,7 @@ bool native_graph_plan_readonly_image(
             &header.instances_offset
         ))
         return fail(error, "native readonly image overflow");
-    std::vector<SchedulerGraphTemplate> templates(plan.definitions.size());
+    templates.resize(plan.definitions.size());
     for (size_t i = 0; i < plan.definitions.size(); ++i) {
         const auto &source = plan.definitions[i];
         const auto &def = source.definition;
@@ -368,6 +372,29 @@ bool native_graph_plan_readonly_image(
     if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &header.readonly_end_offset) ||
         header.readonly_end_offset > std::numeric_limits<size_t>::max())
         return fail(error, "native readonly alignment overflow");
+    return true;
+}
+}  // namespace
+
+bool native_graph_plan_readonly_image_extent(const NativeGraphHostPlan &plan, uint64_t *extent, std::string *error) {
+    if (extent == nullptr) return fail(error, "invalid native image extent output");
+    SchedulerNativeGraphHeader header{};
+    uint64_t header_offset = 0;
+    std::vector<SchedulerGraphTemplate> templates;
+    if (!readonly_image_layout(plan, header, &header_offset, templates, error)) return false;
+    if (error != nullptr) error->clear();
+    *extent = header.readonly_end_offset;
+    return true;
+}
+
+bool native_graph_plan_readonly_image(
+    const NativeGraphHostPlan &plan, NativeGraphReadonlyImage *out, std::string *error
+) {
+    if (out == nullptr) return fail(error, "invalid native image output");
+    NativeGraphReadonlyImage next;
+    SchedulerNativeGraphHeader header{};
+    std::vector<SchedulerGraphTemplate> templates;
+    if (!readonly_image_layout(plan, header, &next.header_offset, templates, error)) return false;
     next.bytes.resize(static_cast<size_t>(header.readonly_end_offset));
     const auto copy = [&](uint64_t offset, const auto &values) {
         if (!values.empty()) std::memcpy(next.bytes.data() + offset, values.data(), values.size() * sizeof(values[0]));

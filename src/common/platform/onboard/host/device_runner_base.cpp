@@ -431,6 +431,19 @@ DeviceRunnerBase::DeviceRunnerBase() {
             on_heap_generation_retired(generation, raw);
         }
     );
+    // Scheduler scratch is allocated through the device allocator, not the
+    // workspace ledger: scheduler state is outside the ledger's budget.
+    scheduler_scratch_pool_ = std::make_shared<ScratchPool>(
+        [](void *ctx, size_t bytes) -> void * {
+            auto *self = static_cast<DeviceRunnerBase *>(ctx);
+            MemoryAllocator::Reservation reservation = self->mem_alloc_.begin_reservation();
+            return reservation.commit_alloc(bytes);
+        },
+        [](void *ctx, void *ptr) {
+            (void)static_cast<DeviceRunnerBase *>(ctx)->mem_alloc_.free(ptr);
+        },
+        this
+    );
     // The sub-owners exist before the first grant is committed, because the
     // commit hands each of them its own per-set storage.
     queued_waits_ = std::make_unique<QueuedStreamWaits>(make_acl_event_ops());
@@ -459,6 +472,7 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
         storage = std::make_shared<PreparedRunResources::TemporaryStorage>();
     staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
     staged.scheduler_state_storage = RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>>::build(granted);
+    staged.scheduler_scratch = RunResourceSlots<SchedulerScratchSlot>::build(granted);
     staged.orchestration_scratch = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.prepare_plans = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
@@ -502,6 +516,7 @@ void DeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &
     temporary_storage_.commit(std::move(staged.temporary_storage));
     graph_definition_staging_.commit(std::move(staged.graph_definition_staging));
     scheduler_state_storage_.commit(std::move(staged.scheduler_state_storage));
+    scheduler_scratch_.commit(std::move(staged.scheduler_scratch));
     orchestration_scratch_.commit(std::move(staged.orchestration_scratch));
     prepare_plans_.commit(std::move(staged.prepare_plans));
     sm_mirrors_.commit(std::move(staged.sm_mirrors));
@@ -976,7 +991,10 @@ void DeviceRunnerBase::note_run_resources_proven(uint32_t pipeline_slot, std::ui
 
 int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) {
     if (!auto_admission_.enabled()) {
-        if (native_run_claim_count() == 0) release_heap_lease(pipeline_slot);
+        if (native_run_claim_count() == 0) {
+            release_heap_lease(pipeline_slot);
+            release_scheduler_scratch(pipeline_slot);
+        }
         return 0;
     }
     if (pipeline_slot >= temporary_storage_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
@@ -986,7 +1004,10 @@ int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_e
     // names whatever plan the slot holds, which is what a caller abandoning a
     // run whose prepare never returned an identity can say.
     if (plan.phase == AutoAdmissionState::Phase::None) {
-        if (native_run_claim_count() == 0) release_heap_lease(pipeline_slot);
+        if (native_run_claim_count() == 0) {
+            release_heap_lease(pipeline_slot);
+            release_scheduler_scratch(pipeline_slot);
+        }
         return 0;
     }
     if (run_epoch != 0 && plan.epoch != run_epoch) return 0;
@@ -1004,6 +1025,7 @@ int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_e
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
     release_heap_lease(pipeline_slot);
+    release_scheduler_scratch(pipeline_slot);
     release_plan_epoch_refs(pipeline_slot, epoch);
     prepare_plans_[pipeline_slot].reset();
     if (plan.plan_stamped) {
@@ -1430,6 +1452,70 @@ int DeviceRunnerBase::acquire_scheduler_state_storage(
         alignment, static_cast<uint32_t>(status)
     );
     return -1;
+}
+
+int DeviceRunnerBase::acquire_scheduler_scratch(
+    uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
+) {
+    if (device_out != nullptr) *device_out = nullptr;
+    if (host_out != nullptr) *host_out = nullptr;
+    if (pipeline_slot >= scheduler_scratch_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1))
+        return -1;
+    if (execution_mode_latch().is_kernel() || !can_accept_run()) return -1;
+    SchedulerScratchSlot &slot = scheduler_scratch_[pipeline_slot];
+    const std::size_t raw_bytes = bytes + alignment - 1;
+    if (slot.host == nullptr || slot.host_capacity < bytes) {
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[raw_bytes]);
+        if (!storage) return -1;
+        slot.host = reinterpret_cast<void *>(
+            (reinterpret_cast<uintptr_t>(storage.get()) + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1)
+        );
+        slot.host_storage = std::move(storage);
+        slot.host_capacity = bytes;
+    }
+    std::lock_guard<std::mutex> lock(scheduler_scratch_mutex_);
+    if (!slot.lease.valid() || slot.lease.capacity < bytes) {
+        ScratchPool::Lease next;
+        if (scheduler_scratch_pool_ == nullptr || scheduler_scratch_pool_->acquire(bytes, &next) != 0) return -1;
+        if (slot.lease.valid()) scheduler_scratch_pool_->release(slot.lease);
+        slot.lease = next;
+    }
+    *device_out = slot.lease.base;
+    *host_out = slot.host;
+    return 0;
+}
+
+void DeviceRunnerBase::release_scheduler_scratch(uint32_t pipeline_slot) {
+    if (pipeline_slot >= scheduler_scratch_.size()) return;
+    std::lock_guard<std::mutex> lock(scheduler_scratch_mutex_);
+    const ScratchPool::Lease lease = scheduler_scratch_[pipeline_slot].lease;
+    scheduler_scratch_[pipeline_slot].lease = {};
+    if (lease.valid() && scheduler_scratch_pool_) scheduler_scratch_pool_->release(lease);
+}
+
+int DeviceRunnerBase::release_scheduler_scratch_storage() {
+    for (uint32_t slot = 0; slot < scheduler_scratch_.size(); ++slot) {
+        std::lock_guard<std::mutex> lock(scheduler_scratch_mutex_);
+        const ScratchPool::Lease lease = scheduler_scratch_[slot].lease;
+        scheduler_scratch_[slot].lease = {};
+        if (lease.valid() && scheduler_scratch_pool_) scheduler_scratch_pool_->release(lease);
+        scheduler_scratch_[slot].host = nullptr;
+        scheduler_scratch_[slot].host_storage.reset();
+        scheduler_scratch_[slot].host_capacity = 0;
+    }
+    if (scheduler_scratch_pool_) scheduler_scratch_pool_->reset();
+    return 0;
+}
+
+void DeviceRunnerBase::abandon_scheduler_scratch_storage() {
+    if (scheduler_scratch_pool_) scheduler_scratch_pool_->abandon();
+    for (auto &slot : scheduler_scratch_) {
+        slot.lease = {};
+        slot.host = nullptr;
+        slot.host_storage.reset();
+        slot.host_capacity = 0;
+    }
 }
 
 int DeviceRunnerBase::release_scheduler_state_storage() {
@@ -3530,6 +3616,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
 
     if (abandon_device_resources) {
         abandon_scheduler_state_storage();
+        abandon_scheduler_scratch_storage();
         for (auto &storage : temporary_storage_)
             storage->abandon();
         // Forget the mappings without unregistering: the reset invalidated them
@@ -3537,6 +3624,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         (void)child_memory_host_views_.take_all();
     } else {
         capture(release_scheduler_state_storage());
+        capture(release_scheduler_scratch_storage());
         capture(clear_temporary_buffer());
     }
     // Pure host memory, so all three are returned on either path — a force reset
@@ -4318,6 +4406,17 @@ int DeviceRunnerBase::retain_prepared_run_resources(
             heap_leases_[slot] = {};
         }
     }
+    ScratchPool::Lease scratch_lease;
+    {
+        std::lock_guard<std::mutex> lock(scheduler_scratch_mutex_);
+        if (slot < scheduler_scratch_.size()) {
+            scratch_lease = scheduler_scratch_[slot].lease;
+            scheduler_scratch_[slot].lease = {};
+        }
+    }
+    auto release_scratch_on_fail = RAIIScopeGuard([&]() {
+        if (scratch_lease.valid() && scheduler_scratch_pool_) scheduler_scratch_pool_->release(scratch_lease);
+    });
     // The set's committed footprint, taken while every source is still named
     // here: the heap lease moves into the published resources below.
     RunResourceCost cost;
@@ -4329,6 +4428,7 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     cost.image_bytes = arena_banks_[banks.image]->runtime_pool.total_size();
     cost.shared_memory_bytes = arena_banks_[banks.sm]->gm_sm.total_size();
     if (scheduler_state_storage_[slot]) cost.scheduler_bytes = scheduler_state_storage_[slot]->device_capacity();
+    if (scratch_lease.valid()) cost.scheduler_bytes += scratch_lease.capacity;
     {
         std::lock_guard<std::mutex> result_lock(run_result_mu_);
         const auto result = run_result_storage_.find(prepared.identity.run_epoch);
@@ -4343,6 +4443,8 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     );
     resources->take_heap_lease(heap_pool_, heap_lease);
     heap_lease = {};
+    resources->take_scheduler_scratch_lease(scheduler_scratch_pool_, scratch_lease);
+    scratch_lease = {};
     if (callable_id >= 0) {
         auto callable = callables_.find(callable_id);
         if (callable == callables_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;

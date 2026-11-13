@@ -59,6 +59,10 @@ struct NativeGraphReadonlyImage {
     uint64_t header_offset{0};
 };
 
+// Reports what native_graph_plan_readonly_image would produce without building
+// it, so a caller can size the run image before the instance addresses exist.
+bool native_graph_plan_readonly_image_extent(const NativeGraphHostPlan &plan, uint64_t *extent, std::string *error);
+
 // Reserves the existing run-control prefix without writing its live contents.
 // Commit patches the header's allocation/epoch/inbox fields and the instances'
 // external addresses before publishing the entire scheduler backing.

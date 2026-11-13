@@ -228,9 +228,8 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
     return runtime_reserve_layout(arena, task_capacity, limit_queue_capacities());
 }
 
-RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, uint64_t task_capacity, const ReadyQueueCapacities &ready_queue_capacities
-) {
+RuntimeArenaLayout
+runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity, const ReadyQueueCapacities &ready_queue_capacities) {
     RuntimeArenaLayout layout{};
 
     layout.task_capacity = task_capacity;
@@ -247,9 +246,13 @@ RuntimeArenaLayout runtime_reserve_layout(
     layout.off_scheduler = arena.reserve(sizeof(SchedulerState), alignof(SchedulerState));
     layout.sched = SchedulerState::reserve_layout(arena, ready_queue_capacities);
 
-    layout.off_copied_begin = arena.total_size();
-    // Padded to a CHIP_ALIGN_SIZE boundary: the shared-memory image starts at
-    // off_copied_end on the device and its segment offsets are aligned from there.
+    // Both ends of the copied zone sit on CHIP_ALIGN_SIZE boundaries: the start
+    // because bind ships the zone to arena_dev + off_copied_begin and the
+    // register-aligned regions appended after it (the shared-memory tail and a
+    // resident scheduler's image) must stay aligned relative to that base; the
+    // end because the shared-memory image starts there and its segment offsets
+    // are aligned from it.
+    layout.off_copied_begin = CHIP_ALIGN_UP(arena.total_size(), CHIP_ALIGN_SIZE);
     layout.off_runtime = arena.reserve(CHIP_ALIGN_UP(sizeof(RuntimeContext), CHIP_ALIGN_SIZE), CHIP_ALIGN_SIZE);
     layout.off_copied_end = arena.total_size();
 

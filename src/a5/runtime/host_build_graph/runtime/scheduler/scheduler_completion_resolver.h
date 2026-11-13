@@ -101,10 +101,12 @@ static __aicore__ __attribute__((noinline)) bool scheduler_resolve_csr_completio
         scheduler_record_error(run, producer_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local, site);
         return false;
     };
-    const auto *offsets = scheduler_state_at<uint64_t>(base, dependencies.fanout_offsets_offset);
+    const auto *offsets =
+        scheduler_state_at<uint64_t>(scheduler_ready_storage_base(local), dependencies.fanout_offsets_offset);
     const uint64_t begin = offsets[producer_ref], end = offsets[producer_ref + 1];
-    const auto *refs = scheduler_state_at<int32_t>(base, dependencies.fanout_refs_offset);
-    auto *remaining = scheduler_state_at<uint64_t>(base, dependencies.remaining_offset);
+    const auto *refs =
+        scheduler_state_at<int32_t>(scheduler_ready_storage_base(local), dependencies.fanout_refs_offset);
+    auto *remaining = scheduler_state_at<uint64_t>(scheduler_ready_storage_base(local), dependencies.remaining_offset);
     // TaskDone and successor counters occupy different atomic lines. A credit
     // may make the successor runnable on another core immediately.
     if (begin != end) scheduler_cache_barrier();

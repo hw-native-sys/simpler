@@ -211,7 +211,9 @@ reserves them in this order:
 
 The copied zone comes last, so `bind` is a single contiguous `copy_to_device`
 starting at `off_copied_begin` — and the device's shared-memory tail begins
-exactly where that zone ends. Both bounds are layout fields, so no consumer infers
+exactly where that zone ends. Both bounds sit on `CHIP_ALIGN_SIZE` boundaries, so
+the copy lands on an aligned device base and every aligned region appended after
+the tail keeps its alignment. Both bounds are layout fields, so no consumer infers
 a boundary from which region happens to be reserved first —
 `bind_callable_to_runtime_impl` asserts only that they are ordered and in range.
 

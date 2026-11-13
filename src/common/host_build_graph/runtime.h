@@ -503,6 +503,10 @@ private:
             uint64_t fanin_elems;
             uint64_t tensor_elems;
             uint64_t scalar_elems;
+            // The tail of the image belongs to the scheduler's native readonly
+            // region, not to the shared-memory image; a program context appends
+            // it there and the two lengths stay separately reportable.
+            uint64_t scheduler_image_bytes;
             std::vector<MetadataRegion> prerequisites;
         };
         RunImagePublication pending_publication_;
@@ -554,7 +558,7 @@ public:
     const HostOnlyState::RunImagePublication &pending_publication() const { return host_.pending_publication_; }
     void set_pending_publication(
         void *device_target, const void *source, uint64_t bytes, uint64_t fanin_elems, uint64_t tensor_elems,
-        uint64_t scalar_elems
+        uint64_t scalar_elems, uint64_t scheduler_image_bytes = 0
     ) {
         host_.prepared_publication_.reset();
         auto &pending = host_.pending_publication_;
@@ -564,6 +568,7 @@ public:
         pending.fanin_elems = fanin_elems;
         pending.tensor_elems = tensor_elems;
         pending.scalar_elems = scalar_elems;
+        pending.scheduler_image_bytes = scheduler_image_bytes;
     }
     void add_pending_metadata(
         void *target, const void *source, size_t bytes, HostPhaseKind phase, std::string attributes,

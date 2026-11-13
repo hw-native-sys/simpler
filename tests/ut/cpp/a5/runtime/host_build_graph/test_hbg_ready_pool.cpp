@@ -101,6 +101,8 @@ struct PoolFixture {
             config.scheduler_count = locals.size();
             config.scheduler_index = worker;
             config.runtime_worker_count = locals.size();
+            config.ready_scratch_address = reinterpret_cast<uint64_t>(base());
+            config.ready_scratch_bytes = layout.total_size;
             config.ready_pool_offset = plan.header_offset;
             config.task_controls_offset = layout.task_controls_offset;
             config.task_metadata_offset = layout.task_metadata_offset;
@@ -875,6 +877,98 @@ TEST(SchedulerReadyPoolTest, RejectsInvalidTopologyAndOverflowWithoutChangingThe
     EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), SCHEDULER_CLUSTER_CAPACITY + 1, 128, &plan));
     EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, UINT64_MAX - 64, &plan));
     EXPECT_EQ(plan.total_size, size);
+}
+
+TEST(SchedulerReadyPoolTest, ScratchRegionHoldsThePoolAndTheDependencyPlan) {
+    const auto metadata = tasks(6, 0);
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(metadata.size(), metadata.size(), 0, &layout));
+    SchedulerReadyPoolPlan plan{};
+    // A program context's scratch starts one alignment unit in: zero is the
+    // planner's "absent" offset.
+    ASSERT_TRUE(scheduler_plan_ready_pool(metadata, 1, SCHEDULER_STATE_ALIGNMENT, &plan));
+    EXPECT_EQ(plan.header_offset, SCHEDULER_STATE_ALIGNMENT);
+
+    scheduler_test::BasicGraphBuffer<16> graph_storage(metadata.size());
+    const std::vector<std::vector<int32_t>> fanins{{}, {0}, {1}, {2}, {3}, {4}};
+    uint64_t edges = 0;
+    for (size_t ref = 0; ref < fanins.size(); ++ref) {
+        graph_storage.executable(ref, 0, fanins[ref]);
+        edges += fanins[ref].size();
+    }
+    SchedulerDependencyPlan dependency_plan;
+    ASSERT_TRUE(scheduler_plan_dependencies(metadata.size(), edges, plan.total_size, &dependency_plan));
+    plan.header.dependencies_offset = dependency_plan.header_offset;
+    plan.header.storage_end_offset = dependency_plan.total_size;
+
+    scheduler_test::SchedulerStateBuffer state(layout);
+    std::copy(
+        metadata.begin(), metadata.end(),
+        scheduler_state_at<SchedulerTaskMetadata>(state.base(), layout.task_metadata_offset)
+    );
+    // The platform hands the scratch over 64-byte aligned; a vector's data() is
+    // not guaranteed to be.
+    std::unique_ptr<void, decltype(&std::free)> scratch_storage(
+        std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, dependency_plan.total_size), &std::free
+    );
+    ASSERT_NE(scratch_storage, nullptr);
+    std::memset(scratch_storage.get(), 0, dependency_plan.total_size);
+    void *const scratch = scratch_storage.get();
+    scheduler_init_ready_pool(scratch, plan);
+    auto graph = graph_storage.graph();
+    graph.scheduler_state_address = reinterpret_cast<uint64_t>(state.base());
+    graph.scheduler_state_bytes = layout.total_size;
+    ASSERT_TRUE(scheduler_init_dependencies(scratch, dependency_plan, graph, {}));
+
+    EXPECT_TRUE(
+        scheduler_ready_pool_validate(scratch, dependency_plan.total_size, plan.header_offset, metadata.size(), 1)
+    );
+    EXPECT_FALSE(
+        scheduler_ready_pool_validate(state.base(), layout.total_size, plan.header_offset, metadata.size(), 1)
+    );
+    const auto *dependencies = scheduler_dependencies(scratch, plan.header_offset);
+    ASSERT_NE(dependencies, nullptr);
+    EXPECT_EQ(dependencies->edge_count, static_cast<uint64_t>(edges));
+    const auto *remaining = scheduler_state_at<uint64_t>(scratch, dependencies->remaining_offset);
+    EXPECT_EQ(remaining[0], 0u);
+    EXPECT_EQ(remaining[5], 1u);
+
+    // Bootstrap resolves the dependency counters through the scratch while the
+    // run control and task controls stay in the state.
+    SchedulerLocalState local;
+    for (auto &slot : local.slots)
+        scheduler_initialize_free_slot(&slot);
+    local.config.graph = &graph;
+    local.config.ready_scratch_address = reinterpret_cast<uint64_t>(scratch);
+    local.config.ready_scratch_bytes = dependency_plan.total_size;
+    local.config.ready_pool_offset = plan.header_offset;
+    local.config.task_controls_offset = layout.task_controls_offset;
+    local.config.task_metadata_offset = layout.task_metadata_offset;
+    local.config.self_core_type = 0;
+    local.config.self_lane = 0;
+    local.config.scheduler_index = 0;
+    local.config.runtime_worker_count = 3;
+    local.config.scheduler_count = 3;
+    local.config.cluster_count = 1;
+    auto *run = scheduler_state_at<SchedulerRunControl>(state.base(), layout.run_control_offset);
+    EXPECT_EQ(
+        scheduler_bootstrap_route_task(graph, state.base(), &local, run, 0), SchedulerRouteResult::READY_TO_ENQUEUE
+    );
+    EXPECT_EQ(scheduler_bootstrap_route_task(graph, state.base(), &local, run, 5), SchedulerRouteResult::WAITING);
+
+    for (int64_t producer = 0; producer < 5; ++producer) {
+        auto *control = scheduler_task_control_at(state.base(), &local, producer);
+        control->state = static_cast<int64_t>(SchedulerTaskState::DONE);
+        ASSERT_TRUE(
+            scheduler_resolve_completion(graph, state.base(), &local, run, producer, 0, producer % 2 != 0, nullptr, 0)
+        );
+        EXPECT_EQ(remaining[producer + 1], 0u);
+        EXPECT_TRUE(scheduler_ready_pool_may_have_work(state.base(), &local, 0));
+        SchedulerReadyClaim claim;
+        ASSERT_TRUE(scheduler_ready_pool_claim(graph, state.base(), &local, run, 0, &claim));
+        EXPECT_EQ(claim.task_ref, producer + 1);
+        EXPECT_FALSE(scheduler_ready_pool_may_have_work(state.base(), &local, 0));
+    }
 }
 
 }  // namespace

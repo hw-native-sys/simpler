@@ -100,13 +100,13 @@ TEST(AicoreGraphView, RejectsReferencesAndRowsOutsideTheOrdinaryGraph) {
 TEST(AicoreGraphView, HeaderOffsetCannotAuthorizeItsOwnRead) {
     scheduler_test::BasicGraphBuffer<8> buffer(2);
     auto graph = current_view(buffer);
-    graph.scheduler_state_address = 1;
-    graph.scheduler_state_bytes = 128;
+    graph.native_image_address = 1;
+    graph.native_image_bytes = 128;
     graph.native_header_offset = UINT64_MAX - 63;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
     graph.native_header_offset = 128;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
-    graph.scheduler_state_address = UINT64_MAX - 63;
+    graph.native_image_address = UINT64_MAX - 63;
     graph.native_header_offset = 64;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
 }

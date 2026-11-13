@@ -191,6 +191,11 @@ struct FixtureStorage {
             context.original_task_count = task_count;
             context.graph_view_version = SCHEDULER_GRAPH_VIEW_VERSION;
             context.graph_view_bytes = sizeof(SchedulerGraphView);
+            context.scheduler_state_base_address = reinterpret_cast<uint64_t>(scheduler_state->base());
+            context.native_image_address = 0;
+            context.native_image_bytes = 0;
+            context.ready_scratch_address = reinterpret_cast<uint64_t>(scheduler_state->base());
+            context.ready_scratch_bytes = layout.total_size;
             context.scheduler_state_bytes = layout.total_size;
             context.runtime_worker_count = workers;
             context.worker_index = worker;
@@ -278,6 +283,8 @@ struct FixtureStorage {
         config.callable_addresses_address = context->callable_addresses_address;
         config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
         config.graph_summary_offset = context->graph_summary_offset;
+        config.ready_scratch_address = context->ready_scratch_address;
+        config.ready_scratch_bytes = context->ready_scratch_bytes;
         config.runtime_worker_count = context->runtime_worker_count;
         config.scheduler_index = context->scheduler_index;
         config.scheduler_count = context->scheduler_count;

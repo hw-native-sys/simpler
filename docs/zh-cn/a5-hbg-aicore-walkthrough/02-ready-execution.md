@@ -18,8 +18,9 @@
 | `scheduler_state_address` | 调度状态 GM 基址 |
 | `native_header_offset` | native graph 头偏移；0 为普通图 |
 | `scheduler_state_bytes` | 调度状态范围 |
+| `native_image_address / native_image_bytes` | native 只读 image 的区域基址和可信长度 |
 | `original_task_count` | 原始任务存储条目数 |
-| `view_version / view_bytes` | 视图版本和大小，当前版本为 3，sizeof 为 56B |
+| `view_version / view_bytes` | 视图版本和大小，当前版本为 4，sizeof 为 72B |
 
 [ChipTaskStorage](../../../src/common/host_build_graph/runtime_types.h) 的三个成员：`task` 是描述符；`slot` 是共享任务存储里的调度信息，resident 可变依赖状态另在 SchedulerTaskControl；`payload` 是参数与依赖区域的入口。当前 sizeof 为 320，不要自行按旧版本跨度寻址。
 
@@ -136,6 +137,9 @@ bootstrap 的 exchange-before-link 只在扫描屏障尚未开放、没有 resol
 | ---- | -------- | ------ |
 | 0：AIC | 纯 AIC，以及所有 MIX（包括双 AIV MIX） | 本轮所有 AIC；MIX 由领取它的 AIC 接入 admission |
 | 1：AIV | 纯 AIV 单 subtask 任务 | 本轮所有 AIV |
+
+`ready_pool_offset` 相对 `config.ready_scratch_address` 解析：kernel/capture 下它指向 scheduler state 自身，
+program 下指向本 run 的共享 scratch 区域（ready pool 与 dependency plan 同在其中）。
 
 两个队列均为多生产者、多消费者的 append-only ticket queue，整轮不覆盖重用 entry。
 同类型核竞争同一个 head；领取到任务后，普通任务进入本核 slot，协作任务还要经过 admission、block 领取和 MIX 协议。任务入队一次，不代表所有 block 都由领到它的核执行。

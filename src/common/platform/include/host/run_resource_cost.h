@@ -31,7 +31,7 @@ struct RunResourceCost {
     std::uint64_t image_bytes{0};
     /** The GM shared-memory region of that bank. */
     std::uint64_t shared_memory_bytes{0};
-    /** This set's retained scheduler state (a5); zero where the runtime has none. */
+    /** This set's retained scheduler state and ready-pool scratch (a5); zero where the runtime has none. */
     std::uint64_t scheduler_bytes{0};
     /** The run-result region this run's epoch committed, when it has one. */
     std::uint64_t reported_bytes{0};

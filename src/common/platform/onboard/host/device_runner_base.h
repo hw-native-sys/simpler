@@ -594,6 +594,20 @@ public:
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
     );
+    /**
+     * Acquire this run's ready-pool scratch: a shared device lease plus this
+     * slot's host staging.
+     *
+     * Both are aligned to `alignment` with at least `bytes` behind them. The
+     * device block is a ScratchPool generation shared by every prepared run
+     * whose demand it covers; the host block is per slot and grow-only. The
+     * lease is retained until the run's resources retire (or the plan aborts),
+     * and refused for a kernel context, which keeps its ready pool inside the
+     * single scheduler allocation.
+     */
+    int acquire_scheduler_scratch(
+        uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
+    );
     std::shared_ptr<void> get_orchestration_scratch(uint32_t slot) const {
         return slot < orchestration_scratch_.size() ? orchestration_scratch_[slot] : std::shared_ptr<void>{};
     }
@@ -2882,6 +2896,13 @@ protected:
      */
     void abandon_scheduler_state_storage();
 
+    /** Release one slot's ready-scratch lease; the host staging stays. */
+    void release_scheduler_scratch(uint32_t pipeline_slot);
+    /** Release every slot's ready-scratch lease and the scratch pool. */
+    int release_scheduler_scratch_storage();
+    /** The fatal counterpart: forget the pool and every slot without frees. */
+    void abandon_scheduler_scratch_storage();
+
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
     void release_run_image_stagings();
@@ -3179,6 +3200,19 @@ protected:
     // which holds the grow, alignment and failure rules. One pair per slot
     // because a slot's runs are serialized while different slots' runs are not.
     RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>> scheduler_state_storage_;
+    // This run's ready-pool scratch. The device base is a shared ScratchPool
+    // generation; the host block is the slot's grow-only staging, because only
+    // the launch H2D writes the shared device region. A lease is moved into
+    // PreparedRunResources when the run is retained; otherwise the slot's own
+    // release path returns it. A grant resize is refused while any run holds a
+    // set, so no live lease is dropped by RunResourceSlots' swap.
+    struct SchedulerScratchSlot {
+        ScratchPool::Lease lease{};
+        std::unique_ptr<std::byte[]> host_storage{};
+        void *host{nullptr};
+        std::size_t host_capacity{0};
+    };
+    RunResourceSlots<SchedulerScratchSlot> scheduler_scratch_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -3229,6 +3263,11 @@ protected:
     std::shared_ptr<ScratchPool> heap_pool_;
     std::mutex heap_lease_mutex_;
     std::vector<ScratchPool::Lease> heap_leases_;
+    // Ready-pool scratch: a second generation chain, charged to the device
+    // allocator rather than the workspace ledger (scheduler state is outside
+    // the ledger's budget), with one lease per slot until its run retires.
+    std::shared_ptr<ScratchPool> scheduler_scratch_pool_;
+    std::mutex scheduler_scratch_mutex_;
     mutable std::mutex prepared_storage_mutex_;
     std::vector<PreparedRunResources::RetiredArena> retired_prepared_arenas_;
     std::vector<std::shared_ptr<RetainedSchedulerStorage>> retired_prepared_schedulers_;
@@ -3289,6 +3328,7 @@ protected:
         RunResourceSlots<std::shared_ptr<PreparedRunResources::TemporaryStorage>>::Storage temporary_storage;
         RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
         RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>>::Storage scheduler_state_storage;
+        RunResourceSlots<SchedulerScratchSlot>::Storage scheduler_scratch;
         RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
         RunResourceSlots<std::shared_ptr<void>>::Storage prepare_plans;
         RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
