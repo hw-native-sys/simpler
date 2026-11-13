@@ -113,7 +113,15 @@ real._test_environments.preflight = package_preflight
         ],
         cwd=_ROOT,
         env={
-            **{key: value for key, value in os.environ.items() if key not in {"GIT_DIR", "GIT_WORK_TREE"}},
+            **{
+                key: value
+                for key, value in os.environ.items()
+                # xdist marks its per-process roles in the environment. The
+                # inner run is a separate pytest process whose role is decided
+                # by its own arguments, so inheriting an outer worker's marker
+                # would make it believe it is already a worker.
+                if key not in {"GIT_DIR", "GIT_WORK_TREE"} and not key.startswith("PYTEST_XDIST_")
+            },
             "PYTHONPATH": os.pathsep.join((str(_ROOT), str(_ROOT / "python"))),
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
         },

@@ -57,6 +57,10 @@ jobs:
     env:
       MANUAL_MODE: ${{ inputs.manual_mode }}
       SIMPLER_SCHEDULER_TIMEOUT_MS: ${{ inputs.scheduler_timeout_ms }}
+      # Simulation devices are virtual, so the only cost of running one is host
+      # CPU and concurrency is bounded by the machine. The self-hosted pool has
+      # hundreds of threads; the 4-vCPU hosted runner Daily uses does not.
+      ST_MAX_PARALLEL: ${{ inputs.setup_variant == 'github' && '1' || '16' }}
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -126,7 +130,7 @@ jobs:
 
       - name: Run pytest scene tests
         run: |
-          .venv/bin/python -m pytest examples tests/st --platform wsesim --device 0 --max-parallel 1 -v \
+          .venv/bin/python -m pytest examples tests/st --platform wsesim --device 0-15 --max-parallel "$ST_MAX_PARALLEL" -v \
             --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "$MANUAL_MODE"
 
@@ -134,6 +138,6 @@ jobs:
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/wse/host_build_graph/vector_example \
-            --platform wsesim --device 0 --max-parallel 1 --enable-dep-gen \
+            --platform wsesim --device 0-15 --max-parallel "$ST_MAX_PARALLEL" --enable-dep-gen \
             --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}"

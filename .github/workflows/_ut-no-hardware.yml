@@ -122,7 +122,7 @@ jobs:
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
-            python -m pytest tests/ut -m "not requires_hardware" -q
+            python -m pytest tests/ut -m "not requires_hardware" -q -n 32
           else
             pytest tests/ut -m "not requires_hardware" -q
           fi
@@ -161,14 +161,14 @@ jobs:
             ccache --zero-stats >/dev/null 2>&1 || true
           fi
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${launcher[@]}"
-          cmake --build tests/ut/cpp/build --parallel 4
+          cmake --build tests/ut/cpp/build --parallel 32
           # The hit rate is what says whether the restored cache was usable, and
           # it is only readable here — a cold cache and a key that stopped
           # matching produce the same full-length build otherwise.
           if command -v ccache >/dev/null 2>&1; then
             ccache --show-stats
           fi
-          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure --timeout 300
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j32 --output-on-failure --timeout 300
 
       - name: Check C++ unit-test axis coverage
         run: |
@@ -189,7 +189,7 @@ jobs:
           # unit's include tree, which costs ~44 s on Linux and ~175 s on macOS,
           # so the second run is the more expensive one and establishes less.
           if [ "$RUNNER_OS" = "Linux" ]; then
-            python tests/lint/check_ut_cpp_axis.py --jobs 4
+            python tests/lint/check_ut_cpp_axis.py --jobs 32
           else
             echo "Axis coverage is established by the Linux leg, whose build graph is a superset of this one; skipping."
           fi

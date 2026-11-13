@@ -325,8 +325,9 @@ itself.
 ### Sim jobs on CPU-constrained runners
 
 PR simulation jobs (`st-sim-a2a3`, `st-sim-a5`, `st-sim-wse`) share the self-hosted CPU pool.
-WSE uses `--device 0 --max-parallel 1` in both PR and Daily workflows.
-The virtual-device pool and automatic parallelism below apply to A2/A3 and A5.
+WSE passes `--max-parallel` explicitly because its width is variant-dependent:
+one worker on the 4-vCPU hosted runner Daily uses, sixteen on the self-hosted
+pool. The virtual-device pool and automatic parallelism below apply to A2/A3 and A5.
 Daily also runs Ubuntu and macOS cells; a standard GitHub-hosted Ubuntu runner has **4 vCPUs**. `--device 0-15` is still the
 right choice for the **pool size** (some L3 cases need several virtual ids), but
 the default `--max-parallel auto` caps the in-flight subprocess count to
