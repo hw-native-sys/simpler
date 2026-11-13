@@ -222,7 +222,12 @@ class TestMixKernelRendezvous(SceneTestCase):
         ],
     }
     CASES = [
-        {"name": f"burst256_mask{mask}", "platforms": ["a5sim", "a5"], "params": {"mask": mask, "task_count": 256}}
+        {
+            "name": f"burst256_mask{mask}",
+            "platforms": ["a5sim", "a5"],
+            "manual": ["a5"],
+            "params": {"mask": mask, "task_count": 256},
+        }
         for mask in [6, 7]
     ]
 

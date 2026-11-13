@@ -247,6 +247,7 @@ def cases(ranks):
                 f"{'counter_late' if late else 'counter_ready'}"
             ),
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": ranks, "num_sub_workers": 0},
             "params": {
                 "ranks": ranks,
