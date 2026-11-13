@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include "kernel_error.h"
 #include "scheduler_context.h"
 
 #include "utils/fatal_shutdown_latch.h"
@@ -665,7 +666,7 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, [[maybe_unu
 int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
     const int32_t *cores = core_trackers_[thread_idx].core_ids();
     const int32_t core_num = core_trackers_[thread_idx].core_num();
-    if (core_num == 0) return 0;  // orchestrator threads own no core
+    if (core_num == 0) return retirement_error();  // orchestrator threads own no core
 
 #if SIMPLER_DFX
     // A fatal run ends in a host-side device reset, so counters read here would
@@ -680,7 +681,8 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
     }
 #endif
     LOG_INFO("Thread %d: retiring %d cores", thread_idx, core_num);
-    return retire_cores(runtime, cores, core_num);
+    const int32_t rc = retire_cores(runtime, cores, core_num);
+    return rc != 0 ? rc : retirement_error();
 }
 
 int32_t SchedulerContext::retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
@@ -764,9 +766,12 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
         Handshake *report = &runtime->dev.workers[claimed_ids[i]];
         aicore_invalidate_retired_report(report);
         cache_flush_range(report, sizeof(*report));
+        __atomic_fetch_or(&retirement_state_[claimed_ids[i]], RETIREMENT_RELEASED, __ATOMIC_RELEASE);
     }
     wmb();
     if (rc != 0) {
+        int32_t expected = 0;
+        retirement_error_.compare_exchange_strong(expected, rc, std::memory_order_acq_rel);
         // Naming the cores is the only signal an unreleased worker leaves: it
         // spins on a gate it cannot log about, and the host sees just a stream
         // timeout. See docs/troubleshooting/a2a3-worker-retirement.md.
@@ -788,6 +793,119 @@ int32_t SchedulerContext::retire_all_cores(Runtime *runtime) {
     for (int32_t i = 0; i < cores_total_num_; ++i)
         all[n++] = i;
     return retire_cores(runtime, all, n);
+}
+
+void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup &result) {
+    result = {};
+    result.run_epoch = get_platform_run_result_epoch();
+    result.core = -1;
+    result.expected_cores = cores_total_num_;
+    result.core_error = retirement_error();
+    for (int32_t core = 0; core < cores_total_num_; ++core) {
+        if ((__atomic_load_n(&retirement_state_[core], __ATOMIC_ACQUIRE) & RETIREMENT_RELEASED) != 0) {
+            ++result.released_cores;
+        } else if (result.core == -1) {
+            result.core = core;
+        }
+    }
+    if (cores_total_num_ == 0 || result.core_error != 0 || result.released_cores != result.expected_cores) {
+        result.source = 1;
+        return;
+    }
+    if (sched_ == nullptr || rt_ == nullptr) {
+        result.async_error = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+        return;
+    }
+    // No completion or release callback is allowed here. The failed graph's
+    // dependencies stay unsatisfied while outstanding hardware readers finish.
+    auto retire = [&](CompletionCondition &condition, TaskId task, uint32_t source, int32_t core) {
+        while (true) {
+            if (condition.completion_type == COMPLETION_TYPE_COUNTER && condition.counter_addr != nullptr) {
+                cache_invalidate_range(const_cast<const uint32_t *>(condition.counter_addr), sizeof(uint32_t));
+            }
+            const CompletionPollResult poll = condition.test();
+            if (poll.state == CompletionPollState::READY) {
+                condition.satisfied = true;
+                condition.retire();
+                ++result.drained_conditions;
+                return true;
+            }
+            if (poll.state == CompletionPollState::FAILED || get_sys_cnt_aicpu() >= deadline) {
+                result.async_error =
+                    poll.state == CompletionPollState::FAILED ? poll.error_code : SIMPLER_ERROR_SCHEDULER_TIMEOUT;
+                result.task_token = TaskId::to_uint64(task);
+                result.source = source;
+                result.core = core;
+                return false;
+            }
+            SPIN_WAIT_HINT();
+        }
+    };
+    auto retire_raw = [&](uint64_t addr, uint64_t cookie, uint32_t expected, uint32_t engine, int32_t type, TaskId task,
+                          uint32_t source, int32_t core) {
+        CompletionCondition condition{};
+        condition.addr = addr;
+        condition.backend_cookie = cookie;
+        condition.expected_value = expected;
+        condition.engine = static_cast<AsyncEngine>(engine);
+        condition.completion_type = type;
+        condition.counter_addr =
+            type == COMPLETION_TYPE_COUNTER ? reinterpret_cast<volatile uint32_t *>(addr) : nullptr;
+        return retire(condition, task, source, core);
+    };
+    auto &waits = sched_->async_wait_list;
+    for (int32_t i = 0; i < waits.count.load(std::memory_order_relaxed); ++i) {
+        auto &entry = waits.entries[i];
+        for (int32_t j = 0; j < entry.condition_count; ++j) {
+            if (!retire(entry.conditions[j], entry.task_token, 2, -1)) return;
+        }
+    }
+    if (rt_->aicore_mailbox != nullptr) {
+        AICoreCompletionMsgView msg{};
+        while (rt_->aicore_mailbox->try_pop(msg)) {
+            if (msg.kind == MSG_KIND_TASK_NORMAL_DONE) continue;
+            if (msg.kind != MSG_KIND_CONDITION || !retire_raw(
+                                                      msg.addr, msg.backend_cookie, msg.expected_value, msg.engine,
+                                                      msg.completion_type, msg.task_token, 3, -1
+                                                  )) {
+                if (result.async_error == 0) result.async_error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+                return;
+            }
+        }
+        if (rt_->aicore_mailbox->has_pending()) {
+            result.async_error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+            result.source = 3;
+            return;
+        }
+    }
+    for (int32_t core = 0; core < cores_total_num_; ++core) {
+        for (int32_t buffer = 0; buffer < 2; ++buffer) {
+            auto &slab = deferred_slab_per_core_[core][buffer];
+            // FIN/exit stopped this slab's writer. Preserve scheduler-owned
+            // suffix compaction: slab storage is already coherent on AICPU.
+            const uint32_t count = slab.count;
+            const TaskId task = payload_per_core_[core][buffer].local_context.async_ctx.task_token;
+            if (count > MAX_COMPLETIONS_PER_TASK || (count != 0 && !task.is_valid()) ||
+                (slab.error_code != 0 && !is_kernel_error(slab.error_code))) {
+                result.async_error = slab.error_code != 0 && !is_kernel_error(slab.error_code) ?
+                                         slab.error_code :
+                                         SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+                result.source = 4;
+                result.core = core;
+                result.task_token = TaskId::to_uint64(task);
+                return;
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto &entry = slab.entries[i];
+                if (!retire_raw(
+                        entry.addr, entry.backend_cookie, entry.expected_value, entry.engine, entry.completion_type,
+                        task, 4, core
+                    ))
+                    return;
+            }
+        }
+    }
+    result.complete = 1;
 }
 
 // =============================================================================
@@ -1252,6 +1370,7 @@ int32_t SchedulerContext::pre_handshake_init(
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
     memset(retirement_state_, 0, sizeof(retirement_state_));
+    retirement_error_.store(0, std::memory_order_relaxed);
 
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1510,6 +1629,7 @@ void SchedulerContext::deinit() {
     orchestrator_done_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
     fatal_shutdown_started_.store(false, std::memory_order_release);
+    retirement_error_.store(0, std::memory_order_relaxed);
 
     // Reset core discovery and assignment state
     aic_count_ = 0;
