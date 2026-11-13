@@ -50,7 +50,7 @@ It needs the compile lines, so configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=O
 
 ```bash
 cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build tests/ut/cpp/build --parallel 4
+cmake --build tests/ut/cpp/build --parallel 32
 python tests/lint/check_ut_cpp_axis.py
 ```
 
