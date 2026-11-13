@@ -205,8 +205,8 @@ inline __aicore__ void aicore_stage_native_report(
  * the address the AICPU republishes at hand-off.
  *
  * `runtime_mode` is 0 until a run publishes a choice: a zero is "no scheduler
- * selected", not a selection, and every supported fallback is published
- * explicitly. `worker_context_base` is the device address of worker 0's
+ * selected", not a selection. A5 HBG accepts only resident modes.
+ * `worker_context_base` is the device address of worker 0's
  * SchedulerWorkerContext, so worker i's context is
  * `worker_context_base + i * sizeof(SchedulerWorkerContext)`; it is 0 whenever
  * the mode is not resident.

@@ -15,7 +15,7 @@
 
 **用户约定：方案确定后按阶段自主实现，遇到问题自行分析、修复、验证和迭代，不因常规实现选择反复询问用户。**
 每阶段保留代码差异、验证结果、未解决问题和下一步，不把上下文切换当作停止任务或重新确认的理由。
-不得通过缩减功能覆盖、掩盖 native fallback、删掉慢用例或放宽数值正确性来完成门禁。
+不得通过缩减功能覆盖、隐藏 prepare 拒绝、删掉慢用例或放宽数值正确性来完成门禁。
 
 执行顺序：修改前主线基线 → 分阶段实现与局部回归 → 新旧功能验证 → 无 Graph 与现有 A5 Qwen3 的性能测量和优化 → 最终复审。
 用户于 2026-11-02 调整优先级：无 Graph 性能尚未达标时，也要优先测出并反馈 Qwen 的主线/候选数据。
@@ -99,7 +99,7 @@ Graph 模式的 raw storage accessor 应拒绝 synthetic/child ref，防止漏�
 | 阶段 | 依赖与产物 | 离开本阶段的证据 |
 | ---- | ---------- | ---------------- |
 | B0 基线 | 冻结主线 SHA、工具链与工作负载 manifest；采集 ST 并筛选性能用例 | 原始日志、机器信息、用例选择理由、可比较的 timing marker 齐全 |
-| I1 统一视图 | B0 后实现 view/accessor，先保持 Graph 仍走 legacy | 无 Graph 新旧结果一致；所有访问器和版本/边界 UT 通过 |
+| I1 统一视图 | view/accessor 统一 ordinary 与 native Graph 输入 | 无 Graph 原有结果保持；所有访问器和版本/边界检查保持有效 |
 | I2 最小 native Graph | I1 后接 plan/GM、ENTER/EXIT/control inbox、普通 child 参数与 completion | 单 Graph、多个实例、交错普通任务端到端 native；进入模式有证据 |
 | I3 完整调度语义 | I2 后接 SPMD、MIX、sync_start、predicate、失败与 pipeline lifecycle | 下面的并发矩阵通过，A2A3 公共层无回归 |
 | I4 DFX 与完整功能 | I3 后补 identity/schema/oracle，审计 trace allocation 与所有诊断读者 | 新用例与原 A5 HBG corpus 通过；结果来自同一 revision |
@@ -107,8 +107,8 @@ Graph 模式的 raw storage accessor 应拒绝 synthetic/child ref，防止漏�
 | P2 A5 Qwen Graph 模型 | 对已有必要功能证据的候选，优先验证完整输出/KV 状态并 benchmark；可先于 P1 达标 | native 路径正确，主线/候选数值及时反馈，性能问题完成归因和迭代验证 |
 | R 最终复审 | 协议、代码、功能、性能、内存/退出证据汇总 | 无未解决正确性缺陷；剩余限制和实测数据明确 |
 
-I2/I3 的中间版本可按已完成 capability 选择整 run legacy，不能用一个总开关掩盖未实现的 shape。
-最终支持集合必须达到总览范围，不能把中间 fallback 视为需求完成。
+A5 HBG 的当前执行合同只包含 resident ordinary/native Graph。Host 拒绝不满足形状、
+canonical 参数布局或容量的输入，不发布另一套执行器的选择。中间实现不能以缩减支持集合完成门禁。
 每轮优化只改变有证据支持的瓶颈；性能变化后复跑相关正确性、协议和生命周期用例。
 
 ## 功能与故障矩阵
@@ -131,10 +131,12 @@ I2/I3 的中间版本可按已完成 capability 选择整 run legacy，不能用
 | 完成 | EXIT 先于某 producer 的 resolve 尾部、空 control queue、有未 flush 计数 | 计数 N-H 与完整 drain 同时满足才成功 |
 | 错误 | 部分绑定、非法 wire、重复 DONE、queue 发布失败、late error、退出超时 | fatal 保留身份；计数不能掩盖错误；未安全退出不得复用 backing |
 | Host 生命周期 | allocation retry、park/resume、partial publication、连续及流水运行 | plan 自有字节、重新 rebase、slot 隔离、资源保留到 fence |
-| 兼容 | 无 Graph 全量、已有 Graph legacy、合法不支持 shape、A2A3 公共路径 | 原语义保留，native/fallback 选择可观测且符合 capability |
+| 当前运行变体 | 无 Graph 全量、native Graph、A2A3 公共路径、显式 percounter | A5 HBG 每次发布 resident 选择；其他活跃 runtime 的构建与语义保持 |
+| 失败启动 | 未知 mode、缺失/不对齐 bootstrap、worker 地址溢出 | AICore 报告身份后不读 backing；AICPU 拒绝并完成 EXIT/ACK/退核，失败 terminal 不得报告成功 |
 
 执行前应用仓库 testing/onboard-arch-precheck 流程，真实检测 A5 silicon，通过 `task-submit` 持有设备锁。
-运行新增 UT、受影响原 UT、A5 HBG 全部原有与新增 scene 的 sim/onboard 验证；手工标记和故障类按各自隔离要求运行。
+新增与修改的 UT 保留给 CI。legacy 执行路径移除任务按用户要求不运行 CPU 验证；
+设备/模拟器验收应记录实际执行范围，手工标记和故障类按各自隔离要求运行。
 改公共 wire/binder 校验时补 A2A3 HBG 的对应 sim 与可用硬件回归；没有对应硬件不能声称 onboard 已通过。
 基线自身失败单独复现并记录，不能当成本次成功或静默跳过；本次引入的问题自行修复。
 

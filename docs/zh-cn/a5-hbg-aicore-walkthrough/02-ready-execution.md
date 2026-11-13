@@ -25,7 +25,7 @@
 
 **范围与用途：** `ChipTaskStorage` 及其 `TaskDescriptor`、`TaskPayload` 属于原始任务存储条目，与 worker/执行 slot 无关。某任务的多个 block 可以反复读取同一份参数源。native child 的描述来自 template/instance，不必各占一个原始 ChipTaskStorage。
 
-[TaskDescriptor](../../../src/common/host_build_graph/runtime_types.h)：`task_id` 为公开任务身份；`kernel_id[3]` 对应三个子任务入口 ID；`packed_buffer_base/end` 为打包输出区的起止地址；`graph_definition_offset` 为 GRAPH 定义偏移；`reserved[20]` 保留。本次不展开它们的 host 构造或 legacy 管理。
+[TaskDescriptor](../../../src/common/host_build_graph/runtime_types.h)：`task_id` 为公开任务身份；`kernel_id[3]` 对应三个子任务入口 ID；`packed_buffer_base/end` 为打包输出区的起止地址；`graph_definition_offset` 为 GRAPH 定义偏移；`reserved[20]` 保留。本次不展开它们的 host 构造。
 
 [TaskPayload](../../../src/common/host_build_graph/runtime_types.h) 中 resident 参数读取关心：
 

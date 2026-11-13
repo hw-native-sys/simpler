@@ -57,12 +57,12 @@ L/G 已接入持久 pending 与 bootstrap/dispatch 服务。复审核对了正�
 | R8 | 提前释放：EXIT DONE 时某 producer 仍在 resolve 其他 waiter，或 MIX lane 未 release | 节点计数位于 resolve 尾部，另外保留 LocalDone/ordered-exit/run fence |
 | R9 | 假完成：错误清理推进计数，被 supervisor 判成功 | count equality、error==0、完整退出证明同时满足；late error 回归 |
 | R10 | 悬空地址：plan 引用局部 GraphHostState；retry 沿用上次 GM base | 自有无地址 plan、commit 时实例化；park/resume/pipeline 隔离测试 |
-| R11 | 不可访问：把 AICPU LaunchEnvelope 地址给 AICore | native Definition 独立 GM backing；native/legacy carrier 在发布前选定 |
+| R11 | 不可访问：把 AICPU LaunchEnvelope 地址给 AICore | native Definition 独立 GM backing；A5 不从 AICPU LaunchEnvelope 读取 Definition |
 | R12 | 容量：直接沿用顶层 128 fanin 上限，EXIT 有 1024 sinks | Graph accessor 用宽 count/cursor；完整 checked capacity，不截断、不静默跳边 |
 | R13 | 内存误报：不写 320N storage 就声称释放其空间，或重复分配 args | 复用已预留 tail，报告真实 reserved_heap；未来 allocator 优化单独证明 |
 | R14 | 进度误判：大 Graph shell 未完成或 worker 持续忙，AICPU 看不到内部进度 | 按真实 node resolved 监督，定期 flush 非空局部计数；不发送假 heartbeat |
 | R15 | 漏测：oracle 直接读取被测 planner 的错误边；DFX 混淆 shell/ref | 独立外部图+原始 Definition oracle，新 schema 携带两种身份 |
-| R16 | 假收益：性能跑到 legacy、无 Graph 集混入 Graph，或仅测试 CSA 子算子 | 每 case 保留 Graph/mode 证据；现有 A5 Qwen 完整模型与同卡主线对照，CSA 按完整负载验证 |
+| R16 | 假收益：实际执行器或产物身份不符、无 Graph 集混入 Graph，或仅测试 CSA 子算子 | 每 case 保留 Graph/mode 证据；现有 A5 Qwen 完整模型与同卡主线对照，CSA 按完整负载验证 |
 | R17 | 越界：先解引用损坏的 header offset，再用 header 自报长度验证自身 | view 携带 allocation layout 的实际 bytes；先验 header 范围，再核对 image_bytes；坏 offset/长度 UT |
 | R18 | 缓存：local config 校验 native header 时，bootstrap 的整 cache observe 尚未发生 | native 首次读取前完成本 run 的 bootstrap observe；保持无 Graph 时序；同地址新 epoch 回归 |
 
@@ -113,17 +113,17 @@ bootstrap 并行准备并未减少参数总写入量，而是改变其并行度�
 
 | PR | 核对 head | 与本设计的关系 |
 | -- | --------- | -------------- |
-| [#2533](https://github.com/hw-native-sys/simpler/pull/2533) | `62a7be43a2f08177940452e2d70801c25081d167` | 公共 Graph roots/external-ready 双事件握手；native 静态 gate 避免复制它，legacy 回归仍相关 |
+| [#2533](https://github.com/hw-native-sys/simpler/pull/2533) | `62a7be43a2f08177940452e2d70801c25081d167` | 公共 Graph roots/external-ready 双事件握手；native 静态 gate 避免复制它，该历史握手用于核对语义，A5 当前执行无需该物化器 |
 | [#2538](https://github.com/hw-native-sys/simpler/pull/2538) | `00ea17ce3f1382008a5ab49ae0f5f1e789dbc213` | Graph config key collision；采用当前主线 key 契约，不能预先声称新规则可用 |
 | [#2646](https://github.com/hw-native-sys/simpler/pull/2646) | `6cb08c739b4ffe211f4c2a007d66b323fd7608fd` | Graph packet/restore 与 Host bind 布局重叠 |
 | [#2647](https://github.com/hw-native-sys/simpler/pull/2647) | `2dd4cbec9a97f96f5bb7a66e9543e9c65ab1376d` | Kernel Mode 与 Graph 资源生命周期重叠 |
 | [#2719](https://github.com/hw-native-sys/simpler/pull/2719) | `dea341f83107f9be9a3c05fbd2af827ac8e81b93` | launch attrs/dep_gen/基准工具重叠，影响 DFX 与 oracle 输入 |
 | [#2750](https://github.com/hw-native-sys/simpler/pull/2750) | `f0f6b314bb3645ec5ecbb279621d5d6170cd0c5d` | resident task-time args dump；child 参数和身份接入点重叠 |
-| [#2759](https://github.com/hw-native-sys/simpler/pull/2759) | `f5ce0e4bf0bd714455a9799bcbd360af40f1fec9` | legacy spare lane 路径；不是 native Graph 实现，保留 fallback 对照 |
+| [#2759](https://github.com/hw-native-sys/simpler/pull/2759) | `f5ce0e4bf0bd714455a9799bcbd360af40f1fec9` | 历史 AICPU spare lane 路径；不属于当前 native Graph 执行合同 |
 
 PR #2533 描述的是 portable C++ memory model 下的可允许执行：两个独立 release/acquire 发布者可能互相读到旧值，
 因而都没有推进 root；它不是本次发现的硬件故障复现。
-其修复用同一原子对象上的 RMW 将事件串接。本方案不声称改好了 legacy 问题，也不依赖该 PR 合入才可建立静态 gate。
+其修复用同一原子对象上的 RMW 将事件串接。该历史问题不改变当前 native 静态 gate 的协议；其他活跃运行时仍按各自合同验证。
 
 ## 尚需实证的风险与完成条件
 
@@ -134,7 +134,7 @@ PR #2533 描述的是 portable C++ memory model 下的可允许执行：两个�
 | control queue 公平性与切片预算 | slot 全满、长链、高 fanout、真实模型 tail | 调整有界服务并复跑普通/cooperative 用例 |
 | 唯一 Definition 计划的复杂度和容量 | 最大 fanin、实例数、host bind/H2D/峰值存储 | 消除重复扫描和浪费；合法容量不足保持发布前明确结果 |
 | 无 Graph 热路径额外开销 | 修改前固定集与筛选 ST 的逐 case A/B | 分离 mapped 快路、减少无 Graph 分支/额外状态后复测 |
-| 参数准备与模型性能 | 现有 A5 Qwen 的 legacy/native、bootstrap、首 child 和间隙分解 | 按性能流程继续迭代，不以功能通过代替性能交付 |
+| 参数准备与模型性能 | 现有 A5 Qwen 冻结主线/候选 resident、bootstrap、首 child 和间隙分解 | 按性能流程继续迭代，不以功能通过代替性能交付 |
 | 新增诊断 offset 为零 | 所有 reader/error/export 审计与 DFX 功能回归 | 审计未完成则保留真实分配，不能报告虚构内存节省 |
 
 实现前没有无法表达的必要协议环节；仍不能因此保证不存在未知漏洞。

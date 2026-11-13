@@ -82,11 +82,11 @@ bool native_graph_plan_definition(
         def.scalar_arg_count > def.task_count * MAX_SCALAR_ARGS || def.predicate_count < 0 ||
         def.predicate_count > def.task_count)
         return fail(error, "invalid Definition header counts");
-    GraphExecutionStorageLayout legacy{};
+    GraphExecutionStorageLayout reserved{};
     if (!graph_execution_storage_layout(
-            def.task_count, def.tensor_arg_count, def.scalar_arg_count, def.edge_count, &legacy
+            def.task_count, def.tensor_arg_count, def.scalar_arg_count, def.edge_count, &reserved
         ) ||
-        legacy.total_bytes != def.execution_storage_bytes)
+        reserved.total_bytes != def.execution_storage_bytes)
         return fail(error, "invalid reserved execution storage");
     std::vector<Region> regions;
     if (!section<int32_t>(def, def.off_fanout_offsets, def.task_count + 1, regions) ||
@@ -161,6 +161,8 @@ bool native_graph_plan_definition(
 
     next.children.resize(static_cast<size_t>(def.task_count));
     uint64_t required_heap = 0;
+    int32_t tensor_cursor = 0;
+    int32_t scalar_cursor = 0;
     for (int32_t i = 0; i < def.task_count; ++i) {
         const auto task = element<SubTaskDefinition>(next.image, def.off_sub_tasks, i);
         const TaskAttrs attrs(task.task_attrs);
@@ -180,6 +182,10 @@ bool native_graph_plan_definition(
             (active == 0 && (task.logical_block_num != 1 || attrs.has_predicate() || attrs.requires_sync_start())) ||
             ((task.ed_flags & ED_FLAG_CANDIDATE) != 0 && (in(i) == in(i + 1) || attrs.has_predicate() || active == 0)))
             return fail(error, "invalid child shape or argument span");
+        if (task.tensor_offset != tensor_cursor || task.scalar_offset != scalar_cursor)
+            return fail(error, "noncanonical child argument span");
+        tensor_cursor += task.tensor_count;
+        scalar_cursor += task.scalar_count;
         const auto offset = element<uint64_t>(next.image, def.off_sub_task_offsets, i);
         const uint64_t output_bytes = CHIP_ALIGN_UP(static_cast<uint64_t>(task.total_output_size), CHIP_ALIGN_SIZE);
         if (offset != required_heap || required_heap > def.required_heap ||
@@ -239,8 +245,11 @@ bool native_graph_plan_definition(
                 return fail(error, "invalid child predicate");
         }
     }
+    if (tensor_cursor != def.tensor_arg_count || scalar_cursor != def.scalar_arg_count)
+        return fail(error, "incomplete child argument pool coverage");
     if (required_heap != def.required_heap) return fail(error, "incomplete child heap coverage");
-    if (next.args_bytes > def.execution_storage_bytes) next.resident_supported = false;
+    if (next.args_bytes > def.execution_storage_bytes)
+        return fail(error, "native arguments exceed reserved execution storage");
     if (error != nullptr) error->clear();
     *out = std::move(next);
     return true;
@@ -353,7 +362,7 @@ bool native_graph_plan_readonly_image(
         entry.args_bytes = source.args_bytes;
         entry.execution_count = source.execution_count;
         entry.required_heap = def.required_heap;
-        entry.legacy_execution_storage_bytes = def.execution_storage_bytes;
+        entry.reserved_execution_storage_bytes = def.execution_storage_bytes;
         entry.graph_key = def.graph_key;
         if (!reserve(entry.definition_bytes, 1, GRAPH_DEFINITION_OBJECT_ALIGN, &entry.definition_offset) ||
             !reserve(

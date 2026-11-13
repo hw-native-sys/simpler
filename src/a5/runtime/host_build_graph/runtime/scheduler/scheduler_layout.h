@@ -17,11 +17,6 @@
 
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING = 1;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
-// A zeroed Handshake is not a scheduler choice. Every supported fallback is
-// published explicitly so an ordinary run cannot silently drift back to the
-// legacy dependency scheduler while continuing to pass result-only tests.
-constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH = 3;
-constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE = 4;
 
 struct SchedulerSpmdRequirements {
     uint64_t worker_count{0};

@@ -75,18 +75,11 @@ TEST(AicoreSchedulerError, LatchesFirstHostVisibleFailure) {
     EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
 }
 
-TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
+TEST(AicoreSchedulerState, AcceptsOnlyCurrentResidentModes) {
     EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(0));
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING));
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_RESIDENT_READY));
-    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH));
-    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
-
-    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(0));
-    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING));
-    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_RESIDENT_READY));
-    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH));
-    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(UINT32_MAX));
 }
 
 TEST(AicoreSchedulerState, ResidentAcceptsOrdinaryPureAndMixMultiBlock) {

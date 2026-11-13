@@ -107,7 +107,7 @@ struct AicpuExecutor {
     void service_args_dump(int32_t thread_idx);
     void deinit(Runtime *runtime);
     void reset_entry_state();
-    int32_t finish_failed_init(Runtime *runtime);
+    int32_t finish_failed_init(Runtime *runtime, int32_t shutdown_rc);
     // Decide this run's terminal record while the state it reads is still
     // valid. Runs inside the completion gate's finalizer, on the last
     // participant out.
@@ -118,7 +118,7 @@ struct AicpuExecutor {
 
     // ===== The steps a scheduler decides for itself =====
     //
-    // Each default is what the AICPU-dispatched and resident schedulers do, and
+    // Each default implements the resident scheduler's lifecycle, and
     // each is weak: a replacement replaces that one step, and the code around it
     // in init and run is the same either way. None runs per task; all but the
     // last run once per thread per run, and the last once per run.
@@ -128,10 +128,8 @@ struct AicpuExecutor {
     SIMPLER_SCHEDULER_STEP int32_t post_handshake_init(Runtime *runtime);
     // Hand this thread's slice of the worker contexts to the cores.
     SIMPLER_SCHEDULER_STEP void publish_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
-    // Whether the cores take their own work for this run. False sends it down
-    // the legacy path instead, where the AICPU dispatches each task and which
-    // owns its own teardown. Both paths drive the cores; what differs is which
-    // side decides what runs next.
+    // Whether this runtime accepts the published bootstrap. A rejection still
+    // discovers the launched cores and retires them without publishing READY.
     SIMPLER_SCHEDULER_STEP bool schedules_on_aicore(const Runtime *runtime) const;
     // Whether the leader waits for the cores to acknowledge the bootstrap.
     SIMPLER_SCHEDULER_STEP bool awaits_bootstrap() const;

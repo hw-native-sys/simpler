@@ -56,7 +56,7 @@
 
 | 字段 | 作用 |
 | ---- | ---- |
-| `runtime_mode` | 选择 resident/明确 fallback；这里读 1 或 2 才走主线 |
+| `runtime_mode` | A5 HBG 选择 resident，取值 1 或 2；无效值进入失败启动清退 |
 | `reserved_` | 对齐保留字段 |
 | `worker_context_base` | worker 0 的 SchedulerWorkerContext 完整 GM 地址 |
 
@@ -79,7 +79,18 @@ epoch 为 0 时，沿无 stamp 的报告协议写身份，屏障后写 done。AI
 [handshake_partition](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp) 中线程 t 负责
 `[t*N/T, (t+1)*N/T)`。每轮扫描自己分区，接受报告后执行 `rmb()`，再读报告 payload 并建立 `cores_[i]`。
 
-所有分区完成后，leader 进入 [post_handshake_init](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp)：
+所有分区完成后，leader 先校验当前 scheduler 启动步骤。A5 HBG 的 mode 必须为 1/2，
+context base 必须非零、满足对齐并容纳全部 worker context，地址计算不能溢出。
+拒绝时锁存 `INVALID_ARGS` 并走各分区失败退休；AICore 在报告身份后只等 EXIT，
+不读取 scheduler backing，nonce ACK 和 teardown release 仍须完成。
+
+READY 前的正常等待同样不解引用 context；READY 发布后才按实际配置的 timeout 检查累计等待时长。
+发现完成后，每个物理寄存器窗口只能有一个退休 owner；重复或缺失 report 不贡献退休证明。
+启动阶段失败不能越过仍在写共享状态的配置 owner。leader 统一发布最终启动结果；
+若某分区已经放行而后续启动屏障失败，该分区仍负责 EXIT/ACK 清退。
+非法 AICPU 线程数由 callback 0 使用平台 startup-abort 清退，不建立非法线程数的 executor 屏障。
+
+校验成功后，leader 进入 [post_handshake_init](../../../src/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp)：
 
 1. 分别为 AIC、AIV 编排 `type_rank`。
 2. 校验 AIV 数恰好为 AIC 数的两倍，与图中预期 worker/cluster 数一致。

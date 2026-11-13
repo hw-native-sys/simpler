@@ -26,8 +26,6 @@
 
 #include "resident_scheduler.h"
 
-__aicore__ void legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
-
 namespace {
 
 template <bool WithProfiling, bool WithNativeGraph>
@@ -61,12 +59,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
     const uint32_t profiling_flag = get_aicore_profiling_flag();
     scheduler_observe_cache_line(handshake);
-    if (runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
-        runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) {
-        legacy_aicore_execute(runtime, block_idx, core_type);
-        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
-        return;
-    }
     const bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     uint64_t aicore_entry_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
     const uint64_t report_epoch = get_aicore_report_epoch();
@@ -100,34 +92,28 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     dsb((mem_dsb_t)0);
     uint64_t handshake_publish_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
 
-    // AICPU publishes the fully configured context through GM. This lets
-    // AICore perform all pre-kernel work without consuming a DMB launch.
-    // The host-published base plus this core's index gives the same address the
-    // AICPU republishes on the handshake at hand-off, so it carries enough
-    // immutable scheduler-state addressing for the READY watchdog. AICPU fills
-    // the topology-dependent context fields before READY, so this pre-publish
-    // view must not be reused for execution.
-    __gm__ SchedulerWorkerContext *pending_context = reinterpret_cast<__gm__ SchedulerWorkerContext *>(
-        scheduler_worker_context_address(bootstrap->worker_context_base, block_idx)
-    );
-    scheduler_observe_cache_line(pending_context);
-    __gm__ void *pending_scheduler_state_base =
-        reinterpret_cast<__gm__ void *>(pending_context->scheduler_state_base_address);
-    __gm__ SchedulerRunControl *pending_run_control =
-        scheduler_state_at<SchedulerRunControl>(pending_scheduler_state_base, pending_context->run_control_offset);
-    scheduler_observe_cache_line(pending_run_control);
+    const uint64_t context_base = bootstrap->worker_context_base;
+    const int32_t worker_count = runtime->dev.worker_count;
+    const bool valid_bootstrap =
+        (runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING ||
+         runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY) &&
+        worker_count > 0 && worker_count <= static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) && block_idx >= 0 &&
+        block_idx < worker_count && context_base != 0 && context_base % alignof(SchedulerWorkerContext) == 0 &&
+        context_base <= UINT64_MAX - static_cast<uint64_t>(worker_count) * sizeof(SchedulerWorkerContext);
+    if (!valid_bootstrap) {
+        // Discovery and retirement use the report and teardown gate only;
+        // an invalid bootstrap grants no access to scheduler backing.
+        wait_for_aicpu_exit_signal();
+        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        return;
+    }
+
+    // READY publishes the configured context. Until then only the report and
+    // EXIT registers are accessible, including when configuration fails.
     uint32_t startup_signal = 0;
-    bool context_wait_timed_out = false;
     const uint64_t context_wait_start = get_sys_cnt_aicore();
     while (handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY && startup_signal != AICORE_EXIT_SIGNAL) {
         scheduler_observe_cache_line(handshake);
-        // Configuration remains valid while AICPU initializes execution state.
-        // The error record does not: it may still belong to the preceding run.
-        context_wait_timed_out =
-            context_wait_timed_out || scheduler_watchdog_expired(
-                                          context_wait_start, get_sys_cnt_aicore(),
-                                          scheduler_gm_query(pending_run_control->scheduler_timeout_cycles)
-                                      );
         startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
         SPIN_WAIT_HINT();
     }
@@ -148,7 +134,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ SchedulerRunControl *run_control =
         scheduler_state_at<SchedulerRunControl>(scheduler_state_base, context->run_control_offset);
     scheduler_observe_cache_line(run_control);
-    if (context_wait_timed_out) {
+    if (scheduler_watchdog_expired(
+            context_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
+        )) {
         scheduler_record_error(
             run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, nullptr, context,
             SchedulerErrorSite::CONTEXT_READY_TIMEOUT

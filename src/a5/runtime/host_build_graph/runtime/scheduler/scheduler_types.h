@@ -1241,8 +1241,7 @@ struct alignas(64) AicpuThreadLifecycleTrace {
 };
 
 struct alignas(64) SchedulerWorkerContext {
-    // READY publishes the configuration prefix. Peer routing and the pre-READY
-    // watchdog read only this first line.
+    // READY publishes the configuration prefix used by peer routing.
     int32_t core_type;
     int32_t physical_core_id;
     int32_t type_rank;

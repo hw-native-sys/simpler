@@ -213,7 +213,7 @@
       "measure": true
     },
     {
-      "path": "tests/st/a5/host_build_graph/spmd_legacy_fallback/test_spmd_legacy_fallback.py",
+      "path": "tests/st/a5/host_build_graph/spmd_shape_selection/test_spmd_shape_selection.py",
       "class": "TestSpmdShapeSelection",
       "case": "aic_root_block_num_2",
       "params": {
@@ -226,7 +226,7 @@
       "timing_requires_golden": true
     },
     {
-      "path": "tests/st/a5/host_build_graph/spmd_legacy_fallback/test_spmd_legacy_fallback.py",
+      "path": "tests/st/a5/host_build_graph/spmd_shape_selection/test_spmd_shape_selection.py",
       "class": "TestSpmdShapeSelection",
       "case": "aic_root_sync_start_block_num_2",
       "params": {

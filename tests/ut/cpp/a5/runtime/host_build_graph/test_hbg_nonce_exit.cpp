@@ -47,30 +47,33 @@ bool wait_until(Predicate predicate, std::chrono::milliseconds budget) {
     return true;
 }
 
-// Run the actual resident and legacy executors. The death-test subprocess
-// bounds deliberately withheld EXIT/request/release without leaking a spinner.
-void check_exit(bool resident, uint64_t epoch, CoreType type, uint32_t old_cond) {
+// The subprocess bounds withheld EXIT/request/release without leaking a spinner.
+enum class BootstrapBase { VALID, ABSENT, MISALIGNED, OVERFLOWING };
+
+void check_exit(uint32_t mode, BootstrapBase base, uint64_t epoch, CoreType type, uint32_t old_cond) {
     auto runtime = std::make_unique<Runtime>();
     SchedulerWorkerContext context{};
     SchedulerRunControl run_control{};
+    runtime->set_worker_count(1);
     report_epoch = epoch;
     registers.fill(0);
     const uint64_t address = reinterpret_cast<uint64_t>(registers.data());
     write_reg(address, RegId::COND, old_cond);
     first_read.store(false);
-    pause_first_read.store(!resident);
+    pause_first_read.store(true);
     resume_read.store(false);
     auto &gate = runtime->dev.teardown_gates[0];
     gate.exit_request = AICORE_EXIT_NONCE_0;
     gate.post_close_release = AICORE_POST_CLOSE_RELEASE;
-    if (resident) {
-        context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&run_control);
-        context.run_control_offset = 0;
-        scheduler_publish_error(&run_control, 1);
-        runtime->publish_scheduler_bootstrap(
-            SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, reinterpret_cast<uint64_t>(&context)
-        );
-    }
+    context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&run_control);
+    context.run_control_offset = 0;
+    scheduler_publish_error(&run_control, 1);
+    const uint64_t context_address = reinterpret_cast<uint64_t>(&context);
+    const uint64_t bootstrap_address = base == BootstrapBase::ABSENT      ? 0 :
+                                       base == BootstrapBase::MISALIGNED  ? context_address + 1 :
+                                       base == BootstrapBase::OVERFLOWING ? UINT64_MAX - 63 :
+                                                                            context_address;
+    runtime->publish_scheduler_bootstrap(mode, bootstrap_address);
     std::atomic<bool> returned{false};
     std::thread worker([&] {
         aicore_execute(runtime.get(), 0, type);
@@ -103,14 +106,14 @@ void check_exit(bool resident, uint64_t epoch, CoreType type, uint32_t old_cond)
             platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()), std::memory_order_release
         );
     });
-    if (!resident && !wait_until(
-                         [&] {
-                             return read_reg(address, RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL;
-                         },
-                         std::chrono::seconds(2)
-                     ))
+    if (!wait_until(
+            [&] {
+                return read_reg(address, RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL;
+            },
+            std::chrono::seconds(2)
+        ))
         std::_Exit(14);
-    if (!resident && (result.load(std::memory_order_acquire) != -2 || gate.post_close_release != 0)) std::_Exit(15);
+    if (result.load(std::memory_order_acquire) != -2 || gate.post_close_release != 0) std::_Exit(15);
     resume_read.store(true, std::memory_order_release);
     if (!wait_until(
             [&] {
@@ -130,6 +133,7 @@ void check_exit(bool resident, uint64_t epoch, CoreType type, uint32_t old_cond)
 // All test-side state changes happen while that Core is stopped at the seam.
 void check_ready_error_publication(bool publish_ready, bool stale_error) {
     auto runtime = std::make_unique<Runtime>();
+    runtime->set_worker_count(1);
     SchedulerWorkerContext context{};
     SchedulerRunControl control{};
     context.scheduler_state_base_address = reinterpret_cast<uint64_t>(&control);
@@ -202,14 +206,30 @@ TEST(HbgNonceExitDeathTest, ResidentFailureBeforeReadyWaitsForCurrentExit) {
     for (auto epoch : {0ULL, 42ULL})
         for (auto type : {CoreType::AIC, CoreType::AIV})
             for (auto old : {AICORE_EXIT_NONCE_0, AICORE_EXIT_NONCE_1})
-                EXPECT_EXIT(check_exit(true, epoch, type, old), testing::ExitedWithCode(0), "");
+                EXPECT_EXIT(
+                    check_exit(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, BootstrapBase::VALID, epoch, type, old),
+                    testing::ExitedWithCode(0), ""
+                );
 }
 
-TEST(HbgNonceExitDeathTest, LegacyFailureBeforeIdleRequiresCurrentNonce) {
-    for (auto epoch : {0ULL, 42ULL})
-        for (auto type : {CoreType::AIC, CoreType::AIV})
-            for (auto old : {AICORE_EXIT_NONCE_0, AICORE_EXIT_NONCE_1})
-                EXPECT_EXIT(check_exit(false, epoch, type, old), testing::ExitedWithCode(0), "");
+TEST(HbgNonceExitDeathTest, InvalidModeReportsIdentityAndRequiresCurrentNonce) {
+    for (uint32_t mode : {0U, 3U, 4U, UINT32_MAX})
+        for (auto epoch : {0ULL, 42ULL})
+            for (auto type : {CoreType::AIC, CoreType::AIV})
+                for (auto old : {AICORE_EXIT_NONCE_0, AICORE_EXIT_NONCE_1})
+                    EXPECT_EXIT(
+                        check_exit(mode, BootstrapBase::OVERFLOWING, epoch, type, old), testing::ExitedWithCode(0), ""
+                    );
+}
+
+TEST(HbgNonceExitDeathTest, InvalidResidentBaseRetiresWithoutReadingSchedulerBacking) {
+    for (uint32_t mode : {SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, SCHEDULER_RUNTIME_MODE_RESIDENT_READY})
+        for (auto base : {BootstrapBase::ABSENT, BootstrapBase::MISALIGNED, BootstrapBase::OVERFLOWING})
+            for (auto epoch : {0ULL, 42ULL})
+                for (auto type : {CoreType::AIC, CoreType::AIV})
+                    EXPECT_EXIT(
+                        check_exit(mode, base, epoch, type, AICORE_EXIT_NONCE_1), testing::ExitedWithCode(0), ""
+                    );
 }
 
 TEST(HbgNonceExitDeathTest, ContextTimeoutDoesNotWriteBeforeReadyOrOnFailedInitExit) {

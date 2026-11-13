@@ -111,10 +111,15 @@ SINGLE_CONTEXT_TREES = frozenset({"utils", "hierarchical", "runtime_status"})
 # Combinations a case is deliberately not built for, each with the reason. Most
 # cannot exist at all; one is a case whose own golden covers a single arch, which
 # is a gap to close rather than an absent combination, and its reason says so. A
-# stale entry is an error, so the table only shrinks.
+# stale entry is an error, so each entry must describe a current gap.
 WAIVERS: dict[tuple[str, str], str] = {
+    ("common/platform/test_mix_lane_priority.cpp", "a5/host_build_graph"): (
+        "this case exercises AICPU SchedulerContext priority-prefix dispatch, "
+        "which a5 HBG does not implement; its resident scheduler uses GM admission "
+        "and group lane ownership, covered by test_hbg_ordered_execution and test_hbg_gm_mix"
+    ),
     ("common/platform/test_mix_lane_priority.cpp", "a5/tensormap_and_ringbuffer"): (
-        "this case exercises the three backends' priority-prefix and captured-cell "
+        "this case exercises A2A3 priority-prefix and captured-cell "
         "queue APIs; a5 TMR uses the same TaggedPtr/LaneDemandCounter types with "
         "its reservation-before-claim admission policy and different queue APIs, "
         "covered by test_mix_admission and test_mix_spare_lane"

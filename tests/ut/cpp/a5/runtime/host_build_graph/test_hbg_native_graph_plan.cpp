@@ -30,11 +30,10 @@
 #include "scheduler/scheduler_dispatch.h"
 
 namespace {
-TEST(NativeGraphPlanTest, LegacyStorageFallbackDoesNotBypassSyncStartCapacity) {
+TEST(NativeGraphPlanTest, SyncStartRequiresDistinctExecutionPositions) {
     NativeGraphHostPlan plan;
     plan.definitions.resize(1);
     auto &definition = plan.definitions[0];
-    definition.resident_supported = false;
     definition.children.resize(1);
     auto &metadata = definition.children[0].metadata;
     metadata.active_mask = LaneMask::all();
@@ -64,7 +63,8 @@ struct DefinitionFixture {
         std::memcpy(bytes.data() + offset + sizeof(T) * index, &value, sizeof(T));
     }
     explicit DefinitionFixture(
-        const std::vector<std::vector<uint16_t>> &fanin, bool dummy = false, bool scalar = false
+        const std::vector<std::vector<uint16_t>> &fanin, bool dummy = false, int32_t scalars_per_child = 0,
+        int32_t tensors_per_child = 0
     ) {
         header.graph_key = 77;
         header.task_count = static_cast<int32_t>(fanin.size());
@@ -99,22 +99,35 @@ struct DefinitionFixture {
             task.active_mask = dummy ? LaneMask::none() : LaneMask::aic();
             task.logical_block_num = 1;
             task.total_required_subtasks = dummy ? 0 : 1;
-            if (scalar) {
-                task.scalar_count = 1;
-                task.scalar_offset = static_cast<int32_t>(i);
-            }
+            task.scalar_count = scalars_per_child;
+            task.scalar_offset = static_cast<int32_t>(i) * scalars_per_child;
+            task.tensor_count = tensors_per_child;
+            task.tensor_offset = static_cast<int32_t>(i) * tensors_per_child;
         }
         header.off_sub_tasks = append(tasks);
-        if (scalar) {
-            header.scalar_arg_count = header.task_count;
-            header.off_scalars = append(std::vector<uint64_t>(fanin.size(), 42));
-            header.off_scalar_inheritance =
-                append(std::vector<GraphScalarInheritance>(fanin.size(), GraphScalarInheritance::self_value()));
+        if (tensors_per_child != 0) {
+            header.boundary_tensor_count = 1;
+            header.tensor_arg_count = header.task_count * tensors_per_child;
+            simpler::hbg::TensorData tensor{};
+            tensor.owner_task_id = TaskId::make_param(0);
+            tensor.ndims = 1;
+            tensor.dtype = DataType::INT32;
+            tensor.address_space = AddressSpace::DEVICE;
+            tensor.shapes[0] = tensor.strides[0] = 1;
+            tensor.extent_elem_cache = 1;
+            header.off_tensors = append(std::vector<simpler::hbg::TensorData>(header.tensor_arg_count, tensor));
+        }
+        if (scalars_per_child != 0) {
+            header.scalar_arg_count = header.task_count * scalars_per_child;
+            header.off_scalars = append(std::vector<uint64_t>(header.scalar_arg_count, 42));
+            header.off_scalar_inheritance = append(
+                std::vector<GraphScalarInheritance>(header.scalar_arg_count, GraphScalarInheritance::self_value())
+            );
         }
         GraphExecutionStorageLayout layout{};
-        EXPECT_TRUE(
-            graph_execution_storage_layout(header.task_count, 0, header.scalar_arg_count, header.edge_count, &layout)
-        );
+        EXPECT_TRUE(graph_execution_storage_layout(
+            header.task_count, header.tensor_arg_count, header.scalar_arg_count, header.edge_count, &layout
+        ));
         header.execution_storage_bytes = static_cast<uint32_t>(layout.total_bytes);
         header.total_bytes = static_cast<uint32_t>(bytes.size());
         sync();
@@ -145,7 +158,7 @@ TEST(HbgNativeGraphPlan, FaninAndSinkCountsUseTheWholeDefinition) {
     ASSERT_TRUE(roots.build(plan, error)) << error;
     EXPECT_EQ(plan.sinks.size(), 1024);
     EXPECT_EQ(plan.execution_count, 0);
-    EXPECT_TRUE(plan.resident_supported);
+    EXPECT_LE(plan.args_bytes, plan.definition.execution_storage_bytes);
 }
 
 TEST(HbgNativeGraphPlan, DenseRefsKeepOriginalShellIdentityAndShareDefinitions) {
@@ -185,13 +198,74 @@ TEST(HbgNativeGraphPlan, OwnsBytesAndKeepsScalarWritersOnSeparateCacheLines) {
     EXPECT_EQ(plan.image, saved);
 }
 
+TEST(HbgNativeGraphPlan, CanonicalMaximumArgumentPoolsFitReservedStorage) {
+    DefinitionFixture fixture(
+        std::vector<std::vector<uint16_t>>(SUB_TASK_MAX_NUM), false, MAX_SCALAR_ARGS, MAX_TENSOR_ARGS
+    );
+    NativeGraphDefinitionPlan plan;
+    std::string error;
+    ASSERT_TRUE(fixture.build(plan, error)) << error;
+    const uint64_t per_child = sizeof(simpler::hbg::Tensor) * MAX_TENSOR_ARGS + sizeof(uint64_t) * MAX_SCALAR_ARGS;
+    EXPECT_EQ(plan.args_bytes, per_child * SUB_TASK_MAX_NUM);
+    EXPECT_LE(plan.args_bytes, plan.definition.execution_storage_bytes);
+}
+
+TEST(HbgNativeGraphPlan, RejectsOverlappingAndGappedChildArgumentSpans) {
+    NativeGraphDefinitionPlan plan;
+    std::string error;
+    for (bool tensors : {false, true}) {
+        DefinitionFixture fixture({{}, {}}, false, tensors ? 0 : 1, tensors ? 1 : 0);
+        ASSERT_TRUE(fixture.build(plan, error)) << error;
+        const auto saved = plan.image;
+        SubTaskDefinition child{};
+        std::memcpy(&child, fixture.bytes.data() + fixture.header.off_sub_tasks + sizeof(child), sizeof(child));
+        if (tensors) child.tensor_offset = 0;
+        else child.scalar_offset = 0;
+        fixture.put(fixture.header.off_sub_tasks, 1, child);
+        EXPECT_FALSE(fixture.build(plan, error));
+        EXPECT_EQ(error, "noncanonical child argument span");
+        EXPECT_EQ(plan.image, saved);
+
+        child.tensor_offset = tensors ? 1 : 0;
+        child.scalar_offset = tensors ? 0 : 1;
+        fixture.put(fixture.header.off_sub_tasks, 1, child);
+        std::memcpy(&child, fixture.bytes.data() + fixture.header.off_sub_tasks, sizeof(child));
+        if (tensors) child.tensor_count = 0;
+        else child.scalar_count = 0;
+        fixture.put(fixture.header.off_sub_tasks, 0, child);
+        EXPECT_FALSE(fixture.build(plan, error));
+        EXPECT_EQ(error, "noncanonical child argument span");
+        EXPECT_EQ(plan.image, saved);
+    }
+}
+
+TEST(HbgNativeGraphPlan, RejectsUnusedArgumentPoolTailAndOverflowingChildSpan) {
+    DefinitionFixture fixture({{}, {}}, false, 1, 1);
+    NativeGraphDefinitionPlan plan;
+    std::string error;
+    ASSERT_TRUE(fixture.build(plan, error)) << error;
+    const auto saved = plan.image;
+    SubTaskDefinition child{};
+    std::memcpy(&child, fixture.bytes.data() + fixture.header.off_sub_tasks + sizeof(child), sizeof(child));
+    child.tensor_count = 0;
+    fixture.put(fixture.header.off_sub_tasks, 1, child);
+    EXPECT_FALSE(fixture.build(plan, error));
+    EXPECT_EQ(error, "incomplete child argument pool coverage");
+    EXPECT_EQ(plan.image, saved);
+    child.tensor_count = INT32_MAX;
+    fixture.put(fixture.header.off_sub_tasks, 1, child);
+    EXPECT_FALSE(fixture.build(plan, error));
+    EXPECT_EQ(error, "invalid child shape or argument span");
+    EXPECT_EQ(plan.image, saved);
+}
+
 TEST(HbgNativeGraphPlan, RejectsDuplicateEdgesRootsAndAsymmetricCsr) {
     NativeGraphDefinitionPlan plan;
     std::string error;
     DefinitionFixture duplicate({{}, {0}, {0, 1}});
     duplicate.put<uint16_t>(duplicate.header.off_fanin_indices, 2, 0);
     EXPECT_FALSE(duplicate.build(plan, error));
-    DefinitionFixture wrong_fanout({{}, {}, {0}, {1}});
+    DefinitionFixture wrong_fanout(std::vector<std::vector<uint16_t>>{{}, {}, {0}, {1}});
     wrong_fanout.put<uint16_t>(wrong_fanout.header.off_fanout_indices, 0, 3);
     EXPECT_FALSE(wrong_fanout.build(plan, error));
     DefinitionFixture duplicate_root({{}, {}, {0, 1}});
@@ -229,7 +303,7 @@ TEST(HbgNativeGraphPlan, CooperativeShapeStillRejectsMalformedTopology) {
     NativeGraphDefinitionPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
-    EXPECT_TRUE(plan.resident_supported);
+    EXPECT_LE(plan.args_bytes, plan.definition.execution_storage_bytes);
     fixture.put<uint16_t>(fixture.header.off_fanin_indices, 0, 1);
     EXPECT_FALSE(fixture.build(plan, error));
 }

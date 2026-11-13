@@ -25,12 +25,15 @@
 #include "aicore_lifecycle.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
+#include "host_build_graph/runtime_status.h"
+#include "host_build_graph/shared_memory.h"
 #include "runtime.h"
-#include "scheduler/scheduler_context.h"
+#include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_types.h"
 
 // The register-layer tests exercise the real ACK, close, read-back, drain and
-// release sequence. This seam verifies that both HBG owners pass the real per-core
-// gate to that protocol, including their failure and overlapping-exit paths.
+// release sequence. This seam verifies that the HBG lifecycle passes the real
+// per-core gate on normal shutdown and failed startup.
 namespace {
 struct RetireCall {
     std::vector<uint64_t> addrs;
@@ -46,6 +49,9 @@ std::mutex retire_mutex;
 int scheduler_timeout_ms = 0;
 bool dump_enabled = false;
 uint64_t dump_base = 0;
+std::array<uint64_t, PLATFORM_MAX_CORES> pmu_registers{};
+uint32_t register_reads = 0;
+uint32_t register_writes = 0;
 int32_t dump_initializations = 0;
 std::vector<int> dump_flushes;
 std::vector<int> dump_closes;
@@ -77,15 +83,12 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
 
 void platform_signal_aicore_exit(uint64_t reg_addr) { exit_signals.push_back(reg_addr); }
 void platform_init_aicore_regs(uint64_t) {}
-void write_reg(uint64_t, RegId, uint64_t) {}
-// The PMU teardown reads a core's control word back before restoring it, to
-// record whether this run's enable survived its tasks. No case here programs a
-// PMU window, so there is nothing for it to observe.
-uint64_t read_reg(uint64_t, RegId) { return 0; }
-uint64_t get_platform_regs() {
-    static std::array<uint64_t, PLATFORM_MAX_CORES> registers{};
-    return reinterpret_cast<uint64_t>(registers.data());
+void write_reg(uint64_t, RegId, uint64_t) { ++register_writes; }
+uint64_t read_reg(uint64_t, RegId) {
+    ++register_reads;
+    return 0;
 }
+uint64_t get_platform_regs() { return reinterpret_cast<uint64_t>(pmu_registers.data()); }
 extern "C" int get_scheduler_timeout_ms() { return scheduler_timeout_ms; }
 extern "C" bool is_dump_args_enabled() { return dump_enabled; }
 extern "C" uint64_t get_platform_dump_base() { return dump_base; }
@@ -99,20 +102,6 @@ bool initialize_resident_args_dump_outputs(void *image, uint64_t, uint64_t) {
     EXPECT_EQ(image, nullptr);
     return image == nullptr;
 }
-
-class SchedulerContextTestPeer {
-public:
-    static void seed(SchedulerContext &context, const std::array<uint64_t, 3> &addrs) {
-        context.cores_total_num_ = 3;
-        context.core_trackers_[0].init(1);
-        context.core_trackers_[0].set_cluster(0, 0, 1, 2);
-        for (int i = 0; i < 3; ++i) {
-            context.core_exec_states_[i].reg_addr = addrs[i];
-            context.core_retired_[i].store(false, std::memory_order_relaxed);
-        }
-    }
-    static void emergency(SchedulerContext &context, Runtime *runtime) { context.emergency_shutdown(runtime); }
-};
 
 class AicoreLifecycleTestPeer {
 public:
@@ -146,6 +135,8 @@ public:
         }
     }
 
+    static void mark_pmu_initialized(AicoreLifecycle &lifecycle) { lifecycle.pmu_initialized_ = true; }
+
     static bool collect_pmu(AicoreLifecycle &lifecycle, Runtime *runtime, uint64_t *missing) {
         return lifecycle.collect_run_pmu_records(runtime, missing);
     }
@@ -162,8 +153,8 @@ struct MinimalSchedulerState {
     static constexpr uint64_t kCellsOffset = kMetadataOffset + 64;
     static constexpr uint64_t kTotalSize = kCellsOffset + sizeof(SchedulerTaskPmuCell);
 
-    std::vector<uint8_t> state{std::vector<uint8_t>(kTotalSize, 0)};
-    std::vector<uint8_t> storage{std::vector<uint8_t>(SCHEDULER_GRAPH_TASK_STORAGE_STRIDE, 0)};
+    alignas(SchedulerWorkerContext) std::array<uint8_t, kTotalSize> state{};
+    alignas(64) std::array<uint8_t, SCHEDULER_GRAPH_TASK_STORAGE_STRIDE> storage{};
 
     SchedulerWorkerContext *context() { return reinterpret_cast<SchedulerWorkerContext *>(state.data()); }
     SchedulerTaskMetadata *metadata() {
@@ -206,10 +197,17 @@ protected:
         dump_initializations = 0;
         dump_flushes.clear();
         dump_closes.clear();
+        pmu_registers.fill(0);
+        register_reads = 0;
+        register_writes = 0;
+        set_platform_pmu_base(0);
         set_pmu_enabled(false);
     }
 
-    void TearDown() override { set_pmu_enabled(false); }
+    void TearDown() override {
+        set_pmu_enabled(false);
+        set_platform_pmu_base(0);
+    }
 
     static void expect_group(const Runtime &runtime) {
         ASSERT_EQ(retire_calls.size(), 1u);
@@ -220,7 +218,7 @@ protected:
 };
 
 TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRoute) {
-    for (int route = 0; route < 3; ++route) {
+    for (int route = 0; route < 2; ++route) {
         for (int failure = 0; failure < 3; ++failure) {
             const bool fail = failure != 0;
             auto runtime = std::make_unique<Runtime>();
@@ -234,17 +232,11 @@ TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRout
             observed_retirement_runtime = runtime.get();
             retirement_result = fail ? -1 : 0;
             released_despite_failure = failure == 1 ? kAddrs[1] : 0;
-            if (route == 0) {
-                SchedulerContext context;
-                SchedulerContextTestPeer::seed(context, kAddrs);
-                SchedulerContextTestPeer::emergency(context, runtime.get());
-            } else {
-                AicoreLifecycle lifecycle;
-                AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
-                const int rc = route == 1 ? lifecycle.release_partition(runtime.get(), 0, false) :
-                                            lifecycle.finish_shutdown_partition(0, runtime.get());
-                EXPECT_EQ(rc, fail ? -1 : 0);
-            }
+            AicoreLifecycle lifecycle;
+            AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+            const int rc = route == 0 ? lifecycle.release_partition(runtime.get(), 0, false) :
+                                        lifecycle.finish_shutdown_partition(0, runtime.get());
+            EXPECT_EQ(rc, fail ? -1 : 0);
             for (int i = 0; i < 3; ++i) {
                 const auto &report = runtime->dev.workers[i];
                 const bool acknowledged = !fail || (failure == 1 && i == 1);
@@ -261,6 +253,8 @@ TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRout
 TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
     scheduler_timeout_ms = 1;
     auto runtime = std::make_unique<Runtime>();
+    SharedMemoryHeader header{};
+    runtime->set_gm_sm_ptr(&header);
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
     for (int i : {0, 2}) {
@@ -270,11 +264,81 @@ TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
     }
     lifecycle.handshake_partition(runtime.get(), 0, 1);
     ASSERT_TRUE(AicoreLifecycleTestPeer::handshake_failed(lifecycle));
-    EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), 0);
+    EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 2);
+    EXPECT_FALSE(lifecycle.cores_retired());
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
     ASSERT_EQ(retire_calls.size(), 1u);
     EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0], kAddrs[2]}));
     EXPECT_EQ(retire_calls[0].gates[0], &runtime->dev.teardown_gates[0]);
     EXPECT_EQ(retire_calls[0].gates[1], &runtime->dev.teardown_gates[2]);
+}
+
+TEST_F(HbgRetirementWiring, MissingReportsLeaveRetirementUnknownWithoutOpeningAWindow) {
+    auto runtime = std::make_unique<Runtime>();
+    SharedMemoryHeader header{};
+    runtime->set_gm_sm_ptr(&header);
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
+    EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_TRUE(retire_calls.empty());
+    EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 0);
+    EXPECT_FALSE(lifecycle.cores_retired());
+    EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), false));
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+}
+
+TEST_F(HbgRetirementWiring, DuplicateReportsKeepOneWindowOwnerAndLeaveRetirementUnproved) {
+    auto runtime = std::make_unique<Runtime>();
+    SharedMemoryHeader header{};
+    runtime->set_gm_sm_ptr(&header);
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
+    for (int32_t worker = 0; worker < 3; ++worker) {
+        auto &report = runtime->dev.workers[worker];
+        report.physical_core_id = 0;
+        report.core_type = CoreType::AIC;
+        report.aicore_done = worker + 1;
+    }
+    lifecycle.handshake_partition(runtime.get(), 0, 1);
+    EXPECT_EQ(lifecycle.validate_discovery(), -SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_TRUE(lifecycle.core_reported(0));
+    EXPECT_FALSE(lifecycle.core_reported(1));
+    EXPECT_FALSE(lifecycle.core_reported(2));
+    EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    ASSERT_EQ(retire_calls.size(), 1u);
+    EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0]}));
+    ASSERT_EQ(retire_calls[0].gates.size(), 1u);
+    EXPECT_EQ(retire_calls[0].gates[0], &runtime->dev.teardown_gates[0]);
+    EXPECT_EQ(runtime->dev.workers[0].aicore_done, 0u);
+    EXPECT_EQ(runtime->dev.workers[1].aicore_done, 2u);
+    EXPECT_EQ(runtime->dev.workers[2].aicore_done, 3u);
+    EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 1);
+    EXPECT_FALSE(lifecycle.cores_retired());
+    EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), false));
+}
+
+TEST_F(HbgRetirementWiring, AReportedCoreWithoutARegisterWindowCannotProveDiscoveryOrRetirement) {
+    auto runtime = std::make_unique<Runtime>();
+    SharedMemoryHeader header{};
+    runtime->set_gm_sm_ptr(&header);
+    AicoreLifecycle lifecycle;
+    const std::array<uint64_t, 3> registers{kAddrs[0], 0, kAddrs[2]};
+    AicoreLifecycleTestPeer::prepare_handshake(lifecycle, registers.data());
+    for (int32_t worker = 0; worker < 3; ++worker) {
+        auto &report = runtime->dev.workers[worker];
+        report.physical_core_id = worker;
+        report.core_type = CoreType::AIV;
+        report.aicore_done = worker + 1;
+    }
+    lifecycle.handshake_partition(runtime.get(), 0, 1);
+    EXPECT_EQ(lifecycle.validate_discovery(), -SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    ASSERT_EQ(retire_calls.size(), 1u);
+    EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0], kAddrs[2]}));
+    EXPECT_EQ(runtime->dev.workers[1].aicore_done, 2u);
+    EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 2);
+    EXPECT_FALSE(lifecycle.cores_retired());
 }
 
 TEST_F(HbgRetirementWiring, CompleteHandshakePreservesFailureRetirementError) {
@@ -291,78 +355,6 @@ TEST_F(HbgRetirementWiring, CompleteHandshakePreservesFailureRetirementError) {
     retirement_result = -1;
     EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -1);
     expect_group(*runtime);
-}
-
-TEST_F(HbgRetirementWiring, SchedulerNormalShutdownClaimsEachCoreBeforeEmergency) {
-    auto runtime = std::make_unique<Runtime>();
-    auto scheduler = std::make_unique<SchedulerContext>();
-    SchedulerContextTestPeer::seed(*scheduler, kAddrs);
-
-    EXPECT_EQ(scheduler->shutdown(runtime.get(), 0), 0);
-    SchedulerContextTestPeer::emergency(*scheduler, runtime.get());
-    expect_group(*runtime);
-}
-
-TEST_F(HbgRetirementWiring, SchedulerClearsStaleGatesBeforeHandshake) {
-    auto runtime = std::make_unique<Runtime>();
-    runtime->set_worker_count(3);
-    for (auto &gate : runtime->dev.teardown_gates) {
-        gate.post_close_release = AICORE_POST_CLOSE_RELEASE;
-        gate.exit_request = AICORE_EXIT_NONCE_1;
-    }
-    auto scheduler = std::make_unique<SchedulerContext>();
-
-    ASSERT_EQ(scheduler->pre_handshake_init(runtime.get(), 1, 0), 0);
-    for (size_t i = 0; i < kAddrs.size(); ++i) {
-        EXPECT_EQ(runtime->dev.teardown_gates[i].post_close_release, 0u);
-        EXPECT_EQ(runtime->dev.teardown_gates[i].exit_request, 0u);
-    }
-}
-
-TEST_F(HbgRetirementWiring, SchedulerEmergencyClaimsEachCoreBeforeNormalShutdown) {
-    auto runtime = std::make_unique<Runtime>();
-    auto scheduler = std::make_unique<SchedulerContext>();
-    SchedulerContextTestPeer::seed(*scheduler, kAddrs);
-
-    SchedulerContextTestPeer::emergency(*scheduler, runtime.get());
-    EXPECT_EQ(scheduler->shutdown(runtime.get(), 0), 0);
-    expect_group(*runtime);
-}
-
-TEST_F(HbgRetirementWiring, ConcurrentNormalAndEmergencyShutdownRetireEachCoreOnce) {
-    auto runtime = std::make_unique<Runtime>();
-    auto scheduler = std::make_unique<SchedulerContext>();
-    SchedulerContextTestPeer::seed(*scheduler, kAddrs);
-    std::atomic<bool> go{false};
-    auto wait_for_start = [&] {
-        while (!go.load(std::memory_order_acquire))
-            std::this_thread::yield();
-    };
-    std::thread normal([&] {
-        wait_for_start();
-        EXPECT_EQ(scheduler->shutdown(runtime.get(), 0), 0);
-    });
-    std::thread emergency([&] {
-        wait_for_start();
-        SchedulerContextTestPeer::emergency(*scheduler, runtime.get());
-    });
-    go.store(true, std::memory_order_release);
-    normal.join();
-    emergency.join();
-    std::array<int, 3> claims{};
-    size_t target_count = 0;
-    for (const RetireCall &call : retire_calls) {
-        for (size_t target = 0; target < call.addrs.size(); ++target) {
-            ++target_count;
-            for (size_t core = 0; core < kAddrs.size(); ++core) {
-                if (call.addrs[target] != kAddrs[core]) continue;
-                ++claims[core];
-                EXPECT_EQ(call.gates[target], &runtime->dev.teardown_gates[core]);
-            }
-        }
-    }
-    EXPECT_EQ(target_count, kAddrs.size());
-    EXPECT_EQ(claims, (std::array<int, 3>{1, 1, 1}));
 }
 
 struct DiscoveryProofState {
@@ -567,6 +559,44 @@ TEST_F(HbgRetirementWiring, AStagedPmuCellCoversTheSubtaskTheGraphOwed) {
     EXPECT_EQ(missing, 0u);
 }
 
+TEST_F(HbgRetirementWiring, ARunWithoutPmuInitializationCannotRestoreThePreviousCollectorsWindows) {
+    struct PmuImage {
+        PmuDataHeader header{};
+        std::array<PmuBufferState, 3> states{};
+    };
+    static auto previous = std::make_unique<PmuImage>();
+    static auto buffers = std::make_unique<std::array<PmuBuffer, 3>>();
+    for (size_t core = 0; core < kAddrs.size(); ++core) {
+        pmu_registers[core] = kAddrs[core];
+        previous->states[core].current_buf_ptr = reinterpret_cast<uint64_t>(&(*buffers)[core]);
+    }
+    const uint32_t physical[] = {0, 1, 2};
+    set_platform_pmu_base(reinterpret_cast<uint64_t>(previous.get()));
+    pmu_aicpu_init(physical, 3, PmuEventType::PIPE_UTILIZATION);
+    ASSERT_GT(register_writes, 0u);
+    register_reads = 0;
+    register_writes = 0;
+
+    auto runtime = std::make_unique<Runtime>();
+    MinimalSchedulerState scheduler_state;
+    scheduler_state.publish(runtime.get());
+    scheduler_state.cell()->worker_id = 0;
+    scheduler_state.cell()->published = 1;
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+    set_pmu_enabled(true);
+    set_platform_pmu_base(0);
+    ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
+    ASSERT_TRUE(lifecycle.cores_retired());
+    EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), false));
+    EXPECT_EQ(register_reads, 0u);
+    EXPECT_EQ(register_writes, 0u);
+
+    pmu_registers.fill(0);
+    set_platform_pmu_base(reinterpret_cast<uint64_t>(previous.get()));
+    pmu_aicpu_init(physical, 3, PmuEventType::PIPE_UTILIZATION);
+}
+
 /**
  * A proved stop with incomplete data still settles nothing — and is still the
  * run that may touch the registers.
@@ -583,6 +613,7 @@ TEST_F(HbgRetirementWiring, AProvedStopWithAMissingMeasurementSettlesNothingAndS
     scheduler_state.publish(runtime.get());
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+    AicoreLifecycleTestPeer::mark_pmu_initialized(lifecycle);
     set_pmu_enabled(true);
 
     ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
@@ -607,6 +638,7 @@ TEST_F(HbgRetirementWiring, AProvedStopWithEveryOwedMeasurementSettles) {
     scheduler_state.cell()->published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+    AicoreLifecycleTestPeer::mark_pmu_initialized(lifecycle);
     set_pmu_enabled(true);
 
     ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
@@ -625,6 +657,7 @@ TEST_F(HbgRetirementWiring, AnIncompleteGraphSettlesNothingEvenWithItsStagedCell
     scheduler_state.cell()->published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+    AicoreLifecycleTestPeer::mark_pmu_initialized(lifecycle);
     set_pmu_enabled(true);
 
     ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
@@ -643,6 +676,7 @@ TEST_F(HbgRetirementWiring, AnUnprovedStopIsRefusedBeforeAnyCellIsRead) {
     scheduler_state.cell()->published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+    AicoreLifecycleTestPeer::mark_pmu_initialized(lifecycle);
     set_pmu_enabled(true);
     retirement_result = -1;
 

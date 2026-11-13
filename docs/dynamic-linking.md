@@ -463,7 +463,15 @@ SchedulerContext owns its own teardown:
   (`initialized_`, `init_done_`, `init_failed_`, `finished_`, `thread_idx_`,
   `finished_count_`).
 
-Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
+This scheduler-owned teardown applies to A2A3 HBG/TMR and A5 TMR.
+
+A5 HBG instead owns an `AicoreLifecycle` and resident argument-dump services.
+Its per-run reset clears only invocation coordination; retirement proof gates
+diagnostic settlement and service cleanup. The final participant selects the
+terminal result before executor teardown, and the sole cleanup owner hands it
+off afterward. Failed initialization follows the same lifetime obligations and
+publishes a failed terminal result. A static executor reused by the next run
+must not destroy unresolved owners or reuse backing from unproved retirement.
 
 ## SO Handle Caching and Reuse
 

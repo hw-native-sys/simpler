@@ -25,6 +25,7 @@ class AicoreLifecycle {
 public:
     int32_t pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base);
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    int32_t validate_discovery();
     int32_t post_handshake_init(Runtime *runtime);
     void publish_context_partition(Runtime *runtime, int32_t thread_idx);
     void begin_bootstrap_wait(int32_t thread_idx);
@@ -90,11 +91,11 @@ private:
     uint32_t physical_core_ids_[kMaxWorkers]{};
     ThreadHandshakeTiming thread_handshake_timing_[PLATFORM_MAX_AICPU_THREADS]{};
     std::atomic<bool> handshake_failed_{false};
-    // Cores this run proved are no longer executing: one per core that
-    // acknowledged exit, plus one per core no window was ever opened on. Read
-    // against `core_count_` before anything reads what a core wrote.
+    // Cores this run proved are no longer executing, counted only after their
+    // acknowledged release. A missing startup report supplies no such proof.
     std::atomic<int32_t> retired_core_count_{0};
     AicpuThreadLifecycleTrace *lifecycle_traces_{nullptr};
+    bool pmu_initialized_{false};
     int32_t core_count_{0};
     int32_t aicpu_thread_num_{0};
     uint64_t regs_base_{0};
