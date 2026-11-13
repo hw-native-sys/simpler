@@ -1071,7 +1071,11 @@ class TestWorkerNativeChip:
             first.wait(timeout=10)
             second.wait(timeout=10)
 
-    def test_staged_observation_snapshot_never_reads_a_terminal_published_entry(self):
+    @pytest.mark.parametrize("mapped", [False, True])
+    @pytest.mark.parametrize("recovery_required", [False, True], ids=["safe-terminal", "unproven-terminal"])
+    def test_staged_observation_snapshot_never_reads_a_terminal_published_entry(self, mapped, recovery_required):
+        import __future__  # noqa: PLC0415
+
         import ast  # noqa: PLC0415
         import inspect  # noqa: PLC0415
 
@@ -1084,6 +1088,9 @@ class TestWorkerNativeChip:
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef) and node.name == "run_staged_frame_loop"
+        )
+        retire_host_use = next(
+            node for node in frame_loop.body if isinstance(node, ast.FunctionDef) and node.name == "retire_host_use"
         )
         activation = next(
             node
@@ -1104,7 +1111,8 @@ class TestWorkerNativeChip:
         events = []
         terminal_b = False
         a_run = SimpleNamespace(launched=True, lane_poisoned=False)
-        b_run = SimpleNamespace(abandon=lambda: events.append("abandon-b"))
+        # A terminal native run returns from abandon without changing its cleanup proof.
+        b_run = SimpleNamespace(abandon=lambda: events.append("abandon-b"), _owner_recovery_required=recovery_required)
         a = SimpleNamespace(
             index=0,
             identity=(1,),
@@ -1130,6 +1138,7 @@ class TestWorkerNativeChip:
         a.identity = (0, 0, 0, 0, 1)
         b.identity = (0, 0, 0, 0, 2)
         staged_runs = {0: a, 1: b}
+        host_uses = {b.identity} if mapped else set()
 
         def load(address):
             if terminal_b and address >= b.entry_addr:
@@ -1151,11 +1160,26 @@ class TestWorkerNativeChip:
         wrapper = ast.FunctionDef(
             name="exercise",
             args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-            body=[ast.parse('shutdown_message = ""').body[0], discard, activation, observation],
+            body=[ast.parse('shutdown_message = ""').body[0], discard, retire_host_use, activation, observation],
             decorator_list=[],
         )
+
+        def release_host_use(identity):
+            assert identity == b.identity
+            host_uses.remove(identity)
+            events.append("release-host-b")
+
+        def defer_host_use(identity, run):
+            assert identity == b.identity and run is b_run
+            events.append("defer-host-b")
+
         context = {
-            "_StagedRun": SimpleNamespace,
+            "import_registry": SimpleNamespace(
+                host_mappings=SimpleNamespace(release=release_host_use, defer_release=defer_host_use)
+                if mapped
+                else None
+            ),
+            "_format_exc": worker_module._format_exc,
             "staged_runs": staged_runs,
             "device_id": 0,
             "live_execution": False,
@@ -1174,10 +1198,15 @@ class TestWorkerNativeChip:
             ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
             str(Path(worker_module.__file__)),
             "exec",
+            flags=__future__.annotations.compiler_flag,
         )
         exec(code, context)  # noqa: S102 -- source-connected host-only loop control, no SDK or replacement executor
         context["exercise"]()
-        assert events == ["abandon-b", "terminal-b", "observe-a"]
+        expected = ["abandon-b"]
+        if mapped:
+            expected.append("defer-host-b" if recovery_required else "release-host-b")
+        assert events == [*expected, "terminal-b", "observe-a"]
+        assert host_uses == ({b.identity} if mapped and recovery_required else set())
         assert not staged_runs
 
     def test_l3_failed_child_does_not_freshly_publish_unobserved_successor_success(self, l3_progress_owner):

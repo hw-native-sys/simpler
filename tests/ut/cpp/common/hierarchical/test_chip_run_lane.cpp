@@ -1068,6 +1068,57 @@ TEST(ChipRunLaneTest, PrepareFailureIsTerminalWithoutPoisoningTheLane) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneTest, TerminalAbandonPreservesPreparationCleanupProof) {
+    for (const bool released : {false, true}) {
+        SCOPED_TRACE(released);
+        ChipWorker worker;
+        prime_worker(worker);
+        ChipRunLane lane(worker);
+        g_prepare_rc[0] = -5;
+        g_prepare_release_proven = released;
+        ChipRun failed = submit(lane, 101, 0);
+        ASSERT_EQ(g_prepare_count[0], 1u);
+        ASSERT_TRUE(failed.done());
+        EXPECT_EQ(failed.owner_recovery_required(), !released);
+        const auto events = g_events;
+        EXPECT_NO_THROW(failed.abandon());
+        EXPECT_EQ(g_events, events);
+        EXPECT_EQ(failed.owner_recovery_required(), !released);
+        if (released) {
+            EXPECT_NO_THROW(lane.close());
+        } else {
+            EXPECT_THROW(lane.close(), std::runtime_error);
+        }
+        worker.finalize();
+    }
+}
+
+TEST(ChipRunLaneTest, CleanAbandonPublishesContextAndLastUseProof) {
+    for (const bool prepared : {false, true}) {
+        SCOPED_TRACE(prepared);
+        ChipWorker worker;
+        prime_worker(worker);
+        g_supports_successor = prepared;
+        ChipRunLane lane(worker);
+        ChipRun first = submit(lane, 101, 0);
+        ChipRun pending = submit(lane, 102, 1, false);
+        ASSERT_FALSE(pending.launched());
+        ASSERT_EQ(g_prepare_count[1], prepared ? 1u : 0u);
+        EXPECT_TRUE(pending.owner_recovery_required());
+        pending.abandon();
+        EXPECT_TRUE(pending.done());
+        EXPECT_FALSE(pending.owner_recovery_required());
+        const auto events = g_events;
+        pending.abandon();
+        EXPECT_EQ(g_events, events);
+        EXPECT_FALSE(pending.owner_recovery_required());
+        g_complete[0] = true;
+        EXPECT_TRUE(first.done());
+        lane.close();
+        worker.finalize();
+    }
+}
+
 TEST(ChipRunLaneTest, ReclaimedLaunchFailureDoesNotPoisonTheLane) {
     ChipWorker worker;
     prime_worker(worker);
@@ -1177,8 +1228,11 @@ TEST(ChipRunLaneTest, UnboundedWaitBlocksInsteadOfPolling) {
 TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
     ChipWorker worker;
     prime_worker(worker);
+    g_supports_successor = false;
     ChipRunLane lane(worker);
     ChipRun first = submit(lane, 101, 0);
+    ChipRun queued = submit(lane, 102, 1, false);
+    ASSERT_EQ(queued.preparation_disposition(), ChipRunPreparationDisposition::VALIDATED_ONLY);
     g_complete[0] = true;
     g_finalize_rc[0] = -7;
     EXPECT_TRUE(first.done());
@@ -1193,9 +1247,38 @@ TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
 
     ChipStorageTaskArgs args{};
     EXPECT_THROW(
-        lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
+        lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 103}, 103, 103, nullptr, 0, true),
+        RunPreparationRefused
     );
     EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_FALSE(queued.owner_recovery_required());
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, CloseRetryProvesCleanupAfterCanonicalFinalizeRefusal) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.finalize_run_fn_ = [](void *, void *storage, int deliver_outputs) {
+        g_events.push_back("finalize" + std::to_string(slot_of(storage)));
+        if (g_finalize_rc[0] == 0) EXPECT_EQ(deliver_outputs, 0);
+        const uint64_t tag = g_finalize_rc[0] != 0 ? kNativeRunContextMagic : 0;
+        std::memcpy(storage, &tag, sizeof(tag));
+        return g_finalize_rc[0];
+    };
+    ChipRunLane lane(worker);
+    auto run = submit(lane, 101, 0);
+    g_complete[0] = true;
+    g_finalize_rc[0] = -7;
+    EXPECT_TRUE(run.done());
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    ASSERT_TRUE(run.owner_recovery_required());
+
+    g_finalize_rc[0] = 0;
+    EXPECT_TRUE(run.retry_owner_cleanup());
+    EXPECT_FALSE(run.owner_recovery_required());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_THROW(run.wait_until(ChipRunLane::Clock::now()), std::runtime_error);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 2);
     worker.finalize();
 }
 

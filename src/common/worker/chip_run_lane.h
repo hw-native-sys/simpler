@@ -64,6 +64,7 @@ public:
     void expire_credit_deadline_for_test();
     bool lane_poisoned() const;
     bool owner_recovery_required() const;
+    bool retry_owner_cleanup();
     ChipRunPreparationDisposition preparation_disposition() const;
     std::unique_ptr<ChipRunResources> retain_resources();
 

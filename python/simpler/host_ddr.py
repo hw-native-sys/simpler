@@ -6,14 +6,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Local A5 Host registrations retained by accepted calls."""
+"""Local Host registrations retained by accepted calls."""
 
 from __future__ import annotations
 
 import ctypes
 import os
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -55,6 +55,9 @@ class HostMappingRegistry:
         if os.getpid() != self._pid:
             raise ValueError("Host mapping belongs to another process")
 
+    def release_admission(self, _identity):
+        return nullcontext()
+
     def _check_context(self):
         self._check_pid()
         if not self._alive():
@@ -86,7 +89,7 @@ class HostMappingRegistry:
         if buffer.backend_kind != BackendKind.POSIX_SHM:
             raise ValueError("local Host mapping requires POSIX Host storage")
         if mapped and not getattr(self._chip, "_host_ddr_mapping_supported", False):
-            raise RuntimeError("MAP requires an A5 onboard runtime with Host mapping support")
+            raise RuntimeError("MAP requires an onboard runtime with Host mapping support")
         memory = buffer.shm.buf if buffer.shm is not None else None
         try:
             if memory is None or buffer.shm.size < descriptor.nbytes or buffer.shm.name.encode() != descriptor.body:

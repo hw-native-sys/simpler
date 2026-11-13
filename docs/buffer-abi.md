@@ -115,7 +115,7 @@ and output copy-back; H2D does not mean every argument is copied in. Buffer iden
 import grants and `TensorArgType` access checks are unchanged.
 
 `Worker.create_buffer(nbytes)` retains ordinary shared Host backing and its native
-grant. A direct A5 L2 Worker accepts an explicit per-call mapping request:
+grant. A direct A3 or A5 L2 Worker accepts an explicit per-call mapping request:
 
 ```python
 buffer = l2.create_buffer(nbytes)
@@ -127,10 +127,11 @@ l2.release_buffer(buffer)
 
 `add_tensor` records MAP without registering memory or changing the Tensor. During
 submission the owning L2 Worker validates the source grant, retains the Buffer,
-and registers its whole POSIX_SHM backing in the current A5 context. Registration
-uses ACL HostRegister/GetDevicePointer and is cached until Buffer release. No
-table-sized Device replica is allocated. Subsequent calls and views reuse the
-registration while preserving their own offsets and geometry.
+and registers its whole POSIX_SHM backing in the current device context. The A3
+backend obtains the mapped address from `aclrtHostRegister`; the A5 backend uses
+`aclrtHostRegisterV2` and `aclrtHostGetDevicePointer`. Registration is cached
+until Buffer release. Subsequent calls and views reuse the registration while
+preserving their own offsets and geometry. MAP uses the Host backing directly.
 
 The ImportRegistry resolves each argument separately as `(base, address_space,
 execution_transfer)`. MAP lowers to the mapped Device base with DEVICE/NONE;
@@ -141,8 +142,13 @@ H2D/MAP arguments with a callable writer are rejected before preparation.
 Tensor remains 144 bytes and BufferDescriptor 88 bytes. Byte 141 is the per-call
 transfer carrier; bytes 142–143 remain padding. No mapping reference is stored in
 a Tensor or transmitted on the wire. Mapping ownership stays in the consumer's
-registry. MAP forwarding to L3+, remote workers, Host compute leaves, borrowed L2
-contexts and unresolved native ChipWorker execution is unsupported and rejected.
+registry. A local A3 or A5 TMR L3 Worker prepares every child mapping from outer MAP
+arguments before entering its callback. Child subviews must name that call's
+declared backing; each child resolves its own Device address. Multiple backings
+and cached mappings are supported, with parent-owned lifetime and coordinated
+cleanup. L3 HBG, L4+, remote workers, Host compute leaves, borrowed L2 contexts
+and unresolved native ChipWorker execution reject MAP. See the
+[L3 shared-table contract](design/a5-host-ddr.md#l3-shared-tables).
 
 MAP supports callable IN / OUT / INOUT and ordinary TensorArgType grant checks.
 Device writes go directly to Host backing without a D2H copy. Finish CPU writes

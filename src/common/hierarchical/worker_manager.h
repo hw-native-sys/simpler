@@ -732,9 +732,7 @@ private:
     std::chrono::steady_clock::time_point next_liveness_check_{};
     std::atomic<bool> mailbox_control_timed_out_{false};
     int child_pid_{-1};
-    // Set once the child has been reaped or observed unwaitable; the exit
-    // status is only available from the reaping waitpid(), so it is retained
-    // here to describe every later operation on this dead mailbox.
+    // Cache the reason once the child is observed exited or no longer waitable.
     bool child_dead_{false};
     std::string child_death_reason_;
 
@@ -745,6 +743,7 @@ private:
     char *task_frame(size_t index) const;
     /** Run-state entry `index`. The table follows the request frames. */
     MailboxRunEntry *run_entry(size_t index) const;
+    void require_writable_control_frame(const char *op_name) const;
     void run_control_command(const char *op_name, double timeout_s = -1.0);
 
     /** One run's state as this endpoint reads it, in one coherent pass. */

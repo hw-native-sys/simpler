@@ -383,6 +383,8 @@ def _dummy_l2_domain(domain_id: int):
 
 
 class _RecordingImportRegistry:
+    host_mappings = None
+
     def __init__(self) -> None:
         self.close_calls = 0
         self.error: Optional[BaseException] = None
@@ -1540,17 +1542,20 @@ class _TwoFrameLoopHarness:
     def start(self) -> None:
         self.thread.start()
 
-    def publish_ccu_control(self, payload: bytes) -> SharedMemory:
+    def publish_control_payload(self, command: int, payload: bytes) -> SharedMemory:
         staged = SharedMemory(create=True, size=len(payload))
         self._control_payloads.append(staged)
         assert staged.buf is not None
-        staged.buf[:] = payload
-        struct.pack_into("Q", self.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_CCU_DOMAIN)
+        staged.buf[: len(payload)] = payload
+        struct.pack_into("Q", self.buf, worker_mod._OFF_CALLABLE, command)
         struct.pack_into("Q", self.buf, worker_mod._CTRL_OFF_ARG0, len(payload))
         name = staged.name.encode().ljust(worker_mod._CTRL_SHM_NAME_BYTES, b"\0")
         self.buf[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES] = name
         _mailbox_store_i32(self.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
         return staged
+
+    def publish_ccu_control(self, payload: bytes) -> SharedMemory:
+        return self.publish_control_payload(worker_mod._CTRL_CCU_DOMAIN, payload)
 
     def stop(self) -> None:
         if self.thread.is_alive():
@@ -2034,6 +2039,18 @@ def test_two_frame_ccu_association_completes_while_run_is_active(ccu_control_loo
         _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
     harness.cw.completed[0].set()
     harness.wait_state(0, worker_mod._TASK_DONE)
+
+
+def test_two_frame_host_map_control_waits_for_run_retirement(ccu_control_loop):
+    harness = ccu_control_loop
+    harness.publish_control_payload(worker_mod._CTRL_HOST_DDR, b"host")
+    harness.assert_control_stays_pending()
+    harness.cw.completed[0].set()
+    harness.wait_state(0, worker_mod._TASK_DONE)
+    harness.wait_control_state(worker_mod._CONTROL_DONE)
+    assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] != 0
+    assert "L3 MAP requires local A3 or A5 TMR chip workers" in worker_mod._read_error_msg(harness.buf)
+    assert not harness.cw.ccu_controls
 
 
 @pytest.mark.parametrize("operation", [1, 3, 4, 5, 7])
@@ -9056,3 +9073,48 @@ def test_the_cpp_pre_bind_level_word_is_the_ladder_word_for_l3():
     assert completed.stdout == WorkerLevel.node.name, (
         f"C++ pre-bind level word is {completed.stdout!r}, ladder says {WorkerLevel.node.name!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "error_type,recovery_required,retained",
+    [
+        (RuntimeError, False, False),
+        (RuntimeError, True, True),
+        (worker_mod.RunPreparationRefused, False, False),
+        (worker_mod.RunPreparationRefused, True, True),
+    ],
+)
+def test_child_host_use_retirement_consumes_native_failure_proof(monkeypatch, error_type, recovery_required, retained):
+    imports = worker_mod.ImportRegistry
+    uses = set()
+    deferred = {}
+    mappings = SimpleNamespace(
+        acquire=lambda identity, _args: uses.add(identity),
+        release=uses.discard,
+        defer_release=deferred.__setitem__,
+        holds_resources=False,
+        require_closed=lambda: None,
+    )
+
+    def with_host_mappings(context):
+        registry = imports(context)
+        registry.host_mappings = mappings
+        return registry
+
+    monkeypatch.setattr(worker_mod, "ImportRegistry", with_host_mappings)
+    monkeypatch.setattr(
+        _FakeChipRun, "_owner_recovery_required", property(lambda _self: recovery_required), raising=False
+    )
+    harness = _TwoFrameLoopHarness()
+    try:
+        launch_error = error_type("injected launch failure")
+        harness.cw.launch_errors[(0, 11)] = launch_error
+        harness.publish(0, 1)
+        harness.start()
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        assert bool(uses) is retained
+        assert deferred.keys() == uses
+        if retained:
+            assert next(iter(deferred.values())).error is launch_error
+    finally:
+        harness.close()

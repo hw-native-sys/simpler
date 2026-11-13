@@ -150,3 +150,12 @@ TEST(MailboxRegistration, AnUndersizedSubRegistrationIsRefused) {
     EXPECT_THROW(manager.add_sub(region.data(), region.size()), std::invalid_argument);
     EXPECT_TRUE(all_canary(region.data(), region.data() + region.size()));
 }
+
+TEST(MailboxRegistration, TimedOutRequestIsNotOverwrittenByRejectedControl) {
+    std::vector<char> region(mailbox_size(1));
+    LocalMailboxEndpoint endpoint(0, region.data(), region.size(), /*child_pid=*/-1, /*granted_sets=*/1);
+    EXPECT_THROW(endpoint.control_generic(42, "/host-map", 32, 0.0, nullptr), std::runtime_error);
+    const auto timed_out_request = region;
+    EXPECT_THROW(endpoint.control_free(0x4000), std::runtime_error);
+    EXPECT_EQ(region, timed_out_request);
+}

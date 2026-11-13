@@ -2668,7 +2668,7 @@ bool ChipWorker::host_ddr_mapping_supported() const noexcept {
 
 uint64_t ChipWorker::map_host_ddr(uint64_t host, uint64_t bytes) {
     if (!initialized_ || !host_ddr_mapping_supported())
-        throw std::runtime_error("Host mapping requires an initialized A5 onboard runtime");
+        throw std::runtime_error("Host mapping requires an initialized onboard runtime with Host mapping support");
     if (!host || !bytes || host > UINT64_MAX - bytes)
         throw std::invalid_argument("Host mapping requires a nonempty address range");
     validate_execution_context();

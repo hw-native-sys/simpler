@@ -12,6 +12,7 @@
 #include "worker_manager.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -126,14 +127,14 @@ constexpr uint64_t kChildFlushReplyMarginMs = 250;
 // than a sentinel the child would have to special-case.
 constexpr uint64_t kUnboundedChildFlushBudgetMs = static_cast<uint64_t>(std::numeric_limits<int>::max());
 
-std::string child_status_message(int child_pid, int status) {
+std::string child_status_message(int child_pid, const siginfo_t &info) {
     std::string msg = "child process pid=" + std::to_string(child_pid) + " exited before mailbox completion";
-    if (WIFEXITED(status)) {
-        msg += " (exit_status=" + std::to_string(WEXITSTATUS(status)) + ")";
-    } else if (WIFSIGNALED(status)) {
-        msg += " (signal=" + std::to_string(WTERMSIG(status)) + ")";
+    if (info.si_code == CLD_EXITED) {
+        msg += " (exit_status=" + std::to_string(info.si_status) + ")";
+    } else if (info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED) {
+        msg += " (signal=" + std::to_string(info.si_status) + ")";
     } else {
-        msg += " (status=" + std::to_string(status) + ")";
+        msg += " (status=" + std::to_string(info.si_status) + ")";
     }
     return msg;
 }
@@ -296,16 +297,17 @@ std::string LocalMailboxEndpoint::check_child_death() {
     if (child_dead_) return child_death_reason_;
     if (child_pid_ <= 0) return {};
 
-    int status = 0;
-    pid_t r = 0;
+    // Host MAP cleanup needs the owner to observe a clean exit.
+    siginfo_t info{};
+    int r = 0;
     do {
-        r = waitpid(static_cast<pid_t>(child_pid_), &status, WNOHANG);
+        r = waitid(P_PID, static_cast<id_t>(child_pid_), &info, WEXITED | WNOHANG | WNOWAIT);
     } while (r < 0 && errno == EINTR);
 
-    if (r == 0) return {};
+    if (r == 0 && info.si_pid == 0) return {};
 
     if (r < 0 && errno != ECHILD) {
-        // Any other waitpid() failure says nothing about the child, so the
+        // Any other waitid() failure says nothing about the child, so the
         // caller keeps polling rather than tearing down a live worker.
         return {};
     }
@@ -315,7 +317,14 @@ std::string LocalMailboxEndpoint::check_child_death() {
         child_death_reason_ = "child process pid=" + std::to_string(child_pid_) +
                               " is no longer waitable (reaped elsewhere) before mailbox completion";
     } else {
-        child_death_reason_ = child_status_message(child_pid_, status);
+        // Preserve mailbox ownership of abnormal exits once reported here.
+        if (info.si_code != CLD_EXITED || info.si_status != 0) {
+            pid_t reaped;
+            do {
+                reaped = waitpid(static_cast<pid_t>(child_pid_), nullptr, WNOHANG);
+            } while (reaped < 0 && errno == EINTR);
+        }
+        child_death_reason_ = child_status_message(child_pid_, info);
     }
     return child_death_reason_;
 }
@@ -1387,7 +1396,7 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
             progress.dispatch = record.dispatch;
             progress.completion = poisoned_completion(record);
             if (preserve_terminal_results_on_exit_) {
-                // The child can publish between an earlier entry read and waitpid observing exit.
+                // The child can publish between an earlier entry read and observing its exit.
                 // This acquire read follows confirmed exit; identity still belongs to this dispatch.
                 MailboxRunEntry *entry = run_entry(index);
                 const auto state = static_cast<MailboxState>(load_entry_i32(&entry->state));
@@ -1768,6 +1777,12 @@ static void write_control_digest(char *mbox, const uint8_t *digest) {
     std::memcpy(mbox + MAILBOX_OFF_CONTROL_CALLABLE_HASH, digest, CALLABLE_HASH_DIGEST_SIZE);
 }
 
+void LocalMailboxEndpoint::require_writable_control_frame(const char *op_name) const {
+    if (mailbox_control_timed_out_) {
+        throw std::runtime_error(std::string(op_name) + " failed: mailbox has an unresolved timed-out control command");
+    }
+}
+
 // Issue a control sub-command and block until the child publishes
 // CONTROL_DONE. Caller must hold `mailbox_mu_`. Registry controls may remain
 // in CONTROL_REQUEST while the child owns an active native run or a live frame
@@ -1778,9 +1793,6 @@ static void write_control_digest(char *mbox, const uint8_t *digest) {
 // the next claim starts from a clean state). The `op_name` is used only for the
 // exception message.
 void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeout_s) {
-    if (mailbox_control_timed_out_) {
-        throw std::runtime_error(std::string(op_name) + " failed: mailbox has an unresolved timed-out control command");
-    }
     int32_t zero_err = 0;
     std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
     std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
@@ -1830,6 +1842,7 @@ void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeo
 
 uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_malloc");
     write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
     run_control_command("control_malloc");
     return read_control_result(mbox());
@@ -1837,6 +1850,7 @@ uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
 
 uint64_t LocalMailboxEndpoint::control_committed_device_memory() {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_committed_device_memory");
     write_control_args(mbox(), CTRL_COMMITTED_DEVICE_MEMORY);
     run_control_command("control_committed_device_memory");
     return read_control_result(mbox());
@@ -1844,6 +1858,7 @@ uint64_t LocalMailboxEndpoint::control_committed_device_memory() {
 
 DeviceMemoryInfo LocalMailboxEndpoint::control_device_memory_info() {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_device_memory_info");
     write_control_args(mbox(), CTRL_DEVICE_MEMORY_INFO);
     run_control_command("control_device_memory_info");
     DeviceMemoryInfo info{};
@@ -1853,13 +1868,7 @@ DeviceMemoryInfo LocalMailboxEndpoint::control_device_memory_info() {
 
 DfxFlushReport LocalMailboxEndpoint::control_dfx_flush(double timeout_s) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    // Checked under the mutex and before any frame byte is written. The other
-    // control methods write their args first and let run_control_command throw,
-    // which leaves a poisoned endpoint's frame mutated; a flush must not, since
-    // the whole point of the poison is that this mailbox is never reused.
-    if (mailbox_control_timed_out_.load(std::memory_order_acquire)) {
-        throw std::runtime_error("control_dfx_flush failed: mailbox has an unresolved timed-out control command");
-    }
+    require_writable_control_frame("control_dfx_flush");
     if (std::isnan(timeout_s)) {
         throw std::runtime_error("control_dfx_flush: timeout is not a number");
     }
@@ -1905,6 +1914,7 @@ DfxFlushReport LocalMailboxEndpoint::control_dfx_flush(double timeout_s) {
 
 void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_prepare");
     write_control_args(mbox(), CTRL_PREPARE);
     write_control_digest(mbox(), digest);
     run_control_command("control_prepare");
@@ -1912,6 +1922,7 @@ void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
 
 void LocalMailboxEndpoint::control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_register");
     // OFF_ERROR / OFF_ERROR_MSG are cleared by run_control_command — no
     // prelude memset needed (matches the other control_* methods).
     uint64_t sub_cmd = CTRL_REGISTER;
@@ -1932,6 +1943,7 @@ void LocalMailboxEndpoint::control_register(const char *shm_name, size_t blob_si
 
 void LocalMailboxEndpoint::control_unregister(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_unregister");
     write_control_args(mbox(), CTRL_UNREGISTER);
     write_control_digest(mbox(), digest);
     run_control_command("control_unregister");
@@ -1993,6 +2005,7 @@ void LocalMailboxEndpoint::control_generic(
     uint64_t sub_cmd, const char *shm_name, size_t staged_payload_size, double timeout_s, const uint8_t *digest
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_generic");
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     uint64_t payload_size = static_cast<uint64_t>(staged_payload_size);
     std::memcpy(mbox() + CTRL_OFF_ARG0, &payload_size, sizeof(uint64_t));
@@ -2009,6 +2022,7 @@ void LocalMailboxEndpoint::control_generic(
 
 void LocalMailboxEndpoint::control_free(uint64_t ptr) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_free");
     write_control_args(mbox(), CTRL_FREE, ptr);
     run_control_command("control_free");
 }
@@ -2017,6 +2031,7 @@ void LocalMailboxEndpoint::control_copy_to(
     const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_copy_to");
     write_control_copy_request(mbox(), CTRL_COPY_TO, dst, src, span);
     run_control_command("control_copy_to");
 }
@@ -2025,6 +2040,7 @@ void LocalMailboxEndpoint::control_copy_from(
     const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_copy_from");
     write_control_copy_request(mbox(), CTRL_COPY_FROM, dst, src, span);
     run_control_command("control_copy_from");
 }
@@ -2051,6 +2067,7 @@ void LocalMailboxEndpoint::control_alloc_domain(const char *request_shm_name, co
         throw std::runtime_error("control_alloc_domain: request and reply shm names must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_alloc_domain");
     uint64_t sub_cmd = CTRL_ALLOC_DOMAIN;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
@@ -2062,6 +2079,7 @@ void LocalMailboxEndpoint::control_release_domain(const char *request_shm_name) 
         throw std::runtime_error("control_release_domain: request shm name must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_release_domain");
     uint64_t sub_cmd = CTRL_RELEASE_DOMAIN;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, "");
@@ -2073,6 +2091,7 @@ void LocalMailboxEndpoint::control_comm_init(const char *request_shm_name) {
         throw std::runtime_error("control_comm_init: request shm name must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_writable_control_frame("control_comm_init");
     uint64_t sub_cmd = CTRL_COMM_INIT;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, "");

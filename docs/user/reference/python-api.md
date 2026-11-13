@@ -109,6 +109,8 @@ requires matching torch/torch_npu/CANN and does not enable capture submission.
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
 | `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
+| `Buffer.host_view()` | CPU view of the local Host backing. Release the view and its derivatives before closing the backing |
+| `release_buffer(buffer)` | Release Worker-owned storage after accepted uses retire. For a mapped Host Buffer, this also releases its cached registration |
 | `Buffer.shm.buf` | CPU bytes of shared Host storage. Host-source domain buffers expose the whole rank window; select slices with `domain.buffer_range(name)`. Device-source HBM buffers have `shm=None` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
@@ -117,6 +119,19 @@ dst_offset=32, nbytes=16)`. A handle rebuilt at `base + 32` is not an interior v
 allocation; it is a different canonical identity that names no allocation at all, and is refused.
 Both offsets are bounded together with the length against the *registered* extent, so an offset
 cannot walk a legal-looking length past the end.
+
+For direct A3/A5 L2 Workers with an owned device context, use
+`args.add_tensor(tensor, transfer=TensorTransfer.MAP)` to let the device access
+a Worker-owned Host Buffer without staging a copy. The Tensor keeps its HOST
+descriptor. Each accepted call retains its use until completion or proven
+cancellation. Borrowed contexts and graph capture do not accept Host MAP. See
+[Buffer ABI](../../buffer-abi.md) for transfer defaults and release behavior.
+
+For a local A3 or A5 L3 Worker using `tensormap_and_ringbuffer`, pass MAP
+arguments to the outer submission to prepare their backings on every child before
+the callback. Child tasks can use MAP for any subview of those same backings.
+Each child resolves its own Device address, and subsequent submissions reuse the
+registrations until release. See [L3 shared tables](../../design/a5-host-ddr.md#l3-shared-tables).
 
 ### Execution
 
