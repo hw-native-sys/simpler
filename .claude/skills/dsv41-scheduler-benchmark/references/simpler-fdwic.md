@@ -1,6 +1,6 @@
 # Simpler's in-repo FDWIC suite
 
-Use [the suite README](../../../../tests/fdwic/dsv41_scheduler/README.md) and [results](../../../../tests/fdwic/dsv41_scheduler/RESULTS.md) from the same checkout. The production ChipWorker runs captured graph slices with vendored generated code and frozen zero-weight inputs. Local cases materialize their prefix inputs, with prefix time outside the case measurement. The suite runs with the checked-in fixtures and the A5 onboard HBG runtime.
+Use [the suite README](../../../../tests/fdwic/dsv41_scheduler/README.md) and [results](../../../../tests/fdwic/dsv41_scheduler/RESULTS.md) from the same checkout. The production ChipWorker runs captured graph slices with vendored generated code and frozen zero-weight inputs. Local cases materialize their prefix inputs, with prefix time outside the case measurement. The suite runs with the checked-in fixtures and the A5 onboard HBG or percounter runtime. Percounter multi-device communication is not supported; mark its MoE and layers_19_21 entries unavailable.
 
 The default matrix has nine cases per flavor, `pypto_lib` and `pypto_lib_dsl`.
 
@@ -9,7 +9,8 @@ The default matrix has nine cases per flavor, `pypto_lib` and `pypto_lib_dsl`.
 | 1 | `swa`, `c2a_full`, `c2a_reuse`, `c1a_full`, `c1a_reindex`, `c1a_reuse`, `engram` |
 | 2 | `moe`, `layers_19_21` |
 
-The optional forced sync-start DSL variant is a separate workload. Report it explicitly if requested.
+The default DSL cases preserve original sync-start flags and add flags until approximately half of each case's SPMD tasks require sync-start. AIC/MIX additions are capped at 32 blocks and AIV at 64.
+This is one 18-configuration matrix, without a third all-sync DSL group. Regenerate bundles with the current exporter; identify the policy from `case.json`.
 
 ## Build and prepare
 
@@ -27,7 +28,7 @@ Prepare into a fresh path. Preparation captures the two-rank source forward and 
 
 ## Run and collect
 
-`run.sh` takes `BUNDLE RUNTIME OUTPUT LEVEL WARMUP ROUNDS`. The wrapper reserves the number of cards required by the bundle when `TASK_DEVICE` is unset. Use `DSV41_DEVICES` to request the same physical cards for matched arms or use an existing reservation with the exact topology. Give each arm a fresh output directory.
+`run.sh` takes `BUNDLE RUNTIME OUTPUT LEVEL WARMUP ROUNDS`. The wrapper reserves the number of cards required by the bundle when `TASK_DEVICE` is unset. Use `task-submit --device auto --device-num N` and run matched arms inside that allocation, using `TASK_DEVICE` as returned. Give each arm a fresh output directory. Append `--runtime=percounter` for percounter; HBG is the default.
 
 ```bash
 export RUN_DIR="$DSV41/outputs/repro"

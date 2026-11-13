@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Assemble nine original-kernel cases from a production Host submission capture."""
+"""Assemble nine cases per flavor, with half-SPMD synchronization for DSL."""
 
 import argparse
 import json
@@ -32,6 +32,7 @@ def export(bundle, capture, flavor, output, tools):
         destination.mkdir(parents=True, exist_ok=False)
         first, last = str(case["first_source_task"]), str(case["last_source_task"])
         metadata = []
+        sync_reports = []
         for rank in range(2):
             plan = capture / f"rank{rank}/submissions.bin"
             detail = json.loads(
@@ -40,7 +41,24 @@ def export(bundle, capture, flavor, output, tools):
             if (detail["tasks"], detail["executions"]) != (case["tasks"], case["executions"]):
                 raise ValueError(f"{flavor}/{name}: original task or physical execution count changed")
             metadata.append(detail)
-            link(plan, destination / f"plan-rank{rank}.bin")
+            if flavor == "pypto_lib_dsl":
+                sync_reports.append(
+                    json.loads(
+                        subprocess.check_output(
+                            [
+                                str(tools / "record-tool"),
+                                "--half-sync-start",
+                                str(plan),
+                                first,
+                                last,
+                                str(destination / f"plan-rank{rank}.bin"),
+                            ],
+                            text=True,
+                        )
+                    )
+                )
+            else:
+                link(plan, destination / f"plan-rank{rank}.bin")
             lines = (bundle / f"rank{rank}.txt").read_text().splitlines()
             count = int(lines[2])
             # The replay entry takes backing buffers. Original kernel views,
@@ -95,6 +113,11 @@ def export(bundle, capture, flavor, output, tools):
                     "flavor": flavor,
                     "case": name,
                     "source": case,
+                    **(
+                        {"sync_start_policy": {"policy": "half_spmd_preserve_existing", "plans": sync_reports}}
+                        if sync_reports
+                        else {}
+                    ),
                     "ranks": metadata,
                     "device_count": 2 if name in ("moe", "layers_19_21") else 1,
                     "preparation": "Run the original prefix into persistent cut inputs; exclude it from measured runs.",
