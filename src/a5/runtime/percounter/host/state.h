@@ -255,11 +255,10 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
 
-    // Each lane's payload keeps these fields for the whole run: its argument
-    // vector points at its own contexts. A lane rewrites the block fields for
-    // every block it runs.
-    for (uint64_t lane = 0; lane < SCHEDULER_WORKER_CAPACITY; ++lane) {
-        const uint64_t offset = layout.dispatch_payloads_offset + lane * sizeof(DispatchPayload);
+    // Each slot points at its own contexts, so preparing another candidate
+    // cannot replace the block identity of a payload already held by the lane.
+    for (uint64_t slot = 0; slot < SCHEDULER_WORKER_CAPACITY * PERCOUNTER_PAYLOAD_SLOT_COUNT; ++slot) {
+        const uint64_t offset = layout.dispatch_payloads_offset + slot * sizeof(DispatchPayload);
         auto *payload = region_at<DispatchPayload>(host_base, offset);
         const uint64_t device_payload = device_base + offset;
         payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);

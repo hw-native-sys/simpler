@@ -51,9 +51,8 @@ BUILD_BY_DEFAULT = False
 # arch-independent cases -- the platform tree's, which compile into every
 # runtime's image -- are built once per runtime under both archs, so a runtime
 # one arch lacks would send them looking for a directory that is not there.
-# They are therefore built for the runtimes both archs carry, and this one
-# goes without them -- it carries no cases of its own either, which is the
-# scope decision this PR states rather than a gap this line papers over.
+# They are therefore built for the runtimes both archs carry. Percounter's
+# own lane/payload unit tests are registered separately under a5.
 #
 # Saying nothing is what a runtime added to one arch by mistake does, and that
 # is the case worth stopping: the build would otherwise drop those cases for it

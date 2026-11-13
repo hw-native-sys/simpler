@@ -48,6 +48,27 @@ constexpr uint32_t PERCOUNTER_SSBUF_REGION_OFFSET = 2 * 1024;
 constexpr uint32_t PERCOUNTER_SSBUF_REGION_SIZE = 1024;
 static_assert(PERCOUNTER_SSBUF_REGION_OFFSET + PERCOUNTER_SSBUF_REGION_SIZE == PLATFORM_SSBUF_SIZE);
 
+// A CPU reader can overlap record reuse even when it discards the snapshot.
+// Acquiring a newer field also orders its opening generation before the
+// reader's closing generation check.
+template <typename T>
+inline __aicore__ T percounter_ssbuf_load_field(const PERCOUNTER_SSBUF volatile T *field) {
+#if defined(__CCE_AICORE__)
+    return *field;
+#else
+    return __atomic_load_n(field, __ATOMIC_ACQUIRE);
+#endif
+}
+
+template <typename T>
+inline __aicore__ void percounter_ssbuf_store_field(PERCOUNTER_SSBUF volatile T *field, T value) {
+#if defined(__CCE_AICORE__)
+    *field = value;
+#else
+    __atomic_store_n(field, value, __ATOMIC_RELEASE);
+#endif
+}
+
 /**
  * Publication tokens, not read-modify-write state: SSBUF has no atomics.
  *
