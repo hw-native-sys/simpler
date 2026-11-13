@@ -173,8 +173,8 @@ struct GraphRecording {
     // (a per-task buffer at the cap is 32 x 128 B = exactly one page, so dsv4's 1679 tasks
     // touched 1679 pages to hold ~210 KB). Allocated once per thread at the cap and never
     // grown, which is what keeps a task's borrowed element addresses valid for the rest of
-    // the recording. `new[]` default-initializes a trivially-default-constructible Tensor,
-    // so the region costs no page until a body writes one; each element a task uses is
+    // the recording. `new[]` default construction writes each Tensor's TaskId invalid
+    // sentinel, touching the pool during stand-up. Each element a task uses is
     // value-initialized before it is filled.
     std::unique_ptr<simpler::hbg::Tensor[]> task_tensor_pool;
     int32_t task_tensor_cursor{0};

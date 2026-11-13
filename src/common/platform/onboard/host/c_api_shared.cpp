@@ -2101,6 +2101,13 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         // measure, so they are written here as well as in the device-run
         // teardown. Skipping the device must not skip the artifact.
         state->runner->write_host_phase_records_artifact(state->config.output_prefix, state->descriptor.pipeline_slot);
+        state->launch_not_started_proven = true;
+        // This timing-only run produces no device outputs. End the copy-back
+        // obligation without reading them; finalization still releases bindings
+        // and abandons the owned preparation through the ordinary cleanup path.
+        state->copyback_rc = 0;
+        state->copyback_returned = true;
+        note_workspace_fact(state, WorkspaceManager::RunFact::CopybackReturned);
         state->completion_rc = 0;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;

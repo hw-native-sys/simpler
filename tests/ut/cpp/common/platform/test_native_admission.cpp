@@ -779,6 +779,29 @@ TEST_F(NativeAdmissionTest, OptionalResultKernelObserverErrorRemainsTheOriginalS
     );
 }
 
+TEST_F(NativeAdmissionTest, SkippedDeviceRunCanFinalizeAndReuseItsSlot) {
+    EXPECT_EXIT(
+        {
+            setenv("SIMPLER_SKIP_DEVICE_RUN", "1", 1);
+            FencedCompletionRunner runner;
+            for (uint64_t epoch = 10; epoch < 12; ++epoch) {
+                Attempt active(runner, 0, epoch);
+                if (active.prepare() != 0) std::_Exit(1);
+                const auto reads_before_launch = control().d2h_calls;
+                if (simpler_launch_run(&runner, active.storage) != 0) std::_Exit(2);
+                if (runner.launch_calls != 0) std::_Exit(3);
+                if (simpler_poll_run(&runner, active.storage) != SIMPLER_NATIVE_RUN_POLL_COMPLETE) std::_Exit(4);
+                if (simpler_wait_run(&runner, active.storage) != 0) std::_Exit(5);
+                if (simpler_finalize_run(&runner, active.storage) != 0) std::_Exit(6);
+                if (!active.consume_release()) std::_Exit(7);
+                if (!active.empty() || control().d2h_calls != reads_before_launch) std::_Exit(8);
+            }
+            std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
 TEST_F(NativeAdmissionTest, SuccessfulExplicitObservationDoesNotReadThePrivateResult) {
     FencedCompletionRunner runner;
     Attempt active(runner, 0, 10);
